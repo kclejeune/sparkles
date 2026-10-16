@@ -212,6 +212,7 @@ pub fn start_reason(
     trigger: Trigger,
     incremental: bool,
     refresh: bool,
+    threads: Option<usize>,
 ) -> crate::state::Task {
     let st2 = st.clone();
     let name = ds.name.clone();
@@ -243,6 +244,8 @@ pub fn start_reason(
                 file_loads: st2.file_loads.clone(),
                 ..Default::default()
             },
+            threads,
+            max_memory: None,
         };
         ds.closure.set_max_triples(st2.reason_cache_triples);
         let outcome = match ds.dataset.reasoning().run_with(&req, &ctl) {
@@ -531,6 +534,7 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
             trigger,
             true,
             false,
+            None,
         );
         p.task = Some((task.id, head));
         p.since = now;

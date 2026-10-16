@@ -182,6 +182,12 @@ pub const CHECKS: &[Check] = &[
         query: include_str!("../diagnostics/thing-empty.rq"),
     },
     Check {
+        id: "literal-not-in-datatype",
+        rules: &["dt-not-type", "dt-type2", "prp-rng"],
+        severity: Severity::Inconsistency,
+        query: include_str!("../diagnostics/datatype-range.rq"),
+    },
+    Check {
         id: "unsatisfiable-class",
         rules: &["lint"],
         severity: Severity::Warning,
@@ -629,7 +635,12 @@ pub fn diagnose(snap: Arc<Snapshot>, opts: &DiagnoseOptions) -> anyhow::Result<D
             graphs: &opts.graphs,
             names: &names,
         };
-        match run.findings(limit) {
+        let found = if check.id == "literal-not-in-datatype" {
+            run.paged_findings(limit)
+        } else {
+            run.findings(limit)
+        };
+        match found {
             Ok((found, truncated)) => {
                 out.findings = found.len();
                 out.status = if truncated {
@@ -655,10 +666,11 @@ pub fn diagnose(snap: Arc<Snapshot>, opts: &DiagnoseOptions) -> anyhow::Result<D
         .any(|c| c.severity == Severity::Inconsistency && c.findings > 0)
     {
         ReportStatus::ViolationsFound
-    } else if outcomes
-        .iter()
-        .any(|c| matches!(c.status, CheckStatus::Timeout | CheckStatus::Error))
-    {
+    } else if outcomes.iter().any(|c| {
+        matches!(c.status, CheckStatus::Timeout | CheckStatus::Error)
+            // a check that stopped before it found anything did not finish
+            || (c.status == CheckStatus::Truncated && c.findings == 0)
+    }) {
         ReportStatus::Incomplete
     } else {
         ReportStatus::NoneFound
@@ -687,6 +699,37 @@ struct Run<'a> {
 }
 
 type Row = BTreeMap<String, Term>;
+
+/// The first and the largest page of candidate rows that [`Run::paged_findings`] reads.
+/// Pages double in size from the first to the largest.
+const PAGE_FIRST: usize = 256;
+const PAGE_MAX: usize = 16_384;
+/// The candidate rows [`Run::paged_findings`] reads at most before it stops and reports
+/// the check truncated.
+const CANDIDATES_MAX: usize = 1 << 18;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the page of [`Run::paged_findings`] (counted from 0) that fails with a
+    /// timeout before it runs its query.
+    static PAGE_TIMEOUT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests only: replaces [`CANDIDATES_MAX`].
+    static CANDIDATES_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`CANDIDATES_MAX`], or the cap a test set.
+fn candidates_max() -> usize {
+    #[cfg(test)]
+    if let Some(n) = CANDIDATES_CAP.with(std::cell::Cell::get) {
+        return n;
+    }
+    CANDIDATES_MAX
+}
+/// A total order of the rows of `datatype-range.rq`. Every key is an IRI, a blank node
+/// or a simple literal, which compare by their strings, and together the keys identify a
+/// row of the DISTINCT projection. Pages of this order therefore neither skip nor repeat
+/// a row, and the rows of one finding, which differ only in `?via`, are adjacent.
+const CANDIDATE_ORDER: &str = "ORDER BY ?x ?p ?range STR(?lit) DATATYPE(?lit) LANG(?lit) ?via";
 
 impl Run<'_> {
     fn options(
@@ -785,6 +828,92 @@ impl Run<'_> {
         Ok((out, truncated))
     }
 
+    /// The findings of a check whose query returns candidates that are often not
+    /// findings (`literal-not-in-datatype`), at most `limit`, and whether more may
+    /// exist. Each candidate is judged before it counts toward the limit. The candidates
+    /// are read in pages of one total order ([`CANDIDATE_ORDER`]). Each page holds its
+    /// rows, and the query's sort keeps the rows up to the end of the page, at most
+    /// 278,528. Every page runs the query and its sort again, which trades repeated
+    /// query work for that bound. The check stops at the first finding past the limit,
+    /// when the candidates run out, at the deadline, or after [`CANDIDATES_MAX`]
+    /// candidate rows, and it reports itself truncated in the first and the last case. A
+    /// deadline after at least one finding returns the findings found, truncated.
+    fn paged_findings(&self, limit: usize) -> sparkles_core::Result<(Vec<Finding>, bool)> {
+        let mut out = Vec::new();
+        match self.paged_into(limit, &mut out) {
+            Ok(truncated) => Ok((out, truncated)),
+            Err(Error::Timeout) if !out.is_empty() => Ok((out, true)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The pages of [`paged_findings`](Self::paged_findings), adding the findings to
+    /// `out` as they are judged. Returns whether the check is truncated.
+    fn paged_into(&self, limit: usize, out: &mut Vec<Finding>) -> sparkles_core::Result<bool> {
+        let mut offset = 0usize;
+        let mut page = (2 * limit + 2).clamp(PAGE_FIRST, PAGE_MAX);
+        #[cfg(test)]
+        let mut pages = 0usize;
+        loop {
+            #[cfg(test)]
+            {
+                if PAGE_TIMEOUT.with(std::cell::Cell::get) == Some(pages) {
+                    return Err(Error::Timeout);
+                }
+                pages += 1;
+            }
+            let text = format!(
+                "{}\n{CANDIDATE_ORDER}\nLIMIT {page} OFFSET {offset}",
+                self.text
+            );
+            let rows = self.select(&text, self.inferences, Vec::new())?;
+            let full = rows.len() >= page;
+            let n = rows.len();
+            // the rows of one finding are adjacent in the order
+            // (key, position of the first row in the page, rows)
+            let mut groups: Vec<(String, usize, Vec<Row>)> = Vec::new();
+            for (i, row) in rows.into_iter().enumerate() {
+                let Some(key) = self.key(&row) else { continue };
+                match groups.last_mut() {
+                    Some((k, _, g)) if *k == key => g.push(row),
+                    _ => groups.push((key, i, vec![row])),
+                }
+            }
+            // The last group of a full page may continue on the next page, so it is
+            // read again there, unless it starts the page.
+            let mut consumed = n;
+            if full && let Some(&(_, start, _)) = groups.last() {
+                if start > 0 {
+                    consumed = start;
+                    groups.pop();
+                } else if page < PAGE_MAX {
+                    page = (page * 2).min(PAGE_MAX);
+                    continue;
+                }
+            }
+            for (_, _, rows) in &groups {
+                let Some(mut f) = self.finding(rows, Basis::Asserted)? else {
+                    continue;
+                };
+                if out.len() == limit {
+                    return Ok(true);
+                }
+                if self.inferences && !self.holds_asserted(&rows[0])? {
+                    f.basis = Basis::UsesInferences;
+                }
+                out.push(f);
+            }
+            if !full {
+                return Ok(false);
+            }
+            offset += consumed;
+            if offset >= candidates_max() {
+                return Ok(true);
+            }
+            page = (page * 2).min(PAGE_MAX);
+        }
+    }
+
     /// The same query with the row's bindings, over the asserted data only.
     fn holds_asserted(&self, row: &Row) -> sparkles_core::Result<bool> {
         let text = format!("{}\nLIMIT 1", self.text);
@@ -827,6 +956,9 @@ impl Run<'_> {
                 format!("{} {} {} {}", t("d")?, t("x")?, t("y")?, pair("p1", "p2")?)
             }
             "negative-property-assertion" => t("a")?,
+            "literal-not-in-datatype" => {
+                format!("{} {} {} {}", t("x")?, t("p")?, t("lit")?, t("range")?)
+            }
             _ => return None,
         })
     }
@@ -1178,6 +1310,49 @@ impl Run<'_> {
                     msg,
                 )
             }
+            "literal-not-in-datatype" => {
+                let (Some(x), Some(p), Some(range), Some(Term::Literal(lit))) =
+                    (get("x"), get("p"), get("range"), get("lit"))
+                else {
+                    return Ok(None);
+                };
+                let Term::NamedNode(r) = &range else {
+                    return Ok(None);
+                };
+                // only a literal the table decides is outside is reported
+                if in_value_space(&lit, r.as_str()) != Some(false) {
+                    return Ok(None);
+                }
+                let by_range = matches!(get("via"), Some(Term::Literal(v)) if v.value() == "range");
+                let l = Term::Literal(lit);
+                let msg = if by_range {
+                    format!(
+                        "{} {} {}: the value is not in the value space of {}, a range of {}",
+                        n(&x),
+                        n(&p),
+                        n(&l),
+                        n(&range),
+                        n(&p)
+                    )
+                } else {
+                    format!(
+                        "{} {} {}: the literal is ill-typed for its datatype {}",
+                        n(&x),
+                        n(&p),
+                        n(&l),
+                        n(&range)
+                    )
+                };
+                (
+                    x,
+                    vec![
+                        ("property", Evidence::One(p)),
+                        ("range", Evidence::One(range)),
+                        ("literal", Evidence::One(l)),
+                    ],
+                    msg,
+                )
+            }
             _ => return Ok(None),
         };
         Ok(Some(Finding {
@@ -1261,5 +1436,714 @@ impl Names {
             }
             t => t.to_string(),
         }
+    }
+}
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+const RDF_PLAIN_LITERAL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral";
+
+/// The bounds of xsd:integer and its derived types, `None` for no bound.
+fn integer_bounds(local: &str) -> Option<(Option<i128>, Option<i128>)> {
+    Some(match local {
+        "integer" => (None, None),
+        "long" => (Some(i64::MIN as i128), Some(i64::MAX as i128)),
+        "int" => (Some(i32::MIN as i128), Some(i32::MAX as i128)),
+        "short" => (Some(i16::MIN as i128), Some(i16::MAX as i128)),
+        "byte" => (Some(i8::MIN as i128), Some(i8::MAX as i128)),
+        "nonNegativeInteger" => (Some(0), None),
+        "nonPositiveInteger" => (None, Some(0)),
+        "positiveInteger" => (Some(1), None),
+        "negativeInteger" => (None, Some(-1)),
+        "unsignedLong" => (Some(0), Some(u64::MAX as i128)),
+        "unsignedInt" => (Some(0), Some(u32::MAX as i128)),
+        "unsignedShort" => (Some(0), Some(u16::MAX as i128)),
+        "unsignedByte" => (Some(0), Some(u8::MAX as i128)),
+        _ => return None,
+    })
+}
+
+const STRING_TYPES: &[&str] = &[
+    "string",
+    "normalizedString",
+    "token",
+    "language",
+    "Name",
+    "NCName",
+    "NMTOKEN",
+];
+
+/// An exact number of the xsd:decimal value space, read from a lexical form: its sign,
+/// the digits of its integer part without leading zeros (empty for zero), and whether
+/// its fractional part is nonzero. Zero is never negative.
+struct Exact<'a> {
+    neg: bool,
+    int: &'a str,
+    frac: bool,
+}
+
+impl Exact<'_> {
+    /// The XSD 1.1 lexical space of xsd:decimal, `(\+|-)?([0-9]+(\.[0-9]*)?|\.[0-9]+)`, or
+    /// with `integer` that of xsd:integer, `[\-+]?[0-9]+`. Any number of digits is read
+    /// exactly.
+    fn parse(lex: &str, integer: bool) -> Option<Exact<'_>> {
+        let (neg, body) = match lex.as_bytes().first() {
+            Some(b'-') => (true, &lex[1..]),
+            Some(b'+') => (false, &lex[1..]),
+            _ => (false, lex),
+        };
+        let (int, frac) = match body.split_once('.') {
+            Some(_) if integer => return None,
+            Some((i, f)) => (i, f),
+            None => (body, ""),
+        };
+        if (int.is_empty() && frac.is_empty())
+            || !int.bytes().all(|b| b.is_ascii_digit())
+            || !frac.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let int = int.trim_start_matches('0');
+        let frac = frac.bytes().any(|b| b != b'0');
+        Some(Exact {
+            neg: neg && (!int.is_empty() || frac),
+            int,
+            frac,
+        })
+    }
+
+    /// The order of an integral number and an integer bound, compared by sign and then
+    /// by the length and the digits of the magnitudes.
+    fn cmp_bound(&self, bound: i128) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let mag = bound.unsigned_abs().to_string();
+        let mag = mag.trim_start_matches('0');
+        let by_mag = |a: &str, b: &str| a.len().cmp(&b.len()).then_with(|| a.cmp(b));
+        match (self.neg, bound < 0) {
+            (false, true) => Ordering::Greater,
+            (true, false) => Ordering::Less,
+            (false, false) => by_mag(self.int, mag),
+            (true, true) => by_mag(mag, self.int),
+        }
+    }
+
+    /// Whether the number is an integer within the bounds of an xsd:integer type.
+    fn in_integer_type(&self, local: &str) -> bool {
+        let Some((lo, hi)) = integer_bounds(local) else {
+            return false;
+        };
+        !self.frac
+            && lo.is_none_or(|lo| self.cmp_bound(lo).is_ge())
+            && hi.is_none_or(|hi| self.cmp_bound(hi).is_le())
+    }
+}
+
+/// Whether `c` matches the XML 1.0 (fifth edition) production NameStartChar.
+fn name_start_char(c: char) -> bool {
+    matches!(c,
+        ':' | 'A'..='Z' | '_' | 'a'..='z'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+}
+
+/// Whether `c` matches the XML 1.0 (fifth edition) production NameChar.
+fn name_char(c: char) -> bool {
+    name_start_char(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+}
+
+/// Whether a string lies in the value space of a string type: xsd:string or one derived
+/// from it by facets. The lexical form is used as it is, without the XML whitespace
+/// processing, since RDF maps lexical forms directly.
+fn string_in(v: &str, local: &str) -> bool {
+    let normalized = !v.contains(['\r', '\n', '\t']);
+    let token = normalized && !v.starts_with(' ') && !v.ends_with(' ') && !v.contains("  ");
+    match local {
+        "string" => true,
+        "normalizedString" => normalized,
+        "token" => token,
+        "language" => {
+            let mut parts = v.split('-');
+            let first = parts.next().unwrap_or("");
+            (1..=8).contains(&first.len())
+                && first.bytes().all(|b| b.is_ascii_alphabetic())
+                && parts.all(|p| {
+                    (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric())
+                })
+        }
+        "NMTOKEN" => !v.is_empty() && v.chars().all(name_char),
+        "Name" | "NCName" => {
+            let mut cs = v.chars();
+            cs.next().is_some_and(name_start_char)
+                && cs.all(name_char)
+                && (local == "Name" || !v.contains(':'))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an xsd:dateTime lexical form ends with a timezone, `Z` or `±hh:mm`.
+fn has_timezone(lex: &str) -> bool {
+    let b = lex.as_bytes();
+    lex.ends_with('Z')
+        || (b.len() > 6 && matches!(b[b.len() - 6], b'+' | b'-') && b[b.len() - 3] == b':')
+}
+
+/// Whether a literal of `local` (an XSD local name) is well typed, for the datatypes of
+/// the last row of the check's table, or `None` for the others.
+fn well_typed_other(lex: &str, local: &str) -> Option<bool> {
+    let lex_t = lex.trim();
+    Some(match local {
+        "boolean" => matches!(lex_t, "true" | "false" | "1" | "0"),
+        "dateTime" => matches!(
+            sparkles_core::sparql::value::Value::from_typed(lex_t, &format!("{XSD}dateTime")),
+            sparkles_core::sparql::value::Value::DateTime(_)
+        ),
+        "dateTimeStamp" => well_typed_other(lex_t, "dateTime")? && has_timezone(lex_t),
+        "anyURI" => true,
+        "hexBinary" => {
+            lex_t.len().is_multiple_of(2) && lex_t.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        "base64Binary" => {
+            let s: Vec<u8> = lex_t.bytes().filter(|b| *b != b' ').collect();
+            let body = s.iter().take_while(|b| **b != b'=').count();
+            s.len().is_multiple_of(4)
+                && s.len() - body <= 2
+                && s[..body]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/')
+                && s[body..].iter().all(|b| *b == b'=')
+        }
+        _ => return None,
+    })
+}
+
+/// The families of value spaces the check implements. Under the OWL 2 datatype map the
+/// value spaces of different families are disjoint: owl:real (holding xsd:decimal and
+/// the integer types), xsd:double and xsd:float are pairwise disjoint, strings are
+/// neither IRIs nor language-tagged strings, and booleans, date-times, xsd:hexBinary
+/// values and xsd:base64Binary values are values of their own (OWL 2 section 4.5 makes
+/// the two binary value spaces disjoint). Within a family the value spaces overlap, and
+/// [`in_value_space`] decides membership from the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    /// language-tagged strings (rdf:langString)
+    Lang,
+    /// xsd:decimal, xsd:integer and the types derived from xsd:integer
+    Exact,
+    /// xsd:double and xsd:float, which the check treats as one family
+    Float,
+    /// xsd:string and the types derived from it
+    Str,
+    Boolean,
+    /// xsd:dateTime and xsd:dateTimeStamp
+    DateTime,
+    AnyUri,
+    /// xsd:hexBinary
+    Hex,
+    /// xsd:base64Binary
+    Base64,
+}
+
+/// The family of an XSD datatype whose value space the check implements.
+fn family(local: &str) -> Option<Family> {
+    Some(match local {
+        "decimal" => Family::Exact,
+        l if integer_bounds(l).is_some() => Family::Exact,
+        "double" | "float" => Family::Float,
+        l if STRING_TYPES.contains(&l) => Family::Str,
+        "boolean" => Family::Boolean,
+        "dateTime" | "dateTimeStamp" => Family::DateTime,
+        "anyURI" => Family::AnyUri,
+        "hexBinary" => Family::Hex,
+        "base64Binary" => Family::Base64,
+        _ => return None,
+    })
+}
+
+/// Whether `lit` is in the value space of the datatype `range` (OWL 2 RL `dt-not-type`),
+/// or `None` when the check does not decide it. It is undecided for a range outside the
+/// table and for a literal whose own datatype is outside it, such as xsd:date or a
+/// datatype outside the XSD namespace. A supported literal that is ill-typed for its
+/// own datatype denotes no value and is outside every supported range.
+pub fn in_value_space(lit: &Literal, range: &str) -> Option<bool> {
+    let lex = lit.value();
+    let dt = lit.datatype();
+    let dt = dt.as_str();
+    // the literal's own datatype and family; any other datatype leaves the answer open
+    let (local, src) = if lit.language().is_some() {
+        ("", Family::Lang)
+    } else {
+        let local = dt.strip_prefix(XSD)?;
+        (local, family(local)?)
+    };
+    // the range's family
+    enum Target<'r> {
+        LangString,
+        PlainLiteral,
+        Xsd(&'r str, Family),
+    }
+    let target = match range {
+        RDF_LANG_STRING => Target::LangString,
+        RDF_PLAIN_LITERAL => Target::PlainLiteral,
+        r => {
+            let r = r.strip_prefix(XSD)?;
+            Target::Xsd(r, family(r)?)
+        }
+    };
+    // the literal's own well-typedness
+    let exact = match src {
+        Family::Exact => match Exact::parse(lex.trim(), local != "decimal") {
+            Some(v) if local == "decimal" || v.in_integer_type(local) => Some(v),
+            _ => return Some(false),
+        },
+        _ => None,
+    };
+    let well_typed = match src {
+        Family::Lang | Family::Exact => true,
+        Family::Float => sparkles_core::sparql::value::Value::from_typed(lex, dt).is_numeric(),
+        Family::Str => string_in(lex, local),
+        _ => well_typed_other(lex, local)?,
+    };
+    if !well_typed {
+        return Some(false);
+    }
+    // membership of the value in the range
+    Some(match target {
+        Target::LangString => src == Family::Lang,
+        Target::PlainLiteral => matches!(src, Family::Lang | Family::Str),
+        Target::Xsd(_, f) if f != src => false,
+        Target::Xsd(r, Family::Exact) => {
+            r == "decimal" || exact.is_some_and(|v| v.in_integer_type(r))
+        }
+        Target::Xsd(r, Family::Str) => string_in(lex, r),
+        Target::Xsd("dateTimeStamp", _) => local == "dateTimeStamp" || has_timezone(lex.trim()),
+        // the other families hold every well-typed value of every datatype in them
+        Target::Xsd(..) => true,
+    })
+}
+
+#[cfg(test)]
+mod value_space_tests {
+    use super::in_value_space;
+    use oxrdf::{Literal, NamedNode};
+
+    fn typed(lex: &str, dt: &str) -> Literal {
+        Literal::new_typed_literal(
+            lex,
+            NamedNode::new_unchecked(format!("http://www.w3.org/2001/XMLSchema#{dt}")),
+        )
+    }
+
+    fn xsd(local: &str) -> String {
+        format!("http://www.w3.org/2001/XMLSchema#{local}")
+    }
+
+    #[test]
+    fn the_table_decides_value_space_membership() {
+        let yes =
+            |l: Literal, r: &str| assert_eq!(in_value_space(&l, &xsd(r)), Some(true), "{l} {r}");
+        let no =
+            |l: Literal, r: &str| assert_eq!(in_value_space(&l, &xsd(r)), Some(false), "{l} {r}");
+        yes(typed("1.0", "decimal"), "integer");
+        no(typed("1.5", "decimal"), "integer");
+        yes(typed("1.5", "decimal"), "decimal");
+        no(typed("abc", "integer"), "integer");
+        no(typed("300", "integer"), "byte");
+        yes(typed("-128", "integer"), "byte");
+        yes(
+            typed("18446744073709551615", "unsignedLong"),
+            "unsignedLong",
+        );
+        no(typed("-1", "integer"), "nonNegativeInteger");
+        no(typed("1", "integer"), "double");
+        yes(typed("1", "float"), "double");
+        no(typed("NaNx", "double"), "double");
+        no(typed("1", "integer"), "string");
+        yes(typed("en-US", "string"), "language");
+        no(typed("not a token ", "string"), "token");
+        no(typed("1abc", "string"), "NCName");
+        no(typed("a:b", "string"), "NCName");
+        yes(typed("a:b", "string"), "Name");
+        no(typed("yes", "boolean"), "boolean");
+        yes(typed("0", "boolean"), "boolean");
+        yes(typed("2020-01-01T00:00:00Z", "dateTimeStamp"), "dateTime");
+        no(typed("2020-01-01T00:00:00", "dateTime"), "dateTimeStamp");
+        no(typed("2020-13-01T00:00:00", "dateTime"), "dateTime");
+        no(typed("abc", "hexBinary"), "hexBinary");
+        yes(typed("0FAB", "hexBinary"), "hexBinary");
+        yes(typed("aGk=", "base64Binary"), "base64Binary");
+        no(typed("true", "boolean"), "dateTime");
+        let tagged = Literal::new_language_tagged_literal_unchecked("x", "en");
+        no(tagged.clone(), "string");
+        let lang = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+        let plain = "http://www.w3.org/1999/02/22-rdf-syntax-ns#PlainLiteral";
+        assert_eq!(in_value_space(&tagged, lang), Some(true));
+        assert_eq!(in_value_space(&tagged, plain), Some(true));
+        assert_eq!(
+            in_value_space(&Literal::new_simple_literal("x"), lang),
+            Some(false)
+        );
+        assert_eq!(
+            in_value_space(&Literal::new_simple_literal("x"), plain),
+            Some(true)
+        );
+        // what the table leaves open
+        let custom = Literal::new_typed_literal("x", NamedNode::new_unchecked("http://ex.org/dt"));
+        assert_eq!(in_value_space(&custom, &xsd("integer")), None);
+        assert_eq!(in_value_space(&typed("1", "integer"), &xsd("date")), None);
+        assert_eq!(
+            in_value_space(
+                &typed("1", "integer"),
+                "http://www.w3.org/2000/01/rdf-schema#Literal"
+            ),
+            None
+        );
+    }
+
+    fn check(l: &Literal, r: &str, want: Option<bool>) {
+        assert_eq!(in_value_space(l, &xsd(r)), want, "{l} in xsd:{r}");
+    }
+
+    fn rdf(local: &str) -> String {
+        format!("http://www.w3.org/1999/02/22-rdf-syntax-ns#{local}")
+    }
+
+    #[test]
+    fn f11_integers_are_compared_exactly() {
+        let yes = |lex: &str, dt: &str, r: &str| check(&typed(lex, dt), r, Some(true));
+        let no = |lex: &str, dt: &str, r: &str| check(&typed(lex, dt), r, Some(false));
+        let two127 = "170141183460469231731687303715884105728";
+        let max127 = "170141183460469231731687303715884105727";
+        let neg_two127 = "-170141183460469231731687303715884105728";
+        let neg_max127 = "-170141183460469231731687303715884105727";
+        for v in [two127, max127, neg_two127, neg_max127] {
+            yes(v, "integer", "integer");
+            yes(v, "integer", "decimal");
+            no(v, "integer", "long");
+            no(v, "integer", "byte");
+        }
+        // a huge integer is in no bounded type
+        let huge = "100000000000000000000000000000000000000000000000000";
+        no(huge, "integer", "byte");
+        no(huge, "integer", "unsignedLong");
+        yes(huge, "integer", "positiveInteger");
+        yes(huge, "integer", "nonNegativeInteger");
+        no(huge, "integer", "nonPositiveInteger");
+        no(huge, "integer", "negativeInteger");
+        yes(two127, "positiveInteger", "positiveInteger");
+        yes(two127, "positiveInteger", "integer");
+        no(two127, "positiveInteger", "nonPositiveInteger");
+        let neg_huge = "-100000000000000000000000000000000000000000000000000";
+        yes(neg_huge, "integer", "negativeInteger");
+        yes(neg_huge, "negativeInteger", "nonPositiveInteger");
+        no(neg_huge, "integer", "nonNegativeInteger");
+        no(neg_huge, "integer", "positiveInteger");
+        // the bounds of xsd:unsignedLong
+        yes("18446744073709551615", "integer", "unsignedLong");
+        no("18446744073709551616", "integer", "unsignedLong");
+        no("18446744073709551616", "unsignedLong", "integer");
+        yes("-9223372036854775808", "integer", "long");
+        no("-9223372036854775809", "integer", "long");
+        // leading zeros and signed zeros
+        yes("000000000000000000000000000000000000000001", "byte", "byte");
+        yes(
+            "-000000000000000000000000000000000000000128",
+            "integer",
+            "byte",
+        );
+        no(
+            "-000000000000000000000000000000000000000129",
+            "integer",
+            "byte",
+        );
+        for z in ["-0", "+0", "-000", "0"] {
+            yes(z, "integer", "nonNegativeInteger");
+            yes(z, "integer", "nonPositiveInteger");
+            no(z, "integer", "positiveInteger");
+            no(z, "integer", "negativeInteger");
+        }
+        yes("-0.0", "decimal", "nonNegativeInteger");
+        // integral decimals beyond i128 are integers
+        let big_dec = "170141183460469231731687303715884105728.000";
+        yes(big_dec, "decimal", "integer");
+        yes(big_dec, "decimal", "decimal");
+        no(big_dec, "decimal", "long");
+        let frac = "170141183460469231731687303715884105728.5";
+        no(frac, "decimal", "integer");
+        yes(frac, "decimal", "decimal");
+        // the lexical spaces: XSD 1.1 decimals allow "1." and ".5", integers do not
+        yes("1.", "decimal", "decimal");
+        yes("1.", "decimal", "integer");
+        yes(".5", "decimal", "decimal");
+        no(".5", "decimal", "integer");
+        no("1.", "integer", "integer");
+        no(".", "decimal", "decimal");
+        no("1e3", "integer", "integer");
+        no("1e3", "decimal", "decimal");
+        no("+-1", "integer", "integer");
+        no("+-1", "decimal", "decimal");
+        no("", "integer", "integer");
+        no("", "decimal", "decimal");
+        no("-", "integer", "integer");
+        yes("+7", "integer", "byte");
+    }
+
+    #[test]
+    fn f12_xml_names_follow_the_xml_productions() {
+        let s = |v: &str| typed(v, "string");
+        let yes = |v: &str, r: &str| check(&s(v), r, Some(true));
+        let no = |v: &str, r: &str| check(&s(v), r, Some(false));
+        // a combining mark is a NameChar but not a NameStartChar
+        yes("a\u{0301}", "NCName");
+        yes("a\u{0301}", "NMTOKEN");
+        yes("\u{0301}", "NMTOKEN");
+        no("\u{0301}a", "NCName");
+        yes("a:b", "Name");
+        no("a:b", "NCName");
+        yes(":a", "Name");
+        // the start character ranges and their endpoints
+        for c in [
+            '\u{10000}',
+            '\u{EFFFF}',
+            '\u{2070}',
+            '\u{C0}',
+            '\u{37F}',
+            '\u{FFFD}',
+        ] {
+            yes(&format!("{c}x"), "NCName");
+        }
+        for c in [
+            '\u{F0000}',
+            '\u{37E}',
+            '\u{D7}',
+            '\u{F7}',
+            '\u{2000}',
+            '\u{FFFE}',
+        ] {
+            no(&format!("{c}x"), "NCName");
+            no(&format!("x{c}"), "NCName");
+            no(&format!("x{c}"), "NMTOKEN");
+        }
+        // NameChars that cannot start a name
+        for c in [
+            '\u{B7}', '\u{300}', '\u{36F}', '\u{203F}', '\u{2040}', '-', '.', '1',
+        ] {
+            no(&format!("{c}a"), "NCName");
+            no(&format!("{c}a"), "Name");
+            yes(&format!("a{c}"), "NCName");
+            yes(&format!("{c}a"), "NMTOKEN");
+        }
+        no("", "NMTOKEN");
+        no("", "Name");
+        // no whitespace processing of the raw lexical form
+        check(&typed(" a\t b ", "token"), "token", Some(false));
+        check(
+            &typed("\t", "normalizedString"),
+            "normalizedString",
+            Some(false),
+        );
+        check(&typed(" a", "NCName"), "string", Some(false));
+    }
+
+    #[test]
+    fn f13_overlapping_value_spaces() {
+        let yes = |lex: &str, dt: &str, r: &str| check(&typed(lex, dt), r, Some(true));
+        let no = |lex: &str, dt: &str, r: &str| check(&typed(lex, dt), r, Some(false));
+        // xsd:hexBinary and xsd:base64Binary are disjoint (OWL 2 section 4.5)
+        no("", "hexBinary", "base64Binary");
+        no("", "base64Binary", "hexBinary");
+        no("0FAB", "hexBinary", "base64Binary");
+        no("D6s=", "base64Binary", "hexBinary");
+        yes("0FAB", "hexBinary", "hexBinary");
+        yes("D6s=", "base64Binary", "base64Binary");
+        no("zz", "hexBinary", "base64Binary");
+        no("abc", "base64Binary", "hexBinary");
+        // a dateTime with a timezone is a dateTimeStamp
+        for v in [
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T00:00:00+05:30",
+            "2020-01-01T00:00:00-08:00",
+        ] {
+            yes(v, "dateTime", "dateTimeStamp");
+            yes(v, "dateTimeStamp", "dateTime");
+        }
+        no("2020-01-01T00:00:00", "dateTime", "dateTimeStamp");
+        no("2020-13-01T00:00:00Z", "dateTime", "dateTimeStamp");
+        // known disjoint pairs stay decided
+        no("true", "boolean", "dateTime");
+        no("http://ex.org/", "anyURI", "boolean");
+        no("1", "integer", "boolean");
+        no("0FAB", "hexBinary", "string");
+    }
+
+    #[test]
+    fn f14_plain_literals_include_the_derived_strings() {
+        let plain = rdf("PlainLiteral");
+        let in_plain = |l: Literal| in_value_space(&l, &plain);
+        for (lex, dt) in [
+            ("abc", "token"),
+            ("a b", "normalizedString"),
+            ("a:b", "Name"),
+            ("ab", "NCName"),
+            ("-1", "NMTOKEN"),
+            ("en-US", "language"),
+            ("a  b\t", "string"),
+        ] {
+            assert_eq!(in_plain(typed(lex, dt)), Some(true), "{lex} {dt}");
+        }
+        assert_eq!(in_plain(Literal::new_simple_literal("x")), Some(true));
+        assert_eq!(
+            in_plain(Literal::new_language_tagged_literal_unchecked("x", "en")),
+            Some(true)
+        );
+        // ill-typed sources and non-strings are outside
+        for (lex, dt) in [
+            ("a  b", "token"),
+            ("a\tb", "normalizedString"),
+            ("1a", "NCName"),
+            ("a:b", "NCName"),
+            ("", "NMTOKEN"),
+            ("1", "integer"),
+            ("true", "boolean"),
+        ] {
+            assert_eq!(in_plain(typed(lex, dt)), Some(false), "{lex} {dt}");
+        }
+    }
+
+    #[test]
+    fn f15_unsupported_source_datatypes_are_undecided() {
+        let custom = typed("1", "custom");
+        let external =
+            Literal::new_typed_literal("1", NamedNode::new_unchecked("http://ex.org/dt"));
+        let date = typed("2020-01-01", "date");
+        for l in [&custom, &external, &date, &typed("P1D", "duration")] {
+            for r in [
+                "integer",
+                "string",
+                "decimal",
+                "dateTime",
+                "boolean",
+                "hexBinary",
+            ] {
+                check(l, r, None);
+            }
+            assert_eq!(in_value_space(l, &rdf("PlainLiteral")), None, "{l}");
+            assert_eq!(in_value_space(l, &rdf("langString")), None, "{l}");
+        }
+        check(&typed("2020", "gYear"), "integer", None);
+        // the known disjoint pairs are still decided
+        check(&typed("1", "integer"), "string", Some(false));
+        check(&typed("true", "boolean"), "decimal", Some(false));
+        check(&typed("1.5", "double"), "decimal", Some(false));
+        assert_eq!(
+            in_value_space(&typed("1", "integer"), &rdf("langString")),
+            Some(false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    const ID: &str = "literal-not-in-datatype";
+
+    /// `count` integer literals under a range of non-negative integers, those at the
+    /// positions of `negative` negative.
+    fn store(count: usize, negative: &[usize]) -> Store {
+        let mut ttl = String::from(
+            "@prefix ex: <http://ex.org/> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+             ex:n rdfs:range xsd:nonNegativeInteger .\n",
+        );
+        for i in 0..count {
+            let v = if negative.contains(&i) {
+                -(i as i64) - 1
+            } else {
+                i as i64
+            };
+            ttl.push_str(&format!("ex:i{i} ex:n \"{v}\"^^xsd:integer .\n"));
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        s
+    }
+
+    fn run(s: &Store, limit: usize) -> (CheckStatus, usize, ReportStatus) {
+        let r = diagnose(
+            s.snapshot(),
+            &DiagnoseOptions {
+                checks: vec![ID.into()],
+                limit,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = r.checks.iter().find(|c| c.id == ID).unwrap();
+        (c.status, c.findings, r.status)
+    }
+
+    /// Clears the test seams when it drops.
+    struct Seams;
+
+    impl Drop for Seams {
+        fn drop(&mut self) {
+            PAGE_TIMEOUT.with(|c| c.set(None));
+            CANDIDATES_CAP.with(|c| c.set(None));
+        }
+    }
+
+    /// A deadline after the first page keeps the violations that page held, and the
+    /// check is truncated. A deadline before the first finding is a timeout.
+    #[test]
+    fn a_timeout_after_findings_truncates() {
+        let _seams = Seams;
+        // in candidate order (by subject name) the first page of 256 rows holds
+        // i0, i100 and i200, and the later ones none
+        let s = store(600, &[0, 100, 200]);
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Violations, 3, ReportStatus::ViolationsFound)
+        );
+        PAGE_TIMEOUT.with(|c| c.set(Some(1)));
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Truncated, 3, ReportStatus::ViolationsFound)
+        );
+        PAGE_TIMEOUT.with(|c| c.set(Some(0)));
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Timeout, 0, ReportStatus::Incomplete)
+        );
+    }
+
+    /// The check stops after the candidate cap and reports itself truncated, also
+    /// when it found nothing before.
+    #[test]
+    fn the_candidate_cap_truncates() {
+        let _seams = Seams;
+        // the only violation has the last name in candidate order ("i999")
+        let s = store(1_200, &[999]);
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Violations, 1, ReportStatus::ViolationsFound)
+        );
+        CANDIDATES_CAP.with(|c| c.set(Some(600)));
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Truncated, 0, ReportStatus::Incomplete)
+        );
     }
 }

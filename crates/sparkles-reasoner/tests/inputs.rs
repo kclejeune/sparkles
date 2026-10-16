@@ -628,3 +628,61 @@ fn imports_fetched_over_http() {
     fetch_imports(&s, &inputs, &[], &allowed).unwrap();
     assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// F16 review finding F2: with several input graphs the rules see the facts graph by
+/// graph, in the order the run resolves the graphs, as when the input was copied into
+/// memory. Two graphs give `ex:l` different first members and different rests: the first
+/// graph's win, whatever the ids of the terms and graphs, the order the graphs are named
+/// in, repeats of a graph, triples held by both graphs and the number of threads.
+#[test]
+fn f16_graph_major_visitation() {
+    let rules = Profile::Rules(format!(
+        "@prefix ex: <{EX}>.
+         [m: (?x ex:list ?l), listMember(?l, ?m) -> (?x ex:member ?m)]
+         [e: (?x ex:list ?l), listEntry(?l, 0, ?m) -> (?x ex:entry ?m)]"
+    ));
+    let g1_text = "ex:s ex:list ex:l . ex:l rdf:first ex:z ; rdf:rest rdf:nil .";
+    let g2_text = "ex:s ex:list ex:l . ex:l rdf:first ex:a ; rdf:rest ex:l2 .
+                   ex:l2 rdf:first ex:b ; rdf:rest rdf:nil .";
+    let with_rdf = |t: &str| format!("@prefix rdf: <{RDF}> . {t}");
+    // the second graph and its terms are created first in one store, and both graphs
+    // come in one load in the other
+    let separate = Store::in_memory(StoreOptions::default());
+    ttl(&separate, Some("http://ex.org/g2"), &with_rdf(g2_text));
+    ttl(&separate, Some("http://ex.org/g1"), &with_rdf(g1_text));
+    let together = Store::in_memory(StoreOptions::default());
+    let trig = format!(
+        "@prefix ex: <{EX}> . @prefix rdf: <{RDF}> . ex:g2 {{ {g2_text} }} ex:g1 {{ {g1_text} }}"
+    );
+    together
+        .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    let g = |n: &str| GraphRef::Named(format!("{EX}{n}"));
+    let want: BTreeSet<String> = [
+        format!("<{EX}s> <{EX}member> <{EX}z>"),
+        format!("<{EX}s> <{EX}entry> <{EX}z>"),
+    ]
+    .into_iter()
+    .collect();
+    for (name, s) in [("separate", &separate), ("together", &together)] {
+        for graphs in [
+            vec![g("g1"), g("g2")],
+            vec![g("g2"), g("g1")],
+            vec![g("g2"), g("g1"), g("g2")],
+        ] {
+            for threads in [1, 4] {
+                let o = ReasonOptions {
+                    inputs: Inputs {
+                        data_graphs: graphs.clone(),
+                        ..Default::default()
+                    },
+                    threads: Some(threads),
+                    ..Default::default()
+                };
+                let (ts, _) = infer(s.snapshot(), &rules, &o).unwrap();
+                let got: BTreeSet<String> = ts.iter().map(|t| t.to_string()).collect();
+                assert_eq!(got, want, "{name}, graphs {graphs:?}, {threads} threads");
+            }
+        }
+    }
+}

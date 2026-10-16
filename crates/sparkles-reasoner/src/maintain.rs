@@ -11,6 +11,7 @@
 //! to the run's commit and rules by `reasoning-generalized.json`.
 
 use crate::INFERRED_GRAPH;
+use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity};
 use crate::graph::{Graph, Triple};
 use crate::incremental::{Closure, Fallback};
 use crate::inputs::GraphRef;
@@ -21,7 +22,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::history::At;
 use sparkles_core::id::Id;
 use sparkles_core::index::Perm;
-use sparkles_core::store::{Chunk, DiffOp, DiffOptions, Snapshot, Store};
+use sparkles_core::store::{Chunk, DiffOp, DiffOptions, Generation, Snapshot, Store};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -38,6 +39,13 @@ pub struct Cache {
 
 /// Default of [`Cache::new`]'s limit.
 pub const DEFAULT_CACHE_TRIPLES: usize = 10_000_000;
+
+impl Kept {
+    /// The heap of the closure and the generalized facts.
+    fn heap_bytes(&self) -> usize {
+        self.closure.heap_bytes() + set_bytes(&self.generalized)
+    }
+}
 
 impl Default for Cache {
     fn default() -> Cache {
@@ -59,6 +67,11 @@ impl Cache {
         self.max_triples.store(n, Ordering::Relaxed);
     }
 
+    /// The largest closure kept, in facts.
+    pub(crate) fn limit(&self) -> usize {
+        self.max_triples.load(Ordering::Relaxed)
+    }
+
     /// Drop the kept closure.
     pub fn clear(&self) {
         *self.kept.lock() = None;
@@ -72,8 +85,47 @@ impl Cache {
             .map(|k| (k.closure.graph.live(), k.commit))
     }
 
-    fn take(&self) -> Option<Kept> {
-        self.kept.lock().take()
+    /// Take the kept closure out for a run that wants the closure of `want`. A closure of
+    /// another dataset, commit or generation, or for other rules or input graphs, is of no
+    /// use to the run: it is dropped, and the run does not fail for its memory. One the run
+    /// can use is taken only when its heap fits `budget`, and is charged there; one that
+    /// does not fit stays for a later run, and the result is the error.
+    fn take_for(&self, budget: &Arc<Budget>, want: &Want<'_>) -> Taken {
+        let mut k = self.kept.lock();
+        let Some(kept) = k.as_ref() else {
+            return Taken::None;
+        };
+        if kept.dataset_id != want.dataset_id
+            || kept.commit != want.since
+            || !Arc::ptr_eq(&kept.snap.generation, want.generation)
+        {
+            *k = None;
+            return Taken::None;
+        }
+        if kept.digest != want.digest {
+            *k = None;
+            return Taken::RulesChanged;
+        }
+        if kept.inputs != want.inputs {
+            *k = None;
+            return Taken::InputsChanged;
+        }
+        let need = kept.heap_bytes();
+        if let Err(e) = budget.try_charge(need) {
+            return Taken::Refused(
+                e.with_context(" (taking the closure kept in memory)".into())
+                    .into(),
+            );
+        }
+        budget.release(need);
+        let Some(mut kept) = k.take() else {
+            return Taken::None;
+        };
+        if let Err(e) = kept.closure.set_budget(budget) {
+            *k = Some(kept);
+            return Taken::Refused(e.into());
+        }
+        Taken::Kept(Box::new(kept))
     }
 
     fn put(&self, k: Kept) {
@@ -81,6 +133,28 @@ impl Cache {
             *self.kept.lock() = Some(k);
         }
     }
+}
+
+/// The state a run needs the kept closure to be the materialization of.
+struct Want<'a> {
+    dataset_id: uuid::Uuid,
+    since: u64,
+    generation: &'a Arc<Generation>,
+    digest: u64,
+    inputs: &'a [GraphRef],
+}
+
+/// What [`Cache::take_for`] found.
+enum Taken {
+    /// no closure is kept, or one of another dataset, commit or generation
+    None,
+    /// the kept closure is for other rules
+    RulesChanged,
+    /// the kept closure is for other input graphs
+    InputsChanged,
+    /// the kept closure does not fit the budget, and stays
+    Refused(anyhow::Error),
+    Kept(Box<Kept>),
 }
 
 pub(crate) struct Kept {
@@ -117,6 +191,8 @@ pub(crate) struct Previous {
     pub source: &'static str,
     /// the generalized facts as the dataset keeps them, when read from it
     pub saved: Option<SavedMeta>,
+    /// the charge of the changes and the generalized facts
+    pub held: Held,
 }
 
 /// Find the closure of the materialization at commit `since`, and the changes from
@@ -166,8 +242,30 @@ pub(crate) fn kept_changes(
     Some(delta_changes(&old, snap, inputs).map_err(|e| e.to_string()))
 }
 
+/// The heap of a set of facts.
+fn set_bytes(s: &FxHashSet<Triple>) -> usize {
+    table_bytes(s.capacity(), size_of::<Triple>())
+}
+
+impl Changes {
+    fn heap_bytes(&self) -> usize {
+        (self.base_added.capacity()
+            + self.base_removed.capacity()
+            + self.inferred_added.capacity()
+            + self.inferred_removed.capacity())
+            * size_of::<Triple>()
+    }
+}
+
 /// Find the closure of the materialization at commit `since`, for an update with the
-/// `raw` changes from there to `snap`.
+/// `raw` changes from there to `snap`, charged to `budget`.
+///
+/// A closure kept in memory for this dataset, commit, generation, rules and inputs is
+/// taken out of the cache only when its heap fits the budget, and otherwise stays there
+/// and this run fails. A kept closure for another state is dropped. Once taken, the
+/// closure is changed by the run, so a run that fails later drops it. A closure read
+/// from the store is charged before each buffer is allocated.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn previous(
     store: &Store,
     snap: &Arc<Snapshot>,
@@ -176,22 +274,26 @@ pub(crate) fn previous(
     inputs: &[GraphRef],
     cache: Option<&Cache>,
     raw: Result<RawChanges, String>,
+    budget: &Arc<Budget>,
 ) -> anyhow::Result<Previous> {
     let dataset_id = store.dataset_id();
     let rules_changed = || Fallback("the rules changed since the previous run".into());
     let inputs_changed = || Fallback("the input graphs changed since the previous run".into());
     let ids = input_ids(snap, None, inputs);
-    let kept = cache.and_then(Cache::take).filter(|k| {
-        k.dataset_id == dataset_id
-            && k.commit == since
-            && Arc::ptr_eq(&k.snap.generation, &snap.generation)
-    });
-    if kept.as_ref().is_some_and(|k| k.digest != digest) {
-        return Err(rules_changed().into());
-    }
-    if kept.as_ref().is_some_and(|k| k.inputs != inputs) {
-        return Err(inputs_changed().into());
-    }
+    let want = Want {
+        dataset_id,
+        since,
+        generation: &snap.generation,
+        digest,
+        inputs,
+    };
+    let kept = match cache.map_or(Taken::None, |c| c.take_for(budget, &want)) {
+        Taken::None => None,
+        Taken::RulesChanged => return Err(rules_changed().into()),
+        Taken::InputsChanged => return Err(inputs_changed().into()),
+        Taken::Refused(e) => return Err(e),
+        Taken::Kept(k) => Some(*k),
+    };
     if let Some(k) = kept {
         let Kept {
             mut closure,
@@ -200,16 +302,23 @@ pub(crate) fn previous(
             ..
         } = k;
         let raw = raw.map_err(Fallback)?;
+        let mut held = Held::new(budget);
+        held.grow(set_bytes(&generalized));
         let moved = closure.terms.rebase(snap.clone());
         closure.remap(&moved);
-        remap_set(&mut generalized, &moved);
+        remap_set(&mut generalized, &moved, None)?;
+        held.set(set_bytes(&generalized));
         let changes = raw.resolve(&closure.terms, snap, &ids)?;
+        held.grow(changes.heap_bytes());
+        closure.settle();
+        budget.check()?;
         return Ok(Previous {
             closure,
             generalized,
             changes,
             source: "memory",
             saved,
+            held,
         });
     }
     let Some(root) = store.root() else {
@@ -227,7 +336,11 @@ pub(crate) fn previous(
     };
     let raw = raw.map_err(Fallback)?;
     let terms = Terms::new(snap.clone());
+    terms.set_budget(budget)?;
     let changes = raw.resolve(&terms, snap, &ids)?;
+    let mut held = Held::new(budget);
+    held.grow(changes.heap_bytes());
+    held.try_grow(table_bytes(table_capacity(keys.len()), size_of::<Triple>()))?;
     let generalized: FxHashSet<Triple> = keys
         .iter()
         .map(|k| {
@@ -235,22 +348,43 @@ pub(crate) fn previous(
             [id(&k[0]), id(&k[1]), id(&k[2])]
         })
         .collect();
-    let closure = reconstruct(snap, terms, &changes, &generalized, &ids)?;
+    held.set(changes.heap_bytes() + set_bytes(&generalized));
+    budget.check()?;
+    let closure = reconstruct(snap, terms, &changes, &generalized, &ids, budget)?;
     Ok(Previous {
         closure,
         generalized,
         changes,
         source: "store",
         saved: Some(meta),
+        held,
     })
 }
 
-fn remap_set(s: &mut FxHashSet<Triple>, moved: &FxHashMap<u64, u64>) {
+/// Replace ids that moved in `s`. The rebuilt set is charged to `held` before it is
+/// built, beside the old one, and released once the old one is dropped.
+fn remap_set(
+    s: &mut FxHashSet<Triple>,
+    moved: &FxHashMap<u64, u64>,
+    held: Option<&mut Held>,
+) -> Result<(), MemoryExceeded> {
     if moved.is_empty() || !s.iter().flatten().any(|x| moved.contains_key(x)) {
-        return;
+        return Ok(());
     }
+    let bytes = table_bytes(table_capacity(s.len()), size_of::<Triple>());
+    let held = match held {
+        Some(h) => {
+            h.try_grow(bytes)?;
+            Some(h)
+        }
+        None => None,
+    };
     let m = |x: u64| moved.get(&x).copied().unwrap_or(x);
     *s = s.iter().map(|t| [m(t[0]), m(t[1]), m(t[2])]).collect();
+    if let Some(h) = held {
+        h.shrink(bytes);
+    }
+    Ok(())
 }
 
 /// The closure as of the previous run: the input graphs and the inferred graph then, and
@@ -261,6 +395,7 @@ fn reconstruct(
     ch: &Changes,
     generalized: &FxHashSet<Triple>,
     inputs: &[Id],
+    budget: &Arc<Budget>,
 ) -> anyhow::Result<Closure> {
     let scan = |g: Id, skip: &FxHashSet<Triple>, out: &mut Vec<Triple>| -> anyhow::Result<()> {
         snap.scan(Perm::Gspo, &[g.0], |c| {
@@ -283,16 +418,34 @@ fn reconstruct(
     };
     let mut n = 0;
     for g in inputs {
-        n += snap.count(Perm::Gspo, &[g.0])?;
+        n += snap.count(Perm::Gspo, &[g.0])? as usize;
     }
-    let mut base = Vec::with_capacity(n as usize);
+    let inferred = snap.lookup_iri(INFERRED_GRAPH);
+    let m = match inferred {
+        Some(g) => snap.count(Perm::Gspo, &[g.0])? as usize,
+        None => 0,
+    };
+    let fact = size_of::<Triple>();
+    let (nb, nd) = (
+        n + ch.base_removed.len(),
+        m + ch.inferred_removed.len() + generalized.len(),
+    );
+    // the facts read and the sets of facts they skip, charged before they are allocated
+    let mut held = Held::try_new(
+        budget,
+        (nb + nd) * fact
+            + table_bytes(table_capacity(ch.base_added.len()), fact)
+            + table_bytes(table_capacity(ch.inferred_added.len()), fact),
+    )?;
+    let mut base = Vec::with_capacity(nb);
     let added: FxHashSet<Triple> = ch.base_added.iter().copied().collect();
     for g in inputs {
         scan(*g, &added, &mut base)?;
     }
+    drop(added);
     base.extend(&ch.base_removed);
-    let mut derived = Vec::new();
-    if let Some(g) = snap.lookup_iri(INFERRED_GRAPH) {
+    let mut derived = Vec::with_capacity(nd);
+    if let Some(g) = inferred {
         scan(
             g,
             &ch.inferred_added.iter().copied().collect(),
@@ -301,10 +454,12 @@ fn reconstruct(
     }
     derived.extend(&ch.inferred_removed);
     derived.extend(generalized);
-    let mut graph = Graph::with_capacity(base.len() + derived.len());
-    graph.add_batch(base);
+    held.set((base.capacity() + derived.capacity()) * fact);
+    let mut graph = Graph::try_with_capacity(base.len() + derived.len(), budget)?;
+    graph.try_add_batch(base)?;
     let n = graph.len();
-    graph.add_batch(derived);
+    graph.try_add_batch(derived)?;
+    drop(held);
     Ok(Closure::new(graph, terms, n))
 }
 
@@ -527,10 +682,12 @@ pub(crate) fn keep(
     mut generalized: FxHashSet<Triple>,
     stored: &FxHashMap<u64, Id>,
     saved: Option<SavedMeta>,
-) {
-    let Some(cache) = cache else { return };
+) -> anyhow::Result<bool> {
+    let Some(cache) = cache else {
+        return Ok(false);
+    };
     if closure.graph.live() > cache.max_triples.load(Ordering::Relaxed) {
-        return;
+        return Ok(false);
     }
     let snap = if receipt.committed {
         store.snapshot()
@@ -538,17 +695,25 @@ pub(crate) fn keep(
         before.clone()
     };
     if snap.commit != receipt.commit.seq || !Arc::ptr_eq(&snap.generation, &before.generation) {
-        return;
+        return Ok(false);
     }
+    // the work after the commit is charged to the run, strictly: a closure that does
+    // not fit is not kept
+    let budget = closure.graph.budget().clone();
     let mut moved: FxHashMap<u64, u64> = stored.iter().map(|(l, id)| (*l, id.0)).collect();
     moved.extend(closure.terms.rebase(snap.clone()));
-    closure.remap(&moved);
-    remap_set(&mut generalized, &moved);
-    closure.compact_if_needed();
+    closure.try_remap(&moved)?;
+    let mut held = Held::new(&budget);
+    remap_set(&mut generalized, &moved, Some(&mut held))?;
+    drop(held);
+    closure.try_settle()?;
+    budget.check_peak()?;
+    closure.compact_if_needed(true)?;
     // the searches for other proofs look facts up by subject and by object: build those
     // indexes now, after the commit, rather than in the next run
-    closure.graph.ensure_s_index();
-    closure.graph.ensure_o_index();
+    closure.graph.ensure_index(true, true)?;
+    closure.graph.ensure_index(false, true)?;
+    budget.check_peak()?;
     cache.put(Kept {
         dataset_id: receipt.dataset_id,
         commit: receipt.commit.seq,
@@ -559,6 +724,7 @@ pub(crate) fn keep(
         generalized,
         saved,
     });
+    Ok(true)
 }
 
 // ------------------------------------------------------------ saved state ----

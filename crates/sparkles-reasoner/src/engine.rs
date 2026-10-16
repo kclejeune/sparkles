@@ -1,13 +1,16 @@
 //! Rule compilation and semi-naive forward chaining over id-level triples.
 
+use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_grown};
 use crate::builtins::{BuiltinKind, HeadAction};
+use crate::facts::{BaseRange, Memo};
 use crate::graph::{Cands, Graph, Triple};
 use crate::parser::{BuiltinCall, Clause, Direction, Node, Rule};
 use crate::terms::{Terms, anchored_regex};
 use oxrdf::Term;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -537,9 +540,18 @@ pub(crate) fn index_needs_with(rule: &CRule, steps: &[Step], prebound: &[usize])
 
 // ================================================================ evaluation ===
 
-/// Receives the body of a rule instance: the rows its atoms matched and the facts its
+/// Receives the body of a rule instance: the facts its atoms matched and the facts its
 /// builtins read (`listForAll`). Returns false to stop the evaluation.
-pub(crate) type Sink<'s> = dyn FnMut(&[u32], &[Triple]) -> bool + 's;
+pub(crate) type Sink<'s> = dyn FnMut(&[Triple], &[Triple]) -> bool + 's;
+
+/// Where the first step of a plan reads its candidates when the work is split.
+#[derive(Clone, Copy)]
+pub(crate) enum First<'a> {
+    /// in-memory rows
+    Rows(Cands<'a>),
+    /// a share of a base-tier scan
+    Base(BaseRange),
+}
 
 /// What an evaluation emits.
 pub(crate) enum Mode<'s> {
@@ -568,11 +580,51 @@ pub(crate) struct Eval<'a> {
     pub max_out: usize,
     ticks: u32,
     pub mode: Mode<'a>,
-    /// rows matched by the atoms of the current partial instance ([`Mode::Instances`])
-    trail: Vec<u32>,
+    /// facts matched by the atoms of the current partial instance ([`Mode::Instances`])
+    trail: Vec<Triple>,
     /// facts read by builtins of the current partial instance ([`Mode::Instances`])
     pub implicit: Vec<Triple>,
     stop: bool,
+    /// heads emitted so far ([`Mode::New`]), so that each goes out once
+    seen: FxHashSet<Triple>,
+    /// the first error of a base-tier scan
+    pub err: Option<anyhow::Error>,
+    /// per plan step: the base-tier blocks it read last
+    memos: Vec<Memo>,
+    /// per plan step: the base-tier facts of its recent lookups with few results
+    looked: Vec<FxHashMap<Triple, std::rc::Rc<[Triple]>>>,
+    /// per plan step: a buffer for the facts of a lookup
+    scratch: Vec<Vec<Triple>>,
+    /// the base-tier blocks builtins read last
+    bmemo: Memo,
+    /// the members of the RDF lists builtins read
+    lists: FxHashMap<u64, Option<std::rc::Rc<[u64]>>>,
+    /// stop at this plan step and keep the bindings instead, up to this many
+    pub collect_at: Option<(usize, usize)>,
+    pub collected: Vec<Vec<u64>>,
+    /// the heap of the buffers and caches above, charged to the run's budget
+    held: Held,
+    /// of `held`: the remembered lookups and lists
+    cached: usize,
+}
+
+/// Lookups in the base tier with at most this many facts are remembered by the step that
+/// made them, so that later candidates with the same bindings do not read the index
+/// again.
+const REMEMBER_FACTS: usize = 64;
+/// Lookups a step remembers before it forgets them all.
+const REMEMBER_LOOKUPS: usize = 4096;
+/// The bytes of one remembered lookup or list besides its facts: its map entry, with
+/// the table's load, and the shared slice's counts.
+const REMEMBERED_ENTRY: usize = 64;
+const TRIPLE: usize = std::mem::size_of::<Triple>();
+
+impl Drop for Eval<'_> {
+    fn drop(&mut self) {
+        if let Some(b) = self.g.base() {
+            b.add_scans(self.memos.iter().map(|m| m.scans).sum::<u64>() + self.bmemo.scans);
+        }
+    }
 }
 
 impl<'a> Eval<'a> {
@@ -587,8 +639,11 @@ impl<'a> Eval<'a> {
         cancel: Option<&'a AtomicBool>,
         max_out: usize,
         mode: Mode<'a>,
+        budget: &Arc<Budget>,
     ) -> Eval<'a> {
         Eval {
+            held: Held::new(budget),
+            cached: 0,
             g,
             terms,
             rule,
@@ -603,7 +658,121 @@ impl<'a> Eval<'a> {
             trail: Vec::new(),
             implicit: Vec::new(),
             stop: false,
+            seen: FxHashSet::default(),
+            err: None,
+            memos: (0..steps.len()).map(|_| Memo::default()).collect(),
+            looked: (0..steps.len()).map(|_| FxHashMap::default()).collect(),
+            scratch: (0..steps.len()).map(|_| Vec::new()).collect(),
+            bmemo: Memo::default(),
+            lists: FxHashMap::default(),
+            collect_at: None,
+            collected: Vec::new(),
         }
+    }
+
+    /// The members of the RDF list at `head` among the visible rows, or `None` when it
+    /// is not a well-formed list.
+    pub fn list(&mut self, head: u64) -> Option<std::rc::Rc<[u64]>> {
+        if let Some(l) = self.lists.get(&head) {
+            return l.clone();
+        }
+        let (g, t) = (self.g, self.terms);
+        let l = g
+            .list(
+                &mut self.bmemo,
+                head,
+                t.rdf_first,
+                t.rdf_rest,
+                t.rdf_nil,
+                self.end,
+            )
+            .map(std::rc::Rc::<[u64]>::from);
+        if self.lists.len() >= REMEMBER_LOOKUPS {
+            self.forget();
+        }
+        let bytes = l.as_ref().map_or(0, |m| m.len() * 8 + 16) + REMEMBERED_ENTRY;
+        if let Err(e) = self.held.try_grow(bytes) {
+            self.fail(e);
+            return None;
+        }
+        self.cached += bytes;
+        self.lists.insert(head, l.clone());
+        l
+    }
+
+    /// Forget the remembered lookups and lists, releasing their charge.
+    fn forget(&mut self) {
+        for l in &mut self.looked {
+            l.clear();
+        }
+        self.lists.clear();
+        self.held.shrink(self.cached);
+        self.cached = 0;
+    }
+
+    /// Stop the evaluation with a memory error (the first one is kept), and the other
+    /// threads of the iteration with it.
+    pub fn fail(&mut self, e: MemoryExceeded) {
+        let e = e.with_context(format!(" (rule '{}')", self.rule.name));
+        self.err.get_or_insert(anyhow::Error::new(e));
+        self.stop = true;
+        self.abort.store(true, Ordering::Relaxed);
+    }
+
+    /// Add a candidate to the output, charging the buffer's growth first (the new
+    /// allocation while the old one is alive); false when it does not fit, and the
+    /// evaluation stops.
+    pub fn push_out(&mut self, t: Triple) -> bool {
+        let cap = self.out.capacity();
+        if self.out.len() == cap {
+            let next = (cap * 2).max(64);
+            if let Err(e) = self.held.try_grow(next * TRIPLE) {
+                self.fail(e);
+                return false;
+            }
+            self.out.reserve_exact(next - self.out.len());
+            // the old buffer is freed
+            self.held.shrink(cap * TRIPLE);
+            self.held.grow((self.out.capacity() - next) * TRIPLE);
+        }
+        self.out.push(t);
+        true
+    }
+
+    /// Whether `t` was not emitted yet, remembering it; the set's growth is charged
+    /// first. `None` when it does not fit, and the evaluation stops.
+    fn see(&mut self, t: Triple) -> Option<bool> {
+        let (cap, len) = (self.seen.capacity(), self.seen.len());
+        if len == cap {
+            let next = table_bytes(table_grown(cap, len, 1), TRIPLE);
+            if let Err(e) = self.held.try_grow(next) {
+                self.fail(e);
+                return None;
+            }
+            self.seen.reserve(1);
+            self.held.shrink(table_bytes(cap, TRIPLE) + next);
+            self.held.grow(table_bytes(self.seen.capacity(), TRIPLE));
+        }
+        Some(self.seen.insert(t))
+    }
+
+    /// The candidates, with the charge of their buffer.
+    pub fn take_out(&mut self) -> (Vec<Triple>, Held) {
+        let out = std::mem::take(&mut self.out);
+        let held = self.held.split(out.capacity() * TRIPLE);
+        (out, held)
+    }
+
+    /// Whether `t` is among the visible facts.
+    pub fn holds(&mut self, t: &Triple) -> bool {
+        let g = self.g;
+        g.holds_before(&mut self.bmemo, t, self.end)
+    }
+
+    /// Whether a visible fact matches the pattern.
+    pub fn exists(&mut self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> bool {
+        let g = self.g;
+        g.exists(&mut self.bmemo, s, p, o, self.end)
     }
 
     /// Whether the evaluation reports rule instances (and so tracks their bodies).
@@ -644,8 +813,23 @@ impl<'a> Eval<'a> {
     }
 
     /// Run the plan from step `k`; for `k == 0` with an atom, `first` overrides its
-    /// candidate list (used to split work across threads).
-    pub fn run(&mut self, k: usize, b: &mut [u64], first: Option<Cands<'_>>) {
+    /// candidates (used to split work across threads).
+    pub fn run(&mut self, k: usize, b: &mut [u64], first: Option<First<'_>>) {
+        if let Some((d, cap)) = self.collect_at
+            && d == k
+        {
+            if self.collected.len() < cap {
+                // the bindings and their slot, with room for the vector's doubling
+                if let Err(e) = self.held.try_grow(b.len() * 8 + 2 * size_of::<Vec<u64>>()) {
+                    self.fail(e);
+                    return;
+                }
+                self.collected.push(b.to_vec());
+            } else {
+                self.stop = true;
+            }
+            return;
+        }
         if k == self.steps.len() {
             self.emit(b);
             return;
@@ -653,44 +837,133 @@ impl<'a> Eval<'a> {
         match self.steps[k] {
             Step::Atom { atom, lo, hi } => {
                 let a = &self.rule.atoms[atom];
-                let cands = match first {
-                    Some(c) => c,
+                let (s, p, o) = (self.opt(a.s, b), self.opt(a.p, b), self.opt(a.o, b));
+                match first {
+                    Some(First::Rows(c)) => self.rows(k, atom, b, c),
+                    Some(First::Base(r)) => self.base_facts(k, atom, b, Some(&r), [s, p, o]),
                     None => {
-                        self.g
-                            .cands(self.opt(a.s, b), self.opt(a.p, b), self.opt(a.o, b), lo, hi)
-                    }
-                };
-                let (as_, ap, ao) = (a.s, a.p, a.o);
-                let collecting = self.collecting();
-                for j in 0..cands.len() {
-                    if self.aborted() {
-                        return;
-                    }
-                    let row = cands.get(j);
-                    if !self.g.alive(row) {
-                        continue;
-                    }
-                    let t = self.g.triples[row as usize];
-                    let mut newly = [usize::MAX; 3];
-                    let mut n = 0;
-                    let ok = unify(as_, t[0], b, &mut newly, &mut n)
-                        && unify(ap, t[1], b, &mut newly, &mut n)
-                        && unify(ao, t[2], b, &mut newly, &mut n);
-                    if ok {
-                        if collecting {
-                            self.trail.push(row);
-                            self.run(k + 1, b, None);
-                            self.trail.pop();
-                        } else {
-                            self.run(k + 1, b, None);
+                        if self.g.reads_base(lo, hi) {
+                            self.base_facts(k, atom, b, None, [s, p, o]);
+                            if self.stop {
+                                return;
+                            }
                         }
-                    }
-                    for &v in &newly[..n] {
-                        b[v] = 0;
+                        let c = self.g.cands(s, p, o, lo, hi);
+                        self.rows(k, atom, b, c);
                     }
                 }
             }
             Step::Builtin(j) => crate::builtins::eval(self, j, k, b),
+        }
+    }
+
+    /// Match the atom of step `k` against in-memory rows.
+    fn rows(&mut self, k: usize, atom: usize, b: &mut [u64], cands: Cands<'_>) {
+        for j in 0..cands.len() {
+            if self.aborted() {
+                return;
+            }
+            let row = cands.get(j);
+            if !self.g.alive(row) {
+                continue;
+            }
+            let t = self.g.triple(row);
+            self.fact(k, atom, b, t);
+        }
+    }
+
+    /// Match the atom of step `k` against the base tier, or a share of its scan.
+    fn base_facts(
+        &mut self,
+        k: usize,
+        atom: usize,
+        b: &mut [u64],
+        r: Option<&BaseRange>,
+        [s, p, o]: [Option<u64>; 3],
+    ) {
+        let g: &'a Graph = self.g;
+        let Some(base) = g.base() else { return };
+        let key = [s.unwrap_or(0), p.unwrap_or(0), o.unwrap_or(0)];
+        if r.is_none()
+            && let Some(facts) = self.looked[k].get(&key).cloned()
+        {
+            for &t in facts.iter() {
+                if self.aborted() {
+                    return;
+                }
+                self.fact(k, atom, b, t);
+            }
+            return;
+        }
+        let mut memo = std::mem::take(&mut self.memos[k]);
+        // the facts of a lookup, while they are few
+        let mut few = std::mem::take(&mut self.scratch[k]);
+        few.clear();
+        // whether the lookup has too many facts to remember (a share of a scan is not
+        // remembered)
+        let mut many = r.is_some();
+        let mut each = |t: Triple| {
+            if self.aborted() {
+                return false;
+            }
+            if !many {
+                if few.len() < REMEMBER_FACTS {
+                    few.push(t);
+                } else {
+                    many = true;
+                }
+            }
+            self.fact(k, atom, b, t);
+            !self.stop
+        };
+        let res = match r {
+            Some(r) => base.for_range(&mut memo, r, s, p, o, &mut each),
+            None => base.for_each_with(&mut memo, s, p, o, &mut each),
+        };
+        self.memos[k] = memo;
+        match res {
+            Ok(true) if !many => {
+                if self.looked[k].len() >= REMEMBER_LOOKUPS {
+                    self.forget();
+                }
+                let bytes = few.len() * TRIPLE + 16 + REMEMBERED_ENTRY;
+                match self.held.try_grow(bytes) {
+                    Ok(()) => {
+                        self.cached += bytes;
+                        self.looked[k].insert(key, few.as_slice().into());
+                    }
+                    Err(e) => self.fail(e),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.err.get_or_insert(e);
+                self.stop = true;
+            }
+        }
+        self.scratch[k] = few;
+    }
+
+    /// Unify the atom of step `k` with fact `t` and continue.
+    #[inline]
+    fn fact(&mut self, k: usize, atom: usize, b: &mut [u64], t: Triple) {
+        let a = &self.rule.atoms[atom];
+        let mut newly = [usize::MAX; 3];
+        let mut n = 0;
+        let ok = unify(a.s, t[0], b, &mut newly, &mut n)
+            && unify(a.p, t[1], b, &mut newly, &mut n)
+            && unify(a.o, t[2], b, &mut newly, &mut n);
+        if ok {
+            if self.collecting() {
+                self.trail.push(t);
+                self.run(k + 1, b, None);
+                self.trail.pop();
+            } else {
+                self.run(k + 1, b, None);
+            }
+        }
+        for &v in &newly[..n] {
+            b[v] = 0;
         }
     }
 
@@ -741,8 +1014,18 @@ impl<'a> Eval<'a> {
             match h {
                 CHead::Triple(s, p, o) => {
                     let t = [self.val(*s, b), self.val(*p, b), self.val(*o, b)];
-                    if self.g.position(&t).is_some() == existing {
-                        self.out.push(t);
+                    let emit = if existing {
+                        self.g.contains(&t)
+                    } else if self.g.known(&t) {
+                        false
+                    } else {
+                        match self.see(t) {
+                            Some(new) => new,
+                            None => return,
+                        }
+                    };
+                    if emit && !self.push_out(t) {
+                        return;
                     }
                 }
                 CHead::Action(action, args) => {
@@ -779,18 +1062,161 @@ pub(crate) struct Limits {
     pub max_inferred: usize,
     pub cancel: Option<Arc<AtomicBool>>,
     pub progress: Option<crate::ProgressFn>,
+    /// the run's memory, against [`crate::ReasonOptions::max_memory`]
+    pub budget: Arc<Budget>,
 }
 
 pub(crate) struct Outcome {
     pub iterations: usize,
 }
 
+/// In-memory rows per work item.
 const CHUNK: usize = 2048;
+/// Base-tier rows per work item.
+const BASE_CHUNK: usize = 4096;
+
+/// A share of an iteration's evaluation: rule `ri`'s plan from step `k`, with the
+/// bindings `b` (none bound when `None`), and the candidates of step `k` restricted to
+/// `first`.
+struct Item<'a> {
+    ri: usize,
+    steps: &'a [Step],
+    k: usize,
+    b: Option<Vec<u64>>,
+    first: Option<First<'a>>,
+}
+
+/// The shares of the candidates of plan step `k` (an atom) with the bindings `b`: base
+/// tier ranges, then in-memory row chunks. A step that is not an atom is one share.
+fn shares<'g>(
+    g: &'g Graph,
+    r: &CRule,
+    steps: &[Step],
+    k: usize,
+    b: &[u64],
+) -> anyhow::Result<Vec<Option<First<'g>>>> {
+    let Some(&Step::Atom { atom, lo, hi }) = steps.get(k) else {
+        return Ok(vec![None]);
+    };
+    let a = &r.atoms[atom];
+    let v = |s: Slot| match s {
+        Slot::Const(c) => Some(c),
+        Slot::Var(x) if b[x] != 0 => Some(b[x]),
+        _ => None,
+    };
+    let (s, p, o) = (v(a.s), v(a.p), v(a.o));
+    let mut out = Vec::new();
+    if let Some(base) = g.base()
+        && g.reads_base(lo, hi)
+    {
+        out.extend(
+            base.ranges(s, p, o, BASE_CHUNK)?
+                .into_iter()
+                .map(|x| Some(First::Base(x))),
+        );
+    }
+    let cands = g.cands(s, p, o, lo, hi);
+    if cands.len() > 0 {
+        out.extend(
+            cands
+                .chunks(CHUNK)
+                .into_iter()
+                .map(|c| Some(First::Rows(c))),
+        );
+    }
+    Ok(out)
+}
+
+/// Bindings worked out up to plan step `d` before the work is split there.
+const MAX_SPLIT_BINDINGS: usize = 1 << 16;
+
+/// The work of a plan split at step `d` (an atom): the bindings of the steps before it,
+/// from the shares `first` of step 0, each with the shares of step `d`'s candidates, in
+/// the order a sequential evaluation visits them, and the charge of the bindings. `None`
+/// when there are too many bindings.
+#[allow(clippy::too_many_arguments)]
+fn split_at<'g>(
+    g: &'g Graph,
+    terms: &Terms,
+    r: &CRule,
+    steps: &'g [Step],
+    ri: usize,
+    d: usize,
+    first: &[Option<First<'g>>],
+    abort: &AtomicBool,
+    limits: &Limits,
+) -> anyhow::Result<Option<(Vec<Item<'g>>, Held)>> {
+    let per = r.nvars * 8 + 2 * size_of::<Vec<u64>>();
+    type Part = anyhow::Result<Option<(Vec<Vec<u64>>, Held)>>;
+    let parts: Vec<Part> = first
+        .par_iter()
+        .map(|f| {
+            let mut ev = Eval::new(
+                g,
+                terms,
+                r,
+                steps,
+                g.len(),
+                abort,
+                limits.cancel.as_deref(),
+                usize::MAX,
+                Mode::New,
+                &limits.budget,
+            );
+            ev.collect_at = Some((d, MAX_SPLIT_BINDINGS));
+            let mut b = vec![0u64; r.nvars];
+            ev.run(0, &mut b, *f);
+            if let Some(e) = ev.err.take() {
+                return Err(e);
+            }
+            let collected = std::mem::take(&mut ev.collected);
+            // the bindings keep their charge
+            let held = ev.held.split(collected.len() * per);
+            Ok((collected.len() < MAX_SPLIT_BINDINGS).then_some((collected, held)))
+        })
+        .collect();
+    let mut bindings = Vec::new();
+    let mut held = Held::new(&limits.budget);
+    for p in parts {
+        match p? {
+            Some((v, h)) => {
+                bindings.extend(v);
+                held.absorb(h);
+            }
+            None => return Ok(None),
+        }
+        if bindings.len() >= MAX_SPLIT_BINDINGS {
+            return Ok(None);
+        }
+    }
+    let mut items = Vec::new();
+    for b in bindings {
+        for f in shares(g, r, steps, d, &b)? {
+            held.try_grow(size_of::<Item<'_>>() + per)?;
+            items.push(Item {
+                ri,
+                steps,
+                k: d,
+                b: Some(b.clone()),
+                first: f,
+            });
+        }
+    }
+    Ok(Some((items, held)))
+}
+
+/// What a work item gave: its rule, its candidates with their charge, and its error.
+type Done = (usize, Vec<Triple>, Held, Option<anyhow::Error>);
 
 /// Run the rules to a fixpoint. Derived triples are appended to `g`.
 ///
 /// With `start`, the rows before it are already closed under the rules and the rows from
 /// it on are new: evaluation is semi-naive from the first iteration.
+///
+/// Every buffer and table the evaluation and the merges allocate is charged to
+/// `limits.budget` before it grows. The first charge past the limit stops the
+/// iteration's other work items at their next check and fails the run with the rule
+/// that was being evaluated.
 pub(crate) fn run(
     g: &mut Graph,
     rules: &[CRule],
@@ -808,6 +1234,9 @@ pub(crate) fn run(
     };
     let mut iteration = 0usize;
     let (mut ds, mut de) = (start.unwrap_or(0).min(base_len), base_len);
+    let memory = |e: MemoryExceeded, iteration: usize| -> anyhow::Error {
+        anyhow::Error::new(e.with_context(format!(" (in iteration {})", iteration + 1)))
+    };
     loop {
         if cancelled() {
             anyhow::bail!("reasoning cancelled");
@@ -819,6 +1248,7 @@ pub(crate) fn run(
                 g.len() - base_len
             );
         }
+        limits.budget.check().map_err(|e| memory(e, iteration))?;
         if let Some(p) = &limits.progress {
             let f = 0.1 + 0.7 * (1.0 - 1.0 / (iteration as f32 + 1.0));
             p(
@@ -831,6 +1261,7 @@ pub(crate) fn run(
             );
         }
         // ---- plans for this iteration
+        let t_iter = std::time::Instant::now();
         let mut tasks: Vec<(usize, Vec<Step>)> = Vec::new();
         // a join with an atom whose constant predicate has no rows in its range is empty
         let empty = |r: &CRule, ranges: &[(u32, u32)], g: &Graph| {
@@ -880,71 +1311,155 @@ pub(crate) fn run(
         for (ri, p) in &tasks {
             let (s, o) = index_needs(&rules[*ri], p);
             if s {
-                g.ensure_s_index();
+                g.ensure_index(true, true)
+                    .map_err(|e| memory(e, iteration))?;
             }
             if o {
-                g.ensure_o_index();
+                g.ensure_index(false, true)
+                    .map_err(|e| memory(e, iteration))?;
             }
         }
         // ---- split into parallel work items
         let gr: &Graph = g;
-        let mut work: Vec<(usize, &[Step], Option<Cands<'_>>)> = Vec::new();
+        let mut work: Vec<Item<'_>> = Vec::new();
+        // the charge of the split bindings, for the iteration
+        let mut split_held = Held::new(&limits.budget);
+        let split_min = rayon::current_num_threads().max(1) * 4;
         for (ri, p) in &tasks {
             let r = &rules[*ri];
-            match p.first() {
-                Some(Step::Atom { atom, lo, hi }) => {
-                    let a = &r.atoms[*atom];
-                    let c = |s: Slot| match s {
-                        Slot::Const(c) => Some(c),
-                        _ => None,
-                    };
-                    let cands = gr.cands(c(a.s), c(a.p), c(a.o), *lo, *hi);
-                    if cands.len() == 0 {
-                        continue;
-                    }
-                    for ch in cands.chunks(CHUNK) {
-                        work.push((*ri, p.as_slice(), Some(ch)));
-                    }
+            let first = shares(gr, r, p, 0, &vec![0; r.nvars])?;
+            // a first step with few candidates followed by a large join runs on one
+            // thread: then the bindings up to the next atom are worked out first, and the
+            // work is split on that atom's candidates
+            let deeper = (first.len() < split_min)
+                .then(|| {
+                    p.iter()
+                        .skip(1)
+                        .position(|s| matches!(s, Step::Atom { .. }))
+                })
+                .flatten()
+                .map(|d| d + 1);
+            if let Some(d) = deeper {
+                let split =
+                    split_at(gr, terms, r, p, *ri, d, &first, &abort, limits).map_err(|e| {
+                        match e.downcast::<MemoryExceeded>() {
+                            Ok(m) => memory(m, iteration),
+                            Err(e) => e,
+                        }
+                    })?;
+                if let Some((items, held)) = split {
+                    work.extend(items);
+                    split_held.absorb(held);
+                    continue;
                 }
-                _ => work.push((*ri, p.as_slice(), None)),
             }
+            work.extend(first.into_iter().map(|f| Item {
+                ri: *ri,
+                steps: p.as_slice(),
+                k: 0,
+                b: None,
+                first: f,
+            }));
         }
         let produced = AtomicUsize::new(0);
         let budget = limits
             .max_inferred
             .saturating_sub((gr.len() - base_len) as usize);
+        // the candidates an evaluation may produce for the limit of inferred triples;
+        // memory is checked by the charges as the candidates arrive
         let max_out = budget.saturating_mul(4).saturating_add(1 << 20);
-        let results: Vec<(usize, Vec<Triple>)> = work
+        let timed = tracing::enabled!(tracing::Level::TRACE);
+        let item_time: Vec<AtomicUsize> = if timed {
+            rules.iter().map(|_| AtomicUsize::new(0)).collect()
+        } else {
+            Vec::new()
+        };
+        let t_eval = std::time::Instant::now();
+        let results: Vec<Done> = work
             .par_iter()
-            .map(|(ri, steps, first)| {
+            .map(|item| {
+                let ri = &item.ri;
+                // an item that starts after another failed or the run was cancelled
+                // does nothing
+                if abort.load(Ordering::Relaxed) || cancelled() {
+                    return (*ri, Vec::new(), Held::new(&limits.budget), None);
+                }
+                let t_item = timed.then(std::time::Instant::now);
                 let r = &rules[*ri];
                 let mut ev = Eval::new(
                     gr,
                     terms,
                     r,
-                    steps,
+                    item.steps,
                     de,
                     &abort,
                     limits.cancel.as_deref(),
                     max_out,
                     Mode::New,
+                    &limits.budget,
                 );
-                let mut b = vec![0u64; r.nvars];
-                ev.run(0, &mut b, *first);
+                let mut b = item.b.clone().unwrap_or_else(|| vec![0u64; r.nvars]);
+                ev.run(item.k, &mut b, item.first);
                 let total = produced.fetch_add(ev.out.len(), Ordering::Relaxed) + ev.out.len();
-                if total > max_out {
+                if total > max_out || ev.err.is_some() {
                     abort.store(true, Ordering::Relaxed);
                 }
-                (*ri, ev.out)
+                if let Some(t) = t_item {
+                    item_time[*ri].fetch_add(t.elapsed().as_micros() as usize, Ordering::Relaxed);
+                }
+                let (out, held) = ev.take_out();
+                (*ri, out, held, ev.err.take())
             })
             .collect();
-        let top_rule = || {
+        drop(split_held);
+        if timed {
+            // the threads' busy time against the wall time of the evaluation: the rest is
+            // the wait at the iteration's barrier, and scheduling
+            let busy: usize = item_time.iter().map(|t| t.load(Ordering::Relaxed)).sum();
+            let wall = t_eval.elapsed().as_micros() as usize;
+            tracing::trace!(
+                iteration,
+                busy_ms = busy / 1000,
+                wall_ms = wall / 1000,
+                threads = rayon::current_num_threads(),
+                "evaluation busy time"
+            );
+            let mut by_rule: Vec<(usize, usize)> = item_time
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.load(Ordering::Relaxed), i))
+                .filter(|x| x.0 > 0)
+                .collect();
+            by_rule.sort_unstable_by(|a, b| b.cmp(a));
+            for (us, ri) in by_rule.into_iter().take(5) {
+                let items = work.iter().filter(|w| w.ri == ri).count();
+                tracing::trace!(iteration, rule = %rules[ri].name, ms = us / 1000, items, "rule time");
+            }
+        }
+        // the first error in the order of the work items: a memory error as it is, with
+        // the iteration, and an error of a base-tier read with what was being read
+        let mut outs_held = Held::new(&limits.budget);
+        let mut results: Vec<(usize, Vec<Triple>)> = {
+            let mut ok = Vec::with_capacity(results.len());
+            for (ri, out, held, err) in results {
+                if let Some(e) = err {
+                    return Err(match e.downcast::<MemoryExceeded>() {
+                        Ok(m) => memory(m, iteration),
+                        Err(e) => e.context("reading the input graphs"),
+                    });
+                }
+                outs_held.absorb(held);
+                ok.push((ri, out));
+            }
+            ok
+        };
+        let top_rule = |results: &[(usize, Vec<Triple>)]| {
             let mut per: FxHashMap<usize, usize> = FxHashMap::default();
-            for (ri, out) in &results {
+            for (ri, out) in results {
                 *per.entry(*ri).or_default() += out.len();
             }
             per.into_iter()
-                .max_by_key(|x| x.1)
+                .max_by_key(|x| (x.1, std::cmp::Reverse(x.0)))
                 .map_or(String::new(), |(ri, n)| {
                     format!(
                         " (rule '{}' produced {n} candidate triples in iteration {})",
@@ -956,32 +1471,49 @@ pub(crate) fn run(
         if cancelled() {
             anyhow::bail!("reasoning cancelled");
         }
-        if produced.load(Ordering::Relaxed) > max_out {
+        let candidates = produced.load(Ordering::Relaxed);
+        if candidates > max_out {
             anyhow::bail!(
                 "reasoning exceeded the limit of {} inferred triples{}",
                 limits.max_inferred,
-                top_rule()
+                top_rule(&results)
             );
         }
-        let overflow = if (g.len() - base_len) as usize + produced.load(Ordering::Relaxed)
-            > limits.max_inferred
-        {
-            top_rule()
+        let overflow = if (g.len() - base_len) as usize + candidates > limits.max_inferred {
+            top_rule(&results)
         } else {
             String::new()
         };
         // ---- merge
+        let eval_ms = t_iter.elapsed().as_millis() as u64;
+        let t_merge = std::time::Instant::now();
         let before = g.len();
-        g.add_batch(results.into_iter().flat_map(|(_, out)| out));
+        let outs: Vec<Vec<Triple>> = results.drain(..).map(|(_, out)| out).collect();
+        g.merge(outs, outs_held)
+            .map_err(|e| match e.downcast::<MemoryExceeded>() {
+                Ok(m) => memory(m.with_context(overflow.clone()), iteration),
+                Err(e) => e,
+            })?;
         iteration += 1;
         let new = g.len() - before;
-        tracing::debug!(iteration, new, "reasoner iteration");
+        tracing::debug!(
+            iteration,
+            new,
+            candidates,
+            eval_ms,
+            merge_ms = t_merge.elapsed().as_millis() as u64,
+            "reasoner iteration"
+        );
         if (g.len() - base_len) as usize > limits.max_inferred {
             anyhow::bail!(
                 "reasoning exceeded the limit of {} inferred triples{overflow}",
                 limits.max_inferred
             );
         }
+        limits
+            .budget
+            .check()
+            .map_err(|e| memory(e.with_context(overflow.clone()), iteration - 1))?;
         if new == 0 {
             break;
         }
@@ -992,7 +1524,6 @@ pub(crate) fn run(
         iterations: iteration,
     })
 }
-
 // ============================================================== incremental ====
 
 /// Why a rule keeps a materialization from being maintained incrementally, if it does.

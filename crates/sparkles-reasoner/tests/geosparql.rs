@@ -204,3 +204,181 @@ fn geometries_are_typed_from_their_serializations() {
     run(&s2, &[], false);
     assert!(select(&s2, "SELECT ?x { ?x a sf:Point }", true).is_empty());
 }
+
+/// Incremental runs with default geometries write what a full run writes, from a closure
+/// kept in memory and from one read back from the dataset.
+#[test]
+fn default_geometries_follow_changes_incrementally() {
+    use sparkles_reasoner::{Cache, Incremental, Method, materialize_incremental};
+    let inferred = |s: &Store| {
+        let mut v = select_all(s);
+        v.sort();
+        v
+    };
+    let changes = [
+        "INSERT DATA { ex:p1 geo:hasGeometry ex:g1b }",
+        "INSERT DATA { ex:p4 geo:hasGeometry ex:g4 }",
+        "DELETE DATA { ex:p2 geo:hasGeometry ex:g2b }",
+        "INSERT DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }",
+        "DELETE DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }",
+        "DELETE DATA { ex:p3 geo:hasDefaultGeometry ex:g3b }",
+        "DELETE DATA { ex:p1 geo:hasGeometry ex:g1b }",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let persistent = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    persistent
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    for (s, cache) in [(store(), Some(Cache::new(1 << 20))), (persistent, None)] {
+        let extras = Extras::parse(&["geosparql"], true).unwrap();
+        let go = |since: Option<u64>| {
+            materialize_incremental(
+                &s,
+                &Profile::Rdfs,
+                &extras,
+                Incremental {
+                    since,
+                    cache: cache.as_ref(),
+                },
+                &ReasonOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e:#}"))
+        };
+        let mut since = go(None).receipt.unwrap().commit.seq;
+        for (i, u) in changes.iter().enumerate() {
+            sparkles_core::sparql::update::update(&s, &format!("{P}{u}"), &QueryOptions::default())
+                .unwrap();
+            let r = go(Some(since));
+            assert_eq!(r.method, Method::Incremental, "{u}: {:?}", r.fallback);
+            let got = inferred(&s);
+            // every other step continues from a full run's closure
+            let r = go(None);
+            assert_eq!(got, inferred(&s), "{u}");
+            if i % 2 == 0 {
+                since = r.receipt.unwrap().commit.seq;
+            } else {
+                sparkles_core::sparql::update::update(
+                    &s,
+                    &format!("{P}INSERT DATA {{ ex:z ex:step {i} }}"),
+                    &QueryOptions::default(),
+                )
+                .unwrap();
+                since = go(Some(r.receipt.unwrap().commit.seq))
+                    .receipt
+                    .unwrap()
+                    .commit
+                    .seq;
+            }
+        }
+        assert_eq!(
+            select(&s, "SELECT ?x { ?x geo:hasDefaultGeometry ?g }", true),
+            ["A", "p1", "p2", "p3", "p4"]
+        );
+    }
+}
+
+/// The triples of the inferred graph, as N-Triples.
+fn select_all(s: &Store) -> Vec<String> {
+    let q = format!("SELECT ?s ?p ?o {{ GRAPH <{INFERRED_GRAPH}> {{ ?s ?p ?o }} }}");
+    let r = query(s.snapshot(), &q, &QueryOptions::default()).unwrap();
+    r.rows()
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|t| t.map_or(String::new(), |t| t.to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// A copy of the default graph of `s` in a new store.
+fn copy(s: &Store) -> Store {
+    use sparkles_core::id::Id;
+    use sparkles_core::index::Perm;
+    let c = Store::in_memory(StoreOptions::default());
+    let snap = s.snapshot();
+    let mut txn = c.write();
+    let mut labels = Default::default();
+    for k in snap.scan_keys(Perm::Gspo, &[Id::DEFAULT_GRAPH.0]).unwrap() {
+        let q = snap.quad_to_terms(&Perm::Gspo.to_quad(&k)).unwrap();
+        let q = txn.encode_quad(&q, &mut labels).unwrap();
+        txn.insert(q).unwrap();
+    }
+    txn.commit().unwrap();
+    c
+}
+
+/// F16 review finding F9: an incremental run with default geometries reads only the
+/// features whose geometry facts changed, with probes bound to the feature, when it
+/// continues from a closure kept in memory. A closure read back from the dataset does
+/// not know its default geometries, and that run reads them with one scan per property.
+#[test]
+fn f16_default_geometry_changed_subjects() {
+    use sparkles_reasoner::{Cache, Incremental, Method, materialize_incremental};
+    let dir = tempfile::tempdir().unwrap();
+    let persistent = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    persistent
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // (update, scans with the closure in memory, scans with the closure read back)
+    let steps = [
+        ("INSERT DATA { ex:z ex:unrelated 1 }", 0, 2),
+        ("INSERT DATA { ex:p1 geo:hasGeometry ex:g1b }", 2, 4),
+        ("DELETE DATA { ex:p2 geo:hasGeometry ex:g2b }", 2, 4),
+        (
+            "INSERT DATA { ex:p4 geo:hasGeometry ex:g4 . ex:p3 geo:hasGeometry ex:g3c }",
+            4,
+            6,
+        ),
+        ("DELETE DATA { ex:p3 geo:hasDefaultGeometry ex:g3b }", 2, 4),
+        ("INSERT DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }", 2, 4),
+        ("INSERT DATA { ex:z ex:unrelated 2 }", 0, 2),
+    ];
+    for (s, cache) in [(store(), Some(Cache::new(1 << 20))), (persistent, None)] {
+        let extras = Extras::parse::<&str>(&[], true).unwrap();
+        let go = |since: Option<u64>| {
+            materialize_incremental(
+                &s,
+                &Profile::Rdfs,
+                &extras,
+                Incremental {
+                    since,
+                    cache: cache.as_ref(),
+                },
+                &ReasonOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e:#}"))
+        };
+        let mut since = go(None).receipt.unwrap().commit.seq;
+        for (u, in_memory, read_back) in steps {
+            sparkles_core::sparql::update::update(&s, &format!("{P}{u}"), &QueryOptions::default())
+                .unwrap();
+            let r = go(Some(since));
+            assert_eq!(r.method, Method::Incremental, "{u}: {:?}", r.fallback);
+            let want = if cache.is_some() {
+                in_memory
+            } else {
+                read_back
+            };
+            assert_eq!(r.base_scans, want, "{u}");
+            since = r.receipt.unwrap().commit.seq;
+            // a full run over a copy writes the same
+            let mut got = select_all(&s);
+            got.sort();
+            let c = copy(&s);
+            materialize_with(&c, &Profile::Rdfs, &extras, &ReasonOptions::default()).unwrap();
+            let mut full = select_all(&c);
+            full.sort();
+            assert_eq!(got, full, "{u}");
+        }
+    }
+}

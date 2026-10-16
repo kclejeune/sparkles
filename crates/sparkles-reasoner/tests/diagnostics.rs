@@ -702,3 +702,178 @@ fn property_checks_see_inferred_assertions_with_their_basis() {
     assert_eq!(f.len(), 1);
     assert_eq!(f[0]["basis"], "uses-inferences");
 }
+
+#[test]
+fn dt_not_type_literals_outside_their_datatype() {
+    // F16 A10: a range violation and an ill-typed literal, but not 1.0 for xsd:integer
+    let mut f = only(
+        r#"ex:age rdfs:range xsd:integer .
+           ex:p ex:age "abc" .
+           ex:q ex:age "1.0"^^xsd:decimal .
+           ex:r ex:height "tall"^^xsd:decimal ."#,
+        "literal-not-in-datatype",
+    );
+    f.sort_by_key(|x| x["focus"]["value"].as_str().unwrap_or("").to_string());
+    assert_eq!(f.len(), 2, "{f:#?}");
+    assert_eq!(f[0]["focus"], uri("p"));
+    assert_eq!(f[0]["rule"], "dt-not-type");
+    assert_eq!(
+        f[0]["evidence"]["range"]["value"],
+        "http://www.w3.org/2001/XMLSchema#integer"
+    );
+    assert_eq!(f[0]["evidence"]["literal"]["value"], "abc");
+    assert_eq!(f[1]["focus"], uri("r"));
+    assert_eq!(f[1]["evidence"]["literal"]["value"], "tall");
+    // ranges through a subproperty, and the value spaces of the table
+    let f = only(
+        r#"ex:size rdfs:range xsd:byte . ex:width rdfs:subPropertyOf ex:size .
+           ex:a ex:width 300 .
+           ex:b ex:width 12 .
+           ex:name rdfs:range rdf:langString .
+           ex:c ex:name "plain" .
+           ex:d ex:name "tagged"@en .
+           ex:w rdfs:range xsd:double .
+           ex:e ex:w 1.5e0 .
+           ex:f ex:w 1.5 .
+           ex:g ex:flag "maybe"^^xsd:boolean .
+           ex:h ex:flag "1"^^xsd:boolean .
+           ex:i ex:other "x"^^ex:custom ."#,
+        "literal-not-in-datatype",
+    );
+    let mut foci: Vec<String> = f
+        .iter()
+        .map(|x| x["focus"]["value"].as_str().unwrap().to_string())
+        .collect();
+    foci.sort();
+    assert_eq!(
+        foci,
+        [
+            "http://ex.org/a",
+            "http://ex.org/c",
+            "http://ex.org/f",
+            "http://ex.org/g"
+        ]
+    );
+}
+
+/// The `literal-not-in-datatype` check alone, with `limit` findings at most.
+fn datatype_only(limit: usize) -> DiagnoseOptions {
+    DiagnoseOptions {
+        checks: vec!["literal-not-in-datatype".into()],
+        limit,
+        ..opts()
+    }
+}
+
+fn check_outcome(r: &DiagnosticsReport, id: &str) -> (CheckStatus, usize) {
+    let c = r.checks.iter().find(|c| c.id == id).unwrap();
+    (c.status, c.findings)
+}
+
+#[test]
+fn f16_datatype_limit_counts_violations() {
+    const ID: &str = "literal-not-in-datatype";
+    // In candidate order a valid long comes first, then more than a page of valid ones,
+    // and the only violation comes last.
+    let mut ttl = String::from("ex:a000 ex:v \"1\"^^xsd:long .\n");
+    for i in 1..600 {
+        ttl.push_str(&format!("ex:a{i:03} ex:v \"{i}\"^^xsd:long .\n"));
+    }
+    let valid = ttl.clone();
+    ttl.push_str("ex:b ex:v \"bad\"^^xsd:long .\n");
+    let s = store(&ttl);
+    let r = check(&s, &datatype_only(1));
+    let f = findings(&r, ID);
+    assert_eq!(f.len(), 1, "{:#?}", r.checks);
+    assert_eq!(f[0]["focus"], uri("b"));
+    assert_eq!(f[0]["evidence"]["literal"]["value"], "bad");
+    assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 1));
+    assert_eq!(r.status, ReportStatus::ViolationsFound);
+
+    // A second violation makes limit 1 truncated and limit 2 complete.
+    ttl.push_str("ex:c ex:v \"2\"^^xsd:byte . ex:c ex:v \"x\"^^xsd:byte .\n");
+    let s = store(&ttl);
+    let r = check(&s, &datatype_only(1));
+    assert_eq!(check_outcome(&r, ID), (CheckStatus::Truncated, 1));
+    assert_eq!(r.status, ReportStatus::ViolationsFound);
+    let r = check(&s, &datatype_only(2));
+    assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 2));
+    let r = check(&s, &datatype_only(3));
+    assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 2));
+
+    // Only valid literals give none, and the check is not truncated.
+    let s = store(&valid);
+    for limit in [1, 2, 100] {
+        let r = check(&s, &datatype_only(limit));
+        assert_eq!(
+            check_outcome(&r, ID),
+            (CheckStatus::None, 0),
+            "limit {limit}"
+        );
+        assert_eq!(r.status, ReportStatus::NoneFound);
+    }
+
+    // The same literal reached through two subproperty paths and by its own datatype
+    // is one finding.
+    let s = store(
+        r#"ex:q rdfs:range xsd:long . ex:q1 rdfs:subPropertyOf ex:q .
+           ex:q2 rdfs:subPropertyOf ex:q . ex:p rdfs:subPropertyOf ex:q1, ex:q2 .
+           ex:a ex:p "1"^^xsd:long . ex:b ex:p "bad"^^xsd:long ."#,
+    );
+    for limit in [1, 5] {
+        let r = check(&s, &datatype_only(limit));
+        let f = findings(&r, ID);
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert_eq!(f[0]["focus"], uri("b"));
+        assert_eq!(f[0]["basis"], "asserted");
+        assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 1));
+    }
+
+    // A finding whose two rows (by range and by datatype) straddle the boundary of the
+    // first page of 256 rows is neither lost nor repeated. ex:s000 has three rows, and
+    // every later subject two, so ex:s127's rows are rows 255 and 256.
+    let mut ttl = String::from("ex:v rdfs:range xsd:long . ex:s000 ex:w \"1\"^^xsd:long .\n");
+    for i in 0..400 {
+        let v = if [127, 300, 350].contains(&i) {
+            "bad"
+        } else {
+            "1"
+        };
+        ttl.push_str(&format!("ex:s{i:03} ex:v \"{v}\"^^xsd:long .\n"));
+    }
+    let s = store(&ttl);
+    let foci = |r: &DiagnosticsReport| -> Vec<J> {
+        findings(r, ID).iter().map(|f| f["focus"].clone()).collect()
+    };
+    let r = check(&s, &datatype_only(3));
+    assert_eq!(foci(&r), [uri("s127"), uri("s300"), uri("s350")]);
+    assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 3));
+    let r = check(&s, &datatype_only(2));
+    assert_eq!(foci(&r), [uri("s127"), uri("s300")]);
+    assert_eq!(check_outcome(&r, ID), (CheckStatus::Truncated, 2));
+
+    // A violation that only the inferences state is marked by its basis.
+    let s = store(
+        r#"ex:q rdfs:range xsd:byte . ex:p rdfs:subPropertyOf ex:q .
+           ex:a ex:p 1, 2, 3 . ex:b ex:p 300 ."#,
+    );
+    materialize(&s, &Profile::Rdfs, &ReasonOptions::default()).unwrap();
+    let r = check(
+        &s,
+        &DiagnoseOptions {
+            inferences: true,
+            ..datatype_only(5)
+        },
+    );
+    let f = findings(&r, ID);
+    assert_eq!(f.len(), 2, "{f:#?}");
+    assert!(f.iter().all(|x| x["evidence"]["literal"]["value"] == "300"));
+    let basis = |p: &str| {
+        f.iter()
+            .find(|x| x["evidence"]["property"] == uri(p))
+            .map(|x| x["basis"].clone())
+    };
+    assert_eq!(basis("p"), Some(json!("asserted")));
+    assert_eq!(basis("q"), Some(json!("uses-inferences")));
+    assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 2));
+}

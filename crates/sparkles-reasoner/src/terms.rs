@@ -1,13 +1,30 @@
 //! Term handling for the engine: classification and decoding of ids, plus a local
 //! dictionary for terms that do not exist in the store yet (head constants, literals
 //! computed by builtins, blank nodes from `makeTemp` / `makeSkolem`).
+//!
+//! The local dictionary is charged to the run's budget ([`Terms::set_budget`]): each
+//! term's key twice (the map's and the table's copy), its map entry, the map's growth
+//! and each segment of the table when it is first used, before they are allocated; and
+//! the regular expressions it compiled, at an estimate each.
 
+use crate::budget::{Budget, MemoryExceeded, table_bytes, table_grown};
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use rustc_hash::FxHashMap;
 use sparkles_core::id::{self, Id, Tag};
 use sparkles_core::sparql::value::Value;
 use sparkles_core::store::Snapshot;
-use std::sync::{Arc, Mutex, RwLock};
+use std::mem::size_of;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+/// Regular expressions compiled for `regex` with a pattern that is not a constant, kept
+/// at most: a full cache starts over.
+const REGEX_CACHE: usize = 256;
+/// The estimate of the heap of one compiled regular expression, besides its pattern.
+const REGEX_BYTES: usize = 16 << 10;
+/// The heap of a key's map entry besides the key's bytes, and of a table slot.
+const ENTRY_BYTES: usize = size_of::<(Vec<u8>, u64)>();
+const SLOT_BYTES: usize = size_of::<OnceLock<LocalTerm>>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -40,7 +57,52 @@ pub(crate) enum LocalTerm {
 #[derive(Default)]
 struct Locals {
     map: FxHashMap<Vec<u8>, u64>,
-    terms: Vec<LocalTerm>,
+    /// local ids handed out
+    len: u64,
+}
+
+/// The local terms by local id, append-only, read without a lock: segment `k` holds
+/// `SEGMENT << k` slots.
+struct LocalTable {
+    segments: Vec<OnceLock<Box<[OnceLock<LocalTerm>]>>>,
+}
+
+const SEGMENT: u64 = 1024;
+
+impl LocalTable {
+    fn new() -> LocalTable {
+        LocalTable {
+            segments: (0..40).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    fn at(i: u64) -> (usize, usize) {
+        let k = 63 - (i / SEGMENT + 1).leading_zeros() as u64;
+        (k as usize, (i - SEGMENT * ((1 << k) - 1)) as usize)
+    }
+
+    fn get(&self, i: u64) -> Option<&LocalTerm> {
+        let (k, off) = Self::at(i);
+        self.segments.get(k)?.get()?.get(off)?.get()
+    }
+
+    /// The bytes slot `i` makes the table allocate: its segment's, when it is the
+    /// segment's first.
+    fn growth(&self, i: u64) -> usize {
+        let (k, _) = Self::at(i);
+        match self.segments.get(k) {
+            Some(s) if s.get().is_none() => (SEGMENT << k) as usize * SLOT_BYTES,
+            _ => 0,
+        }
+    }
+
+    /// Set slot `i` (each slot once, by the holder of the write lock).
+    fn set(&self, i: u64, t: LocalTerm) {
+        let (k, off) = Self::at(i);
+        let seg =
+            self.segments[k].get_or_init(|| (0..(SEGMENT << k)).map(|_| OnceLock::new()).collect());
+        let _ = seg[off].set(t);
+    }
 }
 
 /// Term context shared by all evaluation threads.
@@ -49,11 +111,21 @@ pub(crate) struct Terms {
     /// base vocabulary id range `[lo, hi)` holding literals
     lit_range: (u64, u64),
     locals: RwLock<Locals>,
+    table: LocalTable,
     regex_cache: Mutex<FxHashMap<String, Option<regex::Regex>>>,
+    /// the budget the local terms are charged to, and the bytes charged
+    budget: RwLock<Arc<Budget>>,
+    charged: AtomicUsize,
     pub rdf_first: u64,
     pub rdf_rest: u64,
     pub rdf_nil: u64,
     pub now: u64,
+}
+
+impl Drop for Terms {
+    fn drop(&mut self) {
+        self.budget.read().unwrap().release(*self.charged.get_mut());
+    }
 }
 
 impl Terms {
@@ -63,7 +135,10 @@ impl Terms {
             snap,
             lit_range,
             locals: RwLock::new(Locals::default()),
+            table: LocalTable::new(),
             regex_cache: Mutex::new(FxHashMap::default()),
+            budget: RwLock::new(Budget::unlimited()),
+            charged: AtomicUsize::new(0),
             rdf_first: 0,
             rdf_rest: 0,
             rdf_nil: 0,
@@ -86,68 +161,155 @@ impl Terms {
         t
     }
 
-    /// Id of a term: inline, existing in the store, or a (new) local id.
+    /// Charge the local terms to `budget` from now on, or fail when they do not fit.
+    pub fn set_budget(&self, budget: &Arc<Budget>) -> Result<(), MemoryExceeded> {
+        let mut b = self.budget.write().unwrap();
+        let n = self.charged.load(Ordering::Relaxed);
+        budget.try_charge(n)?;
+        b.release(n);
+        *b = budget.clone();
+        Ok(())
+    }
+
+    /// The budget the local terms are charged to.
+    pub fn budget(&self) -> Arc<Budget> {
+        self.budget.read().unwrap().clone()
+    }
+
+    /// The bytes the local terms are charged.
+    pub fn heap_bytes(&self) -> usize {
+        self.charged.load(Ordering::Relaxed)
+    }
+
+    /// Charge `n` bytes, failing past the limit with `strict`.
+    fn charge(&self, n: usize, strict: bool) -> Result<(), MemoryExceeded> {
+        let b = self.budget.read().unwrap();
+        if strict {
+            b.try_charge(n)?;
+        } else {
+            b.charge(n);
+        }
+        self.charged.fetch_add(n, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn release(&self, n: usize) {
+        let n = n.min(self.charged.load(Ordering::Relaxed));
+        self.budget.read().unwrap().release(n);
+        self.charged.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Id of a term: inline, existing in the store, or a (new) local id, charged to the
+    /// budget even past its limit (for the run to find at its next check).
     pub fn id_for(&self, t: &Term) -> u64 {
+        self.id_charged(t, false)
+            .expect("charges that may pass the limit do not fail")
+    }
+
+    /// [`id_for`](Self::id_for), failing without a new term when it does not fit the
+    /// budget.
+    pub fn try_id_for(&self, t: &Term) -> Result<u64, MemoryExceeded> {
+        self.id_charged(t, true)
+    }
+
+    fn id_charged(&self, t: &Term, strict: bool) -> Result<u64, MemoryExceeded> {
         if let Some(id) = id::inline_id(t) {
-            return id.0;
+            return Ok(id.0);
         }
         if let Term::BlankNode(b) = t {
             if let Some(id) = self.snap.lookup_term(t) {
-                return id.0;
+                return Ok(id.0);
             }
             // rule-level blank node constant: one local bnode per label
             let mut key = b"\0bn".to_vec();
             key.extend_from_slice(b.as_str().as_bytes());
-            return self.local_keyed(key, LocalTerm::BNode);
+            return self.local_keyed(key, LocalTerm::BNode, strict);
         }
         let key = id::term_key(t);
         if let Some(id) = self.snap.lookup_key(&key) {
-            return id.0;
+            return Ok(id.0);
         }
-        self.local_keyed(key.clone(), LocalTerm::Key(key))
+        // the table gets its copy of the key once the term is charged
+        self.local_keyed(key, LocalTerm::Key(Vec::new()), strict)
     }
 
-    fn local_keyed(&self, key: Vec<u8>, term: LocalTerm) -> u64 {
+    /// The local id of `key`, made with `term` (a key term gets a copy of `key`) when
+    /// it is new: its bytes, its entry, the map's growth and a new segment of the table
+    /// are charged first.
+    fn local_keyed(
+        &self,
+        key: Vec<u8>,
+        term: LocalTerm,
+        strict: bool,
+    ) -> Result<u64, MemoryExceeded> {
         if let Some(&id) = self.locals.read().unwrap().map.get(&key) {
-            return id;
+            return Ok(id);
         }
         let mut l = self.locals.write().unwrap();
         if let Some(&id) = l.map.get(&key) {
-            return id;
+            return Ok(id);
         }
-        let id = Id::local(l.terms.len() as u64).0;
-        l.terms.push(term);
+        let n = l.len;
+        let copy = matches!(term, LocalTerm::Key(_));
+        let (cap, len) = (l.map.capacity(), l.map.len());
+        let grow = if len == cap {
+            table_bytes(table_grown(cap, len, 1), ENTRY_BYTES)
+        } else {
+            0
+        };
+        // the map's key and the table's copy; the entry and the slot are part of the
+        // map's table and of the segment
+        let bytes = key.len() * (1 + copy as usize) + self.table.growth(n) + grow;
+        self.charge(bytes, strict)?;
+        let term = match term {
+            LocalTerm::Key(_) => LocalTerm::Key(key.clone()),
+            t => t,
+        };
+        self.table.set(n, term);
+        l.len += 1;
+        let id = Id::local(n).0;
         l.map.insert(key, id);
-        id
+        if grow > 0 {
+            // the old table is freed: the map's heap is now its new table
+            self.release(table_bytes(cap, ENTRY_BYTES));
+        }
+        Ok(id)
     }
 
-    /// A fresh blank node (`makeTemp`).
-    pub fn fresh_bnode(&self) -> u64 {
+    /// A fresh blank node (`makeTemp`), failing when it does not fit the budget.
+    pub fn try_fresh_bnode(&self) -> Result<u64, MemoryExceeded> {
         let mut l = self.locals.write().unwrap();
-        let id = Id::local(l.terms.len() as u64).0;
-        l.terms.push(LocalTerm::BNode);
-        id
+        let n = l.len;
+        self.charge(self.table.growth(n), true)?;
+        self.table.set(n, LocalTerm::BNode);
+        l.len += 1;
+        Ok(Id::local(n).0)
     }
 
-    /// A blank node determined by `args` (`makeSkolem`).
-    pub fn skolem(&self, args: &[u64]) -> u64 {
+    /// A blank node determined by `args` (`makeSkolem`), failing when it does not fit
+    /// the budget.
+    pub fn try_skolem(&self, args: &[u64]) -> Result<u64, MemoryExceeded> {
         let mut key = b"\0sk".to_vec();
         for a in args {
             key.extend_from_slice(&a.to_le_bytes());
         }
-        self.local_keyed(key, LocalTerm::BNode)
+        self.local_keyed(key, LocalTerm::BNode, true)
     }
 
     pub fn local(&self, id: u64) -> Option<LocalTerm> {
         let i = Id(id);
-        (i.tag() == Tag::Local).then(|| {
-            self.locals
-                .read()
-                .unwrap()
-                .terms
-                .get(i.payload() as usize)
-                .cloned()
-        })?
+        (i.tag() == Tag::Local)
+            .then(|| self.table.get(i.payload()).cloned())
+            .flatten()
+    }
+
+    /// The kind of a local id's term, without cloning it.
+    fn local_kind(&self, id: u64) -> Kind {
+        match self.table.get(Id(id).payload()) {
+            Some(LocalTerm::BNode) => Kind::BNode,
+            Some(LocalTerm::Key(k)) => key_kind(k),
+            None => Kind::Other,
+        }
     }
 
     pub fn kind(&self, id: u64) -> Kind {
@@ -172,11 +334,7 @@ impl Terms {
                 }
             }
             Tag::Delta => self.snap.key(i).map_or(Kind::Other, |k| key_kind(&k)),
-            Tag::Local => match self.local(id) {
-                Some(LocalTerm::BNode) => Kind::BNode,
-                Some(LocalTerm::Key(k)) => key_kind(&k),
-                None => Kind::Other,
-            },
+            Tag::Local => self.local_kind(id),
             _ => Kind::Other,
         }
     }
@@ -221,6 +379,7 @@ impl Terms {
         let mut moved = FxHashMap::default();
         let mut l = self.locals.write().unwrap();
         let Locals { map, .. } = &mut *l;
+        let mut freed = 0;
         map.retain(|key, id| {
             if key.starts_with(b"\0") {
                 return true;
@@ -228,11 +387,15 @@ impl Terms {
             match self.snap.lookup_key(key) {
                 Some(s) => {
                     moved.insert(*id, s.0);
+                    // the map's copy of the key; the table keeps its own
+                    freed += key.len();
                     false
                 }
                 None => true,
             }
         });
+        drop(l);
+        self.release(freed);
         moved
     }
 
@@ -245,16 +408,27 @@ impl Terms {
         Some(match self.term(id)? {
             Term::NamedNode(n) => n.into_string(),
             Term::BlankNode(b) => b.into_string(),
-            Term::Literal(l) => l.value().to_string(),
+            Term::Literal(l) => l.destruct().0,
             Term::Triple(t) => t.to_string(),
         })
     }
 
-    pub fn regex(&self, pattern: &str) -> Option<regex::Regex> {
+    /// The compiled pattern, from a cache of at most [`REGEX_CACHE`] patterns, each
+    /// charged at an estimate before it is compiled; `Ok(None)` for an invalid one.
+    pub fn try_regex(&self, pattern: &str) -> Result<Option<regex::Regex>, MemoryExceeded> {
         let mut c = self.regex_cache.lock().unwrap();
-        c.entry(pattern.to_string())
-            .or_insert_with(|| anchored_regex(pattern))
-            .clone()
+        if let Some(r) = c.get(pattern) {
+            return Ok(r.clone());
+        }
+        if c.len() >= REGEX_CACHE {
+            let n: usize = c.keys().map(|p| p.len() + REGEX_BYTES).sum();
+            c.clear();
+            self.release(n);
+        }
+        self.charge(pattern.len() + REGEX_BYTES, true)?;
+        let r = anchored_regex(pattern);
+        c.insert(pattern.to_string(), r.clone());
+        Ok(r)
     }
 }
 

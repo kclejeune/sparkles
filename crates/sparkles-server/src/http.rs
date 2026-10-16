@@ -4380,6 +4380,13 @@ async fn reason(
     // the input graphs the request names, if any
     let mut asked_inputs: Option<sparkles_reasoner::Inputs> = None;
     let mut refresh = query.get("refreshImports").is_some_and(truthy);
+    let threads_of = |s: &str| {
+        s.parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| bad("threads must be a positive number".into()))
+    };
+    let mut threads = query.get("threads").map(threads_of).transpose()?;
     let (profile_name, rules, rerun, vocabularies, geo_default_geometry, full) =
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
@@ -4397,6 +4404,11 @@ async fn reason(
                 );
             }
             refresh |= v["refreshImports"].as_bool().unwrap_or(false);
+            match &v["threads"] {
+                J::Null => {}
+                J::Number(n) => threads = Some(threads_of(&n.to_string())?),
+                _ => return Err(bad("threads must be a positive number".into())),
+            }
             let vocabularies = match &v["vocabularies"] {
                 J::Null => Vec::new(),
                 J::Array(a) => a
@@ -4445,6 +4457,9 @@ async fn reason(
                 asked_inputs = Some(i);
             }
             refresh |= p.get("refreshImports").is_some_and(truthy);
+            if let Some(t) = p.get("threads") {
+                threads = Some(threads_of(t)?);
+            }
             (
                 p.get("profile").unwrap_or("rdfs").to_string(),
                 p.get("rules").map(str::to_string),
@@ -4508,6 +4523,7 @@ async fn reason(
         crate::reasoning::Trigger::Request,
         !full,
         refresh,
+        threads,
     );
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }

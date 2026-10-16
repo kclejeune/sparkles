@@ -1,0 +1,67 @@
+# literal-not-in-datatype: a literal typed with a datatype of the OWL 2 RL datatype map
+# whose value is not in that datatype's value space (OWL 2 RL dt-not-type). The typing
+# comes from the literal's own datatype (dt-type2), which makes an ill-typed literal
+# such as "abc"^^xsd:integer inconsistent, or from a range of a property that has the
+# literal as a value (prp-rng), closed over rdfs:subPropertyOf*.
+#
+# The query only narrows the candidates: it leaves out the literals that are plainly in
+# the value space. Each exclusion in the range branch drops only literals the checker
+# also decides are inside, so the query never hides a literal the checker would report.
+# The checker decides value-space membership for each candidate and reports only the
+# literals it can decide are outside. Ranges outside the table below, rdfs:Literal and
+# datatype restrictions are never reported. The checker appends an ORDER BY over all
+# the projected variables and reads the candidates in LIMIT and OFFSET pages.
+#
+# The datatype branch leaves out xsd:string, xsd:anyURI and language-tagged strings,
+# which the checker treats as always well typed. It keeps the numeric literals that
+# the SPARQL parser cannot read, such as integers beyond its range, and the checker
+# then reads them exactly.
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+
+SELECT DISTINCT ?x ?p ?range ?lit ?via WHERE {
+  {
+    ?q rdfs:range ?range .
+    FILTER(?range IN (
+      xsd:decimal, xsd:integer, xsd:long, xsd:int, xsd:short, xsd:byte,
+      xsd:nonNegativeInteger, xsd:nonPositiveInteger, xsd:positiveInteger,
+      xsd:negativeInteger, xsd:unsignedLong, xsd:unsignedInt, xsd:unsignedShort,
+      xsd:unsignedByte, xsd:double, xsd:float, xsd:string, xsd:normalizedString,
+      xsd:token, xsd:language, xsd:Name, xsd:NCName, xsd:NMTOKEN, rdf:langString,
+      rdf:PlainLiteral, xsd:boolean, xsd:dateTime, xsd:dateTimeStamp, xsd:anyURI,
+      xsd:hexBinary, xsd:base64Binary))
+    ?p rdfs:subPropertyOf* ?q .
+    ?x ?p ?lit .
+    FILTER(isLiteral(?lit))
+    BIND(DATATYPE(?lit) AS ?dt)
+    FILTER(!(
+      (?range IN (xsd:decimal, xsd:integer) && ?dt IN (xsd:integer, xsd:decimal) && isNumeric(?lit)
+        && (?range = xsd:decimal || ?lit = ROUND(?lit)))
+      || (?range IN (xsd:double, xsd:float) && ?dt IN (xsd:double, xsd:float) && isNumeric(?lit))
+      || (?range IN (xsd:string, rdf:PlainLiteral) && ?dt = xsd:string)
+      || (?range IN (rdf:langString, rdf:PlainLiteral) && LANG(?lit) != "")
+      || (?range = ?dt && ?range = xsd:boolean && STR(?lit) IN ("true", "false", "1", "0"))
+      || (?range = ?dt && ?range = xsd:dateTime && COALESCE(YEAR(?lit) > -100000, false))
+    ))
+    BIND("range" AS ?via)
+  }
+  UNION
+  {
+    ?x ?p ?lit .
+    FILTER(isLiteral(?lit))
+    BIND(DATATYPE(?lit) AS ?range)
+    FILTER(
+      (?range IN (xsd:decimal, xsd:integer, xsd:double, xsd:float) && !isNumeric(?lit))
+      || ?range IN (
+        xsd:long, xsd:int, xsd:short, xsd:byte, xsd:nonNegativeInteger,
+        xsd:nonPositiveInteger, xsd:positiveInteger, xsd:negativeInteger,
+        xsd:unsignedLong, xsd:unsignedInt, xsd:unsignedShort, xsd:unsignedByte,
+        xsd:normalizedString, xsd:token, xsd:language, xsd:Name, xsd:NCName,
+        xsd:NMTOKEN, xsd:dateTimeStamp, xsd:hexBinary, xsd:base64Binary)
+      || (?range = xsd:boolean && !(STR(?lit) IN ("true", "false", "1", "0")))
+      || (?range = xsd:dateTime && !COALESCE(YEAR(?lit) > -100000, false))
+    )
+    BIND("datatype" AS ?via)
+  }
+}

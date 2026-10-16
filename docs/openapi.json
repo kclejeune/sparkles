@@ -11869,6 +11869,11 @@
             "description": "The rules of the `rules` profile, in Jena's rule syntax.",
             "type": "string"
           },
+          "threads": {
+            "description": "Threads the run evaluates rules on, at most those of the server's reasoning pool.",
+            "minimum": 1,
+            "type": "integer"
+          },
           "vocabularies": {
             "description": "Built-in vocabularies added to the profile.",
             "examples": [
@@ -12025,6 +12030,9 @@
           },
           "run": {
             "properties": {
+              "baseScans": {
+                "type": "integer"
+              },
               "changes": {
                 "properties": {
                   "checked": {
@@ -12067,6 +12075,12 @@
                   "incremental"
                 ],
                 "type": "string"
+              },
+              "peakBytes": {
+                "type": "integer"
+              },
+              "threads": {
+                "type": "integer"
               }
             },
             "required": [

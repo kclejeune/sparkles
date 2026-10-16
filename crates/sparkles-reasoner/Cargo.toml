@@ -19,7 +19,10 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
+hashbrown.workspace = true
+smallvec.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true

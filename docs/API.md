@@ -640,7 +640,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | POST   | `/$/backups/{ds}`            | Fuseki's alias of `/$/backup/{ds}` when the request has no JSON body. A JSON body (an `application/json` content type, or a body that is a JSON object) makes it a backup into a repository instead; see [Backup routes](#backup-routes). |
 | GET/POST | `/$/backups-list`          | Fuseki's list of the N-Quads backups in `<data>/backups`: `{ "backups": [string] }`, file names sorted. A caller without `server-admin` sees the files of the datasets it administers. |
 | GET/POST | `/$/validate/query`, `/$/validate/update`, `/$/validate/iri`, `/$/validate/data`, `/$/validate/langtag` | Fuseki's validators. See [Validators](#validators). |
-| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean }`. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). The body can also name the input graphs with `dataGraphs`, `ontologyGraphs`, `imports`, `locationMapping` and `refreshImports`, and a form with `dataGraph`, `ontologyGraph` and `imports` ([input graphs and imports](#input-graphs-and-imports)). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules, extras and input graphs, and returns `409` when nothing is recorded. A run updates the previous materialization incrementally when it can, and `{ "full": true }` or `?full=true` asks for a full one ([incremental runs](#reasoning-status-and-diagnostics)). `400` for an unknown profile or vocabulary, a malformed input graph, or the inferred graph as an input. Returns a cancellable `Task` whose `detail` says how the run went. |
+| POST   | `/$/reason/{ds}`             | Materializes inferences. The JSON body is `{ "profile": "rdfs" \| "owl-rl" \| "rules", "rules"?: string, "vocabularies"?: ["geosparql"], "geoDefaultGeometry"?: boolean, "threads"?: number }`. `threads`, also a form field or a query parameter, caps the threads the run evaluates rules on below the server's reasoning pool (`serve --reason-threads`). The run waits until that many of the pool's threads are free. A form takes `vocabulary` (repeated) and `geoDefaultGeometry`. See [Query rewrite and RDFS entailment](#query-rewrite-spatialequals-and-rdfs-entailment). The body can also name the input graphs with `dataGraphs`, `ontologyGraphs`, `imports`, `locationMapping` and `refreshImports`, and a form with `dataGraph`, `ontologyGraph` and `imports` ([input graphs and imports](#input-graphs-and-imports)). `{ "rerun": true }` or `?rerun=true` re-runs the recorded profile, rules, extras and input graphs, and returns `409` when nothing is recorded. A run updates the previous materialization incrementally when it can, and `{ "full": true }` or `?full=true` asks for a full one ([incremental runs](#reasoning-status-and-diagnostics)). `400` for an unknown profile or vocabulary, a malformed input graph, or the inferred graph as an input. Returns a cancellable `Task` whose `detail` says how the run went. |
 | GET    | `/$/reason/{ds}`             | `ReasoningStatus`, or `{ "reasoning": null, "head": number }`. See [Reasoning status and diagnostics](#reasoning-status-and-diagnostics). |
 | PUT    | `/$/reason/{ds}/auto`        | *Extension.* Sets the dataset's own automatic re-runs with `{ "enabled": boolean, "debounceSeconds"?: number, "maxDelaySeconds"?: number }`. Returns the `ReasoningStatus`. `409` when nothing is recorded, `403` on a read-only server. |
 | DELETE | `/$/reason/{ds}/auto`        | *Extension.* Removes the dataset's own setting, so the server's `--auto-reason` applies again. Returns the `ReasoningStatus`. |
@@ -6295,6 +6295,9 @@ type ReasoningRun = {
     derived: number;           // derived triples that now follow
     source: "memory" | "store"; // where the previous closure came from
   };
+  peakBytes?: number;          // the largest estimated heap the run used at any time
+  baseScans?: number;          // index scans of the input graphs the run issued
+  threads?: number;            // threads the rules were evaluated on
 };
 ```
 
@@ -6405,6 +6408,7 @@ establish OWL consistency.
 | `all-disjoint-properties` | `prp-adp` | inconsistency | [all-disjoint-properties.rq](../crates/sparkles-reasoner/diagnostics/all-disjoint-properties.rq) |
 | `negative-property-assertion` | `prp-npa1`, `prp-npa2` | inconsistency | [negative-property-assertion.rq](../crates/sparkles-reasoner/diagnostics/negative-property-assertion.rq) |
 | `thing-empty` | `thing-nonempty`: the domain is never empty | inconsistency | [thing-empty.rq](../crates/sparkles-reasoner/diagnostics/thing-empty.rq) |
+| `literal-not-in-datatype` | `dt-not-type`, through `dt-type2` or `prp-rng` | inconsistency | [datatype-range.rq](../crates/sparkles-reasoner/diagnostics/datatype-range.rq) |
 | `unsatisfiable-class` | `lint`: a class below `owl:Nothing` without members | warning | [unsatisfiable-class.rq](../crates/sparkles-reasoner/diagnostics/unsatisfiable-class.rq) |
 
 A check that implements two rules reports the one that matched in each finding's `rule`.
@@ -6412,6 +6416,23 @@ For example, `all-different` reports `eq-diff2` for `owl:members` and `eq-diff3`
 `owl:distinctMembers`. Property assertions are matched as stated. A subproperty or
 inverse assertion counts only when the inferences are included and contain it.
 Cardinality restrictions match the value 0 of any numeric datatype.
+
+`literal-not-in-datatype` reports a literal whose value is outside the value space of a
+datatype it has. The datatype is either the literal's own, so that `"abc"^^xsd:integer`
+is reported as ill-typed, or a range of a property that has the literal as a value,
+following `rdfs:subPropertyOf*`. Value spaces follow OWL 2. Integers and decimals share
+one, so `"1.0"^^xsd:decimal` is in the value space of `xsd:integer`. `xsd:double` and
+`xsd:float` are disjoint from it, strings without a language tag are disjoint from
+numbers, and the derived integer and string types add their bounds and facets. The
+check reports only what it can decide. Ranges such as `rdfs:Literal`, `xsd:date`,
+datatype restrictions and literals of datatypes outside XSD are never reported, and
+neither is a literal whose own datatype the check does not implement. `xsd:dateTime`
+values with a timezone are in `xsd:dateTimeStamp`, `xsd:hexBinary` and
+`xsd:base64Binary` share a value space, and `rdf:PlainLiteral` holds the well-typed
+literals of the types derived from `xsd:string`. `xsd:double` and `xsd:float` are
+treated as one value space. The finding limit counts findings, not candidates, and the
+check reads at most 262,144 candidate rows. It is truncated when it stops there, and a
+truncated check without findings makes the report incomplete.
 
 There is no unique name assumption. Two IRIs count as different individuals only through
 `owl:differentFrom` or `owl:AllDifferent`. Literal values of a functional property are compared with SPARQL

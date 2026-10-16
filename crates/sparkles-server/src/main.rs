@@ -1084,6 +1084,10 @@ enum Cmd {
         /// run then reads it back from a persistent dataset)
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_CACHE_TRIPLES)]
         reason_cache_triples: usize,
+        /// Threads that materializations evaluate rules on, shared by all runs (default:
+        /// half the cores; 0: all of them, on the pool queries also use)
+        #[arg(long, value_name = "N")]
+        reason_threads: Option<usize>,
         /// Compress responses for clients that accept it: auto or off
         #[arg(long, default_value = "auto", value_name = "MODE")]
         http_compression: String,
@@ -1812,6 +1816,9 @@ enum Cmd {
         /// Load again the imports that earlier runs fetched
         #[arg(long)]
         refresh_imports: bool,
+        /// Threads that the run evaluates rules on (default: all cores)
+        #[arg(long, value_name = "N")]
+        threads: Option<usize>,
         // where fetched imports may come from
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
@@ -2451,6 +2458,7 @@ fn run() -> Result<()> {
             mut auto_reason,
             auto_reason_max_delay,
             reason_cache_triples,
+            reason_threads,
             http_compression,
             http_compression_level,
             http_compression_algorithms,
@@ -2731,6 +2739,12 @@ fn run() -> Result<()> {
                 );
             }
             st.reason_cache_triples = reason_cache_triples;
+            #[cfg(feature = "reasoning")]
+            sparkles::reasoning::set_reason_threads(
+                reason_threads.unwrap_or_else(sparkles::reasoning::default_reason_threads),
+            )?;
+            #[cfg(not(feature = "reasoning"))]
+            let _ = reason_threads;
             if let Some(secs) = auto_reason {
                 if !cfg!(feature = "reasoning") {
                     bail!("--auto-reason: built without the `reasoning` feature");
@@ -3819,6 +3833,7 @@ fn run() -> Result<()> {
             imports,
             location_mapping,
             refresh_imports,
+            threads,
             outbound,
         } => {
             use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
@@ -3946,6 +3961,7 @@ fn run() -> Result<()> {
                     sparkles_reasoner::Incremental { since, cache: None },
                     &sparkles_reasoner::ReasonOptions {
                         inputs: inputs.clone(),
+                        threads,
                         ..Default::default()
                     },
                 )?;

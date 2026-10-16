@@ -26,6 +26,33 @@ use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// The thread pool that materializations evaluate rules on, when the process set one.
+#[cfg(feature = "reasoning")]
+static POOL: std::sync::RwLock<Option<std::sync::Arc<sparkles_reasoner::ReasoningPool>>> =
+    std::sync::RwLock::new(None);
+
+/// Evaluate the rules of later materializations on a pool of `threads` threads (the
+/// server's `--reason-threads`), or, with 0, on the global rayon pool.
+#[cfg(feature = "reasoning")]
+pub fn set_reason_threads(threads: usize) -> Result<()> {
+    let pool = match threads {
+        0 => None,
+        n => Some(sparkles_reasoner::thread_pool(n).map_err(crate::handles::from_anyhow)?),
+    };
+    *POOL.write().unwrap_or_else(|e| e.into_inner()) = pool;
+    Ok(())
+}
+
+/// Half the available cores, at least one: the server's default reasoning pool.
+pub fn default_reason_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
+}
+
+#[cfg(feature = "reasoning")]
+pub(crate) fn reason_pool() -> Option<std::sync::Arc<sparkles_reasoner::ReasoningPool>> {
+    POOL.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// The file of a persistent dataset that holds its [`ReasoningRecord`].
 pub const RECORD_FILE: &str = "reasoning.json";
 
@@ -109,6 +136,19 @@ pub struct RunInfo {
     /// incremental runs: what changed since the previous run
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<RunChanges>,
+    /// the largest estimated heap the run used at any time, in bytes
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub peak_bytes: u64,
+    /// index scans of the input graphs the run issued
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub base_scans: u64,
+    /// threads the rules were evaluated on
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub threads: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// What an incremental run found changed and did.

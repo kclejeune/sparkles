@@ -1,18 +1,22 @@
 # F16: Materialization at scale
 
-> **Status:** specified
+> **Status:** implemented in part, Phase 1 built and its acceptance open
 >
-> **Phases:** None shipped. Phase 1 is rule evaluation over the store's index
-> permutations, a parallel merge of derived facts, the `dt-not-type` check and the
-> LUBM and OWL2Bench reasoning runs. Phase 2 is the derived-fact layer, kept apart from the
-> base indexes. Phase 3 is `owl:sameAs` through canonical representatives with expansion
-> at query time. Phase 4 is evaluation without iteration barriers and incremental
-> maintenance with equality.
+> **Phases:** Phase 1 shipped: rule evaluation over the store's index permutations, a
+> parallel merge of derived facts, snapshot statistics in the rule planner, `max_memory`,
+> the reasoning pool, incremental runs with GeoSPARQL default geometries, the `dt-not-type`
+> check and a LUBM-style reasoning run. Its acceptance runs are open under roadmap item 1.
+> Phase 2 is the derived-fact layer, kept apart from
+> the base indexes. Phase 3 is `owl:sameAs` through canonical representatives with
+> expansion at query time. Phase 4 is evaluation without iteration barriers and
+> incremental maintenance with equality. Phases 2 to 4 are not built.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API: reasoning](../API.md#reasoning-status-and-diagnostics) ·
+> [Usage: `serve` options](../USAGE.md#serve-options) ·
+> [Features](../FEATURES.md#reasoning-validation-and-schema)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it landed.
 
 This design was written from the W3C OWL 2 Profiles recommendation (the OWL 2 RL/RDF rules,
 including `eq-*` and `dt-*`), the W3C RDF 1.1 Semantics and XML Schema Datatypes 1.1
@@ -686,4 +690,211 @@ without reasoning, and the status is fresh within 10 s after the writes stop.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 9.
+**Phase 1 built** on 2026-10-13. A review on 2026-10-16 led to the fixes recorded below.
+Its acceptance runs are open under [ROADMAP](../ROADMAP.md) item 1, and two parts of the
+phase, listed under "Open parts of Phase 1", stay open under item 9. Phases 2, 3 and 4 are
+not built.
+
+* **Base tier.** `crates/sparkles-reasoner/src/facts.rs` reads the input graphs from the
+  snapshot's permutations. A lookup with one input graph and a bound subject uses GSPO.
+  Other lookups use PSO, POS, SPO or OSP with a graph filter and drop the duplicates that
+  several input graphs give. Each rule step keeps the last decoded blocks it read, so a
+  join that probes neighbouring keys decodes each block once. Membership of a batch of
+  candidates is one sorted pass per graph. A filter of local term ids, per-predicate counts
+  and the objects of predicates with at most 4,096 distinct objects answers most probes
+  without reading a block.
+* **Derived tier.** `graph.rs` keeps the derived rows after the base rows. A sharded hash
+  table of row ids, 64 shards, replaces the map from triple to row, and the per-subject and
+  per-object indexes keep up to four rows inline.
+* **Parallel merge.** Candidates are bucketed by shard, deduplicated per shard against the
+  tiers and the batch, and probed against the base in key order. A bitset of the kept
+  positions gives each new triple its row, so rows come in the order of first occurrence,
+  as the sequential merge gave them. The index fill also runs per shard. A rule whose
+  first step has fewer than four work units per thread is split on the bindings of its
+  second step.
+* **Planner.** Join order reads the per-predicate counts of the base tier, and the
+  derived tier adds its own counts.
+* **Limits and reports.** `ReasonOptions::max_memory` bounds the estimated heap of the
+  whole run, as described under "Memory budget" below. `ReasonReport` and the recorded
+  `run` gain `peakBytes`, `baseScans` and `threads`. The three fields are additive members
+  of `reasoning.json` with defaults, so its format stays 2, and an older release that
+  rewrites the record drops them.
+* **Reasoning pool.** `serve --reason-threads N` sets one rayon pool for all runs, half the
+  cores by default, and `0` uses the global pool. A request's `threads` field or query
+  parameter asks for fewer threads. `sparkles infer --threads N` sets the threads of a
+  local run. Runs are admitted to the pool as described under "Reasoning pool admission"
+  below.
+* **GeoSPARQL default geometries.** Incremental runs no longer fall back to a full run with
+  `geoDefaultGeometry`. The default geometries count as explicit facts in the closure, and
+  those of the features whose `geo:hasGeometry` or `geo:hasDefaultGeometry` facts changed
+  join the run's added and removed facts. The kept closure is now kept for these runs too.
+  The closure remembers its default geometries, so an update reads only the changed
+  features, with two probes bound to the feature and the property. A closure read back
+  from the dataset does not know them, and that run reads them with one scan of each
+  property. `baseScans` counts these reads for incremental runs.
+* **`dt-not-type`.** The check `literal-not-in-datatype` and `datatype-range.rq` follow §8,
+  with the corrections under "Diagnostics" below.
+* **LUBM.** `cargo run --release -p sparkles-reasoner --example lubm` generates
+  Univ-Bench-style data, loads it and runs the reasoner. It reports the derived count, the
+  peak heap, and digests of the derived set and of its row order.
+
+**Measurements.** LUBM-style data with 100 universities, 13.1 million triples, measured on
+atlas (Intel Core i5-13500, 20 threads, 16 GiB) on 2026-10-13 against `c7a6811c`, the
+commit of main the work started from. These are development measurements with the
+example's own generator, not published benchmarks. The published LUBM runs are part of
+roadmap item 1. The table gives the time and the peak heap before and after the work.
+
+| Run | Before | After | Peak heap before | Peak heap after |
+|---|---|---|---|---|
+| RDFS, 1 thread | 8.39 s | 5.54 s | 4,182 MiB | 1,384 MiB |
+| RDFS, 16 threads | 5.80 s | 1.02 s | 4,182 MiB | 1,389 MiB |
+| OWL 2 RL, 1 thread | 16.23 s | 15.43 s | 3,891 MiB | 1,890 MiB |
+| OWL 2 RL, 16 threads | 9.84 s | 2.61 s | 3,892 MiB | 1,895 MiB |
+
+RDFS derives 6.84 million facts and OWL 2 RL 12.48 million. Both digests match the
+previous engine and match between 1 and 16 threads, so A2 and the determinism test of §12
+hold on this data as well as in the differential tests. A3 holds, with 3.8 × at 16 threads
+for OWL 2 RL and a 1-thread run 5% faster. A1 was measured at 100 universities, where the
+peak is a third of the previous one for RDFS and under half for OWL 2 RL. The
+1,000-university run does not fit atlas's memory and was not run.
+
+**Phase 4 decision.** At 16 threads, the time threads spend waiting at the iteration
+barrier, the wall time of each evaluation less its busy time divided by the threads, is
+130 ms of a 2.5 s OWL 2 RL run (5%) and under 10 ms of a 1.0 s RDFS run. Both are far below
+the 20% that §4.2 sets, so barrier-free evaluation is not justified by these runs. The
+merge is now the larger part of an OWL 2 RL iteration.
+
+**Memory tradeoffs.** The derived tier costs about 135 bytes per derived fact, which is
+what the in-memory graph cost per fact before. Each iteration's candidate buffers live
+until the merge copies them. A kept closure still holds the explicit facts in memory, so
+when `--reason-cache-triples` admits the closure, the run reads the input graphs into
+memory at its end and the server keeps the same memory as before. The memory saving
+applies to the run itself, and to the server only for closures the cache does not keep.
+
+**Reasoning pool admission.** The review found that a run called on a rayon worker could
+deadlock. While it held the writer lock, the waiting worker could take another queued job
+that asked for the same lock. It also found that runs asking for fewer threads than the
+pool each built a pool of their own beside it, so their threads added up past the pool's
+size. `pool.rs` now owns both concerns. A run called on a rayon worker moves to a native
+thread of its own while the worker waits without taking other jobs, and a run is admitted
+to its `ReasoningPool` before it takes the writer lock. Admission is first come, first
+served, against a capacity equal to the pool's threads. Runs that use the whole pool share
+its threads and run together. A run that asks for fewer threads counts those threads
+against the capacity, waits until they fit, and then evaluates on a pool of exactly that
+size. That pool's threads are joined before the run gives its threads back, also when the
+run fails or panics. A waiting run checks its cancel flag every 20 ms. Threads that do not
+stop within 30 seconds are not waited for, and the run logs a warning. A run that waits
+for the writer lock of its store keeps its admission meanwhile, so a run on another store
+that needs a different grant waits behind it. A run started on a thread of the pool, on a
+thread of another run's own pool, or on the thread that holds another run's admission to
+the same pool, such as from a progress callback, is refused with an error, since it would
+wait for itself. Without a pool, a run on a rayon worker keeps the size of the caller's
+pool on a pool of its own.
+
+**Graph-major visitation.** With several input graphs, the base tier now visits the facts
+graph by graph, in the order of the input graphs, and within a graph in key order, as the
+in-memory copy did. A fact in several input graphs is visited with the first. Rule
+evaluation, list builtins and the order of derived rows therefore match the copy again.
+An existence probe still reads one pass.
+
+**Memory budget.** Every run has one budget, shared by its threads, and every structure
+the run owns is charged to it before it grows: the derived tier with its indexes and the
+cache of base facts found by merges, the local terms the rules make, the candidates and
+lookup caches of rule evaluation, the merge's buffers, the previous closure of an
+incremental run with its search state, the buffers that write the inferred graph, and the
+closure kept for the next run. Sizes come from capacities and from the growth rules of
+`Vec` and of hashbrown's tables, so the figures estimate the reasoner's own heap. The
+store's block cache is shared with queries and not counted. A charge that would pass the
+limit fails the run where it happens, with the rule or the phase in the message.
+`strConcat`, `regex` and the other builtins charge the text they read and the literal they
+build before building it, and a term that is interned twice is charged once. A run whose
+charges passed the limit fails before its commit, also when they are back under it, so a
+run that succeeds reports a peak within its limit. After the commit, keeping the closure
+for the next run is charged strictly, and a closure that does not fit is not kept. A
+closure kept in memory is taken by a run only when it fits that run's budget, and a run
+refused at that point leaves it for the next one. A run that fails later has already
+changed the closure and drops it, so the next run reads the closure back from a persistent
+dataset or runs in full. A kept closure of another commit is dropped without counting
+against the run. To keep the shared counter out of the hot paths, each holder of charges
+takes 16 KiB at a time, or a 16,384th of the limit when that is smaller, and keeps up to
+two such steps of what it frees. The steps that holders keep unused count against the
+limit and in the reported peak. They come to a few tenths of a percent of the limit at 16
+threads, so a run fails only when its need comes that close to its limit. A run's need
+also grows with its threads, by about 2% from 1 to 16 threads on 30,000 triples, so a
+limit taken from a 1-thread run can be too small for 16 threads. The cache
+of base facts that merges found keeps at most 128 facts per shard and starts over when
+full. A fact it no longer holds is found again in the base tier, so an identity rule over
+a large input no longer grows it without bound.
+
+The tests are `f16_local_term_budget`, `f16_shared_candidate_budget`,
+`f16_incremental_runs_are_charged`, `f16_incremental_reports_peak`,
+`f16_limit_holds_on_many_threads`, `f16_stale_kept_closure_is_ignored` and
+`f16_keeping_after_commit_stays_within_limit` in `tests/memory.rs`,
+`f16_reentry_from_run_threads_is_refused` in `tests/pool.rs`, and
+`f16_identity_rule_membership_cache_bound` and `add_rows_charges_the_final_buffers` in
+`graph.rs`. With
+16 threads and a limit of 48,000 bytes, a run over 200,000 candidates allocated 2.5 MB
+beyond its starting heap before it failed, and now allocates 185 KB, mostly decoded store
+blocks. On atlas, with 1 million generated triples and interleaved runs, inference took
+1,333 ms for RDFS and 1,363 ms for OWL 2 RL before the budget and 1,330 ms and 1,368 ms
+with it. Incremental runs that read the closure back from a persistent dataset of 200,000
+triples took about 8% longer, 120 ms instead of 112 ms for a run without changes, mostly
+in the last step, which commits and saves the generalized facts. The figures are A/B measurements on
+a shared host, not published benchmarks.
+
+After the review fixes, a check on atlas compared the build before them with the build
+after them on LUBM-style data with 20 universities, 2.5 million triples, running
+`materialize` on a fresh copy of the dataset each time. The medians of three interleaved
+runs were 4,136 ms before and 4,104 ms after for RDFS on 1 thread, 6,370 ms and 6,370 ms
+for OWL 2 RL on 1 thread, 3,446 ms and 3,422 ms for OWL 2 RL on 16 threads, and 2,510 ms
+and 2,791 ms for RDFS on 16 threads. The last pair differed by 11%, which eight more
+interleaved runs of each build did not reproduce, with medians of 2,634 ms before and
+2,569 ms after. The runs are noisy at that size. The load average on atlas was between 2
+and 4 during the runs, mostly from the runs themselves. The reported peak heap did not
+change in any configuration.
+
+**Diagnostics.** `literal-not-in-datatype` judges each candidate before it counts toward
+the finding limit, so valid literals no longer hide a violation behind the limit. It reads
+the candidates in pages of one total order, from 256 to 16,384 rows, and stops at the
+first finding past the limit, at the end of the candidates, at the deadline or after
+262,144 candidate rows. The check is truncated in the first and the last case, and at the
+deadline when it has findings, and a truncated check without findings makes the report
+incomplete. Every page runs the query and its sort again, and the sort keeps the rows up to
+the end of the page, so memory is bounded by 278,528 candidate rows rather than by all of
+them, at the cost of repeated query work. Integer bounds compare exactly at any number of
+digits. Names follow the XML 1.0 productions. `xsd:dateTime` values with a timezone are in
+`xsd:dateTimeStamp`, and `rdf:PlainLiteral` holds well-typed literals of the types derived
+from `xsd:string`. `xsd:hexBinary` and `xsd:base64Binary` have disjoint value spaces, as
+OWL 2 defines them. A literal whose own datatype the check does not implement is undecided
+for every range and never reported. `xsd:double` and `xsd:float` are treated as one value
+space, which OWL 2 does not do. The check therefore misses a float literal under a double
+range and the reverse, but it never reports a literal that OWL 2 would not report, so it
+stays sound. The tests `a_timeout_after_findings_truncates` and
+`the_candidate_cap_truncates` in `diagnostics.rs` set the page that times out and the
+candidate cap through test-only switches.
+
+**Build.** `Cargo.lock` is current again, so `cargo metadata --locked` succeeds.
+
+**Open parts of Phase 1.** The first two parts are left to a follow-up of
+[ROADMAP](../ROADMAP.md) item 9, and the third moved to item 1.
+
+1. §3.5, the kept closure without the explicit facts. The kept closure still holds them,
+   and so do `Derivation::into_closure` and the closure read back from the dataset. The
+   memory budget charges them.
+2. §8's coverage. Ill-typed literals are found among the literal objects that the query
+   returns, not by a scan of the vocabulary remembered per generation, and the check does
+   not read the generalized facts of a kept closure.
+3. The acceptance runs of §11 and §12 moved to [ROADMAP](../ROADMAP.md) item 1. They are
+   A1 at 1,000 universities, OWL2Bench, and the LUBM and OWL2Bench runs in X06's harness.
+   The measurements above come from the example's own LUBM-style generator at 100
+   universities.
+
+**Deviations.**
+* §3.5 is not built, as listed under the open parts. The kept closure holds the explicit
+  facts with a flag, as before, and the cache limit counts them.
+* The LUBM data comes from the example's own generator, with about 131,000 triples per
+  university, not from the UBA generator.
+* `literal-not-in-datatype` narrows the candidates with one SPARQL query per page of
+  candidates.
+* `examples/reasoner-bench.rs` and `examples/incremental.rs` did not gain flags. The new
+  example takes `RAYON_NUM_THREADS`.

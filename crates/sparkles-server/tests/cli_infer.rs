@@ -61,13 +61,26 @@ fn infer_runs_incrementally() {
     let q = "SELECT ?s ?o { GRAPH <urn:x-sparkles:inferred> { ?s a ?o } } ORDER BY ?s ?o";
     let before = expect(&["query", "--loc", &db, "--results", "csv", q], 0).stdout;
     let o = expect(
-        &["infer", "--loc", &db, "--profile", "rdfs-simple", "--full"],
+        &[
+            "infer",
+            "--loc",
+            &db,
+            "--profile",
+            "rdfs-simple",
+            "--full",
+            "--threads",
+            "2",
+        ],
         0,
     );
     let e = stderr(&o);
     assert!(e.contains("full, ") && e.contains("+0 -0"), "{e}");
     let after = expect(&["query", "--loc", &db, "--results", "csv", q], 0).stdout;
     assert_eq!(before, after);
+    let o = expect(&["infer", "--loc", &db, "--status", "--format", "json"], 0);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["run"]["threads"], 2, "{s}");
+    assert!(s["run"]["peakBytes"].as_u64().unwrap_or(0) > 0, "{s}");
     // other rules: in full, with the reason
     let o = expect(&["infer", "--loc", &db, "--profile", "rdfs"], 0);
     assert!(

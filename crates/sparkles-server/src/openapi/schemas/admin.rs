@@ -675,6 +675,9 @@ fn reasoning(put: &mut dyn FnMut(&str, J)) {
                 "derived": int(),
                 "source": string_enum(&["memory", "store"]),
             })),
+            "peakBytes": int(),
+            "baseScans": int(),
+            "threads": int(),
         }),
     );
     put(
