@@ -2872,7 +2872,9 @@ with a `<!-- Page N -->` marker and a `# Slide N: Title` heading, so the review 
 shows the slide of each fact, and the speaker notes follow the slide's text. A file
 that is encrypted or in an old binary format (`.doc`, `.ppt`, `.xls`) is refused. An
 Excel or OpenDocument spreadsheet (`.xlsx`, `.ods`) gets a mapping draft for each
-visible sheet, with the sheet as CSV to upload with its mapping. Hidden sheets, hidden
+visible sheet, up to 20 sheets, with the sheet as CSV to upload with its mapping. Without
+a `base`, the rows of each sheet get their own namespace that includes the sheet's
+position, so two sheets never share one. Hidden sheets, hidden
 slides and hidden Word text are left out, while the hidden rows and columns of a visible
 sheet are read, because they are data. These conversions share
 the `--pdf-workers` limit with PDF conversion. A conversion holds at most 128 MiB of

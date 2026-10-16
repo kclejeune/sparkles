@@ -88,16 +88,30 @@ pub fn draft(
 ) -> Result<Value, Failed> {
     let tsv = format == Format::Tsv;
     let name = name.unwrap_or(if tsv { "table.tsv" } else { "table.csv" });
-    draft_table(r, req, ds, &req.bytes, tsv, format.name(), name)
+    let table = Table {
+        bytes: &req.bytes,
+        tsv,
+        format: format.name(),
+        name,
+        base: None,
+    };
+    draft_table(r, req, ds, table)
 }
 
 /// The most CSV text a workbook's result carries inline, over all its sheets.
 #[cfg(feature = "office")]
 const INLINE_CSV_BYTES: usize = 2 << 20;
 
+/// The most sheets of a workbook that are drafted. Each draft is a model call, so a
+/// workbook of hundreds of sheets would otherwise cost hundreds of them.
+#[cfg(feature = "office")]
+const MAX_SHEETS: usize = 20;
+
 /// Draft the mappings of a workbook, one for each visible sheet with data (§7.8). Each
 /// sheet is converted to CSV and drafted like an uploaded table named
-/// `<workbook>-<sheet>.csv`, so its rows get their own namespace. A sheet's CSV travels
+/// `<workbook>-<sheet>.csv`, so its rows get their own namespace, which includes the
+/// sheet's position so that sheets with equal or truncated names stay apart. At most 20
+/// sheets are drafted. A sheet's CSV travels
 /// with its draft, up to a total of 2 MiB, because it is the file to upload with the
 /// mapping. A sheet whose draft fails is reported with its error and the others go on.
 #[cfg(feature = "office")]
@@ -140,14 +154,36 @@ pub fn workbook(
     let mut drafts: Vec<Value> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let mut inline = 0usize;
-    for sh in sheets {
+    if sheets.len() > MAX_SHEETS {
+        notes.push(format!(
+            "the workbook has {} sheets with data; the first {MAX_SHEETS} are drafted and {} are left out",
+            sheets.len(),
+            sheets.len() - MAX_SHEETS
+        ));
+    }
+    for sh in sheets.into_iter().take(MAX_SHEETS) {
         r.check()?;
         let mut slug = super::pipeline::slug(&sh.name);
         if slug.is_empty() {
             slug = format!("sheet{}", sh.index);
         }
         let file = format!("{}-{slug}.csv", super::pipeline::slug(stem));
-        match draft_table(r, req, ds, sh.csv.as_bytes(), false, "csv", &file) {
+        // the position keeps the namespaces apart when two names slug alike or are cut
+        // at the same length
+        let base = format!(
+            "urn:sparkles:table:{}:s{}-{slug}:",
+            super::pipeline::slug(stem),
+            sh.index
+        );
+        let base = req.base.is_none().then_some(base.as_str());
+        let table = Table {
+            bytes: sh.csv.as_bytes(),
+            tsv: false,
+            format: "csv",
+            name: &file,
+            base,
+        };
+        match draft_table(r, req, ds, table) {
             Ok(mut d) => {
                 d["sheet"] = sh.name.clone().into();
                 d["index"] = sh.index.into();
@@ -186,17 +222,26 @@ pub fn workbook(
     Ok(out)
 }
 
+/// A table to draft a mapping for.
+struct Table<'a> {
+    bytes: &'a [u8],
+    tsv: bool,
+    format: &'a str,
+    name: &'a str,
+    /// the base of its rows when the request names none
+    base: Option<&'a str>,
+}
+
 /// Draft the mapping of a table given as bytes: a CSV or TSV upload, or one sheet of a
 /// workbook as CSV.
-fn draft_table(
-    r: &mut Run,
-    req: &Request,
-    ds: &Dataset,
-    bytes: &[u8],
-    tsv: bool,
-    format: &str,
-    name: &str,
-) -> Result<Value, Failed> {
+fn draft_table(r: &mut Run, req: &Request, ds: &Dataset, table: Table) -> Result<Value, Failed> {
+    let Table {
+        bytes,
+        tsv,
+        format,
+        name,
+        base,
+    } = table;
     let ctx = r.ctx;
     if bytes.len() > super::convert::MAX_INPUT_BYTES {
         return Err(Failed::new(
@@ -208,7 +253,12 @@ fn draft_table(
             ),
         ));
     }
-    let base = req.base.clone().unwrap_or_else(|| default_base(name));
+    // the request's base wins, then the caller's, then one made of the table's name
+    let base = req
+        .base
+        .clone()
+        .or_else(|| base.map(str::to_string))
+        .unwrap_or_else(|| default_base(name));
     oxiri::Iri::parse(base.as_str())
         .map_err(|e| Failed::new("bad-argument", format!("base {base:?} is not an IRI: {e}")))?;
     ctx.progress.status(super::Status::Converting, 0.05, None);

@@ -4816,7 +4816,10 @@ badges on the dataset page and the sidebar.
   entry per sheet that holds the sheet's name and index, its draft and its CSV, which is
   the file to upload with the mapping. The sheet's name and index are the marker of that
   sheet. Cells with a date format become ISO 8601 text, and formulas give their cached
-  values. Hidden sheets and sheets without data are left out, but hidden rows and
+  values. A sheet's rows get a namespace of their own that includes its position in the
+  workbook, because names that slug alike or are cut at 40 characters would otherwise
+  share one. At most 20 sheets are drafted, each draft being a model call, and a note
+  names how many were left out. Hidden sheets and sheets without data are left out, but hidden rows and
   columns of a visible sheet are read, because they are data. Hidden slides and Word runs
   marked as hidden text are left out as well. The comment of an ODS cell is not read into
   its value. A sheet whose draft fails is reported with its error, and the others go on.

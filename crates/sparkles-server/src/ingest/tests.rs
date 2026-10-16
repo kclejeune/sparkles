@@ -516,6 +516,84 @@ async fn a_workbook_is_drafted_sheet_by_sheet() {
     assert_eq!(ods["result"]["sheets"][0]["rows"], 1, "{ods}");
 }
 
+/// A workbook of tiny sheets with the given names, each with a header and one row.
+#[cfg(feature = "office")]
+fn workbook_of(names: &[&str]) -> Vec<u8> {
+    const X: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+    let mut wb = format!("<workbook {X}><sheets>");
+    let mut rels = String::from(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    let sheet = format!(
+        r#"<worksheet {X}><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>name</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Ana</t></is></c></row></sheetData></worksheet>"#
+    );
+    for (i, n) in names.iter().enumerate() {
+        let k = i + 1;
+        wb.push_str(&format!(
+            r#"<sheet name="{n}" sheetId="{k}" r:id="rId{k}"/>"#
+        ));
+        rels.push_str(&format!(
+            r#"<Relationship Id="rId{k}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>"#
+        ));
+    }
+    wb.push_str("</sheets></workbook>");
+    rels.push_str("</Relationships>");
+    sparkles_office::fixtures::container(&[
+        ("xl/workbook.xml", &wb),
+        ("xl/_rels/workbook.xml.rels", &rels),
+        ("xl/worksheets/sheet1.xml", &sheet),
+    ])
+}
+
+/// The sheets of a workbook get distinct row namespaces even when their names slug alike
+/// or the workbook's name is long, and a workbook is drafted up to 20 sheets.
+#[cfg(feature = "office")]
+#[tokio::test]
+async fn workbook_sheets_get_distinct_bases_and_a_cap() {
+    let (_st, app) = app(None);
+    let stem = "a-workbook-with-a-rather-long-name-over-forty";
+    assert!(stem.len() > 40);
+    let f = workbook_of(&["People", "Teams", "Q1 Sales", "Q1-Sales"]);
+    let v = ingest(&app, office_upload(&f, &format!("{stem}.xlsx"), &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    let bases: Vec<&str> = v["result"]["sheets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["base"].as_str().unwrap())
+        .collect();
+    assert_eq!(bases.len(), 4, "{v}");
+    let distinct: std::collections::HashSet<&str> = bases.iter().copied().collect();
+    assert_eq!(distinct.len(), 4, "{bases:?}");
+    assert!(bases[0].ends_with(":s1-people:"), "{bases:?}");
+    // a base in the request still wins for every sheet
+    let v = ingest(
+        &app,
+        office_upload(
+            &f,
+            &format!("{stem}.xlsx"),
+            &[("base", "http://example.org/p/")],
+        ),
+    )
+    .await;
+    let sheets = v["result"]["sheets"].as_array().unwrap();
+    assert!(
+        sheets.iter().all(|s| s["base"] == "http://example.org/p/"),
+        "{v}"
+    );
+
+    let names: Vec<String> = (1..=25).map(|i| format!("Sheet {i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let v = ingest(&app, office_upload(&workbook_of(&refs), "many.xlsx", &[])).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["result"]["sheets"].as_array().unwrap().len(), 20, "{v}");
+    let notes = v["result"]["notes"].to_string();
+    assert!(
+        notes.contains("25 sheets") && notes.contains("5 are left out"),
+        "{notes}"
+    );
+}
+
 /// A55: without OCR, scanned pages are refused with their pages and reasons, and
 /// `allowPartial` registers the other pages.
 #[cfg(feature = "pdf")]
