@@ -375,9 +375,17 @@ pub(crate) fn update(
                 c.graph.kill(t);
             }
             queue.retain(|t| c.graph.position(t).is_some() && !search.proved.contains(t));
-            let cap = out.deleted.capacity();
+            // the new buffer is charged before it is allocated, and the old one is
+            // released once it holds the facts
+            let (len, cap) = (out.deleted.len(), out.deleted.capacity());
+            let need = len + dead.len();
+            if need > cap {
+                let new = need.max(cap * 2);
+                deleted.try_grow(new * size_of::<Triple>())?;
+                out.deleted.reserve_exact(new - len);
+                deleted.shrink(cap * size_of::<Triple>());
+            }
             out.deleted.extend(dead);
-            deleted.try_grow((out.deleted.capacity() - cap) * size_of::<Triple>())?;
             drop(seen);
             // the next queue keeps its charge, the previous one's is released
             queue_held = step.split(queue.capacity() * size_of::<Triple>());

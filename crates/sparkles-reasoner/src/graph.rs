@@ -60,7 +60,8 @@ fn lists_bytes<K>(m: &Lists<K>) -> usize {
 }
 
 /// Before a map with `len` keys and capacity `cap` takes one more key, the bytes of the
-/// table it would grow to (the old one is still allocated then).
+/// table it would grow to (the old one is still allocated then, and is released once the
+/// new one holds the keys).
 #[inline]
 fn table_growth<K>(len: usize, cap: usize) -> usize {
     if len < cap {
@@ -70,9 +71,9 @@ fn table_growth<K>(len: usize, cap: usize) -> usize {
     }
 }
 
-/// Push `r` onto list `e`. A list about to grow charges its new allocation to `m` first
-/// (the old one stays charged to the graph until it settles), and `spilled` takes the
-/// change of the lists' heap.
+/// Push `r` onto list `e`. A list about to grow charges its new allocation to `m` first,
+/// and the old allocation is released once the new one holds the rows. `spilled` takes
+/// the change of the lists' heap.
 #[inline]
 fn push_row(
     e: &mut List,
@@ -84,6 +85,7 @@ fn push_row(
     if e.len() == cap {
         m.add(spill((cap * 2).max(8)))?;
         e.push(r);
+        m.sub(spill(cap));
         *spilled += spill(e.capacity()) as isize - spill(cap) as isize;
     } else {
         e.push(r);
@@ -105,6 +107,7 @@ fn extend_rows(
     if want > cap {
         m.add(spill(want.next_power_of_two()))?;
         e.extend_from_slice(rows);
+        m.sub(spill(cap));
         *spilled += spill(e.capacity()) as isize - spill(cap) as isize;
     } else {
         e.extend_from_slice(rows);
@@ -113,7 +116,7 @@ fn extend_rows(
 }
 
 /// The entry of key `k` in `m`, charging to `meter` first the table it grows to when
-/// `k` is new and does not fit.
+/// `k` is new and does not fit, and releasing the old table after the growth.
 #[inline]
 fn entry<'m, K: std::hash::Hash + Eq>(
     m: &'m mut Lists<K>,
@@ -121,7 +124,10 @@ fn entry<'m, K: std::hash::Hash + Eq>(
     meter: &mut Meter<'_>,
 ) -> Result<&'m mut List, MemoryExceeded> {
     if m.len() == m.capacity() && !m.contains_key(&k) {
+        let old = lists_bytes(m);
         meter.add(table_growth::<K>(m.len(), m.capacity()))?;
+        m.reserve(1);
+        meter.sub(old);
     }
     Ok(m.entry(k).or_default())
 }
@@ -434,15 +440,20 @@ impl Graph {
                 if tbl.find(h, |&r| triples[(r - off) as usize] == t).is_none() {
                     if triples.len() == triples.capacity() {
                         // the new buffer, while the old one is alive
-                        let next = (triples.capacity() * 2).max(16);
+                        let old = triples.capacity();
+                        let next = (old * 2).max(16);
                         m.add(next * size_of::<Triple>())?;
                         triples.reserve_exact(next - triples.len());
+                        m.sub(old * size_of::<Triple>());
                     }
                     if tbl.len() == tbl.capacity() {
+                        let old = table_bytes(tbl.capacity(), size_of::<u32>());
                         m.add(table_bytes(
                             table_grown(tbl.capacity(), tbl.len(), 1),
                             size_of::<u32>(),
                         ))?;
+                        tbl.reserve(1, |&r| hash3(&triples[(r - off) as usize]));
+                        m.sub(old);
                     }
                     let row = off + triples.len() as u32;
                     triples.push(t);
@@ -1243,6 +1254,22 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Growing a graph row by row from nothing charges each buffer once while it is
+    /// resized and not again after: the peak stays near the final heap.
+    #[test]
+    fn add_rows_charges_the_final_buffers() {
+        let b = Budget::unlimited();
+        let mut g = Graph::try_with_capacity(0, &b).unwrap();
+        g.try_add_batch((0..100_000u64).map(|i| [i, 1, i + 7]))
+            .unwrap();
+        assert!(
+            b.peak() * 10 <= g.heap_bytes() * 13,
+            "peak {} over 1.3 times the heap {}",
+            b.peak(),
+            g.heap_bytes()
+        );
+    }
 
     #[test]
     fn ranges_and_indexes() {

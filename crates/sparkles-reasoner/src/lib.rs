@@ -1354,8 +1354,14 @@ fn write_changes<'a>(
         };
         if want && !have {
             if insert.len() == insert.capacity() {
-                held.try_grow(insert.capacity().max(4) * fact)
+                // the new buffer is charged before it is allocated, and the old one is
+                // released once it holds the facts
+                let old = insert.capacity();
+                let new = (old * 2).max(4);
+                held.try_grow(new * fact)
                     .map_err(|e| e.with_context(context()))?;
+                insert.reserve_exact(new - insert.len());
+                held.shrink(old * fact);
             }
             insert.push(*t);
         } else if !want && have {
