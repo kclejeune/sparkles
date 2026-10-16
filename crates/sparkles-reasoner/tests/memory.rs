@@ -293,6 +293,104 @@ fn f16_incremental_runs_are_charged() {
         assert_eq!(r.changes.as_ref().unwrap().source, "store", "{case}");
         assert_eq!(inferred(&s), expected(&s, &Profile::Rdfs), "{case}");
     }
+
+    // a limit between the closure and the full need: the closure is taken and the run
+    // fails later, after it changed the closure, so the next run does not find it
+    let insert = |s: &Store| {
+        let mut ttl = String::new();
+        for i in 0..600 {
+            ttl.push_str(&format!("ex:n{i} a ex:A .\n"));
+        }
+        load(s, &ttl);
+    };
+    let (s, cache, since) = kept(None);
+    insert(&s);
+    let free = update(&s, Some(&cache), since, None).unwrap().peak_bytes as usize;
+    let (s, cache, since) = kept(None);
+    insert(&s);
+    let before = inferred(&s);
+    let e = update(&s, Some(&cache), since, Some(free * 17 / 20)).unwrap_err();
+    assert!(e.to_string().contains("memory limit"), "{e:#}");
+    assert!(
+        !format!("{e:#}").contains("closure kept in memory"),
+        "the closure did not fit: {e:#}"
+    );
+    assert_eq!(inferred(&s), before, "the failed run wrote");
+    assert_eq!(
+        cache.kept(),
+        None,
+        "a run that failed later kept the closure"
+    );
+    let r = update(&s, Some(&cache), since, None).unwrap();
+    assert_eq!(r.method, Method::Full);
+    assert!(
+        r.fallback
+            .as_deref()
+            .is_some_and(|f| f.contains("no closure of the previous run is kept in memory")),
+        "{:?}",
+        r.fallback
+    );
+    assert_eq!(inferred(&s), expected(&s, &Profile::Rdfs));
+}
+
+/// A closure kept for another dataset is dropped by a run that cannot use it, and does
+/// not make that run fail for memory.
+#[test]
+fn f16_stale_kept_closure_is_ignored() {
+    let _one = one_at_a_time();
+    // the closure of store A, in memory
+    let mut ttl = String::from("ex:A rdfs:subClassOf ex:B . ex:B rdfs:subClassOf ex:C .\n");
+    for i in 0..20_000 {
+        ttl.push_str(&format!("ex:i{i} a ex:A .\n"));
+    }
+    let a = Store::in_memory(StoreOptions::default());
+    load(&a, &ttl);
+    // a second commit, so that the commit of A's closure is not B's
+    load(&a, "ex:extra a ex:A .");
+    let cache = Cache::default();
+    let r = materialize_incremental(
+        &a,
+        &Profile::Rdfs,
+        &Extras::default(),
+        Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &ReasonOptions::default(),
+    )
+    .unwrap();
+    let a_commit = r.receipt.unwrap().commit.seq;
+    assert_eq!(cache.kept().map(|k| k.1), Some(a_commit));
+
+    // store B is persistent and small
+    let setup = |dir: &std::path::Path| {
+        let b = Store::open(dir, StoreOptions::default()).unwrap();
+        let mut ttl = String::from("ex:A rdfs:subClassOf ex:B . ex:B rdfs:subClassOf ex:C .\n");
+        for i in 0..100 {
+            ttl.push_str(&format!("ex:i{i} a ex:A .\n"));
+        }
+        load(&b, &ttl);
+        let r = materialize_with(&b, &Profile::Rdfs, &Extras::default(), &limited(None)).unwrap();
+        let since = r.receipt.unwrap().commit.seq;
+        load(&b, "ex:new a ex:A .");
+        (b, since)
+    };
+    // the need of the update without a closure kept
+    let twin_dir = tempfile::tempdir().unwrap();
+    let (twin, twin_since) = setup(&twin_dir.path().join("db"));
+    let free = update(&twin, None, twin_since, None).unwrap().peak_bytes as usize;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (b, since) = setup(&dir.path().join("db"));
+    assert_ne!(a_commit, since, "the setups share a commit number");
+    let r = update(&b, Some(&cache), since, Some(free * 2))
+        .unwrap_or_else(|e| panic!("a stale closure made the run fail: {e:#}"));
+    assert_eq!(r.changes.as_ref().unwrap().source, "store");
+    assert_ne!(
+        cache.kept().map(|k| k.1),
+        Some(a_commit),
+        "the closure of the other dataset is still kept"
+    );
 }
 
 /// A run that succeeds reports a peak within its limit, and a limit of the peak an
@@ -412,4 +510,67 @@ fn f16_limit_holds_on_many_threads() {
             worst as f64 / p1 as f64
         );
     }
+}
+
+/// Keeping the closure after the commit is charged strictly: a run that succeeds reports
+/// a peak within its limit whether or not the closure fits, and a closure that does not
+/// fit is not kept.
+#[test]
+fn f16_keeping_after_commit_stays_within_limit() {
+    let _one = one_at_a_time();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/> .
+         [dash: (?x ex:p ?l) strConcat(?l, \"-x\", ?y) -> (?x ex:q ?y)]"
+            .into(),
+    );
+    let fresh = || {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..3_000 {
+            ttl.push_str(&format!("ex:s{i} ex:p \"literal number {i}\" .\n"));
+        }
+        load(&s, &ttl);
+        s
+    };
+    let run = |max_memory: Option<usize>, cache: &Cache| {
+        materialize_incremental(
+            &fresh(),
+            &rules,
+            &Extras::default(),
+            Incremental {
+                since: None,
+                cache: Some(cache),
+            },
+            &limited(max_memory),
+        )
+    };
+    let lo = materialize_with(&fresh(), &rules, &Extras::default(), &limited(None))
+        .unwrap()
+        .peak_bytes as usize;
+    let hi_cache = Cache::default();
+    let hi = run(None, &hi_cache).unwrap().peak_bytes as usize;
+    assert!(hi_cache.kept().is_some());
+    assert!(hi > lo, "keeping the closure costs nothing: {lo} and {hi}");
+
+    let mut kept_from = None;
+    for k in 0..=40 {
+        let limit = lo + (hi - lo) * k / 40;
+        let cache = Cache::default();
+        let r = run(Some(limit), &cache)
+            .unwrap_or_else(|e| panic!("limit {limit} ({k} of 40 from {lo} to {hi}): {e:#}"));
+        assert!(
+            r.peak_bytes as usize <= limit,
+            "limit {limit} ({k} of 40): peak {}",
+            r.peak_bytes
+        );
+        match (kept_from, cache.kept().is_some()) {
+            (None, true) => kept_from = Some(k),
+            (Some(from), false) => panic!("kept at {from} of 40 and not at {k}"),
+            _ => {}
+        }
+    }
+    assert!(
+        kept_from.is_some(),
+        "the largest limit does not keep the closure"
+    );
 }

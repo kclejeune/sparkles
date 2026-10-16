@@ -331,6 +331,12 @@ impl Graph {
         self.held.set(n);
     }
 
+    /// [`settle`](Self::settle), failing instead of charging past the limit.
+    pub fn try_settle(&mut self) -> Result<(), MemoryExceeded> {
+        let n = self.heap_bytes();
+        self.held.try_set(n)
+    }
+
     /// The heap of the in-memory tier, from the capacities of its buffers and tables:
     /// the rows, the triple index, the cache of base facts, the index lists and their
     /// heap beyond the inline rows, the per-predicate counts and the dead-row bits.
@@ -466,7 +472,11 @@ impl Graph {
         self.live += new;
         let r = r.and_then(|()| self.fill(start, &mut m));
         self.held.adopt(m.into_bytes());
-        self.settle();
+        // after an error the graph is unusable, and settling would charge what was
+        // allocated beyond the failed charge, past the limit
+        if r.is_ok() {
+            self.settle();
+        }
         r.map(|()| new)
     }
 

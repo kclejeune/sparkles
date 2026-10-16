@@ -647,7 +647,7 @@ impl Derivation {
         let n = g.len();
         g.try_add_batch(derived.iter().copied())?;
         drop(graph);
-        let mut c = incremental::Closure::new(g, terms, n);
+        let mut c = incremental::Closure::try_new(g, terms, n)?;
         if let Some((d, _held)) = defaults {
             let (_, pred) = geo_ids(&c.terms);
             let d = incremental::Defaults {
@@ -656,13 +656,13 @@ impl Derivation {
             };
             for t in d.facts() {
                 if let Some(r) = c.graph.position(&t) {
-                    c.set_base(r, true);
+                    c.set_base_with(r, true, true)?;
                 }
             }
             c.defaults = Some(d);
-            c.settle();
+            c.try_settle()?;
         }
-        budget.check()?;
+        budget.check_peak()?;
         Ok(c)
     }
 }

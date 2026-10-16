@@ -232,6 +232,16 @@ impl Held {
         }
     }
 
+    /// [`set`](Self::set), failing without growing when the growth does not fit.
+    pub fn try_set(&mut self, n: usize) -> Result<(), MemoryExceeded> {
+        if n > self.bytes {
+            self.try_grow(n - self.bytes)
+        } else {
+            self.shrink(self.bytes - n);
+            Ok(())
+        }
+    }
+
     /// Move `n` of these bytes into a new holder.
     pub fn split(&mut self, n: usize) -> Held {
         let n = n.min(self.bytes);

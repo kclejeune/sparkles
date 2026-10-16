@@ -22,7 +22,7 @@
 //! finds no proof and has explored every instance it reached, none of the facts it
 //! reached has a proof, and they are all remembered as unprovable.
 
-use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_grown};
+use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity, table_grown};
 use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step};
 use crate::graph::{Cands, Graph, Triple};
 use crate::terms::Terms;
@@ -73,8 +73,15 @@ impl Defaults {
         table_bytes(self.of.capacity(), size_of::<(u64, u64)>())
     }
 
-    /// Replace ids that moved.
-    fn remap(&mut self, moved: &FxHashMap<u64, u64>) {
+    /// Replace ids that moved. The new map is charged before it is built, beside the old
+    /// one (which stays charged to the closure until it settles), failing past the limit
+    /// when `strict`.
+    fn remap(
+        &mut self,
+        moved: &FxHashMap<u64, u64>,
+        budget: &Arc<Budget>,
+        strict: bool,
+    ) -> Result<(), MemoryExceeded> {
         let m = |x: u64| moved.get(&x).copied().unwrap_or(x);
         self.pred = m(self.pred);
         if self
@@ -82,8 +89,16 @@ impl Defaults {
             .iter()
             .any(|(f, g)| moved.contains_key(f) || moved.contains_key(g))
         {
+            let mut held = Held::new(budget);
+            let bytes = table_bytes(table_capacity(self.of.len()), size_of::<(u64, u64)>());
+            if strict {
+                held.try_grow(bytes)?;
+            } else {
+                held.grow(bytes);
+            }
             self.of = self.of.iter().map(|(f, g)| (m(*f), m(*g))).collect();
         }
+        Ok(())
     }
 }
 
@@ -102,6 +117,27 @@ impl Closure {
             c.set_base(r, true);
         }
         c
+    }
+
+    /// [`new`](Self::new), charging the flags of the explicit facts before they are
+    /// allocated and failing when they do not fit.
+    pub fn try_new(graph: Graph, terms: Terms, base_len: u32) -> Result<Closure, MemoryExceeded> {
+        let mut base_held = Held::new(graph.budget());
+        let words = (base_len as usize).div_ceil(64);
+        base_held.try_grow(words * size_of::<u64>())?;
+        let mut base = Vec::new();
+        base.reserve_exact(words);
+        let mut c = Closure {
+            graph,
+            terms,
+            base,
+            base_held,
+            defaults: None,
+        };
+        for r in 0..base_len {
+            c.set_base(r, true);
+        }
+        Ok(c)
     }
 
     /// The heap of the closure: its graph, its local terms, the flags of its explicit
@@ -135,6 +171,13 @@ impl Closure {
         self.graph.settle();
     }
 
+    /// [`settle`](Self::settle), failing instead of charging past the limit.
+    pub fn try_settle(&mut self) -> Result<(), MemoryExceeded> {
+        let own = self.base.capacity() * size_of::<u64>() + self.defaults_bytes();
+        self.base_held.try_set(own)?;
+        self.graph.try_settle()
+    }
+
     #[inline]
     pub fn is_base(&self, row: u32) -> bool {
         self.base
@@ -143,18 +186,39 @@ impl Closure {
     }
 
     pub fn set_base(&mut self, row: u32, on: bool) {
+        let done = self.set_base_with(row, on, false);
+        debug_assert!(done.is_ok(), "charges that may pass the limit do not fail");
+    }
+
+    /// [`set_base`](Self::set_base), charging the growth of the flags before it is
+    /// allocated, and with `strict` failing when it does not fit.
+    pub fn set_base_with(
+        &mut self,
+        row: u32,
+        on: bool,
+        strict: bool,
+    ) -> Result<(), MemoryExceeded> {
         let w = row as usize / 64;
         if self.base.len() <= w {
             let cap = self.base.capacity();
+            if w + 1 > cap {
+                let new = (cap * 2).max(w + 1).max(4);
+                let bytes = (new - cap) * size_of::<u64>();
+                if strict {
+                    self.base_held.try_grow(bytes)?;
+                } else {
+                    self.base_held.grow(bytes);
+                }
+                self.base.reserve_exact(new - self.base.len());
+            }
             self.base.resize(w + 1, 0);
-            self.base_held
-                .grow((self.base.capacity() - cap) * size_of::<u64>());
         }
         if on {
             self.base[w] |= 1 << (row % 64);
         } else {
             self.base[w] &= !(1 << (row % 64));
         }
+        Ok(())
     }
 
     /// Whether a live triple is explicit.
@@ -170,17 +234,50 @@ impl Closure {
 
     /// Replace local ids by store ids (`moved`) in every live row.
     pub fn remap(&mut self, moved: &FxHashMap<u64, u64>) {
+        let done = self.remap_with(moved, false);
+        debug_assert!(done.is_ok(), "charges that may pass the limit do not fail");
+    }
+
+    /// [`remap`](Self::remap), charging the work beside the closure before it is
+    /// allocated and failing past the limit. The closure is unusable after an error.
+    pub fn try_remap(&mut self, moved: &FxHashMap<u64, u64>) -> Result<(), MemoryExceeded> {
+        self.remap_with(moved, true)
+    }
+
+    fn remap_with(
+        &mut self,
+        moved: &FxHashMap<u64, u64>,
+        strict: bool,
+    ) -> Result<(), MemoryExceeded> {
         if moved.is_empty() {
-            return;
+            return Ok(());
         }
+        let budget = self.graph.budget().clone();
         if let Some(d) = &mut self.defaults {
-            d.remap(moved);
+            d.remap(moved, &budget, strict)?;
         }
         let m = |x: u64| moved.get(&x).copied().unwrap_or(x);
-        let hit: Vec<(Triple, bool)> = self
+        // the facts that move, in a buffer charged before each growth
+        let fact = size_of::<(Triple, bool)>();
+        let mut held = Held::new(&budget);
+        let mut hit: Vec<(Triple, bool)> = Vec::new();
+        for x in self
             .live()
             .filter(|(t, _)| t.iter().any(|x| moved.contains_key(x)))
-            .collect();
+        {
+            if hit.len() == hit.capacity() {
+                let cap = hit.capacity();
+                let new = (cap * 2).max(4);
+                if strict {
+                    held.try_grow(new * fact)?;
+                } else {
+                    held.grow(new * fact);
+                }
+                hit.reserve_exact(new - hit.len());
+                held.shrink(cap * fact);
+            }
+            hit.push(x);
+        }
         for (t, _) in &hit {
             self.graph.kill(t);
         }
@@ -189,16 +286,21 @@ impl Closure {
             match self.graph.position(&n) {
                 Some(r) => {
                     if base {
-                        self.set_base(r, true);
+                        self.set_base_with(r, true, strict)?;
                     }
                 }
                 None => {
-                    self.graph.add_batch([n]);
+                    if strict {
+                        self.graph.try_add_batch([n])?;
+                    } else {
+                        self.graph.add_batch([n]);
+                    }
                     let r = self.graph.len() - 1;
-                    self.set_base(r, base);
+                    self.set_base_with(r, base, strict)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Rebuild the graph without its dead rows when they are a quarter of it or more.
