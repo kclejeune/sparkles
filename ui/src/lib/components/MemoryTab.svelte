@@ -2,13 +2,14 @@
   // The Memory tab of a resource on the Explore page (C18 §8.7): what the caller's view
   // holds about it, with a citation per fact, and the history of superseded and retracted
   // facts. It reads `POST /{ds}/recall` with the resource as the only seed.
+  import { onDestroy } from 'svelte';
   import * as api from '$lib/api';
   import * as askApi from '$lib/ask-api';
   import { parseCompact } from '$lib/compact';
   import { factChanges, fateLine, filterChoices, historyOf, principalName } from '$lib/memory';
   import { timeFailure } from '$lib/timeline';
   import type { PrefixMap } from '$lib/rdf';
-  import { LatestRun } from '$lib/supersede';
+  import { isAbort, LatestRun } from '$lib/supersede';
   import Icon from './Icon.svelte';
   import RecallView from './RecallView.svelte';
   import TermView from './TermView.svelte';
@@ -42,19 +43,26 @@
   /** The facts at the left handle, while comparing. */
   let before = $state<askApi.RecallResult | null>(null);
   const latest = new LatestRun();
+  onDestroy(() => latest.abortAll());
 
   async function load(name: string, seed: string, at: string, earlier: string | null) {
     const owns = latest.claim('memory');
+    // a newer read supersedes this one, which stops on the server too
+    const signal = latest.signal('memory');
     loading = true;
     error = null;
     const read = (sel: string) =>
-      askApi.recall(name, {
-        seeds: [seed],
-        hops: 0,
-        includeSuperseded: true,
-        maxTriples: 1000,
-        ...(sel && sel !== 'head' ? { at: sel } : {}),
-      });
+      askApi.recall(
+        name,
+        {
+          seeds: [seed],
+          hops: 0,
+          includeSuperseded: true,
+          maxTriples: 1000,
+          ...(sel && sel !== 'head' ? { at: sel } : {}),
+        },
+        signal,
+      );
     try {
       const [r, b] = await Promise.all([read(at), earlier ? read(earlier) : Promise.resolve(null)]);
       if (!owns()) return;
@@ -62,7 +70,7 @@
       before = b;
       if (timeOpen) slider?.accept();
     } catch (e) {
-      if (!owns()) return;
+      if (!owns() || isAbort(e)) return;
       const gone = timeOpen ? timeFailure(e) : null;
       if (gone) {
         toasts.push('error', gone.title, gone.detail);

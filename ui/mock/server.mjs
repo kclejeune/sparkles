@@ -2075,9 +2075,25 @@ function schemaPage(items, limit, cursor) {
 // ---------------------------------------------------------------------------
 // router
 
+/** Requests whose client went away before the answer was written (`GET /$/mock/aborted`). */
+const abortedRequests = [];
+
 const server = http.createServer(async (req, res) => {
   if (LATENCY) await new Promise((r) => setTimeout(r, LATENCY));
   const url = new URL(req.url ?? '/', 'http://localhost');
+  // test hooks: `mockDelay=MS` holds the answer, and the aborted requests are listed
+  res.on('close', () => {
+    if (!res.writableFinished) abortedRequests.push(`${req.method} ${req.url}`);
+  });
+  if (url.pathname === '/$/mock/aborted') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(abortedRequests));
+  }
+  const hold = Number(url.searchParams.get('mockDelay'));
+  if (hold > 0) {
+    await new Promise((r) => setTimeout(r, Math.min(hold, 10_000)));
+    if (res.destroyed) return;
+  }
   let path = decodeURIComponent(url.pathname);
   let seg = path.split('/').filter(Boolean);
   const incoming = String(req.headers['x-request-id'] ?? '');

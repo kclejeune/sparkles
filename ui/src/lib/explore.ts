@@ -73,9 +73,10 @@ export async function neighbours(
   ds: string,
   iri: string,
   at?: string,
+  signal?: AbortSignal,
 ): Promise<{ out: Neighbour[]; inc: Neighbour[]; label?: string }> {
   const node = sparqlIri(iri);
-  const o = at ? { ...opts, at } : opts;
+  const o = { ...opts, ...(at ? { at } : {}), signal };
   const [outRows, incRows] = await Promise.all([
     api.select(
       ds,
@@ -140,9 +141,14 @@ export type Details = {
 };
 
 /** A resource's properties and referrers, at the state `at` names (the head by default). */
-export async function details(ds: string, iri: string, at?: string): Promise<Details> {
+export async function details(
+  ds: string,
+  iri: string,
+  at?: string,
+  signal?: AbortSignal,
+): Promise<Details> {
   const node = sparqlIri(iri);
-  const o = at ? { ...opts, at } : opts;
+  const o = { ...opts, ...(at ? { at } : {}), signal };
   const [props, incoming, count] = await Promise.all([
     api.select(ds, `SELECT ?p ?o WHERE { ${node} ?p ?o } LIMIT 1000`, o),
     api.select(ds, `SELECT ?s ?p WHERE { ?s ?p ${node} } LIMIT 200`, o),
@@ -482,7 +488,7 @@ export function schemaFromSummary(s: api.SchemaSummary): Schema {
  */
 export async function loadSchema(
   ds: string,
-  opts: { graph?: string; reasoning?: boolean; at?: string } = {},
+  opts: { graph?: string; reasoning?: boolean; at?: string; signal?: AbortSignal } = {},
 ): Promise<Schema> {
   return schemaFromSummary(await api.schema(ds, { ...opts, limit: 5000 }));
 }

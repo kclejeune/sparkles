@@ -2,7 +2,7 @@
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
-  import { onMount, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { assistantSettings } from '$lib/ask-api';
   import type { Term } from '$lib/api';
@@ -11,7 +11,7 @@
   import { fmtCompact, fmtInt } from '$lib/format';
   import { shortLabel } from '$lib/graph';
   import { displayIri, isVectorLiteral, literalText, RDF_TYPE, termKey } from '$lib/rdf';
-  import { Generation, LatestRun } from '$lib/supersede';
+  import { Generation, isAbort, LatestRun } from '$lib/supersede';
   import { parseCompact } from '$lib/compact';
   import {
     authorsOf,
@@ -103,6 +103,8 @@
   // Bumped whenever the graph is reset (refocus, clear, dataset switch): responses to
   // requests started for an older graph are discarded instead of mutating the new one.
   const graphGen = new Generation();
+  /** Aborts the expansions of the graph that was reset. */
+  let expandCtl = new AbortController();
 
   /** The nodes the person expanded, in order, which a re-read at another commit replays. */
   let expandLog: string[] = [];
@@ -111,6 +113,8 @@
 
   function resetGraph() {
     graphGen.bump();
+    expandCtl.abort();
+    expandCtl = new AbortController();
     nodes = {};
     edges = {};
     expanding = {};
@@ -120,6 +124,11 @@
     changes = null;
   }
   let graphView: GraphView | undefined = $state();
+  // the reads of a view that goes away stop with it
+  onDestroy(() => {
+    expandCtl.abort();
+    for (const r of [graphRuns, detailRuns, schemaRuns, profileRuns, histRuns]) r.abortAll();
+  });
 
   // --- time: a resource's history strip (docs/specs/U01-time-slider.md) ----------------
 
@@ -178,6 +187,7 @@
   /** The commits that changed a resource, as subject or object, from the change log. */
   async function loadHistory(name: string, iri: string) {
     const owns = histRuns.claim('history');
+    const signal = histRuns.signal('history');
     if (histFor && histFor !== iri) {
       exAt = '';
       exFrom = '';
@@ -188,9 +198,9 @@
     histError = null;
     try {
       const [subj, obj, head] = await Promise.all([
-        api.historyChanges(name, { subject: iri, order: 'asc', limit: 5000 }),
-        api.historyChanges(name, { object: iri, order: 'asc', limit: 5000 }),
-        api.commits(name, { limit: 1 }),
+        api.historyChanges(name, { subject: iri, order: 'asc', limit: 5000, signal }),
+        api.historyChanges(name, { object: iri, order: 'asc', limit: 5000, signal }),
+        api.commits(name, { limit: 1, signal }),
       ]);
       if (!owns()) return;
       const changes = entityChanges(subj.changes, obj.changes);
@@ -206,7 +216,7 @@
         note: [unrecordedNote(subj), unrecordedNote(obj)].filter(Boolean)[0] ?? '',
       };
     } catch (e) {
-      if (owns()) {
+      if (owns() && !isAbort(e)) {
         histError = api.errorMessage(e);
         strip?.fail();
       }
@@ -386,18 +396,20 @@
       return;
     }
     expanding[id] = gen;
+    const signal = expandCtl.signal;
     try {
       const r = await ex.neighbours(
         ds,
         n.iri,
         timeActive && graphTimeOpen ? exAt || undefined : undefined,
+        signal,
       );
       if (stale()) return;
       populate(n, r);
       n.expanded = true;
       if (!expandLog.includes(id)) expandLog.push(id);
       // comparing: the new neighbours are marked against the earlier state too
-      if (graphTimeOpen && exCompare) await markChanges(() => !stale());
+      if (graphTimeOpen && exCompare) await markChanges(() => !stale(), signal);
       if (r.out.length >= 100 || r.inc.length >= 100) {
         toasts.push(
           'info',
@@ -406,7 +418,7 @@
         );
       }
     } catch (e) {
-      if (!stale()) toasts.error(`Could not expand ${n.label}`, e);
+      if (!stale() && !isAbort(e)) toasts.error(`Could not expand ${n.label}`, e);
     } finally {
       if (expanding[id] === gen) delete expanding[id];
     }
@@ -415,6 +427,7 @@
   // --- the graph at a commit (docs/specs/U01-time-slider.md) ---------------------------------
 
   const graphRuns = new LatestRun();
+  const detailRuns = new LatestRun();
   let graphReading = $state(false);
   let graphReadMs = $state(0);
   let graphNote = $state('');
@@ -428,7 +441,7 @@
       : 'head';
 
   /** Mark what changed between the two handles, from the diff of the drawn resources. */
-  async function markChanges(owns: () => boolean) {
+  async function markChanges(owns: () => boolean, signal?: AbortSignal) {
     const name = ds;
     if (!name || !graphTimeOpen || !exCompare || !(exFrom || exAgainst)) {
       changes = null;
@@ -445,6 +458,7 @@
       terms: iris,
       quads: true,
       limit: 5000,
+      signal,
     });
     if (!owns()) return;
     const drawnEdges = Object.values(edges);
@@ -456,11 +470,12 @@
       const leftDs = exAgainst ? `${name}@${exAgainst}` : name;
       const leftAt = exAgainst ? undefined : exFrom;
       const [before, after] = await Promise.all([
-        ex.presentEdges(leftDs, [...plan.addedTriples.values()], leftAt),
+        ex.presentEdges(leftDs, [...plan.addedTriples.values()], leftAt, signal),
         ex.presentEdges(
           name,
           plan.ghostEdges.map((g) => g.triple),
           exAt || undefined,
+          signal,
         ),
       ]);
       if (!owns()) return;
@@ -516,6 +531,7 @@
     const root = focusId;
     if (!name || !root) return;
     const owns = graphRuns.claim('graph');
+    const signal = graphRuns.signal('graph');
     const at = graphTimeOpen && exAt ? exAt : undefined;
     graphReading = true;
     graphNote = '';
@@ -526,7 +542,7 @@
       for (const id of [...expandLog]) {
         const term = seenTerms.get(id);
         if (!present.has(id) || !term || term.type !== 'uri') continue;
-        const r = await ex.neighbours(name, term.value, at);
+        const r = await ex.neighbours(name, term.value, at, signal);
         if (!owns()) return;
         fetched.set(id, r);
         for (const nb of [...r.out, ...r.inc]) {
@@ -552,7 +568,7 @@
         const kept = keepLabels.get(id);
         if (kept && n.term.type === 'uri' && n.label === labelFor(n.term)) n.label = kept;
       }
-      await markChanges(owns);
+      await markChanges(owns, signal);
       if (!owns()) return;
       if (!graphTimeOpen) changes = null;
       graphSlider?.accept();
@@ -563,7 +579,7 @@
           : 'The graph at the head';
       }
     } catch (e) {
-      if (!owns()) return;
+      if (!owns() || isAbort(e)) return;
       const gone = at ? timeFailure(e) : null;
       if (gone) {
         toasts.push('error', gone.title, gone.detail);
@@ -633,11 +649,15 @@
     const key = `${id}|${at}`;
     if (!n || n.term.type !== 'uri' || !ds || detailCache[key]) return;
     const gen = graphGen.current;
+    // a newer read of properties supersedes this one, which stops on the server too
+    detailRuns.claim('entity');
+    const signal = detailRuns.signal('entity');
     let d: ex.Details | { error: string };
     try {
-      d = await ex.details(ds, n.iri, at || undefined);
+      d = await ex.details(ds, n.iri, at || undefined, signal);
       if (timeActive && at === exAt) strip?.accept();
     } catch (e) {
+      if (isAbort(e)) return;
       // a state the server can no longer read: the handle goes back to the last one it read
       const gone = at ? timeFailure(e) : null;
       if (gone) {
@@ -864,6 +884,7 @@
 
   async function loadSchema(name: string) {
     const owns = schemaRuns.claim('schema');
+    const signal = schemaRuns.signal('schema');
     schemaLoading = true;
     schemaErr = null;
     const at = schemaTimeOpen && exAt ? exAt : undefined;
@@ -872,7 +893,11 @@
     const t0 = performance.now();
     schemaDrawnKey = schemaKey();
     try {
-      const o = { graph: schemaGraph, reasoning: hasInferences ? schemaInferences : undefined };
+      const o = {
+        graph: schemaGraph,
+        reasoning: hasInferences ? schemaInferences : undefined,
+        signal,
+      };
       const [s, before] = await Promise.all([
         ex.loadSchema(name, { ...o, at }),
         from
@@ -899,7 +924,7 @@
         openClasses = open;
       }
     } catch (e) {
-      if (!owns()) return;
+      if (!owns() || isAbort(e)) return;
       const gone = at || from ? timeFailure(e) : null;
       if (gone) {
         toasts.push('error', gone.title, gone.detail);
@@ -1003,6 +1028,7 @@
     if (!iri || !name || !schema || profileFor === key) return;
     untrack(() => {
       const owns = profileRuns.claim('profile');
+      const signal = profileRuns.signal('profile');
       profileFor = key;
       profile = null;
       profileErr = null;
@@ -1012,12 +1038,13 @@
           reasoning: hasInferences ? schemaInferences : undefined,
           classes: [iri],
           at,
+          signal,
         })
         .then((p) => {
           if (owns()) profile = p.classes.find((c) => c.class === iri) ?? null;
         })
         .catch((e) => {
-          if (owns()) profileErr = api.errorMessage(e);
+          if (owns() && !isAbort(e)) profileErr = api.errorMessage(e);
         });
     });
   });

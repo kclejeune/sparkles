@@ -81,6 +81,29 @@ test('A7: the graph is read again at the commit the slider names', async ({ page
   expect(await labels(page)).not.toMatch(/bob/);
 });
 
+test('U6: a graph read that a later move supersedes is aborted', async ({ page, request }) => {
+  await openGraph(page);
+  // hold every read of an earlier state, so that the next move arrives while it runs
+  await page.route(/\/chrono3\/sparql\?.*at=/, (route) =>
+    route.continue({ url: `${route.request().url()}&mockDelay=3000` }).catch(() => {}),
+  );
+  await right(page, 'Graph history').focus();
+  await page.keyboard.press('ArrowLeft');
+  await page.waitForTimeout(600);
+  await page.keyboard.press('ArrowLeft');
+  await page.waitForTimeout(600);
+  await page.keyboard.press('ArrowLeft');
+  await expect(right(page, 'Graph history')).toHaveAttribute('aria-valuenow', '0');
+  await expect
+    .poll(async () => {
+      const aborted = (await (await request.get('/$/mock/aborted')).json()) as string[];
+      return ['commit%3A2', 'commit%3A1'].map((c) =>
+        aborted.some((r) => r.includes('/chrono3/sparql') && r.includes(c)),
+      );
+    })
+    .toEqual([true, true]);
+});
+
 test('A7: compare marks what was added and what was removed', async ({ page }) => {
   await openGraph(page);
   await right(page, 'Graph history').focus();

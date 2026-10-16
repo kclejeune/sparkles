@@ -350,6 +350,29 @@ test.describe('Memory', () => {
     );
   });
 
+  test('a recall that a later move supersedes is aborted', async ({ page, request }) => {
+    await page.goto(`/ui/explore?ds=notes&iri=${encodeURIComponent(ANA)}&view=memory`);
+    const memory = page.getByLabel('Memory', { exact: true });
+    await expect(memory.getByRole('region', { name: /Facts about/ })).toContainText('payments');
+    await memory.getByRole('button', { name: /^As of/ }).click();
+    const bar = page.getByRole('region', { name: 'Memory time slider' });
+    const handle = bar.getByRole('slider', { name: /^(Commit|Compared to)$/ });
+    // hold the read of the earlier state, so that the move back to the head arrives while it runs
+    await page.route('**/notes/recall', (route) =>
+      route.continue({ url: `${route.request().url()}?mockDelay=3000` }).catch(() => {}),
+    );
+    await handle.focus();
+    await page.keyboard.press('ArrowLeft');
+    await page.waitForTimeout(700);
+    await page.keyboard.press('End');
+    await expect
+      .poll(async () => {
+        const aborted = (await (await request.get('/$/mock/aborted')).json()) as string[];
+        return aborted.filter((r) => r.includes('/notes/recall')).length;
+      })
+      .toBeGreaterThan(0);
+  });
+
   test('the as-of slider reads the facts at a commit and compare lists what changed', async ({
     page,
   }) => {
