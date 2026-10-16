@@ -4775,17 +4775,19 @@ after the reply. Error replies reach the client's retries unchanged, and a faile
 scored failure. A complete real-model matrix and published numbers remain missing.
 
 The initial Anthropic demo pilot on 2026-10-15 passed all 13 local gold checks and
-stopped on the first Haiku request with `upstream_framing`. It attempted and executed
-one of 68 planned Ask executions, scored no cases and left 67 unattempted. The closed
-wallet recorded zero settled spend and retained 1002560000 USD nanodollars, or
-$1.002560, as its full unresolved liability. Actual billed spend is unknown. The
-retained status does not identify which framing check failed, and this pilot supplies
-no accuracy results.
+stopped on the first Haiku request with `upstream_framing`. It ran 17 of the 68 demo
+questions on four pipelines, which were three pairs and a real cascade, so it planned 68
+Ask executions. It attempted and executed one, scored no cases and left 67 unattempted.
+Its wallet recorded zero settled spend and retained 1002560000 USD nanodollars, or
+$1.002560, as its full unresolved liability. Actual billed spend is unknown and is
+probably under one cent for one Haiku call. The retained status does not identify which
+framing check failed, and this pilot supplies no accuracy results.
 
-Compatible upstream framing, bounded nonsecret diagnostics that distinguish framing
-refusals and a separate closed-wallet recovery design remain part of item 6. The
-existing wallet and grant claim must be preserved. Recovery, reset, another grant and
-another run are not authorized. The remaining evaluation work follows.
+The gate that the pilot used is replaced. The new ledger opens with the pilot's
+$1.002560 as a carryover line, so the local cap of $25 leaves $23.997440. The pilot's
+wallet, grant claim and report are kept as the record and are never reopened. The next run
+uses a binary built from a named commit outside the private notes. What remains is a paid
+run of the demo set and the converted QALD-9-plus set, and the work listed below.
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
   questions, gold answers recomputed on the loaded release as §11.1 says) and the
