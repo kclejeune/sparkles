@@ -37,6 +37,8 @@ use std::sync::Arc;
 pub const SPK: &str = "urn:x-sparkles:";
 const PROV: &str = "http://www.w3.org/ns/prov#";
 const SKOS_BROADER: &str = "http://www.w3.org/2004/02/skos/core#broader";
+/// The values of the `metric` parameter of node similarity.
+const METRICS: &[&str] = &["jaccard", "overlap"];
 /// Triples in a batch when a request gives no `batchSize`.
 pub const DEFAULT_BATCH: usize = 100_000;
 
@@ -118,9 +120,10 @@ pub fn expand_iri(s: &str, prefixes: &[(String, String)]) -> Result<String> {
         // The expansion is spliced into query text between `<` and `>`, so it must be a
         // valid absolute IRI on its own. A local part with `>` or a space is refused.
         let full = format!("{ns}{local}");
-        return oxiri::Iri::parse(full.as_str())
-            .map(|_| full.clone())
-            .map_err(|_| not_an_iri(s));
+        if oxiri::Iri::parse(full.as_str()).is_err() {
+            return Err(not_an_iri(s));
+        }
+        return Ok(full);
     }
     oxiri::Iri::parse(bare)
         .map(|_| bare.to_string())
@@ -241,10 +244,13 @@ fn build(
     let mut triples: Vec<String> = Vec::new();
     match &req.projection {
         None => {}
-        Some(ProjectionRef::Named(n)) => triples.push(format!(
-            "algo:projection {}",
-            serde_json::to_string(n).unwrap()
-        )),
+        Some(ProjectionRef::Named(n)) => {
+            // only a catalog name reaches the text, so its quoting never matters
+            if !crate::algo::catalog::valid_name(n) {
+                return Err(invalid(format!("'{n}' is not a valid projection name")));
+            }
+            triples.push(format!("algo:projection \"{n}\""))
+        }
         Some(ProjectionRef::Inline(d)) => {
             d.check()?;
             triples.extend(projection_triples(d, prefixes)?);
@@ -269,7 +275,14 @@ fn build(
                 }
             }
             ("metric", Value::String(s)) => {
-                triples.push(format!("algo:metric {}", serde_json::to_string(s).unwrap()))
+                // a known word only, written as the algo: name of the metric
+                if !METRICS.contains(&s.as_str()) {
+                    return Err(invalid(format!(
+                        "metric is one of {}, not '{s}'",
+                        METRICS.join(", ")
+                    )));
+                }
+                triples.push(format!("algo:metric algo:{s}"))
             }
             ("graphalytics", Value::Bool(b)) => triples.push(format!("algo:graphalytics {b}")),
             ("iterationWeights", Value::Array(items)) => {

@@ -351,12 +351,38 @@ impl Outs {
     }
 }
 
+/// The value of a numeric parameter. An integer parameter keeps its exact value, so
+/// two seeds above 2^53 stay apart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Num {
+    Int(u64),
+    Float(f64),
+}
+
+impl Num {
+    /// The value as a number, for bounds and floating-point parameters.
+    pub fn f64(self) -> f64 {
+        match self {
+            Num::Int(v) => v as f64,
+            Num::Float(v) => v,
+        }
+    }
+
+    /// The value of an integer parameter.
+    pub fn u64(self) -> u64 {
+        match self {
+            Num::Int(v) => v,
+            Num::Float(v) => v as u64,
+        }
+    }
+}
+
 /// A planned algorithm call.
 #[derive(Clone, Debug)]
 pub struct AlgoSpec {
     pub algo: Algo,
     pub proj: ProjectionSpec,
-    pub nums: BTreeMap<String, f64>,
+    pub nums: BTreeMap<String, Num>,
     pub metric: Option<algo::similarity::Metric>,
     pub graphalytics: bool,
     pub iteration_weights: Option<Vec<f64>>,
@@ -373,16 +399,16 @@ impl AlgoSpec {
         self.sources.iter().any(|s| matches!(s, PathEnd::Var(_)))
     }
 
-    fn num(&self, name: &str) -> Option<f64> {
+    fn num(&self, name: &str) -> Option<Num> {
         self.nums.get(name).copied()
     }
 
     fn int(&self, name: &str, default: u64) -> u64 {
-        self.num(name).map_or(default, |x| x as u64)
+        self.num(name).map_or(default, Num::u64)
     }
 
     fn float(&self, name: &str, default: f64) -> f64 {
-        self.num(name).unwrap_or(default)
+        self.num(name).map_or(default, Num::f64)
     }
 
     fn direction(&self) -> Dir {
@@ -413,6 +439,32 @@ fn number(t: &TermPattern, name: &str, kind: Kd) -> Result<f64> {
         return Err(bad(format!("algo:{name} takes a non-negative integer")));
     }
     Ok(v)
+}
+
+/// 2^53. A double holds every integer up to it exactly.
+const EXACT_DOUBLE: f64 = 9_007_199_254_740_992.0;
+
+/// The value of a numeric parameter. An integer parameter written as an integer keeps
+/// its exact value. One written as a decimal or a double must be a whole number of at
+/// most 2^53, which a double holds exactly.
+fn param(t: &TermPattern, name: &str, kind: Kd) -> Result<Num> {
+    if kind == Kd::Float {
+        return number(t, name, kind).map(Num::Float);
+    }
+    if let TermPattern::Literal(l) = t
+        && let Value::Integer(i) = Value::from_literal(l)
+    {
+        return u64::try_from(i64::from(i))
+            .map(Num::Int)
+            .map_err(|_| bad(format!("algo:{name} takes a non-negative integer")));
+    }
+    let v = number(t, name, kind)?;
+    if v > EXACT_DOUBLE {
+        return Err(bad(format!(
+            "algo:{name} is above 2^53, where a decimal or a double is not exact; write it as an integer"
+        )));
+    }
+    Ok(Num::Int(v as u64))
 }
 
 fn dir_of(t: &TermPattern, name: &str) -> Result<Dir> {
@@ -456,7 +508,7 @@ pub(super) fn algo_leaf(
         rdf_type: ctx.snap.lookup_iri(RDF_TYPE).map(|i| i.0),
         reifies: ctx.snap.lookup_iri(RDF_REIFIES).map(|i| i.0),
     };
-    let mut nums: BTreeMap<String, f64> = BTreeMap::new();
+    let mut nums: BTreeMap<String, Num> = BTreeMap::new();
     let mut metric = None;
     let mut graphalytics = false;
     let mut iteration_weights = None;
@@ -652,7 +704,7 @@ pub(super) fn algo_leaf(
                 let Some((n, kind)) = NUMERIC.iter().find(|(n, _)| *n == name) else {
                     return Err(bad(format!("unknown parameter algo:{name}")));
                 };
-                nums.insert(n.to_string(), number(o, name, *kind)?);
+                nums.insert(n.to_string(), param(o, name, *kind)?);
             }
         }
     }
@@ -774,8 +826,8 @@ pub(super) fn algo_leaf(
     {
         return Err(bad("at most one algo:source can be a variable"));
     }
-    if let Some(m) = nums.get("dampingFactor")
-        && !(0.0..1.0).contains(m)
+    if let Some(m) = nums.get("dampingFactor").map(|v| v.f64())
+        && !(0.0..1.0).contains(&m)
     {
         return Err(bad("algo:dampingFactor must be in [0, 1)"));
     }
@@ -788,13 +840,13 @@ pub(super) fn algo_leaf(
         ("epochs", 1.0),
         ("maxLevels", 1.0),
     ] {
-        if nums.get(name).is_some_and(|v| *v < min) {
+        if nums.get(name).is_some_and(|v| v.f64() < min) {
             return Err(bad(format!("algo:{name} must be at least {min}")));
         }
     }
     // an embedding is a `spk:vector`, which a vector index caps at the same value
     if let Some(d) = nums.get("dimension")
-        && *d > crate::vector::MAX_DIM as f64
+        && d.u64() > crate::vector::MAX_DIM as u64
     {
         return Err(bad(format!(
             "algo:dimension must be at most {}",
@@ -954,7 +1006,7 @@ pub(super) fn run(
     vars: &[VarId],
 ) -> Result<(Materialized, serde_json::Map<String, serde_json::Value>)> {
     let started = Instant::now();
-    let limit = spec.num("maxMemory").map_or(u64::MAX, |m| m as u64);
+    let limit = spec.num("maxMemory").map_or(u64::MAX, Num::u64);
     let ctl = Control::for_query(ctx, limit)?;
     let par = Par::acquire(spec.int("concurrency", 0) as usize, &ctl)?;
     let mut result_vars = Buffer::new("algorithm-result-vars", vars.len(), &ctl)?;
@@ -1488,7 +1540,9 @@ fn rows(
     let o = &spec.outs;
     // a call that asks for the summary alone reports one row (GDS's stats mode)
     let stats_only = spec.stats_only();
-    let limit = spec.num("limit").map(|l| l as usize);
+    let limit = spec
+        .num("limit")
+        .map(|l| usize::try_from(l.u64()).unwrap_or(usize::MAX));
     let mut b = Builder::new(vars, ctl)?;
     let c_node = b.col(o.node);
     let c_summary = b.col(o.summary);
@@ -3396,7 +3450,7 @@ mod projection_capacity_tests {
             match case {
                 1 => {
                     spec.outs.embedding = Some(1);
-                    spec.nums.insert("dimension".into(), 8.0);
+                    spec.nums.insert("dimension".into(), Num::Int(8));
                 }
                 2 => {
                     spec.outs.depth = Some(1);
@@ -3405,7 +3459,7 @@ mod projection_capacity_tests {
                 _ => spec.outs.component = Some(1),
             }
             if case == 0 {
-                spec.nums.insert("limit".into(), 1.0);
+                spec.nums.insert("limit".into(), Num::Int(1));
             }
             if case == 3 {
                 spec.graph_var = Some(3);
@@ -3704,7 +3758,7 @@ mod projection_capacity_tests {
             component: Some(1),
             ..Default::default()
         };
-        spec.nums.insert("maxMemory".into(), 2048.0);
+        spec.nums.insert("maxMemory".into(), Num::Int(2048));
         let pool = QueryPool::new(64 << 20);
         let grant = Arc::new(pool.empty_grant());
         ctx.set_grant(Some(grant.clone()));
@@ -3768,7 +3822,7 @@ mod projection_capacity_tests {
             "aggregate GRAPH/output overlap must exceed one isolated graph: {first}/{all}"
         );
         let mut limited = spec.clone();
-        limited.nums.insert("maxMemory".into(), first as f64);
+        limited.nums.insert("maxMemory".into(), Num::Int(first));
         assert!(
             matches!(run(&ctx_all,&limited,None,None,&[0,1,3]),Err(Error::BudgetExceeded(b)) if b.kind==crate::error::BudgetKind::Memory && b.limit==first)
         );
