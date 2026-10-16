@@ -1561,3 +1561,20 @@ async fn the_timeline_reads_only_the_range_and_stops_at_the_head() {
         .json();
     assert_eq!(j["commits"], 1);
 }
+
+#[tokio::test]
+async fn sparql_diff_refuses_a_query_that_is_not_repeatable() {
+    let s = server(|_| {}).await;
+    let r = sparql_diff(
+        &s.app,
+        "/h/sparql/diff?from=1&to=2",
+        "SELECT (STRUUID() AS ?id) WHERE {}",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.json()["code"], "not-repeatable");
+    // a query that returns the same rows every time is not refused
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=4", q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}

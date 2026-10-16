@@ -12,7 +12,8 @@
 //! memory pool, see [`Charge`]. The second result is read against those hashes, which finds the rows only it has
 //! and keeps up to `limit` of them as they go by. The rows only the first result has are
 //! found by running its query once more. That makes three executions, and the request
-//! counts twice against the `query` rate limit.
+//! counts twice against the `query` rate limit. The query must return the same rows each
+//! time it runs, and a request whose query does not is refused with `409`.
 
 use super::*;
 use sparkles::history::At;
@@ -367,6 +368,17 @@ pub(super) async fn sparql_diff(
                 }
                 drop(left);
                 charge.release(again_bytes);
+                // a query that does not return the rows it returned before cannot be compared
+                // by hashes, and listing less than it counted would misdescribe the answer
+                if (removed_rows.len() as u64) < removed.min(limit as u64) {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        json!({
+                            "error": "the query returned different rows when it ran again, as it does with STRUUID, UUID, RAND, NOW, BNODE or SERVICE",
+                            "code": "not-repeatable",
+                        }),
+                    ));
+                }
             }
             // the hashes are no longer needed
             charge.release(seen.len() as u64 * SEEN_ENTRY_BYTES);

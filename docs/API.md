@@ -3503,7 +3503,11 @@ this comparison when a result is too large to compare in the browser.
 
 Rows are compared as bags of their terms in column order. A row that occurs twice in one
 result and once in the other differs once. Blank nodes compare by label, so a query that
-makes new blank nodes for each run reports them as different.
+makes new blank nodes for each run reports them as different. A query whose rows change
+between runs, as with `STRUUID`, `UUID`, `RAND`, `NOW`, `BNODE` or `SERVICE`, cannot be
+listed, because the rows only the earlier state has are found by running it again. The
+request is refused with `409` and `code: "not-repeatable"` instead of listing fewer rows
+than it counted.
 
 ```json
 { "dataset": "ds", "datasetId": "3f1c9a2e-…",

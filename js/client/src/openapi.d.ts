@@ -3376,7 +3376,7 @@ export interface paths {
         put?: never;
         /**
          * Diff a query between two states
-         * @description Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit.
+         * @description Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit. A query that returns different rows when it runs again is refused with `409`.
          */
         post: operations["sparqlDiff"];
         delete?: never;
@@ -17750,6 +17750,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
             410: components["responses"]["Gone"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];

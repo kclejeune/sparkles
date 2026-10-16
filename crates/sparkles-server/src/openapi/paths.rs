@@ -1634,7 +1634,7 @@ fn history(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/sparql/diff", "sparqlDiff", "History", "Diff a query between two states")
-            .doc("Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit.")
+            .doc("Runs one SELECT query at two states and returns the rows only one of them has, as bags of their terms. The server keeps a hash for each row of the earlier result and no row, then reads the later result against them and the earlier query once more to list up to `limit` differing rows of each side. The request counts twice against the `query` rate limit. A query that returns different rows when it runs again is refused with `409`.")
             .see("comparing-a-query-between-two-states")
             .query("from", s(), "A selector of the earlier state.")
             .query("to", s(), "A selector of the later state; the head by default.")
@@ -1650,7 +1650,7 @@ fn history(p: &mut Paths) {
                 }),
             )
             .json("200", "The differing rows and the counts.", "SparqlDiff")
-            .errors(&[400, 408, 410, 507]),
+            .errors(&[400, 408, 409, 410, 507]),
     );
     p.add(
         op(GET, "/{ds}/changes", "changes", "History", "Change feed")
