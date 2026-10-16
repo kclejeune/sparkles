@@ -117,6 +117,21 @@ async fn nested_queries_get_a_400() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn describe_iris_get_a_400() {
+    let (_dir, app) = server();
+    let ct = "application/sparql-query";
+    let describe = |n: usize| {
+        format!(
+            "DESCRIBE {} WHERE {{ ?s ?p ?o }}",
+            "<http://ex.org/a> ".repeat(n)
+        )
+    };
+    for path in ["/c/sparql", "/c/explain"] {
+        refused(&send(&app, post(path, ct, describe(100_000))).await, 1024);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn nested_updates_get_a_400() {
     let (_dir, app) = server();
     let ct = "application/sparql-update";

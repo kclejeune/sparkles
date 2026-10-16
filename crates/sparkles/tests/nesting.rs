@@ -147,6 +147,10 @@ fn chained_queries(k: usize) -> Vec<(&'static str, String)> {
             "filters",
             format!("SELECT * {{ ?s ?p ?o {} }}", r("FILTER(true) ", k)),
         ),
+        (
+            "describe",
+            format!("DESCRIBE <urn:s>{} WHERE {{ ?s ?p ?o }}", r(" <urn:s>", k)),
+        ),
     ]
 }
 
@@ -239,9 +243,9 @@ fn chains_are_refused_past_the_limit() {
             let k = ks.partition_point(|&k| depth(k) <= MAX_DEPTH) - 1;
             assert!(k > MAX_DEPTH - 8, "{what}: {k}");
             let (_, ok) = &chained_queries(k)[i];
-            if !what.starts_with("path") {
-                // (evaluating a path of a thousand steps, or a thousand path patterns,
-                // takes minutes in a debug build)
+            if !what.starts_with("path") && what != "describe" {
+                // (evaluating a path of a thousand steps, a thousand path patterns or the
+                // description of a thousand resources takes minutes in a debug build)
                 ds.query(ok).unwrap_or_else(|e| panic!("{what}: {e}"));
             }
             refused(ds.query(&chained_queries(k + 1)[i].1), what, MAX_DEPTH);
@@ -249,6 +253,19 @@ fn chains_are_refused_past_the_limit() {
         }
         ds.query(&binds(1000)).unwrap();
         refused(ds.query(&binds(2000)), "binds", MAX_DEPTH);
+    });
+}
+
+#[test]
+fn describe_iris_are_refused_not_overflowed() {
+    on_small_stack(|| {
+        let q = format!(
+            "DESCRIBE {} WHERE {{ ?s ?p ?o }}",
+            "<urn:s> ".repeat(100_000)
+        );
+        refused(dataset().query(&q), "describe", MAX_DEPTH);
+        let q = format!("DESCRIBE {} WHERE {{ ?s ?p ?o }}", "<urn:s> ".repeat(1000));
+        assert!(measure(&q).depth <= MAX_DEPTH);
     });
 }
 
