@@ -800,6 +800,9 @@ fn block_range(
 /// blocks first costs more than the reads it would overlap.
 const PREFETCH_RANGES: usize = 16_384;
 
+/// The ranges and blocks a join prefetch walks between two request checks.
+const PREFETCH_CHECK_STEPS: u32 = 1024;
+
 /// Ask the kernel to read the blocks of `ranges` in `perm` that the cache lacks, all
 /// at once, before the reader decodes them one by one (`Optimizations::prefetch_blocks`):
 /// on a cold server their reads then overlap. `cols` are the key columns the reader
@@ -816,12 +819,23 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask) -> Result<()>
         .opt
         .parallel_decode
         .then(|| ctx.snap.cache.warm_columns(idx));
+    // a check reads the clock when the request has a deadline, so the loop checks once
+    // per `PREFETCH_CHECK_STEPS` ranges and blocks rather than at every one
+    let mut steps = 0u32;
     for i in 0..ranges.len() {
-        ctx.check()?;
+        steps += 1;
+        if steps >= PREFETCH_CHECK_STEPS {
+            steps = 0;
+            ctx.check()?;
+        }
         let (lo, hi) = ranges.get(i);
         let (b0, b1) = idx.key_block_range(&lo, &hi);
         for b in b0..b1 {
-            ctx.check()?;
+            steps += 1;
+            if steps >= PREFETCH_CHECK_STEPS {
+                steps = 0;
+                ctx.check()?;
+            }
             // consecutive ranges often share a block
             if last != Some(b) {
                 idx.prefetch(&ctx.snap.cache, b, mask);
@@ -1565,6 +1579,24 @@ mod prefetch_tests {
     use crate::store::{Store, StoreOptions};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
+
+    /// A prefetch checks the request a bounded number of times, not once per range and
+    /// block: with a deadline each check reads the clock (spec X07 §9, gate 4).
+    #[test]
+    fn prefetch_checks_the_request_a_bounded_number_of_times() {
+        let store = Store::in_memory(StoreOptions::default());
+        let keys: Vec<u64> = (0..1000).collect();
+        let ranges = Ranges::Keys {
+            prefix: &[],
+            keys: &keys,
+        };
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.deadline = Some(Instant::now() + Duration::from_secs(600));
+        let before = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        prefetch(&ctx, Perm::Spo, &ranges, ALL_COLS).unwrap();
+        let checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before;
+        assert!(checks <= 4, "{checks} checks for 1,000 ranges");
+    }
 
     #[test]
     fn prefetch_propagates_request_checks_even_when_optional_work_is_disabled() {

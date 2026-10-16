@@ -519,6 +519,12 @@ struct CursorMemory {
     regex: super::cursor_regex::RegexCache,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`Ctx::check`] calls on this thread (for tests of per-query overhead)
+    pub(crate) static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Ctx {
     pub fn new(snap: Arc<Snapshot>) -> Ctx {
         Ctx {
@@ -785,6 +791,8 @@ impl Ctx {
 
     #[inline]
     pub fn check(&self) -> Result<()> {
+        #[cfg(test)]
+        CHECKS.with(|n| n.set(n.get() + 1));
         self.check_cursor_memory()?;
         if self.calls_extensions
             && let Some(state) = &self.extension_failure
