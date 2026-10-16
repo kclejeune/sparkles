@@ -235,11 +235,45 @@ class Errors(Base):
     def test_additive_usage_fields_are_ignored(self):
         usage = dict(REPLY["usage"], speed="standard", surprise={"a": 1})
         self.assertEqual(px.cost(HAIKU, usage), HAIKU_COST)
-        self.assertIsNone(px.cost(HAIKU, dict(usage, service_tier="priority")))
-        # An unrecognised geography is charged at the dearest tier.
-        self.assertEqual(
-            px.cost(HAIKU, dict(usage, inference_geo="mars")), 10 * 500 + 2 * 2500
+
+    def test_priced_or_unknown_tiers_are_never_undercounted(self):
+        usage = dict(REPLY["usage"])
+        base = px.cost(SONNET, usage)
+        # A US-only reply carries a premium on every model.
+        for model in (HAIKU, SONNET, OPUS):
+            exact = px.cost(model, usage)
+            self.assertGreater(px.cost(model, dict(usage, inference_geo="us")), exact)
+        self.assertGreaterEqual(
+            px.cost(SONNET, dict(usage, inference_geo="us")), base * 11 // 10
         )
+        # Anything unrecognised settles at the bound or at a large multiple.
+        limit = 10**8
+        for field, value in (
+            ("service_tier", "priority"),
+            ("inference_geo", "mars"),
+            ("speed", "fast"),
+        ):
+            for model in (HAIKU, SONNET, OPUS):
+                with self.subTest(field=field, model=model):
+                    odd = dict(usage, **{field: value})
+                    self.assertGreaterEqual(px.cost(model, odd, limit), limit)
+                    self.assertGreaterEqual(
+                        px.cost(model, odd), 6 * px.cost(model, usage)
+                    )
+
+    def test_a_settlement_above_its_bound_is_recorded(self):
+        ledger = self.ledger()
+        ident = ledger.reserve(HAIKU, 100)
+        ledger.settle(ident, 101, "ok")
+        self.assertEqual(ledger.report()["settledAboveBound"], 1)
+        self.assertTrue(self.lines()[-1]["overBound"])
+
+    def test_unrecognised_tier_settles_at_the_bound_in_the_ledger(self):
+        reply = dict(REPLY, usage=dict(REPLY["usage"], speed="fast"))
+        proxy = self.proxy(Upstream((200, [], json.dumps(reply).encode())))
+        proxy.handle(raw())
+        reserve, settle = self.lines()[-2:]
+        self.assertGreaterEqual(settle["cost"], reserve["bound"])
 
     def test_cache_and_long_context_rates(self):
         usage = {
@@ -347,6 +381,8 @@ class Requests(Base):
             b"[]",
             raw(messages=[{"role": "user", "content": "q", "cache_control": {}}]),
             raw(service_tier="priority"),
+            raw(messages=[{"role": "user", "content": [{"type": "image"}]}]),
+            raw(system=[{"type": "text", "text": "s"}]),
         ):
             with self.subTest(body=body[:60]):
                 self.assertEqual(proxy.handle(body)[0], 400)

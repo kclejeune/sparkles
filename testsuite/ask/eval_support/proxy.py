@@ -85,11 +85,22 @@ def count(value):
     return value
 
 
-def cost(model, usage):
-    """The exact cost in nanodollars of one reply, or None when it cannot be known.
+GEO_PREMIUM = (
+    5,
+    4,
+)  # US-only inference. The published premium is 1.1, and this adds margin.
+UNKNOWN_PREMIUM = (
+    6  # The dearest premium of any priced mode, for values not recognised.
+)
 
-    Unknown usage keys are ignored. A missing, malformed or unrecognised tier
-    gives None, and the caller then charges the request's full bound.
+
+def cost(model, usage, limit=0):
+    """The cost in nanodollars of one reply, or None when the usage cannot be read.
+
+    Unknown usage keys are ignored. A US-only reply is charged its premium. A tier,
+    geography or speed that is not recognised is charged at least `limit`, the
+    request's bound, and at least the largest premium over the standard price, so a
+    priced mode can never be settled low.
     """
     if not isinstance(usage, dict) or model not in RATES:
         return None
@@ -107,13 +118,19 @@ def cost(model, usage):
             five, hour = 0, creation  # Unsplit writes are charged at the dearer rate.
     except ValueError:
         return None
-    if usage.get("service_tier") not in (None, "standard"):
-        return None
-    long_context = inp + creation + read > LONG_CONTEXT
-    if usage.get("inference_geo") not in (None, "global", "not_available"):
-        long_context = True  # An unrecognised geography is charged at the dearest rate.
-    rates = RATES[model][int(long_context)]
-    return sum(n * r for n, r in zip((inp, five, hour, read, out), rates, strict=True))
+    rates = RATES[model][int(inp + creation + read > LONG_CONTEXT)]
+    exact = sum(n * r for n, r in zip((inp, five, hour, read, out), rates, strict=True))
+    geo = usage.get("inference_geo")
+    if (
+        usage.get("service_tier") in (None, "standard")
+        and usage.get("speed") in (None, "standard")
+        and geo in (None, "global", "not_available", "us")
+    ):
+        if geo == "us":
+            num, den = GEO_PREMIUM
+            return (exact * num + den - 1) // den
+        return exact
+    return max(limit, exact * UNKNOWN_PREMIUM)
 
 
 def has_key(value, name):
@@ -159,6 +176,7 @@ class Ledger:
         self.reserved, self.settled, self.next_id = {}, 0, 1
         self.carryover = 0
         self.requests = 0
+        self.over_bound = 0
         self.costs = []  # (case, model, cost) for every settled request
         if not self.path.is_absolute() or ".." in self.path.parts:
             raise Invalid("absolute ledger path required")
@@ -261,9 +279,12 @@ class Ledger:
     def settle(self, ident, amount, status, usage=None, request_id=None):
         with self.mutex:
             reserve = self.reserved[ident]
+            over = amount > reserve["bound"]
+            self.over_bound += int(over)
             self.write(
                 {
                     "op": "settle",
+                    "overBound": over,
                     "id": ident,
                     "cost": amount,
                     "status": status,
@@ -295,6 +316,7 @@ class Ledger:
                 "unresolvedNanodollars": unresolved,
                 "upperLiabilityNanodollars": self.carryover + self.settled + unresolved,
                 "requests": self.requests,
+                "settledAboveBound": self.over_bound,
             }
 
     def close(self):
@@ -432,6 +454,13 @@ class Proxy:
             raise Refused("model not allowed")
         if type(max_tokens) is not int or not 0 < max_tokens <= self.max_output_tokens:
             raise Refused("max_tokens out of range")
+        if not isinstance(body.get("system", ""), str) or any(
+            not isinstance(m, dict) or not isinstance(m.get("content"), str)
+            for m in body.get("messages") or [None]
+        ):
+            # Only text bodies keep the byte-based bound valid. An image can cost
+            # more tokens than its bytes.
+            raise Refused("only text content is allowed")
         body["stream"] = False
         if self.effort:
             config = body.setdefault("output_config", {})
@@ -474,7 +503,9 @@ class Proxy:
         passed = [(k, v) for k, v in headers if k.lower() in REPLY_HEADERS]
         request_id = next((v for k, v in headers if k.lower() == "request-id"), None)
         if not 200 <= status < 300:
-            # The API does not bill an error reply. The child's own retries see it.
+            # The API does not bill an error reply, which is an assumption. A gateway
+            # error after generation could be billed. The cap's margin absorbs it.
+            # The child's own retries see the reply.
             self.ledger.settle(ident, 0, f"http-{status}", request_id=request_id)
             return status, passed, self.clean_bytes(data)
         try:
@@ -482,7 +513,7 @@ class Proxy:
         except Invalid:
             reply = None
         usage = reply.get("usage") if isinstance(reply, dict) else None
-        amount = cost(model, usage)
+        amount = cost(model, usage, limit)
         self.ledger.settle(
             ident,
             limit if amount is None else amount,
