@@ -832,6 +832,12 @@ impl SharedBlocks {
     }
 }
 
+/// The cache of decoded columns keeps quick_cache's default of four shards per CPU.
+/// That is safe here, unlike in the result and SERVICE caches, because quick_cache halves
+/// the shard count until each shard expects at least 32 items, and the expected items
+/// are the budget over one column's bytes, or 64 for a small budget. A shard therefore
+/// holds about 32 columns, or half the budget when the floor of 64 applies, so a column
+/// of [`BLOCK_ROWS`] ids fits its shard in every budget of 1 MiB or more.
 fn new_column_cache(bytes: u64) -> ColumnCache {
     quick_cache::sync::Cache::with_weighter(
         (bytes / (BLOCK_ROWS as u64 * 8)).max(64) as usize,
@@ -1153,6 +1159,21 @@ impl PermIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full column fits its shard of the column cache in budgets from 1 MiB to 4 GiB,
+    /// whatever the host's CPU count.
+    #[test]
+    fn column_cache_keeps_a_full_column() {
+        for mib in [1u64, 32, 256, 4096] {
+            let c = new_column_cache(mib << 20);
+            assert!(
+                c.shard_capacity() * 97 / 100 >= BLOCK_ROWS as u64 * 8,
+                "{mib} MiB: {} shards of {} bytes",
+                c.num_shards(),
+                c.shard_capacity()
+            );
+        }
+    }
 
     #[test]
     fn write_read_scan() {
