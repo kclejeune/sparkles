@@ -695,11 +695,11 @@ pub fn run_write(
             operation.check()?;
             txn.commit()?;
             commits += 1;
-            operation.check()?;
+            // The next batch starts with its own check. After the last commit the run is
+            // finished and its record says `complete`, so a late cancel or deadline must
+            // not turn it into an error.
         }
-        operation.check()?;
         ctl.progress.report(1.0, "done");
-        operation.check()?;
         Ok(())
     })();
     if let Err(e) = outcome {

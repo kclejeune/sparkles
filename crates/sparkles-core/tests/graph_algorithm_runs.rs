@@ -542,6 +542,39 @@ fn a_cancelled_run_says_how_far_it_got() {
 }
 
 #[test]
+fn a_cancel_after_the_final_commit_still_reports_success() {
+    let s = store();
+    let preds: BTreeMap<String, String> = [("score".to_string(), "ex:rank".to_string())].into();
+    let ctl = Control::none();
+    let flag = ctl.cancel.clone();
+    let ctl = Control {
+        progress: Progress::new(move |_, m| {
+            // the last commit is done when the run reports that it is finished
+            if m == "done" {
+                flag.cancel();
+            }
+        }),
+        ..ctl
+    };
+    let rep = run_write(
+        &s,
+        &request("pageRank", preds, Some(2)),
+        &prefixes(),
+        &QueryOptions::default(),
+        None,
+        &ctl,
+    )
+    .expect("a cancel after the final commit leaves a finished run");
+    assert_eq!(rep.status, "complete");
+    let rec = select(
+        &s,
+        "SELECT ?status WHERE { GRAPH <urn:graph:out> { ?run a spk:AlgorithmRun ; \
+         spk:status ?status ; prov:endedAtTime ?end } }",
+    );
+    assert_eq!(rec, vec![vec!["complete".to_string()]]);
+}
+
+#[test]
 fn merge_replaces_only_the_written_values() {
     let s = store();
     sparkles_core::sparql::update::update(
@@ -1141,7 +1174,7 @@ mod additional_control_contracts {
     }
 
     #[test]
-    fn completion_cancel_preserves_the_one_durable_complete_record() {
+    fn completion_cancel_leaves_the_one_durable_complete_record_and_succeeds() {
         let s = store();
         let before = s.snapshot().commit;
         let ctl = Control::none();
@@ -1166,7 +1199,9 @@ mod additional_control_contracts {
             None,
             &ctl,
         );
-        assert!(matches!(result, Err(Error::Cancelled)));
+        // the last commit is done, so the late cancel does not fail the run
+        let report = result.expect("a cancel after the final commit leaves a finished run");
+        assert_eq!(report.status, "complete");
         assert_eq!(
             s.snapshot().commit,
             before + 4,
