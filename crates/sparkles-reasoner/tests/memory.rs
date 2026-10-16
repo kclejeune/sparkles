@@ -640,20 +640,23 @@ fn f16_keeping_after_commit_stays_within_limit() {
     assert!(hi_cache.kept().is_some());
     assert!(hi > lo, "keeping the closure costs nothing: {lo} and {hi}");
 
+    // limits evenly between the two, a grid dense enough to meet the narrow ranges in
+    // which a step of the keeping work passes the limit
+    const GRID: usize = 160;
     let mut kept_from = None;
-    for k in 0..=40 {
-        let limit = lo + (hi - lo) * k / 40;
+    for k in 0..=GRID {
+        let limit = lo + (hi - lo) * k / GRID;
         let cache = Cache::default();
         let r = run(Some(limit), &cache)
-            .unwrap_or_else(|e| panic!("limit {limit} ({k} of 40 from {lo} to {hi}): {e:#}"));
+            .unwrap_or_else(|e| panic!("limit {limit} ({k} of {GRID} from {lo} to {hi}): {e:#}"));
         assert!(
             r.peak_bytes as usize <= limit,
-            "limit {limit} ({k} of 40): peak {}",
+            "limit {limit} ({k} of {GRID}): peak {}",
             r.peak_bytes
         );
         match (kept_from, cache.kept().is_some()) {
             (None, true) => kept_from = Some(k),
-            (Some(from), false) => panic!("kept at {from} of 40 and not at {k}"),
+            (Some(from), false) => panic!("kept at {from} of {GRID} and not at {k}"),
             _ => {}
         }
     }

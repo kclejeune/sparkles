@@ -300,7 +300,9 @@ impl Graph {
         let bytes = n * size_of::<Triple>() + SHARDS * table_bytes(table_capacity(n / SHARDS), 4);
         let mut held = Held::try_new(budget, bytes)?;
         let mut g = Graph::with_capacity(n);
-        held.set(g.heap_bytes());
+        // strict: the estimate above may fall short of the heap, and settling must not
+        // pass the limit
+        held.try_set(g.heap_bytes())?;
         g.held = held;
         Ok(g)
     }

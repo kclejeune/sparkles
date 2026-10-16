@@ -1,6 +1,6 @@
 # F16: Materialization at scale
 
-> **Status:** implemented in part (Phase 1 built, acceptance open)
+> **Status:** implemented in part, Phase 1 built and its acceptance open
 >
 > **Phases:** Phase 1 shipped: rule evaluation over the store's index permutations, a
 > parallel merge of derived facts, snapshot statistics in the rule planner, `max_memory`,
@@ -776,19 +776,20 @@ deadlock. While it held the writer lock, the waiting worker could take another q
 that asked for the same lock. It also found that runs asking for fewer threads than the
 pool each built a pool of their own beside it, so their threads added up past the pool's
 size. `pool.rs` now owns both concerns. A run called on a rayon worker moves to a native
-thread of its own while the worker waits without taking other jobs, and a run is
-admitted to its `ReasoningPool` before it takes the writer lock. Admission is first come,
-first served, against a capacity equal to the pool's threads. Runs that use the whole pool
-share its threads and run together. A run that asks for fewer threads counts those
-threads against the capacity, waits until they fit, and then evaluates on a pool of
-exactly that size. That pool's threads are joined before the run gives its threads back,
-also when the run fails or panics. A waiting run checks its cancel flag every 20 ms. Threads that do not stop within 30 seconds are not waited for, and the run logs a
-warning. A run that waits for the writer lock of its store keeps its admission meanwhile,
-so a run on another store that needs a different grant waits behind it. A run started on a
-thread of the pool, on a thread of another run's own pool, or on the thread that holds
-another run's admission to the same pool, such as from a progress callback, is refused
-with an error, since it would wait for itself. Without a pool, a run on a rayon worker keeps the size of the
-caller's pool on a pool of its own.
+thread of its own while the worker waits without taking other jobs, and a run is admitted
+to its `ReasoningPool` before it takes the writer lock. Admission is first come, first
+served, against a capacity equal to the pool's threads. Runs that use the whole pool share
+its threads and run together. A run that asks for fewer threads counts those threads
+against the capacity, waits until they fit, and then evaluates on a pool of exactly that
+size. That pool's threads are joined before the run gives its threads back, also when the
+run fails or panics. A waiting run checks its cancel flag every 20 ms. Threads that do not
+stop within 30 seconds are not waited for, and the run logs a warning. A run that waits
+for the writer lock of its store keeps its admission meanwhile, so a run on another store
+that needs a different grant waits behind it. A run started on a thread of the pool, on a
+thread of another run's own pool, or on the thread that holds another run's admission to
+the same pool, such as from a progress callback, is refused with an error, since it would
+wait for itself. Without a pool, a run on a rayon worker keeps the size of the caller's
+pool on a pool of its own.
 
 **Graph-major visitation.** With several input graphs, the base tier now visits the facts
 graph by graph, in the order of the input graphs, and within a graph in key order, as the
@@ -844,12 +845,13 @@ a shared host, not published benchmarks.
 After the review fixes, a check on atlas compared the build before them with the build
 after them on LUBM-style data with 20 universities, 2.5 million triples, running
 `materialize` on a fresh copy of the dataset each time. The medians of three interleaved
-runs were 4,136 ms before and 4,104 ms after for RDFS on 1 thread, 6,370 ms and 6,370 ms for
-OWL 2 RL on 1 thread, 3,446 ms and 3,422 ms for OWL 2 RL on 16 threads, and 2,510 ms and
-2,791 ms for RDFS on 16 threads. The last pair differed by 11%, which eight more
+runs were 4,136 ms before and 4,104 ms after for RDFS on 1 thread, 6,370 ms and 6,370 ms
+for OWL 2 RL on 1 thread, 3,446 ms and 3,422 ms for OWL 2 RL on 16 threads, and 2,510 ms
+and 2,791 ms for RDFS on 16 threads. The last pair differed by 11%, which eight more
 interleaved runs of each build did not reproduce, with medians of 2,634 ms before and
-2,569 ms after. The runs are noisy at that size. The reported peak heap did not change in
-any configuration.
+2,569 ms after. The runs are noisy at that size. The load average on atlas was between 2
+and 4 during the runs, mostly from the runs themselves. The reported peak heap did not
+change in any configuration.
 
 **Diagnostics.** `literal-not-in-datatype` judges each candidate before it counts toward
 the finding limit, so valid literals no longer hide a violation behind the limit. It reads
