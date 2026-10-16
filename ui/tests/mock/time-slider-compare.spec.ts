@@ -213,3 +213,42 @@ test('a read that cut its rows compares counts only, with no marks', async ({ pa
   await expect(grid(page).getByRole('gridcell', { name: /^(added|removed)$/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Compare on the server' })).toBeVisible();
 });
+
+test('a schema link that compares with a branch reopens the slider in compare mode', async ({
+  page,
+}) => {
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'forked'));
+  await page.goto('/ui/explore?ds=forked&tab=schema&against=dev');
+  const bar = page.getByRole('region', { name: 'Schema history time slider' });
+  await expect(bar).toBeVisible();
+  await expect(bar.getByRole('combobox', { name: 'Compare with' })).toHaveValue('dev');
+  await page.reload();
+  await expect(bar.getByRole('combobox', { name: 'Compare with' })).toHaveValue('dev');
+});
+
+test('a history link without a branch reads main after one that named a branch', async ({
+  page,
+}) => {
+  await prepare(page, 'forked', `${PREFIXES}\nSELECT ?o WHERE { ex:root ex:link ?o } ORDER BY ?o`);
+  const reads: string[] = [];
+  page.on('request', (r) => {
+    const path = new URL(r.url()).pathname;
+    if (r.method() === 'POST' && /\/forked(@dev)?\/sparql$/.test(path)) reads.push(path);
+  });
+  await page.goto('/ui/query?ds=forked&at=commit%3A1&branch=dev');
+  await expect(grid(page)).toContainText('/base');
+  expect(reads.at(-1)).toBe('/forked@dev/sparql');
+  // leave the page, then follow a link without `branch` inside the app
+  await page.getByRole('link', { name: 'Explore' }).first().click();
+  await expect(page).toHaveURL(/\/ui\/explore/);
+  reads.length = 0;
+  await page.evaluate(() => {
+    const a = document.createElement('a');
+    a.href = '/ui/query?ds=forked&at=commit%3A1';
+    a.id = 'history-link';
+    document.body.append(a);
+    a.click();
+  });
+  await expect(grid(page)).toContainText('/base');
+  expect(reads.at(-1)).toBe('/forked/sparql');
+});

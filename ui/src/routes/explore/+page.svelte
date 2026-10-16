@@ -822,7 +822,7 @@
   // A newer load (reload, other graph, dataset switch) supersedes an older one.
   const schemaRuns = new LatestRun();
   /** The slider over the schema tab. It shares `exAt` and `exFrom` with the graph's. */
-  let schemaTimeOpen = $state(!!(urlAt || urlFrom) && urlTab === 'schema');
+  let schemaTimeOpen = $state(!!(urlAt || urlFrom || urlAgainst) && urlTab === 'schema');
   let schemaSlider: TimeSlider | undefined = $state();
   /** Comparing two commits: the change of each count, and what came and went. */
   let schemaDelta = $state<SchemaChanges | null>(null);

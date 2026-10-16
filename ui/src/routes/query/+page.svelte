@@ -203,7 +203,8 @@
     const urlDs = urlParams.get('ds');
     if (urlDs && urlDs !== app.current) app.setDataset(urlDs);
     const urlBranch = urlParams.get('branch');
-    if (urlBranch) app.queryBranch = urlBranch === MAIN ? '' : urlBranch;
+    // a link without `branch` is on main, whatever branch the page was left on
+    app.queryBranch = !urlBranch || urlBranch === MAIN ? '' : urlBranch;
     app.queryAt = urlParams.get('at') ?? '';
   }
   /** The slider bar under the toolbar, opened by History (`H`). */
