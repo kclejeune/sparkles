@@ -1488,6 +1488,18 @@ async fn deep_nesting_is_a_syntax_error() {
 /// A basic graph pattern counts two plan levels per triple pattern. At the plan limit the
 /// tools explain it on these small stacks, and one more triple pattern is refused.
 #[tokio::test(flavor = "multi_thread")]
+async fn the_explain_output_schema_names_the_truncation_flag() {
+    let mut c = Client::start(fixture_server());
+    let r = c.request(2, "tools/list", json!({"_meta": m()})).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let tool = tools.iter().find(|t| t["name"] == "explain_query").unwrap();
+    let flag = &tool["outputSchema"]["properties"]["planTruncated"];
+    assert_eq!(flag["type"], "boolean", "{flag}");
+    let required = tool["outputSchema"]["required"].as_array().unwrap();
+    assert!(!required.contains(&json!("planTruncated")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_basic_graph_pattern_at_the_plan_limit() {
     use sparkles::sparql::depth::MAX_PLAN_DEPTH;
     let mut c = Client::start(fixture_server());
