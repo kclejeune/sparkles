@@ -313,3 +313,105 @@ fn f16_admission_cancel_panic_and_sizes() {
         assert_eq!(r.threads, 3);
     });
 }
+
+/// A run started from a progress callback on a thread that works for or holds a run of
+/// the same reasoning pool is refused at once, instead of waiting for the run it is
+/// part of: on the thread of a run's own pool, on the thread that holds the admission
+/// (the callback of the last step), and on a thread of the shared pool. A run on
+/// another reasoning pool from the same callback is not affected.
+#[test]
+fn f16_reentry_from_run_threads_is_refused() {
+    within(Duration::from_secs(60), "the re-entrant runs", || {
+        // (the threads of the outer run, the step whose callback starts the inner run)
+        for (threads, step) in [
+            (Some(1), "reasoning"),
+            (Some(1), "done"),
+            (None, "reasoning"),
+        ] {
+            let pool = thread_pool(2).unwrap();
+            let outer = Arc::new(store(50));
+            let other = Arc::new(store(50));
+            // the inner run would wait for the outer one until this is set
+            let cancel = Arc::new(AtomicBool::new(false));
+            {
+                let cancel = cancel.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(3));
+                    cancel.store(true, Ordering::SeqCst);
+                });
+            }
+            let inner: Arc<Mutex<Option<(String, Duration)>>> = Arc::default();
+            let started = Arc::new(AtomicBool::new(false));
+            let progress: sparkles_reasoner::ProgressFn = {
+                let (pool, other, cancel, inner) =
+                    (pool.clone(), other.clone(), cancel.clone(), inner.clone());
+                Arc::new(move |_, msg: &str| {
+                    if msg != step || started.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let opts = ReasonOptions {
+                        pool: Some(pool.clone()),
+                        cancel: Some(cancel.clone()),
+                        ..Default::default()
+                    };
+                    let t0 = Instant::now();
+                    let r =
+                        materialize_with(&other, &Profile::RdfsSimple, &Extras::default(), &opts);
+                    let text = match r {
+                        Ok(_) => "ok".to_string(),
+                        Err(e) => format!("{e:#}"),
+                    };
+                    *inner.lock().unwrap() = Some((text, t0.elapsed()));
+                })
+            };
+            let opts = ReasonOptions {
+                pool: Some(pool.clone()),
+                threads,
+                progress: Some(progress),
+                ..Default::default()
+            };
+            let r = materialize_with(&outer, &Profile::RdfsSimple, &Extras::default(), &opts);
+            let (text, took) = inner.lock().unwrap().take().expect("the inner run started");
+            assert!(
+                text.contains("same reasoning pool"),
+                "{threads:?} at {step}: {text}"
+            );
+            assert!(
+                took < Duration::from_secs(1),
+                "{threads:?} at {step}: refused after {took:?}"
+            );
+            assert_eq!(r.unwrap().inferred, 101, "{threads:?} at {step}");
+            assert_eq!(pool.admitted_workers(), 0);
+        }
+
+        // a run on another reasoning pool from the callback of the last step succeeds
+        let pool = thread_pool(2).unwrap();
+        let elsewhere = thread_pool(1).unwrap();
+        let outer = Arc::new(store(50));
+        let other = Arc::new(store(50));
+        let inner: Arc<Mutex<Option<anyhow::Result<ReasonReport>>>> = Arc::default();
+        let progress: sparkles_reasoner::ProgressFn = {
+            let inner = inner.clone();
+            Arc::new(move |_, msg: &str| {
+                if msg == "done" {
+                    let opts = ReasonOptions {
+                        pool: Some(elsewhere.clone()),
+                        ..Default::default()
+                    };
+                    let r =
+                        materialize_with(&other, &Profile::RdfsSimple, &Extras::default(), &opts);
+                    *inner.lock().unwrap() = Some(r);
+                }
+            })
+        };
+        let opts = ReasonOptions {
+            pool: Some(pool),
+            threads: Some(1),
+            progress: Some(progress),
+            ..Default::default()
+        };
+        materialize_with(&outer, &Profile::RdfsSimple, &Extras::default(), &opts).unwrap();
+        let r = inner.lock().unwrap().take().expect("the inner run started");
+        assert_eq!(r.unwrap().inferred, 101);
+    });
+}

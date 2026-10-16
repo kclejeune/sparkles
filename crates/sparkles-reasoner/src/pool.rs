@@ -16,11 +16,19 @@
 //! ([`crate::ReasonOptions::threads`]) when that is smaller, on a pool of its own. Runs
 //! are admitted in arrival order while the workers they take fit the capacity. Runs that
 //! use the shared pool share its workers, so any number of them run together, but not
-//! beside a run with a pool of its own. A run is admitted before it takes the writer lock,
-//! waits for admission only while it is not cancelled, and gives its workers back when its
-//! own pool's threads have ended, also when it fails or panics.
+//! beside a run with a pool of its own. A run is admitted before it takes the writer lock.
+//! A run that waits for the writer lock of its store keeps its admission meanwhile, so a
+//! run on another store that needs a different grant waits behind it. A run waits for
+//! admission only while it is not cancelled, and gives its workers back when its own
+//! pool's threads have ended, also when it fails or panics. Threads that do not stop
+//! within 30 seconds, or the threads of a pool that failed to start, are not waited for,
+//! and the run logs a warning in the first case. A run started on a thread of the pool,
+//! on a thread of another run's own pool, or on the thread that holds another run's
+//! admission to the same pool, such as from a progress callback, is refused, since it
+//! would wait for itself.
 
 use parking_lot::{Condvar, Mutex};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,6 +187,38 @@ impl Drop for Permit {
     }
 }
 
+thread_local! {
+    /// The addresses of the reasoning pools whose admission this thread holds or works
+    /// for: the thread that admitted a run, and the threads of that run's own pool.
+    static HOLDING: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The mark of a reasoning pool in [`HOLDING`].
+fn mark(p: &Arc<ReasoningPool>) -> usize {
+    Arc::as_ptr(p) as usize
+}
+
+/// A pool in [`HOLDING`] of the current thread while this lives.
+struct Holding(usize);
+
+impl Holding {
+    fn new(pool: usize) -> Holding {
+        HOLDING.with(|h| h.borrow_mut().push(pool));
+        Holding(pool)
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        HOLDING.with(|h| {
+            let mut h = h.borrow_mut();
+            if let Some(i) = h.iter().rposition(|&x| x == self.0) {
+                h.remove(i);
+            }
+        });
+    }
+}
+
 /// A pool built for one run, whose drop waits for its threads to exit.
 struct OwnPool {
     pool: Option<rayon::ThreadPool>,
@@ -192,7 +232,10 @@ struct OwnPool {
 const STOP_WAIT: Duration = Duration::from_secs(30);
 
 impl OwnPool {
-    fn new(threads: usize) -> anyhow::Result<OwnPool> {
+    /// A pool of `threads` threads. With a `holder`, its threads work for a run admitted
+    /// to that reasoning pool ([`mark`]), and a run started on them to the same pool is
+    /// refused.
+    fn new(threads: usize, holder: Option<usize>) -> anyhow::Result<OwnPool> {
         let exited: Arc<(Mutex<usize>, Condvar)> = Arc::default();
         let handles: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::default();
         let e = exited.clone();
@@ -202,7 +245,11 @@ impl OwnPool {
             .spawn_handler(move |t| {
                 let j = std::thread::Builder::new()
                     .name(format!("reason-run-{}", t.index()))
-                    .spawn(|| t.run())?;
+                    .spawn(move || {
+                        // the thread ends with the pool, which ends its entry
+                        let _holding = holder.map(Holding::new);
+                        t.run()
+                    })?;
                 h.lock().push(j);
                 Ok(())
             })
@@ -253,6 +300,8 @@ pub(crate) struct Exec {
     own: Option<OwnPool>,
     shared: Option<Arc<ReasoningPool>>,
     _permit: Option<Permit>,
+    // dropped after the permit
+    _holding: Option<Holding>,
 }
 
 impl Exec {
@@ -276,36 +325,46 @@ impl Exec {
                     pool: p.clone(),
                     want,
                 };
+                // this thread holds the admission until the run ends
+                let holding = Holding::new(mark(p));
                 Ok(match want {
                     Want::Shared => Exec {
                         own: None,
                         shared: Some(p.clone()),
                         _permit: Some(permit),
+                        _holding: Some(holding),
                     },
                     Want::Own(n) => Exec {
-                        own: Some(OwnPool::new(n)?),
+                        own: Some(OwnPool::new(n, Some(mark(p)))?),
                         shared: None,
                         _permit: Some(permit),
+                        _holding: Some(holding),
                     },
                 })
             }
             None => Ok(Exec {
                 own: asked
                     .or_else(caller_threads)
-                    .map(OwnPool::new)
+                    .map(|n| OwnPool::new(n, None))
                     .transpose()?,
                 shared: None,
                 _permit: None,
+                _holding: None,
             }),
         }
     }
 
-    /// The error for a run called on a thread of the reasoning pool it would use: its
-    /// evaluation would wait for workers that wait for it.
+    /// The error for a run called on a thread that works for or holds a run of the
+    /// reasoning pool it would use: a thread of the pool, a thread of another run's own
+    /// pool, or the thread that holds another run's admission, such as in a progress
+    /// callback. Its admission or its evaluation would wait for that run.
     pub fn refuse_own_threads(pool: Option<&Arc<ReasoningPool>>) -> anyhow::Result<()> {
-        if pool.is_some_and(|p| p.pool.current_thread_index().is_some()) {
+        if pool.is_some_and(|p| {
+            p.pool.current_thread_index().is_some()
+                || HOLDING.with(|h| h.borrow().contains(&mark(p)))
+        }) {
             anyhow::bail!(
-                "a reasoning run cannot be started on a thread of its own reasoning pool"
+                "a reasoning run cannot be started on a thread that works for or holds a run of the same reasoning pool"
             );
         }
         Ok(())
@@ -378,7 +437,7 @@ mod tests {
             .pool
             .install(|| Exec::refuse_own_threads(Some(&p)))
             .unwrap_err();
-        assert!(e.to_string().contains("its own reasoning pool"), "{e}");
+        assert!(e.to_string().contains("same reasoning pool"), "{e}");
         let other = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
