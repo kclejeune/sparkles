@@ -16,10 +16,6 @@ const DEFAULT_BUCKETS: u64 = 200;
 /// The most buckets a request may ask for.
 const MAX_BUCKETS: u64 = 2_000;
 
-/// The most commits one request reads. The catalog hands over its commits as one list, so
-/// this bounds the memory of a request, which a range of this size holds for a few hundred
-/// bytes a commit.
-const MAX_RANGE: u64 = 10_000_000;
 /// How many commits are bucketed between two looks at the cancel flag.
 const CHECK_EVERY: usize = 65_536;
 
@@ -93,16 +89,17 @@ fn bad(msg: impl Into<String>) -> ApiError {
 }
 
 /// The commit numbers from `lo` to `hi` (the head at most): how many commits a request
-/// reads, none when the range starts after the head, and a `400` beyond [`MAX_RANGE`].
-fn range_len(lo: u64, hi: u64) -> ApiResult<u64> {
+/// reads, none when the range starts after the head, and a `400` beyond `max`, which the
+/// catalog's way of handing the commits over as one list makes the bound of a request's memory.
+fn range_len(lo: u64, hi: u64, max: u64) -> ApiResult<u64> {
     let wanted = if lo > hi {
         0
     } else {
         (hi - lo).saturating_add(1)
     };
-    if wanted > MAX_RANGE {
+    if wanted > max {
         return Err(bad(format!(
-            "the range holds {wanted} commits, more than the {MAX_RANGE} a timeline reads: narrow it with from and to"
+            "the range holds {wanted} commits, more than the {max} a timeline reads: narrow it with from and to"
         )));
     }
     Ok(wanted)
@@ -137,7 +134,7 @@ pub(super) async fn timeline(
     // would otherwise give a bucket past the head the response names
     let head = ds.store.head_commit().seq;
     let hi = hi.min(head);
-    let wanted = range_len(lo, hi)?;
+    let wanted = range_len(lo, hi, st.limits.max_timeline_commits)?;
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     let restricted = p.restricted(&ds.name);
     let (width, first, last, count, out) = blocking({
@@ -214,16 +211,17 @@ mod tests {
 
     #[test]
     fn a_range_is_counted_and_capped() {
-        assert_eq!(range_len(0, 0).ok(), Some(1));
-        assert_eq!(range_len(2, 3).ok(), Some(2));
+        const MAX: u64 = 10_000_000;
+        assert_eq!(range_len(0, 0, MAX).ok(), Some(1));
+        assert_eq!(range_len(2, 3, MAX).ok(), Some(2));
         // from after the clamped head: nothing to read
-        assert_eq!(range_len(50, 4).ok(), Some(0));
-        assert_eq!(range_len(0, MAX_RANGE - 1).ok(), Some(MAX_RANGE));
-        let Err(e) = range_len(0, MAX_RANGE) else {
+        assert_eq!(range_len(50, 4, MAX).ok(), Some(0));
+        assert_eq!(range_len(0, MAX - 1, MAX).ok(), Some(MAX));
+        let Err(e) = range_len(0, MAX, MAX) else {
             panic!("a range past the ceiling is refused");
         };
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
         assert!(e.1["error"].as_str().unwrap().contains("10000000"));
-        assert!(range_len(0, u64::MAX).is_err());
+        assert!(range_len(0, u64::MAX, MAX).is_err());
     }
 }

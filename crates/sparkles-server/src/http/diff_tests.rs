@@ -1578,3 +1578,52 @@ async fn sparql_diff_refuses_a_query_that_is_not_repeatable() {
     let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=4", q).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
 }
+
+#[tokio::test]
+async fn sparql_diff_gives_its_three_executions_one_deadline() {
+    // a query no other test runs, so that its executions can be told apart
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } # one-deadline";
+    let s = server(|_| {}).await;
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=1&to=4&timeout=60", q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", head_of(&r));
+    // commit 1 has a row that commit 4 lacks, so the earlier state is read a second time
+    assert_eq!(r.json()["removed"], 1);
+    let runs: Vec<Option<std::time::Duration>> = super::sparql_diff::RUNS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(query, _)| query == q)
+        .map(|(_, t)| *t)
+        .collect();
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    let [a, b, c] = [runs[0].unwrap(), runs[1].unwrap(), runs[2].unwrap()];
+    // each execution gets the time that is left, not the whole timeout again
+    let sixty = std::time::Duration::from_secs(60);
+    assert!(a < sixty && b < a && c < b, "{a:?} {b:?} {c:?}");
+}
+
+#[tokio::test]
+async fn the_timeline_range_is_clamped_to_the_head_before_it_is_capped() {
+    // a ceiling of three commits, and a head of 4 (five commits)
+    let s = server(|l| l.max_timeline_commits = 3).await;
+    let uri = |q: &str| format!("/$/commits/h/timeline?{q}");
+    // all five commits are more than the ceiling
+    let r = get(&s.app, &uri("")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("narrow it with from and to"));
+    // a `to` far past the head is the head, so three commits are read and fit
+    let r = get(&s.app, &uri("from=2&to=99999999999")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(
+        (j["commits"].as_u64(), j["lastSeq"].as_u64()),
+        (Some(3), Some(4))
+    );
+    // one commit more than the ceiling is still refused
+    let r = get(&s.app, &uri("from=1&to=99999999999")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    // and a range after the head reads nothing, whatever its size
+    let r = get(&s.app, &uri("from=50&to=99999999999")).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["commits"], 0);
+}

@@ -279,6 +279,11 @@ impl Listed {
     }
 }
 
+/// The time each execution of a query was given, for the tests that follow the deadline.
+#[cfg(test)]
+pub(super) static RUNS: std::sync::Mutex<Vec<(String, Option<Duration>)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Run the query at `at` and check that it is a SELECT.
 fn run(
     ds: &Dataset,
@@ -286,6 +291,8 @@ fn run(
     query: &str,
     opts: &sparkles::sparql::QueryOptions,
 ) -> ApiResult<(QueryResult, sparkles::history::Resolved)> {
+    #[cfg(test)]
+    RUNS.lock().unwrap().push((query.to_string(), opts.timeout));
     let (snap, resolved) = history::snapshot_for(ds, Some(at), opts)?;
     let r = sparkles::sparql::query_with_plan(snap, query, opts)
         .map_err(|f| ApiError::from(f.error))?;

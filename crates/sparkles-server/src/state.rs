@@ -511,6 +511,8 @@ pub struct Limits {
     pub min_free_disk_bytes: Option<u64>,
     /// the largest `timeout` a request may ask for (never below the server's default)
     pub max_timeout: Option<std::time::Duration>,
+    /// commits one request of `GET /$/commits/{ds}/timeline` reads
+    pub max_timeline_commits: u64,
 }
 
 impl Default for Limits {
@@ -530,6 +532,7 @@ impl Default for Limits {
             max_upload_bytes: Some(4 << 30),
             min_free_disk_bytes: Some(1 << 30),
             max_timeout: Some(std::time::Duration::from_secs(1800)),
+            max_timeline_commits: 10_000_000,
         }
     }
 }
