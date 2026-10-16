@@ -91,6 +91,27 @@ fn push_row(
     Ok(())
 }
 
+/// Append `rows` to list `e` with one copy, charging its growth first as
+/// [`push_row`] does (a list grows to the next power of two that holds them all).
+#[inline]
+fn extend_rows(
+    e: &mut List,
+    rows: &[u32],
+    m: &mut Meter<'_>,
+    spilled: &mut isize,
+) -> Result<(), MemoryExceeded> {
+    let cap = e.capacity();
+    let want = e.len() + rows.len();
+    if want > cap {
+        m.add(spill(want.next_power_of_two()))?;
+        e.extend_from_slice(rows);
+        *spilled += spill(e.capacity()) as isize - spill(cap) as isize;
+    } else {
+        e.extend_from_slice(rows);
+    }
+    Ok(())
+}
+
 /// The entry of key `k` in `m`, charging to `meter` first the table it grows to when
 /// `k` is new and does not fit.
 #[inline]
@@ -851,9 +872,7 @@ impl Graph {
                                 j += 1;
                             }
                             let e = entry(m, p, &mut meter)?;
-                            for &r in &rows[i..j] {
-                                push_row(e, r, &mut meter, &mut spilled)?;
-                            }
+                            extend_rows(e, &rows[i..j], &mut meter, &mut spilled)?;
                             i = j;
                         }
                     }

@@ -146,6 +146,8 @@ impl Budget {
 pub(crate) struct Held {
     budget: Arc<Budget>,
     bytes: usize,
+    /// charged to the budget and not used yet, see [`STEP`]
+    credit: usize,
 }
 
 impl std::fmt::Debug for Held {
@@ -154,11 +156,17 @@ impl std::fmt::Debug for Held {
     }
 }
 
+/// The bytes a holder takes from the budget at once when a charge does not fit what
+/// it took before: small charges then do not each update the counter all threads
+/// share. A holder keeps at most twice this unused.
+const STEP: usize = 16 << 10;
+
 impl Held {
     pub fn new(budget: &Arc<Budget>) -> Held {
         Held {
             budget: budget.clone(),
             bytes: 0,
+            credit: 0,
         }
     }
 
@@ -179,20 +187,28 @@ impl Held {
     }
 
     pub fn try_grow(&mut self, n: usize) -> Result<(), MemoryExceeded> {
-        self.budget.try_charge(n)?;
+        if n > self.credit {
+            take(&self.budget, n, &mut self.credit)?;
+        }
+        self.credit -= n;
         self.bytes += n;
         Ok(())
     }
 
     pub fn grow(&mut self, n: usize) {
-        self.budget.charge(n);
+        if n > self.credit {
+            self.budget.charge(n - self.credit);
+            self.credit = n;
+        }
+        self.credit -= n;
         self.bytes += n;
     }
 
     pub fn shrink(&mut self, n: usize) {
         let n = n.min(self.bytes);
-        self.budget.release(n);
         self.bytes -= n;
+        self.credit += n;
+        give_back(&self.budget, &mut self.credit);
     }
 
     /// Hold `n` bytes: grow (even past the limit) or shrink to it.
@@ -211,6 +227,7 @@ impl Held {
         Held {
             budget: self.budget.clone(),
             bytes: n,
+            credit: 0,
         }
     }
 
@@ -222,7 +239,30 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.budget.release(self.bytes);
+        self.budget.release(self.bytes + self.credit);
+    }
+}
+
+/// Charge `n` bytes more than `credit` holds, with a [`STEP`] beyond when that fits, and
+/// add them to `credit`.
+#[inline]
+fn take(budget: &Budget, n: usize, credit: &mut usize) -> Result<(), MemoryExceeded> {
+    let need = n - *credit;
+    if budget.try_charge(need + STEP).is_ok() {
+        *credit += need + STEP;
+    } else {
+        budget.try_charge(need)?;
+        *credit += need;
+    }
+    Ok(())
+}
+
+/// Give back what `credit` holds beyond two [`STEP`]s.
+#[inline]
+fn give_back(budget: &Budget, credit: &mut usize) {
+    if *credit > 2 * STEP {
+        budget.release(*credit - STEP);
+        *credit = STEP;
     }
 }
 
@@ -241,6 +281,8 @@ pub(crate) struct Meter<'b> {
     /// charges fail past the limit; otherwise they are made anyway
     strict: bool,
     bytes: usize,
+    /// charged to the budget and not used yet, see [`STEP`]
+    credit: usize,
 }
 
 impl<'b> Meter<'b> {
@@ -249,23 +291,30 @@ impl<'b> Meter<'b> {
             budget,
             strict,
             bytes: 0,
+            credit: 0,
         }
     }
 
+    #[inline]
     pub fn add(&mut self, n: usize) -> Result<(), MemoryExceeded> {
-        if self.strict {
-            self.budget.try_charge(n)?;
-        } else {
-            self.budget.charge(n);
+        if n > self.credit {
+            if self.strict {
+                take(self.budget, n, &mut self.credit)?;
+            } else {
+                self.budget.charge(n - self.credit);
+                self.credit = n;
+            }
         }
+        self.credit -= n;
         self.bytes += n;
         Ok(())
     }
 
     pub fn sub(&mut self, n: usize) {
         let n = n.min(self.bytes);
-        self.budget.release(n);
         self.bytes -= n;
+        self.credit += n;
+        give_back(self.budget, &mut self.credit);
     }
 
     pub fn budget(&self) -> &'b Budget {
@@ -281,15 +330,17 @@ impl<'b> Meter<'b> {
         self.bytes += n;
     }
 
-    /// The bytes charged, for a [`Held::adopt`] of the same budget.
+    /// The bytes charged, for a [`Held::adopt`] of the same budget; what it took
+    /// beyond them is given back.
     pub fn into_bytes(mut self) -> usize {
+        self.budget.release(std::mem::take(&mut self.credit));
         std::mem::take(&mut self.bytes)
     }
 }
 
 impl Drop for Meter<'_> {
     fn drop(&mut self) {
-        self.budget.release(self.bytes);
+        self.budget.release(self.bytes + self.credit);
     }
 }
 
@@ -372,12 +423,40 @@ mod tests {
         assert_eq!(b.used(), 60);
         h.try_grow(40).unwrap();
         assert_eq!(b.peak(), 100);
+        // what a holder frees stays charged to it for its next charges
         h.shrink(90);
-        assert_eq!(b.used(), 10);
+        assert_eq!(b.used(), 100);
+        h.try_grow(90).unwrap();
+        assert_eq!(b.used(), 100);
         b.charge(200);
         assert!(b.check().is_err());
         b.release(200);
         drop(h);
-        assert_eq!((b.used(), b.peak()), (0, 210));
+        assert_eq!((b.used(), b.peak()), (0, 300));
+    }
+
+    /// Small charges take a step from the budget when it fits, and a holder gives back
+    /// what it does not use beyond two steps.
+    #[test]
+    fn charges_take_steps() {
+        let b = Budget::unlimited();
+        let mut h = Held::new(&b);
+        h.try_grow(10).unwrap();
+        assert_eq!(b.used(), 10 + STEP);
+        h.try_grow(STEP).unwrap();
+        assert_eq!(b.used(), 10 + STEP);
+        h.try_grow(1).unwrap();
+        assert_eq!(b.used(), 11 + 2 * STEP);
+        // all of it freed: one step stays
+        h.shrink(STEP + 11);
+        assert_eq!(b.used(), STEP);
+        let mut m = Meter::new(&b, true);
+        m.add(5).unwrap();
+        assert_eq!(b.used(), 2 * STEP + 5);
+        assert_eq!(m.into_bytes(), 5);
+        assert_eq!(b.used(), STEP + 5);
+        b.release(5);
+        drop(h);
+        assert_eq!(b.used(), 0);
     }
 }
