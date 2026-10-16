@@ -40,49 +40,57 @@ impl Tools<'_> {
             }
         }
         let started = Instant::now();
-        let core = self.explain_core(&a, None)?;
-        let mut out = core.out;
-        let plan = core.plan.as_ref().expect("the engine's plan");
-        if !notes {
-            let mut lines = String::new();
-            plan_lines(plan, 0, &mut lines);
-            out["plan"] = lines.trim_end().into();
-            return Ok(Outcome::Structured(out));
-        }
-        let kind = out["queryType"].as_str().unwrap_or("SELECT").to_string();
-        let built = explain::build(
-            &core.plan_json,
-            &a.query,
-            &kind,
-            &core.prefixes,
-            core.stop.as_ref(),
-            core.error.is_some(),
-        )
-        .map_err(|e| ToolError::new("internal", 500, e))?;
-        out["plan"] = explain::text_lines(&built.plan).trim_end().into();
-        out["nodes"] = built.plan.facts_json();
-        out["notes"] = serde_json::to_value(&built.notes).unwrap_or_default();
-        out["asks"] = serde_json::to_value(&built.asks).unwrap_or_default();
-        // who wrote `asks` and the notes' text: the templates, or the server's model
-        out["source"] = "template".into();
-        if use_model {
-            let ds = self.dataset(a.dataset.as_deref())?;
-            let w = self.explain_with_model(&ds, &a.query, &built, core.stop.as_ref(), started);
-            let e = model::explanation(&built.asks, &built.notes, w.as_ref());
-            if e["source"] == "model" {
-                out["asks"] = e["asks"].clone();
-                out["notes"] = e["notes"].clone();
-                out["source"] = "model".into();
-                out["provider"] = e["provider"].clone();
-                out["model"] = e["model"].clone();
-            } else if !e["fallback"].is_null() {
-                out["fallback"] = e["fallback"].clone();
+        let core = self.explain_core(&a, None, notes)?;
+        // the JSON form of the plan nests twice as deep as the plan, and reading,
+        // cloning and dropping it recurse
+        sparkles::sparql::depth::with_stack(core.depth, move || {
+            let mut out = core.out;
+            let plan = core.plan.as_ref().expect("the engine's plan");
+            if !notes {
+                let mut lines = String::new();
+                let cut = plan_lines(plan, 0, &mut lines, self.cfg().max_bytes);
+                out["plan"] = lines.trim_end().into();
+                if cut {
+                    out["planTruncated"] = true.into();
+                }
+                return Ok(Outcome::Structured(out));
             }
-            if let Some(w) = &w {
-                out["usage"] = w.usage();
+            let kind = out["queryType"].as_str().unwrap_or("SELECT").to_string();
+            let built = explain::build(
+                &core.plan_json,
+                &a.query,
+                &kind,
+                &core.prefixes,
+                core.stop.as_ref(),
+                core.error.is_some(),
+            )
+            // the explanation reads plans of up to 256 levels and 10,000 nodes
+            .map_err(ToolError::bad_argument)?;
+            out["plan"] = explain::text_lines(&built.plan).trim_end().into();
+            out["nodes"] = built.plan.facts_json();
+            out["notes"] = serde_json::to_value(&built.notes).unwrap_or_default();
+            out["asks"] = serde_json::to_value(&built.asks).unwrap_or_default();
+            // who wrote `asks` and the notes' text: the templates, or the server's model
+            out["source"] = "template".into();
+            if use_model {
+                let ds = self.dataset(a.dataset.as_deref())?;
+                let w = self.explain_with_model(&ds, &a.query, &built, core.stop.as_ref(), started);
+                let e = model::explanation(&built.asks, &built.notes, w.as_ref());
+                if e["source"] == "model" {
+                    out["asks"] = e["asks"].clone();
+                    out["notes"] = e["notes"].clone();
+                    out["source"] = "model".into();
+                    out["provider"] = e["provider"].clone();
+                    out["model"] = e["model"].clone();
+                } else if !e["fallback"].is_null() {
+                    out["fallback"] = e["fallback"].clone();
+                }
+                if let Some(w) = &w {
+                    out["usage"] = w.usage();
+                }
             }
-        }
-        Ok(Outcome::Structured(out))
+            Ok(Outcome::Structured(out))
+        })
     }
 
     /// The `explain` role's prose for `built`, charged to the calling principal, or
@@ -167,13 +175,15 @@ pub(crate) struct ExplainBody {
 
 /// `POST /{ds}/sparql/explain` (C18 §6.6.6) on this thread: `on` receives the `plan`,
 /// `notes` and `explanation` events, and `usage` when a model was called. An error
-/// before the plan is returned. One after it is sent as an `error` event.
+/// before the plan is returned. One after it is sent as an `error` event. Returns how
+/// deeply the plan nests, the stack depth a caller that keeps an event needs to write
+/// and drop it.
 pub(crate) fn sparql_explain(
     server: &McpServer,
     call: &Call,
     b: ExplainBody,
     on: &mut dyn FnMut(&str, Value),
-) -> Result<(), ToolError> {
+) -> Result<usize, ToolError> {
     let t = Tools { server, call };
     let started = Instant::now();
     let profile = b.profile.as_deref().unwrap_or("estimate");
@@ -208,64 +218,72 @@ pub(crate) fn sparql_explain(
         timeout_seconds: b.timeout_seconds,
         ..Default::default()
     };
-    let core = t.explain_core(&ea, given)?;
-    let ds = t.dataset(ea.dataset.as_deref())?;
-    let kind = core.out["queryType"]
-        .as_str()
-        .unwrap_or("SELECT")
-        .to_string();
-    let (stop, error) = match (&core.stop, &b.error) {
-        (Some(s), _) => (Some(s.clone()), core.error.clone()),
-        (None, Some(e)) if profile == "given" => (explain::Stop::of_error_body(e), Some(e.clone())),
-        _ => (None, core.error.clone()),
-    };
-    let built = explain::build(
-        &core.plan_json,
-        &b.query,
-        &kind,
-        &core.prefixes,
-        stop.as_ref(),
-        error.is_some(),
-    )
-    .map_err(ToolError::bad_argument)?;
-    let mut plan = core.out;
-    plan["profile"] = profile.into();
-    plan["executed"] = built.plan.executed.into();
-    plan["plan"] = core.plan_json;
-    if let Some(s) = &stop {
-        plan["stop"] = serde_json::to_value(s).unwrap_or_default();
-    }
-    if let Some(e) = &error {
-        plan["error"] = e.clone();
-    }
-    if let Some(br) = call.principal.branch.as_deref() {
-        plan["branch"] = br.into();
-    }
-    on("plan", plan);
-    on(
-        "notes",
-        json!({
-            "nodes": built.plan.facts_json(),
-            "notes": built.notes,
-            "shownNotes": explain::SHOWN_NOTES.min(built.notes.len()),
-            "hiddenEstimates": built.plan.hidden,
-        }),
-    );
-    let st = &server.state;
-    let settings = crate::assistant::settings(st, &ds);
-    let describe =
-        b.describe.unwrap_or(settings.enabled && settings.explain) && st.models().is_some();
-    let w = if describe {
-        t.explain_with_model(&ds, &b.query, &built, stop.as_ref(), started)
-    } else {
-        None
-    };
-    on(
-        "explanation",
-        model::explanation(&built.asks, &built.notes, w.as_ref()),
-    );
-    if let Some(w) = &w {
-        on("usage", w.usage());
-    }
-    Ok(())
+    let core = t.explain_core(&ea, given, true)?;
+    let depth = core.depth;
+    // the JSON form of the plan nests twice as deep as the plan, and reading, cloning,
+    // writing and dropping it recurse
+    sparkles::sparql::depth::with_stack(depth, move || {
+        let ds = t.dataset(ea.dataset.as_deref())?;
+        let kind = core.out["queryType"]
+            .as_str()
+            .unwrap_or("SELECT")
+            .to_string();
+        let (stop, error) = match (&core.stop, &b.error) {
+            (Some(s), _) => (Some(s.clone()), core.error.clone()),
+            (None, Some(e)) if profile == "given" => {
+                (explain::Stop::of_error_body(e), Some(e.clone()))
+            }
+            _ => (None, core.error.clone()),
+        };
+        let built = explain::build(
+            &core.plan_json,
+            &b.query,
+            &kind,
+            &core.prefixes,
+            stop.as_ref(),
+            error.is_some(),
+        )
+        .map_err(ToolError::bad_argument)?;
+        let mut plan = core.out;
+        plan["profile"] = profile.into();
+        plan["executed"] = built.plan.executed.into();
+        plan["plan"] = core.plan_json;
+        if let Some(s) = &stop {
+            plan["stop"] = serde_json::to_value(s).unwrap_or_default();
+        }
+        if let Some(e) = &error {
+            plan["error"] = e.clone();
+        }
+        if let Some(br) = call.principal.branch.as_deref() {
+            plan["branch"] = br.into();
+        }
+        on("plan", plan);
+        on(
+            "notes",
+            json!({
+                "nodes": built.plan.facts_json(),
+                "notes": built.notes,
+                "shownNotes": explain::SHOWN_NOTES.min(built.notes.len()),
+                "hiddenEstimates": built.plan.hidden,
+            }),
+        );
+        let st = &server.state;
+        let settings = crate::assistant::settings(st, &ds);
+        let describe =
+            b.describe.unwrap_or(settings.enabled && settings.explain) && st.models().is_some();
+        let w = if describe {
+            t.explain_with_model(&ds, &b.query, &built, stop.as_ref(), started)
+        } else {
+            None
+        };
+        on(
+            "explanation",
+            model::explanation(&built.asks, &built.notes, w.as_ref()),
+        );
+        if let Some(w) = &w {
+            on("usage", w.usage());
+        }
+        Ok(())
+    })?;
+    Ok(depth)
 }

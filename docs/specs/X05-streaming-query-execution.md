@@ -936,3 +936,36 @@ the rest are sketched here.
   estimate exceeds half the memory budget, and retries an eager query that fails its
   budget before output as a cursor with spill. Each widening needs the matched
   measurements of §10.
+
+### Large basic graph patterns
+
+[ROADMAP](../ROADMAP.md) item 84. The planner joins the triple patterns of a basic graph
+pattern into a binary join tree with a join and a sort for each pattern, and the planner,
+the executor and the plan description all recurse through it. A query is refused when its
+plan would nest deeper than 4000 levels, as the
+[nesting limits](../API.md#nesting-limits) describe, so a basic graph pattern holds at
+most 1998 triple patterns. Below that limit, planning time grows with the square of the
+number of triple patterns. The ignored test `large_bgp_planning_time` in
+`crates/sparkles/tests/nesting.rs` measures `explain` on chains of triple patterns in a
+release build. A chain of 500 plans in 70 ms and writes 3.5 MB of plan JSON, a chain of
+1000 takes 197 ms and 13.4 MB, and a chain of 1998 at the limit takes 1.1 s and 53.7 MB.
+The JSON grows with the square of the depth because each node is named by its path from
+the root. An n-ary join over all the triple patterns of a basic graph pattern, built and
+run iteratively, would make planning close to linear and the plan flat. The limit could
+then rise, or count only the levels that still nest.
+
+The rest of item 84 is work that makes the limit less important. A release build
+explains a plain chain of 1998 in 1.3 to 1.7 s, a tree of 1998 or a MINUS after each of
+790 patterns in 2.8 s, a BIND after each of 790 patterns in 6.9 s and an OPTIONAL after
+each of them in 7.6 s. Most of these shapes observe the timeout during planning, because
+the greedy order calls `ctx.check()`, but a plain chain and its reverse do not. Every
+planning loop, including `joinorder::order` and the candidate loop of the greedy order,
+needs a deadline check, and the candidates should be built without cloning both subtrees. The
+plan JSON for `/{ds}/explain`, the Sparkles result format and its error body should be
+linear in size, by compact node ids or a node cap with a truncation flag. The explanation
+reader in `crates/sparkles-server/src/explain/mod.rs` should be iterative so that its
+256-level limit can rise. A parsed query that the nesting check refuses should be dropped
+without recursion, and the planner and executor could grow the stack at their recursion
+points or use an iterative clone and drop for plan nodes, so that the stack no longer
+depends on the count of the walk. The command-line plan printers are recursive too, but
+no request reaches them.

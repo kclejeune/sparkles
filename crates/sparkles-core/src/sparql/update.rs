@@ -450,7 +450,9 @@ fn run_op(
             }
             let pattern = super::rdfs::apply(&ctx, pattern);
             let node = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new())?;
-            let executed = super::exec::execute(&ctx, &node);
+            let plan_depth = super::depth::check_plan(node.depth())?;
+            let executed =
+                super::depth::with_stack(plan_depth, || super::exec::execute(&ctx, &node));
             if let Err(error) = &executed
                 && ctx.calls_extensions
             {

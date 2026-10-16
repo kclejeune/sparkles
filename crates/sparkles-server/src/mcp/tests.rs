@@ -1489,6 +1489,104 @@ async fn deep_nesting_is_a_syntax_error() {
     }
 }
 
+/// A basic graph pattern counts two plan levels per triple pattern. At the plan limit the
+/// tools explain it on these small stacks, and one more triple pattern is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_explain_output_schema_names_the_truncation_flag() {
+    let mut c = Client::start(fixture_server());
+    let r = c.request(2, "tools/list", json!({"_meta": m()})).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let tool = tools.iter().find(|t| t["name"] == "explain_query").unwrap();
+    let flag = &tool["outputSchema"]["properties"]["planTruncated"];
+    assert_eq!(flag["type"], "boolean", "{flag}");
+    let required = tool["outputSchema"]["required"].as_array().unwrap();
+    assert!(!required.contains(&json!("planTruncated")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_basic_graph_pattern_at_the_plan_limit() {
+    use sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    let mut c = Client::start(fixture_server());
+    let bgp = |n: usize| format!("SELECT * WHERE {{ {}}}", "?s a ?o . ".repeat(n));
+    // the projection and the group are plan levels too
+    let n = (MAX_PLAN_DEPTH - 3) / 2;
+    let s = c
+        .structured("explain_query", json!({"query": bgp(n)}))
+        .await;
+    // a join and a scan for each triple pattern make a plan text of about 16 MB, which is
+    // cut at the size of a tool result
+    let max = McpConfig::default().max_bytes;
+    let text = s["plan"].as_str().unwrap();
+    let last = text.lines().last().unwrap();
+    // (it stops at the first line end past the cap, and ends with the marker)
+    let longest = text.lines().map(str::len).max().unwrap();
+    assert!(
+        text.len() <= max + longest + last.len() + 2,
+        "{}",
+        text.len()
+    );
+    assert!(
+        last.starts_with("… ") && last.ends_with(" more operators not shown"),
+        "{last}"
+    );
+    assert_eq!(s["planTruncated"], true, "{}", text.len());
+    // a plan under the cap is written whole
+    let s = c
+        .structured("explain_query", json!({"query": bgp(20)}))
+        .await;
+    assert_eq!(s["plan"].as_str().unwrap().lines().count(), 40, "{s}");
+    assert!(s.get("planTruncated").is_none(), "{s}");
+    // the notes read plans of up to 256 levels, and a run's deeper plan is refused
+    let args = json!({"query": bgp(n), "notes": true, "profile": "run"});
+    let (t, e) = c.error("explain_query", args).await;
+    assert!(t.contains("the plan nests deeper than 256 levels"), "{t}");
+    assert_eq!(e, json!({"code": "bad-argument", "status": 400}));
+    let s = c
+        .structured("check_query", json!({"query": bgp(n), "explain": true}))
+        .await;
+    assert_eq!(s["ok"], true, "{s}");
+    let limit = format!("query plan nested deeper than {MAX_PLAN_DEPTH} levels");
+    for tool in ["sparql_query", "explain_query"] {
+        let (t, _) = c.error(tool, json!({"query": bgp(n + 1)})).await;
+        assert!(t.contains(&limit), "{tool}: {t}");
+    }
+}
+
+/// The notes read plans of up to 256 levels, and a plan over that is refused before the
+/// query runs. The run of this cross product stops at a row budget after about as long as
+/// planning it takes several times over, so a refused call that comes back in under half
+/// of the run's time did not run it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_too_deep_for_the_notes_is_refused_before_it_runs() {
+    let mut c = Client::start(server_with(
+        &[("t", &[&numbers(3000)])],
+        McpConfig::default(),
+    ));
+    let patterns: String = (0..300)
+        .map(|i| format!("?s{i} ex:v ?v{i} . "))
+        .collect::<String>();
+    let query = format!("SELECT * WHERE {{ {patterns}}}");
+    // the run without notes, which has no limit on the plan's depth
+    let s = c
+        .structured(
+            "explain_query",
+            json!({"query": query, "profile": "run", "timeoutSeconds": 20}),
+        )
+        .await;
+    assert_eq!(s["error"]["budget"], "rows", "{s}");
+    let run_ms = s["elapsedMs"].as_f64().unwrap();
+    let args = json!({"query": query, "notes": true, "profile": "run", "timeoutSeconds": 20});
+    let started = Instant::now();
+    let (t, e) = c.error("explain_query", args).await;
+    assert!(t.contains("the plan nests deeper than 256 levels"), "{t}");
+    assert_eq!(e, json!({"code": "bad-argument", "status": 400}));
+    let refused_ms = started.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        refused_ms < run_ms / 2.0,
+        "refused after {refused_ms} ms, a run takes {run_ms} ms"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a11_timeout() {
     let mut c = Client::start(server_with(

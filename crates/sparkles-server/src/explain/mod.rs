@@ -21,7 +21,7 @@ use serde_json::Value;
 /// The most nodes a plan given to `/{ds}/sparql/explain` may have.
 pub const MAX_NODES: usize = 10_000;
 /// The deepest a given plan may nest.
-const MAX_DEPTH: usize = 256;
+pub const MAX_DEPTH: usize = 256;
 /// The most notes shown before **More** (§6.6.2). The rest follow in order.
 pub const SHOWN_NOTES: usize = 12;
 
@@ -156,6 +156,26 @@ impl Plan {
     }
 }
 
+/// Whether the engine's plan is within the limits that [`build`] reads a plan by, so that a
+/// caller can refuse a plan before it spends a run on it. It gives the messages of the
+/// reader.
+pub fn fits(plan: &sparkles::sparql::PlanInfo) -> Result<(), String> {
+    // the reader counts the root at depth 0 and refuses a node past `MAX_DEPTH`
+    if plan.depth() > MAX_DEPTH + 1 {
+        return Err(format!("the plan nests deeper than {MAX_DEPTH} levels"));
+    }
+    let mut nodes = 0;
+    let mut todo = vec![plan];
+    while let Some(n) = todo.pop() {
+        nodes += 1;
+        if nodes > MAX_NODES {
+            return Err(format!("the plan has more than {MAX_NODES} nodes"));
+        }
+        todo.extend(&n.children);
+    }
+    Ok(())
+}
+
 fn number(v: &Value) -> Option<f64> {
     v.as_f64().filter(|x| x.is_finite())
 }
@@ -238,11 +258,11 @@ fn read_node(
         parent,
         full_description: full,
     });
+    // borrowed: a copy at each level would copy the subtree once per level above it
     let kids = o
         .get("children")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map_or(&[][..], Vec::as_slice);
     let mut child_ids = Vec::with_capacity(kids.len());
     let mut child_ms = 0.0;
     for (i, c) in kids.iter().enumerate() {

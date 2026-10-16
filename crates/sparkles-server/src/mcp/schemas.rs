@@ -313,7 +313,9 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
             Some(
                 json!({"type":"object","required":["dataset","commit","queryType","estimatedRows","plan","warnings"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"queryType":{"type":"string"},
-                "estimatedRows":{"type":["integer","null"]},"plan":{"type":"string"},"algebra":{"type":"string"},
+                "estimatedRows":{"type":["integer","null"]},"plan":{"type":"string"},
+                "planTruncated":{"type":"boolean","description":"true when plan was cut at --mcp-max-bytes; absent otherwise"},
+                "algebra":{"type":"string"},
                 "warnings":{"type":"array","items":{"type":"object","required":["code","message"],"properties":{
                     "code":{"type":"string","description":"unknown-term, no-limit, large-estimate, service-disabled, or a code of the planner such as geo-not-pushed"},
                     "message":{"type":"string"}}}},

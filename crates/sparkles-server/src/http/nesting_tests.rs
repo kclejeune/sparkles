@@ -117,6 +117,21 @@ async fn nested_queries_get_a_400() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn describe_iris_get_a_400() {
+    let (_dir, app) = server();
+    let ct = "application/sparql-query";
+    let describe = |n: usize| {
+        format!(
+            "DESCRIBE {} WHERE {{ ?s ?p ?o }}",
+            "<http://ex.org/a> ".repeat(n)
+        )
+    };
+    for path in ["/c/sparql", "/c/explain"] {
+        refused(&send(&app, post(path, ct, describe(100_000))).await, 1024);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn nested_updates_get_a_400() {
     let (_dir, app) = server();
     let ct = "application/sparql-update";
@@ -231,4 +246,132 @@ async fn nested_shex_selectors_get_a_400() {
         .await;
         refused(&r, 256);
     }
+}
+
+/// A query of one basic graph pattern of `n` triple patterns, each of which matches.
+fn bgp(n: usize) -> String {
+    format!(
+        "PREFIX : <http://ex.org/> SELECT * WHERE {{ {}}}",
+        ":a :p :b . ".repeat(n)
+    )
+}
+
+/// A `DELETE WHERE` of `n` triple patterns that match nothing.
+fn delete_where(n: usize) -> String {
+    let mut u = String::from("PREFIX : <http://ex.org/> DELETE WHERE { ");
+    for i in 0..n {
+        u.push_str(&format!(":x :p :o{i} . "));
+    }
+    u.push('}');
+    u
+}
+
+fn plan_refused(r: &Resp) {
+    let limit = sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(
+        r.text()
+            .contains(&format!("query plan nested deeper than {limit} levels")),
+        "{}",
+        r.text()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_basic_graph_pattern_at_the_plan_limit_runs_and_explains() {
+    use sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    let (_dir, app) = server();
+    // each triple pattern is a join and a sort, and the projection and the group are plan
+    // levels too
+    let n = (MAX_PLAN_DEPTH - 3) / 2;
+    let ct = "application/sparql-query";
+    let r = send(&app, post("/c/sparql", ct, bgp(n))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = send(&app, post("/c/explain", ct, bgp(n))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.body.len() > 100 * n, "{}", r.body.len());
+    let explain = Request::post("/c/sparql/explain")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::from(json!({ "query": bgp(n) }).to_string()))
+        .unwrap();
+    // the explanation reads plans of up to 256 levels, and refuses a deeper one cleanly
+    let r = send(&app, explain).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("the plan nests deeper than 256 levels"));
+    let u = delete_where((MAX_PLAN_DEPTH - 2) / 2);
+    let r = send(&app, post("/c/update", "application/sparql-update", u)).await;
+    assert!(r.status.is_success(), "{}", r.text());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_ranges_get_a_400() {
+    let (_dir, app) = server();
+    let q = "SELECT * WHERE { ?s ((<http://ex.org/p>{32}){32}){4} ?o }";
+    for path in ["/c/sparql", "/c/explain"] {
+        let r = send(&app, post(path, "application/sparql-query", q.to_string())).await;
+        plan_refused(&r);
+    }
+    let explain = Request::post("/c/sparql/explain")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::from(json!({ "query": q }).to_string()))
+        .unwrap();
+    plan_refused(&send(&app, explain).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_basic_graph_pattern_past_the_plan_limit_gets_a_400() {
+    use sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    let (_dir, app) = server();
+    let ct = "application/sparql-query";
+    for n in [(MAX_PLAN_DEPTH - 3) / 2 + 1, MAX_PLAN_DEPTH + 1, 100_000] {
+        for path in ["/c/sparql", "/c/explain"] {
+            plan_refused(&send(&app, post(path, ct, bgp(n))).await);
+        }
+    }
+    for n in [(MAX_PLAN_DEPTH - 2) / 2 + 1, MAX_PLAN_DEPTH + 1, 100_000] {
+        let u = delete_where(n);
+        plan_refused(&send(&app, post("/c/update", "application/sparql-update", u)).await);
+    }
+}
+
+/// The JSON of a failed plan nests twice as deep as the plan, and writing it and dropping
+/// it recurse. A debug build needs more stack for that than a 2 MiB thread has.
+#[test]
+fn a_failed_plan_at_the_limit_is_written_on_a_small_stack() {
+    use sparkles::sparql::depth::MAX_PLAN_DEPTH;
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            // built without recursion (`json!` would copy the plan by recursion): each plan
+            // level is an object and an array
+            let mut plan = json!({ "operator": "scan" });
+            for _ in 0..MAX_PLAN_DEPTH {
+                let mut node = serde_json::Map::new();
+                node.insert("operator".into(), "join".into());
+                node.insert("children".into(), serde_json::Value::Array(vec![plan]));
+                plan = serde_json::Value::Object(node);
+            }
+            let mut body = serde_json::Map::new();
+            body.insert("error".into(), "timed out".into());
+            body.insert("plan".into(), plan);
+            let body = serde_json::Value::Object(body);
+            let depth = json_depth(&body);
+            assert!(depth > 2 * MAX_PLAN_DEPTH, "{depth}");
+            let mut resp = ApiError(StatusCode::REQUEST_TIMEOUT, body).into_response();
+            assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+            // the middleware that adds the request id writes the body again
+            add_request_id(&mut resp, Some("r1".into()));
+            let length: usize = resp.headers()[header::CONTENT_LENGTH]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(length > 20 * MAX_PLAN_DEPTH, "{length}");
+            drop(resp);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

@@ -141,11 +141,12 @@ The changes, all in `src/parser.rs` unless noted:
   `error at LINE:COLUMN: nested deeper than 256 levels`. The parser recurses once per
   bracket and overflows a 2 MiB thread stack at a few hundred to a few thousand levels.
   The chains it builds in loops (`a || b || …`, the OPTIONALs of a group, the steps of a
-  path) nest in the algebra, and walking or dropping a chain tens of thousands long
-  overflows the stack too. A stack overflow aborts the process, and every caller in
-  Sparkles, the formatter included, parses untrusted text. This is not a fix for upstream
-  but a guard Sparkles needs: when this copy is dropped, the check must move to the
-  callers.
+  path, the IRIs after `DESCRIBE`) nest in the algebra, and walking or dropping a chain
+  tens of thousands long overflows the stack too. The scan counts the `^` steps of a path
+  inside parentheses as well, because the parser nests `a^b^c` once per step. A stack
+  overflow aborts the process, and every caller in Sparkles, the formatter included,
+  parses untrusted text. This is not a fix for upstream but a guard Sparkles needs: when
+  this copy is dropped, the check must move to the callers.
 
 Upstream Oxigraph (the development version after 0.4.7) has a rewritten parser that
 follows the SPARQL 1.2 grammar rules [123] and [138] and moves an OPTIONAL group's own

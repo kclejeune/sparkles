@@ -488,6 +488,9 @@ pub(super) struct ExplainCore {
     /// the error body of a run that a budget stopped
     pub(super) error: Option<Value>,
     pub(super) prefixes: Vec<(String, String)>,
+    /// How deeply `plan` nests: code that reads the JSON form recursively runs on
+    /// `with_stack` of this depth
+    pub(super) depth: usize,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -1189,10 +1192,15 @@ impl Tools<'_> {
     /// The plan of `explain_query` and `POST /{ds}/sparql/explain` (C18 §6.6, §9.6):
     /// the estimated plan with its warnings, or with `run` the plan of a read-only run,
     /// partial when a budget stopped it, or with `given` the client's plan.
+    ///
+    /// With `explained`, the caller reads the plan by the limits of the explanation, and a
+    /// plan over them is refused before a run starts. Without it, the plan's JSON form is
+    /// not built, since nothing reads it.
     pub(super) fn explain_core(
         &self,
         a: &ExplainArgs,
         given: Option<Value>,
+        explained: bool,
     ) -> Result<ExplainCore, ToolError> {
         query_text(&a.query)?;
         let ds = self.dataset(a.dataset.as_deref())?;
@@ -1238,11 +1246,17 @@ impl Tools<'_> {
                 stop: None,
                 error: None,
                 prefixes: prefix_vec(&prefix_map),
+                // a given plan was parsed, which nests at most 128 levels
+                depth: 0,
             });
         }
         let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let (algebra, plan) =
             sparql::explain(snap.clone(), &a.query, &opts).map_err(|e| ctx.engine(e))?;
+        // refused before the run, which a deeper plan than the notes read would waste
+        if explained {
+            crate::explain::fits(&plan).map_err(ToolError::bad_argument)?;
+        }
         // A caller whose grants or protections hide some data must not learn from the
         // dictionary that a term occurs there, so its terms are looked up in its view.
         let view = self
@@ -1331,7 +1345,8 @@ impl Tools<'_> {
         }
         if !run {
             return Ok(ExplainCore {
-                plan_json: serde_json::to_value(&plan).unwrap_or_default(),
+                plan_json: plan_value(&plan, explained),
+                depth: plan.depth(),
                 plan: Some(plan),
                 out,
                 stop: None,
@@ -1370,7 +1385,8 @@ impl Tools<'_> {
             out["error"] = e.clone();
         }
         Ok(ExplainCore {
-            plan_json: serde_json::to_value(&plan).unwrap_or_default(),
+            plan_json: plan_value(&plan, explained),
+            depth: plan.depth(),
             plan: Some(plan),
             out,
             stop,
@@ -1810,25 +1826,53 @@ fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
     e
 }
 
-/// `<operator> <description> est=<rows> [<columns>]`, two spaces per depth.
-pub(super) fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String) {
-    out.push_str(&"  ".repeat(depth));
-    out.push_str(&p.operator);
-    if !p.description.is_empty() {
-        out.push(' ');
-        out.push_str(&p.description.replace(['\n', '\r'], " "));
+/// The JSON form of `plan` when `explained` says something reads it, else `null`. It nests
+/// twice as deep as the plan, so it is written on a stack that fits that.
+fn plan_value(plan: &PlanInfo, explained: bool) -> Value {
+    if !explained {
+        return Value::Null;
     }
-    // a view restricted by grants sees no estimates (-1)
-    if p.estimated_rows < 0.0 {
-        out.push_str(" est=?");
-    } else {
-        out.push_str(&format!(" est={}", p.estimated_rows.round() as u64));
+    sparkles::sparql::depth::with_stack(plan.depth(), || {
+        serde_json::to_value(plan).unwrap_or_default()
+    })
+}
+
+/// `<operator> <description> est=<rows> [<columns>]`, two spaces per depth. Written
+/// without recursion, since a plan nests up to `MAX_PLAN_DEPTH` levels. The indentation
+/// makes the text grow with the square of the depth, so once `out` holds `max_bytes` the
+/// rest is replaced by a line that counts the operators left, and the result says it cut
+/// the text.
+pub(super) fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String, max_bytes: usize) -> bool {
+    let mut todo = vec![(p, depth)];
+    while let Some((p, depth)) = todo.pop() {
+        if out.len() >= max_bytes {
+            let mut left = 0usize;
+            let mut rest = vec![p];
+            rest.extend(todo.iter().map(|(n, _)| *n));
+            while let Some(n) = rest.pop() {
+                left += 1;
+                rest.extend(&n.children);
+            }
+            out.push_str(&format!("… {left} more operators not shown\n"));
+            return true;
+        }
+        out.push_str(&"  ".repeat(depth));
+        out.push_str(&p.operator);
+        if !p.description.is_empty() {
+            out.push(' ');
+            out.push_str(&p.description.replace(['\n', '\r'], " "));
+        }
+        // a view restricted by grants sees no estimates (-1)
+        if p.estimated_rows < 0.0 {
+            out.push_str(" est=?");
+        } else {
+            out.push_str(&format!(" est={}", p.estimated_rows.round() as u64));
+        }
+        let cols: Vec<String> = p.columns.iter().map(|c| format!("?{c}")).collect();
+        out.push_str(&format!(" [{}]\n", cols.join(" ")));
+        todo.extend(p.children.iter().rev().map(|c| (c, depth + 1)));
     }
-    let cols: Vec<String> = p.columns.iter().map(|c| format!("?{c}")).collect();
-    out.push_str(&format!(" [{}]\n", cols.join(" ")));
-    for c in &p.children {
-        plan_lines(c, depth + 1, out);
-    }
+    false
 }
 
 /// The `no-limit` and `large-estimate` warnings of a query's plan.
@@ -1872,10 +1916,13 @@ pub(super) fn plan_warnings(
 }
 
 fn max_estimate(p: &PlanInfo) -> f64 {
-    p.children
-        .iter()
-        .map(max_estimate)
-        .fold(p.estimated_rows, f64::max)
+    let mut max = p.estimated_rows;
+    let mut todo: Vec<&PlanInfo> = p.children.iter().collect();
+    while let Some(c) = todo.pop() {
+        max = max.max(c.estimated_rows);
+        todo.extend(&c.children);
+    }
+    max
 }
 
 /// A top-level LIMIT (below the projection modifiers).

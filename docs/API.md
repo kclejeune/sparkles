@@ -7614,7 +7614,9 @@ The backup routes add a machine-readable `code` (see
 The SPARQL parser recurses once for each level of nesting, and so do the planner, the
 evaluator and the code that frees a parsed query. A query nested a few thousand levels
 deep would overflow a thread's stack, and a stack overflow ends the whole server process.
-The server refuses such requests with `400` before it parses them. The limits are fixed:
+The server refuses such requests with `400`. It checks the limits on the text before it
+parses the query, and the plan limit on the parsed query and again on the plan that the
+planner builds. The limits are fixed:
 
 * A query or update nests at most 256 brackets deep. Every `(`, `[`, `{`, `<<`, `<<(` and
   `{|` counts, including the parentheses of a function call or a property path, and so
@@ -7625,10 +7627,26 @@ The server refuses such requests with `400` before it parses them. The limits ar
   brackets around it. Chains are the operators of an expression such as
   `?a || ?b || …` or `1 + 2 + …`, the steps and operators of a property path, and the
   elements of a group: OPTIONAL, MINUS, UNION, FILTER, BIND, VALUES, a nested group, or a
-  triple with a property path. The count is made on the text and errs on the high side,
-  so a chain of a little under 1024 elements can already be refused. The error reads
-  `nested deeper than 1024 levels, counting each operator of an expression, step of a
-  property path and element of a group as a level`.
+  triple with a property path. Each IRI after `DESCRIBE` counts as an element too. The
+  count is made on the text and errs on the high side, so a chain of a little under 1024
+  elements can already be refused. The error reads `nested deeper than 1024 levels,
+  counting each operator of an expression, step of a property path, element of a group
+  and IRI after DESCRIBE as a level`.
+* A query or update plan nests at most 4000 levels. The planner joins the triple
+  patterns of a basic graph pattern one after another, so a basic graph pattern of a few
+  thousand triple patterns makes a deep plan without any nesting in the text. Each triple
+  pattern counts as two levels, a join and the sort before it, so a basic graph pattern
+  holds at most 1998 triple patterns. A property path counts its steps the same way. A
+  range such as `<p>{n,m}` unrolls its first n steps into joins, and nested ranges
+  multiply, so `((<p>{32}){32}){4}` makes 4096 steps and is refused. A VALUES block and
+  each filter that the planner places between joins add levels as well. The groups of a
+  query that the planner joins into one plan add up, so a BIND, a subquery or a GRAPH
+  between two basic graph patterns does not reset the count, while the branches of a UNION
+  or OPTIONAL count separately. The count is made on the parsed query before planning, and
+  it errs on the high side, because the plan depends on the statistics. The plan that the
+  planner builds is checked against the same limit before it runs. The error reads `query
+  plan nested deeper than 4000 levels; a basic graph pattern counts two levels per triple
+  pattern`.
 * RDF read from a request body, an upload, a `LOAD` or the shapes of `/{ds}/shacl` nests
   at most 256 triple terms (`<<( … )>>` or `<< … >>`) in Turtle, TriG, N-Triples, N-Quads
   and N3. A JSON-LD document nests at most 256 arrays and objects, and an RDF/XML
@@ -7642,10 +7660,23 @@ The server refuses such requests with `400` before it parses them. The limits ar
   SERVICE error does.
 
 Real queries stay far below these limits. In the W3C SPARQL test suites, no query nests
-more than 5 brackets deep, and the deepest algebra count is 29. Parsing a query at the
-bracket limit takes up to 1.5 MiB of stack, which fits the 2 MiB that Rust, tokio and
-rayon give the threads they start. The server runs requests on threads with 8 MiB
-stacks. The planner and the evaluator size their stack from the parsed query and grow it
+more than 5 brackets deep, and the deepest algebra count is 29.
+
+A basic graph pattern at the plan limit is a chain of about 2000 triple patterns, and
+planning time grows with the square of the number of triple patterns. A release build
+explains a query at the limit in 1.3 to 1.7 s for a plain chain of 1998 triple
+patterns and in 2.8 s for a tree of 1998 or a MINUS after each of 790 patterns. A BIND
+after each of 790 patterns takes 6.9 s and an OPTIONAL after each of them 7.6 s. Most
+of these shapes observe the request's timeout during planning, but a plain chain and
+its reverse do not, so a timeout cannot cut those short. The JSON plan of a query at the
+limit, as `/{ds}/explain` and the Sparkles result format write it, reaches about 60 MB,
+because each node is named by its path from the root. A request body of about 40 KB can
+ask for that. [Roadmap](ROADMAP.md) item 84 covers a deadline in every planning loop
+and a plan that is linear in size.
+
+Parsing a query at the bracket limit takes up to 1.5 MiB of stack, which fits the 2 MiB
+that Rust, tokio and rayon give the threads they start. The server runs requests on
+threads with 8 MiB stacks. The planner and the evaluator size their stack from the parsed query and grow it
 when the thread's stack is too small, so a long chain runs on any thread.
 
 The same limits apply to the MCP tools, SHACL-SPARQL constraints, ShEx SPARQL selectors,
@@ -8776,7 +8807,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `diff_schema` | `from` (a commit, or `time:…` / `snapshot:…`), `to` (the head), `graph`, `reasoning`, `limit` (50, at most 500 entries per list), `timeoutSeconds` | `{dataset, from, to, graph, reasoning, counts, report: [Change], classes: {added: [iri], removed: [iri], changed: [{iri, changes: [Change]}]}, predicates: {…}, truncated, prefixes}`: the [schema diff](#schema-diffs) between two readable states. `404` for a commit beyond the head and `410` for one whose history is gone. |
 | `draft_shapes` | `graph`, `language` (`shacl`\|`shex`), `shapesFormat` (`turtle`\|`shaclc`, for SHACL), `support` (1), `classes` (IRIs), `minInstances` (1), `maxIn` (10), `maxCount` (1), `maxInverse` (10), `closed` (false), `timeoutSeconds` (30). `reasoning` defaults to false here. | `{dataset, commit, graph, support, language, totals, shapes: [{class, shape, instances, properties, constraints, excluding: [{path, component, excluded}]}], shapesFormat?, shacl? \| shex?, shapeMap?}`: the [drafted shapes](#drafted-shapes) of the caller's visible graphs, as SHACL in Turtle or SHACLC, or as ShExC with its shape map. `excluding` lists the constraints that reject existing instances. Nothing is installed. |
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
-| `explain_query` | `query` (required), `includeAlgebra`, `profile`, `notes`, `timeoutSeconds`, `useServerModel` | `{dataset, commit, queryType, estimatedRows, plan, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. With `profile: "run"`, the query runs read-only under `timeoutSeconds` (30 by default), its rows are counted in `rows` without being returned, and a run that a budget stopped is explained from its partial plan with the budget in `error`. With `notes: true`, each line starts with the node id and adds `act=` and `ms=` after a run, and the result adds `nodes`, `notes` and `asks` as `POST /{ds}/sparql/explain` defines them, with `source: "template"`. The tool never calls the server's model providers unless `useServerModel` is `true`, which needs the `serverModels` permission and fails with `server-model-not-allowed` otherwise. Its prose then replaces `asks` and the notes' text with `source: "model"`, and its tokens are charged to the caller. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. For a caller whose graph grants or triple protections hide data, `unknown-term` looks terms up in the caller's view, so a term that occurs only in hidden data is reported as an absent one is. Such a caller sees no estimates, so `estimatedRows` is `null`, the plan shows `est=?`, there is no `large-estimate`, and `no-limit` applies to every query without a LIMIT. |
+| `explain_query` | `query` (required), `includeAlgebra`, `profile`, `notes`, `timeoutSeconds`, `useServerModel` | `{dataset, commit, queryType, estimatedRows, plan, planTruncated?, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. With `profile: "run"`, the query runs read-only under `timeoutSeconds` (30 by default), its rows are counted in `rows` without being returned, and a run that a budget stopped is explained from its partial plan with the budget in `error`. With `notes: true`, each line starts with the node id and adds `act=` and `ms=` after a run, and the result adds `nodes`, `notes` and `asks` as `POST /{ds}/sparql/explain` defines them, with `source: "template"`. The tool never calls the server's model providers unless `useServerModel` is `true`, which needs the `serverModels` permission and fails with `server-model-not-allowed` otherwise. Its prose then replaces `asks` and the notes' text with `source: "model"`, and its tokens are charged to the caller. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. For a caller whose graph grants or triple protections hide data, `unknown-term` looks terms up in the caller's view, so a term that occurs only in hidden data is reported as an absent one is. Such a caller sees no estimates, so `estimatedRows` is `null`, the plan shows `est=?`, there is no `large-estimate`, and `no-limit` applies to every query without a LIMIT. |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`), `mode` (`cbd`\|`scbd`\|`outgoing`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, description?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. With `mode`, `description` is `{mode, triples: ["s p o"], truncated}`: the resource's [DESCRIBE](#describe) in that mode, at most `maxTriples` triples. |
 | `find_paths` | `source` and `target` (IRIs; at least one), `predicates` (≤ 20 IRIs; default all), `algorithm` (`shortest`\|`allShortest`\|`kShortest`\|`all`), `direction` (`forward`\|`backward`\|`both`), `minLength`, `maxLength`, `k`, `limit` (10, ≤ 100), `maxVisited`, `weight` (an IRI), `defaultWeight`, `graph` (`default` or a named graph IRI), `timeoutSeconds` (30) | `{dataset, commit, algorithm, paths: [{source, target, length, cost, edges: ["s p o"]}], limited, edgesTruncated, prefixes}`: a [path search](#path-search) as `SERVICE path:search` runs it. With one end, the paths to or from every node it connects to, at most `limit`. At most 2000 edges are returned in all. A malformed search is `syntax`, with the `path:search` message. |
 | `graph_algorithm` | `algorithm` (required), `projection` (a stored projection) or `predicates` (≤ 20), `direction`, `nodeClasses` and `weight`, `params` (the algorithm's parameters by name), `limit` (20, ≤ 100), `timeoutSeconds` (30) | `{dataset, commit, algorithm, columns, rows: [[…]], limited, summary, prefixes}`: a [graph algorithm](#graph-algorithms) as `SERVICE algo:<name>` runs it, with the best `limit` rows by the algorithm's main measure and the statistics of the run. Numbers are numbers and other terms are compact strings. The tool never writes results back. |
@@ -10088,6 +10119,17 @@ answered.
 A client that sends `Accept: application/json` without `text/event-stream` gets one
 object with the members of `plan` and `notes` and the `explanation` and `usage`
 members.
+
+The notes and the template description read plans of up to 256 levels and 10,000 nodes.
+A query whose plan is larger is refused with `400` and the code `bad-argument` before it
+runs, so a `run` profile does not spend its timeout on it. The `explain_query` tool
+without `notes` and the `/{ds}/explain` endpoint have no such limit. With `notes: true`
+or `useServerModel`, the tool applies the same limits and answers `bad-argument`.
+
+The `explain_query` tool cuts the `plan` text at the size of a tool result, which
+`--mcp-max-bytes` sets. The text then ends with a line that says how many operators are
+not shown, and the result has `planTruncated: true`. The field is absent when the text is
+whole.
 
 Each note has a node id, or `null` for a note on the whole query, a `code`, a
 `severity` (`high`, `warning` or `info`), a sentence, and its `source`.

@@ -21,7 +21,8 @@ pub const MAX_NESTING: usize = 256;
 /// The deepest algebra the parser builds: the nesting of brackets plus, at each level, one
 /// level per operator of an expression chain (`||`, `&&`, `+`, `-`, `*`, `/`), per step or
 /// operator of a property path, and per element of a group graph pattern (a nested group,
-/// OPTIONAL, MINUS, UNION, FILTER, BIND, VALUES, a triple with a property path).
+/// OPTIONAL, MINUS, UNION, FILTER, BIND, VALUES, a triple with a property path) and per
+/// IRI after `DESCRIBE`.
 pub const MAX_DEPTH: usize = 1024;
 
 /// How deeply a text nests, as [`measure`] counts it.
@@ -97,6 +98,9 @@ struct Scanner<'a> {
     data_next: bool,
     /// a `VALUES` at this level waits for its `{`
     values_at: Option<usize>,
+    /// at the top level between `DESCRIBE` and its `WHERE`, `FROM` or `{`: each IRI is one
+    /// more element of a chain, since the parser makes a join of one for each of them
+    describe: bool,
     found: Nesting,
 }
 
@@ -121,6 +125,7 @@ impl<'a> Scanner<'a> {
             bangs: 0,
             data_next: false,
             values_at: None,
+            describe: false,
             found: Nesting::default(),
         }
     }
@@ -168,6 +173,7 @@ impl<'a> Scanner<'a> {
                 Some(end) => {
                     self.i = end;
                     self.callee();
+                    self.describe_item()?;
                 }
                 None => {
                     // `<` or `<=`
@@ -210,8 +216,9 @@ impl<'a> Scanner<'a> {
                 self.i += 2;
                 self.operand();
             }
-            // an inverse path
-            b'^' => self.operator(1, false, true)?,
+            // an inverse path, whose steps the parser nests inside parentheses too (a lone
+            // `^` cannot be an operator of an expression)
+            b'^' => self.operator(1, true, true)?,
             // in an expression an operator (a sign too: `?a -1` is a subtraction); in a
             // triple a step or modifier of a property path
             b'+' | b'*' | b'/' => self.operator(1, true, true)?,
@@ -252,8 +259,8 @@ impl<'a> Scanner<'a> {
                 self.trailing_dots();
                 self.operand();
             }
-            b':' | b'_' => self.name(),
-            c if c.is_ascii_alphabetic() || c >= 0x80 => self.name(),
+            b':' | b'_' => self.name()?,
+            c if c.is_ascii_alphabetic() || c >= 0x80 => self.name()?,
             b';' if self.levels.len() == 1 => {
                 // the end of an update operation
                 self.i += 1;
@@ -275,7 +282,7 @@ impl<'a> Scanner<'a> {
 
     /// A keyword, a function name, `a`, `true`, or a prefixed name. `-` and `.` belong to
     /// a name only up to its `:` or after it: `true-1` is `true` and `-1`.
-    fn name(&mut self) {
+    fn name(&mut self) -> Result<(), TooDeep> {
         let start = self.i;
         let mut j = self.i;
         while self.is_name_char(self.at(j)) {
@@ -294,8 +301,12 @@ impl<'a> Scanner<'a> {
                 self.data_next = true;
             } else if word.eq_ignore_ascii_case("VALUES") {
                 self.values_at = Some(self.levels.len());
+            } else if word.eq_ignore_ascii_case("DESCRIBE") {
+                self.describe = self.levels.len() == 1;
+            } else if word.eq_ignore_ascii_case("WHERE") || word.eq_ignore_ascii_case("FROM") {
+                self.describe = false;
             }
-            return;
+            return Ok(());
         }
         // a prefixed name; its local part may hold `:`, `%XX` and `\` escapes
         self.i = k + 1;
@@ -311,6 +322,18 @@ impl<'a> Scanner<'a> {
         }
         self.trailing_dots();
         self.callee();
+        self.describe_item()
+    }
+
+    /// An IRI after `DESCRIBE`: the parser joins one `Extend` per IRI, so each is an
+    /// element of a chain like the steps of a path.
+    fn describe_item(&mut self) -> Result<(), TooDeep> {
+        if self.describe && self.levels.len() == 1 {
+            self.levels[0].chain += 1;
+            self.open_depth += 1;
+            return self.check_depth(self.open_depth);
+        }
+        Ok(())
     }
 
     /// A name does not end with an unescaped `.`: `ex:a.` is `ex:a` and `.`.
@@ -432,7 +455,7 @@ impl<'a> Scanner<'a> {
                 offset: self.i,
                 message: format!(
                     "nested deeper than {} levels, counting each operator of an expression, \
-                     step of a property path and element of a group as a level",
+                     step of a property path, element of a group and IRI after DESCRIBE as a level",
                     self.max_depth
                 ),
             });
@@ -484,6 +507,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn open(&mut self, kind: Kind, len: usize) -> Result<(), TooDeep> {
+        self.describe = false;
         let parent = self.top();
         // a nested group, FILTER or BIND, a collection or a parenthesized path in a group is
         // one more element of the group's chain

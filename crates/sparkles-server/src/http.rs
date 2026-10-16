@@ -411,8 +411,41 @@ async fn authority_host(mut req: axum::extract::Request) -> axum::extract::Reque
 
 pub struct ApiError(StatusCode, J);
 
+/// How deeply a JSON value nests, counted without recursion.
+pub(crate) fn json_depth(v: &J) -> usize {
+    let mut deepest = 0;
+    let mut todo = vec![(v, 1)];
+    while let Some((v, d)) = todo.pop() {
+        deepest = deepest.max(d);
+        match v {
+            J::Array(a) => todo.extend(a.iter().map(|c| (c, d + 1))),
+            J::Object(o) => todo.extend(o.values().map(|c| (c, d + 1))),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// The stack levels that writing and dropping the plan in an error body need, or `None`
+/// for a body without a plan. A JSON value nests about twice as deep as the plan it
+/// describes, and the stack allowance per level covers that.
+fn plan_stack(body: &J) -> Option<usize> {
+    body.get("plan").map(|_| json_depth(body))
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // the body of a failed query holds its plan, which is written and dropped by
+        // recursion
+        match plan_stack(&self.1) {
+            Some(depth) => sparkles::sparql::depth::with_stack(depth, || self.respond()),
+            None => self.respond(),
+        }
+    }
+}
+
+impl ApiError {
+    fn respond(self) -> Response {
         // engine errors with an outcome of their own have their own status codes (see
         // `From<Error>`): 408 timeout, 503 cancelled, 507 with a `budget` field
         let budget = self
@@ -607,11 +640,24 @@ async fn restoring_guard(
 /// Put `requestId` into a response's [`ErrorJson`] body (also used by the auth layer,
 /// which answers outside [`error_request_id`]).
 pub(crate) fn add_request_id(resp: &mut Response, id: Option<String>) {
-    if let (Some(ErrorJson(mut body)), Some(id)) = (resp.extensions_mut().remove(), id)
-        && let Some(obj) = body.as_object_mut()
-    {
+    let Some(ErrorJson(body)) = resp.extensions_mut().remove() else {
+        return;
+    };
+    // the body of a failed query holds its plan, which is written and dropped by recursion
+    let stack = plan_stack(&body);
+    let write = move || {
+        let mut body = body;
+        let (Some(id), Some(obj)) = (id, body.as_object_mut()) else {
+            return None;
+        };
         obj.insert("requestId".into(), id.into());
-        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        Some(serde_json::to_vec(&body).unwrap_or_default())
+    };
+    let bytes = match stack {
+        Some(depth) => sparkles::sparql::depth::with_stack(depth, write),
+        None => write(),
+    };
+    if let Some(bytes) = bytes {
         resp.headers_mut()
             .insert(header::CONTENT_LENGTH, bytes.len().into());
         *resp.body_mut() = axum::body::Body::from(bytes);
@@ -1350,10 +1396,11 @@ pub(crate) async fn run_query(
                 Err(f) => {
                     let mut e: ApiError = f.error.into();
                     if failed_plan && let (Some(plan), Some(body)) = (f.plan, e.1.as_object_mut()) {
-                        body.insert(
-                            "plan".into(),
-                            serde_json::to_value(&plan).unwrap_or_default(),
-                        );
+                        // writing the plan and dropping it recurse as deep as the plan
+                        let value = sparkles::sparql::depth::with_stack(plan.depth(), move || {
+                            serde_json::to_value(&plan).unwrap_or_default()
+                        });
+                        body.insert("plan".into(), value);
                         body.insert("commit".into(), seq.into());
                     }
                     return Err(e);
@@ -2275,11 +2322,12 @@ async fn explain(
         let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
         let seq = snap.commit;
         let (algebra, plan) = sparkles::sparql::explain(snap, &query, &opts)?;
-        let resp = with_commit(
-            Json(json!({ "algebra": algebra, "plan": plan })).into_response(),
-            &ds,
-            seq,
-        );
+        // the JSON value of a plan nests twice as deep as the plan, and writing and
+        // dropping it recurse
+        let body = sparkles::sparql::depth::with_stack(plan.depth(), move || {
+            Json(json!({ "algebra": algebra, "plan": plan })).into_response()
+        });
+        let resp = with_commit(body, &ds, seq);
         Ok(history::history_headers(resp, resolved.as_ref(), &uri))
     })
     .await

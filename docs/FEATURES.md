@@ -257,6 +257,14 @@ that work by priority and links each item to its design spec.
   eagerly. Operator state is never spilled to disk, so a query whose state outgrows its
   budget fails. There is no FSST vocabulary compression, IRI encoding, pattern trick,
   pinned results, materialized views or live query monitoring. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40.
+* **Large basic graph patterns.** A query whose plan would nest deeper than 4000 levels
+  is refused. A basic graph pattern counts two levels per triple pattern, so it holds at
+  most 1998 of them, and a path range counts its unrolled steps, multiplied through
+  nested ranges. The [nesting limits](API.md#nesting-limits) give the rules. Planning
+  time grows with the square of the number of triple patterns, so a basic graph pattern at
+  the limit takes 1.3 to 1.7 s to plan in a release build, and shapes that mix OPTIONAL
+  or BIND with the chain take up to 7.6 s. Most shapes observe the timeout during
+  planning, but a plain chain does not. [Roadmap](ROADMAP.md) item 84.
 * **Query memory pool.** A SERVICE call from a query to the same server is admitted like
   any request, so it waits behind its caller's grant and answers `503` after the
   admission wait, which `SILENT` turns into no rows. MCP tool calls are not admitted, so
