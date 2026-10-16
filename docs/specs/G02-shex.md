@@ -1869,7 +1869,8 @@ against a clone of shexTest too.
   part, matches the triple expression of each part against its own arcs, and checks the
   other conjuncts of an ancestor against the arcs of the part and of its ancestors. An
   arc that no part takes may remain only when the extending shape lists its predicate
-  in `EXTRA` and the arc satisfies no triple constraint on it. `CLOSED` forbids an
+  in `EXTRA` and the arc satisfies no triple constraint on it. When the typing is not yet
+  known for the arc's value, leaving the arc over is undecided and not a success. `CLOSED` forbids an
   outgoing arc that no part can match. The search spends the `max_partitions` budget
   once per candidate assignment, and running out of it is an error, never a false
   result. Failures of an extending shape are reported as one `NoMatch`.

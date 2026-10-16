@@ -7,6 +7,8 @@
 //! remainder: an outgoing arc that no triple constraint of any part has a predicate for
 //! is forbidden when the extending shape is CLOSED, and an arc that a constraint could
 //! match is left over only for an EXTRA predicate that no constraint matches for sure.
+//! Leaving such an arc over is itself undecided, because it is only valid when the arc does
+//! not match, so every partition that does so is at best `Unknown`.
 //!
 //! The partitions are searched depth first over the arcs that have a choice, each leaf
 //! charged to the partition budget. A leaf is a conjunction of readings of the typing, so
@@ -336,7 +338,7 @@ impl Cx<'_, '_, '_> {
                     st.assign[p].pop();
                     res = res.or(r?);
                 }
-                Opt::Remainder => res = res.or(self.dfs(st, i + 1)?),
+                Opt::Remainder => res = res.or(self.dfs(st, i + 1)?.and(Tri::Unknown)),
             }
             if res == Tri::True {
                 break;

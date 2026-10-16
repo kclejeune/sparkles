@@ -300,3 +300,23 @@ fn schema_checks() {
     // a reference to an abstract shape with a concrete descendant is fine
     compile("ABSTRACT ex:A { ex:p . }\nex:B EXTENDS @ex:A { }\nex:C { ex:q @ex:A }").unwrap();
 }
+
+/// An EXTRA arc whose value's typing is still unknown may only stay unmatched if it
+/// does not match, so leaving it over must not be read as a sure success.
+#[test]
+fn an_undecided_extra_arc_is_not_left_over_for_sure() {
+    let schema = "ex:T { ex:r . }
+                  ex:Base { ex:p @ex:T ? }
+                  ex:Child EXTENDS @ex:Base EXTRA ex:p { ex:q . }";
+    let data = r#"
+        ex:n ex:p ex:v1, ex:v2 ; ex:q 1 .
+        ex:v1 ex:r 1 .
+        ex:v2 ex:r 2 ."#;
+    // both p values conform to T, Base takes at most one, and a matching arc cannot
+    // be left over even with EXTRA
+    assert_eq!(check(schema, data, &[("n", "Child")]), [false]);
+    // the same shape without a reference (the typing is never unknown) already fails
+    let plain = "ex:Base { ex:p . ? }
+                 ex:Child EXTENDS @ex:Base EXTRA ex:p { ex:q . }";
+    assert_eq!(check(plain, data, &[("n", "Child")]), [false]);
+}
