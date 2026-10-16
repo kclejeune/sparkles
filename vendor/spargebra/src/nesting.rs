@@ -216,8 +216,9 @@ impl<'a> Scanner<'a> {
                 self.i += 2;
                 self.operand();
             }
-            // an inverse path
-            b'^' => self.operator(1, false, true)?,
+            // an inverse path, whose steps the parser nests inside parentheses too (a lone
+            // `^` cannot be an operator of an expression)
+            b'^' => self.operator(1, true, true)?,
             // in an expression an operator (a sign too: `?a -1` is a subtraction); in a
             // triple a step or modifier of a property path
             b'+' | b'*' | b'/' => self.operator(1, true, true)?,

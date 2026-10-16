@@ -140,6 +140,10 @@ fn chained_queries(k: usize) -> Vec<(&'static str, String)> {
             format!("SELECT * {{ ?s <urn:p>{} ?o }}", r("/<urn:p>", k)),
         ),
         (
+            "inverse steps in parentheses",
+            format!("SELECT * {{ ?s (<urn:p>{}) ?o }}", r("^<urn:p>", k)),
+        ),
+        (
             "path triples",
             format!("SELECT * {{ ?s ?p ?o . {} }}", r("?s <urn:p>* ?o . ", k)),
         ),
@@ -254,6 +258,35 @@ fn chains_are_refused_past_the_limit() {
         ds.query(&binds(1000)).unwrap();
         refused(ds.query(&binds(2000)), "binds", MAX_DEPTH);
     });
+}
+
+#[test]
+fn inverse_steps_in_parentheses_are_refused_not_overflowed() {
+    // the parser builds `a^b^c` as a sequence nested once per step, and it overflowed
+    // an 8 MiB stack at 20,000 steps
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(|| {
+            let ds = dataset();
+            let step = "^<urn:p>";
+            for k in [20_000, 300_000] {
+                let bare = format!("SELECT * {{ ?s (<urn:p>{}) ?o }}", rep(step, k));
+                let optional = format!(
+                    "SELECT * {{ ?s ?p ?o OPTIONAL {{ ?s (<urn:p>{}) ?o }} }}",
+                    rep(step, k)
+                );
+                for q in [bare, optional] {
+                    assert!(measure(&q).depth > MAX_DEPTH, "{k}");
+                    refused(ds.query(&q), "inverse steps", MAX_DEPTH);
+                }
+            }
+            // a few steps still run
+            ds.query("SELECT * { ?s (<urn:p>^<urn:p>^<urn:p>) ?o }")
+                .unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]
