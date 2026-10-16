@@ -640,7 +640,10 @@ it keep their alignment. Every reader that steps through records at multiples of
 from the start of the log, and every saved position of byte 0 meaning "before the first
 commit" (the history index, branch link segments, the backward replay), works unchanged
 by skipping the record where the log starts. A log without the header is version 0 and
-reads as before. Existing logs are never rewritten. The header arrives with the next
+reads as before. Readers of the log header and of a generation's `meta.json` take the
+version before anything else and refuse an unknown one as `Unsupported`, so a newer
+release may use the header's trailing bytes or give `meta.json` another shape, and the
+catalog still refuses only that dataset. Existing logs are never rewritten. The header arrives with the next
 generation, at a compaction, a bulk load, a branch or a clone. Because an older release
 would read the header as a damaged record and could truncate the log as a torn tail,
 `dataset.json` gains reader capability 5 (`DATASET_READER`), and a store raises

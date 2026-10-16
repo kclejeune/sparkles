@@ -201,15 +201,9 @@ impl Generation {
     }
 
     fn open_with(dir: &Path, name: &str, dvocab: DeltaVocab) -> Result<Generation> {
-        let meta: IndexMeta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
-            .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
         // the database's directory holds the generation (a branch's holds its own)
-        let written_by = || dir.parent().and_then(commit::read_written_by);
-        crate::formats::INDEX.check(
-            &dir.display().to_string(),
-            meta.format_version,
-            written_by().as_deref(),
-        )?;
+        let written_by = dir.parent().and_then(commit::read_written_by);
+        let meta: IndexMeta = crate::builder::read_index_meta(dir, written_by.as_deref())?;
         let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
             .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
         Ok(Generation {

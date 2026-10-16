@@ -241,18 +241,26 @@ fn inspect_store(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) ->
         let gdir = dir.join(&g);
         let rel = format!("{prefix}{g}");
         if let Ok(b) = std::fs::read(gdir.join("meta.json")) {
-            let meta: crate::builder::IndexMeta = serde_json::from_slice(&b)
-                .map_err(|e| Error::Corrupt(format!("{rel}/meta.json: {e}")))?;
-            add(plan, &formats::INDEX, rel.clone(), meta.format_version, by);
+            // only the version: a newer meta may have another shape
+            match crate::builder::index_meta_version(&b, &format!("{rel}/meta.json")) {
+                Ok(v) => add(plan, &formats::INDEX, rel.clone(), v, by),
+                // one damaged generation does not stop the rest of the report
+                Err(e) => plan.refused.push(e.to_string()),
+            }
         }
         let wal = gdir.join("wal.log");
         if wal.exists() {
-            let v = match crate::store::wal::file_version(&wal) {
-                Ok(v) => v,
-                Err(Error::Unsupported(_)) => newer_than(&formats::WAL),
-                Err(e) => return Err(e),
-            };
-            add(plan, &formats::WAL, format!("{rel}/wal.log"), v, by);
+            match crate::store::wal::file_version(&wal) {
+                Ok(v) => add(plan, &formats::WAL, format!("{rel}/wal.log"), v, by),
+                Err(Error::Unsupported(_)) => add(
+                    plan,
+                    &formats::WAL,
+                    format!("{rel}/wal.log"),
+                    newer_than(&formats::WAL),
+                    by,
+                ),
+                Err(e) => plan.refused.push(e.to_string()),
+            }
         }
         let dv = gdir.join("delta.vocab");
         if dv.exists() {

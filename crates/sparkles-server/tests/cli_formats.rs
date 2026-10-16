@@ -335,3 +335,70 @@ fn migrate_check_reports_an_interrupted_run_and_changes_nothing() {
     assert!(v["datasets"][0]["interrupted"].is_null(), "{out}");
     assert!(!stale.exists());
 }
+
+fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p)
+            } else if p.file_name().unwrap() == name {
+                out.push(p)
+            }
+        }
+    }
+    out
+}
+
+/// A newer `meta.json` in a new shape, and a newer log header that uses the bytes after
+/// its version, refuse their datasets alone: the catalog opens, keeps them registered,
+/// and serves the others.
+#[test]
+fn newer_shapes_refuse_only_their_dataset() {
+    let fixture = &fixtures()[0];
+    let tmp = tempfile::tempdir().unwrap();
+    let h = tmp.path();
+    unpack(fixture, h);
+    let data = h.join("data");
+    let d = data.to_str().unwrap();
+    for name in ["logs", "other"] {
+        ok(h, &["dataset", "create", "--data-dir", d, name]);
+    }
+    let dbs = data.join("databases");
+    // books: every meta.json at version 3 without `created`
+    for p in files_named(&dbs.join("books"), "meta.json") {
+        let mut m: J = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        m["format_version"] = 3.into();
+        m.as_object_mut().unwrap().remove("created");
+        std::fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
+    }
+    // logs: every headered log at version 2 with a flag after the version
+    let wals: Vec<_> = files_named(&dbs.join("logs"), "wal.log")
+        .into_iter()
+        .filter(|p| std::fs::read(p).unwrap().first() == Some(&0x89))
+        .collect();
+    assert!(!wals.is_empty(), "no headered log in a new dataset");
+    for p in wals {
+        let mut b = std::fs::read(&p).unwrap();
+        b[8..12].copy_from_slice(&2u32.to_le_bytes());
+        b[12] = 1;
+        std::fs::write(&p, b).unwrap();
+    }
+
+    let o = sparkles(h, &["migrate", "--data", d, "--check", "--format", "json"]);
+    assert_eq!(o.status.code(), Some(1));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("newer release"), "{out}");
+
+    let list = ok(h, &["dataset", "list", "--data-dir", d, "--format", "json"]);
+    assert!(list.contains("\"other\""), "{list}");
+    assert!(!list.contains("\"books\""), "{list}");
+    assert!(!list.contains("\"logs\""), "{list}");
+    let config = std::fs::read_to_string(data.join("config.json")).unwrap();
+    assert!(
+        config.contains("books") && config.contains("logs"),
+        "{config}"
+    );
+}
