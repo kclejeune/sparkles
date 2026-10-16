@@ -6638,6 +6638,7 @@ pub(super) fn vector_search(
         counters.insert("rows".into(), i.rows.into());
         counters.insert("scored".into(), i.scored.into());
         counters.insert("overlayInserts".into(), i.inserted.into());
+        counters.insert("overlayPending".into(), i.pending.into());
         counters.insert("overlayDeletes".into(), i.deleted.into());
     }
     if input.is_some() {

@@ -8187,6 +8187,7 @@ export interface components {
             } | null;
             lastBuild?: {
                 at: string;
+                carried?: boolean;
                 ms: number;
                 rows?: number;
             };
@@ -8203,7 +8204,10 @@ export interface components {
             name: string;
             overlay: {
                 deletes: number;
+                indexed: number;
                 inserts: number;
+                overBudget: boolean;
+                pending: number;
             };
             predicate: string;
             progress?: number;

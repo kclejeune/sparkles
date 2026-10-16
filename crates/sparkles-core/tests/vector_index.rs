@@ -543,3 +543,479 @@ fn linked_branches_reuse_immutable_vector_files_with_independent_overlays() {
     work.wait_vector_index("emb").unwrap();
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
+
+/// Rows inserted after the build join the graph in the background: searches then find
+/// them through it, each snapshot sees exactly its own rows, and their scores are the
+/// exact ones.
+#[test]
+fn inserted_rows_join_the_graph() {
+    let all = clustered(6_300, 13);
+    let (vs, rest) = all.split_at(5_000);
+    let (extra, queries) = rest.split_at(1_200);
+    let s = store_with(Store::in_memory(StoreOptions::default()), vs);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    // held: the new rows are scored exactly
+    s.pause_vector_catch_up(true);
+    for (c, chunk) in extra.chunks(200).enumerate() {
+        let rows: Vec<(usize, &Vec<f32>)> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (100_000 + c * 200 + i, v))
+            .collect();
+        load(&s, nt(&rows));
+    }
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!(
+        (st.overlay.inserts, st.overlay.indexed, st.overlay.pending),
+        (1_200, 0, 1_200)
+    );
+    let (_, info) = search(&s.snapshot(), &extra[7], 10, SearchMode::default());
+    assert_eq!(
+        (info.method, info.inserted, info.pending),
+        ("hnsw", 1_200, 1_200)
+    );
+    // released: they join the graph
+    s.pause_vector_catch_up(false);
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(120)));
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!(
+        (st.overlay.inserts, st.overlay.indexed, st.overlay.pending),
+        (1_200, 1_200, 0)
+    );
+    assert_eq!(st.hnsw.unwrap().nodes, 6_200);
+    let snap = s.snapshot();
+    // every inserted row is found for itself through the graph
+    for (i, v) in extra.iter().enumerate().step_by(37) {
+        let (hits, info) = search(&snap, v, 1, SearchMode::default());
+        assert_eq!((info.method, info.pending), ("hnsw", 0));
+        let id = snap.lookup_iri(&format!("urn:n{}", 100_000 + i)).unwrap().0;
+        assert_eq!(hits[0].0, id, "row {i}");
+    }
+    // recall over base and inserted rows, with the exact scores
+    let mut sum = 0.0;
+    for q in queries {
+        let (exact, _) = search(&snap, q, 10, EXACT);
+        let (ann, info) = search(&snap, q, 10, SearchMode::default());
+        assert_eq!(info.method, "hnsw");
+        for a in &ann {
+            if let Some(e) = exact.iter().find(|e| e.0 == a.0) {
+                assert_eq!(a.1.to_bits(), e.1.to_bits());
+            }
+        }
+        sum += recall(&ann, &exact);
+    }
+    let r = sum / queries.len() as f64;
+    assert!(r >= 0.95, "recall@10 with inserted rows: {r}");
+    // a deleted inserted row stays a node that no search returns; the snapshot from
+    // before the delete still finds it
+    let before = s.snapshot();
+    let gone = snap.lookup_iri("urn:n100007").unwrap().0;
+    update(
+        &s,
+        &format!(
+            "DELETE DATA {{ <urn:n100007> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }}",
+            vector::canonical(&extra[7])
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let wide = SearchMode {
+        exact: false,
+        ef: Some(200),
+    };
+    let (hits, info) = search(&s.snapshot(), &extra[7], 10, wide);
+    assert_eq!((info.method, info.pending), ("hnsw", 0));
+    assert!(hits.iter().all(|h| h.0 != gone));
+    let (hits, _) = search(&before, &extra[7], 1, wide);
+    assert_eq!(hits[0].0, gone);
+    // a row inserted later is not seen by the older snapshot, through the graph or not
+    let near: Vec<f32> = (0..DIM)
+        .map(|i| if i % 2 == 0 { 3.0 } else { -3.0 })
+        .collect();
+    load(&s, nt(&[(900_001, &near)]));
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let late = s.snapshot().lookup_iri("urn:n900001").unwrap().0;
+    let (hits, info) = search(&s.snapshot(), &near, 1, SearchMode::default());
+    assert_eq!((hits[0].0, info.pending), (late, 0));
+    let (hits, _) = search(&before, &near, 10, wide);
+    assert!(hits.iter().all(|h| h.0 != late));
+    // the plan counters split the overlay
+    let r = query(
+        s.snapshot(),
+        &format!(
+            "SELECT ?s {{ (?s ?score) <urn:x-sparkles:vectorSearch> (<{EMB}> <urn:n900001> 3) }}"
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let plan = format!("{:?}", r.plan);
+    assert!(plan.contains("overlayPending"), "{plan}");
+}
+
+/// Reopening a store inserts its delta's rows into the graph again.
+#[test]
+fn reopened_stores_catch_up_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let all = clustered(2_300, 17);
+    let (vs, extra) = all.split_at(2_000);
+    let rows: Vec<(usize, &Vec<f32>)> = extra
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (50_000 + i, v))
+        .collect();
+    {
+        let s = store_with(
+            Store::open(dir.path(), StoreOptions::default()).unwrap(),
+            vs,
+        );
+        s.create_vector_index("emb", config(0)).unwrap();
+        s.wait_vector_index("emb").unwrap();
+        load(&s, nt(&rows));
+        assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+        assert_eq!(s.vector_index("emb").unwrap().overlay.indexed, 300);
+    }
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let st = s.wait_vector_index("emb").unwrap();
+    assert!(st.files.unwrap().opened);
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!((st.overlay.indexed, st.overlay.pending), (300, 0));
+    let snap = s.snapshot();
+    let (hits, info) = search(&snap, &extra[5], 1, SearchMode::default());
+    assert_eq!((info.method, info.pending), ("hnsw", 0));
+    assert_eq!(hits[0].0, snap.lookup_iri("urn:n50005").unwrap().0);
+}
+
+/// Mean recall@10 of the default search against the exact one.
+fn mean_recall(snap: &sparkles_core::store::Snapshot, queries: &[Vec<f32>], ef: usize) -> f64 {
+    let mode = SearchMode {
+        exact: false,
+        ef: Some(ef),
+    };
+    let mut sum = 0.0;
+    for q in queries {
+        let (exact, _) = search(snap, q, 10, EXACT);
+        let (ann, info) = search(snap, q, 10, mode);
+        assert_eq!(info.method, "hnsw");
+        sum += recall(&ann, &exact);
+    }
+    sum / queries.len() as f64
+}
+
+/// A compaction that changed few rows carries the graph over before it switches: the
+/// first search after it goes through a graph, deleted rows are gone and new ones are
+/// nodes, the recall matches a full rebuild's, and the carried graph is written to the
+/// new generation's file, which a reopened store maps.
+#[test]
+fn compactions_carry_the_graph_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let all = clustered(6_300, 23);
+    let (vs, rest) = all.split_at(6_000);
+    let (extra, queries) = rest.split_at(100);
+    let s = store_with(
+        Store::open(dir.path(), StoreOptions::default()).unwrap(),
+        vs,
+    );
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    // 1 % of the rows deleted, 100 new ones, part of them in the graph's live layer
+    let mut del = String::new();
+    for i in (0..6_000).step_by(100) {
+        del += &format!(
+            "DELETE DATA {{ <urn:n{i}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }} ;\n",
+            vector::canonical(&vs[i])
+        );
+    }
+    update(&s, del.trim_end_matches(";\n"), &QueryOptions::default()).unwrap();
+    let rows: Vec<(usize, &Vec<f32>)> = extra
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (70_000 + i, v))
+        .collect();
+    load(&s, nt(&rows[..60]));
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    s.pause_vector_catch_up(true);
+    load(&s, nt(&rows[60..]));
+    s.compact().unwrap();
+    s.pause_vector_catch_up(false);
+    // no window of exact scans: the carried index is installed with the switch
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!(st.state, "ready", "{st:?}");
+    assert!(st.last_build.as_ref().unwrap().carried, "{st:?}");
+    assert_eq!((st.rows, st.overlay.inserts), (6_040, 0));
+    assert_eq!(st.hnsw.as_ref().unwrap().nodes, 6_040);
+    let snap = s.snapshot();
+    let (hits, info) = search(&snap, &extra[70], 1, SearchMode::default());
+    assert_eq!((info.method, info.inserted), ("hnsw", 0));
+    assert_eq!(hits[0].0, snap.lookup_iri("urn:n70070").unwrap().0);
+    // a deleted row's subject may have left the vocabulary with it
+    let (hits, _) = search(
+        &snap,
+        &vs[100],
+        10,
+        SearchMode {
+            exact: false,
+            ef: Some(200),
+        },
+    );
+    let n100 = snap.lookup_iri("urn:n100");
+    assert!(n100.is_none_or(|n| hits.iter().all(|h| h.0 != n.0)));
+    let carried = mean_recall(&snap, queries, 64);
+    // the same generation built from scratch
+    s.sequential_vector_builds(false);
+    s.rebuild_vector_index("emb").unwrap();
+    let st = s.wait_vector_index("emb").unwrap();
+    assert!(!st.last_build.as_ref().unwrap().carried);
+    let rebuilt = mean_recall(&s.snapshot(), queries, 64);
+    assert!(
+        carried >= rebuilt - 0.01,
+        "carried {carried}, rebuilt {rebuilt}"
+    );
+    // compact again, carrying the rebuilt graph over unchanged, then reopen: the file
+    // fits the new generation
+    s.compact().unwrap();
+    assert!(s.vector_index("emb").unwrap().last_build.unwrap().carried);
+    drop(s);
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let st = s.wait_vector_index("emb").unwrap();
+    assert!(st.files.as_ref().unwrap().opened, "{st:?}");
+    assert_eq!(st.rows, 6_040);
+    let (_, info) = search(&s.snapshot(), &extra[3], 1, SearchMode::default());
+    assert_eq!(info.method, "hnsw");
+}
+
+/// A compaction that changed many rows, or a graph built with other settings, builds
+/// the graph again.
+#[test]
+fn large_changes_build_the_graph_again() {
+    let all = clustered(3_000, 29);
+    let s = store_with(Store::in_memory(StoreOptions::default()), &all);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    let mut del = String::new();
+    for (i, v) in all.iter().enumerate().take(1_200) {
+        del += &format!(
+            "DELETE DATA {{ <urn:n{i}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }} ;\n",
+            vector::canonical(v)
+        );
+    }
+    update(&s, del.trim_end_matches(";\n"), &QueryOptions::default()).unwrap();
+    s.compact().unwrap();
+    let st = s.wait_vector_index("emb").unwrap();
+    assert_eq!((st.state.as_str(), st.rows), ("ready", 1_800));
+    assert!(!st.last_build.unwrap().carried);
+    let (hits, info) = search(&s.snapshot(), &all[2_000], 1, SearchMode::default());
+    assert_eq!(info.method, "hnsw");
+    assert_eq!(hits[0].0, s.snapshot().lookup_iri("urn:n2000").unwrap().0);
+}
+
+/// A small bulk commit, which switches generations, carries the graph over in its
+/// background build.
+#[test]
+fn bulk_commits_carry_the_graph_over() {
+    let all = clustered(3_050, 31);
+    let (vs, extra) = all.split_at(3_000);
+    let s = store_with(
+        Store::in_memory(StoreOptions {
+            bulk_threshold: 10,
+            ..Default::default()
+        }),
+        vs,
+    );
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    let gen0 = s.snapshot().generation.name.clone();
+    let uid0 = s.snapshot().generation.uid;
+    let rows: Vec<(usize, &Vec<f32>)> = extra
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (80_000 + i, v))
+        .collect();
+    load(&s, nt(&rows));
+    assert_eq!(s.snapshot().generation.name, gen0);
+    assert_ne!(s.snapshot().generation.uid, uid0, "a bulk commit");
+    let st = s.wait_vector_index("emb").unwrap();
+    assert_eq!((st.state.as_str(), st.rows), ("ready", 3_050));
+    assert!(st.last_build.unwrap().carried);
+    let snap = s.snapshot();
+    let (hits, info) = search(&snap, &extra[9], 1, SearchMode::default());
+    assert_eq!(info.method, "hnsw");
+    assert_eq!(hits[0].0, snap.lookup_iri("urn:n80009").unwrap().0);
+}
+
+/// A later operation of one Update request searches the transaction's own view, which
+/// shares the published commit number and row count after a delta vector is replaced.
+/// The replacement row must still be found.
+#[test]
+fn transaction_view_finds_a_replaced_delta_vector() {
+    let all = clustered(2_002, 31);
+    let (vs, extra) = all.split_at(2_000);
+    let s = store_with(Store::in_memory(StoreOptions::default()), vs);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    load(&s, nt(&[(50_000, &extra[0])]));
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!((st.overlay.indexed, st.overlay.pending), (1, 0));
+    // a vector far from every clustered point, so it is the single best hit
+    let far: Vec<f32> = (0..DIM)
+        .map(|i| if i % 2 == 0 { 5.0 } else { -5.0 })
+        .collect();
+    let lit = |v: &[f32]| format!("\"{}\"^^<urn:x-sparkles:vector>", vector::canonical(v));
+    update(
+        &s,
+        &format!(
+            "DELETE DATA {{ <urn:n50000> <{EMB}> {} }} ;\n\
+             INSERT DATA {{ <urn:n50001> <{EMB}> {} }} ;\n\
+             INSERT {{ <urn:found> <urn:is> ?s }} WHERE {{ (?s ?score) <urn:x-sparkles:vectorSearch> (<{EMB}> {} 1) }}",
+            lit(&extra[0]),
+            lit(&far),
+            lit(&far),
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let r = query(
+        s.snapshot(),
+        "ASK { <urn:found> <urn:is> <urn:n50001> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        r.boolean,
+        "the search in the transaction view missed the replacement row"
+    );
+}
+
+/// Control: the same request with catch-up held finds the replacement row.
+#[test]
+fn transaction_view_control_without_catch_up() {
+    let all = clustered(2_002, 31);
+    let (vs, extra) = all.split_at(2_000);
+    let s = store_with(Store::in_memory(StoreOptions::default()), vs);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    s.pause_vector_catch_up(true);
+    load(&s, nt(&[(50_000, &extra[0])]));
+    let far: Vec<f32> = (0..DIM)
+        .map(|i| if i % 2 == 0 { 5.0 } else { -5.0 })
+        .collect();
+    let lit = |v: &[f32]| format!("\"{}\"^^<urn:x-sparkles:vector>", vector::canonical(v));
+    update(
+        &s,
+        &format!(
+            "DELETE DATA {{ <urn:n50000> <{EMB}> {} }} ;\n\
+             INSERT DATA {{ <urn:n50001> <{EMB}> {} }} ;\n\
+             INSERT {{ <urn:found> <urn:is> ?s }} WHERE {{ (?s ?score) <urn:x-sparkles:vectorSearch> (<{EMB}> {} 1) }}",
+            lit(&extra[0]),
+            lit(&far),
+            lit(&far),
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let r = query(
+        s.snapshot(),
+        "ASK { <urn:found> <urn:is> <urn:n50001> }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert!(r.boolean);
+}
+
+/// An index created before its predicate has any row still takes rows inserted later
+/// into its graph, and its status reports them.
+#[test]
+fn indexes_created_before_their_predicate_catch_up() {
+    let vs = clustered(600, 37);
+    let s = Store::in_memory(StoreOptions::default());
+    // a base without the predicate
+    load(&s, "<urn:a> <urn:p> <urn:b> .\n".to_string());
+    s.compact().unwrap();
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    for (c, chunk) in vs.chunks(100).enumerate() {
+        let mut body = String::new();
+        for (i, v) in chunk.iter().enumerate() {
+            body += &format!(
+                "<urn:n{}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> .\n",
+                c * 100 + i,
+                vector::canonical(v)
+            );
+        }
+        update(
+            &s,
+            &format!("INSERT DATA {{ {body} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+    }
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    let (_, info) = search(&s.snapshot(), &vs[7], 10, SearchMode::default());
+    assert_eq!(st.overlay.inserts, 600);
+    assert_eq!(
+        st.overlay.indexed + st.overlay.pending,
+        600,
+        "every inserted row is either indexed or reported pending"
+    );
+    assert_eq!((st.overlay.indexed, st.overlay.pending), (600, 0));
+    assert_eq!((info.method, info.pending), ("hnsw", 0));
+}
+
+/// A compaction that changed too many rows to carry the graph over leaves the full
+/// build to the background after the switch instead of running it on the compaction's
+/// thread. Background builds are held, so the index stays `building` until released.
+#[test]
+fn declined_carries_build_after_the_switch() {
+    let all = clustered(3_000, 43);
+    let s = store_with(Store::in_memory(StoreOptions::default()), &all);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    let mut del = String::new();
+    for (i, v) in all.iter().enumerate().take(1_200) {
+        del += &format!(
+            "DELETE DATA {{ <urn:n{i}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }} ;\n",
+            vector::canonical(v)
+        );
+    }
+    update(&s, del.trim_end_matches(";\n"), &QueryOptions::default()).unwrap();
+    s.pause_vector_builds(true);
+    s.compact().unwrap();
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!(st.state, "building", "{st:?}");
+    let (_, info) = search(&s.snapshot(), &all[2_000], 1, SearchMode::default());
+    assert_eq!(info.method, "exact");
+    s.pause_vector_builds(false);
+    let st = s.wait_vector_index("emb").unwrap();
+    assert_eq!((st.state.as_str(), st.rows), ("ready", 1_800));
+    assert!(!st.last_build.unwrap().carried);
+    let (hits, info) = search(&s.snapshot(), &all[2_000], 1, SearchMode::default());
+    assert_eq!(info.method, "hnsw");
+    assert_eq!(hits[0].0, s.snapshot().lookup_iri("urn:n2000").unwrap().0);
+}
+
+/// A compaction that changed few rows still carries the graph over on its own thread,
+/// so the index is ready at the switch even while background builds are held.
+#[test]
+fn small_carries_stay_on_the_compaction_thread() {
+    let all = clustered(3_000, 47);
+    let s = store_with(Store::in_memory(StoreOptions::default()), &all);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    let mut del = String::new();
+    for i in (0..3_000).step_by(100) {
+        del += &format!(
+            "DELETE DATA {{ <urn:n{i}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }} ;\n",
+            vector::canonical(&all[i])
+        );
+    }
+    update(&s, del.trim_end_matches(";\n"), &QueryOptions::default()).unwrap();
+    s.pause_vector_builds(true);
+    s.compact().unwrap();
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!((st.state.as_str(), st.rows), ("ready", 2_970), "{st:?}");
+    assert!(st.last_build.unwrap().carried);
+    s.pause_vector_builds(false);
+}

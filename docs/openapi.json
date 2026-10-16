@@ -16972,6 +16972,9 @@
               "at": {
                 "type": "string"
               },
+              "carried": {
+                "type": "boolean"
+              },
               "ms": {
                 "type": "number"
               },
@@ -17030,13 +17033,25 @@
               "deletes": {
                 "type": "integer"
               },
+              "indexed": {
+                "type": "integer"
+              },
               "inserts": {
+                "type": "integer"
+              },
+              "overBudget": {
+                "type": "boolean"
+              },
+              "pending": {
                 "type": "integer"
               }
             },
             "required": [
               "inserts",
-              "deletes"
+              "deletes",
+              "indexed",
+              "pending",
+              "overBudget"
             ],
             "type": "object"
           },

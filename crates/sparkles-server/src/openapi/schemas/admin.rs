@@ -513,7 +513,16 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                     "message": string(),
                     "generation": string(),
                     "rows": int(),
-                    "overlay": obj(&["inserts", "deletes"], json!({ "inserts": int(), "deletes": int() })),
+                    "overlay": obj(
+                        &["inserts", "deletes", "indexed", "pending", "overBudget"],
+                        json!({
+                            "inserts": int(),
+                            "deletes": int(),
+                            "indexed": int(),
+                            "pending": int(),
+                            "overBudget": boolean(),
+                        }),
+                    ),
                     "skipped": obj(
                         &["malformed", "wrongDimension", "zeroNorm"],
                         json!({ "malformed": int(), "wrongDimension": int(), "zeroNorm": int() }),
@@ -525,7 +534,10 @@ fn indexes(put: &mut dyn FnMut(&str, J)) {
                     "hnsw": or_null(hnsw),
                     "exactThreshold": int(),
                     "files": obj(&["bytes", "opened"], json!({ "bytes": int(), "opened": boolean() })),
-                    "lastBuild": last_build("rows"),
+                    "lastBuild": obj(
+                        &["at", "ms"],
+                        json!({ "at": string(), "ms": num(), "rows": int(), "carried": boolean() }),
+                    ),
                     "embedding": obj(
                         &["state", "model", "endpoint", "backlog", "appliedSeq", "headSeq"],
                         json!({
