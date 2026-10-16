@@ -139,6 +139,9 @@ pub struct GenerationVectors {
     overlay: Mutex<OverlayCache>,
     /// the generation was replaced: its index files are written no more
     retired: Mutex<bool>,
+    /// indexes whose carry from the previous generation was declined for this one, so
+    /// a later build of the generation does not map the old nodes again
+    declined: Mutex<rustc_hash::FxHashSet<String>>,
     /// the store's embedding state (environment and cache), for searches with text
     embedder: RwLock<Option<std::sync::Weak<super::embed::Embedder>>>,
 }
@@ -197,6 +200,16 @@ impl GenerationVectors {
                 .filter(|(n, _)| n.as_str() != name)
                 .map(|(_, b)| b.bytes())
                 .sum::<u64>()
+    }
+
+    /// Record that carrying index `name` over to this generation was declined.
+    fn decline_carry(&self, name: &str) {
+        self.declined.lock().insert(name.to_string());
+    }
+
+    /// Whether carrying index `name` over to this generation was declined.
+    fn carry_declined(&self, name: &str) -> bool {
+        self.declined.lock().contains(name)
     }
 
     pub fn set_configured(&self, c: Arc<BTreeMap<String, VectorIndexConfig>>) {
@@ -729,22 +742,20 @@ impl<'a> Old<'a> {
     }
 }
 
-/// The graph over `nodes` of the new segment, carried over from `old`: each old node
-/// whose pair is still a row becomes the node of that row with its level, and its links
-/// map through. A node that lost neighbours (rows deleted since) has its links chosen
-/// again by the heuristic from the surviving ones and the neighbours of the lost ones,
-/// as Algorithm 4 repairs on insert. The new rows are then inserted. `Ok(None)` when
-/// more than [`CARRY_MAX_CHANGE`] of the nodes differ; `Err(())` when cancelled.
-fn carry_graph(
-    seg: &Segment,
-    nodes: &[u32],
-    space: &dyn hnsw::Space,
-    params: &hnsw::Params,
-    old: &Old<'_>,
-    ctl: &hnsw::Ctl<'_>,
-) -> std::result::Result<Option<Graph>, ()> {
-    use rayon::prelude::*;
-    const NONE: u32 = u32::MAX;
+/// Which old node each new node continues, which new node each old one became, and the
+/// new nodes that continue none.
+struct CarryMap {
+    old_of_new: Vec<u32>,
+    new_of_old: Vec<u32>,
+    fresh: Vec<u32>,
+}
+
+/// A node with no counterpart in a [`CarryMap`].
+const NONE: u32 = u32::MAX;
+
+/// Map the nodes of the new segment to `old`'s, or `None` when more than
+/// [`CARRY_MAX_CHANGE`] of the nodes differ and the graph is built again instead.
+fn carry_map(seg: &Segment, nodes: &[u32], old: &Old<'_>) -> Option<CarryMap> {
     let n = nodes.len();
     let mut old_of_new = vec![NONE; n];
     let mut new_of_old = vec![NONE; old.nodes()];
@@ -762,8 +773,56 @@ fn carry_graph(
         .collect();
     let dropped = new_of_old.iter().filter(|&&j| j == NONE).count();
     if n == 0 || (fresh.len() + dropped) as f64 > CARRY_MAX_CHANGE * n as f64 {
-        return Ok(None);
+        return None;
     }
+    Some(CarryMap {
+        old_of_new,
+        new_of_old,
+        fresh,
+    })
+}
+
+/// Whether the previous generation's delta at `c.snap` changed so many of `c.old`'s
+/// nodes that a carry would be declined, estimated from the delta alone before anything
+/// is packed: the inserted rows the live layer `live` does not hold count as new nodes,
+/// and the deleted rows as dropped ones. Rows of other dimensions or in several graphs
+/// count too, so the estimate can only overstate the change.
+fn carry_declined_early(c: &Carry, live: &super::live::LiveState) -> bool {
+    let (Some(g), Some(p)) = (&c.old.graph, super::live::pred_in(&c.old, &c.snap)) else {
+        return false;
+    };
+    let pi = Perm::Pso.index();
+    let (lo, hi) = ([p, 0, 0, 0], [p, u64::MAX, u64::MAX, u64::MAX]);
+    let dropped = c.snap.delta.del[pi].count_between(&lo, &hi);
+    let fresh = c.snap.delta.ins[pi]
+        .range(lo..=hi)
+        .filter(|k| !live.seen(k[1], k[2]))
+        .count();
+    let n = (g.nodes + live.nodes() + fresh).saturating_sub(dropped);
+    (fresh + dropped) as f64 > CARRY_MAX_CHANGE * n as f64
+}
+
+/// The graph over `nodes` of the new segment, carried over from `old`: each old node
+/// whose pair is still a row becomes the node of that row with its level, and its links
+/// map through. A node that lost neighbours (rows deleted since) has its links chosen
+/// again by the heuristic from the surviving ones and the neighbours of the lost ones,
+/// as Algorithm 4 repairs on insert. The new rows are then inserted. `map` comes from
+/// [`carry_map`]. `Err(())` when cancelled.
+fn carry_graph(
+    nodes: &[u32],
+    space: &dyn hnsw::Space,
+    params: &hnsw::Params,
+    old: &Old<'_>,
+    map: CarryMap,
+    ctl: &hnsw::Ctl<'_>,
+) -> std::result::Result<Graph, ()> {
+    use rayon::prelude::*;
+    let n = nodes.len();
+    let CarryMap {
+        old_of_new,
+        new_of_old,
+        fresh,
+    } = map;
     let frozen_levels = old.graph.levels();
     let levels: Vec<u8> = (0..n)
         .map(|j| match old_of_new[j] {
@@ -820,7 +879,7 @@ fn carry_graph(
     if !b.insert_all(&fresh, ctl) {
         return Err(());
     }
-    Ok(Some(b.freeze()))
+    Ok(b.freeze())
 }
 
 /// How a build ended.
@@ -877,6 +936,14 @@ pub(crate) fn build_index(
     });
     // a copy of its live layer, so the old generation's inserts go on meanwhile
     let old_live = carry.map(|c| c.old.live.read().clone());
+    // a compaction that changed too much leaves the build to the background at once,
+    // without mapping the old nodes or packing the vectors
+    if ctl.carry_only
+        && let (Some(c), Some(l)) = (carry, &old_live)
+        && carry_declined_early(c, l)
+    {
+        return Ok(Outcome::Cancelled);
+    }
     let old = match (carry, &old_live) {
         (Some(c), Some(l)) => match Old::new(c, l, snap, ctl.cancel) {
             Some(o) => Some(o),
@@ -971,6 +1038,23 @@ pub(crate) fn build_index(
             nodes: &nodes,
             metric: cfg.metric,
         };
+        // which old node each node continues, decided before the half-precision copy so
+        // a declined carry on a compaction's thread makes no copy; a carry this
+        // generation declined before is not tried again
+        let map = match &old {
+            Some(o) if !gv.carry_declined(name) => match carry_map(&segment, &nodes, o) {
+                Some(m) => Some(m),
+                None => {
+                    gv.decline_carry(name);
+                    None
+                }
+            },
+            _ => None,
+        };
+        if ctl.carry_only && map.is_none() {
+            // the background build after the switch builds the graph
+            return Ok(Outcome::Cancelled);
+        }
         // the half-precision copy only when it fits in the budget beside the index and
         // the builder's link distances, one `f32` per link slot, which the build holds
         // while it runs and which take about as much as the graph's links
@@ -996,18 +1080,16 @@ pub(crate) fn build_index(
             progress: &progress,
             cancel: &cancelled,
         };
-        let carried = match &old {
-            Some(o) => match carry_graph(&segment, &nodes, space, &params, o, &hctl) {
-                Ok(g) => g,
+        let carried = match (&old, map) {
+            (Some(o), Some(map)) => match carry_graph(&nodes, space, &params, o, map, &hctl) {
+                Ok(g) => Some(g),
                 Err(()) => return Ok(Outcome::Cancelled),
             },
-            None => None,
+            _ => None,
         };
         built.carried = carried.is_some();
         let g = match carried {
             Some(g) => g,
-            // the carry was declined: the background build after the switch builds it
-            None if ctl.carry_only => return Ok(Outcome::Cancelled),
             None => match Graph::build(space, &params, &hctl) {
                 Some(g) => g,
                 None => return Ok(Outcome::Cancelled),
