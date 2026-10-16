@@ -6,7 +6,7 @@
 //! mapping that sees a float cannot tell a date from a count. Hidden and very hidden
 //! sheets and chart sheets are left out, and so are sheets without a cell.
 
-use crate::budget::Budget;
+use crate::budget::{Budget, SLOT};
 use crate::package::Package;
 use crate::sheet::{self, SheetBuilder};
 use crate::xml;
@@ -87,6 +87,8 @@ fn shared_strings(
                     if total > limits.max_part {
                         return Err(Error::TooLarge("the shared strings are too long".into()));
                     }
+                    // the strings stay for the whole conversion, so they are charged
+                    budget.charge(cur.len() + SLOT)?;
                     out.push(std::mem::take(&mut cur));
                 }
                 "rPh" => skip = skip.saturating_sub(1),
@@ -94,7 +96,10 @@ fn shared_strings(
                 _ => {}
             },
             // an empty `<si/>` is a string like any other, and the ones after it keep their index
-            Event::Empty(e) if xml::local(e.name().as_ref()) == "si" => out.push(String::new()),
+            Event::Empty(e) if xml::local(e.name().as_ref()) == "si" => {
+                budget.charge(SLOT)?;
+                out.push(String::new());
+            }
             Event::Text(t) if in_t => cur.push_str(&xml::text_of(&t)),
             Event::CData(c) if in_t => cur.push_str(&String::from_utf8_lossy(&c)),
             Event::DocType(_) => return Err(corrupt("a DOCTYPE is not allowed")),
