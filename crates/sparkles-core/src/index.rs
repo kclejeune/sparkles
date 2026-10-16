@@ -1108,8 +1108,6 @@ pub struct NamespaceUsage {
 
 impl SharedBlocks {
     pub fn new(bytes: u64) -> SharedBlocks {
-        // Start the shared decode pool during cache construction, before queries.
-        let _ = decode_pool();
         SharedBlocks {
             cache: Arc::new(new_column_cache(bytes)),
         }
@@ -1173,19 +1171,23 @@ thread_local! {
 }
 
 /// The threads that decode blocks ahead of a reader (see [`BlockCache::warm`]). They are
-/// not the global pool, so a parallel scan that uses it does not queue point lookups.
-fn decode_pool() -> &'static rayon::ThreadPool {
+/// not the global pool, so a parallel scan that uses it does not queue point lookups. The
+/// pool starts at the first request that decodes ahead, not with a cache, so a process
+/// that never does holds no threads. `None` when the threads could not be started, and the
+/// caller then decodes on its own thread.
+fn decode_pool() -> Option<&'static rayon::ThreadPool> {
     #[cfg(test)]
     DECODE_POOL_CALLS.with(|n| n.set(n.get() + 1));
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
         rayon::ThreadPoolBuilder::new()
             .num_threads((cpus / 2).clamp(2, 8))
             .thread_name(|i| format!("sparkles-decode-{i}"))
             .build()
-            .expect("decode thread pool")
+            .ok()
     })
+    .as_ref()
 }
 
 #[derive(Clone)]
@@ -1204,8 +1206,6 @@ fn empty_col() -> Arc<[u64]> {
 impl BlockCache {
     /// A cache of its own, of at most `bytes`.
     pub fn new(bytes: u64) -> BlockCache {
-        // start the decode threads now, not inside the first query that uses them
-        let _ = decode_pool();
         BlockCache {
             cache: Arc::new(new_column_cache(bytes)),
             ns: 0,
@@ -1354,6 +1354,7 @@ impl BlockCache {
             work: Vec::new(),
             seen: Default::default(),
             bytes: 0,
+            budget: self.cache.capacity() / 8,
             eligible: self.fill,
         }
     }
@@ -1427,6 +1428,9 @@ pub(crate) struct WarmColumns<'a> {
     work: Vec<(usize, u8)>,
     seen: rustc_hash::FxHashSet<(usize, u8)>,
     bytes: u64,
+    /// the most decoded bytes one request may add, an eighth of the cache so that one
+    /// request cannot push out what the other queries hold
+    budget: u64,
     eligible: bool,
 }
 
@@ -1452,7 +1456,7 @@ impl WarmColumns<'_> {
             let next = u64::from(self.idx.blocks[b].rows)
                 .checked_mul(8)
                 .and_then(|weight| self.bytes.checked_add(weight.max(1)));
-            let Some(bytes) = next.filter(|&n| n <= self.cache.cache.capacity()) else {
+            let Some(bytes) = next.filter(|&n| n <= self.budget) else {
                 self.eligible = false;
                 self.work = Vec::new();
                 self.seen = Default::default();
@@ -1472,15 +1476,17 @@ impl WarmColumns<'_> {
         // threshold; capacity admission never warms a partial prefix of an oversized set.
         const MIN_COLUMNS: usize = 16;
         if self.eligible && self.work.len() >= MIN_COLUMNS {
-            decode_pool().install(|| {
-                self.work.par_iter().try_for_each(|&(b, c)| -> Result<()> {
-                    check()?;
-                    // Only check errors propagate: an advisory decode error remains
-                    // for the consuming reader to encounter if it needs this column.
-                    let _ = self.cache.get_cols_hinted(self.idx, b, 1 << c, false);
-                    Ok(())
-                })
-            })?;
+            let decode = |&(b, c): &(usize, u8)| -> Result<()> {
+                check()?;
+                // Only check errors propagate: an advisory decode error remains
+                // for the consuming reader to encounter if it needs this column.
+                let _ = self.cache.get_cols_hinted(self.idx, b, 1 << c, false);
+                Ok(())
+            };
+            match decode_pool() {
+                Some(pool) => pool.install(|| self.work.par_iter().try_for_each(decode))?,
+                None => self.work.iter().try_for_each(decode)?,
+            }
         }
         // Cancellation during the final already-started decode must not be hidden.
         check()
@@ -1848,17 +1854,21 @@ mod tests {
     }
 
     #[test]
-    fn shared_cache_construction_starts_decode_pool_before_views() {
+    fn cache_construction_does_not_start_the_decode_pool() {
         let before = DECODE_POOL_CALLS.with(|n| n.get());
-        let shared = SharedBlocks::new(16 << 20);
-        assert_eq!(DECODE_POOL_CALLS.with(|n| n.get()), before + 1);
+        let shared = SharedBlocks::new(128 << 20);
         let view = BlockCache::attach(&shared, 7);
         let _through = view.read_through();
-        assert_eq!(DECODE_POOL_CALLS.with(|n| n.get()), before + 1);
         let _private = BlockCache::new(16 << 20);
-        assert_eq!(DECODE_POOL_CALLS.with(|n| n.get()), before + 2);
-        assert!(decode_pool().current_num_threads() >= 2);
-        decode_pool().install(|| {
+        assert_eq!(DECODE_POOL_CALLS.with(|n| n.get()), before);
+        // the pool starts when a request decodes ahead
+        let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
+        view.warm(&idx, &(0..8).collect::<Vec<_>>(), ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(DECODE_POOL_CALLS.with(|n| n.get()), before + 1);
+        let pool = decode_pool().expect("a decode pool");
+        assert!(pool.current_num_threads() >= 2);
+        pool.install(|| {
             assert!(
                 std::thread::current()
                     .name()
@@ -1951,7 +1961,7 @@ mod tests {
         use std::time::Duration;
         let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
         let mut cache = BlockCache::new(64 << 20);
-        let width = decode_pool().current_num_threads();
+        let width = decode_pool().unwrap().current_num_threads();
         let entered = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let expired = Arc::new(AtomicBool::new(false));
@@ -2056,6 +2066,23 @@ mod tests {
     }
 
     #[test]
+    fn warm_admits_at_most_an_eighth_of_the_cache_per_request() {
+        let (_dir, idx) = warm_fixture(8 * BLOCK_ROWS);
+        // 8 blocks of 4 columns fill the cache, which one request may not
+        let cache = BlockCache::new(8 * 4 * BLOCK_ROWS as u64 * 8);
+        cache
+            .warm(&idx, &(0..8).collect::<Vec<_>>(), ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 0);
+        // while a request of 16 columns in a cache of 128 columns is admitted
+        let cache = BlockCache::new(8 * 16 * BLOCK_ROWS as u64 * 8);
+        cache
+            .warm(&idx, &[0, 1, 2, 3], ALL_COLS, &|| Ok(()))
+            .unwrap();
+        assert_eq!(cache.misses(), 16);
+    }
+
+    #[test]
     fn warm_checks_after_the_final_decode_and_preserves_advisory_errors() {
         let (_dir, mut idx) = warm_fixture(4 * BLOCK_ROWS);
         let cache = BlockCache::new(64 << 20);
@@ -2096,7 +2123,8 @@ mod tests {
                 assert_eq!(got.cols[c], idx.decode_col(b, c).unwrap());
             }
         }
-        let cache = BlockCache::new(4 * BLOCK_ROWS as u64 * 8 * 4);
+        // a request may add an eighth of the cache
+        let cache = BlockCache::new(4 * BLOCK_ROWS as u64 * 8 * 4 * 8);
         let duplicates = (0..4).cycle().take(64).collect::<Vec<_>>();
         cache.warm(&idx, &duplicates, ALL_COLS, &|| Ok(())).unwrap();
         assert_eq!(
@@ -2110,7 +2138,7 @@ mod tests {
     fn warm_budget_counts_partial_tails_and_only_missing_bytes() {
         let (_dir, idx) = warm_fixture(4 * BLOCK_ROWS + 17);
         let full = 4 * BLOCK_ROWS as u64 * 8 * 4;
-        let cache = BlockCache::new(full + 17 * 8 * 4);
+        let cache = BlockCache::new((full + 17 * 8 * 4) * 8);
         cache
             .warm(&idx, &[0, 1, 2, 3, 4], ALL_COLS, &|| Ok(()))
             .unwrap();
@@ -2121,7 +2149,7 @@ mod tests {
         );
         let (_dir, idx) = warm_fixture(12 * BLOCK_ROWS);
         let mask = 3;
-        let cache = BlockCache::new(16 * BLOCK_ROWS as u64 * 8);
+        let cache = BlockCache::new(16 * BLOCK_ROWS as u64 * 8 * 8);
         for b in 0..4 {
             cache.get_cols(&idx, b, mask).unwrap();
         }
@@ -2420,7 +2448,7 @@ mod tests {
         let cache = BlockCache::new(64 << 20);
         let (lo, hi) = ([0; 4], [u64::MAX; 4]);
         let mut rows = 0;
-        let mut pass = |rows: &mut usize| {
+        let pass = |rows: &mut usize| {
             idx.for_each_key_range_cols(&cache, &lo, &hi, 0b11, |b, s, e| {
                 *rows += e - s;
                 assert_eq!(b.cols[0].len(), b.len());
