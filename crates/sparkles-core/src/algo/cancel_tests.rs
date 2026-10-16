@@ -231,6 +231,23 @@ fn workspaces_are_charged_and_given_back() {
             matches!(run(&ctl), Err(crate::Error::BudgetExceeded(_))),
             "{name}"
         );
+        assert_eq!(
+            ctl.remaining(),
+            n * 4,
+            "{name}: the failed call kept a charge"
+        );
+        // a call that fails later, after it holds some workspaces, gives them all back
+        for blocks in 2..=16 {
+            let limit = n * 4 * blocks;
+            let ctl = Control::new(Default::default(), None, limit);
+            if run(&ctl).is_err() {
+                assert_eq!(
+                    ctl.remaining(),
+                    limit,
+                    "{name}: the call that failed at a budget of {limit} kept a charge"
+                );
+            }
+        }
         let ctl = Control::new(Default::default(), None, u64::MAX);
         run(&ctl).unwrap();
         assert!(ctl.peak() >= n * 8, "{name}: peak {}", ctl.peak());
