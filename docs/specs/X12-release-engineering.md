@@ -268,7 +268,7 @@ locking whose semantics differ from `flock`.
 | Spatial index | `geo.json`, index files | config `FORMAT_VERSION` 1, `LITERALS_VERSION` 2, file `SPKGEO` `FILE_VERSION` 1 | derived |
 | ShEx guard typing | `validation-typing.bin` | magic `SPXTYP01` and a u32 format 1; another version is discarded and rebuilt | derived |
 | Checked migration state | `.migrate-checked` at the root or checked copy | JSON format 1 records the cleanup mode and the exact old sibling directory. Unknown versions and ambiguous bare legacy markers are refused. | config |
-| Settings and state | `describe.json`, `compaction.json`, `queries.json`, `validation.json`, `models.json`, `assistant.json` and others | `FORMAT` fields on some (stored queries 1, GraphQL 1, ShEx guard 2), none on most | config |
+| Settings and state | `describe.json`, `compaction.json`, `queries.json`, `algo.json`, `validation.json`, `models.json`, `assistant.json` and others | The registry names each version member. Named projections use `format` 1, and an absent marker reads as 1. | config |
 | Backup repository | layout, blobs, manifests, key slots | layout `FORMAT` 1, blob `FORMAT` 1, slot `SLOT_FORMAT` 2, manifest `indexFormat` | archive |
 
 Primary files hold data that cannot be recomputed. Derived files are indexes that can be
@@ -619,13 +619,20 @@ Phases 1, 2 and 4 are not built. See [ROADMAP](../ROADMAP.md) items 58–60.
 **The registry.** `crates/sparkles-core/src/formats.rs` declares every file kind of §4.1
 with its class, its marker, the version this build writes and the versions it reads,
 and a second table lists every settings and state file with the member that holds its
-version. Thirty-five settings files carry a member. Six cannot, because their top level
+version. Thirty-six settings files carry a member. Six cannot, because their top level
 is a map of user keys or an array, or because they are a cache or a transient intent,
 and the registry lists them with the reason. The module documentation describes the
 four kinds of change of §4.3. `GET /$/server` reports the registry in a `formats` member
 for callers that see the version, and `sparkles migrate --check --format json` prints it.
 The backup crate's layout, blob and key-slot constants are now defined from the
 registry, and the module constants of the core files are checked against it by a test.
+
+The named-projection catalog `algo.json` uses the existing format 1 in that registry.
+Its reader checks the version before the typed document shape, so an unknown future
+shape still gives `Unsupported`. A versionless current document reads as 1 without a
+rewrite. Dataset admission checks the catalog in the root and physical branches before
+metadata writers, and migration planning remains read-only. This registration changes
+neither the catalog format nor the backup, clone or migration formats.
 
 The registry also records the server's existing runtime-secret envelope and generated
 key. The server wrapper accepts legacy plaintext as version 0 and sealed version 1, but
@@ -635,18 +642,21 @@ fallback, and the sealer recognizes the whole family while decoding only v1. Thi
 registration changes neither the v1 encoding and AAD nor the dataset reader capability.
 
 **Version markers.** A write-ahead log created by this build starts with a header
-record: the magic `\x89SPKWAL\n`, the version (1) and zeros. The spec asked for a 16-byte
-header. The header is instead 33 bytes, the size of every record, so the records after
-it keep their alignment. Every reader that steps through records at multiples of 33
-from the start of the log, and every saved position of byte 0 meaning "before the first
-commit" (the history index, branch link segments, the backward replay), works unchanged
-by skipping the record where the log starts. A log without the header is version 0 and
-reads as before. Existing logs are never rewritten. The header arrives with the next
-generation, at a compaction, a bulk load, a branch or a clone. Because an older release
-would read the header as a damaged record and could truncate the log as a torn tail,
-`dataset.json` gains reader capability 5 (`DATASET_READER`), and a store raises
-`minimumReader` to 5 when it opens a database for writing, after every file it read
-proved readable.
+record: the magic `\x89SPKWAL\n`, the version (1) and zeros. The spec asked for a
+16-byte header. The header is instead 33 bytes, the size of every record, so the records
+after it keep their alignment. Every reader that steps through records at multiples of
+33 from the start of the log, and every saved position of byte 0 meaning "before the
+first commit" (the history index, branch link segments, the backward replay), works
+unchanged by skipping the record where the log starts. A log without the header is
+version 0 and reads as before. Readers of the log header and of a generation's
+`meta.json` take the version before anything else and refuse an unknown one as
+`Unsupported`, so a newer release may use the header's trailing bytes or give
+`meta.json` another shape, and the catalog still refuses only that dataset. Existing
+logs are never rewritten. The header arrives with the next generation, at a compaction,
+a bulk load, a branch or a clone. Because an older release would read the header as a
+damaged record and could truncate the log as a torn tail, `dataset.json` gains reader
+capability 5 (`DATASET_READER`), and a store raises `minimumReader` to 5 when it opens a
+database for writing, after every file it read proved readable.
 
 The catalog's `config.json` and the settings files gain a member, absent meaning 1, read
 and written through `formats::settings_from_slice`, `settings_to_vec`,

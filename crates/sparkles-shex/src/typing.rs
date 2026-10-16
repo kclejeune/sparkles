@@ -52,6 +52,7 @@ const PARALLEL_MIN: usize = 512;
 pub struct Limits {
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub cancellation: Option<sparkles_core::task::Cancellation>,
 }
 
 impl Limits {
@@ -64,7 +65,10 @@ impl Limits {
         {
             return Err(sparkles_core::Error::Cancelled);
         }
-        if self.deadline.is_some_and(|d| Instant::now() > d) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(sparkles_core::Error::Timeout);
         }
         Ok(())
@@ -162,8 +166,13 @@ impl<'a> Env<'a> {
             max_partitions: opts.max_partitions,
             max_pairs: opts.max_pairs,
             limits: Limits {
-                deadline: opts.timeout.map(|t| Instant::now() + t),
+                deadline: opts
+                    .deadline
+                    .into_iter()
+                    .chain(opts.timeout.map(|t| Instant::now() + t))
+                    .min(),
                 cancel: opts.cancel.clone(),
+                cancellation: opts.cancellation.clone(),
             },
             parallel: opts.parallel,
             pool: opts.pool.clone(),

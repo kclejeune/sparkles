@@ -654,17 +654,17 @@ fn a_lookup_error_makes_a_bulk_commit_a_summary() {
         DiffOp::Add => (a + 1, d),
         _ => (a, d + 1),
     });
-    if (adds, removes) == (0, 0) {
-        assert!(
-            r.unrecorded
-                .iter()
-                .any(|u| u.from <= 2 && 2 <= u.to && u.reason == UnrecordedReason::Bulk),
-            "{:?}",
-            r.unrecorded
-        );
-    } else {
-        assert_eq!((adds, removes), (10, 10), "{:?}", r.unrecorded);
-    }
+    // The lookups that decide which quads changed read the damaged SPO block, so the
+    // commit is recorded as a summary. If a later change makes those lookups read
+    // another permutation, this fails and the test needs a new way to break them.
+    assert_eq!((adds, removes), (0, 0), "{:?}", r.unrecorded);
+    assert!(
+        r.unrecorded
+            .iter()
+            .any(|u| u.from <= 2 && 2 <= u.to && u.reason == UnrecordedReason::Bulk),
+        "{:?}",
+        r.unrecorded
+    );
 }
 
 #[test]
@@ -912,6 +912,263 @@ fn select(snap: Arc<sparkles_core::store::Snapshot>, q: &str, o: &QueryOptions) 
 }
 
 const HIST: &str = "PREFIX hist: <urn:x-sparkles:history#> PREFIX : <urn:>";
+
+#[cfg(feature = "failpoints")]
+mod native_history_controls {
+    use super::*;
+    use sparkles_core::store::{HistoryCheckOutcome, set_history_check_observer};
+    use sparkles_core::task::Cancellation;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    #[derive(Clone, Copy)]
+    enum Trigger {
+        Composition,
+        Primary,
+        Deadline,
+    }
+
+    struct ResetObserver;
+    impl Drop for ResetObserver {
+        fn drop(&mut self) {
+            set_history_check_observer(None);
+        }
+    }
+
+    fn recorded_store() -> Arc<Store> {
+        let s = Arc::new(Store::in_memory(StoreOptions::default()));
+        s.snapshot()
+            .change_log
+            .as_ref()
+            .unwrap()
+            .set_background(false);
+        for n in 0..640 {
+            upd(&s, &format!("INSERT DATA {{ <urn:s{n}> <urn:p> {n} }}"));
+        }
+        s.flush_change_log().unwrap();
+        assert_eq!(s.head_commit().seq, 640, "distinct recorded commits");
+        s
+    }
+
+    fn during_scan(trigger: Trigger, native: bool) {
+        let s = recorded_store();
+        let primary = Arc::new(AtomicBool::new(false));
+        let secondary = Arc::new(AtomicBool::new(false));
+        let opts = QueryOptions {
+            cancel: Some(primary.clone()),
+            cancellation: Some(Cancellation::from_flags([secondary.clone()])),
+            deadline: matches!(trigger, Trigger::Deadline)
+                .then(|| Instant::now() + Duration::from_secs(1)),
+            no_cache: true,
+            ..Default::default()
+        };
+        let (paused_tx, paused_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Mutex::new(release_rx);
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let observed = outcomes.clone();
+        let worker = std::thread::spawn(move || {
+            let _reset = ResetObserver;
+            set_history_check_observer(Some(Arc::new(move |n, outcome, deadline| {
+                observed.lock().unwrap().push((n, outcome));
+                if n == 256 && outcome == HistoryCheckOutcome::Before {
+                    let _ = paused_tx.send(deadline);
+                    let _ = release_rx.lock().unwrap().recv_timeout(WAIT);
+                }
+            })));
+            if native {
+                s.history_changes(&HistoryQuery {
+                    from: Some(HistoryBound::At(At::Commit(1))),
+                    cancel: opts.cancel,
+                    cancellation: opts.cancellation,
+                    deadline: opts.deadline,
+                    ..Default::default()
+                })
+                .map(|result| result.changes.len())
+            } else {
+                sparkles_core::sparql::query(
+                    s.snapshot(),
+                    &format!("{HIST} SELECT ?s ?c WHERE {{ SERVICE hist:changes {{ << ?s :p ?o >> hist:commit ?c }} }}"),
+                    &opts,
+                )
+                .map(|result| result.rows().len())
+            }
+        });
+        let reached = paused_rx.recv_timeout(WAIT);
+        if let Ok(deadline) = reached {
+            match trigger {
+                Trigger::Composition => secondary.store(true, Ordering::Relaxed),
+                Trigger::Primary => primary.store(true, Ordering::Relaxed),
+                Trigger::Deadline => {
+                    if let Some(at) = deadline {
+                        // Expire the actual worker's bound, while touching no log/store state.
+                        while Instant::now() <= at {
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            }
+        }
+        let _ = release_tx.send(());
+        let result = worker.join().expect("history worker panicked");
+        let native_deadline = reached.expect("native scan callback256 must be reached");
+        let expected = match trigger {
+            Trigger::Deadline => {
+                assert!(native_deadline.is_some());
+                assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+                HistoryCheckOutcome::Timeout
+            }
+            _ => {
+                assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+                HistoryCheckOutcome::Cancelled
+            }
+        };
+        let actual = outcomes.lock().unwrap().clone();
+        eprintln!("actual native history outcomes: {actual:?}; worker released and joined");
+        assert_eq!(
+            actual,
+            vec![(256, HistoryCheckOutcome::Before), (256, expected)],
+            "the acknowledged native scan check must reject, rather than finish the scan and fail a later Ctx check"
+        );
+        assert_eq!(
+            primary.load(Ordering::Relaxed),
+            matches!(trigger, Trigger::Primary)
+        );
+        assert_eq!(
+            secondary.load(Ordering::Relaxed),
+            matches!(trigger, Trigger::Composition)
+        );
+    }
+
+    #[test]
+    fn composed_cancel_reaches_native_history_scan() {
+        during_scan(Trigger::Composition, false);
+    }
+
+    #[test]
+    fn primary_cancel_reaches_native_history_scan() {
+        during_scan(Trigger::Primary, false);
+    }
+
+    #[test]
+    fn absolute_deadline_reaches_native_history_scan() {
+        during_scan(Trigger::Deadline, false);
+    }
+
+    #[test]
+    fn direct_composed_cancel_survives_bound_resolution() {
+        during_scan(Trigger::Composition, true);
+    }
+}
+
+#[test]
+fn native_and_service_history_preserve_default_bounds_limits_and_visibility() {
+    use sparkles_core::access::{GraphAccess, GraphRule, Graphs};
+
+    let s = Store::in_memory(StoreOptions::default());
+    for data in [
+        "<urn:a> <urn:p> 1",
+        "GRAPH <urn:secret> { <urn:a> <urn:p> 2 }",
+        "<urn:b> <urn:p> 3",
+        "<urn:c> <urn:p> 4",
+    ] {
+        upd(&s, &format!("INSERT DATA {{ {data} }}"));
+    }
+    s.flush_change_log().unwrap();
+    let default = HistoryQuery::default();
+    assert!(
+        default.cancel.is_none() && default.cancellation.is_none() && default.deadline.is_none()
+    );
+    let commits = |q: HistoryQuery| {
+        let r = s.history_changes(&q).unwrap();
+        assert!(r.unrecorded.is_empty());
+        (
+            r.changes.iter().map(|c| c.commit.seq).collect::<Vec<_>>(),
+            r.truncated,
+        )
+    };
+    assert_eq!(commits(default), (vec![1, 2, 3, 4], false));
+    let service = |params: &str, opts: &QueryOptions| {
+        select(
+            s.snapshot(),
+            &format!(
+                "{HIST} SELECT ?c ?v ?g WHERE {{ SERVICE hist:changes {{ << ?s :p ?v >> hist:commit ?c ; hist:graph ?g {params} }} }}"
+            ),
+            opts,
+        )
+    };
+    let opts = QueryOptions::default();
+    assert_eq!(
+        service("", &opts),
+        ["1 1 -", "2 2 <urn:secret>", "3 3 -", "4 4 -"]
+    );
+    assert_eq!(
+        commits(HistoryQuery {
+            from: Some(HistoryBound::Commit(2)),
+            to: Some(HistoryBound::Commit(4)),
+            descending: true,
+            limit: 2,
+            ..Default::default()
+        }),
+        (vec![4, 3], true)
+    );
+    assert_eq!(
+        service(
+            "; hist:from 2 ; hist:to 4 ; hist:order hist:descending ; hist:limit 2",
+            &opts
+        ),
+        ["4 4 -", "3 3 -"]
+    );
+    assert_eq!(
+        commits(HistoryQuery {
+            limit: 4,
+            ..Default::default()
+        }),
+        (vec![1, 2, 3, 4], false)
+    );
+    assert_eq!(
+        commits(HistoryQuery {
+            from: Some(HistoryBound::Commit(5)),
+            to: Some(HistoryBound::Commit(9)),
+            ..Default::default()
+        }),
+        (vec![], false)
+    );
+    assert!(service("; hist:from 5 ; hist:to 9", &opts).is_empty());
+    assert!(
+        commits(HistoryQuery {
+            predicates: vec![NamedNode::new("urn:absent").unwrap()],
+            ..Default::default()
+        })
+        .0
+        .is_empty()
+    );
+    let access = Arc::new(GraphAccess::graphs(
+        Graphs::Only(GraphRule::new(["default"], &[])),
+        Graphs::none(),
+    ));
+    assert_eq!(
+        commits(HistoryQuery {
+            access: Some(access.clone()),
+            ..Default::default()
+        }),
+        (vec![1, 3, 4], false)
+    );
+    assert_eq!(
+        service(
+            "",
+            &QueryOptions {
+                graphs: Some(access),
+                ..Default::default()
+            }
+        ),
+        ["1 1 -", "3 3 -", "4 4 -"]
+    );
+}
 
 #[test]
 fn sparql_history_queries() {

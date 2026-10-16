@@ -482,10 +482,10 @@ tools = { node = "24" }
 description = "Test Node bindings, remote client and transaction/lifecycle contracts, with the remote client's tests against a debug server"
 depends = ["node:build"]
 dir = "js"
-env = { SPARKLES_CLIENT_TEST_SERVER_BIN = "{{config_root}}/target/debug/sparkles" }
 run = [
   "cargo build --locked --manifest-path ../Cargo.toml -p sparkles-server --bin sparkles",
-  "node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs",
+  # the server cargo just built, under CARGO_TARGET_DIR when one is set
+  'SPARKLES_CLIENT_TEST_SERVER_BIN="${SPARKLES_CLIENT_TEST_SERVER_BIN:-${CARGO_TARGET_DIR:-{{config_root}}/target}/debug/sparkles}" node --test common/test/*.test.mjs client/test/*.test.mjs engine/test/*.test.mjs',
 ]
 
 [tasks."node:lint"]

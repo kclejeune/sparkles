@@ -106,6 +106,8 @@ pub struct WriteOptions {
     /// the request's deadline (a guard also applies its own budget)
     pub deadline: Option<Instant>,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Additional cancellation sources, intersected with `cancel`.
+    pub cancellation: Option<crate::task::Cancellation>,
     /// results carried in a summary (the guard's default if `None`)
     pub report_limit: Option<usize>,
     /// the message recorded with the commit (see
@@ -169,7 +171,10 @@ impl WriteOptions {
         {
             return Err(crate::Error::Cancelled);
         }
-        if self.deadline.is_some_and(|d| Instant::now() > d) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(crate::Error::Timeout);
         }
         Ok(())

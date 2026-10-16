@@ -486,14 +486,31 @@ exact search on the same vectors, and no other vector engine was measured.
 
 | Search | Recall@10 against exact | Mean (ms) | p50 (ms) | p99 (ms) |
 |---|---:|---:|---:|---:|
-| Exact | 1.0000 | 5.458 | 5.476 | 6.109 |
-| HNSW `ef=16` | 0.9916 | 0.257 | 0.251 | 0.336 |
-| HNSW `ef=32` | 0.9982 | 0.309 | 0.299 | 0.413 |
-| HNSW `ef=64` | 0.9993 | 0.429 | 0.418 | 0.783 |
-| HNSW `ef=128` | 0.9993 | 0.655 | 0.648 | 0.927 |
-| HNSW `ef=256` | 0.9993 | 1.181 | 1.169 | 1.554 |
+| Exact | 1.0000 | 5.39 | 5.44 | 5.99 |
+| HNSW `ef=16` | 0.9903 | 0.45 | 0.52 | 0.60 |
+| HNSW `ef=32` | 0.9994 | 0.72 | 0.72 | 0.86 |
+| HNSW `ef=64` | 0.9994 | 0.46 | 0.35 | 0.94 |
+| HNSW `ef=128` | 0.9994 | 0.54 | 0.54 | 0.65 |
+| HNSW `ef=256` | 0.9994 | 0.92 | 0.91 | 1.37 |
+
+The index was built by the 2026-10-13 build, which builds the graph over a half-precision
+copy of the vectors. The previous build reached 0.9921 recall at `ef=16` and 0.9989 from
+`ef=32` up. Its `ef=128` mean was 0.66 ms and its `ef=256` mean 1.14 ms, so the new graph
+answers the higher settings about 18 % faster.
+
+Means below about 0.7 ms are not comparable between runs on this host. The same binary
+answered the 1,000 `ef=16` queries in 0.29 ms at the median in one pass and 0.60 ms in the
+next, and cheap settings were often slower than `ef=64`. Both the old and the new build
+showed this, so it comes from the client and the processor's idle states rather than from
+the search.
 
 These figures describe this synthetic distribution, not all vectors.
+
+The vector maintenance work was also screened on a Namespace instance (8 AMD EPYC vCPUs)
+with the interleaved A/B harness and the 27-query SPARQL suite over 100,000 people. These
+are Namespace numbers, not forge numbers. Both binaries returned the same answers, and the
+geometric mean of server execution time was 0.962 of the previous build's, which is within
+the harness's noise.
 
 ### Path search
 
@@ -687,7 +704,8 @@ Decompression runs as one stream in front of the parallel parser and adds 0.1–
 | Full-text index, 1.05M triples | **0.41 s** (Fuseki 4.37, QLever 1.86) | 13.1 MB (QLever **11.1**, Fuseki 24.9) |
 | Full-text index, 10.5M triples | **6.48 s** (Fuseki 25.98, QLever 19.35) | 122.5 MB (QLever **99.9**, Fuseki 227.8) |
 | Full-text document store, every string literal of 10.5M (1,540,012 documents) | 6.17 s with zstd, 6.07 s with LZ4 | 114.1 MB with zstd (the default), 117.3 MB with LZ4 |
-| HNSW vector index, 100,000 × 384 dimensions, `M=16`, `efConstruction=128` | 14.0 s | 163 MB of mapped files, 1,019.5 MB peak RSS |
+| HNSW vector index, 100,000 × 384 dimensions, `M=16`, `efConstruction=128` | 6.43 s (14.02 s before the half-precision build) | 163 MB of mapped files, 1,044.4 MB peak RSS |
+| HNSW vector index, 1,000,000 × 384 dimensions, in-process example | 63.5 s, down from 139.5 s. USearch 2.26.2 in half precision takes 50.0 s. | Recall@10 is 0.963 at `ef=128`. Peak RSS is 12.6 GB, up from 10.2 GB. |
 | Spatial index, 180,640 geometries | 0.54 s | 13.8 MiB |
 | RDFS materialization, 1,001,418 triples to 2,751,996 with inferences | 3.974 s, of which inference takes 2.323 s | — |
 | Numeric column added to the DBpedia index by `sparkles vocab-index` | 4.8 s | 20.7 MB |

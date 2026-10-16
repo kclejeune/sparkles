@@ -268,7 +268,7 @@ fn need_of(route: &str, method: &Method) -> Option<Need> {
 
 /// `x-sparkles-permission` for a need.
 fn permission(route: &str, need: Option<Need>) -> String {
-    if route == "/{ds}" {
+    if route == "/{ds}" || route == "/$/algo/{ds}/run" {
         return "read or write, by operation".into();
     }
     match need {
@@ -883,6 +883,11 @@ fn tags() -> J {
             "Stored queries",
             "Named, parameterized queries of a dataset.",
             "stored-queries"
+        ),
+        t(
+            "Graph algorithms",
+            "PageRank, communities, similarity and embeddings on projections of a dataset.",
+            "graph-algorithms"
         ),
         t(
             "GraphQL",

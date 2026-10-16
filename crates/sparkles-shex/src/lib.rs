@@ -489,6 +489,10 @@ pub struct ValidateOptions {
     /// The thread pool parallel validation runs in (the global rayon pool if `None`).
     pub pool: Option<Arc<rayon::ThreadPool>>,
     pub timeout: Option<Duration>,
+    /// Absolute bound shared with an enclosing operation, without phase renewal.
+    pub deadline: Option<std::time::Instant>,
+    /// Additional cancellation sources, checked with the existing single flag.
+    pub cancellation: Option<sparkles_core::task::Cancellation>,
     pub cancel: Option<Arc<AtomicBool>>,
     /// Stop with [`TooManyResults`] once the result map would hold more results.
     pub max_results: Option<usize>,
@@ -522,6 +526,8 @@ impl Default for ValidateOptions {
             parallel: true,
             pool: None,
             timeout: None,
+            deadline: None,
+            cancellation: None,
             cancel: None,
             max_results: None,
             max_pairs: Some(DEFAULT_MAX_PAIRS),

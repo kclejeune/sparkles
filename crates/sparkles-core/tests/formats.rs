@@ -152,3 +152,123 @@ fn a_newer_informational_file_does_not_refuse() {
         drop(Store::open(&root, StoreOptions::default()).unwrap());
     }
 }
+
+fn find_files(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p)
+            } else if p.file_name().unwrap() == name {
+                out.push(p)
+            }
+        }
+    }
+    out
+}
+
+/// A database with a sealed generation and a current one, each with a headered log.
+fn two_generation_database(root: &Path) {
+    let s = Store::open(root, StoreOptions::default()).unwrap();
+    update(
+        &s,
+        "INSERT DATA { <http://e/a> <http://e/p> 1 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    s.compact().unwrap();
+    update(
+        &s,
+        "INSERT DATA { <http://e/a> <http://e/p> 2 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+}
+
+fn open_err(root: &Path) -> String {
+    match Store::open(root, StoreOptions::default()) {
+        Ok(_) => "opened".into(),
+        Err(sparkles_core::error::Error::Unsupported(m)) => format!("Unsupported({m})"),
+        Err(e) => format!("other: {e:?}"),
+    }
+}
+
+/// A newer log header may use the bytes after its version: the version is read first,
+/// so the log is refused as newer, not reported as damaged.
+#[test]
+fn a_newer_wal_header_with_a_used_tail_is_unsupported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    two_generation_database(&root);
+    let wals: Vec<_> = find_files(&root, "wal.log")
+        .into_iter()
+        .filter(|p| std::fs::read(p).unwrap().first() == Some(&0x89))
+        .collect();
+    assert!(!wals.is_empty(), "no headered log");
+    for p in &wals {
+        let mut b = std::fs::read(p).unwrap();
+        b[8..12].copy_from_slice(&2u32.to_le_bytes());
+        b[12] = 1; // a flag a version 2 header might define
+        std::fs::write(p, b).unwrap();
+    }
+    let r = open_err(&root);
+    let plan = sparkles_core::migrate::plan(&root);
+    assert!(r.starts_with("Unsupported"), "open: {r}; plan: {plan:?}");
+    let plan = plan.expect("migrate --check plan failed");
+    assert!(!plan.refused.is_empty(), "plan refuses nothing");
+}
+
+/// A newer `meta.json` may drop members this build needs: the version is read first, so
+/// the generation is refused as newer, not reported as damaged.
+#[test]
+fn a_newer_index_meta_in_a_new_shape_is_unsupported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    two_generation_database(&root);
+    for p in &find_files(&root, "meta.json") {
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+        v["format_version"] = 3.into();
+        v.as_object_mut().unwrap().remove("created");
+        v.as_object_mut().unwrap().remove("quads");
+        std::fs::write(p, serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+    let r = open_err(&root);
+    let plan = sparkles_core::migrate::plan(&root);
+    assert!(r.starts_with("Unsupported"), "open: {r}; plan: {plan:?}");
+    let plan = plan.expect("migrate --check plan failed");
+    assert!(!plan.refused.is_empty(), "plan refuses nothing");
+}
+
+/// A `meta.json` without a usable version is damaged, and `migrate --check` reports it
+/// as a refusal instead of failing.
+#[test]
+fn an_index_meta_without_a_version_is_corrupt() {
+    for bad in [
+        serde_json::json!("2"),
+        serde_json::json!(-1),
+        serde_json::Value::Null,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        two_generation_database(&root);
+        for p in &find_files(&root, "meta.json") {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+            if bad.is_null() {
+                v.as_object_mut().unwrap().remove("format_version");
+            } else {
+                v["format_version"] = bad.clone();
+            }
+            std::fs::write(p, serde_json::to_vec(&v).unwrap()).unwrap();
+        }
+        match Store::open(&root, StoreOptions::default()) {
+            Err(sparkles_core::error::Error::Corrupt(_)) => {}
+            Err(e) => panic!("{bad}: {e:?}"),
+            Ok(_) => panic!("{bad}: opened"),
+        }
+        let plan = sparkles_core::migrate::plan(&root).expect("plan failed");
+        assert!(!plan.refused.is_empty(), "{bad}: plan refuses nothing");
+    }
+}

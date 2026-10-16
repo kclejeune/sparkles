@@ -15,6 +15,40 @@ use super::*;
 use rustc_hash::FxHashMap;
 use std::time::Instant;
 
+/// A test-only observation of the existing native history scan check.
+#[cfg(feature = "failpoints")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryCheckOutcome {
+    Before,
+    Passed,
+    Cancelled,
+    Timeout,
+    OtherError,
+}
+
+#[cfg(feature = "failpoints")]
+pub type HistoryCheckObserver =
+    Arc<dyn Fn(u64, HistoryCheckOutcome, Option<Instant>) + Send + Sync>;
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static HISTORY_CHECK_OBSERVER: std::cell::RefCell<Option<HistoryCheckObserver>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install an observer on this thread only. It runs under the change-log lock.
+#[cfg(feature = "failpoints")]
+pub fn set_history_check_observer(observer: Option<HistoryCheckObserver>) {
+    HISTORY_CHECK_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(feature = "failpoints")]
+fn observe_history_check(n: u64, outcome: HistoryCheckOutcome, deadline: Option<Instant>) {
+    let observer = HISTORY_CHECK_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(n, outcome, deadline);
+    }
+}
+
 /// One end of the range of commits a history query reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryBound {
@@ -49,6 +83,8 @@ pub struct HistoryQuery {
     /// the graphs and triples the caller may read (`None`: everything)
     pub access: Option<Arc<crate::access::GraphAccess>>,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Additional immutable cancellation sources, checked during the native log scan.
+    pub cancellation: Option<crate::task::Cancellation>,
     pub deadline: Option<Instant>,
 }
 
@@ -119,6 +155,10 @@ impl HistoryQuery {
             .cancel
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(|c| c.check().is_err())
         {
             return Err(Error::Cancelled);
         }
@@ -186,7 +226,24 @@ impl ChangeLog {
         let mut n = 0u64;
         let mut check = || {
             n += 1;
-            if n & 0xFF == 0 { q.check() } else { Ok(()) }
+            if n & 0xFF != 0 {
+                return Ok(());
+            }
+            #[cfg(feature = "failpoints")]
+            observe_history_check(n, HistoryCheckOutcome::Before, q.deadline);
+            let result = q.check();
+            #[cfg(feature = "failpoints")]
+            observe_history_check(
+                n,
+                match &result {
+                    Ok(()) => HistoryCheckOutcome::Passed,
+                    Err(Error::Cancelled) => HistoryCheckOutcome::Cancelled,
+                    Err(Error::Timeout) => HistoryCheckOutcome::Timeout,
+                    Err(_) => HistoryCheckOutcome::OtherError,
+                },
+                q.deadline,
+            );
+            result
         };
         let unrecorded = self.scan(
             from,

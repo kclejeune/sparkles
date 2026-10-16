@@ -472,6 +472,10 @@ pub enum Kind {
     PathSearch(Box<super::pathsearch::PathSearchSpec>),
     /// the recorded changes of the dataset (`SERVICE hist:changes`)
     HistoryChanges(Box<super::history_svc::HistorySpec>),
+    /// a graph algorithm on a projection of the dataset (`SERVICE algo:pageRank`, …);
+    /// child 0, if the call has a variable source, is the rest of the group, and the last
+    /// child is the nested pattern of edges, if any
+    AlgoCall(Box<super::algosvc::AlgoSpec>),
 }
 
 #[derive(Clone)]
@@ -604,6 +608,7 @@ impl Node {
             Kind::SpatialRelate(_) => "SpatialRelate",
             Kind::PathSearch(_) => "PathSearch",
             Kind::HistoryChanges(_) => "HistoryChanges",
+            Kind::AlgoCall(_) => "AlgoCall",
         }
     }
 }
@@ -1198,6 +1203,10 @@ impl<'a> Planner<'a> {
             }
             GP::Service { inner, name, .. } if super::history_svc::is_changes(name) => {
                 let n = super::history_svc::history_leaf(self, inner)?;
+                Ok(self.apply_filters(n, filters))
+            }
+            GP::Service { name, inner, .. } if super::algosvc::is_algo(name) => {
+                let n = super::algosvc::algo_leaf(self, name, inner, g)?;
                 Ok(self.apply_filters(n, filters))
             }
             GP::Service { name, inner, .. } if super::pathsearch::is_search(name) => {
@@ -2435,6 +2444,7 @@ impl<'a> Planner<'a> {
                 Kind::PathSearch(s) => s.needs_input(),
                 Kind::PropertyFn(s) => s.needs_input(),
                 Kind::HistoryChanges(s) => s.needs_input(),
+                Kind::AlgoCall(s) => s.needs_input(),
                 _ => false,
             });
         for n in nodes {
@@ -2493,6 +2503,7 @@ impl<'a> Planner<'a> {
                 Kind::SpatialPf(_) => super::geopf::attach_spatial(self, result, d)?,
                 Kind::PathSearch(_) => super::pathsearch::attach(self, result, d)?,
                 Kind::HistoryChanges(_) => super::history_svc::attach(self, result, d)?,
+                Kind::AlgoCall(_) => super::algosvc::attach(self, result, d)?,
                 Kind::PropertyFn(_) => super::arqpf::attach(result, d),
                 Kind::TextSearch(_) => self.attach_text(result, d)?,
                 Kind::HybridSearch(_) => super::hybrid::attach(self, result, d)?,

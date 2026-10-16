@@ -161,6 +161,34 @@ pub struct IndexMeta {
 
 pub const FORMAT_VERSION: u32 = 2;
 
+/// The `format_version` of a generation's `meta.json` whose bytes are `bytes`, read on
+/// its own so that a newer meta in another shape is refused as newer instead of being
+/// reported as damaged. A missing version, or one that is not a `u32`, is
+/// [`Error::Corrupt`]. `what` names the file in messages.
+pub fn index_meta_version(bytes: &[u8], what: &str) -> Result<u32> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(format!("{what}: {e}")))?;
+    meta_version_of(&v, what)
+}
+
+fn meta_version_of(v: &serde_json::Value, what: &str) -> Result<u32> {
+    v.get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| Error::Corrupt(format!("{what}: format_version is missing or not a u32")))
+}
+
+/// Read the `meta.json` of the generation in `dir`: its version first, checked against
+/// the index versions this build reads, then the rest. `written_by` names the release
+/// that wrote the database, for the refusal.
+pub fn read_index_meta(dir: &Path, written_by: Option<&str>) -> Result<IndexMeta> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)
+        .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
+    let version = meta_version_of(&v, "meta.json")?;
+    crate::formats::INDEX.check(&dir.display().to_string(), version, written_by)?;
+    serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("meta.json: {e}")))
+}
+
 struct BatchInfo {
     id: usize,
     /// the place of the batch in the order of `id`, set before the vocabulary merge

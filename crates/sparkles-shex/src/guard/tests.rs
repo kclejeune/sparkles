@@ -1502,3 +1502,61 @@ fn typing_of_another_version_is_discarded() {
     assert_eq!(typing_commit(&g), None);
     assert!(!exists(&root, TYPING_FILE));
 }
+
+#[test]
+fn operation_controls_survive_guard_adapter_and_runtime() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        DATA.as_bytes().to_vec(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let (guard, _) = installed(set_config(&s, Some(cfg("warn", SCHEMA, MAP)), &NoImports).unwrap());
+    let snap = s.snapshot();
+    let model = guard.model();
+    let flag = Arc::new(AtomicBool::new(false));
+    let primary = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let opts = WriteOptions {
+        deadline: Some(deadline),
+        cancel: Some(primary.clone()),
+        cancellation: Some(sparkles_core::task::Cancellation::from_flags(
+            [flag.clone()],
+        )),
+        ..Default::default()
+    };
+    for source in 0..4 {
+        flag.store(false, Ordering::Relaxed);
+        primary.store(false, Ordering::Relaxed);
+        let mut opts = opts.clone();
+        if source == 2 {
+            opts.deadline = Some(Instant::now());
+        }
+        let mut vo = guard.options(&snap, &opts, deadline).unwrap();
+        assert_eq!(vo.deadline, opts.deadline);
+        assert!(vo.timeout.is_none());
+        assert!(vo.cancellation.as_ref().unwrap().check().is_ok());
+        if source == 0 {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if source == 1 {
+            primary.store(true, Ordering::Relaxed);
+        }
+        if source == 3 {
+            vo.deadline = None;
+            vo.timeout = Some(Duration::ZERO);
+        }
+        let error = crate::engine::validate_typed(&snap, &model.schema, &model.map, &vo, None, &[])
+            .unwrap_err();
+        assert!(
+            if source < 2 {
+                matches!(error.downcast_ref::<Error>(), Some(Error::Cancelled))
+            } else {
+                matches!(error.downcast_ref::<Error>(), Some(Error::Timeout))
+            },
+            "{error}"
+        );
+    }
+}

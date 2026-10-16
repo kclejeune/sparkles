@@ -113,6 +113,7 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "explain_query" => t.explain_query(args),
         "describe_resource" => t.describe_resource(args),
         "find_paths" => t.find_paths(args),
+        "graph_algorithm" => t.graph_algorithm(args),
         "list_commits" => t.list_commits(args),
         "list_changes" => t.list_changes(args),
         #[cfg(feature = "text")]

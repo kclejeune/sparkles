@@ -713,17 +713,20 @@ impl Checker<'_> {
         let meta_file = format!("{name}/meta.json");
         match std::fs::read(dir.join("meta.json")) {
             Err(e) => run.add(Issue::error(e.to_string()).file(&meta_file)),
-            Ok(b) => match serde_json::from_slice::<IndexMeta>(&b) {
-                Err(e) => run.add(Issue::error(format!("does not parse: {e}")).file(&meta_file)),
-                Ok(m) => {
-                    let written_by = dir.parent().and_then(crate::commit::read_written_by);
-                    if let Err(e) =
-                        crate::formats::INDEX.check(name, m.format_version, written_by.as_deref())
-                    {
-                        run.add(Issue::error(e.to_string()).file(&meta_file));
-                    }
-                    self.meta = Some(m);
+            // the version first: a newer meta may have another shape
+            Ok(b) => match crate::builder::index_meta_version(&b, "meta.json").and_then(|v| {
+                let written_by = dir.parent().and_then(crate::commit::read_written_by);
+                crate::formats::INDEX.check(name, v, written_by.as_deref())
+            }) {
+                Err(e @ Error::Unsupported(_)) => {
+                    run.add(Issue::error(e.to_string()).file(&meta_file))
                 }
+                _ => match serde_json::from_slice::<IndexMeta>(&b) {
+                    Err(e) => {
+                        run.add(Issue::error(format!("does not parse: {e}")).file(&meta_file))
+                    }
+                    Ok(m) => self.meta = Some(m),
+                },
             },
         }
         let stats_file = format!("{name}/stats.json");

@@ -83,24 +83,47 @@ impl quick_cache::Weighter<NsKey, Arc<Rows>> for Weighter {
 
 type Inner = quick_cache::sync::Cache<NsKey, Arc<Rows>, Weighter>;
 
-/// The most shards the cache has. quick_cache splits the byte budget evenly between its
-/// shards and refuses an entry heavier than 97% of one shard's share. An entry is kept
-/// up to an eighth of the whole budget, so every kept entry fits its shard only when a
-/// shard holds at least twice that, which means at most four shards. The default of four
-/// shards per CPU gave a shard less than an eighth of a small budget on a host with 32 or
-/// more CPUs, and the cache dropped entries that `put` had accepted. Four shards cost
-/// little here, because a lookup takes a read lock and each miss costs a remote request.
-const MAX_SHARDS: usize = 4;
+/// The most shards a cache of query results has. quick_cache splits the byte budget
+/// evenly between its shards and refuses an entry heavier than 97% of one shard's share.
+/// The SERVICE cache and the result cache keep an entry up to an eighth of the whole
+/// budget, so every kept entry fits its shard only when a shard holds at least twice
+/// that, which means at most four shards. The default of four shards per CPU gave a
+/// shard less than an eighth of a small budget on a host with 32 or more CPUs, and the
+/// cache dropped entries that `put` had accepted. Four shards cost little, because each
+/// lookup takes a read lock and comes once per cached subtree or remote request, not
+/// once per row.
+pub(crate) const MAX_SHARDS: usize = 4;
 
-/// A cache of at most `bytes` with `shards` shards, at most [`MAX_SHARDS`].
-fn build_cache(bytes: u64, shards: usize) -> Inner {
+/// A cache of at most `bytes` weighed by `weighter`, with `shards` shards but at most
+/// [`MAX_SHARDS`].
+pub(crate) fn bounded_cache<K, V, W>(
+    bytes: u64,
+    shards: usize,
+    weighter: W,
+) -> quick_cache::sync::Cache<K, V, W>
+where
+    K: Eq + std::hash::Hash,
+    V: Clone,
+    W: quick_cache::Weighter<K, V> + Clone,
+{
     let options = quick_cache::OptionsBuilder::new()
         .estimated_items_capacity(10_000)
         .weight_capacity(bytes)
         .shards(shards.min(MAX_SHARDS))
         .build()
         .expect("the cache options are complete");
-    Inner::with_options(options, Weighter, Default::default(), Default::default())
+    quick_cache::sync::Cache::with_options(
+        options,
+        weighter,
+        Default::default(),
+        Default::default(),
+    )
+}
+
+/// The shards a cache asks for on this host before [`MAX_SHARDS`] applies: four per CPU,
+/// quick_cache's default.
+pub(crate) fn host_shards() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()) * 4
 }
 
 /// The storage of remote SERVICE results that stores can share.
@@ -112,13 +135,12 @@ pub struct ServiceStore {
 impl ServiceStore {
     /// Storage of at most `bytes` (0 turns it off).
     pub fn new(bytes: u64) -> ServiceStore {
-        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        Self::with_shards(bytes, cpus * 4)
+        Self::with_shards(bytes, host_shards())
     }
 
     fn with_shards(bytes: u64, shards: usize) -> ServiceStore {
         ServiceStore {
-            cache: (bytes > 0).then(|| build_cache(bytes, shards)),
+            cache: (bytes > 0).then(|| bounded_cache(bytes, shards, Weighter)),
             max_entry_bytes: bytes / 8,
         }
     }

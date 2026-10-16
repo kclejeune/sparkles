@@ -24,9 +24,53 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { QueryEngine } from '@comunica/query-sparql-rdfjs';
 import { Dataset, Catalog, Repository, factory, ConflictError } from '../dist/index.js';
 const temp = () => mkdtemp(join(tmpdir(), 'sparkles-node-admin-'));
+for (const mode of ['compute-cancel', 'compute-timeout', 'slot-cancel', 'slot-timeout']) {
+  test(
+    `algorithm stats controls reach native ${mode}`,
+    {
+      skip: process.env.SPARKLES_TEST_ALGO_STATS_ENABLE !== '1',
+      timeout: 15000,
+    },
+    async () => {
+      const dir = await temp();
+      const child = spawn(
+        process.execPath,
+        [new URL('./fixtures/algo-stats-child.mjs', import.meta.url).pathname, mode, dir],
+        {
+          env: { ...process.env, SPARKLES_TEST_ALGO_STATS_DIR: dir },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      let output = '';
+      child.stdout.on('data', (chunk) => {
+        output += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        output += chunk;
+      });
+      const timer = setTimeout(() => child.kill('SIGKILL'), 12000);
+      try {
+        const code = await new Promise((resolve, reject) => {
+          child.once('error', reject);
+          child.once('close', resolve);
+        });
+        assert.equal(code, 0, output);
+        console.log(output.trim());
+      } finally {
+        clearTimeout(timer);
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL');
+          await new Promise((resolve) => child.once('close', resolve));
+        }
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
+}
 test('catalog identities, alias transaction ownership and dataset recreation', async (t) => {
   const cat = t.resource(Catalog.memory());
   const ds = t.resource(await cat.create('one', { kind: 'mem' }));
@@ -241,6 +285,38 @@ test('stored queries and paged schema/history admin surfaces', async (t) => {
   const clone = t.resource(await ds.cloneToMemory());
   assert.notEqual(clone.id, ds.id);
   assert.equal(await clone.count(), 2n);
+});
+test('graph algorithms and named projections', async (t) => {
+  const ds = t.resource(Dataset.memory());
+  await ds.update(
+    'INSERT DATA {<urn:a> <urn:p> <urn:b>. <urn:b> <urn:p> <urn:c>. <urn:c> <urn:p> <urn:a>. <urn:d> <urn:p> <urn:e>}',
+  );
+  const saved = await ds.algorithms.projections.put('p', {
+    predicates: ['urn:p'],
+    direction: 'undirected',
+  });
+  assert.equal(saved.created, true);
+  assert.equal(saved.stored.revision, 1);
+  assert.equal((await ds.algorithms.projections.list()).length, 1);
+  const request = { algorithm: 'wcc', projection: 'p' };
+  const rows = await (await ds.algorithms.run(request)).toArray();
+  assert.equal(rows.length, 5);
+  assert.equal(new Set(rows.map((r) => r.get('component').value)).size, 2);
+  const stats = await ds.algorithms.stats({ algorithm: 'pageRank', projection: 'p' });
+  assert.equal(stats.nodes, 5);
+  await assert.rejects(ds.algorithms.run({ algorithm: 'nope' }));
+  await assert.rejects(
+    ds.algorithms.projections.put('p', { direction: 'forward' }, { ifRevision: 7 }),
+  );
+  const report = await ds.algorithms.runWrite({
+    algorithm: 'pageRank',
+    projection: 'p',
+    write: { graph: 'urn:out', predicates: { score: 'urn:rank' }, batchSize: 2 },
+  });
+  assert.equal(report.status, 'complete');
+  assert.equal(report.triples, 5);
+  assert.equal(await ds.algorithms.projections.delete('p'), true);
+  assert.equal((await ds.algorithms.projections.list()).length, 0);
 });
 test('replacement is atomic and callback snapshot capture is rejected', async (t) => {
   const ds = t.resource(Dataset.memory());

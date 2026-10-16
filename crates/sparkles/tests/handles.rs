@@ -698,3 +698,325 @@ fn sparkles_graphql_request(q: &str) -> sparkles::handles::graphql::Request {
         variables: Default::default(),
     }
 }
+
+#[test]
+fn algorithms_and_named_projections() {
+    use sparkles::algo::catalog::{PredicateDef, ProjectionDef};
+    use sparkles::sparql::QueryOptions;
+    use sparkles::sparql::algorun::{AlgoRequest, ProjectionRef};
+    const ALGO: &str = "urn:x-sparkles:algo#";
+    let (dir, ds) = persistent();
+    ds.update(
+        "INSERT DATA { <http://ex.org/b> <http://ex.org/p> <http://ex.org/a> . \
+         <http://ex.org/a> <http://ex.org/p> <http://ex.org/b> }",
+    )
+    .unwrap();
+    let def = ProjectionDef {
+        predicates: Some(vec![PredicateDef::new("http://ex.org/p", None)]),
+        ..Default::default()
+    };
+    let (st, created) = ds
+        .algorithms()
+        .projections()
+        .put("p", def.clone(), None, None)
+        .unwrap();
+    assert!(created && st.revision == 1);
+    // the definition survives a reopen
+    drop(ds);
+    let ds = Dataset::open(dir.path().join("db")).unwrap();
+    assert_eq!(
+        ds.algorithms().projections().get("p").unwrap().definition,
+        def
+    );
+    // a SPARQL query and an update find it
+    let wcc = format!(
+        "SERVICE <{ALGO}wcc> {{ [] <{ALGO}projection> \"p\" ; <{ALGO}node> ?n ; <{ALGO}component> ?c }}"
+    );
+    let r = ds
+        .query(&format!("SELECT ?n ?c WHERE {{ {wcc} }}"))
+        .unwrap();
+    assert_eq!(r.rows().len(), 2);
+    ds.update(&format!(
+        "INSERT {{ <urn:out> <urn:n> ?n }} WHERE {{ {wcc} }}"
+    ))
+    .unwrap();
+    // a request
+    let req = AlgoRequest {
+        algorithm: "pageRank".into(),
+        projection: Some(ProjectionRef::Named("p".into())),
+        params: Default::default(),
+        write: None,
+    };
+    let r = ds.algorithms().run(&req, &QueryOptions::default()).unwrap();
+    assert_eq!(r.rows().len(), 2);
+    let stats = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    assert!(stats.contains("\"nodes\":2"), "{stats}");
+    assert!(ds.algorithms().projections().delete("p", None).unwrap());
+    assert!(ds.algorithms().projections().list().is_empty());
+}
+
+#[test]
+fn algorithms_graphalytics_clustering_request() {
+    use sparkles::sparql::{QueryOptions, algorun::AlgoRequest};
+    let (_dir, ds) = persistent();
+    ds.update("INSERT DATA { <urn:a> <urn:p> <urn:b>, <urn:c> . <urn:b> <urn:p> <urn:c> }")
+        .unwrap();
+    let req = AlgoRequest::from_json(serde_json::json!({"algorithm":"clustering","projection":{"predicates":["urn:p"]},"params":{"graphalytics":true}})).unwrap();
+    let result = ds.algorithms().run(&req, &QueryOptions::default()).unwrap();
+    assert_eq!(result.vars, ["node", "coefficient"]);
+    assert_eq!(result.rows().len(), 3);
+    for row in result.rows() {
+        assert!(
+            matches!(&row[1], Some(oxrdf::Term::Literal(l)) if l.value().parse::<f64>().unwrap() == 0.5)
+        );
+    }
+    let stats = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stats).unwrap()["nodes"],
+        3
+    );
+}
+
+fn algorithms_empty_stats(populated: bool) {
+    use sparkles::sparql::{QueryOptions, algorun::AlgoRequest};
+    let ds = Dataset::memory();
+    if populated {
+        ds.update("INSERT DATA { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+    }
+    let req = AlgoRequest::from_json(
+        serde_json::json!({"algorithm":"pageRank","projection":{"predicates":["urn:absent"]}}),
+    )
+    .unwrap();
+    let text = ds
+        .algorithms()
+        .stats(&req, &QueryOptions::default())
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(j["nodes"], 0);
+    assert_eq!(j["edges"], 0);
+    assert_eq!(j["iterations"], 0);
+    assert_eq!(j["converged"], true);
+    assert!(
+        ds.algorithms()
+            .run(&req, &QueryOptions::default())
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
+}
+
+#[test]
+fn algorithms_stats_on_empty_dataset() {
+    algorithms_empty_stats(false);
+}
+
+#[test]
+fn algorithms_stats_with_absent_predicate() {
+    algorithms_empty_stats(true);
+}
+
+#[test]
+fn algorithms_numerical_refusal_has_no_rows_stats_or_writeback() {
+    use sparkles::algo::catalog::{PredicateDef, ProjectionDef};
+    use sparkles::sparql::{
+        QueryOptions,
+        algorun::{AlgoRequest, ProjectionRef, WriteMode, WriteSpec},
+    };
+    let (_dir, ds) = persistent();
+    ds.load_str(
+        "<http://ex/a> <http://ex/edge> <http://ex/c> {| <http://ex/w> 1e0 |} .
+         <http://ex/a> <http://ex/edge> <http://ex/b> {| <http://ex/w> 1e0 |} .
+         <http://ex/c> <http://ex/edge> <http://ex/b> {| <http://ex/w> 1.401298464324817e-45 |} .
+         <http://ex/b> <http://ex/edge> <http://ex/d> {| <http://ex/w> 1e0 |} .",
+        RdfFormat::Turtle,
+    )
+    .unwrap();
+    let before = ds.head_commit().seq;
+    let mut req = AlgoRequest {
+        algorithm: "betweenness".into(),
+        projection: Some(ProjectionRef::Inline(ProjectionDef {
+            predicates: Some(vec![PredicateDef::new("http://ex/edge", None)]),
+            weight: Some("http://ex/w".into()),
+            direction: Some("forward".into()),
+            ..Default::default()
+        })),
+        params: [("samples".into(), 8.into())].into_iter().collect(),
+        write: None,
+    };
+    let rows = ds.algorithms().run(&req, &QueryOptions::default());
+    assert!(
+        matches!(&rows,Err(sparkles::Error::Invalid(m)) if m.contains("shortest-path distance cannot increase at floating-point precision")),
+        "{:?}",
+        rows.err()
+    );
+    let stats = ds.algorithms().stats(&req, &QueryOptions::default());
+    assert!(
+        matches!(&stats,Err(sparkles::Error::Invalid(m)) if m.contains("shortest-path distance cannot increase at floating-point precision")),
+        "{stats:?}"
+    );
+    req.write = Some(WriteSpec {
+        graph: "urn:precision:out".into(),
+        mode: WriteMode::Replace,
+        predicates: [("score".into(), "http://ex/score".into())].into(),
+        batch_size: Some(1),
+        atomic: false,
+    });
+    let result = ds
+        .algorithms()
+        .run_write(&req, &QueryOptions::default(), None, &Control::none());
+    assert!(
+        matches!(&result,Err(sparkles::Error::Invalid(m)) if m.contains("shortest-path distance cannot increase at floating-point precision")),
+        "{result:?}"
+    );
+    assert_eq!(ds.head_commit().seq, before);
+    assert!(
+        ds.query("SELECT ?s WHERE { GRAPH <urn:precision:out> { ?s ?p ?o } }")
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
+}
+
+#[test]
+fn algorithms_catalog_future_versions_refuse_dataset_open() {
+    for content in [
+        br#"{"format":2,"projections":{}}"#.as_slice(),
+        br#"{"format":2,"futureShape":[1,2]}"#,
+    ] {
+        let (dir, ds) = persistent();
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+            .unwrap();
+        drop(ds);
+        std::fs::write(dir.path().join("db/algo.json"), content).unwrap();
+        let result = Dataset::open(dir.path().join("db"));
+        assert!(
+            matches!(result, Err(sparkles::Error::Unsupported(_))),
+            "future catalog was hidden by the facade fallback"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("db/algo.json")).unwrap(),
+            content
+        );
+    }
+}
+
+#[test]
+fn algorithms_catalog_malformed_current_stays_broken_without_overwrite() {
+    for content in [b"{".as_slice(), br#"{"format":null,"projections":{}}"#, br#"{"format":1,"projections":{"bad":{"revision":1,"updated":"fixture","definition":{"direction":"sideways"}}}}"#] {
+        let (dir,ds)=persistent();drop(ds);
+        let path=dir.path().join("db/algo.json");std::fs::write(&path,content).unwrap();
+        let ds=Dataset::open(dir.path().join("db")).unwrap();
+        assert!(ds.algorithms().projections().list().is_empty());
+        assert!(matches!(ds.algorithms().projections().put("valid",sparkles::algo::catalog::ProjectionDef::default(),None,None),Err(sparkles::Error::Conflict(_))));
+        ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(),content);
+    }
+}
+
+#[cfg(feature = "backup")]
+#[test]
+fn algorithms_catalog_backup_restore_and_clone_preserve_revision_and_definition() {
+    use sparkles::algo::catalog::ProjectionDef;
+    use sparkles::backup::{CreateOptions, OpenEnv, RepoConfig, RestoreOptions};
+    let (dir, ds) = persistent();
+    ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
+        .unwrap();
+    let definition = ProjectionDef::from_json(
+        serde_json::json!({"predicates":["urn:p"],"direction":"undirected","aggregate":"sum"}),
+    )
+    .unwrap();
+    ds.algorithms()
+        .projections()
+        .put("named", definition.clone(), None, None)
+        .unwrap();
+    let (expected, created) = ds
+        .algorithms()
+        .projections()
+        .put("named", definition, Some("roundtrip".into()), Some(1))
+        .unwrap();
+    assert!(!created);
+    assert_eq!(expected.revision, 2);
+    let raw = std::fs::read(dir.path().join("db/algo.json")).unwrap();
+    let copy = dir.path().join("cloned");
+    ds.clone_to_with(&copy, &Default::default(), &sparkles::task::Control::none())
+        .unwrap();
+    let cloned = Dataset::open(&copy).unwrap();
+    assert_eq!(
+        cloned.algorithms().projections().get("named"),
+        Some(expected.clone())
+    );
+    assert_eq!(std::fs::read(copy.join("algo.json")).unwrap(), raw);
+    let cfg = RepoConfig::from_url(
+        "local",
+        &format!("file://{}", dir.path().join("repository").display()),
+    )
+    .unwrap();
+    let repo = sparkles::backup::open(&cfg, &OpenEnv::default()).unwrap();
+    ds.backups(&repo)
+        .create_with(
+            &CreateOptions {
+                name: "named-projection".into(),
+                dataset_name: "catalog-fixture".into(),
+                ..Default::default()
+            },
+            &sparkles::task::Control::none(),
+        )
+        .unwrap();
+    let restored = dir.path().join("restored");
+    sparkles::backup::blocking(&repo)
+        .restore_to_dir("named-projection", &restored, &RestoreOptions::default())
+        .unwrap();
+    let restored_ds = Dataset::open(&restored).unwrap();
+    assert_eq!(
+        restored_ds.algorithms().projections().get("named"),
+        Some(expected)
+    );
+    assert_eq!(std::fs::read(restored.join("algo.json")).unwrap(), raw);
+}
+
+#[test]
+fn algorithms_catalog_duplicate_fields_stay_readable_and_read_only() {
+    use sparkles::algo::catalog::ProjectionDef;
+    for content in [
+        br#"{"format":1,"projections":{"keep":{"revision":1,"updated":"fixture","definition":{}}},"projections":{}}"#.as_slice(),
+        br#"{"projections":{"keep":{"revision":1,"updated":"fixture","definition":{"direction":"forward","direction":"backward"}}}}"#,
+    ] {
+        let (dir, ds) = persistent();
+        drop(ds);
+        let root = dir.path().join("db");
+        let path = root.join("algo.json");
+        std::fs::write(&path, content).unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        let entries = || {
+            let mut names: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+            names.sort();
+            names
+        };
+        let before = entries();
+        let unchanged = || {
+            assert_eq!(std::fs::read(&path).unwrap(), content);
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions(), permissions);
+            assert_eq!(entries(), before);
+        };
+        let ds = Dataset::open(&root).unwrap();
+        unchanged();
+        let catalog = ds.algorithms().projections();
+        assert!(catalog.list().is_empty());
+        assert!(matches!(catalog.put("new", ProjectionDef::default(), None, None), Err(sparkles::Error::Conflict(_))), "duplicate catalog must refuse a real facade put");
+        unchanged();
+        for name in ["keep", "missing"] {
+            assert!(matches!(catalog.delete(name, None), Err(sparkles::Error::Conflict(_))));
+            unchanged();
+        }
+        assert!(ds.ask("ASK { <http://ex.org/a> <http://ex.org/p> 1 }").unwrap());
+        ds.update("INSERT DATA { <urn:readable> <urn:p> <urn:o> }").unwrap();
+        unchanged();
+    }
+}

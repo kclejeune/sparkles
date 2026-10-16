@@ -309,6 +309,19 @@ pub struct VectorIndexStatus {
 pub struct VectorOverlay {
     pub inserts: u64,
     pub deletes: u64,
+    /// inserted rows the graph holds since the background task added them, so searches
+    /// find them through it
+    #[serde(default)]
+    pub indexed: u64,
+    /// inserted rows the background task has yet to add to the graph, which searches
+    /// score exactly meanwhile
+    #[serde(default)]
+    pub pending: u64,
+    /// rows are pending and the graph cannot take another inserted node within the vector
+    /// memory budget, so they stay pending until the budget allows more or the next
+    /// compaction releases the inserted nodes
+    #[serde(default)]
+    pub over_budget: bool,
 }
 
 /// Literals of the predicate that are not indexed, by reason (rows).
@@ -372,6 +385,10 @@ pub struct VectorBuild {
     pub at: String,
     pub ms: f64,
     pub rows: u64,
+    /// the graph was carried over from the previous generation's build, with only
+    /// the rows that changed inserted or repaired
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub carried: bool,
 }
 
 #[cfg(test)]

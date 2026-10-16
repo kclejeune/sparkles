@@ -289,6 +289,18 @@ impl KeySet {
         self.len == 0
     }
 
+    /// Whether `other` is this set or an unchanged clone of it: both are empty, or both
+    /// share one root and hold as many keys. A set changed after a clone has a copied
+    /// root, so this is false for it even when it holds the same keys.
+    pub fn same(&self, other: &KeySet) -> bool {
+        self.len == other.len
+            && match (&self.root, &other.root) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+
     pub fn contains(&self, k: &Key) -> bool {
         self.root.as_ref().is_some_and(|r| r.contains(k))
     }
