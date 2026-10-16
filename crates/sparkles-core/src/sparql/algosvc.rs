@@ -516,6 +516,7 @@ pub(super) fn algo_leaf(
     let mut outs = Outs::default();
     let (mut start, mut end_var, mut edge_weight) = (None, None, None);
     let mut seen: Vec<String> = Vec::new();
+    p.ctx.note_algorithm_call();
     let mut default_weight_given = false;
     let mut named: Option<String> = None;
     let mut pred_names: Vec<String> = Vec::new();

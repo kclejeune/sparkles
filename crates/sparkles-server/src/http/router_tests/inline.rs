@@ -78,6 +78,34 @@ async fn an_algorithm_query_is_never_run_in_place() {
     assert!(!crate::http::QUICK.is_quick(key));
 }
 
+/// The algorithm namespace is found in the parsed query, not in its text. A prefixed
+/// name can spell the IRI of the service without the namespace appearing in the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_algorithm_named_by_a_prefix_is_never_run_in_place() {
+    let s = server();
+    for q in [
+        // `\#` in a local name is the `#` of the namespace
+        "PREFIX a: <urn:x-sparkles:> SELECT ?n ?c WHERE { SERVICE a:algo\\#wcc { [] a:algo\\#node ?n ; a:algo\\#component ?c } }",
+        // the namespace is split between the prefix and the local name
+        "PREFIX a: <urn:x-sparkles:algo> SELECT ?n ?c WHERE { SERVICE a:\\#wcc { [] a:\\#node ?n ; a:\\#component ?c } }",
+    ] {
+        assert!(!q.contains(sparkles::sparql::algosvc::NS), "{q}");
+        ignore_time(q);
+        for _ in 0..3 {
+            let r = select(&s.app, q, "application/sparql-results+json").await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            assert!(
+                !r.json()["results"]["bindings"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let key = crate::http::inline::QuickQueries::key("ds", q);
+        assert!(!crate::http::QUICK.is_quick(key), "{q}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_quick_query_reports_its_error_and_runs_on_the_pool_next() {
     let s = server();

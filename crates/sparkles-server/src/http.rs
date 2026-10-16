@@ -1383,9 +1383,10 @@ pub(crate) async fn run_query(
     opts.initial_bindings = bindings;
     // A graph-algorithm call can take milliseconds on a cached projection and much
     // longer after a commit, and work in place cannot stop when its client goes away.
-    // A query that names the algorithm namespace is never remembered as quick.
-    let algorithmic = query.contains(sparkles::sparql::algosvc::NS);
-    let in_place = !algorithmic && at.is_none() && inline::available() && QUICK.is_quick(quick_key);
+    // The first run of a query decides from its parsed algebra whether it has a SERVICE
+    // of the algorithm namespace, so a prefixed name counts like the full IRI, and a
+    // query that does is never remembered as quick and so never runs in place.
+    let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
@@ -1424,6 +1425,7 @@ pub(crate) async fn run_query(
         QUICK.record(quick_key, f64::INFINITY);
     }
     let (r, seq, resolved, t0) = ran.map_err(|e| with_timeout(e, timeout))?;
+    let algorithmic = r.ctx.calls_algorithm();
     let query_ms = r.timing.total_ms;
     let cells = r.len().saturating_mul(r.vars.len().max(3));
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
