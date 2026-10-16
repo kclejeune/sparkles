@@ -1357,3 +1357,50 @@ async fn sparql_diff_lists_the_rows_one_state_lacks() {
     let r = sparql_diff(&s.app, "/h/sparql/diff?from=99", q).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
 }
+
+/// The start of a response body, for the message of a failed assertion.
+fn head(r: &Resp) -> String {
+    r.text().chars().take(200).collect()
+}
+
+#[tokio::test]
+async fn sparql_diff_keeps_the_result_byte_budget() {
+    let s = server(|l| l.max_result_bytes = Some(4096)).await;
+    let big = "x".repeat(10_000);
+    update(
+        &s.app,
+        "h",
+        &format!("INSERT DATA {{ <urn:d> <urn:p> \"{big}\" }}"),
+    )
+    .await;
+    let r = sparql_diff(
+        &s.app,
+        "/h/sparql/diff?from=4&to=5",
+        "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", head(&r));
+    assert_eq!(r.json()["budget"], "result-bytes");
+}
+
+#[tokio::test]
+async fn sparql_diff_keeps_the_result_budget_a_request_asks_for() {
+    // no server limit: the request's own `max-result-mb` applies
+    let s = server(|_| {}).await;
+    let big = "x".repeat(2 << 20);
+    update(
+        &s.app,
+        "h",
+        &format!("INSERT DATA {{ <urn:d> <urn:p> \"{big}\" }}"),
+    )
+    .await;
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=1", q).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", head(&r));
+    // without it, or with a larger one, the answer is the whole body
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=8", q).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", head(&r));
+    assert_eq!(r.json()["added"], 1);
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=0", q).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}

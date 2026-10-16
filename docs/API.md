@@ -3513,7 +3513,9 @@ makes new blank nodes for each run reports them as different.
 `addedRows` are the rows only the later state has and `removedRows` those only the earlier
 state has, each as SPARQL JSON terms with unbound variables left out. `limit` caps each
 list, 100 by default and at most 10,000, and `truncated` says that a list is cut. The
-counts are always complete.
+counts are always complete. The body obeys `--max-result-mb` and the request's own
+`max-result-mb`, and a comparison whose listed rows would pass it fails with `507` and
+`budget: "result-bytes"`, so that a few very large literals cannot make a large response.
 
 The server keeps a 128-bit hash for each distinct row of the earlier result and no row.
 It reads the later result against those hashes, which finds its own rows as they go by,

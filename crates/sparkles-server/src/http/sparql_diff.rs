@@ -60,6 +60,44 @@ fn row_json(r: &QueryResult, i: usize) -> J {
     J::Object(o)
 }
 
+/// The rows listed so far, against the response's byte budget (`--max-result-mb` and the
+/// request's `max-result-mb`). Both lists count together, since both go in one body.
+struct Listed {
+    limit: Option<u64>,
+    bytes: u64,
+}
+
+impl Listed {
+    fn new(limit: Option<u64>) -> Listed {
+        Listed { limit, bytes: 0 }
+    }
+
+    /// Count a row's JSON, or fail with `507` once the rows alone pass the budget.
+    fn add(&mut self, row: J) -> ApiResult<J> {
+        // the comma that separates it from the row before
+        self.bytes += serde_json::to_vec(&row).map_or(0, |v| v.len() as u64) + 1;
+        self.check(self.bytes)?;
+        Ok(row)
+    }
+
+    /// The whole body, which also holds the envelope.
+    fn check_body(&self, len: u64) -> ApiResult<()> {
+        self.check(len)
+    }
+
+    fn check(&self, len: u64) -> ApiResult<()> {
+        match self.limit {
+            Some(limit) if len > limit => Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::ResultBytes,
+                limit,
+                requested: len,
+            })
+            .into()),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Run the query at `at` and check that it is a SELECT.
 fn run(
     ds: &Dataset,
@@ -125,6 +163,10 @@ pub(super) async fn sparql_diff(
         },
     };
     let mut opts = query_options(&st, &ds, &params);
+    // budgets the request asked for, never above the server's
+    let asked = budgets::Overrides::parse(&params)?;
+    asked.apply(&mut opts);
+    let max_bytes = asked.result_limit(st.limits.max_result_bytes);
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel);
@@ -156,6 +198,7 @@ pub(super) async fn sparql_diff(
             let right_rows = right.len() as u64;
             let (mut same, mut added) = (0u64, 0u64);
             let mut added_rows = Vec::new();
+            let mut listed = Listed::new(max_bytes);
             for i in 0..right.len() {
                 match seen.get_mut(&row_hash(&right, i, &mut buf)) {
                     Some(n) if *n > 0 => {
@@ -165,7 +208,7 @@ pub(super) async fn sparql_diff(
                     _ => {
                         added += 1;
                         if added_rows.len() < limit {
-                            added_rows.push(row_json(&right, i));
+                            added_rows.push(listed.add(row_json(&right, i))?);
                         }
                     }
                 }
@@ -185,7 +228,7 @@ pub(super) async fn sparql_diff(
                         && *n > 0
                     {
                         *n -= 1;
-                        removed_rows.push(row_json(&left, i));
+                        removed_rows.push(listed.add(row_json(&left, i))?);
                     }
                 }
             }
@@ -196,7 +239,7 @@ pub(super) async fn sparql_diff(
                 }
                 json!({ "selector": r.at.to_string(), "commit": commit })
             };
-            Ok(json!({
+            let out = json!({
                 "dataset": ds.name,
                 "datasetId": ds.store.owner_dataset_id(),
                 "from": side(&from_at),
@@ -210,9 +253,13 @@ pub(super) async fn sparql_diff(
                 "addedRows": added_rows,
                 "removedRows": removed_rows,
                 "truncated": { "added": added > added_rows.len() as u64, "removed": removed > removed_rows.len() as u64 },
-            }))
+            });
+            // the envelope is small next to the rows, and the check makes the bound exact
+            let body = serde_json::to_vec(&out).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            listed.check_body(body.len() as u64)?;
+            Ok(body)
         }
     })
     .await?;
-    Ok(Json(out).into_response())
+    Ok(([(header::CONTENT_TYPE, "application/json")], out).into_response())
 }
