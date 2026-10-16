@@ -954,9 +954,13 @@ the root. An n-ary join over all the triple patterns of a basic graph pattern, b
 run iteratively, would make planning close to linear and the plan flat. The limit could
 then rise, or count only the levels that still nest.
 
-The rest of item 84 is work that makes the limit less important. Planning does not check
-the deadline, so `joinorder::order` and the candidate loop of the greedy order need
-deadline checks, and the candidates should be built without cloning both subtrees. The
+The rest of item 84 is work that makes the limit less important. A release build
+explains a plain chain of 1998 in 1.3 to 1.7 s, a tree of 1998 or a MINUS after each of
+790 patterns in 2.8 s, a BIND after each of 790 patterns in 6.9 s and an OPTIONAL after
+each of them in 7.6 s. Most of these shapes observe the timeout during planning, because
+the greedy order calls `ctx.check()`, but a plain chain and its reverse do not. Every
+planning loop, including `joinorder::order` and the candidate loop of the greedy order,
+needs a deadline check, and the candidates should be built without cloning both subtrees. The
 plan JSON for `/{ds}/explain`, the Sparkles result format and its error body should be
 linear in size, by compact node ids or a node cap with a truncation flag. The explanation
 reader in `crates/sparkles-server/src/explain/mod.rs` should be iterative so that its
