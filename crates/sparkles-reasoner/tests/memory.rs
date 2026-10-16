@@ -159,8 +159,10 @@ fn f16_local_term_budget() {
 fn f16_shared_candidate_budget() {
     let _one = one_at_a_time();
     const LIMIT: usize = 48_000;
-    // the store's blocks a scan decodes, the threads' evaluation state and the error
-    const SLACK: usize = 512 << 10;
+    // the store's blocks a scan decodes, the threads' evaluation state and the error:
+    // 20 runs allocated at most 185,663 bytes beyond what they started with, and the
+    // slack is that less the limit, 1.5 times over, rounded up to 64 KiB
+    const SLACK: usize = 256 << 10;
     let s = Store::in_memory(StoreOptions::default());
     let mut ttl = String::from("ex:A rdfs:subClassOf ex:B . ex:B rdfs:subClassOf ex:C .\n");
     for i in 0..200_000 {
@@ -437,6 +439,92 @@ fn f16_incremental_reports_peak() {
             ),
             Err(e) => assert!(e.to_string().contains("memory limit"), "{case}: {e:#}"),
         }
+    }
+    // the closure read from the dataset: a run that reads it, applies the change and
+    // writes reports the same
+    for case in ["no-op", "deletion", "duplicate insert"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, _cache, since) = kept(Some(&dir.path().join("db")));
+        apply(&s, case);
+        let free = update(&s, None, since, None).unwrap();
+        assert!(free.peak_bytes > 0, "{case}");
+        assert_eq!(free.changes.as_ref().unwrap().source, "store", "{case}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let (s, _cache, since) = kept(Some(&dir.path().join("db")));
+        apply(&s, case);
+        let peak = free.peak_bytes as usize + 256;
+        let r = update(&s, None, since, Some(peak))
+            .unwrap_or_else(|e| panic!("{case}: a limit of the reported peak {peak}: {e:#}"));
+        assert!(
+            r.peak_bytes as usize <= peak,
+            "store {case}: {} over {peak}",
+            r.peak_bytes
+        );
+    }
+    // many candidates that collapse in the merge: each rule has its own evaluations and
+    // its own set of emitted facts, so 4 rules buffer 4 x 20,000 candidates for 20,000
+    // new rows. The run is charged for the buffered candidates and for the merge's
+    // buffers sized for all of them, and a limit at the reported peak suffices.
+    const N: usize = 20_000;
+    const K: usize = 4;
+    let mut text = String::from(
+        "@prefix ex: <http://ex.org/> .
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n",
+    );
+    for k in 0..K {
+        text.push_str(&format!(
+            "[r{k}: (?x rdf:type ex:A) -> (?x rdf:type ex:B)]\n"
+        ));
+    }
+    let rules = Profile::Rules(text);
+    let collapse = || {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut ttl = String::new();
+        for i in 0..N {
+            ttl.push_str(&format!("ex:i{i} a ex:A .\n"));
+        }
+        load(&s, &ttl);
+        s
+    };
+    let free = materialize_with(&collapse(), &rules, &Extras::default(), &limited(None)).unwrap();
+    assert_eq!(free.inferred, N as u64);
+    // the candidate buffers (24 bytes each) and the merge's names of them (2 x 8 bytes)
+    // are held at once
+    let c = K * N;
+    assert!(
+        free.peak_bytes as usize >= c * 40,
+        "peak {} for {c} candidates collapsing to {N} rows",
+        free.peak_bytes
+    );
+    let peak = free.peak_bytes as usize + 256;
+    let r = materialize_with(
+        &collapse(),
+        &rules,
+        &Extras::default(),
+        &limited(Some(peak)),
+    )
+    .unwrap_or_else(|e| panic!("collapse: a limit of the reported peak {peak}: {e:#}"));
+    assert_eq!(r.inferred, N as u64);
+    assert!(
+        r.peak_bytes as usize <= peak,
+        "collapse: {} over {peak}",
+        r.peak_bytes
+    );
+    // under it, a run either fails or stays within its limit
+    let half = peak / 2;
+    match materialize_with(
+        &collapse(),
+        &rules,
+        &Extras::default(),
+        &limited(Some(half)),
+    ) {
+        Ok(r) => assert!(
+            r.peak_bytes as usize <= half,
+            "collapse: {} over {half}",
+            r.peak_bytes
+        ),
+        Err(e) => assert!(e.to_string().contains("memory limit"), "collapse: {e:#}"),
     }
     // a full run likewise
     let (s, _, _) = kept(None);
