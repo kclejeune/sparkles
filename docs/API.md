@@ -6740,6 +6740,13 @@ the shapes graph in the request body, with Fuseki's semantics:
   `sh:memberShape` result has one `sh:detail` per member that does not conform, holding
   that member's results against the member shape. A `sh:uniqueMembers true` result has one
   `sh:detail` per repeated member, with the member as `sh:value`.
+* **Node expressions** (SHACL 1.2 node expressions) are read in targets, `sh:values`,
+  `sh:defaultValue`, `sh:deactivated`, `sh:expression` and `sh:nodeByExpression`. One
+  evaluation may take at most 16,777,216 units of work, where each evaluation of a
+  sub-expression is a unit and so is each node that a concatenation or a mapping appends.
+  The nodes that a read of the data returns are not counted. A shared sub-expression counts
+  each time it is evaluated, so an expression graph that doubles at every level fails
+  quickly. The limit is fixed for requests, and the timeout also stops an evaluation.
 * **Budgets.** The report is bounded like a query result. It fails with `507` and
   `budget: "result-bytes"` once it holds more results than fit in `--max-result-mb` at 48
   bytes each, or in `--query-memory-mb` at an estimated 512 bytes each. It also fails once

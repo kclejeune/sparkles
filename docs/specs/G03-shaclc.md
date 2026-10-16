@@ -557,11 +557,18 @@ namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
   needs an RDF list. The draft does not define computed forms of either. The
   two-argument `shnex:hasLang` is `LANGMATCHES(LANG(x), range)`, and `shnex:sameValue` is
   `COALESCE(a = b, false)`. Nesting is limited to 128 levels when parsing and 192 when
-  evaluating, and deep evaluation grows its stack. One evaluation may work through at
-  most 1,048,576 nodes, counting the output of every sub-expression each time it is
-  evaluated, and `ValidateOptions::max_expr_nodes` changes that limit. Past it the
-  evaluation fails, so an expression graph that doubles at every level stops early.
-  Evaluation also honours the timeout and cancellation of the validation.
+  evaluating, and deep evaluation grows its stack. One evaluation may take at most
+  16,777,216 units of work. Each evaluation of a sub-expression is a unit, and so is each
+  node that a concatenation or a mapping appends. The nodes that a read of the data
+  returns are not counted, because the data bounds them and a class with millions of
+  instances is a legitimate result. A shared sub-expression counts each time it is
+  evaluated, so an expression graph that doubles at every level fails early, holding at
+  most 128 MiB of node ids. The Rust field `ValidateOptions::max_expr_nodes` changes the
+  limit, and the other nesting limits are fixed in the same way, so requests and the guard
+  keep the default. Evaluation also honours the timeout and cancellation of the
+  validation, which it checks every 4096 nodes that evaluations produce. A read of the
+  data that is repeated many times over a shared sub-expression costs one unit each time
+  and is bounded by the timeout, not by the budget.
 * *Write-time validation.* The incremental guard works out the predicates an expression
   reads from the focus node, as it does for anchored SHACL-SPARQL queries. An expression
   that reads the graph away from the focus node falls back to full validation. Value

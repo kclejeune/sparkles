@@ -271,3 +271,41 @@ fn doubling_expressions_are_bounded() {
         .unwrap_err();
     assert!(format!("{err:#}").contains("more than"), "{err:#}");
 }
+
+/// A read of the data may return more nodes than the budget of work. A class with over a
+/// million instances is an ordinary size, and the budget only guards against expression
+/// graphs that multiply their own work.
+#[test]
+fn a_large_read_is_not_charged_to_the_budget() {
+    let n = (1u64 << 20) + 10;
+    let mut nt = String::from("<http://ex.org/x> <http://ex.org/p> <http://ex.org/y> .\n");
+    for i in 0..n {
+        nt.push_str(&format!(
+            "<http://ex.org/i{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/C> .\n"
+        ));
+    }
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[Source::from_bytes(
+            nt.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let shapes = Shapes::parse(
+        &format!(
+            "{PREFIXES}ex:S a sh:NodeShape ; sh:targetNode ex:x ;
+               sh:property [ sh:path ex:p ;
+                 sh:values [ shnex:instancesOf ex:C ] ; sh:minCount 1 ; sh:nodeKind sh:IRI ] ."
+        ),
+        RdfFormat::Turtle,
+        None,
+    )
+    .unwrap();
+    let opts = ValidateOptions {
+        parallel: false,
+        ..ValidateOptions::default()
+    };
+    let r = sparkles_shacl::validate(&store.snapshot(), &shapes, &opts).unwrap();
+    assert!(r.conforms, "{r}");
+}

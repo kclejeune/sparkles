@@ -96,6 +96,7 @@ impl Engine<'_> {
         }
         if cx.depth == 0 {
             cx.expr_work = 0;
+            cx.expr_seen = 0;
         }
         cx.depth += 1;
         // each level is a big frame; grow the stack for a deep expression
@@ -106,31 +107,37 @@ impl Engine<'_> {
         Ok(out)
     }
 
-    /// Count one evaluation that produced `n` nodes against the budget of the top-level
-    /// evaluation, and look at the timeout and cancellation every few thousand units.
+    /// Count one finished evaluation, which produced `n` nodes. Only the evaluations
+    /// count against the budget of the top-level evaluation. The nodes that a read of the
+    /// data returns do not, because the data bounds them and a legitimate result can be
+    /// large. They are counted separately, so that the timeout and cancellation are
+    /// looked at every few thousand units however big the reads are.
     fn charge(&self, cx: &mut Cx, n: usize) -> Result<()> {
-        let before = cx.expr_work;
-        cx.expr_work = before.saturating_add(1 + n as u64);
-        if cx.expr_work > self.max_expr_nodes {
-            return fail(format!(
-                "a node expression worked through more than {} nodes",
-                self.max_expr_nodes
-            ));
-        }
-        if before / EXPR_CHECK_EVERY != cx.expr_work / EXPR_CHECK_EVERY {
+        cx.expr_work = cx.expr_work.saturating_add(1);
+        self.over_budget(cx)?;
+        let before = cx.expr_seen;
+        cx.expr_seen = before.saturating_add(1 + n as u64);
+        if before / EXPR_CHECK_EVERY != cx.expr_seen / EXPR_CHECK_EVERY {
             self.check_limits()?;
         }
         Ok(())
     }
 
-    /// Append `next` to `out`, unless the result would pass the budget.
-    fn append(&self, out: &mut Vec<Id>, next: Vec<Id>) -> Result<()> {
-        if (out.len() as u64).saturating_add(next.len() as u64) > self.max_expr_nodes {
+    fn over_budget(&self, cx: &Cx) -> Result<()> {
+        if cx.expr_work > self.max_expr_nodes {
             return fail(format!(
-                "a node expression produced more than {} nodes",
+                "a node expression worked through more than {} units",
                 self.max_expr_nodes
             ));
         }
+        Ok(())
+    }
+
+    /// Append `next` to `out`, and count the nodes against the budget. Concatenation and
+    /// mapping are the operators whose output can be larger than their inputs.
+    fn append(&self, cx: &mut Cx, out: &mut Vec<Id>, next: Vec<Id>) -> Result<()> {
+        cx.expr_work = cx.expr_work.saturating_add(next.len() as u64);
+        self.over_budget(cx)?;
         out.extend(next);
         Ok(())
     }
@@ -221,7 +228,7 @@ impl Engine<'_> {
                 let mut out = Vec::new();
                 for x in xs {
                     let next = self.eval(*x, focus, scope, cx)?;
-                    self.append(&mut out, next)?;
+                    self.append(cx, &mut out, next)?;
                 }
                 Ok(out)
             }
@@ -273,7 +280,7 @@ impl Engine<'_> {
                 for (i, x) in n.into_iter().enumerate() {
                     self.tick(i)?;
                     let next = self.eval(*map, x, scope, cx)?;
-                    self.append(&mut out, next)?;
+                    self.append(cx, &mut out, next)?;
                 }
                 Ok(out)
             }

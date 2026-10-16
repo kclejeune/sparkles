@@ -44,14 +44,16 @@ pub struct ValidateOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Stop with [`TooManyResults`] once the report would hold more results than this.
     pub max_results: Option<usize>,
-    /// The most nodes one node expression evaluation may work through, counting every
-    /// sub-expression's output. A shared sub-expression counts each time it is evaluated,
-    /// so a doubling expression graph stops here and not after exhausting memory.
+    /// The most units of work one node expression evaluation may take. Each evaluation of a
+    /// sub-expression is one unit, and so is each node that a concatenation or a mapping
+    /// appends. The nodes that a read of the data returns are not counted, so a large
+    /// result is fine. A shared sub-expression counts each time it is evaluated, so a
+    /// doubling expression graph stops here and not after exhausting memory.
     pub max_expr_nodes: u64,
 }
 
 /// The default of [`ValidateOptions::max_expr_nodes`].
-pub const DEFAULT_MAX_EXPR_NODES: u64 = 1 << 20;
+pub const DEFAULT_MAX_EXPR_NODES: u64 = 1 << 24;
 
 /// A report that would hold more than [`ValidateOptions::max_results`] results.
 #[derive(Debug)]
@@ -216,8 +218,10 @@ pub(crate) struct Cx {
     stack: Vec<(ShapeId, Id)>,
     /// nesting of node expression evaluations
     pub depth: usize,
-    /// nodes worked through by the top-level evaluation in progress
+    /// units of work of the top-level evaluation in progress, counted against the budget
     pub expr_work: u64,
+    /// nodes that its evaluations produced, which set how often the deadline is checked
+    pub expr_seen: u64,
 }
 
 pub(crate) struct Engine<'a> {
