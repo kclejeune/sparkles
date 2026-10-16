@@ -400,16 +400,18 @@ fn a_deadline_that_has_passed_stops_every_format() {
     assert!(to_markdown(&docx(), Format::Docx, &l).is_ok());
 }
 
-#[test]
-fn many_footnote_references_convert_quickly() {
-    // the scan of the used notes that this replaced took about 20 s at this size in a
-    // debug build, the lookup takes about 2 s
-    let n = 100_000;
+/// A document of `n` paragraphs, each naming its own footnote when `refs` is set.
+fn footnoted(n: usize, refs: bool) -> Vec<u8> {
     let mut body = String::new();
     let mut notes = String::new();
     for i in 1..=n {
+        let r = if refs {
+            format!(r#"<w:footnoteReference w:id="{i}"/>"#)
+        } else {
+            String::new()
+        };
         body.push_str(&format!(
-            r#"<w:p><w:r><w:t>p{i}</w:t></w:r><w:r><w:footnoteReference w:id="{i}"/></w:r></w:p>"#
+            r#"<w:p><w:r><w:t>p{i}</w:t></w:r><w:r>{r}</w:r></w:p>"#
         ));
         notes.push_str(&format!(
             r#"<w:footnote w:id="{i}"><w:p><w:r><w:t>note {i}</w:t></w:r></w:p></w:footnote>"#
@@ -417,17 +419,51 @@ fn many_footnote_references_convert_quickly() {
     }
     let doc = format!(r#"<w:document {W}><w:body>{body}</w:body></w:document>"#);
     let foot = format!(r#"<w:footnotes {W}>{notes}</w:footnotes>"#);
-    let b = container(&[("word/document.xml", &doc), ("word/footnotes.xml", &foot)]);
+    container(&[("word/document.xml", &doc), ("word/footnotes.xml", &foot)])
+}
+
+// The scan of the used notes that a set replaced made each reference cost as much as all
+// the references before it: 100,000 references took about ten times as long as the same
+// document without them. The ratio to that baseline, the faster of two runs each, holds
+// on a loaded machine where a wall-clock bound does not.
+#[test]
+fn many_footnote_references_convert_quickly() {
     let l = Limits {
         max_text: 64 << 20,
         ..lim()
     };
-    let start = std::time::Instant::now();
-    let d = to_markdown(&b, Format::Docx, &l).unwrap();
+    let (with, without) = (footnoted(100_000, true), footnoted(100_000, false));
+    let d = to_markdown(&with, Format::Docx, &l).unwrap();
     assert!(d.markdown.contains("[^fn100000]: note 100000"));
-    assert!(
-        start.elapsed().as_secs_f64() < 10.0,
-        "{:?}",
-        start.elapsed()
-    );
+    let time = |b: &[u8]| {
+        (0..2)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                to_markdown(b, Format::Docx, &l).unwrap();
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let (tw, t0) = (time(&with), time(&without));
+    assert!(tw < t0 * 4, "with references {tw:?}, without {t0:?}");
+}
+
+// Cells set out of column order are appended, not inserted, and a row is sorted once
+// when it is added. Inserting each cell at the front of the row was a memmove of the
+// whole row per cell.
+#[test]
+fn cells_out_of_order_are_appended_then_sorted_once() {
+    use std::borrow::Cow;
+    let mut budget = crate::budget::Budget::new(&lim());
+    let mut row: crate::sheet::Cells = Vec::new();
+    for c in [5usize, 3, 4, 3, 0] {
+        crate::sheet::set(&mut row, c, Cow::Owned(format!("v{c}")), &mut budget).unwrap();
+    }
+    let cols: Vec<u32> = row.iter().map(|(c, _)| *c).collect();
+    assert_eq!(cols, [5, 3, 4, 3, 0], "set must append in call order");
+    let mut b = crate::sheet::SheetBuilder::new(100);
+    b.row(row, 1, &mut budget).unwrap();
+    let sh = b.finish("S", 1, 1 << 20, &mut budget).unwrap().unwrap();
+    assert_eq!(sh.csv, "v0,,,v3,v4,v5\n");
 }

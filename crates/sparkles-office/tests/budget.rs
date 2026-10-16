@@ -585,14 +585,24 @@ fn r2_f2_one_long_format_code_in_many_cell_formats() {
     assert!(r.is_ok(), "{r:?}");
 }
 
-// Re-review 2, F3: a body placeholder inside 190 others walked its 400,000 paragraphs once
-// per level, and the deadline was read only a few times.
-#[test]
-fn r2_f3_nested_note_placeholders_over_many_paragraphs() {
-    let _g = serial();
+/// The faster of two runs of `f`, which takes out most of the noise of a loaded machine.
+fn fastest<T>(mut f: impl FnMut() -> T) -> std::time::Duration {
+    (0..2)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            std::hint::black_box(f());
+            t.elapsed()
+        })
+        .min()
+        .unwrap()
+}
+
+/// A presentation whose notes hold 400,000 empty paragraphs under `depth` nested body
+/// placeholders.
+fn nested_notes(depth: usize) -> Vec<u8> {
     let ph = r#"<p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr>"#;
     let leaf = format!("<p:txBody>{}</p:txBody>", "<a:p/>".repeat(400_000));
-    let shapes = nest(&format!("<p:sp>{ph}"), "</p:sp>", 190, &leaf);
+    let shapes = nest(&format!("<p:sp>{ph}"), "</p:sp>", depth, &leaf);
     let notes = format!(r#"<p:notes {P}><p:cSld><p:spTree>{shapes}</p:spTree></p:cSld></p:notes>"#);
     let prels = rels(&[("rId2", "slide", "slides/slide1.xml", false)]);
     let srels = rels(&[(
@@ -605,17 +615,29 @@ fn r2_f3_nested_note_placeholders_over_many_paragraphs() {
         r#"<p:presentation {P}><p:sldIdLst><p:sldId r:id="rId2"/></p:sldIdLst></p:presentation>"#
     );
     let slide = format!(r#"<p:sld {P}><p:cSld><p:spTree/></p:cSld></p:sld>"#);
-    let f = zip(&[
+    zip(&[
         ("ppt/presentation.xml", &pres),
         ("ppt/_rels/presentation.xml.rels", &prels),
         ("ppt/slides/slide1.xml", &slide),
         ("ppt/slides/_rels/slide1.xml.rels", &srels),
         ("ppt/notesSlides/notesSlide1.xml", &notes),
-    ]);
-    let started = std::time::Instant::now();
-    let r = within(60, move || to_markdown(&f, Format::Pptx, &deadline_in(30)));
-    assert!(r.is_ok(), "{r:?}");
-    assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+    ])
+}
+
+// Re-review 2, F3: a body placeholder inside 190 others walked its 400,000 paragraphs once
+// per level, and the deadline was read only a few times. The walk is linear when 190
+// levels cost about what one level costs. The ratio, unlike a wall-clock bound, holds on
+// a loaded machine: the per-level walk made it well over 20.
+#[test]
+fn r2_f3_nested_note_placeholders_over_many_paragraphs() {
+    let _g = serial();
+    let (one, deep) = (nested_notes(1), nested_notes(190));
+    let r = within(60, move || {
+        let run = |f: &[u8]| to_markdown(f, Format::Pptx, &deadline_in(30)).unwrap();
+        (fastest(|| run(&one)), fastest(|| run(&deep)))
+    });
+    let (t1, t190) = r;
+    assert!(t190 < t1 * 20, "one level {t1:?}, 190 levels {t190:?}");
 }
 
 // Re-review 2, F4: a style based on itself with a 7 MiB id cloned and hashed that id nine
@@ -657,25 +679,28 @@ fn r2_f4_long_table_style_name() {
 }
 
 // Re-review 2, P3: cells of a row in descending column order were each inserted at the
-// front of the row, a quadratic memmove for every row.
+// front of the row, a quadratic memmove for every row. The unit test
+// `cells_out_of_order_are_appended_then_sorted_once` checks the cost deterministically,
+// and this one checks that such rows come out in column order.
 #[test]
 fn r2_cells_in_descending_column_order() {
     let _g = serial();
     let mut row = String::new();
     for c in (0..16_384usize).rev() {
-        row.push_str(&format!(r#"<c r="{}1"><v>1</v></c>"#, column_name(c)));
+        row.push_str(&format!(r#"<c r="{}1"><v>{c}</v></c>"#, column_name(c)));
     }
     let mut sheet = format!("<worksheet {X}><sheetData>");
-    for _ in 0..60 {
+    for _ in 0..20 {
         sheet.push_str(&format!("<row>{row}</row>"));
     }
     sheet.push_str("</sheetData></worksheet>");
     let f = workbook(1, &format!("<sst {X}/>"), &sheet);
-    let started = std::time::Instant::now();
-    let r = within(60, move || sheets(&f, Format::Xlsx, &Limits::default()));
-    let s = r.unwrap();
+    let s = within(60, move || sheets(&f, Format::Xlsx, &Limits::default())).unwrap();
     assert_eq!(s[0].columns, 16_384);
-    assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+    assert_eq!(s[0].rows, 20);
+    let first = s[0].csv.lines().next().unwrap();
+    let want: Vec<String> = (0..16_384).map(|c| c.to_string()).collect();
+    assert_eq!(first, want.join(","));
 }
 
 fn column_name(mut c: usize) -> String {
