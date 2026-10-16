@@ -114,7 +114,7 @@ fn metrics(put: &mut dyn FnMut(&str, J)) {
                             "commits": obj(
                                 &["fences", "failures", "fallbacks"],
                                 json!({
-                                    "fences": { "type": "integer", "description": "Group commit fences since the dataset was opened." },
+                                    "fences": { "type": "integer", "description": "Group commit fences that synchronized successfully since the dataset was opened. Failed fences are counted in failures." },
                                     "failures": { "type": "integer", "description": "Fences whose synchronization failed." },
                                     "fallbacks": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Commits that took the ordinary path, by the first condition that kept them out of a group." },
                                 }),

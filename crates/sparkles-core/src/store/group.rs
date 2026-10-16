@@ -1337,6 +1337,13 @@ mod tests {
         assert_eq!(m.fallbacks[Fallback::Kind as usize], 1);
         assert_eq!(m.fallbacks[Fallback::Noop as usize], 1);
         assert_eq!(m.fallbacks.iter().sum::<u64>(), 2);
+        // every reason has a producer in admission (review X09-4)
+        assert_eq!(
+            Fallback::ALL.map(Fallback::as_str),
+            [
+                "poisoned", "kind", "text", "geo", "embed", "bulk", "size", "noop"
+            ]
+        );
         // a store without group commit counts nothing
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path(), Default::default()).unwrap();

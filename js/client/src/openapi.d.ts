@@ -5841,7 +5841,7 @@ export interface components {
                     fallbacks: {
                         [key: string]: number;
                     };
-                    /** @description Group commit fences since the dataset was opened. */
+                    /** @description Group commit fences that synchronized successfully since the dataset was opened. Failed fences are counted in failures. */
                     fences: number;
                 };
                 deltaDeletes: number;

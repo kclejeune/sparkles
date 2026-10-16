@@ -501,7 +501,12 @@ full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
   failing condition. `/$/metrics` exports them as `sparkles_commit_sync_seconds`,
   `sparkles_group_commit_size`, `sparkles_group_commit_wait_seconds`,
   `sparkles_group_commit_fallbacks_total` and `sparkles_group_commit_failures_total`.
-  `/$/stats` reports `groupCommit` and `commits` per dataset.
+  `/$/stats` reports `groupCommit` and `commits` per dataset, where `fences` counts the
+  fences that synchronized successfully and `failures` the ones that did not. The fallback
+  reasons are `poisoned`, `kind`, `text`, `geo`, `embed`, `bulk`, `size` and `noop`. The
+  other seven reasons of section 8 (`message`, `precondition`, `guard`, `compaction`,
+  `digests`, `bypass` and `graphs`) name conditions that Phase 2 admits, so they are no
+  longer reasons and have no series.
 - **Serial latency (A1).** A grouped singleton was 4% to 9% slower than the default writer at
   1.05M, so the idle fast path of section 4.1 was added
   (`StoreOptions::group_commit_idle_direct`, on by default, hidden flag

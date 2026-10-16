@@ -36,62 +36,43 @@ impl SyncPath {
 }
 
 /// Why a commit of a store with group commit on took the ordinary path: the first
-/// condition of admission that failed.
+/// condition of admission that failed. Commit messages, preconditions, guards,
+/// compaction, change digests, bypassed validation and graph restrictions were reasons
+/// before Phase 2 admitted them, and are no longer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {
-    Message,
-    Precondition,
-    Guard,
+    Poisoned,
+    Kind,
     Text,
     Geo,
     Embed,
-    Compaction,
-    Kind,
     Bulk,
     Size,
     Noop,
-    Digests,
-    Bypass,
-    Graphs,
-    Poisoned,
 }
 
 impl Fallback {
-    pub const ALL: [Fallback; 15] = [
-        Fallback::Message,
-        Fallback::Precondition,
-        Fallback::Guard,
+    pub const ALL: [Fallback; 8] = [
+        Fallback::Poisoned,
+        Fallback::Kind,
         Fallback::Text,
         Fallback::Geo,
         Fallback::Embed,
-        Fallback::Compaction,
-        Fallback::Kind,
         Fallback::Bulk,
         Fallback::Size,
         Fallback::Noop,
-        Fallback::Digests,
-        Fallback::Bypass,
-        Fallback::Graphs,
-        Fallback::Poisoned,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Fallback::Message => "message",
-            Fallback::Precondition => "precondition",
-            Fallback::Guard => "guard",
+            Fallback::Poisoned => "poisoned",
+            Fallback::Kind => "kind",
             Fallback::Text => "text",
             Fallback::Geo => "geo",
             Fallback::Embed => "embed",
-            Fallback::Compaction => "compaction",
-            Fallback::Kind => "kind",
             Fallback::Bulk => "bulk",
             Fallback::Size => "size",
             Fallback::Noop => "noop",
-            Fallback::Digests => "digests",
-            Fallback::Bypass => "bypass",
-            Fallback::Graphs => "graphs",
-            Fallback::Poisoned => "poisoned",
         }
     }
 }
