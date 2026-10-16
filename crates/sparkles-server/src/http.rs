@@ -1381,7 +1381,11 @@ pub(crate) async fn run_query(
         inline::QuickQueries::key(&ds.name, &format!("{query}\n{}", values.join("\n")))
     };
     opts.initial_bindings = bindings;
-    let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
+    // A graph-algorithm call can take milliseconds on a cached projection and much
+    // longer after a commit, and work in place cannot stop when its client goes away.
+    // A query that names the algorithm namespace is never remembered as quick.
+    let algorithmic = query.contains(sparkles::sparql::algosvc::NS);
+    let in_place = !algorithmic && at.is_none() && inline::available() && QUICK.is_quick(quick_key);
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
@@ -1516,7 +1520,14 @@ pub(crate) async fn run_query(
     };
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
-            QUICK.record(quick_key, query_ms + serialize_ms);
+            QUICK.record(
+                quick_key,
+                if algorithmic {
+                    f64::INFINITY
+                } else {
+                    query_ms + serialize_ms
+                },
+            );
             let report = RequestReport {
                 response_bytes: Some(body.len() as u64),
                 serialize_ms: Some(serialize_ms),

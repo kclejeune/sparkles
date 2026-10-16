@@ -1080,7 +1080,7 @@
         "type": "object"
       },
       "AlgoProjectionList": {
-        "description": "A dataset's named projections and the size of the cache of built projections.",
+        "description": "A dataset's named projections. A server administrator also sees `cache`, the size of the cache of built projections, which every dataset shares.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
         },
@@ -1116,8 +1116,7 @@
         },
         "required": [
           "dataset",
-          "projections",
-          "cache"
+          "projections"
         ],
         "type": "object"
       },

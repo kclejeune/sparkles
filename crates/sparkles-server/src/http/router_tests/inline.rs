@@ -62,6 +62,22 @@ async fn a_quick_query_runs_in_place_the_second_time_with_the_same_answer() {
     assert_eq!(lines(&second).len(), 2);
 }
 
+/// A graph-algorithm call can take milliseconds on a cached projection and much longer
+/// after a commit, and work in place cannot stop when its client goes away. A query
+/// that calls an algorithm is never remembered as quick, so it never runs in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_algorithm_query_is_never_run_in_place() {
+    let s = server();
+    let q = "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:node ?n ; algo:component ?c } }";
+    ignore_time(q);
+    for _ in 0..2 {
+        let r = select(&s.app, q, "application/sparql-results+json").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    }
+    let key = crate::http::inline::QuickQueries::key("ds", q);
+    assert!(!crate::http::QUICK.is_quick(key));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_quick_query_reports_its_error_and_runs_on_the_pool_next() {
     let s = server();

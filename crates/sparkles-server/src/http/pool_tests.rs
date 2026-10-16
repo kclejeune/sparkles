@@ -296,3 +296,79 @@ async fn dropping_profiled_streaming_body_releases_its_query_grant() {
     .await
     .expect("cancelled serializer releases its grant");
 }
+
+async fn algorithm(app: &Router, body: &str) -> (StatusCode, String) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/$/algo/ds/run")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/sparql-results+json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn wait_task(st: &AppState, id: &str) -> crate::state::Task {
+    let t0 = std::time::Instant::now();
+    loop {
+        let t = st
+            .tasks
+            .lock()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .unwrap();
+        if t.state != "running" {
+            return t;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "task {id} did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn task_id(body: &str) -> String {
+    serde_json::from_str::<J>(body).unwrap()["taskId"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// An algorithm run selects its class from its body, so the admission layer cannot
+/// classify it by route. A read run waits for its initial grant as a query does, and a
+/// write-back run takes its grant when its task starts.
+#[tokio::test]
+async fn algorithm_runs_wait_for_the_memory_pool() {
+    const READ: &str = r#"{"algorithm":"wcc","projection":{"predicates":["urn:p"]}}"#;
+    const WRITE: &str = r#"{"algorithm":"wcc","projection":{"predicates":["urn:p"]},"write":{"graph":"urn:out","predicates":{"component":"urn:component"}}}"#;
+    let s = server(64, Duration::from_millis(200));
+    let held = pool(&s).try_grant(56 * MB).unwrap();
+    let (status, body) = algorithm(&s.app, READ).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["budget"], "server-memory");
+    assert_eq!(pool(&s).stats().rejected, 1);
+    let (status, body) = algorithm(&s.app, WRITE).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let task = wait_task(&s.state, &task_id(&body)).await;
+    assert_eq!(task.state, "failed", "{:?}", task.message);
+    assert_eq!(pool(&s).stats().rejected, 2);
+    drop(held);
+    let (status, body) = algorithm(&s.app, READ).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = algorithm(&s.app, WRITE).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let task = wait_task(&s.state, &task_id(&body)).await;
+    assert_eq!(task.state, "done", "{:?}", task.message);
+    assert_eq!(pool(&s).granted(), 0);
+}

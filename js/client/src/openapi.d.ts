@@ -3578,9 +3578,9 @@ export interface components {
             /** @description The property of an edge's reifier that holds its weight. */
             weight?: string;
         };
-        /** @description A dataset's named projections and the size of the cache of built projections. */
+        /** @description A dataset's named projections. A server administrator also sees `cache`, the size of the cache of built projections, which every dataset shares. */
         AlgoProjectionList: {
-            cache: {
+            cache?: {
                 bytes: number;
                 entries: number;
             };

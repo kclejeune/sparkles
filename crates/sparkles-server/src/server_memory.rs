@@ -205,9 +205,6 @@ pub fn current_grant() -> Option<Arc<PoolGrant>> {
 /// order, for an initial grant. They answer `503` with `Retry-After` when the wait
 /// passes `--query-admission-wait`. Other requests run without a grant.
 pub async fn admit(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Response {
-    let Some(pool) = st.catalog.pool() else {
-        return next.run(req).await;
-    };
     let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str());
     if !matches!(
         classify(route, req.method(), req.uri(), req.headers()),
@@ -215,10 +212,25 @@ pub async fn admit(State(st): State<Arc<AppState>>, req: Request, next: Next) ->
     ) {
         return next.run(req).await;
     }
-    // a request whose own budget is below the initial grant takes only that much
-    let want = INITIAL_GRANT
+    granted(&st, req, next).await
+}
+
+/// The initial grant a request asks the pool for: a request whose own budget is below
+/// the usual initial grant takes only that much.
+pub fn initial_grant(st: &AppState, pool: &sparkles::sparql::pool::QueryPool) -> u64 {
+    INITIAL_GRANT
         .min(st.limits.query_memory_bytes.unwrap_or(u64::MAX))
-        .min(pool.capacity());
+        .min(pool.capacity())
+}
+
+/// Run `next` with an initial grant of the query memory pool, waiting in arrival order
+/// up to `--query-admission-wait`, as [`admit`] does for the requests it classifies.
+/// The algorithm route selects its class from its body, so it calls this itself.
+pub async fn granted(st: &AppState, req: Request, next: Next) -> Response {
+    let Some(pool) = st.catalog.pool() else {
+        return next.run(req).await;
+    };
+    let want = initial_grant(st, pool);
     let started = Instant::now();
     let grant = match pool.try_grant(want) {
         Some(g) => g,

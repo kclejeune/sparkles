@@ -333,7 +333,7 @@ fn algorithms(put: &mut dyn FnMut(&str, J)) {
         "AlgoProjectionList",
         doc(
             obj(
-                &["dataset", "projections", "cache"],
+                &["dataset", "projections"],
                 json!({
                     "dataset": string(),
                     "projections": array(sref("AlgoProjection")),
@@ -341,7 +341,7 @@ fn algorithms(put: &mut dyn FnMut(&str, J)) {
                     "warning": { "type": "string", "description": "Why `algo.json` could not be read. The list is then empty and refuses changes." },
                 }),
             ),
-            "A dataset's named projections and the size of the cache of built projections.",
+            "A dataset's named projections. A server administrator also sees `cache`, the size of the cache of built projections, which every dataset shares.",
             "graph-algorithms",
         ),
     );
