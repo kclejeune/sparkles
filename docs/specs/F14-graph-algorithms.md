@@ -286,8 +286,11 @@ projection.
 A projection of `n` nodes and `m` edges takes about `8n + 4m` bytes per direction, plus
 `4m` for weights and the node id table of `8n`. The ten-million-triple benchmark's
 `foaf:knows` graph of 2.6 million edges and about a million people takes about 40 MB
-undirected. The projection and every array an algorithm allocates are charged to the
-query's memory budget, so a call that would pass it fails before it allocates.
+undirected. The projection and the main arrays of each algorithm are charged to the
+query's memory budget, so a call that would pass it fails before it allocates. The heap
+of single-source shortest paths grows without a charge, and some small auxiliary
+workspaces of other algorithms are not charged either. Roadmap item 8 tracks charging
+them.
 
 ## 4. Algorithms
 

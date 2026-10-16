@@ -216,6 +216,18 @@ other RDF stores have and Sparkles does not.
 Each gap ends with the [roadmap](ROADMAP.md) items that address it. The roadmap orders
 that work by priority and links each item to its design spec.
 
+* **Graph algorithm cancellation.** Strongly connected components, breadth-first search,
+  label propagation, betweenness and FastRP check for cancellation and the deadline
+  between iterations or sources, not inside a long pass over the graph, so a cancel can
+  take as long as one such pass. Spec F14 asks for a check every 64K nodes inside an
+  iteration.
+  [Roadmap](ROADMAP.md) item 8.
+
+* **Graph algorithm memory charges.** The heap of single-source shortest paths and some
+  small auxiliary workspaces of the algorithms are not charged to the call's memory
+  budget, although the projection, the main arrays and the results are.
+  [Roadmap](ROADMAP.md) item 8.
+
 * **Weighted betweenness.** Betweenness requires finite, strictly positive stored edge
   weights. Zero-weight shortest-path counting needs defined cycle semantics and a
   validated algorithm. SSSP still accepts zero weights, and PageRank retains its

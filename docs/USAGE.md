@@ -2097,7 +2097,11 @@ sparkles algo run --loc ./db leiden --predicate http://xmlns.com/foaf/0.1/knows 
 takes the whole request as JSON, as the HTTP route does. A write-back run records itself
 in the output graph with the commit it computed at, so a reader knows which state the
 numbers describe. It commits in batches so that a large result does not hold the writer
-lock for long. Query and task cancellation both reach computation, result preparation and
+lock for long. A write-back run is an update, so the server's query timeout does not
+apply to it. It has no deadline unless the request has a `timeout` or the server runs with
+`--update-timeout`. The commits are in batches, but the run decodes its whole result in
+memory before its first batch is written, so a result of many rows takes memory in
+proportion to the rows, up to `--max-rows`. Query and task cancellation both reach computation, result preparation and
 writer admission. A supplied timeout and task deadline share the earlier absolute bound
 from operation entry through completion, including built-in SHACL and ShEx validation.
 History SERVICE calls retain the same controls at the native change-log scan checks.

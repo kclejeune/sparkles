@@ -166,4 +166,60 @@ async fn a_run_that_writes_is_a_task() {
     assert_eq!(r.json()["results"]["bindings"].as_array().unwrap().len(), 5);
 }
 
+/// A write-back run is an update: the query timeout does not apply to it, and the
+/// `timeout` parameter and `--update-timeout` do.
+#[tokio::test]
+async fn a_run_that_writes_has_the_update_timeout() {
+    let body = r#"{"algorithm": "pageRank", "projection": {"predicates": ["http://ex/p"]},
+                   "write": {"graph": "http://ex/out", "predicates": {"score": "http://ex/rank"}}}"#;
+    let server = |configure: &dyn Fn(&mut AppState)| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st =
+            AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+        configure(&mut st);
+        let state = Arc::new(st);
+        let ds = state.attach("g", DbType::Mem, None).unwrap();
+        ds.store
+            .load(&[Source::from_bytes(
+                GRAPH.as_bytes().to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let app = router(state.clone());
+        Server {
+            _dir: dir,
+            state,
+            app,
+        }
+    };
+    let run = |s: Server, uri: &'static str| async move {
+        let r = send(&s.app, json_req("POST", uri, body)).await;
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+        let id = r.json()["id"].as_str().unwrap().to_string();
+        super::tasks::wait_done(&s.state, &id).await
+    };
+    // the query timeout is far too short for the run, and the run is not a query
+    let done = run(
+        server(&|st| st.default_timeout = Duration::from_nanos(1)),
+        "/$/algo/g/run",
+    )
+    .await;
+    assert_eq!(done.state, task_state::DONE, "{:?}", done.message);
+    // --update-timeout does apply
+    let done = run(
+        server(&|st| st.limits.update_timeout = Some(Duration::from_nanos(1))),
+        "/$/algo/g/run",
+    )
+    .await;
+    assert_ne!(done.state, task_state::DONE, "{:?}", done.message);
+    // and an explicit timeout parameter overrides it
+    let done = run(
+        server(&|st| st.limits.update_timeout = Some(Duration::from_nanos(1))),
+        "/$/algo/g/run?timeout=30",
+    )
+    .await;
+    assert_eq!(done.state, task_state::DONE, "{:?}", done.message);
+}
+
 mod admission;

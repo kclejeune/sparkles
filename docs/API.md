@@ -5206,7 +5206,9 @@ take, fails with `400`.
 Every algorithm also has `algo:node` and `algo:summary` as outputs, and takes
 `algo:concurrency`, `algo:maxMemory` and `algo:limit` as parameters. `algo:source` is a
 constant or a variable that another pattern of the group binds. The call then runs once
-for all its values and joins its rows with the group's.
+for all its values and joins its rows with the group's. Under `GRAPH ?g`, the call runs
+once for each named graph, and `algo:limit` applies to the rows of each graph, not to
+all of them together.
 
 FastRP takes `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
 Neo4j GDS. The list has one weight for each propagation, and the weight at index `i`
@@ -5411,6 +5413,11 @@ Other task kinds and task polling or cancellation permissions are unchanged.
 | `predicates` | The predicate each output is written with, for at least one output. An output without a predicate is not written. |
 | `batchSize` | The triples in each commit, 100,000 by default. A batch holds whole nodes. |
 | `atomic` | One commit for the whole run. |
+
+A write-back run is an update, so it has the update deadline. It has no deadline unless
+the request gives a `timeout` or the server runs with `--update-timeout`, and
+`--max-timeout` caps a `timeout` that a request asks for. The server's query timeout does
+not apply to it.
 
 The answer is `202` with a task of kind `algo-run`. The task computes at the head commit
 and then writes batches in commits with the message `algo run <uuid> batch i/n`. It needs

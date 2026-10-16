@@ -192,6 +192,10 @@ pub(super) async fn run(
     }
     super::task_start_check(&st, Some(TASK), &ds.name)?;
     let mut opts = super::query_options(&st, &ds, &params);
+    // A write-back run is an update, so it has the update deadline: none unless the
+    // request or `--update-timeout` gives one, and never above `--max-timeout`. The
+    // server's query timeout does not apply.
+    opts.timeout = super::update_timeout(&st, &params);
     crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Update);
     let author = super::author(&p);
     #[cfg(test)]
