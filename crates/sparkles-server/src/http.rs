@@ -153,7 +153,20 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .put(budgets::put_quota)
                 .delete(budgets::delete_quota),
         )
-        .route("/$/algo/{ds}/run", post(algo::run))
+        // Body-aware run admission wraps this route's restore guard, and only this
+        // route pays for it (the global restore guard skips it, see `ALGO_RUN`).
+        .route(
+            "/$/algo/{ds}/run",
+            post(algo::run)
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    restoring_guard,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    algo::admit_run,
+                )),
+        )
         .route("/$/algo/{ds}/projections", get(algo::list))
         .route(
             "/$/algo/{ds}/projections/{name}",
@@ -308,11 +321,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // hidden dataset stays a 404)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            restoring_guard,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            algo::admit_run,
+            global_restoring_guard,
         ))
         .layer(axum::middleware::from_fn(error_request_id))
         // for extractors without a ceiling of their own (see `limited_body!`)
@@ -520,6 +529,26 @@ fn finalize_error_response(resp: &mut Response, id: Option<String>, turtle: bool
 /// A request that passes holds the dataset until its handler answers: the swap waits
 /// for such requests before it takes the dataset out of the map, so a handler never
 /// looks up a dataset that went missing after this check.
+/// The route of graph algorithm runs, whose own layers admit the run and then guard
+/// the restore (see [`algo::admit_run`]).
+const ALGO_RUN: &str = "/$/algo/{ds}/run";
+
+/// [`restoring_guard`] for every route but [`ALGO_RUN`], which has its own.
+async fn global_restoring_guard(
+    st: St,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .is_some_and(|m| m.as_str() == ALGO_RUN)
+    {
+        return next.run(req).await;
+    }
+    restoring_guard(st, req, next).await
+}
+
 async fn restoring_guard(
     State(st): St,
     req: axum::extract::Request,
