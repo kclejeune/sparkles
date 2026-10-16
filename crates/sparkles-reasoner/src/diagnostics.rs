@@ -707,6 +707,24 @@ const PAGE_MAX: usize = 16_384;
 /// The candidate rows [`Run::paged_findings`] reads at most before it stops and reports
 /// the check truncated.
 const CANDIDATES_MAX: usize = 1 << 18;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the page of [`Run::paged_findings`] (counted from 0) that fails with a
+    /// timeout before it runs its query.
+    static PAGE_TIMEOUT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests only: replaces [`CANDIDATES_MAX`].
+    static CANDIDATES_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`CANDIDATES_MAX`], or the cap a test set.
+fn candidates_max() -> usize {
+    #[cfg(test)]
+    if let Some(n) = CANDIDATES_CAP.with(std::cell::Cell::get) {
+        return n;
+    }
+    CANDIDATES_MAX
+}
 /// A total order of the rows of `datatype-range.rq`. Every key is an IRI, a blank node
 /// or a simple literal, which compare by their strings, and together the keys identify a
 /// row of the DISTINCT projection. Pages of this order therefore neither skip nor repeat
@@ -813,17 +831,37 @@ impl Run<'_> {
     /// The findings of a check whose query returns candidates that are often not
     /// findings (`literal-not-in-datatype`), at most `limit`, and whether more may
     /// exist. Each candidate is judged before it counts toward the limit. The candidates
-    /// are read in pages of one total order ([`CANDIDATE_ORDER`]), so only one page is
-    /// held in memory. The check stops at the first finding past the limit, when the
-    /// candidates run out, at the deadline, or after [`CANDIDATES_MAX`] candidate rows,
-    /// and it reports itself truncated in the first and the last case. Every page runs
-    /// the query and its sort again, which trades repeated query work for bounded
-    /// memory.
+    /// are read in pages of one total order ([`CANDIDATE_ORDER`]). Each page holds its
+    /// rows, and the query's sort keeps the rows up to the end of the page, at most
+    /// 278,528. Every page runs the query and its sort again, which trades repeated
+    /// query work for that bound. The check stops at the first finding past the limit,
+    /// when the candidates run out, at the deadline, or after [`CANDIDATES_MAX`]
+    /// candidate rows, and it reports itself truncated in the first and the last case. A
+    /// deadline after at least one finding returns the findings found, truncated.
     fn paged_findings(&self, limit: usize) -> sparkles_core::Result<(Vec<Finding>, bool)> {
         let mut out = Vec::new();
+        match self.paged_into(limit, &mut out) {
+            Ok(truncated) => Ok((out, truncated)),
+            Err(Error::Timeout) if !out.is_empty() => Ok((out, true)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The pages of [`paged_findings`](Self::paged_findings), adding the findings to
+    /// `out` as they are judged. Returns whether the check is truncated.
+    fn paged_into(&self, limit: usize, out: &mut Vec<Finding>) -> sparkles_core::Result<bool> {
         let mut offset = 0usize;
         let mut page = (2 * limit + 2).clamp(PAGE_FIRST, PAGE_MAX);
+        #[cfg(test)]
+        let mut pages = 0usize;
         loop {
+            #[cfg(test)]
+            {
+                if PAGE_TIMEOUT.with(std::cell::Cell::get) == Some(pages) {
+                    return Err(Error::Timeout);
+                }
+                pages += 1;
+            }
             let text = format!(
                 "{}\n{CANDIDATE_ORDER}\nLIMIT {page} OFFSET {offset}",
                 self.text
@@ -858,7 +896,7 @@ impl Run<'_> {
                     continue;
                 };
                 if out.len() == limit {
-                    return Ok((out, true));
+                    return Ok(true);
                 }
                 if self.inferences && !self.holds_asserted(&rows[0])? {
                     f.basis = Basis::UsesInferences;
@@ -866,11 +904,11 @@ impl Run<'_> {
                 out.push(f);
             }
             if !full {
-                return Ok((out, false));
+                return Ok(false);
             }
             offset += consumed;
-            if offset >= CANDIDATES_MAX {
-                return Ok((out, true));
+            if offset >= candidates_max() {
+                return Ok(true);
             }
             page = (page * 2).min(PAGE_MAX);
         }
@@ -1586,8 +1624,9 @@ fn well_typed_other(lex: &str, local: &str) -> Option<bool> {
 /// The families of value spaces the check implements. Under the OWL 2 datatype map the
 /// value spaces of different families are disjoint: owl:real (holding xsd:decimal and
 /// the integer types), xsd:double and xsd:float are pairwise disjoint, strings are
-/// neither IRIs nor language-tagged strings, and booleans, date-times and octet
-/// sequences are values of their own. Within a family the value spaces overlap, and
+/// neither IRIs nor language-tagged strings, and booleans, date-times, xsd:hexBinary
+/// values and xsd:base64Binary values are values of their own (OWL 2 section 4.5 makes
+/// the two binary value spaces disjoint). Within a family the value spaces overlap, and
 /// [`in_value_space`] decides membership from the value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
@@ -1603,8 +1642,10 @@ enum Family {
     /// xsd:dateTime and xsd:dateTimeStamp
     DateTime,
     AnyUri,
-    /// xsd:hexBinary and xsd:base64Binary, both finite sequences of octets
-    Binary,
+    /// xsd:hexBinary
+    Hex,
+    /// xsd:base64Binary
+    Base64,
 }
 
 /// The family of an XSD datatype whose value space the check implements.
@@ -1617,7 +1658,8 @@ fn family(local: &str) -> Option<Family> {
         "boolean" => Family::Boolean,
         "dateTime" | "dateTimeStamp" => Family::DateTime,
         "anyURI" => Family::AnyUri,
-        "hexBinary" | "base64Binary" => Family::Binary,
+        "hexBinary" => Family::Hex,
+        "base64Binary" => Family::Base64,
         _ => return None,
     })
 }
@@ -1911,11 +1953,13 @@ mod value_space_tests {
     fn f13_overlapping_value_spaces() {
         let yes = |lex: &str, dt: &str, r: &str| check(&typed(lex, dt), r, Some(true));
         let no = |lex: &str, dt: &str, r: &str| check(&typed(lex, dt), r, Some(false));
-        // xsd:hexBinary and xsd:base64Binary share the finite octet sequences
-        yes("", "hexBinary", "base64Binary");
-        yes("", "base64Binary", "hexBinary");
-        yes("0FAB", "hexBinary", "base64Binary");
-        yes("D6s=", "base64Binary", "hexBinary");
+        // xsd:hexBinary and xsd:base64Binary are disjoint (OWL 2 section 4.5)
+        no("", "hexBinary", "base64Binary");
+        no("", "base64Binary", "hexBinary");
+        no("0FAB", "hexBinary", "base64Binary");
+        no("D6s=", "base64Binary", "hexBinary");
+        yes("0FAB", "hexBinary", "hexBinary");
+        yes("D6s=", "base64Binary", "base64Binary");
         no("zz", "hexBinary", "base64Binary");
         no("abc", "base64Binary", "hexBinary");
         // a dateTime with a timezone is a dateTimeStamp
@@ -1998,6 +2042,108 @@ mod value_space_tests {
         assert_eq!(
             in_value_space(&typed("1", "integer"), &rdf("langString")),
             Some(false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    const ID: &str = "literal-not-in-datatype";
+
+    /// `count` integer literals under a range of non-negative integers, those at the
+    /// positions of `negative` negative.
+    fn store(count: usize, negative: &[usize]) -> Store {
+        let mut ttl = String::from(
+            "@prefix ex: <http://ex.org/> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+             ex:n rdfs:range xsd:nonNegativeInteger .\n",
+        );
+        for i in 0..count {
+            let v = if negative.contains(&i) {
+                -(i as i64) - 1
+            } else {
+                i as i64
+            };
+            ttl.push_str(&format!("ex:i{i} ex:n \"{v}\"^^xsd:integer .\n"));
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        s
+    }
+
+    fn run(s: &Store, limit: usize) -> (CheckStatus, usize, ReportStatus) {
+        let r = diagnose(
+            s.snapshot(),
+            &DiagnoseOptions {
+                checks: vec![ID.into()],
+                limit,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = r.checks.iter().find(|c| c.id == ID).unwrap();
+        (c.status, c.findings, r.status)
+    }
+
+    /// Clears the test seams when it drops.
+    struct Seams;
+
+    impl Drop for Seams {
+        fn drop(&mut self) {
+            PAGE_TIMEOUT.with(|c| c.set(None));
+            CANDIDATES_CAP.with(|c| c.set(None));
+        }
+    }
+
+    /// A deadline after the first page keeps the violations that page held, and the
+    /// check is truncated. A deadline before the first finding is a timeout.
+    #[test]
+    fn a_timeout_after_findings_truncates() {
+        let _seams = Seams;
+        // in candidate order (by subject name) the first page of 256 rows holds
+        // i0, i100 and i200, and the later ones none
+        let s = store(600, &[0, 100, 200]);
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Violations, 3, ReportStatus::ViolationsFound)
+        );
+        PAGE_TIMEOUT.with(|c| c.set(Some(1)));
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Truncated, 3, ReportStatus::ViolationsFound)
+        );
+        PAGE_TIMEOUT.with(|c| c.set(Some(0)));
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Timeout, 0, ReportStatus::Incomplete)
+        );
+    }
+
+    /// The check stops after the candidate cap and reports itself truncated, also
+    /// when it found nothing before.
+    #[test]
+    fn the_candidate_cap_truncates() {
+        let _seams = Seams;
+        // the only violation has the last name in candidate order ("i999")
+        let s = store(1_200, &[999]);
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Violations, 1, ReportStatus::ViolationsFound)
+        );
+        CANDIDATES_CAP.with(|c| c.set(Some(600)));
+        assert_eq!(
+            run(&s, 10),
+            (CheckStatus::Truncated, 0, ReportStatus::Incomplete)
         );
     }
 }
