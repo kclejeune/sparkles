@@ -1543,9 +1543,10 @@ fn rows(
         Algo::Betweenness => {
             let max = crate::algo::pool::max_exact_betweenness();
             let samples = spec.int("samples", 0) as usize;
-            if samples == 0 && n > max {
+            // samples at or above the node count is an exact run as well
+            if (samples == 0 || samples >= n) && n > max {
                 return Err(bad(format!(
-                    "betweenness without algo:samples on {n} nodes passes the limit of {max}; use algo:samples to estimate it"
+                    "betweenness without algo:samples below the node count on {n} nodes passes the limit of {max}; use algo:samples to estimate it"
                 )));
             }
             let p = algo::betweenness::Params {

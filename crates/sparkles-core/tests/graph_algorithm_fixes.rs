@@ -181,3 +181,27 @@ fn fastrp_node_self_influence_is_a_parameter() {
     assert!(e.to_string().contains("iterationWeights"), "{e}");
     assert_eq!(run("").unwrap().len(), 3);
 }
+
+/// `algo:samples` at or above the node count is an exact run, so it obeys the exact limit.
+/// The test changes a process-wide limit, so it is the only betweenness test of this file.
+#[test]
+fn betweenness_samples_at_or_above_n_obey_the_exact_limit() {
+    sparkles_core::algo::pool::set_exact_betweenness_max(2);
+    let s = trig("ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:d .");
+    let run = |samples: u32| {
+        let q = format!(
+            "{PREFIXES}SELECT ?n ?r WHERE {{ SERVICE algo:betweenness {{ [] algo:predicate ex:p ; algo:samples {samples} ; algo:node ?n ; algo:score ?r }} }}"
+        );
+        query(s.snapshot(), &q, &QueryOptions::default())
+    };
+    let (above, equal, below) = (run(1000), run(4), run(3));
+    sparkles_core::algo::pool::set_exact_betweenness_max(100_000);
+    assert!(
+        above.is_err(),
+        "an exact run on 4 nodes passed a limit of 2"
+    );
+    assert!(equal.is_err(), "samples equal to n is an exact run");
+    assert_eq!(below.unwrap().len(), 4, "samples below n stays sampled");
+    // within the limit, samples at or above n stays exact and allowed
+    assert_eq!(run(1000).unwrap().len(), 4);
+}
