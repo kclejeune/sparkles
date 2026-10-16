@@ -561,6 +561,20 @@ sorting, batching and early close. Cached projections and result tables retain p
 data. Each warm caller admits its own copied or shared storage without keeping the
 initializer's query grant alive.
 
+A query that calls no graph algorithm does not create the ledger. An eager context
+first charges and checks a fast account of a few atomic counters, which applies the
+ledger's rules for a single owner to the live estimate, the query's limit and the
+admitted high-water contribution to its grant. The first algorithm call, output lease,
+cursor transition or change of the public grant creates the ledger, and the ledger
+takes the account over as its first owner with its live bytes, contribution and peak.
+Charges made before that point grow and release there. Algorithm admission runs only
+on the `/$/algo/{ds}/run` route, and the global restore guard skips that route because
+it has its own guard inside admission. On forge with 1.05M triples, these changes cut
+the instructions per HTTP request by 6 to 9 thousand on the small benchmark queries, and
+the median execution time of distinct-obj from 3.75 to 3.19 µs. Against the release
+before F14, the execution time of the three smallest queries stays 0.5 to 0.7 µs
+higher, spread over the operator result plumbing, and wall time is within 0.7 to 3.3%.
+
 A call's `algo:maxMemory` covers all selected graphs together, including retained
 outputs and old and replacement append buffers while both are live. Accumulation
 within one call reuses column capacity and grows it geometrically. The complete
