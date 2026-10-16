@@ -1,7 +1,8 @@
 //! Per-query execution context: snapshot, local vocabulary, decode cache,
 //! cancellation and dataset description.
 
-use super::query_memory::{QueryMemoryLease, QueryMemoryLedger};
+use super::pool::PoolGrant;
+use super::query_memory::{PRIMARY, QueryMemoryLease, QueryMemoryLedger, same};
 use super::table::VarId;
 use super::value::Value;
 use crate::error::{Budget, BudgetKind, Error, Result};
@@ -504,7 +505,70 @@ pub struct Ctx {
     // Opt-in cursor accounting stays after the ordinary execution fields.
     cursor_memory: Option<Box<CursorMemory>>,
     // Data and weak retained caches drop before final ledger ownership.
+    fast: FastMemory,
     memory: std::sync::OnceLock<Arc<QueryMemoryLedger>>,
+}
+
+/// Set in [`FastMemory::live`] once the ledger has taken the account over.
+const PROMOTED: u64 = 1 << 63;
+
+/// The memory account of an eager context until something needs the query ledger: a
+/// graph algorithm call, a lease that outlives an operator, cursor accounting or a
+/// change of the grant. Plain queries charge and check it with a few atomic operations
+/// and never create the ledger. [`Ctx::memory`] hands the account to the ledger as its
+/// [`PRIMARY`] owner, after which every charge goes through the ledger.
+#[derive(Default)]
+struct FastMemory {
+    /// live bytes, with [`PROMOTED`] set once the ledger took the account over
+    live: AtomicU64,
+    /// the highest estimate seen while the account was fast
+    peak: AtomicU64,
+    /// the account's admitted contribution to `grant`, kept until the context drops
+    eager: AtomicU64,
+    /// the grant the account charges, fixed at its first use
+    grant: std::sync::OnceLock<Option<Arc<PoolGrant>>>,
+    /// serializes growth of `eager` with the hand-over to the ledger
+    resize: parking_lot::Mutex<()>,
+}
+
+impl FastMemory {
+    #[inline]
+    fn note_peak(&self, bytes: u64) {
+        if bytes > self.peak.load(Ordering::Relaxed) {
+            self.peak.fetch_max(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Give back `bytes` of the account's live estimate. `false` once the ledger owns
+    /// the account.
+    #[inline]
+    fn release(&self, bytes: u64) -> bool {
+        let mut cur = self.live.load(Ordering::Acquire);
+        loop {
+            if cur & PROMOTED != 0 {
+                return false;
+            }
+            let next = cur.checked_sub(bytes).expect("query live bytes");
+            match self
+                .live
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(c) => cur = c,
+            }
+        }
+    }
+}
+
+impl Drop for FastMemory {
+    /// An account the ledger never took over returns its eager contribution here.
+    fn drop(&mut self) {
+        if *self.live.get_mut() & PROMOTED == 0
+            && let Some(Some(grant)) = self.grant.get()
+        {
+            grant.release(*self.eager.get_mut());
+        }
+    }
 }
 
 struct CursorMemory {
@@ -523,8 +587,131 @@ thread_local! {
 }
 
 impl Ctx {
+    /// The query's memory ledger, made on first use from the fast account (see
+    /// [`FastMemory`]).
     pub(crate) fn memory(&self) -> &Arc<QueryMemoryLedger> {
-        self.memory.get_or_init(QueryMemoryLedger::new)
+        self.memory.get_or_init(|| self.promote())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn promote(&self) -> Arc<QueryMemoryLedger> {
+        let fast = &self.fast;
+        // No eager growth is in flight, and none starts on the fast account after this.
+        let _resize = fast.resize.lock();
+        let live = fast.live.fetch_or(PROMOTED, Ordering::AcqRel);
+        debug_assert_eq!(live & PROMOTED, 0, "one hand-over");
+        let grant = match fast.grant.get() {
+            Some(grant) => grant.clone(),
+            None => self.grant.clone(),
+        };
+        QueryMemoryLedger::seeded(
+            grant,
+            live,
+            fast.eager.load(Ordering::Acquire),
+            fast.peak.load(Ordering::Acquire),
+        )
+    }
+
+    /// The fast account's grant, or `None` when the ledger must take the request: it
+    /// exists already, or the public grant changed since the fast account began.
+    #[inline]
+    fn fast_grant(&self) -> Option<Option<&Arc<PoolGrant>>> {
+        if self.memory.get().is_some() {
+            return None;
+        }
+        let grant = self.fast.grant.get_or_init(|| self.grant.clone()).as_ref();
+        same(grant, self.grant.as_ref()).then_some(grant)
+    }
+
+    /// Admit `bytes` more live estimate (`add`) or check a transient output of
+    /// `bytes` on the fast account, with the ledger's semantics for a single eager
+    /// owner. `None` when the ledger must take the request.
+    #[inline]
+    fn fast_admit(&self, bytes: u64, add: bool) -> Option<Result<()>> {
+        let grant = self.fast_grant()?;
+        let fast = &self.fast;
+        let mut cur = fast.live.load(Ordering::Acquire);
+        loop {
+            if cur & PROMOTED != 0 {
+                return None;
+            }
+            let need = cur.checked_add(bytes).filter(|n| *n < PROMOTED)?;
+            if !add {
+                // Like the ledger, an output check records the attempted estimate.
+                fast.note_peak(need);
+            }
+            if need > self.mem_limit {
+                return Some(Err(self.memory_exceeded(need)));
+            }
+            if let Some(grant) = grant
+                && need > fast.eager.load(Ordering::Acquire)
+            {
+                return self.fast_grow(grant, bytes, add);
+            }
+            if !add {
+                return Some(Ok(()));
+            }
+            match fast
+                .live
+                .compare_exchange_weak(cur, need, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    fast.note_peak(need);
+                    return Some(Ok(()));
+                }
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// [`Ctx::fast_admit`] when the estimate passes the eager contribution: grow it
+    /// from the grant first, so a refused grant changes nothing.
+    #[cold]
+    #[inline(never)]
+    fn fast_grow(&self, grant: &Arc<PoolGrant>, bytes: u64, add: bool) -> Option<Result<()>> {
+        let fast = &self.fast;
+        let _resize = fast.resize.lock();
+        let mut cur = fast.live.load(Ordering::Acquire);
+        loop {
+            if cur & PROMOTED != 0 {
+                return None;
+            }
+            let need = cur.checked_add(bytes).filter(|n| *n < PROMOTED)?;
+            if need > self.mem_limit {
+                return Some(Err(self.memory_exceeded(need)));
+            }
+            let eager = fast.eager.load(Ordering::Acquire);
+            if need > eager {
+                if let Err(error) = grant.charge(need - eager) {
+                    return Some(Err(error));
+                }
+                fast.eager.store(need, Ordering::Release);
+            }
+            if !add {
+                return Some(Ok(()));
+            }
+            // Lock-free admissions in between stayed within the old contribution.
+            match fast
+                .live
+                .compare_exchange(cur, need, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    fast.note_peak(need);
+                    return Some(Ok(()));
+                }
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    /// The query's live estimate, from the ledger once it exists.
+    #[inline]
+    fn live_bytes(&self) -> u64 {
+        match self.memory.get() {
+            Some(ledger) => ledger.live.load(Ordering::Relaxed),
+            None => self.fast.live.load(Ordering::Relaxed) & !PROMOTED,
+        }
     }
 
     pub fn new(snap: Arc<Snapshot>) -> Ctx {
@@ -538,6 +725,7 @@ impl Ctx {
             callback_bnodes: Default::default(),
             callback_terms: Default::default(),
             cursor_memory: None,
+            fast: Default::default(),
             memory: Default::default(),
             snap,
             local: RwLock::new(AppendVocab::default()),
@@ -897,11 +1085,16 @@ impl Ctx {
     /// longer needs.
     #[inline]
     fn release_live(&self, owner: Option<u64>, bytes: u64) {
-        if let Some(id) = owner {
-            self.memory().release(id, bytes);
-        } else {
-            debug_assert_eq!(bytes, 0);
-            self.memory().trim_zero(self.grant.as_ref());
+        match owner {
+            Some(PRIMARY) if self.fast.release(bytes) => {}
+            Some(id) => self.memory().release(id, bytes),
+            None => {
+                debug_assert_eq!(bytes, 0);
+                // Only cursor accounting trims, and it always has a ledger.
+                if let Some(ledger) = self.memory.get() {
+                    ledger.trim_zero(self.grant.as_ref());
+                }
+            }
         }
     }
 
@@ -911,8 +1104,7 @@ impl Ctx {
     }
 
     pub(super) fn memory_remaining(&self) -> u64 {
-        self.mem_limit
-            .saturating_sub(self.memory().live.load(Ordering::Relaxed))
+        self.mem_limit.saturating_sub(self.live_bytes())
     }
 
     pub(super) fn release_cursor_work(&self) {
@@ -1074,9 +1266,12 @@ impl Ctx {
     #[inline]
     pub fn check_output(&self, rows: usize, width: usize) -> Result<()> {
         self.check_output_rows(rows)?;
+        let bytes = table_bytes(rows, width);
+        if let Some(checked) = self.fast_admit(bytes, false) {
+            return checked;
+        }
         let owner = self.memory().owner(self.grant.as_ref())?;
-        self.memory()
-            .check_output(&owner, self.mem_limit, table_bytes(rows, width))
+        self.memory().check_output(&owner, self.mem_limit, bytes)
     }
 
     pub(super) fn check_output_rows(&self, rows: usize) -> Result<()> {
@@ -1119,7 +1314,10 @@ impl Ctx {
 
     /// The highest memory estimate of this context so far.
     pub fn mem_peak(&self) -> u64 {
-        self.memory().peak.load(Ordering::Relaxed)
+        let fast = self.fast.peak.load(Ordering::Relaxed);
+        self.memory
+            .get()
+            .map_or(fast, |ledger| fast.max(ledger.peak.load(Ordering::Relaxed)))
     }
 
     /// How many rows of `width` columns fit in what is left of the memory budget (for
@@ -1128,9 +1326,7 @@ impl Ctx {
         if self.mem_limit == u64::MAX {
             return usize::MAX;
         }
-        let left = self
-            .mem_limit
-            .saturating_sub(self.memory().live.load(Ordering::Relaxed));
+        let left = self.mem_limit.saturating_sub(self.live_bytes());
         usize::try_from(left / table_bytes(1, width)).unwrap_or(usize::MAX)
     }
 
@@ -1664,6 +1860,14 @@ impl Charge<'_> {
             .get()
             .checked_add(bytes)
             .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        if self.owner.get().is_none_or(|id| id == PRIMARY)
+            && let Some(admitted) = self.ctx.fast_admit(bytes, true)
+        {
+            admitted?;
+            self.owner.set(Some(PRIMARY));
+            self.bytes.set(owned);
+            return Ok(());
+        }
         let ledger = self.ctx.memory();
         let owner = match self.owner.get() {
             Some(id) => ledger.owner_by_id(id),
