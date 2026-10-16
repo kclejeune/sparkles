@@ -618,6 +618,11 @@ pub(crate) struct BuildCtl<'a> {
     pub sequential: bool,
     /// the previous generation's build of the index, to carry over
     pub carry: Option<Carry>,
+    /// only carry the graph over: when there is no usable carry, or it changed too much,
+    /// end with [`Outcome::Cancelled`] instead of building the graph from scratch. A
+    /// compaction sets it, so its thread never runs a full build, which the background
+    /// build after the switch does instead.
+    pub carry_only: bool,
 }
 
 /// The previous generation's build of an index, which the new generation's build reuses:
@@ -879,6 +884,10 @@ pub(crate) fn build_index(
         },
         _ => None,
     };
+    // nothing to carry over: the vectors would be packed only to be dropped
+    if ctl.carry_only && (old.is_none() || cfg.hnsw.is_none()) {
+        return Ok(Outcome::Cancelled);
+    }
     let (segment, skipped) = match pred {
         None => (
             Segment {
@@ -994,6 +1003,8 @@ pub(crate) fn build_index(
         built.carried = carried.is_some();
         let g = match carried {
             Some(g) => g,
+            // the carry was declined: the background build after the switch builds it
+            None if ctl.carry_only => return Ok(Outcome::Cancelled),
             None => match Graph::build(space, &params, &hctl) {
                 Some(g) => g,
                 None => return Ok(Outcome::Cancelled),

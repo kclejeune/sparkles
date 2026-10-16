@@ -610,9 +610,10 @@ impl Store {
     /// During a compaction, before the switch: carry every index of `prev`'s generation
     /// over to the new generation, whose base `new` reads, and install the results there,
     /// so searches right after the switch use a graph. `base_seq` is the new generation's
-    /// base commit. An index that cannot be carried (no graph yet, or one built with
-    /// other settings) is built after the switch instead. Runs on the compaction's
-    /// thread, without the writer lock.
+    /// base commit. An index that cannot be carried (no graph yet, one built with other
+    /// settings, or one whose nodes changed by more than the carry limit) is built after
+    /// the switch instead, so this never runs a full graph build. Runs on the
+    /// compaction's thread, without the writer lock.
     pub(super) fn prebuild_vectors(
         &self,
         new: &Snapshot,
@@ -649,6 +650,7 @@ impl Store {
                     old,
                     snap: prev.clone(),
                 }),
+                carry_only: true,
             };
             let reading = new.without_cache_fill();
             let t0 = std::time::Instant::now();
@@ -838,6 +840,7 @@ impl Store {
                     write,
                     sequential,
                     carry,
+                    carry_only: false,
                 };
                 let gv = &snap.generation.vectors;
                 let install = |b: Arc<Built>| {

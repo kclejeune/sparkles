@@ -4773,7 +4773,8 @@ exactly.
   before it switches. The new index reuses the old one's vectors and links, repairs the
   links around deleted vectors and inserts the new ones, so searches use a graph right
   after the switch. When more than 30 % of the vectors changed, or the graph's settings
-  differ, the graph is built again instead. A bulk load starts a new generation whose
+  differ, the graph is built again in the background after the switch, and searches scan
+  exactly until it is ready. A bulk load starts a new generation whose
   index is built, or carried over, in the background, and searches are exact until it is
   ready.
 * **Exact fallback.** A search skips the graph and scans exactly in these cases:

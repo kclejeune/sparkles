@@ -963,3 +963,59 @@ fn indexes_created_before_their_predicate_catch_up() {
     assert_eq!((st.overlay.indexed, st.overlay.pending), (600, 0));
     assert_eq!((info.method, info.pending), ("hnsw", 0));
 }
+
+/// A compaction that changed too many rows to carry the graph over leaves the full
+/// build to the background after the switch instead of running it on the compaction's
+/// thread. Background builds are held, so the index stays `building` until released.
+#[test]
+fn declined_carries_build_after_the_switch() {
+    let all = clustered(3_000, 43);
+    let s = store_with(Store::in_memory(StoreOptions::default()), &all);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    let mut del = String::new();
+    for (i, v) in all.iter().enumerate().take(1_200) {
+        del += &format!(
+            "DELETE DATA {{ <urn:n{i}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }} ;\n",
+            vector::canonical(v)
+        );
+    }
+    update(&s, del.trim_end_matches(";\n"), &QueryOptions::default()).unwrap();
+    s.pause_vector_builds(true);
+    s.compact().unwrap();
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!(st.state, "building", "{st:?}");
+    let (_, info) = search(&s.snapshot(), &all[2_000], 1, SearchMode::default());
+    assert_eq!(info.method, "exact");
+    s.pause_vector_builds(false);
+    let st = s.wait_vector_index("emb").unwrap();
+    assert_eq!((st.state.as_str(), st.rows), ("ready", 1_800));
+    assert!(!st.last_build.unwrap().carried);
+    let (hits, info) = search(&s.snapshot(), &all[2_000], 1, SearchMode::default());
+    assert_eq!(info.method, "hnsw");
+    assert_eq!(hits[0].0, s.snapshot().lookup_iri("urn:n2000").unwrap().0);
+}
+
+/// A compaction that changed few rows still carries the graph over on its own thread,
+/// so the index is ready at the switch even while background builds are held.
+#[test]
+fn small_carries_stay_on_the_compaction_thread() {
+    let all = clustered(3_000, 47);
+    let s = store_with(Store::in_memory(StoreOptions::default()), &all);
+    s.create_vector_index("emb", config(0)).unwrap();
+    s.wait_vector_index("emb").unwrap();
+    let mut del = String::new();
+    for i in (0..3_000).step_by(100) {
+        del += &format!(
+            "DELETE DATA {{ <urn:n{i}> <{EMB}> \"{}\"^^<urn:x-sparkles:vector> }} ;\n",
+            vector::canonical(&all[i])
+        );
+    }
+    update(&s, del.trim_end_matches(";\n"), &QueryOptions::default()).unwrap();
+    s.pause_vector_builds(true);
+    s.compact().unwrap();
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!((st.state.as_str(), st.rows), ("ready", 2_970), "{st:?}");
+    assert!(st.last_build.unwrap().carried);
+    s.pause_vector_builds(false);
+}

@@ -1225,8 +1225,11 @@ rebuild's.
   their links and levels carry over. A node that lost a neighbour to a deleted row has
   its links chosen again by the heuristic from the surviving neighbours and the lost
   neighbours' neighbours. The live layer's nodes become frozen nodes, and the remaining
-  new rows are inserted. The graph is built again when more than 30 % of the nodes
-  changed or when the old graph was built with other settings. The carried index is
+  new rows are inserted. A compaction carries a graph over only when at most 30 % of the
+  nodes changed and the old graph was built with the same settings. Otherwise the graph
+  is built in the background after the switch, as before this item, and searches scan
+  exactly until it is ready. The compaction does not run that full build itself. The
+  carried index is
   installed in the new generation before the switch, so searches use the old graph up
   to the switch and the carried one from the first query after it, with no window of
   exact scans. A bulk commit's background build carries the old index over in the same
