@@ -613,6 +613,14 @@ impl Ctx {
         )
     }
 
+    /// Set the public grant before any charge, and fix it as the fast account's grant
+    /// without a lazy initialization on the first charge.
+    pub(crate) fn set_grant(&mut self, grant: Option<Arc<PoolGrant>>) {
+        debug_assert!(self.fast.grant.get().is_none() && self.memory.get().is_none());
+        self.fast.grant = std::sync::OnceLock::from(grant.clone());
+        self.grant = grant;
+    }
+
     /// The fast account's grant, or `None` when the ledger must take the request: it
     /// exists already, or the public grant changed since the fast account began.
     #[inline]

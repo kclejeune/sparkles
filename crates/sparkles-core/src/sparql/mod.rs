@@ -465,7 +465,7 @@ fn make_ctx(
     if let Some(m) = opts.max_memory_bytes {
         ctx.mem_limit = m;
     }
-    ctx.grant = opts.query_grant();
+    ctx.set_grant(opts.query_grant());
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;
     }
