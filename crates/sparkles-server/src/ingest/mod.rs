@@ -69,8 +69,8 @@ pub struct IngestServeArgs {
     /// How many PDF and Office conversions may run at once (spec C18 §7.1.1)
     #[arg(long, value_name = "N", default_value_t = DEFAULT_PDF_WORKERS)]
     pub pdf_workers: usize,
-    /// The address-space limit of each PDF or Office conversion's child process, in MiB
-    /// (at least 256)
+    /// The address-space limit of each PDF or Office conversion's child process on Linux,
+    /// in MiB (at least 256; give at least 4096 with OCR)
     #[arg(long, value_name = "MIB", default_value_t = DEFAULT_CONVERT_MEMORY_MIB)]
     pub convert_memory: u64,
     /// Convert PDF and Office files on threads of the server instead of in child

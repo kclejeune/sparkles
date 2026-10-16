@@ -3017,15 +3017,23 @@ directory of `--pdf-ocr-models`. It loads PDFium from `--pdfium-lib` and ONNX Ru
 from `--onnxruntime-lib`, or from their usual library paths, and never downloads a model.
 `--pdf-workers` (2 by default) limits the conversions that run at once.
 
-The server converts each PDF and Office file in a child process of its own, started from
-the same `sparkles` binary. The child runs under an address-space limit of
-`--convert-memory` MiB (2048 by default, at least 256), a CPU-time limit and, without
-OCR, a file-size limit of zero, and the server kills it when the task's deadline passes, so a file that
-makes a converter loop or allocate without end fails with `conversion-timeout` or
-`conversion-failed` and frees its worker slot. Starting the child costs a few
-milliseconds per conversion. `--convert-in-process` converts on threads of the server
-instead, where a conversion that overruns its deadline keeps its worker slot until it
-ends and its memory is bounded only by the converters' own limits.
+On Linux the server converts each PDF and Office file in a child process of its own,
+started from the same `sparkles` binary. The child runs under an address-space limit of
+`--convert-memory` MiB, 2048 by default and at least 256, a CPU-time limit and, without
+OCR, a file-size limit of zero. The server kills it when the task's deadline passes, so
+a file that makes a converter loop or allocate without end fails with
+`conversion-timeout` or `conversion-failed` and frees its worker slot. The child gets a
+cleared environment without the server's keys and tokens, but it runs as the server's
+user, so this limits resources and is not a sandbox. Starting the child adds about 10 ms
+to each document. The server starts one child when it starts. If that child cannot set
+its limits, for example under a system call filter that forbids them, the server logs
+the reason and refuses PDF and Office files with status 500 until it is restarted with
+`--convert-in-process`. That flag converts on threads of the server instead, where a
+conversion that overruns its deadline keeps its worker slot until it ends and its memory
+is bounded only by the converters' own limits. On macOS and other platforms, which do
+not enforce the address-space limit, conversions always run on threads. With OCR, give
+`--convert-memory` at least 4096, because PDFium and ONNX Runtime map their libraries
+and models into the child's address space. OCR in a child has not been measured.
 
 Word, PowerPoint and OpenDocument files (`.docx`, `.pptx`, `.odt`, `.odp`) need a build
 with the `office` feature, which is on by default. The server converts them to Markdown
@@ -3036,7 +3044,8 @@ that is encrypted or in an old binary format (`.doc`, `.ppt`, `.xls`) is refused
 Excel or OpenDocument spreadsheet (`.xlsx`, `.ods`) gets a mapping draft for each
 visible sheet, up to 20 sheets, with the sheet as CSV to upload with its mapping. Without
 a `base`, the rows of each sheet get their own namespace that includes the sheet's
-position, so two sheets never share one. Hidden sheets, hidden
+position, so two sheets never share one. A hyperlink whose target is longer than 2,048
+bytes keeps its text and loses its URL. Hidden sheets, hidden
 slides and hidden Word text are left out, while the hidden rows and columns of a visible
 sheet are read, because they are data. These conversions share
 the `--pdf-workers` limit and the child processes with PDF conversion. A conversion

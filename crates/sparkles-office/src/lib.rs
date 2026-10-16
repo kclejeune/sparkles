@@ -29,10 +29,11 @@
 //! The tradeoff is memory for safety. A conversion may hold `max_output` bytes, which is
 //! 128 MiB by default, beside its input and XML trees.
 //!
-//! A conversion stops with [`Error::Timeout`] at [`Limits::deadline`]. The readers check
-//! the clock once every 16 steps of a walk, where a step is an XML event, a node or a
-//! stored value, and on every charge of 64 KiB or more, so a conversion ends within a
-//! bounded amount of work after its deadline. These bounds come from review and testing,
+//! A conversion stops with [`Error::Timeout`] at [`Limits::deadline`]. The walks and the
+//! streaming readers check the clock once every 16 steps, where a step is an XML event, a
+//! node or a stored value, and on every charge of 64 KiB or more. The parser that builds a
+//! tree checks it once every 1,024 events, each of which copies at most its own text. So
+//! a conversion ends within a bounded amount of work after its deadline. These bounds come from review and testing,
 //! not from proof. A caller that must stop a conversion whatever happens, such as the
 //! Sparkles server, runs it in a child process under an address-space limit and kills it
 //! at the deadline. A file past a limit is refused with [`Error::TooLarge`]. A damaged

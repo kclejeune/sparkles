@@ -1550,22 +1550,32 @@ with its own digest, which re-ingestion handles as a changed source (§7.9).
 
 **Isolation.** Parsing a PDF is the riskiest step of ingestion, because the file comes
 from outside. The input limit of §7.1 is checked before parsing, and at most
-`--pdf-workers` conversions, 2 by default, run at any time. The `sparkles` binary runs
-each PDF and Office conversion in a child process of its own, which is the same binary
-started with a hidden first argument. The child reads the file from a pipe and writes
-its result to another, and the server reads at most a bounded number of bytes of it.
-The child runs under an address-space limit (`--convert-memory`, 2 GiB by default), a
-CPU-time limit, a file-size limit of zero unless OCR is configured, and no core file,
-and on Linux it dies with the server. The server kills it 250 ms after the task's
+`--pdf-workers` conversions, 2 by default, run at any time. On Linux the `sparkles`
+binary runs each PDF and Office conversion in a child process of its own, which is the
+same binary started through `/proc/self/exe` with a hidden first argument, so a binary
+replaced by an upgrade is never the child of an older server. The child reads the file
+from a pipe and writes its result to another, and the server reads at most a bounded
+number of bytes of it. Before it reads the file, the child sets an address-space limit
+(`--convert-memory`, 2 GiB by default), a CPU-time limit, a file-size limit of zero
+unless OCR is configured, no core file and death with the server, and it refuses to run
+without them. Its environment is cleared except for the locale, the time zone, the
+library paths that OCR needs and `PATH`, so it holds no provider key or token. This is
+resource containment and not a sandbox, because the child runs as the server's user with
+its privileges. The arguments and the reply carry a protocol version, and a child of
+another version refuses to run. The server kills the child 250 ms after the task's
 deadline, so the task reports `conversion-timeout` and the worker slot is free again
 whatever the converter does. A child that ends without a result, through a panic or its
-memory limit, gives `conversion-failed`. Where no child process can be started, which is
-library use of the server crate, its unit tests, a server started with
-`--convert-in-process`, and a binary that has been deleted from disk since it started,
-the conversion runs on a blocking thread of its own under the same deadline with a panic
-caught as `conversion-failed`. A conversion on a thread that overruns its deadline
-cannot be interrupted, so the task reports `conversion-timeout` at once and the thread
-is left to finish, holding its slot.
+memory limit, gives `conversion-failed` with status 422, and one that could not set its
+limits gives `conversion-failed` with status 500, with its exit status and the start of
+its error output in the server's log. The server starts one child when it starts, to
+check that a child can set its limits. When it cannot, every PDF and Office conversion
+is refused with that reason, and `--convert-in-process` is the way to convert without
+the limits. The conversion runs on a blocking thread of its own under the same deadline,
+with a panic caught as `conversion-failed`, in library use of the server crate, its unit
+tests, a server started with `--convert-in-process`, and on macOS, Windows and other
+platforms, where `RLIMIT_AS` is not enforced or does not exist. A conversion on a thread
+that overruns its deadline cannot be interrupted, so the task reports
+`conversion-timeout` at once and the thread is left to finish, holding its slot.
 
 ### 7.2 Sources, renditions and chunks
 
@@ -4898,28 +4908,41 @@ audio and video remain, and so do the follow-ups listed at the end of this secti
   server's query memory pool, which stays part of roadmap item 15's remaining work.
 - **Child processes.** These bounds come from three rounds of review and from tests,
   and a fourth review could find another path. So the server now runs each PDF and
-  Office conversion in a child process, as §7.1.1 describes, under an address-space
-  limit of `--convert-memory` MiB, 2,048 by default, a CPU-time limit and a file-size
-  limit of zero unless OCR is configured. The server kills the child 250 ms after the
-  task's deadline, so the worker slot is released and the memory is bounded whatever a
-  converter does. Before, a PDF conversion that overran its deadline kept its slot until
-  pdf-inspector returned, which could be never. Where no child can be started, the
-  conversion runs on a thread as before. That covers library use and the unit tests of
-  the server crate, `--convert-in-process`, and a binary deleted from disk since it
-  started. The child sets its limits on itself before it reads the file and refuses to
+  Office conversion on Linux in a child process, as §7.1.1 describes, under an
+  address-space limit of `--convert-memory` MiB, 2,048 by default, a CPU-time limit and a
+  file-size limit of zero unless OCR is configured. The server kills the child 250 ms
+  after the task's deadline, so the worker slot is released and the address space is
+  bounded whatever a converter does. Before, a PDF conversion that overran its deadline
+  kept its slot until pdf-inspector returned, which could be never. The conversion runs
+  on a thread as before in library use and the unit tests of the server crate, with
+  `--convert-in-process`, and on macOS, Windows and other platforms. macOS accepts
+  `RLIMIT_AS` without enforcing it, so a child there would promise a bound it does not
+  keep. A review of the child found that it inherited the server's environment, with its
+  provider keys, that a child unable to set its limits failed every conversion with a
+  generic error and no log line, and that a binary replaced in place would have answered
+  in another protocol. The child's environment is now an allowlist, the server probes the
+  child at start and logs and refuses with the reason, and the child is started through
+  `/proc/self/exe` with a protocol version. The NixOS VM test converts a DOCX in a child
+  under the module's system call filter and a 256 MiB limit. OCR in a child has not been
+  run, because no OCR models were at hand. PDFium and ONNX Runtime map their libraries
+  and model weights into the address space, so a server with OCR should give
+  `--convert-memory` at least 4,096 MiB until a measurement says otherwise. The child sets its limits on itself before it reads the file and refuses to
   run without them, so the server starts it with `posix_spawn` and does not copy its own
   page tables, as a `fork` would. The child is given `MIMALLOC_ARENA_RESERVE=64MiB`,
   because mimalloc otherwise reserves 1 GiB of address space before the limit is set.
-  The flag takes at least 256 MiB, below which the binary cannot start its threads. The
+  The flag takes at least 256 MiB, below which the binary cannot start its threads. A
+  build without mimalloc uses glibc's allocator, which reserves 64 MiB of address space
+  for each thread's arena, so a small limit leaves fewer threads room there. The
   tradeoff is latency and memory for containment. A child costs one process start per
   conversion, and the server may use up to `--pdf-workers` times `--convert-memory` of
   address space for conversions on top of its own. On a shared 16-core Linux laptop,
   converting the 5 KB DOCX fixture took a median of 41 µs in process, or 85 µs with the
   thread the in-process path starts, and a median of 8.5 ms with a 90th percentile of
   9.5 ms through a child of the release binary, measured 200 times with the ignored test
-  `ingest::isolate::tests::overhead`. Starting `/bin/true` took 2 to 4 ms on the same
-  machine, so most of the cost is starting a process. The cost is small next to the
-  model calls of an ingestion and is paid once per document. The converter has a cargo-fuzz target in
+  `ingest::isolate::tests::overhead`, and BENCHMARKS.md records them. Starting
+  `/bin/true` took 2 to 4 ms on the same machine, so most of the cost is starting a
+  process. The cost is small next to the model calls of an ingestion and is paid once per
+  document. The converter has a cargo-fuzz target in
   `crates/sparkles-office/fuzz`, started with `mise run office:fuzz`, and its normal
   tests convert 400 seeded mutations of every format's fixture. The fuzz corpus starts
   from the fixtures and from the amplification shapes of `tests/budget.rs` at the target's

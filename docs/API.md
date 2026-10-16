@@ -9396,10 +9396,12 @@ server built with `pdf-ocr` and started with `--pdf-ocr-models DIR` reads those 
 OCR instead and records them as `spk:ocrPage`. It loads PDFium from `--pdfium-lib` and
 ONNX Runtime from `--onnxruntime-lib` or their usual search paths, and never downloads a
 model. Conversions of PDF and Office files run at most `--pdf-workers` (2) at a time,
-each in a child process under the `--convert-memory` address-space limit that the server
-kills at the task's deadline. A conversion that overruns the deadline fails with
+each in a child process on Linux under the `--convert-memory` address-space limit that the
+server kills at the task's deadline. A conversion that overruns the deadline fails with
 `conversion-timeout`, and one that ends without a result, such as at its memory limit,
-fails with `conversion-failed`.
+fails with `conversion-failed` and status 422. When the child cannot start with its
+limits, conversions fail with `conversion-failed` and status 500, and the message names
+the reason.
 A build without `pdf` refuses a PDF with `unsupported-format`, and a build without
 `office` refuses the Office formats the same way. A damaged Office file fails with
 `conversion-failed`. A password-protected file or an old binary one, such as `.doc`,
