@@ -129,27 +129,55 @@ impl ClassAcc {
         by_label: &BTreeMap<String, BTreeSet<String>>,
         enforcement: Enforcement,
     ) {
-        let shape = &ir.shapes[s.index()];
-        self.closed |= shape.closed;
-        // a shape that extends others also needs their triple constraints
-        let mut all = vec![s];
-        if let Some(ext) = &shape.ext
-            && let Some(frame) = ext.frames.first()
-        {
-            all.extend(frame.parts.iter().map(|p| p.shape));
+        let own = &ir.shapes[s.index()];
+        // an ancestor's CLOSED closes only the part of the neighbourhood that is its own
+        self.closed |= own.closed;
+        // the shapes whose triple constraints the node needs: the shape itself, and with
+        // an extension, the ancestors of each reading (frame)
+        let frames: &[crate::ir::Frame] = own.ext.as_ref().map_or(&[], |e| &e.frames[..]);
+        // Several readings (an ancestor's alternatives) make an ancestor's constraints
+        // conditional. A property that two parts of one reading both constrain is limited
+        // by the whole neighbourhood, so neither part's cardinality is the property's.
+        let conditional = frames.len() > 1;
+        let mut shared: FxHashSet<(&str, Dir)> = FxHashSet::default();
+        for frame in frames {
+            let mut seen: FxHashSet<(&str, Dir)> = FxHashSet::default();
+            let parts = std::iter::once(s).chain(frame.parts.iter().map(|p| p.shape));
+            for id in parts {
+                let preds: FxHashSet<(&str, Dir)> = ir.shapes[id.index()]
+                    .tcs
+                    .iter()
+                    .map(|tc| (tc.pred.as_str(), tc.dir))
+                    .collect();
+                for k in preds {
+                    if !seen.insert(k) {
+                        shared.insert(k);
+                    }
+                }
+            }
         }
-        for id in all {
+        let mut shapes = vec![(s, false)];
+        let mut ancestors = FxHashSet::default();
+        for frame in frames {
+            for part in &frame.parts {
+                // a part that is also the shape itself or an earlier ancestor is listed once
+                if part.shape != s && ancestors.insert(part.shape) {
+                    shapes.push((part.shape, conditional));
+                }
+            }
+        }
+        for (id, conditional) in shapes {
             let shape = &ir.shapes[id.index()];
-            self.closed |= shape.closed;
             let mut plain = vec![false; shape.tcs.len()];
             if let Some(root) = shape.root {
-                mark_plain(shape, root, true, &mut plain);
+                mark_plain(shape, root, !conditional, &mut plain);
             }
             for (i, tc) in shape.tcs.iter().enumerate() {
+                let alone = !shared.contains(&(tc.pred.as_str(), tc.dir));
                 self.properties.push(property(
                     ir,
                     tc,
-                    plain.get(i).copied().unwrap_or(false),
+                    plain.get(i).copied().unwrap_or(false) && alone,
                     by_label,
                     enforcement,
                 ));

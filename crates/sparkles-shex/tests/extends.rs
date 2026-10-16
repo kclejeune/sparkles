@@ -374,3 +374,35 @@ fn a_search_without_leaves_is_bounded() {
         Err(_) => panic!("the partition search ran past its timeout and budget"),
     }
 }
+
+/// What the validator enforces, which the constraint summaries of extending shapes follow.
+#[test]
+fn constraint_summary_cases_as_the_validator_enforces_them() {
+    let d = "ex:n ex:p 1 ; ex:q 1 ; ex:r 1 . ex:m ex:q 1 . ex:k ex:p 1 .";
+    assert_eq!(
+        check(
+            "ex:A CLOSED { ex:p . } ex:B EXTENDS @ex:A { ex:q . }",
+            d,
+            &[("n", "B")]
+        ),
+        [true],
+        "an ancestor's CLOSED does not close B"
+    );
+    assert_eq!(
+        check(
+            "ex:A { ex:p . } OR { ex:q . } ex:B EXTENDS @ex:A { }",
+            d,
+            &[("m", "B")]
+        ),
+        [true]
+    );
+    assert_eq!(
+        check(
+            "ex:A { ex:p . } ex:B EXTENDS @ex:A { ex:p . }",
+            d,
+            &[("k", "B")]
+        ),
+        [false],
+        "one p arc is not enough"
+    );
+}

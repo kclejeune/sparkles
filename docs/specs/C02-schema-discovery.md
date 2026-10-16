@@ -1221,7 +1221,11 @@ where this section says otherwise. `DRAFT_FORMAT` is now 2, because property sha
   [API.md](../API.md#constraints-layer). The property constraint gained `inverse` and
   `values`. A triple constraint inside a choice, or a group with a cardinality of its
   own, lists its predicate with the `shex#Group` component under `other`, since its
-  cardinality is not the shape's.
+  cardinality is not the shape's. A shape that extends others needs their triple
+  constraints too. A predicate that two of its parts both constrain is limited by the
+  whole neighbourhood, so it also goes under `other`. When an ancestor has alternatives,
+  every property the ancestors contribute is conditional. An ancestor's `CLOSED` does not
+  close the class, because the validator lets the extending shape's other arcs through.
 * *Restart-stable cursors.* A cursor now holds the dataset id, the commit of its report,
   the selection hash and the last IRI, and the kept report is keyed by commit. A cursor
   survives a restart and a compaction. When the report of that commit is not kept, it is

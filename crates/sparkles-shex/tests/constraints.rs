@@ -138,3 +138,49 @@ fn warn_mode_only_reports() {
             .all(|p| p.enforcement == Enforcement::WarnOnWrite)
     );
 }
+
+fn class_of(schema: &str, class: &str) -> sparkles_core::schema::constraints::ClassConstraints {
+    let c: ShexValidationConfig = serde_json::from_value(serde_json::json!({
+        "language": "shex",
+        "mode": "reject",
+        "schema": {"inline": format!("PREFIX ex: <http://ex.org/>\n{schema}"), "format": "shexc"},
+        "shapeMap": format!("{{FOCUS a ex:{class}}}@ex:{class}"),
+    }))
+    .unwrap();
+    c.check().unwrap();
+    let store = Store::in_memory(StoreOptions::default());
+    let SetOutcome::Installed(g, _) = set_config(&store, Some(c), &NoImports).unwrap() else {
+        panic!("not installed")
+    };
+    let s = guard_source(&g);
+    s.classes
+        .into_iter()
+        .find(|c| c.class == format!("http://ex.org/{class}"))
+        .unwrap()
+}
+
+/// `B EXTENDS @A { p . }` with `A { p . }` needs two `p` arcs, so no entry may claim
+/// exactly one.
+#[test]
+fn extension_cardinalities_cover_the_whole_neighbourhood() {
+    let b = class_of("ex:A { ex:p . } ex:B EXTENDS @ex:A { ex:p . }", "B");
+    for p in b.properties.iter().filter(|p| p.path == "http://ex.org/p") {
+        assert_ne!((p.min_count, p.max_count), (Some(1), Some(1)), "{p:#?}");
+    }
+}
+
+/// When an ancestor has alternatives, neither alternative's properties are mandatory.
+#[test]
+fn alternative_frames_are_not_mandatory() {
+    let b = class_of("ex:A { ex:p . } OR { ex:q . } ex:B EXTENDS @ex:A { }", "B");
+    for p in &b.properties {
+        assert_eq!(p.min_count, None, "{p:#?}");
+    }
+}
+
+/// An ancestor's CLOSED does not close the extending shape.
+#[test]
+fn ancestor_closed_does_not_close_the_class() {
+    let b = class_of("ex:A CLOSED { ex:p . } ex:B EXTENDS @ex:A { ex:q . }", "B");
+    assert!(!b.closed);
+}
