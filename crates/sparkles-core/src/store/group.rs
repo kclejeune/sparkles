@@ -135,8 +135,12 @@ impl Coordinator {
                 Err(_) if ticket.0.load(Ordering::Acquire) == 1 => return Ok(()),
                 Err(e) => return Err(e),
             }
+            store.failpoint("group-wait-parking");
+            // Park only while a fence is running. If the fence that kept `drive` from
+            // leading finished after it returned, nobody leads the queued commit, so this
+            // waiter must loop and lead it instead of sleeping out the poll.
             let mut s = self.state.lock();
-            if ticket.0.load(Ordering::Acquire) == 0 {
+            if ticket.0.load(Ordering::Acquire) == 0 && s.active {
                 self.changed.wait_for(&mut s, Duration::from_millis(20));
             }
         }
@@ -563,6 +567,46 @@ mod tests {
         assert!(t.insert(ids)?);
         t.commit()
     }
+    /// A waiter whose fence completes between its own `drive` and its park must lead the
+    /// next fence at once, not sleep out the 20 ms poll with nobody leading.
+    #[test]
+    fn a_waiter_does_not_sleep_through_a_finished_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+        insert(&s, "seed").unwrap();
+        let (sealed, release_a) = pause_thread(&s, "group-sealed", "lw-a");
+        let a = thread::Builder::new()
+            .name("lw-a".into())
+            .spawn({
+                let s = s.clone();
+                move || insert(&s, "a").unwrap()
+            })
+            .unwrap();
+        sealed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (parked, release_b) = pause_thread(&s, "group-wait-parking", "lw-b");
+        let b = thread::Builder::new()
+            .name("lw-b".into())
+            .spawn({
+                let s = s.clone();
+                move || {
+                    insert(&s, "b").unwrap();
+                    Instant::now()
+                }
+            })
+            .unwrap();
+        parked.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_a.send(()).unwrap();
+        a.join().unwrap();
+        let resumed = Instant::now();
+        release_b.send(()).unwrap();
+        let done = b.join().unwrap();
+        let stalled = done.duration_since(resumed);
+        assert!(
+            stalled < Duration::from_millis(10),
+            "the waiter slept {stalled:?} with its commit queued and no fence running"
+        );
+    }
+
     fn pause(s: &Store, name: &'static str) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (hit, observed) = mpsc::channel();
         let (resume, go) = mpsc::channel();
