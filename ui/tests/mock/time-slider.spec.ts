@@ -244,6 +244,77 @@ test('A5: an entity history strip has a tick for each commit that changed the re
   await expect(net.locator('.net')).toHaveCount(2);
 });
 
+test('U2: a refused read in the middle of a scrub keeps the last result on screen', async ({
+  page,
+}) => {
+  await openSlider(page);
+  const reads: string[] = [];
+  await page.route('**/chrono/sparql*', async (route) => {
+    const at = new URL(route.request().url()).searchParams.get('at') ?? 'head';
+    reads.push(at);
+    if (at === 'commit:2') {
+      // slow enough for the next move to supersede it
+      await new Promise((r) => setTimeout(r, 1500));
+      return route.continue().catch(() => {});
+    }
+    if (at === 'commit:1') {
+      return route.fulfill({
+        status: 410,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          error: 'gone',
+          message: 'commit 1 is no longer reconstructable',
+          code: 'history-gone',
+          commit: 1,
+          reconstructable: [{ from: 2, to: 3 }],
+        }),
+      });
+    }
+    return route.continue();
+  });
+  await right(page).focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect.poll(() => reads.includes('commit:2')).toBe(true);
+  await page.keyboard.press('ArrowLeft');
+  await expect(page.getByText('Commit 1 can no longer be read')).toBeVisible();
+  // the head's rows were put back without reading the head again
+  await expect(right(page)).toHaveAttribute('aria-valuenow', '3');
+  await expect(grid(page)).toContainText('/carol');
+  await page.waitForTimeout(800);
+  expect(reads).toEqual(['commit:2', 'commit:1']);
+  await expect(grid(page)).toContainText('/carol');
+});
+
+test('U2: Play stops on a read that fails and leaves the handle on that commit', async ({
+  page,
+}) => {
+  await openSlider(page);
+  const reads: string[] = [];
+  await page.route('**/chrono/sparql*', (route) => {
+    const at = new URL(route.request().url()).searchParams.get('at') ?? 'head';
+    reads.push(at);
+    if (at !== 'commit:2') return route.continue();
+    return route.fulfill({
+      status: 408,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'timeout', message: 'the query timed out' }),
+    });
+  });
+  await right(page).focus();
+  await page.keyboard.press('Home');
+  await expect(right(page)).toHaveAttribute('aria-valuenow', '0');
+  reads.length = 0;
+  await slider(page).getByRole('combobox', { name: 'Play speed' }).selectOption('4');
+  await slider(page).getByRole('button', { name: 'Play' }).click();
+  await expect(page.locator('.error-box')).toBeVisible();
+  await expect(slider(page).getByRole('button', { name: 'Play' })).toBeVisible();
+  // nothing steps on and overwrites the error
+  await page.waitForTimeout(1500);
+  expect(reads).toEqual(['commit:1', 'commit:2']);
+  await expect(right(page)).toHaveAttribute('aria-valuenow', '2');
+  await expect(page.locator('.error-box')).toBeVisible();
+});
+
 test('the bar closes with Escape and the view reads the head again', async ({ page }) => {
   await openSlider(page);
   await right(page).focus();

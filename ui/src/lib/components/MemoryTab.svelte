@@ -69,6 +69,7 @@
         slider?.reject({ seq: gone.seq, readable: gone.readable });
         if (result) return;
       }
+      slider?.fail();
       result = null;
       before = null;
       error =

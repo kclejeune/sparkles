@@ -157,6 +157,11 @@
   /** Include materialized inferences (the server's `reasoning=` parameter). */
   let inferences = $state(saved.inferences !== false);
   let outcomes = $state<Record<string, Outcome>>({});
+  /**
+   * The last result of each tab that reached the screen. While the slider moves, a read that
+   * is superseded or refused puts it back, whichever reads were in flight in between.
+   */
+  const lastShown: Record<string, Outcome> = {};
   let examplesOpen = $state(false);
   let savedOpen = $state(false);
   let formatMenuOpen = $state(false);
@@ -684,6 +689,7 @@
     if (!o.query) {
       outcomes[tabId]?.controller?.abort();
       delete outcomes[tabId];
+      delete lastShown[tabId];
     }
     const run = o.run ?? askPrefs.mode === 'run';
     const summary = !!assistant?.summary;
@@ -1048,6 +1054,7 @@
     if (i < 0) return;
     outcomes[id]?.controller?.abort();
     delete outcomes[id];
+    delete lastShown[id];
     delete checks[id];
     editor?.forget(id);
     tabs.splice(i, 1);
@@ -1222,11 +1229,8 @@
       }
     }
     // while the slider moves, the last state stays on screen until the next one has arrived
-    const shown = outcomes[tabId];
-    const keepShown =
-      timeOpen && shown?.status === 'done' && !!shown.result && shown.ds === dsName
-        ? shown
-        : undefined;
+    const shown = lastShown[tabId];
+    const keepShown = timeOpen && !!shown?.result && shown.ds === dsName ? shown : undefined;
     const controller = new AbortController();
     const prevView = outcomes[tabId]?.view;
     const prevKind = outcomes[tabId]?.result?.queryType;
@@ -1247,6 +1251,7 @@
       if (k === 'UPDATE') {
         const result = await api.update(dsTarget, text, controller.signal);
         const ms = performance.now() - started;
+        delete lastShown[tabId];
         // the update was applied either way; only the outcome display is ownership-bound
         delete app.vocab[dsName];
         void app.refreshDatasets();
@@ -1311,6 +1316,7 @@
           reasoning,
           query: stored ? undefined : text,
         };
+        lastShown[tabId] = outcomes[tabId];
         autoPickColumns(result);
         // an empty result gets a diagnosis, after the result is on screen
         if (!stored && isEmptyResult(result))
@@ -1342,6 +1348,9 @@
           return;
         }
       }
+      // a read that failed for any other reason stops Play on the commit that failed
+      slider?.fail();
+      delete lastShown[tabId];
       outcomes[tabId] = {
         status: 'error',
         ds: dsName,

@@ -437,6 +437,14 @@
     clearTimeout(timer);
   }
 
+  /**
+   * A read failed for a reason other than a state that cannot be read: Play stops and the
+   * handle stays where it is, so that retrying reads the same state.
+   */
+  export function fail() {
+    playing = false;
+  }
+
   /** The view read the state the slider names. */
   export function accept() {
     good = { right: rightSeq, left: leftSeq, compare, at, from };

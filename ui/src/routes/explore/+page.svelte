@@ -200,7 +200,10 @@
         note: [unrecordedNote(subj), unrecordedNote(obj)].filter(Boolean)[0] ?? '',
       };
     } catch (e) {
-      if (owns()) histError = api.errorMessage(e);
+      if (owns()) {
+        histError = api.errorMessage(e);
+        strip?.fail();
+      }
     }
   }
 
@@ -541,6 +544,8 @@
         drawnKey = timeKey();
         return;
       }
+      graphSlider?.fail();
+      strip?.fail();
       toasts.error('Could not read the graph at that commit', e);
     } finally {
       if (owns()) graphReading = false;
@@ -612,6 +617,10 @@
         strip?.reject({ seq: gone.seq, readable: gone.readable });
         graphSlider?.reject({ seq: gone.seq, readable: gone.readable });
         return;
+      }
+      if (at) {
+        strip?.fail();
+        graphSlider?.fail();
       }
       d = { error: api.errorMessage(e) };
     }
@@ -869,6 +878,7 @@
         schemaSlider?.reject({ seq: gone.seq, readable: gone.readable });
         schemaDrawnKey = schemaKey();
       } else {
+        schemaSlider?.fail();
         schemaErr = api.errorMessage(e);
       }
     } finally {
