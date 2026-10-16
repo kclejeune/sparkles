@@ -308,3 +308,47 @@ fn the_output_budget_stops_every_format() {
         assert!(!sheets(&b, f, &lim()).unwrap().is_empty(), "{f:?}");
     }
 }
+
+#[test]
+fn a_hidden_run_is_left_out() {
+    let doc = format!(
+        r#"<w:document {W}><w:body><w:p><w:r><w:t>shown </w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>secret </w:t></w:r><w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:t>also shown</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:rPr><w:vanish w:val="true"/></w:rPr><w:t>cell secret</w:t></w:r><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>"#
+    );
+    let b = container(&[("word/document.xml", &doc)]);
+    let m = to_markdown(&b, Format::Docx, &lim()).unwrap().markdown;
+    assert!(m.contains("shown also shown"), "{m}");
+    assert!(!m.contains("secret"), "{m}");
+    assert!(m.contains("| cell |"), "{m}");
+}
+
+const X: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:x="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+fn workbook_with(sheet_tag: &str, sheet: &str) -> Vec<u8> {
+    let wb = format!(r#"<workbook {X}><sheets>{sheet_tag}</sheets></workbook>"#);
+    let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+    container(&[
+        ("xl/workbook.xml", &wb),
+        ("xl/_rels/workbook.xml.rels", rels),
+        ("xl/worksheets/sheet1.xml", sheet),
+    ])
+}
+
+#[test]
+fn a_workbook_may_bind_another_prefix_to_the_relationship_namespace() {
+    let sheet = format!(
+        r#"<worksheet {X}><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>kept</t></is></c></row></sheetData></worksheet>"#
+    );
+    let f = workbook_with(r#"<sheet name="S" sheetId="1" x:id="rId1"/>"#, &sheet);
+    let s = sheets(&f, Format::Xlsx, &lim()).unwrap();
+    assert_eq!(s[0].csv, "kept\n");
+}
+
+#[test]
+fn the_phonetic_runs_of_an_inline_string_are_left_out() {
+    let sheet = format!(
+        r#"<worksheet {X}><sheetData><row r="1"><c r="A1" t="inlineStr"><is><r><t>Tokyo</t></r><rPh sb="0" eb="2"><t>toukyou</t></rPh></is></c></row></sheetData></worksheet>"#
+    );
+    let f = workbook_with(r#"<sheet name="S" sheetId="1" x:id="rId1"/>"#, &sheet);
+    let s = sheets(&f, Format::Xlsx, &lim()).unwrap();
+    assert_eq!(s[0].csv, "Tokyo\n");
+}

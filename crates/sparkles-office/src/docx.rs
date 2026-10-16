@@ -188,6 +188,14 @@ fn notes(pkg: &mut Package, limits: &Limits, part: &str, tag: &str) -> HashMap<S
     out
 }
 
+/// Whether a run is hidden text (`w:vanish` in its properties, unless it says `0` or
+/// `false`), which Word does not show and the rendition leaves out.
+fn hidden(run: &Node) -> bool {
+    run.first("rPr")
+        .and_then(|p| p.first("vanish"))
+        .is_some_and(|v| !matches!(v.attr("val"), Some("0" | "false" | "off")))
+}
+
 /// The text of a paragraph, with nothing else: for notes and cells.
 fn plain_text(p: &Node) -> String {
     let mut s = String::new();
@@ -202,6 +210,7 @@ fn plain_runs(n: &Node, out: &mut String) {
             "tab" | "br" | "cr" => out.push(' '),
             "noBreakHyphen" => out.push('-'),
             "del" | "moveFrom" | "drawing" | "pict" | "pPr" | "rPr" | "Fallback" => {}
+            "r" if hidden(c) => {}
             _ => plain_runs(c, out),
         }
     }
@@ -391,6 +400,9 @@ impl Cx<'_, '_> {
     }
 
     fn run(&mut self, r: &Node, out: &mut String, extra: &mut Vec<Block>, flat: bool) {
+        if hidden(r) {
+            return;
+        }
         for c in r.elements() {
             match c.name.as_str() {
                 "t" => out.push_str(&c.text()),

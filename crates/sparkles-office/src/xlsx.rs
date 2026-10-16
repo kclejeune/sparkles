@@ -32,7 +32,14 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
         if matches!(s.attr("state"), Some("hidden" | "veryHidden")) {
             continue;
         }
-        let Some(rel) = s.attr("r:id").and_then(|id| rels.get(id)) else {
+        // the relationship id is `r:id` by habit, but any prefix may be bound to the namespace
+        let rid = s.attr("r:id").or_else(|| {
+            s.attrs
+                .iter()
+                .find(|(k, _)| k.rsplit_once(':').is_some_and(|(_, l)| l == "id"))
+                .map(|(_, v)| v.as_str())
+        });
+        let Some(rel) = rid.and_then(|id| rels.get(id)) else {
             continue;
         };
         if rel.kind != "worksheet" || rel.external {
@@ -81,6 +88,8 @@ fn shared_strings(pkg: &mut Package, limits: &Limits) -> Result<Vec<String>, Err
                 "t" => in_t = false,
                 _ => {}
             },
+            // an empty `<si/>` is a string like any other, and the ones after it keep their index
+            Event::Empty(e) if xml::local(e.name().as_ref()) == "si" => out.push(String::new()),
             Event::Text(t) if in_t => cur.push_str(&xml::text_of(&t)),
             Event::CData(c) if in_t => cur.push_str(&String::from_utf8_lossy(&c)),
             Event::DocType(_) => return Err(corrupt("a DOCTYPE is not allowed")),
@@ -193,6 +202,7 @@ fn read_sheet(
     let mut text = String::new();
     let mut target = Target::None;
     let mut in_cell = false;
+    let mut phonetic = 0usize; // inside rPh, the phonetic runs of an inline string
     loop {
         let ev = r.read_event_into(&mut buf).map_err(corrupt)?;
         match &ev {
@@ -218,8 +228,9 @@ fn read_sheet(
                             in_cell = false;
                         }
                     }
+                    "rPh" if !empty => phonetic += 1,
                     "v" if in_cell && !empty => target = Target::Value,
-                    "t" if in_cell && !empty => target = Target::Inline,
+                    "t" if in_cell && !empty && phonetic == 0 => target = Target::Inline,
                     _ => {}
                 }
             }
@@ -227,6 +238,7 @@ fn read_sheet(
             Event::CData(c) if target != Target::None => text.push_str(&String::from_utf8_lossy(c)),
             Event::End(e) => match xml::local(e.name().as_ref()).as_str() {
                 "v" | "t" => target = Target::None,
+                "rPh" => phonetic = phonetic.saturating_sub(1),
                 "c" if in_cell => {
                     in_cell = false;
                     let v = cell_value(&kind, &text, style, shared, dates, date1904);

@@ -4816,8 +4816,10 @@ badges on the dataset page and the sidebar.
   entry per sheet that holds the sheet's name and index, its draft and its CSV, which is
   the file to upload with the mapping. The sheet's name and index are the marker of that
   sheet. Cells with a date format become ISO 8601 text, and formulas give their cached
-  values. Hidden sheets and sheets without data are left out. A sheet whose draft fails
-  is reported with its error, and the others go on.
+  values. Hidden sheets and sheets without data are left out, but hidden rows and
+  columns of a visible sheet are read, because they are data. Hidden slides and Word runs
+  marked as hidden text are left out as well. The comment of an ODS cell is not read into
+  its value. A sheet whose draft fails is reported with its error, and the others go on.
 - **Bounds and isolation.** The converter bounds the entries of the container, the
   unpacked size of each part and of all parts, the nodes and depth of an XML tree, the
   cells of a sheet and the size of the text. A ZIP bomb stops at the limit whatever its

@@ -17,8 +17,12 @@ pub enum Block {
 }
 
 /// Text made safe to put in a line: no line starts a comment, so that a document cannot
-/// forge a page or an image marker.
+/// forge a page or an image marker. Every kind of line end becomes `\n` first, because the
+/// server folds a lone `\r` into `\n` afterwards and a marker must not appear then.
 pub fn plain(s: &str) -> String {
+    let s = s
+        .replace("\r\n", "\n")
+        .replace(['\r', '\u{85}', '\u{2028}', '\u{2029}'], "\n");
     s.trim()
         .lines()
         .map(|l| {

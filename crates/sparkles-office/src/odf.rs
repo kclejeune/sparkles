@@ -498,6 +498,8 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
     let mut cell: Option<CellState> = None;
     let mut para = String::new();
     let mut in_p = false;
+    // inside an `office:annotation`, the comment of a cell, which is not its value
+    let mut annotation = 0usize;
     let mut paras: Vec<String> = Vec::new();
     // bytes charged for the paragraphs and spaces of the current cell
     let mut transient = 0usize;
@@ -588,6 +590,8 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                             cell = Some(st);
                         }
                     }
+                    "annotation" if !empty => annotation += 1,
+                    _ if annotation > 0 => {}
                     "p" if cell.is_some() && !empty => {
                         in_p = true;
                         para.clear();
@@ -608,8 +612,10 @@ pub fn sheets(pkg: &mut Package, limits: &Limits) -> Result<Vec<Sheet>, Error> {
                     _ => {}
                 }
             }
-            Event::Text(t) if in_p => para.push_str(&xml::text_of(t)),
+            Event::Text(t) if in_p && annotation == 0 => para.push_str(&xml::text_of(t)),
             Event::End(e) => match xml::local(e.name().as_ref()).as_str() {
+                "annotation" => annotation = annotation.saturating_sub(1),
+                "p" if annotation > 0 => {}
                 "p" if in_p => {
                     in_p = false;
                     budget.charge(para.len() + SLOT)?;
