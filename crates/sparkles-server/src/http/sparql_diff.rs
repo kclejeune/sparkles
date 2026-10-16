@@ -8,18 +8,25 @@
 //! state and once at the other differs once.
 //!
 //! The comparison keeps a 128-bit hash for each distinct row of the first result and no
-//! row. The second result is read against those hashes, which finds the rows only it has
+//! row. Everything it keeps is charged to the request's memory budget and to the server's
+//! memory pool, see [`Charge`]. The second result is read against those hashes, which finds the rows only it has
 //! and keeps up to `limit` of them as they go by. The rows only the first result has are
 //! found by running its query once more. That makes three executions, and the request
 //! counts twice against the `query` rate limit.
 
 use super::*;
 use sparkles::history::At;
+use sparkles::sparql::pool::PoolGrant;
 use sparkles::sparql::{QueryKind, QueryResult};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
+/// What a distinct row costs in the table of hashes: a 32-byte slot, which the 16-byte
+/// alignment of the key makes of a `(u128, u32)`, a control byte, and room for the load
+/// factor and for the table's growth.
+const SEEN_ENTRY_BYTES: u64 = 48;
 /// The rows listed for each side without `limit`.
 const DEFAULT_LIMIT: usize = 100;
 /// The most rows listed for each side.
@@ -60,6 +67,68 @@ fn row_json(r: &QueryResult, i: usize) -> J {
     J::Object(o)
 }
 
+/// The memory the comparison holds, charged as it grows to the request's budget
+/// (`--query-memory-mb`, lowered by `memory-mb`) and to the grant the request was admitted
+/// with when the server has a memory pool. The engine charges its own execution and
+/// releases it when a run ends, so this counts what the comparison keeps between runs: the
+/// table of the result being read, the hashes and the listed rows. Dropping it gives the
+/// grant back everything it still holds, whichever way the request ends.
+struct Charge {
+    grant: Option<Arc<PoolGrant>>,
+    limit: Option<u64>,
+    held: u64,
+}
+
+impl Charge {
+    fn new(opts: &sparkles::sparql::QueryOptions) -> Charge {
+        Charge {
+            grant: opts.grant.clone(),
+            limit: opts.max_memory_bytes,
+            held: 0,
+        }
+    }
+
+    /// Account for `n` more bytes: `507` with `budget: "memory"` past the request's budget,
+    /// and the pool's own refusal when it cannot give the bytes.
+    fn charge(&mut self, n: u64) -> Result<(), sparkles::Error> {
+        let total = self.held.saturating_add(n);
+        if let Some(limit) = self.limit
+            && total > limit
+        {
+            return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::Memory,
+                limit,
+                requested: total,
+            }));
+        }
+        if let Some(g) = &self.grant {
+            g.charge(n)?;
+        }
+        self.held = total;
+        Ok(())
+    }
+
+    /// Account for `n` fewer bytes.
+    fn release(&mut self, n: u64) {
+        let n = n.min(self.held);
+        if let Some(g) = &self.grant {
+            g.release(n);
+        }
+        self.held -= n;
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.release(self.held);
+    }
+}
+
+/// The bytes of the table a result keeps: a cell is a term id.
+fn table_bytes(r: &QueryResult) -> u64 {
+    (r.len() as u64).saturating_mul(r.table.cols.len() as u64) * 8
+}
+
 /// The rows listed so far, against the response's byte budget (`--max-result-mb` and the
 /// request's `max-result-mb`). Both lists count together, since both go in one body.
 struct Listed {
@@ -72,11 +141,14 @@ impl Listed {
         Listed { limit, bytes: 0 }
     }
 
-    /// Count a row's JSON, or fail with `507` once the rows alone pass the budget.
-    fn add(&mut self, row: J) -> ApiResult<J> {
+    /// Count a row's JSON, or fail with `507` once the rows alone pass the budget, and
+    /// charge the row to the memory the comparison holds.
+    fn add(&mut self, row: J, charge: &mut Charge) -> ApiResult<J> {
         // the comma that separates it from the row before
-        self.bytes += serde_json::to_vec(&row).map_or(0, |v| v.len() as u64) + 1;
+        let len = serde_json::to_vec(&row).map_or(0, |v| v.len() as u64) + 1;
+        self.bytes += len;
         self.check(self.bytes)?;
+        charge.charge(len)?;
         Ok(row)
     }
 
@@ -170,32 +242,36 @@ pub(super) async fn sparql_diff(
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel);
-    let max_distinct = st.limits.max_rows;
     let restricted = p.restricted(&ds.name);
     let out = blocking({
         let ds = ds.clone();
         move || {
             let mut buf = String::new();
+            let mut charge = Charge::new(&opts);
             // the earlier state: a hash for each distinct row, and how many of it there are
             let (left, from_at) = run(&ds, &from, &query, &opts)?;
             let vars = left.vars.clone();
             let left_rows = left.len() as u64;
+            // the table is held for as long as `left` is
+            let left_bytes = table_bytes(&left);
+            charge.charge(left_bytes)?;
             let mut seen: HashMap<u128, u32> = HashMap::new();
             for i in 0..left.len() {
-                *seen.entry(row_hash(&left, i, &mut buf)).or_default() += 1;
-                if max_distinct > 0 && seen.len() > max_distinct {
-                    return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
-                        kind: sparkles::BudgetKind::Rows,
-                        limit: max_distinct as u64,
-                        requested: seen.len() as u64,
-                    })
-                    .into());
+                match seen.entry(row_hash(&left, i, &mut buf)) {
+                    Entry::Occupied(mut e) => *e.get_mut() += 1,
+                    Entry::Vacant(e) => {
+                        charge.charge(SEEN_ENTRY_BYTES)?;
+                        e.insert(1);
+                    }
                 }
             }
             drop(left);
+            charge.release(left_bytes);
             // the later state: a row without a partner is only there, and kept as it goes by
             let (right, to_at) = run(&ds, &to, &query, &opts)?;
             let right_rows = right.len() as u64;
+            let right_bytes = table_bytes(&right);
+            charge.charge(right_bytes)?;
             let (mut same, mut added) = (0u64, 0u64);
             let mut added_rows = Vec::new();
             let mut listed = Listed::new(max_bytes);
@@ -208,18 +284,21 @@ pub(super) async fn sparql_diff(
                     _ => {
                         added += 1;
                         if added_rows.len() < limit {
-                            added_rows.push(listed.add(row_json(&right, i))?);
+                            added_rows.push(listed.add(row_json(&right, i), &mut charge)?);
                         }
                     }
                 }
             }
             drop(right);
+            charge.release(right_bytes);
             // what is left of the earlier hashes is only there: read that state again for the rows
             let removed: u64 = seen.values().map(|n| u64::from(*n)).sum();
             let mut removed_rows = Vec::new();
             if removed > 0 {
                 let again = At::Commit(from_at.commit.seq);
                 let (left, _) = run(&ds, &again, &query, &opts)?;
+                let again_bytes = table_bytes(&left);
+                charge.charge(again_bytes)?;
                 for i in 0..left.len() {
                     if removed_rows.len() >= limit {
                         break;
@@ -228,10 +307,15 @@ pub(super) async fn sparql_diff(
                         && *n > 0
                     {
                         *n -= 1;
-                        removed_rows.push(listed.add(row_json(&left, i))?);
+                        removed_rows.push(listed.add(row_json(&left, i), &mut charge)?);
                     }
                 }
+                drop(left);
+                charge.release(again_bytes);
             }
+            // the hashes are no longer needed
+            charge.release(seen.len() as u64 * SEEN_ENTRY_BYTES);
+            drop(seen);
             let side = |r: &sparkles::history::Resolved| {
                 let mut commit = json!(r.commit);
                 if restricted {
@@ -257,9 +341,87 @@ pub(super) async fn sparql_diff(
             // the envelope is small next to the rows, and the check makes the bound exact
             let body = serde_json::to_vec(&out).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             listed.check_body(body.len() as u64)?;
+            // the body is held until the response is sent
+            charge.charge(body.len() as u64)?;
             Ok(body)
         }
     })
     .await?;
     Ok(([(header::CONTENT_TYPE, "application/json")], out).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparkles::BudgetKind;
+    use sparkles::sparql::pool::QueryPool;
+
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn a_charge_rises_in_the_pool_and_falls_back_when_it_ends() {
+        let pool = QueryPool::new(8 * MIB);
+        let grant = Arc::new(pool.try_grant(MIB).unwrap());
+        let mut c = Charge {
+            grant: Some(grant.clone()),
+            limit: None,
+            held: 0,
+        };
+        c.charge(MIB / 2).unwrap();
+        assert_eq!(grant.used(), MIB / 2);
+        // past the first granule the grant grows and the pool's granted bytes rise
+        c.charge(3 * MIB).unwrap();
+        assert_eq!(grant.used(), MIB / 2 + 3 * MIB);
+        assert!(pool.granted() >= 3 * MIB + MIB / 2);
+        c.release(3 * MIB);
+        assert_eq!(grant.used(), MIB / 2);
+        // a charge that ends early, as on an error, gives back what it still holds
+        drop(c);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn a_charge_past_the_request_budget_is_a_memory_budget_error() {
+        let pool = QueryPool::new(8 * MIB);
+        let grant = Arc::new(pool.try_grant(MIB).unwrap());
+        let mut c = Charge {
+            grant: Some(grant.clone()),
+            limit: Some(100),
+            held: 0,
+        };
+        c.charge(60).unwrap();
+        let sparkles::Error::BudgetExceeded(b) = c.charge(50).unwrap_err() else {
+            panic!("not a budget error");
+        };
+        assert_eq!(
+            (b.kind, b.limit, b.requested),
+            (BudgetKind::Memory, 100, 110)
+        );
+        // the refused bytes were not taken
+        assert_eq!((c.held, grant.used()), (60, 60));
+        // without a pool the request's budget still applies
+        let mut c = Charge {
+            grant: None,
+            limit: Some(10),
+            held: 0,
+        };
+        assert!(c.charge(11).is_err());
+        assert!(c.charge(10).is_ok());
+    }
+
+    #[test]
+    fn a_charge_the_pool_cannot_cover_is_refused_and_not_counted() {
+        let pool = QueryPool::new(MIB);
+        let grant = Arc::new(pool.try_grant(MIB / 2).unwrap());
+        let mut c = Charge {
+            grant: Some(grant.clone()),
+            limit: None,
+            held: 0,
+        };
+        c.charge(MIB / 4).unwrap();
+        assert!(c.charge(2 * MIB).is_err());
+        assert_eq!((c.held, grant.used()), (MIB / 4, MIB / 4));
+    }
 }

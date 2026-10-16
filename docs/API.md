@@ -3520,10 +3520,14 @@ counts are always complete. The body obeys `--max-result-mb` and the request's o
 The server keeps a 128-bit hash for each distinct row of the earlier result and no row.
 It reads the later result against those hashes, which finds its own rows as they go by,
 and runs the earlier query once more to list the rows that no row of the later result
-matched. That is three executions of the query, each with the request's timeout and
-budgets, so the request counts twice against the `query` rate limit. The hashes count
-against the rows budget (`--max-rows`), and a comparison beyond it fails with `507` and
-`budget: "rows"`.
+matched. That is three executions of the query, each with the request's budgets, so the
+request counts twice against the `query` rate limit. The hashes, the table of the result
+being read and the listed rows count against the memory budget (`--query-memory-mb`, or
+the request's `memory-mb`) and against the server memory pool when it is on. A comparison
+beyond the request's budget fails with `507` and `budget: "memory"`, and one the pool
+cannot cover fails with `503` and `budget: "server-memory"`. The hashes cost about 48
+bytes for each distinct row of the earlier result, which is the memory the comparison
+trades for not keeping the rows.
 
 ### Change feed
 

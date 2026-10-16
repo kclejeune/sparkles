@@ -95,9 +95,25 @@ const T0: i64 = 1_893_456_000_000; // 2030-01-01T00:00:00Z
 
 /// A persistent dataset `h`: 1 (+a), 2 (+b in g1), 3 (−a), 4 (+c).
 async fn server(limits: impl FnOnce(&mut crate::state::Limits)) -> Server {
+    server_with_pool(None, limits).await
+}
+
+/// The same dataset on a server whose query memory pool has `pool` bytes, if any.
+async fn server_with_pool(
+    pool: Option<u64>,
+    limits: impl FnOnce(&mut crate::state::Limits),
+) -> Server {
     let dir = tempfile::tempdir().unwrap();
-    let mut st =
-        AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)).unwrap();
+    let mut st = match pool {
+        None => AppState::new(dir.path(), StoreOptions::default(), Duration::from_secs(30)),
+        Some(p) => AppState::with_memory(
+            dir.path(),
+            StoreOptions::default(),
+            Duration::from_secs(30),
+            Some(p),
+        ),
+    }
+    .unwrap();
     limits(&mut st.limits);
     let state = Arc::new(st);
     state.attach("h", DbType::Persistent, None).unwrap();
@@ -1359,7 +1375,7 @@ async fn sparql_diff_lists_the_rows_one_state_lacks() {
 }
 
 /// The start of a response body, for the message of a failed assertion.
-fn head(r: &Resp) -> String {
+fn head_of(r: &Resp) -> String {
     r.text().chars().take(200).collect()
 }
 
@@ -1379,7 +1395,12 @@ async fn sparql_diff_keeps_the_result_byte_budget() {
         "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
     )
     .await;
-    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", head(&r));
+    assert_eq!(
+        r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        head_of(&r)
+    );
     assert_eq!(r.json()["budget"], "result-bytes");
 }
 
@@ -1396,11 +1417,100 @@ async fn sparql_diff_keeps_the_result_budget_a_request_asks_for() {
     .await;
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
     let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=1", q).await;
-    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", head(&r));
+    assert_eq!(
+        r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        head_of(&r)
+    );
     // without it, or with a larger one, the answer is the whole body
     let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=8", q).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", head(&r));
+    assert_eq!(r.status, StatusCode::OK, "{}", head_of(&r));
     assert_eq!(r.json()["added"], 1);
     let r = sparql_diff(&s.app, "/h/sparql/diff?from=4&to=5&max-result-mb=0", q).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+async fn big_server(memory: Option<u64>, n: usize) -> Server {
+    let s = server(|l| l.query_memory_bytes = memory).await;
+    let mut u = String::from("INSERT DATA {");
+    for i in 0..n {
+        u.push_str(&format!(" <urn:r{i}> <urn:q> <urn:o> ."));
+    }
+    u.push('}');
+    update(&s.app, "h", &u).await;
+    s
+}
+
+#[tokio::test]
+async fn sparql_diff_charges_its_hashes_to_the_memory_budget() {
+    let q = "SELECT ?s WHERE { ?s <urn:q> <urn:o> }";
+    let n = 20_000;
+    let probe = big_server(None, n).await;
+    let ds = probe.state.datasets()["h"].clone();
+    let (snap, _) = history::snapshot_for(&ds, None, &QueryOptions::default()).unwrap();
+    let peak = sparkles::sparql::query_with_plan(snap, q, &QueryOptions::default())
+        .ok()
+        .unwrap()
+        .mem_peak_bytes;
+    let budget = (peak * 2).max(1);
+    // a HashMap<u128, u32> of n entries takes at least 32 bytes a slot
+    let map_bytes = (n as u64).next_power_of_two() * 32;
+    assert!(
+        map_bytes > budget,
+        "precondition: the map ({map_bytes}) must exceed the budget ({budget})"
+    );
+    let s = big_server(Some(budget), n).await;
+    // the query alone fits the budget
+    let r = get(
+        &s.app,
+        "/h/sparql?query=SELECT%20%3Fs%20WHERE%20%7B%20%3Fs%20%3Curn%3Aq%3E%20%3Curn%3Ao%3E%20%7D",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=5&to=5", q).await;
+    assert_eq!(
+        r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        head_of(&r)
+    );
+    assert_eq!(r.json()["budget"], "memory");
+}
+
+#[tokio::test]
+async fn sparql_diff_charges_the_server_memory_pool() {
+    const MIB: u64 = 1 << 20;
+    let q = "SELECT ?s WHERE { ?s <urn:q> <urn:o> }";
+    let s = server_with_pool(Some(4 * MIB), |_| {}).await;
+    let pool = s.state.catalog.pool().expect("a pool").clone();
+    let ds = s.state.datasets()["h"].clone();
+    // 100,000 rows: the query fits the pool, and its hashes (about 4.8 MB) do not
+    let nt: String = (0..100_000)
+        .map(|i| format!("<urn:r{i}> <urn:q> <urn:o> .\n"))
+        .collect();
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let head = ds.store.head_commit().seq;
+    let uri = format!("/h/sparql/diff?from={head}&to={head}");
+    let r = sparql_diff(&s.app, &uri, q).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", head_of(&r));
+    assert_eq!(r.json()["budget"], "server-memory");
+    // the grant went back to the pool on the error
+    assert_eq!(pool.granted(), 0);
+    // a comparison that fits is answered, and gives everything back too
+    let small = sparql_diff(
+        &s.app,
+        &format!("/h/sparql/diff?from={head}&to={head}"),
+        "SELECT ?s WHERE { ?s <urn:q> <urn:o> } LIMIT 100",
+    )
+    .await;
+    assert_eq!(small.status, StatusCode::OK, "{}", head_of(&small));
+    assert_eq!(small.json()["same"], 100);
+    assert_eq!(pool.granted(), 0);
 }
