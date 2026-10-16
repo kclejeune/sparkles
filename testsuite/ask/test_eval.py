@@ -316,7 +316,7 @@ class Processes(unittest.TestCase):
             ("deadline", float("nan")),
             ("deadline", float("inf")),
             ("deadline", -1),
-            ("jobs", 2),
+            ("max_tokens", 0),
             ("pair", ["p/m", "p/m"]),
             ("pair", ["p/absent"]),
             ("only", "absent"),
@@ -355,9 +355,9 @@ class Processes(unittest.TestCase):
         args.pair = ["p/a:b", "p/a_b"]
         out, report = eval_ask.run_matrix(args)
         self.assertTrue(report["complete"])
-        self.assertEqual(report["executed"], 3)
+        self.assertEqual(report["executed"], 2)
         ids = [c["case"] for c in report["cases"]]
-        self.assertEqual(len(set(ids)), 3)
+        self.assertEqual(len(set(ids)), 2)
         self.assertTrue(all((out / (i + ".json")).is_file() for i in ids))
 
     def test_forwarded_limits_and_exit17(self):
@@ -375,13 +375,155 @@ class Processes(unittest.TestCase):
         status = json.loads(next(out.glob("*/status.json")).read_text())
         self.assertEqual(status["returncode"], 17)
         for flag, value in [
-            ("--deadline", "30"),
+            ("--deadline", "300"),
             ("--timeout", "5"),
             ("--max-tokens", "32768"),
             ("--max-rows", "1000"),
         ]:
             self.assertEqual(status["argv"][status["argv"].index(flag) + 1], value)
         self.assertLessEqual(status["elapsedSeconds"], 2)
+
+    def questions_fixture(self, kinds):
+        args = self.fixture()
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"] = [
+            {"id": f"q{i}", "kind": kind, "question": f"question {i}"}
+            for i, kind in enumerate(kinds, 1)
+        ]
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        return args
+
+    def fake_ask(self, args, body):
+        binary = pathlib.Path(args.sparkles)
+        binary.write_text("#!" + PYTHON + "\n" + body)
+        args.sparkles_sha256 = digest(binary)
+
+    def test_failed_ask_is_scored_and_does_not_end_the_run(self):
+        args = self.questions_fixture(["clarify"] * 3)
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if "question 2" in sys.argv:\n'
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "    raise SystemExit(2)\n"
+            'print(json.dumps({"outcome":"clarify"}))\n',
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report["error"])
+        self.assertEqual(report["scored"], 3)
+        self.assertEqual(
+            [c["detail"].get("status") for c in report["cases"]],
+            [None, "provider_error", None],
+        )
+        row = report["rows"][0]
+        self.assertEqual(row["endToEndSuccess"]["denominator"], 3)
+        self.assertEqual(row["endToEndSuccess"]["numerator"], 2)
+        self.assertEqual(row["failureStatuses"], {"provider_error": 1})
+
+    def test_each_ask_failure_has_a_status(self):
+        args = self.questions_fixture(["clarify"] * 4)
+        args.deadline = 0.5
+        self.fake_ask(
+            args,
+            "import json,sys,time\n"
+            'q = sys.argv[sys.argv.index("--json") - 1]\n'
+            'if q.endswith("1"):\n'
+            "    time.sleep(30)\n"
+            'if q.endswith("2"):\n'
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"},'
+            '"usage":{"steps":[{"outcome":"refusal"}]}}))\n'
+            "    raise SystemExit(2)\n"
+            'if q.endswith("3"):\n'
+            '    print(json.dumps({"outcome":"error","error":{"code":"timeout"}}))\n'
+            "    raise SystemExit(2)\n"
+            'print(json.dumps({"outcome":"checked"}))\n',
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report["error"])
+        self.assertEqual(
+            [c["detail"]["status"] for c in report["cases"]],
+            ["timeout", "refusal", "timeout", "invalid_output"],
+        )
+
+    def test_unknown_exit_status_still_stops_the_run(self):
+        args = self.questions_fixture(["clarify"] * 2)
+        self.fake_ask(
+            args,
+            'import json\nprint(json.dumps({"outcome":"clarify"}))\nraise SystemExit(17)\n',
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["scored"], 0)
+        self.assertEqual(report["error"], "Invalid")
+
+    def test_cap_refusal_is_excluded_and_stops_the_run(self):
+        class Proxy:
+            token, cap_refusals = "t", 0
+
+            def set_case(self, case):
+                pass
+
+            def report(self):
+                return {"capRefusals": self.cap_refusals}
+
+        proxy = Proxy()
+        args = self.questions_fixture(["clarify"] * 3)
+        marker = self.root / "calls"
+        self.fake_ask(
+            args,
+            "import json\n"
+            f'open({str(marker)!r}, "a").write("x")\n'
+            'print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "raise SystemExit(2)\n",
+        )
+        original = eval_ask.Runner.classify
+
+        def classify(runner, record, directory):
+            proxy.cap_refusals += 1
+            return original(runner, record, directory)
+
+        eval_ask.Runner.classify = classify
+        self.addCleanup(setattr, eval_ask.Runner, "classify", original)
+        _, report = eval_ask.run_matrix(args, proxy)
+        self.assertFalse(report["complete"])
+        self.assertTrue(report["budgetStopped"])
+        self.assertEqual(marker.read_text(), "x")
+        row = report["rows"][0]
+        self.assertEqual(row["endToEndSuccess"]["denominator"], 0)
+        self.assertTrue(row["incomplete"])
+        self.assertEqual(report["unattemptedIds"], {"p/m": ["q1", "q2", "q3"]})
+        self.assertEqual(report["cases"][0]["detail"]["status"], "budget_refused")
+
+    def test_cascade_row_is_computed_from_pair_runs(self):
+        args = self.questions_fixture(["clarify"] * 3)
+        pathlib.Path(args.model_config).write_text(
+            json.dumps({"models": {"providers": {"p": {"models": {"a": {}, "b": {}}}}}})
+        )
+        args.pair = ["p/a", "p/b"]
+        # The first pair fails on question 2, so the cascade takes the second pair.
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'q = sys.argv[sys.argv.index("--json") - 1]\n'
+            'pair = sys.argv[sys.argv.index("--pair") + 1]\n'
+            'if pair.endswith("p/a") and q.endswith("2"):\n'
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"},'
+            '"usage":{"inputTokens":5}}))\n'
+            "    raise SystemExit(2)\n"
+            'print(json.dumps({"outcome":"clarify","usage":{"inputTokens":10,"outputTokens":1}}))\n',
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report["error"])
+        self.assertEqual(report["planned"], 6)
+        self.assertEqual(report["executed"], 6)
+        rows = {r["pair"]: r for r in report["rows"]}
+        cascade = rows["p/a > p/b"]
+        self.assertEqual(cascade["derivation"], "computed from the per-pair runs")
+        self.assertEqual(cascade["answeredBy"], {"p/a": 2, "p/b": 1})
+        self.assertEqual(cascade["endToEndSuccess"]["numerator"], 3)
+        self.assertEqual(rows["p/a"]["endToEndSuccess"]["numerator"], 2)
+        # The cascade pays for the failed first try as well as the second pair.
+        self.assertEqual(cascade["cliInputTokens"], 35)
 
     def test_invalid_gold_prevents_ask(self):
         args = self.fixture()

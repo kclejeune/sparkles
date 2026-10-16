@@ -6,8 +6,10 @@ QALD and Text2SPARQL datasets need separate licensed data, pinned gold results a
 reference metric alignment. This fixture does not provide that coverage.
 
 `scripts/eval-ask` reports one `demo-pipeline` row per configured pair and a
-separate real cascade run. Each pair supplies the draft, repair and summary roles
-together. These rows measure the final pipeline. They do not measure independent
+cascade row that it computes from those runs. The cascade moves a question to the
+next pair when the server itself sees a failed or errored Ask, never by comparing
+with the gold answer, and it charges the cost of every pair it tried. Each pair
+supplies the draft, repair and summary roles together. These rows measure the final pipeline. They do not measure independent
 repair or summary accuracy. Citation checks remain unjudged diagnostics. Whole-
 pipeline token and estimated cost totals appear once. Unknown estimated cost stays
 unknown.
@@ -47,11 +49,18 @@ official QALD score.
 Every selected gold query runs before the first Ask. Reports retain bounded raw
 query results and process status for recomputation. A failed, malformed, truncated
 or unsupported gold result is a preflight failure. Candidate query failure is a
-separate result status. A valid JSON object cannot hide a nonzero process exit,
+separate result status. A provider error, a refusal, an Ask timeout or an unusable
+draft is scored as a failure with the status `provider_error`, `refusal`, `timeout`
+or `invalid_output`, and the run goes on. A case that the cost cap refused is
+`budget_refused`. It leaves the accuracy denominators, marks its row incomplete and
+ends the run. Only a harness fault stops a run, such as a failed gold query, a bad
+binary hash or a child with an unknown exit status. A valid JSON object cannot hide a nonzero process exit,
 noise before JSON or multiple final objects. Each child has incremental 4 MiB
 stdout and 1 MiB stderr caps, an owned process group and a bounded two-second
-cleanup allowance. The initial phase has one monotonic 900-second deadline. Ask
-receives deadline 30, query timeout 5, total token limit 32768 and row limit 1000.
+cleanup allowance. A matrix has no wall-clock deadline unless `--phase-deadline`
+sets one. Ask receives deadline 300 seconds, query timeout 5 seconds, a total token
+limit of 32768 and a row limit of 1000, and `--deadline`, `--timeout` and
+`--max-tokens` change the first three.
 Reports require a new directory outside the repository, an explicitly selected
 absolute binary and its SHA256. Existing outputs and fallback binaries are
 refused.

@@ -3666,10 +3666,12 @@ bar.
 `scripts/eval-ask` runs `sparkles ask` for each pair on a question set and reports, for
 each pair and role, the accuracy overall and by complexity, the share of answers that
 matched the schema without a retry, the latency per call, and the tokens and estimated
-cost per question and per correct answer. With two or more pairs, it also asks every
-question again with the pairs as the role lists, in the order given, and reports the
-cascade's accuracy and cost, the share of answers each pair wrote, and the escalations
-by signal.
+cost per question and per correct answer. With two or more pairs, it also computes a
+cascade row from those runs, in the order given. A question moves to the next pair when
+its Ask failed or ended in an error, and the row counts the cost of every pair that was
+tried. The row reports the cascade's accuracy and cost and the share of answers each
+pair wrote. A provider error, a refusal or a timeout counts as a failed answer, and the
+run goes on.
 
 ```sh
 scripts/eval-ask --model-config models.json --model-secret anthropic=env:ANTHROPIC_API_KEY \

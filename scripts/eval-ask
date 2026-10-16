@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run the initial Ask demo as whole pipelines with strict RDF-term scoring.
+"""Run Ask question sets as whole pipelines with strict RDF-term scoring.
 
-This script makes no claim of independent role accuracy or public QALD compatibility.
-Paid Anthropic runs must use eval-ask-anthropic and its single durable wallet.
+This script makes no claim of independent role accuracy or official QALD scores.
+Paid Anthropic runs use eval-ask-anthropic, which adds a cost-capped local proxy.
 """
 
 import argparse
@@ -54,7 +54,7 @@ def load_questions(args):
     if (
         not isinstance(qset, dict)
         or not isinstance(qset.get("questions"), list)
-        or not isinstance(qset.get("data"), str)
+        or not (isinstance(qset.get("data"), str) or args.loc)
     ):
         raise Invalid("invalid question set")
     ids = []
@@ -82,24 +82,23 @@ def load_questions(args):
         )
     if not qset["questions"]:
         raise Invalid("empty question selection")
-    data = (pathlib.Path(args.set).resolve().parent / qset["data"]).resolve()
-    if not data.is_file():
-        raise Invalid("data file required")
+    if args.loc:
+        if not pathlib.Path(args.loc).is_dir():
+            raise Invalid("database directory required for --loc")
+    else:
+        data = (pathlib.Path(args.set).resolve().parent / qset["data"]).resolve()
+        if not data.is_file():
+            raise Invalid("data file required")
     return qset
 
 
 def validate_args(args):
-    for value in (args.deadline, args.phase_deadline, args.timeout):
+    for value in (args.deadline, args.timeout, args.max_tokens):
         finite_positive(value)
-    if (
-        args.deadline > 30
-        or args.phase_deadline > 900
-        or args.timeout > 5
-        or args.jobs != 1
-    ):
-        raise Invalid(
-            "initial limits: jobs 1, Ask deadline <=30, query <=5, phase <=900"
-        )
+    # A phase deadline of zero means none. The run's cost cap and the Ask deadline
+    # bound a campaign, so a long matrix is not cut off by a wall-clock limit.
+    if args.phase_deadline:
+        finite_positive(args.phase_deadline)
     binary = pathlib.Path(args.sparkles)
     if (
         not binary.is_absolute()
@@ -160,17 +159,24 @@ def validate_args(args):
 
 
 class Runner:
-    def __init__(self, args, qset, out_dir=None, gate=None, deadline=None):
-        self.args, self.qset, self.gate = args, qset, gate
+    def __init__(self, args, qset, out_dir=None, proxy=None, deadline=None):
+        self.args, self.qset, self.proxy = args, qset, proxy
         self.out = pathlib.Path(out_dir or args.out)
-        self.deadline = deadline or time.monotonic() + args.phase_deadline
-        self.data = (pathlib.Path(args.set).parent / qset["data"]).resolve()
+        self.deadline = deadline or (
+            time.monotonic() + args.phase_deadline if args.phase_deadline else math.inf
+        )
+        self.loc = pathlib.Path(args.loc).resolve() if args.loc else None
+        self.data = (
+            None
+            if self.loc
+            else (pathlib.Path(args.set).parent / qset["data"]).resolve()
+        )
         self.header = "".join(
             f"PREFIX {k}: <{v}>\n" for k, v in qset.get("prefixes", {}).items()
         )
         self.gold_cache, self.serial, self.last_record = {}, 0, None
         self.env = leaf_environment(
-            {"SPARKLES_EVAL_GATE_TOKEN": gate.token} if gate else None
+            {"SPARKLES_EVAL_GATE_TOKEN": proxy.token} if proxy else None
         )
         cfg = strict_json(bounded_file(args.model_config, 1024 * 1024))
         self.cli_priced_pairs = set()
@@ -188,12 +194,13 @@ class Runner:
     def check(self):
         if time.monotonic() >= self.deadline:
             raise Invalid("phase deadline expired")
-        if self.gate and (
-            self.gate.stopped or self.gate.wallet.snapshot_report()["stopped"]
-        ):
-            raise Invalid("gate stopped")
 
-    def execute(self, argv, label, child_limit=None):
+    def source_args(self, ask=False):
+        if self.loc:
+            return ["--loc", str(self.loc)]
+        return ["--data", str(self.data)] + (["--text"] if ask else [])
+
+    def spawn(self, argv, label, child_limit=None):
         self.check()
         self.serial += 1
         directory = self.out / f"{self.serial:05d}-{label}"
@@ -204,6 +211,10 @@ class Runner:
             self.env,
         )
         self.last_record = record
+        return record, directory
+
+    def execute(self, argv, label, child_limit=None):
+        record, directory = self.spawn(argv, label, child_limit)
         result = parse_child(record, directory)
         if not isinstance(result, dict):
             raise Invalid("final result object required")
@@ -215,8 +226,7 @@ class Runner:
             [
                 self.args.sparkles,
                 "query",
-                "--data",
-                str(self.data),
+                *self.source_args(),
                 "--results",
                 "json",
                 "--timeout",
@@ -236,13 +246,65 @@ class Runner:
             self.gold_cache[q["id"]] = self.query(q["gold"], "gold")[0]
         return self.gold_cache[q["id"]]
 
+    def classify(self, record, directory):
+        """Return the Ask object and a failure status, or raise for harness faults.
+
+        A provider error, refusal, Ask timeout or unusable draft is a measured
+        failure of the pipeline and is scored. Only a child that cannot be trusted
+        at all, such as one that is not cleaned up or exits with an unknown status,
+        stops the run.
+        """
+        if "pid" not in record or not record["cleanup"]:
+            raise Invalid("child execution incomplete")
+        if record["timeout"]:
+            if time.monotonic() >= self.deadline:
+                raise Invalid("phase deadline expired")
+            return {"outcome": "error", "error": {"code": "timeout"}}, "timeout"
+        if record["byteCap"]:
+            return {"outcome": "error", "error": {"code": "output-cap"}}, (
+                "invalid_output"
+            )
+        if record["returncode"] not in (0, 2):
+            raise Invalid("child execution incomplete")
+        out = validate_ask_record(
+            strict_json(bounded_file(directory / "stdout", 4 * 1024 * 1024))
+        )
+        if record["returncode"] == 2:
+            if out.get("outcome") != "error":
+                raise Invalid("child execution incomplete")
+            steps = (out.get("usage") or {}).get("steps") or []
+            if (out.get("error") or {}).get("code") == "timeout":
+                return out, "timeout"
+            if any(s.get("outcome") == "refusal" for s in steps):
+                return out, "refusal"
+            return out, "provider_error"
+        semantic_failed = (
+            out.get("outcome") == "failed"
+            and not out.get("error")
+            and any(
+                i.get("severity") == "error"
+                for i in ((out.get("result") or {}).get("issues") or [])
+            )
+        )
+        if (
+            out.get("outcome")
+            in (
+                "answered",
+                "empty",
+                "clarify",
+                "unanswerable",
+                "not-run",
+            )
+            or semantic_failed
+        ):
+            return out, None
+        return out, "invalid_output"
+
     def ask(self, pair, q, config=None):
         cmd = [
             self.args.sparkles,
             "ask",
-            "--data",
-            str(self.data),
-            "--text",
+            *self.source_args(ask=True),
             self.qset.get("dataset", "data"),
             q["question"],
             "--json",
@@ -251,7 +313,7 @@ class Runner:
             "--timeout",
             str(self.args.timeout),
             "--max-tokens",
-            "32768",
+            str(self.args.max_tokens),
             "--max-rows",
             "1000",
             "--model-config",
@@ -264,28 +326,18 @@ class Runner:
             cmd += ["--model-secret", secret]
         if self.args.allow_loopback:
             cmd += ["--outbound-allow", "127.0.0.1/32"]
-        out, record = self.execute(cmd, "ask")
-        validate_ask_record(out)
-        semantic_failed = (
-            out.get("outcome") == "failed"
-            and not out.get("error")
-            and any(
-                i.get("severity") == "error"
-                for i in ((out.get("result") or {}).get("issues") or [])
-            )
-        )
-        if (
-            out.get("outcome")
-            not in ("answered", "empty", "clarify", "unanswerable", "not-run")
-            and not semantic_failed
-        ):
-            raise Invalid("nonsemantic or error Ask outcome")
+        refused = self.proxy.cap_refusals if self.proxy else 0
+        record, directory = self.spawn(cmd, "ask")
+        out, failure = self.classify(record, directory)
+        if self.proxy and self.proxy.cap_refusals > refused:
+            failure = "budget_refused"
+        if failure:
+            out["evalFailure"] = failure
         out["wallSeconds"] = record["elapsedSeconds"]
         out["execution"] = record
-        # The SDK reports zero when pricing is unconfigured, and cannot represent
-        # the gate's full context-tier/cache attempt accounting. Never call that a
+        # The SDK reports zero when pricing is unconfigured. Never call that a
         # known free answer. Preserve the raw SDK value in stdout as a diagnostic.
-        out["cliEstimatedCostKnown"] = self.gate is None and all(
+        out["cliEstimatedCostKnown"] = self.proxy is None and all(
             p in self.cli_priced_pairs for p in ([pair] if pair else self.args.pair)
         )
         return out
@@ -331,9 +383,13 @@ class Runner:
 
     def score(self, q, out):
         kind, outcome = q["kind"], out.get("outcome")
+        failed = out.get("evalFailure")
         if kind in ("clarify", "unanswerable"):
-            ok = outcome == kind
-            return ok, (float(ok),) * 3, {"kind": kind}
+            ok = outcome == kind and not failed
+            detail = {"kind": kind}
+            if failed:
+                detail["status"] = failed
+            return ok, (float(ok),) * 3, detail
         first = self.first_draft(q, out)
         gold = self.gold(q)
 
@@ -352,6 +408,8 @@ class Runner:
             return False, (0.0, 0.0, 0.0), detail
 
         query = (out.get("result") or {}).get("query")
+        if failed:
+            return failure(failed)
         if outcome not in ("answered", "empty"):
             return failure("pipeline_" + str(outcome))
         if not isinstance(query, str) or not query:
@@ -467,21 +525,63 @@ def summarize_pair(pair, qs, answers, scores):
     ]
 
 
-def cascade_config(args, pairs, out_dir):
-    cfg = strict_json(bounded_file(args.model_config, 1024 * 1024))
-    roles = {
-        r: [dict(zip(("provider", "model"), p.split("/"))) for p in pairs]
-        for r in ("draft", "repair", "summarize")
-    }
-    cfg["models"]["roles"] = roles
-    path = out_dir / "cascade-models.json"
-    with path.open("x") as f:
-        json.dump(cfg, f)
-    return str(path)
+def server_failed(answer):
+    """The failure signal that the server itself can see, without any gold answer."""
+    return bool(answer.get("evalFailure")) or answer.get("outcome") in (
+        "failed",
+        "error",
+    )
+
+
+def cascade_cases(pairs, qs, answers, scores):
+    """Compute the cascade row offline from the per-pair runs.
+
+    A question moves to the next pair when the server sees the current pair fail,
+    which is a failed or errored Ask and never a comparison with the gold answer.
+    The last pair's case stands when every pair failed. The cost of a cascaded
+    answer includes every pair that was tried. A question that some pair did not
+    attempt, because the cost cap ended the run, is left out of the row.
+    """
+    used, cascade_answers, cascade_scores, tally = [], [], [], {p: 0 for p in pairs}
+    for q in qs:
+        if any(q["id"] not in answers[p] for p in pairs):
+            continue
+        tried = []
+        for pair in pairs:
+            tried.append(pair)
+            if not server_failed(answers[pair][q["id"]]):
+                break
+        chosen = answers[tried[-1]][q["id"]]
+        merged = dict(chosen)
+        usage = dict(chosen.get("usage") or {})
+        spent = [answers[p][q["id"]] for p in tried]
+        usage["inputTokens"] = sum(
+            (a.get("usage") or {}).get("inputTokens", 0) for a in spent
+        )
+        usage["outputTokens"] = sum(
+            (a.get("usage") or {}).get("outputTokens", 0) for a in spent
+        )
+        costs = [(a.get("usage") or {}).get("estimatedCost") for a in spent]
+        usage["estimatedCost"] = (
+            sum(costs) if all(type(c) in (int, float) for c in costs) else None
+        )
+        merged["usage"] = usage
+        merged["cliEstimatedCostKnown"] = all(
+            a.get("cliEstimatedCostKnown", True) for a in spent
+        )
+        used.append(q)
+        cascade_answers.append(merged)
+        cascade_scores.append(scores[tried[-1]][q["id"]])
+        tally[tried[-1]] += 1
+    return used, cascade_answers, cascade_scores, tally
 
 
 def finish_run(report, out_dir, runner, error=None):
-    report["complete"] = error is None and report["executed"] == report["planned"]
+    report["complete"] = (
+        error is None
+        and report["executed"] == report["planned"]
+        and not report["budgetStopped"]
+    )
     report["error"] = error
     report["unattempted"] = report["planned"] - report["attempted"]
     report["goldUnattemptedIds"] = [
@@ -490,54 +590,60 @@ def finish_run(report, out_dir, runner, error=None):
         if i not in {r["id"] for r in report["goldPreflight"]}
     ]
     report["phaseElapsedSeconds"] = time.monotonic() - report.pop("_started")
-    if runner.gate:
-        runner.gate.set_case(None)
-        report["gate"] = runner.gate.wallet.snapshot_report()
-        report["gate"]["upstreamDispatchInvocations"] = runner.gate.attempts
-        report["gate"]["validInboundRequests"] = runner.gate.received
-        report["gate"]["blockedRequests"] = runner.gate.received - runner.gate.attempts
-        if report["gate"]["stopped"] or report["gate"]["unresolvedUpperNanodollars"]:
-            report["complete"] = False
+    if runner.proxy:
+        runner.proxy.set_case(None)
+        report["ledger"] = runner.proxy.report()
     with (out_dir / "report.json").open("x") as f:
         json.dump(report, f, indent=2)
         f.write("\n")
     with (out_dir / "report.md").open("x") as f:
         f.write(
-            "# Initial Ask demo pipelines\n\nStrict RDF-term accuracy uses rdf-term-set-global-columns-v1.\n\n"
+            "# Ask pipelines\n\nStrict RDF-term accuracy uses rdf-term-set-global-columns-v1.\n\n"
         )
         f.write(
             "The run is "
             + ("complete" if report["complete"] else "incomplete")
-            + ". Role accuracy and public corpus alignment remain unmeasured.\n"
+            + ". Role accuracy and official benchmark scores remain unmeasured.\n"
         )
     return out_dir, report
 
 
-def run_matrix(args, gate=None, prepared=None):
+def run_matrix(args, proxy=None, prepared=None):
     started = time.monotonic()
     qset, out_dir = prepared or validate_args(args)
     qs = qset["questions"]
-    runner = Runner(args, qset, out_dir, gate, started + args.phase_deadline)
+    runner = Runner(
+        args,
+        qset,
+        out_dir,
+        proxy,
+        started + args.phase_deadline if args.phase_deadline else None,
+    )
     report = {
-        "schema": 2,
-        "mode": "demo-pipeline",
+        "schema": 3,
+        "mode": "pipeline",
         "scoringPolicy": "rdf-term-set-global-columns-v1",
         "set": str(args.set),
         "setSha256": digest(args.set),
-        "dataSha256": digest(runner.data),
+        "dataSha256": digest(runner.data) if runner.data else None,
+        "dataLoc": str(runner.loc) if runner.loc else None,
         "binary": args.sparkles,
         "binarySha256": digest(args.sparkles),
         "modelConfigSha256": digest(args.model_config),
         "evaluatorSha256": digest(__file__),
         "supportSha256": digest(ROOT / "testsuite/ask/eval_support/evaluator.py"),
+        "askDeadlineSeconds": args.deadline,
+        "askTokenBudget": args.max_tokens,
         "questions": len(qs),
         "selectedQuestionIds": [q["id"] for q in qs],
         "pairs": args.pair,
-        "planned": len(qs) * (len(args.pair) + int(len(args.pair) > 1)),
+        "planned": len(qs) * len(args.pair),
         "executed": 0,
         "attempted": 0,
         "attemptedCases": [],
         "scored": 0,
+        "budgetStopped": False,
+        "unattemptedIds": {},
         "rows": [],
         "cases": [],
         "goldPreflight": [],
@@ -569,29 +675,29 @@ def run_matrix(args, gate=None, prepared=None):
                         "empty": not gold.rows if hasattr(gold, "rows") else False,
                     }
                 )
-        matrix = [(p, None) for p in args.pair]
-        if len(args.pair) > 1:
-            matrix.append(
-                (" > ".join(args.pair), cascade_config(args, args.pair, out_dir))
-            )
-        for pair, cfg in matrix:
-            answers, scores = [], []
+        per_pair = {}
+        for pair in args.pair:
+            done, answers, scores = [], [], []
+            per_pair[pair] = ({}, {})
             for q in qs:
                 runner.check()
+                if report["budgetStopped"]:
+                    report["unattemptedIds"].setdefault(pair, []).append(q["id"])
+                    continue
                 case_id = hashlib.sha256(
                     json.dumps(
                         [pair, q["id"]], separators=(",", ":"), ensure_ascii=False
                     ).encode()
                 ).hexdigest()
-                if gate:
-                    gate.set_case(case_id)
+                if proxy:
+                    proxy.set_case(case_id)
                 report["attempted"] += 1
                 report["attemptedCases"].append(
                     {"case": case_id, "pair": pair, "id": q["id"]}
                 )
                 runner.last_record = None
                 try:
-                    answer = runner.ask(None if cfg else pair, q, cfg)
+                    answer = runner.ask(pair, q)
                 except (Invalid, OSError):
                     report["failedCase"] = {
                         "case": case_id,
@@ -602,15 +708,10 @@ def run_matrix(args, gate=None, prepared=None):
                 finally:
                     if runner.last_record and "pid" in runner.last_record:
                         report["executed"] += 1
-                if gate:
-                    gate.set_case(
-                        None
-                    )  # Waits for actual in-flight reservation/settlement.
-                    runner.check()
+                if proxy:
+                    proxy.set_case(None)
                 score = runner.score(q, answer)
                 report["scored"] += 1
-                answers.append(answer)
-                scores.append(score)
                 report["cases"].append(
                     {
                         "case": case_id,
@@ -625,12 +726,49 @@ def run_matrix(args, gate=None, prepared=None):
                     json.dump(
                         {"id": q["id"], "answer": answer, "score": score}, f, indent=2
                     )
-            report["rows"] += summarize_pair(pair, qs, answers, scores)
+                if answer.get("evalFailure") == "budget_refused":
+                    # The cost cap ended the run. This case is not a measurement.
+                    report["budgetStopped"] = True
+                    report["unattemptedIds"].setdefault(pair, []).append(q["id"])
+                    continue
+                done.append(q)
+                answers.append(answer)
+                scores.append(score)
+                per_pair[pair][0][q["id"]] = answer
+                per_pair[pair][1][q["id"]] = score
+            row = summarize_pair(pair, done, answers, scores)
+            for r in row:
+                r["incomplete"] = len(done) < len(qs)
+                r["unattemptedQuestions"] = len(qs) - len(done)
+                r["failureStatuses"] = failure_counts(answers)
+            report["rows"] += row
+        if len(args.pair) > 1:
+            used, c_answers, c_scores, tally = cascade_cases(
+                args.pair,
+                qs,
+                {p: per_pair[p][0] for p in args.pair},
+                {p: per_pair[p][1] for p in args.pair},
+            )
+            label = " > ".join(args.pair)
+            for r in summarize_pair(label, used, c_answers, c_scores):
+                r["derivation"] = "computed from the per-pair runs"
+                r["answeredBy"] = tally
+                r["incomplete"] = len(used) < len(qs)
+                report["rows"].append(r)
         runner.check()
         return finish_run(report, out_dir, runner)
     except (Invalid, OSError) as error:
         # No raw subprocess/provider exception or environment is published here.
         return finish_run(report, out_dir, runner, type(error).__name__)
+
+
+def failure_counts(answers):
+    counts = {}
+    for a in answers:
+        status = a.get("evalFailure")
+        if status:
+            counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 def parse_args(argv=None):
@@ -644,10 +782,16 @@ def parse_args(argv=None):
     ap.add_argument("--out")
     ap.add_argument("--sparkles", required=True)
     ap.add_argument("--sparkles-sha256")
-    ap.add_argument("--jobs", type=int, default=1)
-    ap.add_argument("--deadline", type=float, default=30)
-    ap.add_argument("--timeout", type=float, default=5)
-    ap.add_argument("--phase-deadline", type=float, default=900)
+    ap.add_argument("--loc", help="database directory instead of the set's data file")
+    ap.add_argument(
+        "--jobs", type=int, default=1, help="accepted for compatibility; serial"
+    )
+    ap.add_argument("--deadline", type=float, default=300, help="Ask seconds")
+    ap.add_argument("--timeout", type=float, default=5, help="query seconds")
+    ap.add_argument("--max-tokens", type=int, default=32768, help="Ask token budget")
+    ap.add_argument(
+        "--phase-deadline", type=float, default=0, help="matrix seconds, 0 for none"
+    )
     ap.add_argument("--only")
     ap.add_argument("--allow-loopback", action="store_true")
     ap.add_argument("--self-test", action="store_true")

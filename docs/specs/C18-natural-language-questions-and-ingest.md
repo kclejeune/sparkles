@@ -3899,8 +3899,10 @@ built.
   answerable questions with gold queries in seven categories, four that need a
   clarification and five that the data cannot answer. A test runs every gold query
   and checks its stored complexity. The initial `scripts/eval-ask` report now uses
-  one whole-pipeline row per pair and a separate real cascade. Schema 2 reports
-  strict RDF-term row-set precision and recall under one global column mapping,
+  one whole-pipeline row per pair and a cascade row computed from those runs.
+  A failed Ask counts as a scored failure, so one provider error no longer ends a
+  matrix. Schema 3 reports strict RDF-term row-set precision and recall under one
+  global column mapping,
   separate answerable, clarification and refusal denominators, and bounded child
   execution statuses. A bounded first-draft query probe distinguishes an actually
   failed first draft from repair invocation. Incomplete probes stay unknown and
@@ -4004,8 +4006,8 @@ rather than measured ones.
   server scripts the pipeline for the Playwright tests in `ui/tests/mock/ask.spec.ts`.
 - **CLI and matrix.** `sparkles ask` reads `assistant.json` of a database, walks the role
   lists without `--pair`, and takes `--try-harder N`. The cascade row of
-  `scripts/eval-ask` comes from real runs with the pairs as the role lists of a copy of
-  the model configuration, and reports the escalations by signal (A43).
+  `scripts/eval-ask` is computed from the per-pair runs, moving a question on when the
+  server sees a failed Ask, and reports the share answered by each pair (A43).
 
 **Deviations and additions of Phase 2.**
 
