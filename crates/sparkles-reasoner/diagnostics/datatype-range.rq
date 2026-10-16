@@ -5,10 +5,17 @@
 # literal as a value (prp-rng), closed over rdfs:subPropertyOf*.
 #
 # The query only narrows the candidates: it leaves out the literals that are plainly in
-# the value space. The checker decides value-space membership for each candidate and
-# reports only the literals it can decide are outside. Ranges outside the table below,
-# rdfs:Literal and datatype restrictions are never reported. The checker appends a
-# LIMIT.
+# the value space. Each exclusion in the range branch drops only literals the checker
+# also decides are inside, so the query never hides a literal the checker would report.
+# The checker decides value-space membership for each candidate and reports only the
+# literals it can decide are outside. Ranges outside the table below, rdfs:Literal and
+# datatype restrictions are never reported. The checker appends an ORDER BY over all
+# the projected variables and reads the candidates in LIMIT and OFFSET pages.
+#
+# The datatype branch leaves out xsd:string, xsd:anyURI and language-tagged strings,
+# which the checker treats as always well typed. It keeps the numeric literals that
+# the SPARQL parser cannot read, such as integers beyond its range, and the checker
+# then reads them exactly.
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
