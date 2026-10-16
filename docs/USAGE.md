@@ -3017,6 +3017,16 @@ directory of `--pdf-ocr-models`. It loads PDFium from `--pdfium-lib` and ONNX Ru
 from `--onnxruntime-lib`, or from their usual library paths, and never downloads a model.
 `--pdf-workers` (2 by default) limits the conversions that run at once.
 
+The server converts each PDF and Office file in a child process of its own, started from
+the same `sparkles` binary. The child runs under an address-space limit of
+`--convert-memory` MiB (2048 by default, at least 256), a CPU-time limit and, without
+OCR, a file-size limit of zero, and the server kills it when the task's deadline passes, so a file that
+makes a converter loop or allocate without end fails with `conversion-timeout` or
+`conversion-failed` and frees its worker slot. Starting the child costs a few
+milliseconds per conversion. `--convert-in-process` converts on threads of the server
+instead, where a conversion that overruns its deadline keeps its worker slot until it
+ends and its memory is bounded only by the converters' own limits.
+
 Word, PowerPoint and OpenDocument files (`.docx`, `.pptx`, `.odt`, `.odp`) need a build
 with the `office` feature, which is on by default. The server converts them to Markdown
 with their headings, lists, tables and footnotes. Each slide of a presentation starts
@@ -3029,9 +3039,9 @@ a `base`, the rows of each sheet get their own namespace that includes the sheet
 position, so two sheets never share one. Hidden sheets, hidden
 slides and hidden Word text are left out, while the hidden rows and columns of a visible
 sheet are read, because they are data. These conversions share
-the `--pdf-workers` limit with PDF conversion. A conversion holds at most 128 MiB of
-output besides the file and its XML trees, so a small file cannot ask for more memory,
-and a file that would is refused with `too-large`.
+the `--pdf-workers` limit and the child processes with PDF conversion. A conversion
+holds at most 128 MiB of output besides the file and its XML trees, so a small file
+cannot ask for more memory, and a file that would is refused with `too-large`.
 
 When the model drafts a mapping that maps a column to IRIs of a class the dataset has,
 the draft links that column's values to the existing entities. The most frequent values
@@ -5711,6 +5721,8 @@ above the query budgets (`--query-memory-mb`, `--max-mem-dataset-mb`,
 the container. Add the local models that the server loads. Qwen3-Embedding-0.6B takes
 about 1.2 GB in bf16 while it is loaded. With OCR, add the PP-OCR models and ONNX
 Runtime's working memory for each of the `--pdf-workers` conversions that run at once.
+Each conversion runs in a child process that may use up to `--convert-memory` (2 GiB by
+default), so the container's limit should leave room for `--pdf-workers` of them.
 
 ## Deploying on NixOS
 

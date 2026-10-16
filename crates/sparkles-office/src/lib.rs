@@ -9,19 +9,35 @@
 //!
 //! The file comes from outside, so every size is bounded by [`Limits`]: the number of
 //! entries in the container, the uncompressed size of a part and of all parts together
-//! (a ZIP bomb stops at the limit, whatever its header says), the nodes of an XML tree,
-//! the cells of a sheet and the text that comes out. One output budget, [`Limits::max_output`],
-//! also bounds everything a conversion holds besides the input and its XML trees: Markdown
-//! blocks and table slots, sheet rows, shared strings, the text of notes and the CSV of all
-//! sheets together. The paths that can multiply the size of the input, which are repeated
-//! and padded cells, table slots, shared strings and the spaces of `text:s`, charge it
-//! before they allocate, and text that is copied once from the input is bounded by the
-//! limits on the input. A small file therefore cannot ask for gigabytes. The tradeoff is
-//! memory for safety. A conversion may hold up to `max_output` bytes, which is 128 MiB by
-//! default, beside its input and XML trees. A conversion also stops at
-//! [`Limits::deadline`]. A file
-//! past a limit is refused with [`Error::TooLarge`]. A damaged file gives [`Error::Corrupt`] and never a panic, which
-//! the tests and the cargo-fuzz targets of `fuzz/` check.
+//! (a ZIP bomb stops at the limit, whatever its header says), the elements, attributes
+//! and text nodes of an XML tree, the cells of a sheet and the text that comes out. One
+//! output budget, [`Limits::max_output`], also bounds what a conversion holds besides the
+//! input and its XML trees: Markdown blocks and table slots, links, sheet rows, shared
+//! strings, the text of notes and the CSV of all sheets together. The paths that can
+//! multiply the size of the input charge it before they allocate. Those are repeated and
+//! padded cells, table slots, shared strings, the spaces of `text:s` and links, whose
+//! target is copied once per link. A value that is copied, hashed or scanned once per
+//! reference to it is short. A relationship target longer than 2,048 bytes and a style
+//! id, style name or relationship id longer than 256 bytes are dropped where they are
+//! read, a number format code longer than 512 bytes is not a date, and each code is read
+//! once. The walks of a tree visit each node once, a note inside a note is left out and
+//! a link inside a link is read as its text. The text of a table inside a table cell is
+//! copied into the cells around it, and each copy is charged. A small file therefore
+//! cannot ask for gigabytes or for hours. The budget counts the bytes of the text and a fixed 32 bytes
+//! for each stored value, while the process also pays for the vectors and allocator
+//! headers around them, so a sheet of sparse rows can use about six times its charge.
+//! The tradeoff is memory for safety. A conversion may hold `max_output` bytes, which is
+//! 128 MiB by default, beside its input and XML trees.
+//!
+//! A conversion stops with [`Error::Timeout`] at [`Limits::deadline`]. The readers check
+//! the clock once every 16 steps of a walk, where a step is an XML event, a node or a
+//! stored value, and on every charge of 64 KiB or more, so a conversion ends within a
+//! bounded amount of work after its deadline. These bounds come from review and testing,
+//! not from proof. A caller that must stop a conversion whatever happens, such as the
+//! Sparkles server, runs it in a child process under an address-space limit and kills it
+//! at the deadline. A file past a limit is refused with [`Error::TooLarge`]. A damaged
+//! file gives [`Error::Corrupt`] and never a panic, which the tests and the cargo-fuzz
+//! targets of `fuzz/` check.
 
 mod budget;
 mod docx;
@@ -45,7 +61,7 @@ pub struct Limits {
     pub max_part: usize,
     /// uncompressed bytes of all parts read
     pub max_total: usize,
-    /// nodes of one XML tree
+    /// nodes of one XML tree: elements, attributes and text nodes
     pub max_nodes: usize,
     /// nesting depth of an XML tree
     pub max_depth: usize,
@@ -63,8 +79,9 @@ pub struct Limits {
     /// sheet rows, and the CSV of all sheets together
     pub max_output: usize,
     /// when to stop: a conversion that is still running at this time fails with
-    /// [`Error::Timeout`]. It is checked while the XML is read and while the output is
-    /// charged, so a thread that the caller has given up on ends soon after the deadline.
+    /// [`Error::Timeout`]. It is checked while the XML is read, while trees are walked and
+    /// while the output is charged, so a thread that the caller has given up on ends soon
+    /// after the deadline.
     pub deadline: Option<std::time::Instant>,
 }
 

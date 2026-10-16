@@ -1549,12 +1549,23 @@ recorded in the Outcome, and re-registering an old source then yields a new rend
 with its own digest, which re-ingestion handles as a changed source (§7.9).
 
 **Isolation.** Parsing a PDF is the riskiest step of ingestion, because the file comes
-from outside. The conversion runs on a blocking thread of its own under the task's
-deadline, with the input limit of §7.1 checked before parsing. A panic inside the crate
-is caught and becomes a `conversion-failed` result. A conversion that overruns its
-deadline cannot be interrupted inside the library, so the task reports
-`conversion-timeout` at once and the thread is left to finish, with at most
-`--pdf-workers` conversions, 2 by default, running at any time.
+from outside. The input limit of §7.1 is checked before parsing, and at most
+`--pdf-workers` conversions, 2 by default, run at any time. The `sparkles` binary runs
+each PDF and Office conversion in a child process of its own, which is the same binary
+started with a hidden first argument. The child reads the file from a pipe and writes
+its result to another, and the server reads at most a bounded number of bytes of it.
+The child runs under an address-space limit (`--convert-memory`, 2 GiB by default), a
+CPU-time limit, a file-size limit of zero unless OCR is configured, and no core file,
+and on Linux it dies with the server. The server kills it 250 ms after the task's
+deadline, so the task reports `conversion-timeout` and the worker slot is free again
+whatever the converter does. A child that ends without a result, through a panic or its
+memory limit, gives `conversion-failed`. Where no child process can be started, which is
+library use of the server crate, its unit tests, a server started with
+`--convert-in-process`, and a binary that has been deleted from disk since it started,
+the conversion runs on a blocking thread of its own under the same deadline with a panic
+caught as `conversion-failed`. A conversion on a thread that overruns its deadline
+cannot be interrupted, so the task reports `conversion-timeout` at once and the thread
+is left to finish, holding its slot.
 
 ### 7.2 Sources, renditions and chunks
 
@@ -4860,22 +4871,55 @@ audio and video remain, and so do the follow-ups listed at the end of this secti
   which is the Markdown blocks and table slots, the sparse rows of a sheet, the shared
   strings, the text of notes and the CSV of all sheets together. The paths that can
   multiply the size of the input charge the budget before they allocate. Those are
-  repeated and padded cells, table slots, shared strings and the spaces of `text:s`. Text
-  that is copied once from the input is bounded by the limits on the input, and each
+  repeated and padded cells, table slots, shared strings and the spaces of `text:s`. Each
   paragraph of a note, a text box or a notes shape is read once however deeply its
-  elements nest. A note inside a note is left out. The conversion fails with `too-large`
-  when the budget is gone. The tradeoff is memory for safety. A conversion may hold up to 128 MiB of
-  output beside its input and trees, and at most `--pdf-workers` conversions run at once.
-  Sheets are stored sparsely, a repeated row is stored once, and the rendering of a
-  table is checked against the text limit after every row. Each XML attribute counts as a
-  node, and an element with more than 1,024 attributes is refused. The conversion also
-  stops at the task's deadline. The readers check it while they read the XML and while
-  they charge the budget, so the thread that a task has given up on ends soon after the
-  deadline and frees its `--pdf-workers` slot, and the task reports `conversion-timeout`.
-  The converter is not registered with the server's query memory pool, which stays part
-  of roadmap item 15's remaining work. A conversion runs on a thread of its own under
-  the task's deadline with a panic caught as `conversion-failed`, and shares the
-  `--pdf-workers` slots with PDF conversion. The converter has a cargo-fuzz target in
+  elements nest. A note inside a note is left out. A third review found values that are
+  as long as a part and are copied, hashed or scanned once per reference to them. One
+  20 MiB relationship target named by 1,000 hyperlinks became 20 GB of links, one 12 MiB
+  number format named by 400,000 cell formats took hours to scan, and a style id based
+  on itself was hashed nine times per paragraph. A relationship target longer than 2,048
+  bytes and a style id, style name or relationship id longer than 256 bytes are now
+  dropped where they are read. A number format code longer than 512 bytes is not a date,
+  and each code is read once. Links are charged to the budget, and all links together
+  may not exceed the text limit, because every link ends up in the text. A link inside a
+  link is read as its text, the notes of a slide are found in one walk, and the cells of
+  a row in descending column order are sorted once instead of inserted one by one. Text
+  and CDATA children count as nodes of an XML tree. The conversion fails with
+  `too-large` when the budget is gone. The tradeoff is memory for safety. A conversion
+  may hold up to 128 MiB of output beside its input and trees, and the budget charges 32
+  bytes for each stored value while a sparse sheet row costs the process about six times
+  its charge. At most `--pdf-workers` conversions run at once. Sheets are stored
+  sparsely, a repeated row is stored once, and the rendering of a table is checked
+  against the text limit after every row. Each XML attribute counts as a node, and an
+  element with more than 1,024 attributes is refused. The conversion also stops at the
+  task's deadline. The readers read the clock every 16 steps of a walk and on every
+  charge of 64 KiB or more, instead of every 1,024 calls, so the overshoot past the
+  deadline is a bounded amount of work. The converter is not registered with the
+  server's query memory pool, which stays part of roadmap item 15's remaining work.
+- **Child processes.** These bounds come from three rounds of review and from tests,
+  and a fourth review could find another path. So the server now runs each PDF and
+  Office conversion in a child process, as §7.1.1 describes, under an address-space
+  limit of `--convert-memory` MiB, 2,048 by default, a CPU-time limit and a file-size
+  limit of zero unless OCR is configured. The server kills the child 250 ms after the
+  task's deadline, so the worker slot is released and the memory is bounded whatever a
+  converter does. Before, a PDF conversion that overran its deadline kept its slot until
+  pdf-inspector returned, which could be never. Where no child can be started, the
+  conversion runs on a thread as before. That covers library use and the unit tests of
+  the server crate, `--convert-in-process`, and a binary deleted from disk since it
+  started. The child sets its limits on itself before it reads the file and refuses to
+  run without them, so the server starts it with `posix_spawn` and does not copy its own
+  page tables, as a `fork` would. The child is given `MIMALLOC_ARENA_RESERVE=64MiB`,
+  because mimalloc otherwise reserves 1 GiB of address space before the limit is set.
+  The flag takes at least 256 MiB, below which the binary cannot start its threads. The
+  tradeoff is latency and memory for containment. A child costs one process start per
+  conversion, and the server may use up to `--pdf-workers` times `--convert-memory` of
+  address space for conversions on top of its own. On a shared 16-core Linux laptop,
+  converting the 5 KB DOCX fixture took a median of 41 µs in process, or 85 µs with the
+  thread the in-process path starts, and a median of 8.5 ms with a 90th percentile of
+  9.5 ms through a child of the release binary, measured 200 times with the ignored test
+  `ingest::isolate::tests::overhead`. Starting `/bin/true` took 2 to 4 ms on the same
+  machine, so most of the cost is starting a process. The cost is small next to the
+  model calls of an ingestion and is paid once per document. The converter has a cargo-fuzz target in
   `crates/sparkles-office/fuzz`, started with `mise run office:fuzz`, and its normal
   tests convert 400 seeded mutations of every format's fixture. The fuzz corpus starts
   from the fixtures and from the amplification shapes of `tests/budget.rs` at the target's
