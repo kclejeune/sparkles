@@ -268,7 +268,7 @@ locking whose semantics differ from `flock`.
 | Spatial index | `geo.json`, index files | config `FORMAT_VERSION` 1, `LITERALS_VERSION` 2, file `SPKGEO` `FILE_VERSION` 1 | derived |
 | ShEx guard typing | `validation-typing.bin` | magic `SPXTYP01` and a u32 format 1; another version is discarded and rebuilt | derived |
 | Checked migration state | `.migrate-checked` at the root or checked copy | JSON format 1 records the cleanup mode and the exact old sibling directory. Unknown versions and ambiguous bare legacy markers are refused. | config |
-| Settings and state | `describe.json`, `compaction.json`, `queries.json`, `algo.json`, `validation.json`, `models.json`, `assistant.json` and others | The registry names each version member. Named projections use `format` 2, which added the last revisions of deleted projections. Format 1 still reads, and an absent marker reads as 1. | config |
+| Settings and state | `describe.json`, `compaction.json`, `queries.json`, `algo.json`, `validation.json`, `models.json`, `assistant.json` and others | The registry names each version member. Named projections use `format` 2 only while the file holds the last revision of a deleted projection, and `format` 1 otherwise. Both read, and an absent marker reads as 1. | config |
 | Backup repository | layout, blobs, manifests, key slots | layout `FORMAT` 1, blob `FORMAT` 1, slot `SLOT_FORMAT` 2, manifest `indexFormat` | archive |
 
 Primary files hold data that cannot be recomputed. Derived files are indexes that can be
@@ -630,8 +630,13 @@ registry, and the module constants of the core files are checked against it by a
 The named-projection catalog `algo.json` was registered at format 1. Format 2 adds a
 `deleted` member with the last revision of each deleted projection, so that a projection
 created again under the same name continues its revisions. A format 1 file reads as a
-catalog with no deleted projections, and the next change writes format 2, which an older
-release refuses with `Unsupported`. The reader checks the version before the typed
+catalog with no deleted projections. A build writes format 2 only while `deleted` has an
+entry, and format 1 otherwise, so a dataset that never deleted a projection still opens
+in a release that knows only format 1. After the first delete such a release refuses the
+file with `Unsupported`, and it opens again once every deleted name has been created
+again. The `deleted` member keeps one entry for each name that was deleted and not
+created again, with the name and one revision number, so it grows slowly and is never
+trimmed. The reader checks the version before the typed
 document shape, so an unknown future shape still gives `Unsupported`. A versionless
 document reads as 1 without a rewrite. Dataset admission checks the catalog in the root and physical branches before
 metadata writers, and migration planning remains read-only. This registration changes

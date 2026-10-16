@@ -5680,9 +5680,11 @@ uses today's definitions.
 
 The definitions are kept in `algo.json` of a persistent dataset, which backups and
 clones include. Its registered format is 2, which keeps the last revision of each
-deleted definition. A format 1 file still reads, and a missing format marker reads as 1
-without rewriting the file. A release that knows only format 1 refuses format 2 with
-`Unsupported`. A newer version returns `Unsupported` before dataset
+deleted definition, with one entry for each name that was deleted and not created again.
+A file is written as format 2 only while it holds such an entry, and as format 1 otherwise.
+A format 1 file still reads, and a missing format marker reads as 1 without rewriting the
+file. A release that knows only format 1 refuses format 2 with `Unsupported`, so it opens
+the dataset until the first projection is deleted. A newer version returns `Unsupported` before dataset
 metadata changes, including when it belongs to an active or retained branch.
 `sparkles migrate --check` applies the same version check without changing files.
 Malformed JSON, duplicate known struct fields or malformed current definitions leave

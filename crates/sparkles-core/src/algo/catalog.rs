@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 /// The file of a database directory that holds its named projections.
 pub const FILE: &str = "algo.json";
 
-/// Version of the file's JSON shape. Format 2 added `deleted`. A format 1 file reads
-/// as format 2 with no deleted projections.
+/// The newest version of the file's JSON shape, which this build reads and can write.
+/// Format 2 added `deleted`. A format 1 file reads as one with no deleted projections.
+/// A file is written as format 2 only while `deleted` has an entry, and as format 1
+/// otherwise, so that a release that knows only format 1 still opens a dataset that has
+/// never deleted a projection.
 pub const FORMAT: u32 = 2;
 
 /// Longest projection name.
@@ -176,7 +179,9 @@ struct FileDoc {
     projections: BTreeMap<String, Stored>,
     /// The last revision of each deleted projection, so that a projection created
     /// again under the same name continues its revisions. A client that holds a
-    /// revision of the deleted projection cannot mistake the new one for it.
+    /// revision of the deleted projection cannot mistake the new one for it. The map
+    /// keeps one entry for every name deleted and not created again, and an entry takes
+    /// at most `MAX_NAME` characters and a number, so it grows slowly.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     deleted: BTreeMap<String, u64>,
 }
@@ -309,7 +314,8 @@ impl Catalog {
                 _ => Ok(()),
             };
         }
-        let bytes = crate::formats::settings_to_vec(FILE, doc)?;
+        let format = if doc.deleted.is_empty() { 1 } else { FORMAT };
+        let bytes = crate::formats::settings_to_vec_at(FILE, doc, format)?;
         crate::store::write_atomic(&path, &bytes)?;
         Ok(())
     }
@@ -428,8 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn a_format_1_file_reads_and_is_written_as_format_2() {
+    fn a_file_is_format_2_only_while_it_holds_a_deleted_name() {
         let dir = tempfile::tempdir().unwrap();
+        let on_disk = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap()
+        };
         std::fs::write(
             dir.path().join(FILE),
             br#"{"format":1,"projections":{"keep":{"revision":4,"updated":"fixture","definition":{}}}}"#,
@@ -437,16 +446,19 @@ mod tests {
         .unwrap();
         let c = Catalog::open(Some(dir.path())).unwrap();
         assert_eq!(c.get_stored("keep").unwrap().revision, 4);
+        // a change that deletes nothing keeps format 1, so an older release reads it
+        c.put("other", def(), None, None).unwrap();
+        assert_eq!(on_disk()["format"], 1);
+        assert!(on_disk().get("deleted").is_none());
+        // the first delete needs format 2
         assert!(c.delete("keep", Some(4)).unwrap());
-        let doc: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap();
-        assert_eq!(doc["format"], 2);
-        assert_eq!(doc["deleted"]["keep"], 4);
+        assert_eq!(on_disk()["format"], 2);
+        assert_eq!(on_disk()["deleted"]["keep"], 4);
         let c = Catalog::open(Some(dir.path())).unwrap();
         assert_eq!(c.put("keep", def(), None, None).unwrap().0.revision, 5);
-        let doc: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap();
-        assert!(doc.get("deleted").is_none());
+        // no deleted name is left, so the file is format 1 again
+        assert!(on_disk().get("deleted").is_none());
+        assert_eq!(on_disk()["format"], 1);
         // a deleted name is checked like a projection name
         std::fs::write(
             dir.path().join(FILE),
@@ -546,7 +558,8 @@ mod algo_catalog_format_tests {
             .unwrap();
         let doc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap();
-        assert_eq!(doc["format"], FORMAT);
+        // nothing was deleted, so the file stays at format 1
+        assert_eq!(doc["format"], 1);
     }
     #[test]
     fn algo_catalog_null_version_stays_broken_without_rewrite() {

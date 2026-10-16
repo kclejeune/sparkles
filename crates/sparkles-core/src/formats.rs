@@ -727,6 +727,29 @@ pub fn settings_to_vec<T: Serialize + ?Sized>(name: &str, value: &T) -> Result<V
     serde_json::to_vec_pretty(&v).map_err(|e| Error::Invalid(format!("{name}: {e}")))
 }
 
+/// [`settings_to_vec`] with the version member set to `format`, for a file whose content
+/// needs an older version than the one this build writes at most. A release that reads
+/// only that older version can then still read the file. `format` runs from 1 up to the
+/// version this build writes.
+pub fn settings_to_vec_at<T: Serialize + ?Sized>(
+    name: &str,
+    value: &T,
+    format: u32,
+) -> Result<Vec<u8>> {
+    let s = registered(name);
+    if format < 1 || format > s.writes {
+        return Err(Error::Invalid(format!(
+            "{name}: cannot write {} {format}; this build writes 1 to {}",
+            s.member, s.writes
+        )));
+    }
+    let mut v = serde_json::to_value(value).map_err(|e| Error::Invalid(format!("{name}: {e}")))?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert(s.member.into(), format.into());
+    }
+    serde_json::to_vec_pretty(&v).map_err(|e| Error::Invalid(format!("{name}: {e}")))
+}
+
 /// Read the settings file `name` from its bytes: check its `format` with
 /// [`check_settings`], then deserialize it without that member, so a type that denies
 /// unknown members reads it too. Returns the value and the format found.
