@@ -359,6 +359,7 @@ pub(super) async fn sparql_diff(
     let (cancel, _cancel_on_drop) = cancel_on_drop();
     opts.cancel = Some(cancel.clone());
     let restricted = p.restricted(&ds.name);
+    let timeout = opts.timeout;
     let out = blocking({
         let ds = ds.clone();
         move || {
@@ -475,12 +476,11 @@ pub(super) async fn sparql_diff(
             deadline.now()?;
             let body = serde_json::to_vec(&out).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             listed.check_body(body.len() as u64)?;
-            // the body is held until the response is sent
-            charge.charge(body.len() as u64)?;
             Ok(body)
         }
     })
-    .await?;
+    .await
+    .map_err(|e| with_timeout(e, timeout))?;
     Ok(([(header::CONTENT_TYPE, "application/json")], out).into_response())
 }
 

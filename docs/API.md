@@ -2788,10 +2788,10 @@ server reads only the commits of that range, up to the head it saw when the requ
 so a commit made during the read never gives a bucket past `head`. A range of more than
 10,000,000 commits is a `400`, since the catalog hands the commits over as one list, and
 `from` and `to` narrow it. A range that starts after the head holds no commit and gives no
-buckets. `buckets` is the most buckets, 200 by default and
-at most 2,000. Every bucket spans `bucketWidth` commit numbers, which is the width of the
-range divided by `buckets` and rounded up, so a position on a track maps to a commit by
-arithmetic. A bucket with no retained commit is left out.
+buckets. `buckets` is the most buckets, 200 by default and at most 2,000. Every bucket
+spans `bucketWidth` commit numbers, which is the width of the range divided by `buckets`
+and rounded up, so a position on a track maps to a commit by arithmetic. A bucket with no
+retained commit is left out.
 
 ```json
 { "dataset": "ds", "datasetId": "3f1c9a2e-…", "head": 4999, "firstSeq": 0, "lastSeq": 4999,

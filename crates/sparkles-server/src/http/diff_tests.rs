@@ -1522,6 +1522,12 @@ async fn sparql_diff_runs_under_one_timeout() {
     // a request that cannot finish in a microsecond answers the timeout status
     let r = sparql_diff(&s.app, "/h/sparql/diff?from=5&to=5&timeout=0.000001", q).await;
     assert_eq!(r.status, StatusCode::REQUEST_TIMEOUT, "{}", head_of(&r));
+    // the body names the timeout that applied, as the query endpoint's does
+    assert!(
+        r.json()["timeoutSeconds"].as_f64().is_some(),
+        "{}",
+        head_of(&r)
+    );
 }
 
 #[tokio::test]
