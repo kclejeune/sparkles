@@ -14,13 +14,22 @@
 //! Incremental maintenance removes triples by marking their rows dead: a dead row stays
 //! in the index lists (evaluation skips it) but leaves the triple index, so the triple
 //! can be added again as a new row.
+//!
+//! The graph's heap is charged to the run's [`Budget`] by capacity
+//! ([`Graph::heap_bytes`]). A buffer or table about to grow is charged its new
+//! allocation first, with the old one, and the merge charges its working buffers before
+//! it allocates them ([`crate::budget`]).
 
+use crate::budget::{
+    Budget, Held, MemoryExceeded, Meter, table_bytes, table_capacity, table_grown,
+};
 use crate::facts::{Base, Memo, ProbeFilter};
 use hashbrown::HashTable;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::hash::BuildHasher;
+use std::mem::size_of;
 use std::sync::Arc;
 
 pub(crate) type Triple = [u64; 3];
@@ -28,10 +37,73 @@ pub(crate) type Triple = [u64; 3];
 const SHARDS: usize = 64;
 /// Batches smaller than this are merged on the calling thread.
 const PAR_MIN: usize = 1 << 14;
+/// Facts a merge found in the base tier that one shard of [`Graph::known`]'s cache
+/// remembers. A full shard forgets them all, so the cache has a fixed size whatever
+/// the input: a fact it forgot is emitted again and found in the base tier by the next
+/// merge's probe.
+pub(crate) const IN_BASE_SHARD: usize = 128;
+
+type List = SmallVec<[u32; 4]>;
 
 /// Rows by key; most keys of the per-subject and per-object indexes have a few rows,
 /// which fit without an allocation of their own.
-type Lists<K> = FxHashMap<K, SmallVec<[u32; 4]>>;
+type Lists<K> = FxHashMap<K, List>;
+
+/// The heap of a list beyond the rows it keeps inline.
+#[inline]
+fn spill(cap: usize) -> usize {
+    if cap > 4 { cap * size_of::<u32>() } else { 0 }
+}
+
+fn lists_bytes<K>(m: &Lists<K>) -> usize {
+    table_bytes(m.capacity(), size_of::<(K, List)>())
+}
+
+/// Before a map with `len` keys and capacity `cap` takes one more key, the bytes of the
+/// table it would grow to (the old one is still allocated then).
+#[inline]
+fn table_growth<K>(len: usize, cap: usize) -> usize {
+    if len < cap {
+        0
+    } else {
+        table_bytes(table_grown(cap, len, 1), size_of::<(K, List)>())
+    }
+}
+
+/// Push `r` onto list `e`. A list about to grow charges its new allocation to `m` first
+/// (the old one stays charged to the graph until it settles), and `spilled` takes the
+/// change of the lists' heap.
+#[inline]
+fn push_row(
+    e: &mut List,
+    r: u32,
+    m: &mut Meter<'_>,
+    spilled: &mut isize,
+) -> Result<(), MemoryExceeded> {
+    let cap = e.capacity();
+    if e.len() == cap {
+        m.add(spill((cap * 2).max(8)))?;
+        e.push(r);
+        *spilled += spill(e.capacity()) as isize - spill(cap) as isize;
+    } else {
+        e.push(r);
+    }
+    Ok(())
+}
+
+/// The entry of key `k` in `m`, charging to `meter` first the table it grows to when
+/// `k` is new and does not fit.
+#[inline]
+fn entry<'m, K: std::hash::Hash + Eq>(
+    m: &'m mut Lists<K>,
+    k: K,
+    meter: &mut Meter<'_>,
+) -> Result<&'m mut List, MemoryExceeded> {
+    if m.len() == m.capacity() && !m.contains_key(&k) {
+        meter.add(table_growth::<K>(m.len(), m.capacity()))?;
+    }
+    Ok(m.entry(k).or_default())
+}
 
 #[inline]
 fn hash3(t: &Triple) -> u64 {
@@ -73,8 +145,8 @@ pub(crate) struct Graph {
     /// the rows of the live triples, hashed by triple, by [`shard3`]
     index: Vec<HashTable<u32>>,
     /// facts a merge found in the base tier, by [`shard3`], so that evaluation does not
-    /// emit them again
-    in_base: Vec<FxHashSet<Triple>>,
+    /// emit them again: at most [`IN_BASE_SHARD`] per shard
+    pub(crate) in_base: Vec<FxHashSet<Triple>>,
     live: usize,
     /// by [`shard1`] of the predicate
     by_p: Vec<Lists<u64>>,
@@ -90,11 +162,17 @@ pub(crate) struct Graph {
     /// one bit per dead in-memory row (empty while no row is dead)
     dead: Vec<u64>,
     dead_rows: u32,
+    /// the heap of the index lists beyond their inline rows
+    spilled: usize,
+    /// the graph's heap, charged to the run's budget
+    held: Held,
 }
 
 impl Default for Graph {
     fn default() -> Graph {
         Graph {
+            spilled: 0,
+            held: Held::new(&Budget::unlimited()),
             offset: 0,
             base: None,
             triples: Vec::new(),
@@ -186,7 +264,76 @@ impl Graph {
         for m in &mut g.index {
             *m = HashTable::with_capacity(n / SHARDS);
         }
+        g.settle();
         g
+    }
+
+    /// [`with_capacity`](Self::with_capacity), charged to `budget` before it allocates.
+    pub fn try_with_capacity(n: usize, budget: &Arc<Budget>) -> Result<Graph, MemoryExceeded> {
+        let bytes = n * size_of::<Triple>() + SHARDS * table_bytes(table_capacity(n / SHARDS), 4);
+        let mut held = Held::try_new(budget, bytes)?;
+        let mut g = Graph::with_capacity(n);
+        held.set(g.heap_bytes());
+        g.held = held;
+        Ok(g)
+    }
+
+    /// Charge the graph's heap to `budget` from now on, or fail when it does not fit.
+    pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), MemoryExceeded> {
+        self.held = Held::try_new(budget, self.heap_bytes())?;
+        Ok(())
+    }
+
+    /// [`set_budget`](Self::set_budget), charging even past the limit.
+    pub fn charge_to(&mut self, budget: &Arc<Budget>) {
+        let mut h = Held::new(budget);
+        h.grow(self.heap_bytes());
+        self.held = h;
+    }
+
+    /// The budget the graph's heap is charged to.
+    pub fn budget(&self) -> &Arc<Budget> {
+        self.held.budget()
+    }
+
+    /// Bring the charge of the graph's heap in line with [`heap_bytes`](Self::heap_bytes),
+    /// releasing what freed allocations held (and charging, past the limit if need be,
+    /// what grew beyond the estimates).
+    pub fn settle(&mut self) {
+        let n = self.heap_bytes();
+        self.held.set(n);
+    }
+
+    /// The heap of the in-memory tier, from the capacities of its buffers and tables:
+    /// the rows, the triple index, the cache of base facts, the index lists and their
+    /// heap beyond the inline rows, the per-predicate counts and the dead-row bits.
+    pub fn heap_bytes(&self) -> usize {
+        let mut n = self.triples.capacity() * size_of::<Triple>();
+        n += self
+            .index
+            .iter()
+            .map(|t| table_bytes(t.capacity(), size_of::<u32>()))
+            .sum::<usize>();
+        n += self
+            .in_base
+            .iter()
+            .map(|s| table_bytes(s.capacity(), size_of::<Triple>()))
+            .sum::<usize>();
+        n += self.by_p.iter().map(lists_bytes).sum::<usize>();
+        n += self.by_ps.iter().map(lists_bytes).sum::<usize>();
+        n += self.by_po.iter().map(lists_bytes).sum::<usize>();
+        for v in [&self.by_s, &self.by_o].into_iter().flatten() {
+            n += v.iter().map(lists_bytes).sum::<usize>();
+        }
+        n += table_bytes(self.distinct_s.capacity(), 16)
+            + table_bytes(self.distinct_o.capacity(), 16);
+        n += self.dead.capacity() * size_of::<u64>();
+        // the shard vectors themselves
+        n += SHARDS
+            * (size_of::<HashTable<u32>>()
+                + size_of::<FxHashSet<Triple>>()
+                + 5 * size_of::<Lists<u64>>());
+        n + self.spilled
     }
 
     /// A graph whose rows `[0, base.len)` are the base tier.
@@ -231,42 +378,99 @@ impl Graph {
     /// new triples. The base tier is not consulted: the caller adds facts that are not in
     /// it.
     pub fn add_batch(&mut self, ts: impl IntoIterator<Item = Triple>) -> usize {
+        let n = self.add_rows(ts, false);
+        n.expect("charges that may pass the limit do not fail")
+    }
+
+    /// [`add_batch`](Self::add_batch), failing when a buffer or table that has to grow
+    /// does not fit the budget. The graph is unusable after an error.
+    pub fn try_add_batch(
+        &mut self,
+        ts: impl IntoIterator<Item = Triple>,
+    ) -> Result<usize, MemoryExceeded> {
+        self.add_rows(ts, true)
+    }
+
+    fn add_rows(
+        &mut self,
+        ts: impl IntoIterator<Item = Triple>,
+        strict: bool,
+    ) -> Result<usize, MemoryExceeded> {
         let start = self.triples.len();
-        let Graph {
-            index,
-            triples,
-            offset,
-            ..
-        } = self;
-        let off = *offset;
-        for t in ts {
-            let h = hash3(&t);
-            let tbl = &mut index[shard3(&t)];
-            if tbl.find(h, |&r| triples[(r - off) as usize] == t).is_none() {
-                let row = off + triples.len() as u32;
-                triples.push(t);
-                tbl.insert_unique(h, row, |&r| hash3(&triples[(r - off) as usize]));
+        let budget = self.held.budget().clone();
+        let mut m = Meter::new(&budget, strict);
+        let r = (|| {
+            let Graph {
+                index,
+                triples,
+                offset,
+                ..
+            } = &mut *self;
+            let off = *offset;
+            for t in ts {
+                let h = hash3(&t);
+                let tbl = &mut index[shard3(&t)];
+                if tbl.find(h, |&r| triples[(r - off) as usize] == t).is_none() {
+                    if triples.len() == triples.capacity() {
+                        // the new buffer, while the old one is alive
+                        let next = (triples.capacity() * 2).max(16);
+                        m.add(next * size_of::<Triple>())?;
+                        triples.reserve_exact(next - triples.len());
+                    }
+                    if tbl.len() == tbl.capacity() {
+                        m.add(table_bytes(
+                            table_grown(tbl.capacity(), tbl.len(), 1),
+                            size_of::<u32>(),
+                        ))?;
+                    }
+                    let row = off + triples.len() as u32;
+                    triples.push(t);
+                    tbl.insert_unique(h, row, |&r| hash3(&triples[(r - off) as usize]));
+                }
             }
-        }
+            Ok(())
+        })();
         let new = self.triples.len() - start;
         self.live += new;
-        self.fill(start);
-        new
+        let r = r.and_then(|()| self.fill(start, &mut m));
+        self.held.adopt(m.into_bytes());
+        self.settle();
+        r.map(|()| new)
     }
 
     /// Merge the outputs of an iteration, in order: each triple that is not in the graph
     /// yet, the base tier included, gets the next row, in the order of its first
     /// occurrence. Returns the number of new triples. Deduplication and the index updates
     /// run with one task per shard.
-    pub fn merge(&mut self, mut outs: Vec<Vec<Triple>>) -> anyhow::Result<usize> {
+    ///
+    /// `outs_held` holds the charge of the outputs, released when they are dropped. The
+    /// merge's own buffers, and the growth of the graph, are charged before they are
+    /// allocated; a charge past the limit fails the merge, and the graph is unusable
+    /// after an error.
+    pub fn merge(&mut self, outs: Vec<Vec<Triple>>, outs_held: Held) -> anyhow::Result<usize> {
+        let r = self.merge_charged(outs, outs_held);
+        self.settle();
+        r
+    }
+
+    fn merge_charged(
+        &mut self,
+        mut outs: Vec<Vec<Triple>>,
+        outs_held: Held,
+    ) -> anyhow::Result<usize> {
         outs.retain(|o| !o.is_empty());
         let total: usize = outs.iter().map(Vec::len).sum();
         if (total < PAR_MIN && self.base.is_none())
             || outs.len() >= u32::MAX as usize
             || outs.iter().any(|o| o.len() >= u32::MAX as usize)
         {
-            return Ok(self.add_batch(outs.into_iter().flatten()));
+            let n = self.try_add_batch(outs.into_iter().flatten())?;
+            drop(outs_held);
+            return Ok(n);
         }
+        let budget = self.held.budget().clone();
+        // the merge's working buffers, released when it ends
+        let mut work = Held::new(&budget);
         let t0 = std::time::Instant::now();
         // a candidate is named by its output and its place there; `offsets` give its
         // position in the order of the outputs
@@ -292,7 +496,11 @@ impl Graph {
                 from = i + 1;
             }
         }
-        // the candidates of each group by shard
+        // the candidates of each group by shard: a name of 8 bytes per candidate, in
+        // buffers that may double
+        work.try_grow(
+            2 * total * size_of::<u64>() + groups.len() * SHARDS * size_of::<Vec<u64>>(),
+        )?;
         let buckets: Vec<Vec<Vec<u64>>> = groups
             .par_iter()
             .map(|&(a, z)| {
@@ -309,16 +517,24 @@ impl Graph {
         let base = self.base.clone();
         let buckets_ref = &buckets;
         let (triples, off) = (&self.triples, self.offset);
+        let budget_ref = &*budget;
         // per shard: the first occurrence of each triple that is new, in position order,
-        // and those of them the base tier may hold
-        let (mut kept, maybe): (Vec<Vec<u64>>, Vec<Vec<u64>>) = self
+        // and those of them the base tier may hold, with the bytes charged for them
+        type Dedup = Result<(Vec<u64>, Vec<u64>, usize), MemoryExceeded>;
+        let deduped: Vec<Dedup> = self
             .index
             .par_iter()
             .zip(self.in_base.par_iter())
             .enumerate()
             .map(|(s, (tbl, known))| {
-                let mut batch: HashTable<u64> = HashTable::new();
-                let mut kept: Vec<u64> = Vec::new();
+                let mut m = Meter::new(budget_ref, true);
+                let c: usize = buckets_ref.iter().map(|b| b[s].len()).sum();
+                // the batch's table, sized for every candidate of the shard, and the
+                // buffers of the kept ones
+                let batch_bytes = table_bytes(table_capacity(c), size_of::<u64>());
+                m.add(batch_bytes + 2 * c * size_of::<u64>())?;
+                let mut batch: HashTable<u64> = HashTable::with_capacity(c);
+                let mut kept: Vec<u64> = Vec::with_capacity(c);
                 for b in buckets_ref {
                     for &h in &b[s] {
                         let t = get(h);
@@ -340,23 +556,53 @@ impl Graph {
                         }
                     }
                 }
+                drop(batch);
+                m.sub(batch_bytes);
                 let maybe = match &base {
                     Some(b) => {
+                        // the probe filter's tables: an entry per kept candidate at most
+                        let filter = 2 * table_bytes(table_capacity(kept.len()), 24);
+                        m.add(filter)?;
                         let mut f = ProbeFilter::default();
-                        kept.iter()
+                        let maybe: Vec<u64> = kept
+                            .iter()
                             .copied()
                             .filter(|&h| b.may_contain(&get(h), &mut f))
-                            .collect()
+                            .collect();
+                        drop(f);
+                        m.sub(filter);
+                        maybe
                     }
                     None => Vec::new(),
                 };
-                (kept, maybe)
+                Ok((kept, maybe, m.into_bytes()))
             })
-            .unzip();
+            .collect();
+        let mut kept: Vec<Vec<u64>> = Vec::with_capacity(SHARDS);
+        let mut maybe: Vec<Vec<u64>> = Vec::with_capacity(SHARDS);
+        let mut first_err = None;
+        for d in deduped {
+            match d {
+                Ok((k, mb, bytes)) => {
+                    work.adopt(bytes);
+                    kept.push(k);
+                    maybe.push(mb);
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e.into());
+        }
         drop(buckets);
         // the new triples that are in the base tier: probed in key order, a contiguous
         // range of keys per task, so that each task reads few blocks
         if let Some(base) = &base {
+            let probes: usize = maybe.iter().map(Vec::len).sum();
+            // the probe list, the found names and those of them by shard
+            work.try_grow(probes * (size_of::<(Triple, u64)>() + 4 * size_of::<u64>()))?;
             let mut probe: Vec<(Triple, u64)> =
                 maybe.iter().flatten().map(|&h| (get(h), h)).collect();
             drop(maybe);
@@ -370,6 +616,7 @@ impl Graph {
                     Ok(c.iter().zip(f).filter(|x| x.1).map(|x| x.0.1).collect())
                 })
                 .collect();
+            drop(probe);
             let mut gone: Vec<u64> = Vec::new();
             for f in found {
                 gone.extend(f?);
@@ -381,6 +628,15 @@ impl Graph {
                     by_shard[shard3(&get(h))].push(h);
                 }
                 let gone_ref = &gone;
+                // the cache of base facts grows to its fixed size at most
+                let grow: usize = self
+                    .in_base
+                    .iter()
+                    .zip(&by_shard)
+                    .filter(|(k, g)| !g.is_empty() && k.capacity() < IN_BASE_SHARD)
+                    .map(|_| table_bytes(table_capacity(IN_BASE_SHARD), size_of::<Triple>()))
+                    .sum();
+                work.try_grow(grow)?;
                 self.in_base
                     .par_iter_mut()
                     .zip(kept.par_iter_mut())
@@ -390,6 +646,9 @@ impl Graph {
                             return;
                         }
                         for &h in g {
+                            if known.len() >= IN_BASE_SHARD {
+                                known.clear();
+                            }
                             known.insert(get(h));
                         }
                         ks.retain(|h| gone_ref.binary_search(h).is_err());
@@ -400,6 +659,7 @@ impl Graph {
         // the kept positions as a bitset with a running count per word: a position's
         // rank among them is its new row
         let words = total.div_ceil(64);
+        work.try_grow(words * (size_of::<u64>() + size_of::<u32>()))?;
         let mut bits = vec![0u64; words];
         for k in &kept {
             for &h in k {
@@ -416,6 +676,20 @@ impl Graph {
         let new = n as usize;
         let start = self.triples.len();
         let first_row = self.len();
+        // the grown buffer of rows and index tables, while the old ones are alive
+        let mut grow = 0;
+        if start + new > self.triples.capacity() {
+            grow += (start + new) * size_of::<Triple>();
+        }
+        for (tbl, ks) in self.index.iter().zip(&kept) {
+            if tbl.len() + ks.len() > tbl.capacity() {
+                grow += table_bytes(
+                    table_grown(tbl.capacity(), tbl.len(), ks.len()),
+                    size_of::<u32>(),
+                );
+            }
+        }
+        work.try_grow(grow)?;
         self.triples.reserve_exact(new);
         let mut item = 0;
         for (i, &w) in bits.iter().enumerate() {
@@ -430,6 +704,7 @@ impl Graph {
             }
         }
         drop(outs);
+        drop(outs_held);
         // the new rows in the triple index
         let (bits_ref, before_ref) = (&bits, &before);
         let triples = &self.triples;
@@ -451,7 +726,10 @@ impl Graph {
         let t_rows = std::time::Instant::now();
         drop(kept);
         self.live += new;
-        self.fill(start);
+        let mut m = Meter::new(&budget, true);
+        let filled = self.fill(start, &mut m);
+        work.adopt(m.into_bytes());
+        filled?;
         tracing::trace!(
             candidates = total,
             new,
@@ -465,11 +743,12 @@ impl Graph {
     }
 
     /// Add the in-memory rows from `start` (an index of `triples`) to the secondary
-    /// indexes, with one task per index shard when there are many.
-    fn fill(&mut self, start: usize) {
+    /// indexes, with one task per index shard when there are many. Growth is charged to
+    /// `m` (and its strictness) before it is allocated.
+    fn fill(&mut self, start: usize, m: &mut Meter<'_>) -> Result<(), MemoryExceeded> {
         let n = self.triples.len() - start;
         if n == 0 {
-            return;
+            return Ok(());
         }
         let first_row = self.offset + start as u32;
         let new = &self.triples[start..];
@@ -480,6 +759,12 @@ impl Graph {
             rayon::current_num_threads().max(1)
         };
         let size = n.div_ceil(threads * 2).max(4096);
+        // the pieces: a row number per new row and index, in buffers that may double
+        let indexes = 3 + with_s as usize + with_o as usize;
+        m.add(
+            2 * n * indexes * size_of::<u32>()
+                + n.div_ceil(size) * indexes * SHARDS * size_of::<Vec<u32>>(),
+        )?;
         let make = |(k, c): (usize, &[Triple])| {
             let empty = || vec![Vec::new(); SHARDS];
             let mut pc = Piece {
@@ -544,9 +829,15 @@ impl Graph {
         let triples: &[Triple] = triples;
         let offset = *offset;
         let t = |r: u32| triples[(r - offset) as usize];
-        let run = |task: Fill<'_>| -> (bool, Vec<(u64, u32)>) {
-            // the predicates whose distinct subjects (or objects) grew, and by how much
+        let (budget, strict) = (m.budget(), m.strict());
+        // per task: whether it counts subjects, the predicates whose distinct subjects (or
+        // objects) grew and by how much, the change of the lists' heap beyond their inline
+        // rows, and the bytes it charged
+        type Filled = Result<(bool, Vec<(u64, u32)>, isize, usize), MemoryExceeded>;
+        let run = |task: Fill<'_>| -> Filled {
             let mut grew: FxHashMap<u64, u32> = FxHashMap::default();
+            let mut meter = Meter::new(budget, strict);
+            let mut spilled = 0isize;
             let subjects = matches!(task, Fill::Ps(..));
             match task {
                 Fill::P(m, s) => {
@@ -559,7 +850,10 @@ impl Graph {
                             while j < rows.len() && t(rows[j])[1] == p {
                                 j += 1;
                             }
-                            m.entry(p).or_default().extend_from_slice(&rows[i..j]);
+                            let e = entry(m, p, &mut meter)?;
+                            for &r in &rows[i..j] {
+                                push_row(e, r, &mut meter, &mut spilled)?;
+                            }
                             i = j;
                         }
                     }
@@ -570,37 +864,55 @@ impl Graph {
                         let rows = if subjects { &pc.ps[s] } else { &pc.po[s] };
                         for &r in rows {
                             let x = t(r);
-                            let e = m.entry((x[1], x[col])).or_default();
+                            let e = entry(m, (x[1], x[col]), &mut meter)?;
                             if e.is_empty() {
                                 *grew.entry(x[1]).or_default() += 1;
                             }
-                            e.push(r);
+                            push_row(e, r, &mut meter, &mut spilled)?;
                         }
                     }
                 }
                 Fill::S(m, s) => {
                     for pc in &pieces {
                         for &r in &pc.s[s] {
-                            m.entry(t(r)[0]).or_default().push(r);
+                            let e = entry(m, t(r)[0], &mut meter)?;
+                            push_row(e, r, &mut meter, &mut spilled)?;
                         }
                     }
                 }
                 Fill::O(m, s) => {
                     for pc in &pieces {
                         for &r in &pc.o[s] {
-                            m.entry(t(r)[2]).or_default().push(r);
+                            let e = entry(m, t(r)[2], &mut meter)?;
+                            push_row(e, r, &mut meter, &mut spilled)?;
                         }
                     }
                 }
             }
-            (subjects, grew.into_iter().collect())
+            Ok((
+                subjects,
+                grew.into_iter().collect(),
+                spilled,
+                meter.into_bytes(),
+            ))
         };
-        let grown: Vec<(bool, Vec<(u64, u32)>)> = if threads == 1 {
+        let grown: Vec<Filled> = if threads == 1 {
             tasks.into_iter().map(run).collect()
         } else {
             tasks.into_par_iter().map(run).collect()
         };
-        for (subjects, g) in grown {
+        let mut first_err = None;
+        let mut spilled = 0isize;
+        for g in grown {
+            let (subjects, g, sp, bytes) = match g {
+                Ok(x) => x,
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                    continue;
+                }
+            };
+            m.adopt(bytes);
+            spilled += sp;
             let d = if subjects {
                 &mut *distinct_s
             } else {
@@ -610,34 +922,53 @@ impl Graph {
                 *d.entry(p).or_default() += k;
             }
         }
+        self.spilled = (self.spilled as isize + spilled).max(0) as usize;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
+    #[cfg(test)]
     pub fn ensure_s_index(&mut self) {
-        if self.by_s.is_none() {
-            let mut v: Vec<Lists<u64>> = shards();
-            for (i, t) in self.triples.iter().enumerate() {
-                v[shard1(t[0])]
-                    .entry(t[0])
-                    .or_default()
-                    .push(self.offset + i as u32);
-            }
-            self.by_s = Some(v);
-        }
+        let _ = self.ensure_index(true, false);
     }
 
-    pub fn ensure_o_index(&mut self) {
-        if self.by_o.is_none() {
-            let mut v: Vec<Lists<u64>> = shards();
-            for (i, t) in self.triples.iter().enumerate() {
-                v[shard1(t[2])]
-                    .entry(t[2])
-                    .or_default()
-                    .push(self.offset + i as u32);
-            }
-            self.by_o = Some(v);
+    /// Build the per-subject (`subjects`) or per-object index if it is missing, its
+    /// growth charged before it is allocated: with `strict`, failing past the limit.
+    pub fn ensure_index(&mut self, subjects: bool, strict: bool) -> Result<(), MemoryExceeded> {
+        let present = if subjects {
+            self.by_s.is_some()
+        } else {
+            self.by_o.is_some()
+        };
+        if present {
+            return Ok(());
         }
+        let budget = self.held.budget().clone();
+        let mut meter = Meter::new(&budget, strict);
+        let mut spilled = 0isize;
+        let col = if subjects { 0 } else { 2 };
+        let mut v: Vec<Lists<u64>> = shards();
+        let r = (|| {
+            for (i, t) in self.triples.iter().enumerate() {
+                let e = entry(&mut v[shard1(t[col])], t[col], &mut meter)?;
+                push_row(e, self.offset + i as u32, &mut meter, &mut spilled)?;
+            }
+            Ok(())
+        })();
+        if r.is_ok() {
+            if subjects {
+                self.by_s = Some(v);
+            } else {
+                self.by_o = Some(v);
+            }
+            self.spilled = (self.spilled as isize + spilled).max(0) as usize;
+        }
+        self.held.adopt(meter.into_bytes());
+        self.settle();
+        r
     }
-
     /// The row of a live in-memory triple.
     #[inline]
     pub fn position(&self, t: &Triple) -> Option<u32> {
@@ -686,7 +1017,11 @@ impl Graph {
         let i = i - self.offset;
         let w = i as usize / 64;
         if self.dead.len() <= w {
+            let cap = self.dead.capacity();
             self.dead.resize(w + 1, 0);
+            // a few bits per row, charged as they grow
+            self.held
+                .grow((self.dead.capacity() - cap) * size_of::<u64>());
         }
         self.dead[w] |= 1 << (i % 64);
         self.dead_rows += 1;
@@ -884,12 +1219,6 @@ impl Graph {
         }
         Some(out)
     }
-
-    /// An estimate of the heap the in-memory tier takes: about 135 bytes per row with
-    /// the indexes (measured on the benchmark data).
-    pub fn approx_bytes(&self) -> usize {
-        self.triples.len() * 135
-    }
 }
 
 #[cfg(test)]
@@ -973,7 +1302,11 @@ mod tests {
         b.add_batch([[1, 2, 3], outs[3][5]]);
         b.ensure_s_index();
         a.add_batch(outs.iter().flatten().copied());
-        assert!(b.merge(outs.clone()).unwrap() > PAR_MIN);
+        assert!(
+            b.merge(outs.clone(), Held::new(&Budget::unlimited()))
+                .unwrap()
+                > PAR_MIN
+        );
         assert_eq!(a.derived(), b.derived());
         for t in a.derived() {
             assert_eq!(a.position(t), b.position(t));
@@ -1002,6 +1335,63 @@ mod tests {
                 rows(a.cands(Some(s), None, None, 0, a.len())),
                 rows(b.cands(Some(s), None, None, 0, b.len()))
             );
+        }
+        // the charge follows the heap
+        assert_eq!(b.held.bytes(), b.heap_bytes());
+    }
+
+    /// F16 review finding F6: the candidates of an identity rule are all facts of the
+    /// base tier. The cache of base facts that merges found keeps a fixed size however
+    /// many there are, and a fact it forgot is still found in the base tier, so repeated
+    /// merges add nothing to the derived tier, with one input graph or two.
+    #[test]
+    fn f16_identity_rule_membership_cache_bound() {
+        use sparkles_core::id::Id;
+        use sparkles_core::io::{RdfFormat, Source};
+        use sparkles_core::store::{Store, StoreOptions};
+        const N: usize = 20_000;
+        let mut nq = String::new();
+        for i in 0..N {
+            nq.push_str(&format!("<urn:s{i}> <urn:p> <urn:o{}> .\n", i % 97));
+            if i % 3 == 0 {
+                nq.push_str(&format!("<urn:s{i}> <urn:p> <urn:o{}> <urn:g> .\n", i % 97));
+            }
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        let snap = store.snapshot();
+        let g2 = snap.lookup_iri("urn:g").unwrap();
+        for graphs in [vec![Id::DEFAULT_GRAPH], vec![Id::DEFAULT_GRAPH, g2]] {
+            let base = Arc::new(Base::new(snap.clone(), &graphs).unwrap());
+            let mut all = Vec::new();
+            base.for_each(None, None, None, |t| {
+                all.push(t);
+                true
+            })
+            .unwrap();
+            assert_eq!(all.len(), N);
+            let mut g = Graph::with_base(base);
+            for round in 0..3 {
+                let new = g
+                    .merge(vec![all.clone()], Held::new(&Budget::unlimited()))
+                    .unwrap();
+                assert_eq!(new, 0, "round {round}");
+                let cached: usize = g.in_base.iter().map(|s| s.len()).sum();
+                assert!(
+                    cached <= SHARDS * IN_BASE_SHARD,
+                    "{cached} cached base facts"
+                );
+                let cap: usize = g.in_base.iter().map(|s| s.capacity()).sum();
+                assert!(
+                    cap <= SHARDS * table_capacity(IN_BASE_SHARD),
+                    "capacity {cap}"
+                );
+                assert!(g.derived().is_empty());
+            }
+            assert!(all.iter().all(|t| g.contains(t)));
+            assert!(g.heap_bytes() < 2 << 20, "{} bytes", g.heap_bytes());
         }
     }
 }

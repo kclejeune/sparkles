@@ -136,10 +136,10 @@ pub struct RunInfo {
     /// incremental runs: what changed since the previous run
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<RunChanges>,
-    /// the largest estimated heap of the run's derived facts and candidates, in bytes
+    /// the largest estimated heap the run used at any time, in bytes
     #[serde(default, skip_serializing_if = "is_zero")]
     pub peak_bytes: u64,
-    /// index scans of the input graphs that rule evaluation issued
+    /// index scans of the input graphs the run issued
     #[serde(default, skip_serializing_if = "is_zero")]
     pub base_scans: u64,
     /// threads the rules were evaluated on

@@ -1,5 +1,6 @@
 //! Jena rule builtins (`org.apache.jena.reasoner.rulesys.builtins`).
 
+use crate::budget::MemoryExceeded;
 use crate::engine::{Eval, Slot};
 use crate::terms::{Kind, Terms};
 use oxrdf::{Literal, NamedNode, Term};
@@ -164,12 +165,20 @@ pub(crate) fn head_action(ev: &mut Eval<'_>, action: HeadAction, vals: &[u64]) {
     match action {
         HeadAction::ListMapAsSubject => {
             if let Some(ms) = ev.list(vals[0]) {
-                ev.out.extend(ms.iter().map(|&m| [m, vals[1], vals[2]]));
+                for &m in ms.iter() {
+                    if !ev.push_out([m, vals[1], vals[2]]) {
+                        return;
+                    }
+                }
             }
         }
         HeadAction::ListMapAsObject => {
             if let Some(ms) = ev.list(vals[2]) {
-                ev.out.extend(ms.iter().map(|&m| [vals[0], vals[1], m]));
+                for &m in ms.iter() {
+                    if !ev.push_out([vals[0], vals[1], m]) {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -205,7 +214,16 @@ fn num(t: &Terms, a: u64) -> Option<Value> {
     t.value(a).filter(|v| v.is_numeric())
 }
 
-fn arith(t: &Terms, kind: BuiltinKind, a: u64, b: u64) -> Option<u64> {
+/// The id of the result of an arithmetic builtin, `Ok(None)` when there is none, or the
+/// error when a new term does not fit the run's memory.
+fn arith(t: &Terms, kind: BuiltinKind, a: u64, b: u64) -> Result<Option<u64>, MemoryExceeded> {
+    let Some(r) = arith_value(t, kind, a, b) else {
+        return Ok(None);
+    };
+    t.try_id_for(&r.to_term()).map(Some)
+}
+
+fn arith_value(t: &Terms, kind: BuiltinKind, a: u64, b: u64) -> Option<Value> {
     let (x, y) = (num(t, a)?, num(t, b)?);
     let r = match (kind, &x, &y) {
         // Jena: long division for integers
@@ -226,7 +244,7 @@ fn arith(t: &Terms, kind: BuiltinKind, a: u64, b: u64) -> Option<u64> {
     {
         return None;
     }
-    Some(t.id_for(&r.to_term()))
+    Some(r)
 }
 
 fn is_dtype(t: &Terms, v: u64, dt: u64) -> bool {
@@ -283,8 +301,22 @@ fn integer_in_range(lex: &str, dt: &str) -> bool {
     }
 }
 
-fn string_id(t: &Terms, s: String) -> u64 {
-    t.id_for(&Term::Literal(Literal::new_simple_literal(s)))
+fn string_id(t: &Terms, s: String) -> Result<u64, MemoryExceeded> {
+    t.try_id_for(&Term::Literal(Literal::new_simple_literal(s)))
+}
+
+/// Run `f`, and on an error that the run's memory is exceeded, stop the evaluation with
+/// it: a builtin that cannot make its result does not fail as if it had none.
+macro_rules! charged {
+    ($ev:expr, $e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => {
+                $ev.fail(e);
+                return;
+            }
+        }
+    };
 }
 
 // --------------------------------------------------------------- evaluation ----
@@ -350,7 +382,8 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
         }
         // ---- binders / generators
         Sum | Difference | Product | Quotient => {
-            if let Some(r) = arith(t, bi.kind, a(0), a(1)) {
+            let (x, y) = (a(0), a(1));
+            if let Some(r) = charged!(ev, arith(t, bi.kind, x, y)) {
                 ev.bind_and_continue(bi.args[2], r, k, b);
             }
             return;
@@ -370,63 +403,84 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
         }
         AddOne => {
             let one = sparkles_core::id::Id::from_i64(1).unwrap().0;
-            if let Some(r) = arith(t, Sum, a(0), one) {
+            let x = a(0);
+            if let Some(r) = charged!(ev, arith(t, Sum, x, one)) {
                 ev.bind_and_continue(bi.args[1], r, k, b);
             }
             return;
         }
         StrConcat | UriConcat => {
             let n = bi.args.len();
-            let mut s = String::new();
-            for i in 0..n - 1 {
-                match t.lexical(a(i)) {
-                    Some(x) => s.push_str(&x),
-                    None => return,
-                }
+            let ids: Vec<u64> = (0..n - 1).map(a).collect();
+            // the lexical forms read, then the result and its key, charged before they
+            // are made
+            let mut held = crate::budget::Held::new(&t.budget());
+            let mut parts = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(x) = t.lexical(id) else { return };
+                held.grow(x.len());
+                charged!(ev, t.budget().check());
+                parts.push(x);
+            }
+            let len: usize = parts.iter().map(String::len).sum();
+            charged!(ev, held.try_grow(2 * len));
+            let mut s = String::with_capacity(len);
+            for x in parts {
+                s.push_str(&x);
             }
             let r = if bi.kind == StrConcat {
-                string_id(t, s)
+                charged!(ev, string_id(t, s))
             } else {
                 match NamedNode::new(s) {
-                    Ok(n) => t.id_for(&Term::NamedNode(n)),
+                    Ok(n) => charged!(ev, t.try_id_for(&Term::NamedNode(n))),
                     Err(_) => return,
                 }
             };
+            drop(held);
             ev.bind_and_continue(bi.args[n - 1], r, k, b);
             return;
         }
         Regex => {
-            let Some(text) = t.lexical(a(0)) else { return };
+            let (x, p) = (a(0), a(1));
+            let Some(text) = t.lexical(x) else { return };
+            let mut held = crate::budget::Held::new(&t.budget());
+            held.grow(text.len());
+            charged!(ev, t.budget().check());
             let re = match &bi.regex {
                 Some(r) => r.clone(),
-                None => match t.lexical(a(1)).and_then(|p| t.regex(&p)) {
-                    Some(r) => r,
-                    None => return,
-                },
+                None => {
+                    let Some(p) = t.lexical(p) else { return };
+                    match charged!(ev, t.try_regex(&p)) {
+                        Some(r) => r,
+                        None => return,
+                    }
+                }
             };
             let Some(caps) = re.captures(&text) else {
                 return;
             };
-            let groups: Vec<u64> = (1..bi.args.len() - 1)
-                .map(|g| {
-                    string_id(
-                        t,
-                        caps.get(g)
-                            .map_or(String::new(), |m| m.as_str().to_string()),
-                    )
-                })
-                .collect();
+            let mut groups: Vec<u64> = Vec::with_capacity(bi.args.len());
+            for g in 1..bi.args.len() - 1 {
+                let s = caps
+                    .get(g)
+                    .map_or(String::new(), |m| m.as_str().to_string());
+                groups.push(charged!(ev, string_id(t, s)));
+            }
+            drop(held);
             bind_all(ev, &bi.args[2..], &groups, k, b);
             return;
         }
         MakeTemp => {
-            let vals: Vec<u64> = (0..bi.args.len()).map(|_| t.fresh_bnode()).collect();
+            let mut vals: Vec<u64> = Vec::with_capacity(bi.args.len());
+            for _ in 0..bi.args.len() {
+                vals.push(charged!(ev, t.try_fresh_bnode()));
+            }
             bind_all(ev, &bi.args, &vals, k, b);
             return;
         }
         MakeSkolem => {
             let inputs: Vec<u64> = (1..bi.args.len()).map(a).collect();
-            let v = t.skolem(&inputs);
+            let v = charged!(ev, t.try_skolem(&inputs));
             ev.bind_and_continue(bi.args[0], v, k, b);
             return;
         }
@@ -469,7 +523,10 @@ pub(crate) fn eval(ev: &mut Eval<'_>, j: usize, k: usize, b: &mut [u64]) {
                     .map(|n| format!("{}{n}", sparkles_core::geo::types::GML_ONT))
             };
             if let Some(iri) = iri {
-                let v = t.id_for(&Term::NamedNode(NamedNode::new_unchecked(iri)));
+                let v = charged!(
+                    ev,
+                    t.try_id_for(&Term::NamedNode(NamedNode::new_unchecked(iri)))
+                );
                 ev.bind_and_continue(bi.args[1], v, k, b);
             }
             return;

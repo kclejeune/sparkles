@@ -15,6 +15,7 @@
 //! [`materialize_incremental`] updates a previous materialization from the changes to
 //! the input graphs since its commit, with the same result as a full run.
 
+mod budget;
 mod builtins;
 pub mod diagnostics;
 mod engine;
@@ -38,6 +39,7 @@ pub use parser::{
 };
 
 use anyhow::Context as _;
+use budget::{Budget, Held};
 use incremental::Fallback;
 use oxrdf::{NamedNode, NamedOrBlankNode, Term, Triple};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -45,6 +47,7 @@ use sparkles_core::id::{Id, Tag};
 use sparkles_core::index::Perm;
 use sparkles_core::store::{Chunk, Snapshot, Store};
 use std::fmt;
+use std::mem::size_of;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -136,8 +139,12 @@ pub struct ReasonOptions {
     pub progress: Option<ProgressFn>,
     /// The graphs the rules read (the default graph and its imports by default).
     pub inputs: Inputs,
-    /// The largest estimated heap of the run's derived facts and candidates, in bytes,
-    /// before it fails. `None` sets no limit.
+    /// The estimated heap a run may use at any time, in bytes, before it fails. It
+    /// covers the derived facts and their indexes, the local terms the rules make, the
+    /// candidates and caches of rule evaluation, the previous closure of an incremental
+    /// run with its maintenance state, the buffers that write the inferred graph and the
+    /// closure kept for the next run. Each is charged before it grows. The store's block
+    /// cache is not counted. `None` sets no limit.
     pub max_memory: Option<usize>,
     /// Threads for rule evaluation: at most the size of [`pool`](Self::pool) when there
     /// is one. `None` uses the pool, or the caller's threads.
@@ -204,9 +211,11 @@ pub struct ReasonReport {
     pub inferred_removed: u64,
     /// the graphs the run read, with its imports
     pub inputs: Option<Resolved>,
-    /// the largest estimated heap of the run's derived facts and candidates
+    /// the largest estimated heap the run used at any time, within
+    /// [`ReasonOptions::max_memory`] when the run succeeds
     pub peak_bytes: u64,
-    /// index scans of the input graphs that rule evaluation issued
+    /// index scans of the input graphs the run issued: rule evaluation and the GeoSPARQL
+    /// default geometries
     pub base_scans: u64,
     /// threads the rules were evaluated on
     pub threads: usize,
@@ -262,17 +271,27 @@ struct Derivation {
     rules: usize,
     iterations: usize,
     warnings: Vec<String>,
-    peak_bytes: usize,
+    /// the run's memory: the graph and the local terms stay charged to it
+    budget: Arc<Budget>,
+    /// the GeoSPARQL default geometries the run added as facts, sorted, and their charge
+    defaults: Option<(Vec<[u64; 3]>, Held)>,
     base_scans: u64,
     threads: usize,
 }
 
-/// The union of the triples of graphs `graphs`, in memory.
-fn load_graphs(snap: &Snapshot, graphs: &[Id], extra: usize) -> anyhow::Result<graph::Graph> {
+/// The union of the triples of graphs `graphs`, in memory, with room for `extra` more,
+/// charged to `budget` before it is allocated.
+fn load_graphs(
+    snap: &Snapshot,
+    graphs: &[Id],
+    extra: usize,
+    budget: &Arc<Budget>,
+) -> anyhow::Result<graph::Graph> {
     let mut n = 0;
     for g in graphs {
         n += snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) as usize;
     }
+    let read = Held::try_new(budget, n * size_of::<[u64; 3]>())?;
     let mut triples = Vec::with_capacity(n);
     for g in graphs {
         snap.scan(Perm::Gspo, &[g.0], |c| {
@@ -285,8 +304,9 @@ fn load_graphs(snap: &Snapshot, graphs: &[Id], extra: usize) -> anyhow::Result<g
             Ok(true)
         })?;
     }
-    let mut g = graph::Graph::with_capacity(n + extra);
-    g.add_batch(triples);
+    let mut g = graph::Graph::try_with_capacity(n + extra, budget)?;
+    g.try_add_batch(triples)?;
+    drop(read);
     Ok(g)
 }
 
@@ -329,51 +349,94 @@ fn derive_here(
 ) -> anyhow::Result<Derivation> {
     let rules = profile_rules(profile, extras)?;
     progress(opts, 0.0, "reading the input graphs");
+    let budget = Budget::new(opts.max_memory);
     let base = Arc::new(facts::Base::new(snap.clone(), graphs)?);
     let mut g = graph::Graph::with_base(base.clone());
+    g.set_budget(&budget)?;
     let terms = Terms::new(snap);
+    terms.set_budget(&budget)?;
+    let mut defaults = None;
     if extras.geo_default_geometry {
-        let defaults = default_geometries(&base, &terms)?;
-        g.add_batch(defaults);
+        let d = default_geometries(&base, &terms, &budget)?;
+        g.try_add_batch(d.0.iter().copied())?;
+        defaults = Some(d);
     }
     let mut warnings = Vec::new();
     let compiled = engine::compile(&rules, &terms, &mut warnings);
     let limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
-        max_memory: opts.max_memory,
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
+        budget: budget.clone(),
     };
     progress(opts, 0.1, "reasoning");
     let out = engine::run(&mut g, &compiled, &terms, &limits, None)?;
+    budget.check_peak()?;
     Ok(Derivation {
         graph: g,
         terms,
         rules: compiled.len(),
         iterations: out.iterations,
         warnings,
-        peak_bytes: out.peak_bytes,
+        budget,
+        defaults,
         base_scans: base.scans(),
         threads: rayon::current_num_threads(),
     })
 }
 
-/// `F geo:hasDefaultGeometry G` for every `F` of the input graphs with exactly one
-/// `geo:hasGeometry` (`G`) and no `geo:hasDefaultGeometry` (Jena's
-/// `applyDefaultGeometry`).
-fn default_geometries(base: &facts::Base, terms: &Terms) -> anyhow::Result<Vec<[u64; 3]>> {
-    const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+const GEO: &str = "http://www.opengis.net/ont/geosparql#";
+
+/// The ids of `geo:hasGeometry` and `geo:hasDefaultGeometry`.
+fn geo_ids(terms: &Terms) -> (u64, u64) {
     let iri = |l: &str| {
         terms.id_for(&Term::NamedNode(NamedNode::new_unchecked(format!(
             "{GEO}{l}"
         ))))
     };
-    let (has, default) = (iri("hasGeometry"), iri("hasDefaultGeometry"));
+    (iri("hasGeometry"), iri("hasDefaultGeometry"))
+}
+
+/// Room in `held` for one more key of a table of capacity `cap` with `len` keys of
+/// `elem` bytes (with their values): the table it grows to is charged while the old one
+/// is still charged.
+fn room_for_key(
+    held: &mut Held,
+    cap: usize,
+    len: usize,
+    elem: usize,
+) -> Result<(), budget::MemoryExceeded> {
+    let to = budget::table_grown(cap, len, 1);
+    if to != cap {
+        held.try_grow(budget::table_bytes(to, elem))?;
+        held.shrink(budget::table_bytes(cap, elem));
+    }
+    Ok(())
+}
+
+/// `F geo:hasDefaultGeometry G` for every `F` of the input graphs with exactly one
+/// `geo:hasGeometry` (`G`) and no `geo:hasDefaultGeometry` (Jena's
+/// `applyDefaultGeometry`), sorted, with their charge to `budget`. Two scans of the
+/// input graphs, one per property.
+fn default_geometries(
+    base: &facts::Base,
+    terms: &Terms,
+    budget: &Arc<Budget>,
+) -> anyhow::Result<(Vec<[u64; 3]>, Held)> {
+    let (has, default) = geo_ids(terms);
+    let mut held = Held::new(budget);
+    let mut refused = None;
     // feature → its only geometry (`None` once it has a second)
     let mut one: FxHashMap<u64, Option<u64>> = FxHashMap::default();
-    let mut with_default: FxHashSet<u64> = FxHashSet::default();
+    let entry = size_of::<(u64, Option<u64>)>();
     base.for_each(None, Some(has), None, |t| {
+        if !one.contains_key(&t[0])
+            && let Err(e) = room_for_key(&mut held, one.capacity(), one.len(), entry)
+        {
+            refused = Some(e);
+            return false;
+        }
         one.entry(t[0])
             .and_modify(|x| {
                 if *x != Some(t[2]) {
@@ -383,45 +446,72 @@ fn default_geometries(base: &facts::Base, terms: &Terms) -> anyhow::Result<Vec<[
             .or_insert(Some(t[2]));
         true
     })?;
-    base.for_each(None, Some(default), None, |t| {
-        with_default.insert(t[0]);
-        true
-    })?;
-    let mut out: Vec<[u64; 3]> = one
-        .into_iter()
-        .filter(|(f, _)| !with_default.contains(f))
-        .filter_map(|(f, geom)| Some([f, default, geom?]))
-        .collect();
+    let mut with_default: FxHashSet<u64> = FxHashSet::default();
+    if refused.is_none() {
+        base.for_each(None, Some(default), None, |t| {
+            if one.contains_key(&t[0])
+                && !with_default.contains(&t[0])
+                && let Err(e) = room_for_key(
+                    &mut held,
+                    with_default.capacity(),
+                    with_default.len(),
+                    size_of::<u64>(),
+                )
+            {
+                refused = Some(e);
+                return false;
+            }
+            if one.contains_key(&t[0]) {
+                with_default.insert(t[0]);
+            }
+            true
+        })?;
+    }
+    if let Some(e) = refused {
+        return Err(e
+            .with_context(" (finding the GeoSPARQL default geometries)".into())
+            .into());
+    }
+    let n = one
+        .iter()
+        .filter(|(f, g)| g.is_some() && !with_default.contains(f))
+        .count();
+    let tables = budget::table_bytes(one.capacity(), entry)
+        + budget::table_bytes(with_default.capacity(), size_of::<u64>());
+    held.try_grow(n * size_of::<[u64; 3]>())?;
+    let mut out: Vec<[u64; 3]> = Vec::with_capacity(n);
+    out.extend(
+        one.into_iter()
+            .filter(|(f, _)| !with_default.contains(f))
+            .filter_map(|(f, geom)| Some([f, default, geom?])),
+    );
+    drop(with_default);
+    held.shrink(tables);
     out.sort_unstable();
-    Ok(out)
+    Ok((out, held))
 }
 
-/// The default geometries now, and those that changed.
-type DefaultGeometries = (FxHashSet<[u64; 3]>, Vec<[u64; 3]>);
-
-/// Flag the default geometries of the previous run explicit in `closure`, and add the
-/// changes of the default geometries of the features that `ch` changes to `ch`: a
-/// default geometry is added as an explicit fact, and one that no longer holds is
-/// removed as one. Returns the default geometries now, and those that changed, which the
-/// inferred graph may have to follow even when the explicit facts do not change.
+/// Bring the default geometries of `closure` up to date with the changes `ch` of the
+/// input graphs, and add their changes to `ch`: a default geometry is added as an
+/// explicit fact, and one that no longer holds is removed as one. Returns the default
+/// geometries that changed, which the inferred graph may have to follow even when the
+/// explicit facts do not change.
 ///
-/// The previous ones are those of now, except for the features whose `geo:hasGeometry`
-/// or `geo:hasDefaultGeometry` facts changed. For those, the input graphs then are the
-/// input graphs now without the added facts and with the removed ones.
+/// Only the features whose `geo:hasGeometry` or `geo:hasDefaultGeometry` facts changed
+/// can change, and each is read with two probes of the input graphs bound to the feature
+/// and the property. The previous default geometries are the closure's when it knows
+/// them (it came from the run before, kept in memory). A closure read from the store
+/// does not know them: they are then the default geometries now, from two scans of the
+/// input graphs, except for the changed features, whose facts then are their facts now
+/// without the added ones and with the removed ones. Those are flagged explicit in the
+/// closure, as a run that knows them has them.
 fn default_geometry_changes(
     base: &facts::Base,
     closure: &mut incremental::Closure,
     ch: &mut maintain::Changes,
-) -> anyhow::Result<DefaultGeometries> {
-    const GEO: &str = "http://www.opengis.net/ont/geosparql#";
-    let terms = &closure.terms;
-    let iri = |l: &str| {
-        terms.id_for(&Term::NamedNode(NamedNode::new_unchecked(format!(
-            "{GEO}{l}"
-        ))))
-    };
-    let (has, default) = (iri("hasGeometry"), iri("hasDefaultGeometry"));
-    let now: FxHashSet<[u64; 3]> = default_geometries(base, terms)?.into_iter().collect();
+    budget: &Arc<Budget>,
+) -> anyhow::Result<Vec<[u64; 3]>> {
+    let (has, default) = geo_ids(&closure.terms);
     let geo = |t: &&[u64; 3]| t[1] == has || t[1] == default;
     let mut changed: Vec<u64> = ch
         .base_added
@@ -443,12 +533,24 @@ fn default_geometry_changes(
         let first = g.next()?;
         g.all(|x| x == first).then_some([f, default, first])
     };
-    let mut before: FxHashSet<[u64; 3]> = now
-        .iter()
-        .filter(|t| changed.binary_search(&t[0]).is_err())
-        .copied()
-        .collect();
+    let known = closure.defaults.take();
+    let unknown = known.is_none();
+    let mut defaults = match known {
+        Some(d) => d,
+        None => {
+            let (now, _held) = default_geometries(base, &closure.terms, budget)?;
+            incremental::Defaults {
+                pred: default,
+                of: now
+                    .iter()
+                    .filter(|t| changed.binary_search(&t[0]).is_err())
+                    .map(|t| (t[0], t[2]))
+                    .collect(),
+            }
+        }
+    };
     let (mut gone, mut new) = (Vec::new(), Vec::new());
+    let mut then_of = Vec::new();
     for &f in &changed {
         let mut facts: Vec<[u64; 3]> = Vec::new();
         for p in [has, default] {
@@ -458,22 +560,38 @@ fn default_geometry_changes(
             })?;
         }
         let after = of(f, &facts);
-        facts.retain(|t| !added.contains(t));
-        facts.extend(removed.iter().filter(|t| t[0] == f));
-        let then = of(f, &facts);
-        if let Some(d) = then {
-            before.insert(d);
-        }
+        let then = if unknown {
+            facts.retain(|t| !added.contains(t));
+            facts.extend(removed.iter().filter(|t| t[0] == f));
+            of(f, &facts)
+        } else {
+            defaults.of.get(&f).map(|g| [f, default, *g])
+        };
+        then_of.extend(then);
         if then != after {
             gone.extend(then);
             new.extend(after);
         }
     }
-    for d in &before {
-        if let Some(r) = closure.graph.position(d) {
-            closure.set_base(r, true);
+    if unknown {
+        for (f, g) in then_of.iter().map(|t| (t[0], t[2])) {
+            defaults.of.insert(f, g);
+        }
+        for d in defaults.facts() {
+            if let Some(r) = closure.graph.position(&d) {
+                closure.set_base(r, true);
+            }
         }
     }
+    for d in &gone {
+        defaults.of.remove(&d[0]);
+    }
+    for d in &new {
+        defaults.of.insert(d[0], d[2]);
+    }
+    closure.defaults = Some(defaults);
+    closure.settle();
+    budget.check()?;
     let touched: Vec<[u64; 3]> = gone.iter().chain(&new).copied().collect();
     // a default geometry that is also stated, or no longer stated, does not change
     for d in gone {
@@ -492,7 +610,7 @@ fn default_geometry_changes(
             None => ch.base_added.push(d),
         }
     }
-    Ok((now, touched))
+    Ok(touched)
 }
 
 impl Derivation {
@@ -511,17 +629,41 @@ impl Derivation {
     }
 
     /// The closure in memory, for incremental runs: the input graphs, read into memory,
-    /// then the derived facts.
+    /// then the derived facts, with the default geometries flagged explicit. Its graph is
+    /// charged to the run's budget before it is allocated, beside the derivation's.
     fn into_closure(self) -> anyhow::Result<incremental::Closure> {
-        let Derivation { graph, terms, .. } = self;
+        let Derivation {
+            graph,
+            terms,
+            budget,
+            defaults,
+            ..
+        } = self;
         let derived = graph.derived();
         let Some(base) = graph.base() else {
             anyhow::bail!("a derivation without a base tier");
         };
-        let mut g = load_graphs(&base.snap, &base.graph_ids(), derived.len())?;
+        let mut g = load_graphs(&base.snap, &base.graph_ids(), derived.len(), &budget)?;
         let n = g.len();
-        g.add_batch(derived.iter().copied());
-        Ok(incremental::Closure::new(g, terms, n))
+        g.try_add_batch(derived.iter().copied())?;
+        drop(graph);
+        let mut c = incremental::Closure::new(g, terms, n);
+        if let Some((d, _held)) = defaults {
+            let (_, pred) = geo_ids(&c.terms);
+            let d = incremental::Defaults {
+                pred,
+                of: d.iter().map(|t| (t[0], t[2])).collect(),
+            };
+            for t in d.facts() {
+                if let Some(r) = c.graph.position(&t) {
+                    c.set_base(r, true);
+                }
+            }
+            c.defaults = Some(d);
+            c.settle();
+        }
+        budget.check()?;
+        Ok(c)
     }
 }
 
@@ -680,7 +822,7 @@ fn materialize_admitted(
     let done = Done {
         rules: d.rules,
         iterations: d.iterations,
-        peak_bytes: d.peak_bytes,
+        budget: d.budget.clone(),
         base_scans: d.base_scans,
         threads: d.threads,
         closure: Some(ClosureState::Derived(d)),
@@ -785,7 +927,8 @@ impl ClosureState {
 struct Done {
     /// the closure, for the next incremental run
     closure: Option<ClosureState>,
-    peak_bytes: usize,
+    /// the run's memory, whose peak the report gives
+    budget: Arc<Budget>,
     base_scans: u64,
     threads: usize,
     generalized: FxHashSet<[u64; 3]>,
@@ -833,6 +976,9 @@ fn finish(
     {
         anyhow::bail!("reasoning cancelled");
     }
+    // a run that went over its limit fails before its commit, also when its charges are
+    // back under it now
+    done.budget.check_peak()?;
     let receipt = txn.commit()?;
     progress(opts, 1.0, "done");
     let mut warnings = resolved.warnings.clone();
@@ -853,10 +999,12 @@ fn finish(
             tracing::warn!("saving the closure state for incremental runs: {e:#}");
             None
         });
+        // keeping the closure after the commit is charged strictly: a closure that does
+        // not fit is not kept, and the run still succeeds
         if let Some(cache) = inc.cache
             && let Some(closure) = state.for_cache(cache)
         {
-            maintain::keep(
+            match maintain::keep(
                 store,
                 inc.cache,
                 &receipt,
@@ -867,8 +1015,10 @@ fn finish(
                 done.generalized,
                 &done.written.stored,
                 saved,
-            );
-            kept = true;
+            ) {
+                Ok(k) => kept = k,
+                Err(e) => tracing::warn!("keeping the closure for incremental runs: {e:#}"),
+            }
         }
     }
     if !kept && let Some(c) = inc.cache {
@@ -888,7 +1038,7 @@ fn finish(
         inferred_added: done.written.added,
         inferred_removed: done.written.removed,
         inputs: Some(resolved.clone()),
-        peak_bytes: done.peak_bytes as u64,
+        peak_bytes: done.budget.peak() as u64,
         base_scans: done.base_scans,
         threads: done.threads,
     };
@@ -943,19 +1093,38 @@ fn write_full(
     opts: &ReasonOptions,
 ) -> anyhow::Result<Written> {
     let mut w = Written::default();
+    let fact = size_of::<[Id; 3]>();
+    let n = d.derived().len();
+    // the new graph's triples and their set
+    let mut held = Held::try_new(
+        &d.budget,
+        n * fact + budget::table_bytes(budget::table_capacity(n), fact),
+    )
+    .map_err(|e| e.with_context(" (writing the inferred graph)".into()))?;
     // existing inferred graph
     let old_graph = snap.lookup_iri(INFERRED_GRAPH);
-    let old: Vec<[Id; 4]> = match old_graph {
-        Some(g) => snap
-            .scan_keys(Perm::Gspo, &[g.0])?
-            .iter()
-            .map(|k| Perm::Gspo.to_quad(k))
-            .collect(),
+    let old: Vec<[Id; 3]> = match old_graph {
+        Some(g) => {
+            let m = snap.count(Perm::Gspo, &[g.0])? as usize;
+            held.try_grow(m * fact + budget::table_bytes(budget::table_capacity(m.min(n)), fact))
+                .map_err(|e| e.with_context(" (writing the inferred graph)".into()))?;
+            let mut old = Vec::with_capacity(m);
+            snap.scan(Perm::Gspo, &[g.0], |c| {
+                match c {
+                    Chunk::Block(b, s, e) => old.extend(
+                        (s..e).map(|i| [Id(b.cols[1][i]), Id(b.cols[2][i]), Id(b.cols[3][i])]),
+                    ),
+                    Chunk::Row(k) => old.push([Id(k[1]), Id(k[2]), Id(k[3])]),
+                }
+                Ok(true)
+            })?;
+            old
+        }
         None => Vec::new(),
     };
 
     // map local ids to store ids and collect the new graph content
-    let mut new_triples: Vec<[Id; 3]> = Vec::new();
+    let mut new_triples: Vec<[Id; 3]> = Vec::with_capacity(n);
     for t in d.derived() {
         if !d.valid(t) {
             w.generalized += 1;
@@ -966,10 +1135,10 @@ fn write_full(
 
     let new_set: FxHashSet<[Id; 3]> = new_triples.iter().copied().collect();
     let mut old_set: FxHashSet<[Id; 3]> = FxHashSet::default();
-    for q in &old {
-        let t = [q[0], q[1], q[2]];
+    for t in old {
         if !new_set.contains(&t) {
-            txn.delete(*q)?;
+            let g = old_graph.expect("present");
+            txn.delete([t[0], t[1], t[2], g])?;
             w.removed += 1;
         } else {
             old_set.insert(t);
@@ -980,6 +1149,8 @@ fn write_full(
             Some(g) => g,
             None => txn.intern(&Term::NamedNode(NamedNode::new_unchecked(INFERRED_GRAPH)))?,
         };
+        held.try_grow(new_triples.len() * size_of::<[Id; 4]>())
+            .map_err(|e| e.with_context(" (writing the inferred graph)".into()))?;
         let added: Vec<[Id; 4]> = new_triples
             .iter()
             .filter(|t| !old_set.contains(*t))
@@ -997,6 +1168,7 @@ fn write_full(
         txn.insert_bulk(added)?;
     }
     w.inferred = new_set.len() as u64;
+    drop(held);
     Ok(w)
 }
 
@@ -1045,26 +1217,30 @@ fn update_closure(
         }
     }
     progress(opts, 0.0, "reading the previous closure");
-    let prev = maintain::previous(store, snap, since, digest, &graphs, inc.cache, raw)?;
+    let budget = Budget::new(opts.max_memory);
+    let prev = maintain::previous(store, snap, since, digest, &graphs, inc.cache, raw, &budget)?;
     let mut closure = prev.closure;
     let mut ch = prev.changes;
+    let _prev_held = prev.held;
     // the default geometries count as explicit facts, so that the update keeps the facts
     // derived from them; those of the changed features change with the explicit ones
-    let (defaults, touched) = if extras.geo_default_geometry {
+    let mut base_scans = 0;
+    let touched = if extras.geo_default_geometry {
         let base = facts::Base::new(snap.clone(), &resolved.ids(snap))?;
-        let (now, touched) = default_geometry_changes(&base, &mut closure, &mut ch)?;
-        (Some(now), touched)
+        let touched = default_geometry_changes(&base, &mut closure, &mut ch, &budget)?;
+        base_scans = base.scans();
+        touched
     } else {
-        (None, Vec::new())
+        Vec::new()
     };
     let mut warnings = Vec::new();
     let compiled = engine::compile(&rules, &closure.terms, &mut warnings);
     let limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
-        max_memory: opts.max_memory,
         cancel: opts.cancel.clone(),
         progress: opts.progress.clone(),
+        budget: budget.clone(),
     };
     let ch = &ch;
     progress(opts, 0.1, "updating the closure");
@@ -1086,6 +1262,10 @@ fn update_closure(
             gen_changes.removed.push(*t);
         }
     }
+    let _added_held = Held::try_new(
+        &budget,
+        (closure.graph.len() - up.added_from) as usize * size_of::<[u64; 3]>(),
+    )?;
     let added: Vec<[u64; 3]> = up.added(&closure).collect();
     for t in &added {
         if !closure.explicit(t) && !closure.terms.valid(t) && generalized.insert(*t) {
@@ -1102,7 +1282,7 @@ fn update_closure(
         .chain(&ch.inferred_added)
         .chain(&ch.inferred_removed)
         .chain(&touched);
-    let written = write_changes(txn, snap, &closure, candidates, defaults.as_ref())?;
+    let written = write_changes(txn, snap, &closure, candidates, &budget)?;
     let changes = Changes {
         base_added: ch.base_added.len() as u64,
         base_removed: ch.base_removed.len() as u64,
@@ -1119,8 +1299,8 @@ fn update_closure(
         ));
     }
     Ok(Done {
-        peak_bytes: closure.graph.approx_bytes(),
-        base_scans: 0,
+        budget,
+        base_scans,
         threads,
         closure: Some(ClosureState::Ready(closure)),
         generalized_saved: prev.saved.map(|m| (m, gen_changes)),
@@ -1142,13 +1322,21 @@ fn write_changes<'a>(
     snap: &Snapshot,
     c: &incremental::Closure,
     candidates: impl Iterator<Item = &'a [u64; 3]>,
-    defaults: Option<&FxHashSet<[u64; 3]>>,
+    budget: &Arc<Budget>,
 ) -> anyhow::Result<Written> {
     let mut w = Written::default();
+    let defaults = c.defaults.as_ref();
     let graph = snap.lookup_iri(INFERRED_GRAPH);
+    let fact = size_of::<[u64; 3]>();
+    let context = || " (writing the inferred graph)".to_string();
+    let mut held = Held::new(budget);
     let mut seen: FxHashSet<[u64; 3]> = FxHashSet::default();
     let mut insert: Vec<[u64; 3]> = Vec::new();
     for t in candidates {
+        if !seen.contains(t) {
+            room_for_key(&mut held, seen.capacity(), seen.len(), fact)
+                .map_err(|e| e.with_context(context()))?;
+        }
         if !seen.insert(*t) {
             continue;
         }
@@ -1165,6 +1353,10 @@ fn write_changes<'a>(
             _ => false,
         };
         if want && !have {
+            if insert.len() == insert.capacity() {
+                held.try_grow(insert.capacity().max(4) * fact)
+                    .map_err(|e| e.with_context(context()))?;
+            }
             insert.push(*t);
         } else if !want && have {
             let g = graph.expect("present");
@@ -1181,6 +1373,9 @@ fn write_changes<'a>(
             Some(g) => g,
             None => txn.intern(&Term::NamedNode(NamedNode::new_unchecked(INFERRED_GRAPH)))?,
         };
+        drop(seen);
+        held.try_grow(insert.len() * size_of::<[Id; 4]>())
+            .map_err(|e| e.with_context(context()))?;
         let mut quads = Vec::with_capacity(insert.len());
         for t in &insert {
             let ids = store_ids(txn, &c.terms, &mut w.stored, t)?;
@@ -1266,9 +1461,9 @@ pub fn dred_overdeletion(
     let limits = engine::Limits {
         max_iterations: usize::MAX,
         max_inferred: usize::MAX,
-        max_memory: None,
         cancel: None,
         progress: None,
+        budget: Budget::unlimited(),
     };
     let mut c = d.into_closure()?;
     Ok(incremental::dred_overdeletion(
@@ -1317,7 +1512,7 @@ pub fn infer(
         warnings: d.warnings,
         receipt: None,
         inputs: Some(resolved),
-        peak_bytes: d.peak_bytes as u64,
+        peak_bytes: d.budget.peak() as u64,
         base_scans: d.base_scans,
         threads: d.threads,
         ..Default::default()

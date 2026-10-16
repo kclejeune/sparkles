@@ -37,8 +37,9 @@ pub struct ReasonRequest {
     /// ([`set_reason_threads`](crate::reasoning::set_reason_threads)). `None` uses the
     /// whole pool.
     pub threads: Option<usize>,
-    /// The largest estimated heap of the derived facts and their candidates, in bytes,
-    /// before the run fails. `None` sets no limit.
+    /// The estimated heap a run may use, in bytes, before it fails: its derived facts,
+    /// local terms, candidates, caches, previous closure and write buffers (see
+    /// [`sparkles_reasoner::ReasonOptions::max_memory`]). `None` sets no limit.
     pub max_memory: Option<usize>,
 }
 

@@ -223,7 +223,8 @@ impl Base {
     }
 
     /// Visit the facts matching a pattern, in the order of the module documentation.
-    /// `f` returns false to stop; the result is false when it did.
+    /// `f` returns false to stop; the result is false when it did. The scans count in
+    /// [`scans`](Self::scans).
     pub fn for_each(
         &self,
         s: Option<u64>,
@@ -231,7 +232,10 @@ impl Base {
         o: Option<u64>,
         f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
-        self.for_each_with(&mut Memo::default(), s, p, o, f)
+        let mut memo = Memo::default();
+        let r = self.for_each_with(&mut memo, s, p, o, f);
+        self.add_scans(memo.scans);
+        r
     }
 
     /// [`for_each`](Self::for_each), reading blocks through `memo`.

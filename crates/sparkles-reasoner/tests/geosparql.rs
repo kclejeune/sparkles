@@ -295,3 +295,90 @@ fn select_all(s: &Store) -> Vec<String> {
         })
         .collect()
 }
+
+/// A copy of the default graph of `s` in a new store.
+fn copy(s: &Store) -> Store {
+    use sparkles_core::id::Id;
+    use sparkles_core::index::Perm;
+    let c = Store::in_memory(StoreOptions::default());
+    let snap = s.snapshot();
+    let mut txn = c.write();
+    let mut labels = Default::default();
+    for k in snap.scan_keys(Perm::Gspo, &[Id::DEFAULT_GRAPH.0]).unwrap() {
+        let q = snap.quad_to_terms(&Perm::Gspo.to_quad(&k)).unwrap();
+        let q = txn.encode_quad(&q, &mut labels).unwrap();
+        txn.insert(q).unwrap();
+    }
+    txn.commit().unwrap();
+    c
+}
+
+/// F16 review finding F9: an incremental run with default geometries reads only the
+/// features whose geometry facts changed, with probes bound to the feature, when it
+/// continues from a closure kept in memory. A closure read back from the dataset does
+/// not know its default geometries, and that run reads them with one scan per property.
+#[test]
+fn f16_default_geometry_changed_subjects() {
+    use sparkles_reasoner::{Cache, Incremental, Method, materialize_incremental};
+    let dir = tempfile::tempdir().unwrap();
+    let persistent = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    persistent
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // (update, scans with the closure in memory, scans with the closure read back)
+    let steps = [
+        ("INSERT DATA { ex:z ex:unrelated 1 }", 0, 2),
+        ("INSERT DATA { ex:p1 geo:hasGeometry ex:g1b }", 2, 4),
+        ("DELETE DATA { ex:p2 geo:hasGeometry ex:g2b }", 2, 4),
+        (
+            "INSERT DATA { ex:p4 geo:hasGeometry ex:g4 . ex:p3 geo:hasGeometry ex:g3c }",
+            4,
+            6,
+        ),
+        ("DELETE DATA { ex:p3 geo:hasDefaultGeometry ex:g3b }", 2, 4),
+        ("INSERT DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }", 2, 4),
+        ("INSERT DATA { ex:z ex:unrelated 2 }", 0, 2),
+    ];
+    for (s, cache) in [(store(), Some(Cache::new(1 << 20))), (persistent, None)] {
+        let extras = Extras::parse::<&str>(&[], true).unwrap();
+        let go = |since: Option<u64>| {
+            materialize_incremental(
+                &s,
+                &Profile::Rdfs,
+                &extras,
+                Incremental {
+                    since,
+                    cache: cache.as_ref(),
+                },
+                &ReasonOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e:#}"))
+        };
+        let mut since = go(None).receipt.unwrap().commit.seq;
+        for (u, in_memory, read_back) in steps {
+            sparkles_core::sparql::update::update(&s, &format!("{P}{u}"), &QueryOptions::default())
+                .unwrap();
+            let r = go(Some(since));
+            assert_eq!(r.method, Method::Incremental, "{u}: {:?}", r.fallback);
+            let want = if cache.is_some() {
+                in_memory
+            } else {
+                read_back
+            };
+            assert_eq!(r.base_scans, want, "{u}");
+            since = r.receipt.unwrap().commit.seq;
+            // a full run over a copy writes the same
+            let mut got = select_all(&s);
+            got.sort();
+            let c = copy(&s);
+            materialize_with(&c, &Profile::Rdfs, &extras, &ReasonOptions::default()).unwrap();
+            let mut full = select_all(&c);
+            full.sort();
+            assert_eq!(got, full, "{u}");
+        }
+    }
+}

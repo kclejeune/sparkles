@@ -6295,8 +6295,8 @@ type ReasoningRun = {
     derived: number;           // derived triples that now follow
     source: "memory" | "store"; // where the previous closure came from
   };
-  peakBytes?: number;          // the largest estimated heap of the derived triples and their candidates
-  baseScans?: number;          // index scans of the input graphs that rule evaluation issued
+  peakBytes?: number;          // the largest estimated heap the run used at any time
+  baseScans?: number;          // index scans of the input graphs the run issued
   threads?: number;            // threads the rules were evaluated on
 };
 ```
