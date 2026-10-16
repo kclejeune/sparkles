@@ -2266,7 +2266,9 @@ the copy as `sparkles check` does and swaps it in with two renames. The copy nee
 free space as the database. It keeps the mode and the owner of every file and directory,
 and a file that a step rewrites keeps those of the file it replaces. The command must
 therefore run as the user that owns the database or as root, and it refuses to start
-otherwise. The dataset id, the commit numbers, the commit catalog, the branches and the
+otherwise. It also refuses a database directory that its owner cannot write, and a
+database named through a symlink, which the swap would replace with a directory. Run it
+on the directory the link points to. The dataset id, the commit numbers, the commit catalog, the branches and the
 snapshots stay as they were. `--keep-old` keeps the database as it was in
 `.pre-migrate-<version>-<name>`, and without it that directory is removed. The command
 refuses to start while that directory exists, so it never deletes an earlier kept copy.

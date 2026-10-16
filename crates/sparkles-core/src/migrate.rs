@@ -443,7 +443,7 @@ fn recover_locked(root: &Path) -> Result<Option<std::fs::File>> {
             }
         }
         // A valid or unchecked copy next to the unchanged root was never swapped in.
-        std::fs::remove_dir_all(&work)?;
+        remove_work(&work)?;
         return Ok(None);
     }
     let Some(mark) = mark else {
@@ -517,7 +517,7 @@ fn read_mark(dir: &Path, root: &Path) -> Result<Option<CheckedMark>> {
 fn finish_swap(root: &Path, mark: &CheckedMark) -> Result<()> {
     let old = mark.old_path(root)?;
     if mark.mode == CleanupMode::RemoveOld && old.exists() {
-        std::fs::remove_dir_all(&old)?;
+        remove_work(&old)?;
         sync_parent(root)?;
     }
     std::fs::remove_file(root.join(CHECKED_MARK))?;
@@ -675,23 +675,70 @@ fn not_owner(root: &Path, owner: u32) -> Error {
     ))
 }
 
-/// Refuse to start when this process cannot give the copy the database's owner.
-#[cfg(unix)]
+/// Refuse to start a copy that could not be completed or cleaned up: a root named through
+/// a symlink, which the swap would replace with a directory next to the link, a root
+/// without its owner's write bit, which the copy takes and which then refuses the mark,
+/// and a process that cannot give the copy the database's owner.
 fn preflight_owner(root: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Err(Error::Invalid(format!(
+            "{}: is a symlink; `sparkles migrate` replaces the database directory, so run it on the directory the link points to",
+            root.display()
+        )));
+    }
+    preflight_unix(root)
+}
+
+#[cfg(unix)]
+fn preflight_unix(root: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let owner = std::fs::metadata(root)?.uid();
+    let meta = std::fs::metadata(root)?;
+    if meta.mode() & 0o200 == 0 {
+        return Err(Error::Invalid(format!(
+            "{}: its owner has no write permission on it; give the owner write permission (`chmod u+w`) and run again",
+            root.display()
+        )));
+    }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
-    if may_migrate(euid, owner) {
+    if may_migrate(euid, meta.uid()) {
         Ok(())
     } else {
-        Err(not_owner(root, owner))
+        Err(not_owner(root, meta.uid()))
     }
 }
 
 #[cfg(not(unix))]
-fn preflight_owner(_root: &Path) -> Result<()> {
+fn preflight_unix(_root: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Remove a migration copy, or the database a migration replaced. Either may hold
+/// read-only directories, so its directories first get their owner's permissions back.
+fn remove_work(work: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fn writable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::symlink_metadata(dir)
+            && m.is_dir()
+        {
+            let mode = m.permissions().mode();
+            if mode & 0o700 != 0o700 {
+                let _ =
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        writable(&e.path());
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    writable(work);
+    std::fs::remove_dir_all(work)
 }
 
 /// Give every entry of the copy `to` the mode and owner of the same entry of `from`,
@@ -723,7 +770,8 @@ fn copy_tree_meta(_: &Path, _: &Path, _: &std::fs::Metadata, _: &Path) -> Result
 #[cfg(unix)]
 fn copy_meta(from: &Path, to: &Path, owner: &std::fs::Metadata, root: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let src = match std::fs::symlink_metadata(from) {
+    // the copy holds no symlink, and a symlinked root is refused before the copy
+    let src = match std::fs::metadata(from) {
         Ok(m) => Some(m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
@@ -833,29 +881,29 @@ fn migrate_planned_with(
     let work = work_dir(root);
     std::fs::create_dir(&work)?;
     copy_contents(root, &work).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(&work);
+        let _ = remove_work(&work);
     })?;
     hook("copied")?;
     for p in &plan.steps {
         let s = step(p.kind, p.from).expect("planned from STEPS");
         (s.run)(&work, Path::new(&p.file)).inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&work);
+            let _ = remove_work(&work);
         })?;
     }
     // the copy, and the files the steps rewrote, take the modes and owners of the originals
     let owner = std::fs::metadata(root)?;
     copy_tree_meta(root, &work, &owner, root).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(&work);
+        let _ = remove_work(&work);
     })?;
     // Until the mark is durable the copy is only a candidate, so any error removes it and
     // leaves the database as it was. After that, recovery owns the copy.
     let report = hook("before-check")
         .and_then(|()| crate::check::check(&work, &crate::check::CheckOptions { quick: false }))
         .inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&work);
+            let _ = remove_work(&work);
         })?;
     if report.status == crate::check::Status::Error {
-        let _ = std::fs::remove_dir_all(&work);
+        let _ = remove_work(&work);
         return Err(Error::Corrupt(format!(
             "{}: the upgraded copy failed `sparkles check` with {} error(s); the database is unchanged",
             root.display(),
@@ -863,7 +911,7 @@ fn migrate_planned_with(
         )));
     }
     write_mark(&work, &mark).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(&work);
+        let _ = remove_work(&work);
     })?;
     hook("checked")?;
     // The database's lock is released before its directory is renamed, since a directory
@@ -1369,6 +1417,88 @@ mod tests {
 mod mode_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_owner_of_a_database_may_migrate_it() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(tmp.path()).unwrap().uid();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        assert!(may_migrate(euid, owner));
+        preflight_owner(tmp.path()).unwrap();
+        if euid != 0 {
+            assert!(!may_migrate(euid, euid + 1));
+        }
+        assert!(may_migrate(0, 5) && may_migrate(5, 5) && !may_migrate(6, 5));
+    }
+
+    /// A database named through a symlink is refused before anything is copied: the swap
+    /// would replace the link with a directory on the link's file system.
+    #[test]
+    fn a_symlinked_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        tests::legacy_database(&real);
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = tmp.path().join("db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = migrate(&link, false).unwrap_err().to_string();
+        assert!(e.contains("symlink"), "{e}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!work_dir(&absolute(&link).unwrap()).exists());
+        // through its real path it migrates and keeps its mode
+        migrate(&real, false).unwrap();
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    /// A root without the owner's write bit is refused before anything is copied, since
+    /// the copy would take that mode and could not take its mark or be removed.
+    #[test]
+    fn a_read_only_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        tests::legacy_database(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = migrate(&root, false);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("write"), "{e}");
+        assert!(!work_dir(&absolute(&root).unwrap()).exists());
+    }
+
+    /// A failure after the copy took a read-only generation directory's mode still
+    /// removes the copy, so the database is not left pending.
+    #[test]
+    fn a_failed_run_removes_a_copy_with_read_only_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        let g = tests::legacy_database(&root);
+        std::fs::set_permissions(root.join(&g), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = migrate_with(&root, false, &mut |at| {
+            if at == "before-check" {
+                Err(Error::Invalid("stop".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(r.is_err());
+        let work = work_dir(&absolute(&root).unwrap());
+        let left = work.exists();
+        if left {
+            // let the temporary directory be removed
+            let _ = std::fs::set_permissions(work.join(&g), std::fs::Permissions::from_mode(0o755));
+        }
+        std::fs::set_permissions(root.join(&g), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!left, "the copy was left behind");
+        crate::store::Store::open(&root, crate::store::StoreOptions::default()).unwrap();
+    }
 
     #[test]
     fn migrate_keeps_directory_modes() {
