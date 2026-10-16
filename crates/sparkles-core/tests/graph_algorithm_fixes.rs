@@ -293,3 +293,16 @@ fn betweenness_samples_at_or_above_n_obey_the_exact_limit() {
     // within the limit, samples at or above n stays exact and allowed
     assert_eq!(run(1000).unwrap().len(), 4);
 }
+
+/// Weights that are all zero with no self influence would give all-zero vectors.
+#[test]
+fn fastrp_all_zero_weights_are_refused() {
+    let s = trig("ex:a ex:p ex:b .");
+    let q = format!(
+        "{PREFIXES}SELECT ?n ?e WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; algo:dimension 8 ; algo:iterationWeights (0.0 0.0) ; algo:node ?n ; algo:embedding ?e }} }}"
+    );
+    let Err(e) = query(s.snapshot(), &q, &QueryOptions::default()) else {
+        panic!("all-zero iterationWeights were accepted");
+    };
+    assert!(e.to_string().contains("iterationWeights"), "{e}");
+}

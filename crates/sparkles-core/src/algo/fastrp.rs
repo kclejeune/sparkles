@@ -56,10 +56,10 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
     if d == 0 {
         return Err(bad("fastRP", "dimension must be above 0"));
     }
-    if p.iteration_weights.is_empty() && p.node_self_influence == 0.0 {
+    if p.node_self_influence == 0.0 && p.iteration_weights.iter().all(|w| *w == 0.0) {
         return Err(bad(
             "fastRP",
-            "iterationWeights must not be empty unless nodeSelfInfluence is not zero",
+            "iterationWeights must have a non-zero weight unless nodeSelfInfluence is not zero",
         ));
     }
     if d > crate::vector::MAX_DIM {
@@ -291,6 +291,25 @@ mod tests {
         };
         let e = run(&path3(), &p, &Par::single(), &Control::unlimited()).unwrap_err();
         assert!(e.to_string().contains("iterationWeights"), "{e}");
+    }
+
+    #[test]
+    fn all_zero_weights_need_a_node_self_influence() {
+        for weights in [vec![0.0], vec![0.0, 0.0, 0.0]] {
+            let p = Params {
+                iteration_weights: weights,
+                ..Params::default()
+            };
+            let e = run(&path3(), &p, &Par::single(), &Control::unlimited()).unwrap_err();
+            assert!(e.to_string().contains("iterationWeights"), "{e}");
+        }
+        // a self influence alone is a valid embedding
+        let p = Params {
+            iteration_weights: vec![0.0],
+            node_self_influence: 1.0,
+            ..Params::default()
+        };
+        assert!(run(&path3(), &p, &Par::single(), &Control::unlimited()).is_ok());
     }
 
     #[test]

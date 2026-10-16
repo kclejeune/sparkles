@@ -314,7 +314,7 @@ definition.
 | `algo:kCore` | undirected | `core` | Batagelj and Zaversnik's bucket algorithm, linear in edges. |
 | `algo:bfs` | forward | `depth` | From `algo:source`. Levels expanded in parallel. Unreached nodes are left out, or bound with depth `"inf"` under `graphalytics`. |
 | `algo:sssp` | forward | `distance` | From one `algo:source`, Dijkstra's algorithm with weights, BFS without. |
-| `algo:fastRP` | undirected | `embedding` | `dimension` 128, at most 16384 as in a vector index, `iterationWeights` (0.0, 1.0, 1.0), `nodeSelfInfluence` 0, `normalizationStrength` 0, `seed`. Very sparse random projection, then powers of the normalized adjacency, as Chen et al. define. The two weights mean what they do in Neo4j GDS. The list holds one weight for each propagation, so the default propagates three times and weights the second and third rounds. `nodeSelfInfluence` weights the random vectors as a 0th round. An empty list needs a non-zero `nodeSelfInfluence`. |
+| `algo:fastRP` | undirected | `embedding` | `dimension` 128, at most 16384 as in a vector index, `iterationWeights` (0.0, 1.0, 1.0), `nodeSelfInfluence` 0, `normalizationStrength` 0, `seed`. Very sparse random projection, then powers of the normalized adjacency, as Chen et al. define. The two weights mean what they do in Neo4j GDS. The list holds one weight for each propagation, so the default propagates three times and weights the second and third rounds. `nodeSelfInfluence` weights the random vectors as a 0th round. An empty list or one with only zero weights needs a non-zero `nodeSelfInfluence`. The default once propagated twice and now propagates three times. |
 | `algo:node2vec` | forward | `embedding` | `dimension` 128, at most 16384, `walkLength` 80, `walksPerNode` 10, `windowSize` 10, `returnFactor` (p) 1, `inOutFactor` (q) 1, `negativeSamples` 5, `epochs` 1, `learningRate` 0.025, `seed`. Biased second-order walks, then skip-gram with negative sampling. |
 
 **Determinism.** Every algorithm is deterministic for a commit, a projection, its
@@ -854,3 +854,12 @@ The current guard does not establish exact path equality or prevent path-count
 overflow. Supporting refused mixed-scale inputs and defining stronger numerical
 guarantees needs a separately reviewed distance and path-count design.
 [Roadmap item 80](../ROADMAP.md) tracks this work separately from zero-weight semantics.
+
+### Validation of the free strings of a request
+
+`algorun::build` writes the name of a named projection and the `metric` parameter into
+the query text as JSON strings. JSON escaping makes them safe, and no request can end
+the string early. The text form would become an injection point if its escaping ever
+changed, and no test would notice. The follow-up refuses a projection name that is not
+a valid catalog name and a `metric` outside the known list while the request is built,
+with one test for each. [Roadmap item 8](../ROADMAP.md) tracks it.
