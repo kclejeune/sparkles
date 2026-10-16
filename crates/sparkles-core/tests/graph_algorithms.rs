@@ -1626,24 +1626,6 @@ fn a10_node_similarity() {
 }
 
 #[test]
-fn a13_betweenness_over_the_node_limit() {
-    let s = store_of(A);
-    sparkles_core::algo::pool::set_exact_betweenness_max(3);
-    let e = error(
-        &s,
-        "SELECT * WHERE { SERVICE algo:betweenness { [] algo:predicate ex:p ; algo:node ?n ; algo:score ?r } }",
-    );
-    assert!(e.contains("algo:samples"), "{e}");
-    // sampling is allowed
-    let r = rows(
-        &s,
-        "SELECT * WHERE { SERVICE algo:betweenness { [] algo:predicate ex:p ; algo:samples 2 ; algo:node ?n ; algo:score ?r } }",
-    );
-    assert!(!r.is_empty());
-    sparkles_core::algo::pool::set_exact_betweenness_max(100_000);
-}
-
-#[test]
 fn a14_max_memory_fails_before_building() {
     let s = store_of(A);
     let e = error(

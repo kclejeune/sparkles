@@ -89,3 +89,29 @@ fn integer_parameters_keep_their_exact_value() {
         );
     }
 }
+
+/// The test changes a process-wide limit, so it is the only betweenness test of this
+/// file. In `graph_algorithms.rs` it raced the betweenness tests that run without
+/// sampling.
+#[test]
+fn a13_betweenness_over_the_node_limit() {
+    let s = trig(
+        "ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:a . ex:c ex:p ex:d .
+         ex:d ex:p ex:e . ex:e ex:p ex:d . ex:f ex:p ex:g . ex:h a ex:N .",
+    );
+    sparkles_core::algo::pool::set_exact_betweenness_max(3);
+    let run = |extra: &str| {
+        query(
+            s.snapshot(),
+            &format!(
+                "{PREFIXES}SELECT * WHERE {{ SERVICE algo:betweenness {{ [] algo:predicate ex:p ;{extra} algo:node ?n ; algo:score ?r }} }}"
+            ),
+            &QueryOptions::default(),
+        )
+    };
+    let e = run("").err().expect("an error over the limit").to_string();
+    assert!(e.contains("algo:samples"), "{e}");
+    // sampling is allowed
+    assert!(!run(" algo:samples 2 ;").unwrap().rows().is_empty());
+    sparkles_core::algo::pool::set_exact_betweenness_max(100_000);
+}
