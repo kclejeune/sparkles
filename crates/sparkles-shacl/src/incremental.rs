@@ -243,6 +243,11 @@ impl Analyzer<'_> {
             }
         }
         let path_for_values = value_prefix;
+        // where an expression finds the variable `value`: the value nodes, when each is
+        // reached over the path
+        let value_pre: Pre = anchored_values.then(|| path_for_values.clone());
+        // only `sh:class` and `sh:closed` read the graph at the value nodes, and both
+        // check `anchored_values` first
         let at_values = |pred: Option<NamedNode>| Dep {
             prefix: path_for_values.clone(),
             pred,
@@ -288,12 +293,7 @@ impl Analyzer<'_> {
                     out.push(at_values(None));
                 }
                 Constraint::Expression(e) => {
-                    self.expr_deps(
-                        *e,
-                        &Some(Vec::new()),
-                        &Some(path_for_values.clone()),
-                        &mut out,
-                    )?;
+                    self.expr_deps(*e, &Some(Vec::new()), &value_pre, &mut out)?;
                 }
                 // the shapes an expression computes are known only for a constant
                 Constraint::NodeByExpression(e) => match &self.shapes.exprs[*e] {
@@ -323,8 +323,12 @@ impl Analyzer<'_> {
                 Constraint::Component(c) => {
                     let mut anchors = vec![("this", Vec::new())];
                     if c.ask {
-                        // `$value` is each value node
-                        anchors.push(("value", path.clone()));
+                        // `$value` is each value node, which a computed one is not
+                        // reached over the path
+                        if !anchored_values {
+                            return Err(Fallback::Sparql);
+                        }
+                        anchors.push(("value", path_for_values.clone()));
                     }
                     let reads =
                         crate::localize::reads(&c.parsed, &anchors).ok_or(Fallback::Sparql)?;
@@ -356,6 +360,10 @@ impl Analyzer<'_> {
             }
         }
         if lists {
+            // the lists hang off each value node
+            if !anchored_values {
+                return Err(Fallback::Sparql);
+            }
             for p in [rdf::FIRST, rdf::REST] {
                 out.push(Dep {
                     prefix: along_lists(),

@@ -557,7 +557,12 @@ namespace. The code is `nodeexpr.rs`, the expression tree and its parser, and
   evaluating, and deep evaluation grows its stack.
 * *Write-time validation.* The incremental guard works out the predicates an expression
   reads from the focus node, as it does for anchored SHACL-SPARQL queries. An expression
-  that reads the graph away from the focus node falls back to full validation. The
+  that reads the graph away from the focus node falls back to full validation. Value
+  nodes that `sh:values` or `sh:defaultValue` compute are not reached over the property's
+  path, so a constraint that reads the graph at them, such as an expression that reads
+  the variable `value`, a SHACL-SPARQL component or a list constraint, falls back as well.
+  Constraints that look only at the value itself, such as `sh:datatype`, stay
+  incremental. The
   differential test of the guard now includes shapes with expressions.
 * *SHACLC.* Unchanged, as designed. Shapes with expressions are Turtle.
 * *Tests.* The Working Group's node expression library is vendored under

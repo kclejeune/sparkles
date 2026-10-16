@@ -165,7 +165,7 @@ impl ShapeGen<'_> {
     /// value node, and sometimes a lookup of instances that no path anchors.
     fn bool_expr(&mut self, from: usize) -> String {
         let path = self.path(1);
-        match self.r.below(7) {
+        match self.r.below(8) {
             0 => format!(
                 "[ <http://www.w3.org/ns/sparql#greater-than> ( [ shnex:count [ shnex:pathValues {path} ] ] {} ) ]",
                 self.r.below(3)
@@ -184,6 +184,11 @@ impl ShapeGen<'_> {
                 "[ <http://www.w3.org/ns/sparql#less-than> ( [ shnex:count [ shnex:flatMap [ shnex:pathValues {} ] ; shnex:nodes [ shnex:pathValues {path} ] ] ] {} ) ]",
                 pred(self.r.below(PREDS)),
                 1 + self.r.below(3)
+            ),
+            // reads the graph at the value node
+            6 => format!(
+                "[ shnex:exists [ shnex:pathValues {} ; shnex:focusNode [ shnex:var \"value\" ] ] ]",
+                pred(self.r.below(PREDS))
             ),
             // not anchored: finds nodes by their class
             _ => format!(
@@ -921,4 +926,57 @@ fn node_expressions_equal_full_validation() {
     );
     assert!(t.rejected > 0, "{t:?}");
     run_with(GuardMode::Reject, BaselinePolicy::Strict, 700, true, true);
+}
+
+/// A value node that `sh:values` computes (a constant here) is not reached over the
+/// property's path, so an expression that reads the graph at `value` cannot be localized
+/// under that path.
+#[test]
+fn computed_value_nodes_read_at_value_fall_back() {
+    let shapes = format!(
+        "@prefix sh: <{SH}> . @prefix ex: <{EX}> .
+         @prefix shnex: <http://www.w3.org/ns/shacl-node-expr#> .
+         ex:S a sh:NodeShape ; sh:targetNode ex:x ;
+           sh:property [ sh:path ex:p ; sh:values ex:c ;
+             sh:expression [ shnex:exists [ shnex:pathValues ex:q ;
+                                            shnex:focusNode [ shnex:var \"value\" ] ] ] ] ."
+    );
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[Source::from_bytes(
+            format!(
+                "<{EX}x> <{EX}p> <{EX}y> .\n<{EX}y> <{EX}q> \"1\" .\n<{EX}c> <{EX}q> \"1\" .\n"
+            )
+            .into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    match guard::set_config(
+        &store,
+        Some(config(GuardMode::Reject, BaselinePolicy::Strict, &shapes)),
+    ) {
+        Ok(SetOutcome::Installed(..)) => {}
+        Ok(_) => panic!("the data should conform"),
+        Err(e) => panic!("{e:#}"),
+    }
+    // ex:c, a computed value node, loses its ex:q: full validation reports ex:x
+    let res = update(
+        &store,
+        &format!("DELETE DATA {{ <{EX}c> <{EX}q> \"1\" }}"),
+        &QueryOptions::default(),
+    );
+    match res {
+        Err(Error::Rejected(_)) => {}
+        Err(e) => panic!("{e}"),
+        Ok(st) => panic!(
+            "accepted: {:?}",
+            st.commit.and_then(|c| c.validation).map(|v| (
+                v.status,
+                v.strategy,
+                v.fallback.clone(),
+                v.blocking
+            ))
+        ),
+    }
 }
