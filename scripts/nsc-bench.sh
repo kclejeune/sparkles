@@ -239,7 +239,16 @@ note "phase create: $(secs "$T_CREATE" "$T_UP") s"
 
 rsh() { nsc ssh -T "$ID" -- "$@"; }
 for f in bin-A.zst bin-B.zst data.nt.zst queries.tar nsc-bench-remote.sh run.env; do
-  nsc instance upload "$ID" "$STAGE/$f" "$REMOTE/$f" --mkdir > "$OUT/logs/upload.log" 2>&1 || die "upload of $f failed"
+  ok=0
+  for _try in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if nsc instance upload "$ID" "$STAGE/$f" "$REMOTE/$f" --mkdir > "$OUT/logs/upload.log" 2>&1; then
+      ok=1
+      break
+    fi
+    echo "upload of $f failed (try $_try), retrying" >&2
+    sleep 2
+  done
+  [ "$ok" = 1 ] || die "upload of $f failed"
 done
 T_SENT=$(now)
 note "phase upload: $(secs "$T_UP" "$T_SENT") s for $(du -ch "$STAGE"/{bin-A.zst,bin-B.zst,data.nt.zst,queries.tar} | tail -1 | cut -f1)"
@@ -253,7 +262,7 @@ while :; do
   sleep "$POLL"
   if ! r=$(rsh "tail -n +$((seen + 1)) $REMOTE/results/progress.log 2> /dev/null; if [ -f $REMOTE/results/done ]; then echo __DONE__ \$(cat $REMOTE/results/done); fi" 2> /dev/null); then
     fails=$((fails + 1))
-    [ "$fails" -lt 6 ] || die "lost contact with $ID"
+    [ "$fails" -lt 60 ] || die "lost contact with $ID"
     continue
   fi
   fails=0
@@ -272,8 +281,31 @@ done
 T_RAN=$(now)
 note "phase remote run: $(secs "$T_SENT" "$T_RAN") s"
 
-rsh "cd $REMOTE && tar -czf results.tgz results" || die "could not pack the results"
-nsc instance download "$ID" "$REMOTE/results.tgz" "$OUT/results.tgz" > "$OUT/logs/download.log" 2>&1 || die "download failed"
+ok=0
+for _try in $(seq 40); do
+  if rsh "cd $REMOTE && tar -czf results.tgz results" 2> "$OUT/logs/pack.log"; then
+    ok=1
+    break
+  fi
+  echo "pack failed (try $_try), retrying" >&2
+  sleep 5
+done
+[ "$ok" = 1 ] || die "could not pack the results"
+ok=0
+for _try in $(seq 40); do
+  if nsc instance download "$ID" "$REMOTE/results.tgz" "$OUT/results.tgz" > "$OUT/logs/download.log" 2>&1; then
+    ok=1
+    break
+  fi
+  if rsh "cat $REMOTE/results.tgz" > "$OUT/results.tgz.ssh" 2>> "$OUT/logs/download.log" && [ -s "$OUT/results.tgz.ssh" ] && tar -tzf "$OUT/results.tgz.ssh" > /dev/null 2>&1; then
+    mv "$OUT/results.tgz.ssh" "$OUT/results.tgz"
+    ok=1
+    break
+  fi
+  echo "download failed (try $_try), retrying" >&2
+  sleep 5
+done
+[ "$ok" = 1 ] || die "download failed"
 tar -xzf "$OUT/results.tgz" -C "$OUT"
 note "phase download: $(secs "$T_RAN" "$(now)") s"
 destroy
