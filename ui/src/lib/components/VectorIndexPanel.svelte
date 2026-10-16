@@ -483,7 +483,7 @@
                   {#if ix.overlay.indexed}
                     <span class="faint"
                       >· {fmtInt(ix.overlay.indexed)} added to the graph{ix.overlay.pending
-                        ? `, ${fmtInt(ix.overlay.pending)} pending`
+                        ? `, ${fmtInt(ix.overlay.pending)} pending${ix.overlay.overBudget ? ' at the memory budget' : ''}`
                         : ''}</span
                     >
                   {:else}

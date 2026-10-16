@@ -104,10 +104,13 @@ pub struct Built {
 }
 
 impl Built {
+    /// Heap and mapped bytes: the segment, the graph and the live layer of nodes
+    /// inserted since the build. Takes the live layer's read lock.
     pub fn bytes(&self) -> u64 {
         self.segment.bytes()
             + self.graph.as_ref().map_or(0, |g| g.bytes())
             + self.node_rows.len() as u64 * 4
+            + self.live.read().bytes()
     }
 
     pub fn mapped(&self) -> bool {

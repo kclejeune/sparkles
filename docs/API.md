@@ -4793,7 +4793,12 @@ exactly.
   copy the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
   would pass the budget leaves the index `over-budget`, and searches then scan exactly
   within the same budget. Vectors inserted into the graph since the base stay in memory
-  with their links until the next compaction. On x86-64 CPUs with F16C, a build reads a
+  with their links until the next compaction, and they count against the budget too.
+  When inserting the next batch would pass it, the background thread stops and leaves
+  the rest pending, so searches score them exactly and the status reports
+  `overBudget`. The next compaction releases the inserted vectors and the thread
+  resumes. Lowering the budget at run time stops further inserts but does not remove
+  vectors already inserted. On x86-64 CPUs with F16C, a build reads a
   binary16 copy of the vectors, 2 bytes per dimension, which it holds while it runs and
   makes only when it fits in the budget.
 
@@ -4807,10 +4812,11 @@ exactly.
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
 
 A `VectorIndexStatus` is
-`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes, indexed, pending }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
+`{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes, indexed, pending, overBudget }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
 `state` is `ready`, `building`, `failed` or `over-budget`. `rows` counts the packed base
 rows, and `overlay` the changes since the base. Of its inserts, `indexed` are in the
-graph and `pending` are still scored exactly. `lastBuild` is `{ at, ms, rows, carried? }`,
+graph and `pending` are still scored exactly. `overBudget` means the pending rows wait
+because the graph's inserted vectors reached `--vector-memory-mb`. `lastBuild` is `{ at, ms, rows, carried? }`,
 where `carried` means the graph was carried over from the previous generation.
 `residency` is `heap` or `mmap`. `hnsw` is `null` or `{ m, efConstruction, efSearch, nodes, layers }`, and
 `files` is `{ bytes, opened }`, where `opened` means the build was read from its file.

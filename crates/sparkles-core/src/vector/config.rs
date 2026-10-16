@@ -317,6 +317,11 @@ pub struct VectorOverlay {
     /// score exactly meanwhile
     #[serde(default)]
     pub pending: u64,
+    /// the background task stopped adding rows to the graph because the graph's inserted
+    /// nodes would pass the vector memory budget, so the pending rows stay pending until
+    /// the next compaction
+    #[serde(default)]
+    pub over_budget: bool,
 }
 
 /// Literals of the predicate that are not indexed, by reason (rows).

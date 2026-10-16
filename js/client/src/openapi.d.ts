@@ -8089,6 +8089,7 @@ export interface components {
                 deletes: number;
                 indexed: number;
                 inserts: number;
+                overBudget: boolean;
                 pending: number;
             };
             predicate: string;

@@ -16814,6 +16814,9 @@
               "inserts": {
                 "type": "integer"
               },
+              "overBudget": {
+                "type": "boolean"
+              },
               "pending": {
                 "type": "integer"
               }
@@ -16822,7 +16825,8 @@
               "inserts",
               "deletes",
               "indexed",
-              "pending"
+              "pending",
+              "overBudget"
             ],
             "type": "object"
           },

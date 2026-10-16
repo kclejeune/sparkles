@@ -386,18 +386,18 @@ impl Store {
     }
 
     /// Wait until the graphs of every ready index hold the rows of the current snapshot
-    /// that they can hold (the overlay's `pending` count is 0), or `timeout` passes.
-    /// Returns whether they do.
+    /// that they can hold (the overlay's `pending` count is 0) or stopped at the vector
+    /// memory budget, or `timeout` passes. Returns whether they do.
     pub fn wait_vector_catch_up(&self, timeout: std::time::Duration) -> bool {
         let end = std::time::Instant::now() + timeout;
         loop {
             let snap = self.snapshot();
             let names: Vec<String> = self.vector.indexes.read().keys().cloned().collect();
             let done = names.iter().all(|n| {
-                snap.generation
-                    .vectors
-                    .built(n)
-                    .is_none_or(|b| crate::vector::live::overlay_split(&snap, &b).1 == 0)
+                snap.generation.vectors.built(n).is_none_or(|b| {
+                    crate::vector::live::overlay_split(&snap, &b).1 == 0
+                        || b.live.read().over_budget()
+                })
             });
             if done {
                 return true;
@@ -449,6 +449,8 @@ impl Store {
                 deletes,
                 indexed,
                 pending,
+                over_budget: pending > 0
+                    && built.as_ref().is_some_and(|b| b.live.read().over_budget()),
             },
             skipped: built.as_ref().map(|b| b.skipped).unwrap_or_default(),
             memory: VectorMemory {

@@ -84,6 +84,8 @@ pub struct LiveState {
     /// the last snapshot whose rows were all looked at: a search of a snapshot with the
     /// same delta has no row to score exactly
     caught: Option<Caught>,
+    /// the last pass stopped because inserting more would pass the vector memory budget
+    over_budget: bool,
 }
 
 /// The snapshot a layer last caught up with.
@@ -243,6 +245,12 @@ impl LiveState {
                 && c.rows == rows
                 && c.ins.same(&snap.delta.ins[Perm::Pso.index()])
         })
+    }
+
+    /// Whether catch-up stopped because inserting more rows would pass the vector memory
+    /// budget. The rows it left stay pending until the next compaction frees the layer.
+    pub fn over_budget(&self) -> bool {
+        self.over_budget
     }
 
     /// The first live node's number (the frozen graph's node count).
@@ -482,7 +490,8 @@ pub(crate) fn pred_in(b: &Built, snap: &Snapshot) -> Option<u64> {
 }
 
 /// Insert the rows of `snap`'s delta that `b`'s graph lacks, in batches, until none is
-/// left or `cancel` says stop. Returns the nodes added.
+/// left, `cancel` says stop, or the next batch would pass the vector memory budget, which
+/// the layer counts against. Returns the nodes added.
 pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) -> usize {
     let (Some(_), Some(pred), Some(p)) = (b.graph.as_ref(), pred_in(b, snap), params_of(b)) else {
         return 0;
@@ -513,6 +522,7 @@ pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) ->
         if keys.is_empty() {
             let rows = snap.delta.ins[pi].count_between(&lo, &hi) as u64;
             let mut st = b.live.state.write();
+            st.over_budget = false;
             if st.caught.as_ref().is_none_or(|c| c.commit <= snap.commit) {
                 st.caught = Some(Caught {
                     commit: snap.commit,
@@ -520,6 +530,13 @@ pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) ->
                     ins: snap.delta.ins[pi].clone(),
                 });
             }
+            return total;
+        }
+        // an upper bound of the batch's bytes: vector, norm, key, level, map entry and a
+        // full list of links per layer-0 slot
+        let per_row = b.segment.dim as u64 * 4 + 4 + 16 + 1 + 24 + (2 * p.m as u64 + 1) * 4;
+        if gv.used_bytes() + keys.len() as u64 * per_row > super::budget() {
+            b.live.state.write().over_budget = true;
             return total;
         }
         let items = keys
