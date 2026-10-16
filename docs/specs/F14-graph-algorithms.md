@@ -856,9 +856,11 @@ graph or the ten-million-triple benchmark graph that §9 names.
 The polling and charging of roadmap item 8 were measured on forge on a random graph of
 1,000,000 nodes and 5,000,000 edges under a far deadline, in four ABBA pairs. PageRank
 became four times faster, 2146 to 533 ms on one thread, because it no longer reads the
-clock before every node. The other algorithms changed by -1% to +5%, and k-core by +9%
-on one thread and +0.2% on four. A later change that appends rows without a check per
-value was not timed on forge. The table is in
+clock before every node. The other algorithms changed by -1.3% to +4.8%, and k-core by
++9.3% on one thread and +0.2% on four. Sequential code differs by as much between the
+one-thread and four-thread columns, so the measurement does not show a cost for them. A
+later change that appends rows without a check per value was not timed on forge. The
+table is in
 [BENCHMARKS](../BENCHMARKS.md#graph-algorithm-polling).
 
 **Deviations.**

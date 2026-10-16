@@ -594,8 +594,8 @@ that costs. Both builds ran the ignored `polling_cost` test of
 `tests/graph_algorithms_scale.rs` on forge, an Intel i5-13500 with nothing else running,
 pinned to four cores. The graph is random with 1,000,000 nodes and 5,000,000 edges, and
 each call ran under a far deadline, so every check reads the clock. The builds ran in
-four ABBA pairs at one and four threads, and the table gives the median of the four
-runs of each build.
+four ABBA pairs at one and four threads. Each run is the fastest of `ALGO_ROUNDS` rounds,
+and the table gives the median of the four runs of each build.
 
 | algorithm | 1 thread before | 1 thread after | change | 4 threads before | 4 threads after | change |
 |---|---:|---:|---:|---:|---:|---:|
@@ -611,11 +611,15 @@ runs of each build.
 
 Times are in milliseconds. PageRank is four times faster because it read the clock
 before every node, and now counts its rows and checks once per 64K units. The other
-algorithms pay up to 5% for the counting and the charged workspaces, and k-core up to
-9% on one thread. A later change appends rows without a check per value in the
-undirected view that k-core and triangle counting build, in breadth-first search and in
-label propagation. It has not been timed on forge, because forge was taken by other
-measurements when it landed.
+algorithms changed by between -1.3% and +4.8%, except k-core, which changed by +9.3% on
+one thread and +0.2% on four. Strongly connected components and k-core take no thread
+pool, yet the build before the change needs 312.6 ms for components in the one-thread
+column and 239.1 ms in the four-thread column. The run-to-run noise of this measurement
+is therefore as large as every change in the table except PageRank's, and the table does
+not show whether the other algorithms got slower. A later change appends rows without a
+check per value in the undirected view that k-core and triangle counting build, in
+breadth-first search and in label propagation. It has not been timed, because forge was
+taken by other measurements when it landed.
 
 ### Spatial queries
 

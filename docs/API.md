@@ -5558,8 +5558,10 @@ Read-only requests, including `summary=true`, require `read` through the `query`
 endpoint. Requests with `write` require `write` through the `update` endpoint. A caller
 that has neither grant is refused before the body is read. The server then parses the
 bounded body once and checks the grant that the body selects before looking up the
-dataset or disclosing a restore task. Input projections and output writes retain the
-selected endpoint's graph and triple restrictions. Both forms use the admin-body
+dataset or disclosing a restore task. A dataset that does not exist, or that the caller
+may not see, answers `404` before the contents of the body are checked, so a malformed
+body sent to a missing dataset gets `404` where earlier builds answered `400`. Input
+projections and output writes retain the selected endpoint's graph and triple restrictions. Both forms use the admin-body
 ceiling, including after request decompression. Projection-management permissions
 are unchanged.
 
