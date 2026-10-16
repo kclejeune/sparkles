@@ -414,7 +414,9 @@ client parity table list all three.
   A9 and the bucketed track against the mock server, and A7 and A9 against a real
   server.
 - **Phase 3.** Rust tests cover `/sparql/diff` against two runs compared in the test and
-  its charge of two against the `query` rate-limit class. Playwright covers marks on the
+  its charge of two against the `query` rate-limit class. They also cover its result byte
+  budget, its charges to the memory budget and to the server memory pool, its single
+  deadline and its refusal of a query that is not repeatable. Playwright covers marks on the
   map, a comparison with another branch on the query page and in the Explore graph, and
   **Compare on the server**, against the mock server and against a real one.
 
@@ -442,6 +444,20 @@ client parity table list all three.
   when a branch has more than 2,000 commits.
 - **The `507` of a history read.** The slider reports the server's `507` with the limit it
   names, as designed. For a past state the budget it names is `memory`.
+- **Memory of the server comparison.** `POST /{ds}/sparql/diff` charges the hashes it
+  keeps, the table of the result it is reading and the rows it lists to the request's
+  memory budget and to the request's grant in the server memory pool, as the engine charges
+  its own execution. A hash costs about 48 bytes, so the comparison trades memory for not
+  keeping the rows, and a comparison past the budget fails with `507` and `budget:
+  "memory"`. The response also obeys the result byte budget, and the request's timeout
+  covers all three executions together.
+- **Queries that change between runs.** The rows only the earlier state has come from
+  running its query a third time. A query whose rows differ from run to run, such as one
+  that calls `STRUUID` or `RAND`, would list fewer rows than the server counted, so the
+  server answers `409` with `code: "not-repeatable"`.
+- **Timeline reads.** The timeline reads only the commits of the requested range, up to the
+  head it saw at the start, and refuses a range of more than 10,000,000 commits. The client
+  also ignores a bucket that lies past the head.
 - **Term filter cost.** The `log` method still reads every record of the commit range and
   keeps only the matching changes, so memory stays proportional to the matches and not to
   the range. The filter cannot be combined with RDF Patch output, and the server answers
