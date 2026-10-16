@@ -15,11 +15,11 @@
 //! SHA-256 of the schema copy, so an edited copy never takes the typing of the schema it
 //! replaced. A SHA-256 of the whole file ends it. That digest detects damage and not
 //! tampering. The file is trusted like the rest of the database directory, because anyone
-//! who can write it can also write `validation.json` and turn the guard off. Anything that does not match leaves the typing unknown, and the first
-//! write validates in full as before. The first commit after an open removes the file,
-//! so a head that moved on can never be mistaken for the one in the file: it is written
-//! again on a clean close, and only then. A crash leaves no file or a stale one that is
-//! never trusted.
+//! who can write it can also write `validation.json` and turn the guard off. Anything
+//! that does not match leaves the typing unknown, and the first write validates in full
+//! as before. The first commit after an open removes the file, so a head that moved on
+//! can never be mistaken for the one in the file: it is written again on a clean close,
+//! and only then. A crash leaves no file or a stale one that is never trusted.
 //!
 //! Nodes are keyed by term and never by id, since ids differ between generations:
 //! stored terms by their vocabulary key, inline values and blank nodes by their id (a
