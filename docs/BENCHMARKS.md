@@ -716,6 +716,27 @@ adds a mutex, four atomic counters and a lazily set grant to each query context 
 the ledger allocation of a plain query, so a plain query does not use more memory than it
 did before.
 
+The cold-read work of X07 added a second fixed cost to warm queries with constants. On
+values-star it was about 14 thousand instructions per request. Most of it went to the
+constant prefetch, which allocated a key and searched the sparse vocabulary index for every
+constant of every query. The planner's counts also looked each warm end block up twice, and
+the vocabulary checked for an I/O profile at every step of a lookup. The prefetch now
+remembers the hashes of keys whose group it has asked for, a warm count takes its end
+blocks from the cache once, and a lookup checks for a profile once. The table of key
+hashes takes 8 KiB per vocabulary with a sparse index. The runs used forge with 2,000
+requests per server process for instructions and 8 rounds of 50 requests for times.
+
+| Comparison | Measure | Result |
+|---|---|---|
+| Warm X07 paths against main at 824b7238 | Instructions per request of values-star | 1,005.6 thousand down to 998.7 thousand |
+| Warm X07 paths against main at 824b7238 | Instructions per request of star-lookup and employee-docs | 5 to 7 thousand fewer |
+| Warm X07 paths against main at 824b7238 | Median wall time of the seven small queries | 0.990 to 1.003 of main |
+| Warm X07 paths against origin/main at 20f01c82 | Instructions per request of values-star | 1.4% higher |
+
+The rest of the gap to 20f01c82 on values-star is the fast memory account of F14, about
+4 thousand instructions on every query, and the warm checks that the X07 hints need. These
+are a hash per constant, a bit test per answer term and one cache lookup per scan.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
