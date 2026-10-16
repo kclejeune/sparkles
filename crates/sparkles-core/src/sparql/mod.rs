@@ -1247,6 +1247,8 @@ mod charsets_tests;
 #[cfg(test)]
 mod costcal_tests;
 #[cfg(test)]
+mod depth_tests;
+#[cfg(test)]
 mod exists_tests;
 #[cfg(test)]
 mod exprcache_tests;

@@ -74,7 +74,33 @@ pub fn check_update(u: &Update) -> Result<usize> {
 /// depth, for [`with_stack`]. The count of the parsed query bounds the plan, and this
 /// makes the bound true of the plan whatever the count misses.
 pub fn check_plan(depth: usize) -> Result<usize> {
+    #[cfg(test)]
+    if let Some(limit) = probe::PLAN_LIMIT.get() {
+        return if depth > limit {
+            Err(Error::invalid(format!(
+                "query plan nested deeper than {MAX_PLAN_DEPTH} levels; a basic graph \
+                 pattern counts two levels per triple pattern"
+            )))
+        } else {
+            Ok(depth)
+        };
+    }
     plan_limit(depth)
+}
+
+/// Knobs for the tests of this module's callers. The text of a query cannot build a plan
+/// deeper than its walk allows, so a test lowers the limit [`check_plan`] applies, and
+/// reads the depths [`with_stack`] was asked for.
+#[cfg(test)]
+pub(super) mod probe {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        /// The limit [`check_plan`](super::check_plan) applies on this thread, when set.
+        pub static PLAN_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+        /// The depths [`with_stack`](super::with_stack) was called with on this thread.
+        pub static STACKS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
 }
 
 fn limit(depth: usize) -> Result<usize> {
@@ -101,6 +127,8 @@ fn plan_limit(depth: usize) -> Result<usize> {
 /// thread (`stacker`). A spawned thread (2 MiB by default) or a rayon worker has room for
 /// a few hundred levels.
 pub fn with_stack<R>(depth: usize, f: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    probe::STACKS.with_borrow_mut(|v| v.push(depth));
     let need = depth
         .saturating_mul(STACK_PER_LEVEL)
         .saturating_add(STACK_BASE)
