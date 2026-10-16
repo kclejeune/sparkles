@@ -452,37 +452,38 @@ impl NumColumn {
     }
 
     /// Ask for the pages that [`NumColumn::get_many`] would read for `ids` (best sorted
-    /// ascending), without reading the values or building a result. The pages of the kinds
-    /// and the rank come first. The pages of the values follow only when those were new to
-    /// this mapping: a warm request then makes no system call and reads nothing. A column
-    /// held in memory has nothing to ask for.
+    /// ascending), without reading the values or building a result. A column whose head is
+    /// mapped gets the pages of the kinds and the rank first, and every column gets the
+    /// pages of the values. Each page is asked for once in the life of the mapping, so a
+    /// warm request makes no system call. It locates each id, which costs a memory read
+    /// when the head is resident.
     pub fn advise_ids(&self, ids: &[u64]) {
-        if !crate::index::io_hints() || ids.len() < 2 || self.head.is_some() {
+        if !crate::index::io_hints() || ids.len() < 2 {
             return;
         }
-        let inside = || ids.iter().filter_map(|&id| self.position(id));
-        let kinds = self.advise(inside().map(|id| {
-            let first = (id / RANK_IDS) * RANK_IDS / 16;
-            (
-                HEADER + first as usize * 8,
-                HEADER + (id / 16 + 1) as usize * 8,
-            )
-        }));
-        let ranks = self.advise(inside().map(|id| {
-            let at = self.rank + (id / RANK_IDS) as usize * 4;
-            (at, at + 4)
-        }));
-        if kinds || ranks {
-            self.advise(
-                ids.iter()
-                    .map(|&id| self.locate(id))
-                    .filter(|&(k, r)| k & 8 != 0 && r < self.count)
-                    .map(|(_, r)| {
-                        let at = self.values + r as usize * 8;
-                        (at, at + 8)
-                    }),
-            );
+        if self.head.is_none() {
+            let inside = || ids.iter().filter_map(|&id| self.position(id));
+            self.advise(inside().map(|id| {
+                let first = (id / RANK_IDS) * RANK_IDS / 16;
+                (
+                    HEADER + first as usize * 8,
+                    HEADER + (id / 16 + 1) as usize * 8,
+                )
+            }));
+            self.advise(inside().map(|id| {
+                let at = self.rank + (id / RANK_IDS) as usize * 4;
+                (at, at + 4)
+            }));
         }
+        self.advise(
+            ids.iter()
+                .map(|&id| self.locate(id))
+                .filter(|&(k, r)| k & 8 != 0 && r < self.count)
+                .map(|(_, r)| {
+                    let at = self.values + r as usize * 8;
+                    (at, at + 8)
+                }),
+        );
     }
 
     /// What the column says about each of `ids` (best sorted ascending), reading a cold
@@ -826,6 +827,35 @@ pub(crate) mod tests {
             "actual mapped numeric reads must be observed"
         );
         assert_eq!(&actual, expected, "independent full page-set oracle");
+    }
+
+    /// A request for the pages of some values marks their chunks once, with the column's
+    /// head in memory as well as mapped, and a repeat asks for nothing (review N1).
+    #[cfg(unix)]
+    #[test]
+    fn advise_ids_hints_value_pages_once() {
+        if !crate::index::io_hints() {
+            return;
+        }
+        let bits =
+            |n: &NumColumn| -> Vec<u64> { n.hinted.iter().map(|b| b.load(Relaxed)).collect() };
+        for resident in [true, false] {
+            let (_dir, mut num) = numeric_profile_fixture();
+            if !resident {
+                num.head = None;
+            }
+            let ids = [100, 9_000, 16_001, 30_000];
+            let before = bits(&num);
+            num.advise_ids(&ids);
+            let first = bits(&num);
+            assert_ne!(first, before, "resident head: {resident}");
+            // the value of the last id lies in a chunk that no other read marks
+            let at = num.values + num.locate(30_000).1 as usize * 8;
+            let chunk = at / HINT_CHUNK;
+            assert!(first[chunk / 64] & (1 << (chunk % 64)) != 0, "value chunk");
+            num.advise_ids(&ids);
+            assert_eq!(bits(&num), first, "a repeat marks nothing");
+        }
     }
 
     #[cfg(unix)]
