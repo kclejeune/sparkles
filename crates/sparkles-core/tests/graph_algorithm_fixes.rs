@@ -5,6 +5,8 @@ use sparkles_core::sparql::algorun::{AlgoRequest, expand_iri, query_text_with_su
 use sparkles_core::sparql::{QueryOptions, query};
 use sparkles_core::store::{Store, StoreOptions};
 
+use std::collections::{BTreeMap, BTreeSet};
+
 const PREFIXES: &str = "PREFIX ex: <http://ex/> PREFIX algo: <urn:x-sparkles:algo#> ";
 
 fn trig(data: &str) -> Store {
@@ -16,6 +18,92 @@ fn trig(data: &str) -> Store {
     )])
     .unwrap();
     s
+}
+
+fn short(t: &Option<oxrdf::Term>) -> String {
+    match t {
+        None => "-".into(),
+        Some(oxrdf::Term::NamedNode(n)) => n
+            .as_str()
+            .strip_prefix("http://ex/")
+            .unwrap_or(n.as_str())
+            .to_string(),
+        Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
+        Some(t) => t.to_string(),
+    }
+}
+
+fn rows(s: &Store, q: &str) -> Vec<BTreeMap<String, String>> {
+    let r = query(
+        s.snapshot(),
+        &format!("{PREFIXES}{q}"),
+        &QueryOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("{q}: {e}"));
+    r.rows()
+        .iter()
+        .map(|row| {
+            r.vars
+                .iter()
+                .zip(row)
+                .map(|(v, t)| (v.clone(), short(t)))
+                .collect()
+        })
+        .collect()
+}
+
+// The planner unrolls `GRAPH ?g { SERVICE algo:… }` into one branch for each named graph, so
+// the two tests below hold the scoping of a nested pattern and of a variable source.
+/// Guard: a nested edge pattern under GRAPH ?g must build one projection
+/// per graph from that graph's edges only.
+#[test]
+fn nested_pattern_under_graph_var_is_scoped_per_graph() {
+    let s = trig("ex:g1 { ex:a ex:p ex:b } ex:g2 { ex:c ex:p ex:d }");
+    let r = rows(
+        &s,
+        "SELECT ?g ?n WHERE { GRAPH ?g { SERVICE algo:wcc { [] algo:start ?s ; algo:end ?e ; \
+         algo:node ?n ; algo:component ?c . ?s ex:p ?e } } }",
+    );
+    let got: BTreeSet<(String, String)> = r
+        .iter()
+        .map(|row| (row["g"].clone(), row["n"].clone()))
+        .collect();
+    let want: BTreeSet<(String, String)> = [("g1", "a"), ("g1", "b"), ("g2", "c"), ("g2", "d")]
+        .iter()
+        .map(|(g, n)| (g.to_string(), n.to_string()))
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// Guard: a variable algo:source under GRAPH ?g must seed each graph's
+/// run only with the rows bound to that graph.
+#[test]
+fn variable_source_under_graph_var_uses_the_rows_of_that_graph() {
+    // Both graphs hold the same chain a -> b -> c. g1 seeds a, g2 seeds c.
+    let s = trig(
+        "ex:g1 { ex:a ex:p ex:b . ex:b ex:p ex:c . ex:a a ex:Seed } \
+         ex:g2 { ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c a ex:Seed }",
+    );
+    let r = rows(
+        &s,
+        "SELECT ?g ?n ?d WHERE { GRAPH ?g { ?s a ex:Seed . SERVICE algo:bfs { [] algo:predicate ex:p ; \
+         algo:source ?s ; algo:node ?n ; algo:depth ?d } } }",
+    );
+    let got: BTreeSet<(String, String, String)> = r
+        .iter()
+        .map(|row| (row["g"].clone(), row["n"].clone(), row["d"].clone()))
+        .collect();
+    // g1: a=0, b=1, c=2. g2: only c=0 (c has no out-edges).
+    let want: BTreeSet<(String, String, String)> = [
+        ("g1", "a", "0"),
+        ("g1", "b", "1"),
+        ("g1", "c", "2"),
+        ("g2", "c", "0"),
+    ]
+    .iter()
+    .map(|(g, n, d)| (g.to_string(), n.to_string(), d.to_string()))
+    .collect();
+    assert_eq!(got, want);
 }
 
 /// A prefixed-name source is spliced into the query text, so it must be validated as an
