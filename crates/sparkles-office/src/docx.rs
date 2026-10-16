@@ -121,7 +121,11 @@ fn styles(pkg: &mut Package, limits: &Limits) -> HashMap<String, Style> {
 
 fn num_pr(n: &Node) -> Option<(u64, usize)> {
     let id = val(n, "numId")?.parse().ok()?;
-    let lvl = val(n, "ilvl").and_then(|v| v.parse().ok()).unwrap_or(0);
+    // clamped here, before any use: a level is only ever an index into nine
+    let lvl = val(n, "ilvl")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(8);
     Some((id, lvl))
 }
 
