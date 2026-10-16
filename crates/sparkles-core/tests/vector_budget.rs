@@ -110,6 +110,7 @@ fn indexed_store(vs: &[Vec<f32>]) -> (Store, u64) {
 
 /// Catch-up stops at the budget: it inserts the rows that fit, the rows it leaves stay
 /// pending, the status says why, and searches still find them by scoring them exactly.
+/// Raising the budget lets catch-up go on, and the status no longer reports the stop.
 #[test]
 fn the_live_layer_stops_at_the_memory_budget() {
     let _held = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
@@ -152,7 +153,17 @@ fn the_live_layer_stops_at_the_memory_budget() {
             exact.iter().map(|h| h.0).collect::<Vec<_>>()
         );
     }
+    // more room: the rows left pending join the graph
     vector::set_budget(initial);
+    assert!(s.wait_vector_catch_up(std::time::Duration::from_secs(60)));
+    let st = s.vector_index("emb").unwrap();
+    assert_eq!(
+        (st.overlay.indexed, st.overlay.pending),
+        (500, 0),
+        "{:?}",
+        st.overlay
+    );
+    assert!(!st.overlay.over_budget);
 }
 
 /// A compaction releases the live layer that reached the budget, and catch-up then

@@ -396,7 +396,7 @@ impl Store {
             let done = names.iter().all(|n| {
                 snap.generation.vectors.built(n).is_none_or(|b| {
                     crate::vector::live::overlay_split(&snap, &b).1 == 0
-                        || b.live.read().over_budget()
+                        || crate::vector::live::at_budget(&snap, &b)
                 })
             });
             if done {
@@ -450,7 +450,9 @@ impl Store {
                 indexed,
                 pending,
                 over_budget: pending > 0
-                    && built.as_ref().is_some_and(|b| b.live.read().over_budget()),
+                    && built
+                        .as_ref()
+                        .is_some_and(|b| crate::vector::live::at_budget(snap, b)),
             },
             skipped: built.as_ref().map(|b| b.skipped).unwrap_or_default(),
             memory: VectorMemory {

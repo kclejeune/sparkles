@@ -84,8 +84,6 @@ pub struct LiveState {
     /// the last snapshot whose rows were all looked at: a search of a snapshot with the
     /// same delta has no row to score exactly
     caught: Option<Caught>,
-    /// the last pass stopped because inserting more would pass the vector memory budget
-    over_budget: bool,
 }
 
 /// The snapshot a layer last caught up with.
@@ -245,12 +243,6 @@ impl LiveState {
                 && c.rows == rows
                 && c.ins.same(&snap.delta.ins[Perm::Pso.index()])
         })
-    }
-
-    /// Whether catch-up stopped because inserting more rows would pass the vector memory
-    /// budget. The rows it left stay pending until the next compaction frees the layer.
-    pub fn over_budget(&self) -> bool {
-        self.over_budget
     }
 
     /// The first live node's number (the frozen graph's node count).
@@ -522,7 +514,6 @@ pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) ->
         if keys.is_empty() {
             let rows = snap.delta.ins[pi].count_between(&lo, &hi) as u64;
             let mut st = b.live.state.write();
-            st.over_budget = false;
             if st.caught.as_ref().is_none_or(|c| c.commit <= snap.commit) {
                 st.caught = Some(Caught {
                     commit: snap.commit,
@@ -555,10 +546,17 @@ pub(crate) fn catch_up(snap: &Snapshot, b: &Built, cancel: &dyn Fn() -> bool) ->
             total += b.live.insert(b, items, &p);
         }
         if left {
-            b.live.state.write().over_budget = true;
             return total;
         }
     }
+}
+
+/// Whether `b`'s live layer cannot take another node within the vector memory budget as
+/// it stands now, so catch-up leaves the rows it lacks pending. Computed on each call,
+/// so it turns false as soon as the budget is raised or other indexes shrink.
+pub(crate) fn at_budget(snap: &Snapshot, b: &Built) -> bool {
+    params_of(b)
+        .is_some_and(|p| snap.generation.vectors.used_bytes() + row_bytes(b, &p) > super::budget())
 }
 
 /// An upper bound of the bytes one node adds to `b`'s live layer: its vector, norm,
