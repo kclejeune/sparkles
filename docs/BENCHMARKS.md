@@ -586,6 +586,37 @@ because the bidirectional search stops where its frontiers meet. Searching from 
 person to everyone costs 1.4–1.8× the `+` count, since it also keeps path parents and
 levels, and weighted search costs 5.6–6.3× the unweighted search.
 
+### Graph algorithm polling
+
+Roadmap item 8 moved the cancellation and deadline checks of the graph algorithms
+inside every long loop and charged every workspace to the call. This A/B measures what
+that costs. Both builds ran the ignored `polling_cost` test of
+`tests/graph_algorithms_scale.rs` on forge, an Intel i5-13500 with nothing else running,
+pinned to four cores. The graph is random with 1,000,000 nodes and 5,000,000 edges, and
+each call ran under a far deadline, so every check reads the clock. The builds ran in
+four ABBA pairs at one and four threads, and the table gives the median of the four
+runs of each build.
+
+| algorithm | 1 thread before | 1 thread after | change | 4 threads before | 4 threads after | change |
+|---|---:|---:|---:|---:|---:|---:|
+| PageRank, 20 iterations | 2145.9 | 533.2 | -75.2% | 541.6 | 165.4 | -69.5% |
+| Weakly connected components | 145.8 | 146.4 | +0.4% | 41.0 | 41.0 | 0.0% |
+| Strongly connected components | 312.6 | 318.8 | +2.0% | 239.1 | 247.2 | +3.4% |
+| Breadth-first search | 155.4 | 158.9 | +2.2% | 39.5 | 39.8 | +0.5% |
+| Label propagation | 722.7 | 713.0 | -1.3% | 180.8 | 181.0 | +0.1% |
+| Triangle count | 581.3 | 596.8 | +2.6% | 237.1 | 248.7 | +4.8% |
+| K-core | 262.1 | 286.4 | +9.3% | 252.4 | 252.9 | +0.2% |
+| Betweenness, sampled | 7521.0 | 7723.6 | +2.7% | 3134.8 | 3184.1 | +1.6% |
+| FastRP | 2289.2 | 2274.6 | -0.6% | 992.4 | 997.0 | +0.5% |
+
+Times are in milliseconds. PageRank is four times faster because it read the clock
+before every node, and now counts its rows and checks once per 64K units. The other
+algorithms pay up to 5% for the counting and the charged workspaces, and k-core up to
+9% on one thread. A later change appends rows without a check per value in the
+undirected view that k-core and triangle counting build, in breadth-first search and in
+label propagation. It has not been timed on forge, because forge was taken by other
+measurements when it landed.
+
 ### Spatial queries
 
 This Sparkles-only run uses the geo fixture with 100,000 points, its polygons and 180,640
