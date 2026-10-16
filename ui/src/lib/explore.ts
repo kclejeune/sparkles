@@ -1,6 +1,7 @@
 // SPARQL used by the Explore page (resource graph + ontology browser).
 import * as api from './api';
 import type { Term } from './api';
+import { CANDIDATES_PER_QUERY, candidateQuery, edgeIdOf, type EdgeTriple } from './explore-time';
 import { sparqlIri, sparqlString } from './rdf';
 
 const P = `PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
@@ -107,6 +108,29 @@ LIMIT 100`,
     .map((r) => ({ predicate: v(r.p)!, term: r.s!, label: v(r.label), incoming: true }));
   const label = pickLabel(out.filter((n) => LABEL_IRIS.includes(n.predicate)).map((n) => n.term));
   return { out, inc, label };
+}
+
+/**
+ * The ids of the drawn edges of `triples` that hold in `ds` at `at` (the head by default),
+ * read as `neighbours` reads the graph, so that the answer is about the view that is drawn.
+ */
+export async function presentEdges(
+  ds: string,
+  triples: readonly EdgeTriple[],
+  at?: string,
+  signal?: AbortSignal,
+): Promise<Set<string>> {
+  const found = new Set<string>();
+  const o = { ...opts, ...(at ? { at } : {}), signal };
+  const queries: string[] = [];
+  for (let i = 0; i < triples.length; i += CANDIDATES_PER_QUERY) {
+    const q = candidateQuery(triples.slice(i, i + CANDIDATES_PER_QUERY));
+    if (q) queries.push(q);
+  }
+  const answers = await Promise.all(queries.map((q) => api.select(ds, q, o)));
+  for (const rows of answers)
+    for (const r of rows) if (r.s && r.p && r.o) found.add(edgeIdOf([r.s, r.p, r.o]));
+  return found;
 }
 
 export type Details = {

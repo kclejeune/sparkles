@@ -446,6 +446,13 @@ client parity table list all three.
   keeps only the matching changes, so memory stays proportional to the matches and not to
   the range. The filter cannot be combined with RDF Patch output, and the server answers
   `400` for that pair.
+- **Marks on the drawn view.** A diff lists the changes of every graph, and the Explore
+  graph draws one view of them. The compare step therefore runs two candidate queries
+  beside the diff. One asks the earlier state which of the edges marked added it already
+  had, and the other asks the later state which of the ghost edges it still has. Both are
+  read as the graph is read, so they see the same default graph, union and inference
+  settings, and an edge that a diff quad changed only in another graph keeps no mark. A
+  diff that lists fewer changes than it counts says so under the graph.
 - **Graph rebuilds.** The Explore graph is rebuilt at a commit from the expansions the
   person made, so a node added by hand with the graph's link action is not kept when the
   slider moves.

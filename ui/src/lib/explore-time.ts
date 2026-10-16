@@ -4,7 +4,7 @@
 import type { DiffQuad, Term } from './api';
 import { parseCompact } from './compact';
 import type { Schema } from './explore';
-import { termKey } from './rdf';
+import { termKey, toSparql } from './rdf';
 import type { Mark } from './rowdiff';
 
 /** The most removed elements a comparison draws as ghosts. */
@@ -12,13 +12,25 @@ export const MAX_GHOSTS = 200;
 
 export type DrawnEdge = { id: string; source: string; target: string };
 
+/** The subject, predicate and object of an edge. */
+export type EdgeTriple = [Term, Term, Term];
+
 export type DiffPlan = {
   /** Drawn edges that the later state added. */
   addedEdges: Set<string>;
+  /** The triple of each added edge, to check it against the earlier state. */
+  addedTriples: Map<string, EdgeTriple>;
   /** Drawn nodes whose every edge was added (the focus is never one of them). */
   addedNodes: Set<string>;
   /** Edges only the earlier state had, drawn as dashed ghosts. */
-  ghostEdges: { id: string; source: string; target: string; predicate: string; lit: boolean }[];
+  ghostEdges: {
+    id: string;
+    source: string;
+    target: string;
+    predicate: string;
+    lit: boolean;
+    triple: EdgeTriple;
+  }[];
   /** The ends of those edges that are not drawn. */
   ghostNodes: { id: string; term: Term }[];
   /** More removed edges than are drawn. */
@@ -58,6 +70,7 @@ export function planDiff(
   const drawn = new Set(edges.map((e) => e.id));
   const plan: DiffPlan = {
     addedEdges: new Set(),
+    addedTriples: new Map(),
     addedNodes: new Set(),
     ghostEdges: [],
     ghostNodes: [],
@@ -76,7 +89,10 @@ export function planDiff(
     const sid = termKey(s);
     const { oid, lit, edge } = ids(sid, p, o);
     if (q.op === '+') {
-      if (drawn.has(edge)) plan.addedEdges.add(edge);
+      if (drawn.has(edge)) {
+        plan.addedEdges.add(edge);
+        plan.addedTriples.set(edge, [s, { type: 'uri', value: p }, o]);
+      }
       continue;
     }
     // a removed quad is drawn only next to something that is drawn
@@ -88,20 +104,86 @@ export function planDiff(
     }
     addGhostNode(sid, s);
     addGhostNode(oid, o);
-    plan.ghostEdges.push({ id: edge, source: sid, target: oid, predicate: p, lit });
+    plan.ghostEdges.push({
+      id: edge,
+      source: sid,
+      target: oid,
+      predicate: p,
+      lit,
+      triple: [s, { type: 'uri', value: p }, o],
+    });
   }
-  // a node is new when everything drawn at it is new
+  plan.addedNodes = addedNodesOf(edges, plan.addedEdges, focus);
+  return plan;
+}
+
+/** A node is new when everything drawn at it is new. */
+function addedNodesOf(
+  edges: readonly DrawnEdge[],
+  addedEdges: ReadonlySet<string>,
+  focus: string | null,
+): Set<string> {
   const incident = new Map<string, number>();
   const incidentAdded = new Map<string, number>();
   for (const e of edges) {
     for (const n of [e.source, e.target]) {
       incident.set(n, (incident.get(n) ?? 0) + 1);
-      if (plan.addedEdges.has(e.id)) incidentAdded.set(n, (incidentAdded.get(n) ?? 0) + 1);
+      if (addedEdges.has(e.id)) incidentAdded.set(n, (incidentAdded.get(n) ?? 0) + 1);
     }
   }
-  for (const [n, count] of incident)
-    if (n !== focus && count === incidentAdded.get(n)) plan.addedNodes.add(n);
-  return plan;
+  const out = new Set<string>();
+  for (const [n, count] of incident) if (n !== focus && count === incidentAdded.get(n)) out.add(n);
+  return out;
+}
+
+/** The id the drawn graph gives the edge of a triple. */
+export function edgeIdOf([s, p, o]: EdgeTriple): string {
+  return ids(termKey(s), p.type === 'uri' ? p.value : termKey(p), o).edge;
+}
+
+/** Most triples one candidate query checks. */
+export const CANDIDATES_PER_QUERY = 200;
+
+/**
+ * A query for which of `triples` hold in a state, as the Explore graph reads it (the
+ * dataset's default graph view, with its union or inference settings), whatever graph a
+ * diff quad was in. Blank nodes and triple terms cannot stand in VALUES, so those triples
+ * are left out and keep their marks. Empty when none is left.
+ */
+export function candidateQuery(triples: readonly EdgeTriple[]): string {
+  const rows = triples
+    .filter((t) => t.every((x) => x.type === 'uri' || x.type === 'literal'))
+    .map(([s, p, o]) => `(${toSparql(s)} ${toSparql(p)} ${toSparql(o)})`);
+  if (!rows.length) return '';
+  return `SELECT ?s ?p ?o WHERE { VALUES (?s ?p ?o) { ${rows.join(' ')} } ?s ?p ?o }`;
+}
+
+/**
+ * The plan once the candidate queries have answered. A diff lists changes of every graph, and
+ * the drawn graph shows one view of them: an edge marked added that the earlier state already
+ * had (`presentBefore`, ids of edges) was added in another graph only, and a ghost edge that
+ * the later state still has (`presentAfter`) was removed from another graph only. Their marks
+ * go, and a node that had only such edges is no longer new.
+ */
+export function confirmPlan(
+  plan: DiffPlan,
+  edges: readonly DrawnEdge[],
+  focus: string | null,
+  presentBefore: ReadonlySet<string>,
+  presentAfter: ReadonlySet<string>,
+): DiffPlan {
+  const addedEdges = new Set([...plan.addedEdges].filter((e) => !presentBefore.has(e)));
+  const addedTriples = new Map([...plan.addedTriples].filter(([e]) => addedEdges.has(e)));
+  const ghostEdges = plan.ghostEdges.filter((g) => !presentAfter.has(g.id));
+  const ends = new Set(ghostEdges.flatMap((g) => [g.source, g.target]));
+  return {
+    ...plan,
+    addedEdges,
+    addedTriples,
+    addedNodes: addedNodesOf(edges, addedEdges, focus),
+    ghostEdges,
+    ghostNodes: plan.ghostNodes.filter((n) => ends.has(n.id)),
+  };
 }
 
 // --- the schema over time ------------------------------------------------------------------

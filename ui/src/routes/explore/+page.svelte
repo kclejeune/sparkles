@@ -24,7 +24,13 @@
   } from '$lib/entity-history';
   import { unrecordedNote } from '$lib/history';
   import { timeFailure, type Range } from '$lib/timeline';
-  import { deltaText, planDiff, schemaAnnouncement, schemaChanges } from '$lib/explore-time';
+  import {
+    confirmPlan,
+    deltaText,
+    planDiff,
+    schemaAnnouncement,
+    schemaChanges,
+  } from '$lib/explore-time';
   import type { SchemaChanges } from '$lib/explore-time';
   import ClassTree from '$components/ClassTree.svelte';
   import GeoMapCard from '$components/GeoMapCard.svelte';
@@ -441,12 +447,27 @@
       limit: 5000,
     });
     if (!owns()) return;
-    const plan = planDiff(
-      d.quads ?? [],
-      new Set(Object.keys(nodes)),
-      Object.values(edges),
-      focusId,
-    );
+    const drawnEdges = Object.values(edges);
+    let plan = planDiff(d.quads ?? [], new Set(Object.keys(nodes)), drawnEdges, focusId);
+    // the diff lists the changes of every graph and the drawn graph shows one view of them, so
+    // a marked edge is checked against the state it was added to, and a ghost against the
+    // state it was removed from, read as the graph is read
+    if (plan.addedTriples.size || plan.ghostEdges.length) {
+      const leftDs = exAgainst ? `${name}@${exAgainst}` : name;
+      const leftAt = exAgainst ? undefined : exFrom;
+      const [before, after] = await Promise.all([
+        ex.presentEdges(leftDs, [...plan.addedTriples.values()], leftAt),
+        ex.presentEdges(
+          name,
+          plan.ghostEdges.map((g) => g.triple),
+          exAt || undefined,
+        ),
+      ]);
+      if (!owns()) return;
+      plan = confirmPlan(plan, drawnEdges, focusId, before, after);
+    }
+    const listed = d.quads?.length ?? 0;
+    const partial = listed < d.added + d.removed;
     const ghostNodes: Record<string, ENode> = {};
     for (const g of plan.ghostNodes) {
       const lit = g.term.type === 'literal';
@@ -475,7 +496,14 @@
     const added = plan.addedEdges.size;
     const removed = plan.ghostEdges.length;
     graphAnnounce = `Commit ${d.to.commit.seq}: ${added} ${added === 1 ? 'edge' : 'edges'} added, ${removed} removed`;
-    graphNote = plan.truncated ? `Only ${plan.ghostEdges.length} removed edges are drawn.` : '';
+    graphNote = [
+      plan.truncated ? `Only ${plan.ghostEdges.length} removed edges are drawn.` : '',
+      partial
+        ? `The comparison listed ${fmtInt(listed)} of ${fmtInt(d.added + d.removed)} changes, so the marks are partial.`
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
   }
 
   /**

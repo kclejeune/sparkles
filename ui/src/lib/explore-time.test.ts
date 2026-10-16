@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import type { DiffQuad } from './api';
+import type { DiffQuad, Term } from './api';
 import type { ClassInfo, PropertyInfo, Schema } from './explore';
-import { deltaText, planDiff, schemaAnnouncement, schemaChanges } from './explore-time';
+import {
+  candidateQuery,
+  confirmPlan,
+  deltaText,
+  edgeIdOf,
+  planDiff,
+  schemaAnnouncement,
+  schemaChanges,
+} from './explore-time';
 
 const EX = 'http://example.org/';
 const alice = `<${EX}alice>`;
@@ -59,6 +67,11 @@ describe('planDiff', () => {
         target: bob,
         predicate: `${EX}knows`,
         lit: false,
+        triple: [
+          { type: 'uri', value: `${EX}alice` },
+          { type: 'uri', value: `${EX}knows` },
+          { type: 'uri', value: `${EX}bob` },
+        ],
       },
     ]);
     expect(plan.ghostNodes.map((n) => n.id)).toEqual([bob]);
@@ -92,6 +105,81 @@ describe('planDiff', () => {
     const plan = planDiff(many, nodes, edges, alice, 3);
     expect(plan.ghostEdges.length).toBe(3);
     expect(plan.truncated).toBe(true);
+  });
+});
+
+describe('confirmPlan', () => {
+  const nodes = new Set([alice, bob]);
+  const edges = [{ id: edge(alice, `${EX}knows`, bob), source: alice, target: bob }];
+  const inGraph = (op: '+' | '-', s: string, p: string, o: string): DiffQuad => ({
+    ...quad(op, s, p, o),
+    graph: `${EX}g`,
+  });
+
+  it('drops the mark of a drawn edge whose triple the earlier state already had', () => {
+    // a copy in a named graph was added, and the drawn default-graph edge is not new
+    const plan = planDiff([inGraph('+', alice, knows, bob)], nodes, edges, alice);
+    expect([...plan.addedEdges]).toEqual([edge(alice, `${EX}knows`, bob)]);
+    const sure = confirmPlan(
+      plan,
+      edges,
+      alice,
+      new Set([edge(alice, `${EX}knows`, bob)]),
+      new Set(),
+    );
+    expect([...sure.addedEdges]).toEqual([]);
+    expect([...sure.addedNodes]).toEqual([]);
+    expect(sure.addedTriples.size).toBe(0);
+  });
+
+  it('keeps the mark of an edge the earlier state lacked, and the node only it reaches', () => {
+    const plan = planDiff([quad('+', alice, knows, bob)], nodes, edges, alice);
+    const sure = confirmPlan(plan, edges, alice, new Set(), new Set());
+    expect([...sure.addedEdges]).toEqual([edge(alice, `${EX}knows`, bob)]);
+    expect([...sure.addedNodes]).toEqual([bob]);
+  });
+
+  it('drops a ghost edge the later state still has, and the ghost node only it reached', () => {
+    const plan = planDiff([inGraph('-', alice, knows, carol)], nodes, edges, alice);
+    const gone = edge(alice, `${EX}knows`, carol);
+    expect(plan.ghostEdges.map((g) => g.id)).toEqual([gone]);
+    expect(plan.ghostNodes.map((n) => n.id)).toEqual([carol]);
+    const sure = confirmPlan(plan, edges, alice, new Set(), new Set([gone]));
+    expect(sure.ghostEdges).toEqual([]);
+    expect(sure.ghostNodes).toEqual([]);
+  });
+
+  it('keeps a ghost the later state lacks', () => {
+    const plan = planDiff([quad('-', alice, knows, carol)], nodes, edges, alice);
+    const sure = confirmPlan(plan, edges, alice, new Set(), new Set());
+    expect(sure.ghostEdges.length).toBe(1);
+  });
+});
+
+describe('candidateQuery', () => {
+  it('lists the triples as VALUES rows, a literal as its N-Triples term', () => {
+    const t: [Term, Term, Term][] = [
+      [
+        { type: 'uri', value: `${EX}alice` },
+        { type: 'uri', value: `${EX}name` },
+        { type: 'literal', value: 'Al "A"', 'xml:lang': 'en' },
+      ],
+      [
+        { type: 'uri', value: `${EX}alice` },
+        { type: 'uri', value: `${EX}age` },
+        { type: 'literal', value: '3', datatype: 'http://www.w3.org/2001/XMLSchema#integer' },
+      ],
+    ];
+    const q = candidateQuery(t);
+    expect(q).toBe(
+      `SELECT ?s ?p ?o WHERE { VALUES (?s ?p ?o) { (<${EX}alice> <${EX}name> "Al \\"A\\""@en) (<${EX}alice> <${EX}age> "3"^^<http://www.w3.org/2001/XMLSchema#integer>) } ?s ?p ?o }`,
+    );
+    expect(edgeIdOf(t[0])).toBe(`${alice}|${EX}name|lit:${alice}|${EX}name|"Al \\"A\\""@en`);
+  });
+
+  it('leaves out blank nodes, and is empty when nothing is left', () => {
+    const b: Term = { type: 'bnode', value: 'b0' };
+    expect(candidateQuery([[b, { type: 'uri', value: `${EX}p` }, b]])).toBe('');
   });
 });
 
