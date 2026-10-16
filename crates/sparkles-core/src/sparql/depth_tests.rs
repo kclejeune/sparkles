@@ -107,3 +107,26 @@ fn a_plan_deeper_than_the_limit_is_refused_after_planning() {
     probe::PLAN_LIMIT.set(None);
     query(s.snapshot(), &q, &opts).unwrap();
 }
+
+#[test]
+fn the_walk_bounds_the_plan_of_a_group_without_a_triple_pattern() {
+    let s = store();
+    let opts = QueryOptions::default();
+    for q in [
+        "SELECT * { BIND(1 AS ?z) }",
+        "ASK { BIND(1 AS ?z) }",
+        "ASK { FILTER(true) }",
+        "CONSTRUCT { ?a <urn:p> ?a } WHERE { FILTER(BOUND(?a)) }",
+        "SELECT * { { } }",
+        "SELECT * { OPTIONAL { BIND(1 AS ?z) } }",
+        "SELECT * { VALUES ?x { 1 } }",
+    ] {
+        let measured = check_query(&parsed(q)).unwrap();
+        let (_, info) = explain(s.snapshot(), q, &opts).unwrap();
+        assert!(
+            measured >= info.depth(),
+            "{q}: {measured} < {}",
+            info.depth()
+        );
+    }
+}

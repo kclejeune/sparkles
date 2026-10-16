@@ -226,11 +226,13 @@ impl Walk {
         let n = d + 1;
         match p {
             GraphPattern::Bgp { patterns } => {
+                // a group with no triple pattern is still a leaf of the plan, which the
+                // planner makes a unit
                 let terms = patterns
                     .iter()
                     .map(|t| self.triple(t, n))
                     .max()
-                    .unwrap_or(d);
+                    .unwrap_or(if self.bgp { n } else { d });
                 if self.bgp {
                     // a join, and the sort before it, per triple pattern; a blank node
                     // is a variable to the planner
