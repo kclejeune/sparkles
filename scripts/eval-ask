@@ -19,6 +19,9 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
 from evaluator import (
+    QUERY_GRACE_SECONDS,
+    GoldFault,
+    HarnessFault,
     Invalid,
     OfflinePolicy,
     answer_set,
@@ -141,6 +144,8 @@ def validate_args(args):
     ):
         raise Invalid("only evaluation gate secret reference is allowed")
     qset = load_questions(args)
+    if args.timeout < qset.get("goldTimeoutSecs", 0):
+        raise Invalid("query timeout is below the one the gold answers were made with")
     out = (
         pathlib.Path(args.out)
         if args.out
@@ -193,7 +198,7 @@ class Runner:
 
     def check(self):
         if time.monotonic() >= self.deadline:
-            raise Invalid("phase deadline expired")
+            raise HarnessFault("phase deadline expired")
 
     def source_args(self, ask=False):
         if self.loc:
@@ -207,10 +212,18 @@ class Runner:
         record = capture_child(
             argv,
             directory,
-            min(self.deadline, time.monotonic() + (child_limit or self.args.deadline)),
+            min(
+                self.deadline,
+                time.monotonic()
+                + (child_limit or self.args.deadline)
+                + QUERY_GRACE_SECONDS,
+            ),
             self.env,
         )
         self.last_record = record
+        if "pid" in record and not record["cleanup"]:
+            # The census could not show that the child's group is gone.
+            raise HarnessFault("child cleanup unconfirmed")
         return record, directory
 
     def execute(self, argv, label, child_limit=None):
@@ -254,11 +267,11 @@ class Runner:
         at all, such as one that is not cleaned up or exits with an unknown status,
         stops the run.
         """
-        if "pid" not in record or not record["cleanup"]:
-            raise Invalid("child execution incomplete")
+        if "pid" not in record:
+            raise HarnessFault("child did not start")
         if record["timeout"]:
             if time.monotonic() >= self.deadline:
-                raise Invalid("phase deadline expired")
+                raise HarnessFault("phase deadline expired")
             return {"outcome": "error", "error": {"code": "timeout"}}, "timeout"
         if record["byteCap"]:
             return {"outcome": "error", "error": {"code": "output-cap"}}, (
@@ -275,6 +288,8 @@ class Runner:
             steps = (out.get("usage") or {}).get("steps") or []
             if (out.get("error") or {}).get("code") == "timeout":
                 return out, "timeout"
+            if (out.get("error") or {}).get("code") == "budget-exceeded":
+                return out, "budget_exceeded"  # The Ask token budget, a measured limit.
             if any(s.get("outcome") == "refusal" for s in steps):
                 return out, "refusal"
             return out, "provider_error"
@@ -373,6 +388,8 @@ class Runner:
                 "reason": "offline_policy_exclusion",
                 "querySha256": query_sha,
             }
+        except HarnessFault:
+            raise
         except (Invalid, OSError):
             return {
                 "status": "unknown",
@@ -416,6 +433,8 @@ class Runner:
             return failure("missing_query")
         try:
             got, _ = self.query(query)
+        except HarnessFault:
+            raise
         except Invalid:
             return failure("candidate_query_failure")
         ok, scores, detail = score_sets(gold, got, self.check)
@@ -675,10 +694,15 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                             "id": q["id"],
                             "status": "failed",
                             "reason": type(error).__name__,
+                            "detail": str(error)
+                            if isinstance(error, Invalid)
+                            else None,
                             "execution": runner.last_record,
                         }
                     )
-                    raise
+                    if isinstance(error, HarnessFault):
+                        raise
+                    raise GoldFault(f"gold query of {q['id']} failed") from None
                 report["goldPreflight"].append(
                     {
                         "id": q["id"],
@@ -691,7 +715,7 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                 )
         per_pair = {}
         for pair in args.pair:
-            done, answers, scores = [], [], []
+            done, answers, scores, streak = [], [], [], 0
             per_pair[pair] = ({}, {})
             if report["budgetStopped"] or (admit and not admit(pair, qs)):
                 # The projected cost does not fit what is left of the cap.
@@ -728,6 +752,7 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                     if runner.last_record and "pid" in runner.last_record:
                         report["executed"] += 1
                 if proxy:
+                    proxy.wait_idle()  # A killed child can leave a request in flight.
                     proxy.set_case(None)
                     answer["ledgerNanodollars"] = proxy.case_cost(case_id)
                 score = runner.score(q, answer)
@@ -751,11 +776,23 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
                     report["budgetStopped"] = True
                     report["unattemptedIds"].setdefault(pair, []).append(q["id"])
                     continue
+                streak = (
+                    streak + 1 if answer.get("evalFailure") == "provider_error" else 0
+                )
                 done.append(q)
                 answers.append(answer)
                 scores.append(score)
                 per_pair[pair][0][q["id"]] = answer
                 per_pair[pair][1][q["id"]] = score
+                if (
+                    args.max_consecutive_errors
+                    and streak >= args.max_consecutive_errors
+                ):
+                    # A bad model name, a rejected parameter or a dead key fails every
+                    # case for free. That is a harness problem, not a measurement.
+                    raise HarnessFault(
+                        f"{streak} consecutive provider errors for {pair}"
+                    )
             row = summarize_pair(pair, done, answers, scores)
             for r in row:
                 r["incomplete"] = len(done) < len(qs)
@@ -812,6 +849,12 @@ def parse_args(argv=None):
     ap.add_argument("--deadline", type=float, default=300, help="Ask seconds")
     ap.add_argument("--timeout", type=float, default=5, help="query seconds")
     ap.add_argument("--max-tokens", type=int, default=32768, help="Ask token budget")
+    ap.add_argument(
+        "--max-consecutive-errors",
+        type=int,
+        default=5,
+        help="stop after this many provider errors in a row, 0 for no limit",
+    )
     ap.add_argument(
         "--phase-deadline", type=float, default=0, help="matrix seconds, 0 for none"
     )

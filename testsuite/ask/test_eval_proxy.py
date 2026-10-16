@@ -124,7 +124,7 @@ class Base(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.ledgers = []
 
-    def ledger(self, cap=10**12, carryover=None, name="ledger.jsonl"):
+    def ledger(self, cap=10**10, carryover=None, name="ledger.jsonl"):
         ledger = px.Ledger(self.root / name, cap, carryover)
         self.ledgers.append(ledger)
         self.addCleanup(ledger.close)
@@ -235,11 +235,45 @@ class Errors(Base):
     def test_additive_usage_fields_are_ignored(self):
         usage = dict(REPLY["usage"], speed="standard", surprise={"a": 1})
         self.assertEqual(px.cost(HAIKU, usage), HAIKU_COST)
-        self.assertIsNone(px.cost(HAIKU, dict(usage, service_tier="priority")))
-        # An unrecognised geography is charged at the dearest tier.
-        self.assertEqual(
-            px.cost(HAIKU, dict(usage, inference_geo="mars")), 10 * 500 + 2 * 2500
+
+    def test_priced_or_unknown_tiers_are_never_undercounted(self):
+        usage = dict(REPLY["usage"])
+        base = px.cost(SONNET, usage)
+        # A US-only reply carries a premium on every model.
+        for model in (HAIKU, SONNET, OPUS):
+            exact = px.cost(model, usage)
+            self.assertGreater(px.cost(model, dict(usage, inference_geo="us")), exact)
+        self.assertGreaterEqual(
+            px.cost(SONNET, dict(usage, inference_geo="us")), base * 11 // 10
         )
+        # Anything unrecognised settles at the bound or at a large multiple.
+        limit = 10**8
+        for field, value in (
+            ("service_tier", "priority"),
+            ("inference_geo", "mars"),
+            ("speed", "fast"),
+        ):
+            for model in (HAIKU, SONNET, OPUS):
+                with self.subTest(field=field, model=model):
+                    odd = dict(usage, **{field: value})
+                    self.assertGreaterEqual(px.cost(model, odd, limit), limit)
+                    self.assertGreaterEqual(
+                        px.cost(model, odd), 6 * px.cost(model, usage)
+                    )
+
+    def test_a_settlement_above_its_bound_is_recorded(self):
+        ledger = self.ledger()
+        ident = ledger.reserve(HAIKU, 100)
+        ledger.settle(ident, 101, "ok")
+        self.assertEqual(ledger.report()["settledAboveBound"], 1)
+        self.assertTrue(self.lines()[-1]["overBound"])
+
+    def test_unrecognised_tier_settles_at_the_bound_in_the_ledger(self):
+        reply = dict(REPLY, usage=dict(REPLY["usage"], speed="fast"))
+        proxy = self.proxy(Upstream((200, [], json.dumps(reply).encode())))
+        proxy.handle(raw())
+        reserve, settle = self.lines()[-2:]
+        self.assertGreaterEqual(settle["cost"], reserve["bound"])
 
     def test_cache_and_long_context_rates(self):
         usage = {
@@ -324,6 +358,58 @@ class Cap(Base):
             px.Ledger(path, 1)
         self.assertFalse((self.root / "ledger.jsonl.lock").exists())
 
+    def test_stale_lock_of_a_dead_owner_is_recovered_and_a_live_one_is_not(self):
+        import subprocess
+
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        lock = self.root / "ledger.jsonl.lock"
+        lock.write_text(str(dead.pid))
+        ledger = self.ledger()  # The owner is gone, so the lock is stale.
+        self.assertEqual(lock.read_text(), str(__import__("os").getpid()))
+        ledger.close()
+        self.assertFalse(lock.exists())
+        for owner in (str(__import__("os").getpid()), "", "not a pid"):
+            with self.subTest(owner=owner):
+                lock.write_text(owner)
+                with self.assertRaises(Invalid):
+                    px.Ledger(self.root / "ledger.jsonl", 10**10)
+                self.assertTrue(lock.exists())
+                lock.unlink()
+
+    def test_the_cap_is_global_not_per_ledger_file(self):
+        carry = {"name": "pilot", "cost": 1_002_560_000}
+        self.assertEqual(px.HARD_CAP, 25 * 10**9)
+        with self.assertRaises(Invalid):
+            px.Ledger(self.root / "big.jsonl", px.HARD_CAP, carry)  # with carryover
+        with self.assertRaises(Invalid):
+            px.Ledger(self.root / "none.jsonl", px.HARD_CAP + 1)
+        self.ledger(cap=px.HARD_CAP - carry["cost"], carryover=carry)
+        # A second ledger file beside the first is refused for a real run.
+        with self.assertRaises(Invalid):
+            px.require_single_ledger(self.root / "other.jsonl")
+        px.require_single_ledger(self.root / "ledger.jsonl")
+
+    def test_wait_idle_waits_for_a_request_in_flight(self):
+        gate, started = threading.Event(), threading.Event()
+
+        class Slow(Upstream):
+            def send(self, path, body, timeout):
+                started.set()
+                gate.wait(5)
+                return super().send(path, body, timeout)
+
+        proxy = self.proxy(Slow())
+        proxy.set_case("c")
+        thread = threading.Thread(target=proxy.handle, args=(raw(),))
+        thread.start()
+        started.wait(5)
+        self.assertFalse(proxy.wait_idle(0.05))  # Still in flight.
+        gate.set()
+        self.assertTrue(proxy.wait_idle(5))
+        thread.join(5)
+        self.assertEqual(proxy.case_cost("c"), HAIKU_COST)
+
     def test_costs_by_case_and_model(self):
         proxy = self.proxy(Upstream())
         proxy.set_case("c1")
@@ -332,6 +418,40 @@ class Cap(Base):
         proxy.set_case(None)
         proxy.handle(raw())
         self.assertEqual(proxy.ledger.case_costs(), {("c1", HAIKU): 2 * HAIKU_COST})
+
+
+class Preflight(Base):
+    def test_every_model_is_tried_with_the_runs_request_shape(self):
+        upstream = Upstream()
+        proxy = self.proxy(upstream, models=px.MODELS)
+        result = px.preflight(proxy, upstream)
+        sent = [body for path, body in upstream.calls if path == "/v1/messages"]
+        self.assertEqual([b["model"] for b in sent], list(px.MODELS))
+        for body in sent:
+            self.assertEqual(body["output_config"]["format"]["type"], "json_schema")
+            self.assertEqual(body["output_config"]["effort"], "medium")
+            self.assertIs(body["stream"], False)
+        self.assertEqual(set(result["models"]), set(px.MODELS))
+
+    def test_a_failing_model_stops_the_preflight(self):
+        ok = (200, [], BODY)
+        for bad in ((400, [], b'{"type":"error"}'), (401, [], b"{}")):
+            with self.subTest(status=bad[0]):
+                upstream = Upstream(ok, ok, bad)  # count_tokens, haiku, sonnet
+                proxy = self.proxy(
+                    upstream,
+                    ledger=self.ledger(name=f"pre-{bad[0]}.jsonl"),
+                    models=px.MODELS,
+                )
+                with self.assertRaises(Invalid):
+                    px.preflight(proxy, upstream)
+
+    def test_a_reply_that_is_not_the_requested_json_stops_the_preflight(self):
+        text = dict(REPLY, content=[{"type": "text", "text": "not json"}])
+        upstream = Upstream((200, [], BODY), (200, [], json.dumps(text).encode()))
+        proxy = self.proxy(upstream)
+        with self.assertRaises(Invalid):
+            px.preflight(proxy, upstream)
 
 
 class Requests(Base):
@@ -347,6 +467,8 @@ class Requests(Base):
             b"[]",
             raw(messages=[{"role": "user", "content": "q", "cache_control": {}}]),
             raw(service_tier="priority"),
+            raw(messages=[{"role": "user", "content": [{"type": "image"}]}]),
+            raw(system=[{"type": "text", "text": "s"}]),
         ):
             with self.subTest(body=body[:60]):
                 self.assertEqual(proxy.handle(body)[0], 400)

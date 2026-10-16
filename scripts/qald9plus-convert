@@ -20,6 +20,7 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
 from evaluator import (
+    QUERY_GRACE_SECONDS,
     Invalid,
     OfflinePolicy,
     Unsupported,
@@ -96,7 +97,7 @@ def gold_result(args, query, directory):
             query,
         ],
         directory,
-        time.monotonic() + args.timeout + 10,
+        time.monotonic() + args.timeout + QUERY_GRACE_SECONDS,
     )
     try:
         result = answer_set(parse_child(record, directory))
@@ -158,6 +159,7 @@ def convert(args, source):
             "license": "CC BY 4.0",
         },
         "goldRecomputed": recompute,
+        "goldTimeoutSecs": args.timeout if recompute else None,
         "dbpediaRelease": args.release if recompute else None,
         "goldBinarySha256": digest(args.sparkles) if recompute else None,
         "sourceQuestions": len(data["questions"]),

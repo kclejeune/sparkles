@@ -107,6 +107,20 @@ class Convert(unittest.TestCase):
         self.assertEqual(dropped["noEnglish"], ["qald9p-7"])
         self.assertEqual(len(out["goldBinarySha256"]), 64)
 
+    def test_gold_children_share_the_evaluators_grace_and_the_timeout_is_recorded(self):
+        import evaluator
+
+        self.assertIs(qald.QUERY_GRACE_SECONDS, evaluator.QUERY_GRACE_SECONDS)
+        slow = self.root / "slow"
+        slow.write_text("#!" + PYTHON + "\nimport time\ntime.sleep(0.6)\n" + FAKE)
+        slow.chmod(0o700)
+        args = self.args()
+        args.loc, args.sparkles, args.timeout = str(self.root), str(slow), 0.2
+        out = qald.convert(args, self.source)
+        self.assertEqual(out["goldTimeoutSecs"], 0.2)
+        self.assertEqual(out["dropped"]["failed"]["count"], 1)
+        self.assertEqual(len(out["questions"]), 2)
+
     def test_categories(self):
         cases = {
             "ASK { ?s ?p ?o }": "ask",

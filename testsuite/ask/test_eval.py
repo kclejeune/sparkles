@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "eval_support"))
@@ -423,6 +424,9 @@ class Processes(unittest.TestCase):
     def test_each_ask_failure_has_a_status(self):
         args = self.questions_fixture(["clarify"] * 4)
         args.deadline = 0.5
+        grace = mock.patch.object(eval_ask, "QUERY_GRACE_SECONDS", 0.2)
+        grace.start()
+        self.addCleanup(grace.stop)
         self.fake_ask(
             args,
             "import json,sys,time\n"
@@ -445,6 +449,44 @@ class Processes(unittest.TestCase):
             ["timeout", "refusal", "timeout", "invalid_output"],
         )
 
+    def test_exceeding_the_ask_token_budget_is_its_own_status(self):
+        args = self.questions_fixture(["clarify"])
+        self.fake_ask(
+            args,
+            "import json\n"
+            'print(json.dumps({"outcome":"error","error":{"code":"budget-exceeded"}}))\n'
+            "raise SystemExit(2)\n",
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertEqual(report["cases"][0]["detail"]["status"], "budget_exceeded")
+        self.assertEqual(report["rows"][0]["failureStatuses"], {"budget_exceeded": 1})
+        self.assertEqual(report["askTokenBudget"], 32768)
+
+    def test_in_flight_requests_settle_before_a_case_cost_is_read(self):
+        order = []
+
+        class Proxy:
+            token, cap_refusals = "t", 0
+
+            def set_case(self, case):
+                order.append(("case", case is not None))
+
+            def wait_idle(self):
+                order.append("idle")
+
+            def case_cost(self, case):
+                order.append("cost")
+                return 7
+
+            def report(self):
+                return {}
+
+        args = self.questions_fixture(["clarify"])
+        self.fake_ask(args, 'import json\nprint(json.dumps({"outcome":"clarify"}))\n')
+        _, report = eval_ask.run_matrix(args, Proxy())
+        self.assertLess(order.index("idle"), order.index("cost"))
+        self.assertEqual(report["rows"][0]["ledgerCostUSD"], 7e-9)
+
     def test_unknown_exit_status_still_stops_the_run(self):
         args = self.questions_fixture(["clarify"] * 2)
         self.fake_ask(
@@ -456,11 +498,140 @@ class Processes(unittest.TestCase):
         self.assertEqual(report["scored"], 0)
         self.assertEqual(report["error"], "Invalid")
 
+    def test_failed_cleanup_of_a_query_child_is_a_harness_fault(self):
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "EMPTY"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"answered","result":{"query":"SELECT"}}))\n',
+        )
+        original = eval_ask.capture_child
+
+        def capture(argv, directory, deadline, env=None):
+            record = original(argv, directory, deadline, env)
+            if argv[1] == "query" and directory.name.endswith("-query"):
+                record["cleanup"] = False  # as after a failed process census
+            return record
+
+        eval_ask.capture_child = capture
+        self.addCleanup(setattr, eval_ask, "capture_child", original)
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["error"], "HarnessFault")
+        statuses = [c["detail"].get("status") for c in report["cases"]]
+        self.assertNotIn("candidate_query_failure", statuses)
+
+    def test_answerable_failure_status_is_scored(self):
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "EMPTY"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "    raise SystemExit(2)\n",
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report["error"])
+        self.assertEqual(report["cases"][0]["detail"]["status"], "provider_error")
+        self.assertFalse(report["cases"][0]["correct"])
+
+    def test_query_and_ask_children_get_grace_beyond_the_server_timeout(self):
+        import evaluator
+
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "EMPTY"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        args.timeout, args.deadline = 0.3, 0.3
+        self.fake_ask(
+            args,
+            "import json,sys,time\n"
+            "time.sleep(0.8)  # past the server timeout, within the grace\n"
+            'if sys.argv[1] == "query":\n'
+            '    print(json.dumps({"head":{"vars":["x"]},"results":{"bindings":[]}}))\n'
+            "else:\n"
+            '    print(json.dumps({"outcome":"answered","result":{"query":"SELECT"}}))\n',
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertGreaterEqual(evaluator.QUERY_GRACE_SECONDS, 5)
+        self.assertEqual(report["goldPreflight"][0]["status"], "complete")
+        self.assertIsNone(report["cases"][0]["detail"].get("status"), report["cases"])
+
+    def test_slow_gold_is_reported_as_a_gold_problem(self):
+        args = self.questions_fixture(["answerable"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["questions"][0]["gold"] = "SLOW"
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        self.fake_ask(args, "raise SystemExit(1)\n")
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["error"], "GoldFault")
+        self.assertIn("q1", report["errorDetail"])
+        self.assertEqual(report["goldPreflight"][0]["status"], "failed")
+        self.assertEqual(report["executed"], 0)
+
+    def test_run_with_a_shorter_query_timeout_than_the_gold_was_made_with(self):
+        args = self.questions_fixture(["clarify"])
+        s = json.loads(pathlib.Path(args.set).read_text())
+        s["goldTimeoutSecs"] = 60
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        args.timeout = 5
+        with self.assertRaises(Invalid):
+            eval_ask.validate_args(args)
+        args = self.questions_fixture(["clarify"])
+        s["goldTimeoutSecs"] = 5
+        pathlib.Path(args.set).write_text(json.dumps(s))
+        args.out = str(self.root / "second")
+        eval_ask.validate_args(args)
+
+    def test_systematic_provider_errors_stop_the_run_as_incomplete(self):
+        args = self.questions_fixture(["clarify"] * 8)
+        args.max_consecutive_errors = 3
+        self.fake_ask(
+            args,
+            "import json\n"
+            'print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "raise SystemExit(2)\n",
+        )
+        _, report = eval_ask.run_matrix(args)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["error"], "HarnessFault")
+        self.assertIn("consecutive", report["errorDetail"])
+        self.assertEqual(report["scored"], 3)
+        # A success in between resets the count.
+        args = self.questions_fixture(["clarify"] * 6)
+        args.max_consecutive_errors = 3
+        self.fake_ask(
+            args,
+            "import json,sys\n"
+            'if int(sys.argv[sys.argv.index("--json") - 1][-1]) % 3:\n'
+            '    print(json.dumps({"outcome":"error","error":{"code":"provider-unavailable"}}))\n'
+            "    raise SystemExit(2)\n"
+            'print(json.dumps({"outcome":"clarify"}))\n',
+        )
+        args.out = str(self.root / "second")
+        _, report = eval_ask.run_matrix(args)
+        self.assertTrue(report["complete"], report["error"])
+
     def test_cap_refusal_is_excluded_and_stops_the_run(self):
         class Proxy:
             token, cap_refusals = "t", 0
 
             def set_case(self, case):
+                pass
+
+            def wait_idle(self):
                 pass
 
             def case_cost(self, case):
@@ -558,6 +729,57 @@ class Processes(unittest.TestCase):
             next(pathlib.Path(args.out).glob("*/status.json")).read_text()
         )
         self.assertEqual(status["argv"][1], "query")
+
+
+class ProcessCensus(unittest.TestCase):
+    def test_a_process_that_exits_during_the_census_is_not_a_failure(self):
+        # A process can exit between open and read of its /proc stat file, which
+        # raises ProcessLookupError. It aborted a dry run after 127 cases.
+        from unittest import mock
+
+        import evaluator
+
+        real = pathlib.Path.read_text
+        raised = []
+
+        def read_text(path, *a, **kw):
+            if path.name == "stat" and not raised:
+                raised.append(path)
+                raise ProcessLookupError(3, "No such process")
+            return real(path, *a, **kw)
+
+        with mock.patch.object(pathlib.Path, "read_text", read_text):
+            states = evaluator.group_states(1)
+        self.assertTrue(raised)
+        self.assertIsInstance(states, list)
+        # A torn stat line is skipped like a vanished process.
+        with mock.patch.object(pathlib.Path, "read_text", lambda *a, **k: "1 (x"):
+            self.assertEqual(evaluator.group_states(1), [])
+
+    def test_capture_child_survives_the_race(self):
+        from unittest import mock
+
+        real = pathlib.Path.read_text
+        calls = []
+
+        def read_text(path, *a, **kw):
+            if path.name == "stat" and len(calls) < 40:
+                calls.append(path)
+                raise ProcessLookupError(3, "No such process")
+            return real(path, *a, **kw)
+
+        with (
+            tempfile.TemporaryDirectory(prefix="ask-census-") as d,
+            mock.patch.object(pathlib.Path, "read_text", read_text),
+        ):
+            record = capture_child(
+                [PYTHON, "-c", "print(1)"],
+                pathlib.Path(d) / "child",
+                time.monotonic() + 5,
+            )
+        self.assertTrue(calls)
+        self.assertTrue(record["cleanup"])
+        self.assertEqual(record["returncode"], 0)
 
 
 class ExtraInvariants(unittest.TestCase):

@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from evaluator import Invalid, strict_json
 
 LEDGER_VERSION = 1
+HARD_CAP = 25 * 10**9  # USD 25 in nanodollars, for the carryover and every run together
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # Integer USD nanodollars per token as input, 5 minute cache write, 1 hour cache
@@ -85,11 +86,22 @@ def count(value):
     return value
 
 
-def cost(model, usage):
-    """The exact cost in nanodollars of one reply, or None when it cannot be known.
+GEO_PREMIUM = (
+    5,
+    4,
+)  # US-only inference. The published premium is 1.1, and this adds margin.
+UNKNOWN_PREMIUM = (
+    6  # The dearest premium of any priced mode, for values not recognised.
+)
 
-    Unknown usage keys are ignored. A missing, malformed or unrecognised tier
-    gives None, and the caller then charges the request's full bound.
+
+def cost(model, usage, limit=0):
+    """The cost in nanodollars of one reply, or None when the usage cannot be read.
+
+    Unknown usage keys are ignored. A US-only reply is charged its premium. A tier,
+    geography or speed that is not recognised is charged at least `limit`, the
+    request's bound, and at least the largest premium over the standard price, so a
+    priced mode can never be settled low.
     """
     if not isinstance(usage, dict) or model not in RATES:
         return None
@@ -107,13 +119,19 @@ def cost(model, usage):
             five, hour = 0, creation  # Unsplit writes are charged at the dearer rate.
     except ValueError:
         return None
-    if usage.get("service_tier") not in (None, "standard"):
-        return None
-    long_context = inp + creation + read > LONG_CONTEXT
-    if usage.get("inference_geo") not in (None, "global", "not_available"):
-        long_context = True  # An unrecognised geography is charged at the dearest rate.
-    rates = RATES[model][int(long_context)]
-    return sum(n * r for n, r in zip((inp, five, hour, read, out), rates, strict=True))
+    rates = RATES[model][int(inp + creation + read > LONG_CONTEXT)]
+    exact = sum(n * r for n, r in zip((inp, five, hour, read, out), rates, strict=True))
+    geo = usage.get("inference_geo")
+    if (
+        usage.get("service_tier") in (None, "standard")
+        and usage.get("speed") in (None, "standard")
+        and geo in (None, "global", "not_available", "us")
+    ):
+        if geo == "us":
+            num, den = GEO_PREMIUM
+            return (exact * num + den - 1) // den
+        return exact
+    return max(limit, exact * UNKNOWN_PREMIUM)
 
 
 def has_key(value, name):
@@ -159,18 +177,14 @@ class Ledger:
         self.reserved, self.settled, self.next_id = {}, 0, 1
         self.carryover = 0
         self.requests = 0
+        self.over_bound = 0
         self.costs = []  # (case, model, cost) for every settled request
         if not self.path.is_absolute() or ".." in self.path.parts:
             raise Invalid("absolute ledger path required")
+        if not 0 < cap or cap + (carryover["cost"] if carryover else 0) > HARD_CAP:
+            raise Invalid("the cap and the carryover together pass the hard cap")
         self.lock = self.path.with_name(self.path.name + ".lock")
-        try:
-            self.lock_fd = os.open(
-                self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
-            )
-        except FileExistsError:
-            raise Invalid(
-                "ledger is locked by another run, or by one that did not exit cleanly"
-            ) from None
+        self.lock_fd = self.acquire_lock()
         try:
             fresh = not self.path.exists()
             self.fd = os.open(
@@ -189,6 +203,39 @@ class Ledger:
         except BaseException:
             self.close()
             raise
+
+    def acquire_lock(self):
+        """Take the run lock. A lock whose owner process is gone is stale and is
+        replaced. A live, unreadable or foreign owner keeps it."""
+        for _ in range(2):
+            try:
+                fd = os.open(
+                    self.lock,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+            except FileExistsError:
+                if not self.stale_lock():
+                    raise Invalid("ledger is locked by a running evaluation") from None
+                with contextlib.suppress(FileNotFoundError):
+                    self.lock.unlink()
+                continue
+            os.write(fd, str(os.getpid()).encode())
+            os.fsync(fd)
+            return fd
+        raise Invalid("ledger lock could not be taken")
+
+    def stale_lock(self):
+        try:
+            pid = int(self.lock.read_text())
+            if pid <= 0:
+                return False
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, ValueError):
+            return False
+        return False
 
     def write(self, line):
         os.write(self.fd, (json.dumps(line, separators=(",", ":")) + "\n").encode())
@@ -261,9 +308,12 @@ class Ledger:
     def settle(self, ident, amount, status, usage=None, request_id=None):
         with self.mutex:
             reserve = self.reserved[ident]
+            over = amount > reserve["bound"]
+            self.over_bound += int(over)
             self.write(
                 {
                     "op": "settle",
+                    "overBound": over,
                     "id": ident,
                     "cost": amount,
                     "status": status,
@@ -295,6 +345,7 @@ class Ledger:
                 "unresolvedNanodollars": unresolved,
                 "upperLiabilityNanodollars": self.carryover + self.settled + unresolved,
                 "requests": self.requests,
+                "settledAboveBound": self.over_bound,
             }
 
     def close(self):
@@ -305,6 +356,15 @@ class Ledger:
                 setattr(self, name, None)
         with contextlib.suppress(OSError):
             self.lock.unlink()
+
+
+def require_single_ledger(path):
+    """A real run keeps one ledger per directory, so a second file cannot reset the
+    cap. The ledger file is the account of record for the whole spend."""
+    path = pathlib.Path(path)
+    others = [p for p in path.parent.glob("*.jsonl") if p != path]
+    if others:
+        raise Invalid("another ledger file is in the ledger directory")
 
 
 class HTTPUpstream:
@@ -396,10 +456,21 @@ class Proxy:
         self.last_headers = []
         self.request_bytes = []
         self.mutex = threading.Lock()
+        self.idle = threading.Condition(self.mutex)
+        self.in_flight = 0
         self.server_port = None
 
     def set_case(self, case):
         self.case = case
+
+    def wait_idle(self, timeout=None):
+        """Wait until no request is in flight. A child killed on a timeout can leave
+        one behind, and its cost belongs to the case that sent it."""
+        with self.idle:
+            return self.idle.wait_for(
+                lambda: self.in_flight == 0,
+                self.timeout + 5 if timeout is None else timeout,
+            )
 
     def case_cost(self, case):
         """Nanodollars settled so far for one case, over every model it called."""
@@ -432,6 +503,13 @@ class Proxy:
             raise Refused("model not allowed")
         if type(max_tokens) is not int or not 0 < max_tokens <= self.max_output_tokens:
             raise Refused("max_tokens out of range")
+        if not isinstance(body.get("system", ""), str) or any(
+            not isinstance(m, dict) or not isinstance(m.get("content"), str)
+            for m in body.get("messages") or [None]
+        ):
+            # Only text bodies keep the byte-based bound valid. An image can cost
+            # more tokens than its bytes.
+            raise Refused("only text content is allowed")
         body["stream"] = False
         if self.effort:
             config = body.setdefault("output_config", {})
@@ -442,6 +520,16 @@ class Proxy:
 
     def handle(self, raw):
         """Forward one request. Return (status, headers, body) for the child."""
+        with self.mutex:
+            self.in_flight += 1
+        try:
+            return self.handle_one(raw)
+        finally:
+            with self.idle:
+                self.in_flight -= 1
+                self.idle.notify_all()
+
+    def handle_one(self, raw):
         try:
             body = self.prepare(raw)
         except Refused as refusal:
@@ -474,7 +562,9 @@ class Proxy:
         passed = [(k, v) for k, v in headers if k.lower() in REPLY_HEADERS]
         request_id = next((v for k, v in headers if k.lower() == "request-id"), None)
         if not 200 <= status < 300:
-            # The API does not bill an error reply. The child's own retries see it.
+            # The API does not bill an error reply, which is an assumption. A gateway
+            # error after generation could be billed. The cap's margin absorbs it.
+            # The child's own retries see the reply.
             self.ledger.settle(ident, 0, f"http-{status}", request_id=request_id)
             return status, passed, self.clean_bytes(data)
         try:
@@ -482,7 +572,7 @@ class Proxy:
         except Invalid:
             reply = None
         usage = reply.get("usage") if isinstance(reply, dict) else None
-        amount = cost(model, usage)
+        amount = cost(model, usage, limit)
         self.ledger.settle(
             ident,
             limit if amount is None else amount,
@@ -578,13 +668,23 @@ class Proxy:
         }
 
 
-def preflight(proxy, upstream, timeout=30):
-    """Check framing and authentication before any evaluation spend.
+SCHEMA = {
+    "type": "object",
+    "properties": {"ok": {"type": "boolean"}},
+    "required": ["ok"],
+    "additionalProperties": False,
+}
 
-    Counting tokens costs nothing. The Messages call asks for 16 tokens from the
-    cheapest model and goes through the ledger like every other request. Returns the
-    two replies' status lines and header names and values for the record, without
-    the rate-limit, request and key-like headers.
+
+def preflight(proxy, upstream, timeout=30):
+    """Check framing, authentication and every model before any evaluation spend.
+
+    Counting tokens costs nothing. Each configured model then gets one small request
+    with the same structured-output shape and effort that the run uses, through the
+    ledger like every other request. A model that the account cannot use, a parameter
+    it rejects or a reply that is not the requested JSON stops the run here, for a
+    fraction of a cent each. Returns the replies' status lines and header names and
+    values for the record, without the rate-limit, request and key-like headers.
     """
     model = proxy.models[0]
     counted = upstream.send(
@@ -596,26 +696,42 @@ def preflight(proxy, upstream, timeout=30):
     )
     if counted[0] != 200 or not isinstance(strict_json(counted[2]), dict):
         raise Invalid("preflight token count failed")
-    request = {
-        "model": model,
-        "max_tokens": 16,
-        "messages": [{"role": "user", "content": "Say ok."}],
-    }
-    start = time.monotonic()
-    status, _, body = proxy.handle(json.dumps(request).encode())
-    if status != 200:
-        raise Invalid("preflight message failed")
 
     def keep(headers):
         dropped = ("anthropic-ratelimit", "request-id", "x-api-key", "set-cookie")
         return [[k, v] for k, v in headers if not k.lower().startswith(dropped)]
 
-    return {
-        "countTokens": {"status": counted[0], "headers": keep(counted[1])},
-        "message": {
+    models = {}
+    for name in proxy.models:
+        request = {
+            "model": name,
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Reply with ok true."}],
+            "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
+        }
+        start = time.monotonic()
+        status, _, body = proxy.handle(json.dumps(request).encode())
+        if status != 200:
+            raise Invalid(f"preflight failed for {name} with status {status}")
+        try:
+            text = "".join(
+                b.get("text", "")
+                for b in strict_json(body)["content"]
+                if b.get("type") == "text"
+            )
+            valid = isinstance(strict_json(text), dict)
+        except (Invalid, KeyError, TypeError, AttributeError):
+            valid = False
+        if not valid:
+            raise Invalid(f"preflight reply of {name} is not the requested JSON")
+        models[name] = {
             "status": status,
             "headers": keep(proxy.last_headers),
             "seconds": time.monotonic() - start,
-            "bytes": len(body),
-        },
+        }
+    first = models[proxy.models[0]]
+    return {
+        "countTokens": {"status": counted[0], "headers": keep(counted[1])},
+        "message": first,
+        "models": models,
     }

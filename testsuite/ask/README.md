@@ -24,7 +24,7 @@ it starts a query. This is a strict RDF-term policy and not an official QALD sco
 Answerable accuracy, clarification precision and refusal accuracy have separate
 denominators. Only the `unanswerable` outcome is a successful refusal. A provider error,
 a refusal by the model, an Ask timeout or an unusable draft is a failed answer with the
-status `provider_error`, `refusal`, `timeout` or `invalid_output`, and the run goes on.
+status `provider_error`, `refusal`, `timeout`, `budget_exceeded` or `invalid_output`, and the run goes on.
 A case that the cost cap refused is `budget_refused`. It leaves the denominators, marks
 its row incomplete and ends the run. A harness fault stops a run, such as failing gold,
 a wrong binary hash or a child with an unknown exit status.
@@ -75,14 +75,38 @@ or a prior from the run file, times a margin.
 
 ## A paid run
 
-The run file sets the sets, models, effort, `maxOutputTokens`, the cap, the carryover, the
-ledger, the output directory and the binary with its SHA256. A binary built from a named
-commit outside `docs/plans` is the one to use. After the dry run passes, one command
-starts the run.
+`run.example.json` shows the run file. Copy it and set the paths. It holds the sets and
+the models of each set, the effort, `maxOutputTokens`, the request and Ask timeouts, the
+query timeout, the cap, the carryover, the ledger, the output directory and the binary
+with its SHA256. The carryover is required, and the cap plus the carryover cannot pass
+USD 25. A real run refuses a second `.jsonl` file in the ledger directory, so the ledger
+file stays the account of record for the whole spend.
+
+`askTokenBudget` is the total token limit of one Ask. The default of 32768 ends most
+repaired or DBpedia-grounded Asks after one or two calls, so the example sets 100000. The
+budget is checked before each model call, so a case can pass it by one call. An Ask that
+spends it is a `budget_exceeded` failure and not an API error. `queryTimeoutSecs` must be
+at least the timeout that a converted set's gold answers were made with. Children get ten
+seconds beyond the Ask deadline and the query timeout.
+
+The preflight sends the run's own structured-output request to every model, and a run
+also stops as incomplete after five provider errors in a row. The projection of a block
+borrows the measured cost of the same model from earlier sets, so the first block of a new
+set uses demo costs until it has its own.
+
+A binary built from a named commit outside `docs/plans` is the one to use. After the dry
+run passes, one command starts the run.
 
 ```
-fnox exec -- scripts/eval-ask-anthropic --run /home/kclejeune/sparkles-ask-item6-r2/run.json
+fnox exec -- scripts/eval-ask-anthropic --run /ABSOLUTE/PATH/TO/run.json
 ```
+
+A crash such as SIGKILL leaves `ledger.jsonl.lock` holding the owner's PID. The next start
+replaces it when that process is gone and refuses while it runs. A restart needs a new
+`out` directory because the old one stays as the record. The ledger resumes and counts
+every unsettled reserve at its bound. After the first real preflight, copy
+`anthropic-reply-headers.json` from the output directory to
+`testsuite/ask/fixtures/`, which enables the framing test on a real reply.
 
 The pilot of 2026-10-15 ran 17 of the 68 demo questions on three pairs and a real cascade,
 which made 68 planned executions. It stopped on its first request and scored nothing. Its
