@@ -681,9 +681,29 @@ The counter tests measured these changes. A prefetch of 1,000 ranges made 1,004 
 checks before and at most 4 after. A warm predicate scan issued 4 `WILLNEED` requests for
 425,181 bytes before and none after. A second warm pass over 8 blocks made 8 read-ahead
 calls before and none after. The prefetch of a small FILTER table made 3 `get_many`
-calls before and none after. The instruction counts per request of the measurement
-below have not been taken, so the warm cost of the corrected branch against the base is
-still unmeasured.
+calls before and none after.
+
+### Warm cost on forge
+
+The instruction count described under the remaining measurements ran on forge on
+2026-10-16, with the server pinned to one performance core and the client on another.
+At `81afe624`, `employee-docs` took 2.4% more instructions per request than the base.
+Two causes made up most of the difference. Every answer of fewer than 256 rows collected,
+sorted and deduplicated its vocabulary ids before the prefetch dropped the blocks it had
+already hinted, which on a warm server was all of them. The profile-only accounting also
+added a check and an out-of-line call to every vocabulary block lookup. The serializer now
+tests the hinted bit of each id's block first and returns without allocating when all are
+set, and the profile hooks inline to a load and a branch. After these changes
+`employee-docs` takes 1.2% more instructions than the base, `star-lookup` 1.0%,
+`values-star` 1.3%, and the other measured queries less than 1.1%.
+
+The timing screen on forge flagged the execution time of `count-all` and `distinct-obj`,
+which run in about 3 microseconds. A build that counts instructions and cycles in the
+timed window of both binaries showed the same work in that window (10,908 against 10,988
+instructions for `count-all`, 9,256 against 9,275 for `distinct-obj`). With that counting
+code added to both, the execution ratios became 1.04 and 0.94. A ratio of this size at 3
+microseconds therefore follows code placement rather than added work, and the wall time
+of both queries stays within 1.5% of the base.
 
 ### Remaining measurements
 
