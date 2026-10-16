@@ -1,7 +1,7 @@
 // Helpers of the schema browser's "Draft shapes" dialog: the request, the constraints
 // that would exclude existing instances, a summary line, and the text to show or keep.
 
-import type { DraftShape, ShapesDraft } from './api';
+import type { DraftProperty, DraftShape, ShapesDraft } from './api';
 import { fmtInt } from './format';
 
 /** The draft's text: SHACL in Turtle or in SHACLC, or ShEx. */
@@ -18,6 +18,12 @@ export function parseSupport(text: string): number | null {
 /** One drafted constraint that rejects some current instances. */
 export type Exclusion = { path: string; component: string; excluded: number; applicable: number };
 
+/** The path of a drafted property: `^p` for an inverse one, `p/q` for a sequence. */
+export function pathLabel(p: DraftProperty): string {
+  if (p.then) return `${p.path}/${p.then}`;
+  return p.inverse ? `^${p.path}` : p.path;
+}
+
 /** The drafted constraints of a shape that exclude instances, most exclusions first. */
 export function exclusions(shape: DraftShape): Exclusion[] {
   const out: Exclusion[] = [];
@@ -25,7 +31,7 @@ export function exclusions(shape: DraftShape): Exclusion[] {
     for (const c of p.constraints) {
       if (c.excluded > 0) {
         out.push({
-          path: p.path,
+          path: pathLabel(p),
           component: c.component,
           excluded: c.excluded,
           applicable: c.applicable,

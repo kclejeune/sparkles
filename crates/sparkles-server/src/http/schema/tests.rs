@@ -535,7 +535,7 @@ async fn send(app: &Router, req: Request<Body>) -> (StatusCode, String, String) 
 async fn drafted_shapes() {
     let s = server(DRAFT_DATA);
     let j = ok(&s.app, "/$/schema/t/shapes").await;
-    assert_eq!(j["draftFormat"], 1);
+    assert_eq!(j["draftFormat"], 2);
     assert_eq!(j["selection"]["graph"], "default");
     assert_eq!(j["options"]["support"], 1.0);
     let classes: Vec<&str> = j["shapes"]

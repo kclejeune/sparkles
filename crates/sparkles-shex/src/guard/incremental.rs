@@ -71,7 +71,7 @@ impl Plan {
         };
         let mut steps = FxHashSet::default();
         for s in &ir.shapes {
-            if s.closed {
+            if s.closed || s.ext.is_some() {
                 p.out = None;
             }
             for tc in &s.tcs {

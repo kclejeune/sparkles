@@ -1811,11 +1811,10 @@ covers a schema change, a rejected change and a restart,
 `http::validation::shex_tests::schema_in_a_graph` the HTTP side, and
 `tests/cli_validation.rs` the CLI.
 
-**Deferred or rejected.** SHACL and ShEx guards on one dataset, a persisted typing, a
-schema in graphs merged with a file, and ShEx 2.2 (`EXTENDS`, `ABSTRACT`) are not
-built. The copy of shexTest that the harness runs, Jena's `jena-shex/src/test/files/spec`,
-has no test that uses `EXTENDS` or `ABSTRACT`, so ShEx 2.2 waits for a suite that covers
-it, as Open question 11 says.
+**Deferred or rejected.** SHACL and ShEx guards on one dataset and a schema in graphs
+merged with a file are not built. A persisted typing and ShEx 2.2 (`EXTENDS`,
+`ABSTRACT`) were built on 2026-10-13, as the first of the roadmap follow-ups below
+records.
 
 ### Roadmap follow-ups (2026-10-12)
 
@@ -1850,6 +1849,98 @@ it, as Open question 11 says.
   did not judge still drops the typing. Acceptance: with `foaf:knows @ex:Person *` at
   1.05M triples, the first person write after a restart takes the same 16 to 28 ms as
   the next ones, against a full validation of 2.1 to 2.7 s before.
+
+**Outcome of the ShEx 2.2 and persisted typing work (2026-10-13).**
+
+*ShEx 2.2.* `ABSTRACT` and `EXTENDS @label` are read and written in ShExC, ShExJ
+(`abstract`, `extends`) and ShExR (`sx:abstract`, `sx:extends`). `RESTRICTS` is still a
+syntax error. The `shex22` directory under `crates/sparkles-shex/tests` holds the 2.2
+cases of the upstream shexTest repository, and `tests/shextest.rs` runs every group over
+the Jena copy and over them. The harness now also reads the upstream layout, so it runs
+against a clone of shexTest too.
+
+* The compiler (`check.rs`, `compile.rs`) rejects an extension cycle, an `EXTENDS` target
+  that is not defined, and a reference to an abstract shape that nothing concrete
+  extends. A reference to a shape reaches every shape that extends it. The shapes of a
+  declaration that has a parent become an `ExtPlan` of frames and parts, where each part
+  is one ancestor's own shape together with the other conjuncts of its declaration.
+* The evaluator (`ext.rs`) reads all outgoing arcs of the node and the incoming arcs of
+  every inverse predicate the schema uses. It searches the ways to give each arc to one
+  part, matches the triple expression of each part against its own arcs, and checks the
+  other conjuncts of an ancestor against the arcs of the part and of its ancestors. An
+  arc that no part takes may remain only when the extending shape lists its predicate
+  in `EXTRA` and the arc satisfies no triple constraint on it. When the typing is not yet
+  known for the arc's value, leaving the arc over is undecided and not a success.
+  `CLOSED` forbids an outgoing arc that no part can match. The search spends the
+  `max_partitions` budget once per candidate assignment and once per abandoned option,
+  and running out of it is an error, never a false result. The search keeps its own stack, so a node with tens of
+  thousands of arcs does not exhaust the thread's stack, and it checks the timeout and
+  cancellation as it goes. Failures of an extending shape are reported as one `NoMatch`.
+* The write guard treats an extending shape as reading every outgoing arc of its nodes,
+  so no write is skipped for it, and it validates in full instead of incrementally.
+* *Results.* On the 2.2 cases validation passes 100 of 100 from ShExC and from ShExJ, and
+  77 of 77 from ShExR, where 23 cases have no ShExR form. Representation, ShExR reading
+  and ShExR writing pass 22 of 22 each, syntax 25 of 25, negative structure 4 of 4 and
+  negative syntax 1 of 1. The 2.1 numbers of the Jena copy are unchanged. On the
+  upstream suite every `EXTENDS` and `ABSTRACT` validation case passes. The remaining
+  upstream failures are not about 2.2 and were not adopted, namely float and double
+  infinities, the print format of semantic actions, annotations on node constraints,
+  relative shape labels, `includeWithCardinality` and a duplicate-label negative syntax
+  test.
+* *Limits.* The `EXACTLY` reference syntax is not read. The 2.2 draft's extension
+  coherence rule and its rule that `EXTENDS` appears only in extendable expressions are
+  not enforced, because upstream cases (`ExtendsRepeatedP`, `extends-abstract-or`)
+  contradict them. A declaration that is extended must be a shape or a conjunction with a
+  shape, and the compiler says so otherwise. A declaration that is a disjunction offers
+  one frame per disjunct, at most 64 frames. Only the extending shape's own `EXTRA`
+  applies to the arcs that no part takes. The ShExR writer wraps a declaration in
+  `sx:ShapeDecl` only when it is abstract or a bare reference.
+
+*Persisted typing.* The guard keeps the typing of the head across a restart and across a
+compaction. It differs from the design above in where and when it writes.
+
+* The file is `validation-typing.bin` in the database directory, next to
+  `validation-status.json` and outside the list of files a clone or a backup copies. The
+  store calls a new `CommitGuard::close` hook when it is dropped cleanly, under the
+  writer lock, and the guard writes the file there when the typing is that of the head.
+  The file is not written at a generation switch.
+* A compaction calls a new `CommitGuard::rekey` hook after it publishes the new
+  generation, still holding the writer lock. The guard translates the typing's nodes to
+  the new generation's ids in memory, by vocabulary key, and drops the typing if it
+  cannot. This avoids a file round trip, and a failed compaction loses nothing.
+* The header names the dataset, the head commit with its time and quad count, the SHA-256
+  of `validation.json` and a fingerprint of the compiled schema's pair kinds. The
+  fingerprint also covers the SHA-256 of the schema copy, so an edited copy never takes
+  the typing of the schema it replaced. A SHA-256 of the whole file ends it. That digest
+  detects damage and not tampering. The file is trusted like the rest of the database
+  directory, because anyone who can write it can also write `validation.json` or the
+  schema copy. Nodes are stored as the store's vocabulary key, or
+  as the raw id for inline values and blank nodes, whose ids come from their labels. A
+  term the store no longer has is dropped with its pairs, which a changed store can
+  only make smaller. At install the guard reads the file when every field matches the
+  head and leaves it in place.
+* The first commit, bypass or schema write after an open removes the file, so a head
+  that moved on can never be mistaken for the one in the file. Replacing or removing the
+  configuration removes it too. A guard whose schema is in graphs, and an in-memory
+  dataset, keep no file.
+* *Memory and speed.* The typing was in memory already after the first full validation,
+  so resident memory is the same once the file is read. While it is read, the file's
+  bytes are held as well, about the size of the typing, and freed at once. Closing the
+  store costs one write of that size. The first write after a restart no longer
+  validates the dataset in full. The timings of the acceptance example, 16 to 28 ms
+  against 2.1 to 2.7 s, were not measured again at 1.05M triples. The test
+  `guard::tests::the_typing_survives_a_restart` checks a restart, a compaction, a
+  changed file, a file of an older commit and a replaced configuration.
+* A process that exits without dropping the store, or one that is killed, leaves no file
+  or an old one that is never trusted, and the first write validates in full as before.
+* The file has a magic number and a format number of its own, and it is registered in the
+  file-format registry that [X12](X12-release-engineering.md) adds as the derived kind
+  `validation-typing`. A file of a version this build does not read is discarded and the
+  typing is rebuilt by a full validation, which is logged.
+* *Limitation.* The schema copy's own digest in `validation-status.json` is not checked
+  when the guard loads, which is older than this work. The typing file no longer relies on
+  it, since it carries a digest of the copy it was written for. The gap is recorded under
+  the follow-ups of [C10](C10-write-time-validation.md).
 
 **Guards, schema sources and CLI controls** (item 54, Tier 5,
 [ROADMAP](../ROADMAP.md)).

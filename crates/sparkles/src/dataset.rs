@@ -197,7 +197,7 @@ impl From<Arc<Store>> for StoreHandle {
 
 /// A computed schema report and what it was computed for.
 pub struct SchemaCacheEntry {
-    /// snapshot identity (`sparkles::schema::snapshot_identity`)
+    /// the commit the report was computed at
     pub identity: u64,
     /// hash of the selection parameters
     pub selection: u64,

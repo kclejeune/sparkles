@@ -120,6 +120,14 @@ fn plural(n: u64, one: &str) -> String {
     }
 }
 
+/// Whether any property of the draft refers to the shape of a class.
+fn has_references(d: &ShapesDraft) -> bool {
+    d.shapes
+        .iter()
+        .flat_map(|s| &s.properties)
+        .any(|p| p.constraints.iter().any(|c| c.component == "node"))
+}
+
 fn header_comment(d: &ShapesDraft, out: &mut String, what: &str) {
     let _ = writeln!(
         out,
@@ -144,12 +152,19 @@ fn header_comment(d: &ShapesDraft, out: &mut String, what: &str) {
             ""
         },
     );
+    if has_references(d) {
+        let _ = writeln!(
+            out,
+            "# The shapes refer to each other for the classes of values, and the references may form cycles. Both validators handle recursion."
+        );
+    }
 }
 
-/// The comment after a constraint: how many satisfy it of how many.
+/// The comment after a constraint: how many satisfy it of how many. A bound of a range
+/// says it is the observed one.
 fn note(c: &ConstraintDraft) -> String {
-    if c.excluded == 0 && c.applicable == 1 {
-        "the 1 instance".into()
+    let counts = if c.excluded == 0 && c.applicable == 1 {
+        "the 1 instance".to_string()
     } else if c.excluded == 0 {
         format!("all {} instances", c.applicable)
     } else {
@@ -157,7 +172,17 @@ fn note(c: &ConstraintDraft) -> String {
             "{} of {} instances, excludes {}",
             c.satisfied, c.applicable, c.excluded
         )
+    };
+    match c.component {
+        "minInclusive" => format!("{counts}, the observed minimum, not an intended one"),
+        "maxInclusive" => format!("{counts}, the observed maximum, not an intended one"),
+        _ => counts,
     }
+}
+
+/// A string literal for Turtle and SHACLC.
+fn quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// A SHACL constraint's predicate and object.
@@ -169,7 +194,17 @@ fn shacl_constraint(
     let obj = match &c.value {
         ConstraintValue::Count(n) => n.to_string(),
         ConstraintValue::Iri(i) => names.iri(i, used),
+        ConstraintValue::Term(t) => term(t, names, used),
+        ConstraintValue::Text(t) => quoted(t),
         ConstraintValue::Bool(b) => b.to_string(),
+        ConstraintValue::List(items) if c.component == "or" => format!(
+            "( {} )",
+            items
+                .iter()
+                .map(|d| format!("[ sh:datatype {} ]", names.iri(d, used)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         ConstraintValue::List(items) if c.component == "languageIn" => format!(
             "( {} )",
             items
@@ -190,11 +225,42 @@ fn shacl_constraint(
     (names.iri(&format!("{SH}{}", c.component), used), obj)
 }
 
+/// The path of a property shape in Turtle.
+fn shacl_path(p: &PropertyDraft, names: &Prefixes, used: &mut BTreeSet<usize>) -> String {
+    let first = names.iri(&p.path, used);
+    match (&p.then, p.inverse) {
+        (Some(q), _) => format!("( {first} {} )", names.iri(q, used)),
+        (None, true) => format!("[ sh:inversePath {first} ]"),
+        (None, false) => first,
+    }
+}
+
+/// The path of a property shape in the SHACL Compact Syntax.
+fn shaclc_path(p: &PropertyDraft, names: &Prefixes, used: &mut BTreeSet<usize>) -> String {
+    let first = names.iri(&p.path, used);
+    match (&p.then, p.inverse) {
+        (Some(q), _) => format!("{first}/{}", names.iri(q, used)),
+        (None, true) => format!("^{first}"),
+        (None, false) => first,
+    }
+}
+
+/// How the instances with a value are described: of the class, the subjects that point
+/// at them, or the values at the end of a path.
+fn with_a_value(p: &PropertyDraft) -> &'static str {
+    if p.inverse {
+        "with a subject pointing at it"
+    } else {
+        "with a value"
+    }
+}
+
 fn shacl_property(p: &PropertyDraft, names: &Prefixes, used: &mut BTreeSet<usize>) -> String {
     let mut lines = vec![format!(
-        "sh:path {} ;  # {} with a value",
-        names.iri(&p.path, used),
-        plural(p.instances, "instance")
+        "sh:path {} ;  # {} {}",
+        shacl_path(p, names, used),
+        plural(p.instances, "instance"),
+        with_a_value(p)
     )];
     for c in &p.constraints {
         let (pred, obj) = shacl_constraint(c, names, used);
@@ -279,6 +345,14 @@ fn shaclc_atom(c: &ConstraintDraft, names: &Prefixes, used: &mut BTreeSet<usize>
         },
         ("datatype", ConstraintValue::Iri(d)) if shaclc_datatype(d) => names.iri(d, used),
         ("class", ConstraintValue::Iri(k)) if !shaclc_datatype(k) => names.iri(k, used),
+        ("node", ConstraintValue::Iri(s)) => format!("@{}", names.iri(s, used)),
+        ("or", ConstraintValue::List(items)) => items
+            .iter()
+            .map(|d| names.iri(d, used))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        (name, ConstraintValue::Term(t)) => format!("{name}={}", term(t, names, used)),
+        (name, ConstraintValue::Text(t)) => format!("{name}={}", quoted(t)),
         (name, ConstraintValue::Iri(i)) => format!("{name}={}", names.iri(i, used)),
         (name, ConstraintValue::Count(n)) => format!("{name}={n}"),
         (name, ConstraintValue::Bool(b)) => format!("{name}={b}"),
@@ -327,9 +401,10 @@ fn shaclc_property(p: &PropertyDraft, names: &Prefixes, used: &mut BTreeSet<usiz
         }
     }
     let mut out = format!(
-        "    {}  # {} with a value\n",
-        names.iri(&p.path, used),
-        plural(p.instances, "instance")
+        "    {}  # {} {}\n",
+        shaclc_path(p, names, used),
+        plural(p.instances, "instance"),
+        with_a_value(p)
     );
     let n = atoms.len();
     for (i, (atom, comment)) in atoms.into_iter().enumerate() {
@@ -387,57 +462,129 @@ pub fn shaclc(d: &ShapesDraft, names: &Prefixes) -> String {
     out
 }
 
-/// The ShExC value expression of a property, or `.`.
+/// A number as a ShExC numeric literal, from a term in N-Triples syntax (`None` when it
+/// is not a finite integer, decimal or double).
+fn shex_number(t: &str) -> Option<String> {
+    let rest = t.strip_prefix('"')?;
+    let (lex, dt) = rest.split_once("\"^^<")?;
+    let dt = dt.strip_suffix('>')?.strip_prefix(XSD)?;
+    if !matches!(dt, "integer" | "decimal" | "double") {
+        return None;
+    }
+    let body = lex.strip_prefix(['+', '-']).unwrap_or(lex);
+    let (mantissa, exp) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e.strip_prefix(['+', '-']).unwrap_or(e))),
+        None => (body, None),
+    };
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    let ok_mantissa = match mantissa.split_once('.') {
+        Some((i, f)) => {
+            (digits(i) || i.is_empty()) && (digits(f) || f.is_empty()) && (digits(i) || digits(f))
+        }
+        None => digits(mantissa),
+    };
+    (ok_mantissa && exp.is_none_or(digits)).then(|| lex.to_string())
+}
+
+/// The ShExC value expression of a property, or `.`, and the comments for constraints
+/// that have no ShEx counterpart.
 fn shex_value(
     p: &PropertyDraft,
     names: &Prefixes,
     used: &mut BTreeSet<usize>,
     subclasses: &dyn Fn(&str) -> Vec<String>,
-) -> String {
+) -> (String, Vec<String>) {
     let get = |k: &str| p.constraints.iter().find(|c| c.component == k);
+    let mut notes = Vec::new();
+    // the facets: a pattern, and the bounds of a range of numbers
+    let mut facets: Vec<String> = Vec::new();
+    if let Some(ConstraintValue::Text(re)) = get("pattern").map(|c| &c.value) {
+        facets.push(format!("/{}/", re.replace('/', "\\/")));
+    }
+    for (component, keyword) in [
+        ("minInclusive", "MININCLUSIVE"),
+        ("maxInclusive", "MAXINCLUSIVE"),
+    ] {
+        if let Some(ConstraintValue::Term(t)) = get(component).map(|c| &c.value) {
+            match shex_number(t) {
+                Some(n) => facets.push(format!("{keyword} {n}")),
+                None => notes.push(format!(
+                    "sh:{component} {} has no ShEx counterpart",
+                    term(t, names, used)
+                )),
+            }
+        }
+    }
+    let facets = facets.join(" ");
+    let with = |base: String| {
+        if facets.is_empty() {
+            base
+        } else {
+            format!("{base} {facets}")
+        }
+    };
     if let Some(ConstraintValue::List(items)) = get("in").map(|c| &c.value) {
         let vals: Vec<String> = items.iter().map(|t| term(t, names, used)).collect();
-        return format!("[{}]", vals.join(" "));
+        return (with(format!("[{}]", vals.join(" "))), notes);
     }
     if let Some(ConstraintValue::List(tags)) = get("languageIn").map(|c| &c.value) {
         let vals: Vec<String> = tags.iter().map(|t| format!("@{t}")).collect();
-        return format!("[{}]", vals.join(" "));
+        return (with(format!("[{}]", vals.join(" "))), notes);
     }
     if let Some(ConstraintValue::Iri(dt)) = get("datatype").map(|c| &c.value) {
-        return names.iri(dt, used);
+        return (with(names.iri(dt, used)), notes);
     }
+    let mut parts: Vec<String> = Vec::new();
     let kind = get("nodeKind").and_then(|c| match &c.value {
         ConstraintValue::Iri(k) => k.strip_prefix(SH),
         _ => None,
     });
-    let kind = kind.map(|k| match k {
-        "IRI" => "IRI",
-        "BlankNode" => "BNODE",
-        "Literal" => "LITERAL",
-        "BlankNodeOrIRI" => "NONLITERAL",
-        "IRIOrLiteral" => "(IRI OR LITERAL)",
-        _ => "(BNODE OR LITERAL)",
+    if let Some(k) = kind {
+        parts.push(
+            match k {
+                "IRI" => "IRI",
+                "BlankNode" => "BNODE",
+                "Literal" => "LITERAL",
+                "BlankNodeOrIRI" => "NONLITERAL",
+                "IRIOrLiteral" => "(IRI OR LITERAL)",
+                _ => "(BNODE OR LITERAL)",
+            }
+            .to_string(),
+        );
+    }
+    if let Some(ConstraintValue::List(items)) = get("or").map(|c| &c.value) {
+        let alts: Vec<String> = items.iter().map(|d| names.iri(d, used)).collect();
+        parts.push(format!("({})", alts.join(" OR ")));
+    }
+    let node = get("node").and_then(|c| match &c.value {
+        ConstraintValue::Iri(s) => Some(s.as_str()),
+        _ => None,
     });
     let class = get("class").and_then(|c| match &c.value {
         ConstraintValue::Iri(k) => Some(k.as_str()),
         _ => None,
     });
-    match (kind, class) {
-        (k, Some(class)) => {
+    match (node, class) {
+        (Some(shape), _) => parts.push(format!("@{}", names.iri(shape, used))),
+        (None, Some(class)) => {
             let ty = names.iri(&format!("{RDF}type"), used);
             let set: Vec<String> = subclasses(class)
                 .iter()
                 .map(|c| names.iri(c, used))
                 .collect();
-            let shape = format!("EXTRA {ty} {{ {ty} [{}] + }}", set.join(" "));
-            match k {
-                Some(k) => format!("({k} AND {shape})"),
-                None => format!("({shape})"),
-            }
+            parts.push(format!("(EXTRA {ty} {{ {ty} [{}] + }})", set.join(" ")));
         }
-        (Some(k), None) => k.to_string(),
-        (None, None) => ".".into(),
+        (None, None) => {}
     }
+    if !facets.is_empty() {
+        parts.push(facets);
+    }
+    let value = match parts.len() {
+        0 => ".".to_string(),
+        1 => parts.remove(0),
+        _ => format!("({})", parts.join(" AND ")),
+    };
+    (value, notes)
 }
 
 fn cardinality(p: &PropertyDraft) -> String {
@@ -479,17 +626,29 @@ fn shex_shape(
     }
     out.push_str(" {\n");
     let mut items: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     for p in &s.properties {
-        let mut line = format!(
-            "  {} {} {}",
-            names.iri(&p.path, used),
-            shex_value(p, names, used, subclasses),
-            cardinality(p)
-        );
+        // ShEx has no sequence paths: the shape of the values in the middle would ask
+        // for more than the path does
+        if let Some(q) = &p.then {
+            notes.push(format!(
+                "{}/{}: a sequence path has no ShEx counterpart",
+                names.iri(&p.path, used),
+                names.iri(q, used)
+            ));
+            continue;
+        }
+        let (value, more) = shex_value(p, names, used, subclasses);
+        let mut path = names.iri(&p.path, used);
+        if p.inverse {
+            path.insert(0, '^');
+        }
+        let mut line = format!("  {path} {value} {}", cardinality(p));
         if p.constraints.iter().any(|c| c.component == "uniqueLang") {
             line.push_str("  # sh:uniqueLang has no ShEx counterpart");
         }
         items.push(line);
+        notes.extend(more.into_iter().map(|m| format!("{path}: {m}")));
     }
     if s.closed {
         items.push(format!("  {} . *", names.iri(&format!("{RDF}type"), used)));
@@ -506,6 +665,9 @@ fn shex_shape(
                 let _ = writeln!(out, "{item}{sep}");
             }
         }
+    }
+    for n in notes {
+        let _ = writeln!(out, "  # {n}");
     }
     out.push_str("}\n");
     out

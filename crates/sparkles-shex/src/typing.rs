@@ -95,6 +95,9 @@ pub struct Env<'a> {
     /// per shape expression: no reference or shape below it, so it is evaluated at the
     /// value instead of through a pair
     pure: Vec<bool>,
+    /// the predicates whose incoming arcs a shape that extends others reads (empty when
+    /// no shape does)
+    pub(crate) ext_inverse: Vec<Id>,
 }
 
 /// Per-thread scratch: a neighbourhood buffer and the semantic-action state.
@@ -174,6 +177,11 @@ impl<'a> Env<'a> {
             parallel: opts.parallel,
             pool: opts.pool.clone(),
             pure: pure.into_iter().map(|p| p.unwrap_or(false)).collect(),
+            ext_inverse: if ir.shapes.iter().any(|s| s.ext.is_some()) {
+                Env::inverse_predicates(ir, snap)
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -276,6 +284,9 @@ impl<'a> Env<'a> {
         read: &Read<'_>,
         w: &mut Worker<'_>,
     ) -> anyhow::Result<Tri> {
+        if self.ir.shapes[sid.index()].ext.is_some() {
+            return self.ext_shape(sid, node, read, w);
+        }
         let Worker { neigh, cx, .. } = w;
         if neigh::fetch(self.data, &self.plan, node, sid, neigh)? == FetchOutcome::FailFast {
             return Ok(Tri::False);

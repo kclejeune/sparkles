@@ -6291,6 +6291,17 @@ impl Drop for Store {
         // process (or a restore's swap) may own next
         {
             let mut w = self.guarded_writer();
+            // a guard keeps what it knows of the head for the next open
+            if !w.poisoned
+                && !std::thread::panicking()
+                && self.root.is_some()
+                && let Some(g) = self.guard()
+            {
+                let snap = self.snapshot();
+                if snap.commit == w.head.seq && !snap.historical {
+                    g.close(&w.head, &snap);
+                }
+            }
             w.closed = true;
             // Backup leases may retain WriterState after the store closes.
             // Shut down the owned worker now, rather than with that last lease.

@@ -1,4 +1,4 @@
-//! The schema AST. It mirrors ShExJ (the JSON-LD form of ShEx 2.1), so ShExC → AST →
+//! The schema AST. It mirrors ShExJ (the JSON-LD form of ShEx 2.2), so ShExC → AST →
 //! ShExJ → AST → ShExC round trips keep everything but comments: annotations and
 //! semantic actions included.
 //!
@@ -66,6 +66,20 @@ impl std::fmt::Display for Label {
 pub struct ShapeDecl {
     pub label: Label,
     pub expr: ShapeExpr,
+    /// `ABSTRACT`: no node conforms to the shape itself, only through a shape that
+    /// extends it (ShEx 2.2)
+    pub is_abstract: bool,
+}
+
+impl ShapeDecl {
+    /// A declaration that is not abstract.
+    pub fn new(label: Label, expr: ShapeExpr) -> ShapeDecl {
+        ShapeDecl {
+            label,
+            expr,
+            is_abstract: false,
+        }
+    }
 }
 
 /// A shape expression (ShExJ `shapeExpr`).
@@ -204,6 +218,8 @@ pub enum ValueSetValue {
 /// A shape (ShExJ `Shape`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Shape {
+    /// `EXTENDS @label`, in order (ShEx 2.2)
+    pub extends: Vec<Label>,
     pub closed: Option<bool>,
     /// `EXTRA` predicates
     pub extra: Vec<String>,

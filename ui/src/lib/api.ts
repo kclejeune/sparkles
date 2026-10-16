@@ -955,6 +955,8 @@ export type Enforcement = 'reject-on-write' | 'warn-on-write' | 'validated-on-re
 /** One property shape with a predicate path. */
 export type PropertyConstraint = {
   path: string;
+  /** The constraint is on the subjects that point at the instance over `path` (ShEx `^p`). */
+  inverse?: boolean;
   shape?: string;
   severity: string;
   enforcement: Enforcement;
@@ -963,6 +965,8 @@ export type PropertyConstraint = {
   datatype?: string;
   class?: string[];
   nodeKind?: string;
+  /** The value set of a ShEx node constraint, as N-Triples terms. */
+  values?: string[];
   /** Constraint components of the shape's other constraints. */
   other?: string[];
 };
@@ -2954,6 +2958,10 @@ export type DraftConstraint = {
 
 export type DraftProperty = {
   path: string;
+  /** The values are the subjects that point at the instance over `path`. */
+  inverse?: boolean;
+  /** A sequence path: the values of `then` at the values of `path`. */
+  then?: string;
   instances: number;
   maxValues: number;
   constraints: DraftConstraint[];
@@ -2979,6 +2987,7 @@ export type ShapesDraft = {
     minInstances: number;
     maxIn: number;
     maxCount: number;
+    maxInverse: number;
     closed: boolean;
     base: string;
     classes: string[];

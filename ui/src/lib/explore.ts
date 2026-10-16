@@ -289,6 +289,7 @@ export function constraintSummary(
   if (c.datatype) parts.push(`datatype ${short(c.datatype)}`);
   for (const k of c.class ?? []) parts.push(`class ${short(k)}`);
   if (c.nodeKind) parts.push(`nodeKind ${short(c.nodeKind)}`);
+  if (c.values?.length) parts.push(`in [${c.values.join(' ')}]`);
   for (const o of c.other ?? [])
     parts.push(`+${o.replace(/^.*[#/]/, '').replace(/ConstraintComponent$/, '')}`);
   return parts.length ? parts.join(' · ') : 'no constraints';
@@ -305,7 +306,7 @@ export function constraintChips(
   short: (iri: string) => string,
 ): { text: string; title: string; enforcement: api.Enforcement }[] {
   return lines
-    .filter((l) => l.constraint.path === predicate)
+    .filter((l) => l.constraint.path === predicate && !l.constraint.inverse)
     .map((l) => {
       const e = enforcementText(l.constraint.enforcement);
       return {

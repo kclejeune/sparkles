@@ -797,6 +797,7 @@ pub(crate) mod build {
                 max_occ,
                 class,
                 sem_acts: Vec::new(),
+                ext: None,
             }
         }
     }

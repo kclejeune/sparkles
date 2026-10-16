@@ -28,8 +28,11 @@
 //!
 //! Test ids are `group/name`. Failures listed in `tests/known-failures.txt` do not fail
 //! the run, and listed tests that pass are reported. Tests with `mf:status mf:Proposed`
-//! run but never fail it. Tests of ShEx 2.2 features (the `Extends`, `Abstract` and
-//! `ExtendsDiamond` traits) are excluded. Validation tests of facets on blank-node
+//! run but never fail it. Both layouts work: an upstream checkout names its files by
+//! `https://raw.githubusercontent.com/shexSpec/shexTest/master/…` IRIs, which are read
+//! from the suite directory. The ShEx 2.2 tests (the `Extends`, `Abstract` and
+//! `ExtendsDiamond` traits) are part of an upstream checkout, and `tests/shex22` holds a
+//! copy of them, run by `shex22_*` tests. Validation tests of facets on blank-node
 //! labels (`LexicalBNode`) are skipped with a reason and counted, because the store
 //! does not keep blank node labels. Parts of the crate that still report "not
 //! implemented" are counted as skipped, not failed.
@@ -54,8 +57,21 @@ const SHT: &str = "http://www.w3.org/ns/shacl/test-suite#";
 const SX: &str = "https://shexspec.github.io/shexTest/ns#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
-/// Traits of ShEx 2.2 features, which ShEx 2.1 does not have.
-const EXCLUDED_TRAITS: &[&str] = &["Extends", "Abstract", "ExtendsDiamond"];
+/// Traits of tests that are left out of a run.
+const EXCLUDED_TRAITS: &[&str] = &[];
+
+/// What upstream's manifests use as the IRI of the suite directory.
+const UPSTREAM: &str = "https://raw.githubusercontent.com/shexSpec/shexTest/master/";
+
+/// The suite directories of the run, for the upstream IRIs.
+static SUITE_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn register_root(dir: &Path) {
+    let mut roots = SUITE_ROOTS.lock().unwrap();
+    if !roots.iter().any(|r| r == dir) {
+        roots.push(dir.to_path_buf());
+    }
+}
 
 /// Validation tests skipped by trait, with the reason: they test what Sparkles does
 /// not keep. They are counted per reason and left out of the pass rate.
@@ -73,7 +89,38 @@ fn suite_dir() -> Option<PathBuf> {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../../apache/jena/jena-shex/src/test/files/spec")
         });
-    p.join("schemas").is_dir().then_some(p)
+    if p.join("schemas").is_dir() {
+        register_root(&p);
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// The suites a group runs over: the one `SPARKLES_SHEX_TESTS` names, and the ShEx 2.2
+/// tests this repository holds (their ids have the prefix `shex22/`).
+fn suites(group: &str) -> Vec<(PathBuf, &'static str)> {
+    let mut v = Vec::new();
+    if let Some(d) = suite_or_skip(group) {
+        v.push((d, ""));
+    }
+    let own = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/shex22");
+    if own.join("schemas").is_dir() {
+        register_root(&own);
+        v.push((own, "shex22/"));
+    }
+    v
+}
+
+fn each_suite(group: &str, f: fn(PathBuf, &'static str)) {
+    for (dir, prefix) in suites(group) {
+        f(dir, prefix);
+    }
+}
+
+/// A group's name with its suite's prefix.
+fn gname(prefix: &str, name: &str) -> &'static str {
+    Box::leak(format!("{prefix}{name}").into_boxed_str())
 }
 
 fn suite_or_skip(group: &str) -> Option<PathBuf> {
@@ -85,6 +132,15 @@ fn suite_or_skip(group: &str) -> Option<PathBuf> {
 }
 
 fn url_to_path(u: &str) -> PathBuf {
+    if let Some(rest) = u.strip_prefix(UPSTREAM) {
+        let roots = SUITE_ROOTS.lock().unwrap();
+        let found = roots.iter().map(|r| r.join(rest)).find(|p| p.exists());
+        let path = found.or_else(|| roots.first().map(|r| r.join(rest)));
+        if let Some(p) = path {
+            drop(roots);
+            return url_to_path(&p.to_string_lossy());
+        }
+    }
     let p = u.strip_prefix("file://").unwrap_or(u);
     // percent-decoding, for the few characters IRIs escape
     let b = p.as_bytes();
@@ -418,10 +474,11 @@ fn run_group(name: &'static str, body: impl FnOnce(&mut Group) + Send + 'static)
 
 #[test]
 fn syntax() {
-    let Some(dir) = suite_or_skip("syntax") else {
-        return;
-    };
-    run_group("syntax", move |g| {
+    each_suite("syntax", syntax_in);
+}
+
+fn syntax_in(dir: PathBuf, prefix: &'static str) {
+    run_group(gname(prefix, "syntax"), move |g| {
         // Jena's layout has a `syntax/` directory; upstream, the schemas are the
         // syntax tests
         let sdir = if dir.join("syntax").is_dir() {
@@ -451,10 +508,11 @@ fn syntax() {
 
 #[test]
 fn negative_syntax() {
-    let Some(dir) = suite_or_skip("negativeSyntax") else {
-        return;
-    };
-    run_group("negativeSyntax", move |g| {
+    each_suite("negativeSyntax", negative_syntax_in);
+}
+
+fn negative_syntax_in(dir: PathBuf, prefix: &'static str) {
+    run_group(gname(prefix, "negativeSyntax"), move |g| {
         for f in shex_files(&dir.join("negativeSyntax")) {
             let name = stem(&f);
             if !g.selects(&name) {
@@ -489,10 +547,11 @@ fn resolver_for(schema_file: &Path) -> FileResolver {
 
 #[test]
 fn negative_structure() {
-    let Some(dir) = suite_or_skip("negativeStructure") else {
-        return;
-    };
-    run_group("negativeStructure", move |g| {
+    each_suite("negativeStructure", negative_structure_in);
+}
+
+fn negative_structure_in(dir: PathBuf, prefix: &'static str) {
+    run_group(gname(prefix, "negativeStructure"), move |g| {
         for f in shex_files(&dir.join("negativeStructure")) {
             let name = stem(&f);
             if !g.selects(&name) {
@@ -744,10 +803,11 @@ fn representation(t: &RepTest) -> Outcome {
 
 #[test]
 fn representation_tests() {
-    let Some(dir) = suite_or_skip("representation") else {
-        return;
-    };
-    run_group("representation", move |g| {
+    each_suite("representation", representation_tests_in);
+}
+
+fn representation_tests_in(dir: PathBuf, prefix: &'static str) {
+    run_group(gname(prefix, "representation"), move |g| {
         for t in rep_tests(&dir) {
             if !g.selects(&t.name) {
                 continue;
@@ -892,6 +952,40 @@ fn shexr_read(t: &RepTest, ttl: &Path) -> Outcome {
     Outcome::Pass
 }
 
+/// The graph with each `sx:ShapeDecl` that is not abstract and wraps a shape expression
+/// written in place replaced by that expression (the form the writer uses, and the
+/// ShEx 2.1 one).
+fn unwrap_decls(g: &Graph) -> Graph {
+    let sx = |l: &str| nn(&format!("{}{l}", sparkles_shex::shexr::SX));
+    let (ty, decl, wraps, abs) = (
+        nn(&format!("{RDF}type")),
+        sx("ShapeDecl"),
+        sx("shapeExpr"),
+        sx("abstract"),
+    );
+    let mut out = g.clone();
+    let decls: Vec<oxrdf::NamedOrBlankNode> = g
+        .subjects_for_predicate_object(&ty, &decl)
+        .map(oxrdf::NamedOrBlankNodeRef::into_owned)
+        .collect();
+    for d in decls {
+        let dt = Term::from(d.clone());
+        if matches!(obj(g, &dt, abs.as_str()), Some(Term::Literal(l)) if l.value() == "true") {
+            continue;
+        }
+        let Some(Term::BlankNode(x)) = obj(g, &dt, wraps.as_str()) else {
+            continue;
+        };
+        for t in g.triples_for_subject(&x) {
+            out.remove(t);
+            out.insert(&oxrdf::Triple::new(d.clone(), t.predicate, t.object));
+        }
+        out.remove(&oxrdf::Triple::new(d.clone(), ty.clone(), decl.clone()));
+        out.remove(&oxrdf::Triple::new(d, wraps.clone(), x));
+    }
+    out
+}
+
 /// ShExC → ShExR is the graph of the `.ttl` file.
 fn shexr_write(t: &RepTest, ttl: &Path) -> Outcome {
     let text = match read(&t.shex) {
@@ -903,7 +997,7 @@ fn shexr_write(t: &RepTest, ttl: &Path) -> Outcome {
         Err(e) => return failed(format!("ShExC: {e}")),
     };
     let expected = match load_turtle(&path_to_url(ttl)) {
-        Ok(g) => canonical(sorted_shapes(&g)),
+        Ok(g) => canonical(sorted_shapes(&unwrap_decls(&g))),
         Err(e) => return Outcome::Fail(e),
     };
     let got = canonical(sorted_shapes(&schema.to_shexr()));
@@ -928,15 +1022,16 @@ fn shexr_write(t: &RepTest, ttl: &Path) -> Outcome {
 
 #[test]
 fn shexr_tests() {
-    let Some(dir) = suite_or_skip("shexr") else {
-        return;
-    };
+    each_suite("shexr", shexr_tests_in);
+}
+
+fn shexr_tests_in(dir: PathBuf, prefix: &'static str) {
     let h = std::thread::Builder::new()
         .name("group_shexr".into())
         .stack_size(64 << 20)
         .spawn(move || {
-            let mut r = Group::new("shexr");
-            let mut w = Group::new("shexr-write");
+            let mut r = Group::new(gname(prefix, "shexr"));
+            let mut w = Group::new(gname(prefix, "shexr-write"));
             for t in rep_tests(&dir) {
                 for (g, write) in [(&mut r, false), (&mut w, true)] {
                     if !g.selects(&t.name) {
@@ -976,11 +1071,11 @@ fn shexr_tests() {
 
 // ----------------------------------------------------------------- validation ----
 
-fn manifest_entries(g: &Graph, url: &str) -> Vec<Term> {
-    let me = Term::NamedNode(nn(url));
+/// The entries of the manifest in `g` (whatever IRI its `@base` gives it).
+fn manifest_entries(g: &Graph, _url: &str) -> Vec<Term> {
     let mut out = Vec::new();
-    for head in objs(g, &me, &format!("{MF}entries")) {
-        out.extend(list(g, &head));
+    for t in g.triples_for_predicate(&nn(&format!("{MF}entries"))) {
+        out.extend(list(g, &t.object.into_owned()));
     }
     out
 }
@@ -1351,17 +1446,18 @@ fn validation(t: &ValTest, syntax: Syntax, store: &Store, focus: Option<&Term>) 
 
 #[test]
 fn validation_tests() {
-    let Some(dir) = suite_or_skip("validation") else {
-        return;
-    };
+    each_suite("validation", validation_tests_in);
+}
+
+fn validation_tests_in(dir: PathBuf, prefix: &'static str) {
     let h = std::thread::Builder::new()
         .name("group_validation".into())
         .stack_size(64 << 20)
         .spawn(move || {
             let mut groups = [
-                (Group::new("validation"), Syntax::ShExC),
-                (Group::new("validation-shexj"), Syntax::ShExJ),
-                (Group::new("validation-shexr"), Syntax::ShExR),
+                (Group::new(gname(prefix, "validation")), Syntax::ShExC),
+                (Group::new(gname(prefix, "validation-shexj")), Syntax::ShExJ),
+                (Group::new(gname(prefix, "validation-shexr")), Syntax::ShExR),
             ];
             for t in val_tests(&dir) {
                 let selected: Vec<bool> = groups.iter().map(|(g, _)| g.selects(&t.name)).collect();

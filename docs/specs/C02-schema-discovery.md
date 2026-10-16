@@ -849,7 +849,8 @@ for the map of typed subjects. The deadline, cancel flag and entry cap of §4.6 
   few instances use would always pass.
 - **`sh:or` of datatypes for mixed values, and `sh:node` between class shapes.** They
   make drafts harder to read, and recursive references make the guard validate in full
-  (C10 §6.2.3). A person can add them while editing the draft.
+  (C10 §6.2.3). A person could add them while editing the draft. The 2026-10-13
+  [follow-up](#roadmap-follow-ups-2026-10-12) drafts both anyway.
 - **Writing drafts into a shapes graph of the dataset.** That would be a write to the
   data. Drafts go through review, and installing one uses the validation configuration.
 
@@ -1001,8 +1002,8 @@ questions 6 to 9 record the decisions taken for them.
 
 **Choices made during implementation.**
 
-- A ShEx guard is not summarized. The layer is defined in SHACL terms, and a ShEx
-  schema's triple constraints would need a mapping of their own.
+- A ShEx guard was not summarized at first, because the layer is defined in SHACL terms.
+  The 2026-10-13 [follow-up](#roadmap-follow-ups-2026-10-12) adds the mapping.
 - With `at=`, shapes graphs are read at that state, but the guard's shapes are always
   those installed now, because the configuration has no history.
 - Several shapes graphs named by one request form one source, merged as write-time
@@ -1178,3 +1179,65 @@ integer-or-decimal property, an address blank node and a class pointed at by ano
 the draft at support 1 contains the `sh:or`, the `ex:address/ex:city` path, the inverse
 shape and the `sh:node` reference, and the data conforms to it; a schema page fetched
 with a cursor before a restart continues after it.
+
+**Outcome of the follow-ups (2026-10-13).** Everything in the list above is built except
+where this section says otherwise. `DRAFT_FORMAT` is now 2, because property shapes carry
+`inverse` and `then`.
+
+* *Datatype alternatives.* The profile keeps, per instance, the set of datatypes of its
+  values. When no single datatype reaches the support, the draft takes the smallest set
+  of two or three whose union does, and writes the component `or` (`sh:or`, ShExC
+  `(A OR B)`). The count is exact, since an instance with an integer and a decimal
+  satisfies the alternative.
+* *Patterns and ranges.* A pattern is drafted for a property whose values are all
+  `xsd:string` literals, as a fixed prefix of letters and punctuation before the first
+  digit or as the character-class skeleton most instances share, from at most 64
+  distinct skeletons, and it must hold for two instances or more. An enumeration that is
+  drafted replaces it. A range is drafted for a property whose values are all inline
+  numbers of one datatype, or all dates or dateTimes that agree on having a timezone,
+  from the smallest and largest value of each instance. Below full support the bound
+  leaves out the instances with the most extreme values. A property with any other
+  value gets neither, so the counts stay exact. The Turtle and SHACLC comments say the
+  bounds are observed and not intended. ShExC gets numeric ranges only, and a comment for
+  the rest.
+* *Inverse paths.* The `POS[p]` pass also counts, per class, the subjects that point at
+  its instances. An inverse property shape is drafted when enough instances are pointed
+  at, at most `maxInverse` per class (default 10, at most 1000), most used first. ShExC
+  writes `^p`.
+* *Sequence paths.* One extra pass over the predicates profiles the values of `q` at the
+  blank nodes that no drafted class describes, reached from instances over `p`. The
+  sequence `p/q` is drafted for a class when its direct property `p` has the node kind
+  `sh:BlankNode` and no class, and no value of `p` anywhere is a blank node that a
+  drafted class describes. Without that condition the shape would reach nodes the profile
+  left out, and the source data could fail its own draft. It goes one level deep. ShExC
+  has no sequence paths, so the schema lists them in a comment.
+* *Class references.* `sh:node` is drafted beside `sh:class` when the draft has a shape
+  for that class, and ShExC writes `@<shape>` in place of the class test. It is drafted
+  at support 1 only. Below it, a value that the class shape excludes would exclude the
+  instance that has it, and the draft could not count those instances. The draft's
+  comment says that the references may form cycles.
+* *ShEx summaries.* `sparkles_shex::constraints::guard_source` builds the constraints
+  layer from a ShEx guard's compiled schema, as described in
+  [API.md](../API.md#constraints-layer). The property constraint gained `inverse` and
+  `values`. A triple constraint inside a choice, or a group with a cardinality of its
+  own, lists its predicate with the `shex#Group` component under `other`, since its
+  cardinality is not the shape's. A shape that extends others needs their triple
+  constraints too. A predicate that two of its parts both constrain is limited by the
+  whole neighbourhood, so it also goes under `other`. When an ancestor has alternatives,
+  every property the ancestors contribute is conditional. An ancestor's `CLOSED` does not
+  close the class, because the validator lets the extending shape's other arcs through.
+* *Restart-stable cursors.* A cursor now holds the dataset id, the commit of its report,
+  the selection hash and the last IRI, and the kept report is keyed by commit. A cursor
+  survives a restart and a compaction. When the report of that commit is not kept, it is
+  computed again at that commit through the point-in-time read, and `409` remains for a
+  commit that can no longer be read and for a cursor of another dataset. The report's
+  `snapshot.version` is still the process counter, for display. A cursor of the older
+  format is a malformed cursor. The test
+  `schema_cursors_survive_a_restart_and_a_compaction` closes a dataset, reopens it and
+  compacts it between pages.
+* *Tests.* On the draft fixture with ratings that are integers or decimals, organisations
+  with an address blank node and teams that every organisation points at, the draft at
+  support 1 holds the `sh:or`, the `ex:address/ex:city` path, the inverse shape on
+  teams, the `sh:node` reference and the pattern and range, and the data conforms to it
+  in SHACL and in ShEx. A second test below full support checks that each new component
+  excludes exactly the focus nodes validation reports.

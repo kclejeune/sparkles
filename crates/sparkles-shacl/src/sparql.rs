@@ -84,7 +84,7 @@ fn literal_text(t: &Term) -> Option<&str> {
 
 /// Prefix declarations reachable from the `sh:prefixes` values of `node`
 /// (following `owl:imports`).
-fn prefixes(g: &G<'_>, node: &Term) -> Vec<(String, String)> {
+pub(crate) fn prefixes(g: &G<'_>, node: &Term) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut seen = FxHashSet::default();
     let mut stack = g.objects(node, sh::PREFIXES);
@@ -434,7 +434,7 @@ fn display(t: &Term) -> String {
 
 impl Engine<'_> {
     /// Execute a parsed query with pre-bound variables.
-    fn run_query(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Ctx)> {
+    pub(crate) fn run_query(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Ctx)> {
         let depth = depth::check_query(q).map_err(|e| anyhow!("{e}"))?;
         depth::with_stack(depth, || self.run_query_on(q, binds))
     }
@@ -493,7 +493,7 @@ impl Engine<'_> {
         Ok(b)
     }
 
-    fn result_term(ctx: &Ctx, id: Id) -> Option<Term> {
+    pub(crate) fn result_term(ctx: &Ctx, id: Id) -> Option<Term> {
         if id.is_undef() {
             return None;
         }

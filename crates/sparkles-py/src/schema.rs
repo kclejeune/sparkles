@@ -224,7 +224,7 @@ impl PySchema {
         })?;
         admin::to_py(py, &r)
     }
-    #[pyo3(signature=(*,format="turtle",classes=None,support=1.0,min_instances=1,max_in=20,max_count=10,closed=false,base=None,graph="default".to_string(),include_inferred=true,at=None,max_entries=100000,cancel=None,progress=None,timeout=None))]
+    #[pyo3(signature=(*,format="turtle",classes=None,support=1.0,min_instances=1,max_in=20,max_count=10,max_inverse=10,closed=false,base=None,graph="default".to_string(),include_inferred=true,at=None,max_entries=100000,cancel=None,progress=None,timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn draft_shapes<'py>(
         &self,
@@ -235,6 +235,7 @@ impl PySchema {
         min_instances: u64,
         max_in: usize,
         max_count: u64,
+        max_inverse: usize,
         closed: bool,
         base: Option<String>,
         graph: String,
@@ -259,6 +260,7 @@ impl PySchema {
                 min_instances,
                 max_in,
                 max_count,
+                max_inverse,
                 closed,
                 prefixes: ds.prefixes().into_iter().collect(),
                 ..Default::default()

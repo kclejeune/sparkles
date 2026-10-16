@@ -15,13 +15,20 @@ use sparkles_core::store::{Chunk, Snapshot};
 use sparkles_core::validation::{self, graph_id};
 use std::sync::{Arc, RwLock};
 
+/// Terms with local ids.
+#[derive(Default)]
+struct Locals {
+    terms: Vec<Term>,
+    index: FxHashMap<Term, Id>,
+}
+
 /// The data graph ([`sparkles_core::validation::DataGraph`], whose scans it derefs to) plus
 /// the id mapping of a shapes graph's terms.
 pub(crate) struct DataGraph {
     graph: validation::DataGraph,
-    /// terms that are not in the store; `Id::local(i)` ↔ `locals[i]`
-    locals: Vec<Term>,
-    local_index: FxHashMap<Term, Id>,
+    /// terms that are not in the store; `Id::local(i)` ↔ `locals.terms[i]`. Node
+    /// expressions add the terms they compute while a validation runs.
+    locals: RwLock<Locals>,
     pub rdf_type: Id,
     pub sub_class_of: Id,
     /// `rdf:first`, `rdf:rest` and `rdf:nil` (local ids when the store lacks them)
@@ -55,8 +62,7 @@ impl DataGraph {
             rdf_rest: Id::UNDEF,
             rdf_nil: Id::UNDEF,
             graph,
-            locals: Vec::new(),
-            local_index: FxHashMap::default(),
+            locals: RwLock::new(Locals::default()),
             subclasses: RwLock::new(FxHashMap::default()),
         };
         d.rdf_type = d.resolve(&rdf::TYPE.into_owned().into(), false);
@@ -74,7 +80,12 @@ impl DataGraph {
 
     /// Id of a term: store id if it exists, else a local id.
     pub fn resolve(&mut self, t: &Term, bnodes_in_store: bool) -> Id {
-        if let Some(&id) = self.local_index.get(t) {
+        self.resolve_shared(t, bnodes_in_store)
+    }
+
+    /// [`DataGraph::resolve`] for a term computed during a validation.
+    pub fn resolve_shared(&self, t: &Term, bnodes_in_store: bool) -> Id {
+        if let Some(&id) = self.locals.read().unwrap().index.get(t) {
             return id;
         }
         let stored = match t {
@@ -84,15 +95,25 @@ impl DataGraph {
         if let Some(id) = stored {
             return id;
         }
-        let id = Id::local(self.locals.len() as u64);
-        self.locals.push(t.clone());
-        self.local_index.insert(t.clone(), id);
+        let mut l = self.locals.write().unwrap();
+        if let Some(&id) = l.index.get(t) {
+            return id;
+        }
+        let id = Id::local(l.terms.len() as u64);
+        l.terms.push(t.clone());
+        l.index.insert(t.clone(), id);
         id
     }
 
     pub fn term(&self, id: Id) -> Option<Term> {
         match id.tag() {
-            Tag::Local => self.locals.get(id.payload() as usize).cloned(),
+            Tag::Local => self
+                .locals
+                .read()
+                .unwrap()
+                .terms
+                .get(id.payload() as usize)
+                .cloned(),
             _ => self.snap.term(id),
         }
     }

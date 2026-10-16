@@ -107,6 +107,7 @@ impl Rebase<'_> {
                 }
             }
             ShapeExpr::Shape(sh) => {
+                sh.extends.iter_mut().for_each(|l| self.label(l));
                 sh.extra.iter_mut().for_each(|p| self.iri(p));
                 if let Some(t) = &mut sh.expression {
                     self.triple_expr(t);
@@ -184,9 +185,9 @@ impl Rebase<'_> {
 
 // ------------------------------------------------------------------- writing ------
 
-/// Write ShExJ: the ShEx 2.1 form (`shapes` with `id`s), with a 2.next `ShapeDecl`
-/// wrapper only for a declaration that is a bare reference (a string cannot carry an
-/// `id`). Lists that are empty and `Option`s that are `None` are left out.
+/// Write ShExJ: the ShEx 2.1 form (`shapes` with `id`s), with a `ShapeDecl` wrapper
+/// only for a declaration that is a bare reference (a string cannot carry an `id`) or
+/// abstract. Lists that are empty and `Option`s that are `None` are left out.
 pub fn to_shexj(schema: &Schema) -> Value {
     let mut o = Map::new();
     o.insert("@context".into(), CONTEXT.into());
@@ -217,14 +218,17 @@ fn typed(t: &str) -> Map<String, Value> {
 fn w_shape_decl(d: &ShapeDecl) -> Value {
     let id = Value::from(d.label.to_shexj());
     match w_shape_expr(&d.expr) {
-        Value::Object(mut o) => {
+        Value::Object(mut o) if !d.is_abstract => {
             o.insert("id".into(), id);
             Value::Object(o)
         }
-        reference => {
+        expr => {
             let mut o = typed("ShapeDecl");
             o.insert("id".into(), id);
-            o.insert("shapeExpr".into(), reference);
+            if d.is_abstract {
+                o.insert("abstract".into(), true.into());
+            }
+            o.insert("shapeExpr".into(), expr);
             Value::Object(o)
         }
     }
@@ -254,6 +258,12 @@ fn w_shape_expr(e: &ShapeExpr) -> Value {
         ShapeExpr::Nc(nc) => w_node_constraint(nc),
         ShapeExpr::Shape(s) => {
             let mut o = typed("Shape");
+            if !s.extends.is_empty() {
+                o.insert(
+                    "extends".into(),
+                    Value::Array(s.extends.iter().map(|l| l.to_shexj().into()).collect()),
+                );
+            }
             if let Some(c) = s.closed {
                 o.insert("closed".into(), c.into());
             }
@@ -564,9 +574,10 @@ fn label(v: &Value, path: &str) -> R<Label> {
     Ok(Label::from_shexj(&string(v, path)?))
 }
 
-/// ShEx 2.2 members are errors that name the feature.
+/// The members of ShEx 2.2 drafts that no published form kept are errors that name the
+/// feature.
 fn no_2_2(o: &Map<String, Value>, path: &str) -> R<()> {
-    for key in ["abstract", "extends", "restricts"] {
+    for key in ["restricts"] {
         if let Some(v) = o.get(key)
             && *v != Value::Bool(false)
         {
@@ -600,8 +611,10 @@ fn shape_decl(v: &Value, path: &str) -> R<ShapeDecl> {
         return fail(path, "a shape declaration needs an \"id\"");
     };
     let label = label(id, &member(path, "id"))?;
+    let mut is_abstract = false;
     let expr = if type_of(o, path)? == "ShapeDecl" {
         no_2_2(o, path)?;
+        is_abstract = opt_bool(o, path, "abstract")? == Some(true);
         let p = member(path, "shapeExpr");
         match o.get("shapeExpr") {
             Some(e) => shape_expr(e, &p)?,
@@ -610,7 +623,11 @@ fn shape_decl(v: &Value, path: &str) -> R<ShapeDecl> {
     } else {
         shape_expr_object(o, path)?
     };
-    Ok(ShapeDecl { label, expr })
+    Ok(ShapeDecl {
+        label,
+        expr,
+        is_abstract,
+    })
 }
 
 fn shape_expr(v: &Value, path: &str) -> R<ShapeExpr> {
@@ -827,6 +844,7 @@ fn value_set_value(v: &Value, path: &str) -> R<ValueSetValue> {
 fn shape(o: &Map<String, Value>, path: &str) -> R<Shape> {
     no_2_2(o, path)?;
     Ok(Shape {
+        extends: list(o, path, "extends", label)?,
         closed: opt_bool(o, path, "closed")?,
         extra: list(o, path, "extra", string)?,
         expression: o
@@ -1092,7 +1110,8 @@ mod tests {
         );
         let e = from_shexj(
             r#"{"type": "Schema", "shapes": [{"type": "ShapeDecl",
-            "id": "http://ex.org/S", "abstract": true, "shapeExpr": {"type": "Shape"}}]}"#,
+            "id": "http://ex.org/S", "restricts": ["http://ex.org/T"],
+            "shapeExpr": {"type": "Shape"}}]}"#,
         )
         .unwrap_err();
         assert!(e.message.contains("ShEx 2.2"), "{}", e.message);

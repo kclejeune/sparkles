@@ -306,6 +306,16 @@ pub const GEO: FileKind = FileKind {
     reads: &[1],
 };
 
+/// The typing of the head that a ShEx write guard keeps between runs.
+pub const VALIDATION_TYPING: FileKind = FileKind {
+    id: "validation-typing",
+    files: "validation-typing.bin",
+    marker: "the u32 after the `SPXTYP01` magic; another version is discarded and the typing rebuilt",
+    class: Class::Derived,
+    writes: 1,
+    reads: &[1],
+};
+
 /// The layout marker of a backup repository.
 pub const BACKUP_LAYOUT: FileKind = FileKind {
     id: "backup-layout",
@@ -430,6 +440,7 @@ pub const KINDS: &[&FileKind] = &[
     &TEXT,
     &VECTOR,
     &GEO,
+    &VALIDATION_TYPING,
     &BACKUP_LAYOUT,
     &BACKUP_BLOB,
     &BACKUP_SLOTS,

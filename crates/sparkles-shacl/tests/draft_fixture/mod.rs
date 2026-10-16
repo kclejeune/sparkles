@@ -60,6 +60,26 @@ pub fn fixture() -> String {
     t
 }
 
+/// [`fixture`] with more of what a draft can describe: ratings that are integers or
+/// decimals, organisations with an address that is a blank node, teams that every
+/// organisation points at, codes of two letters and four digits, and weights in a range.
+pub fn extended() -> String {
+    let mut t = fixture();
+    for i in 0..4 {
+        let rating = ["3", "2.5", "4", "1.5"][i];
+        t.push_str(&format!("ex:d{} ex:rating {rating} .\n", i + 1));
+    }
+    t.push_str("ex:t0 a ex:Team ; ex:code \"AB1234\" .\nex:t1 a ex:Team ; ex:code \"CD5678\" .\n");
+    for i in 0..5 {
+        t.push_str(&format!(
+            "ex:o{i} ex:address [ ex:city \"City{i}\" ; ex:street \"Street {i}\" ] ; ex:team ex:t{} ; ex:weight {} .\n",
+            i % 2,
+            10 + i * 5
+        ));
+    }
+    t
+}
+
 pub fn store(trig: &str) -> Store {
     let s = Store::in_memory(StoreOptions::default());
     s.load(&[Source::from_bytes(

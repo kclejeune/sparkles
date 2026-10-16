@@ -258,6 +258,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
                 "minInstances": {"type":"integer","minimum":1,"default":1},
                 "maxIn": {"type":"integer","minimum":0,"maximum":64,"default":10,"description":"Largest sh:in list (0: none)"},
                 "maxCount": {"type":"integer","minimum":0,"default":1,"description":"Largest sh:maxCount drafted (0: none)"},
+                "maxInverse": {"type":"integer","minimum":0,"maximum":1000,"default":10,"description":"Most inverse property shapes drafted per class (0: none)"},
                 "closed": {"type":"boolean","default":false},
                 "atCommit": at(), "at": at_sel(),
                 "timeoutSeconds": to(cfg)}}),
