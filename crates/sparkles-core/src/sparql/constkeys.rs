@@ -2,53 +2,73 @@
 //!
 //! The planner resolves each constant to an id with one vocabulary lookup, one after the
 //! other. On a cold server each lookup in a vocabulary group not read before waits for that
-//! group. Collecting the keys first lets [`Vocab::prefetch_keys`](crate::vocab::Vocab) ask for
+//! group. Visiting the keys first lets [`KeyPrefetch`](crate::vocab::KeyPrefetch) ask for
 //! every group at once.
 
 use crate::id;
-use oxrdf::Term;
+use oxrdf::Literal;
 use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
-/// The most keys collected: a `VALUES` list of thousands of constants would otherwise
-/// allocate a key for each, and the first groups the lookups reach are the ones worth
-/// asking for.
+/// The most keys visited: the first groups the lookups of a `VALUES` list of thousands of
+/// constants reach are the ones worth asking for.
 pub(crate) const MAX_KEYS: usize = 4096;
 
-/// The keys of the IRIs and the non-inline literals that `pattern` names, with duplicates,
-/// up to [`MAX_KEYS`]. Constants of expressions are included for the usual comparisons and
-/// calls.
+/// Call `f` with the key of each IRI and non-inline literal that `pattern` names, with
+/// duplicates, up to [`MAX_KEYS`]. Constants of expressions are included for the usual
+/// comparisons and calls. The keys are written one after another into one buffer, so a
+/// warm query allocates nothing for them.
+pub(crate) fn for_each_key(pattern: &GraphPattern, f: &mut dyn FnMut(&[u8])) {
+    let mut keys = Keys {
+        buf: Vec::new(),
+        n: 0,
+        f,
+    };
+    keys.pattern(pattern);
+}
+
+/// The keys [`for_each_key`] visits, collected.
+#[cfg(test)]
 pub(crate) fn constant_keys(pattern: &GraphPattern) -> Vec<Vec<u8>> {
-    let mut out = Keys::default();
-    out.pattern(pattern);
-    out.keys
+    let mut out = Vec::new();
+    for_each_key(pattern, &mut |k| out.push(k.to_vec()));
+    out
 }
 
-#[derive(Default)]
-struct Keys {
-    keys: Vec<Vec<u8>>,
+struct Keys<'f> {
+    buf: Vec<u8>,
+    /// the keys visited so far
+    n: usize,
+    f: &'f mut dyn FnMut(&[u8]),
 }
 
-impl Keys {
-    fn term(&mut self, t: &Term) {
-        if self.keys.len() < MAX_KEYS
-            && id::inline_id(t).is_none()
-            && !matches!(t, Term::BlankNode(_) | Term::Triple(_))
-        {
-            self.keys.push(id::term_key(t));
+impl Keys<'_> {
+    fn emit(&mut self) {
+        (self.f)(&self.buf);
+        self.n += 1;
+    }
+
+    fn literal(&mut self, l: &Literal) {
+        if self.n < MAX_KEYS && id::inline_literal(l.value(), l.datatype().as_str()).is_none() {
+            self.buf.clear();
+            id::write_literal_key(l, &mut self.buf);
+            self.emit();
         }
     }
 
     fn iri(&mut self, iri: &str) {
-        if self.keys.len() < MAX_KEYS {
-            self.keys.push(id::iri_key(iri));
+        if self.n < MAX_KEYS {
+            self.buf.clear();
+            self.buf.push(b'<');
+            self.buf.extend_from_slice(iri.as_bytes());
+            self.emit();
         }
     }
 
     fn term_pattern(&mut self, t: &TermPattern) {
         match t {
             TermPattern::NamedNode(n) => self.iri(n.as_str()),
-            TermPattern::Literal(l) => self.term(&Term::Literal(l.clone())),
+            TermPattern::Literal(l) => self.literal(l),
             _ => {}
         }
     }
@@ -86,7 +106,7 @@ impl Keys {
     fn expr(&mut self, e: &Expression) {
         match e {
             Expression::NamedNode(n) => self.iri(n.as_str()),
-            Expression::Literal(l) => self.term(&Term::Literal(l.clone())),
+            Expression::Literal(l) => self.literal(l),
             Expression::Or(a, b)
             | Expression::And(a, b)
             | Expression::Equal(a, b)
@@ -161,7 +181,7 @@ impl Keys {
                     for t in row.iter().flatten() {
                         match t {
                             GroundTerm::NamedNode(n) => self.iri(n.as_str()),
-                            GroundTerm::Literal(l) => self.term(&Term::Literal(l.clone())),
+                            GroundTerm::Literal(l) => self.literal(l),
                             _ => {}
                         }
                     }

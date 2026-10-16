@@ -717,15 +717,12 @@ fn prepare_query(
         ctx.attach_cursor_owner();
     }
     crate::geo::validate_query(pattern, &mut |w| ctx.warn(w))?;
-    // the keys are collected only when asking for their groups can do something
+    // the keys are visited only when asking for their groups can do something
     if ctx.opt.prefetch_constants
-        && crate::index::io_hints()
-        && ctx.snap.generation.vocab.has_sparse()
+        && let Some(mut prefetch) = ctx.snap.generation.vocab.key_prefetch()
     {
-        ctx.snap
-            .generation
-            .vocab
-            .prefetch_keys(&constkeys::constant_keys(pattern));
+        constkeys::for_each_key(pattern, &mut |key| prefetch.add(key));
+        prefetch.finish();
     }
     let mut planner = Planner::new(&ctx);
     planner.source = Some(parsed);
