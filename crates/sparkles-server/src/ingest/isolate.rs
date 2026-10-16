@@ -235,6 +235,10 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
         }
     }
     cmd.args(limit_args(iso.memory, left, ocr.is_none()));
+    // the child leads a process group of its own, so that a kill at the deadline also
+    // ends any process it started, which could otherwise hold the pipes open
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         // the binary is gone, as after an upgrade that replaced it
@@ -297,7 +301,7 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
                             pause = (pause * 2).min(Duration::from_millis(10));
                         }
                         _ => {
-                            let _ = child.kill();
+                            kill(&mut child);
                             killed = true;
                             break child.wait().ok();
                         }
@@ -305,7 +309,7 @@ pub fn run(iso: &Isolation, job: Job, bytes: &[u8], o: &Options) -> Result<Reply
                 }
             }
             _ => {
-                let _ = child.kill();
+                kill(&mut child);
                 killed = true;
                 child.wait().ok()
             }
@@ -387,6 +391,19 @@ fn mismatch() -> Refusal {
         500,
         "the conversion child is another version of sparkles than the server: restart the server",
     )
+}
+
+/// Kill the child and every process in its group.
+fn kill(child: &mut std::process::Child) {
+    // the child is not reaped yet, so its id still names its group
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: kill takes no pointers, and a negative pid names a process group
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 /// Why a child that wrote nothing ended. `killed` says that the parent killed it.
@@ -949,6 +966,23 @@ mod tests {
         let o = options(Duration::from_millis(300), Default::default());
         let started = Instant::now();
         let r = run(&shell("sleep 30"), JOB, b"x", &o);
+        let e = r.unwrap_err().unwrap();
+        assert_eq!(e.code, "conversion-timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    // A child whose shell forks the hung command, as dash does, is killed with the
+    // command, so the grandchild cannot hold the pipes open past the deadline.
+    #[cfg(feature = "office")]
+    #[test]
+    fn a_hung_grandchild_is_killed_at_the_deadline() {
+        let o = options(Duration::from_millis(300), Default::default());
+        let started = Instant::now();
+        let r = run(&shell("sleep 30; true"), JOB, b"x", &o);
         let e = r.unwrap_err().unwrap();
         assert_eq!(e.code, "conversion-timeout");
         assert!(
