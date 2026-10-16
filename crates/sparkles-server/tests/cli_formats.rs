@@ -503,11 +503,11 @@ fn algo_catalog_cli_inventory_and_future_plan() {
         .filter(|v| v["name"] == "algo.json")
         .collect();
     assert_eq!(registered.len(), 1);
-    assert_eq!(registered[0]["writes"], 1);
+    assert_eq!(registered[0]["writes"], 2);
     assert_eq!(registered[0]["scope"], "dataset");
     assert_eq!(report["datasets"][0]["inWindow"], true);
     assert_eq!(files(&db), before);
-    std::fs::write(db.join("algo.json"), br#"{"format":2,"futureShape":[1,2]}"#).unwrap();
+    std::fs::write(db.join("algo.json"), br#"{"format":3,"futureShape":[1,2]}"#).unwrap();
     let before = files(&db);
     let future = sparkles(tmp.path(), &args);
     assert_eq!(future.status.code(), Some(1));

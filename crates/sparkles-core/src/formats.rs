@@ -520,7 +520,7 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("branches.json", 2),
     ds("branch.json", 1),
     ds("queries.json", 1),
-    ds("algo.json", 1),
+    ds("algo.json", 2),
     ds("validation.json", 2),
     ds("validation-status.json", 1),
     ds("text.json", 1),
@@ -884,6 +884,6 @@ mod algo_catalog_registry_tests {
             .filter(|s| s["name"] == name)
             .collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["writes"], 1);
+        assert_eq!(entries[0]["writes"], 2);
     }
 }

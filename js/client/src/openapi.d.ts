@@ -3558,7 +3558,7 @@ export interface components {
             author?: string;
             definition: components["schemas"]["AlgoProjectionDefinition"];
             name: string;
-            /** @description 1 for a new projection, one more for each replacement. */
+            /** @description 1 for a new projection, one more for each replacement. A projection created again after a delete continues from the revision it had. */
             revision: number;
             updated: string;
         };

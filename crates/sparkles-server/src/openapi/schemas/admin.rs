@@ -319,7 +319,7 @@ fn algorithms(put: &mut dyn FnMut(&str, J)) {
                 &["name", "revision", "updated", "definition"],
                 json!({
                     "name": string(),
-                    "revision": { "type": "integer", "description": "1 for a new projection, one more for each replacement." },
+                    "revision": { "type": "integer", "description": "1 for a new projection, one more for each replacement. A projection created again after a delete continues from the revision it had." },
                     "updated": string(),
                     "author": string(),
                     "definition": sref("AlgoProjectionDefinition"),

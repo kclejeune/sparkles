@@ -718,9 +718,13 @@ gates are still pending.
   Sampling checks only its selected source searches. Accepted distance and path-count
   arithmetic remains approximate, as the numerical follow-up below describes.
 * **Named projections.** `algo/catalog.rs` keeps `<db>/algo.json` as
-  `{"format": 1, "projections": {name: {revision, updated, author?, definition}}}`,
-  written the way `queries.json` is, with a revision for `If-Match`. Format 1 is in the
-  shared settings registry. A missing marker reads as 1 without a rewrite. A future
+  `{"format": 2, "projections": {name: {revision, updated, author?, definition}},
+  "deleted": {name: revision}}`, written the way `queries.json` is, with a revision for
+  `If-Match`. The `deleted` member keeps the last revision of each deleted projection,
+  so a projection created again under the same name continues its revisions and a client
+  that holds a revision of the old one cannot mistake the new one for it. Format 2 is in
+  the shared settings registry. A format 1 file reads as a catalog with no deleted
+  projections, and a missing marker reads as 1 without a rewrite. A future
   version gives `Unsupported` at dataset admission before metadata writers, including
   for active and retained branches, and migration planning makes the same read-only
   check. Malformed JSON, duplicate known struct fields or invalid current definitions

@@ -887,8 +887,8 @@ fn algorithms_numerical_refusal_has_no_rows_stats_or_writeback() {
 #[test]
 fn algorithms_catalog_future_versions_refuse_dataset_open() {
     for content in [
-        br#"{"format":2,"projections":{}}"#.as_slice(),
-        br#"{"format":2,"futureShape":[1,2]}"#,
+        br#"{"format":3,"projections":{}}"#.as_slice(),
+        br#"{"format":3,"futureShape":[1,2]}"#,
     ] {
         let (dir, ds) = persistent();
         ds.update("INSERT DATA { <urn:s> <urn:p> <urn:o> }")
