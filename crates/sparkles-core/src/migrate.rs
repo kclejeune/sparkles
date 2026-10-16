@@ -654,6 +654,89 @@ fn copy_contents(from: &Path, to: &Path) -> Result<()> {
     crate::store::sync_dir(to)
 }
 
+/// Whether a process with effective uid `euid` may migrate a database owned by `owner`:
+/// the copy must get the owner of every file, which only the owner or root can arrange.
+fn may_migrate(euid: u32, owner: u32) -> bool {
+    euid == 0 || euid == owner
+}
+
+fn not_owner(root: &Path, owner: u32) -> Error {
+    Error::Invalid(format!(
+        "{}: owned by uid {owner}; run `sparkles migrate` as that user or as root",
+        root.display()
+    ))
+}
+
+/// Refuse to start when this process cannot give the copy the database's owner.
+#[cfg(unix)]
+fn preflight_owner(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(root)?.uid();
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if may_migrate(euid, owner) {
+        Ok(())
+    } else {
+        Err(not_owner(root, owner))
+    }
+}
+
+#[cfg(not(unix))]
+fn preflight_owner(_root: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Give every entry of the copy `to` the mode and owner of the same entry of `from`,
+/// directories after their contents, so that a read-only directory is filled before
+/// its mode is set. An entry a step added has no counterpart and takes the owner of
+/// `owner` (the database's root) and keeps its mode. Called after the steps ran, so the
+/// files they rewrote take the mode and owner of the file they replace.
+#[cfg(unix)]
+fn copy_tree_meta(from: &Path, to: &Path, owner: &std::fs::Metadata, root: &Path) -> Result<()> {
+    for e in std::fs::read_dir(to)? {
+        let e = e?;
+        let (f, t) = (from.join(e.file_name()), e.path());
+        if e.file_type()?.is_dir() {
+            copy_tree_meta(&f, &t, owner, root)?;
+        } else {
+            copy_meta(&f, &t, owner, root)?;
+        }
+    }
+    copy_meta(from, to, owner, root)
+}
+
+#[cfg(not(unix))]
+fn copy_tree_meta(_: &Path, _: &Path, _: &std::fs::Metadata, _: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Give `to` the owner and mode of `from`, or the owner of `owner` when `from` does not
+/// exist. The owner comes first, since a change of owner clears the set-id bits.
+#[cfg(unix)]
+fn copy_meta(from: &Path, to: &Path, owner: &std::fs::Metadata, root: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let src = match std::fs::symlink_metadata(from) {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let want = src.as_ref().unwrap_or(owner);
+    let have = std::fs::symlink_metadata(to)?;
+    if have.uid() != want.uid() || have.gid() != want.gid() {
+        std::os::unix::fs::chown(to, Some(want.uid()), Some(want.gid())).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                not_owner(root, want.uid())
+            } else {
+                e.into()
+            }
+        })?;
+    }
+    if let Some(src) = &src {
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(src.mode() & 0o7777))?;
+    }
+    Ok(())
+}
+
 /// Upgrade the closed database at `root`: run the steps of [`plan`] on a copy, check the
 /// copy, and swap it in. With `keep_old`, the database as it was stays in a sibling
 /// directory named `.pre-migrate-<version>-<name>`, otherwise it is removed. A database
@@ -737,6 +820,7 @@ fn migrate_planned_with(
         old_directory: old.file_name().unwrap().to_string_lossy().into_owned(),
     };
     mark.old_path(root)?;
+    preflight_owner(root)?;
     let work = work_dir(root);
     std::fs::create_dir(&work)?;
     copy_contents(root, &work).inspect_err(|_| {
@@ -749,6 +833,11 @@ fn migrate_planned_with(
             let _ = std::fs::remove_dir_all(&work);
         })?;
     }
+    // the copy, and the files the steps rewrote, take the modes and owners of the originals
+    let owner = std::fs::metadata(root)?;
+    copy_tree_meta(root, &work, &owner, root).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&work);
+    })?;
     let report = crate::check::check(&work, &crate::check::CheckOptions { quick: false })?;
     if report.status == crate::check::Status::Error {
         let _ = std::fs::remove_dir_all(&work);
@@ -1237,5 +1326,32 @@ mod tests {
         assert!(matches!(e, Error::Corrupt(_)), "{e:?}");
         assert!(work_dir(&root).is_dir());
         assert!(old_dir(&root).is_dir());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn migrate_keeps_directory_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("db");
+        let g = tests::legacy_database(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(root.join(&g), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dv = root.join(&g).join("delta.vocab");
+        std::fs::set_permissions(&dv, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let ds = root.join("dataset.json");
+        std::fs::set_permissions(&ds, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let out = migrate(&root, false).unwrap();
+        assert!(!out.steps.is_empty(), "the fixture needs a step");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700, "root mode");
+        assert_eq!(mode(&root.join(&g)), 0o700, "generation mode");
+        // a step keeps the mode of the file it rewrites
+        assert_eq!(mode(&dv), 0o600, "{:o}", mode(&dv));
+        assert_eq!(mode(&ds), 0o600, "{:o}", mode(&ds));
     }
 }

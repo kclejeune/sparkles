@@ -2256,7 +2256,10 @@ missing database and new nested directories.
 Without `--check`, the command copies each database that has steps to run into a
 sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
 the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
-free space as the database. The dataset id, the commit numbers, the commit catalog, the
+free space as the database. It keeps the mode and the owner of every file and directory,
+and a file that a step rewrites keeps those of the file it replaces. The command must
+therefore run as the user that owns the database or as root, and it refuses to start
+otherwise. The dataset id, the commit numbers, the commit catalog, the
 branches and the snapshots stay as they were. `--keep-old` keeps the database as it was
 in `.pre-migrate-<version>-<name>`, and without it that directory is removed. The
 command refuses to start while that directory exists, so it never deletes an earlier
