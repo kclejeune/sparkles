@@ -401,8 +401,10 @@ fn a_deadline_that_has_passed_stops_every_format() {
 }
 
 #[test]
-fn twenty_thousand_footnote_references_convert_quickly() {
-    let n = 20_000;
+fn many_footnote_references_convert_quickly() {
+    // the scan of the used notes that this replaced took about 20 s at this size in a
+    // debug build, the lookup takes about 2 s
+    let n = 100_000;
     let mut body = String::new();
     let mut notes = String::new();
     for i in 1..=n {
@@ -422,6 +424,10 @@ fn twenty_thousand_footnote_references_convert_quickly() {
     };
     let start = std::time::Instant::now();
     let d = to_markdown(&b, Format::Docx, &l).unwrap();
-    assert!(d.markdown.contains("[^fn20000]: note 20000"));
-    assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
+    assert!(d.markdown.contains("[^fn100000]: note 100000"));
+    assert!(
+        start.elapsed().as_secs_f64() < 10.0,
+        "{:?}",
+        start.elapsed()
+    );
 }
