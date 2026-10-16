@@ -1516,6 +1516,41 @@ async fn a_basic_graph_pattern_at_the_plan_limit() {
     }
 }
 
+/// The notes read plans of up to 256 levels, and a plan over that is refused before the
+/// query runs. The run of this cross product stops at a row budget after about as long as
+/// planning it takes several times over, so a refused call that comes back in under half
+/// of the run's time did not run it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_too_deep_for_the_notes_is_refused_before_it_runs() {
+    let mut c = Client::start(server_with(
+        &[("t", &[&numbers(3000)])],
+        McpConfig::default(),
+    ));
+    let patterns: String = (0..300)
+        .map(|i| format!("?s{i} ex:v ?v{i} . "))
+        .collect::<String>();
+    let query = format!("SELECT * WHERE {{ {patterns}}}");
+    // the run without notes, which has no limit on the plan's depth
+    let s = c
+        .structured(
+            "explain_query",
+            json!({"query": query, "profile": "run", "timeoutSeconds": 20}),
+        )
+        .await;
+    assert_eq!(s["error"]["budget"], "rows", "{s}");
+    let run_ms = s["elapsedMs"].as_f64().unwrap();
+    let args = json!({"query": query, "notes": true, "profile": "run", "timeoutSeconds": 20});
+    let started = Instant::now();
+    let (t, e) = c.error("explain_query", args).await;
+    assert!(t.contains("the plan nests deeper than 256 levels"), "{t}");
+    assert_eq!(e, json!({"code": "bad-argument", "status": 400}));
+    let refused_ms = started.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        refused_ms < run_ms / 2.0,
+        "refused after {refused_ms} ms, a run takes {run_ms} ms"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a11_timeout() {
     let mut c = Client::start(server_with(

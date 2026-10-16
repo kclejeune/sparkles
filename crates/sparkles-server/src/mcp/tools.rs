@@ -1192,10 +1192,15 @@ impl Tools<'_> {
     /// The plan of `explain_query` and `POST /{ds}/sparql/explain` (C18 §6.6, §9.6):
     /// the estimated plan with its warnings, or with `run` the plan of a read-only run,
     /// partial when a budget stopped it, or with `given` the client's plan.
+    ///
+    /// With `explained`, the caller reads the plan by the limits of the explanation, and a
+    /// plan over them is refused before a run starts. Without it, the plan's JSON form is
+    /// not built, since nothing reads it.
     pub(super) fn explain_core(
         &self,
         a: &ExplainArgs,
         given: Option<Value>,
+        explained: bool,
     ) -> Result<ExplainCore, ToolError> {
         query_text(&a.query)?;
         let ds = self.dataset(a.dataset.as_deref())?;
@@ -1248,6 +1253,10 @@ impl Tools<'_> {
         let snap = self.snapshot(&ds, a.at_commit, a.at.as_ref(), self.call.arrived + timeout)?;
         let (algebra, plan) =
             sparql::explain(snap.clone(), &a.query, &opts).map_err(|e| ctx.engine(e))?;
+        // refused before the run, which a deeper plan than the notes read would waste
+        if explained {
+            crate::explain::fits(&plan).map_err(ToolError::bad_argument)?;
+        }
         // A caller whose grants or protections hide some data must not learn from the
         // dictionary that a term occurs there, so its terms are looked up in its view.
         let view = self
@@ -1336,7 +1345,7 @@ impl Tools<'_> {
         }
         if !run {
             return Ok(ExplainCore {
-                plan_json: serde_json::to_value(&plan).unwrap_or_default(),
+                plan_json: plan_value(&plan, explained),
                 depth: plan.depth(),
                 plan: Some(plan),
                 out,
@@ -1376,7 +1385,7 @@ impl Tools<'_> {
             out["error"] = e.clone();
         }
         Ok(ExplainCore {
-            plan_json: serde_json::to_value(&plan).unwrap_or_default(),
+            plan_json: plan_value(&plan, explained),
             depth: plan.depth(),
             plan: Some(plan),
             out,
@@ -1815,6 +1824,17 @@ fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
         e["subjectClasses"] = list.into();
     }
     e
+}
+
+/// The JSON form of `plan` when `explained` says something reads it, else `null`. It nests
+/// twice as deep as the plan, so it is written on a stack that fits that.
+fn plan_value(plan: &PlanInfo, explained: bool) -> Value {
+    if !explained {
+        return Value::Null;
+    }
+    sparkles::sparql::depth::with_stack(plan.depth(), || {
+        serde_json::to_value(plan).unwrap_or_default()
+    })
 }
 
 /// `<operator> <description> est=<rows> [<columns>]`, two spaces per depth. Written

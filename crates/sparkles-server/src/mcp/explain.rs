@@ -40,7 +40,7 @@ impl Tools<'_> {
             }
         }
         let started = Instant::now();
-        let core = self.explain_core(&a, None)?;
+        let core = self.explain_core(&a, None, notes)?;
         // the JSON form of the plan nests twice as deep as the plan, and reading,
         // cloning and dropping it recurse
         sparkles::sparql::depth::with_stack(core.depth, move || {
@@ -215,7 +215,7 @@ pub(crate) fn sparql_explain(
         timeout_seconds: b.timeout_seconds,
         ..Default::default()
     };
-    let core = t.explain_core(&ea, given)?;
+    let core = t.explain_core(&ea, given, true)?;
     let depth = core.depth;
     // the JSON form of the plan nests twice as deep as the plan, and reading, cloning,
     // writing and dropping it recurse

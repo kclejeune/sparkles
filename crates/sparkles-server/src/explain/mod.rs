@@ -21,7 +21,7 @@ use serde_json::Value;
 /// The most nodes a plan given to `/{ds}/sparql/explain` may have.
 pub const MAX_NODES: usize = 10_000;
 /// The deepest a given plan may nest.
-const MAX_DEPTH: usize = 256;
+pub const MAX_DEPTH: usize = 256;
 /// The most notes shown before **More** (§6.6.2). The rest follow in order.
 pub const SHOWN_NOTES: usize = 12;
 
@@ -154,6 +154,26 @@ impl Plan {
     pub fn facts_json(&self) -> Value {
         serde_json::to_value(&self.nodes).unwrap_or_default()
     }
+}
+
+/// Whether the engine's plan is within the limits that [`build`] reads a plan by, so that a
+/// caller can refuse a plan before it spends a run on it. It gives the messages of the
+/// reader.
+pub fn fits(plan: &sparkles::sparql::PlanInfo) -> Result<(), String> {
+    // the reader counts the root at depth 0 and refuses a node past `MAX_DEPTH`
+    if plan.depth() > MAX_DEPTH + 1 {
+        return Err(format!("the plan nests deeper than {MAX_DEPTH} levels"));
+    }
+    let mut nodes = 0;
+    let mut todo = vec![plan];
+    while let Some(n) = todo.pop() {
+        nodes += 1;
+        if nodes > MAX_NODES {
+            return Err(format!("the plan has more than {MAX_NODES} nodes"));
+        }
+        todo.extend(&n.children);
+    }
+    Ok(())
 }
 
 fn number(v: &Value) -> Option<f64> {
