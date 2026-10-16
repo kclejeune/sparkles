@@ -1203,7 +1203,7 @@ pub(crate) async fn run_query(
     query: String,
     bindings: Vec<(String, oxrdf::Term)>,
 ) -> ApiResult {
-    let io = io_profile(&params);
+    let io = io_profile(&params, &p)?;
     let execution = match params.get("execution") {
         None | Some("eager") => sparkles::sparql::ExecutionMode::Eager,
         Some("streaming") => sparkles::sparql::ExecutionMode::Streaming,
@@ -1436,9 +1436,26 @@ pub(crate) async fn run_query(
 }
 
 /// The I/O profile a request asked for with `profile=io`, started before the query is
-/// parsed so that it covers the resolution of the query's constants.
-pub(crate) fn io_profile(params: &Params) -> Option<Arc<sparkles::ioacct::Profile>> {
-    (params.get("profile") == Some("io")).then(|| Arc::new(sparkles::ioacct::Profile::start()))
+/// parsed so that it covers the resolution of the query's constants. The profile counts the
+/// reads of the whole process, so only a caller with the `metrics` permission may ask for it
+/// (without authentication everyone has it), and any other value is refused. An eager
+/// response drops the profile once its metadata is written, and a streaming one keeps it
+/// until the body ends.
+pub(crate) fn io_profile(
+    params: &Params,
+    p: &Principal,
+) -> ApiResult<Option<Arc<sparkles::ioacct::Profile>>> {
+    match params.get("profile") {
+        None => Ok(None),
+        Some("io") if p.has(crate::auth::ServerPerm::Metrics) => {
+            Ok(Some(Arc::new(sparkles::ioacct::Profile::start())))
+        }
+        Some("io") => Err(err(
+            StatusCode::FORBIDDEN,
+            "profile=io requires the metrics permission",
+        )),
+        Some(_) => Err(err(StatusCode::BAD_REQUEST, "profile must be io")),
+    }
 }
 
 /// Query texts whose last run was quick (see `inline`).

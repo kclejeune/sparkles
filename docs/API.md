@@ -1541,7 +1541,9 @@ Query parameters beyond the standard protocol:
   A write whose client disconnects is cancelled and commits nothing, even while it waits
   for the dataset's writer lock. A commit that has already started completes.
 * `profile=io` adds an `io` object to the metadata of an `application/x-sparkles+json`
-  result. See [the I/O profile](#the-io-profile).
+  result. It needs the `metrics` permission, which every caller has without authentication,
+  and answers `403` otherwise. Any other value of `profile` answers `400`. See
+  [the I/O profile](#the-io-profile).
 * `execution=eager|streaming|auto` chooses how the query runs. The default is `eager`.
   `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
   and CONSTRUCT and DESCRIBE in RDF or native Sparkles JSON. The query reads from a
@@ -6846,7 +6848,10 @@ generated strings. The batch size alone does not limit that state.
 
 With `profile=io`, the metadata of a native result has an `io` object. It reports what the
 query read from the index and vocabulary files, which helps explain the time of a first
-query after a restart.
+query after a restart. The counters cover the whole process, so the profile needs the
+`metrics` permission, as `/$/metrics` does. A caller without it gets a `403`, and a value
+of `profile` other than `io` gets a `400`. A streaming response keeps the profile running
+until its body ends.
 
 ```ts
 type IoProfile = {
