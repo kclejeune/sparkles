@@ -4768,44 +4768,42 @@ exactly.
   on. Commits themselves do no index work. A search sees exactly the vectors of its own
   snapshot, also when the graph holds vectors inserted after it. The inserts run on the
   shared worker pool at normal priority, so under sustained writes they compete with
-  queries for the cores. An index created before
-  its predicate has any row takes the vectors inserted later into its graph like any
-  other index.
-* **New generations.** A compaction carries each index over to the new generation
-  before it switches. The new index reuses the old one's vectors and links, repairs the
-  links around deleted vectors and inserts the new ones, so searches use a graph right
-  after the switch. When more than 30 % of the vectors changed, or the graph's settings
+  queries for the cores. An index created before its predicate has any row takes the
+  vectors inserted later into its graph like any other index.
+* **New generations.** A compaction carries each index over to the new generation before
+  it switches. The new index reuses the old one's vectors and links, repairs the links
+  around deleted vectors and inserts the new ones, so searches use a graph right after
+  the switch. When more than 30 % of the vectors changed, or the graph's settings
   differ, the graph is built again in the background after the switch, and searches scan
-  exactly until it is ready. A bulk load starts a new generation whose
-  index is built, or carried over, in the background, and searches are exact until it is
-  ready.
+  exactly until it is ready. A bulk load starts a new generation whose index is built,
+  or carried over, in the background, and searches are exact until it is ready.
 * **Exact fallback.** A search skips the graph and scans exactly in these cases:
   `exact:true` is set, it reads a past commit, its metric is not the index's, the graph
-  is still being built, at most `exactThreshold` base and inserted rows together are in
-  scope, or the active graph holds less than 5 % of the indexed rows. It also falls back
-  when the graph finds fewer than k rows although more exist. The counters of an executed plan name the path
-  (`method`) and the reason (`exactBecause`).
+  is still being built, at most `exactThreshold` rows are in scope, counting every row
+  the snapshot inserted for the predicate whatever its graph, or the active graph holds
+  less than 5 % of the indexed rows. It also falls back when the graph finds fewer than
+  k rows although more exist. The counters of an executed plan name the path (`method`)
+  and the reason (`exactBecause`).
 * **Builds and files.** Creating an index starts a background build, and writes go on
   meanwhile. The build first publishes the packed vectors, which searches then scan
   exactly, and then the graph. A persistent store writes the build to
   `gen-NNNN/vectors/<name>.spkv` and maps it from there, also after a restart. A file
   that is damaged, or was built for another configuration or generation, is built again.
   Changing only `efSearch`, `exactThreshold` or `model` keeps the build.
-* **Memory.** Packed vectors take `4·dim + 28` bytes per row. The graph takes about
-  `(2M + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not
-  copy the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
+* **Memory.** Packed vectors take `4·dim + 28` bytes per row. The graph takes about `(2M
+  + 1)·4 + 4` bytes per vector, 136 bytes with the default M, because it does not copy
+  the vectors. Both count against `--vector-memory-mb`, mapped or not. A build that
   would pass the budget leaves the index `over-budget`, and searches then scan exactly
   within the same budget. Vectors inserted into the graph since the base stay in memory
-  with their links until the next compaction, and they count against the budget too.
-  When inserting the next batch would pass it, the background thread stops and leaves
-  the rest pending, so searches score them exactly and the status reports
-  `overBudget`. The next compaction releases the inserted vectors and the thread
-  resumes. Lowering the budget at run time stops further inserts but does not remove
-  vectors already inserted. On x86-64 CPUs with F16C, a build reads a
-  binary16 copy of the vectors, 2 bytes per dimension, which it holds while it runs. A
-  build also holds a 4-byte distance per link slot while it runs, about as much as the
-  graph's links, and it makes the binary16 copy only when the copy and those distances
-  fit in the budget.
+  with their links until the next compaction, and they count against the budget too. The
+  background thread inserts vectors only while they fit, and leaves the rest pending, so
+  searches score them exactly and the status reports `overBudget`. Raising the budget
+  lets it go on, and the next compaction releases the inserted vectors. Lowering the
+  budget at run time stops further inserts but does not remove vectors already inserted.
+  On x86-64 CPUs with F16C, a build reads a binary16 copy of the vectors, 2 bytes per
+  dimension, which it holds while it runs. A build also holds a 4-byte distance per link
+  slot while it runs, about as much as the graph's links, and it makes the binary16 copy
+  only when the copy and those distances fit in the budget.
 
 | Method | Path | Result |
 |---|---|---|

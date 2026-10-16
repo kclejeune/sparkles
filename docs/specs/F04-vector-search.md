@@ -1228,8 +1228,9 @@ rebuild's.
   new rows are inserted. A compaction carries a graph over only when at most 30 % of the
   nodes changed and the old graph was built with the same settings. Otherwise the graph
   is built in the background after the switch, as before this item, and searches scan
-  exactly until it is ready. The compaction does not run that full build itself. The
-  carried index is
+  exactly until it is ready. The compaction does not run that full build itself. When
+  the previous generation's delta shows too many changes it declines before packing, and
+  otherwise it declines before the binary16 copy. The carried index is
   installed in the new generation before the switch, so searches use the old graph up
   to the switch and the carried one from the first query after it, with no window of
   exact scans. A bulk commit's background build carries the old index over in the same
@@ -1308,8 +1309,9 @@ found no change outside noise, with a geometric mean of 0.962.
 In exchange, inserted rows are found through the graph instead of being parsed and
 scored on every query, a compaction leaves no window of exact scans, and the build at
 1M × 384 takes 63.5 s instead of 139.5 s. The example's peak RSS at 1M rose from 10.2 GB
-to 12.6 GB. The binary16 copy, the link distances and the second segment during a
-carry-over all contribute to that rise, and no breakdown between them was measured.
+to 12.6 GB. The live layer filled by the example's inserts, the binary16 copy, the link
+distances and the second segment during a carry-over all contribute to that rise, and no
+breakdown between them was measured.
 
 **Design notes.** The hand-written x86-64 graph kernels and the software binary16
 conversions are kept because the build at 1M × 384 was limited by memory bandwidth, and
@@ -1328,7 +1330,9 @@ inserted key set it caught up with and compares its identity. An index created b
 its predicate had any row ignored the rows inserted later, and its searches stayed
 exact, because the predicate id was resolved once at the build and the search plan
 counted only base rows. Both now take the inserted rows into account. The live layer
-counts against the vector memory budget. A compaction whose carry is declined no longer
+counts against the vector memory budget. Catch-up inserts as many rows as fit, and the
+status reports the stop from the budget as it stands, so raising the budget clears it.
+A compaction whose carry is declined no longer
 runs a full build on its own thread, as described under *Graphs across compactions*.
 
 **Catch-up cost and half-precision recall** (item 82, Tier 4, [ROADMAP](../ROADMAP.md)).
