@@ -273,6 +273,18 @@ fn session_digests(
     Ok(out)
 }
 
+/// The first eight hex digits of the SHA-256 of `path` relative to `root`, or of the whole
+/// path when it is not below `root`.
+fn path_hash(path: &Path, root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    Sha256::digest(rel.to_string_lossy().as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Import the project's transcripts. Returns a report per transcript.
 pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
     let mut found = find(run.roots, run.project, &run.harnesses, run.opts.subagents);
@@ -349,6 +361,11 @@ pub fn sync(run: &Run, cache: &mut Cache) -> Result<Vec<FileReport>, CmdError> {
         let id = match (&f.parent, &s.id) {
             (Some(parent), _) => format!("{parent}.{stem}"),
             (None, Some(id)) => id.clone(),
+            // Aider's log has no session id and the project may hold one in its directory
+            // and one in its root, so the stem alone would send both to one graph
+            (None, None) if f.harness == Harness::Aider => {
+                format!("{stem}-{}", path_hash(&f.path, &run.project.root))
+            }
             (None, None) => stem.clone(),
         };
         s.id = Some(id.clone());

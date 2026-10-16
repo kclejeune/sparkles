@@ -2692,6 +2692,13 @@ project) and Aider (`.aider.chat.history.md` in the project). `GEMINI_CLI_HOME` 
 `copilot` and `aider` select them, and a sync without a name reads all of them. Their
 instruction files are the generic adapter's. Gemini CLI, Cursor and Copilot do not
 document their log formats, so a version that writes something new may leave turns out.
+Aider's file does not say which lines are the person's and which are the model's. A reply
+that contains a level-4 Markdown heading is read as a turn of the person, and a reply line
+that starts with `> ` is read as one of Aider's notices and dropped. Cursor's text form
+starts a new turn at any line that begins with `A:` or `user:`, which can also happen
+inside an answer. Aider's log has no session id, so the session is named after the file
+and a short hash of its path below the repository, and the histories in a project's
+directory and in its root are two sessions.
 `--transcript FILE` imports one file, wherever it is. A file that none of these
 adapters recognizes is read by the generic adapter, which understands JSON lines or a
 JSON value of messages with a speaker and a text, Markdown with `## User` and

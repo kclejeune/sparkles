@@ -1298,6 +1298,52 @@ fn memory_transcripts_of_other_harnesses() {
     assert_eq!(report(&sy, "export.md")["status"], "unchanged", "{sy:#}");
 }
 
+/// Aider's log has no session id, so the histories in a project's directory and in its
+/// root must not share a graph because they share a file name.
+#[test]
+fn memory_aider_histories_in_directory_and_root_are_two_sessions() {
+    let s = start_server(&["--mem", DS]);
+    let f = Fixture::new();
+    let root = f.project();
+    let dir = root.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    mem_json(&f, &s, "admin", &["init", "--import-base", BASE]);
+    let (st, mut settings) = s.json("admin", "GET", &format!("/$/memory/{DS}"), None);
+    assert_eq!(st, 200);
+    settings["imports"]["transcripts"] = true.into();
+    let (st, _) = s.json("admin", "PUT", &format!("/$/memory/{DS}"), Some(&settings));
+    assert_eq!(st, 200);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    for (d, text) in [(&root, "Rename the helper"), (&dir, "Fix the build")] {
+        let path = d.join(".aider.chat.history.md");
+        std::fs::write(
+            &path,
+            format!("# aider chat started at 2026-09-01 10:00:00\n\n#### {text}\n\nDone.\n"),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let sy = mem_json(
+        &f,
+        &s,
+        "ana",
+        &["sync", "--project", dir.to_str().unwrap(), "--transcripts"],
+    );
+    let graphs: std::collections::HashSet<&str> = sy["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["harness"] == "aider")
+        .map(|r| r["graph"].as_str().unwrap())
+        .collect();
+    assert_eq!(graphs.len(), 2, "{sy:#}");
+}
+
 /// A66, A67, A75 and A76: transcripts with their opt-ins and redaction, the server's
 /// secret check, export with its copies, and promotion and rejection from the terminal.
 #[test]
