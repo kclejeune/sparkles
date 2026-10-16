@@ -1497,9 +1497,29 @@ async fn a_basic_graph_pattern_at_the_plan_limit() {
     let s = c
         .structured("explain_query", json!({"query": bgp(n)}))
         .await;
-    // a join and a scan for each triple pattern
-    let lines = s["plan"].as_str().unwrap().lines().count();
-    assert_eq!(lines, 2 * n, "{s}");
+    // a join and a scan for each triple pattern make a plan text of about 16 MB, which is
+    // cut at the size of a tool result
+    let max = McpConfig::default().max_bytes;
+    let text = s["plan"].as_str().unwrap();
+    let last = text.lines().last().unwrap();
+    // (it stops at the first line end past the cap, and ends with the marker)
+    let longest = text.lines().map(str::len).max().unwrap();
+    assert!(
+        text.len() <= max + longest + last.len() + 2,
+        "{}",
+        text.len()
+    );
+    assert!(
+        last.starts_with("… ") && last.ends_with(" more operators not shown"),
+        "{last}"
+    );
+    assert_eq!(s["planTruncated"], true, "{}", text.len());
+    // a plan under the cap is written whole
+    let s = c
+        .structured("explain_query", json!({"query": bgp(20)}))
+        .await;
+    assert_eq!(s["plan"].as_str().unwrap().lines().count(), 40, "{s}");
+    assert!(s.get("planTruncated").is_none(), "{s}");
     // the notes read plans of up to 256 levels, and a run's deeper plan is refused
     let args = json!({"query": bgp(n), "notes": true, "profile": "run"});
     let (t, e) = c.error("explain_query", args).await;

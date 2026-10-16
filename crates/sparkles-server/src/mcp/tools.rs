@@ -1838,10 +1838,24 @@ fn plan_value(plan: &PlanInfo, explained: bool) -> Value {
 }
 
 /// `<operator> <description> est=<rows> [<columns>]`, two spaces per depth. Written
-/// without recursion, since a plan nests up to `MAX_PLAN_DEPTH` levels.
-pub(super) fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String) {
+/// without recursion, since a plan nests up to `MAX_PLAN_DEPTH` levels. The indentation
+/// makes the text grow with the square of the depth, so once `out` holds `max_bytes` the
+/// rest is replaced by a line that counts the operators left, and the result says it cut
+/// the text.
+pub(super) fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String, max_bytes: usize) -> bool {
     let mut todo = vec![(p, depth)];
     while let Some((p, depth)) = todo.pop() {
+        if out.len() >= max_bytes {
+            let mut left = 0usize;
+            let mut rest = vec![p];
+            rest.extend(todo.iter().map(|(n, _)| *n));
+            while let Some(n) = rest.pop() {
+                left += 1;
+                rest.extend(&n.children);
+            }
+            out.push_str(&format!("… {left} more operators not shown\n"));
+            return true;
+        }
         out.push_str(&"  ".repeat(depth));
         out.push_str(&p.operator);
         if !p.description.is_empty() {
@@ -1858,6 +1872,7 @@ pub(super) fn plan_lines(p: &PlanInfo, depth: usize, out: &mut String) {
         out.push_str(&format!(" [{}]\n", cols.join(" ")));
         todo.extend(p.children.iter().rev().map(|c| (c, depth + 1)));
     }
+    false
 }
 
 /// The `no-limit` and `large-estimate` warnings of a query's plan.

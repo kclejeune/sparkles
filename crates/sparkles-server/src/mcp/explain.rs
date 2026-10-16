@@ -48,8 +48,11 @@ impl Tools<'_> {
             let plan = core.plan.as_ref().expect("the engine's plan");
             if !notes {
                 let mut lines = String::new();
-                plan_lines(plan, 0, &mut lines);
+                let cut = plan_lines(plan, 0, &mut lines, self.cfg().max_bytes);
                 out["plan"] = lines.trim_end().into();
+                if cut {
+                    out["planTruncated"] = true.into();
+                }
                 return Ok(Outcome::Structured(out));
             }
             let kind = out["queryType"].as_str().unwrap_or("SELECT").to_string();
