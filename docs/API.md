@@ -3521,7 +3521,9 @@ The server keeps a 128-bit hash for each distinct row of the earlier result and 
 It reads the later result against those hashes, which finds its own rows as they go by,
 and runs the earlier query once more to list the rows that no row of the later result
 matched. That is three executions of the query, each with the request's budgets, so the
-request counts twice against the `query` rate limit. The hashes, the table of the result
+request counts twice against the `query` rate limit. The request's timeout covers the
+whole comparison, and each execution gets the time that is left. A client that disconnects
+stops the comparison within a few thousand rows. The hashes, the table of the result
 being read and the listed rows count against the memory budget (`--query-memory-mb`, or
 the request's `memory-mb`) and against the server memory pool when it is on. A comparison
 beyond the request's budget fails with `507` and `budget: "memory"`, and one the pool

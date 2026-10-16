@@ -1514,3 +1514,12 @@ async fn sparql_diff_charges_the_server_memory_pool() {
     assert_eq!(small.json()["same"], 100);
     assert_eq!(pool.granted(), 0);
 }
+
+#[tokio::test]
+async fn sparql_diff_runs_under_one_timeout() {
+    let q = "SELECT ?s WHERE { ?s <urn:q> <urn:o> }";
+    let s = big_server(None, 20_000).await;
+    // a request that cannot finish in a microsecond answers the timeout status
+    let r = sparql_diff(&s.app, "/h/sparql/diff?from=5&to=5&timeout=0.000001", q).await;
+    assert_eq!(r.status, StatusCode::REQUEST_TIMEOUT, "{}", head_of(&r));
+}

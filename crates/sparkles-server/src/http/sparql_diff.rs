@@ -22,7 +22,11 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+/// How many rows a loop reads between two looks at the deadline and the cancel flag.
+const CHECK_EVERY: usize = 4096;
 /// What a distinct row costs in the table of hashes: a 32-byte slot, which the 16-byte
 /// alignment of the key makes of a `(u128, u32)`, a control byte, and room for the load
 /// factor and for the table's growth.
@@ -65,6 +69,48 @@ fn row_json(r: &QueryResult, i: usize) -> J {
         }
     }
     J::Object(o)
+}
+
+/// The deadline of the whole comparison, which the three executions and the loops between
+/// them share, and the flag that a disconnected client sets.
+struct Deadline {
+    at: Option<Instant>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    fn new(timeout: Option<Duration>, cancel: Arc<AtomicBool>) -> Deadline {
+        Deadline {
+            at: timeout.map(|t| Instant::now() + t),
+            cancel,
+        }
+    }
+
+    /// Fail when the request was cancelled or its time is up.
+    fn now(&self) -> Result<(), sparkles::Error> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(sparkles::Error::Cancelled);
+        }
+        if self.at.is_some_and(|t| Instant::now() >= t) {
+            return Err(sparkles::Error::Timeout);
+        }
+        Ok(())
+    }
+
+    /// The look that a loop takes at row `i`: every [`CHECK_EVERY`] rows.
+    fn check(&self, i: usize) -> Result<(), sparkles::Error> {
+        if i.is_multiple_of(CHECK_EVERY) {
+            self.now()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The time that is left for the next execution, which fails when there is none.
+    fn left(&self) -> Result<Option<Duration>, sparkles::Error> {
+        self.now()?;
+        Ok(self.at.map(|t| t.saturating_duration_since(Instant::now())))
+    }
 }
 
 /// The memory the comparison holds, charged as it grows to the request's budget
@@ -241,14 +287,18 @@ pub(super) async fn sparql_diff(
     let max_bytes = asked.result_limit(st.limits.max_result_bytes);
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
     let (cancel, _cancel_on_drop) = cancel_on_drop();
-    opts.cancel = Some(cancel);
+    opts.cancel = Some(cancel.clone());
     let restricted = p.restricted(&ds.name);
     let out = blocking({
         let ds = ds.clone();
         move || {
             let mut buf = String::new();
+            let mut opts = opts;
+            // one deadline for all three executions and the loops between them
+            let deadline = Deadline::new(opts.timeout, cancel);
             let mut charge = Charge::new(&opts);
             // the earlier state: a hash for each distinct row, and how many of it there are
+            opts.timeout = deadline.left()?;
             let (left, from_at) = run(&ds, &from, &query, &opts)?;
             let vars = left.vars.clone();
             let left_rows = left.len() as u64;
@@ -257,6 +307,7 @@ pub(super) async fn sparql_diff(
             charge.charge(left_bytes)?;
             let mut seen: HashMap<u128, u32> = HashMap::new();
             for i in 0..left.len() {
+                deadline.check(i)?;
                 match seen.entry(row_hash(&left, i, &mut buf)) {
                     Entry::Occupied(mut e) => *e.get_mut() += 1,
                     Entry::Vacant(e) => {
@@ -268,6 +319,7 @@ pub(super) async fn sparql_diff(
             drop(left);
             charge.release(left_bytes);
             // the later state: a row without a partner is only there, and kept as it goes by
+            opts.timeout = deadline.left()?;
             let (right, to_at) = run(&ds, &to, &query, &opts)?;
             let right_rows = right.len() as u64;
             let right_bytes = table_bytes(&right);
@@ -276,6 +328,7 @@ pub(super) async fn sparql_diff(
             let mut added_rows = Vec::new();
             let mut listed = Listed::new(max_bytes);
             for i in 0..right.len() {
+                deadline.check(i)?;
                 match seen.get_mut(&row_hash(&right, i, &mut buf)) {
                     Some(n) if *n > 0 => {
                         *n -= 1;
@@ -296,10 +349,12 @@ pub(super) async fn sparql_diff(
             let mut removed_rows = Vec::new();
             if removed > 0 {
                 let again = At::Commit(from_at.commit.seq);
+                opts.timeout = deadline.left()?;
                 let (left, _) = run(&ds, &again, &query, &opts)?;
                 let again_bytes = table_bytes(&left);
                 charge.charge(again_bytes)?;
                 for i in 0..left.len() {
+                    deadline.check(i)?;
                     if removed_rows.len() >= limit {
                         break;
                     }
@@ -339,6 +394,7 @@ pub(super) async fn sparql_diff(
                 "truncated": { "added": added > added_rows.len() as u64, "removed": removed > removed_rows.len() as u64 },
             });
             // the envelope is small next to the rows, and the check makes the bound exact
+            deadline.now()?;
             let body = serde_json::to_vec(&out).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             listed.check_body(body.len() as u64)?;
             // the body is held until the response is sent
@@ -357,6 +413,31 @@ mod tests {
     use sparkles::sparql::pool::QueryPool;
 
     const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn a_deadline_that_has_passed_fails_the_next_look_of_a_loop() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let d = Deadline::new(Some(Duration::ZERO), cancel.clone());
+        // the look is taken every CHECK_EVERY rows, starting with the first
+        assert!(matches!(d.check(0), Err(sparkles::Error::Timeout)));
+        assert!(d.check(1).is_ok());
+        assert!(matches!(
+            d.check(CHECK_EVERY),
+            Err(sparkles::Error::Timeout)
+        ));
+        assert!(matches!(d.left(), Err(sparkles::Error::Timeout)));
+        // time that is left goes to the next execution
+        let d = Deadline::new(Some(Duration::from_secs(60)), cancel.clone());
+        assert!(d.check(0).is_ok());
+        let left = d.left().unwrap().unwrap();
+        assert!(left > Duration::from_secs(50) && left <= Duration::from_secs(60));
+        // no timeout means no deadline
+        assert_eq!(Deadline::new(None, cancel.clone()).left().unwrap(), None);
+        // a cancelled request stops at the next look, whatever the time
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(d.check(0), Err(sparkles::Error::Cancelled)));
+        assert!(matches!(d.left(), Err(sparkles::Error::Cancelled)));
+    }
 
     #[test]
     fn a_charge_rises_in_the_pool_and_falls_back_when_it_ends() {
