@@ -662,7 +662,8 @@ fn cyclic() -> Dataset {
     ds
 }
 
-/// Shapes of `n` triple patterns, each joined to the one before it by a variable.
+/// Shapes of `n` triple patterns, each joined to the one before it by a variable, or in the
+/// star and the hub to all the others by one.
 fn plan_shapes(n: usize) -> Vec<(String, String)> {
     let select = |body: String| format!("SELECT * {{ {body} }}");
     let each = |f: &dyn Fn(usize) -> String| (0..n).map(f).collect::<String>();
@@ -683,6 +684,16 @@ fn plan_shapes(n: usize) -> Vec<(String, String)> {
         (
             "tree",
             select(each(&|i| format!("?a{} <urn:p> ?a{} . ", i / 2, i + 1))),
+        ),
+        (
+            "star",
+            select(each(&|i| {
+                format!("?x <urn:{}> ?v{i} . ", ["p", "q"][i % 2])
+            })),
+        ),
+        (
+            "hub",
+            select(each(&|i| format!("?a{i} ?hub ?a{} . ", i + 1))),
         ),
         (
             "pairs",
@@ -949,12 +960,18 @@ fn large_bgp_planning_time() {
 }
 
 /// Every shape at the plan limit stops soon after its timeout or its cancellation, in
-/// planning as well as in running, since the planner checks them as it goes. Each shape
-/// gets a third and two thirds of the time `explain` takes for it as its timeout, and must
-/// stop within a quarter of that time past it, besides the time to parse it.
+/// planning as well as in running, since the planner checks them as it goes. The time
+/// `explain` takes for a shape is the least of three runs, so that a run slowed by other
+/// work does not make the timeouts too long. Each shape gets a quarter and a half of that
+/// time as its timeout and must stop within half of it, or a second, past the timeout,
+/// besides the time to parse it. Whether describing a plan checks the deadline is tested
+/// without a clock in `sparkles-core`.
+///
+/// Other work on the machine stretches the overshoot, so a nextest group runs this test
+/// alone.
 #[test]
 fn planning_at_the_limit_stops_at_the_timeout() {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     let ds = cyclic();
     let cursor = sparkles::sparql::CursorOptions::default();
     let stopped = |what: &str, r: sparkles::Result<()>, t: Instant, want: &str, by| {
@@ -975,14 +992,19 @@ fn planning_at_the_limit_stops_at_the_timeout() {
     };
     let shapes = shapes_at_the_limit();
     explain(&shapes[0].1);
-    let parse = std::time::Duration::from_millis(if cfg!(debug_assertions) { 200 } else { 20 });
     for (i, (what, q)) in shapes.iter().enumerate() {
-        let planned = explain(q);
-        // in planning, and in describing the plan
+        let planned = (0..3).map(|_| explain(q)).min().unwrap();
+        // the parse comes before the timeout starts
+        let t = Instant::now();
+        let parsed = spargebra::SparqlParser::new().parse_query(q).unwrap();
+        check_query(&parsed).unwrap();
+        drop(parsed);
+        let parse = t.elapsed() * 2;
+        // what the thread wake-ups and the drop of a half-built plan add under load
+        let slack = (planned / 2).max(Duration::from_secs(1)) + parse;
         for part in [1, 2] {
-            let timeout = planned * part / 3;
-            // and the parse, before the timeout starts
-            let by = timeout + planned / 4 + parse;
+            let timeout = planned * part / 4;
+            let by = timeout + slack;
             let opts = sparkles::sparql::QueryOptions {
                 timeout: Some(timeout),
                 ..Default::default()
@@ -990,15 +1012,15 @@ fn planning_at_the_limit_stops_at_the_timeout() {
             let t = Instant::now();
             let r = sparkles::sparql::explain(ds.snapshot(), q, &opts).map(|_| ());
             stopped(
-                &format!("{what}, explain in {part}/3"),
+                &format!("{what}, explain in {part}/4"),
                 r,
                 t,
                 "timed out",
                 by,
             );
         }
-        let timeout = planned / 3;
-        let by = timeout + planned / 4 + parse;
+        let timeout = planned / 4;
+        let by = timeout + slack;
         let opts = sparkles::sparql::QueryOptions {
             timeout: Some(timeout),
             ..Default::default()
