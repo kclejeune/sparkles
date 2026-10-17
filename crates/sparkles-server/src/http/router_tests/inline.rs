@@ -76,6 +76,11 @@ async fn an_algorithm_query_is_never_run_in_place() {
     }
     let key = crate::http::inline::QuickQueries::key("ds", q);
     assert!(!crate::http::QUICK.is_quick(key));
+    assert_eq!(
+        crate::http::inline::ran_by_key(key),
+        0,
+        "no run was in place"
+    );
 }
 
 /// The algorithm namespace is found in the parsed query, not in its text. A prefixed
@@ -103,6 +108,43 @@ async fn an_algorithm_named_by_a_prefix_is_never_run_in_place() {
         }
         let key = crate::http::inline::QuickQueries::key("ds", q);
         assert!(!crate::http::QUICK.is_quick(key), "{q}");
+        assert_eq!(
+            crate::http::inline::ran_by_key(key),
+            0,
+            "no run was in place: {q}"
+        );
+    }
+}
+
+/// `EXISTS` is planned only when rows reach it, so over an empty outer pattern the
+/// planner never meets the call. The algebra decides, and the text is never quick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_algorithm_inside_exists_over_an_empty_pattern_is_never_run_in_place() {
+    let s = server();
+    for q in [
+        "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?s WHERE { ?s <urn:no:rows> ?o FILTER EXISTS { SERVICE algo:bfs { [] algo:source ?s ; algo:node ?n } } }",
+        "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?s WHERE { ?s <urn:no:rows> ?o FILTER NOT EXISTS { SERVICE algo:bfs { [] algo:source ?s ; algo:node ?n } } }",
+        // spelled with a prefix that hides the namespace
+        "PREFIX a: <urn:x-sparkles:> SELECT ?s WHERE { ?s <urn:no:rows> ?o FILTER EXISTS { SERVICE a:algo\\#bfs { [] a:algo\\#source ?s ; a:algo\\#node ?n } } }",
+    ] {
+        ignore_time(q);
+        for _ in 0..3 {
+            let r = select(&s.app, q, "application/sparql-results+json").await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            assert!(
+                r.json()["results"]["bindings"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let key = crate::http::inline::QuickQueries::key("ds", q);
+        assert!(!crate::http::QUICK.is_quick(key), "{q}");
+        assert_eq!(
+            crate::http::inline::ran_by_key(key),
+            0,
+            "no run was in place: {q}"
+        );
     }
 }
 

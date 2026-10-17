@@ -1416,6 +1416,7 @@ pub(crate) async fn run_query(
         }
     };
     let ran = if in_place {
+        inline::note_in_place(quick_key);
         inline::run(run).and_then(|r| r)
     } else {
         blocking(run).await

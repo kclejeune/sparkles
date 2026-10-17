@@ -50,6 +50,108 @@ pub fn is_algo(name: &NamedNodePattern) -> bool {
     matches!(name, NamedNodePattern::NamedNode(n) if Algo::from_iri(n.as_str()).is_some())
 }
 
+/// Whether a parsed pattern has a `SERVICE` of the algorithm namespace anywhere, also
+/// inside `EXISTS` and `NOT EXISTS` of a filter, a bind, an order, an aggregate or a
+/// projection, which the planner plans only when rows reach them. Prefixes and the base
+/// are already resolved in the algebra. The walk stops at the first match and allocates
+/// nothing.
+pub(super) fn calls_algorithm(p: &GraphPattern) -> bool {
+    #[cfg(test)]
+    WALKS.with(|w| w.set(w.get() + 1));
+    pattern_calls(p)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// how many times [`calls_algorithm`] ran on this thread
+    pub(super) static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn pattern_calls(p: &GraphPattern) -> bool {
+    use GraphPattern as P;
+    use spargebra::algebra::{AggregateExpression, OrderExpression};
+    let order = |o: &OrderExpression| match o {
+        OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr_calls(e),
+    };
+    match p {
+        P::Bgp { .. } | P::Path { .. } | P::Values { .. } => false,
+        P::Join { left, right }
+        | P::Lateral { left, right }
+        | P::Union { left, right }
+        | P::Minus { left, right }
+        | P::SemiJoin { left, right }
+        | P::AntiJoin { left, right } => pattern_calls(left) || pattern_calls(right),
+        P::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            pattern_calls(left)
+                || pattern_calls(right)
+                || expression.as_ref().is_some_and(expr_calls)
+        }
+        P::Filter { inner, expr } => pattern_calls(inner) || expr_calls(expr),
+        P::Extend {
+            inner, expression, ..
+        }
+        | P::Assign {
+            inner, expression, ..
+        }
+        | P::Unfold {
+            inner, expression, ..
+        } => pattern_calls(inner) || expr_calls(expression),
+        P::OrderBy { inner, expression } => pattern_calls(inner) || expression.iter().any(order),
+        P::Group {
+            inner, aggregates, ..
+        } => {
+            pattern_calls(inner)
+                || aggregates.iter().any(|(_, a)| match a {
+                    AggregateExpression::CountSolutions { .. } => false,
+                    AggregateExpression::FunctionCall { expr, .. } => expr_calls(expr),
+                    AggregateExpression::Fold {
+                        expr,
+                        value,
+                        order: os,
+                        ..
+                    } => expr_calls(expr) || value.iter().any(expr_calls) || os.iter().any(order),
+                })
+        }
+        P::Service { name, inner, .. } => {
+            matches!(name, NamedNodePattern::NamedNode(n) if n.as_str().starts_with(NS))
+                || pattern_calls(inner)
+        }
+        P::Graph { inner, .. }
+        | P::Project { inner, .. }
+        | P::Distinct { inner }
+        | P::Reduced { inner }
+        | P::Slice { inner, .. } => pattern_calls(inner),
+    }
+}
+
+fn expr_calls(e: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::Expression as E;
+    match e {
+        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
+        E::Exists(p) => pattern_calls(p),
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => expr_calls(a) || expr_calls(b),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_calls(a),
+        E::In(a, list) => expr_calls(a) || list.iter().any(expr_calls),
+        E::If(a, b, c) => expr_calls(a) || expr_calls(b) || expr_calls(c),
+        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expr_calls),
+    }
+}
+
 fn bad(m: impl std::fmt::Display) -> Error {
     Error::invalid(format!("algo: {m}"))
 }
@@ -479,10 +581,10 @@ fn param(t: &TermPattern, name: &str, kind: Kd) -> Result<Num> {
     {
         // an exact integer outside 0..=i64::MAX is refused by name, not as "not a number"
         let text = l.value().trim();
-        let digits = text.strip_prefix('+').unwrap_or(text);
+        let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
         if !digits.is_empty()
             && digits.bytes().all(|b| b.is_ascii_digit())
-            && digits.parse::<i64>().is_err()
+            && text.parse::<i64>().map_or(true, |v| v < 0)
         {
             return Err(bad(format!(
                 "algo:{name} takes an integer from 0 to {}",
@@ -4445,5 +4547,58 @@ mod graph_variable_tests {
         drop(hook);
         assert_eq!(result.len(), 0);
         assert_eq!(read.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod calls_algorithm_tests {
+    use super::*;
+    use crate::sparql::{QueryOptions, query};
+    use crate::store::{Store, StoreOptions};
+
+    const CALL: &str = "SERVICE algo:bfs { [] algo:source ?s ; algo:node ?n }";
+
+    fn flagged(store: &Store, body: &str) -> bool {
+        let q = format!("PREFIX algo: <urn:x-sparkles:algo#> {body}");
+        query(store.snapshot(), &q, &QueryOptions::default())
+            .unwrap()
+            .ctx
+            .calls_algorithm()
+    }
+
+    /// The flag comes from the algebra, so a call that the planner reaches only when rows
+    /// arrive still sets it, here with no row at all.
+    #[test]
+    fn an_algorithm_inside_an_expression_is_found_on_an_empty_store() {
+        let s = Store::in_memory(StoreOptions::default());
+        for body in [
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o FILTER EXISTS {{ {CALL} }} }}"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o FILTER NOT EXISTS {{ {CALL} }} }}"),
+            format!("SELECT ?s ?b WHERE {{ ?s <urn:t> ?o BIND(EXISTS {{ {CALL} }} AS ?b) }}"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o }} ORDER BY (EXISTS {{ {CALL} }})"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o }} GROUP BY ?s HAVING (EXISTS {{ {CALL} }})"),
+            format!("SELECT (EXISTS {{ {CALL} }} AS ?b) WHERE {{ ?s <urn:t> ?o }}"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o FILTER(!EXISTS {{ {CALL} }} || ?o = 1) }}"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o OPTIONAL {{ {CALL} }} }}"),
+        ] {
+            assert!(flagged(&s, &body), "{body}");
+        }
+    }
+
+    /// A plain query is not flagged, and the walk runs once for each query.
+    #[test]
+    fn a_plain_query_is_not_flagged_and_the_walk_runs_once() {
+        let s = Store::in_memory(StoreOptions::default());
+        WALKS.with(|w| w.set(0));
+        assert!(!flagged(
+            &s,
+            "SELECT ?s WHERE { ?s <urn:t> ?o FILTER EXISTS { ?o <urn:u> ?x } }"
+        ));
+        assert_eq!(WALKS.with(|w| w.get()), 1);
+        assert!(flagged(
+            &s,
+            &format!("SELECT ?s WHERE {{ ?s <urn:t> ?o FILTER EXISTS {{ {CALL} }} }}")
+        ));
+        assert_eq!(WALKS.with(|w| w.get()), 2);
     }
 }
