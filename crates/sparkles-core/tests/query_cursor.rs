@@ -1371,11 +1371,21 @@ fn incremental_distinct_preserves_unbound_and_zero_column_rows_across_batches() 
         }
     }
     let s = store(5000);
-    let q = "SELECT DISTINCT ?s WHERE { ?s <urn:p> ?o }";
     let opts = QueryOptions {
         max_memory_bytes: Some(32 << 10),
         ..Default::default()
     };
+    // Input ordered on every output column keeps only its last row, so it fits.
+    let q = "SELECT DISTINCT ?s WHERE { ?s <urn:p> ?o }";
+    let mut cursor = select_cursor(s.snapshot(), q, &opts, &options(3)).unwrap();
+    let mut produced = 0;
+    while let Some(batch) = cursor.next_batch().unwrap() {
+        produced += batch.len();
+    }
+    assert_eq!(produced, 5000);
+    assert!(cursor.stats().mem_peak_bytes <= 32 << 10);
+    // A computed column is not ordered, so the set of emitted rows grows past it.
+    let q = "SELECT DISTINCT ?k WHERE { ?s <urn:p> ?o BIND(?o * 2 AS ?k) }";
     let mut cursor = select_cursor(s.snapshot(), q, &opts, &options(3)).unwrap();
     let mut produced = 0;
     loop {

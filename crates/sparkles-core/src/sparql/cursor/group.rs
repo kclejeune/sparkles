@@ -105,7 +105,12 @@ pub(super) struct Group {
     at: usize,
     charge: Option<RetainedCharge>,
     bytes: u64,
+    /// The bytes the charge holds, at least `bytes`.
+    reserved: u64,
 }
+
+/// The least step by which the retained charge of the group state grows.
+const RETAIN_STEP: u64 = 64 << 10;
 
 impl Group {
     pub(super) fn new(ctx: &Ctx, node: &Node) -> Result<Self> {
@@ -152,6 +157,7 @@ impl Group {
             at: 0,
             charge,
             bytes,
+            reserved: bytes,
         };
         if group.keys.is_empty() {
             group.insert(ctx, &[])?;
@@ -182,10 +188,25 @@ impl Group {
         Ok(at)
     }
 
+    /// Count `bytes` more of retained state. The charge grows ahead in steps of at
+    /// least 64 KiB, still before the state does, so that adding many small groups does
+    /// not update the memory ledger for each of them. It overstates the state by less
+    /// than one step.
     fn retain(&mut self, bytes: u64) -> Result<()> {
         let retained = self.bytes.saturating_add(bytes);
-        if let Some(charge) = &mut self.charge {
-            charge.resize(retained)?;
+        if retained > self.reserved {
+            let reserved = retained.saturating_add((retained / 8).max(RETAIN_STEP));
+            if let Some(charge) = &mut self.charge {
+                if charge.resize(reserved).is_err() {
+                    // Near the budget, reserve only what the state needs.
+                    charge.resize(retained)?;
+                    self.reserved = retained;
+                } else {
+                    self.reserved = reserved;
+                }
+            } else {
+                self.reserved = reserved;
+            }
         }
         self.bytes = retained;
         Ok(())
@@ -274,19 +295,88 @@ impl Group {
                     _ => Ok(None),
                 })
                 .collect::<Result<Vec<Option<Vec<Id>>>>>()?;
-            for row in 0..table.len {
-                if row.is_multiple_of(1024) {
-                    ctx.check()?;
+            // The group of every row of the batch, then each aggregate over the whole
+            // batch, so that the kind of an aggregate is matched once per batch.
+            let _slots = ctx.charge(table.len as u64 * 4 + 64)?;
+            let mut slots: Vec<u32> = Vec::with_capacity(table.len);
+            if self.keys.is_empty() {
+                slots.resize(table.len, 0);
+            } else if let ([Some(column)], Index::One(_)) = (self.keys.as_slice(), &self.index) {
+                let column = &table.cols[*column];
+                for (row, &id) in column.iter().enumerate() {
+                    if row.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let found = match &self.index {
+                        Index::One(index) => index.get(&id).copied(),
+                        Index::Many(_) => unreachable!("a one-key index"),
+                    };
+                    slots.push(match found {
+                        Some(group) => group as u32,
+                        None => self.insert(ctx, &[id])? as u32,
+                    });
                 }
-                for (k, column) in key.iter_mut().zip(&self.keys) {
-                    *k = column.map_or(Id::UNDEF, |c| table.cols[c][row]);
+            } else {
+                for row in 0..table.len {
+                    if row.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    for (k, column) in key.iter_mut().zip(&self.keys) {
+                        *k = column.map_or(Id::UNDEF, |c| table.cols[c][row]);
+                    }
+                    slots.push(self.find(ctx, &key)? as u32);
                 }
-                let group = if self.keys.is_empty() {
-                    0
-                } else {
-                    self.find(ctx, &key)?
+            }
+            for (a, values) in computed.iter().enumerate() {
+                ctx.check()?;
+                let na = self.aggs.len();
+                let agg = &self.aggs[a];
+                let column = match (&self.args[a], values) {
+                    (_, Some(values)) => Some(values.as_slice()),
+                    (Arg::Column(Some(c)), _) => Some(table.cols[*c].as_slice()),
+                    _ => None,
                 };
-                for (a, values) in computed.iter().enumerate() {
+                let unbound = matches!(self.args[a], Arg::Column(None));
+                if !agg.distinct && !matches!(agg.func, AggregateFunction::GroupConcat { .. }) {
+                    // Running states that need no payload: counts and sums.
+                    match (&agg.func, column) {
+                        (AggregateFunction::Count, None) if !unbound => {
+                            for &slot in &slots {
+                                if let State::Agg(AggState::Count(n)) =
+                                    &mut self.states[slot as usize * na + a]
+                                {
+                                    *n += 1;
+                                }
+                            }
+                            continue;
+                        }
+                        (AggregateFunction::Count, Some(values)) => {
+                            for (&slot, id) in slots.iter().zip(values) {
+                                if let State::Agg(AggState::Count(n)) =
+                                    &mut self.states[slot as usize * na + a]
+                                {
+                                    *n += u64::from(!id.is_undef());
+                                }
+                            }
+                            continue;
+                        }
+                        (AggregateFunction::Sum | AggregateFunction::Avg, Some(values)) => {
+                            for (&slot, &id) in slots.iter().zip(values) {
+                                if let State::Agg(state) = &mut self.states[slot as usize * na + a]
+                                {
+                                    state.add(ctx, agg, Some(id));
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                for (row, &slot) in slots.iter().enumerate() {
+                    if row.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let group = slot as usize;
                     if matches!(self.args[a], Arg::Star)
                         && self.aggs[a].distinct
                         && !self.new_row(group, a, table, row)?

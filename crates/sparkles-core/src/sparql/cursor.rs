@@ -1883,7 +1883,11 @@ impl Operator {
                     loaded: None,
                     at: 0,
                 },
-                Kind::Distinct => State::Distinct(distinct::Distinct::new(ctx)?),
+                Kind::Distinct => State::Distinct(distinct::Distinct::new(
+                    ctx,
+                    &node.vars,
+                    &children[0].order,
+                )?),
                 Kind::Slice { offset, limit } => State::Slice {
                     offset: *offset,
                     remaining: *limit,

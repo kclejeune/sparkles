@@ -1432,7 +1432,7 @@ fn run_len(col: &[u64], v: u64) -> usize {
 /// End of the run of ids equal to `col[i]` in a sorted column: short runs are stepped
 /// through instead of binary-searching the rest of the column.
 #[inline]
-fn run_end(col: &[Id], i: usize) -> usize {
+pub(super) fn run_end(col: &[Id], i: usize) -> usize {
     const PROBE: usize = 16;
     let v = col[i];
     let end = col.len().min(i + PROBE);
