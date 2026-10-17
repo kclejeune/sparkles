@@ -67,9 +67,35 @@ struct Sparse {
     offsets: Vec<u64>,
     /// one bit per group: a lookup asked for the group to be read ahead
     hinted: Box<[AtomicU64]>,
+    /// the hashes of keys whose group has been asked for, one per slot and 0 for none (see
+    /// [`KeyPrefetch`])
+    warm_keys: Box<[AtomicU64]>,
+}
+
+/// The slots of [`Sparse::warm_keys`], 8 KiB per vocabulary with a sparse index.
+const WARM_KEY_SLOTS: usize = 1024;
+
+/// The hash of a key in [`Sparse::warm_keys`], never 0.
+fn warm_key_hash(key: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(key);
+    h.finish().max(1)
 }
 
 impl Sparse {
+    /// Whether a key of this hash was seen by [`KeyPrefetch`] after its group was asked
+    /// for. Groups are asked for once in the life of the vocabulary, so the answer stays
+    /// true. Two keys of one hash would leave the second key's group unasked, which costs
+    /// a slower cold read and changes no answer.
+    fn key_warm(&self, h: u64) -> bool {
+        self.warm_keys[h as usize % WARM_KEY_SLOTS].load(AtomicOrdering::Relaxed) == h
+    }
+
+    fn set_key_warm(&self, h: u64) {
+        self.warm_keys[h as usize % WARM_KEY_SLOTS].store(h, AtomicOrdering::Relaxed);
+    }
+
     fn len(&self) -> usize {
         self.offsets.len()
     }
@@ -147,6 +173,7 @@ impl Sparse {
             starts: Vec::with_capacity(n),
             offsets: Vec::with_capacity(n),
             hinted: (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            warm_keys: (0..WARM_KEY_SLOTS).map(|_| AtomicU64::new(0)).collect(),
         };
         let mut pos = 24;
         for _ in 0..n {
@@ -390,9 +417,16 @@ impl Vocab {
     }
     #[inline]
     fn block_offset(&self, b: usize) -> usize {
+        self.block_offset_at::<true>(b)
+    }
+
+    /// [`Vocab::block_offset`], recording the read under a profile when `P` (the hot
+    /// lookups check for a profile once and pass `false` without one).
+    #[inline(always)]
+    fn block_offset_at<const P: bool>(&self, b: usize) -> usize {
         // Observe residency before the first mapped load, including offsets read
         // while preparing hints or binary-searching block starts.
-        if ioacct::profiling() {
+        if P && ioacct::profiling() {
             self.touch_offset(b);
         }
         let o = self.offsets.as_slice();
@@ -401,9 +435,16 @@ impl Vocab {
 
     /// First key of block `b` (stored uncompressed).
     fn block_first(&self, b: usize) -> &[u8] {
-        self.touch_block(b);
+        self.block_first_at::<true>(b)
+    }
+
+    #[inline(always)]
+    fn block_first_at<const P: bool>(&self, b: usize) -> &[u8] {
+        if P {
+            self.touch_block(b);
+        }
         let data = self.data.as_slice();
-        let mut pos = self.block_offset(b);
+        let mut pos = self.block_offset_at::<P>(b);
         let _shared = read_varint(data, &mut pos);
         let len = read_varint(data, &mut pos) as usize;
         &data[pos..pos + len]
@@ -448,13 +489,25 @@ impl Vocab {
     }
 
     /// Decode a whole block, invoking `f(index_in_block, key)`; stops when `f` returns false.
-    fn scan_block(&self, b: usize, mut f: impl FnMut(usize, &[u8]) -> bool) {
+    fn scan_block(&self, b: usize, f: impl FnMut(usize, &[u8]) -> bool) {
+        if ioacct::profiling() {
+            self.scan_block_at::<true>(b, f)
+        } else {
+            self.scan_block_at::<false>(b, f)
+        }
+    }
+
+    /// [`Vocab::scan_block`], counting and recording the block under a profile when `P`.
+    #[inline(always)]
+    fn scan_block_at<const P: bool>(&self, b: usize, mut f: impl FnMut(usize, &[u8]) -> bool) {
         let data = self.data.as_slice();
-        let mut pos = self.block_offset(b);
+        let mut pos = self.block_offset_at::<P>(b);
         let start = b * FC_BLOCK;
         let n = FC_BLOCK.min((self.len as usize) - start);
-        ioacct::vocab_blocks_scanned(1);
-        self.touch_block(b);
+        if P {
+            ioacct::vocab_blocks_scanned(1);
+            self.touch_block(b);
+        }
         // Single-key callers own this fresh buffer throughout their scan.
         let mut key = Vec::with_capacity(64);
         for i in 0..n {
@@ -505,15 +558,26 @@ impl Vocab {
 
     /// Decode a key while its block scratch is borrowed, avoiding an intermediate
     /// owned key when the caller immediately converts it to another owned value.
-    pub(crate) fn get_with<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
+    pub(crate) fn get_with<T>(&self, id: u64, f: impl FnMut(&[u8]) -> T) -> Option<T> {
         if id >= self.len {
             return None;
         }
-        let _t = ioacct::timer(Phase::VocabRead);
+        // one check for a profile here, rather than one in each step of the decoding:
+        // a result of a few hundred terms decodes each with its own call
+        if ioacct::profiling() {
+            let _t = ioacct::timer(Phase::VocabRead);
+            self.get_with_at::<true, T>(id, f)
+        } else {
+            self.get_with_at::<false, T>(id, f)
+        }
+    }
+
+    #[inline(always)]
+    fn get_with_at<const P: bool, T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
         let b = (id as usize) / FC_BLOCK;
         let want = (id as usize) % FC_BLOCK;
         let mut out = None;
-        self.scan_block(b, |i, k| {
+        self.scan_block_at::<P>(b, |i, k| {
             if i == want {
                 out = Some(f(k));
                 false
@@ -829,41 +893,40 @@ impl Vocab {
     /// group before looking for the next key). Groups read before are left alone. Does
     /// nothing without a sparse index or with the read hints off.
     pub fn prefetch_keys<K: AsRef<[u8]>>(&self, keys: &[K]) {
-        let Some(s) = &self.sparse else { return };
+        if let Some(mut p) = self.key_prefetch() {
+            keys.iter().for_each(|k| p.add(k.as_ref()));
+            p.finish();
+        }
+    }
+
+    /// [`Vocab::prefetch_keys`] for keys given one at a time, or `None` when it would do
+    /// nothing (no sparse index, the read hints off or an empty vocabulary).
+    pub fn key_prefetch(&self) -> Option<KeyPrefetch<'_>> {
+        let sparse = self.sparse.as_ref()?;
         if !crate::index::io_hints() || self.num_blocks() == 0 {
-            return;
+            return None;
         }
-        let mut groups: Vec<usize> = keys
-            .iter()
-            .filter_map(|k| {
-                let key = k.as_ref();
-                let g = partition_point_by(s.len(), |g| s.key(g) <= key);
-                g.checked_sub(1)
-            })
-            .collect();
-        groups.sort_unstable();
-        groups.dedup();
-        let nb = self.num_blocks();
-        for g in groups {
-            if !s.first_hint(g) {
-                continue;
-            }
-            let (lo, hi) = (g * IDX_BLOCKS, ((g + 1) * IDX_BLOCKS).min(nb));
-            self.offsets
-                .will_need(IoFile::VocabOff, lo * 8, (hi + 1) * 8);
-            let end = s
-                .offsets
-                .get(g + 1)
-                .map_or(self.data.as_slice().len(), |&o| o as usize);
-            self.data
-                .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
-        }
+        Some(KeyPrefetch {
+            vocab: self,
+            sparse,
+            cold: Vec::new(),
+        })
     }
 
     /// Binary search: `Ok(id)` if present, `Err(insertion point)` otherwise.
     pub fn find(&self, key: &[u8]) -> std::result::Result<u64, u64> {
-        ioacct::vocab_find();
-        let _t = ioacct::timer(Phase::VocabFind);
+        // one check for a profile, rather than one in each step of the search
+        if ioacct::profiling() {
+            ioacct::vocab_find();
+            let _t = ioacct::timer(Phase::VocabFind);
+            self.find_at::<true>(key)
+        } else {
+            self.find_at::<false>(key)
+        }
+    }
+
+    #[inline(always)]
+    fn find_at<const P: bool>(&self, key: &[u8]) -> std::result::Result<u64, u64> {
         let nb = self.num_blocks();
         if nb == 0 {
             return Err(0);
@@ -896,7 +959,7 @@ impl Vocab {
         }
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.block_first(mid) <= key {
+            if self.block_first_at::<P>(mid) <= key {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -907,7 +970,7 @@ impl Vocab {
         }
         let b = lo - 1;
         let mut result = Err(((b + 1) * FC_BLOCK).min(self.len as usize) as u64);
-        self.scan_block(b, |i, k| match k.cmp(key) {
+        self.scan_block_at::<P>(b, |i, k| match k.cmp(key) {
             std::cmp::Ordering::Less => true,
             std::cmp::Ordering::Equal => {
                 result = Ok((b * FC_BLOCK + i) as u64);
@@ -1405,6 +1468,64 @@ impl AppendVocab {
     }
     pub fn bytes(&self) -> usize {
         self.key_bytes + self.keys.len() * 48
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// the keys [`KeyPrefetch::add`] searched the sparse index for on this thread
+    static KEY_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The sparse-index groups of keys given one at a time, asked for at once by
+/// [`KeyPrefetch::finish`] (see [`Vocab::prefetch_keys`]). A key seen before after its group
+/// was asked for costs a hash and a load, so a warm query with constants does not
+/// binary-search the sparse index twice for each of them, once here and once in
+/// [`Vocab::find`].
+pub struct KeyPrefetch<'v> {
+    vocab: &'v Vocab,
+    sparse: &'v Sparse,
+    /// the group and hash of each key not known to be warm
+    cold: Vec<(usize, u64)>,
+}
+
+impl KeyPrefetch<'_> {
+    pub fn add(&mut self, key: &[u8]) {
+        let h = warm_key_hash(key);
+        if self.sparse.key_warm(h) {
+            return;
+        }
+        let s = self.sparse;
+        #[cfg(test)]
+        KEY_SEARCHES.with(|n| n.set(n.get() + 1));
+        // a key before the first group's has no group to ask for
+        if let Some(g) = partition_point_by(s.len(), |g| s.key(g) <= key).checked_sub(1) {
+            self.cold.push((g, h));
+        }
+    }
+
+    /// Ask for the groups of the keys added that no lookup has asked for before.
+    pub fn finish(mut self) {
+        let (v, s) = (self.vocab, self.sparse);
+        self.cold.sort_unstable();
+        let nb = v.num_blocks();
+        let mut last = None;
+        for &(g, h) in &self.cold {
+            if last != Some(g) {
+                last = Some(g);
+                if s.first_hint(g) {
+                    let (lo, hi) = (g * IDX_BLOCKS, ((g + 1) * IDX_BLOCKS).min(nb));
+                    v.offsets.will_need(IoFile::VocabOff, lo * 8, (hi + 1) * 8);
+                    let end = s
+                        .offsets
+                        .get(g + 1)
+                        .map_or(v.data.as_slice().len(), |&o| o as usize);
+                    v.data
+                        .will_need(IoFile::VocabData, s.offsets[g] as usize, end);
+                }
+            }
+            s.set_key_warm(h);
+        }
     }
 }
 
@@ -2217,12 +2338,85 @@ mod tests {
             }
             v.prefetch_keys(&[keys[picks[0]].clone()]);
             assert_eq!(hinted() - start, groups.len() as u64);
+            // the keys are now known to be warm, so a later batch skips their search
+            for &i in &picks {
+                assert!(s.key_warm(warm_key_hash(&keys[i])), "key {i} warm");
+            }
+            // a key whose group a lookup asked for is not warm until a batch has seen it,
+            // and that batch asks for nothing more
+            let other = 20 * FC_BLOCK * IDX_BLOCKS + 1;
+            assert_eq!(v.find(&keys[other]), Ok(other as u64));
+            assert!(!s.key_warm(warm_key_hash(&keys[other])));
+            v.prefetch_keys(&[keys[other].clone()]);
+            assert!(s.key_warm(warm_key_hash(&keys[other])));
+            assert_eq!(hinted() - start, groups.len() as u64 + 1);
         }
         for &i in &picks {
             assert_eq!(v.find(&keys[i]), Ok(i as u64));
         }
         // keys outside the vocabulary, before its first key or in no group, do no harm
         v.prefetch_keys(&[b"".to_vec(), b"\xff\xff".to_vec()]);
+    }
+
+    /// Whether group `g` has been asked for.
+    fn group_hinted(s: &Sparse, g: usize) -> bool {
+        s.hinted[g / 64].load(AtomicOrdering::Relaxed) & (1 << (g % 64)) != 0
+    }
+
+    #[test]
+    fn a_warm_constant_costs_no_search() {
+        if !crate::index::io_hints() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 16 * FC_BLOCK * IDX_BLOCKS);
+        let v = Vocab::open(dir.path()).unwrap();
+        let searches = || KEY_SEARCHES.with(|n| n.get());
+        let picks = [keys[100].clone(), keys[5 * FC_BLOCK * IDX_BLOCKS].clone()];
+        let start = searches();
+        v.prefetch_keys(&picks);
+        assert_eq!(searches() - start, 2);
+        // the second batch of the same constants searches nothing
+        v.prefetch_keys(&picks);
+        v.prefetch_keys(&picks);
+        assert_eq!(searches() - start, 2);
+    }
+
+    #[test]
+    fn a_hash_collision_only_skips_a_hint() {
+        if !crate::index::io_hints() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 16 * FC_BLOCK * IDX_BLOCKS);
+        let v = Vocab::open(dir.path()).unwrap();
+        let s = v.sparse.as_ref().unwrap();
+        let group = |i: usize| i / (FC_BLOCK * IDX_BLOCKS);
+        // a key whose hash another key took: it reads as warm, so its group is not asked
+        // for by the batch, and the lookup still finds it and asks for the group itself
+        let i = 9 * FC_BLOCK * IDX_BLOCKS + 7;
+        s.set_key_warm(warm_key_hash(&keys[i]));
+        let start = KEY_SEARCHES.with(|n| n.get());
+        v.prefetch_keys(&[keys[i].clone()]);
+        assert_eq!(KEY_SEARCHES.with(|n| n.get()), start);
+        assert!(!group_hinted(s, group(i)));
+        assert_eq!(v.find(&keys[i]), Ok(i as u64));
+        assert!(group_hinted(s, group(i)));
+        // two keys of one slot and different hashes take the slot in turn, and each is
+        // searched again after the other took it
+        let a = 3 * FC_BLOCK * IDX_BLOCKS;
+        let slot = |k: &[u8]| warm_key_hash(k) as usize % WARM_KEY_SLOTS;
+        let b = (a + 1..keys.len())
+            .find(|&b| slot(&keys[b]) == slot(&keys[a]))
+            .unwrap();
+        assert_ne!(warm_key_hash(&keys[a]), warm_key_hash(&keys[b]));
+        let start = KEY_SEARCHES.with(|n| n.get());
+        for k in [a, b, a] {
+            v.prefetch_keys(&[keys[k].clone()]);
+        }
+        assert_eq!(KEY_SEARCHES.with(|n| n.get()) - start, 3);
+        assert_eq!(v.find(&keys[a]), Ok(a as u64));
+        assert_eq!(v.find(&keys[b]), Ok(b as u64));
     }
 
     #[test]

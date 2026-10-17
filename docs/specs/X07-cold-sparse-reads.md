@@ -442,9 +442,13 @@ Phase 2 adds the following read optimizations. Four `Optimizations` flags contro
 constant prefetch, first-scan prefetch, term prefetch and parallel decode. They are on
 by default. The `ReadAhead` and vocabulary windows use `SPARKLES_READ_WINDOW_KB`.
 
-* `prefetch_constants` collects the constants of the algebra (`sparql/constkeys.rs`) and
-  hints their vocabulary groups with `Vocab::prefetch_keys` before the planner resolves
-  any of them.
+* `prefetch_constants` visits the constants of the algebra (`sparql/constkeys.rs`) and
+  hints their vocabulary groups through `Vocab::key_prefetch` before the planner resolves
+  any of them. A warm constant skips the search. Each vocabulary with a sparse index keeps
+  a direct-mapped table of 1,024 key hashes (8 KiB) of keys whose group was asked for, and
+  a key found there costs a hash and a load. A collision can only skip a hint, since the
+  lookup asks for its own group. Before this, the warm prefetch cost about 6 thousand
+  instructions on values-star.
 * `prefetch_first_scan` requests the blocks of leaf scans of at most 64 blocks at the
   end of planning. A count over the whole index and a plan-time decode were removed from
   this step after they cost 7 ms at 1M.

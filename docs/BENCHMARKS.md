@@ -716,6 +716,35 @@ adds a mutex, four atomic counters and a lazily set grant to each query context 
 the ledger allocation of a plain query, so a plain query does not use more memory than it
 did before.
 
+On values-star, main at fb8d56cf ran 20.4 thousand instructions per request more than
+20f01c82. The F14 merge 073e0663 added about 11 thousand, and the lazy ledger brought that
+down to about 4.4 thousand. The X07 merge d370602e added 14.6 thousand to warm queries with
+constants. About 6 thousand of it was the constant prefetch, which allocated a key and
+searched the sparse vocabulary index for every constant of every query, and about 6.5
+thousand was the block hints. The planner's counts looked each warm end block up twice,
+and the vocabulary checked for an I/O profile at every step of a lookup. The prefetch now
+remembers the hashes of keys whose group it has asked for, a warm count takes its end
+blocks from the cache once, and a lookup checks for a profile once. These changes recover
+about 7 thousand instructions. Each vocabulary with a sparse index keeps 8 KiB more for the
+table of key hashes, which saves the search of every warm constant. The table holds 1,024
+keys, so it helps queries whose constants repeat and does nothing for a stream of new
+ones. The runs used forge with 2,000 requests per server process for instructions and 8
+rounds of 50 requests for times.
+
+| Comparison | Measure | Result |
+|---|---|---|
+| Warm X07 paths against main at 824b7238 | Instructions per request of values-star | 1,005.6 thousand down to 998.7 thousand |
+| Warm X07 paths against main at 824b7238 | Instructions per request of star-lookup and employee-docs | 5 to 7 thousand fewer |
+| Warm X07 paths against main at 824b7238 | Median wall time of the seven small queries | 0.990 to 1.003 of main |
+| Warm X07 paths against origin/main at 20f01c82 | Instructions per request of values-star | 1.4% higher |
+| Warm X07 paths against main at 824b7238 | Instructions per request of 10,000 distinct entity lookups, 1 and 8 clients | 1.000 and 0.998 of main |
+| Warm X07 paths against main at 824b7238 | Instructions per request of a VALUES list of 4,096 IRIs, 1 and 8 clients | 0.989 and 0.990 of main |
+| Warm X07 paths against main at 824b7238 | Median wall time of those four workloads | 1.005 to 1.018 of main |
+
+The rest of the gap to 20f01c82 on values-star is the fast memory account of F14, about
+4 thousand instructions on every query, and the warm checks that the X07 hints need. These
+are a hash per constant, a bit test per answer term and one cache lookup per scan.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
