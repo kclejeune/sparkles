@@ -162,7 +162,7 @@ fn r7_transpose_checks_all_phases_and_bounds_high_degree_work() {
         let f = flag.clone();
         let _scope = probe::install(
             move |p| {
-                if let Point::Work(at) = p
+                if let Point::Work(at, _) = p
                     && at == phase
                 {
                     f.store(true, Ordering::Relaxed);
@@ -183,7 +183,7 @@ fn r7_transpose_checks_all_phases_and_bounds_high_degree_work() {
     let seen = count.clone();
     let _scope = probe::install(
         move |p| {
-            if let Point::Work(at) = p
+            if let Point::Work(at, _) = p
                 && (at == "incoming-scatter" || flag.load(Ordering::Relaxed))
             {
                 flag.store(true, Ordering::Relaxed);

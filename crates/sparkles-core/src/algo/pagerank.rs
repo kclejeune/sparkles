@@ -363,7 +363,7 @@ mod tests {
         let v = visits.clone();
         let _scope = probe::install(
             move |point| {
-                if matches!(point, Point::Work("pagerank-weight-validation")) {
+                if matches!(point, Point::Work("pagerank-weight-validation", _)) {
                     v.fetch_add(1, Ordering::Relaxed);
                     cancel.store(true, Ordering::Relaxed);
                 }

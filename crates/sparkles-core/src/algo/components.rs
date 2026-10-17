@@ -114,9 +114,11 @@ pub fn scc(g: &Graph, ctl: &Control) -> Result<Components> {
         if index[s as usize] != UNSEEN {
             continue;
         }
-        // A node's row is counted when the search enters it, its edges and one more for
-        // finishing it, so the search polls once its work passes the interval.
-        work.tick_n(g.out.row(s).len() + 1, "scc-dfs")?;
+        // A node's row is counted when the search enters it, its first CHECK_EVERY edges
+        // and one more for finishing it, so the search polls once its work passes the
+        // interval. A longer row counts each further piece of CHECK_EVERY edges before
+        // the scan reads it.
+        work.tick_n(g.out.row(s).len().min(CHECK_EVERY) + 1, "scc-dfs")?;
         call.push((s, 0))?;
         index[s as usize] = next;
         low[s as usize] = next;
@@ -125,11 +127,17 @@ pub fn scc(g: &Graph, ctl: &Control) -> Result<Components> {
         on_stack[s as usize] = true;
         while let Some(&(u, i)) = call.last() {
             let row = g.out.row(u);
-            // the next edge to a node not yet seen, updating `low` on the way
+            // the next edge to a node not yet seen, updating `low` on the way, within the
+            // piece of the row that is counted
             let mut i = i as usize;
+            if i > 0 && i.is_multiple_of(CHECK_EVERY) && i < row.len() {
+                // the next piece of a long row, counted before it is read
+                work.tick_n((row.len() - i).min(CHECK_EVERY), "scc-dfs")?;
+            }
             let mut child = None;
-            while i < row.len() {
-                let v = row[i];
+            let piece = &row[..row.len().min((i / CHECK_EVERY + 1) * CHECK_EVERY)];
+            while i < piece.len() {
+                let v = piece[i];
                 i += 1;
                 if index[v as usize] == UNSEEN {
                     child = Some(v);
@@ -142,13 +150,15 @@ pub fn scc(g: &Graph, ctl: &Control) -> Result<Components> {
                 top.1 = i as u32;
             }
             if let Some(v) = child {
-                work.tick_n(g.out.row(v).len() + 1, "scc-dfs")?;
+                work.tick_n(g.out.row(v).len().min(CHECK_EVERY) + 1, "scc-dfs")?;
                 index[v as usize] = next;
                 low[v as usize] = next;
                 next += 1;
                 stack.push(v)?;
                 on_stack[v as usize] = true;
                 call.push((v, 0))?;
+            } else if i < row.len() {
+                // the piece ended, and the next turn counts the next one
             } else {
                 call.pop();
                 if let Some(&(parent, _)) = call.last() {
@@ -193,6 +203,28 @@ mod tests {
         // {a b c}, {d e}, {f}, {g}, {h}
         assert_eq!(c.count, 5);
         assert_eq!(c.comp, vec![0, 0, 0, 1, 1, 2, 3, 4]);
+    }
+
+    /// Rows longer than one piece of CHECK_EVERY edges, scanned across piece boundaries
+    /// both when a child ends a piece and when a piece holds no child.
+    #[test]
+    fn scc_scans_long_rows_in_pieces() {
+        let m = 2 * CHECK_EVERY as u32 + 5;
+        // node 0 reaches every other node and each links back: one component, with a
+        // child found at every edge of the long row
+        let edges: Vec<(u32, u32)> = (1..=m).flat_map(|v| [(0, v), (v, 0)]).collect();
+        let c = scc(&digraph(m + 1, &edges), &Control::unlimited()).unwrap();
+        assert_eq!(c.count, 1);
+        // the last node links to every other node, all seen before it but node 5, which
+        // links to it and so shares its component
+        let hub = m;
+        let mut edges: Vec<(u32, u32)> = (0..hub).map(|v| (hub, v)).collect();
+        edges.push((5, hub));
+        let c = scc(&digraph(m + 1, &edges), &Control::unlimited()).unwrap();
+        assert_eq!(c.count, m);
+        assert_eq!(c.comp[5], c.comp[hub as usize]);
+        assert_eq!(c.comp[4], 4);
+        assert_eq!(c.comp[6], 6);
     }
 
     #[test]

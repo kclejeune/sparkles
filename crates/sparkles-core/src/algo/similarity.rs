@@ -696,7 +696,7 @@ mod probe {
                         &ctl,
                     );
                 }
-                super::super::memory::probe::Point::Work(phase) => at(Event::Work(phase), &ctl),
+                super::super::memory::probe::Point::Work(phase, _) => at(Event::Work(phase), &ctl),
                 super::super::memory::probe::Point::Physical(name, bytes, add) => {
                     at(Event::Physical(name, bytes, add), &ctl)
                 }

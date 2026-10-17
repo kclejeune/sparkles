@@ -318,13 +318,14 @@ impl<'a> Work<'a> {
     }
     #[inline(always)]
     pub(crate) fn tick(&mut self, phase: &'static str) -> Result<()> {
-        #[cfg(test)]
-        probe::at(probe::Point::Work(phase));
-        let _ = phase;
         self.left -= 1;
         if self.left == 0 {
-            return self.refill();
+            self.refill()?;
         }
+        // a test sees the operation once it is allowed to run, with its units
+        #[cfg(test)]
+        probe::at(probe::Point::Work(phase, 1));
+        let _ = phase;
         Ok(())
     }
 
@@ -344,13 +345,14 @@ impl<'a> Work<'a> {
     /// polled before the next row starts.
     #[inline(always)]
     pub(crate) fn tick_n(&mut self, units: usize, phase: &'static str) -> Result<()> {
-        #[cfg(test)]
-        probe::at(probe::Point::Work(phase));
-        let _ = phase;
         if units >= self.left {
-            return self.refill();
+            self.refill()?;
+        } else {
+            self.left -= units;
         }
-        self.left -= units;
+        #[cfg(test)]
+        probe::at(probe::Point::Work(phase, units));
+        let _ = phase;
         Ok(())
     }
 
@@ -557,7 +559,8 @@ pub(crate) mod probe {
     pub(crate) enum Point {
         Allocation(&'static str, usize),
         Physical(&'static str, u64, bool),
-        Work(&'static str),
+        /// A count of work that is about to run: its phase and its units.
+        Work(&'static str, usize),
         Waiting,
         Initializing,
         Publishing,
@@ -628,7 +631,7 @@ mod capacity_tests {
             b.extend(&[1u64, 2, 3, 4]).unwrap();
             let scope = probe::install(
                 move |point| {
-                    if let probe::Point::Work("buffer-move") = point {
+                    if let probe::Point::Work("buffer-move", _) = point {
                         if mode == 1 {
                             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                         }

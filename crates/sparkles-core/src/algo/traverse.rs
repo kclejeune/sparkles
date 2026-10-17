@@ -37,22 +37,22 @@ pub fn bfs(g: &Graph, sources: &[u32], par: &Par, ctl: &Control) -> Result<Vec<u
             let mut work = Work::new(ctl)?;
             let mut next = Growing::new("bfs-next", ctl)?;
             let block = &frontier[lo..hi];
-            // A block of rows that stays within one interval is counted, and its room
-            // charged, once before it is read. A larger block counts and charges each
-            // row before the row is read.
+            // A block of rows that stays within one interval is counted once before it is
+            // read, and a larger block counts each row before the row is read. Room for
+            // the neighbours is charged row by row, so the capacity follows the nodes
+            // found and not the edges of the whole block.
             let units: usize = block.iter().map(|&u| g.out.deg(u) + 1).sum();
             let at_once = units <= CHECK_EVERY;
             if at_once {
                 work.tick_n(units, "bfs-frontier")?;
-                next.reserve(units - block.len())?;
             }
             for &u in block {
                 let row = g.out.row(u);
                 if !at_once {
                     work.tick_n(row.len() + 1, "bfs-frontier")?;
-                    // room for every neighbour, charged before the row is read
-                    next.reserve(row.len())?;
                 }
+                // room for every neighbour, charged before the row is read
+                next.reserve(row.len())?;
                 for &v in row {
                     if depth[v as usize]
                         .compare_exchange(UNREACHED, level, Ordering::Relaxed, Ordering::Relaxed)
@@ -163,6 +163,40 @@ mod tests {
             assert_eq!(&d[..5], &[0, 1, 2, 3, 4]);
             assert_eq!(d[5], UNREACHED);
         }
+    }
+
+    /// The next frontier is charged a row at a time, for the nodes it finds, and not for
+    /// every edge of a block of rows at once. On a random graph of degree 50 the edges
+    /// of a level outnumber the nodes it finds many times over, so a charge per block
+    /// would hold about 4 bytes per edge read until the level ends.
+    #[test]
+    fn bfs_charges_the_next_frontier_row_by_row() {
+        let (n, degree) = (100_000u32, 50u32);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let edges: Vec<(u32, u32)> = (0..n)
+            .flat_map(|u| (0..degree).map(move |_| u))
+            .map(|u| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (u, (x % n as u64) as u32)
+            })
+            .collect();
+        let g = digraph(n, &edges);
+        let ctl = Control::unlimited();
+        let d = bfs(&g, &[0], &Par::single(), &ctl).unwrap();
+        assert!(d.iter().filter(|&&x| x != UNREACHED).count() > 99_000);
+        // The depths and the output take 8 bytes a node. The frontiers and the parts of
+        // the next one hold the nodes of two levels with room for one row and the
+        // doubling of a growth, well under 8 bytes a node more. A charge per block of
+        // rows would add about 4 bytes for each of the 5M edges.
+        let per_row = 16 * n as u64;
+        eprintln!("bfs peak {} bytes, bound {per_row}", ctl.peak());
+        assert!(
+            ctl.peak() <= per_row,
+            "bfs peak {} bytes for {n} nodes",
+            ctl.peak()
+        );
     }
 
     #[test]

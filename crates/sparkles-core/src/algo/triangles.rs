@@ -88,7 +88,10 @@ fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
         for r in lo as u32..hi as u32 {
             let a = up(r);
             // each merge takes at most a.len() + longest steps
-            let bound = a.len() * (a.len() + longest) + 1;
+            let bound = a
+                .len()
+                .saturating_mul(a.len().saturating_add(longest))
+                .saturating_add(1);
             if bound <= CHECK_EVERY {
                 // the merges of a node this small stay within one interval: they are
                 // counted together by their bound before they start
@@ -103,12 +106,15 @@ fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
         Ok(())
     })?;
     drop((order, rank, off, adj));
-    // the counts become the output in place, keeping their charge
-    Ok(tri_buffer
-        .into_output()
-        .into_iter()
-        .map(AtomicU32::into_inner)
-        .collect())
+    Ok(into_values(tri_buffer.into_output()))
+}
+
+/// The counts as plain values, in the allocation that held them, so the output keeps
+/// its charge and is not copied. The standard library collects a map over a vector's
+/// own iterator in place when the two types share a layout, as `AtomicU32` and `u32`
+/// do, and a test checks that it still does.
+fn into_values(counts: Vec<AtomicU32>) -> Vec<u32> {
+    counts.into_iter().map(AtomicU32::into_inner).collect()
 }
 
 /// The merges of a node whose merges can pass one polling interval: each merge is
@@ -216,6 +222,16 @@ pub fn clustering_graphalytics(g: &Graph, par: &Par, ctl: &Control) -> Result<Ve
 mod tests {
     use super::super::testutil::*;
     use super::*;
+
+    #[test]
+    fn counts_become_the_output_without_a_copy() {
+        let counts: Vec<AtomicU32> = (0..1000).map(AtomicU32::new).collect();
+        let (ptr, capacity) = (counts.as_ptr() as usize, counts.capacity());
+        let values = into_values(counts);
+        assert_eq!(values.as_ptr() as usize, ptr);
+        assert_eq!(values.capacity(), capacity);
+        assert_eq!(values, (0..1000).collect::<Vec<u32>>());
+    }
 
     #[test]
     fn triangle_and_tail() {

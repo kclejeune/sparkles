@@ -37,23 +37,50 @@ fn weighted_star() -> Graph {
     Graph::build(raw, Aggregate::None, &Par::single(), &Control::unlimited()).unwrap()
 }
 
-/// Run `f` with a control that is cancelled at the first operation of `phase`, and
-/// check that the call stops within one polling interval of it.
-fn stops_in(phase: &'static str, f: impl FnOnce(&Control) -> crate::error::Result<()>) {
+/// A small row followed by a hub row in the same block: node 0 has one neighbour and
+/// node 1 has `BIG - 2`, so the rows of the first block hold more than one interval.
+fn small_then_hub() -> Graph {
+    let edges: Vec<(u32, u32)> = std::iter::once((0, 2))
+        .chain((2..BIG).map(|v| (1, v)))
+        .collect();
+    ugraph(BIG, &edges)
+}
+
+/// The units a hub row of [`small_then_hub`] counts at once: its edges and one more.
+const HUB_ROW: usize = BIG as usize - 1;
+
+/// What the probe saw of one cancelled call.
+struct Watched {
+    /// The units of work that ran after the count that cancelled the call.
+    after: usize,
+    /// The most units of `phase` counted at once.
+    largest: usize,
+}
+
+/// Run `f` with a control that is cancelled at the first count of `phase` of at least
+/// `from` units, and expect the call to fail as cancelled.
+fn watch(
+    phase: &'static str,
+    from: usize,
+    f: impl FnOnce(&Control) -> crate::error::Result<()>,
+) -> Watched {
     let flag = Arc::new(AtomicBool::new(false));
     let set = flag.clone();
     let seen = Rc::new(Cell::new(false));
-    let since = Rc::new(Cell::new(0usize));
-    let (s, c) = (seen.clone(), since.clone());
+    let after = Rc::new(Cell::new(0usize));
+    let largest = Rc::new(Cell::new(0usize));
+    let (s, a, l) = (seen.clone(), after.clone(), largest.clone());
     let hook = probe::install(
         move |point| {
-            if let probe::Point::Work(p) = point {
-                if p == phase && !s.get() {
-                    s.set(true);
-                    set.store(true, Ordering::Relaxed);
+            if let probe::Point::Work(p, units) = point {
+                if p == phase {
+                    l.set(l.get().max(units));
                 }
                 if s.get() {
-                    c.set(c.get() + 1);
+                    a.set(a.get() + units);
+                } else if p == phase && units >= from {
+                    s.set(true);
+                    set.store(true, Ordering::Relaxed);
                 }
             }
         },
@@ -67,11 +94,88 @@ fn stops_in(phase: &'static str, f: impl FnOnce(&Control) -> crate::error::Resul
         matches!(result, Err(crate::Error::Cancelled)),
         "{phase}: {result:?}"
     );
+    Watched {
+        after: after.get(),
+        largest: largest.get(),
+    }
+}
+
+/// Run `f` with a control that is cancelled at the first count of `phase`, and check
+/// that less than one polling interval of work runs after that count.
+fn stops_in(phase: &'static str, f: impl FnOnce(&Control) -> crate::error::Result<()>) {
+    let w = watch(phase, 0, f);
     assert!(
-        since.get() <= CHECK_EVERY + 1,
-        "{phase}: {} operations after the cancel",
-        since.get()
+        w.after < CHECK_EVERY,
+        "{phase}: {} units of work after the cancel",
+        w.after
     );
+}
+
+/// Check that a loop over a block holding a small row and then a hub row counts the
+/// rows one at a time: no count of `phase` covers more than the hub row, and the call
+/// stops within one interval of the cancel.
+fn counts_rows_of_a_large_block(
+    phase: &'static str,
+    f: impl FnOnce(&Control) -> crate::error::Result<()>,
+) {
+    let w = watch(phase, 0, f);
+    assert!(
+        w.largest <= HUB_ROW,
+        "{phase}: {} units counted at once for a block whose largest row holds {HUB_ROW}",
+        w.largest
+    );
+    assert!(
+        w.after < CHECK_EVERY,
+        "{phase}: {} units of work after the cancel",
+        w.after
+    );
+}
+
+#[test]
+fn weakly_connected_components_count_each_row_of_a_large_block() {
+    let g = small_then_hub();
+    counts_rows_of_a_large_block("wcc-union", |ctl| {
+        components::wcc(&g, &Par::single(), ctl).map(drop)
+    });
+}
+
+#[test]
+fn breadth_first_search_counts_each_row_of_a_large_block() {
+    let g = small_then_hub();
+    counts_rows_of_a_large_block("bfs-frontier", |ctl| {
+        traverse::bfs(&g, &[0, 1], &Par::single(), ctl).map(drop)
+    });
+}
+
+#[test]
+fn label_propagation_counts_each_row_of_a_large_block() {
+    let g = small_then_hub();
+    counts_rows_of_a_large_block("labelprop-node", |ctl| {
+        labelprop::run(&g, 1, &Par::single(), ctl).map(drop)
+    });
+}
+
+#[test]
+fn the_simple_view_counts_each_row_of_a_large_block() {
+    let g = small_then_hub();
+    counts_rows_of_a_large_block("simple-rows", |ctl| g.simple(ctl).map(drop));
+}
+
+#[test]
+fn strongly_connected_components_split_a_hub_row() {
+    // the last node links to every other node, all of them seen by the time the search
+    // reaches it, so its scan finds no child and reads the whole row
+    let edges: Vec<(u32, u32)> = (0..BIG - 1).map(|v| (BIG - 1, v)).collect();
+    let g = digraph(BIG, &edges);
+    let w = watch("scc-dfs", CHECK_EVERY, |ctl| {
+        components::scc(&g, ctl).map(drop)
+    });
+    assert!(
+        w.largest <= CHECK_EVERY + 1,
+        "scc-dfs: {} units counted at once",
+        w.largest
+    );
+    assert!(w.after < CHECK_EVERY, "scc-dfs: {} units after", w.after);
 }
 
 #[test]

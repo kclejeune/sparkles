@@ -1381,18 +1381,24 @@ fn append(
                     return Err(error);
                 }
                 #[cfg(test)]
-                memory::probe::at(memory::probe::Point::Work("algorithm-append-transferred"));
+                memory::probe::at(memory::probe::Point::Work(
+                    "algorithm-append-transferred",
+                    0,
+                ));
                 let old = std::mem::replace(&mut left.table.cols[c], replacement);
                 drop(old); // Backing dies before its capacity leaves the lease.
                 #[cfg(test)]
-                memory::probe::at(memory::probe::Point::Work("algorithm-append-old-dropped"));
+                memory::probe::at(memory::probe::Point::Work(
+                    "algorithm-append-old-dropped",
+                    0,
+                ));
                 let bytes = table_capacity(&left.table)?;
                 left.lease
                     .as_mut()
                     .expect("admitted accumulator")
                     .resize(ctx.mem_limit, bytes)?;
                 #[cfg(test)]
-                memory::probe::at(memory::probe::Point::Work("algorithm-append-resized"));
+                memory::probe::at(memory::probe::Point::Work("algorithm-append-resized", 0));
             }
         }
     }
@@ -2891,6 +2897,7 @@ mod projection_capacity_tests {
                         | "algorithm-append-copy"
                         | "algorithm-append-relocate"
                         | "buffer-fill",
+                        _,
                     ) => v.set(v.get() + 1),
                     memory::probe::Point::Allocation(
                         "algorithm-column" | "algorithm-graph-column" | "algorithm-append-column",
@@ -3225,7 +3232,8 @@ mod projection_capacity_tests {
                 assert!(!new_events.iter().any(|p| matches!(
                     p,
                     memory::probe::Point::Work(
-                        "algorithm-append-copy" | "algorithm-append-relocate"
+                        "algorithm-append-copy" | "algorithm-append-relocate",
+                        _
                     )
                 )));
             }
@@ -3354,7 +3362,8 @@ mod projection_capacity_tests {
                                 | memory::probe::Point::Work(
                                     "algorithm-append-transferred"
                                         | "algorithm-append-old-dropped"
-                                        | "algorithm-append-resized"
+                                        | "algorithm-append-resized",
+                                    _
                                 )
                         ) {
                             captured.borrow_mut().push((
@@ -3489,7 +3498,10 @@ mod projection_capacity_tests {
             let hook = memory::probe::install(
                 move |p| {
                     if mode == "unwind"
-                        && matches!(p, memory::probe::Point::Work("algorithm-append-relocate"))
+                        && matches!(
+                            p,
+                            memory::probe::Point::Work("algorithm-append-relocate", _)
+                        )
                     {
                         panic!("caught actual relocation unwind");
                     }
@@ -3543,7 +3555,7 @@ mod projection_capacity_tests {
             let visits = seen.clone();
             let scope = memory::probe::install(
                 move |p| {
-                    if matches!(p, memory::probe::Point::Work("algorithm-append-copy")) {
+                    if matches!(p, memory::probe::Point::Work("algorithm-append-copy", _)) {
                         visits.set(visits.get() + 1);
                         if let Some(deadline) = deadline {
                             while Instant::now() < deadline {
@@ -4183,7 +4195,7 @@ mod projection_capacity_tests {
             let prior = ctl.remaining();
             let scope = memory::probe::install(
                 move |point| {
-                    if let memory::probe::Point::Work("projection-distinct-move") = point {
+                    if let memory::probe::Point::Work("projection-distinct-move", _) = point {
                         if unwind {
                             panic!("distinct migration unwind");
                         } else {
@@ -4298,7 +4310,7 @@ mod projection_capacity_tests {
             let ctl = Control::new(cancel.clone(), None, 1 << 20);
             let scope = memory::probe::install(
                 move |point| {
-                    if let memory::probe::Point::Work(p) = point
+                    if let memory::probe::Point::Work(p, _) = point
                         && p == phase
                     {
                         cancel.store(true, Ordering::Relaxed);
@@ -4361,7 +4373,7 @@ mod projection_capacity_tests {
         let count = observed.clone();
         let scope = memory::probe::install(
             move |point| {
-                if let memory::probe::Point::Work("projection-edge") = point {
+                if let memory::probe::Point::Work("projection-edge", _) = point {
                     count.set(count.get() + 1);
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -4373,7 +4385,9 @@ mod projection_capacity_tests {
             Err(Error::Cancelled)
         ));
         drop(scope);
-        assert_eq!(observed.get(), algo::CHECK_EVERY);
+        // the probe sees each row that is allowed to run, and the count of the last row
+        // of the interval checks the control and stops the call
+        assert_eq!(observed.get(), algo::CHECK_EVERY - 1);
         assert_eq!(ctl.remaining(), 64);
     }
     #[test]
@@ -4511,7 +4525,7 @@ mod graph_variable_tests {
         let r = read.clone();
         let hook = memory::probe::install(
             move |point| {
-                if let memory::probe::Point::Work("projection-edge") = point {
+                if let memory::probe::Point::Work("projection-edge", _) = point {
                     r.set(r.get() + 1);
                 }
             },
@@ -4536,7 +4550,7 @@ mod graph_variable_tests {
         let r = read.clone();
         let hook = memory::probe::install(
             move |point| {
-                if let memory::probe::Point::Work("projection-edge") = point {
+                if let memory::probe::Point::Work("projection-edge", _) = point {
                     r.set(r.get() + 1);
                 }
             },
