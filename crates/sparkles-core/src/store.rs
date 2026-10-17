@@ -30,6 +30,8 @@ mod diff;
 mod embed;
 mod geo;
 mod group;
+#[cfg(test)]
+mod group_model;
 mod history_query;
 pub mod keyset;
 mod link;
