@@ -320,6 +320,8 @@ impl<'a> DecodedBatch<'a> {
         // charge goes through the memory ledger, and one reservation per term cost a
         // large native JSON answer about 15% of its time. The reservation still comes
         // before each term's allocation and overstates the batch by under one chunk.
+        // With under one chunk of budget left, a term reserves its exact size instead,
+        // so the cache is declined only when its terms do not fit.
         let mut ahead = 0u64;
         ctx.snap.generation.vocab.get_sorted_checked(
             &ids,
@@ -337,8 +339,18 @@ impl<'a> DecodedBatch<'a> {
                 let bytes = (key.len() as u64).saturating_mul(8).saturating_add(128);
                 if bytes > ahead {
                     let more = bytes.max(TERM_RESERVE);
-                    charge.add(more)?;
-                    ahead = ahead.saturating_add(more);
+                    match charge.add(more) {
+                        Ok(()) => ahead = ahead.saturating_add(more),
+                        // a refused charge leaves the ledger unchanged, so this term can
+                        // still reserve alone
+                        Err(Error::BudgetExceeded(b))
+                            if b.kind == crate::error::BudgetKind::Memory && more > bytes =>
+                        {
+                            charge.add(bytes)?;
+                            ahead = ahead.saturating_add(bytes);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 ahead -= bytes;
                 terms.push(crate::id::key_to_term(key));
@@ -3101,6 +3113,77 @@ mod tests {
         ));
         // A retained immutable context stays admissible after a concurrent write.
         assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()));
+    }
+
+    /// A cursor over a few dozen distinct IRIs and literals, and its first batch of
+    /// eight rows, for the tests of the decoded batch's reservation.
+    fn first_batch(memory: u64) -> QueryBatch {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..48)
+            .map(|i| format!("<urn:s:{i}> <urn:p> \"object number {i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let options = QueryOptions {
+            max_memory_bytes: Some(memory),
+            ..Default::default()
+        };
+        let cursor = CursorOptions {
+            batch_rows: 8,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(
+            store.snapshot(),
+            "SELECT ?s ?o { ?s <urn:p> ?o }",
+            &options,
+            &cursor,
+        )
+        .unwrap();
+        let batch = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(batch.len(), 8);
+        batch
+    }
+
+    #[test]
+    fn decoded_batch_reserves_exactly_when_under_one_chunk_remains() {
+        let batch = first_batch(4 << 20);
+        let ctx = batch.ctx.clone();
+        let filler = ctx.charge(ctx.memory_remaining() - (32 << 10)).unwrap();
+        assert!(ctx.memory_remaining() < TERM_RESERVE);
+        let decoded = batch.decoded().unwrap();
+        assert!(
+            decoded.is_some(),
+            "a batch whose terms fit in the budget decodes, whatever the chunk size"
+        );
+        assert!(ctx.memory_remaining() < 32 << 10);
+        drop(decoded);
+        drop(filler);
+    }
+
+    #[test]
+    fn decoded_batch_releases_its_reservation() {
+        let batch = first_batch(4 << 20);
+        let ctx = batch.ctx.clone();
+        let before = ctx.memory_remaining();
+        let decoded = batch.decoded().unwrap().unwrap();
+        assert!(ctx.memory_remaining() < before);
+        drop(decoded);
+        assert_eq!(ctx.memory_remaining(), before);
+        // A budget that holds the pairs but not the terms declines the cache, and the
+        // failed attempt gives back everything it reserved.
+        let filler = ctx.charge(before - (4 << 10)).unwrap();
+        let tight = ctx.memory_remaining();
+        assert!(batch.decoded().unwrap().is_none());
+        assert_eq!(ctx.memory_remaining(), tight);
+        drop(filler);
+        assert_eq!(ctx.memory_remaining(), before);
     }
 
     #[test]
