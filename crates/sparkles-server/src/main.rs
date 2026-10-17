@@ -3322,6 +3322,15 @@ fn run() -> Result<()> {
                 } else {
                     let out = std::io::stdout();
                     let mut out = out.lock();
+                    // the eager path ends a solutions answer with a newline, so a streamed one
+                    // does too, while a graph answer ends as its serializer leaves it
+                    let solutions = match &cursor {
+                        QueryExecution::Select(_) | QueryExecution::Ask(_) => true,
+                        QueryExecution::Eager(result) => {
+                            matches!(result.result().kind, QueryKind::Select | QueryKind::Ask)
+                        }
+                        QueryExecution::Graph(_) => false,
+                    };
                     match &mut cursor {
                         QueryExecution::Eager(result) => {
                             let result = result.result();
@@ -3397,6 +3406,9 @@ fn run() -> Result<()> {
                                 results::write_cursor_jena_graph(c, format, &mut out, None)?;
                             }
                         }
+                    }
+                    if solutions {
+                        writeln!(out)?;
                     }
                     if time {
                         let stats = cursor.stats();

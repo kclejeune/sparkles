@@ -1,7 +1,8 @@
 //! `sparkles query` and the execution mode: without `--execution`, a local query with a
 //! machine-readable format runs in automatic mode and prints what an eager query prints
-//! when the plan stays eager, the text table stays eager, and a remote query that the
-//! server cuts off after its response has started fails instead of looking complete.
+//! when the plan stays eager, the text table stays eager, a streamed local query prints
+//! what an eager one prints down to the final newline, and a remote query that the server
+//! cuts off after its response has started fails instead of looking complete.
 
 use std::io::{Read, Write};
 use std::process::Command;
@@ -41,6 +42,32 @@ fn a_default_local_query_prints_what_an_eager_one_prints() {
             SELECT,
         ]);
         assert_eq!(default, eager, "{format}");
+    }
+}
+
+#[test]
+fn a_streamed_local_query_prints_what_an_eager_one_prints() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.ttl");
+    std::fs::write(&data, "<urn:a> <urn:p> 1 .\n<urn:b> <urn:p> 2 .\n").unwrap();
+    let db = dir.path().join("db").to_str().unwrap().to_string();
+    run(&["load", "--loc", &db, data.to_str().unwrap()]);
+    for query in [SELECT, "ASK { ?s <urn:p> ?o }"] {
+        for format in ["json", "tsv", "csv", "xml"] {
+            let output = |execution: &str| {
+                run(&[
+                    "query",
+                    "--loc",
+                    &db,
+                    "--results",
+                    format,
+                    "--execution",
+                    execution,
+                    query,
+                ])
+            };
+            assert_eq!(output("streaming"), output("eager"), "{format} {query}");
+        }
     }
 }
 
