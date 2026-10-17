@@ -3440,28 +3440,50 @@ fn streaming_top_k_keeps_only_its_rows_within_the_memory_budget() {
 
 #[test]
 fn a_cursor_deadline_excludes_time_its_consumer_paused() {
+    // No step depends on how fast the host runs. Both cursors start with an hour of
+    // credited waiting, so their first batches cannot time out. The slow cursor then
+    // loses its credit after its deadline has passed, and the paused one keeps it.
     let s = store(200);
+    let timeout = Duration::from_millis(100);
     let opts = QueryOptions {
-        timeout: Some(Duration::from_millis(200)),
+        timeout: Some(timeout),
         ..Default::default()
     };
+    let hour = 3_600_000_000_000;
     let open = || select_cursor(s.snapshot(), "SELECT * {?s ?p ?o}", &opts, &options(16)).unwrap();
     let (mut slow, mut paused) = (open(), open());
+    // both deadlines come before `opened + timeout`
+    let opened = std::time::Instant::now();
     for c in [&mut slow, &mut paused] {
+        c.deadline_pause().store(hour, Ordering::Relaxed);
         assert!(c.next_batch().unwrap().is_some());
         assert_eq!(c.status(), CursorStatus::Open);
     }
-    std::thread::sleep(Duration::from_millis(300));
-    // a consumer that kept the cursor waiting for as long as it slept has not used up
-    // the deadline, and one that did not report its wait has
+    while opened.elapsed() <= timeout {
+        std::thread::sleep(timeout);
+    }
+    // a consumer that did not report its wait has used up the deadline
+    slow.deadline_pause().store(0, Ordering::Relaxed);
     assert!(matches!(slow.next_batch(), Err(Error::Timeout)));
-    paused
-        .deadline_pause()
-        .fetch_add(300_000_000, Ordering::Relaxed);
     let mut rows = 16;
     while let Some(batch) = paused.next_batch().unwrap() {
         rows += batch.len();
     }
     assert_eq!(rows, 200);
     assert_eq!(paused.status(), CursorStatus::Complete);
+}
+
+#[test]
+fn work_that_copies_the_deadline_takes_the_paused_one() {
+    use sparkles_core::sparql::Ctx;
+    let s = store(1);
+    let mut ctx = Ctx::new(s.snapshot());
+    assert_eq!(ctx.current_deadline(), None);
+    ctx.deadline = Some(std::time::Instant::now() - Duration::from_secs(1));
+    assert!(ctx.past_deadline());
+    ctx.deadline_pause
+        .fetch_add(3_600_000_000_000, Ordering::Relaxed);
+    assert!(!ctx.past_deadline());
+    // a SERVICE call or an algorithm run that starts now gets the moved deadline
+    assert!(ctx.current_deadline().unwrap() > std::time::Instant::now());
 }

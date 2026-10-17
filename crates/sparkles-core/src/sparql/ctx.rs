@@ -430,9 +430,9 @@ pub struct Ctx {
     /// the blank nodes that labels inside the composite literals of the query text name
     /// (see [`Ctx::query_literal`])
     literal_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
-    /// The query's deadline. The readers that copy it raw (`algo`, `history_svc`) are
-    /// stricter than [`Ctx::check`], which also counts [`Ctx::deadline_pause`], and no
-    /// automatic plan reaches them.
+    /// The query's deadline, without the time the query waited for its consumer. Code
+    /// that hands a deadline to other work reads [`Ctx::current_deadline`], which adds
+    /// [`Ctx::deadline_pause`].
     pub deadline: Option<Instant>,
     /// Nanoseconds the query spent waiting for its consumer, which the deadline does not
     /// count. The thread that drives the cursor adds to it, after each stretch of waiting
@@ -1074,6 +1074,16 @@ impl Ctx {
         }
         let paused = std::time::Duration::from_nanos(self.deadline_pause.load(Ordering::Relaxed));
         d.checked_add(paused).is_some_and(|end| now >= end)
+    }
+
+    /// The deadline as it stands now, moved back by the time the query has waited for
+    /// its consumer so far. Work that copies the deadline, such as a SERVICE call or an
+    /// algorithm run, takes this value when it starts. A deadline too far out to
+    /// represent is none.
+    pub fn current_deadline(&self) -> Option<Instant> {
+        let d = self.deadline?;
+        let paused = std::time::Duration::from_nanos(self.deadline_pause.load(Ordering::Relaxed));
+        d.checked_add(paused)
     }
 
     pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {

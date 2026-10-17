@@ -573,7 +573,7 @@ fn lookup(ctx: &Ctx, spec: &HistorySpec, vars: &[VarId]) -> Result<Table> {
         access: ctx.graphs.clone(),
         cancel: Some(ctx.cancel.clone()),
         cancellation: ctx.cancellation.clone(),
-        deadline: ctx.deadline,
+        deadline: ctx.current_deadline(),
     };
     // a `head` bound means the state the query reads
     let resolve = |b: &Option<HistoryBound>| match b {
