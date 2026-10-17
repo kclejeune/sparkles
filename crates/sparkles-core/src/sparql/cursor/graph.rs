@@ -209,6 +209,9 @@ impl GraphCursor {
     pub fn deadline(&self) -> Option<Instant> {
         self.where_cursor.deadline()
     }
+    pub fn deadline_pause(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.where_cursor.deadline_pause()
+    }
     pub fn describe_truncated(&self) -> bool {
         self.truncated
     }

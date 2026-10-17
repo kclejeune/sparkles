@@ -28,6 +28,7 @@ const QUERY_PARAMS: &[&str] = &[
     "timeout",
     "reasoning",
     "at",
+    "execution",
 ];
 const GSP_WRITE_PARAMS: &[&str] = &[
     "graph", "default", "timeout", "dryRun", "receipt", "validate",
@@ -67,7 +68,8 @@ op!(
         "named-graph-uri",
         "timeout",
         "reasoning",
-        "at"
+        "at",
+        "execution"
     ]
 );
 op!(

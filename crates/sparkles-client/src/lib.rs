@@ -64,7 +64,9 @@ pub mod blocking;
 pub use body::{RdfBody, UploadPart};
 pub use client::{CallOptions, Client, ClientBuilder, TokenSource};
 pub use dataset::{CommitsOptions, Dataset, UpdateBatch, UploadOptions};
-pub use endpoint::{Endpoint, QueryMethod, QueryOptions, ReadOptions, UpdateOptions, WriteOptions};
+pub use endpoint::{
+    Endpoint, Execution, QueryMethod, QueryOptions, ReadOptions, UpdateOptions, WriteOptions,
+};
 pub use error::{Error, Result, StatusError};
 pub use results::{Quads, QueryResults, ResponseMeta, Solutions, Triples};
 pub use retry::{RateLimit, RetryPolicy};

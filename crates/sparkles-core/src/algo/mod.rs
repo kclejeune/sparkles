@@ -189,7 +189,7 @@ impl Control {
         let mut control = Self::with_cancellation(
             ctx.cancel.clone(),
             ctx.cancellation.clone(),
-            ctx.deadline,
+            ctx.current_deadline(),
             limit,
         );
         ledger.start_call();

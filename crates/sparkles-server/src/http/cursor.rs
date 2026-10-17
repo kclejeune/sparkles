@@ -1,4 +1,5 @@
-//! Explicit native query execution with bounded response backpressure.
+//! Native query execution with bounded response backpressure, for a request that asks for
+//! streaming and for an answer that automatic execution streams.
 
 use super::*;
 use crate::obs::DeferredReport;
@@ -20,23 +21,34 @@ pub(super) struct Request {
     pub thrift: bool,
     pub rdf_format: OutFormat,
     pub native_graph: bool,
-    pub execution: ExecutionMode,
     /// the declared and runtime prefixes, for graph results (spec C20 §5)
     pub prefixes: std::collections::BTreeMap<String, String>,
     /// the I/O profile of the request (`profile=io`)
     pub io: Option<Arc<sparkles::ioacct::Profile>>,
 }
 
-/// The mode actually run for a request. Automatic execution falls back to eager
-/// when the negotiated encoding has no cursor writer, which today is SPARQL
-/// Results Thrift. An explicit streaming request keeps its mode so that the
-/// unsupported combination is reported as an error.
-pub(super) fn effective_mode(execution: ExecutionMode, thrift: bool) -> ExecutionMode {
-    if thrift && execution == ExecutionMode::Auto {
-        ExecutionMode::Eager
-    } else {
-        execution
-    }
+/// How an opened execution is answered: everything of [`Request`] except what opening
+/// it needed.
+pub(super) struct Serve {
+    pub params: Params,
+    pub uri: Uri,
+    pub guard: CancelOnDrop,
+    pub limit: Option<u64>,
+    pub format: SolutionsFormat,
+    pub thrift: bool,
+    pub rdf_format: OutFormat,
+    pub native_graph: bool,
+    pub prefixes: std::collections::BTreeMap<String, String>,
+    pub io: Option<Arc<sparkles::ioacct::Profile>>,
+    pub timeout: Option<std::time::Duration>,
+    pub with_extra: bool,
+    /// the start of the query, for the phase spans (`None` when OTel is off)
+    pub t0: Option<std::time::SystemTime>,
+    /// The quick-query key of an answer that automatic execution chose to stream, and
+    /// when its run began on the thread that planned it. A streamed answer that completes in one whole
+    /// body is remembered with its time, as an eager one is, so that a quick query runs
+    /// in place again from its next run on.
+    pub quick: Option<(u64, Instant)>,
 }
 
 pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
@@ -51,24 +63,78 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         thrift,
         rdf_format,
         native_graph,
-        execution,
-        prefixes: prefix_map,
+        prefixes,
         io,
     } = request;
-    let execution = effective_mode(execution, thrift);
     let at = history::at_param(&params)?;
-    let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let timeout = options.timeout;
     let with_extra = !options.default_graph_extra.is_empty();
+    let t0 = crate::otel::start();
     let captured_ds = ds.clone();
-    let (mut cursor, seq, resolved) = blocking(move || {
+    let (cursor, seq, resolved) = blocking(move || {
         let (snapshot, resolved) = history::snapshot_for(&captured_ds, at.as_ref(), &options)?;
         let seq = snapshot.commit;
-        let cursor = query_execution(snapshot, &query, &options, &Default::default(), execution)?;
+        let cursor = query_execution(
+            snapshot,
+            &query,
+            &options,
+            &Default::default(),
+            ExecutionMode::Streaming,
+        )?;
         Ok((cursor, seq, resolved))
     })
     .await
     .map_err(|e| with_timeout(e, timeout))?;
+    serve(
+        ds,
+        cursor,
+        seq,
+        resolved,
+        Serve {
+            params,
+            uri,
+            guard,
+            limit,
+            format,
+            thrift,
+            rdf_format,
+            native_graph,
+            prefixes,
+            io,
+            timeout,
+            with_extra,
+            t0,
+            quick: None,
+        },
+    )
+    .await
+}
+
+/// Answer an opened execution, writing a cursor's batches as they come.
+pub(super) async fn serve(
+    ds: Arc<Dataset>,
+    mut cursor: QueryExecution,
+    seq: u64,
+    resolved: Option<sparkles::history::Resolved>,
+    serve: Serve,
+) -> ApiResult {
+    let Serve {
+        params,
+        uri,
+        guard,
+        limit,
+        format,
+        thrift,
+        rdf_format,
+        native_graph,
+        prefixes: prefix_map,
+        io,
+        timeout,
+        with_extra,
+        t0,
+        quick,
+    } = serve;
+    let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     if thrift && cursor.kind() == QueryKind::Select && !matches!(cursor, QueryExecution::Eager(_)) {
         return Err(Error::Unsupported(
             "streaming SELECT does not support Thrift; choose JSON, XML, CSV, TSV or native JSON"
@@ -77,6 +143,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         .into());
     }
     let graph = matches!(cursor.kind(), QueryKind::Construct | QueryKind::Describe);
+    let kind = cursor.kind();
     let content_type =
         if thrift && cursor.kind() == QueryKind::Select && format != SolutionsFormat::Sparkles {
             jena_formats::RESULTS_THRIFT
@@ -89,9 +156,17 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         .iter()
         .map(|(a, b)| (a.clone(), b.clone()))
         .collect::<Vec<_>>();
-    let control = stream::StreamControl::new(cursor.cancellation_token(), cursor.deadline());
+    let control = stream::StreamControl::new(
+        cursor.cancellation_token(),
+        cursor.deadline(),
+        cursor.deadline_pause(),
+        timeout,
+    );
     let completed: Arc<parking_lot::Mutex<Option<CursorStats>>> = Default::default();
     let stats_slot = completed.clone();
+    // how the cursor ended, for the quick-query record of a whole body
+    let ended: Arc<parking_lot::Mutex<Option<sparkles::sparql::CursorStatus>>> = Default::default();
+    let ended_slot = ended.clone();
     // the plan as it stood when a native JSON stream failed before its first byte
     let failed_plan: Arc<parking_lot::Mutex<Option<serde_json::Value>>> = Default::default();
     let plan_slot = failed_plan.clone();
@@ -177,6 +252,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         },
         move |end| {
             let stats = completed.lock().take();
+            *ended_slot.lock() = stats.as_ref().map(|s| s.status);
             let wait_ms = waits.wait_ms();
             let exec_ms = stats.as_ref().map_or(0.0, |s| s.timing.exec_ms);
             let serialize_ms =
@@ -189,6 +265,9 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
                 Some(_) => (Some(Outcome::Error), None),
                 None => (None, None),
             };
+            if let Some(stats) = &stats {
+                crate::otel::cursor_done(t0, kind, stats, serialize_ms);
+            }
             let mut timing = stats.as_ref().map(|s| s.timing.clone());
             if let Some(t) = &mut timing {
                 t.serialize_ms = serialize_ms;
@@ -213,6 +292,10 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     let serialized = match serialized {
         Ok(serialized) => serialized,
         Err(error) => {
+            // a failed run is not known to be quick, as for an eager answer
+            if let Some((key, _)) = quick {
+                QUICK.record(key, f64::INFINITY);
+            }
             let mut error = with_timeout(error, timeout);
             if let (Some(plan), Some(body)) = (failed_plan.lock().take(), error.1.as_object_mut()) {
                 body.insert("plan".into(), plan);
@@ -224,8 +307,23 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         }
     };
     let body = match serialized {
-        stream::Serialized::Whole { body, .. } => Body::from(body),
-        stream::Serialized::Streamed(body) => body,
+        stream::Serialized::Whole { body, .. } => {
+            // A cursor that stopped at `send` has not run the whole query, so only a
+            // complete answer counts.
+            if let Some((key, began)) = quick
+                && *ended.lock() == Some(sparkles::sparql::CursorStatus::Complete)
+            {
+                QUICK.record(key, began.elapsed().as_secs_f64() * 1000.0);
+            }
+            Body::from(body)
+        }
+        stream::Serialized::Streamed(body) => {
+            // a body too large to buffer is not quick, as for an eager answer
+            if let Some((key, _)) = quick {
+                QUICK.record(key, f64::INFINITY);
+            }
+            body
+        }
     };
     let ct = if params.has("force-accept") {
         "text/plain; charset=utf-8"

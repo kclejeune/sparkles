@@ -22,3 +22,15 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# Tests whose outcome depends on how long a run takes, such as whether planning stops
+# soon after its timeout. They run one at a time and alone, with no other test on the
+# machine, since other work stretches the time a stop takes.
+[test-groups.timing]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "test(planning_at_the_limit_stops_at_the_timeout)"
+test-group = "timing"
+threads-required = "num-cpus"
+slow-timeout = { period = "300s", terminate-after = 4 }

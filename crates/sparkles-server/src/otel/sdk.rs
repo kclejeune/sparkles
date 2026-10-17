@@ -620,7 +620,54 @@ pub(super) fn query_done(
     plan_spans: bool,
     descriptions: bool,
 ) {
-    let kind = match r.kind {
+    let plan = plan_spans.then_some((&r.plan, descriptions));
+    phases(
+        span,
+        t0,
+        r.kind,
+        &r.timing,
+        r.len() as u64,
+        r.mem_peak_bytes,
+        serialize_ms,
+        plan,
+    );
+}
+
+/// Phase spans of an answer written from a cursor. A cursor's plan changes shape as the
+/// answer is produced, so these answers have the phases but no operator spans.
+pub(super) fn cursor_done(
+    span: &Span,
+    t0: SystemTime,
+    kind: sparkles::sparql::QueryKind,
+    stats: &sparkles::sparql::CursorStats,
+    serialize_ms: f64,
+) {
+    phases(
+        span,
+        t0,
+        kind,
+        &stats.timing,
+        stats.emitted_rows,
+        stats.mem_peak_bytes,
+        serialize_ms,
+        None,
+    );
+}
+
+/// The parse, plan, execute and serialize spans of a query, and the operator spans of
+/// `plan` (with the descriptions when its second field is set).
+#[allow(clippy::too_many_arguments)]
+fn phases(
+    span: &Span,
+    t0: SystemTime,
+    kind: sparkles::sparql::QueryKind,
+    t: &sparkles::sparql::Timing,
+    rows: u64,
+    mem_peak_bytes: u64,
+    serialize_ms: f64,
+    plan: Option<(&sparkles::sparql::PlanInfo, bool)>,
+) {
+    let kind = match kind {
         sparkles::sparql::QueryKind::Select => "SELECT",
         sparkles::sparql::QueryKind::Ask => "ASK",
         sparkles::sparql::QueryKind::Construct => "CONSTRUCT",
@@ -630,7 +677,6 @@ pub(super) fn query_done(
         return;
     };
     span.set_attribute("sparkles.sparql.kind", kind);
-    let t = &r.timing;
     let parse_end = t0 + ms(t.parse_ms);
     let plan_end = parse_end + ms(t.plan_ms);
     let exec_end = plan_end + ms(t.exec_ms);
@@ -643,19 +689,22 @@ pub(super) fn query_done(
         plan_end,
         exec_end,
         vec![
-            KeyValue::new("db.response.returned_rows", r.len() as i64),
-            KeyValue::new("sparkles.memory.peak_bytes", r.mem_peak_bytes as i64),
+            KeyValue::new("db.response.returned_rows", rows as i64),
+            KeyValue::new("sparkles.memory.peak_bytes", mem_peak_bytes as i64),
         ],
     );
     let now = SystemTime::now();
+    // a cursor computes while it serializes, so its execution can end after the
+    // serialization starts
     let ser_start = now
         .checked_sub(ms(serialize_ms))
         .unwrap_or(now)
-        .max(exec_end);
+        .max(exec_end)
+        .min(now);
     child(tracer, &cx, "sparql.serialize", ser_start, now, vec![]);
-    if plan_spans {
+    if let Some((plan, descriptions)) = plan {
         let mut budget = MAX_PLAN_SPANS;
-        plan_tree(tracer, &exec, &r.plan, plan_end, descriptions, &mut budget);
+        plan_tree(tracer, &exec, plan, plan_end, descriptions, &mut budget);
     }
 }
 

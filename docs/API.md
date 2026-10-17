@@ -1592,8 +1592,10 @@ Query parameters beyond the standard protocol:
   result. It needs the `metrics` permission, which every caller has without authentication,
   and answers `403` otherwise. Any other value of `profile` answers `400`. See
   [the I/O profile](#the-io-profile).
-* `execution=eager|streaming|auto` chooses how the query runs. The default is `eager`.
-  `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
+* `execution=eager|streaming|auto` chooses how the query runs. The default is `auto`, or
+  `eager` on a server started with `--default-execution eager`. `eager` materializes the
+  whole result before the response starts, and `streaming` writes every query from a
+  cursor. `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
   and CONSTRUCT and DESCRIBE in RDF or native Sparkles JSON. The query reads from a
   snapshot taken when it starts, produces bounded batches, and pauses when the response
   buffers are full. Scans, FILTER and BIND without EXISTS, projection, OFFSET, LIMIT,
@@ -1607,28 +1609,47 @@ Query parameters beyond the standard protocol:
   Results Thrift is not supported in streaming mode and returns `501`. An invalid mode
   returns `400`.
 
-  `auto` streams a plain SELECT of scans and projections when it expects at least one
-  million rows and the data comes from immutable blocks with no pending changes. It also
-  streams a `COUNT(*)` over a single-key OPTIONAL between two plain scans when the
-  estimated work reaches one million rows and the result cache is off or bypassed. An
-  aggregate query that the cache serves still runs eagerly. In both cases, any graph
+  `auto` streams a plain SELECT of scans and projections when it expects at least a
+  thousand rows and the data comes from immutable blocks with no pending changes. Any graph
   restriction must cover whole blocks, the query must have no restored initial bindings
   or offset, and there must be enough memory to own the blocks and to hold batches of at
-  least 4,096 rows and 128 KiB. Every other plan runs eagerly. A request for SPARQL
-  Results Thrift also runs eagerly, because that encoding has no streaming writer. The
-  policy is deliberately narrow, and it can widen as more query shapes prove faster when
-  streamed.
+  least 4,096 rows and 128 KiB. A scan whose estimate exceeds the request's row budgets
+  (`max-rows` or `max-rows-produced`) runs eagerly, so that the budget fails it with a
+  status before any output. Every other plan runs eagerly, with the same response as
+  `execution=eager`. A query that ran in under 10 ms the last time also runs eagerly
+  without being planned for the decision, also when its last run streamed and its answer
+  fit in one 1 MiB body. A `COUNT(*)` over a single-key OPTIONAL between two plain scans
+  streamed from an estimated million rows until 2026-10-17 and now runs eagerly, because
+  the cursor counted it up to 1.23 times slower on AMD EPYC hosts. A request for SPARQL
+  Results Thrift runs eagerly because that encoding has no streaming writer. A stored-query run with
+  parameter values also runs eagerly, because initial bindings rule out every automatic
+  plan. A streamed answer that passes a lowered `max-result-mb` within its first
+  1 MiB is refused with a status before any output, as an eager one is. The policy is
+  deliberately narrow, and it can widen as more query shapes prove faster when streamed.
 
-  The memory and work budgets cover the whole cursor, including batches it still holds
-  and terms it generates. The deadline includes time spent waiting for the client. An
-  error before the response starts gets the normal status and JSON error. A later error
-  aborts the body transfer, so treat a failed or truncated transfer as a partial answer.
-  The access log entry and the metrics are recorded once both the query and the response
-  body have finished. Streaming requests skip the full-result cache. Stored-query runs
-  accept the same option.
+  A streamed answer differs from an eager one in what the caller sees. The memory and
+  work budgets cover the whole cursor, including batches it still holds and terms it
+  generates. The deadline counts the query's own time and not the time spent waiting for
+  the client, so a slow reader does not run it out. A client that reads nothing for
+  longer than the request's `timeout` ends the stream as a timeout. That limit applies to
+  each wait and not to the whole transfer, and the snapshot and the query's memory grant
+  stay held until the body ends. An error before the response starts gets the normal
+  status and JSON error. An error after the first 1 MiB has been sent, such as a timeout
+  or an exhausted budget, aborts the body transfer. The client then sees a truncated
+  response with a `200` status, and in TSV, CSV or N-Triples the rows before
+  the cut are well formed, so only a transfer that completes is a complete answer. Treat
+  a failed or truncated transfer as an error. The clients Sparkles ships do. With `send`,
+  the native metadata reports `stopped` and an unknown total instead of the full count.
+  Rows come in the same order as eagerly. Streamed answers skip the full-result cache,
+  and the access log entry and the metrics are recorded once both the query and the
+  response body have finished. `execution=eager` restores the previous behaviour for one
+  request, and stored-query runs accept the same option. The MCP tools, GraphQL, SPARQL
+  diffs and `/{ds}/explain` always run eagerly, because each of them returns one
+  document built from the whole result.
 * `send=<n>` caps the number of rows serialized. The UI uses it so that a huge result does
-  not hang the browser. With eager execution, the native metadata reports the full count.
-  With streaming, the query stops after the first n rows. `meta.status` is then
+  not hang the browser, and asks for eager execution, because it shows the full count.
+  With eager execution, the native metadata reports the full count. With streaming,
+  including a scan that `auto` streams, the query stops after the first n rows. `meta.status` is then
   `stopped`, and `meta.totalRows` is `null` unless the cursor had already reached the
   end. A SPARQL LIMIT ends the query normally.
 * `reasoning=true|false` includes or excludes materialized inferences. The default is
@@ -7367,6 +7388,8 @@ type Term =
   | { type: "literal"; value: string; datatype?: string; "xml:lang"?: string }
   | { type: "triple"; value: { subject: Term; predicate: Term; object: Term } };
 type PlanNode = {
+  planFormat?: 2;            // root only: a plan deeper than 256 levels, whose nodes have no id
+  id?: string;               // the path of child indexes from the root, such as "0.1.2"
   operator: string;          // "IndexScan", "Join", "Sort", "Filter", ...
   description: string;       // human readable, e.g. "PSO ?s <p> ?o"
   columns: string[];         // variables produced
@@ -7485,10 +7508,16 @@ also lists the warnings that came up while it ran:
 
 Every node of a returned plan has an `id`, the path of child indexes from the root, such
 as `0.1.2`. A `CursorPlan` node and its operator share the id. Ids are valid only for
-the plan of the same response. The estimated plan of `/{ds}/explain` and the plan of an
-executed query have the same shape, so an `ASK` has its `Slice` root and a `CONSTRUCT`
-or `DESCRIBE` has a `CONSTRUCT` or `DESCRIBE` root in both. A node can also carry these
-members.
+the plan of the same response. A plan deeper than 256 levels is written in plan format 2
+instead, whose root has `"planFormat": 2` and whose nodes have no `id`, because ids that
+are paths would make the JSON grow with the square of the depth. A client that needs the
+ids of such a plan derives them from its shape. A plan without `planFormat` is in format
+1, and a reader refuses a format it does not know. The OpenAPI description lists
+`planFormat` on `PlanNode` and `CursorPlan`, and the plan view of the UI shows plans in
+formats 1 and 2 and says that it cannot show a plan in any other. The estimated plan of
+`/{ds}/explain` and the plan of an executed query have the same shape, so an `ASK` has
+its `Slice` root and a `CONSTRUCT` or `DESCRIBE` has a `CONSTRUCT` or `DESCRIBE` root in
+both. A node can also carry these members.
 
 | Member | Meaning |
 |---|---|
@@ -7725,15 +7754,20 @@ more than 5 brackets deep, and the deepest algebra count is 29.
 
 A basic graph pattern at the plan limit is a chain of about 2000 triple patterns, and
 planning time grows with the square of the number of triple patterns. A release build
-explains a query at the limit in 1.3 to 1.7 s for a plain chain of 1998 triple
-patterns and in 2.8 s for a tree of 1998 or a MINUS after each of 790 patterns. A BIND
-after each of 790 patterns takes 6.9 s and an OPTIONAL after each of them 7.6 s. Most
-of these shapes observe the request's timeout during planning, but a plain chain and
-its reverse do not, so a timeout cannot cut those short. The JSON plan of a query at the
-limit, as `/{ds}/explain` and the Sparkles result format write it, reaches about 60 MB,
-because each node is named by its path from the root. A request body of about 40 KB can
-ask for that. [Roadmap](ROADMAP.md) item 84 covers a deadline in every planning loop
-and a plan that is linear in size.
+explains a plain chain of 1998 triple patterns in about 0.35 s. The other shapes
+measured take from 34 ms to 0.8 s. The slowest are an OPTIONAL after each of 799
+patterns, in about 0.5 s, and a star or a hub of 1998 patterns, in about 0.75 s over a
+dataset of four triples. The cost of a star depends on the data too. A star of 1998
+patterns on one frequent predicate took about 2.7 s to explain over a dataset of 31,815
+triples, against about 3 s before item 84. Running a query at the limit takes about 1 s on
+the small dataset. Planning and the description of the plan observe the request's
+timeout and cancellation, so every shape stops close to its timeout. The JSON plan of a
+query at the limit, as `/{ds}/explain` and the Sparkles result format write it, is up to
+about 33 MB, because each node lists the variables it binds. A request body of about 40
+KB can ask for that. The explanation of `/{ds}/sparql/explain` reads at most 257 levels,
+the root and 256 below it. The engine writes plan format 2 only for plans of more than
+256 levels, so the only plans in format 2 that the explanation reads have exactly 257
+levels. [Roadmap](ROADMAP.md) item 84 keeps an n-ary join that would let the limit rise.
 
 Parsing a query at the bracket limit takes up to 1.5 MiB of stack, which fits the 2 MiB
 that Rust, tokio and rayon give the threads they start. The server runs requests on
@@ -7878,7 +7912,11 @@ as it is serialized, so server memory stays flat. An error after that point, suc
 budget running out at 1.2 GiB, aborts the transfer, and the client sees a truncated
 response instead of a status code. A query result whose smallest encoding already
 exceeds the budget is refused with `507` before anything is sent. A client that
-disconnects stops the serialization.
+disconnects stops the serialization. A query that runs as a cursor, which by default
+includes a scan of a million rows or more, is computed while it is sent, so its timeout
+and its memory and row budgets can also end the transfer after it has started. The
+`execution` parameter of [the query endpoint](#per-dataset-sparql-protocol-fuseki-compatible)
+describes when that happens, and `execution=eager` avoids it.
 
 **Large request bodies.** Graph Store PUT/POST bodies over 16 MiB, and upload files, are
 written to a temporary file as they arrive rather than held in memory. A large PUT,

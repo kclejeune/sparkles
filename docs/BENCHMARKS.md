@@ -801,6 +801,38 @@ The rest of the gap to 20f01c82 on values-star is the fast memory account of F14
 4 thousand instructions on every query, and the warm checks that the X07 hints need. These
 are a hash per constant, a bit test per answer term and one cache lookup per scan.
 
+### Planning large basic graph patterns
+
+[Roadmap](ROADMAP.md) item 84 made the plan of a basic graph pattern near the 4000-level
+plan limit cheap to build. These are measurements on the development laptop in a release
+build, and other builds shared the machine, so the times are good to about a fifth. They
+are not forge numbers. The ignored test `large_bgp_planning_time` in
+`crates/sparkles/tests/nesting.rs` ran `explain` on each shape of `plan_shapes` at the
+limit over a dataset of four triples, and the star and hub rows also ran on a build of
+the commit before the change. [X05](specs/X05-streaming-query-execution.md#large-basic-graph-patterns)
+has the design and the shapes.
+
+| Shape at the limit | `explain` before | `explain` after | Plan JSON before | Plan JSON after |
+|---|---|---|---|---|
+| Chain of 1998 | 1.08 s | 0.35 s | 53.7 MB | 29.7 MB |
+| Reversed chain of 1998 | 1.01 s | 0.27 s | 64.5 MB | 32.5 MB |
+| Tree of 1998 | 2.24 s | 0.34 s | 37.4 MB | 22.4 MB |
+| Star of 1998 | 3.35 s | 0.73 s | 23.1 MB | 15.1 MB |
+| Hub of 1998 | 0.98 s | 0.77 s | 53.8 MB | 29.8 MB |
+| Pairs of 999 | 1.36 s | 0.49 s | 34.1 MB | 18.1 MB |
+| Chain of 999 with a second predicate | 0.67 s | 0.19 s | 26.2 MB | 11.2 MB |
+| Chain of 571 with VALUES | 0.43 s | 0.11 s | 15.9 MB | 7.3 MB |
+| Chain of 1019 with filters | 71 ms | 34 ms | 1.3 MB | 1.3 MB |
+| Chain of 799 with OPTIONAL | 6.49 s | 0.53 s | 23.3 MB | 13.7 MB |
+| Chain of 799 with MINUS | 2.49 s | 0.15 s | 8.6 MB | 4.8 MB |
+| Chain of 799 with BIND | 5.88 s | 0.18 s | 21.2 MB | 13.5 MB |
+
+A star of 1998 patterns on `foaf:knows` over the 31,815 triples of
+`scripts/gen-data.py 3000` took 2.9 to 3.0 s to plan before and 2.6 to 2.8 s after, so
+the data decides how much a star gains. The change keeps the star masks and probed sides
+with each plan, which costs 2.6 to 3.2% more planning instructions for a snowflake of
+12 patterns and up to 64 MB while the greedy order runs on a plan of 1998 inputs.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
@@ -1452,9 +1484,98 @@ processes at 10.5M, show the tradeoff:
 | TSV, 500,000 rows | **89.868** | 123.520 |
 
 For the complete scan, the query's allocation estimate peaks at 241.0 MiB for eager
-result columns and 1.0 MiB when streaming. Eager execution stays the default because it
-is faster on several shapes, and automatic selection streams only the large scans and
-OPTIONAL counts where streaming measured faster.
+result columns and 1.0 MiB when streaming. Automatic execution is the default over HTTP,
+in the CLI, in Node and in the JVM library. It streams only plain scans, where streaming
+measured faster, and runs every other plan eagerly, because eager is faster on several
+shapes at 12 threads. The OPTIONAL count above streamed by default until 2026-10-17. On
+the AMD EPYC hosts of the Namespace screens it took 3.5 ms streamed against 2.9 ms
+eagerly at 10.5M with one thread, so it now runs eagerly.
+
+The table below measures the change of default on forge at 10.5M. Each case is one
+request to a fresh server process, which reports the query's allocation estimate in the
+native metadata and its peak RSS in `VmHWM`. The baseline is 6f0f928c, whose default
+was eager, and the candidate runs the same scan by default and with `execution=eager`.
+
+| 10.5M, one request | Eager | Automatic |
+|---|---:|---:|
+| Full scan, first 10 rows, allocation estimate | 241.0 MiB | **1.0 to 1.1 MiB** |
+| Full scan, first 10 rows, server peak RSS | 804 MiB | **63 to 66 MiB** |
+| Full scan, first 10 rows, wall time | 240 to 320 ms | **2 to 5 ms** |
+| Full scan, 10.5M rows as TSV, server peak RSS | 881 to 889 MiB | **580 to 582 MiB** |
+| Full scan, 10.5M rows as TSV, wall time | 5.20 to 5.69 s | 4.87 to 5.46 s |
+| Name scan, 1.02M rows, allocation estimate | 16.3 MB | **5.0 MB** |
+| Name scan, 1.02M rows, server peak RSS | 140 MiB | **121 MiB** |
+
+A streamed answer stopped after `send` rows reports an unknown total, where the eager
+answer counted all 10.5M rows. The automatic decision costs a small query nothing that
+`perf stat` can see. Over 1000 requests each of `star-lookup`, `values-star`,
+`employee-docs` and `star-join` at 1.05M, with a unique comment so that no request takes
+the in-place path, the server's user-space instructions per request moved by -0.2% to
++0.1% against the baseline.
+
+Interleaved A/B screens on forge compared 210f52fc with 6f0f928c at 1.05M and 10.5M
+with the bench queries and a full scan. No query's median server or wall time regressed
+by 10% or more. At 10.5M, the server time of the name scan fell by 72%, because the
+cursor's batches no longer wait for the whole answer, and its wall time for all 1.02M
+rows in native JSON stayed at 553 ms. At 1.05M the full scan's server time fell by 81%
+with the same wall time. The geometric mean of the server times fell by 6.3% at 1.05M and
+5.2% at 10.5M, and that of the wall times moved by -0.7% and +0.1%.
+
+The streaming parity work of 2026-10-17 measured eager against streaming execution again
+on forge with a probe binary that interleaves the modes in one process. The table gives
+the streaming time divided by the eager time at 10.5M, where under 1 means streaming is
+faster. Each row's modes ran in the same process, and
+[X05](specs/X05-streaming-query-execution.md#streaming-parity-2026-10-17) describes the
+changes.
+
+| 10.5M, ratio of streaming to eager | af4a79d6, 12 threads | 2026-10-17, 12 threads | 2026-10-17, 1 thread |
+|---|---:|---:|---:|
+| TSV, 500,000 rows | 1.80 | **0.86** | **0.83** |
+| TSV, name scan of 1.02M rows | 1.37 | **0.89** | **0.91** |
+| Range top-k, rows only | 2.06 | 1.56 | **0.94** |
+| Expression ordering, rows only | 1.48 | 1.08 | **0.89** |
+| Substring filter, rows only | 1.60 | 1.45 | 1.02 |
+| Regular expression filter, rows only | 1.56 | 1.50 | 1.07 |
+
+Small scans stream faster too, which is why automatic execution now streams scans from an
+estimated thousand rows.
+
+The threshold was also measured over HTTP, against af4a79d6, whose automatic execution ran
+these scans eagerly. Each line is the median of three rounds, each the median wall time of
+60 TSV requests from curl to a fresh server at 10.5M with one Rayon thread, the server and
+client pinned to their own cores. A first run is the server with `SPARKLES_NO_IN_PLACE`,
+so that every request is planned and runs as a first one does. A repeat lets a query that
+answered in under 10 ms run eagerly in place, which a streamed answer now also earns. The
+wall times on forge include a constant floor of about 1.97 ms in its client path, which
+hides differences at 1,000 and 5,000 rows.
+
+| 10.5M, TSV over HTTP, ms | forge af4a79d6 | forge candidate | Namespace af4a79d6 | Namespace candidate |
+|---|---:|---:|---:|---:|
+| 1,000 rows, first run | 2.012 | 2.014 | 0.447 | 0.467 |
+| 5,000 rows, first run | 3.148 | 3.149 | 1.239 | 1.218 |
+| 20,000 rows, first run | 6.454 | **5.461** | 3.617 | 3.569 |
+| 50,000 rows, first run | 15.086 | **14.007** | 10.230 | 10.050 |
+| 1,000 rows, repeated | 2.015 | 2.013 | 0.453 | 0.461 |
+| 5,000 rows, repeated | 3.146 | 3.155 | 1.238 | 1.238 |
+| 20,000 rows, repeated | 6.433 | 6.443 | 3.522 | 3.637 |
+| 50,000 rows, repeated | 15.968 | **14.004** | 9.896 | 10.067 |
+
+The scans read `foaf:name` with `LIMIT` and `ex:city`, which has 20,000 triples. Both
+builds returned the same rows.
+
+| 10.5M, TSV, ms | Eager, 12 threads | Streaming, 12 threads | Eager, 1 thread | Streaming, 1 thread |
+|---|---:|---:|---:|---:|
+| 1,000 triples | 0.332 | **0.259** | 0.335 | **0.260** |
+| 5,000 triples | 1.604 | **1.126** | 1.610 | **1.229** |
+| 50,000 triples | 15.590 | **8.057** | 15.676 | **12.034** |
+| 100,000 names | 19.151 | **16.888** | 30.216 | **23.228** |
+
+The JVM library also runs in automatic mode by default since 2026-10-17. In the binding
+comparison of `scripts/bench-bindings` at 1.05M on forge, with every case run twice in
+each mode in alternating processes, the JNI export of 500,000 rows took 130 ms against
+126 ms eagerly on disk and 129 ms against 124 ms in memory. No other query, `find`,
+`contains` or `getProperty` moved by more than run-to-run noise, and the small-query
+latencies at one thread stayed within 2%.
 
 **mimalloc** keeps freed memory in per-thread heaps, and the server hands idle memory back
 to the OS after a second (`--idle-release-ms`). On the development laptop, a fresh 10.5M

@@ -72,7 +72,7 @@ Queries and updates follow the W3C recommendations and Jena ARQ's extensions, ch
 * SPARQL 1.1 Update: INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE, ADD, COPY and MOVE.
 * SERVICE (federated query, with SILENT) under an outbound network policy. On a server, only public destinations are allowed by default. The local `query` and `update` commands also reach private ones. The policy has allowlists, DNS pinning, checked redirects, timeouts and a response ceiling ([USAGE.md](USAGE.md#outbound-requests-service-and-load)).
 * Jena's service enhancer options on SERVICE ([API.md](API.md#service-options-loop-bulk-and-cache), spec [G10](specs/G10-service-enhancer.md)). `loop:` runs a SERVICE once per solution of the patterns before it, on the `LATERAL` operator with Jena's substitution. `bulk+n:` sends `n` solutions per request, as one VALUES block or as Jena's UNION, and asks again one at a time when an endpoint cuts a response short. `cache:` keeps each solution's remote result in a per-dataset cache with a memory budget, apart for each caller, with `cache+clear` and `cache+off`. `urn:x-arq:self` reads the dataset itself. Jena's tests of the module run against an endpoint in process.
-* Snapshot-owning SELECT and graph cursors in Rust, Python and Node, opt-in JVM SELECT pulls, and HTTP/CLI execution selection. Direct result writers use bounded output buffers, backpressure, cumulative budgets and body-lifetime cancellation. Joins resume across batches; hash joins, DISTINCT and eligible aggregates retain charged state. ORDER BY with LIMIT keeps only its best rows in a bounded heap. A full sort and unsupported shapes expose budgeted materialization, failing explicitly when the budget is exceeded. Automatic execution selects measured eligible large immutable scans and uncached OPTIONAL COUNT queries. Eager remains the default; explicit streaming can cost more on some workloads. Disk spill is not implemented.
+* Snapshot-owning SELECT and graph cursors in Rust, Python and Node, JVM SELECT pulls, and HTTP/CLI execution selection. Direct result writers use bounded output buffers, backpressure, cumulative budgets and body-lifetime cancellation. Joins resume across batches; hash joins, DISTINCT and eligible aggregates retain charged state. ORDER BY with LIMIT keeps only its best rows in a bounded heap. A full sort and unsupported shapes expose budgeted materialization, failing explicitly when the budget is exceeded. Automatic execution, the default over HTTP, in the CLI, in Node and in the JVM library, streams immutable scans expected to return at least a thousand rows and runs every other plan eagerly. Cursor result writers decode the next batch ahead, and cursor filters and top-k read growing inputs. `execution=eager` opts out, and explicit streaming can cost more on some workloads. Disk spill is not implemented.
 * Result formats: JSON, XML, CSV, TSV and `x-sparkles+json` (with the executed plan). RDF formats: Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
 * W3C conformance: SPARQL 1.1 query 328/328, SPARQL 1.1 update 157/157, SPARQL 1.0 482/482 and SPARQL 1.2 269/269, with the vendored, patched `spargebra` ([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)).
 
@@ -240,24 +240,29 @@ that work by priority and links each item to its design spec.
   source searches. [Roadmap](ROADMAP.md) item 80.
 
 * **Scale and execution.** The largest measured dataset is English DBpedia, 1.24 billion
-  triples on one machine. Nothing larger, such as Wikidata, has been tried. Queries run
-  eagerly by default, and each operator then materializes its result within budgets.
-  Streaming execution ([X05](specs/X05-streaming-query-execution.md)) is opt-in, apart
-  from the scans and OPTIONAL counts that automatic selection picks. It runs scans,
+  triples on one machine. Nothing larger, such as Wikidata, has been tried. Most queries
+  run eagerly, and each operator then materializes its result within budgets. Automatic
+  execution, the default over HTTP, in the CLI, in Node and in the JVM library, streams
+  only plain scans of a thousand rows or more. Other plans stream only when the caller asks for
+  `execution=streaming` ([X05](specs/X05-streaming-query-execution.md)). Streaming runs scans,
   joins, DISTINCT and eligible aggregates batch by batch. ORDER BY with LIMIT reads its
   input batch by batch into a heap of the rows it returns. Sorts without LIMIT and
   DESCRIBE still collect their whole input, and EXISTS and the operators it does not support run
   eagerly. Operator state is never spilled to disk, so a query whose state outgrows its
-  budget fails. There is no FSST vocabulary compression, IRI encoding, pattern trick,
-  pinned results, materialized views or live query monitoring. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40.
+  budget fails. The UI's result table, the MCP tools and the Python and JVM query calls
+  run eagerly, because they report exact totals or return collected results. There is no
+  FSST vocabulary compression, IRI encoding, pattern trick, pinned results, materialized
+  views or live query monitoring. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40.
 * **Large basic graph patterns.** A query whose plan would nest deeper than 4000 levels
   is refused. A basic graph pattern counts two levels per triple pattern, so it holds at
   most 1998 of them, and a path range counts its unrolled steps, multiplied through
   nested ranges. The [nesting limits](API.md#nesting-limits) give the rules. Planning
-  time grows with the square of the number of triple patterns, so a basic graph pattern at
-  the limit takes 1.3 to 1.7 s to plan in a release build, and shapes that mix OPTIONAL
-  or BIND with the chain take up to 7.6 s. Most shapes observe the timeout during
-  planning, but a plain chain does not. [Roadmap](ROADMAP.md) item 84.
+  time grows with the square of the number of triple patterns. A basic graph pattern at
+  the limit takes from 34 ms to 0.8 s to plan in a release build, and a star of 1998
+  patterns on one frequent predicate takes about 3 s over a dataset of 31,815 triples,
+  because the pairs of plans that share one variable stay quadratic. Planning observes
+  the timeout and cancellation. The explanation of `/{ds}/sparql/explain` reads plans of
+  at most 256 levels. [Roadmap](ROADMAP.md) item 84.
 * **Query memory pool.** A SERVICE call from a query to the same server is admitted like
   any request, so it waits behind its caller's grant and answers `503` after the
   admission wait, which `SILENT` turns into no rows. MCP tool calls are not admitted, so

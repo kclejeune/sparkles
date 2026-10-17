@@ -107,8 +107,16 @@ impl Plan {
     /// Read a `PlanNode` or `CursorPlan` tree. A given plan is data: anything that is
     /// not a plan is refused with the reason, and text is never interpreted.
     pub fn read(v: &Value) -> Result<Plan, String> {
-        let mut nodes = Vec::new();
-        read_node(v, "0".to_string(), None, 0, &mut nodes)?;
+        // format 2 writes a deep plan without ids, which are derived from the shape here
+        // for every format
+        if let Some(f) = v.get("planFormat")
+            && !matches!(f.as_u64(), Some(1 | 2))
+        {
+            return Err(format!(
+                "the plan is in format {f}, which this server does not read"
+            ));
+        }
+        let nodes = read_nodes(v)?;
         let executed = nodes
             .iter()
             .any(|n| n.actual_rows.is_some() || n.time_ms > 0.0);
@@ -180,19 +188,56 @@ fn number(v: &Value) -> Option<f64> {
     v.as_f64().filter(|x| x.is_finite())
 }
 
-fn read_node(
-    v: &Value,
-    id: String,
-    parent: Option<usize>,
-    depth: usize,
-    out: &mut Vec<NodeFacts>,
-) -> Result<usize, String> {
-    if depth > MAX_DEPTH {
-        return Err(format!("the plan nests deeper than {MAX_DEPTH} levels"));
+// How many child ids `read_nodes` has formatted on this thread, for the test that a plan
+// over the node limit is refused without building them all.
+#[cfg(test)]
+thread_local!(static IDS_FORMATTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
+/// The nodes of the plan `v` in tree order, a node before its children. The tree is read
+/// with a list of the nodes still to read rather than by recursion, so that the depth of a
+/// given plan cannot exhaust the stack.
+fn read_nodes(v: &Value) -> Result<Vec<NodeFacts>, String> {
+    let mut out: Vec<NodeFacts> = Vec::new();
+    // nodes still to read, the next one last
+    let mut todo = vec![(v, "0".to_string(), None, 0)];
+    while let Some((v, id, parent, depth)) = todo.pop() {
+        if depth > MAX_DEPTH {
+            return Err(format!("the plan nests deeper than {MAX_DEPTH} levels"));
+        }
+        let me = out.len();
+        let facts = read_node(v, id, parent)?;
+        // borrowed: a copy at each level would copy the subtree once per level above it
+        let kids = v
+            .get("children")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        // the nodes read, this one and those waiting to be read bound the plan from below,
+        // so a plan over the limit is refused before the ids of its children are built
+        if out.len() + 1 + todo.len() + kids.len() > MAX_NODES {
+            return Err(format!("the plan has more than {MAX_NODES} nodes"));
+        }
+        for (i, c) in kids.iter().enumerate().rev() {
+            #[cfg(test)]
+            IDS_FORMATTED.with(|n| n.set(n.get() + 1));
+            todo.push((c, format!("{}.{i}", facts.id), Some(me), depth + 1));
+        }
+        out.push(facts);
     }
-    if out.len() >= MAX_NODES {
-        return Err(format!("the plan has more than {MAX_NODES} nodes"));
+    // each node's children, in order, and its own time
+    for i in 1..out.len() {
+        if let Some(p) = out[i].parent {
+            out[p].children.push(i);
+        }
     }
+    for i in 0..out.len() {
+        let child_ms: f64 = out[i].children.iter().map(|&c| out[c].time_ms).sum();
+        out[i].self_ms = (out[i].time_ms - child_ms).max(0.0);
+    }
+    Ok(out)
+}
+
+/// The facts of one node `id` of a plan, without its children.
+fn read_node(v: &Value, id: String, parent: Option<usize>) -> Result<NodeFacts, String> {
     let Some(o) = v.as_object() else {
         return Err(format!("node {id} is not an object"));
     };
@@ -221,9 +266,8 @@ fn read_node(
     let time = number(&op["timeMs"]).unwrap_or(0.0).max(0.0);
     let skipped = op["skipped"].as_str().map(|s| short(s, 200));
     let stopped = op["stoppedEarly"].as_bool().unwrap_or(false) || full.contains("[stopped early]");
-    let me = out.len();
-    out.push(NodeFacts {
-        id: id.clone(),
+    Ok(NodeFacts {
+        id,
         operator,
         description: clean(&full),
         columns: op["columns"]
@@ -257,23 +301,7 @@ fn read_node(
         children: Vec::new(),
         parent,
         full_description: full,
-    });
-    // borrowed: a copy at each level would copy the subtree once per level above it
-    let kids = o
-        .get("children")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let mut child_ids = Vec::with_capacity(kids.len());
-    let mut child_ms = 0.0;
-    for (i, c) in kids.iter().enumerate() {
-        let at = read_node(c, format!("{id}.{i}"), Some(me), depth + 1, out)?;
-        child_ms += out[at].time_ms;
-        child_ids.push(at);
-    }
-    let n = &mut out[me];
-    n.children = child_ids;
-    n.self_ms = (n.time_ms - child_ms).max(0.0);
-    Ok(me)
+    })
 }
 
 /// A generated variable name (aggregates, DESCRIBE): 32 hex digits.
@@ -1008,8 +1036,10 @@ fn list(items: &[String]) -> String {
     }
 }
 
-/// The patterns under `at`, as text, with the ids of the nodes they come from. An
-/// optional side is not followed.
+/// The patterns of the subtree of node `at`, as text and in tree order, with the ids of
+/// the nodes that name them. An optional side is not followed. The subtree is walked with
+/// a list of the nodes still to visit rather than by recursion, since a plan can nest
+/// thousands of levels.
 fn patterns(
     plan: &Plan,
     at: usize,
@@ -1017,64 +1047,60 @@ fn patterns(
     texts: &mut Vec<String>,
     ids: &mut Vec<String>,
 ) {
-    let n = &plan.nodes[at];
-    if n.skipped.is_some() && n.parent.is_some_and(|p| plan.nodes[p].cached) {
-        // the subtree of a cache hit still says what was computed
-    }
-    match n.operator.as_str() {
-        "IndexScan" | "IndexRangeScan" | "CountFromIndex" | "IndexTopK" => {
-            if let Some(t) = pattern_text(&n.description, labels)
-                && !texts.contains(&t)
-            {
-                texts.push(t);
+    // nodes still to visit, the next one last
+    let mut todo = vec![at];
+    while let Some(at) = todo.pop() {
+        let n = &plan.nodes[at];
+        // the children to visit, in order
+        let mut visit: &[usize] = &[];
+        match n.operator.as_str() {
+            "IndexScan" | "IndexRangeScan" | "CountFromIndex" | "IndexTopK" => {
+                if let Some(t) = pattern_text(&n.description, labels)
+                    && !texts.contains(&t)
+                {
+                    texts.push(t);
+                    ids.push(n.id.clone());
+                }
+                // a top-k's fallback plan describes the same patterns again
+            }
+            "TransitivePath" => {
+                let d = words(&n.description)
+                    .iter()
+                    .map(|w| {
+                        term(
+                            w.trim_start_matches('(').trim_end_matches([')', '+', '*']),
+                            labels,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if d.len() >= 3 {
+                    let mark = if n.description.contains(")+") {
+                        " at any depth"
+                    } else {
+                        " at any depth, or itself"
+                    };
+                    texts.push(format!("{} {} {}{mark}", d[0], d[1], d[d.len() - 1]));
+                    ids.push(n.id.clone());
+                }
+                visit = &n.children;
+            }
+            "OptionalJoin" => {
                 ids.push(n.id.clone());
+                visit = &n.children[..n.children.len().min(1)];
             }
-            // a top-k's fallback plan describes the same patterns again
-        }
-        "TransitivePath" => {
-            let d = words(&n.description)
-                .iter()
-                .map(|w| {
-                    term(
-                        w.trim_start_matches('(').trim_end_matches([')', '+', '*']),
-                        labels,
-                    )
-                })
-                .collect::<Vec<_>>();
-            if d.len() >= 3 {
-                let mark = if n.description.contains(")+") {
-                    " at any depth"
-                } else {
-                    " at any depth, or itself"
-                };
-                texts.push(format!("{} {} {}{mark}", d[0], d[1], d[d.len() - 1]));
-                ids.push(n.id.clone());
+            "Minus" | "AntiJoin" => {
+                visit = &n.children[..n.children.len().min(1)];
             }
-            for &c in &n.children {
-                patterns(plan, c, labels, texts, ids);
-            }
-        }
-        "OptionalJoin" => {
-            ids.push(n.id.clone());
-            if let Some(&c) = n.children.first() {
-                patterns(plan, c, labels, texts, ids);
-            }
-        }
-        "Minus" | "AntiJoin" => {
-            if let Some(&c) = n.children.first() {
-                patterns(plan, c, labels, texts, ids);
-            }
-        }
-        _ => {
-            if joins(&n.operator) || n.operator == "Union" {
-                ids.push(n.id.clone());
-            }
-            if n.operator != "IndexTopK" {
-                for &c in &n.children {
-                    patterns(plan, c, labels, texts, ids);
+            _ => {
+                if joins(&n.operator) || n.operator == "Union" {
+                    ids.push(n.id.clone());
+                }
+                if n.operator != "IndexTopK" {
+                    visit = &n.children;
                 }
             }
         }
+        todo.extend(visit.iter().rev());
     }
 }
 

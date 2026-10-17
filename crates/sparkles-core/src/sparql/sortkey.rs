@@ -75,6 +75,12 @@ impl SortKey {
         }
     }
 
+    /// Whether the key's value is of a kind on which the order is total (see
+    /// [`totally_ordered`]).
+    pub fn totally_ordered(&self) -> bool {
+        totally_ordered(self.value.as_ref())
+    }
+
     /// Bytes this key keeps beyond its own size, for memory accounting.
     pub fn payload_bytes(&self) -> u64 {
         match &self.value {

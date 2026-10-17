@@ -379,8 +379,33 @@ fn anon_regex() -> &'static regex::Regex {
     })
 }
 
+/// The most variables the nodes of a subtree with a cache key may have, summed over its
+/// nodes. A key writes the variables of every node of its subtree, so the keys of a
+/// subtree's nodes grow with the cube of its depth: the eager run of a chain of 2000 triple
+/// patterns spent minutes writing them. A larger subtree is not cached. A key of this many
+/// variables is about 100 KB, and the subtrees of ordinary queries stay far below it.
+const KEY_MAX_VARS: usize = 16_384;
+
+/// Whether the variables of the nodes of `n` are within [`KEY_MAX_VARS`], read without
+/// walking further than that.
+fn small_enough(n: &Node) -> bool {
+    let mut left = KEY_MAX_VARS;
+    let mut todo = vec![n];
+    while let Some(n) = todo.pop() {
+        match left.checked_sub(n.vars.len() + 1) {
+            Some(l) => left = l,
+            None => return false,
+        }
+        todo.extend(&n.children);
+    }
+    true
+}
+
 /// Canonical cache key of a subtree, or `None` if it must not be cached.
 pub fn key(n: &Node, ctx: &Ctx) -> Option<CacheKey> {
+    if !small_enough(n) {
+        return None;
+    }
     let raw = raw_key(n, ctx)?;
     let mut anon: Vec<String> = Vec::new();
     let key = anon_regex()

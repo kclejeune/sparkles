@@ -248,10 +248,11 @@ fn open_query_cursor(
     flag: Arc<AtomicBool>,
 ) -> sparkles::Result<sparkles::sparql::QueryExecution> {
     let opts = query_options(v, flag)?;
-    let mode = if v["execution"].as_str() == Some("auto") {
-        sparkles::sparql::ExecutionMode::Auto
-    } else {
+    // callers open a cursor for `streaming` and for `auto`, the default
+    let mode = if v["execution"].as_str() == Some("streaming") {
         sparkles::sparql::ExecutionMode::Streaming
+    } else {
+        sparkles::sparql::ExecutionMode::Auto
     };
     let cursor_opts = sparkles::sparql::CursorOptions {
         batch_rows: v["batchSize"]
@@ -515,9 +516,28 @@ impl NativeDataset {
         let shared = self.get(false)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
-        match v["execution"].as_str().unwrap_or("eager") {
+        match v["execution"].as_str().unwrap_or("auto") {
             "eager" => {}
-            "streaming" | "auto" => {
+            "auto" => {
+                // A plan that automatic execution keeps eager returns the same result as
+                // an eager query, with its first batch computed in this call.
+                let permit = query_permit(&v, &flag).await?;
+                let first = first_batch_option(&v);
+                let cancellation = flag.clone();
+                let result =
+                    blocking(
+                        move || match open_query_cursor(&shared.ds, &text, &v, flag)? {
+                            sparkles::sparql::QueryExecution::Eager(result) => {
+                                NativeResult::query(result.into_result()).with_first(first)
+                            }
+                            cursor => NativeResult::streaming(cursor, cancellation),
+                        },
+                    )
+                    .await?;
+                drop(permit);
+                return Ok(result);
+            }
+            "streaming" => {
                 let permit = query_permit(&v, &flag).await?;
                 let cancellation = flag.clone();
                 let cursor =
@@ -900,6 +920,21 @@ fn pull(
     let Some(c) = lock.as_mut() else {
         return Ok(None);
     };
+    // The time since the last batch went to JavaScript was spent by the caller, so the
+    // query's timeout does not count it.
+    if let Some(returned) = c.returned.take() {
+        let paused = match &c.rows {
+            Rows::Streaming(state) => Some(state.cursor.deadline_pause()),
+            Rows::Graph(state) => Some(state.cursor.deadline_pause()),
+            _ => None,
+        };
+        if let Some(paused) = paused {
+            let ns = returned.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let _ = paused.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(ns))
+            });
+        }
+    }
     let max_rows = max_rows.clamp(1, 65536) as usize;
     let mut table = TermTable::new(max_rows);
     let mut cells: Vec<u32> = Vec::new();
@@ -1006,10 +1041,14 @@ fn pull(
     }
     let eager = matches!(c.rows, Rows::Query(_) | Rows::Collected(_) | Rows::Scan(_));
     let done = drained && eager;
+    let batch = table.finish(cells, rows, width, done);
     if done {
         lock.take();
+    } else {
+        // stamped once the batch is built, which is the query's own time
+        c.returned = Some(Instant::now());
     }
-    Ok(Some(table.finish(cells, rows, width, done)))
+    Ok(Some(batch))
 }
 
 struct SelectCursor {
@@ -1074,6 +1113,8 @@ enum Rows {
 struct Cursor {
     rows: Rows,
     pos: usize,
+    /// when the last batch was handed to JavaScript, until the next pull
+    returned: Option<Instant>,
 }
 /// A query result that JavaScript pulls in batches. A streaming cursor keeps its snapshot
 /// until it is drained, closed or collected, but it holds a reader permit only while a
@@ -1109,6 +1150,7 @@ impl NativeResult {
             cursor: Arc::new(Mutex::new(Some(Cursor {
                 rows: Rows::Query(Box::new(result)),
                 pos: 0,
+                returned: None,
             }))),
             metadata,
             statistics: Default::default(),
@@ -1171,7 +1213,12 @@ impl NativeResult {
             QueryExecution::Ask(result) => Rows::Ask(result),
         };
         Ok(Self {
-            cursor: Arc::new(Mutex::new(Some(Cursor { rows, pos: 0 }))),
+            cursor: Arc::new(Mutex::new(Some(Cursor {
+                rows,
+                pos: 0,
+                // the time until the first pull is the caller's too
+                returned: Some(Instant::now()),
+            }))),
             metadata,
             statistics: Default::default(),
             cancel: Some(cancel),
@@ -1197,6 +1244,7 @@ impl NativeResult {
             cursor: Arc::new(Mutex::new(Some(Cursor {
                 rows: Rows::Scan(Box::new(scan)),
                 pos: 0,
+                returned: None,
             }))),
             metadata: r#"{"type":"quads"}"#.into(),
             statistics: Default::default(),

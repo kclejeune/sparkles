@@ -228,6 +228,61 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 }
 
+/// The reservation for the cells of a streamed row that the batch's term cache does not
+/// hold, which are decoded or built for the row and dropped after it. It grows to the
+/// largest such row and is held until the output ends, so a row costs no reservation of
+/// its own. One reservation per row went through the query's memory ledger for every row
+/// with a computed value, which took about a quarter of the time of writing 500,000 rows
+/// with a BIND.
+#[derive(Default)]
+struct RowCharge {
+    charge: Option<super::ctx::OwnedCharge>,
+    held: u64,
+    /// what the current row has asked for so far
+    used: u64,
+}
+
+impl RowCharge {
+    fn start_row(&mut self) {
+        self.used = 0;
+    }
+
+    /// Cover `bytes` more of the current row before they are allocated.
+    fn cover(&mut self, cursor: &super::QueryCursor, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.used = self.used.saturating_add(bytes);
+        if self.used <= self.held {
+            return Ok(());
+        }
+        match &mut self.charge {
+            Some(charge) => charge.resize(self.used)?,
+            None => self.charge = Some(cursor.charge(self.used)?),
+        }
+        self.held = self.used;
+        Ok(())
+    }
+
+    /// The term of a cell, from the batch's term cache or decoded under this
+    /// reservation.
+    fn term<'b>(
+        &mut self,
+        cursor: &super::QueryCursor,
+        batch: &super::QueryBatch,
+        decoded: Option<&'b super::cursor::DecodedBatch<'b>>,
+        row: usize,
+        col: usize,
+    ) -> Result<Option<Cow<'b, Term>>> {
+        match decoded {
+            Some(d) => d.term(row, col),
+            None => Ok(batch
+                .covered_term(row, col, |bytes| self.cover(cursor, bytes))?
+                .map(Cow::Owned)),
+        }
+    }
+}
+
 /// Consume SELECT batches directly, applying writer backpressure before requesting
 /// the next batch. A later error leaves partial bytes and no success terminator.
 pub fn write_cursor_solutions(
@@ -253,31 +308,23 @@ pub fn write_cursor_solutions(
         let mut serializer = QueryResultsSerializer::from_format(format)
             .serialize_solutions_to_writer(&mut writer, variables.clone())
             .map_err(io)?;
-        let mut remaining = send.unwrap_or(usize::MAX);
-        while remaining > 0 {
-            let Some(batch) = cursor.next_batch_at_most(remaining)? else {
-                break;
-            };
-            let decoded = batch.decoded()?;
+        let mut left = send.unwrap_or(usize::MAX);
+        let mut row_charge = RowCharge::default();
+        let remaining = cursor.for_each_decoded(send, |cursor, batch, decoded| {
             let _row_storage = cursor.charge(
                 batch.width() as u64 * std::mem::size_of::<(usize, Cow<'_, Term>)>() as u64 + 128,
             )?;
             let mut terms = Vec::with_capacity(batch.width());
-            for row in 0..batch.len().min(remaining) {
+            for row in 0..batch.len().min(left) {
                 if row.is_multiple_of(1024) {
                     cursor.check()?;
                 }
-                let bytes = match &decoded {
-                    Some(d) => d.row_bytes(row)?,
-                    None => batch.row_bytes(row)?,
-                };
-                let _charge = (bytes != 0).then(|| cursor.charge(bytes)).transpose()?;
+                row_charge.start_row();
+                if let Some(d) = decoded {
+                    row_charge.cover(cursor, d.row_bytes(row)?)?;
+                }
                 for col in 0..batch.width() {
-                    let term = match &decoded {
-                        Some(d) => d.term(row, col),
-                        None => Ok(batch.term(row, col)?.map(Cow::Owned)),
-                    }?;
-                    if let Some(term) = term {
+                    if let Some(term) = row_charge.term(cursor, batch, decoded, row, col)? {
                         terms.push((col, term));
                     }
                 }
@@ -291,9 +338,10 @@ pub fn write_cursor_solutions(
                 // Release owned fallbacks before their row reservation drops;
                 // keep only the adapter capacity for the next row.
                 terms.clear();
-                remaining -= 1;
+                left -= 1;
             }
-        }
+            Ok(())
+        })?;
         if remaining == 0 {
             cursor.close();
         }
@@ -674,14 +722,11 @@ pub fn write_cursor_native_json(
         writer.write_all(b"{\"queryType\":\"SELECT\",\"vars\":")?;
         json(&mut writer, &cursor.variables())?;
         writer.write_all(b",\"rows\":[")?;
-        let mut remaining = send.unwrap_or(usize::MAX);
+        let mut left = send.unwrap_or(usize::MAX);
         let mut sent = 0u64;
-        while remaining > 0 {
-            let Some(batch) = cursor.next_batch_at_most(remaining)? else {
-                break;
-            };
-            let decoded = batch.decoded()?;
-            for row in 0..batch.len() {
+        let mut row_charge = RowCharge::default();
+        let remaining = cursor.for_each_decoded(send, |cursor, batch, decoded| {
+            for row in 0..batch.len().min(left) {
                 if row.is_multiple_of(1024) {
                     cursor.check()?;
                 }
@@ -691,19 +736,15 @@ pub fn write_cursor_native_json(
                 writer.write_all(b"[")?;
                 // One reservation covers the row's uncached cells through their
                 // serialization, as in the other result formats.
-                let bytes = match &decoded {
-                    Some(d) => d.row_bytes(row)?,
-                    None => batch.row_bytes(row)?,
-                };
-                let _charge = (bytes != 0).then(|| cursor.charge(bytes)).transpose()?;
+                row_charge.start_row();
+                if let Some(d) = decoded {
+                    row_charge.cover(cursor, d.row_bytes(row)?)?;
+                }
                 for col in 0..batch.width() {
                     if col > 0 {
                         writer.write_all(b",")?;
                     }
-                    let term = match &decoded {
-                        Some(d) => d.term(row, col)?,
-                        None => batch.term(row, col)?.map(Cow::Owned),
-                    };
+                    let term = row_charge.term(cursor, batch, decoded, row, col)?;
                     json(
                         &mut writer,
                         &term.as_ref().map(|t| NativeTerm(t.as_ref().as_ref())),
@@ -711,9 +752,10 @@ pub fn write_cursor_native_json(
                 }
                 writer.write_all(b"]")?;
                 sent += 1;
-                remaining -= 1;
+                left -= 1;
             }
-        }
+            Ok(())
+        })?;
         if remaining == 0 {
             cursor.close();
         }

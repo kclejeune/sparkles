@@ -117,6 +117,35 @@ test('automatic small queries retain collected result semantics', { timeout: 300
   }
 });
 
+test('queries run automatically by default and eager opts out', { timeout: 300000 }, async () => {
+  const ds = Dataset.memory();
+  try {
+    // a small query keeps its collected result, outside and inside a transaction
+    const small = await ds.select('SELECT ?x { VALUES ?x { 1 2 3 } }');
+    assert.equal(small.size, 3);
+    await ds.transaction(async (tx) => {
+      const rows = await tx.select('SELECT ?x { VALUES ?x { 1 2 } }');
+      assert.equal((await rows.toArray()).length, 2);
+    });
+    // a scan of a million rows from immutable blocks streams by default
+    let data = '';
+    for (let i = 0; i < 1_000_000; i++) data += `<urn:s${i}> <urn:p> ${i} .\n`;
+    await ds.load(data, { format: 'ttl' });
+    // pending changes rule streaming out, so the scan reads compacted blocks
+    await ds.compact();
+    const q = 'SELECT ?s ?o WHERE { ?s <urn:p> ?o }';
+    const streamed = await ds.select(q);
+    assert.equal(streamed.size, undefined);
+    assert.equal((await streamed.next()).done, false);
+    await streamed.close();
+    const eager = await ds.select(q, { execution: 'eager' });
+    assert.equal(eager.size, 1_000_000);
+    await eager.close();
+  } finally {
+    await ds.close();
+  }
+});
+
 test('idle streaming cursors do not hold query permits', { timeout: 30000 }, async () => {
   const ds = Dataset.memory();
   configure({ maxConcurrentQueries: 1 });
@@ -283,6 +312,49 @@ test(
         await new Promise((resolve) => setTimeout(resolve, 10));
       assert.equal((await result.stats()).sentRows, 8);
       assert.equal((await result.toArray()).length, 18);
+    } finally {
+      await ds.close();
+    }
+  },
+);
+
+test('a slow consumer does not run out a streaming timeout', { timeout: 30000 }, async () => {
+  const ds = Dataset.memory();
+  try {
+    const data = Array.from({ length: 200 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+    await ds.load(data, { format: 'ttl' });
+    const result = await ds.select('SELECT ?s ?o WHERE { ?s <urn:p> ?o }', {
+      execution: 'streaming',
+      timeout: 200,
+      batchSize: 10,
+    });
+    assert.ok(await result.next());
+    // The query computes batches for far less than its timeout, but the caller takes
+    // longer than the timeout to ask for the rest.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal((await result.toArray()).length, 199);
+  } finally {
+    await ds.close();
+  }
+});
+
+test(
+  'a streaming timeout leaves out the time before the first read',
+  { timeout: 30000 },
+  async () => {
+    const ds = Dataset.memory();
+    try {
+      const data = Array.from({ length: 200 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+      await ds.load(data, { format: 'ttl' });
+      const result = await ds.select('SELECT ?s ?o WHERE { ?s <urn:p> ?o }', {
+        execution: 'streaming',
+        timeout: 200,
+        batchSize: 10,
+      });
+      // The caller opens the result and does other work for longer than the timeout
+      // before it reads the first row.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      assert.equal((await result.toArray()).length, 200);
     } finally {
       await ds.close();
     }

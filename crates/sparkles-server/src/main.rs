@@ -910,6 +910,11 @@ enum Cmd {
         /// never below --timeout or --update-timeout
         #[arg(long, default_value_t = 1800.0)]
         max_timeout: f64,
+        /// How a query runs when its request names no `execution`: `auto` streams the
+        /// plans that measured faster and runs the rest eagerly, `eager` runs every query
+        /// eagerly
+        #[arg(long, value_name = "MODE", default_value = "auto", value_parser = ["auto", "eager"])]
+        default_execution: String,
         /// Reject updates, uploads and admin changes
         #[arg(long)]
         read_only: bool,
@@ -1415,9 +1420,11 @@ enum Cmd {
         /// rdfxml, trix, rt, rpb, rj)
         #[arg(long, default_value = "text")]
         results: String,
-        /// Engine execution mode (streaming text output uses TSV)
-        #[arg(long, default_value = "eager", value_parser = ["eager", "streaming", "auto"])]
-        execution: String,
+        /// Engine execution mode (streaming text output uses TSV). Without it, a local
+        /// query runs in `auto` mode, except for `text` output, whose table needs every row
+        /// first, and a remote query runs in the server's default mode
+        #[arg(long, value_parser = ["eager", "streaming", "auto"])]
+        execution: Option<String>,
         /// Print the query plan instead of executing
         #[arg(long)]
         explain: bool,
@@ -2414,6 +2421,7 @@ fn run() -> Result<()> {
             fuseki_config,
             timeout,
             max_timeout,
+            default_execution,
             mut read_only,
             no_service,
             embedding_secret,
@@ -2688,6 +2696,11 @@ fn run() -> Result<()> {
             st.access_log = !no_access_log;
             st.metrics = obs::Metrics::new(!no_metrics, metrics_max_datasets);
             st.metrics.fuseki_names = metrics_fuseki_names;
+            st.default_execution = if default_execution == "eager" {
+                sparkles::sparql::ExecutionMode::Eager
+            } else {
+                sparkles::sparql::ExecutionMode::Auto
+            };
             st.task_queue.set_max(max_tasks);
             st.task_queue.set_kind_max("clone", max_clones);
             st.compaction = auto_compact.state()?;
@@ -3200,7 +3213,7 @@ fn run() -> Result<()> {
                 let ds = remote_dataset(server.as_deref(), dataset.as_deref())?;
                 // the server's DESCRIBE request parameters, over the dataset's setting
                 let mut params: Vec<(&str, String)> = Vec::new();
-                if execution != "eager" {
+                if let Some(execution) = &execution {
                     params.push(("execution", execution.clone()));
                 }
                 if let Some(m) = &describe {
@@ -3277,113 +3290,150 @@ fn run() -> Result<()> {
                 }
                 None => store.snapshot(),
             };
-            if execution != "eager" {
-                use sparkles::sparql::{ExecutionMode, QueryExecution};
+            use sparkles::sparql::{ExecutionMode, QueryExecution};
+            let mode = match execution.as_deref() {
+                Some("streaming") => ExecutionMode::Streaming,
+                Some("auto") => ExecutionMode::Auto,
+                Some(_) => ExecutionMode::Eager,
+                // the text table measures every row before it prints one, and `--explain`
+                // prints the eager explanation
+                None if fmt == "text" || explain => ExecutionMode::Eager,
+                None => ExecutionMode::Auto,
+            };
+            // the result of a default automatic run that stayed eager, printed as an eager
+            // query's is
+            let mut collected = None;
+            if mode != ExecutionMode::Eager {
                 let mut cursor = sparkles::sparql::query_execution(
-                    snap,
+                    snap.clone(),
                     &q,
                     &qopts,
                     &Default::default(),
-                    if execution == "auto" {
-                        ExecutionMode::Auto
-                    } else {
-                        ExecutionMode::Streaming
-                    },
+                    mode,
                 )?;
                 if explain {
                     println!("{}", cursor.plan_json()?);
                     return Ok(());
                 }
-                let out = std::io::stdout();
-                let mut out = out.lock();
-                match &mut cursor {
-                    QueryExecution::Eager(result) => {
-                        let result = result.result();
-                        match result.kind {
-                            QueryKind::Select | QueryKind::Ask => {
-                                let format = SolutionsFormat::from_name(if fmt == "text" {
-                                    "tsv"
-                                } else {
-                                    &fmt
-                                })
-                                .context("unknown result format")?;
-                                results::write_solutions(result, format, &mut out, None)?;
-                            }
-                            _ => {
-                                if let Some(format) = if fmt == "text" {
-                                    Some(oxrdfio::RdfFormat::Turtle)
-                                } else {
-                                    results::rdf_format_from_name(&fmt)
-                                } {
-                                    results::write_graph(
-                                        result,
-                                        format,
-                                        &store.prefixes(),
-                                        &mut out,
-                                    )?;
-                                } else {
-                                    let format = http::jena_formats::JenaFormat::from_name(&fmt)
-                                        .context("unknown RDF format")?;
-                                    results::write_jena_graph(result, format, &mut out)?;
+                if execution.is_none()
+                    && let QueryExecution::Eager(result) = cursor
+                {
+                    collected = Some(result.into_result());
+                } else {
+                    let out = std::io::stdout();
+                    let mut out = out.lock();
+                    // the eager path ends a solutions answer with a newline, so a streamed one
+                    // does too, while a graph answer ends as its serializer leaves it
+                    let solutions = match &cursor {
+                        QueryExecution::Select(_) | QueryExecution::Ask(_) => true,
+                        QueryExecution::Eager(result) => {
+                            matches!(result.result().kind, QueryKind::Select | QueryKind::Ask)
+                        }
+                        QueryExecution::Graph(_) => false,
+                    };
+                    match &mut cursor {
+                        QueryExecution::Eager(result) => {
+                            let result = result.result();
+                            match result.kind {
+                                QueryKind::Select | QueryKind::Ask => {
+                                    let format = SolutionsFormat::from_name(if fmt == "text" {
+                                        "tsv"
+                                    } else {
+                                        &fmt
+                                    })
+                                    .context("unknown result format")?;
+                                    results::write_solutions(result, format, &mut out, None)?;
+                                }
+                                _ => {
+                                    if let Some(format) = if fmt == "text" {
+                                        Some(oxrdfio::RdfFormat::Turtle)
+                                    } else {
+                                        results::rdf_format_from_name(&fmt)
+                                    } {
+                                        results::write_graph(
+                                            result,
+                                            format,
+                                            &store.prefixes(),
+                                            &mut out,
+                                        )?;
+                                    } else {
+                                        let format =
+                                            http::jena_formats::JenaFormat::from_name(&fmt)
+                                                .context("unknown RDF format")?;
+                                        results::write_jena_graph(result, format, &mut out)?;
+                                    }
                                 }
                             }
                         }
-                    }
-                    QueryExecution::Select(c) => {
-                        let format =
-                            SolutionsFormat::from_name(if fmt == "text" { "tsv" } else { &fmt })
-                                .context("unknown result format")?;
-                        results::write_cursor_solutions(c, format, &mut out, None)?;
-                    }
-                    QueryExecution::Ask(result) => {
-                        let format =
-                            SolutionsFormat::from_name(if fmt == "text" { "tsv" } else { &fmt })
-                                .context("unknown result format")?;
-                        results::write_solutions(result.result(), format, &mut out, None)?;
-                    }
-                    QueryExecution::Graph(c)
-                        if fmt == "sparkles" || fmt == SolutionsFormat::Sparkles.media_type() =>
-                    {
-                        results::write_cursor_graph_native_json(c, &mut out, None, None)?;
-                    }
-                    QueryExecution::Graph(c) => {
-                        let format = if fmt == "text" {
-                            Some(oxrdfio::RdfFormat::Turtle)
-                        } else {
-                            results::rdf_format_from_name(&fmt)
-                        };
-                        if let Some(format) = format {
-                            let prefixes = store.prefixes().into_iter().collect::<Vec<_>>();
-                            sparkles::sparql::cursor::graph::write_cursor_graph(
-                                c, format, &mut out, None, &prefixes,
-                            )?;
-                        } else {
-                            let format = http::jena_formats::JenaFormat::from_name(&fmt)
-                                .context("unknown RDF format")?;
-                            results::write_cursor_jena_graph(c, format, &mut out, None)?;
+                        QueryExecution::Select(c) => {
+                            let format = SolutionsFormat::from_name(if fmt == "text" {
+                                "tsv"
+                            } else {
+                                &fmt
+                            })
+                            .context("unknown result format")?;
+                            results::write_cursor_solutions(c, format, &mut out, None)?;
+                        }
+                        QueryExecution::Ask(result) => {
+                            let format = SolutionsFormat::from_name(if fmt == "text" {
+                                "tsv"
+                            } else {
+                                &fmt
+                            })
+                            .context("unknown result format")?;
+                            results::write_solutions(result.result(), format, &mut out, None)?;
+                        }
+                        QueryExecution::Graph(c)
+                            if fmt == "sparkles"
+                                || fmt == SolutionsFormat::Sparkles.media_type() =>
+                        {
+                            results::write_cursor_graph_native_json(c, &mut out, None, None)?;
+                        }
+                        QueryExecution::Graph(c) => {
+                            let format = if fmt == "text" {
+                                Some(oxrdfio::RdfFormat::Turtle)
+                            } else {
+                                results::rdf_format_from_name(&fmt)
+                            };
+                            if let Some(format) = format {
+                                let prefixes = store.prefixes().into_iter().collect::<Vec<_>>();
+                                sparkles::sparql::cursor::graph::write_cursor_graph(
+                                    c, format, &mut out, None, &prefixes,
+                                )?;
+                            } else {
+                                let format = http::jena_formats::JenaFormat::from_name(&fmt)
+                                    .context("unknown RDF format")?;
+                                results::write_cursor_jena_graph(c, format, &mut out, None)?;
+                            }
                         }
                     }
+                    if solutions {
+                        writeln!(out)?;
+                    }
+                    if time {
+                        let stats = cursor.stats();
+                        eprintln!(
+                            "\nparse {:.2} ms · plan {:.2} ms · exec {:.2} ms · total {:.2} ms",
+                            stats.timing.parse_ms,
+                            stats.timing.plan_ms,
+                            stats.timing.exec_ms,
+                            stats.timing.total_ms
+                        );
+                        eprintln!("{}", cursor.plan_json()?);
+                    }
+                    return Ok(());
                 }
-                if time {
-                    let stats = cursor.stats();
-                    eprintln!(
-                        "\nparse {:.2} ms · plan {:.2} ms · exec {:.2} ms · total {:.2} ms",
-                        stats.timing.parse_ms,
-                        stats.timing.plan_ms,
-                        stats.timing.exec_ms,
-                        stats.timing.total_ms
-                    );
-                    eprintln!("{}", cursor.plan_json()?);
-                }
-                return Ok(());
             }
             if explain {
                 let (sse, plan) = sparkles::sparql::explain(snap, &q, &qopts)?;
                 println!("{sse}\n");
-                print_plan(&plan, 0);
+                print_plan(&plan);
                 return Ok(());
             }
-            let r = sparkles::sparql::query(snap, &q, &qopts)?;
+            let r = match collected {
+                Some(r) => r,
+                None => sparkles::sparql::query(snap, &q, &qopts)?,
+            };
             let out = std::io::stdout();
             let mut out = out.lock();
             match r.kind {
@@ -3422,7 +3472,7 @@ fn run() -> Result<()> {
                     "\nparse {:.2} ms · plan {:.2} ms · exec {:.2} ms · total {:.2} ms",
                     r.timing.parse_ms, r.timing.plan_ms, r.timing.exec_ms, r.timing.total_ms
                 );
-                print_plan_stderr(&r.plan, 0);
+                print_plan_stderr(&r.plan);
             }
             Ok(())
         }
@@ -5013,33 +5063,44 @@ fn shacl_parse(
     Ok(())
 }
 
-fn print_plan(p: &sparkles::sparql::PlanInfo, depth: usize) {
-    println!(
-        "{}{} {}  [est {} rows, cost {}]",
-        "  ".repeat(depth),
-        p.operator,
-        p.description,
-        p.estimated_rows,
-        p.estimated_cost
-    );
-    for c in &p.children {
-        print_plan(c, depth + 1);
+/// Each operator of plan `p` with its depth, in tree order, without recursion, since a
+/// plan nests up to `MAX_PLAN_DEPTH` levels.
+fn plan_walk(
+    p: &sparkles::sparql::PlanInfo,
+    mut f: impl FnMut(&sparkles::sparql::PlanInfo, usize),
+) {
+    let mut todo = vec![(p, 0)];
+    while let Some((p, depth)) = todo.pop() {
+        f(p, depth);
+        todo.extend(p.children.iter().rev().map(|c| (c, depth + 1)));
     }
 }
 
-fn print_plan_stderr(p: &sparkles::sparql::PlanInfo, depth: usize) {
-    eprintln!(
-        "{}{} {}  [{} rows (est {}), {:.2} ms]",
-        "  ".repeat(depth),
-        p.operator,
-        p.description,
-        p.actual_rows,
-        p.estimated_rows,
-        p.time_ms
-    );
-    for c in &p.children {
-        print_plan_stderr(c, depth + 1);
-    }
+fn print_plan(p: &sparkles::sparql::PlanInfo) {
+    plan_walk(p, |p, depth| {
+        println!(
+            "{}{} {}  [est {} rows, cost {}]",
+            "  ".repeat(depth),
+            p.operator,
+            p.description,
+            p.estimated_rows,
+            p.estimated_cost
+        )
+    });
+}
+
+fn print_plan_stderr(p: &sparkles::sparql::PlanInfo) {
+    plan_walk(p, |p, depth| {
+        eprintln!(
+            "{}{} {}  [{} rows (est {}), {:.2} ms]",
+            "  ".repeat(depth),
+            p.operator,
+            p.description,
+            p.actual_rows,
+            p.estimated_rows,
+            p.time_ms
+        )
+    });
 }
 
 /// Jena-style text table (`ResultSetFormatter.out`).

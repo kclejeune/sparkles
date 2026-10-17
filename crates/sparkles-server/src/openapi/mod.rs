@@ -645,8 +645,8 @@ fn parameters() -> Map<String, J> {
         "execution",
         q(
             "execution",
-            json!({ "type": "string", "enum": ["eager", "streaming", "auto"], "default": "eager" }),
-            "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body.",
+            json!({ "type": "string", "enum": ["eager", "streaming", "auto"], "default": "auto" }),
+            "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out.",
         ),
     );
     put(

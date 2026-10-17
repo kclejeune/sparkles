@@ -43,6 +43,7 @@ pub enum QueryMethod {
 #[derive(Clone, Debug, Default)]
 pub struct QueryOptions {
     pub(crate) at: Option<At>,
+    pub(crate) execution: Option<Execution>,
     pub(crate) server_timeout: Option<Duration>,
     pub(crate) reasoning: Option<bool>,
     pub(crate) default_graphs: Vec<String>,
@@ -63,6 +64,12 @@ impl QueryOptions {
     /// The server's `timeout` parameter: how long the server may work on the query.
     pub fn server_timeout(mut self, d: Duration) -> Self {
         self.server_timeout = Some(d);
+        self
+    }
+    /// How the server runs the query (Sparkles only). Without it the server uses its
+    /// default, which is [`Execution::Auto`] unless the server was started otherwise.
+    pub fn execution(mut self, mode: Execution) -> Self {
+        self.execution = Some(mode);
         self
     }
     /// Include (`true`) or exclude materialized inferences (Sparkles only).
@@ -86,6 +93,29 @@ impl QueryOptions {
     }
 }
 call_options!(QueryOptions);
+
+/// The `execution` parameter of a Sparkles query. A streamed answer can fail after its
+/// response has started. The server then aborts the transfer and reading the results
+/// returns an error, so only results read to their end are complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Execution {
+    /// Materialize the whole result before the response starts.
+    Eager,
+    /// Write the result from a cursor as it is computed.
+    Streaming,
+    /// Stream the plans that measured faster and run the rest eagerly.
+    Auto,
+}
+
+impl Execution {
+    fn as_str(self) -> &'static str {
+        match self {
+            Execution::Eager => "eager",
+            Execution::Streaming => "streaming",
+            Execution::Auto => "auto",
+        }
+    }
+}
 
 /// Options of an update.
 #[derive(Clone, Debug, Default)]
@@ -359,6 +389,10 @@ impl Endpoint {
         if let Some(r) = opts.reasoning {
             self.sparkles_only("reasoning")?;
             extra.push(("reasoning", r.to_string()));
+        }
+        if let Some(mode) = opts.execution {
+            self.sparkles_only("execution")?;
+            extra.push(("execution", mode.as_str().to_string()));
         }
         if let Some(t) = opts.server_timeout {
             extra.push(("timeout", secs(t)));

@@ -148,6 +148,14 @@ The changes, all in `src/parser.rs` unless noted:
   parses untrusted text. This is not a fix for upstream but a guard Sparkles needs: when
   this copy is dropped, the check must move to the callers.
 
+- **A set for the selected variables.** `build_select` tests whether a variable is
+  already selected through `add_var`, which scans the list of selected variables while it
+  holds fewer than 32 and keeps a hash set of them from then on. 0.4.7 scanned the whole
+  list for each variable, so a `SELECT` of thousands of variables, or a `SELECT *` over a
+  pattern with thousands of variables, took time with the square of their number. The
+  duplicate error, its text and the order of the variables are unchanged. The change is
+  for speed only, for basic graph patterns at the plan limit.
+
 Upstream Oxigraph (the development version after 0.4.7) has a rewritten parser that
 follows the SPARQL 1.2 grammar rules [123] and [138] and moves an OPTIONAL group's own
 FILTERs into the `LeftJoin`; the changes here are written against 0.4.7's rust-peg

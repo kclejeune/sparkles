@@ -4780,10 +4780,15 @@ export interface components {
             complete: boolean;
             fullInputBeforeOutput: boolean;
             growingState: boolean;
-            /** @description The node id, the same as the operator's. */
+            /** @description The node id, the same as the operator's. Absent in plan format 2. */
             id?: string;
             materializes: boolean;
             operator: components["schemas"]["PlanNode"];
+            /**
+             * @description On the root only. A plan deeper than 256 levels is in plan format 2, whose nodes have no `id`, and a client derives each id from the shape of the plan. A plan without this member is in format 1. A reader refuses a format it does not know.
+             * @enum {integer}
+             */
+            planFormat?: 2;
             reason?: string | null;
         };
         DatasetInfo: {
@@ -6430,9 +6435,14 @@ export interface components {
             estimatedCost?: number;
             /** @description `-1` when the caller's view hides estimates. */
             estimatedRows?: number;
-            /** @description The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response. */
+            /** @description The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response. Absent in plan format 2. */
             id?: string;
             operator: string;
+            /**
+             * @description On the root only. A plan deeper than 256 levels is in plan format 2, whose nodes have no `id`, and a client derives each id from the shape of the plan. A plan without this member is in format 1. A reader refuses a format it does not know.
+             * @enum {integer}
+             */
+            planFormat?: 2;
             pushedFilters?: string[];
             /** @description How often the node ran, when more than once. Its counts are of the last run and its time spans all of them. */
             runs?: number;
@@ -8707,7 +8717,7 @@ export interface components {
         dryRunHeader: boolean;
         /** @description The dataset name. */
         ds: string;
-        /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+        /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
         execution: "eager" | "streaming" | "auto";
         /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
         format: string;
@@ -8950,7 +8960,7 @@ export interface operations {
                 timeout?: components["parameters"]["timeout"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description Return only the summary of the run. */
                 summary?: boolean;
@@ -15651,7 +15661,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -15808,7 +15818,7 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -17389,7 +17399,7 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description Run an older version. */
                 version?: number;
@@ -17454,7 +17464,7 @@ export interface operations {
                 at?: components["parameters"]["at"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description Run an older version. */
                 version?: number;
@@ -17535,7 +17545,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -17604,7 +17614,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -17902,7 +17912,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];
@@ -17971,7 +17981,7 @@ export interface operations {
                 branch?: components["parameters"]["branch"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
                 send?: components["parameters"]["send"];
-                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto conservatively selects streaming for large immutable SELECT scans and eligible uncached OPTIONAL counts, and eager execution otherwise. The default remains eager. Explicit streaming SELECT does not support Thrift results, and auto runs those requests eagerly. Deadlines include blocked response writes; late failures abort the body. */
+                /** @description Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams immutable SELECT scans expected to return at least a thousand rows and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out. */
                 execution?: components["parameters"]["execution"];
                 /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
                 profile?: components["parameters"]["profile"];

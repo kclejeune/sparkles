@@ -82,7 +82,8 @@ pub(super) fn map_rows<T: Send>(
 ///
 /// A written node carries an `id`, the path of child indexes from the root (`0`, `0.1`,
 /// `0.1.2`), which is computed when the tree is serialized. An id is only valid for the
-/// plan it was written with (spec C18 §6.6.1).
+/// plan it was written with (spec C18 §6.6.1). A plan deeper than [`MAX_ID_DEPTH`] levels
+/// is written without ids, in plan format 2 (see [`PLAN_FORMAT`]).
 #[derive(Clone, Debug, Default)]
 pub struct PlanInfo {
     pub operator: String,
@@ -137,42 +138,67 @@ static NO_FIDELITY: PlanFidelity = PlanFidelity {
     estimate_guessed: false,
 };
 
+/// The deepest plan whose nodes are written with their ids. A node's id is its path from
+/// the root, so the ids of a plan grow with the square of its depth: those of a chain of
+/// 2000 triple patterns, 4000 levels deep, took 24 MB of its 54 MB. Every query of the
+/// test suites plans far less deep than this.
+pub const MAX_ID_DEPTH: usize = 256;
+
+/// The format a plan deeper than [`MAX_ID_DEPTH`] is written in, which its root names as
+/// `planFormat`. Its nodes have no `id`, and the id of each is the path of child indexes
+/// from the root, as format 1 writes it. A plan without `planFormat` is in format 1.
+pub const PLAN_FORMAT: u64 = 2;
+
 impl Serialize for PlanInfo {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        self.with_id("0").serialize(s)
+        if self.depth() <= MAX_ID_DEPTH {
+            self.with_id("0").serialize(s)
+        } else {
+            PlanWithId {
+                info: self,
+                id: None,
+                root: true,
+            }
+            .serialize(s)
+        }
     }
 }
 
 /// A [`PlanInfo`] written as the node `id` of its plan, with its children as `id.0`,
-/// `id.1` and so on.
+/// `id.1` and so on, or in format 2 without ids.
 pub struct PlanWithId<'a> {
     info: &'a PlanInfo,
-    id: std::borrow::Cow<'a, str>,
+    id: Option<std::borrow::Cow<'a, str>>,
+    /// it is the root of a plan written in format 2
+    root: bool,
 }
 
 impl Serialize for PlanWithId<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        struct Children<'a>(&'a [PlanInfo], &'a str);
+        struct Children<'a>(&'a [PlanInfo], Option<&'a str>);
         impl Serialize for Children<'_> {
             fn serialize<S: serde::Serializer>(
                 &self,
                 s: S,
             ) -> std::result::Result<S::Ok, S::Error> {
-                s.collect_seq(
-                    self.0
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| c.with_id(format!("{}.{i}", self.1))),
-                )
+                s.collect_seq(self.0.iter().enumerate().map(|(i, c)| PlanWithId {
+                    info: c,
+                    id: self.1.map(|id| format!("{id}.{i}").into()),
+                    root: false,
+                }))
             }
         }
         // a plan nests up to `MAX_PLAN_DEPTH` levels, more than the stack of a small
         // thread holds in a debug build, so each level makes sure of its own stack
         stacker::maybe_grow(PLAN_RED_ZONE, PLAN_STACK_SEGMENT, || {
             let mut m = s.serialize_map(None)?;
-            self.info.serialize_members(&self.id, &mut m)?;
-            m.serialize_entry("children", &Children(&self.info.children, &self.id))?;
+            if self.root {
+                m.serialize_entry("planFormat", &PLAN_FORMAT)?;
+            }
+            let id = self.id.as_deref();
+            self.info.serialize_members(id, &mut m)?;
+            m.serialize_entry("children", &Children(&self.info.children, id))?;
             m.end()
         })
     }
@@ -189,18 +215,22 @@ impl PlanInfo {
     pub fn with_id<'a>(&'a self, id: impl Into<std::borrow::Cow<'a, str>>) -> PlanWithId<'a> {
         PlanWithId {
             info: self,
-            id: id.into(),
+            id: Some(id.into()),
+            root: false,
         }
     }
 
-    /// Write `id` and every member except `children`, for a caller that writes the
-    /// children in its own form (the operator of a [`CursorPlan`](super::CursorPlan)).
+    /// Write `id`, when the plan is written with ids, and every member except `children`,
+    /// for a caller that writes the children in its own form (the operator of a
+    /// [`CursorPlan`](super::CursorPlan)).
     pub(super) fn serialize_members<M: serde::ser::SerializeMap>(
         &self,
-        id: &str,
+        id: Option<&str>,
         m: &mut M,
     ) -> std::result::Result<(), M::Error> {
-        m.serialize_entry("id", id)?;
+        if let Some(id) = id {
+            m.serialize_entry("id", id)?;
+        }
         m.serialize_entry("operator", &self.operator)?;
         m.serialize_entry("description", &self.description)?;
         m.serialize_entry("columns", &self.columns)?;
@@ -374,14 +404,42 @@ fn node_fidelity(ctx: &Ctx, n: &Node) -> Option<Box<PlanFidelity>> {
 }
 
 fn names(ctx: &Ctx, vars: &[VarId]) -> Vec<String> {
+    let all = ctx.var_names.read();
     vars.iter()
-        .map(|v| ctx.var_name(*v))
+        .map(|v| &all[*v as usize])
         .filter(|n| !n.starts_with(' '))
+        .cloned()
         .collect()
 }
 
 /// Plan description without execution (EXPLAIN).
 pub fn describe(ctx: &Ctx, n: &Node) -> PlanInfo {
+    PlanInfo {
+        children: described_children(ctx, n),
+        ..describe_node(ctx, n)
+    }
+}
+
+/// [`describe`] that stops at the query's timeout or cancellation: describing a plan at
+/// the plan limit names thousands of columns for each of thousands of nodes.
+pub(super) fn try_describe(ctx: &Ctx, n: &Node) -> Result<PlanInfo> {
+    ctx.check()?;
+    // the node before its children, so that each check follows the work of a node
+    let mut info = describe_node(ctx, n);
+    info.children = match &n.kind {
+        Kind::OrderedTopK(spec) => vec![try_describe(ctx, &spec.fallback)?],
+        _ => n
+            .children
+            .iter()
+            .map(|c| try_describe(ctx, c))
+            .collect::<Result<_>>()?,
+    };
+    Ok(info)
+}
+
+/// [`describe`] of `n` alone, without its children. A caller that describes each node of
+/// a plan would otherwise describe each subtree once per node above it.
+pub(super) fn describe_node(ctx: &Ctx, n: &Node) -> PlanInfo {
     PlanInfo {
         operator: n.operator().to_string(),
         description: n.desc.clone(),
@@ -390,7 +448,6 @@ pub fn describe(ctx: &Ctx, n: &Node) -> PlanInfo {
         estimated_rows: n.est.round(),
         estimated_cost: n.cost.round(),
         actual_rows: -1,
-        children: described_children(ctx, n),
         fidelity: node_fidelity(ctx, n),
         ..Default::default()
     }
@@ -2767,11 +2824,24 @@ fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(
             rest.cols[0].iter().all(total)
         }
     };
-    drop(decoded);
     if !total {
         return Ok(None);
     }
     let keys = [(Expr::Var(spec.var), spec.asc)];
+    // A cursor ranks the rounded values it decoded above, rather than decoding the same
+    // dictionary values again in the prefilter of `order_by`.
+    if let Some(values) = &decoded
+        && ctx.opt.topk_prefilter
+        && rest.len() > spec.k
+        && let Some((rows, charge)) =
+            cursor_topk_candidates(ctx, &rest, &keys, spec.k, Some(values))?
+        && rows.len() < rest.len()
+    {
+        ctx.check_output(rows.len(), rest.width())?;
+        rest = rest.take_rows(&rows);
+        drop(charge);
+    }
+    drop(decoded);
     // only their first k can be among the first k of all rows (the order of two rows
     // does not depend on the others)
     if rest.len() > spec.k {
@@ -3473,7 +3543,7 @@ pub(super) fn join_algorithm_tables(ctx: &Ctx, l: &Table, r: &Table) -> Result<M
     let ctl = crate::algo::Control::with_cancellation(
         ctx.cancel.clone(),
         ctx.cancellation.clone(),
-        ctx.deadline,
+        ctx.current_deadline(),
         u64::MAX,
     );
     let mut sorted = memory::allocate("algorithm-join-order", sorted_len, &ctl)?;
@@ -4249,6 +4319,7 @@ fn cursor_topk_candidates(
     t: &Table,
     keys: &[(Expr, bool)],
     k: usize,
+    decoded: Option<&super::exprcache::PerValue<Option<Value>>>,
 ) -> Result<Option<CursorCandidates>> {
     let [(expr @ Expr::Var(var), asc)] = keys else {
         return Ok(None);
@@ -4264,7 +4335,15 @@ fn cursor_topk_candidates(
     let Ok(charge) = ctx.retained_charge(t.len() as u64 * 64 + 4096) else {
         return Ok(None);
     };
-    let values = super::exprcache::cursor_dictionary_values(ctx, t, expr)?;
+    // the dictionary values a caller decoded already, or this table's
+    let owned;
+    let values = match decoded {
+        Some(values) => Some(values),
+        None => {
+            owned = super::exprcache::cursor_dictionary_values(ctx, t, expr)?;
+            owned.as_ref()
+        }
+    };
     let column = &t.cols[column];
     let sign = if *asc { -1.0 } else { 1.0 };
     let approximate = |i: usize| {
@@ -4274,7 +4353,6 @@ fn cursor_topk_candidates(
             Tag::Int => Some(id.as_i64() as f64),
             Tag::Double => Some(id.as_f64()).filter(|v| !v.is_nan()),
             Tag::Vocab | Tag::Delta if values.is_some() => values
-                .as_ref()
                 .unwrap()
                 .get(i)
                 .as_ref()
@@ -4356,7 +4434,7 @@ fn order_by(
     if let Some(k) = limit
         && ctx.opt.topk_prefilter
         && let Some(cand) = if ctx.is_cursor() {
-            cursor_topk_candidates(ctx, &t, keys, k)?.map(|(rows, charge)| {
+            cursor_topk_candidates(ctx, &t, keys, k, None)?.map(|(rows, charge)| {
                 cursor_candidate_charge = charge;
                 rows
             })
@@ -4527,11 +4605,39 @@ pub(super) fn offer_rows<P>(
         }
     };
     let mut ranked = 0;
+    // When the first key holds one result per distinct value and its values are totally
+    // ordered, a value the heap screened out is remembered, and its later rows cost a
+    // load instead of a comparison of sort keys. A rejected value is worse than the
+    // heap's worst row, and in a total order the worst row only improves as rows enter,
+    // so the value stays rejected. Dates with and without a timezone, for example, can
+    // form a cycle, where a value rejected once ranks ahead of a later worst row, so
+    // their rows are screened one by one. The answers are those of screening every row.
+    let mut screened: Vec<bool> = match &sources[0] {
+        HeapKey::Column(c @ super::exprcache::Column::Values(p))
+            if p.vals.len() < t.len() && p.vals.iter().all(SortKey::totally_ordered) =>
+        {
+            vec![false; c.distinct().unwrap_or(0)]
+        }
+        _ => Vec::new(),
+    };
     for i in 0..t.len() {
         if i.is_multiple_of(4096) {
             ctx.check()?;
         }
         let first = match &sources[0] {
+            HeapKey::Column(c) if !screened.is_empty() => {
+                let slot = c.index(i);
+                if screened[slot] {
+                    heap.skip();
+                    continue;
+                }
+                if heap.screen(c.get(i)) == Screen::Reject {
+                    screened[slot] = true;
+                    heap.skip();
+                    continue;
+                }
+                c.get(i).clone()
+            }
             HeapKey::Column(c) => {
                 // screen by reference: most rows of a large input leave here
                 if heap.screen(c.get(i)) == Screen::Reject {
@@ -6905,7 +7011,7 @@ pub(super) fn fetch(
     );
     let _entered = span.enter();
     // within the query's deadline too
-    let timeout = ctx.deadline.map_or(ctx.outbound.timeout, |d| {
+    let timeout = ctx.current_deadline().map_or(ctx.outbound.timeout, |d| {
         d.saturating_duration_since(Instant::now())
     });
     let resp = ctx

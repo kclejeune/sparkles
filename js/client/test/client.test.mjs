@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { SparklesClient, NotFoundError, InvalidInputError, factory } from '../dist/index.js';
 
 const body = {
@@ -128,4 +129,41 @@ test('CONSTRUCT reads N-Quads literals and named graphs', async () => {
   )[0];
   assert.equal(q.object.language, 'en');
   assert.equal(q.graph.value, 'urn:g');
+});
+test('a response cut off before its transfer completes rejects instead of looking short', async () => {
+  // A Sparkles server that fails after a streamed response has started closes the
+  // connection without the final chunk. The rows before the cut are well formed, so only
+  // the transfer error tells the caller that the answer is partial.
+  const server = createServer((request, response) => {
+    const graph = request.headers.accept?.startsWith('application/n-quads');
+    response.writeHead(200, {
+      'content-type': graph ? 'application/n-quads' : 'application/sparql-results+json',
+    });
+    response.write(
+      graph
+        ? '<urn:s> <urn:p> <urn:o> .\n'
+        : '{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"urn:s"}}',
+    );
+    setTimeout(() => response.socket.destroy(), 50);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const select = await new SparklesClient(base)
+      .dataset('wiki')
+      .select('SELECT ?s WHERE {?s ?p ?o}');
+    await assert.rejects(select.toArray());
+    const quads = new SparklesClient(base, {
+      fetch: (input, init) => {
+        const request = new Request(input, init);
+        request.headers.set('accept', 'application/n-quads');
+        return fetch(request);
+      },
+    });
+    const graph = await quads.dataset('wiki').construct('CONSTRUCT {?s ?p ?o} WHERE {?s ?p ?o}');
+    await assert.rejects(graph.toArray());
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

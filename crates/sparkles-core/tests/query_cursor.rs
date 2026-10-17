@@ -2038,6 +2038,31 @@ fn automatic_execution_keeps_small_and_stateful_queries_eager() {
 }
 
 #[test]
+fn automatic_execution_keeps_the_plan_of_an_eager_failure() {
+    use sparkles_core::sparql::{ExecutionMode, query_execution_with_plan, query_with_plan};
+    // The default mode is automatic, and a plan it keeps eager fails as an eager query
+    // does: with the plan as far as it ran, which the native error body reports.
+    assert_eq!(ExecutionMode::default(), ExecutionMode::Auto);
+    let s = store(10);
+    let q = "SELECT * {?s ?p ?o . ?t ?q ?u}";
+    let opts = QueryOptions {
+        max_rows: Some(20),
+        ..Default::default()
+    };
+    let eager = query_with_plan(s.snapshot(), q, &opts)
+        .err()
+        .expect("the row budget fails the cross product");
+    assert!(eager.plan.is_some());
+    for mode in [ExecutionMode::Eager, ExecutionMode::Auto] {
+        let failed = query_execution_with_plan(s.snapshot(), q, &opts, &Default::default(), mode)
+            .err()
+            .expect("the row budget fails the cross product");
+        assert!(matches!(failed.error, Error::BudgetExceeded(_)), "{mode:?}");
+        assert_eq!(failed.plan.is_some(), eager.plan.is_some(), "{mode:?}");
+    }
+}
+
+#[test]
 fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     use sparkles_core::sparql::{ExecutionMode, QueryExecution, query_execution};
     let s = store(10);
@@ -3411,4 +3436,435 @@ fn streaming_top_k_keeps_only_its_rows_within_the_memory_budget() {
         c.next_batch(),
         Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
     ));
+}
+
+#[test]
+fn a_cursor_deadline_excludes_time_its_consumer_paused() {
+    // No step depends on how fast the host runs. Both cursors start with an hour of
+    // credited waiting, so their first batches cannot time out. The slow cursor then
+    // loses its credit after its deadline has passed, and the paused one keeps it.
+    let s = store(200);
+    let timeout = Duration::from_millis(100);
+    let opts = QueryOptions {
+        timeout: Some(timeout),
+        ..Default::default()
+    };
+    let hour = 3_600_000_000_000;
+    let open = || select_cursor(s.snapshot(), "SELECT * {?s ?p ?o}", &opts, &options(16)).unwrap();
+    let (mut slow, mut paused) = (open(), open());
+    // both deadlines come before `opened + timeout`
+    let opened = std::time::Instant::now();
+    for c in [&mut slow, &mut paused] {
+        c.deadline_pause().store(hour, Ordering::Relaxed);
+        assert!(c.next_batch().unwrap().is_some());
+        assert_eq!(c.status(), CursorStatus::Open);
+    }
+    while opened.elapsed() <= timeout {
+        std::thread::sleep(timeout);
+    }
+    // a consumer that did not report its wait has used up the deadline
+    slow.deadline_pause().store(0, Ordering::Relaxed);
+    assert!(matches!(slow.next_batch(), Err(Error::Timeout)));
+    let mut rows = 16;
+    while let Some(batch) = paused.next_batch().unwrap() {
+        rows += batch.len();
+    }
+    assert_eq!(rows, 200);
+    assert_eq!(paused.status(), CursorStatus::Complete);
+}
+
+#[test]
+fn work_that_copies_the_deadline_takes_the_paused_one() {
+    use sparkles_core::sparql::Ctx;
+    let s = store(1);
+    let mut ctx = Ctx::new(s.snapshot());
+    assert_eq!(ctx.current_deadline(), None);
+    ctx.deadline = Some(std::time::Instant::now() - Duration::from_secs(1));
+    assert!(ctx.past_deadline());
+    ctx.deadline_pause
+        .fetch_add(3_600_000_000_000, Ordering::Relaxed);
+    assert!(!ctx.past_deadline());
+    // a SERVICE call or an algorithm run that starts now gets the moved deadline
+    assert!(ctx.current_deadline().unwrap() > std::time::Instant::now());
+}
+
+/// A store of `n` subjects with a name, of which every seventh contains "Ada", and an
+/// integer that repeats every 100 subjects.
+fn named(n: usize) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..n)
+        .map(|i| {
+            let name = if i % 7 == 0 { "Ada" } else { "Grace" };
+            format!(
+                "<urn:s:{i}> <urn:name> \"{name} {i}\" .\n<urn:s:{i}> <urn:age> {} .\n",
+                i % 100
+            )
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+fn without(names: &str) -> QueryOptions {
+    QueryOptions {
+        optimizations: Some(
+            sparkles_core::sparql::Optimizations::default()
+                .disable(names)
+                .unwrap(),
+        ),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn writers_decoding_ahead_match_eager_at_send_limits_across_batches() {
+    use sparkles_core::sparql::results::{
+        SolutionsFormat, write_cursor_solutions, write_solutions,
+    };
+    let s = named(9000);
+    let q = "SELECT ?s ?n ?a WHERE { ?s <urn:name> ?n ; <urn:age> ?a }";
+    let eager = query(s.snapshot(), q, &Default::default()).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for fmt in [SolutionsFormat::Tsv, SolutionsFormat::Json] {
+        for send in [None, Some(0), Some(1), Some(4096), Some(4097), Some(8999)] {
+            let mut expected = Vec::new();
+            write_solutions(&eager, fmt, &mut expected, send).unwrap();
+            for opts in [QueryOptions::default(), without("decode_ahead")] {
+                let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
+                let mut output = Vec::new();
+                let stats = pool
+                    .install(|| write_cursor_solutions(&mut c, fmt, &mut output, send))
+                    .unwrap();
+                assert_eq!(output, expected, "{fmt:?}, send {send:?}");
+                let n = send.unwrap_or(9000).min(9000) as u64;
+                assert_eq!(stats.emitted_rows, n, "{fmt:?}, send {send:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_failure_while_decoding_ahead_comes_after_the_rows_before_it() {
+    use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions};
+    let s = store(5000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for opts in [QueryOptions::default(), without("decode_ahead")] {
+        let opts = QueryOptions {
+            max_rows_produced: Some(2500),
+            ..opts
+        };
+        let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
+        let mut output = Vec::new();
+        let result = pool
+            .install(|| write_cursor_solutions(&mut c, SolutionsFormat::Tsv, &mut output, None));
+        assert!(result.is_err(), "the row budget stops the scan");
+        assert_eq!(c.status(), CursorStatus::Failed);
+        // the header and the whole batches before the failing pull
+        let text = String::from_utf8(output).unwrap();
+        let rows = text.lines().count() - 1;
+        assert!(
+            (1000..5000).contains(&rows) && rows.is_multiple_of(1000),
+            "{rows} rows"
+        );
+    }
+}
+
+#[test]
+fn long_filters_and_top_k_read_growing_inputs_with_the_answers_of_eager() {
+    let s = named(150_000);
+    let filtered = "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) }";
+    let expected = bag(query(s.snapshot(), filtered, &Default::default())
+        .unwrap()
+        .rows());
+    assert_eq!(expected.len(), 150_000 / 7 + 1);
+    let ordered = [
+        "SELECT ?s ?a WHERE { ?s <urn:age> ?a } ORDER BY DESC(ABS(?a - 50)) ?s LIMIT 10",
+        "SELECT ?s ?a WHERE { ?s <urn:age> ?a } ORDER BY ?a DESC(?s) LIMIT 7",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n } ORDER BY DESC(?n) LIMIT 5",
+    ];
+    for opts in [QueryOptions::default(), without("grow_input")] {
+        let mut c = select_cursor(s.snapshot(), filtered, &opts, &options(4096)).unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = c.next_batch().unwrap() {
+            assert!(
+                batch.len() <= 4096,
+                "the filter keeps the caller's batch size"
+            );
+            for row in 0..batch.len() {
+                rows.push(batch.row(row).unwrap());
+            }
+        }
+        assert_eq!(bag(rows), expected);
+        for q in ordered {
+            let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+            let c = select_cursor(s.snapshot(), q, &opts, &options(4096)).unwrap();
+            assert_eq!(all(c), eager, "{q}");
+        }
+    }
+}
+
+/// Without `grow_input` a top-k reads its input under the caller's byte cap, as it did
+/// before inputs could grow, however many rows the caller allows per batch. A budget that
+/// batches of 4,096 rows fit, and one read of all 200,000 rows does not, shows it.
+#[test]
+fn top_k_keeps_the_callers_byte_cap_when_its_input_does_not_grow() {
+    let s = store(200_000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(ABS(?o - 7)) LIMIT 5";
+    let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let cursor_options = CursorOptions {
+        batch_rows: 1 << 20,
+        batch_bytes: 64 << 10,
+        ..options(1 << 20)
+    };
+    let budget = QueryOptions {
+        max_memory_bytes: Some(4 << 20),
+        ..without("grow_input")
+    };
+    let mut c = select_cursor(s.snapshot(), q, &budget, &cursor_options).unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = c.next_batch().unwrap() {
+        for row in 0..batch.len() {
+            rows.push(batch.row(row).unwrap());
+        }
+    }
+    assert_eq!(rows, eager);
+}
+
+/// A top-k over input that improves row by row, where nearly every row enters the heap and
+/// the first key holds each value twice, screens each value from the answers it gave
+/// before, which a row entering the heap does not change.
+#[test]
+fn top_k_over_improving_input_with_repeated_values_matches_eager() {
+    let s = Store::in_memory(StoreOptions::default());
+    let n = 60_000;
+    let data = (0..n)
+        .map(|i| format!("<urn:s:{i:07}> <urn:v> \"v{:07}\" .\n", i / 2))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for q in [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 10",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) ?s LIMIT 7",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 10",
+    ] {
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for opts in [QueryOptions::default(), without("grow_input")] {
+            let c = select_cursor(
+                s.snapshot(),
+                q,
+                &opts,
+                &CursorOptions {
+                    fallback: FallbackPolicy::AllowMaterialization,
+                    ..CursorOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(all(c), eager, "{q}");
+        }
+    }
+}
+
+/// With `grow_input` a filter over a long scan and a top-k read larger inputs as the scan
+/// goes on, which holds more rows at once than reads of the first size.
+#[test]
+fn growing_inputs_hold_larger_reads() {
+    let s = named(300_000);
+    for q in [
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) }",
+        "SELECT ?s ?a WHERE { ?s <urn:age> ?a } ORDER BY DESC(ABS(?a - 50)) ?s LIMIT 10",
+    ] {
+        let peak = |opts: &QueryOptions| {
+            let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+            while c.next_batch().unwrap().is_some() {}
+            c.stats().mem_peak_bytes
+        };
+        let (grown, fixed) = (peak(&QueryOptions::default()), peak(&without("grow_input")));
+        assert!(grown > fixed, "{q}: grown {grown}, fixed {fixed}");
+    }
+}
+
+/// A writer that decodes ahead holds two batches and their terms. Under any memory budget
+/// it writes what the writer without decoding ahead writes, and fails where that one
+/// fails, and a writer that fails partway, while a batch is being decoded ahead, ends the
+/// cursor with the same error.
+#[test]
+fn decoding_ahead_under_tight_budgets_and_failing_writers() {
+    use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions};
+    struct Failing(usize);
+    impl std::io::Write for Failing {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.0 < b.len() {
+                return Err(std::io::Error::other("the client went away"));
+            }
+            self.0 -= b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let s = named(20_000);
+    let q = "SELECT ?s ?n ?a WHERE { ?s <urn:name> ?n ; <urn:age> ?a }";
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let write = |opts: &QueryOptions| {
+        let mut c = select_cursor(s.snapshot(), q, opts, &options(1000)).unwrap();
+        let mut out = Vec::new();
+        pool.install(|| write_cursor_solutions(&mut c, SolutionsFormat::Tsv, &mut out, None))
+            .map(|_| out)
+    };
+    // From 550 KiB to 900 KiB the writer that decoded ahead from its first batch failed
+    // where the other wrote every row.
+    for kb in (100u64..=1500).step_by(50) {
+        let budget = |opts: QueryOptions| QueryOptions {
+            max_memory_bytes: Some(kb << 10),
+            ..opts
+        };
+        let serial = write(&budget(without("decode_ahead")));
+        let ahead = write(&budget(QueryOptions::default()));
+        match (serial, ahead) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{kb} KiB"),
+            (Err(_), Err(_)) => {}
+            (a, b) => panic!(
+                "{kb} KiB: in turn {:?}, ahead {:?}",
+                a.map(|o| o.len()),
+                b.map(|o| o.len())
+            ),
+        }
+    }
+    for after in [0, 10, 40_000, 200_000] {
+        for opts in [QueryOptions::default(), without("decode_ahead")] {
+            let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
+            let r = pool.install(|| {
+                write_cursor_solutions(&mut c, SolutionsFormat::Tsv, Failing(after), None)
+            });
+            assert!(r.is_err(), "the writer fails after {after} bytes");
+            assert_ne!(c.status(), CursorStatus::Complete);
+        }
+    }
+}
+
+/// Three dateTimes that `ORDER BY` does not order totally: p is before q by value, and q
+/// is before a and a before p by their lexical forms, since a has no timezone and lies
+/// within 14 hours of both. The top-k's screen cannot remember a rejected value of such a
+/// key, because a later heap can rank it again, so every batch size gives eager's answer.
+#[test]
+fn top_k_over_a_cycle_of_partially_ordered_keys_matches_eager_at_every_batch_size() {
+    let s = Store::in_memory(StoreOptions::default());
+    let dt = |v: &str| format!("\"{v}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>");
+    let (p, q, a) = (
+        dt("2020-01-02T01:00:00+05:00"),
+        dt("2020-01-01T23:00:00Z"),
+        dt("2020-01-01T23:30:00"),
+    );
+    let mut data = String::new();
+    for (i, v) in [&p, &q, &a, &q].into_iter().enumerate() {
+        data.push_str(&format!("<urn:s:{:05}> <urn:v> {v} .\n", i + 1));
+    }
+    for i in 5..3001 {
+        data.push_str(&format!("<urn:s:{i:05}> <urn:v> {p} .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for q in [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 1",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v ?s LIMIT 2",
+    ] {
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for rows in [1, 512, 1024, 4096] {
+            let c = select_cursor(
+                s.snapshot(),
+                q,
+                &QueryOptions::default(),
+                &CursorOptions {
+                    batch_rows: rows,
+                    fallback: FallbackPolicy::AllowMaterialization,
+                    ..CursorOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(all(c), eager, "{q}; batch {rows}");
+        }
+    }
+}
+
+/// Later batches can be larger than the first, here because the second half of the names
+/// is 200 bytes longer, and the room that decoding ahead measured from the first batch
+/// can then run out where the writer in turn just fits. That happens only within a few
+/// KiB of the writer's own need, and only as a memory budget error, never with other
+/// output.
+#[test]
+fn decoding_ahead_with_growing_batches_under_tight_budgets() {
+    use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions};
+    let s = Store::in_memory(StoreOptions::default());
+    let pad = "x".repeat(200);
+    let data = (0..20_000)
+        .map(|i| {
+            let tail = if i >= 10_000 { pad.as_str() } else { "" };
+            format!("<urn:s:{i:05}> <urn:name> \"name {i}{tail}\" .\n")
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "SELECT ?s ?n WHERE { ?s <urn:name> ?n }";
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let write = |opts: &QueryOptions| {
+        let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+        let mut out = Vec::new();
+        pool.install(|| write_cursor_solutions(&mut c, SolutionsFormat::Tsv, &mut out, None))
+            .map(|_| out)
+    };
+    let mut mismatches = Vec::new();
+    for kb in (1000u64..=1150).step_by(3) {
+        let budget = |opts: QueryOptions| QueryOptions {
+            max_memory_bytes: Some(kb << 10),
+            ..opts
+        };
+        let serial = write(&budget(without("decode_ahead")));
+        let ahead = write(&budget(QueryOptions::default()));
+        match (serial, ahead) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{kb} KiB"),
+            (Err(_), Err(_)) => {}
+            (Ok(_), Err(Error::BudgetExceeded(b))) if b.kind == BudgetKind::Memory => {
+                mismatches.push(kb)
+            }
+            (Ok(_), Err(e)) => panic!("{kb} KiB: decoding ahead failed otherwise: {e}"),
+            (Err(e), Ok(_)) => panic!("{kb} KiB: only the writer in turn failed: {e}"),
+        }
+    }
+    // The window moves with thread timing by a few KiB. Four of these 51 budgets failed
+    // at most in repeated runs.
+    assert!(
+        mismatches.len() <= 10,
+        "decoding ahead failed at {mismatches:?} KiB"
+    );
 }

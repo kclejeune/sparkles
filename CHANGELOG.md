@@ -18,6 +18,37 @@ from 512 MiB to 256 MiB and the default history cache from 1 GiB to 512 MiB.
 defaults for library users. `--memory-profile small` sets smaller sizes for constrained
 hosts.
 
+Queries over HTTP, in the local CLI, in Node and in the JVM library now run in automatic
+mode by default. A plain scan that is expected to return at least a thousand rows from
+immutable blocks streams as a cursor, and every other query runs eagerly as before. An
+OPTIONAL count, which `execution=auto` streamed from a million rows, now runs eagerly,
+because the cursor counted it up to 1.23 times slower on AMD EPYC hosts. A streamed
+answer that fails after its first 1 MiB aborts the transfer after a `200` status, so
+only a completed transfer is a complete answer. A streamed answer reports no total in
+advance. The native metadata of a scan of a thousand rows or more therefore reports an
+unknown total with `send`, and a Node result of such a scan has no `size`, where both
+used to appear for every answer under a million rows. For Rust callers
+`ExecutionMode::default()` is now `Auto`, and `Dataset::query_execution` uses it, while
+`Dataset::query` stays eager. A request opts out with `execution=eager`, a server with
+`serve --default-execution eager`, the CLI with `--execution eager`, Node with
+`execution: 'eager'` and Jena with `Sparkles.STREAMING_EXECUTION` set to false. A server
+remembers a streamed answer that completed in one body in under 10 ms as a quick query,
+as it does an eager one, and runs its next request eagerly in place.
+
+A Jena result that streams can throw from `hasNext()` partway through, and Jena queries in
+a write transaction run eagerly. A Jena query iterator now throws
+`JenaTransactionException` when it is read after its transaction has ended, eager or
+streamed, where an eager result used to hand out its remaining rows. This covers an
+iterator created in a read transaction and first read after the transaction ended, and
+a final `hasNext()` after the last row when it comes after the end of the transaction.
+
+The deadline of a streamed answer now counts the query's own time. The time a query spends
+blocked on its reader, which is the response channel over HTTP and the gap between two
+pulls in Node, no longer counts against `timeout`, so a slow but steady reader of a large
+export is not cut off. Over HTTP a client that reads nothing for longer than the
+request's timeout ends the stream as a timeout. This applies to `execution=streaming` as
+well. A local `sparkles query --timeout` still counts the time its output is blocked.
+
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server
 refuses until `sparkles migrate` runs without `--check`, and its JSON report adds `opens`.
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as
@@ -32,6 +63,14 @@ propagated twice, so FastRP embeddings written by earlier builds differ from new
 a default call costs about a third more. A call whose weights are all zero with a zero
 `nodeSelfInfluence` is refused. A write-back graph algorithm run now has the update
 timeout instead of the query timeout.
+
+A query plan deeper than 256 levels, as `/{ds}/explain`, the Sparkles result format and
+the cursor write it, is in plan format 2. Its root has `"planFormat": 2` and its nodes
+have no `id`, which a client derives from the shape. Shallower plans are unchanged.
+Planning a basic graph pattern near the plan limit is faster by 1.1 to 33 times
+depending on its shape, 3 to 4 times for a plain chain or its reverse. A star on one
+frequent predicate gains the least. Planning observes the request's timeout and cancellation
+throughout.
 
 ### Format
 

@@ -221,21 +221,30 @@ impl Run {
     }
 }
 
+/// Where each of `vars` is among `of`. By a map when both are long, since a join near the
+/// root of a large plan has thousands of variables.
+fn positions(vars: &[VarId], of: &[VarId]) -> Vec<Option<usize>> {
+    if vars.len() > 32 && of.len() > 32 {
+        let at: rustc_hash::FxHashMap<VarId, usize> =
+            of.iter().enumerate().rev().map(|(i, &v)| (v, i)).collect();
+        vars.iter().map(|v| at.get(v).copied()).collect()
+    } else {
+        vars.iter()
+            .map(|v| of.iter().position(|x| x == v))
+            .collect()
+    }
+}
+
 impl Merge {
     pub(super) fn new(ctx: &Ctx, node: &Node) -> Result<Self> {
         let keys = [key(node).expect("eligible merge key")];
         let charge =
             ctx.retained_charge(node.vars.len() as u64 * 64 + keys.len() as u64 * 32 + 1024)?;
-        let columns = node
-            .vars
-            .iter()
-            .map(|v| {
-                (
-                    node.children[0].vars.iter().position(|x| x == v),
-                    node.children[1].vars.iter().position(|x| x == v),
-                )
-            })
-            .collect();
+        let (left, right) = (
+            positions(&node.vars, &node.children[0].vars),
+            positions(&node.vars, &node.children[1].vars),
+        );
+        let columns = left.into_iter().zip(right).collect();
         let key_columns = |side: usize| {
             keys[..1]
                 .iter()

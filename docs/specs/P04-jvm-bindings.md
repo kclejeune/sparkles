@@ -150,7 +150,7 @@ The exported interface is small. Each object is an `Arc` on the Rust side and an
 | `FfiDataset` | `open(path, options)`, `memory(options)`, `close`, `dataset_id`, `head_commit`, `commits`, `prefixes`, `set_prefix`, `remove_prefix`, `begin_read`, `begin_read_at(at)`, `begin_write`, `load_files`, `load_bytes`, `capabilities`, `version` | One per open database. `options` is a record with the union default graph flag, the blank node label mode and the store options. |
 | `FfiReadTxn` | `commit_seq`, `find(pattern, first_rows)`, `contains(quad)`, `count(pattern)`, `graph_names`, `prepare_query(text, options)` | Holds an `Arc<Snapshot>`. Calls run on the caller's thread. |
 | `FfiWriteTxn` | `base_seq`, `apply(batch)`, `find`, `contains`, `count`, `graph_names`, `remove_matching(pattern)`, `prepare_query`, `update(text, options)`, `commit`, `abort` | Owns a worker thread that holds the writer lock (§3.3). |
-| `FfiQuery` | `cancel`, `execute(first_rows)`, `variables`, `kind`, `boolean`, `next_batch(max_rows)`, `timing`, `close` | A prepared query and, after `execute`, its result table. `cancel` works from any thread. |
+| `FfiQuery` | `cancel`, `execute(first_rows)`, `execute_with(first_rows, auto)`, `variables`, `kind`, `boolean`, `next_batch(max_rows)`, `timing`, `close` | A prepared query and, after `execute`, its result table. `cancel` works from any thread. |
 | `FfiCursor` | `next_batch(max_rows)`, `close` | The rest of the quads of a `find`, read from one snapshot. |
 | `FfiError` | an error enum with fields (§4.3) | Mapped to Jena's exceptions in Kotlin. |
 | records | `CommitInfo`, `Receipt`, `UpdateStats`, `Timing`, `Capabilities` | Plain values, copied across. |
@@ -468,10 +468,15 @@ The initial binding becomes `QueryOptions::initial_bindings`, and the context sy
 when Jena first asks for a binding. Execution happens then, and not in `create`, because
 Jena's first timeout counts the time to the first result from that point. The query runs
 on the thread's snapshot, in the thread's write transaction when there is one, or on the
-head snapshot outside a transaction. Sparkles evaluates a whole query before it returns
-its first row, so the time to the first row equals the execution time. The iterator then
-pulls row batches and turns each row into a `BindingSparkles`, a `Binding` that holds the
-variables and an array of `Node`s and whose parent is the input binding.
+head snapshot outside a transaction. The query runs in Sparkles' automatic mode
+([X05](X05-streaming-query-execution.md#streaming-parity-2026-10-17)) unless
+`Sparkles.STREAMING_EXECUTION` says otherwise. A plan that streams returns its first rows
+before the rest are computed, and a later batch can then fail. Every other plan is
+evaluated whole before its first row returns. Queries in a write transaction always run
+eagerly. The iterator pulls row batches and turns each row into a `BindingSparkles`, a
+`Binding` that holds the variables and an array of `Node`s and whose parent is the input
+binding. Once the transaction it ran in has ended, the iterator throws
+`JenaTransactionException` instead of reading on.
 
 **Cancellation.** `QueryExecDataset` handles timeouts and `abort()` by calling
 `QueryIterator.cancel()` from another thread. `QueryIterSparkles.requestCancel` calls
@@ -610,6 +615,8 @@ global context, the dataset's context and the execution's own settings.
 | `Sparkles.INCLUDE_INFERRED` | the reasoner's `urn:x-sparkles:inferred` graph is merged into the default graph |
 | `Sparkles.MAX_ROWS`, `Sparkles.MAX_MEMORY_BYTES`, `Sparkles.MAX_ROWS_PRODUCED` | the budgets of [C01](C01-observability-and-budgets.md) |
 | `Sparkles.FALLBACK` | the mode of §3.5 |
+| `Sparkles.STREAMING_EXECUTION` | unset runs automatic execution, true streams every SELECT through a cursor, and false runs every query eagerly |
+| `Sparkles.STREAMING_STRICT` | with streaming, refuse plans that would have to materialize their input |
 | `ARQ.httpServiceAllowed` | `allow_service`. SERVICE is allowed unless the context says false, as in Jena. |
 | `ARQ.queryTimeout` | handled by Jena through cancellation, and passed on as `timeout` as a backstop |
 

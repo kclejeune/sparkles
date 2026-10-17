@@ -296,7 +296,7 @@ existing limits.
 | `max_rows_produced` and shared `work` | Sum of rows produced by physical operators, kept on the existing shared request counter |
 | `max_memory_bytes` | Estimated query-owned capacity and retained data that are live at the same time, including outstanding batches |
 | Result-byte budget | Serialized uncompressed bytes actually written, independent of row and batch counts |
-| Timeout | One absolute query deadline. Consumer waits and transport backpressure do not reset or suspend it. |
+| Timeout | One query deadline that counts the query's own time. Time blocked on the reader is added to a per-query pause and does not count, and one wait longer than the request's timeout ends the stream. |
 | Cancellation | Checked during production, decoding, serialization and interruptible transport waits |
 
 Counters use checked or saturating arithmetic and fail on overflow. Counts are updated
@@ -307,6 +307,18 @@ series of batches that each stay under the limit. Eager and cursor plans can
 legitimately do different physical work, so semantic parity does not require identical
 counters. In access-filtered plans and reports, checks of hidden candidates do not
 reveal hidden cardinalities.
+
+The Timeout row changed on 2026-10-17, when automatic execution became the default. It
+used to read that consumer waits and transport backpressure do not suspend the deadline.
+That rule made a large default export to a slow but steady client fail where eager
+execution, whose deadline ends before the transfer starts, had succeeded. The deadline
+now leaves out the time a cursor waits for its reader over HTTP and in Node, and so does
+every copy of the deadline that a SERVICE call, an algorithm run or a history service
+takes when it starts. The stall bound limits one wait, not the whole transfer, so a
+client that takes a chunk just often enough keeps the stream and its snapshot, memory
+grant and producer thread for as long as it reads, as an eager answer always did. A
+limit on the whole transfer belongs to the `--stream-idle-timeout` follow-up under
+[Roadmap follow-ups](#roadmap-follow-ups-2026-10-12).
 
 Allocated column capacity is charged before it grows, including the overhead of
 zero-column rows. Accounting covers parent and child batches, materialized fallback
@@ -369,8 +381,9 @@ The producer does not retry a cursor that has already advanced after a serializa
 trial. Streaming uses a single-use writer path, and the repeatable quick-result
 serializer remains for eager results. The producer can run ahead by a finite amount of
 queued bytes and one batch in progress. Once those fill, it stops pulling. Channel waits
-observe cancellation and the deadline and never wait indefinitely for another write.
-When the receiver drops, blocked sends wake up and the producer is released. The
+observe cancellation, the deadline and the stall bound. A request with a timeout never
+waits longer than that timeout for another write, and one without a timeout waits until
+the client reads or disconnects. When the receiver drops, blocked sends wake up and the producer is released. The
 disconnect guard belongs to the lifetime of the body and the producer, not only to the
 handler future, so returning response headers cannot cancel the running query.
 
@@ -474,12 +487,12 @@ documented acceptance decision.
   path may bypass the budget unseen.
 - **A8 — Deadline and cancellation:** cancel during rejected scan candidates, during
   filtering and callback work, and between pulls. Consumer sleep does not reset the
-  deadline. Check that work checks happen at bounded intervals rather than relying on a
+  deadline, and since 2026-10-17 it does not count against it either. Check that work checks happen at bounded intervals rather than relying on a
   test that hangs indefinitely.
 - **A9 — Backpressure:** stall an HTTP reader until the bounded channel fills, and
   verify that examined and emitted rows stop growing beyond the bounded producer
-  allowance. Disconnect, and let a deadline expire, during a blocked send. The producer
-  is reaped and its resources are released.
+  allowance. Disconnect, and let the stall bound expire, during a blocked send. The
+  producer is reaped and its resources are released.
 - **A10 — HTTP failures:** inject errors before and after header commitment,
   result-byte overflow, partial CSV and TSV output, and a serializer failure after
   execution completes. Assert the proper early status or late body error, no success
@@ -677,11 +690,14 @@ opt-in Jena WHERE execution on the JVM, and the CLI. Copies of rows and transpor
 in the foreign bindings follow their own bounded batching contract. Python rejects
 snapshot capture inside an owned transaction.
 
-The ordinary query path remains eager. Auto selects large plain immutable SELECT scans,
-and uncached eligible OPTIONAL COUNT queries on a single key, under the measured batch,
-graph-predicate and memory conditions that the API documents. Admitting aggregates in
-this way preserves enabled result caches. Over HTTP, auto falls back to eager execution
-when the negotiated encoding is SPARQL Results Thrift, which has no cursor writer.
+Auto selects plain immutable SELECT scans under the measured batch, graph-predicate and
+memory conditions that the API documents. Until 2026-10-17 it also selected uncached
+OPTIONAL COUNT queries on a single key, which
+[the parity section](#streaming-parity-2026-10-17) explains. Over HTTP, auto falls back
+to eager execution when the negotiated encoding is SPARQL Results Thrift, which has no
+cursor writer. Auto became the default mode over
+HTTP, in the CLI and in Node on 2026-10-16, as
+[the section below](#automatic-execution-by-default-2026-10-16) describes.
 
 The W3C SPARQL 1.0 and 1.1 query evaluation tests run through cursors at batch sizes
 of 1, 2, 3 and 4,096 rows and match the expected results. The queries that need eager
@@ -930,12 +946,251 @@ the rest are sketched here.
 * **Earlier first bytes.** Explicit streaming commits the response after the first
   batch or 64 KiB, whichever comes first, instead of after 1 MiB. A later failure aborts
   the transport as §6 specifies. Slow streaming bodies count against the X08 pool through
-  their retained batches, and a `--stream-idle-timeout` (default 60 s) ends a body whose
-  reader takes nothing for that long.
+  their retained batches. The stall bound is now the request's timeout, and a
+  `--stream-idle-timeout` (default 60 s) would replace it with its own limit on how long a
+  body's reader may take nothing.
 * **Broader automatic selection.** X08 §6.8 lets `auto` stream SELECT plans whose
   estimate exceeds half the memory budget, and retries an eager query that fails its
   budget before output as a cursor with spill. Each widening needs the matched
   measurements of §10.
+
+### Automatic execution by default (2026-10-16)
+
+`execution=auto` is now the default where a caller gets its answer as a stream of rows
+or bytes. Plans that measured faster as cursors then stream without being asked for, and
+every other plan runs eagerly with the response it had before. The table lists every
+entry point that picks a mode and what it does now.
+
+| Entry point | Default | Reason |
+|---|---|---|
+| HTTP `/{ds}/sparql`, GET and POST, every result format | `auto` | The answer is a byte stream, and the cursor writer covers every format except SPARQL Results Thrift. `serve --default-execution eager` restores eager for a whole server. |
+| HTTP with SPARQL Results Thrift | eager | That encoding has no cursor writer. |
+| A query that ran in under 10 ms last time | eager, in place | The decision would cost more than any stream can save, and the in-place path stays as it was. |
+| Stored queries, `/{ds}/queries/{name}` | as `/{ds}/sparql` | A run with parameter values has initial bindings, which rule out every automatic plan, so it runs eagerly. |
+| Graph algorithms over HTTP | as `/{ds}/sparql` | Their plans never qualify, so they run eagerly. |
+| UI result table | eager, asked for explicitly | The table shows the full row count and the time slider compares totals, which a streamed answer stopped after `send` rows does not know. |
+| UI downloads | the server's default | A download reads the whole answer. |
+| CLI `sparkles query`, local | `auto`, but eager for the `text` table and `--explain` | The table measures every row before printing one. A plan that stays eager prints exactly what an eager query prints. |
+| CLI `sparkles query --server` | the server's default | It sends `execution` only when `--execution` is given. |
+| Rust `Dataset::query` and `query_with` | eager | They return a collected `QueryResult`. `ExecutionMode::default()` is now `Auto`, and `Dataset::query_execution` uses it. |
+| Rust client | the server's default | `QueryOptions::execution` chooses a mode. |
+| Python `query`, `select` and the rdflib store | eager | They return collected values whose iteration cannot fail, and they also run inside transactions. `select_cursor` and `graph_cursor` stream on request. |
+| Node `query`, `select`, `construct`, `ask` and `queryToStream` | `auto` | Node results are already async iterators that pull batches, so a streamed result only loses `size` and can reject while it is read. A plan that stays eager keeps its size and its first batch from the call. |
+| Node transactions | eager | A cursor cannot read a transaction's state. |
+| JVM and Jena | `auto` since 2026-10-17 | ARQ result sets are lazy iterators that already fail from `hasNext`, so a streamed result keeps their contract. Write transactions run eagerly, and `Sparkles.STREAMING_EXECUTION` set to false opts out. |
+| TypeScript client | the server's default | It sends `execution` only when the caller sets it. |
+| MCP tools, GraphQL, SPARQL diffs, `/{ds}/explain`, Ask | eager | Each returns one document built from the whole result, such as an MCP answer with an exact total. |
+| SERVICE to Sparkles, including the same server | the remote server's default | The SERVICE client reads SPARQL JSON or XML as it arrives, so a cut-off answer fails the parse and the transfer and the SERVICE call fails. |
+
+When automatic execution streams an answer, the caller sees the explicit-streaming
+contract that the API documents. An error after the first 1 MiB of the body, such as a
+timeout or an exhausted budget, aborts the transfer after a `200` status, and in TSV,
+CSV or N-Triples the rows before the cut are well formed. The Rust client, the CLI, the
+TypeScript client and the UI report the cut-off transfer as an error, and new tests serve
+such a response to each of them. They all already did, through the transfer errors of
+reqwest and of fetch, so none of those tests failed before the change. The deadline
+counts the query's own time and not the time the client takes to read, a client that reads
+nothing for longer than the timeout ends the stream, and the snapshot and the query's
+memory grant stay held until the body ends. With `send`, the native metadata reports `stopped`
+and an unknown total. Rows come in the same order as eagerly, which a test checks over a
+million-row scan. Streamed answers skip the full-result cache. A plain scan is never
+cached, so this matters only for its projection, which a cursor reads from decoded
+blocks at about a third of the eager cost. The access log and the metrics record a
+streamed answer when its body ends.
+
+One rule keeps late errors rarer than in explicit streaming. A scan whose estimate passes
+the request's `max-rows` or `max-rows-produced` stays eager, so the budget fails it with
+`507` before any output. A request that lowers `max-result-mb` does not stay eager. A
+streamed answer that passes the lowered budget within its first 1 MiB is refused with
+`507` before any output, and one that passes it later aborts the transfer, as an eager
+answer past 1 MiB already did. A streamed scan can still run out its `timeout`
+partway through when the query itself is slow, and a reader that takes nothing for
+longer than the timeout is cut off.
+
+Automatic execution plans the query once on the blocking pool. When it keeps the plan
+eager, the HTTP handler continues on the eager path with that result, so the response,
+its headers, the quick-query memory and the error body with the failed plan are those of
+an eager request. The comparisons in the server tests that relied on eager being the
+default now ask for it, and the test of the default streams a million-row scan, checks
+the eager opt-outs per request and per server, the row-budget rule and a late timeout
+that cuts off a default stream.
+
+The first build of the change cost a never-repeated small query between 0.5% and 0.9%
+more instructions on forge, because the server measured the query's nesting a second
+time to size the parser's stack. A profile put about 1.5% of the instructions in that
+scan. Spargebra already checks the nesting on every parse, so the server now skips the
+measurement when the thread has at least 2 MiB of stack left, which every server thread
+has. After that fix, 1000 requests each of `star-lookup`, `values-star`,
+`employee-docs` and `star-join` at 1.05M, each with a unique comment so that none takes
+the in-place path, cost -0.2% to +0.1% instructions against 6f0f928c. Repeated requests,
+which take the in-place path, moved by less than 0.1% except `star-join` at +0.4%. The
+in-place path runs the same code in both builds, so that difference is noise between
+server processes.
+
+The memory effect is the one the explicit-streaming measurements predicted. At 10.5M,
+the full scan with `send=10` peaks at a 1.1 MiB allocation estimate and 66 MiB of server
+RSS by default, against 241.0 MiB and 804 MiB eagerly, and answers in 2 to 5 ms instead
+of 240 to 320 ms. Read whole as TSV, the scan peaks at 581 MiB of RSS instead of 885 MiB
+in about the same time. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) has the table.
+
+The first A/B screen on forge flagged the whole name scan at 10.5M in native JSON, which
+the default streams. Its wall time rose by 10.5%, from 553 ms to 611 ms. A profile put
+about 15% of the cycles in the memory ledger, because the writer cache of each batch
+reserved every decoded term on its own and a cursor's charge cannot take the fast path of
+an eager query. The cache now reserves ahead in steps of at least 64 KiB, still before
+each term is allocated, and overstates a batch by less than one step. After that fix the
+default name scan takes 547 ms in native JSON against 531 to 563 ms eagerly, 1.37 s against
+1.41 s in SPARQL JSON and 273 ms against 357 ms in TSV. The final screens at 1.05M and
+10.5M found no query whose median server or wall time regressed by 10% or more, and the
+name scan's wall time matched the baseline's at 553 ms.
+
+### Streaming parity (2026-10-17)
+
+The first part of roadmap item 7 measured eager against streaming execution again on
+forge, at 10.5M with 12 Rayon threads and with one, and profiled each gap before changing
+anything. Most of the remaining eager wins at 12 threads come from parallelism inside
+eager operators, which run Rayon over the whole table, while a cursor works on one batch
+at a time. With one Rayon thread, the setting of the Namespace screens, streaming ties
+or wins on most shapes.
+
+Four changes closed the gaps that profiles traced to the cursor itself.
+
+* A result writer that reads a cursor decodes the terms of the next batch on another
+  Rayon thread while it writes the current one (`decode_ahead`), and charges each written
+  row's terms to the memory ledger once instead of once per cell. It writes the first
+  batch before it pulls the second, so the first rows wait for one batch only, and it
+  reads ahead only when the memory budget has room for twice what the first batch took.
+  That room is an estimate from the first batch, so when later batches hold larger terms
+  a budget within a few KiB of the writer's own need can still fail with decoding ahead,
+  always with a memory budget error.
+  An error from a batch read ahead reaches the writer after it has written the batch
+  before it. A memory budget failure inside the plan is the exception, since it fails
+  every later check of the query, and the writer then stops before writing that batch.
+* A cursor filter starts at 32,768 rows and doubles its row demand with each read up to
+  262,144 rows, and a cursor top-k doubles from the cursor's batch size up to 65,536 rows,
+  while the row budget and the memory ledger have room (`grow_input`). The scan under a
+  filter still stops at the caller's `batch_bytes`, so with the default 1 MiB a filter
+  over two columns reads at most 65,536 rows at once and over one column 131,072. A top-k
+  raises the byte cap with its demand. The tradeoff is memory. Over 300,000 rows a
+  substring filter peaked at 12.3 MB against 6.7 MB with fixed reads, and a top-k at
+  24.1 MB against 2.5 MB, both within the query's budgets.
+* A cursor top-k reuses the values it decoded for its prefilter instead of decoding them
+  again. When its first key holds one result per distinct value of totally ordered
+  kinds, its screen remembers which values it rejected for the rest of the batch. In a
+  total order a rejected value is worse than the heap's worst row, which only improves,
+  so it stays rejected. DateTimes with and without a timezone can form a cycle, and the
+  first build remembered their rejections too, so a batch of 1,024 rows or more could
+  rank them differently from eager execution. Such keys are now screened row by row.
+* The numeric columns of a cursor's expression cache are located in parallel when a
+  batch has at least 16,384 ids.
+
+The table gives the streaming time divided by the eager time, each measured in the same
+interleaved run of a probe binary. A ratio under 1 means streaming is faster.
+
+| 10.5M, ratio of streaming to eager | af4a79d6, 12 threads | Now, 12 threads | Now, 1 thread |
+|---|---:|---:|---:|
+| TSV, 500,000 rows | 1.80 | **0.86** | **0.83** |
+| TSV, name scan of 1.02M rows | 1.37 | **0.89** | **0.91** |
+| Native JSON, 500,000 rows | not measured | **0.47** | not measured |
+| Range top-k, rows only | 2.06 | 1.56 | **0.94** |
+| Expression ordering, rows only | 1.48 | 1.08 | **0.89** |
+| Substring filter, rows only | 1.60 | 1.45 | 1.02 |
+| Regular expression filter, rows only | 1.56 | 1.50 | 1.07 |
+
+The streamed TSV export of 500,000 rows went from 134.7 ms to 72 ms, where eager takes
+75 to 84 ms. The filters over a scan stay slower at 12 threads because the cursor scans,
+copies and filters one batch at a time, where eager filters the scan's runs in parallel.
+A morsel-parallel scan and filter in the cursor would close that gap and is left to the
+next part of item 7. Range top-k runs as an eager `IndexTopK` inside the cursor, so
+streaming it saves no memory. A filter over a scan in native JSON at one thread is also
+left open. It takes 1.35 to 1.39 times as long streamed, because the cursor's sorted batch
+decode of unique IRIs costs more than eager's per-row lookup.
+
+The first build of the writer pulled the second batch before it wrote the first, so the
+first rows of every streamed answer waited for two batches. With the first batch written
+in turn, on the development laptop at 10.5M with four threads on its performance cores,
+the first row of a substring filter came after 0.37 ms instead of 1.25 to 1.43 ms, and
+that of a regular expression matching two names after 9.0 ms instead of 15.6 ms. Scans of
+1,000 to 500,000 rows took the same time either way. Decoding ahead also made a tight
+memory budget fail a query that the writer in turn completed, which the room it now
+requires prevents. Decoding ahead runs on the global Rayon pool, so under many concurrent
+queries a writer can wait for its decoding task where decoding in turn would not wait.
+That case has not been measured and is left to item 7.
+
+Automatic execution now streams a plain scan, its projection or a `LIMIT` over it from an
+estimated thousand rows, where it needed a million before. On forge a cursor wrote such a
+scan faster than eager execution from about a hundred rows on, at one thread and at 12,
+in TSV and native JSON. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) gives the
+library times of one probe run, 0.259 ms streamed against 0.332 ms at 1,000 triples and
+1.126 ms against 1.604 ms at 5,000 with 12 threads. An earlier probe run measured 0.22
+against 0.24 ms and 0.85 against 1.10 ms. Filters, top-k and orderings stay eager by
+default, since streaming them is still slower at 12 threads.
+
+The server remembers a query that answered in under 10 ms as quick and runs its next
+request eagerly in place, without a thread hop or the automatic decision. Only eager
+answers were remembered at first, so a scan of a few thousand rows that streamed on its
+first run went through the blocking pool and the streamed writer on every run. A streamed
+answer that completes in one body, which the server buffers up to 1 MiB, is now
+remembered with its time as well. A stream that `send` stops early has not run the whole
+query and is not remembered. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) measures the threshold
+over HTTP against af4a79d6, which ran these scans eagerly. With one Rayon thread on forge,
+scans of 20,000 and 50,000 rows answered 7% to 15% faster on their first run, and scans of
+1,000 and 5,000 rows matched. On a Namespace AMD EPYC instance every size was within 5%,
+and a repeated scan that answered in under 10 ms ran in place as fast as before.
+
+An uncached OPTIONAL COUNT on a single key, which automatic execution streamed from an
+estimated million rows, now runs eagerly. The pre-push screen of af4a79d6 measured the
+benchmark's `optional-count` at 10.5M 1.19 to 1.23 times slower under automatic execution
+on Namespace's AMD EPYC instances, while forge's i5-13500 measured 0.99. On a Namespace
+instance with one Rayon thread the cursor took 3.55 ms against 2.92 ms eagerly, both in
+place and on the blocking pool. `perf` put 83% of the cursor's samples in the merge count,
+whose branches on the comparison of the two key columns mispredict when the left and
+right keys interleave, as students and employees do in id order. Eager execution counts
+with a branch-free merge over several lanes. The tradeoff is memory, since the eager
+count held 20.8 MB at 10.5M where the cursor held 2.2 MB. A branch-free count in the
+cursor is left to the next part of item 7.
+
+The JVM library now runs queries in automatic mode by default as well. ARQ's result sets
+are lazy iterators that are valid only while their query execution and transaction are
+open, and errors already surface from `hasNext` and `next`, so a streamed result keeps the
+contract Jena callers rely on. Unset `Sparkles.STREAMING_EXECUTION` is automatic
+execution, true streams every SELECT and false runs every query eagerly. Queries in a write
+transaction still run eagerly, because a cursor cannot read the transaction's changes.
+`FfiQuery::execute_with` makes the decision, and when it streams, `FfiQuery::next_batch`
+reads the cursor and can fail. Its batches share one term dictionary up to the dataset's
+term cache size, as an eager result's batches do, and restart it when it is full. The
+encoder decodes a term it has not seen without charging it to the query's memory budget,
+as eager execution decodes its results, so a row of very large literals is held
+uncharged while it is encoded. That is the one exception to the cursor's budget
+accounting, and `QueryBatch::transient_term` is public only for this encoder. A query
+iterator now refuses to read once its transaction has ended and throws `JenaTransactionException`, eager or streamed,
+as Jena's own iterators do, instead of handing out the rest of an eager result.
+
+The first build of the JVM change exported 500,000 rows through JNI in 169 ms against
+126 ms eagerly on forge at 1.05M. Profiles of the native side put the gap in the select
+cursor's encoder. It decoded each cell and charged the term and its vocabulary block's
+scratch to the memory ledger, and it restarted its dictionary every batch. The encoder now
+keys its dictionary by id, decodes a term only when the dictionary lacks it, decodes it as
+eager execution does without the transient charges, and keeps the dictionary across
+batches. The native export then took 52.3 ms against 51.3 ms eagerly, and the JNI export
+130 ms against 126 ms on disk and 129 ms against 124 ms in memory. The binding comparison
+of `scripts/bench-bindings` ran every case twice in each mode in alternating processes.
+No other query, `find`, `contains` or `getProperty` moved by more than run-to-run noise,
+and the small-query latencies at one thread stayed within 2%. The Jena adapter tests now
+cover automatic execution: result iteration, early close, rewindable and copied result
+sets, `ResultSetFormatter` in TSV, JSON and XML, CONSTRUCT and DESCRIBE through graph
+iterators, timeouts and `abort` between reads, and reads after a read transaction ends.
+Jena's contract suites passed on the new default with and without the hand-written JNI
+calls.
+
+The regression of `regex-iri` by about 5% on forge since 6f0f928c has no source change
+behind it. `perf stat` over 2000 requests at 1.05M with one thread counted 3.7% more
+instructions and 5% to 10% more cycles for 6f0f928c than for bb379b91, while `contains`
+moved by 0.6%. In the slower build the regular expression search runs out of line, and
+`KeyFilter::test` shrank from 0xa48 to 0x82a bytes. Unrelated commits changed the
+inlining decisions of thin LTO with four codegen units. Giving the eager key filter
+explicit per-clone `regex_automata` caches, as the cursor's regular expression filter
+has, would make the call independent of that inlining, and is left to item 7.
 
 ### Large basic graph patterns
 
@@ -944,28 +1199,145 @@ pattern into a binary join tree with a join and a sort for each pattern, and the
 the executor and the plan description all recurse through it. A query is refused when its
 plan would nest deeper than 4000 levels, as the
 [nesting limits](../API.md#nesting-limits) describe, so a basic graph pattern holds at
-most 1998 triple patterns. Below that limit, planning time grows with the square of the
-number of triple patterns. The ignored test `large_bgp_planning_time` in
-`crates/sparkles/tests/nesting.rs` measures `explain` on chains of triple patterns in a
-release build. A chain of 500 plans in 70 ms and writes 3.5 MB of plan JSON, a chain of
-1000 takes 197 ms and 13.4 MB, and a chain of 1998 at the limit takes 1.1 s and 53.7 MB.
-The JSON grows with the square of the depth because each node is named by its path from
-the root. An n-ary join over all the triple patterns of a basic graph pattern, built and
-run iteratively, would make planning close to linear and the plan flat. The limit could
-then rise, or count only the levels that still nest.
+most 1998 triple patterns.
 
-The rest of item 84 is work that makes the limit less important. A release build
-explains a plain chain of 1998 in 1.3 to 1.7 s, a tree of 1998 or a MINUS after each of
-790 patterns in 2.8 s, a BIND after each of 790 patterns in 6.9 s and an OPTIONAL after
-each of them in 7.6 s. Most of these shapes observe the timeout during planning, because
-the greedy order calls `ctx.check()`, but a plain chain and its reverse do not. Every
-planning loop, including `joinorder::order` and the candidate loop of the greedy order,
-needs a deadline check, and the candidates should be built without cloning both subtrees. The
-plan JSON for `/{ds}/explain`, the Sparkles result format and its error body should be
-linear in size, by compact node ids or a node cap with a truncation flag. The explanation
-reader in `crates/sparkles-server/src/explain/mod.rs` should be iterative so that its
-256-level limit can rise. A parsed query that the nesting check refuses should be dropped
-without recursion, and the planner and executor could grow the stack at their recursion
-points or use an iterative clone and drop for plan nodes, so that the stack no longer
-depends on the count of the walk. The command-line plan printers are recursive too, but
-no request reaches them.
+Item 84 made the plans at that limit cheap to plan, run and write, and made planning stop
+at the request's timeout or cancellation. The ignored test `large_bgp_planning_time` in
+`crates/sparkles/tests/nesting.rs` measures each shape of `plan_shapes` at the limit in a
+release build. The table gives its numbers on the development laptop before and after the
+change. A shape's name gives its number of triple patterns, and the plan JSON is what
+`/{ds}/explain` writes. A chain of 500 now plans in 43 ms and writes 1.9 MB, against
+66 ms and 3.5 MB before, and a chain of 1000 in 92 ms and 7.4 MB, against 193 ms and
+13.4 MB. Other builds shared the laptop during both runs, so the times are good to
+about a fifth. The star joins every pattern to the others through one variable, with the
+predicates `<urn:p>` and `<urn:q>` alternating, and the hub binds one variable in the
+predicate position of every pattern of a chain. The two rows come from the same shapes
+run through `explain` on a build of the commit before item 84 and on this one, the least
+of three runs each, over the four triples of the test.
+
+| Shape at the limit | `explain` before | `explain` after | Plan JSON before | Plan JSON after |
+|---|---|---|---|---|
+| Chain of 1998 | 1.08 s | 0.35 s | 53.7 MB | 29.7 MB |
+| Reversed chain of 1998 | 1.01 s | 0.27 s | 64.5 MB | 32.5 MB |
+| Tree of 1998 | 2.24 s | 0.34 s | 37.4 MB | 22.4 MB |
+| Pairs of 999 | 1.36 s | 0.49 s | 34.1 MB | 18.1 MB |
+| Chain of 999 with a second predicate | 0.67 s | 0.19 s | 26.2 MB | 11.2 MB |
+| Chain of 571 with VALUES | 0.43 s | 0.11 s | 15.9 MB | 7.3 MB |
+| Chain of 1019 with filters | 71 ms | 34 ms | 1.3 MB | 1.3 MB |
+| Chain of 799 with OPTIONAL | 6.49 s | 0.53 s | 23.3 MB | 13.7 MB |
+| Chain of 799 with MINUS | 2.49 s | 0.15 s | 8.6 MB | 4.8 MB |
+| Chain of 799 with BIND | 5.88 s | 0.18 s | 21.2 MB | 13.5 MB |
+| Star of 1998 | 3.35 s | 0.73 s | 23.1 MB | 15.1 MB |
+| Hub of 1998 | 0.98 s | 0.77 s | 53.8 MB | 29.8 MB |
+
+The gain depends on the shape, from 1.3 times for the hub to 33 times for the BIND, and
+a plain chain or its reverse is 3 to 4 times faster. A star over data does not always
+gain. A star of 1998 patterns on `foaf:knows`, which has the most triples of any
+predicate in `scripts/gen-data.py 3000`, a dataset of 31,815 triples, plans in 2.6 to
+2.8 s against 2.9 to 3.0 s before in three runs on each build, a gain of 1 to 13%. The
+quadratic cost of a variable that many patterns share, described below, dominates it.
+
+Before the change, a plain chain, its reverse and the chain with a second predicate ran
+past a timeout of half their planning time and returned a plan. Every shape now stops
+with `timed out` within half of its planning time past the timeout, or within a second,
+which the test `planning_at_the_limit_stops_at_the_timeout` checks at a quarter and at
+half of the planning time, and the same holds for a cancellation. The eager run of a
+chain at the limit did not finish in ten minutes, and a cursor over it took about four
+minutes to open. Each now takes 0.12 to 1.04 s for every shape, and a cursor opens in 64
+to 890 ms. The test measures the planning time as the least of three runs, and a nextest
+group runs it alone on the machine, since other work stretches the time that a stop takes.
+Whether the description of a plan checks the deadline for each node is tested in
+`sparkles-core` with a deadline that has passed and a count of the checks, which needs no
+clock.
+
+The planner did several kinds of work for each join that grew with the plan below it.
+The join ordering copied an input that is a whole subtree, such as the plan of the
+patterns before an OPTIONAL, to cost it and again to build the plan, so an OPTIONAL
+after each pattern copied the plan once per OPTIONAL. It now moves each input into the
+plan it builds and copies one only to place a filter on it. The greedy ordering tested
+every pair of plans at every step. It now pairs only the plans that share a variable,
+which it finds through a list of the plans that bind each variable, and it keeps with each
+plan what its inputs hold on the join variables, the star masks and the probed sides, rather
+than gathering them from every input at each pairing. The estimate of a join read the
+star masks of every pattern below both sides and kept only those of its join variable.
+It now reads only those. The union of two plans' variables and their distinct-value
+estimates tested membership with a linear search, which costs the product of their
+variables near the root of a deep plan, and they use a hash set once both sides are large.
+The connected parts of a group of more than 32 inputs are found through a map of
+variables instead of a test of every pair of inputs. None of these changes a plan, since
+the costs, the estimates and the tie breaks are the same, and the planner tests pass
+unchanged.
+
+Keeping the star masks and probed sides with each plan trades memory and a little time
+for speed. Each unit holds a sorted vector of the join variables its inputs hold and
+merges it at every join, so planning a snowflake of 12 patterns costs 2.6 to 3.2% more
+instructions than before, and a plan of n inputs whose variables all have star masks can
+hold a vector of n entries for each unit. At the limit the worst case is about 1998 times
+1998 times 32 bytes over two, or 64 MB, which the greedy ordering frees when it ends. The
+lists of the plans that bind each variable add about 100 KB. The trade is made because the
+alternative gathers the same facts from every input at each pairing, which is the work the
+table above removes. Ordinary queries have too few inputs for the vectors to matter.
+
+The greedy ordering checks the timeout and the cancellation for each input, for each
+plan whose pairs it costs and for each plan it builds, and the dynamic program for each
+plan it builds. `explain` checks them for each node it describes, describing a node
+before its children so that each check follows the work of one node. Each operator of a
+cursor describes its own node instead of the subtree below it, which it discarded. A key
+of the result cache writes the variables of every node of its subtree, so the keys of a
+deep plan grew with the cube of its depth. A subtree whose nodes hold more than 16,384
+variables in all, a key of about 100 KB, is no longer cached. The subtrees of ordinary
+queries hold far fewer. The order of the columns of a `SELECT *` result is found once per
+variable, and the parser tests whether a selected variable is new with a set once there
+are more than 32. A merge join of a cursor finds its columns in its inputs through a map
+when both are large.
+
+A plan deeper than 256 levels is written in plan format 2. Its root names `"planFormat":
+2`, and its nodes have no `id`. The ids were paths from the root and took 24 MB of the
+53.7 MB of a chain at the limit, so the JSON grew with the square of the depth. A client
+derives the same ids from the shape, as the plan view of the UI already did and the reader
+of `/{ds}/sparql/explain` now does. A plan of 256 levels or fewer keeps its ids, and every
+query of the test suites plans far less deep. The columns of each node still name every
+variable it binds, so the JSON of a chain stays quadratic in the number of its triple
+patterns, as the plan's own size is. `/{ds}/sparql/explain` refuses a plan whose
+`planFormat` it does not know, and so does the plan view of the UI, which shows a message
+that it cannot show the plan. The OpenAPI description and the generated types of the
+remote JavaScript client list `planFormat`.
+
+A parsed query or update that the nesting check refuses is taken apart without
+recursion, so a shape whose text the nesting scan undercounts cannot overflow the stack
+when it is dropped. The explanation reader and its walk of the patterns use a list of the
+nodes still to visit, and so do the command-line plan printers. The explanation keeps its
+limit of 256 levels below the root and 10,000 nodes, because it names each node by its
+path in its `nodes` and notes and in the `explain_query` text, which would grow with the
+square of the depth. The engine writes format 2 only above 256 levels, so the one
+format 2 plan that the explanation can read has exactly 257 levels, the root and 256
+below it.
+
+The change costs ordinary queries nothing that a count of instructions shows. Eleven
+small queries, from a single triple pattern to a five-pattern join, an OPTIONAL with
+FILTER, ORDER BY and LIMIT, two property paths, a grouped COUNT and a UNION, ran between
+0.95 and 1.01 times the user-mode instructions per query of the base, counted in process
+as the best of five runs on one performance core. The one at 1.01 varied by 5% between
+runs of the base. A chain of 30 triple patterns ran 0.69 times the instructions of the
+base.
+
+Planning time still grows with the square of the triple patterns. A variable shared by
+many patterns costs the most. The index of pairs lists every plan that binds a variable,
+so a variable bound by k plans costs k squared over two candidate pairs at the start and k
+pairs at each of k steps, which is why a star of 1998 patterns plans in 0.7 s on a tiny
+dataset and in 2.6 to 2.8 s on a larger one, which gained the least. Pairing only the
+cheapest holders of such a variable would change plans, so item 84 leaves it to the n-ary
+join. Each join keeps a map of distinct-value estimates for all its variables, each
+estimate of a join walks the patterns below it for its star masks, and variable names are
+interned by a linear search. An n-ary join would let the limit count only the levels that
+nest. The planner would emit one join node for a basic graph pattern whose join tree is
+left-deep, holding its inputs in join order with the algorithm, the keys and the sort of
+each step, so the plan is one level with an input for each pattern. The eager executor
+would fold the inputs in a loop, a cursor would keep the binary operators of the steps in
+a list and pull through them without recursion, and the plan description would write the
+steps as the children of one node. The bushy trees that the greedy order makes for some
+shapes would stay binary. The depth walk would then count a basic graph pattern as two
+levels, and the limit could rise to what the text allows. That changes the planner, both
+executors and the plan format, so it stays on the roadmap. Growing the stack at the
+recursion points of the planner and the executor, or an iterative clone and drop of plan
+nodes, would also make the stack independent of the count of the walk.

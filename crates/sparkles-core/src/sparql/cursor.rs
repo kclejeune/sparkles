@@ -15,6 +15,7 @@ use oxrdf::Term;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 mod binary;
@@ -80,7 +81,9 @@ impl CursorStatus {
 /// retain growing state (for example query-created strings).
 ///
 /// A written node and its operator carry the same `id`, the path of child indexes from
-/// the root, as the nodes of an eager plan do (see [`PlanInfo`]).
+/// the root, as the nodes of an eager plan do (see [`PlanInfo`]). A plan deeper than
+/// [`MAX_ID_DEPTH`](super::exec::MAX_ID_DEPTH) levels is written without ids, in plan
+/// format 2.
 #[derive(Clone, Debug)]
 pub struct CursorPlan {
     pub operator: PlanInfo,
@@ -95,14 +98,35 @@ pub struct CursorPlan {
 
 impl Serialize for CursorPlan {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        self.write("0", s)
+        if self.depth() <= super::exec::MAX_ID_DEPTH {
+            self.write(Some("0"), false, s)
+        } else {
+            self.write(None, true, s)
+        }
     }
 }
 
 impl CursorPlan {
-    fn write<S: serde::Serializer>(&self, id: &str, s: S) -> std::result::Result<S::Ok, S::Error> {
+    /// The levels of the plan: 1 for a plan of one node.
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut todo = vec![(self, 1)];
+        while let Some((n, d)) = todo.pop() {
+            deepest = deepest.max(d);
+            todo.extend(n.children.iter().map(|c| (c, d + 1)));
+        }
+        deepest
+    }
+
+    /// Write the node `id` and its children, or the plan without ids from its `root`.
+    fn write<S: serde::Serializer>(
+        &self,
+        id: Option<&str>,
+        root: bool,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        struct Operator<'a>(&'a PlanInfo, &'a str);
+        struct Operator<'a>(&'a PlanInfo, Option<&'a str>);
         impl Serialize for Operator<'_> {
             fn serialize<S: serde::Serializer>(
                 &self,
@@ -114,13 +138,13 @@ impl CursorPlan {
                 m.end()
             }
         }
-        struct Child<'a>(&'a CursorPlan, String);
+        struct Child<'a>(&'a CursorPlan, Option<String>);
         impl Serialize for Child<'_> {
             fn serialize<S: serde::Serializer>(
                 &self,
                 s: S,
             ) -> std::result::Result<S::Ok, S::Error> {
-                self.0.write(&self.1, s)
+                self.0.write(self.1.as_deref(), false, s)
             }
         }
         // a plan nests up to `MAX_PLAN_DEPTH` levels, as in `PlanWithId`
@@ -129,7 +153,12 @@ impl CursorPlan {
             super::exec::PLAN_STACK_SEGMENT,
             || {
                 let mut m = s.serialize_map(None)?;
-                m.serialize_entry("id", id)?;
+                if root {
+                    m.serialize_entry("planFormat", &super::exec::PLAN_FORMAT)?;
+                }
+                if let Some(id) = id {
+                    m.serialize_entry("id", id)?;
+                }
                 m.serialize_entry("operator", &Operator(&self.operator, id))?;
                 m.serialize_entry("materializes", &self.materializes)?;
                 m.serialize_entry("fullInputBeforeOutput", &self.full_input_before_output)?;
@@ -140,7 +169,7 @@ impl CursorPlan {
                     .children
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| Child(c, format!("{id}.{i}")))
+                    .map(|(i, c)| Child(c, id.map(|id| format!("{id}.{i}"))))
                     .collect();
                 m.serialize_entry("children", &children)?;
                 m.end()
@@ -221,11 +250,56 @@ impl QueryBatch {
         self.ctx.batch_term(id)
     }
 
+    /// The term of a key that [`QueryBatch::key`] gave for a cell of this batch, decoded
+    /// without the checks against the query's memory budget, for a caller that drops the
+    /// term at once, such as an encoder that writes it out. The charges of
+    /// [`QueryBatch::term`] for the term and its vocabulary block's scratch end with the
+    /// call, so they only refuse a term that does not fit in what remains of the budget,
+    /// and eager execution decodes its results the same way.
+    pub fn transient_term(&self, key: u64) -> Option<Term> {
+        self.ctx.transient_batch_term(Id(key))
+    }
+
+    /// A key of the cell's term that is the same for every cell of the query that holds
+    /// the same internal id, so that a writer can encode each term once without decoding
+    /// it first. UNDEF is None. Two keys can still name equal terms.
+    pub fn key(&self, row: usize, column: usize) -> Result<Option<u64>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        let id = self.id(row, column);
+        Ok((!id.is_undef()).then_some(id.0))
+    }
+
     pub fn row(&self, row: usize) -> Result<Vec<Option<Term>>> {
         if row >= self.len() {
             return Err(Error::invalid("query batch row is out of bounds"));
         }
         (0..self.width()).map(|c| self.term(row, c)).collect()
+    }
+
+    /// [`QueryBatch::term`] for a writer that has reserved [`QueryBatch::cell_bytes`] for
+    /// the cell, through [`QueryBatch::row_bytes`] or [`DecodedBatch::row_bytes`].
+    pub(super) fn reserved_term(&self, row: usize, column: usize) -> Result<Option<Term>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        self.ctx.reserved_batch_term(self.id(row, column))
+    }
+
+    /// [`QueryBatch::term`] for a writer that holds one reservation for its row: `cover`
+    /// is asked for the cell's [`QueryBatch::cell_bytes`] before the term is built, and
+    /// the key is decoded once.
+    pub(super) fn covered_term(
+        &self,
+        row: usize,
+        column: usize,
+        cover: impl FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Term>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        self.ctx.covered_batch_term(self.id(row, column), cover)
     }
 
     pub(super) fn row_bytes(&self, row: usize) -> Result<u64> {
@@ -258,23 +332,39 @@ impl QueryBatch {
     /// sorted order. Its terms and construction scratch stay on this query's
     /// budget. A refused cache is discarded before returning the row-wise path.
     pub(super) fn decoded(&self) -> Result<Option<DecodedBatch<'_>>> {
-        match DecodedBatch::new(self) {
-            Ok(decoded) => Ok(Some(decoded)),
+        Ok(self
+            .term_cache()?
+            .map(|cache| DecodedBatch { batch: self, cache }))
+    }
+
+    /// The terms of [`QueryBatch::decoded`] without the borrow of the batch, so that
+    /// another thread can build them while the writer serializes the batch before it.
+    pub(super) fn term_cache(&self) -> Result<Option<TermCache>> {
+        match TermCache::new(self) {
+            Ok(cache) => Ok(Some(cache)),
             Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory => Ok(None),
             Err(error) => Err(error),
         }
     }
 }
 
+/// The smallest step in which a decoded batch reserves memory for its terms.
+const TERM_RESERVE: u64 = 64 << 10;
 pub(super) struct DecodedBatch<'a> {
     batch: &'a QueryBatch,
-    terms: Vec<Term>,
-    slots: Vec<u32>,
-    _charge: super::ctx::Charge<'a>,
+    cache: TermCache,
 }
 
-impl<'a> DecodedBatch<'a> {
-    fn new(batch: &'a QueryBatch) -> Result<Self> {
+/// The decoded base-vocabulary terms of one batch, each decoded once in key order, and
+/// the term of each cell. It holds its reservation until it is dropped.
+pub(super) struct TermCache {
+    terms: Vec<Term>,
+    slots: Vec<u32>,
+    _charge: OwnedCharge,
+}
+
+impl TermCache {
+    fn new(batch: &QueryBatch) -> Result<Self> {
         let ctx = &batch.ctx;
         ctx.check()?;
         let cells = batch
@@ -284,7 +374,8 @@ impl<'a> DecodedBatch<'a> {
             .ok_or_else(|| Error::invalid("query batch has too many cells"))?;
         // Pairs, slots, unique IDs, term capacity and row adapters coexist during
         // construction. Reserve before allocating, including reconstruction.
-        let charge = ctx.charge((cells as u64).saturating_mul(128).saturating_add(1024))?;
+        let mut held = (cells as u64).saturating_mul(128).saturating_add(1024);
+        let mut charge = OwnedCharge::new(ctx, held)?;
         let mut pairs = Vec::with_capacity(cells);
         for column in 0..batch.width() {
             for row in 0..batch.len() {
@@ -313,6 +404,13 @@ impl<'a> DecodedBatch<'a> {
         let mut terms = Vec::with_capacity(ids.len());
         let scratch = ctx.charge(0)?;
         let mut reserved = 0;
+        // Terms are reserved ahead in chunks of at least TERM_RESERVE bytes. A cursor's
+        // charge goes through the memory ledger, and one reservation per term cost a
+        // large native JSON answer about 15% of its time. The reservation still comes
+        // before each term's allocation and overstates the batch by under one chunk.
+        // With under one chunk of budget left, a term reserves its exact size instead,
+        // so the cache is declined only when its terms do not fit.
+        let mut ahead = 0u64;
         ctx.snap.generation.vocab.get_sorted_checked(
             &ids,
             |need| {
@@ -326,28 +424,55 @@ impl<'a> DecodedBatch<'a> {
                 if terms.len() % 1024 == 0 {
                     ctx.check()?;
                 }
-                charge.add((key.len() as u64).saturating_mul(8).saturating_add(128))?;
+                let bytes = (key.len() as u64).saturating_mul(8).saturating_add(128);
+                if bytes > ahead {
+                    let more = bytes.max(TERM_RESERVE);
+                    match charge.resize(held.saturating_add(more)) {
+                        Ok(()) => {
+                            held = held.saturating_add(more);
+                            ahead = ahead.saturating_add(more);
+                        }
+                        // A refused charge leaves the ledger unchanged, so this term can
+                        // still reserve what the leftover of the last chunk lacks.
+                        Err(Error::BudgetExceeded(b))
+                            if b.kind == crate::error::BudgetKind::Memory && more > bytes =>
+                        {
+                            charge.resize(held.saturating_add(bytes - ahead))?;
+                            held = held.saturating_add(bytes - ahead);
+                            ahead = bytes;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                ahead -= bytes;
                 terms.push(crate::id::key_to_term(key));
                 Ok::<(), Error>(())
             },
         )?;
         Ok(Self {
-            batch,
             terms,
             slots,
             _charge: charge,
         })
     }
+}
+
+impl<'a> DecodedBatch<'a> {
+    /// A batch with the terms that [`QueryBatch::term_cache`] built for it.
+    pub(super) fn new(batch: &'a QueryBatch, cache: TermCache) -> Self {
+        Self { batch, cache }
+    }
 
     fn cached(&self, row: usize, column: usize) -> Option<&Term> {
-        self.terms
-            .get(self.slots[column * self.batch.len() + row] as usize)
+        self.cache
+            .terms
+            .get(self.cache.slots[column * self.batch.len() + row] as usize)
     }
 
     pub(super) fn term(&self, row: usize, column: usize) -> Result<Option<Cow<'_, Term>>> {
         match self.cached(row, column) {
             Some(term) => Ok(Some(Cow::Borrowed(term))),
-            None => Ok(self.batch.term(row, column)?.map(Cow::Owned)),
+            None => Ok(self.batch.reserved_term(row, column)?.map(Cow::Owned)),
         }
     }
 
@@ -628,6 +753,11 @@ impl MaterializedResult {
             serde_json::to_string(&self.result().plan).map_err(|e| Error::invalid(e.to_string()))
         })
     }
+    /// The result itself, as the eager query APIs return it. Its plan is then dropped
+    /// by its new owner, as theirs is.
+    pub fn into_result(mut self) -> QueryResult {
+        self.result.take().expect("live materialized result")
+    }
 }
 impl Drop for MaterializedResult {
     fn drop(&mut self) {
@@ -638,17 +768,31 @@ impl Drop for MaterializedResult {
 /// The completed boolean query result.
 pub type AskResult = MaterializedResult;
 
+/// How a query runs. [`ExecutionMode::Auto`] is the default: it streams the plans that
+/// measured faster as cursors and runs every other plan eagerly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
-    #[default]
     Eager,
     Streaming,
-    /// Use pull execution for measured large immutable scans and uncached OPTIONAL counts.
+    /// Use pull execution for plain immutable scans of an estimated thousand rows or more.
+    #[default]
     Auto,
 }
 
-/// Production-allocator admission for immutable scans and uncached large
-/// OPTIONAL counts. Other plans retain eager execution.
+/// The estimated rows from which automatic execution streams a plain scan. A cursor
+/// writes a scan's results faster than eager execution from about a hundred rows on, at
+/// one Rayon thread and at twelve, and costs a query of fewer rows a microsecond or two.
+pub(super) const AUTO_SCAN_ROWS: f64 = 1_000.0;
+
+/// Production-allocator admission for immutable scans. Other plans retain eager
+/// execution.
+///
+/// An uncached OPTIONAL count on a single key streamed from an estimated million input
+/// rows until 2026-10-17. The cursor counts the join with a branching merge, which on the
+/// AMD EPYC hosts of the Namespace screens took 1.19 to 1.23 times as long as eager
+/// execution's branch-free merge at 10.5M, and on forge's Intel CPU 0.99 times as long.
+/// Such a count now runs eagerly. Eager execution holds both sides of the join, 20.8 MB at
+/// 10.5M where the cursor held 2.2 MB.
 pub(super) fn auto_streaming(
     ctx: &Ctx,
     node: &Node,
@@ -674,47 +818,14 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
-    fn count(ctx: &Ctx, node: &Node) -> bool {
-        match &node.kind {
-            Kind::Project(_)
-            | Kind::Slice { offset: 0, .. }
-            | Kind::Extend(_, super::expr::Expr::Var(_))
-                if node.children.len() == 1 =>
-            {
-                count(ctx, &node.children[0])
-            }
-            Kind::Group { keys, aggs } if keys.is_empty() && group::eligible(node) => {
-                let child = &node.children[0];
-                let rows = child.est + child.children.iter().map(|child| child.est).sum::<f64>();
-                aggs.iter().all(|(_, agg)| {
-                    agg.expr.is_none()
-                        && !agg.distinct
-                        && matches!(agg.func, spargebra::algebra::AggregateFunction::Count)
-                }) && matches!(child.kind, Kind::LeftJoin { expr: None })
-                    && merge::eligible(child)
-                    && child.children[0]
-                        .vars
-                        .iter()
-                        .filter(|v| child.children[1].vars.contains(v))
-                        .count()
-                        == 1
-                    && child
-                        .children
-                        .iter()
-                        .all(|child| matches!(child.kind, Kind::Scan(_)) && scan(ctx, child))
-                    && rows.is_finite()
-                    && rows >= 1_000_000.0
-            }
-            _ => false,
-        }
-    }
-    let scans = if node.est.is_finite() && node.est >= 1_000_000.0 && scan(ctx, node) {
-        1
-    } else if (!ctx.use_cache || !ctx.snap.results.enabled()) && count(ctx, node) {
-        2
-    } else {
+    if !(node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node)) {
         return false;
-    };
+    }
+    // A scan expected to pass the row budgets stays eager, so that it fails before the
+    // first byte of output with an error status rather than partway through a stream.
+    if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
+        return false;
+    }
     let cap = options
         .batch_rows
         .min(options.batch_bytes / node.vars.len().max(1).saturating_mul(8));
@@ -724,12 +835,11 @@ pub(super) fn auto_streaming(
             .map(width)
             .fold(node.vars.len(), usize::max)
     }
-    // Aggregate output can be narrower than either scan or the join layout.
-    // Admission must leave room for their input batches as well as the result.
+    // A projection can be narrower than its scan. Admission must leave room for the
+    // scan's input batches as well as the result.
     let row_bytes = (width(node) as u64).saturating_mul(8).saturating_add(16);
     let headroom = (crate::index::BLOCK_ROWS as u64 * 32 + 512)
-        .saturating_mul(scans)
-        .saturating_add((cap as u64).saturating_mul(row_bytes).saturating_mul(scans))
+        .saturating_add((cap as u64).saturating_mul(row_bytes))
         .saturating_add((ctx.nvars() as u64).saturating_mul(16))
         .saturating_add(4096);
     kind == QueryKind::Select
@@ -748,22 +858,49 @@ pub fn query_execution(
     cursor: &CursorOptions,
     mode: ExecutionMode,
 ) -> Result<QueryExecution> {
+    query_execution_with_plan(snapshot, query, options, cursor, mode).map_err(|f| f.error)
+}
+
+/// The stack left on a thread that parses without measuring the text first. It covers the
+/// parser at the deepest nesting spargebra accepts, about 1.5 MiB.
+const PARSE_STACK: usize = 2 << 20;
+
+/// [`query_execution`], with the plan of an eager query that failed while it ran, as
+/// [`super::query_with_plan`] gives it.
+pub fn query_execution_with_plan(
+    snapshot: Arc<Snapshot>,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    mode: ExecutionMode,
+) -> std::result::Result<QueryExecution, Box<super::Failed>> {
     if mode == ExecutionMode::Streaming
         || (mode == ExecutionMode::Auto && cursor.fallback == FallbackPolicy::RejectMaterialization)
     {
-        return query_cursor(snapshot, query, options, cursor);
+        return Ok(query_cursor(snapshot, query, options, cursor)?);
     }
     let started = Instant::now();
-    let parser_depth = spargebra::nesting::measure(query)
-        .depth
-        .min(depth::MAX_ALGEBRA_DEPTH);
-    depth::with_stack(parser_depth, || {
+    // The parser recurses once per bracket, and spargebra refuses a text with more than
+    // MAX_NESTING of them, which takes about 1.5 MiB. A thread with more stack left than
+    // that, such as a server worker, parses as the eager query APIs do. Measuring the text
+    // first would scan it a second time, which costs a small query about 0.5% of its
+    // instructions. A smaller thread measures the text and grows its stack to fit.
+    let parser_depth = if stacker::remaining_stack().is_some_and(|left| left >= PARSE_STACK) {
+        0
+    } else {
+        spargebra::nesting::measure(query)
+            .depth
+            .min(depth::MAX_ALGEBRA_DEPTH)
+    };
+    depth::with_stack(parser_depth, move || {
         let parsed = super::parse_query(query, options.base_iri.as_deref(), &options.prefixes)?;
         let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
         let levels = depth::check_query(&parsed)?;
-        depth::with_stack(levels, || {
+        // the algebra is dropped on the stack sized for its depth
+        depth::with_stack(levels, move || {
             if mode == ExecutionMode::Eager {
-                let mut result = super::execute_query(snapshot, &parsed, options, parse_ms)?;
+                let mut result =
+                    super::execute_query_with_plan(snapshot, &parsed, options, parse_ms)?;
                 if result.kind == QueryKind::Select {
                     super::select_star_order(query, &mut result);
                 }
@@ -774,9 +911,7 @@ pub fn query_execution(
                 })));
             }
             if cursor.batch_rows == 0 || cursor.batch_bytes == 0 {
-                return Err(Error::invalid(
-                    "cursor batch rows and bytes must be positive",
-                ));
+                return Err(Error::invalid("cursor batch rows and bytes must be positive").into());
             }
             let planning = Instant::now();
             let prepared =
@@ -793,8 +928,7 @@ pub fn query_execution(
             } else {
                 let mut result = depth::with_stack(levels, || {
                     super::execute_prepared(&parsed, options, parse_ms, plan_ms, prepared)
-                })
-                .map_err(|f| f.error)?;
+                })?;
                 if result.kind == QueryKind::Select {
                     super::select_star_order(query, &mut result);
                 }
@@ -847,11 +981,22 @@ impl QueryExecution {
             Self::Eager(r) | Self::Ask(r) => r.result().ctx.cancel.clone(),
         }
     }
+    /// The deadline without the time the query spent waiting for its consumer. The
+    /// effective deadline is `deadline() + deadline_pause()`.
     pub fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Select(c) => c.deadline(),
             Self::Graph(c) => c.deadline(),
             Self::Eager(r) | Self::Ask(r) => r.result().ctx.deadline,
+        }
+    }
+    /// The nanoseconds the query spent waiting for its consumer. Adding to the counter
+    /// moves the effective deadline back by as much.
+    pub fn deadline_pause(&self) -> Arc<AtomicU64> {
+        match self {
+            Self::Select(c) => c.deadline_pause(),
+            Self::Graph(c) => c.deadline_pause(),
+            Self::Eager(r) | Self::Ask(r) => r.result().ctx.deadline_pause.clone(),
         }
     }
     pub fn plan_json(&self) -> Result<String> {
@@ -922,6 +1067,11 @@ impl QueryCursor {
     pub fn deadline(&self) -> Option<Instant> {
         self.ctx.deadline
     }
+    /// The nanoseconds this cursor's consumer kept it waiting, which its deadline does
+    /// not count.
+    pub fn deadline_pause(&self) -> Arc<AtomicU64> {
+        self.ctx.deadline_pause.clone()
+    }
 
     pub(super) fn check(&self) -> Result<()> {
         self.ctx.check()
@@ -962,6 +1112,96 @@ impl QueryCursor {
 
     pub fn next_batch(&mut self) -> Result<Option<QueryBatch>> {
         self.next_batch_at_most(self.options.batch_rows)
+    }
+
+    /// Hand each batch, with the terms of its base-vocabulary cells decoded once in key
+    /// order, to `each`, until `send` rows have been pulled or the cursor ends. Returns the
+    /// rows of `send` left over, which without `send` count down from `usize::MAX`, so that
+    /// 0 means the writer stopped at `send`.
+    ///
+    /// With `decode_ahead` and more than one Rayon worker, every batch after the first is
+    /// pulled before `each` handles the one before it, and its terms are decoded on the pool
+    /// while `each` runs. Two batches and their terms are then live at once, both charged.
+    /// The first batch goes to `each` before the second is pulled, so the first rows of an
+    /// answer wait for one batch only, however slowly the plan produces the next. Decoding
+    /// ahead then starts only when the memory budget has room for twice what the first
+    /// batch took, and the writer otherwise goes on in turn. The first batch is only an
+    /// estimate of the others. When later batches hold larger terms, a budget within a
+    /// few KiB of what the writer in turn needs can still fail with decoding ahead, with a
+    /// memory budget error and never with other output.
+    ///
+    /// An error while pulling a batch ahead is returned after `each` has been called with the
+    /// batch before it. A memory budget failure inside the plan also fails every later
+    /// check of the query, so `each` then stops at its first check, and the rows of that
+    /// batch are not written. Without decoding ahead those rows would be written before the
+    /// pull that fails. The answer is an error either way.
+    pub(super) fn for_each_decoded(
+        &mut self,
+        send: Option<usize>,
+        mut each: impl FnMut(&Self, &QueryBatch, Option<&DecodedBatch<'_>>) -> Result<()>,
+    ) -> Result<usize> {
+        let mut remaining = send.unwrap_or(usize::MAX);
+        let mut ahead = self.ctx.opt.decode_ahead && rayon::current_num_threads() >= 2;
+        // In turn: every batch without decoding ahead, and the first batch with it.
+        let mut first = true;
+        while remaining > 0 && (first || !ahead) {
+            let before = self.ctx.live_bytes();
+            let Some(batch) = self.next_batch_at_most(remaining)? else {
+                return Ok(remaining);
+            };
+            let decoded = batch.decoded()?;
+            each(self, &batch, decoded.as_ref())?;
+            remaining -= batch.len().min(remaining);
+            if first {
+                first = false;
+                // Decoding ahead holds a second batch and its terms. It starts only when
+                // the memory budget has room for twice what the first batch took at its
+                // peak, which keeps most budgets that the writer fits in turn from failing
+                // it. Batches larger than the first can still use up the room.
+                let took = self.ctx.mem_peak().saturating_sub(before);
+                ahead = ahead && self.ctx.memory_remaining() >= took.saturating_mul(2);
+            }
+        }
+        if remaining == 0 {
+            return Ok(remaining);
+        }
+        let mut current = match self.next_batch_at_most(remaining)? {
+            Some(batch) => {
+                let cache = batch.term_cache()?;
+                Some((batch, cache))
+            }
+            None => None,
+        };
+        while let Some((batch, cache)) = current.take() {
+            remaining -= batch.len().min(remaining);
+            let next = if remaining > 0 {
+                self.next_batch_at_most(remaining)
+            } else {
+                Ok(None)
+            };
+            let decoded = cache.map(|cache| DecodedBatch::new(&batch, cache));
+            match next {
+                Ok(Some(next)) => {
+                    let mut built = None;
+                    let (slot, upcoming, this) = (&mut built, &next, &*self);
+                    let written = rayon::in_place_scope(|scope| {
+                        scope.spawn(move |_| *slot = Some(upcoming.term_cache()));
+                        each(this, &batch, decoded.as_ref())
+                    });
+                    drop(decoded);
+                    drop(batch);
+                    written?;
+                    let cache = built.expect("the decoding task ran")?;
+                    current = Some((next, cache));
+                }
+                Ok(None) => each(self, &batch, decoded.as_ref())?,
+                Err(error) => {
+                    each(self, &batch, decoded.as_ref())?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(remaining)
     }
 
     pub(super) fn next_batch_at_most(&mut self, rows: usize) -> Result<Option<QueryBatch>> {
@@ -1456,11 +1696,10 @@ impl Operator {
                 node.operator()
             )));
         }
-        let mut info = exec::describe(ctx, &node);
+        let mut info = exec::describe_node(ctx, &node);
         if ctx.graphs.is_some() {
             info.redact();
         }
-        info.children.clear();
         info.actual_rows = 0;
         let vars = node.vars.clone();
         // A fallback materializes only its own operator when it reads its children as
@@ -2878,8 +3117,11 @@ mod tests {
         evicted_skipped_read_ahead_column("count");
     }
 
+    /// The decision table of automatic execution for an OPTIONAL count on a single key:
+    /// eager whether results are cached or not and however many rows it reads, since the
+    /// cursor's count measured up to 1.23 times as long as eager's on AMD hosts.
     #[test]
-    fn automatic_counts_preserve_enabled_result_caches() {
+    fn automatic_execution_keeps_optional_counts_eager() {
         use crate::io::Source;
         use crate::store::{Store, StoreOptions};
         let store = Store::in_memory(StoreOptions::default());
@@ -2896,45 +3138,34 @@ mod tests {
             &[],
         )
         .unwrap();
-        let options = QueryOptions {
-            no_cache: true,
-            ..Default::default()
-        };
-        let mut p =
-            super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
-        let mut group = &mut p.node;
-        while matches!(
-            group.kind,
-            Kind::Project(_)
-                | Kind::Slice { offset: 0, .. }
-                | Kind::Extend(_, super::super::expr::Expr::Var(_))
-        ) {
-            group = &mut group.children[0];
+        for no_cache in [true, false] {
+            for est in [1_000.0, 1_000_000.0, 100_000_000.0] {
+                let options = QueryOptions {
+                    no_cache,
+                    ..Default::default()
+                };
+                let mut p = super::super::prepare_query(store.snapshot(), &q, &options, None, None)
+                    .unwrap();
+                let mut group = &mut p.node;
+                while matches!(
+                    group.kind,
+                    Kind::Project(_)
+                        | Kind::Slice { offset: 0, .. }
+                        | Kind::Extend(_, super::super::expr::Expr::Var(_))
+                ) {
+                    group = &mut group.children[0];
+                }
+                assert!(matches!(group.kind, Kind::Group { .. }));
+                group.children[0].est = est;
+                for child in &mut group.children[0].children {
+                    child.est = est;
+                }
+                assert!(
+                    !auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()),
+                    "no_cache {no_cache}, {est} rows"
+                );
+            }
         }
-        assert!(matches!(group.kind, Kind::Group { .. }));
-        group.children[0].est = 1_000_000.0;
-        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()));
-        let cached =
-            super::super::prepare_query(store.snapshot(), &q, &Default::default(), None, None)
-                .unwrap();
-        assert!(!auto_streaming(
-            &cached.ctx,
-            &p.node,
-            p.kind,
-            &Default::default()
-        ));
-        let low = QueryOptions {
-            no_cache: true,
-            max_memory_bytes: Some(2 << 20),
-            ..Default::default()
-        };
-        let low = super::super::prepare_query(store.snapshot(), &q, &low, None, None).unwrap();
-        assert!(!auto_streaming(
-            &low.ctx,
-            &p.node,
-            p.kind,
-            &Default::default()
-        ));
     }
 
     #[test]
@@ -2960,6 +3191,29 @@ mod tests {
         let p = prepare(store.snapshot(), &Default::default());
         let options = CursorOptions::default();
         assert!(auto_streaming(&p.ctx, &p.node, p.kind, &options));
+        // a scan streams from the measured size on
+        let mut small = prepare(store.snapshot(), &Default::default());
+        small.node.est = AUTO_SCAN_ROWS;
+        assert!(auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
+        small.node.est = AUTO_SCAN_ROWS - 1.0;
+        assert!(!auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
+        small.node.est = f64::INFINITY;
+        assert!(!auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
         assert!(!auto_streaming(
             &p.ctx,
             &p.node,
@@ -3001,6 +3255,40 @@ mod tests {
             low.kind,
             &Default::default()
         ));
+        // A scan expected to pass a row budget stays eager, so that the budget fails it
+        // before any output.
+        for budget in [
+            QueryOptions {
+                max_rows: Some(999_999),
+                ..Default::default()
+            },
+            QueryOptions {
+                max_rows_produced: Some(999_999),
+                ..Default::default()
+            },
+        ] {
+            let capped = prepare(store.snapshot(), &budget);
+            assert!(!auto_streaming(
+                &capped.ctx,
+                &capped.node,
+                capped.kind,
+                &Default::default()
+            ));
+        }
+        let roomy = prepare(
+            store.snapshot(),
+            &QueryOptions {
+                max_rows: Some(1_000_000),
+                max_rows_produced: Some(1_000_000),
+                ..Default::default()
+            },
+        );
+        assert!(auto_streaming(
+            &roomy.ctx,
+            &roomy.node,
+            roomy.kind,
+            &Default::default()
+        ));
         super::super::update::update(
             &store,
             "INSERT DATA {<urn:new> <urn:p> 2}",
@@ -3018,9 +3306,164 @@ mod tests {
         assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()));
     }
 
+    /// A cursor over a few dozen distinct IRIs and literals, and its first batch of
+    /// eight rows, for the tests of the decoded batch's reservation.
+    fn first_batch(memory: u64) -> QueryBatch {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..48)
+            .map(|i| format!("<urn:s:{i}> <urn:p> \"object number {i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let options = QueryOptions {
+            max_memory_bytes: Some(memory),
+            ..Default::default()
+        };
+        let cursor = CursorOptions {
+            batch_rows: 8,
+            ..Default::default()
+        };
+        let mut cursor = select_cursor(
+            store.snapshot(),
+            "SELECT ?s ?o { ?s <urn:p> ?o }",
+            &options,
+            &cursor,
+        )
+        .unwrap();
+        let batch = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(batch.len(), 8);
+        batch
+    }
+
+    #[test]
+    fn decoded_batch_reserves_exactly_when_under_one_chunk_remains() {
+        let batch = first_batch(4 << 20);
+        let ctx = batch.ctx.clone();
+        let filler = ctx.charge(ctx.memory_remaining() - (32 << 10)).unwrap();
+        assert!(ctx.memory_remaining() < TERM_RESERVE);
+        let decoded = batch.decoded().unwrap();
+        assert!(
+            decoded.is_some(),
+            "a batch whose terms fit in the budget decodes, whatever the chunk size"
+        );
+        assert!(ctx.memory_remaining() < 32 << 10);
+        drop(decoded);
+        drop(filler);
+    }
+
+    #[test]
+    fn decoded_batch_releases_its_reservation() {
+        let batch = first_batch(4 << 20);
+        let ctx = batch.ctx.clone();
+        let before = ctx.memory_remaining();
+        let decoded = batch.decoded().unwrap().unwrap();
+        assert!(ctx.memory_remaining() < before);
+        drop(decoded);
+        assert_eq!(ctx.memory_remaining(), before);
+        // A budget that holds the pairs but not the terms declines the cache, and the
+        // failed attempt gives back everything it reserved.
+        let filler = ctx.charge(before - (4 << 10)).unwrap();
+        let tight = ctx.memory_remaining();
+        assert!(batch.decoded().unwrap().is_none());
+        assert_eq!(ctx.memory_remaining(), tight);
+        drop(filler);
+        assert_eq!(ctx.memory_remaining(), before);
+    }
+
     #[test]
     fn successor_carries_and_stops_at_maximum() {
         assert_eq!(successor([7, 9, u64::MAX, u64::MAX]), Some([7, 10, 0, 0]));
         assert_eq!(successor([u64::MAX; 4]), None);
+    }
+
+    /// A writer that decodes ahead pulls each batch after the first before it writes the
+    /// one before, and it writes the first batch before it pulls the second, so that the
+    /// first rows wait for one batch only. Its batches and term caches go back to the
+    /// ledger as they do without decoding ahead.
+    #[test]
+    fn decoding_ahead_writes_the_first_batch_before_pulling_the_second() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..10_000)
+            .map(|i| format!("<urn:s:{i}> <urn:p> \"v{i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let run = |ahead: bool, send: Option<usize>| {
+            let mut opt = crate::sparql::Optimizations::default();
+            if !ahead {
+                opt = opt.disable("decode_ahead").unwrap();
+            }
+            let options = QueryOptions {
+                optimizations: Some(opt),
+                ..Default::default()
+            };
+            let mut cursor = select_cursor(
+                store.snapshot(),
+                "SELECT ?s ?o {?s <urn:p> ?o}",
+                &options,
+                &CursorOptions {
+                    batch_rows: 1000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut produced = Vec::new();
+            let mut rows = 0;
+            let left = pool
+                .install(|| {
+                    cursor.for_each_decoded(send, |cursor, batch, decoded| {
+                        assert!(decoded.is_some(), "the terms of every batch are decoded");
+                        produced.push(cursor.ctx.rows_produced());
+                        rows += batch.len();
+                        Ok(())
+                    })
+                })
+                .unwrap();
+            (produced, rows, left, cursor.ctx.live_bytes())
+        };
+        let (serial, rows, left, serial_live) = run(false, None);
+        assert_eq!((rows, left), (10_000, usize::MAX - 10_000));
+        // the operators' rows of one batch
+        let unit = serial[0];
+        assert!(unit >= 1000);
+        assert_eq!(serial, (1..=10).map(|i| i * unit).collect::<Vec<u64>>());
+        let (ahead, rows, left, ahead_live) = run(true, None);
+        assert_eq!((rows, left), (10_000, usize::MAX - 10_000));
+        // the first batch alone, then each batch with the next one pulled
+        let mut want = vec![unit, 3 * unit];
+        want.extend((4..=10).map(|i| i * unit));
+        want.push(10 * unit);
+        assert_eq!(ahead, want);
+        assert_eq!(
+            ahead_live, serial_live,
+            "decoding ahead holds nothing afterwards"
+        );
+        // `send` stops the pulls at its rows
+        for send in [0, 1, 999, 1000, 1001, 2500, 10_000] {
+            let (serial, rows, left, _) = run(false, Some(send));
+            let (ahead, ahead_rows, ahead_left, _) = run(true, Some(send));
+            assert_eq!((rows, left), (send, 0), "send {send}");
+            assert_eq!((ahead_rows, ahead_left), (send, 0), "send {send}");
+            assert_eq!(ahead.first(), serial.first(), "send {send}");
+            assert_eq!(ahead.last(), serial.last(), "send {send}");
+        }
     }
 }

@@ -70,6 +70,247 @@ pub fn check_update(u: &Update) -> Result<usize> {
     plan_limit(Walk::new(MAX_PLAN_DEPTH, true).update(u))
 }
 
+/// [`check_query`] for a query the caller gives up when it is refused: a refused query is
+/// taken apart without recursion (see [`discard_query`]).
+pub fn checked_query(q: Query) -> Result<(Query, usize)> {
+    match check_query(&q) {
+        Ok(depth) => Ok((q, depth)),
+        Err(e) => {
+            discard_query(q);
+            Err(e)
+        }
+    }
+}
+
+/// [`check_update`] for an update the caller gives up when it is refused, which is taken
+/// apart without recursion.
+pub fn checked_update(u: Update) -> Result<(Update, usize)> {
+    match check_update(&u) {
+        Ok(depth) => Ok((u, depth)),
+        Err(e) => {
+            discard_update(u);
+            Err(e)
+        }
+    }
+}
+
+/// Drop a query without recursion. Dropping the algebra recurses once per level, and the
+/// walk of [`check_query`] stops at its limit, so a refused query can nest deeper than any
+/// stack holds when the count of its text missed how it nests.
+pub fn discard_query(q: Query) {
+    let mut t = Teardown::default();
+    match q {
+        Query::Select { pattern, .. }
+        | Query::Ask { pattern, .. }
+        | Query::Describe { pattern, .. } => t.patterns.push(pattern),
+        Query::Construct {
+            template,
+            graph_templates,
+            pattern,
+            ..
+        } => {
+            t.patterns.push(pattern);
+            t.triples.extend(template);
+            t.triples
+                .extend(graph_templates.into_iter().flat_map(|g| g.triples));
+        }
+    }
+    t.run();
+}
+
+/// Drop an update without recursion, as [`discard_query`] drops a query.
+pub fn discard_update(u: Update) {
+    let mut t = Teardown::default();
+    for op in u.operations {
+        if let GraphUpdateOperation::DeleteInsert { pattern, .. } = op {
+            t.patterns.push(*pattern);
+        }
+    }
+    t.run();
+}
+
+/// The parts of an algebra still to take apart. Each is moved out of its parent before
+/// the parent is dropped, so no drop recurses into a child that still has children.
+#[derive(Default)]
+struct Teardown {
+    patterns: Vec<GraphPattern>,
+    exprs: Vec<Expression>,
+    paths: Vec<PropertyPathExpression>,
+    triples: Vec<TriplePattern>,
+}
+
+impl Teardown {
+    fn run(&mut self) {
+        loop {
+            if let Some(p) = self.patterns.pop() {
+                self.pattern(p);
+            } else if let Some(e) = self.exprs.pop() {
+                self.expr(e);
+            } else if let Some(p) = self.paths.pop() {
+                self.path(p);
+            } else if let Some(t) = self.triples.pop() {
+                self.term(t.subject);
+                self.term(t.object);
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn term(&mut self, t: TermPattern) {
+        if let TermPattern::Triple(t) = t {
+            self.triples.push(*t);
+        }
+    }
+
+    fn order(&mut self, o: OrderExpression) {
+        match o {
+            OrderExpression::Asc(e) | OrderExpression::Desc(e) => self.exprs.push(e),
+        }
+    }
+
+    fn pattern(&mut self, p: GraphPattern) {
+        match p {
+            GraphPattern::Bgp { patterns } => self.triples.extend(patterns),
+            GraphPattern::Path {
+                subject,
+                path,
+                object,
+            } => {
+                self.term(subject);
+                self.paths.push(path);
+                self.term(object);
+            }
+            GraphPattern::Join { left, right }
+            | GraphPattern::Lateral { left, right }
+            | GraphPattern::Union { left, right }
+            | GraphPattern::Minus { left, right }
+            | GraphPattern::SemiJoin { left, right }
+            | GraphPattern::AntiJoin { left, right } => {
+                self.patterns.push(*left);
+                self.patterns.push(*right);
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } => {
+                self.patterns.push(*left);
+                self.patterns.push(*right);
+                self.exprs.extend(expression);
+            }
+            GraphPattern::Filter { expr, inner } => {
+                self.exprs.push(expr);
+                self.patterns.push(*inner);
+            }
+            GraphPattern::Extend {
+                inner, expression, ..
+            }
+            | GraphPattern::Assign {
+                inner, expression, ..
+            }
+            | GraphPattern::Unfold {
+                inner, expression, ..
+            } => {
+                self.patterns.push(*inner);
+                self.exprs.push(expression);
+            }
+            GraphPattern::Values { .. } => {}
+            GraphPattern::OrderBy { inner, expression } => {
+                self.patterns.push(*inner);
+                for o in expression {
+                    self.order(o);
+                }
+            }
+            GraphPattern::Group {
+                inner, aggregates, ..
+            } => {
+                self.patterns.push(*inner);
+                for (_, a) in aggregates {
+                    match a {
+                        AggregateExpression::CountSolutions { .. } => {}
+                        AggregateExpression::FunctionCall { expr, .. } => self.exprs.push(expr),
+                        AggregateExpression::Fold {
+                            expr, value, order, ..
+                        } => {
+                            self.exprs.push(expr);
+                            self.exprs.extend(value);
+                            for o in order {
+                                self.order(o);
+                            }
+                        }
+                    }
+                }
+            }
+            GraphPattern::Graph { inner, .. }
+            | GraphPattern::Project { inner, .. }
+            | GraphPattern::Distinct { inner }
+            | GraphPattern::Reduced { inner }
+            | GraphPattern::Slice { inner, .. }
+            | GraphPattern::Service { inner, .. } => self.patterns.push(*inner),
+        }
+    }
+
+    fn expr(&mut self, e: Expression) {
+        match e {
+            Expression::NamedNode(_)
+            | Expression::Literal(_)
+            | Expression::Variable(_)
+            | Expression::Bound(_) => {}
+            Expression::Or(a, b)
+            | Expression::And(a, b)
+            | Expression::Equal(a, b)
+            | Expression::SameTerm(a, b)
+            | Expression::Greater(a, b)
+            | Expression::GreaterOrEqual(a, b)
+            | Expression::Less(a, b)
+            | Expression::LessOrEqual(a, b)
+            | Expression::Add(a, b)
+            | Expression::Subtract(a, b)
+            | Expression::Multiply(a, b)
+            | Expression::Divide(a, b) => {
+                self.exprs.push(*a);
+                self.exprs.push(*b);
+            }
+            Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => {
+                self.exprs.push(*a);
+            }
+            Expression::In(a, list) => {
+                self.exprs.push(*a);
+                self.exprs.extend(list);
+            }
+            Expression::If(a, b, c) => {
+                self.exprs.push(*a);
+                self.exprs.push(*b);
+                self.exprs.push(*c);
+            }
+            Expression::Coalesce(list) | Expression::FunctionCall(_, list) => {
+                self.exprs.extend(list);
+            }
+            Expression::Exists(p) => self.patterns.push(*p),
+        }
+    }
+
+    fn path(&mut self, p: PropertyPathExpression) {
+        use PropertyPathExpression as PP;
+        match p {
+            PP::NamedNode(_) | PP::NegatedPropertySet(_) => {}
+            PP::Reverse(a)
+            | PP::ZeroOrMore(a)
+            | PP::OneOrMore(a)
+            | PP::ZeroOrOne(a)
+            | PP::Distinct(a)
+            | PP::Multi(a)
+            | PP::Shortest(a)
+            | PP::Range { path: a, .. } => self.paths.push(*a),
+            PP::Sequence(a, b) | PP::Alternative(a, b) => {
+                self.paths.push(*a);
+                self.paths.push(*b);
+            }
+        }
+    }
+}
+
 /// Refuse a plan the planner built that nests deeper than [`MAX_PLAN_DEPTH`]; else its
 /// depth, for [`with_stack`]. The count of the parsed query bounds the plan, and this
 /// makes the bound true of the plan whatever the count misses.

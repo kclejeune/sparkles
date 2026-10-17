@@ -35,7 +35,11 @@ public object Sparkles {
     @JvmField
     public val MAX_ROWS_PRODUCED: Symbol = Symbol.create(NS + "maxRowsProduced")
 
-    /** Use a fallible engine cursor for query solutions (Boolean; default false). */
+    /**
+     * How Sparkles runs a query (a Boolean). Unset is automatic execution, which streams
+     * the plans that measured faster as cursors and runs the others eagerly. True streams
+     * every SELECT through a cursor, and false runs every query eagerly.
+     */
     @JvmField
     public val STREAMING_EXECUTION: Symbol = Symbol.create(NS + "streamingExecution")
 

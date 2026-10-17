@@ -203,10 +203,16 @@ pub struct Optimizations {
     /// the columns of the blocks that an index join has asked the kernel for are decoded
     /// in parallel on a pool of the cache's own, before the reader gets to them
     pub parallel_decode: bool,
+    /// a streamed result writer decodes the terms of the next batch on the Rayon pool
+    /// while it writes the current one
+    pub decode_ahead: bool,
+    /// cursor operators that read their whole input before output, and filters over a
+    /// scan, read larger inputs as a long input goes on
+    pub grow_input: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 38] = [
+    pub const NAMES: [&str; 40] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -245,6 +251,8 @@ impl Optimizations {
         "prefetch_terms",
         "prefetch_first_scan",
         "parallel_decode",
+        "decode_ahead",
+        "grow_input",
     ];
 
     /// Everything on.
@@ -287,6 +295,8 @@ impl Optimizations {
         prefetch_terms: true,
         prefetch_first_scan: true,
         parallel_decode: true,
+        decode_ahead: true,
+        grow_input: true,
     };
 
     /// Everything off: the generic operators only.
@@ -329,6 +339,8 @@ impl Optimizations {
         prefetch_terms: false,
         prefetch_first_scan: false,
         parallel_decode: false,
+        decode_ahead: false,
+        grow_input: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -371,6 +383,8 @@ impl Optimizations {
             "prefetch_terms" => &mut self.prefetch_terms,
             "prefetch_first_scan" => &mut self.prefetch_first_scan,
             "parallel_decode" => &mut self.parallel_decode,
+            "decode_ahead" => &mut self.decode_ahead,
+            "grow_input" => &mut self.grow_input,
             _ => return None,
         })
     }
@@ -430,7 +444,16 @@ pub struct Ctx {
     /// the blank nodes that labels inside the composite literals of the query text name
     /// (see [`Ctx::query_literal`])
     literal_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
+    /// The query's deadline, without the time the query waited for its consumer. Code
+    /// that hands a deadline to other work reads [`Ctx::current_deadline`], which adds
+    /// [`Ctx::deadline_pause`].
     pub deadline: Option<Instant>,
+    /// Nanoseconds the query spent waiting for its consumer, which the deadline does not
+    /// count. The thread that drives the cursor adds to it, after each stretch of waiting
+    /// for its consumer, and the same thread runs every check, so a check never misses a
+    /// wait that is still in progress. A background reader of the deadline would need to
+    /// credit a wait before it starts.
+    pub deadline_pause: Arc<AtomicU64>,
     pub cancel: Arc<AtomicBool>,
     pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
@@ -739,7 +762,7 @@ impl Ctx {
 
     /// The query's live estimate, from the ledger once it exists.
     #[inline]
-    fn live_bytes(&self) -> u64 {
+    pub(super) fn live_bytes(&self) -> u64 {
         match self.memory.get() {
             Some(ledger) => ledger.live.load(Ordering::Relaxed),
             None => self.fast.live.load(Ordering::Relaxed) & !PROMOTED,
@@ -769,6 +792,7 @@ impl Ctx {
             outside_bnodes: Default::default(),
             literal_bnodes: Default::default(),
             deadline: None,
+            deadline_pause: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             cancellation: None,
             dataset: DatasetSpec::default(),
@@ -1045,12 +1069,35 @@ impl Ctx {
         if let Some(cancellation) = &self.cancellation {
             cancellation.check()?;
         }
-        if let Some(d) = self.deadline
-            && Instant::now() >= d
-        {
+        if self.past_deadline() {
             return Err(Error::Timeout);
         }
         Ok(())
+    }
+
+    /// Whether the deadline has passed, not counting the time the query spent waiting
+    /// for its consumer. The counter is read only once the raw deadline has passed, which
+    /// keeps the atomic load off the common path.
+    pub fn past_deadline(&self) -> bool {
+        let Some(d) = self.deadline else {
+            return false;
+        };
+        let now = Instant::now();
+        if now < d {
+            return false;
+        }
+        let paused = std::time::Duration::from_nanos(self.deadline_pause.load(Ordering::Relaxed));
+        d.checked_add(paused).is_some_and(|end| now >= end)
+    }
+
+    /// The deadline as it stands now, moved back by the time the query has waited for
+    /// its consumer so far. Work that copies the deadline, such as a SERVICE call or an
+    /// algorithm run, takes this value when it starts. A deadline too far out to
+    /// represent is none.
+    pub fn current_deadline(&self) -> Option<Instant> {
+        let d = self.deadline?;
+        let paused = std::time::Duration::from_nanos(self.deadline_pause.load(Ordering::Relaxed));
+        d.checked_add(paused)
     }
 
     pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {
@@ -1745,6 +1792,65 @@ impl Ctx {
             Tag::Undef | Tag::Special => Ok(None),
             _ => {
                 let _charge = self.charge(128)?;
+                Ok(self.snap.term(id))
+            }
+        }
+    }
+
+    /// The term of an id as eager execution decodes it, without charging the scratch of
+    /// a vocabulary block or the term, for a caller that drops the term at once.
+    pub(super) fn transient_batch_term(&self, id: Id) -> Option<Term> {
+        match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map(id::key_to_term),
+            Tag::Undef | Tag::Special => None,
+            _ => self.snap.term(id),
+        }
+    }
+
+    /// [`Ctx::batch_term`] for a caller that has already reserved
+    /// [`Ctx::decoded_bytes`] for the term, as the result writers do for a row's cells.
+    /// It takes no reservation of its own, which cost an inline number one pass through
+    /// the memory ledger per cell.
+    pub(super) fn reserved_batch_term(&self, id: Id) -> Result<Option<Term>> {
+        let decode = |key: &[u8]| Some(id::key_to_term(key));
+        Ok(match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).and_then(decode),
+            Tag::Vocab => self.with_cursor_vocab_key(id.payload(), decode)?.flatten(),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(id.payload()).and_then(decode)),
+            Tag::Undef | Tag::Special => None,
+            _ => self.snap.term(id),
+        })
+    }
+
+    /// [`Ctx::batch_term`] that asks `cover` for the [`Ctx::decoded_bytes`] of the term
+    /// before it builds it, so that a result writer can hold one reservation for its row
+    /// and decode each key once.
+    pub(super) fn covered_batch_term(
+        &self,
+        id: Id,
+        mut cover: impl FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Term>> {
+        let mut decode = |key: &[u8]| -> Result<Option<Term>> {
+            cover((key.len() as u64).saturating_mul(8).saturating_add(128))?;
+            Ok(Some(id::key_to_term(key)))
+        };
+        match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map_or(Ok(None), decode),
+            Tag::Vocab => self
+                .with_cursor_vocab_key(id.payload(), decode)?
+                .unwrap_or(Ok(None)),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(id.payload()).map_or(Ok(None), &mut decode)),
+            Tag::Undef | Tag::Special => Ok(None),
+            _ => {
+                cover(128)?;
                 Ok(self.snap.term(id))
             }
         }
