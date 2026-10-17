@@ -168,6 +168,72 @@ fn a_streamed_plan_reads_like_an_eager_one() {
     assert!(!n.iter().any(|x| x.code == "misestimate"));
 }
 
+/// A plan in format 2 has no node ids, and the reader derives them from its shape as it
+/// does for format 1. A format the reader does not know is refused.
+#[test]
+fn a_plan_without_ids_reads_like_one_with_them() {
+    let mut v = slow_plan();
+    v["planFormat"] = 2.into();
+    let p = Plan::read(&v).unwrap();
+    let ids: Vec<&str> = p.nodes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(ids, ["0", "0.0", "0.0.0", "0.0.0.0", "0.0.0.1"]);
+    v["planFormat"] = 3.into();
+    let e = Plan::read(&v).unwrap_err();
+    assert!(e.contains("format 3"), "{e}");
+}
+
+/// The reader and the template description walk a plan without recursion: a plan at the
+/// depth limit is read and described on a stack that holds only a few of their frames.
+/// It runs in a child process, so that a stack overflow fails it rather than abort the
+/// whole run.
+#[test]
+fn a_plan_at_the_depth_limit_is_read_without_recursion() {
+    const CHILD: &str = "SPARKLES_EXPLAIN_CHILD";
+    let name = "explain::tests::a_plan_at_the_depth_limit_is_read_without_recursion";
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads", "1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let mut v = node(
+        "IndexScan",
+        "SPO ?s <http://ex.org/p> ?o",
+        1.0,
+        1,
+        0.0,
+        vec![],
+    );
+    for _ in 0..MAX_DEPTH {
+        v = node("HashJoin", "on ?s", 1.0, 1, 0.0, vec![v]);
+    }
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(64 << 10)
+            .spawn_scoped(s, || {
+                let p = Plan::read(&v).unwrap();
+                assert_eq!(p.nodes.len(), MAX_DEPTH + 1);
+                let labels = LocalNames {
+                    prefixes: &[],
+                    labels: Default::default(),
+                };
+                assert!(!describe(&p, "SELECT", &labels).is_empty());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    });
+}
+
 #[test]
 fn a_plan_that_is_not_a_plan_is_refused() {
     assert!(Plan::read(&json!({"x": 1})).is_err());

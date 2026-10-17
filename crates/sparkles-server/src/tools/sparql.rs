@@ -223,17 +223,21 @@ pub fn uparse(a: UparseArgs) -> Result<()> {
 }
 
 /// The plan as `query --explain` prints it.
+/// A line per operator, indented by its depth. Written without recursion, since a plan
+/// nests up to `MAX_PLAN_DEPTH` levels.
 fn plan_text(p: &sparkles::sparql::PlanInfo, depth: usize) -> String {
-    let mut s = format!(
-        "{}{} {}  [est {} rows, cost {}]\n",
-        "  ".repeat(depth),
-        p.operator,
-        p.description,
-        p.estimated_rows,
-        p.estimated_cost
-    );
-    for c in &p.children {
-        s.push_str(&plan_text(c, depth + 1));
+    let mut s = String::new();
+    let mut todo = vec![(p, depth)];
+    while let Some((p, depth)) = todo.pop() {
+        s.push_str(&format!(
+            "{}{} {}  [est {} rows, cost {}]\n",
+            "  ".repeat(depth),
+            p.operator,
+            p.description,
+            p.estimated_rows,
+            p.estimated_cost
+        ));
+        todo.extend(p.children.iter().rev().map(|c| (c, depth + 1)));
     }
     s
 }
