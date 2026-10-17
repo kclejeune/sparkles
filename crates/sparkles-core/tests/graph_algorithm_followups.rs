@@ -114,6 +114,57 @@ fn an_integer_above_the_exact_range_is_refused_by_name() {
     }
 }
 
+/// The same refusal covers the other exact integer types and negative integers, which
+/// were refused as "not a number" or as "non-negative" without the range.
+#[test]
+fn every_integer_type_outside_the_range_is_refused_by_name() {
+    let s = trig("ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:a .");
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    for (lexical, datatype) in [
+        ("99999999999999999999", "nonNegativeInteger"),
+        ("9223372036854775808", "long"),
+        ("9223372036854775808", "positiveInteger"),
+        ("18446744073709551615", "unsignedLong"),
+        ("-1", "integer"),
+        ("-5", "long"),
+        ("-1", "negativeInteger"),
+        ("-9223372036854775809", "integer"),
+    ] {
+        let q = format!(
+            "{PREFIXES}SELECT ?n WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; algo:seed \"{lexical}\"^^<{xsd}{datatype}> ; algo:node ?n }} }}"
+        );
+        let e = query(s.snapshot(), &q, &QueryOptions::default())
+            .err()
+            .unwrap_or_else(|| panic!("{lexical} {datatype} was accepted"))
+            .to_string();
+        assert!(
+            e.contains("algo:seed takes an integer from 0 to 9223372036854775807"),
+            "{lexical} {datatype}: {e}"
+        );
+    }
+    // the bare spelling of a negative integer too
+    let q = format!(
+        "{PREFIXES}SELECT ?n WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; algo:seed -1 ; algo:node ?n }} }}"
+    );
+    let e = query(s.snapshot(), &q, &QueryOptions::default())
+        .err()
+        .expect("-1 was accepted")
+        .to_string();
+    assert!(e.contains("takes an integer from 0 to"), "{e}");
+    // values in range of the same types are still accepted
+    for (lexical, datatype) in [
+        ("7", "long"),
+        ("0", "nonNegativeInteger"),
+        ("+7", "integer"),
+    ] {
+        let q = format!(
+            "{PREFIXES}SELECT ?n WHERE {{ SERVICE algo:fastRP {{ [] algo:predicate ex:p ; algo:seed \"{lexical}\"^^<{xsd}{datatype}> ; algo:node ?n }} }}"
+        );
+        query(s.snapshot(), &q, &QueryOptions::default())
+            .unwrap_or_else(|e| panic!("{lexical} {datatype}: {e}"));
+    }
+}
+
 /// The iteration and level counts are 32-bit. A larger value is refused instead of
 /// wrapping to a few iterations or none.
 #[test]

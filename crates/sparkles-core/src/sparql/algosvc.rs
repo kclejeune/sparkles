@@ -447,8 +447,22 @@ fn number(t: &TermPattern, name: &str, kind: Kd) -> Result<f64> {
     Ok(v)
 }
 
-const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
-const XSD_UNSIGNED_LONG: &str = "http://www.w3.org/2001/XMLSchema#unsignedLong";
+/// The datatypes of exact integers, `xsd:integer` and the types derived from it.
+const INTEGER_TYPES: &[&str] = &[
+    "http://www.w3.org/2001/XMLSchema#integer",
+    "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+    "http://www.w3.org/2001/XMLSchema#positiveInteger",
+    "http://www.w3.org/2001/XMLSchema#nonPositiveInteger",
+    "http://www.w3.org/2001/XMLSchema#negativeInteger",
+    "http://www.w3.org/2001/XMLSchema#long",
+    "http://www.w3.org/2001/XMLSchema#int",
+    "http://www.w3.org/2001/XMLSchema#short",
+    "http://www.w3.org/2001/XMLSchema#byte",
+    "http://www.w3.org/2001/XMLSchema#unsignedLong",
+    "http://www.w3.org/2001/XMLSchema#unsignedInt",
+    "http://www.w3.org/2001/XMLSchema#unsignedShort",
+    "http://www.w3.org/2001/XMLSchema#unsignedByte",
+];
 
 /// 2^53. A double holds every integer up to it exactly.
 const EXACT_DOUBLE: f64 = 9_007_199_254_740_992.0;
@@ -461,9 +475,9 @@ fn param(t: &TermPattern, name: &str, kind: Kd) -> Result<Num> {
         return number(t, name, kind).map(Num::Float);
     }
     if let TermPattern::Literal(l) = t
-        && matches!(l.datatype().as_str(), XSD_INTEGER | XSD_UNSIGNED_LONG)
+        && INTEGER_TYPES.contains(&l.datatype().as_str())
     {
-        // an exact integer that i64 cannot hold is refused by name, not as "not a number"
+        // an exact integer outside 0..=i64::MAX is refused by name, not as "not a number"
         let text = l.value().trim();
         let digits = text.strip_prefix('+').unwrap_or(text);
         if !digits.is_empty()
