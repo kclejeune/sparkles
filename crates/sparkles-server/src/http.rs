@@ -1374,7 +1374,6 @@ pub(crate) async fn run_query(
                 thrift,
                 rdf_format,
                 native_graph,
-                execution,
                 prefixes,
                 io,
             },

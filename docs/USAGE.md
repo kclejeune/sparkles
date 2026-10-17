@@ -4188,9 +4188,10 @@ through `--server`. Without it, a local query runs in automatic mode and prints 
 eager query prints when its plan stays eager, except that the `text` table, the default
 output, always runs eagerly because it measures every row before printing one. A query
 through `--server` runs in the server's default mode. A streamed `text` result is printed
-as TSV. Rust callers choose a mode with `query_execution_with`, and `query_execution`
-runs in `ExecutionMode::Auto`, the default of `ExecutionMode`. `query` and `query_with`
-return a collected result and always run eagerly.
+as TSV. Rust callers choose a mode with `Dataset::query_execution_with`, and
+`Dataset::query_execution` runs in `ExecutionMode::Auto`, the default of `ExecutionMode`.
+`Dataset::query` and `Dataset::query_with` return a collected result and always run
+eagerly.
 
 Python has `Dataset.select_cursor` and `Dataset.graph_cursor`. A Python cursor can be
 iterated, closed with `close()`, used as a context manager, asked for stats and

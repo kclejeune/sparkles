@@ -1468,24 +1468,6 @@ async fn cursor_graph_and_ask_formats_use_the_negotiated_query_form() {
     assert_eq!(doc["meta"]["status"], "stopped");
 }
 
-#[test]
-fn automatic_execution_uses_eager_when_thrift_has_no_cursor_writer() {
-    use super::cursor::effective_mode;
-    use sparkles::sparql::ExecutionMode;
-    assert_eq!(
-        effective_mode(ExecutionMode::Auto, true),
-        ExecutionMode::Eager
-    );
-    assert_eq!(
-        effective_mode(ExecutionMode::Auto, false),
-        ExecutionMode::Auto
-    );
-    assert_eq!(
-        effective_mode(ExecutionMode::Streaming, true),
-        ExecutionMode::Streaming
-    );
-}
-
 #[tokio::test]
 async fn automatic_thrift_results_match_eager() {
     let s = server();

@@ -1,4 +1,5 @@
-//! Explicit native query execution with bounded response backpressure.
+//! Native query execution with bounded response backpressure, for a request that asks for
+//! streaming and for an answer that automatic execution streams.
 
 use super::*;
 use crate::obs::DeferredReport;
@@ -20,23 +21,10 @@ pub(super) struct Request {
     pub thrift: bool,
     pub rdf_format: OutFormat,
     pub native_graph: bool,
-    pub execution: ExecutionMode,
     /// the declared and runtime prefixes, for graph results (spec C20 §5)
     pub prefixes: std::collections::BTreeMap<String, String>,
     /// the I/O profile of the request (`profile=io`)
     pub io: Option<Arc<sparkles::ioacct::Profile>>,
-}
-
-/// The mode actually run for a request. Automatic execution falls back to eager
-/// when the negotiated encoding has no cursor writer, which today is SPARQL
-/// Results Thrift. An explicit streaming request keeps its mode so that the
-/// unsupported combination is reported as an error.
-pub(super) fn effective_mode(execution: ExecutionMode, thrift: bool) -> ExecutionMode {
-    if thrift && execution == ExecutionMode::Auto {
-        ExecutionMode::Eager
-    } else {
-        execution
-    }
 }
 
 /// How an opened execution is answered: everything of [`Request`] except what opening
@@ -70,11 +58,9 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         thrift,
         rdf_format,
         native_graph,
-        execution,
         prefixes,
         io,
     } = request;
-    let execution = effective_mode(execution, thrift);
     let at = history::at_param(&params)?;
     let timeout = options.timeout;
     let with_extra = !options.default_graph_extra.is_empty();
@@ -83,7 +69,13 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     let (cursor, seq, resolved) = blocking(move || {
         let (snapshot, resolved) = history::snapshot_for(&captured_ds, at.as_ref(), &options)?;
         let seq = snapshot.commit;
-        let cursor = query_execution(snapshot, &query, &options, &Default::default(), execution)?;
+        let cursor = query_execution(
+            snapshot,
+            &query,
+            &options,
+            &Default::default(),
+            ExecutionMode::Streaming,
+        )?;
         Ok((cursor, seq, resolved))
     })
     .await
