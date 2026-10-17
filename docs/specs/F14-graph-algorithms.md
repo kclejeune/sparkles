@@ -357,9 +357,16 @@ computing, so the wait cannot form a cycle with the pool.
 
 Each call checks the query's timeout and cancel flag between iterations, and every
 long loop over nodes, rows, heap entries or intersection steps inside one counts its
-work and checks after 64K units. A unit is a node, an edge of a row, a heap entry or one
-step of an intersection. A row is counted before it is read, so a node of high degree is
-checked before the next row starts, and a loop over one row's edges is not interrupted.
+work and checks once the count reaches 64K units. A unit is a node, an edge of a row, a
+heap entry or one step of an intersection. Consecutive rows that hold at most 64K units
+together are counted at once before the first of them, so the loops over them carry no
+count per row and at most 128K units pass between two checks. Rows that hold more are
+counted one at a time before each is read, so a node of high degree is checked before
+the next row starts, and a loop over one row's edges is not interrupted. Triangle
+counting bounds the merges of a node by its higher neighbours times the sum of their
+number and the longest list of higher neighbours. It counts that bound before the
+merges when it is at most 64K units, and otherwise counts each merge before it starts.
+Strongly connected components count a node's row when the search enters it.
 The sorts that sit between two checks run as one step that cannot be interrupted. They
 are the sort of all node indexes by degree in triangle counting, which takes time
 proportional to `n log n` for `n` nodes, the sort of one row in triangle counting,
@@ -854,13 +861,15 @@ query's `projectionMs` is higher. These numbers are not from the LDBC SNB SF10 `
 graph or the ten-million-triple benchmark graph that §9 names.
 
 The polling and charging of roadmap item 8 were measured on forge on a random graph of
-1,000,000 nodes and 5,000,000 edges under a far deadline, in four ABBA pairs. PageRank
-became four times faster, 2146 to 533 ms on one thread, because it no longer reads the
-clock before every node. The other algorithms changed by -1.3% to +4.8%, and k-core by
-+9.3% on one thread and +0.2% on four. Sequential code differs by as much between the
-one-thread and four-thread columns, so the measurement does not show a cost for them. A
-later change that appends rows without a check per value was not timed on forge. The
-table is in
+1,000,000 nodes and 5,000,000 edges under a far deadline, in eight ABBA pairs against
+824b7238, the code before the follow-ups. A first build that counted every row and every
+merge cost triangle counting 5 to 7.5% and the connected components about 5% on one
+thread. Counting blocks of rows at once and keeping the checks out of the inner loops
+removed that cost. PageRank is 3.4 to 3.9 times faster, because it no longer reads the
+clock before every node. Breadth-first search is 12 to 13% faster and strongly connected
+components 11 to 13% faster. Weakly connected components, k-core and triangle counting
+stay between -2% and +0.3%. Label propagation and FastRP measured +0.4% to +1.4% in one
+run and +0.4% to +0.9% in a repeat, within the noise of the measurement. The table is in
 [BENCHMARKS](../BENCHMARKS.md#graph-algorithm-polling).
 
 **Deviations.**

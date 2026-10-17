@@ -592,34 +592,41 @@ Roadmap item 8 moved the cancellation and deadline checks of the graph algorithm
 inside every long loop and charged every workspace to the call. This A/B measures what
 that costs. Both builds ran the ignored `polling_cost` test of
 `tests/graph_algorithms_scale.rs` on forge, an Intel i5-13500 with nothing else running,
-pinned to four cores. The graph is random with 1,000,000 nodes and 5,000,000 edges, and
-each call ran under a far deadline, so every check reads the clock. The builds ran in
-four ABBA pairs at one and four threads. Each run is the fastest of `ALGO_ROUNDS` rounds,
-and the table gives the median of the four runs of each build.
+pinned to four cores. The build before is 824b7238 with the same test file. The graph is
+random with 1,000,000 nodes and 5,000,000 edges, and each call ran under a far deadline,
+so every check reads the clock. The builds ran in eight ABBA pairs at one and four
+threads. Each run is the fastest of three calls, and the table gives the median of the
+eight runs of each build, with the slowest and fastest run.
 
-| algorithm | 1 thread before | 1 thread after | change | 4 threads before | 4 threads after | change |
-|---|---:|---:|---:|---:|---:|---:|
-| PageRank, 20 iterations | 2145.9 | 533.2 | -75.2% | 541.6 | 165.4 | -69.5% |
-| Weakly connected components | 145.8 | 146.4 | +0.4% | 41.0 | 41.0 | 0.0% |
-| Strongly connected components | 312.6 | 318.8 | +2.0% | 239.1 | 247.2 | +3.4% |
-| Breadth-first search | 155.4 | 158.9 | +2.2% | 39.5 | 39.8 | +0.5% |
-| Label propagation | 722.7 | 713.0 | -1.3% | 180.8 | 181.0 | +0.1% |
-| Triangle count | 581.3 | 596.8 | +2.6% | 237.1 | 248.7 | +4.8% |
-| K-core | 262.1 | 286.4 | +9.3% | 252.4 | 252.9 | +0.2% |
-| Betweenness, sampled | 7521.0 | 7723.6 | +2.7% | 3134.8 | 3184.1 | +1.6% |
-| FastRP | 2289.2 | 2274.6 | -0.6% | 992.4 | 997.0 | +0.5% |
+| algorithm | threads | before | range | after | range | change |
+|---|---:|---:|---|---:|---|---:|
+| PageRank, 20 iterations | 1 | 1956.7 | 1920.0–2022.5 | 505.5 | 488.0–523.7 | -74.2% |
+| Weakly connected components | 1 | 145.7 | 144.8–153.0 | 142.8 | 140.8–145.2 | -2.0% |
+| Strongly connected components | 1 | 238.0 | 233.0–250.7 | 210.7 | 186.5–223.8 | -11.5% |
+| Breadth-first search | 1 | 138.2 | 137.3–142.6 | 119.8 | 109.5–121.1 | -13.3% |
+| Label propagation | 1 | 694.8 | 693.3–700.6 | 704.4 | 700.1–711.5 | +1.4% |
+| Triangle count | 1 | 495.8 | 490.8–497.9 | 494.9 | 470.2–498.5 | -0.2% |
+| K-core | 1 | 252.6 | 250.8–255.6 | 251.8 | 224.5–252.9 | -0.4% |
+| FastRP | 1 | 2300.4 | 2298.8–2302.8 | 2310.0 | 2123.9–2313.3 | +0.4% |
+| PageRank, 20 iterations | 4 | 543.2 | 533.6–552.6 | 161.6 | 153.0–167.3 | -70.2% |
+| Weakly connected components | 4 | 40.8 | 39.5–41.2 | 40.2 | 38.9–40.5 | -1.3% |
+| Strongly connected components | 4 | 235.8 | 233.5–250.6 | 205.1 | 199.9–220.0 | -13.0% |
+| Breadth-first search | 4 | 39.4 | 38.0–40.2 | 34.6 | 33.8–35.1 | -12.1% |
+| Label propagation | 4 | 182.2 | 181.6–182.8 | 183.4 | 182.5–184.8 | +0.7% |
+| Triangle count | 4 | 239.0 | 238.0–244.7 | 239.8 | 235.4–243.1 | +0.3% |
+| K-core | 4 | 252.9 | 251.4–253.5 | 252.3 | 251.4–254.5 | -0.2% |
+| FastRP | 4 | 997.9 | 994.8–1004.5 | 1009.4 | 1003.0–1015.1 | +1.1% |
 
-Times are in milliseconds. PageRank is four times faster because it read the clock
-before every node, and now counts its rows and checks once per 64K units. The other
-algorithms changed by between -1.3% and +4.8%, except k-core, which changed by +9.3% on
-one thread and +0.2% on four. Strongly connected components and k-core take no thread
-pool, yet the build before the change needs 312.6 ms for components in the one-thread
-column and 239.1 ms in the four-thread column. The run-to-run noise of this measurement
-is therefore as large as every change in the table except PageRank's, and the table does
-not show whether the other algorithms got slower. A later change appends rows without a
-check per value in the undirected view that k-core and triangle counting build, in
-breadth-first search and in label propagation. It has not been timed, because forge was
-taken by other measurements when it landed.
+Times are in milliseconds. PageRank is 3.4 to 3.9 times faster because it read the
+clock before every node, and now counts its rows and checks once per 64K units. A first
+build that counted every row and every merge cost triangle counting 5 to 7.5% and the
+connected components about 5% on one thread. The build measured here counts a block of
+rows at once while it holds at most 64K units, keeps the check out of the inner loops,
+and lets the search of strongly connected components scan a node's edges in one inner
+loop, which also makes that search and breadth-first search faster than before. A
+repeat of eight pairs for label propagation and FastRP measured +0.6% and +0.9% for
+label propagation and +0.6% and +0.4% for FastRP at one and four threads, so their
+changes in the table are within the noise of the measurement.
 
 ### Spatial queries
 

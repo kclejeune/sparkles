@@ -5528,9 +5528,13 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   bounds exclude allocator and Rayon bookkeeping and small summary metadata.
 * **Cancellation.** Every long loop of an algorithm over nodes, rows or heap entries
   counts its work, a node, an edge of a row or a heap entry at a time, and checks
-  cancellation and the deadline after 64K units. A row is counted before it is read, so
-  a node of high degree is checked before the next row starts. PageRank counts the rows
-  of each block in its four iteration passes. These are work bounds, and they do not
+  cancellation and the deadline once the count reaches 64K units. Consecutive rows that
+  hold at most 64K units together are counted at once before the first of them, so at
+  most 128K units pass between two checks. Rows that hold more are counted one at a
+  time before each is read, so a node of high degree is checked before the next row
+  starts. Triangle counting counts a node's merges by a bound before they start, and
+  counts each merge of a node whose bound passes 64K units. PageRank counts the rows of
+  each block in its four iteration passes. These are work bounds, and they do not
   preempt one row's edges or guarantee a wall-clock bound. A sort runs as one step that
   cannot be interrupted. Triangle counting sorts all node indexes by degree, which takes
   time proportional to `n log n`, and a few algorithms sort one row, the neighbouring

@@ -2217,8 +2217,9 @@ data skips the build. `--algo-threads` and `--algo-max-threads-per-call` bound t
 that algorithms take, and a call that is over its memory budget fails with a message that
 names the parameter that would make it fit.
 
-An algorithm checks cancellation and the deadline after every 64K units of work in its
-loops over nodes, edges and heap entries. A sort runs as one step that cannot be
+An algorithm checks cancellation and the deadline in its loops over nodes, edges and
+heap entries, with at most 128K units of work between two checks, except inside one
+row's edges. A sort runs as one step that cannot be
 interrupted. Triangle counting sorts all node indexes by degree, which takes time
 proportional to `n log n` for `n` nodes. Triangle counting, clustering, community
 detection and label propagation also sort one row, the neighbouring communities of one
