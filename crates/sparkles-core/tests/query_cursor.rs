@@ -1697,6 +1697,11 @@ fn hash_join_keys_cover_unbound_build_and_probe_values_with_duplicates() {
     queries.push(format!(
         "SELECT * WHERE {{ VALUES (?x ?a) {{ {few} }} MINUS {{ VALUES (?x ?b) {{ {many} }} }} }}"
     ));
+    // A condition over keys with more rows than an output batch: a probe row resumes
+    // its candidates in the next chunk and keeps whether one of them passed.
+    queries.push(format!(
+        "SELECT * WHERE {{ VALUES (?x ?a) {{ {few} }} OPTIONAL {{ VALUES (?x ?b) {{ {many} }} FILTER(?b > 150 + ?a) }} }}"
+    ));
     for q in &queries {
         let q = q.as_str();
         let expected = bag(query(s.snapshot(), q, &Default::default()).unwrap().rows());
