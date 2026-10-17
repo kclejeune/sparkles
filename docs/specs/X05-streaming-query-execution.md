@@ -1056,15 +1056,24 @@ Four changes closed the gaps that profiles traced to the cursor itself.
 
 * A result writer that reads a cursor decodes the terms of the next batch on another
   Rayon thread while it writes the current one (`decode_ahead`), and charges each written
-  row's terms to the memory ledger once instead of once per cell. An error from the next
-  batch reaches the writer only after it has written the rows before it.
-* A cursor filter reads 32,768 rows at first and doubles each read up to 262,144 rows,
-  and a cursor top-k doubles from the cursor's batch size up to 65,536 rows, while the row
-  budget and the memory ledger have room (`grow_input`). A filter can then hold up to eight
-  times the rows it held before, within the query's budgets.
+  row's terms to the memory ledger once instead of once per cell. It writes the first
+  batch before it pulls the second, so the first rows wait for one batch only, and it
+  reads ahead only when the memory budget has room for twice what the first batch took.
+  An error from a batch read ahead reaches the writer after it has written the batch
+  before it. A memory budget failure inside the plan is the exception, since it fails
+  every later check of the query, and the writer then stops before writing that batch.
+* A cursor filter starts at 32,768 rows and doubles its row demand with each read up to
+  262,144 rows, and a cursor top-k doubles from the cursor's batch size up to 65,536 rows,
+  while the row budget and the memory ledger have room (`grow_input`). The scan under a
+  filter still stops at the caller's `batch_bytes`, so with the default 1 MiB a filter
+  over two columns reads at most 65,536 rows at once and over one column 131,072. A top-k
+  raises the byte cap with its demand. The tradeoff is memory. Over 300,000 rows a
+  substring filter peaked at 12.3 MB against 6.7 MB with fixed reads, and a top-k at
+  24.1 MB against 2.5 MB, both within the query's budgets.
 * A cursor top-k reuses the values it decoded for its prefilter instead of decoding them
-  again, and its screen remembers which values of the first key it rejected until the
-  heap changes.
+  again. When its first key holds one result per distinct value, its screen remembers
+  which values it rejected for the rest of the batch. A rejected value is worse than the
+  heap's worst row, which only improves, so it stays rejected.
 * The numeric columns of a cursor's expression cache are located in parallel when a
   batch has at least 16,384 ids.
 
@@ -1090,13 +1099,49 @@ streaming it saves no memory. A filter over a scan in native JSON at one thread 
 left open. It takes 1.35 to 1.39 times as long streamed, because the cursor's sorted batch
 decode of unique IRIs costs more than eager's per-row lookup.
 
+The first build of the writer pulled the second batch before it wrote the first, so the
+first rows of every streamed answer waited for two batches. With the first batch written
+in turn, on the development laptop at 10.5M with four threads on its performance cores,
+the first row of a substring filter came after 0.37 ms instead of 1.25 to 1.43 ms, and
+that of a regular expression matching two names after 9.0 ms instead of 15.6 ms. Scans of
+1,000 to 500,000 rows took the same time either way. Decoding ahead also made a tight
+memory budget fail a query that the writer in turn completed, which the room it now
+requires prevents. Decoding ahead runs on the global Rayon pool, so under many concurrent
+queries a writer can wait for its decoding task where decoding in turn would not wait.
+That case has not been measured and is left to item 7.
+
 Automatic execution now streams a plain scan, its projection or a `LIMIT` over it from an
 estimated thousand rows, where it needed a million before. On forge a cursor wrote such a
 scan faster than eager execution from about a hundred rows on, at one thread and at 12,
-in TSV and native JSON. At 5,000 rows a TSV scan took 0.85 ms streamed against 1.10 ms,
-and at 1,000 rows 0.22 ms against 0.24 ms. Filters, top-k and orderings stay eager by
-default, since streaming them is still slower at 12 threads. The server's quick-query
-path still runs a query that answered in under 10 ms last time eagerly in place.
+in TSV and native JSON. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) gives the
+library times of one probe run, 0.259 ms streamed against 0.332 ms at 1,000 triples and
+1.126 ms against 1.604 ms at 5,000 with 12 threads. An earlier probe run measured 0.22
+against 0.24 ms and 0.85 against 1.10 ms. Filters, top-k and orderings stay eager by
+default, since streaming them is still slower at 12 threads.
+
+The server remembers a query that answered in under 10 ms as quick and runs its next
+request eagerly in place, without a thread hop or the automatic decision. Only eager
+answers were remembered at first, so a scan of a few thousand rows that streamed on its
+first run went through the blocking pool and the streamed writer on every run. A streamed
+answer that completes in one body, which the server buffers up to 1 MiB, is now
+remembered with its time as well. A stream that `send` stops early has not run the whole
+query and is not remembered. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) measures the threshold
+over HTTP against af4a79d6, which ran these scans eagerly. With one Rayon thread on forge,
+scans of 20,000 and 50,000 rows answered 7% to 15% faster on their first run, and scans of
+1,000 and 5,000 rows matched. On a Namespace AMD EPYC instance every size was within 5%,
+and a repeated scan that answered in under 10 ms ran in place as fast as before.
+
+An uncached OPTIONAL COUNT on a single key, which automatic execution streamed from an
+estimated million rows, now runs eagerly. The pre-push screen of af4a79d6 measured the
+benchmark's `optional-count` at 10.5M 1.19 to 1.23 times slower under automatic execution
+on Namespace's AMD EPYC instances, while forge's i5-13500 measured 0.99. On a Namespace
+instance with one Rayon thread the cursor took 3.55 ms against 2.92 ms eagerly, both in
+place and on the blocking pool. `perf` put 83% of the cursor's samples in the merge count,
+whose branches on the comparison of the two key columns mispredict when the left and
+right keys interleave, as students and employees do in id order. Eager execution counts
+with a branch-free merge over several lanes. The tradeoff is memory, since the eager
+count held 20.8 MB at 10.5M where the cursor held 2.2 MB. A branch-free count in the
+cursor is left to the next part of item 7.
 
 The JVM library now runs queries in automatic mode by default as well. ARQ's result sets
 are lazy iterators that are valid only while their query execution and transaction are
@@ -1106,7 +1151,11 @@ execution, true streams every SELECT and false runs every query eagerly. Queries
 transaction still run eagerly, because a cursor cannot read the transaction's changes.
 `FfiQuery::execute_with` makes the decision, and when it streams, `FfiQuery::next_batch`
 reads the cursor and can fail. Its batches share one term dictionary up to the dataset's
-term cache size, as an eager result's batches do. A query iterator now refuses to read
+term cache size, as an eager result's batches do, and restart it when it is full. The
+encoder decodes a term it has not seen without charging it to the query's memory budget,
+as eager execution decodes its results, so a row of very large literals is held
+uncharged while it is encoded. That is the one exception to the cursor's budget
+accounting, and `QueryBatch::transient_term` is public only for this encoder. A query iterator now refuses to read
 once its transaction has ended and throws `JenaTransactionException`, eager or streamed,
 as Jena's own iterators do, instead of handing out the rest of an eager result.
 

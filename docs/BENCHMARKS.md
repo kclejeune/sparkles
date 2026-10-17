@@ -1540,6 +1540,29 @@ changes.
 Small scans stream faster too, which is why automatic execution now streams scans from an
 estimated thousand rows.
 
+The threshold was also measured over HTTP, against af4a79d6, whose automatic execution ran
+these scans eagerly. Each line is the median of three rounds, each the median wall time of
+60 TSV requests from curl to a fresh server at 10.5M with one Rayon thread, the server and
+client pinned to their own cores. A first run is the server with `SPARKLES_NO_IN_PLACE`,
+so that every request is planned and runs as a first one does. A repeat lets a query that
+answered in under 10 ms run eagerly in place, which a streamed answer now also earns. The
+wall times on forge include a constant floor of about 1.97 ms in its client path, which
+hides differences at 1,000 and 5,000 rows.
+
+| 10.5M, TSV over HTTP, ms | forge af4a79d6 | forge candidate | Namespace af4a79d6 | Namespace candidate |
+|---|---:|---:|---:|---:|
+| 1,000 rows, first run | 2.012 | 2.014 | 0.447 | 0.467 |
+| 5,000 rows, first run | 3.148 | 3.149 | 1.239 | 1.218 |
+| 20,000 rows, first run | 6.454 | **5.461** | 3.617 | 3.569 |
+| 50,000 rows, first run | 15.086 | **14.007** | 10.230 | 10.050 |
+| 1,000 rows, repeated | 2.015 | 2.013 | 0.453 | 0.461 |
+| 5,000 rows, repeated | 3.146 | 3.155 | 1.238 | 1.238 |
+| 20,000 rows, repeated | 6.433 | 6.443 | 3.522 | 3.637 |
+| 50,000 rows, repeated | 15.968 | **14.004** | 9.896 | 10.067 |
+
+The scans read `foaf:name` with `LIMIT` and `ex:city`, which has 20,000 triples. Both
+builds returned the same rows.
+
 | 10.5M, TSV, ms | Eager, 12 threads | Streaming, 12 threads | Eager, 1 thread | Streaming, 1 thread |
 |---|---:|---:|---:|---:|
 | 1,000 triples | 0.332 | **0.259** | 0.335 | **0.260** |

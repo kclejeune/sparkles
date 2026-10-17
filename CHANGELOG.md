@@ -20,18 +20,27 @@ hosts.
 
 Queries over HTTP, in the local CLI, in Node and in the JVM library now run in automatic
 mode by default. A plain scan that is expected to return at least a thousand rows from
-immutable blocks, and an uncached OPTIONAL count of a million rows, stream as a cursor. Every other query runs eagerly as before.
-A streamed answer that fails after its first 1 MiB aborts the transfer after a `200`
-status, so only a completed transfer is a complete answer. With `send`, the native
-metadata reports `stopped` and an unknown total, and a Node result that streams has no
-`size`. For Rust callers `ExecutionMode::default()` is now `Auto`, and
-`Dataset::query_execution` uses it, while `Dataset::query` stays eager. A request opts
-out with `execution=eager`, a server with `serve --default-execution eager`, the CLI
-with `--execution eager`, Node with `execution: 'eager'` and Jena with
-`Sparkles.STREAMING_EXECUTION` set to false. A Jena result that streams can throw from
-`hasNext()` partway through, and Jena queries in a write transaction run eagerly. A Jena
-query iterator now throws `JenaTransactionException` when it is read after its
-transaction has ended, where an eager result used to hand out its remaining rows.
+immutable blocks streams as a cursor, and every other query runs eagerly as before. An
+OPTIONAL count, which `execution=auto` streamed from a million rows, now runs eagerly,
+because the cursor counted it up to 1.23 times slower on AMD EPYC hosts. A streamed
+answer that fails after its first 1 MiB aborts the transfer after a `200` status, so
+only a completed transfer is a complete answer. A streamed answer reports no total in
+advance. The native metadata of a scan of a thousand rows or more therefore reports an
+unknown total with `send`, and a Node result of such a scan has no `size`, where both
+used to appear for every answer under a million rows. For Rust callers
+`ExecutionMode::default()` is now `Auto`, and `Dataset::query_execution` uses it, while
+`Dataset::query` stays eager. A request opts out with `execution=eager`, a server with
+`serve --default-execution eager`, the CLI with `--execution eager`, Node with
+`execution: 'eager'` and Jena with `Sparkles.STREAMING_EXECUTION` set to false. A server
+remembers a streamed answer that completed in one body in under 10 ms as a quick query,
+as it does an eager one, and runs its next request eagerly in place.
+
+A Jena result that streams can throw from `hasNext()` partway through, and Jena queries in
+a write transaction run eagerly. A Jena query iterator now throws
+`JenaTransactionException` when it is read after its transaction has ended, eager or
+streamed, where an eager result used to hand out its remaining rows. This covers an
+iterator created in a read transaction and first read after the transaction ended, and
+a final `hasNext()` after the last row when it comes after the end of the transaction.
 
 The deadline of a streamed answer now counts the query's own time. The time a query spends
 blocked on its reader, which is the response channel over HTTP and the gap between two
