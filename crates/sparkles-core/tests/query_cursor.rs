@@ -3679,3 +3679,85 @@ fn top_k_over_improving_input_with_repeated_values_matches_eager() {
         }
     }
 }
+
+/// With `grow_input` a filter over a long scan and a top-k read larger inputs as the scan
+/// goes on, which holds more rows at once than reads of the first size.
+#[test]
+fn growing_inputs_hold_larger_reads() {
+    let s = named(300_000);
+    for q in [
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) }",
+        "SELECT ?s ?a WHERE { ?s <urn:age> ?a } ORDER BY DESC(ABS(?a - 50)) ?s LIMIT 10",
+    ] {
+        let peak = |opts: &QueryOptions| {
+            let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+            while c.next_batch().unwrap().is_some() {}
+            c.stats().mem_peak_bytes
+        };
+        let (grown, fixed) = (peak(&QueryOptions::default()), peak(&without("grow_input")));
+        assert!(grown > fixed, "{q}: grown {grown}, fixed {fixed}");
+    }
+}
+
+/// A writer that decodes ahead holds two batches and their terms. Under any memory budget
+/// it writes what the writer without decoding ahead writes, and fails where that one
+/// fails, and a writer that fails partway, while a batch is being decoded ahead, ends the
+/// cursor with the same error.
+#[test]
+fn decoding_ahead_under_tight_budgets_and_failing_writers() {
+    use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions};
+    struct Failing(usize);
+    impl std::io::Write for Failing {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.0 < b.len() {
+                return Err(std::io::Error::other("the client went away"));
+            }
+            self.0 -= b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let s = named(20_000);
+    let q = "SELECT ?s ?n ?a WHERE { ?s <urn:name> ?n ; <urn:age> ?a }";
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let write = |opts: &QueryOptions| {
+        let mut c = select_cursor(s.snapshot(), q, opts, &options(1000)).unwrap();
+        let mut out = Vec::new();
+        pool.install(|| write_cursor_solutions(&mut c, SolutionsFormat::Tsv, &mut out, None))
+            .map(|_| out)
+    };
+    // From 550 KiB to 900 KiB the writer that decoded ahead from its first batch failed
+    // where the other wrote every row.
+    for kb in (100u64..=1500).step_by(50) {
+        let budget = |opts: QueryOptions| QueryOptions {
+            max_memory_bytes: Some(kb << 10),
+            ..opts
+        };
+        let serial = write(&budget(without("decode_ahead")));
+        let ahead = write(&budget(QueryOptions::default()));
+        match (serial, ahead) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{kb} KiB"),
+            (Err(_), Err(_)) => {}
+            (a, b) => panic!(
+                "{kb} KiB: in turn {:?}, ahead {:?}",
+                a.map(|o| o.len()),
+                b.map(|o| o.len())
+            ),
+        }
+    }
+    for after in [0, 10, 40_000, 200_000] {
+        for opts in [QueryOptions::default(), without("decode_ahead")] {
+            let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
+            let r = pool.install(|| {
+                write_cursor_solutions(&mut c, SolutionsFormat::Tsv, Failing(after), None)
+            });
+            assert!(r.is_err(), "the writer fails after {after} bytes");
+            assert_ne!(c.status(), CursorStatus::Complete);
+        }
+    }
+}

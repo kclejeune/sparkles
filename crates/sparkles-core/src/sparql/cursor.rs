@@ -1123,7 +1123,9 @@ impl QueryCursor {
     /// pulled before `each` handles the one before it, and its terms are decoded on the pool
     /// while `each` runs. Two batches and their terms are then live at once, both charged.
     /// The first batch goes to `each` before the second is pulled, so the first rows of an
-    /// answer wait for one batch only, however slowly the plan produces the next.
+    /// answer wait for one batch only, however slowly the plan produces the next. Decoding
+    /// ahead then starts only when the memory budget has room for twice what the first
+    /// batch took, and the writer otherwise goes on in turn.
     ///
     /// An error while pulling a batch ahead is returned after `each` has been called with the
     /// batch before it. A memory budget failure inside the plan also fails every later
@@ -1136,17 +1138,25 @@ impl QueryCursor {
         mut each: impl FnMut(&Self, &QueryBatch, Option<&DecodedBatch<'_>>) -> Result<()>,
     ) -> Result<usize> {
         let mut remaining = send.unwrap_or(usize::MAX);
-        let ahead = self.ctx.opt.decode_ahead && rayon::current_num_threads() >= 2;
+        let mut ahead = self.ctx.opt.decode_ahead && rayon::current_num_threads() >= 2;
         // In turn: every batch without decoding ahead, and the first batch with it.
         let mut first = true;
         while remaining > 0 && (first || !ahead) {
-            first = false;
+            let before = self.ctx.live_bytes();
             let Some(batch) = self.next_batch_at_most(remaining)? else {
                 return Ok(remaining);
             };
             let decoded = batch.decoded()?;
             each(self, &batch, decoded.as_ref())?;
             remaining -= batch.len().min(remaining);
+            if first {
+                first = false;
+                // Decoding ahead holds a second batch and its terms. It starts only when
+                // the memory budget has room for twice what the first batch took at its
+                // peak, so that a budget the writer fits in turn does not fail it.
+                let took = self.ctx.mem_peak().saturating_sub(before);
+                ahead = ahead && self.ctx.memory_remaining() >= took.saturating_mul(2);
+            }
         }
         if remaining == 0 {
             return Ok(remaining);
