@@ -184,6 +184,16 @@ check and exits with the number of failures. Jena and a JDK come from nixpkgs un
 `JENA_HOME` and `JAVA` name them, `SPARKLES_BIN` picks another server binary, and `PORT`
 another port. The task is not part of `mise run ci`.
 
+`scripts/power-loss.sh` runs the crash tests of
+[X09](specs/X09-group-commit-by-default.md) sections 10.2 and 10.4 with a release build and
+`scripts/crash-harness.rs`, which `rustc --edition 2024 -O` builds as one file. Its
+`logwrites` mode needs root and the device-mapper `log-writes` target. It records every
+write, flush and FUA of a file system under a 16-writer load and then replays crash images
+from the log, 1,000 by default, checking each recovered store. Its `kill9` mode kills the
+server at random moments of the same load, 200 times by default, and checks every receipt
+after each restart. With a directory in place of `ext4` or `xfs` it needs no root. Neither
+mode is part of `mise run ci`.
+
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
 `SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.
 `crates/sparkles-shex/tests/known-failures.txt` lists the tests that fail, with reasons.
