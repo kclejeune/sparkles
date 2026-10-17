@@ -113,7 +113,7 @@ pub struct Execution {
 enum Rows {
     Select(Box<QueryResult>, TermTable<u64>),
     /// the solutions of a SELECT that automatic execution streams
-    Cursor(Box<crate::FfiSelectCursor>),
+    Cursor(Box<crate::FfiSelectCursor>, TermTable<u64>),
     /// CONSTRUCT and DESCRIBE quads; `None` keys the default graph
     Quads(Vec<(Option<Term>, [Term; 3])>, TermTable<Option<Term>>),
 }
@@ -178,7 +178,7 @@ impl FfiQuery {
         self.state
             .lock()
             .as_ref()
-            .is_some_and(|st| matches!(st.rows, Rows::Cursor(_)))
+            .is_some_and(|st| matches!(st.rows, Rows::Cursor(..)))
     }
 
     /// The execution of a materialized result, with its first `first_rows` rows.
@@ -286,7 +286,7 @@ impl FfiQuery {
                 w.finish()
             }
             // next_batch reads a cursor itself
-            Rows::Cursor(_) => encode::empty_batch(0),
+            Rows::Cursor(..) => encode::empty_batch(0),
         })
     }
 
@@ -294,7 +294,7 @@ impl FfiQuery {
         match &st.rows {
             Rows::Select(r, _) => st.pos < r.table.len(),
             Rows::Quads(q, _) => st.pos < q.len(),
-            Rows::Cursor(_) => true,
+            Rows::Cursor(..) => true,
         }
     }
 }
@@ -392,10 +392,12 @@ impl FfiQuery {
                 let cursor =
                     crate::FfiSelectCursor::new(*cursor, self.labels.clone(), self.cancel.clone());
                 let variables = cursor.variables();
-                let first = cursor.next_batch(first_rows)?;
+                // the batches share one dictionary, as an eager result's do
+                let mut table = TermTable::new(self.term_cache);
+                let first = cursor.fill(first_rows, Some(&mut table))?;
                 if !first.done {
                     *self.state.lock() = Some(State {
-                        rows: Rows::Cursor(Box::new(cursor)),
+                        rows: Rows::Cursor(Box::new(cursor), table),
                         pos: 0,
                     });
                 }
@@ -431,8 +433,8 @@ impl FfiQuery {
                 done: true,
             });
         };
-        if let Rows::Cursor(cursor) = &st.rows {
-            let batch = cursor.next_batch(max_rows);
+        if let Rows::Cursor(cursor, table) = &mut st.rows {
+            let batch = cursor.fill(max_rows, Some(table));
             if !matches!(&batch, Ok(b) if !b.done) {
                 *guard = None;
             }

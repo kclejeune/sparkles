@@ -250,6 +250,16 @@ impl QueryBatch {
         self.ctx.batch_term(id)
     }
 
+    /// The term of a key that [`QueryBatch::key`] gave for a cell of this batch, decoded
+    /// without the checks against the query's memory budget, for a caller that drops the
+    /// term at once, such as an encoder that writes it out. The charges of
+    /// [`QueryBatch::term`] for the term and its vocabulary block's scratch end with the
+    /// call, so they only refuse a term that does not fit in what remains of the budget,
+    /// and eager execution decodes its results the same way.
+    pub fn transient_term(&self, key: u64) -> Option<Term> {
+        self.ctx.transient_batch_term(Id(key))
+    }
+
     /// A key of the cell's term that is the same for every cell of the query that holds
     /// the same internal id, so that a writer can encode each term once without decoding
     /// it first. UNDEF is None. Two keys can still name equal terms.

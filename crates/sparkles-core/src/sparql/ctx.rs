@@ -1797,6 +1797,16 @@ impl Ctx {
         }
     }
 
+    /// The term of an id as eager execution decodes it, without charging the scratch of
+    /// a vocabulary block or the term, for a caller that drops the term at once.
+    pub(super) fn transient_batch_term(&self, id: Id) -> Option<Term> {
+        match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map(id::key_to_term),
+            Tag::Undef | Tag::Special => None,
+            _ => self.snap.term(id),
+        }
+    }
+
     /// [`Ctx::batch_term`] for a caller that has already reserved
     /// [`Ctx::decoded_bytes`] for the term, as the result writers do for a row's cells.
     /// It takes no reservation of its own, which cost an inline number one pass through
