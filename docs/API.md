@@ -1609,8 +1609,8 @@ Query parameters beyond the standard protocol:
   Results Thrift is not supported in streaming mode and returns `501`. An invalid mode
   returns `400`.
 
-  `auto` streams a plain SELECT of scans and projections when it expects at least one
-  million rows and the data comes from immutable blocks with no pending changes. It also
+  `auto` streams a plain SELECT of scans and projections when it expects at least a
+  thousand rows and the data comes from immutable blocks with no pending changes. It also
   streams a `COUNT(*)` over a single-key OPTIONAL between two plain scans when the
   estimated work reaches one million rows and the result cache is off or bypassed. An
   aggregate query that the cache serves still runs eagerly. In both cases, any graph

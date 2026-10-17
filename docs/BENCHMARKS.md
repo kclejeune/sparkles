@@ -1485,9 +1485,9 @@ processes at 10.5M, show the tradeoff:
 
 For the complete scan, the query's allocation estimate peaks at 241.0 MiB for eager
 result columns and 1.0 MiB when streaming. Automatic execution is the default over HTTP,
-in the CLI and in Node. It streams only the large scans and OPTIONAL counts where
-streaming measured faster and runs every other plan eagerly, because eager is faster on
-several shapes.
+in the CLI, in Node and in the JVM library. It streams only the scans and OPTIONAL counts
+where streaming measured faster and runs every other plan eagerly, because eager is
+faster on several shapes at 12 threads.
 
 The table below measures the change of default on forge at 10.5M. Each case is one
 request to a fresh server process, which reports the query's allocation estimate in the
@@ -1518,6 +1518,39 @@ cursor's batches no longer wait for the whole answer, and its wall time for all 
 rows in native JSON stayed at 553 ms. At 1.05M the full scan's server time fell by 81%
 with the same wall time. The geometric mean of the server times fell by 6.3% at 1.05M and
 5.2% at 10.5M, and that of the wall times moved by -0.7% and +0.1%.
+
+The streaming parity work of 2026-10-17 measured eager against streaming execution again
+on forge with a probe binary that interleaves the modes in one process. The table gives
+the streaming time divided by the eager time at 10.5M, where under 1 means streaming is
+faster. Each row's modes ran in the same process, and
+[X05](specs/X05-streaming-query-execution.md#streaming-parity-2026-10-17) describes the
+changes.
+
+| 10.5M, ratio of streaming to eager | af4a79d6, 12 threads | 2026-10-17, 12 threads | 2026-10-17, 1 thread |
+|---|---:|---:|---:|
+| TSV, 500,000 rows | 1.80 | **0.86** | **0.83** |
+| TSV, name scan of 1.02M rows | 1.37 | **0.89** | **0.91** |
+| Range top-k, rows only | 2.06 | 1.56 | **0.94** |
+| Expression ordering, rows only | 1.48 | 1.08 | **0.89** |
+| Substring filter, rows only | 1.60 | 1.45 | 1.02 |
+| Regular expression filter, rows only | 1.56 | 1.50 | 1.07 |
+
+Small scans stream faster too, which is why automatic execution now streams scans from an
+estimated thousand rows.
+
+| 10.5M, TSV, ms | Eager, 12 threads | Streaming, 12 threads | Eager, 1 thread | Streaming, 1 thread |
+|---|---:|---:|---:|---:|
+| 1,000 triples | 0.332 | **0.259** | 0.335 | **0.260** |
+| 5,000 triples | 1.604 | **1.126** | 1.610 | **1.229** |
+| 50,000 triples | 15.590 | **8.057** | 15.676 | **12.034** |
+| 100,000 names | 19.151 | **16.888** | 30.216 | **23.228** |
+
+The JVM library also runs in automatic mode by default since 2026-10-17. In the binding
+comparison of `scripts/bench-bindings` at 1.05M on forge, with every case run twice in
+each mode in alternating processes, the JNI export of 500,000 rows took 130 ms against
+126 ms eagerly on disk and 129 ms against 124 ms in memory. No other query, `find`,
+`contains` or `getProperty` moved by more than run-to-run noise, and the small-query
+latencies at one thread stayed within 2%.
 
 **mimalloc** keeps freed memory in per-thread heaps, and the server hands idle memory back
 to the OS after a second (`--idle-release-ms`). On the development laptop, a fresh 10.5M

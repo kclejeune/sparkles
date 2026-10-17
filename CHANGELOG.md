@@ -18,16 +18,20 @@ from 512 MiB to 256 MiB and the default history cache from 1 GiB to 512 MiB.
 defaults for library users. `--memory-profile small` sets smaller sizes for constrained
 hosts.
 
-Queries over HTTP, in the local CLI and in Node now run in automatic mode by default. A
-plain scan that is expected to return at least a million rows from immutable blocks, and
-an uncached OPTIONAL count, stream as a cursor. Every other query runs eagerly as before.
+Queries over HTTP, in the local CLI, in Node and in the JVM library now run in automatic
+mode by default. A plain scan that is expected to return at least a thousand rows from
+immutable blocks, and an uncached OPTIONAL count of a million rows, stream as a cursor. Every other query runs eagerly as before.
 A streamed answer that fails after its first 1 MiB aborts the transfer after a `200`
 status, so only a completed transfer is a complete answer. With `send`, the native
 metadata reports `stopped` and an unknown total, and a Node result that streams has no
 `size`. For Rust callers `ExecutionMode::default()` is now `Auto`, and
 `Dataset::query_execution` uses it, while `Dataset::query` stays eager. A request opts
 out with `execution=eager`, a server with `serve --default-execution eager`, the CLI
-with `--execution eager` and Node with `execution: 'eager'`.
+with `--execution eager`, Node with `execution: 'eager'` and Jena with
+`Sparkles.STREAMING_EXECUTION` set to false. A Jena result that streams can throw from
+`hasNext()` partway through, and Jena queries in a write transaction run eagerly. A Jena
+query iterator now throws `JenaTransactionException` when it is read after its
+transaction has ended, where an eager result used to hand out its remaining rows.
 
 The deadline of a streamed answer now counts the query's own time. The time a query spends
 blocked on its reader, which is the response channel over HTTP and the gap between two

@@ -4150,7 +4150,7 @@ result it returns. `results::write_cursor_native_json` also writes the native sn
 metadata.
 
 HTTP queries run in automatic mode unless they ask otherwise. Automatic execution
-streams a plain SELECT of scans and projections when it expects at least one million
+streams a plain SELECT of scans and projections when it expects at least a thousand
 rows. The data must come from immutable blocks with no pending changes, any graph
 restriction must cover whole blocks, the query must have no restored initial bindings
 or offset, and its row budgets must cover the estimate. There must also be enough memory
@@ -4210,10 +4210,13 @@ results are collected values whose iteration cannot fail. Node runs `query`, `se
 `construct` and `queryToStream` in automatic mode by default and accepts
 `execution: 'eager' | 'streaming' | 'auto'` in its query options. A streamed Node result
 has no `size` and can reject while it is read. Queries in a Node transaction run eagerly.
-JVM callers keep eager execution by default and turn streaming on with the context
-symbol `Sparkles.STREAMING_EXECUTION`. Jena then reads SELECT results in batches and
-handles graph queries through its usual adapters. Close cursors and iterators when
-stopping early.
+JVM queries also run in automatic mode by default, and Jena reads a streamed SELECT in
+batches through its usual result sets and graph adapters. Setting the context symbol
+`Sparkles.STREAMING_EXECUTION` to false runs every query eagerly, and true streams every
+SELECT. A streamed result can throw `QueryCancelledException` or another query error from
+`hasNext()` partway through, as any ARQ result set can. Queries in a write transaction run
+eagerly, and reading a result after its transaction has ended throws
+`JenaTransactionException`. Close result sets and iterators when stopping early.
 
 ### Registered scalar functions
 
