@@ -1485,11 +1485,13 @@ processes at 10.5M, show the tradeoff:
 
 For the complete scan, the query's allocation estimate peaks at 241.0 MiB for eager
 result columns and 1.0 MiB when streaming. Automatic execution is the default over HTTP,
-in the CLI, in Node and in the JVM library. It streams only plain scans, where streaming
-measured faster, and runs every other plan eagerly, because eager is faster on several
-shapes at 12 threads. The OPTIONAL count above streamed by default until 2026-10-17. On
-the AMD EPYC hosts of the Namespace screens it took 3.5 ms streamed against 2.9 ms
-eagerly at 10.5M with one thread, so it now runs eagerly.
+in the CLI, in Node and in the JVM library. It streams plain scans and, since the column
+kernels described [below](#batch-kernels-and-disk-spill), groupings of an estimated 20,000
+input rows or more, where streaming measured faster, and runs every other plan eagerly,
+because eager is faster on several shapes at 12 threads. The OPTIONAL count above ran
+eagerly for a few hours on 2026-10-17, because the cursor's branching merge count took
+3.5 ms against 2.9 ms eagerly on the AMD EPYC hosts of the Namespace screens. Its
+branch-free count streams again.
 
 The table below measures the change of default on forge at 10.5M. Each case is one
 request to a fresh server process, which reports the query's allocation estimate in the
@@ -1569,6 +1571,60 @@ builds returned the same rows.
 | 5,000 triples | 1.604 | **1.126** | 1.610 | **1.229** |
 | 50,000 triples | 15.590 | **8.057** | 15.676 | **12.034** |
 | 100,000 names | 19.151 | **16.888** | 30.216 | **23.228** |
+
+<a id="batch-kernels-and-disk-spill"></a>
+
+**Batch kernels and disk spill.** On 2026-10-17 the cursor's merge and hash joins, counts,
+groupings and DISTINCT moved to column kernels, and sorts, groupings and unordered
+DISTINCT learned to spill (X08 Phase 2). A probe binary interleaved eager and cursor runs
+of each query in one process over a store loaded on an 8-vCPU AMD EPYC Namespace instance,
+reading every row. The table gives the cursor's time divided by the eager time, the median
+of three to five rounds, where under 1 means streaming is faster.
+
+| Ratio of streaming to eager | 1.05M, 1 thread | 10.5M, 1 thread | 10.5M, 8 threads |
+|---|---:|---:|---:|
+| `expr-agg-arg`, a grouped SUM of an expression | **0.50** | **0.51** | **0.51** |
+| `group-avg`, grouped AVG and COUNT then top 10 | **0.90** | **0.61** | **0.71** |
+| `expr-bind-group`, a COUNT by a computed key | **0.70** | **0.66** | **0.78** |
+| `x-group-out`, 2,000 groups of a join | **0.91** | **0.83** | **0.75** |
+| `x-group-knows`, a COUNT per subject | **0.65** | **0.70** | **0.79** |
+| `optional-count`, COUNT over OPTIONAL | **0.88** | **0.80** | **0.79** |
+| `minus`, COUNT over MINUS | **0.88** | **0.82** | **0.83** |
+| `x-distinct-out`, DISTINCT of a scan | **0.90** | **0.93** | **0.96** |
+| `distinct-join`, DISTINCT of a join | 1.09 | **0.95** | **0.99** |
+| `optional-chain`, two OPTIONAL joins | 1.00 | 1.33 | **0.92** |
+| `x-hash-join`, a hash join's 1.75M rows | 1.10 | 1.02 | **0.99** |
+| `x-join-out`, an index join's 1M rows | 1.28 | 1.03 | **0.98** |
+| `star-join` | 1.03 | 1.09 | 1.16 |
+| `regex-iri` | 1.26 | 1.26 | 1.30 |
+| `order-by-full`, a sort of 1.02M rows | 1.01 | **0.69** | **0.82** |
+
+Every grouped query streamed faster at every size and thread count, so automatic
+execution now streams groupings from an estimated 20,000 input rows, counts over OPTIONAL
+and MINUS included. Joins without a grouping stay eager, because they measured slower or
+mixed. The cursor also holds much less. At 10.5M its ledger peaked at 2.2 MB for
+`optional-count` against 19.8 MB eagerly, and 2.6 MB for `distinct-join` against
+102.1 MB. A full sort stays eager by default, because the in-memory cursor sort holds its
+whole input with decoded keys, 580 MB in the ledger against 31 MB eagerly.
+
+Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
+10.5M. The spill directory was on the instance's local disk.
+
+| 10.5M, ms | Eager, unlimited | Cursor with spill, 64 MiB, 1 thread | Eager, 8 threads | Cursor with spill, 64 MiB, 8 threads |
+|---|---:|---:|---:|---:|
+| `order-by-full`, 1.02M rows by name | 773 | **658** | **238** | 535 |
+| ORDER BY age then person, 1M rows | 1,677 | **1,294** | **298** | 563 |
+| ORDER BY an expression, 1M rows | 1,809 | **1,297** | **307** | 600 |
+| GROUP BY person, 833,177 groups | **127** | 195 | **124** | 205 |
+| DISTINCT over a UNION, 986,333 rows | 56 | **51** | 69 | **56** |
+
+The spilling sorts held 45 to 54 MB in the ledger, where the in-memory cursor sort held 580
+to 708 MB and the eager sort reported 31 MB. The merge runs on one thread, so a spilling
+sort is faster than eager execution at one thread and about twice as slow at eight. The
+grouping held 38 MB against 130 MB eagerly and took 1.5 to 1.7 times as long, and at
+16 MiB it held 11 MB and took 2.8 times as long. DISTINCT held 14.5 MB against 152 MB, and
+at 16 MiB 4.4 MB at 1.7 times the eager time. A budget near a tenth of the state's size
+thus costs 1.7 to 2.8 times the time, and one near half of it costs little.
 
 The JVM library also runs in automatic mode by default since 2026-10-17. In the binding
 comparison of `scripts/bench-bindings` at 1.05M on forge, with every case run twice in

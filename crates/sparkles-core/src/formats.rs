@@ -316,6 +316,17 @@ pub const VALIDATION_TYPING: FileKind = FileKind {
     reads: &[1],
 };
 
+/// The spill files of cursor operators that outgrow their memory budget. Only the
+/// process that wrote a file reads it, and a start removes what dead processes left.
+pub const SPILL: FileKind = FileKind {
+    id: "spill",
+    files: "the spill files under `--spill-dir` and their SPARKLES-SPILL marker",
+    marker: "the u16 after the `SPKSPL01` magic; another version is refused",
+    class: Class::Derived,
+    writes: 1,
+    reads: &[1],
+};
+
 /// The layout marker of a backup repository.
 pub const BACKUP_LAYOUT: FileKind = FileKind {
     id: "backup-layout",
@@ -441,6 +452,7 @@ pub const KINDS: &[&FileKind] = &[
     &VECTOR,
     &GEO,
     &VALIDATION_TYPING,
+    &SPILL,
     &BACKUP_LAYOUT,
     &BACKUP_BLOB,
     &BACKUP_SLOTS,
@@ -825,6 +837,7 @@ mod tests {
         );
         assert_eq!(VECTOR.writes, crate::vector::config::FORMAT_VERSION);
         assert_eq!(GEO.writes, crate::geo::config::FORMAT_VERSION);
+        assert_eq!(SPILL.writes, u32::from(crate::spill::FORMAT_VERSION));
         assert_eq!(
             crate::stored::FORMAT,
             settings_file(crate::stored::FILE).unwrap().writes

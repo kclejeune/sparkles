@@ -20,9 +20,10 @@ hosts.
 
 Queries over HTTP, in the local CLI, in Node and in the JVM library now run in automatic
 mode by default. A plain scan that is expected to return at least a thousand rows from
-immutable blocks streams as a cursor, and every other query runs eagerly as before. An
-OPTIONAL count, which `execution=auto` streamed from a million rows, now runs eagerly,
-because the cursor counted it up to 1.23 times slower on AMD EPYC hosts. A streamed
+immutable blocks streams as a cursor, and so does a grouping that reads an estimated
+20,000 rows or more, counts over OPTIONAL and MINUS included, since the cursor's column
+kernels measured 0.50 to 0.91 times the eager time on such queries. Every other query
+runs eagerly as before. A streamed
 answer that fails after its first 1 MiB aborts the transfer after a `200` status, so
 only a completed transfer is a complete answer. A streamed answer reports no total in
 advance. The native metadata of a scan of a thousand rows or more therefore reports an
@@ -49,6 +50,17 @@ export is not cut off. Over HTTP a client that reads nothing for longer than the
 request's timeout ends the stream as a timeout. This applies to `execution=streaming` as
 well. A local `sparkles query --timeout` still counts the time its output is blocked.
 
+`sparkles serve --spill on` lets a streamed sort without LIMIT, a grouping and a DISTINCT
+over unordered input write what does not fit in their memory budget to `--spill-dir`
+(default `<data>/.spill`) and finish. The disk is limited by `--spill-max-mb` for the
+server and `--query-spill-mb` for one query, a request may lower the latter with
+`spill-mb`, and a query over it fails with the new `spill` budget and `507`. With spill
+on, automatic execution also streams a query that eager execution would hold in more
+than half its budget, and runs an eager SELECT that exceeds its memory budget once more
+as a cursor. Spill is off by default until hash joins spill too. `/$/server/memory` adds
+a `spill` object and `/$/metrics` the `sparkles_spill_*` series. Rust callers set
+`QueryOptions::spill` and `max_spill_bytes`, and `BudgetKind::Spill` is a new variant.
+
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server
 refuses until `sparkles migrate` runs without `--check`, and its JSON report adds `opens`.
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as
@@ -73,6 +85,13 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+Spill files are registered as the derived format `spill` version 1. A file has the magic
+`SPKSPL01`, the version as a u16, the operator kind, the codec, an encryption flag and
+the column count, then frames of up to 4,096 rows with a CRC-32 over each frame's header
+and columns. Only the process that wrote a file reads it, and a reader refuses another
+version, kind, codec or encryption flag. A spill directory holds a `SPARKLES-SPILL`
+marker that names the format and its version.
 
 The ShEx write guard's persisted typing, `validation-typing.bin`, is registered as the
 derived format `validation-typing` version 1. The version is the u32 after the `SPXTYP01`

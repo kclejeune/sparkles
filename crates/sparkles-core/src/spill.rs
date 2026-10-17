@@ -38,7 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The name of the format in the marker file.
 pub const FORMAT_NAME: &str = "sparkles-spill";
-/// The version of the file format, in every file's header.
+/// The version of the file format, in every file's header, registered as
+/// [`crate::formats::SPILL`].
 pub const FORMAT_VERSION: u16 = 1;
 const MAGIC: [u8; 8] = *b"SPKSPL01";
 const HEADER_BYTES: usize = 32;
@@ -725,9 +726,10 @@ impl SpillRun {
             return Err(Error::Corrupt("spill file: not a spill file".into()));
         }
         let version = u16::from_le_bytes([header[8], header[9]]);
-        if version != FORMAT_VERSION {
+        if !crate::formats::SPILL.reads(u32::from(version)) {
             return Err(Error::Corrupt(format!(
-                "spill file: format version {version}, this build reads {FORMAT_VERSION}"
+                "spill file: format version {version}, this build reads {}",
+                crate::formats::SPILL.readable()
             )));
         }
         if SpillKind::from_u8(header[10]) != Some(self.kind) {
@@ -931,6 +933,15 @@ mod tests {
         run.file
             .write_all_at(&FORMAT_VERSION.to_le_bytes(), 8)
             .unwrap();
+        // An unknown operator kind, codec or encryption flag.
+        for (at, byte) in [(10u64, 99u8), (11, 9), (12, 1)] {
+            let mut was = [0u8];
+            run.file.read_exact_at(&mut was, at).unwrap();
+            run.file.write_all_at(&[byte], at).unwrap();
+            assert!(matches!(run.reader(), Err(Error::Corrupt(_))), "byte {at}");
+            run.file.write_all_at(&was, at).unwrap();
+        }
+        assert!(run.reader().is_ok());
         // A flipped payload byte.
         run.file
             .write_all_at(&[0xff], (HEADER_BYTES + FRAME_HEADER_BYTES + 6) as u64)

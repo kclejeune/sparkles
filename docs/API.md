@@ -1604,8 +1604,11 @@ Query parameters beyond the standard protocol:
   keeps its group state. All of that memory counts against the query budget. Sorting
   reads its whole input into budgeted memory before the first row. DESCRIBE and
   unsupported operators also read their whole input first, which the plan shows, and
-  that memory is budgeted too. A query that exceeds the budget fails, and nothing spills
-  to disk, so streaming does not keep every query in constant memory. SELECT in SPARQL
+  that memory is budgeted too. On a server started with `--spill on`, a sort without
+  LIMIT, a grouping and a DISTINCT over unordered input write what does not fit to disk
+  and finish within the budget (see [Disk spill](#disk-spill)). A hash join still keeps
+  its whole build side in memory. A query that exceeds the budget otherwise fails, so
+  streaming does not keep every query in constant memory. SELECT in SPARQL
   Results Thrift is not supported in streaming mode and returns `501`. An invalid mode
   returns `400`.
 
@@ -1613,14 +1616,20 @@ Query parameters beyond the standard protocol:
   thousand rows and the data comes from immutable blocks with no pending changes. Any graph
   restriction must cover whole blocks, the query must have no restored initial bindings
   or offset, and there must be enough memory to own the blocks and to hold batches of at
-  least 4,096 rows and 128 KiB. A scan whose estimate exceeds the request's row budgets
+  least 4,096 rows and 128 KiB. It also streams a SELECT whose grouping, with or without
+  ORDER BY, LIMIT, HAVING or BIND above it, reads an estimated 20,000 rows or more when
+  every operator of the query has a cursor implementation. That covers counts over
+  OPTIONAL and MINUS. Such groupings measured 0.50 to 0.91 times the eager time. On a
+  server with spill on, a SELECT of cursor operators that eager execution would hold in
+  more than half its memory budget streams too, and an eager SELECT that exceeds its
+  memory budget runs once more as a cursor within the same deadline, unless it calls
+  SERVICE, a graph algorithm or an extension function. The cursor plan then counts
+  `eagerMemoryRetry`. A plan whose estimate exceeds the request's row budgets
   (`max-rows` or `max-rows-produced`) runs eagerly, so that the budget fails it with a
   status before any output. Every other plan runs eagerly, with the same response as
   `execution=eager`. A query that ran in under 10 ms the last time also runs eagerly
   without being planned for the decision, also when its last run streamed and its answer
-  fit in one 1 MiB body. A `COUNT(*)` over a single-key OPTIONAL between two plain scans
-  streamed from an estimated million rows until 2026-10-17 and now runs eagerly, because
-  the cursor counted it up to 1.23 times slower on AMD EPYC hosts. A request for SPARQL
+  fit in one 1 MiB body. A request for SPARQL
   Results Thrift runs eagerly because that encoding has no streaming writer. A stored-query run with
   parameter values also runs eagerly, because initial bindings rule out every automatic
   plan. A streamed answer that passes a lowered `max-result-mb` within its first
@@ -7798,6 +7807,10 @@ fails the request with `507 Insufficient Storage` and a body like this:
 * `server-memory` is not one of the request's own budgets. It reports that the server's
   [query memory pool](#query-memory-pool) is in use. It answers `503 Service Unavailable`
   with `Retry-After: 1`, because a retry can succeed once other queries finish.
+* `spill` (`--query-spill-mb`, default 16384, and `--spill-max-mb` for all queries) is
+  the disk that a query's spill files may reserve (see [Disk spill](#disk-spill)). The
+  server reserves it in 64 MiB extents, and a write that fails for lack of space fails
+  the same way.
 * `result-bytes` (`--max-result-mb`, default 1024) is the serialized, uncompressed body of
   a SPARQL query response. Graph Store GET, the export path for a graph or the whole
   dataset, has its own budget, `--max-export-mb`, which is unlimited (`0`) by default.
@@ -7877,6 +7890,8 @@ caches.
 { "profile": "default", "queryMemoryBytes": 8589934592,
   "pool": { "enabled": true, "capacityBytes": 4294967296, "grantedBytes": 33554432,
             "waiting": 0, "admitted": 120, "rejected": 0, "admissionWaitSeconds": 2.0 },
+  "spill": { "enabled": true, "capacityBytes": 68719476736, "queryBytes": 17179869184,
+             "reservedBytes": 0, "writtenBytes": 52428800, "spilledQueries": 1 },
   "caches": { "shared": true,
               "block": { "capacityBytes": 1073741824, "bytes": 402653184, "entries": 1536 },
               "result": { "capacityBytes": 268435456, "bytes": 0, "entries": 0 },
@@ -7892,10 +7907,50 @@ query that such a request or an MCP tool call runs starts with an empty grant an
 like any other. It does not queue, and it fails with `server-memory` when the pool is
 short.
 
+#### Disk spill
+
+The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
+`sparkles serve --spill on` lets a streamed query finish within its memory budget by
+writing to disk what does not fit. It is off by default until hash joins spill too.
+Three operators spill.
+
+* A sort without LIMIT writes sorted runs once its input would take half the memory the
+  query had when the sort started, and merges up to 64 runs at a time, with one frame of
+  each in memory. Equal keys keep their input order.
+* A grouping stops taking new groups once its groups hold half that memory. Rows of the
+  groups it holds are still aggregated, and the rows of other groups go to 16 files by a
+  hash of their keys. Each file is grouped by a pass of its own after the first groups are
+  sent, so every aggregate, `GROUP_CONCAT` order and DISTINCT included, sees the rows it
+  would see in memory.
+* A DISTINCT over unordered input does the same with a hash of the whole row, and the rows
+  from the files come after the others. Over ordered input it needs no memory and never
+  spills.
+
+Spill files live in a directory per server process under `--spill-dir`, which defaults
+to `<data>/.spill` and must be on a local file system. A file has no name while it is
+written, so it disappears when it is closed or when the process dies, and the next start
+removes the directories of processes that are gone. The format is versioned, every frame
+carries a CRC-32, and a reader refuses a version, kind or codec it does not know. All
+queries together reserve at most `--spill-max-mb`, which defaults to a quarter of the
+free space of the directory at start, at most 64 GiB, and the server keeps
+`--min-free-disk-mb` free. One query reserves at most `--query-spill-mb`, and a request
+may lower that with `spill-mb`. The plan of an operator that spilled counts
+`spilledBytes` and either `spillRuns` and `mergePasses` for a sort or `spillPasses` for
+a grouping or DISTINCT. `/$/server/memory` reports the directory's use, and
+`/$/metrics` adds `sparkles_spill_capacity_bytes`, `sparkles_spill_reserved_bytes`,
+`sparkles_spill_written_bytes_total` and `sparkles_spill_queries_total`.
+
+Spill files hold ids, and inline ids carry literal values such as numbers and dates. The
+files are not encrypted, so a deployment that must not write query data to disk keeps
+spill off. A sort on an expression that calls `RAND`, `BNODE`, `UUID` or `STRUUID` keeps
+its computed keys in memory for the whole query, since the merge must compare the values
+the runs were sorted by.
+
 **Budgets per request.** A query can ask for lower budgets than the server's with
-`memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb`, in the query string or
-in a form body. An update takes the first three. Each value is a positive whole number,
-in MiB for `memory-mb` and `max-result-mb`. Anything else is a `400`. A value above the
+`memory-mb`, `spill-mb`, `max-rows`, `max-rows-produced` and `max-result-mb`, in the
+query string or in a form body. An update takes `memory-mb`, `max-rows` and
+`max-rows-produced`. Each value is a positive whole number, in MiB for `memory-mb`,
+`spill-mb` and `max-result-mb`. Anything else is a `400`. A value above the
 server's budget is clamped to it, so a request can lower a budget but never raise it. The
 error of a request over its budget reports the budget that applied as `limit`. The time
 budget is the `timeout` parameter, which may ask for more than the default, up to
