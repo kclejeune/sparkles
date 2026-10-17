@@ -437,3 +437,87 @@ async fn the_default_quota_covers_bulk_loads_and_clones() {
     );
     assert!(st.get("copy").is_none());
 }
+
+// ------------------------------------------------------------------- spill ------
+
+/// A dataset `s` of 120,000 subjects whose objects sort in another order.
+/// With `spill`, the server may spill `spill_bytes` of disk in all.
+fn spill_server(spill: bool, spill_bytes: u64) -> ([tempfile::TempDir; 2], Arc<AppState>, Router) {
+    let spill_dir = tempfile::tempdir().unwrap();
+    let path = spill_dir.path().to_path_buf();
+    let (dir, st, _) = server(StoreOptions::default(), |st| {
+        if spill {
+            st.spill = Some(
+                sparkles::spill::Spill::open(&sparkles::spill::SpillOptions {
+                    dir: path,
+                    max_bytes: spill_bytes,
+                    query_bytes: spill_bytes,
+                    min_free_bytes: 0,
+                })
+                .unwrap(),
+            );
+        }
+    });
+    let ds = st.attach("s", DbType::Mem, None).unwrap();
+    let data = (0..120_000)
+        .map(|i| {
+            format!(
+                "<urn:s{i}> <urn:p> \"{}\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+                (i * 7919) % 120_000
+            )
+        })
+        .collect::<String>();
+    ds.store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let app = router(st.clone());
+    ([dir, spill_dir], st, app)
+}
+
+const SORT: &str = "SELECT ?s ?o { ?s <urn:p> ?o } ORDER BY DESC(STR(?s))";
+
+#[tokio::test]
+async fn streamed_sorts_spill_within_the_memory_budget_and_fail_with_the_spill_budget() {
+    let (_d, _st, app) = spill_server(false, 0);
+    // Without spill the sort holds its whole input.
+    let r = query(&app, "s", SORT, "execution=streaming&memory-mb=1").await;
+    r.budget("memory");
+    let (_d, st, app) = spill_server(true, 4 << 30);
+    let r = query(&app, "s", SORT, "execution=streaming&memory-mb=1").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rows = r.json()["results"]["bindings"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 120_000);
+    assert_eq!(rows[0]["s"]["value"], "urn:s99999");
+    assert_eq!(rows[119_999]["s"]["value"], "urn:s0");
+    let m = get(&app, "/$/server/memory").await.json();
+    assert_eq!(m["spill"]["enabled"], true, "{m}");
+    assert!(m["spill"]["writtenBytes"].as_u64().unwrap() > 0, "{m}");
+    assert_eq!(m["spill"]["reservedBytes"], 0, "{m}");
+    assert_eq!(m["spill"]["spilledQueries"], 1, "{m}");
+    let metrics = get(&app, "/$/metrics").await.text();
+    assert!(
+        metrics.contains("sparkles_spill_queries_total 1"),
+        "{metrics}"
+    );
+    // The run files take about 260 KiB, which `spill-mb=1` holds.
+    let r = query(
+        &app,
+        "s",
+        SORT,
+        "execution=streaming&memory-mb=1&spill-mb=1",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = query(&app, "s", SORT, "spill-mb=0").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert_eq!(st.spill.as_ref().unwrap().reserved_bytes(), 0);
+    // The server reserves disk in 64 MiB extents, which 32 MiB cannot hold.
+    let (_d, st, app) = spill_server(true, 32 << 20);
+    let r = query(&app, "s", SORT, "execution=streaming&memory-mb=1").await;
+    r.budget("spill");
+    assert_eq!(st.spill.as_ref().unwrap().reserved_bytes(), 0);
+}

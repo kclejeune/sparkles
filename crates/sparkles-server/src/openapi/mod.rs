@@ -682,6 +682,14 @@ fn parameters() -> Map<String, J> {
         ),
     );
     put(
+        "spillMb",
+        q(
+            "spill-mb",
+            json!({ "type": "integer", "minimum": 1 }),
+            "A lower budget of the disk this query's spill files may reserve, in MiB.",
+        ),
+    );
+    put(
         "maxRows",
         q(
             "max-rows",

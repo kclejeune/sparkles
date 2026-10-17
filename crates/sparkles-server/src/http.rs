@@ -1159,6 +1159,9 @@ fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
         // the grant the request was admitted with, if the server has a memory pool
         grant: crate::server_memory::current_grant(),
         max_rows_produced: st.limits.max_rows_produced,
+        // cursor sorts write sorted runs here when they outgrow the memory budget
+        spill: st.spill.clone(),
+        max_spill_bytes: st.limits.query_spill_bytes,
         no_cache: params.get("nocache").is_some_and(truthy),
         default_graph_uris: params.all("default-graph-uri"),
         named_graph_uris: params.all("named-graph-uri"),

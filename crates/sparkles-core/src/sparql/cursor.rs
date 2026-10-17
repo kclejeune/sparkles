@@ -22,6 +22,7 @@ mod binary;
 mod bind;
 mod distinct;
 mod expand;
+mod extsort;
 mod filter;
 pub mod graph;
 mod group;
@@ -1453,6 +1454,8 @@ enum State {
         node: Node,
         loaded: Option<Buffer>,
         at: usize,
+        /// The external sort, once the input has spilled.
+        external: Option<Box<extsort::External>>,
     },
     TopK(Box<topk::TopK>),
 }
@@ -1854,6 +1857,7 @@ impl Operator {
                 node,
                 loaded: None,
                 at: 0,
+                external: None,
             }
         } else if materializes {
             State::Fallback {
@@ -2021,6 +2025,9 @@ impl Operator {
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
         plan.complete = self.done;
+        if self.info.counters.is_some() {
+            plan.operator.counters.clone_from(&self.info.counters);
+        }
         fn update(info: &PlanInfo, plan: &mut CursorPlan) {
             plan.operator.actual_rows = info.actual_rows;
             plan.operator.time_ms = info.time_ms;
@@ -2289,18 +2296,63 @@ impl Operator {
                     self.done = topk.done();
                     b
                 }
-                State::Blocking { node, loaded, at } => {
+                State::Blocking {
+                    node,
+                    loaded,
+                    at,
+                    external,
+                } => 'blocking: {
+                    if let Some(sort) = external {
+                        break 'blocking sort.next(ctx, cap)?;
+                    }
                     if loaded.is_none() {
-                        let mut input = Buffer::new(ctx, &self.children[0].vars, 0)?;
-                        // The concatenated input keeps the child's order, which lets a
-                        // sort on a prefix of it skip reordering.
-                        input.table.sorted.clone_from(&self.children[0].order);
-                        // Blocking input demand is independent of the requested output prefix.
-                        while let Some(batch) =
-                            self.children[0].next(ctx, options, options.batch_rows)?
-                        {
-                            merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
-                        }
+                        // A sort with somewhere to spill writes sorted runs when its
+                        // input outgrows memory and then merges them.
+                        let mut spill = if extsort::eligible(node) {
+                            extsort::External::new(ctx, node, &self.children[0].vars)
+                        } else {
+                            None
+                        };
+                        let input = match &mut spill {
+                            Some(sort) => {
+                                let input =
+                                    extsort::load(ctx, sort, &mut self.children[0], options)?;
+                                if input.is_none() {
+                                    let mut counters =
+                                        self.info.counters.take().unwrap_or_default();
+                                    counters.insert("spilledBytes".into(), sort.written.into());
+                                    counters.insert("spillRuns".into(), sort.run_count.into());
+                                    counters.insert("mergePasses".into(), sort.passes.into());
+                                    self.info.counters = Some(counters);
+                                }
+                                input
+                            }
+                            None => {
+                                let mut input = Buffer::new(ctx, &self.children[0].vars, 0)?;
+                                // The concatenated input keeps the child's order, which
+                                // lets a sort on a prefix of it skip reordering.
+                                input.table.sorted.clone_from(&self.children[0].order);
+                                // Blocking input demand is independent of the requested
+                                // output prefix.
+                                while let Some(batch) =
+                                    self.children[0].next(ctx, options, options.batch_rows)?
+                                {
+                                    merge::append(
+                                        ctx,
+                                        &mut input,
+                                        &batch.table,
+                                        0..batch.table.len,
+                                    )?;
+                                }
+                                Some(input)
+                            }
+                        };
+                        let Some(mut input) = input else {
+                            let mut sort = Box::new(spill.expect("a spilled sort"));
+                            let batch = sort.next(ctx, cap)?;
+                            *external = Some(sort);
+                            break 'blocking batch;
+                        };
                         // Row reordering/output copies and their index arrays can
                         // coexist with the input columns. Reserve before sorting.
                         input.charge.resize(

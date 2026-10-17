@@ -4286,10 +4286,10 @@ export interface components {
             /** @description The brief as plain text. Its first line says that the lines are recalled data. */
             text: string;
         };
-        /** @description A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed. */
+        /** @description A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed. The `spill` budget is the disk a query's spill files may reserve. */
         BudgetError: components["schemas"]["Error"] & {
             /** @enum {string} */
-            budget: "memory" | "result-bytes" | "outbound-bytes" | "validation-work" | "rows" | "rows-produced" | "dataset-bytes" | "server-memory";
+            budget: "memory" | "result-bytes" | "outbound-bytes" | "validation-work" | "rows" | "rows-produced" | "dataset-bytes" | "server-memory" | "spill";
             /** @description Bytes, or rows for `rows` and `rows-produced`. */
             limit?: number;
             requested?: number;
@@ -7405,6 +7405,18 @@ export interface components {
             profile: "default" | "small";
             /** @description The budget of one query (`--query-memory-mb`), `null` when unlimited. */
             queryMemoryBytes: number | null;
+            spill?: {
+                /** @description The disk all queries' spill files may reserve together (`--spill-max-mb`). */
+                capacityBytes?: number;
+                /** @description Whether streamed sorts may write sorted runs to disk (`--spill`). */
+                enabled: boolean;
+                /** @description The disk one query may reserve (`--query-spill-mb`), `null` when only the total limits it. */
+                queryBytes?: number | null;
+                reservedBytes?: number;
+                /** @description Queries that wrote a spill file since the server started. */
+                spilledQueries?: number;
+                writtenBytes?: number;
+            };
         };
         /** @description A server-wide settings kind with its layers and sources. */
         ServerSettingsKind: {
@@ -8767,6 +8779,8 @@ export interface components {
         repo: string;
         /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
         send: number;
+        /** @description A lower budget of the disk this query's spill files may reserve, in MiB. */
+        spillMb: number;
         /** @description The id of the ingestion task. */
         task: string;
         /** @description Seconds. Capped at the server's `--max-timeout`. */
@@ -15669,6 +15683,8 @@ export interface operations {
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
                 "memory-mb"?: components["parameters"]["memoryMb"];
+                /** @description A lower budget of the disk this query's spill files may reserve, in MiB. */
+                "spill-mb"?: components["parameters"]["spillMb"];
                 /** @description A lower budget of intermediate rows. */
                 "max-rows"?: components["parameters"]["maxRows"];
                 /** @description A budget of the rows all operators produce. */
@@ -15826,6 +15842,8 @@ export interface operations {
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
                 "memory-mb"?: components["parameters"]["memoryMb"];
+                /** @description A lower budget of the disk this query's spill files may reserve, in MiB. */
+                "spill-mb"?: components["parameters"]["spillMb"];
                 /** @description A lower budget of intermediate rows. */
                 "max-rows"?: components["parameters"]["maxRows"];
                 /** @description A budget of the rows all operators produce. */
@@ -17553,6 +17571,8 @@ export interface operations {
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
                 "memory-mb"?: components["parameters"]["memoryMb"];
+                /** @description A lower budget of the disk this query's spill files may reserve, in MiB. */
+                "spill-mb"?: components["parameters"]["spillMb"];
                 /** @description A lower budget of intermediate rows. */
                 "max-rows"?: components["parameters"]["maxRows"];
                 /** @description A budget of the rows all operators produce. */
@@ -17622,6 +17642,8 @@ export interface operations {
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
                 "memory-mb"?: components["parameters"]["memoryMb"];
+                /** @description A lower budget of the disk this query's spill files may reserve, in MiB. */
+                "spill-mb"?: components["parameters"]["spillMb"];
                 /** @description A lower budget of intermediate rows. */
                 "max-rows"?: components["parameters"]["maxRows"];
                 /** @description A budget of the rows all operators produce. */
@@ -17920,6 +17942,8 @@ export interface operations {
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
                 "memory-mb"?: components["parameters"]["memoryMb"];
+                /** @description A lower budget of the disk this query's spill files may reserve, in MiB. */
+                "spill-mb"?: components["parameters"]["spillMb"];
                 /** @description A lower budget of intermediate rows. */
                 "max-rows"?: components["parameters"]["maxRows"];
                 /** @description A budget of the rows all operators produce. */
@@ -17989,6 +18013,8 @@ export interface operations {
                 nocache?: components["parameters"]["nocache"];
                 /** @description A lower memory budget, in MiB. */
                 "memory-mb"?: components["parameters"]["memoryMb"];
+                /** @description A lower budget of the disk this query's spill files may reserve, in MiB. */
+                "spill-mb"?: components["parameters"]["spillMb"];
                 /** @description A lower budget of intermediate rows. */
                 "max-rows"?: components["parameters"]["maxRows"];
                 /** @description A budget of the rows all operators produce. */

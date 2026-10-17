@@ -12,6 +12,7 @@ pub(super) struct Overrides {
     result_bytes: Option<u64>,
     rows: Option<u64>,
     rows_produced: Option<u64>,
+    spill_bytes: Option<u64>,
 }
 
 /// The smaller of a server budget and a requested one (`None`: unlimited).
@@ -51,12 +52,14 @@ impl Overrides {
             result_bytes: get("max-result-mb")?.map(mib),
             rows: get("max-rows")?,
             rows_produced: get("max-rows-produced")?,
+            spill_bytes: get("spill-mb")?.map(mib),
         })
     }
 
     /// Lower the engine budgets of `o` to what the request asked for.
     pub(super) fn apply(&self, o: &mut QueryOptions) {
         o.max_memory_bytes = lower(o.max_memory_bytes, self.memory_bytes);
+        o.max_spill_bytes = lower(o.max_spill_bytes, self.spill_bytes);
         o.max_rows_produced = lower(o.max_rows_produced, self.rows_produced);
         o.max_rows = lower(o.max_rows.map(|r| r as u64), self.rows)
             .map(|r| usize::try_from(r).unwrap_or(usize::MAX));

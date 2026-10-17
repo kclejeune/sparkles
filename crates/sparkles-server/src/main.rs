@@ -877,6 +877,56 @@ impl CompressArgs {
 }
 
 // parsed once; `serve` has most of the flags
+/// Whether streamed sorts may spill to disk (`serve --spill`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SpillMode {
+    On,
+    Off,
+}
+
+/// Open the spill directory, removing what dead processes left in it. A directory that
+/// cannot be used leaves spill off with a warning, so that a read-only or remote data
+/// directory still serves queries within their memory budgets.
+fn open_spill(
+    dir: &std::path::Path,
+    max_mb: Option<u64>,
+    query_mb: u64,
+    min_free_mb: u64,
+) -> Option<Arc<sparkles::spill::Spill>> {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!("spill is off: cannot create {}: {e}", dir.display());
+        return None;
+    }
+    let max_bytes = match max_mb {
+        Some(mb) => mb << 20,
+        None => sparkles::disk::free_bytes(dir).map_or(16 << 30, |free| (free / 4).min(64 << 30)),
+    };
+    let options = sparkles::spill::SpillOptions {
+        dir: dir.to_path_buf(),
+        max_bytes,
+        query_bytes: if query_mb == 0 {
+            max_bytes
+        } else {
+            query_mb << 20
+        },
+        min_free_bytes: min_free_mb << 20,
+    };
+    match sparkles::spill::Spill::open(&options) {
+        Ok(spill) => {
+            tracing::info!(
+                "spill directory {}, {} MiB for all queries",
+                spill.dir().display(),
+                max_bytes >> 20
+            );
+            Some(spill)
+        }
+        Err(e) => {
+            tracing::warn!("spill is off: {e}");
+            None
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
@@ -1055,6 +1105,22 @@ enum Cmd {
         /// with `Retry-After`
         #[arg(long, default_value_t = 2.0)]
         query_admission_wait: f64,
+        /// Whether a streamed sort that outgrows its memory budget writes sorted runs to
+        /// disk (`on`) or fails with its memory budget (`off`)
+        #[arg(long, value_enum, default_value_t = SpillMode::On)]
+        spill: SpillMode,
+        /// Directory of the spill files, on a local file system (default:
+        /// `<data>/.spill`)
+        #[arg(long, value_name = "DIR")]
+        spill_dir: Option<PathBuf>,
+        /// Disk all queries' spill files may reserve together, in MiB (default: a quarter
+        /// of the free space of the spill directory at start, at most 64 GiB)
+        #[arg(long)]
+        spill_max_mb: Option<u64>,
+        /// Disk one query's spill files may reserve, in MiB; a request may lower it with
+        /// `spill-mb`
+        #[arg(long, default_value_t = 16384)]
+        query_spill_mb: u64,
         /// Budget for the serialized body of a SPARQL query response, in MiB (0: unlimited)
         #[arg(long, default_value_t = 1024)]
         max_result_mb: u64,
@@ -2457,6 +2523,10 @@ fn run() -> Result<()> {
             query_memory_mb,
             total_query_memory_mb,
             query_admission_wait,
+            spill,
+            spill_dir,
+            spill_max_mb,
+            query_spill_mb,
             max_result_mb,
             max_export_mb,
             max_rows,
@@ -2623,6 +2693,10 @@ fn run() -> Result<()> {
             )?;
             st.admission.profile = cli_memory_profile;
             st.admission.wait = Duration::from_secs_f64(query_admission_wait);
+            if spill == SpillMode::On {
+                let dir = spill_dir.unwrap_or_else(|| data.join(".spill"));
+                st.spill = open_spill(&dir, spill_max_mb, query_spill_mb, min_free_disk_mb);
+            }
             st.auth = auth;
             st.cors_origins = cors_origin;
             st.hosts = hosts;
@@ -2725,6 +2799,7 @@ fn run() -> Result<()> {
                 max_timeout: (max_timeout.is_finite() && max_timeout > 0.0)
                     .then(|| Duration::from_secs_f64(max_timeout)),
                 max_timeline_commits: state::Limits::default().max_timeline_commits,
+                query_spill_bytes: mib(query_spill_mb),
             };
             #[cfg(feature = "fmt")]
             {

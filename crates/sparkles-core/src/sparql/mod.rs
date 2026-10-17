@@ -112,6 +112,13 @@ pub struct QueryOptions {
     /// empty grant and fails with [`BudgetKind::ServerMemory`](crate::BudgetKind) when
     /// the pool cannot cover its charges. Nothing queues.
     pub pool: Option<Arc<pool::QueryPool>>,
+    /// Where cursor operators may move state that outgrows the memory budget (see
+    /// [`crate::spill`]). `None` turns spill off, and such operators fail with their
+    /// memory budget.
+    pub spill: Option<Arc<crate::spill::Spill>>,
+    /// The disk this query's spill files may take, at most the server's limit for one
+    /// query (`None`: that limit).
+    pub max_spill_bytes: Option<u64>,
     /// Budget for the rows all operators of a query produce together, including
     /// distinct CONSTRUCT output (`None`: unlimited); exceeding it fails with
     /// [`Error::BudgetExceeded`]. An update's WHERE clauses share one count.
@@ -465,6 +472,10 @@ fn make_ctx(
     if let Some(m) = opts.max_memory_bytes {
         ctx.mem_limit = m;
     }
+    ctx.spill = opts
+        .spill
+        .as_ref()
+        .map(|spill| Arc::new(spill.query(opts.max_spill_bytes)));
     ctx.set_grant(opts.query_grant());
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;

@@ -334,17 +334,66 @@ pub fn report(st: &AppState) -> J {
             }));
         }
     }
+    let spill = match &st.spill {
+        Some(s) => json!({
+            "enabled": true,
+            "capacityBytes": s.capacity(),
+            "queryBytes": st.limits.query_spill_bytes,
+            "reservedBytes": s.reserved_bytes(),
+            "writtenBytes": s.written_bytes(),
+            "spilledQueries": s.spilled_queries(),
+        }),
+        None => json!({ "enabled": false }),
+    };
     json!({
         "profile": st.admission.profile.name(),
         "queryMemoryBytes": st.limits.query_memory_bytes,
         "pool": pool,
+        "spill": spill,
         "caches": caches,
         "datasets": datasets,
     })
 }
 
+/// The spill directory's series for `/$/metrics`.
+fn render_spill(st: &AppState, o: &mut String) {
+    let Some(s) = &st.spill else {
+        return;
+    };
+    let mut family = |name: &str, kind: &str, help: &str, value: u64| {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+        let _ = writeln!(o, "{name} {value}");
+    };
+    family(
+        "sparkles_spill_capacity_bytes",
+        "gauge",
+        "Bytes of disk all queries' spill files may reserve together.",
+        s.capacity(),
+    );
+    family(
+        "sparkles_spill_reserved_bytes",
+        "gauge",
+        "Bytes of disk running queries have reserved for spill files.",
+        s.reserved_bytes(),
+    );
+    family(
+        "sparkles_spill_written_bytes_total",
+        "counter",
+        "Bytes written to spill files.",
+        s.written_bytes(),
+    );
+    family(
+        "sparkles_spill_queries_total",
+        "counter",
+        "Queries that wrote a spill file.",
+        s.spilled_queries(),
+    );
+}
+
 /// The pool's series for `/$/metrics`.
 pub fn render_prometheus(st: &AppState, o: &mut String) {
+    render_spill(st, o);
     let Some(p) = st.catalog.pool() else {
         return;
     };
