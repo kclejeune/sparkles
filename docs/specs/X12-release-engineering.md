@@ -256,7 +256,7 @@ locking whose semantics differ from `flock`.
 | Generation index | `gen-*/meta.json` and the index files | `format_version`, must equal `FORMAT_VERSION` 2 (`builder.rs`) | primary |
 | Vocabulary | `vocab.idx` (`SPKVIDX1`), numeric vocabulary (`SPKVNUM2`) | magic | primary |
 | Delta vocabulary | `delta.vocab` | framed header `\x89SDV`, `VERSION` 2, or legacy without a header | primary |
-| Write-ahead log | `wal.log` | A 33-byte header record starts with `\x89SPKWAL\n` and version 1. Headerless logs are version 0. Commit-record flag bits in byte 27 are added compatibly. | primary |
+| Write-ahead log | `wal.log` | A 33-byte header record starts with `\x89SPKWAL\n` and version 1. Headerless logs are version 0. Commit-record flag bits in byte 27 are added compatibly. A headerless log is strictly framed from the offset in the additive `walStrictFrom` member of its generation's `commit.json`. | primary |
 | Commit catalog | `commits.bin` | magic `SPKCMTS\0`, 64-byte records, flag bits added compatibly | primary |
 | Change log | segments and index | magics `SPKCHGL\0`, `SPKCHGI\0`, `FORMAT` 1 | primary |
 | Annotations | `annotations.bin` | magic `SPKANNO\0`, `FORMAT` 1 | primary |

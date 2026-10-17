@@ -31,7 +31,7 @@ use crate::id::{Id, Tag};
 use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, decode_column, read_varint_checked,
 };
-use crate::store::{WAL_COMMIT, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC};
+use crate::store::{Framing, WAL_COMMIT, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC};
 use crate::vocab::{FC_BLOCK, parse_delta};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -1249,8 +1249,25 @@ impl Checker<'_> {
         let recs = buf.as_chunks::<WAL_REC>().0;
         // whether damage at record `i` is a torn tail that open truncates, by the rule
         // open uses
-        let torn_at = |i: usize, prev_seq: Option<u64>, framed_metadata: bool| {
-            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1), framed_metadata)
+        let torn_at = |i: usize, prev_seq: Option<u64>, framing: Framing| {
+            crate::store::wal_torn_from(buf, i, prev_seq.map_or(0, |s| s + 1), framing)
+        };
+        // Where a headerless log's strict framing starts. It is read after the log: it is
+        // recorded once, before anything is appended past it, so every byte read above
+        // that a writer appended lies after the offset read here.
+        let strict_from = match commit::wal_strict_from(dir) {
+            Ok(m) => m,
+            Err(e) => {
+                run.add(Issue::error(e.to_string()).file(format!("{name}/commit.json")));
+                None
+            }
+        };
+        let strict_from = match crate::store::check_strict_from(&dir.join("wal.log"), strict_from) {
+            Ok(()) => strict_from,
+            Err(e) => {
+                run.add(Issue::error(e.to_string()).file(format!("{name}/commit.json")));
+                None
+            }
         };
         // the commits that have an annotation, to find a commit of a group that reached
         // the disk without the one it asked for (see `commit::WAL_FLAG_ANNOTATED`)
@@ -1263,7 +1280,7 @@ impl Checker<'_> {
         let mut txn_start = 0usize;
         let mut good = 0usize;
         let mut seen_v2 = false;
-        let mut framed_metadata = false;
+        let mut framing = Framing::of(strict_from);
         let mut torn = false;
         // the log's version: 0 without a header record
         let mut version = 0u32;
@@ -1285,7 +1302,17 @@ impl Checker<'_> {
                     match crate::store::wal::header_version(rec, &dir.join("wal.log")) {
                         Ok(v) => {
                             version = v;
-                            framed_metadata = v == 1;
+                            if strict_from.is_some() {
+                                run.add(
+                                    Issue::warning(
+                                        "commit.json records walStrictFrom for a log with a header record, which ignores it",
+                                    )
+                                    .file(format!("{name}/commit.json")),
+                                );
+                            }
+                            if v == 1 {
+                                framing = Framing::Strict { from: 1 };
+                            }
                         }
                         Err(e) => {
                             run.add(Issue::error(e.to_string()).file(&file).offset(0));
@@ -1318,8 +1345,8 @@ impl Checker<'_> {
                     let n = i - txn_start;
                     let n = format!("{n} data record{}", if n == 1 { "" } else { "s" });
                     let meta = commit::open_wal_commit(rec, data);
-                    if meta.is_none() && framed_metadata {
-                        let suffix_torn = torn_at(i, prev_seq, framed_metadata);
+                    if meta.is_none() && framing.strict_at(i) {
+                        let suffix_torn = torn_at(i, prev_seq, framing);
                         let message = if suffix_torn {
                             format!(
                                 "the transaction ({n} from offset {}) has lost its modern commit metadata, and no later commit shows it was durable: it is treated as torn and truncated on open",
@@ -1346,7 +1373,7 @@ impl Checker<'_> {
                     // damage that no later commit record shows was durable is a torn tail
                     let torn_here = (matches!(meta, Some(Err(())))
                         || (missing_terms && matches!(meta, Some(Ok(_)))))
-                        && torn_at(i, prev_seq, framed_metadata);
+                        && torn_at(i, prev_seq, framing);
                     if torn_here && missing_terms && matches!(meta, Some(Ok(_))) {
                         run.add(
                             Issue::warning(format!(
@@ -1364,7 +1391,7 @@ impl Checker<'_> {
                         && flags & commit::WAL_FLAG_ANNOTATED != 0
                         && !set.contains(seq)
                     {
-                        if torn_at(i, prev_seq, framed_metadata) {
+                        if torn_at(i, prev_seq, framing) {
                             run.add(
                                 Issue::warning(format!(
                                     "the annotation of commit {seq} is missing from annotations.bin, and no later commit shows it was durable: it did not reach the disk before a crash, so the commit is treated as torn and truncated on open"
@@ -1461,7 +1488,7 @@ impl Checker<'_> {
                     txn_start = i + 1;
                 }
                 op => {
-                    if !torn_at(i, prev_seq, framed_metadata) {
+                    if !torn_at(i, prev_seq, framing) {
                         run.add(
                             Issue::error(format!(
                                 "record {i} has unknown type {op}, and a later commit record shows its transaction was durable: open refuses the database"
@@ -1506,6 +1533,18 @@ impl Checker<'_> {
                 Issue::warning(format!(
                     "{} records after the last commit form an incomplete transaction: truncated on open",
                     recs.len() - good / WAL_REC
+                ))
+                .file(&file)
+                .offset(good as u64),
+            );
+        }
+        if let Some(m) = strict_from
+            && version == 0
+            && (good as u64) < m
+        {
+            run.add(
+                Issue::error(format!(
+                    "the log's complete transactions end at byte {good}, before byte {m}, which commit.json records as durable: open refuses the database"
                 ))
                 .file(&file)
                 .offset(good as u64),

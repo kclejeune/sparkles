@@ -533,6 +533,14 @@ last one.
   to an upgraded database. Each gets `seq = prev + 1`, kind `unknown`, the parent's
   timestamp and the `reconstructed` flag. The rule is deterministic, so every replay
   assigns the same ids. Downgrading is still unsupported, but it corrupts nothing.
+* **Strict framing of a headerless log.** A torn version-2 commit record can be
+  byte-identical to a legacy one. The first write open of a headerless log by a release
+  with [X09](X09-group-commit-by-default.md) Phase 3 records the log's logical end, after
+  replay, truncation and a sync, as `walStrictFrom` in the generation's `commit.json`.
+  Records before it keep the rules above. Records after it follow the rules of a log with
+  a header record, so a commit record without metadata there is damage, and damage before
+  the offset is corruption. Legacy records that a downgraded binary appends after the
+  offset are therefore treated as damage.
 
 ### 5.7 Server plumbing
 

@@ -2413,16 +2413,16 @@ mod tests {
         let mut partial = [0; WAL_REC];
         partial[0] = WAL_COMMIT;
         buf.extend_from_slice(&partial);
-        assert!(!wal_torn_from(&buf, 0, 1, false));
-        assert!(wal_torn_from(&buf, 0, 1, true));
+        assert!(!wal_torn_from(&buf, 0, 1, Framing::Mixed));
+        assert!(wal_torn_from(&buf, 0, 1, Framing::Strict { from: 0 }));
         let mut proof = [0; WAL_REC];
         proof[0] = WAL_COMMIT;
         commit::seal_wal_commit(&mut proof, 4, 0, CommitKind::Update, 0, &[]);
         buf.extend_from_slice(&proof);
-        assert!(!wal_torn_from(&buf, 0, 1, true));
+        assert!(!wal_torn_from(&buf, 0, 1, Framing::Strict { from: 0 }));
         // A version byte alone is not proof when its CRC fails.
         *buf.last_mut().unwrap() ^= 0x55;
-        assert!(wal_torn_from(&buf, 0, 1, true));
+        assert!(wal_torn_from(&buf, 0, 1, Framing::Strict { from: 0 }));
     }
 
     fn mixed_headerless_history(resumed: bool) {
@@ -2492,6 +2492,177 @@ mod tests {
     #[test]
     fn mixed_headerless_v2_legacy_and_resumed_v2_keep_every_commit() {
         mixed_headerless_history(true);
+    }
+
+    /// A headerless log of two commits (seq 1 and 2) written by an older release, opened
+    /// once by this one, which records its strict-framing offset, then `appended` commits
+    /// more (seq 3 on) in the strictly framed part. Returns the case, its log and the
+    /// offset.
+    fn marked_headerless_case(
+        dir: &tempfile::TempDir,
+        root: &Path,
+        buf: &[u8],
+        appended: usize,
+    ) -> (PathBuf, Vec<u8>, u64) {
+        let mut legacy = buf[WAL_REC..].to_vec();
+        let txns = transactions(&legacy);
+        legacy.truncate(txns[1].end * WAL_REC);
+        let case = dir.path().join("marked");
+        copy_dir(root, &case);
+        std::fs::write(wal_path(&case), &legacy).unwrap();
+        let gen_dir = wal_path(&case).parent().unwrap().to_path_buf();
+        assert_eq!(commit::wal_strict_from(&gen_dir).unwrap(), None);
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, 2);
+        let marker = commit::wal_strict_from(&gen_dir).unwrap();
+        assert_eq!(marker, Some(legacy.len() as u64));
+        for i in 0..appended {
+            assert_eq!(
+                insert(&store, &format!("strict{i}")).unwrap().commit.seq,
+                3 + i as u64
+            );
+        }
+        drop(store);
+        assert_eq!(commit::wal_strict_from(&gen_dir).unwrap(), marker);
+        let mut buf = std::fs::read(wal_path(&case)).unwrap();
+        let end = transactions(&buf).last().unwrap().end * WAL_REC;
+        buf.truncate(end);
+        (case, buf, marker.unwrap())
+    }
+
+    #[test]
+    fn a_legacy_shaped_tail_past_the_strict_offset_is_truncated() {
+        let (dir, root, buf) = metadata_fixture();
+        let (case, mut buf, _) = marked_headerless_case(&dir, &root, &buf, 2);
+        let txns = transactions(&buf);
+        assert_eq!(txns.len(), 4);
+        // the last commit's record lost everything after its opcode, which makes it
+        // byte-identical to a legacy record, and its data record lost a byte of an id
+        zero_commit_metadata(&mut buf, &txns[3]);
+        buf[txns[3].start * WAL_REC + 3] ^= 0x40;
+        std::fs::write(wal_path(&case), &buf).unwrap();
+        assert_eq!(wal_check(&case), crate::check::Status::Warning);
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, 3);
+        assert!(!has(&store.snapshot(), "strict1"));
+        assert_eq!(
+            std::fs::metadata(wal_path(&case)).unwrap().len(),
+            (txns[3].start * WAL_REC) as u64
+        );
+        assert_eq!(insert(&store, "next").unwrap().commit.seq, 4);
+        drop(store);
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, 4);
+        assert!(has(&store.snapshot(), "next"));
+        assert_eq!(wal_check(&case), crate::check::Status::Ok);
+    }
+
+    #[test]
+    fn a_legacy_shaped_commit_in_an_unfenced_suffix_past_the_strict_offset_is_torn() {
+        let (dir, root, buf) = metadata_fixture();
+        let (case, mut buf, _) = marked_headerless_case(&dir, &root, &buf, 4);
+        let txns = transactions(&buf);
+        assert_eq!(txns.len(), 6);
+        // commits 3 to 6 as one group wrote them, before one shared sync
+        for (k, txn) in txns[2..].iter().enumerate() {
+            reseal_transaction(&mut buf, txn, k as u8);
+        }
+        // commit 4 lost a byte of a data record, and commit 6 its metadata
+        buf[txns[3].start * WAL_REC + 3] ^= 0x40;
+        zero_commit_metadata(&mut buf, &txns[5]);
+        std::fs::write(wal_path(&case), &buf).unwrap();
+        assert_eq!(wal_check(&case), crate::check::Status::Warning);
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, 3);
+        assert!(has(&store.snapshot(), "strict0"));
+        assert_eq!(
+            std::fs::metadata(wal_path(&case)).unwrap().len(),
+            (txns[3].start * WAL_REC) as u64
+        );
+        assert_eq!(insert(&store, "next").unwrap().commit.seq, 4);
+    }
+
+    #[test]
+    fn a_legacy_shaped_commit_past_the_strict_offset_with_a_later_proof_is_corruption() {
+        let (dir, root, buf) = metadata_fixture();
+        let (case, mut buf, _) = marked_headerless_case(&dir, &root, &buf, 3);
+        let txns = transactions(&buf);
+        // commit 4 lost its metadata, and commit 5, written after commit 4 was synced,
+        // proves it durable
+        zero_commit_metadata(&mut buf, &txns[3]);
+        std::fs::write(wal_path(&case), &buf).unwrap();
+        assert_eq!(wal_check(&case), crate::check::Status::Error);
+        let e = Store::open(&case, Default::default()).err().unwrap();
+        assert!(matches!(e, Error::Corrupt(_)), "{e:?}");
+    }
+
+    #[test]
+    fn damage_before_the_strict_offset_is_corruption() {
+        let (dir, root, buf) = metadata_fixture();
+        let (case, mut buf, marker) = marked_headerless_case(&dir, &root, &buf, 0);
+        assert_eq!(buf.len() as u64, marker);
+        let txns = transactions(&buf);
+        // the last commit before the offset was synced when the offset was recorded
+        buf[txns[1].start * WAL_REC + 3] ^= 0x40;
+        std::fs::write(wal_path(&case), &buf).unwrap();
+        let unmarked = dir.path().join("unmarked");
+        copy_dir(&case, &unmarked);
+        assert_eq!(wal_check(&case), crate::check::Status::Error);
+        let e = Store::open(&case, Default::default()).err().unwrap();
+        assert!(matches!(e, Error::Corrupt(_)), "{e:?}");
+        // without the offset the same bytes are a torn tail, as before
+        let path = wal_path(&unmarked).parent().unwrap().join("commit.json");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("walStrictFrom").unwrap();
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(wal_check(&unmarked), crate::check::Status::Warning);
+        let store = Store::open(&unmarked, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, 1);
+    }
+
+    #[test]
+    fn the_strict_offset_is_recorded_once_and_only_for_headerless_logs() {
+        let (dir, root, buf) = metadata_fixture();
+        let gen_dir = |r: &Path| wal_path(r).parent().unwrap().to_path_buf();
+        // a log with a header record never gets one
+        drop(Store::open(&root, Default::default()).unwrap());
+        assert_eq!(commit::wal_strict_from(&gen_dir(&root)).unwrap(), None);
+        let (case, _, marker) = marked_headerless_case(&dir, &root, &buf, 1);
+        let (_, base, origin) = commit::read_gen_commit(&gen_dir(&case)).unwrap().unwrap();
+        let (_, base0, origin0) = commit::read_gen_commit(&gen_dir(&root)).unwrap().unwrap();
+        assert_eq!((base, origin), (base0, origin0));
+        let store = Store::open(&case, Default::default()).unwrap();
+        insert(&store, "later").unwrap();
+        drop(store);
+        drop(Store::open(&case, Default::default()).unwrap());
+        assert_eq!(
+            commit::wal_strict_from(&gen_dir(&case)).unwrap(),
+            Some(marker)
+        );
+        assert_eq!(wal_check(&case), crate::check::Status::Ok);
+    }
+
+    #[test]
+    fn an_impossible_strict_offset_is_refused() {
+        let (dir, root, buf) = metadata_fixture();
+        let (case, buf, marker) = marked_headerless_case(&dir, &root, &buf, 0);
+        let path = wal_path(&case).parent().unwrap().join("commit.json");
+        let original = std::fs::read(&path).unwrap();
+        for bad in [marker + 1, buf.len() as u64 + WAL_REC as u64] {
+            let mut v: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            v["walStrictFrom"] = bad.into();
+            std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+            assert_eq!(wal_check(&case), crate::check::Status::Error, "{bad}");
+            let e = Store::open(&case, Default::default()).err().unwrap();
+            assert!(matches!(e, Error::Corrupt(_)), "{bad}: {e:?}");
+        }
+        // a commit.json of a newer format is refused, not misread
+        let mut v: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        v["format"] = 2.into();
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let e = Store::open(&case, Default::default()).err().unwrap();
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 
     /// What `sparkles check` says about a WAL, which must agree with open.
