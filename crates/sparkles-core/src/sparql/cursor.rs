@@ -1125,7 +1125,10 @@ impl QueryCursor {
     /// The first batch goes to `each` before the second is pulled, so the first rows of an
     /// answer wait for one batch only, however slowly the plan produces the next. Decoding
     /// ahead then starts only when the memory budget has room for twice what the first
-    /// batch took, and the writer otherwise goes on in turn.
+    /// batch took, and the writer otherwise goes on in turn. The first batch is only an
+    /// estimate of the others. When later batches hold larger terms, a budget within a
+    /// few KiB of what the writer in turn needs can still fail with decoding ahead, with a
+    /// memory budget error and never with other output.
     ///
     /// An error while pulling a batch ahead is returned after `each` has been called with the
     /// batch before it. A memory budget failure inside the plan also fails every later
@@ -1153,7 +1156,8 @@ impl QueryCursor {
                 first = false;
                 // Decoding ahead holds a second batch and its terms. It starts only when
                 // the memory budget has room for twice what the first batch took at its
-                // peak, so that a budget the writer fits in turn does not fail it.
+                // peak, which keeps most budgets that the writer fits in turn from failing
+                // it. Batches larger than the first can still use up the room.
                 let took = self.ctx.mem_peak().saturating_sub(before);
                 ahead = ahead && self.ctx.memory_remaining() >= took.saturating_mul(2);
             }
