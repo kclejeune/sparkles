@@ -1984,10 +1984,16 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
         wal_direct_writes: !cli.no_wal_direct_writes,
-        group_commit: group_commit_on(
-            cli.no_group_commit,
-            std::env::var("SPARKLES_GROUP_COMMIT").ok(),
-        ),
+        group_commit: {
+            let (on, warning) = group_commit_setting(
+                cli.no_group_commit,
+                std::env::var("SPARKLES_GROUP_COMMIT").ok(),
+            );
+            if let Some(w) = warning {
+                tracing::warn!(target: "sparkles::server", "{w}");
+            }
+            on
+        },
         group_commit_idle_direct: !cli.no_group_commit_idle_direct,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,
@@ -5123,15 +5129,23 @@ fn print_table(
 }
 
 /// Whether persistent stores group commits: on unless `--no-group-commit` is given or
-/// `SPARKLES_GROUP_COMMIT` is `off`, `false`, `no` or `0`.
-fn group_commit_on(no_flag: bool, env: Option<String>) -> bool {
-    !no_flag
-        && !env.is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "off" | "false" | "no" | "0"
-            )
-        })
+/// `SPARKLES_GROUP_COMMIT` is `off`, `false`, `no` or `0`. `on`, `true`, `yes`, `1` and an
+/// empty value keep it on. Any other value keeps it on too, with a warning to log, so a
+/// typo in an attempt to turn it off is not silent.
+fn group_commit_setting(no_flag: bool, env: Option<String>) -> (bool, Option<String>) {
+    let v = env.as_deref().map(|v| v.trim().to_ascii_lowercase());
+    let (on, warning) = match v.as_deref() {
+        None | Some("" | "on" | "true" | "yes" | "1") => (true, None),
+        Some("off" | "false" | "no" | "0") => (false, None),
+        Some(_) => (
+            true,
+            Some(format!(
+                "SPARKLES_GROUP_COMMIT={} is not recognised, so group commit stays on; use off to turn it off",
+                env.as_deref().unwrap_or_default()
+            )),
+        ),
+    };
+    (on && !no_flag, warning)
 }
 
 #[cfg(test)]
@@ -5160,14 +5174,30 @@ mod group_options_tests {
             .unwrap()
             .join()
             .unwrap();
-        assert!(group_commit_on(false, None));
-        assert!(!group_commit_on(true, None));
-        for v in ["off", "OFF", "false", "no", "0"] {
-            assert!(!group_commit_on(false, Some(v.into())), "{v}");
+        assert_eq!(group_commit_setting(false, None), (true, None));
+        assert_eq!(group_commit_setting(true, None), (false, None));
+        for v in ["off", "OFF", "false", "no", " 0 "] {
+            assert_eq!(
+                group_commit_setting(false, Some(v.into())),
+                (false, None),
+                "{v}"
+            );
         }
-        for v in ["on", "1", "true", ""] {
-            assert!(group_commit_on(false, Some(v.into())), "{v}");
+        for v in ["on", "1", "true", "yes", ""] {
+            assert_eq!(
+                group_commit_setting(false, Some(v.into())),
+                (true, None),
+                "{v}"
+            );
         }
-        assert!(!group_commit_on(true, Some("on".into())));
+        assert_eq!(group_commit_setting(true, Some("on".into())), (false, None));
+        // an unrecognised value keeps the default and says so
+        for v in ["disabled", "none", "of"] {
+            let (on, warning) = group_commit_setting(false, Some(v.into()));
+            assert!(on, "{v}");
+            assert!(warning.is_some_and(|w| w.contains(v)), "{v}");
+        }
+        let (on, warning) = group_commit_setting(true, Some("disabled".into()));
+        assert!(!on && warning.is_some());
     }
 }

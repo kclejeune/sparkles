@@ -5583,6 +5583,10 @@
             },
             "type": "array"
           },
+          "groupCommit": {
+            "description": "Whether concurrent commits of this dataset share one synchronization. False for an in-memory dataset.",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
