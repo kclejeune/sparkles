@@ -1603,6 +1603,60 @@ async fn the_default_streams_a_large_scan_and_eager_opts_out() {
         tiny.text()
     );
     assert_eq!(tiny.json()["budget"], "result-bytes");
+    // a scan expected to pass `max-rows-produced` stays eager and fails before any output
+    let produced = get(
+        &s.app,
+        &format!("{BIG_SCAN}&format=tsv&max-rows-produced=500000"),
+    )
+    .await;
+    assert_eq!(
+        produced.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        produced.text()
+    );
+}
+
+#[tokio::test]
+async fn the_default_runs_thrift_eagerly() {
+    let s = server();
+    million(&s);
+    // the cursor writer has no Thrift encoding, so a streamed answer would be an error
+    let r = get(&s.app, &format!("{BIG_SCAN}&format=thrift")).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body[..r.body.len().min(200)])
+    );
+    assert!(r.header("content-type").contains("thrift"));
+}
+
+#[tokio::test]
+async fn a_stored_query_with_values_runs_eagerly() {
+    let s = server();
+    million(&s);
+    let definition = serde_json::json!({
+        "query": "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+        "parameters": { "o": { "type": "integer", "required": false } }
+    });
+    let put = send(
+        &s.app,
+        Request::put("/$/queries/big/scan")
+            .header("content-type", "application/json")
+            .body(Body::from(definition.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(put.status, StatusCode::CREATED, "{}", put.text());
+    // a run with a value has initial bindings, which rule out every automatic plan
+    let bound = get(&s.app, "/big/queries/scan?o=5&format=sparkles&send=10").await;
+    assert_eq!(bound.status, StatusCode::OK, "{}", bound.text());
+    assert_eq!(bound.json()["meta"]["totalRows"], 1);
+    // without one the same query is a plain scan and streams
+    let free = get(&s.app, "/big/queries/scan?format=sparkles&send=10").await;
+    assert_eq!(free.status, StatusCode::OK, "{}", free.text());
+    assert_eq!(free.json()["meta"]["status"], "stopped");
 }
 
 #[tokio::test]

@@ -297,6 +297,50 @@ async fn dropping_profiled_streaming_body_releases_its_query_grant() {
     .expect("cancelled serializer releases its grant");
 }
 
+#[tokio::test]
+async fn dropping_a_default_streamed_body_releases_its_query_grant() {
+    let s = server(256, Duration::from_secs(2));
+    // a million-row scan is what automatic execution streams, and the bounded channel
+    // holds the producer while this response remains unpolled
+    let mut data = String::with_capacity(32 << 20);
+    for i in 0..1_000_000 {
+        data.push_str(&format!("<urn:s{i}> <urn:q> {i} .\n"));
+    }
+    s.state
+        .get("ds")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let response = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get("/ds/sparql?query=SELECT%20%3Fs%20%3Fo%20WHERE%20%7B%3Fs%20%3Curn%3Aq%3E%20%3Fo%7D&format=tsv")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        pool(&s).granted() > 0,
+        "a default stream that nobody reads retains its grant"
+    );
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool(&s).granted() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled serializer releases its grant");
+}
+
 async fn algorithm(app: &Router, body: &str) -> (StatusCode, String) {
     let res = app
         .clone()
