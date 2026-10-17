@@ -1010,10 +1010,21 @@ in-place path runs the same code in both builds, so that difference is noise bet
 server processes.
 
 The memory effect is the one the explicit-streaming measurements predicted. At 10.5M,
-the full scan with `send=10` peaks at a 1.0 MiB allocation estimate and 63 MiB of server
-RSS by default, against 241.0 MiB and 804 MiB eagerly, and answers in 2 to 4 ms instead
+the full scan with `send=10` peaks at a 1.1 MiB allocation estimate and 66 MiB of server
+RSS by default, against 241.0 MiB and 804 MiB eagerly, and answers in 2 to 5 ms instead
 of 240 to 320 ms. Read whole as TSV, the scan peaks at 581 MiB of RSS instead of 885 MiB
 in about the same time. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) has the table.
+
+The first A/B screen on forge flagged the whole name scan at 10.5M in native JSON, which
+the default streams. Its wall time rose by 10.5%, from 553 ms to 611 ms. A profile put
+about 15% of the cycles in the memory ledger, because the writer cache of each batch
+reserved every decoded term on its own and a cursor's charge cannot take the fast path of
+an eager query. The cache now reserves ahead in steps of at least 64 KiB, still before
+each term is allocated, and overstates a batch by less than one step. After that fix the
+default name scan takes 547 ms in native JSON against 531 to 563 ms eagerly, 1.37 s against
+1.41 s in SPARQL JSON and 273 ms against 357 ms in TSV. The final screens at 1.05M and
+10.5M found no query whose median server or wall time regressed by 10% or more, and the
+name scan's wall time matched the baseline's at 553 ms.
 
 ### Large basic graph patterns
 
