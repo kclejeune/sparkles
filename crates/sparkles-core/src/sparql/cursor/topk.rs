@@ -154,9 +154,13 @@ impl TopK {
         let mut input_options = options.clone();
         loop {
             input_options.batch_rows = demand;
-            input_options.batch_bytes = options
-                .batch_bytes
-                .max(demand.saturating_mul(child.vars.len().max(1) * 8));
+            // A grown read also raises the byte cap, which would otherwise hold it to the
+            // caller's batch. A read of the caller's size keeps the caller's byte cap.
+            if demand > options.batch_rows {
+                input_options.batch_bytes = options
+                    .batch_bytes
+                    .max(demand.saturating_mul(child.vars.len().max(1) * 8));
+            }
             let Some(batch) = child.next(ctx, &input_options, demand)? else {
                 break;
             };

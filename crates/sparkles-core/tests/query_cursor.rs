@@ -3615,6 +3615,33 @@ fn long_filters_and_top_k_read_growing_inputs_with_the_answers_of_eager() {
     }
 }
 
+/// Without `grow_input` a top-k reads its input under the caller's byte cap, as it did
+/// before inputs could grow, however many rows the caller allows per batch. A budget that
+/// batches of 4,096 rows fit, and one read of all 200,000 rows does not, shows it.
+#[test]
+fn top_k_keeps_the_callers_byte_cap_when_its_input_does_not_grow() {
+    let s = store(200_000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(ABS(?o - 7)) LIMIT 5";
+    let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let cursor_options = CursorOptions {
+        batch_rows: 1 << 20,
+        batch_bytes: 64 << 10,
+        ..options(1 << 20)
+    };
+    let budget = QueryOptions {
+        max_memory_bytes: Some(4 << 20),
+        ..without("grow_input")
+    };
+    let mut c = select_cursor(s.snapshot(), q, &budget, &cursor_options).unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = c.next_batch().unwrap() {
+        for row in 0..batch.len() {
+            rows.push(batch.row(row).unwrap());
+        }
+    }
+    assert_eq!(rows, eager);
+}
+
 /// A top-k over input that improves row by row, where nearly every row enters the heap and
 /// the first key holds each value twice, screens each value from the answers it gave
 /// before, which a row entering the heap does not change.
