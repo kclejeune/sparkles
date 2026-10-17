@@ -61,18 +61,24 @@ keeps the handoff notes current.
 | Role | Model |
 |---|---|
 | Orchestration, validating review findings, remediation plans, consults | Claude Opus 5.5 |
-| Implementing non-trivial engineering work that has no written plan | Claude Opus 5.5 |
-| Implementing from an explicit plan or a clear-cut spec | Claude Sonnet 5.5 at high effort |
+| Implementing engineering work, including remediation plans | Claude Opus 5.5 |
+| Implementing clear-cut work that needs no judgment | Claude Sonnet 5.5 at high effort |
 | Code review | Codex with gpt-6.1-sol at high effort |
 | Mechanical tasks with a deterministic check | Claude Haiku 5.5 |
 
-A lane goes to Sonnet only when someone can write down how to do it: a remediation
-`plan.md` that names the files, the behaviour, the edge cases and the tests, or a spec
-phase that leaves no design decision open. Everything else that takes engineering
-judgment starts on Opus. That includes a refactor whose shape is unclear, a bug whose cause
-is unknown, a spec that leaves behaviour or an API open, and any lane whose core is crash
-durability or WAL ordering, concurrency beyond a parallel iterator, an on-disk format,
-planner or executor cost decisions, or `unsafe` code.
+Opus implements by default. The Opus agent that validates a review and writes its
+`plan.md` goes on to implement that plan itself, because it already holds the code and the
+reasoning in its context and its prompt cache, and this holds for large plans as well as
+small ones. Opus also starts every lane whose work needs engineering judgment, such as a
+refactor whose shape is unclear, a bug whose cause is unknown, a spec that leaves behaviour
+or an API open, and any lane whose core is crash durability or WAL ordering, concurrency
+beyond a parallel iterator, an on-disk format, planner or executor cost decisions, or
+`unsafe` code.
+
+A lane goes to Sonnet only when the work is clear-cut and needs no judgment at all. Examples
+are a loader or benchmark harness for a documented format, a conformance phase whose
+behaviour the test suite fixes, and a client binding that mirrors an existing API. When in
+doubt, use Opus.
 
 Haiku takes tasks that need a model to read or write language but little judgment, and
 that end in a check a script can run. Examples are triaging test and benchmark logs into
@@ -107,8 +113,8 @@ No lane lands without review:
    item the plan gives the files and functions to change, the behaviour to implement, the
    edge cases, the regression test that must fail before the fix, the docs to update and the
    commands that verify it. It also records serious problems the review missed.
-3. **Sonnet implements.** The lane, or a new Sonnet agent, applies `plan.md` as written and
-   reports what it did for each item.
+3. **Opus implements.** The validating Opus agent applies its own `plan.md` and reports
+   what it did for each item.
 4. **Re-review.** Codex reviews the fix commits and Opus validates them again. The lane
    merges once this comes back clean.
 
