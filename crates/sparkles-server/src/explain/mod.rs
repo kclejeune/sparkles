@@ -188,6 +188,11 @@ fn number(v: &Value) -> Option<f64> {
     v.as_f64().filter(|x| x.is_finite())
 }
 
+// How many child ids `read_nodes` has formatted on this thread, for the test that a plan
+// over the node limit is refused without building them all.
+#[cfg(test)]
+thread_local!(static IDS_FORMATTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
 /// The nodes of the plan `v` in tree order, a node before its children. The tree is read
 /// with a list of the nodes still to read rather than by recursion, so that the depth of a
 /// given plan cannot exhaust the stack.
@@ -199,9 +204,6 @@ fn read_nodes(v: &Value) -> Result<Vec<NodeFacts>, String> {
         if depth > MAX_DEPTH {
             return Err(format!("the plan nests deeper than {MAX_DEPTH} levels"));
         }
-        if out.len() >= MAX_NODES {
-            return Err(format!("the plan has more than {MAX_NODES} nodes"));
-        }
         let me = out.len();
         let facts = read_node(v, id, parent)?;
         // borrowed: a copy at each level would copy the subtree once per level above it
@@ -209,7 +211,14 @@ fn read_nodes(v: &Value) -> Result<Vec<NodeFacts>, String> {
             .get("children")
             .and_then(Value::as_array)
             .map_or(&[][..], Vec::as_slice);
+        // the nodes read, this one and those waiting to be read bound the plan from below,
+        // so a plan over the limit is refused before the ids of its children are built
+        if out.len() + 1 + todo.len() + kids.len() > MAX_NODES {
+            return Err(format!("the plan has more than {MAX_NODES} nodes"));
+        }
         for (i, c) in kids.iter().enumerate().rev() {
+            #[cfg(test)]
+            IDS_FORMATTED.with(|n| n.set(n.get() + 1));
             todo.push((c, format!("{}.{i}", facts.id), Some(me), depth + 1));
         }
         out.push(facts);
@@ -1027,11 +1036,10 @@ fn list(items: &[String]) -> String {
     }
 }
 
-/// The patterns under `at`, as text, with the ids of the nodes they come from. An
-/// optional side is not followed.
-/// The patterns of the subtree of node `at`, in tree order, with the ids of the nodes
-/// that name them. The subtree is walked with a list of the nodes still to visit rather
-/// than by recursion, since a plan can nest thousands of levels.
+/// The patterns of the subtree of node `at`, as text and in tree order, with the ids of
+/// the nodes that name them. An optional side is not followed. The subtree is walked with
+/// a list of the nodes still to visit rather than by recursion, since a plan can nest
+/// thousands of levels.
 fn patterns(
     plan: &Plan,
     at: usize,

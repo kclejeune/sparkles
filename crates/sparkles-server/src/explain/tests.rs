@@ -234,6 +234,29 @@ fn a_plan_at_the_depth_limit_is_read_without_recursion() {
     });
 }
 
+/// A plan over the node limit is refused when the reader meets the node whose children
+/// pass it, before the ids of those children are built, so the memory a request costs is
+/// bounded by the limit and not by the width of the plan.
+#[test]
+fn a_plan_over_the_node_limit_is_refused_without_building_its_ids() {
+    let wide = |n: usize| {
+        let scan = node("IndexScan", "SPO ?s ?p ?o", 1.0, 1, 0.0, vec![]);
+        node("Union", "", 1.0, 1, 0.0, vec![scan; n])
+    };
+    let formatted = || IDS_FORMATTED.with(|n| n.replace(0));
+    formatted();
+    // a root and as many children as fit
+    let p = Plan::read(&wide(MAX_NODES - 1)).unwrap();
+    assert_eq!(p.nodes.len(), MAX_NODES);
+    assert_eq!(formatted(), MAX_NODES - 1);
+    let e = Plan::read(&wide(MAX_NODES)).unwrap_err();
+    assert!(e.contains("more than 10000 nodes"), "{e}");
+    assert_eq!(formatted(), 0, "ids were built for a plan over the limit");
+    let e = Plan::read(&wide(100 * MAX_NODES)).unwrap_err();
+    assert!(e.contains("more than 10000 nodes"), "{e}");
+    assert_eq!(formatted(), 0);
+}
+
 #[test]
 fn a_plan_that_is_not_a_plan_is_refused() {
     assert!(Plan::read(&json!({"x": 1})).is_err());
