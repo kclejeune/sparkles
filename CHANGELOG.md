@@ -29,6 +29,13 @@ metadata reports `stopped` and an unknown total, and a Node result that streams 
 out with `execution=eager`, a server with `serve --default-execution eager`, the CLI
 with `--execution eager` and Node with `execution: 'eager'`.
 
+The deadline of a streamed answer now counts the query's own time. The time a query spends
+blocked on its reader, which is the response channel over HTTP and the gap between two
+pulls in Node, no longer counts against `timeout`, so a slow but steady reader of a large
+export is not cut off. Over HTTP a client that reads nothing for longer than the
+request's timeout ends the stream as a timeout. This applies to `execution=streaming` as
+well. A local `sparkles query --timeout` still counts the time its output is blocked.
+
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server
 refuses until `sparkles migrate` runs without `--check`, and its JSON report adds `opens`.
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as
