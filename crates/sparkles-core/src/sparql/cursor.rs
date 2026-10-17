@@ -1149,36 +1149,42 @@ impl QueryCursor {
 
     /// Hand each batch, with the terms of its base-vocabulary cells decoded once in key
     /// order, to `each`, until `send` rows have been pulled or the cursor ends. Returns the
-    /// rows of `send` left over, `usize::MAX` without one.
+    /// rows of `send` left over, which without `send` count down from `usize::MAX`, so that
+    /// 0 means the writer stopped at `send`.
     ///
-    /// With `decode_ahead` and more than one Rayon worker, the next batch is pulled before
-    /// `each` handles the current one, and its terms are decoded on the pool while `each`
-    /// runs. Two batches and their terms are then live at once, both charged. An error
-    /// while pulling the next batch is returned after `each` has handled the current one,
-    /// so the rows before it are written as they are without decoding ahead.
+    /// With `decode_ahead` and more than one Rayon worker, every batch after the first is
+    /// pulled before `each` handles the one before it, and its terms are decoded on the pool
+    /// while `each` runs. Two batches and their terms are then live at once, both charged.
+    /// The first batch goes to `each` before the second is pulled, so the first rows of an
+    /// answer wait for one batch only, however slowly the plan produces the next.
+    ///
+    /// An error while pulling a batch ahead is returned after `each` has been called with the
+    /// batch before it. A memory budget failure inside the plan also fails every later
+    /// check of the query, so `each` then stops at its first check, and the rows of that
+    /// batch are not written. Without decoding ahead those rows would be written before the
+    /// pull that fails. The answer is an error either way.
     pub(super) fn for_each_decoded(
         &mut self,
         send: Option<usize>,
         mut each: impl FnMut(&Self, &QueryBatch, Option<&DecodedBatch<'_>>) -> Result<()>,
     ) -> Result<usize> {
         let mut remaining = send.unwrap_or(usize::MAX);
-        if !self.ctx.opt.decode_ahead || rayon::current_num_threads() < 2 {
-            while remaining > 0 {
-                let Some(batch) = self.next_batch_at_most(remaining)? else {
-                    break;
-                };
-                let decoded = batch.decoded()?;
-                each(self, &batch, decoded.as_ref())?;
-                remaining -= batch.len().min(remaining);
-            }
+        let ahead = self.ctx.opt.decode_ahead && rayon::current_num_threads() >= 2;
+        // In turn: every batch without decoding ahead, and the first batch with it.
+        let mut first = true;
+        while remaining > 0 && (first || !ahead) {
+            first = false;
+            let Some(batch) = self.next_batch_at_most(remaining)? else {
+                return Ok(remaining);
+            };
+            let decoded = batch.decoded()?;
+            each(self, &batch, decoded.as_ref())?;
+            remaining -= batch.len().min(remaining);
+        }
+        if remaining == 0 {
             return Ok(remaining);
         }
-        let first = if remaining > 0 {
-            self.next_batch_at_most(remaining)?
-        } else {
-            None
-        };
-        let mut current = match first {
+        let mut current = match self.next_batch_at_most(remaining)? {
             Some(batch) => {
                 let cache = batch.term_cache()?;
                 Some((batch, cache))
@@ -3402,5 +3408,89 @@ mod tests {
     fn successor_carries_and_stops_at_maximum() {
         assert_eq!(successor([7, 9, u64::MAX, u64::MAX]), Some([7, 10, 0, 0]));
         assert_eq!(successor([u64::MAX; 4]), None);
+    }
+
+    /// A writer that decodes ahead pulls each batch after the first before it writes the
+    /// one before, and it writes the first batch before it pulls the second, so that the
+    /// first rows wait for one batch only. Its batches and term caches go back to the
+    /// ledger as they do without decoding ahead.
+    #[test]
+    fn decoding_ahead_writes_the_first_batch_before_pulling_the_second() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..10_000)
+            .map(|i| format!("<urn:s:{i}> <urn:p> \"v{i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let run = |ahead: bool, send: Option<usize>| {
+            let mut opt = crate::sparql::Optimizations::default();
+            if !ahead {
+                opt = opt.disable("decode_ahead").unwrap();
+            }
+            let options = QueryOptions {
+                optimizations: Some(opt),
+                ..Default::default()
+            };
+            let mut cursor = select_cursor(
+                store.snapshot(),
+                "SELECT ?s ?o {?s <urn:p> ?o}",
+                &options,
+                &CursorOptions {
+                    batch_rows: 1000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut produced = Vec::new();
+            let mut rows = 0;
+            let left = pool
+                .install(|| {
+                    cursor.for_each_decoded(send, |cursor, batch, decoded| {
+                        assert!(decoded.is_some(), "the terms of every batch are decoded");
+                        produced.push(cursor.ctx.rows_produced());
+                        rows += batch.len();
+                        Ok(())
+                    })
+                })
+                .unwrap();
+            (produced, rows, left, cursor.ctx.live_bytes())
+        };
+        let (serial, rows, left, serial_live) = run(false, None);
+        assert_eq!((rows, left), (10_000, usize::MAX - 10_000));
+        // the operators' rows of one batch
+        let unit = serial[0];
+        assert!(unit >= 1000);
+        assert_eq!(serial, (1..=10).map(|i| i * unit).collect::<Vec<u64>>());
+        let (ahead, rows, left, ahead_live) = run(true, None);
+        assert_eq!((rows, left), (10_000, usize::MAX - 10_000));
+        // the first batch alone, then each batch with the next one pulled
+        let mut want = vec![unit, 3 * unit];
+        want.extend((4..=10).map(|i| i * unit));
+        want.push(10 * unit);
+        assert_eq!(ahead, want);
+        assert_eq!(
+            ahead_live, serial_live,
+            "decoding ahead holds nothing afterwards"
+        );
+        // `send` stops the pulls at its rows
+        for send in [0, 1, 999, 1000, 1001, 2500, 10_000] {
+            let (serial, rows, left, _) = run(false, Some(send));
+            let (ahead, ahead_rows, ahead_left, _) = run(true, Some(send));
+            assert_eq!((rows, left), (send, 0), "send {send}");
+            assert_eq!((ahead_rows, ahead_left), (send, 0), "send {send}");
+            assert_eq!(ahead.first(), serial.first(), "send {send}");
+            assert_eq!(ahead.last(), serial.last(), "send {send}");
+        }
     }
 }

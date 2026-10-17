@@ -762,7 +762,7 @@ impl Ctx {
 
     /// The query's live estimate, from the ledger once it exists.
     #[inline]
-    fn live_bytes(&self) -> u64 {
+    pub(super) fn live_bytes(&self) -> u64 {
         match self.memory.get() {
             Some(ledger) => ledger.live.load(Ordering::Relaxed),
             None => self.fast.live.load(Ordering::Relaxed) & !PROMOTED,
