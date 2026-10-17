@@ -3761,3 +3761,110 @@ fn decoding_ahead_under_tight_budgets_and_failing_writers() {
         }
     }
 }
+
+/// Three dateTimes that `ORDER BY` does not order totally: p is before q by value, and q
+/// is before a and a before p by their lexical forms, since a has no timezone and lies
+/// within 14 hours of both. The top-k's screen cannot remember a rejected value of such a
+/// key, because a later heap can rank it again, so every batch size gives eager's answer.
+#[test]
+fn top_k_over_a_cycle_of_partially_ordered_keys_matches_eager_at_every_batch_size() {
+    let s = Store::in_memory(StoreOptions::default());
+    let dt = |v: &str| format!("\"{v}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>");
+    let (p, q, a) = (
+        dt("2020-01-02T01:00:00+05:00"),
+        dt("2020-01-01T23:00:00Z"),
+        dt("2020-01-01T23:30:00"),
+    );
+    let mut data = String::new();
+    for (i, v) in [&p, &q, &a, &q].into_iter().enumerate() {
+        data.push_str(&format!("<urn:s:{:05}> <urn:v> {v} .\n", i + 1));
+    }
+    for i in 5..3001 {
+        data.push_str(&format!("<urn:s:{i:05}> <urn:v> {p} .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for q in [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 1",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v ?s LIMIT 2",
+    ] {
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for rows in [1, 512, 1024, 4096] {
+            let c = select_cursor(
+                s.snapshot(),
+                q,
+                &QueryOptions::default(),
+                &CursorOptions {
+                    batch_rows: rows,
+                    fallback: FallbackPolicy::AllowMaterialization,
+                    ..CursorOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(all(c), eager, "{q}; batch {rows}");
+        }
+    }
+}
+
+/// Later batches can be larger than the first, here because the second half of the names
+/// is 200 bytes longer, and the room that decoding ahead measured from the first batch
+/// can then run out where the writer in turn just fits. That happens only within a few
+/// KiB of the writer's own need, and only as a memory budget error, never with other
+/// output.
+#[test]
+fn decoding_ahead_with_growing_batches_under_tight_budgets() {
+    use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions};
+    let s = Store::in_memory(StoreOptions::default());
+    let pad = "x".repeat(200);
+    let data = (0..20_000)
+        .map(|i| {
+            let tail = if i >= 10_000 { pad.as_str() } else { "" };
+            format!("<urn:s:{i:05}> <urn:name> \"name {i}{tail}\" .\n")
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let q = "SELECT ?s ?n WHERE { ?s <urn:name> ?n }";
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let write = |opts: &QueryOptions| {
+        let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+        let mut out = Vec::new();
+        pool.install(|| write_cursor_solutions(&mut c, SolutionsFormat::Tsv, &mut out, None))
+            .map(|_| out)
+    };
+    let mut mismatches = Vec::new();
+    for kb in (1000u64..=1150).step_by(3) {
+        let budget = |opts: QueryOptions| QueryOptions {
+            max_memory_bytes: Some(kb << 10),
+            ..opts
+        };
+        let serial = write(&budget(without("decode_ahead")));
+        let ahead = write(&budget(QueryOptions::default()));
+        match (serial, ahead) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{kb} KiB"),
+            (Err(_), Err(_)) => {}
+            (Ok(_), Err(Error::BudgetExceeded(b))) if b.kind == BudgetKind::Memory => {
+                mismatches.push(kb)
+            }
+            (Ok(_), Err(e)) => panic!("{kb} KiB: decoding ahead failed otherwise: {e}"),
+            (Err(e), Ok(_)) => panic!("{kb} KiB: only the writer in turn failed: {e}"),
+        }
+    }
+    // The window moves with thread timing by a few KiB. Four of these 51 budgets failed
+    // at most in repeated runs.
+    assert!(
+        mismatches.len() <= 10,
+        "decoding ahead failed at {mismatches:?} KiB"
+    );
+}

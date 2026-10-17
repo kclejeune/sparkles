@@ -421,7 +421,9 @@ little and change nothing. Each one has the same answers with it on and off.
   top-k screen work on more rows at a time. The tradeoff is memory. Over 300,000 rows a
   substring filter peaked at 12.3 MB against 6.7 MB, and a top-k at 24.1 MB against
   2.5 MB, bounded by the query's budgets. Independently of the switch, when the first key
-  of a cursor top-k holds one result per distinct value, its screen remembers which
-  values it rejected for the rest of the batch, so a repeated value is screened once. A
-  rejected value is worse than the heap's worst row, which only improves as rows enter,
-  so it stays rejected.
+  of a cursor top-k holds one result per distinct value and every value is of a totally
+  ordered kind, its screen remembers which values it rejected for the rest of the batch,
+  so a repeated value is screened once. In a total order a rejected value is worse than
+  the heap's worst row, which only improves as rows enter, so it stays rejected. Dates,
+  times and durations can form cycles, where a value rejected once ranks ahead of a
+  later worst row, so their rows are screened one by one.

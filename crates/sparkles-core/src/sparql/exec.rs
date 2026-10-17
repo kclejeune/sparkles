@@ -4605,13 +4605,19 @@ pub(super) fn offer_rows<P>(
         }
     };
     let mut ranked = 0;
-    // When the first key holds one result per distinct value, a value the heap screened
-    // out is remembered, and its later rows cost a load instead of a comparison of sort
-    // keys. A rejected value is worse than the heap's worst row, and the worst row only
-    // improves as rows enter, so the value stays rejected. The answers are those of
-    // screening every row.
+    // When the first key holds one result per distinct value and its values are totally
+    // ordered, a value the heap screened out is remembered, and its later rows cost a
+    // load instead of a comparison of sort keys. A rejected value is worse than the
+    // heap's worst row, and in a total order the worst row only improves as rows enter,
+    // so the value stays rejected. Dates with and without a timezone, for example, can
+    // form a cycle, where a value rejected once ranks ahead of a later worst row, so
+    // their rows are screened one by one. The answers are those of screening every row.
     let mut screened: Vec<bool> = match &sources[0] {
-        HeapKey::Column(c) => vec![false; c.distinct().filter(|&n| n < t.len()).unwrap_or(0)],
+        HeapKey::Column(c @ super::exprcache::Column::Values(p))
+            if p.vals.len() < t.len() && p.vals.iter().all(SortKey::totally_ordered) =>
+        {
+            vec![false; c.distinct().unwrap_or(0)]
+        }
         _ => Vec::new(),
     };
     for i in 0..t.len() {

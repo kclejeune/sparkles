@@ -1620,8 +1620,8 @@ Query parameters beyond the standard protocol:
   without being planned for the decision, also when its last run streamed and its answer
   fit in one 1 MiB body. A `COUNT(*)` over a single-key OPTIONAL between two plain scans
   streamed from an estimated million rows until 2026-10-17 and now runs eagerly, because
-  the cursor counted it up to 1.23 times slower on AMD EPYC hosts. A request for SPARQL Results Thrift runs
-  eagerly because that encoding has no streaming writer. A stored-query run with
+  the cursor counted it up to 1.23 times slower on AMD EPYC hosts. A request for SPARQL
+  Results Thrift runs eagerly because that encoding has no streaming writer. A stored-query run with
   parameter values also runs eagerly, because initial bindings rule out every automatic
   plan. A streamed answer that passes a lowered `max-result-mb` within its first
   1 MiB is refused with a status before any output, as an eager one is. The policy is

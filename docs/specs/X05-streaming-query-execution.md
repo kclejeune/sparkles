@@ -693,8 +693,9 @@ snapshot capture inside an owned transaction.
 Auto selects plain immutable SELECT scans under the measured batch, graph-predicate and
 memory conditions that the API documents. Until 2026-10-17 it also selected uncached
 OPTIONAL COUNT queries on a single key, which
-[the parity section](#streaming-parity-2026-10-17) explains. Over HTTP, auto falls back to eager execution when the negotiated encoding is
-SPARQL Results Thrift, which has no cursor writer. Auto became the default mode over
+[the parity section](#streaming-parity-2026-10-17) explains. Over HTTP, auto falls back
+to eager execution when the negotiated encoding is SPARQL Results Thrift, which has no
+cursor writer. Auto became the default mode over
 HTTP, in the CLI and in Node on 2026-10-16, as
 [the section below](#automatic-execution-by-default-2026-10-16) describes.
 
@@ -1059,6 +1060,9 @@ Four changes closed the gaps that profiles traced to the cursor itself.
   row's terms to the memory ledger once instead of once per cell. It writes the first
   batch before it pulls the second, so the first rows wait for one batch only, and it
   reads ahead only when the memory budget has room for twice what the first batch took.
+  That room is an estimate from the first batch, so when later batches hold larger terms
+  a budget within a few KiB of the writer's own need can still fail with decoding ahead,
+  always with a memory budget error.
   An error from a batch read ahead reaches the writer after it has written the batch
   before it. A memory budget failure inside the plan is the exception, since it fails
   every later check of the query, and the writer then stops before writing that batch.
@@ -1071,9 +1075,12 @@ Four changes closed the gaps that profiles traced to the cursor itself.
   substring filter peaked at 12.3 MB against 6.7 MB with fixed reads, and a top-k at
   24.1 MB against 2.5 MB, both within the query's budgets.
 * A cursor top-k reuses the values it decoded for its prefilter instead of decoding them
-  again. When its first key holds one result per distinct value, its screen remembers
-  which values it rejected for the rest of the batch. A rejected value is worse than the
-  heap's worst row, which only improves, so it stays rejected.
+  again. When its first key holds one result per distinct value of totally ordered
+  kinds, its screen remembers which values it rejected for the rest of the batch. In a
+  total order a rejected value is worse than the heap's worst row, which only improves,
+  so it stays rejected. DateTimes with and without a timezone can form a cycle, and the
+  first build remembered their rejections too, so a batch of 1,024 rows or more could
+  rank them differently from eager execution. Such keys are now screened row by row.
 * The numeric columns of a cursor's expression cache are located in parallel when a
   batch has at least 16,384 ids.
 
@@ -1155,8 +1162,8 @@ term cache size, as an eager result's batches do, and restart it when it is full
 encoder decodes a term it has not seen without charging it to the query's memory budget,
 as eager execution decodes its results, so a row of very large literals is held
 uncharged while it is encoded. That is the one exception to the cursor's budget
-accounting, and `QueryBatch::transient_term` is public only for this encoder. A query iterator now refuses to read
-once its transaction has ended and throws `JenaTransactionException`, eager or streamed,
+accounting, and `QueryBatch::transient_term` is public only for this encoder. A query
+iterator now refuses to read once its transaction has ended and throws `JenaTransactionException`, eager or streamed,
 as Jena's own iterators do, instead of handing out the rest of an eager result.
 
 The first build of the JVM change exported 500,000 rows through JNI in 169 ms against
