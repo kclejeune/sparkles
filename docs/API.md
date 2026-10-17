@@ -5527,12 +5527,13 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   scratch, and grows them only after charging the new capacity. These Vec-capacity
   bounds exclude allocator and Rayon bookkeeping and small summary metadata.
 * **Cancellation.** Every long loop of an algorithm over nodes, rows or heap entries
-  counts its work, a node, an edge of a row or a heap entry at a time, and checks
-  cancellation and the deadline once the count reaches 64K units. Consecutive rows that
-  hold at most 64K units together are counted at once before the first of them, so at
-  most 128K units pass between two checks. Rows that hold more are counted one at a
-  time before each is read, so a node of high degree is checked before the next row
-  starts. Triangle counting counts a node's merges by a bound before they start, and
+  counts its work in units, where a node, an edge of a row and a heap entry are one unit
+  each, and checks cancellation and the deadline once the count reaches 64K units.
+  Consecutive rows that hold at most 64K units together are counted at once before the
+  first of them, so at most 128K units pass between two checks. Rows that hold more are
+  counted one at a time before each is read, so a node of high degree is checked before
+  the next row starts. The search of strongly connected components also checks every
+  64K edges within one row. Triangle counting counts a node's merges by a bound before they start, and
   counts each merge of a node whose bound passes 64K units. PageRank counts the rows of
   each block in its four iteration passes. These are work bounds, and they do not
   preempt one row's edges or guarantee a wall-clock bound. A sort runs as one step that

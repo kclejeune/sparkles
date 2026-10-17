@@ -366,7 +366,10 @@ the next row starts, and a loop over one row's edges is not interrupted. Triangl
 counting bounds the merges of a node by its higher neighbours times the sum of their
 number and the longest list of higher neighbours. It counts that bound before the
 merges when it is at most 64K units, and otherwise counts each merge before it starts.
-Strongly connected components count a node's row when the search enters it.
+Strongly connected components count a node's row when the search enters it, up to its
+first 64K edges, and count each further piece of 64K edges of a longer row before the
+scan reads it. The search therefore checks at least once in every 128K units of work,
+even inside the row of a hub whose neighbours have all been seen.
 The sorts that sit between two checks run as one step that cannot be interrupted. They
 are the sort of all node indexes by degree in triangle counting, which takes time
 proportional to `n log n` for `n` nodes, the sort of one row in triangle counting,
@@ -866,9 +869,14 @@ The polling and charging of roadmap item 8 were measured on forge on a random gr
 merge cost triangle counting 5 to 7.5% and the connected components about 5% on one
 thread. Counting blocks of rows at once and keeping the checks out of the inner loops
 removed that cost. PageRank is 3.4 to 3.9 times faster, because it no longer reads the
-clock before every node. Breadth-first search is 12 to 13% faster and strongly connected
-components 11 to 13% faster. Weakly connected components, k-core and triangle counting
-stay between -2% and +0.3%. Label propagation and FastRP measured +0.4% to +1.4% in one
+clock before every node. After the search of strongly connected components began to
+check every 64K edges within a row and breadth-first search went back to charging its
+next frontier row by row, a second run of eight pairs measured breadth-first search 10
+to 15% faster and strongly connected components about 7% faster, with triangle counting
+at +0.6% to +1.0%. Breadth-first search charges at most 9.1 MB at its peak there,
+against 8.0 MB before, when its frontiers were not charged. Weakly connected components
+and k-core stay between -2% and -0.2%. The graph is uniform random, so the checks
+inside a long row are covered by the cancellation tests rather than by this timing. Label propagation and FastRP measured +0.4% to +1.4% in one
 run and +0.4% to +0.9% in a repeat, within the noise of the measurement. The table is in
 [BENCHMARKS](../BENCHMARKS.md#graph-algorithm-polling).
 

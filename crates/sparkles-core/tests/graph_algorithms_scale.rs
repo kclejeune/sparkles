@@ -105,6 +105,15 @@ fn polling_cost() {
     time("bfs", &|| {
         traverse::bfs(&g, &[0], &par, &ctl).unwrap();
     });
+    if only
+        .as_deref()
+        .is_none_or(|o| o.split(',').any(|o| o == "bfs"))
+    {
+        // the memory one search charges at its peak, on a control of its own
+        let own = Control::new(Arc::new(AtomicBool::new(false)), None, u64::MAX);
+        traverse::bfs(&g, &[0], &par, &own).unwrap();
+        println!("POLL bfsPeakMB  {:>9.2} MB", own.peak() as f64 / 1e6);
+    }
     time("labelProp", &|| {
         labelprop::run(&g, 10, &par, &ctl).unwrap();
     });
