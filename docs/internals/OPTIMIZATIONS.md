@@ -403,3 +403,19 @@ little and change nothing. Each one has the same answers with it on and off.
   each spends most of its time decoding whole 32,768-row columns, and this spreads that
   time over several cores. Reads through a view that keeps no blocks, such as an export,
   skip it.
+* **Decoding the next cursor batch ahead** (`decode_ahead`). A result writer that reads
+  a cursor decodes the terms of the next batch on another Rayon thread while it writes the
+  current one. The decoded terms of a batch are charged to the query's memory ledger, and
+  a batch whose terms the ledger refuses is decoded cell by cell as before. An error from
+  the next batch reaches the writer only after it has written the rows before it. With one
+  Rayon thread the writer decodes in turn. Together with charging each written row's terms
+  once, this took a streamed TSV export of 500,000 rows on forge from 134.7 ms to 72 ms at
+  12 threads, where eager execution takes 84 ms.
+* **Growing filter and top-k inputs** (`grow_input`). A cursor filter starts by reading
+  32,768 rows and doubles each read up to 262,144 rows while the row budget and the memory
+  ledger have room. A cursor top-k starts at the cursor's batch size and doubles up to
+  65,536 rows on the same condition. Larger reads let the expression caches and the top-k
+  screen work on more rows at a time. A top-k also remembers which values of its first key
+  the screen rejected until the heap changes, so a repeated value is screened once. The
+  tradeoff is memory, since a filter can hold up to eight times the rows it held before,
+  bounded by the query's budgets.

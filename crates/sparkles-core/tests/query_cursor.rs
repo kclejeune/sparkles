@@ -3487,3 +3487,130 @@ fn work_that_copies_the_deadline_takes_the_paused_one() {
     // a SERVICE call or an algorithm run that starts now gets the moved deadline
     assert!(ctx.current_deadline().unwrap() > std::time::Instant::now());
 }
+
+/// A store of `n` subjects with a name, of which every seventh contains "Ada", and an
+/// integer that repeats every 100 subjects.
+fn named(n: usize) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let data = (0..n)
+        .map(|i| {
+            let name = if i % 7 == 0 { "Ada" } else { "Grace" };
+            format!(
+                "<urn:s:{i}> <urn:name> \"{name} {i}\" .\n<urn:s:{i}> <urn:age> {} .\n",
+                i % 100
+            )
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+fn without(names: &str) -> QueryOptions {
+    QueryOptions {
+        optimizations: Some(
+            sparkles_core::sparql::Optimizations::default()
+                .disable(names)
+                .unwrap(),
+        ),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn writers_decoding_ahead_match_eager_at_send_limits_across_batches() {
+    use sparkles_core::sparql::results::{
+        SolutionsFormat, write_cursor_solutions, write_solutions,
+    };
+    let s = named(9000);
+    let q = "SELECT ?s ?n ?a WHERE { ?s <urn:name> ?n ; <urn:age> ?a }";
+    let eager = query(s.snapshot(), q, &Default::default()).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for fmt in [SolutionsFormat::Tsv, SolutionsFormat::Json] {
+        for send in [None, Some(0), Some(1), Some(4096), Some(4097), Some(8999)] {
+            let mut expected = Vec::new();
+            write_solutions(&eager, fmt, &mut expected, send).unwrap();
+            for opts in [QueryOptions::default(), without("decode_ahead")] {
+                let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
+                let mut output = Vec::new();
+                let stats = pool
+                    .install(|| write_cursor_solutions(&mut c, fmt, &mut output, send))
+                    .unwrap();
+                assert_eq!(output, expected, "{fmt:?}, send {send:?}");
+                let n = send.unwrap_or(9000).min(9000) as u64;
+                assert_eq!(stats.emitted_rows, n, "{fmt:?}, send {send:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_failure_while_decoding_ahead_comes_after_the_rows_before_it() {
+    use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions};
+    let s = store(5000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for opts in [QueryOptions::default(), without("decode_ahead")] {
+        let opts = QueryOptions {
+            max_rows_produced: Some(2500),
+            ..opts
+        };
+        let mut c = select_cursor(s.snapshot(), q, &opts, &options(1000)).unwrap();
+        let mut output = Vec::new();
+        let result = pool
+            .install(|| write_cursor_solutions(&mut c, SolutionsFormat::Tsv, &mut output, None));
+        assert!(result.is_err(), "the row budget stops the scan");
+        assert_eq!(c.status(), CursorStatus::Failed);
+        // the header and the whole batches before the failing pull
+        let text = String::from_utf8(output).unwrap();
+        let rows = text.lines().count() - 1;
+        assert!(
+            rows >= 1000 && rows < 5000 && rows % 1000 == 0,
+            "{rows} rows"
+        );
+    }
+}
+
+#[test]
+fn long_filters_and_top_k_read_growing_inputs_with_the_answers_of_eager() {
+    let s = named(150_000);
+    let filtered = "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) }";
+    let expected = bag(query(s.snapshot(), filtered, &Default::default())
+        .unwrap()
+        .rows());
+    assert_eq!(expected.len(), 150_000 / 7 + 1);
+    let ordered = [
+        "SELECT ?s ?a WHERE { ?s <urn:age> ?a } ORDER BY DESC(ABS(?a - 50)) ?s LIMIT 10",
+        "SELECT ?s ?a WHERE { ?s <urn:age> ?a } ORDER BY ?a DESC(?s) LIMIT 7",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n } ORDER BY DESC(?n) LIMIT 5",
+    ];
+    for opts in [QueryOptions::default(), without("grow_input")] {
+        let mut c = select_cursor(s.snapshot(), filtered, &opts, &options(4096)).unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = c.next_batch().unwrap() {
+            assert!(
+                batch.len() <= 4096,
+                "the filter keeps the caller's batch size"
+            );
+            for row in 0..batch.len() {
+                rows.push(batch.row(row).unwrap());
+            }
+        }
+        assert_eq!(bag(rows), expected);
+        for q in ordered {
+            let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+            let c = select_cursor(s.snapshot(), q, &opts, &options(4096)).unwrap();
+            assert_eq!(all(c), eager, "{q}");
+        }
+    }
+}

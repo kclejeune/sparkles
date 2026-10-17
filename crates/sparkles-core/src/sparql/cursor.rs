@@ -257,6 +257,30 @@ impl QueryBatch {
         (0..self.width()).map(|c| self.term(row, c)).collect()
     }
 
+    /// [`QueryBatch::term`] for a writer that has reserved [`QueryBatch::cell_bytes`] for
+    /// the cell, through [`QueryBatch::row_bytes`] or [`DecodedBatch::row_bytes`].
+    pub(super) fn reserved_term(&self, row: usize, column: usize) -> Result<Option<Term>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        self.ctx.reserved_batch_term(self.id(row, column))
+    }
+
+    /// [`QueryBatch::term`] for a writer that holds one reservation for its row: `cover`
+    /// is asked for the cell's [`QueryBatch::cell_bytes`] before the term is built, and
+    /// the key is decoded once.
+    pub(super) fn covered_term(
+        &self,
+        row: usize,
+        column: usize,
+        cover: impl FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Term>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        self.ctx.covered_batch_term(self.id(row, column), cover)
+    }
+
     pub(super) fn row_bytes(&self, row: usize) -> Result<u64> {
         (0..self.width())
             .map(|column| self.ctx.decoded_bytes(self.id(row, column)))
@@ -287,8 +311,16 @@ impl QueryBatch {
     /// sorted order. Its terms and construction scratch stay on this query's
     /// budget. A refused cache is discarded before returning the row-wise path.
     pub(super) fn decoded(&self) -> Result<Option<DecodedBatch<'_>>> {
-        match DecodedBatch::new(self) {
-            Ok(decoded) => Ok(Some(decoded)),
+        Ok(self
+            .term_cache()?
+            .map(|cache| DecodedBatch { batch: self, cache }))
+    }
+
+    /// The terms of [`QueryBatch::decoded`] without the borrow of the batch, so that
+    /// another thread can build them while the writer serializes the batch before it.
+    pub(super) fn term_cache(&self) -> Result<Option<TermCache>> {
+        match TermCache::new(self) {
+            Ok(cache) => Ok(Some(cache)),
             Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory => Ok(None),
             Err(error) => Err(error),
         }
@@ -297,16 +329,21 @@ impl QueryBatch {
 
 /// The smallest step in which a decoded batch reserves memory for its terms.
 const TERM_RESERVE: u64 = 64 << 10;
-
 pub(super) struct DecodedBatch<'a> {
     batch: &'a QueryBatch,
-    terms: Vec<Term>,
-    slots: Vec<u32>,
-    _charge: super::ctx::Charge<'a>,
+    cache: TermCache,
 }
 
-impl<'a> DecodedBatch<'a> {
-    fn new(batch: &'a QueryBatch) -> Result<Self> {
+/// The decoded base-vocabulary terms of one batch, each decoded once in key order, and
+/// the term of each cell. It holds its reservation until it is dropped.
+pub(super) struct TermCache {
+    terms: Vec<Term>,
+    slots: Vec<u32>,
+    _charge: OwnedCharge,
+}
+
+impl TermCache {
+    fn new(batch: &QueryBatch) -> Result<Self> {
         let ctx = &batch.ctx;
         ctx.check()?;
         let cells = batch
@@ -316,7 +353,8 @@ impl<'a> DecodedBatch<'a> {
             .ok_or_else(|| Error::invalid("query batch has too many cells"))?;
         // Pairs, slots, unique IDs, term capacity and row adapters coexist during
         // construction. Reserve before allocating, including reconstruction.
-        let charge = ctx.charge((cells as u64).saturating_mul(128).saturating_add(1024))?;
+        let mut held = (cells as u64).saturating_mul(128).saturating_add(1024);
+        let mut charge = OwnedCharge::new(ctx, held)?;
         let mut pairs = Vec::with_capacity(cells);
         for column in 0..batch.width() {
             for row in 0..batch.len() {
@@ -368,14 +406,18 @@ impl<'a> DecodedBatch<'a> {
                 let bytes = (key.len() as u64).saturating_mul(8).saturating_add(128);
                 if bytes > ahead {
                     let more = bytes.max(TERM_RESERVE);
-                    match charge.add(more) {
-                        Ok(()) => ahead = ahead.saturating_add(more),
+                    match charge.resize(held.saturating_add(more)) {
+                        Ok(()) => {
+                            held = held.saturating_add(more);
+                            ahead = ahead.saturating_add(more);
+                        }
                         // A refused charge leaves the ledger unchanged, so this term can
                         // still reserve what the leftover of the last chunk lacks.
                         Err(Error::BudgetExceeded(b))
                             if b.kind == crate::error::BudgetKind::Memory && more > bytes =>
                         {
-                            charge.add(bytes - ahead)?;
+                            charge.resize(held.saturating_add(bytes - ahead))?;
+                            held = held.saturating_add(bytes - ahead);
                             ahead = bytes;
                         }
                         Err(e) => return Err(e),
@@ -387,22 +429,29 @@ impl<'a> DecodedBatch<'a> {
             },
         )?;
         Ok(Self {
-            batch,
             terms,
             slots,
             _charge: charge,
         })
     }
+}
+
+impl<'a> DecodedBatch<'a> {
+    /// A batch with the terms that [`QueryBatch::term_cache`] built for it.
+    pub(super) fn new(batch: &'a QueryBatch, cache: TermCache) -> Self {
+        Self { batch, cache }
+    }
 
     fn cached(&self, row: usize, column: usize) -> Option<&Term> {
-        self.terms
-            .get(self.slots[column * self.batch.len() + row] as usize)
+        self.cache
+            .terms
+            .get(self.cache.slots[column * self.batch.len() + row] as usize)
     }
 
     pub(super) fn term(&self, row: usize, column: usize) -> Result<Option<Cow<'_, Term>>> {
         match self.cached(row, column) {
             Some(term) => Ok(Some(Cow::Borrowed(term))),
-            None => Ok(self.batch.term(row, column)?.map(Cow::Owned)),
+            None => Ok(self.batch.reserved_term(row, column)?.map(Cow::Owned)),
         }
     }
 
@@ -1070,6 +1119,76 @@ impl QueryCursor {
 
     pub fn next_batch(&mut self) -> Result<Option<QueryBatch>> {
         self.next_batch_at_most(self.options.batch_rows)
+    }
+
+    /// Hand each batch, with the terms of its base-vocabulary cells decoded once in key
+    /// order, to `each`, until `send` rows have been pulled or the cursor ends. Returns the
+    /// rows of `send` left over, `usize::MAX` without one.
+    ///
+    /// With `decode_ahead` and more than one Rayon worker, the next batch is pulled before
+    /// `each` handles the current one, and its terms are decoded on the pool while `each`
+    /// runs. Two batches and their terms are then live at once, both charged. An error
+    /// while pulling the next batch is returned after `each` has handled the current one,
+    /// so the rows before it are written as they are without decoding ahead.
+    pub(super) fn for_each_decoded(
+        &mut self,
+        send: Option<usize>,
+        mut each: impl FnMut(&Self, &QueryBatch, Option<&DecodedBatch<'_>>) -> Result<()>,
+    ) -> Result<usize> {
+        let mut remaining = send.unwrap_or(usize::MAX);
+        if !self.ctx.opt.decode_ahead || rayon::current_num_threads() < 2 {
+            while remaining > 0 {
+                let Some(batch) = self.next_batch_at_most(remaining)? else {
+                    break;
+                };
+                let decoded = batch.decoded()?;
+                each(self, &batch, decoded.as_ref())?;
+                remaining -= batch.len().min(remaining);
+            }
+            return Ok(remaining);
+        }
+        let first = if remaining > 0 {
+            self.next_batch_at_most(remaining)?
+        } else {
+            None
+        };
+        let mut current = match first {
+            Some(batch) => {
+                let cache = batch.term_cache()?;
+                Some((batch, cache))
+            }
+            None => None,
+        };
+        while let Some((batch, cache)) = current.take() {
+            remaining -= batch.len().min(remaining);
+            let next = if remaining > 0 {
+                self.next_batch_at_most(remaining)
+            } else {
+                Ok(None)
+            };
+            let decoded = cache.map(|cache| DecodedBatch::new(&batch, cache));
+            match next {
+                Ok(Some(next)) => {
+                    let mut built = None;
+                    let (slot, upcoming, this) = (&mut built, &next, &*self);
+                    let written = rayon::in_place_scope(|scope| {
+                        scope.spawn(move |_| *slot = Some(upcoming.term_cache()));
+                        each(this, &batch, decoded.as_ref())
+                    });
+                    drop(decoded);
+                    drop(batch);
+                    written?;
+                    let cache = built.expect("the decoding task ran")?;
+                    current = Some((next, cache));
+                }
+                Ok(None) => each(self, &batch, decoded.as_ref())?,
+                Err(error) => {
+                    each(self, &batch, decoded.as_ref())?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(remaining)
     }
 
     pub(super) fn next_batch_at_most(&mut self, rows: usize) -> Result<Option<QueryBatch>> {

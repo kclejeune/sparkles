@@ -239,6 +239,9 @@ pub struct TopK<P> {
     asc: Vec<bool>,
     heap: Vec<Entry<P>>,
     seen: u64,
+    /// rows that entered the heap, which are the only events that change what
+    /// [`TopK::screen`] answers
+    entered: u64,
 }
 
 impl<P> TopK<P> {
@@ -248,7 +251,14 @@ impl<P> TopK<P> {
             asc,
             heap: Vec::new(),
             seen: 0,
+            entered: 0,
         }
+    }
+
+    /// How many rows have entered the heap. [`TopK::screen`] gives the same answer for
+    /// the same key as long as this count does not change.
+    pub fn entered(&self) -> u64 {
+        self.entered
     }
 
     /// The number of rows kept now.
@@ -308,6 +318,7 @@ impl<P> TopK<P> {
             return Some(entry);
         }
         if !self.is_full() {
+            self.entered += 1;
             self.heap.push(entry);
             self.sift_up(self.heap.len() - 1);
             return None;
@@ -315,6 +326,7 @@ impl<P> TopK<P> {
         if !self.worse(&self.heap[0], &entry) {
             return Some(entry);
         }
+        self.entered += 1;
         let out = std::mem::replace(&mut self.heap[0], entry);
         self.sift_down(0);
         Some(out)

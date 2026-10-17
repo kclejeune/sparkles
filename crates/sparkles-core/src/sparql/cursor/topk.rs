@@ -17,6 +17,9 @@ use crate::sparql::sortkey::{Entry, SortKey, TopK as Heap};
 use crate::sparql::table::VarId;
 use std::sync::Arc;
 
+/// The largest input batch the operator asks for when its reads grow.
+const MAX_INPUT_ROWS: usize = 1 << 16;
+
 /// Whether the operator for `node` is a streaming top-k.
 pub(super) fn eligible(ctx: &Ctx, node: &Node) -> bool {
     matches!(&node.kind, Kind::OrderBy { keys, limit: Some(k) }
@@ -143,8 +146,27 @@ impl TopK {
         } = self;
         let mut report = Report::default();
         let width = slots.width();
-        // Input demand is independent of the requested output prefix.
-        while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
+        // Input demand is independent of the requested output prefix. With `grow_input`
+        // it doubles with each read up to MAX_INPUT_ROWS, as long as the rows fit the
+        // budget with room to spare, so that the first key is evaluated and screened over
+        // larger batches.
+        let mut demand = options.batch_rows;
+        let mut input_options = options.clone();
+        loop {
+            input_options.batch_rows = demand;
+            input_options.batch_bytes = options
+                .batch_bytes
+                .max(demand.saturating_mul(child.vars.len().max(1) * 8));
+            let Some(batch) = child.next(ctx, &input_options, demand)? else {
+                break;
+            };
+            let next = demand.saturating_mul(2).min(MAX_INPUT_ROWS);
+            if ctx.opt.grow_input
+                && next > demand
+                && ctx.rows_within_budget(child.vars.len() + keys.len() * 4) / 4 >= next
+            {
+                demand = next;
+            }
             let heap = heap.as_mut().expect("an unloaded top-k");
             let table = &batch.table;
             slots.batch.clear();

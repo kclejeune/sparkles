@@ -2824,11 +2824,24 @@ fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(
             rest.cols[0].iter().all(total)
         }
     };
-    drop(decoded);
     if !total {
         return Ok(None);
     }
     let keys = [(Expr::Var(spec.var), spec.asc)];
+    // A cursor ranks the rounded values it decoded above, rather than decoding the same
+    // dictionary values again in the prefilter of `order_by`.
+    if let Some(values) = &decoded
+        && ctx.opt.topk_prefilter
+        && rest.len() > spec.k
+        && let Some((rows, charge)) =
+            cursor_topk_candidates(ctx, &rest, &keys, spec.k, Some(values))?
+        && rows.len() < rest.len()
+    {
+        ctx.check_output(rows.len(), rest.width())?;
+        rest = rest.take_rows(&rows);
+        drop(charge);
+    }
+    drop(decoded);
     // only their first k can be among the first k of all rows (the order of two rows
     // does not depend on the others)
     if rest.len() > spec.k {
@@ -4306,6 +4319,7 @@ fn cursor_topk_candidates(
     t: &Table,
     keys: &[(Expr, bool)],
     k: usize,
+    decoded: Option<&super::exprcache::PerValue<Option<Value>>>,
 ) -> Result<Option<CursorCandidates>> {
     let [(expr @ Expr::Var(var), asc)] = keys else {
         return Ok(None);
@@ -4321,7 +4335,15 @@ fn cursor_topk_candidates(
     let Ok(charge) = ctx.retained_charge(t.len() as u64 * 64 + 4096) else {
         return Ok(None);
     };
-    let values = super::exprcache::cursor_dictionary_values(ctx, t, expr)?;
+    // the dictionary values a caller decoded already, or this table's
+    let owned;
+    let values = match decoded {
+        Some(values) => Some(values),
+        None => {
+            owned = super::exprcache::cursor_dictionary_values(ctx, t, expr)?;
+            owned.as_ref()
+        }
+    };
     let column = &t.cols[column];
     let sign = if *asc { -1.0 } else { 1.0 };
     let approximate = |i: usize| {
@@ -4331,7 +4353,6 @@ fn cursor_topk_candidates(
             Tag::Int => Some(id.as_i64() as f64),
             Tag::Double => Some(id.as_f64()).filter(|v| !v.is_nan()),
             Tag::Vocab | Tag::Delta if values.is_some() => values
-                .as_ref()
                 .unwrap()
                 .get(i)
                 .as_ref()
@@ -4413,7 +4434,7 @@ fn order_by(
     if let Some(k) = limit
         && ctx.opt.topk_prefilter
         && let Some(cand) = if ctx.is_cursor() {
-            cursor_topk_candidates(ctx, &t, keys, k)?.map(|(rows, charge)| {
+            cursor_topk_candidates(ctx, &t, keys, k, None)?.map(|(rows, charge)| {
                 cursor_candidate_charge = charge;
                 rows
             })
@@ -4584,11 +4605,37 @@ pub(super) fn offer_rows<P>(
         }
     };
     let mut ranked = 0;
+    // When the first key holds one result per distinct value, the heap's answer for each
+    // value is kept until a row enters the heap, which is the only change to the heap's
+    // worst row. A value screened out again costs a load instead of a comparison of sort
+    // keys. The answers are those of screening every row.
+    let mut screened: Vec<bool> = match &sources[0] {
+        HeapKey::Column(c) => vec![false; c.distinct().filter(|&n| n < t.len()).unwrap_or(0)],
+        _ => Vec::new(),
+    };
+    let mut entered = heap.entered();
     for i in 0..t.len() {
         if i.is_multiple_of(4096) {
             ctx.check()?;
         }
+        if !screened.is_empty() && heap.entered() != entered {
+            screened.fill(false);
+            entered = heap.entered();
+        }
         let first = match &sources[0] {
+            HeapKey::Column(c) if !screened.is_empty() => {
+                let slot = c.index(i);
+                if screened[slot] {
+                    heap.skip();
+                    continue;
+                }
+                if heap.screen(c.get(i)) == Screen::Reject {
+                    screened[slot] = true;
+                    heap.skip();
+                    continue;
+                }
+                c.get(i).clone()
+            }
             HeapKey::Column(c) => {
                 // screen by reference: most rows of a large input leave here
                 if heap.screen(c.get(i)) == Screen::Reject {
