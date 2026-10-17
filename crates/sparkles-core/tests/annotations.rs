@@ -488,7 +488,7 @@ fn a_pruned_catalog_reopens_flagged_commits_at_the_wal_tail() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("db");
         let opts = StoreOptions {
-            experimental_group_commit: group,
+            group_commit: group,
             ..Default::default()
         };
         let s = Store::open(&root, opts.clone()).unwrap();

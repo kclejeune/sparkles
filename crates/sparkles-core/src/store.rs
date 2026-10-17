@@ -1126,9 +1126,12 @@ pub struct StoreOptions {
     /// whole cache. Where the file system does not take direct I/O, commits use the
     /// buffered path. On by default.
     pub wal_direct_writes: bool,
-    /// Experimental durable prefix grouping for ordinary persistent WAL writes.
-    /// Off by default; unsupported operations drain and use the ordinary commit path.
-    pub experimental_group_commit: bool,
+    /// Group commit: concurrent commits of a persistent store share one synchronization,
+    /// and each is acknowledged once the prefix that holds it is durable. On by default,
+    /// and ignored for in-memory stores. Writes the group does not admit (on datasets with
+    /// a full-text, spatial or embedding index, merges, forced and bulk commits) drain it
+    /// and take the ordinary path.
+    pub group_commit: bool,
     /// With group commit on, a commit that is the only writer (nothing queued, no fence
     /// running, no transaction waiting for the writer lock) takes the ordinary path with
     /// its write-through writes, which need no cache flush. On by default; off, every
@@ -1203,7 +1206,7 @@ impl Default for StoreOptions {
             commit_digests: false,
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
             wal_direct_writes: true,
-            experimental_group_commit: false,
+            group_commit: true,
             group_commit_idle_direct: true,
             change_log: true,
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
@@ -1932,7 +1935,7 @@ impl Store {
         let store = Store {
             root: Some(root.to_path_buf()),
             group: opts
-                .experimental_group_commit
+                .group_commit
                 .then(|| Box::new(group::Coordinator::default())),
             commit_stats: Default::default(),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
@@ -3811,7 +3814,7 @@ impl Store {
     }
 
     /// Whether this store groups commits
-    /// ([`StoreOptions::experimental_group_commit`] on a persistent store).
+    /// ([`StoreOptions::group_commit`] on a persistent store).
     pub fn groups_commits(&self) -> bool {
         self.group.is_some()
     }
@@ -8214,7 +8217,7 @@ mod ordinary_sync_tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let opts = StoreOptions {
-                experimental_group_commit: group,
+                group_commit: group,
                 bulk_threshold: if bulk { 0 } else { 250_000 },
                 group_commit_idle_direct: false,
                 ..Default::default()
@@ -8387,7 +8390,7 @@ mod ordinary_sync_tests {
         let store = Store::open(
             dir.path(),
             StoreOptions {
-                experimental_group_commit: true,
+                group_commit: true,
                 group_commit_idle_direct: true,
                 wal_direct_writes: false,
                 ..Default::default()

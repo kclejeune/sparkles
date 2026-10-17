@@ -110,7 +110,7 @@ struct Config {
 impl Config {
     fn options(&self) -> StoreOptions {
         StoreOptions {
-            experimental_group_commit: self.group,
+            group_commit: self.group,
             wal_direct_writes: self.direct,
             group_commit_idle_direct: self.idle_direct,
             ..Default::default()
@@ -699,7 +699,7 @@ fn child_annotation_retry() {
     let s = Store::open(
         &db,
         StoreOptions {
-            experimental_group_commit: spec == "group",
+            group_commit: spec == "group",
             group_commit_idle_direct: true,
             ..Default::default()
         },

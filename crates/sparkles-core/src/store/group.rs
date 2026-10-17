@@ -543,7 +543,7 @@ mod tests {
 
     fn options() -> StoreOptions {
         StoreOptions {
-            experimental_group_commit: true,
+            group_commit: true,
             group_commit_idle_direct: false,
             ..Default::default()
         }
@@ -626,7 +626,7 @@ mod tests {
         let s = Store::open(
             dir.path(),
             StoreOptions {
-                experimental_group_commit: true,
+                group_commit: true,
                 ..Default::default()
             },
         )
@@ -1311,7 +1311,18 @@ mod tests {
         assert_eq!(s.group.as_ref().unwrap().fences.load(Ordering::Relaxed), 1);
         assert_eq!(s.snapshot().commit, 1);
         drop(s);
+        // group commit is the default for a persistent store
         let s = Store::open(dir.path(), Default::default()).unwrap();
+        assert!(s.group.is_some());
+        drop(s);
+        let s = Store::open(
+            dir.path(),
+            StoreOptions {
+                group_commit: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(s.group.is_none());
         assert_eq!(s.snapshot().len(), 1);
         assert_eq!(insert(&s, "two").unwrap().commit.seq, 2);
@@ -1340,7 +1351,7 @@ mod tests {
             Store::open(
                 dir.path(),
                 StoreOptions {
-                    experimental_group_commit: true,
+                    group_commit: true,
                     ..Default::default()
                 },
             )
@@ -1415,7 +1426,14 @@ mod tests {
         );
         // a store without group commit counts nothing
         let dir = tempfile::tempdir().unwrap();
-        let s = Store::open(dir.path(), Default::default()).unwrap();
+        let s = Store::open(
+            dir.path(),
+            StoreOptions {
+                group_commit: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         insert(&s, "plain").unwrap();
         let m = s.commit_metrics();
         assert!(!m.group_commit);
@@ -1957,7 +1975,7 @@ mod tests {
             let s = Store::open(
                 dir.path(),
                 StoreOptions {
-                    experimental_group_commit: enabled,
+                    group_commit: enabled,
                     ..Default::default()
                 },
             )
@@ -2803,7 +2821,7 @@ mod tests {
             let s = Store::open(
                 &root,
                 StoreOptions {
-                    experimental_group_commit: true,
+                    group_commit: true,
                     ..Default::default()
                 },
             )
@@ -2942,7 +2960,7 @@ mod tests {
             let s = Store::open(
                 dir.path(),
                 StoreOptions {
-                    experimental_group_commit: grouped,
+                    group_commit: grouped,
                     group_commit_idle_direct: false,
                     ..Default::default()
                 },

@@ -1,5 +1,5 @@
-//! The experimental option reaches real persistent HTTP updates; every request
-//! retains its receipt and the final durable dataset survives reopening.
+//! Group commit reaches real persistent HTTP updates; every request retains its receipt
+//! and the final durable dataset survives reopening.
 use super::*;
 
 /// Wait for actual enqueue events without occupying a Tokio worker.
@@ -17,18 +17,18 @@ async fn append_events(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn opt_in_persistent_updates_keep_independent_durable_receipts() {
+async fn persistent_updates_keep_independent_durable_receipts() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dataset");
     let opts = StoreOptions {
-        experimental_group_commit: true,
+        group_commit: true,
         ..Default::default()
     };
     let state = Arc::new(
         AppState::new(&temp.path().join("server"), opts, Duration::from_secs(30)).unwrap(),
     );
     let dataset = state.attach("ds", DbType::Persistent, Some(&root)).unwrap();
-    assert!(dataset.store.options().experimental_group_commit);
+    assert!(dataset.store.options().group_commit);
     let app = router(state.clone());
     let mut writers = tokio::task::JoinSet::new();
     for n in 0..32 {
@@ -86,7 +86,7 @@ async fn a_failed_fence_fails_every_request_of_its_group_with_503() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dataset");
     let opts = StoreOptions {
-        experimental_group_commit: true,
+        group_commit: true,
         group_commit_idle_direct: false,
         ..Default::default()
     };
@@ -237,7 +237,7 @@ async fn every_http_write_kind_groups_and_keeps_its_receipt_and_message() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("dataset");
         let opts = StoreOptions {
-            experimental_group_commit: true,
+            group_commit: true,
             group_commit_idle_direct: false,
             ..Default::default()
         };
@@ -400,7 +400,7 @@ async fn http_patch_abort_case(fail: bool) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dataset");
     let opts = StoreOptions {
-        experimental_group_commit: true,
+        group_commit: true,
         group_commit_idle_direct: false,
         ..Default::default()
     };
@@ -552,4 +552,39 @@ async fn http_plain_patch_abort_reports_published_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_plain_patch_abort_reports_published_failure() {
     http_patch_abort_case(true).await;
+}
+
+/// A10, through the JSON metrics snapshot: persistent datasets group commits by default,
+/// the option off (`--no-group-commit`) turns it off, and an in-memory dataset never groups.
+#[tokio::test]
+async fn metrics_report_group_commit_on_by_default_and_off_when_asked() {
+    for (opts, db, expected) in [
+        (StoreOptions::default(), DbType::Persistent, true),
+        (
+            StoreOptions {
+                group_commit: false,
+                ..Default::default()
+            },
+            DbType::Persistent,
+            false,
+        ),
+        (StoreOptions::default(), DbType::Mem, false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("dataset");
+        let state = Arc::new(
+            AppState::new(&temp.path().join("server"), opts, Duration::from_secs(30)).unwrap(),
+        );
+        let path = matches!(db, DbType::Persistent).then_some(root.as_path());
+        let dataset = state.attach("ds", db, path).unwrap();
+        assert_eq!(dataset.store.groups_commits(), expected);
+        let app = router(state.clone());
+        let (stats, _) = super::branches::get(&app, "/$/metrics?format=json").await;
+        let stats = stats.json();
+        let text = stats.to_string();
+        assert!(
+            text.contains(&format!("\"groupCommit\":{expected}")),
+            "{expected}: {text}"
+        );
+    }
 }

@@ -57,6 +57,7 @@ pub(crate) fn shared_for_path(
             {
                 if state.options["unionDefaultGraph"] != options["unionDefaultGraph"]
                     || state.options["cacheBytes"] != options["cacheBytes"]
+                    || state.options["groupCommit"] != options["groupCommit"]
                 {
                     return Err(EngineError::invalid(
                         "dataset open options differ from existing catalog",
@@ -155,6 +156,7 @@ impl NativeCatalog {
                     let mut o = sparkles::store::StoreOptions::default();
                     o.union_default_graph = v["unionDefaultGraph"].as_bool().unwrap_or(false);
                     o.cache_bytes = v["cacheBytes"].as_u64().unwrap_or(o.cache_bytes);
+                    o.group_commit = v["groupCommit"].as_bool().unwrap_or(o.group_commit);
                     let mut o: sparkles::CatalogOptions = o.into();
                     o.memory.pool_bytes = v["totalQueryMemoryBytes"].as_u64();
                     o
@@ -175,6 +177,7 @@ impl NativeCatalog {
             if let Some(s) = map.get(&path).and_then(Weak::upgrade) {
                 if s.options["unionDefaultGraph"] != v["unionDefaultGraph"]
                     || s.options["cacheBytes"] != v["cacheBytes"]
+                    || s.options["groupCommit"] != v["groupCommit"]
                 {
                     return Err(EngineError::invalid(
                         "catalog open options differ from existing handle",
@@ -185,6 +188,7 @@ impl NativeCatalog {
             let mut opts = sparkles::store::StoreOptions::default();
             opts.union_default_graph = v["unionDefaultGraph"].as_bool().unwrap_or(false);
             opts.cache_bytes = v["cacheBytes"].as_u64().unwrap_or(opts.cache_bytes);
+            opts.group_commit = v["groupCommit"].as_bool().unwrap_or(opts.group_commit);
             let mut catalog_opts: sparkles::CatalogOptions = opts.into();
             catalog_opts.memory.pool_bytes = v["totalQueryMemoryBytes"].as_u64();
             let s = Arc::new(CatalogState {

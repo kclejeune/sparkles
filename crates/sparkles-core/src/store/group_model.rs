@@ -514,7 +514,7 @@ fn concurrent_random_writes_match_a_sequential_model() {
         let messages = rng.below(4) != 0;
         let fault = FAULTS[rng.below(FAULTS.len() as u64) as usize];
         let opts = StoreOptions {
-            experimental_group_commit: true,
+            group_commit: true,
             group_commit_idle_direct: rng.below(2) == 0,
             wal_direct_writes: rng.below(2) == 0,
             ..Default::default()
