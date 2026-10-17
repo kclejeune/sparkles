@@ -677,11 +677,13 @@ opt-in Jena WHERE execution on the JVM, and the CLI. Copies of rows and transpor
 in the foreign bindings follow their own bounded batching contract. Python rejects
 snapshot capture inside an owned transaction.
 
-The ordinary query path remains eager. Auto selects large plain immutable SELECT scans,
-and uncached eligible OPTIONAL COUNT queries on a single key, under the measured batch,
-graph-predicate and memory conditions that the API documents. Admitting aggregates in
-this way preserves enabled result caches. Over HTTP, auto falls back to eager execution
-when the negotiated encoding is SPARQL Results Thrift, which has no cursor writer.
+Auto selects large plain immutable SELECT scans, and uncached eligible OPTIONAL COUNT
+queries on a single key, under the measured batch, graph-predicate and memory conditions
+that the API documents. Admitting aggregates in this way preserves enabled result
+caches. Over HTTP, auto falls back to eager execution when the negotiated encoding is
+SPARQL Results Thrift, which has no cursor writer. Auto became the default mode over
+HTTP, in the CLI and in Node on 2026-10-16, as
+[the section below](#automatic-execution-by-default-2026-10-16) describes.
 
 The W3C SPARQL 1.0 and 1.1 query evaluation tests run through cursors at batch sizes
 of 1, 2, 3 and 4,096 rows and match the expected results. The queries that need eager
@@ -936,6 +938,82 @@ the rest are sketched here.
   estimate exceeds half the memory budget, and retries an eager query that fails its
   budget before output as a cursor with spill. Each widening needs the matched
   measurements of §10.
+
+### Automatic execution by default (2026-10-16)
+
+`execution=auto` is now the default where a caller gets its answer as a stream of rows
+or bytes. Plans that measured faster as cursors then stream without being asked for, and
+every other plan runs eagerly with the response it had before. The table lists every
+entry point that picks a mode and what it does now.
+
+| Entry point | Default | Reason |
+|---|---|---|
+| HTTP `/{ds}/sparql`, GET and POST, every result format | `auto` | The answer is a byte stream, and the cursor writer covers every format except SPARQL Results Thrift. `serve --default-execution eager` restores eager for a whole server. |
+| HTTP with SPARQL Results Thrift | eager | That encoding has no cursor writer. |
+| HTTP with `max-result-mb` | eager | Only the eager path refuses a result too large for the budget before its first byte. |
+| A query that ran in under 10 ms last time | eager, in place | The decision would cost more than any stream can save, and the in-place path stays as it was. |
+| Stored queries, `/{ds}/queries/{name}` | as `/{ds}/sparql` | A run with parameter values has initial bindings, which rule out every automatic plan, so it runs eagerly. |
+| Graph algorithms over HTTP | as `/{ds}/sparql` | Their plans never qualify, so they run eagerly. |
+| UI result table | eager, asked for explicitly | The table shows the full row count and the time slider compares totals, which a streamed answer stopped after `send` rows does not know. |
+| UI downloads | the server's default | A download reads the whole answer. |
+| CLI `sparkles query`, local | `auto`, but eager for the `text` table and `--explain` | The table measures every row before printing one. A plan that stays eager prints exactly what an eager query prints. |
+| CLI `sparkles query --server` | the server's default | It sends `execution` only when `--execution` is given. |
+| Rust `Dataset::query` and `query_with` | eager | They return a collected `QueryResult`. `ExecutionMode::default()` is now `Auto`, and `Dataset::query_execution` uses it. |
+| Rust client | the server's default | `QueryOptions::execution` chooses a mode. |
+| Python `query`, `select` and the rdflib store | eager | They return collected values whose iteration cannot fail, and they also run inside transactions. `select_cursor` and `graph_cursor` stream on request. |
+| Node `query`, `select`, `construct`, `ask` and `queryToStream` | `auto` | Node results are already async iterators that pull batches, so a streamed result only loses `size` and can reject while it is read. A plan that stays eager keeps its size and its first batch from the call. |
+| Node transactions | eager | A cursor cannot read a transaction's state. |
+| JVM and Jena | eager | Eager is idiomatic there, and `Sparkles.STREAMING_EXECUTION` still opts in. |
+| TypeScript client | the server's default | It sends `execution` only when the caller sets it. |
+| MCP tools, GraphQL, SPARQL diffs, `/{ds}/explain`, Ask | eager | Each returns one document built from the whole result, such as an MCP answer with an exact total. |
+| SERVICE to Sparkles, including the same server | the remote server's default | The SERVICE client reads SPARQL JSON or XML as it arrives, so a cut-off answer fails the parse and the transfer and the SERVICE call fails. |
+
+When automatic execution streams an answer, the caller sees the explicit-streaming
+contract that the API documents. An error after the first 1 MiB of the body, such as a
+timeout or an exhausted budget, aborts the transfer after a `200` status, and in TSV,
+CSV or N-Triples the rows before the cut are well formed. The Rust client, the CLI, the
+TypeScript client and the UI report the cut-off transfer as an error, and new tests serve
+such a response to each of them. They all already did, through the transfer errors of
+reqwest and of fetch, so none of those tests failed before the change. The deadline
+includes the time the client takes to read, and the snapshot and the query's memory
+grant stay held until the body ends. With `send`, the native metadata reports `stopped`
+and an unknown total. Rows come in the same order as eagerly, which a test checks over a
+million-row scan. Streamed answers skip the full-result cache. A plain scan is never
+cached, so this matters only for its projection, which a cursor reads from decoded
+blocks at about a third of the eager cost. The access log and the metrics record a
+streamed answer when its body ends.
+
+Two rules keep late errors rarer than in explicit streaming. A scan whose estimate passes
+the request's `max-rows` or `max-rows-produced` stays eager, so the budget fails it with
+`507` before any output. A request that lowers `max-result-mb` stays eager for the same
+reason. A timeout cannot be predicted, so a slow reader of a streamed scan can still run
+out its `timeout` partway through.
+
+Automatic execution plans the query once on the blocking pool. When it keeps the plan
+eager, the HTTP handler continues on the eager path with that result, so the response,
+its headers, the quick-query memory and the error body with the failed plan are those of
+an eager request. The comparisons in the server tests that relied on eager being the
+default now ask for it, and the test of the default streams a million-row scan, checks
+the eager opt-outs per request and per server, the row-budget rule and a late timeout
+that cuts off a default stream.
+
+The first build of the change cost a never-repeated small query between 0.5% and 0.9%
+more instructions on forge, because the server measured the query's nesting a second
+time to size the parser's stack. A profile put about 1.5% of the instructions in that
+scan. Spargebra already checks the nesting on every parse, so the server now skips the
+measurement when the thread has at least 2 MiB of stack left, which every server thread
+has. After that fix, 1000 requests each of `star-lookup`, `values-star`,
+`employee-docs` and `star-join` at 1.05M, each with a unique comment so that none takes
+the in-place path, cost -0.2% to +0.1% instructions against 6f0f928c. Repeated requests,
+which take the in-place path, moved by less than 0.1% except `star-join` at +0.4%. The
+in-place path runs the same code in both builds, so that difference is noise between
+server processes.
+
+The memory effect is the one the explicit-streaming measurements predicted. At 10.5M,
+the full scan with `send=10` peaks at a 1.0 MiB allocation estimate and 63 MiB of server
+RSS by default, against 241.0 MiB and 804 MiB eagerly, and answers in 2 to 4 ms instead
+of 240 to 320 ms. Read whole as TSV, the scan peaks at 581 MiB of RSS instead of 885 MiB
+in about the same time. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) has the table.
 
 ### Large basic graph patterns
 
