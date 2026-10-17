@@ -224,9 +224,13 @@ impl Group {
         let at = self.groups;
         let na = self.aggs.len();
         ctx.check_rows(at.saturating_add(1))?;
-        self.retain(
-            512 + key.len() as u64 * 24 + na as u64 * (size_of::<State>() as u64 * 4 + 128),
-        )?;
+        // The index entry, twice while the index grows, a boxed key for several key
+        // columns, the key in `order`, and each aggregate's state, twice while `states`
+        // grows, with its payload slot. Text and values that states own are charged as
+        // they grow.
+        let nk = key.len() as u64;
+        let entry = if nk == 1 { 17 } else { 8 * nk + 16 + 25 };
+        self.retain(entry * 2 + nk * 8 + na as u64 * (size_of::<State>() as u64 * 2 + 8) + 16)?;
         match &mut self.index {
             Index::One(index) => {
                 index.insert(key[0], at);
