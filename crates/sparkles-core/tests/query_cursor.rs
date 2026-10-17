@@ -2038,6 +2038,31 @@ fn automatic_execution_keeps_small_and_stateful_queries_eager() {
 }
 
 #[test]
+fn automatic_execution_keeps_the_plan_of_an_eager_failure() {
+    use sparkles_core::sparql::{ExecutionMode, query_execution_with_plan, query_with_plan};
+    // The default mode is automatic, and a plan it keeps eager fails as an eager query
+    // does: with the plan as far as it ran, which the native error body reports.
+    assert_eq!(ExecutionMode::default(), ExecutionMode::Auto);
+    let s = store(10);
+    let q = "SELECT * {?s ?p ?o . ?t ?q ?u}";
+    let opts = QueryOptions {
+        max_rows: Some(20),
+        ..Default::default()
+    };
+    let eager = query_with_plan(s.snapshot(), q, &opts)
+        .err()
+        .expect("the row budget fails the cross product");
+    assert!(eager.plan.is_some());
+    for mode in [ExecutionMode::Eager, ExecutionMode::Auto] {
+        let failed = query_execution_with_plan(s.snapshot(), q, &opts, &Default::default(), mode)
+            .err()
+            .expect("the row budget fails the cross product");
+        assert!(matches!(failed.error, Error::BudgetExceeded(_)), "{mode:?}");
+        assert_eq!(failed.plan.is_some(), eager.plan.is_some(), "{mode:?}");
+    }
+}
+
+#[test]
 fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     use sparkles_core::sparql::{ExecutionMode, QueryExecution, query_execution};
     let s = store(10);

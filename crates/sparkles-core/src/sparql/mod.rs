@@ -59,7 +59,8 @@ pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use cursor::{
     AskResult, CursorOptions, CursorPlan, CursorStats, CursorStatus, ExecutionMode, FallbackPolicy,
     GraphBatch, GraphCursor, MaterializedResult, QueryBatch, QueryCursor, QueryExecution,
-    ask_streaming, graph_cursor, query_cursor, query_execution, select_cursor,
+    ask_streaming, graph_cursor, query_cursor, query_execution, query_execution_with_plan,
+    select_cursor,
 };
 pub use exec::{PlanFidelity, PlanInfo};
 

@@ -628,6 +628,11 @@ impl MaterializedResult {
             serde_json::to_string(&self.result().plan).map_err(|e| Error::invalid(e.to_string()))
         })
     }
+    /// The result itself, as the eager query APIs return it. Its plan is then dropped
+    /// by its new owner, as theirs is.
+    pub fn into_result(mut self) -> QueryResult {
+        self.result.take().expect("live materialized result")
+    }
 }
 impl Drop for MaterializedResult {
     fn drop(&mut self) {
@@ -638,12 +643,14 @@ impl Drop for MaterializedResult {
 /// The completed boolean query result.
 pub type AskResult = MaterializedResult;
 
+/// How a query runs. [`ExecutionMode::Auto`] is the default: it streams the plans that
+/// measured faster as cursors and runs every other plan eagerly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
-    #[default]
     Eager,
     Streaming,
     /// Use pull execution for measured large immutable scans and uncached OPTIONAL counts.
+    #[default]
     Auto,
 }
 
@@ -709,6 +716,12 @@ pub(super) fn auto_streaming(
         }
     }
     let scans = if node.est.is_finite() && node.est >= 1_000_000.0 && scan(ctx, node) {
+        // A scan expected to pass the row budgets stays eager, so that it fails before
+        // the first byte of output with an error status rather than partway through a
+        // stream. A count returns one row, so its errors always come before output.
+        if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
+            return false;
+        }
         1
     } else if (!ctx.use_cache || !ctx.snap.results.enabled()) && count(ctx, node) {
         2
@@ -748,10 +761,22 @@ pub fn query_execution(
     cursor: &CursorOptions,
     mode: ExecutionMode,
 ) -> Result<QueryExecution> {
+    query_execution_with_plan(snapshot, query, options, cursor, mode).map_err(|f| f.error)
+}
+
+/// [`query_execution`], with the plan of an eager query that failed while it ran, as
+/// [`super::query_with_plan`] gives it.
+pub fn query_execution_with_plan(
+    snapshot: Arc<Snapshot>,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    mode: ExecutionMode,
+) -> std::result::Result<QueryExecution, Box<super::Failed>> {
     if mode == ExecutionMode::Streaming
         || (mode == ExecutionMode::Auto && cursor.fallback == FallbackPolicy::RejectMaterialization)
     {
-        return query_cursor(snapshot, query, options, cursor);
+        return Ok(query_cursor(snapshot, query, options, cursor)?);
     }
     let started = Instant::now();
     let parser_depth = spargebra::nesting::measure(query)
@@ -763,7 +788,8 @@ pub fn query_execution(
         let levels = depth::check_query(&parsed)?;
         depth::with_stack(levels, || {
             if mode == ExecutionMode::Eager {
-                let mut result = super::execute_query(snapshot, &parsed, options, parse_ms)?;
+                let mut result =
+                    super::execute_query_with_plan(snapshot, &parsed, options, parse_ms)?;
                 if result.kind == QueryKind::Select {
                     super::select_star_order(query, &mut result);
                 }
@@ -774,9 +800,7 @@ pub fn query_execution(
                 })));
             }
             if cursor.batch_rows == 0 || cursor.batch_bytes == 0 {
-                return Err(Error::invalid(
-                    "cursor batch rows and bytes must be positive",
-                ));
+                return Err(Error::invalid("cursor batch rows and bytes must be positive").into());
             }
             let planning = Instant::now();
             let prepared =
@@ -793,8 +817,7 @@ pub fn query_execution(
             } else {
                 let mut result = depth::with_stack(levels, || {
                     super::execute_prepared(&parsed, options, parse_ms, plan_ms, prepared)
-                })
-                .map_err(|f| f.error)?;
+                })?;
                 if result.kind == QueryKind::Select {
                     super::select_star_order(query, &mut result);
                 }
@@ -2999,6 +3022,40 @@ mod tests {
             &low.ctx,
             &low.node,
             low.kind,
+            &Default::default()
+        ));
+        // A scan expected to pass a row budget stays eager, so that the budget fails it
+        // before any output.
+        for budget in [
+            QueryOptions {
+                max_rows: Some(999_999),
+                ..Default::default()
+            },
+            QueryOptions {
+                max_rows_produced: Some(999_999),
+                ..Default::default()
+            },
+        ] {
+            let capped = prepare(store.snapshot(), &budget);
+            assert!(!auto_streaming(
+                &capped.ctx,
+                &capped.node,
+                capped.kind,
+                &Default::default()
+            ));
+        }
+        let roomy = prepare(
+            store.snapshot(),
+            &QueryOptions {
+                max_rows: Some(1_000_000),
+                max_rows_produced: Some(1_000_000),
+                ..Default::default()
+            },
+        );
+        assert!(auto_streaming(
+            &roomy.ctx,
+            &roomy.node,
+            roomy.kind,
             &Default::default()
         ));
         super::super::update::update(
