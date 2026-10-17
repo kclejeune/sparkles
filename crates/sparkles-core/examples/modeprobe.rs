@@ -6,7 +6,8 @@
 //! times, their ratio (streaming over eager, under 1 means streaming is faster), the peak
 //! of each mode's memory ledger and what automatic execution chose. `SPARKLES_PROBE_MODES`
 //! picks `rows`, `tsv` or both (the default), and `SPARKLES_PROBE_MEMORY_MB` sets the
-//! query memory budget.
+//! query memory budget. `SPARKLES_PROBE_STREAM_MEMORY_MB` sets another budget for the
+//! cursor runs, and `SPARKLES_PROBE_SPILL_DIR` lets them spill to that directory.
 use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions, write_solutions};
 use sparkles_core::sparql::{
     CursorOptions, ExecutionMode, QueryExecution, QueryOptions, query, query_cursor,
@@ -39,6 +40,20 @@ fn main() {
         max_memory_bytes: memory,
         ..Default::default()
     };
+    let mut stream_options = options.clone();
+    if let Ok(mb) = std::env::var("SPARKLES_PROBE_STREAM_MEMORY_MB") {
+        stream_options.max_memory_bytes = Some(mb.parse::<u64>().unwrap() << 20);
+    }
+    if let Ok(dir) = std::env::var("SPARKLES_PROBE_SPILL_DIR") {
+        let spill = sparkles_core::spill::Spill::open(&sparkles_core::spill::SpillOptions {
+            dir: dir.into(),
+            max_bytes: 64 << 30,
+            query_bytes: 64 << 30,
+            min_free_bytes: 1 << 30,
+        })
+        .unwrap();
+        stream_options.spill = Some(spill);
+    }
     let cursor = CursorOptions::default();
     // `eager` or `stream` runs only that mode, for a profiler
     let only = std::env::var("SPARKLES_PROBE_ONLY").ok();
@@ -96,7 +111,7 @@ fn main() {
                         }
                     } else {
                         let Ok(QueryExecution::Select(mut c)) =
-                            query_cursor(store.snapshot(), &text, &options, &cursor)
+                            query_cursor(store.snapshot(), &text, &stream_options, &cursor)
                         else {
                             panic!("{name}: not a SELECT cursor");
                         };

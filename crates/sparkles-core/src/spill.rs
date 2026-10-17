@@ -398,7 +398,7 @@ pub fn sweep(root: &Path) -> usize {
         let Some(name) = name.to_str() else { continue };
         let path = entry.path();
         if !entry.file_type().is_ok_and(|t| t.is_dir()) || !process_dir_name(name) {
-            tracing::warn!(path = %path.display(), "leaving a foreign entry in the spill directory");
+            tracing::warn!(target: "sparkles::spill", path = %path.display(), "leaving a foreign entry in the spill directory");
             continue;
         }
         let marker_path = path.join(MARKER);
@@ -434,7 +434,7 @@ pub fn sweep(root: &Path) -> usize {
         if ok.is_some() {
             removed += 1;
         } else if path.exists() {
-            tracing::warn!(path = %path.display(), "leaving a spill directory that is in use or not a spill directory");
+            tracing::warn!(target: "sparkles::spill", path = %path.display(), "leaving a spill directory that is in use or not a spill directory");
         }
     }
     removed

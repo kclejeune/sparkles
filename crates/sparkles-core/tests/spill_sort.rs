@@ -3,7 +3,8 @@ use oxrdf::Term;
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
 use sparkles_core::sparql::{
-    CursorOptions, CursorStatus, FallbackPolicy, QueryOptions, query, select_cursor,
+    CursorOptions, CursorStatus, ExecutionMode, FallbackPolicy, QueryExecution, QueryOptions,
+    query, query_execution, select_cursor,
 };
 use sparkles_core::spill::{Spill, SpillOptions};
 use sparkles_core::store::{Store, StoreOptions};
@@ -340,4 +341,76 @@ fn cancelled_spilled_sorts_remove_their_files() {
     drop(c);
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
+}
+
+type Rows = Vec<Vec<Option<Term>>>;
+
+/// The rows of an automatic execution, and its cursor plan when it ran as a cursor.
+fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Result<(Rows, Option<String>), Error> {
+    match query_execution(
+        s.snapshot(),
+        q,
+        opts,
+        &CursorOptions::default(),
+        ExecutionMode::Auto,
+    )? {
+        QueryExecution::Select(mut c) => {
+            let mut rows = Vec::new();
+            while let Some(b) = c.next_batch()? {
+                for i in 0..b.len() {
+                    rows.push(b.row(i).unwrap());
+                }
+            }
+            Ok((rows, Some(c.plan_json()?)))
+        }
+        QueryExecution::Eager(r) => Ok((r.into_result().rows(), None)),
+        _ => unreachable!("a SELECT"),
+    }
+}
+
+#[test]
+fn automatic_execution_streams_or_retries_sorts_that_outgrow_memory() {
+    let s = store(60_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";
+    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let opts = QueryOptions {
+        max_memory_bytes: Some(MEMORY),
+        spill: Some(spill.clone()),
+        ..Default::default()
+    };
+    // Eager execution would hold more than half the budget, so the query streams.
+    let (rows, plan) = automatic(&s, q, &opts).unwrap();
+    assert_eq!(rows, expected);
+    let plan = plan.expect("a cursor");
+    assert!(!plan.contains("eagerMemoryRetry"), "{plan}");
+    assert!(plan.contains("spilledBytes"), "{plan}");
+    // Without spill the query stays eager and fails within its budget.
+    let without = QueryOptions {
+        spill: None,
+        ..opts.clone()
+    };
+    assert!(matches!(
+        automatic(&s, q, &without),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+    ));
+    // A store with uncompacted changes keeps automatic execution eager, and the eager
+    // run that exceeds its budget runs again as a cursor.
+    sparkles_core::sparql::update::update(
+        &s,
+        "INSERT DATA { <urn:x> <urn:q> 1 }",
+        &Default::default(),
+    )
+    .unwrap();
+    let (rows, plan) = automatic(&s, q, &opts).unwrap();
+    assert_eq!(rows, expected);
+    let plan = plan.expect("a retried cursor");
+    assert!(plan.contains("\"eagerMemoryRetry\":1"), "{plan}");
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+    // A small sort stays eager.
+    let small = "SELECT ?s ?o WHERE { ?s <urn:p> ?o FILTER(?s = <urn:s:5>) } ORDER BY ?o";
+    let (_, plan) = automatic(&s, small, &opts).unwrap();
+    assert!(plan.is_none());
 }
