@@ -152,7 +152,8 @@ case $MODE in
     seed "$WORK/seed.nt"
     "$BIN" load --loc "$MNT/db" "$WORK/seed.nt" > "$WORK/load.log" 2>&1
     sync
-    : > "$WORK/receipts.txt"
+    # images at the start mark need no receipt yet
+    echo "M start 0" > "$WORK/receipts.txt"
     dmsetup message "$DM" 0 mark start
     start_server "$MNT/db"
     "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/receipts.txt" \
