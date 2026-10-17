@@ -6670,9 +6670,9 @@ pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64, framing: Framing) -
 /// on every commit, so every record after the header is strictly framed. A headerless
 /// log (version 0) is mixed up to `walStrictFrom` of its generation's `commit.json`, the
 /// logical end at the first write open by a release that records it, and strictly framed
-/// after it. That release replayed, truncated and synced everything before the offset
-/// before it recorded it, so damage there is corruption, and it writes metadata on every
-/// commit after it. A headerless log without the member is mixed throughout.
+/// after it. That release replayed, truncated and synced everything before the offset,
+/// with the vocabulary terms and annotation records it names, before it recorded it, so
+/// damage there is corruption, and it writes metadata on every commit after it. A headerless log without the member is mixed throughout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Framing {
     /// a commit record without metadata is a legacy commit, and proves its predecessors

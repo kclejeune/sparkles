@@ -535,8 +535,11 @@ last one.
   assigns the same ids. Downgrading is still unsupported, but it corrupts nothing.
 * **Strict framing of a headerless log.** A torn version-2 commit record can be
   byte-identical to a legacy one. The first write open of a headerless log by a release
-  with [X09](X09-group-commit-by-default.md) Phase 3 records the log's logical end, after
-  replay, truncation and a sync, as `walStrictFrom` in the generation's `commit.json`.
+  with [X09](X09-group-commit-by-default.md) Phase 3 records the log's logical end as
+  `walStrictFrom` in the generation's `commit.json`. It does so after replay, truncation,
+  the log's sync and the syncs of `delta.vocab` and `annotations.bin`, so the terms and
+  annotations of the commits before the offset are durable with them. A log cut to nothing
+  records 0, and a recorded offset whose log is missing is corruption.
   Records before it keep the rules above. Records after it follow the rules of a log with
   a header record, so a commit record without metadata there is damage, and damage before
   the offset is corruption. Legacy records that a downgraded binary appends after the

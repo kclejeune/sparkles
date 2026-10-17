@@ -989,9 +989,9 @@ and recovery recognizes a torn tail.
 
 ### Concurrent durable commits
 
-These runs measured the default writer and opt-in group commit (`--experimental-group-commit`)
-on `forge` (Intel Core i5-13500, NVMe, ext4) on 2026-10-17, with the same binary at revision
-758a6a25. The server ran on six CPUs and the client on four, and nothing else ran on the
+These runs measured the default writer and opt-in group commit, turned on by
+`--experimental-group-commit`, on `forge` on 2026-10-17, with the same binary at revision
+758a6a25. `forge` has an Intel Core i5-13500 and an NVMe drive with ext4. The server ran on six CPUs and the client on four, and nothing else ran on the
 host. Six rounds alternated the two settings, each run in a fresh process on a fresh copy
 of the store. Each cell is the median over the rounds. Every run completed with distinct,
 contiguous receipts and the correct final state. No commit of any run fell back from the

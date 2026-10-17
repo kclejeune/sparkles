@@ -35,10 +35,11 @@
 //! A headerless log may hold commit records from a release that wrote no commit
 //! metadata, and such a record is byte-identical to a modern one whose metadata a crash
 //! tore away. The first write open of a headerless log by this release therefore records
-//! the log's logical end, after replaying, truncating and syncing it, as `walStrictFrom`
-//! in the generation's `commit.json`, once and before it appends anything. Records after
-//! that offset follow the rules of a log with a header, and damage before it is
-//! corruption (see `store::Framing`).
+//! the log's logical end as `walStrictFrom` in the generation's `commit.json`, once and
+//! before it appends anything. It does so after replaying, truncating and syncing the log
+//! and syncing the vocabulary and annotations its commits name. Records after that offset
+//! follow the rules of a log with a header, and damage before it is corruption (see
+//! `store::Framing`).
 
 use super::*;
 use std::io::{BufReader, Seek, SeekFrom};
