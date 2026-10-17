@@ -989,17 +989,49 @@ and recovery recognizes a torn tail.
 
 ### Concurrent durable commits
 
-Four clients apply 50,000 fresh-literal changes, one quad per request, with the server on
-ten logical CPUs. The runs alternate the default writer and opt-in group commit
-(`--experimental-group-commit`), two fresh processes per setting. Group commit shares one
-synchronization among eligible commits and keeps acknowledgments durable. Every run
-completes all 50,000 inserts with contiguous receipts and the correct final state.
+These runs measured the default writer and opt-in group commit (`--experimental-group-commit`)
+on `forge` (Intel Core i5-13500, NVMe, ext4) on 2026-10-17, with the same binary at revision
+758a6a25. The server ran on six CPUs and the client on four, and nothing else ran on the
+host. Six rounds alternated the two settings, each run in a fresh process on a fresh copy
+of the store. Each cell is the median over the rounds. Every run completed with distinct,
+contiguous receipts and the correct final state. No commit of any run fell back from the
+group.
 
-| Four writers, 50,000 changes | 1.05M default | 1.05M group commit | 10.5M default | 10.5M group commit |
+| 50,000 changes, transactions/s | 1.05M default | 1.05M group commit | 10.5M default | 10.5M group commit |
 |---|---:|---:|---:|---:|
-| Acknowledged transactions/s | 221.5–231.8 | **529.0–543.3** | 201.1–204.0 | **402.3–406.9** |
-| Request p50 (ms) | 19.016–19.211 | **9.051–9.104** | 19.338–19.415 | **9.709–9.735** |
-| Request p99 (ms) | 39.972–41.342 | **15.693–15.894** | 41.066–41.200 | **16.089–16.171** |
+| Four writers | 3,399.8 | **6,173.8** | 3,375.6 | **6,160.0** |
+| Sixteen writers | 3,342.8 | **18,119.2** | 3,332.0 | **18,304.4** |
+
+| Request latency (ms) | 1.05M default | 1.05M group commit | 10.5M default | 10.5M group commit |
+|---|---:|---:|---:|---:|
+| Four writers, p50 / p99 | 1.159 / 1.383 | **0.631 / 0.954** | 1.168 / 1.381 | **0.633 / 0.952** |
+| Sixteen writers, p50 / p99 | 4.738 / 5.867 | **0.813 / 1.467** | 4.752 / 6.083 | **0.793 / 1.445** |
+
+With sixteen writers, no writer's share of the commits differed from the mean by more than
+1.2% with group commit, and by 0.3% with the default writer.
+
+A single writer gains nothing from grouping, so the idle fast path commits it as the
+default writer does. These serial runs send 5,000 single-triple commits.
+
+| Serial commits, p50 / p90 (ms) | 1.05M default | 1.05M group commit | 10.5M default | 10.5M group commit |
+|---|---:|---:|---:|---:|
+| Literal insert | 0.426 / 0.461 | 0.427 / 0.459 | 0.429 / 0.463 | 0.421 / 0.458 |
+| IRI insert | 0.426 / 0.458 | 0.425 / 0.459 | 0.422 / 0.460 | 0.425 / 0.464 |
+| Delete | 0.425 / 0.459 | 0.430 / 0.459 | 0.423 / 0.456 | 0.425 / 0.456 |
+
+The write modes of `scripts/bench.sh` ran on the same host with four rounds per setting.
+The churn applies the 5,000 commits of the `updates` mode one at a time. The mixed load
+runs 16 `star-join` readers and one writer for 30 s, with the server on six CPUs.
+
+| bench.sh write modes | 1.05M default | 1.05M group commit | 10.5M default | 10.5M group commit |
+|---|---:|---:|---:|---:|
+| Churn, commits/s | 1,045.3 | 1,047.7 | 1,000.3 | 1,018.7 |
+| Mixed, reads/s | 994.3 | 1,009.6 | 101.4 | 104.8 |
+| Mixed, writes/s | 127.9 | 130.8 | 128.0 | 130.3 |
+
+An earlier measurement on the same host, before direct writes into preallocated space,
+had 221.5 to 231.8 transactions/s for the default writer and 529.0 to 543.3 for group
+commit with four writers at 1.05M.
 
 ### Group commit on Namespace instances
 

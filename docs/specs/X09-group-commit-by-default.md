@@ -1,14 +1,16 @@
 # X09: Group commit by default
 
-> **Status:** Phases 1 and 2 built, with exceptions listed in the Outcome. Phase 3 not started.
+> **Status:** Phases 1 and 2 built, with exceptions listed in the Outcome. Phase 3 built except
+> the default switch, which waits for the power-loss replays of section 10.2.
 >
 > **Phases:** Phase 1 is the measurements and fixes that the switch depends on: serial
 > latency, reader tails, metrics and power-loss and sync-failure tests. Phase 2 widens
 > admission to the writes that fall back today (commit messages, preconditions,
 > validation, Graph Store and RDF Patch writes, full-text, spatial and embedding hooks,
 > writes during compaction). Phase 3 makes group commit the default for persistent
-> stores, with `--no-group-commit` to opt out. Phases 1 and 2 are built, and Phase 3 waits
-> on the conditions of section 7.2.
+> stores, with `--no-group-commit` to opt out. Phases 1 and 2 are built. Phase 3 meets
+> every condition of section 7.2 except the 1,000-point `log-writes` runs, so group commit
+> stays opt-in.
 >
 > **User docs:** [FEATURES.md](../FEATURES.md) and [API.md](../API.md#metrics) for the
 > metrics and the `groupCommit` and `commits` fields of `/$/stats`.
@@ -494,9 +496,10 @@ logged receipt's commit is present.
 ## Outcome
 
 Phases 1 and 2 are built behind `--experimental-group-commit`, with the exceptions below.
-Phase 3 is not started, because conditions 1, 2 and 4 of section 7.2 need a quiet `forge`
-run and a host with device-mapper `log-writes`, and condition 3 is not yet met for
-full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
+Phase 3 met conditions 1, 3 and 4 of section 7.2 and the `kill -9` part of condition 2, and
+resolved the ambiguity of headerless logs. The 1,000-point `log-writes` runs of condition 2
+did not run, because no host available to the lane had both root and the device-mapper
+`log-writes` target, so the default stays off. See [ROADMAP](../ROADMAP.md) item 3.
 
 ### Phase 1
 
@@ -682,12 +685,91 @@ flagged commit at the WAL tail remain unwritten.
 
 ### Left for Phase 3
 
+Phase 2 left six items. The Phase 3 section below records what became of each.
+
 1. The gates of section 9 on `forge`, in particular serial parity at 1.05M
-   and 10.5M.
-2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs.
+   and 10.5M. Met.
+2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs. The `kill -9`
+   runs passed. The `log-writes` runs remain.
 3. Full-text, spatial and embedding datasets and the ShEx guard grouping, or measurements
-   that show them rare.
-4. The BENCHMARKS.md refresh under X06, with a `--no-group-commit` row.
-5. The default, the opt-out flag and the removal of `--experimental-group-commit`.
+   that show them rare. Decided per kind.
+4. The BENCHMARKS.md refresh under X06, with a `--no-group-commit` row. Refreshed, with the
+   default writer as the comparison while group commit is opt-in.
+5. The default, the opt-out flag and the removal of `--experimental-group-commit`. Built
+   and tested, not landed.
 6. Resolve the inherited ambiguity of torn metadata in headerless WALs while preserving
-   mixed-history compatibility and strict legacy corruption checks.
+   mixed-history compatibility and strict legacy corruption checks. Resolved.
+
+### Phase 3
+
+**Headerless logs.** A torn version-2 commit record whose bytes after a sector boundary
+read as zero is byte-identical to a legacy record. In a headerless log the old rules could
+recover such a record as a reconstructed legacy commit, with data records no checksum
+covers. They could also refuse the store after a power loss inside a group's unfenced
+suffix. The first write open of a headerless log now records the log's logical end as
+`walStrictFrom` in the generation's `commit.json`, once. It does so after replay, the
+truncation of any torn tail and a sync, and before anything is appended. Records after the
+offset follow the rules of a log with a header record. Damage before it is corruption,
+because those bytes were durable when the offset was recorded, and a log that ends before
+it is refused. Records before it keep the mixed interpretation of
+[CI section 5.6](CI-commit-identity.md#56-dataset-file-creation-migration), so existing
+mixed histories read as before. `sparkles check` applies the same rule, and it reads the
+offset after the log, so a live writer cannot append past an offset it has not seen. The
+member is additive under [X12 section 4.3](X12-release-engineering.md#43-how-a-format-changes).
+A release that predates it ignores it and reads the log with the old rules. `commit.json`
+now refuses a `format` other than 1. A truncation to an empty log is now synced before
+the first append. The design came from a consult on the ambiguity, which recommended
+setting the offset once rather than advancing it, so that damage below it stays
+detectable. Two cases remain. A headerless log that this release has never opened for
+writing keeps the mixed rules for the bytes it holds, so a torn record that an older
+build left there is still ambiguous. Legacy records that a downgraded build appends after
+the offset are treated as damage, and downgrading stays unsupported.
+
+**Indexed and ShEx-guarded datasets.** These stay on the ordinary path. Full-text,
+spatial and embedding indexes are opt-in per dataset. A commit on such a dataset takes
+exactly the path that the default writer takes, so grouping cannot slow it down, and it
+only misses the gain. Admitting it would need index state in speculative snapshots,
+because without it every fence would hold one commit. In every measured workload below,
+no commit fell back from the group for any reason, which `sparkles_group_commit_fallbacks_total`
+shows by having no series. ShEx-guarded datasets already take the group path one commit
+per fence, as Phase 2 left them.
+
+**Section 9 gates.** These runs used `forge` on 2026-10-17 with one binary at revision
+758a6a25, comparing the default writer with `--experimental-group-commit`, and nothing
+else running on the host. [BENCHMARKS.md](../BENCHMARKS.md#concurrent-durable-commits)
+has the tables.
+
+| Gate | 1.05M | 10.5M | Target |
+|---|---|---|---|
+| Serial literal, IRI and delete, p50 and p90 against the default writer | 0.997 to 1.011 | 0.981 to 1.010 | Within 5% |
+| Four writers, transactions/s | 6,174 | 6,160 | At least 529 and 402 |
+| Sixteen writers, largest share deviation | 1.0% | 1.2% | Within 25% |
+| bench.sh mixed reads/s and writes/s against the default writer | 1.015 and 1.023 | 1.034 and 1.018 | Reads within 5%, writes at least 1 |
+| bench.sh updates churn, commits/s against the default writer | 1.002 | 1.018 | Within 5% |
+
+The reader tail at an equal write rate was met before Phase 3.
+
+**Crash runs.** `scripts/power-loss.sh` and `scripts/crash-harness.rs` implement
+sections 10.2 and 10.4. The `kill9` mode starts sixteen writers that log every receipt,
+kills the server with SIGKILL at a random moment between 0.2 and 2.2 seconds, restarts it
+and checks every receipt logged in the store so far. It starts a new store every 20 kills.
+With grouping on, 200 kills on a new XFS file system and 200 on a new ext4 file system
+of an 8-vCPU Namespace instance had no failure, over 2,812,041 and 2,715,882 receipts. A
+further 200 kills on the laptop's ext4 had none over 1,625,905 receipts. Every check found
+the head at or after the last receipt, every receipt's triple and message, and
+`sparkles check` passing before and after the restart.
+The `logwrites` mode puts the store's file system behind the device-mapper `log-writes`
+target, marks the log after every batch of receipts, and replays crash images that hold
+the writes before the last flush, every FUA write and a random part of the rest per 4 KiB
+block. It checks each image as the restart above does, with the next commit continuing the
+sequence. A synthetic log checked the replay's choice of writes, but the 1,000-point runs
+did not run. The Namespace kernel is built without `CONFIG_DM_LOG_WRITES`, the laptop has no
+root, atlas was down, and `forge`, which has the module, is reserved for timing.
+
+**The default.** The switch is built and tested on branch `x09-phase3-switch-20261016`
+(commit d9e66915). It renames the option to `StoreOptions::group_commit` with a default of
+true, adds `--no-group-commit` and `SPARKLES_GROUP_COMMIT=off`, removes
+`--experimental-group-commit` as section 7.1 says, and adds a `groupCommit` open option to
+the Node binding. The Python and JVM bindings expose no store options, so they take the
+default. The core and server suites pass with it. It lands once the `log-writes` runs pass
+on ext4 and XFS.
