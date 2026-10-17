@@ -1,13 +1,24 @@
 //! Incremental DISTINCT. Input ordered on every output column drops a row equal to the
 //! one before it and keeps only the last row. Other input keeps a charged set of the
 //! rows emitted so far.
+//!
+//! Unordered input of a query that may spill deduplicates in passes (X08 §6.5). Once
+//! the set of rows emitted would hold half the room the query had when the operator
+//! started, it stops growing. Rows already in it are still dropped, and other rows are
+//! written to one of [`PARTITIONS`] spill files chosen by a hash of the whole row. Once
+//! the input ends the set is freed, and each file is deduplicated by a pass of its own,
+//! which partitions what it passes on with another hash. Equal rows always land in the
+//! same file, so each distinct row is emitted once. Rows from the files come after the
+//! input's other rows, so this needs input with no order to keep.
 use super::Buffer;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::sparql::ctx::{Ctx, RetainedCharge};
 use crate::sparql::table::VarId;
+use crate::spill::{QuerySpill, SpillKind, SpillReader, SpillRun, SpillWriter};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::hash::BuildHasher;
+use std::sync::Arc;
 
 /// The rows emitted so far. A single column keeps its IDs, which avoids a heap key and
 /// its hashing per row. Wider rows live in one flat arena of IDs, and the table holds
@@ -41,18 +52,146 @@ pub(super) struct Distinct {
     emitted_empty: bool,
     charge: Option<RetainedCharge>,
     bytes: u64,
+    /// The bytes of the empty state.
+    base: u64,
+    /// Where rows go once the set stops growing, when the query may spill.
+    query: Option<Arc<QuerySpill>>,
+    /// The set's bytes at which it stops growing.
+    threshold: u64,
+    /// Whether the set has stopped growing in this pass.
+    frozen: bool,
+    /// The rows this pass passes on, by partition.
+    writers: Vec<Option<SpillWriter>>,
+    /// The partitions later passes read, each with its partitioning depth.
+    pending: Vec<(Arc<SpillRun>, u64)>,
+    /// How many times the rows of this pass were partitioned.
+    depth: u64,
+    /// The partition this pass reads.
+    source: Option<SpillReader>,
+    /// What the plan reports.
+    pub(super) spilled: u64,
+    pub(super) passes: usize,
 }
+
+/// The spill files one pass divides the rows it passes on among.
+const PARTITIONS: usize = 16;
+/// The least set a pass keeps before it stops growing.
+const MIN_PASS_BYTES: u64 = 256 << 10;
 
 impl Distinct {
     pub(super) fn new(ctx: &Ctx, vars: &[VarId], input_order: &[VarId]) -> Result<Self> {
+        let adjacent = !vars.is_empty() && vars.iter().all(|v| input_order.contains(v));
+        let base = 256 + vars.len() as u64 * 8;
         Ok(Self {
             seen: None,
-            adjacent: !vars.is_empty() && vars.iter().all(|v| input_order.contains(v)),
+            adjacent,
             last: None,
             emitted_empty: false,
-            charge: ctx.retained_charge(256 + vars.len() as u64 * 8)?,
-            bytes: 256 + vars.len() as u64 * 8,
+            charge: ctx.retained_charge(base)?,
+            bytes: base,
+            base,
+            // Rows read back from disk come last, which only unordered input allows.
+            query: if adjacent || vars.is_empty() || !input_order.is_empty() {
+                None
+            } else {
+                ctx.spill.clone()
+            },
+            threshold: 0,
+            frozen: false,
+            writers: Vec::new(),
+            pending: Vec::new(),
+            depth: 0,
+            source: None,
+            spilled: 0,
+            passes: 0,
         })
+    }
+
+    /// Whether rows passed to later passes are still to be read.
+    pub(super) fn has_more(&self) -> bool {
+        self.source.is_some()
+            || !self.pending.is_empty()
+            || self.writers.iter().any(Option::is_some)
+    }
+
+    /// The next rows of the partitions that passes passed on, deduplicated, once the
+    /// input has ended.
+    pub(super) fn drain(&mut self, ctx: &Arc<Ctx>, vars: &[VarId]) -> Result<Option<Buffer>> {
+        loop {
+            if let Some(reader) = &mut self.source {
+                if let Some((columns, len)) = reader.next_frame()? {
+                    let mut buffer = Buffer::new(ctx, vars, len)?;
+                    for (to, from) in buffer.table.cols.iter_mut().zip(&columns) {
+                        to.extend_from_slice(from);
+                    }
+                    buffer.table.len = len;
+                    buffer.reconcile()?;
+                    drop(columns);
+                    self.apply(ctx, &mut buffer)?;
+                    if buffer.table.len > 0 {
+                        return Ok(Some(buffer));
+                    }
+                    continue;
+                }
+                self.source = None;
+            }
+            for writer in std::mem::take(&mut self.writers).into_iter().flatten() {
+                let run = writer.finish()?;
+                self.spilled = self.spilled.saturating_add(run.bytes());
+                self.pending.push((Arc::new(run), self.depth + 1));
+            }
+            let Some((run, depth)) = self.pending.pop() else {
+                return Ok(None);
+            };
+            // The previous pass's rows went out: free its set and read the next file.
+            self.seen = None;
+            self.frozen = false;
+            self.retain(self.base)?;
+            self.depth = depth;
+            self.source = Some(run.reader()?);
+            self.passes += 1;
+        }
+    }
+
+    /// Write the rows of `buffer` marked in `passed` to the partitions of later passes.
+    fn pass_on(&mut self, ctx: &Ctx, buffer: &Buffer, passed: &[usize]) -> Result<()> {
+        use std::hash::{Hash, Hasher};
+        let query = self.query.clone().expect("a spilling DISTINCT");
+        let table = &buffer.table;
+        let _gather = ctx.charge(passed.len() as u64 * (table.cols.len() as u64 * 8 + 8) + 256)?;
+        let seed = self.depth.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5bd1_e995;
+        let mut parts: Vec<Vec<usize>> = vec![Vec::new(); PARTITIONS];
+        for &row in passed {
+            let mut hasher = rustc_hash::FxHasher::default();
+            seed.hash(&mut hasher);
+            for column in &table.cols {
+                column[row].hash(&mut hasher);
+            }
+            parts[(hasher.finish() >> 60) as usize % PARTITIONS].push(row);
+        }
+        if self.writers.is_empty() {
+            self.writers.resize_with(PARTITIONS, || None);
+        }
+        for (part, rows) in parts.iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let columns: Vec<Vec<Id>> = table
+                .cols
+                .iter()
+                .map(|column| rows.iter().map(|&row| column[row]).collect())
+                .collect();
+            let writer = &mut self.writers[part];
+            if writer.is_none() {
+                *writer = Some(query.create(SpillKind::DistinctPartition, table.cols.len())?);
+            }
+            let slices: Vec<&[Id]> = columns.iter().map(Vec::as_slice).collect();
+            writer
+                .as_mut()
+                .expect("an open spill file")
+                .write(&slices, rows.len())?;
+        }
+        Ok(())
     }
 
     fn retain(&mut self, bytes: u64) -> Result<()> {
@@ -92,7 +231,21 @@ impl Distinct {
             Seen::Many { table, rows } => (table.len(), table.capacity(), 4, rows.capacity()),
         };
         let needed = size.saturating_add(len);
-        if needed > capacity {
+        if self.query.is_some() && self.threshold == 0 {
+            self.threshold = (ctx.memory_room() / 2).max(MIN_PASS_BYTES);
+        }
+        if self.query.is_some()
+            && !self.frozen
+            && size > 0
+            && needed > capacity
+            && (table_bytes(needed.max(capacity.saturating_mul(2)), entry)
+                .saturating_add(needed.max(capacity.saturating_mul(2)) as u64 * width as u64 * 8)
+                >= self.threshold
+                || ctx.memory_room() < self.threshold / 2)
+        {
+            self.frozen = true;
+        }
+        if needed > capacity && !self.frozen {
             let target = needed.max(capacity.saturating_mul(2));
             let old = table_bytes(capacity, entry);
             let new = table_bytes(target, entry);
@@ -103,7 +256,22 @@ impl Distinct {
                 0
             };
             let during = old + new + arena_old + arena_new + 256;
-            self.retain(during)?;
+            match self.retain(during) {
+                Ok(()) => {}
+                // A set that holds rows stops growing when it no longer fits.
+                Err(Error::BudgetExceeded(b))
+                    if self.query.is_some()
+                        && size > 0
+                        && matches!(
+                            b.kind,
+                            crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+                        ) =>
+                {
+                    self.frozen = true;
+                    return self.apply(ctx, buffer);
+                }
+                Err(error) => return Err(error),
+            }
             let seen = self.seen.as_mut().expect("distinct state");
             match seen {
                 Seen::One(ids) => ids.reserve(target - ids.len()),
@@ -120,6 +288,9 @@ impl Distinct {
                 Seen::Many { table, rows } => (table.capacity(), rows.capacity()),
             };
             self.retain(table_bytes(capacity, entry) + arena as u64 * 8 + 256)?;
+        }
+        if self.frozen {
+            return self.apply_frozen(ctx, buffer);
         }
         let seen = self.seen.as_mut().expect("distinct state");
         let mut output = 0;
@@ -172,6 +343,49 @@ impl Distinct {
             column.truncate(output);
         }
         buffer.table.len = output;
+        buffer.reconcile()
+    }
+
+    /// A set that no longer grows: rows in it are dropped and the others go to the
+    /// partitions of later passes, so none is emitted now.
+    fn apply_frozen(&mut self, ctx: &Ctx, buffer: &mut Buffer) -> Result<()> {
+        let len = buffer.table.len;
+        let width = buffer.table.width();
+        let _rows = ctx.charge(len as u64 * 8 + 64)?;
+        let mut passed = Vec::new();
+        {
+            let seen = self.seen.as_ref().expect("distinct state");
+            let mut key = Vec::with_capacity(width);
+            for row in 0..len {
+                if row.is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                let found = match seen {
+                    Seen::One(ids) => ids.contains(&buffer.table.cols[0][row]),
+                    Seen::Many { table, rows } => {
+                        key.clear();
+                        key.extend(buffer.table.cols.iter().map(|column| column[row]));
+                        let hash = FxBuildHasher.hash_one(key.as_slice());
+                        table
+                            .find(hash, |&r| {
+                                let r = r as usize;
+                                rows[r * width..(r + 1) * width] == key[..]
+                            })
+                            .is_some()
+                    }
+                };
+                if !found {
+                    passed.push(row);
+                }
+            }
+        }
+        if !passed.is_empty() {
+            self.pass_on(ctx, buffer, &passed)?;
+        }
+        for column in &mut buffer.table.cols {
+            column.clear();
+        }
+        buffer.table.len = 0;
         buffer.reconcile()
     }
 

@@ -2389,7 +2389,14 @@ impl Operator {
                     binary.next(ctx, &mut self.children, options, &self.vars, cap)?
                 }
                 State::Group(group) => {
-                    group.next(ctx, &mut self.children[0], options, &self.vars, cap)?
+                    let batch = group.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
+                    if group.spilled > 0 {
+                        let mut counters = self.info.counters.take().unwrap_or_default();
+                        counters.insert("spilledBytes".into(), group.spilled.into());
+                        counters.insert("spillPasses".into(), (group.passes + 1).into());
+                        self.info.counters = Some(counters);
+                    }
+                    batch
                 }
                 State::Filter(filter) => {
                     let batch = filter.next(ctx, &mut self.children[0], options, cap)?;
@@ -2408,12 +2415,27 @@ impl Operator {
                     batch
                 }
                 State::Distinct(distinct) => {
-                    let Some(mut buffer) = self.children[0].next(ctx, options, cap)? else {
-                        return Ok(None);
+                    let batch = match self.children[0].next(ctx, options, cap)? {
+                        Some(mut buffer) => {
+                            distinct.apply(ctx, &mut buffer)?;
+                            Some(buffer)
+                        }
+                        // Rows that did not fit in memory are deduplicated last.
+                        None => distinct.drain(ctx, &self.vars)?,
                     };
-                    distinct.apply(ctx, &mut buffer)?;
-                    self.done = self.children[0].done;
-                    Some(buffer)
+                    if distinct.spilled > 0 {
+                        let mut counters = self.info.counters.take().unwrap_or_default();
+                        counters.insert("spilledBytes".into(), distinct.spilled.into());
+                        counters.insert("spillPasses".into(), (distinct.passes + 1).into());
+                        self.info.counters = Some(counters);
+                    }
+                    self.done = self.children[0].done && !distinct.has_more();
+                    match batch {
+                        Some(batch) => Some(batch),
+                        None if self.done => None,
+                        // A batch the set emptied is still a batch.
+                        None => Some(Buffer::new(ctx, &self.vars, 0)?),
+                    }
                 }
                 State::Empty => None,
                 State::Values { table, at } => {
