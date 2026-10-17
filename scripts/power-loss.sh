@@ -82,8 +82,10 @@ seed() { # <file>: 2,000 triples to start from
 
 SPID=
 start_server() { # <store>
+  # the test file systems are small, so the server keeps only 64 MiB free instead of 1 GiB
   # shellcheck disable=SC2086 # the flags are a command line
-  "$BIN" $FLAGS serve --data "$WORK/srv" --loc "ds=$1" --port "$PORT" --no-access-log > "$WORK/server.log" 2>&1 &
+  "$BIN" $FLAGS serve --data "$WORK/srv" --loc "ds=$1" --port "$PORT" --no-access-log \
+    --min-free-disk-mb 64 > "$WORK/server.log" 2>&1 &
   SPID=$!
   for _ in $(seq 1 300); do
     curl -sf "http://127.0.0.1:$PORT/\$/ping" > /dev/null 2>&1 && return 0
