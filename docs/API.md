@@ -1620,10 +1620,10 @@ Query parameters beyond the standard protocol:
   (`max-rows` or `max-rows-produced`) runs eagerly, so that the budget fails it with a
   status before any output. Every other plan runs eagerly, with the same response as
   `execution=eager`. A query that ran in under 10 ms the last time also runs eagerly
-  without being planned for the decision. A request for SPARQL Results Thrift, a
-  stored-query run with parameter values run eagerly, the first because that
-  encoding has no streaming writer and the second because initial bindings rule out every
-  automatic plan. A streamed answer that passes a lowered `max-result-mb` within its first
+  without being planned for the decision. A request for SPARQL Results Thrift runs
+  eagerly because that encoding has no streaming writer. A stored-query run with
+  parameter values also runs eagerly, because initial bindings rule out every automatic
+  plan. A streamed answer that passes a lowered `max-result-mb` within its first
   1 MiB is refused with a status before any output, as an eager one is. The policy is
   deliberately narrow, and it can widen as more query shapes prove faster when streamed.
 
@@ -1631,12 +1631,12 @@ Query parameters beyond the standard protocol:
   work budgets cover the whole cursor, including batches it still holds and terms it
   generates. The deadline counts the query's own time and not the time spent waiting for
   the client, so a slow reader does not run it out. A client that reads nothing for
-  longer than the request's `timeout` ends the stream as a timeout. The snapshot and the
-  query's memory grant stay
-  held until the body ends. An error before the response starts gets the normal status
-  and JSON error. An error after the first 1 MiB has been sent, such as a timeout or an
-  exhausted budget, aborts the body transfer. The client then sees a
-  truncated response with a `200` status, and in TSV, CSV or N-Triples the rows before
+  longer than the request's `timeout` ends the stream as a timeout. That limit applies to
+  each wait and not to the whole transfer, and the snapshot and the query's memory grant
+  stay held until the body ends. An error before the response starts gets the normal
+  status and JSON error. An error after the first 1 MiB has been sent, such as a timeout
+  or an exhausted budget, aborts the body transfer. The client then sees a truncated
+  response with a `200` status, and in TSV, CSV or N-Triples the rows before
   the cut are well formed, so only a transfer that completes is a complete answer. Treat
   a failed or truncated transfer as an error. The clients Sparkles ships do. With `send`,
   the native metadata reports `stopped` and an unknown total instead of the full count.

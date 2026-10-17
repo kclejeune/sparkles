@@ -4171,14 +4171,16 @@ request that does not name a mode. The UI's result table asks for eager executio
 because it shows the full row count, and its downloads use the server's default.
 
 When a client reads a streamed answer slowly, the query pauses once the bounded output
-buffers are full. A disconnect or a deadline stops the query even while it waits. The
-query's `timeout` counts the time the query itself spends and not the time it waits for
-the client, so a slow reader does not run it out. A client that reads nothing for longer
-than the `timeout` ends the stream, and a request without a timeout has no such limit.
-An error that happens
-after the first 1 MiB of the response has been sent aborts the response. The status was
-already `200`, and in a line format such as TSV or N-Triples the rows before the cut are
-well formed, so only a transfer that finishes successfully is a complete answer.
+buffers are full. A disconnect stops the query even while it waits. The query's
+`timeout` counts the time the query itself spends and not the time it waits for the
+client, so a slow reader does not run it out. A client that reads nothing for longer than
+the `timeout` ends the stream, and a request without a timeout has no such limit. The
+limit applies to each wait and not to the whole transfer, so a client that keeps reading,
+however slowly, keeps the query's snapshot and memory until it finishes. An error that
+happens after the first 1 MiB of the response has been sent aborts the response. The
+status was already `200`, and in a line format such as TSV or N-Triples the rows before
+the cut are well formed, so only a transfer that finishes successfully is a complete
+answer.
 `curl --fail` does not catch this case, but curl exits with an error for a transfer that
 ends early. The Rust client, the CLI, the TypeScript client and the UI report a cut-off
 transfer as an error. With `send=N`, the native metadata reports `stopped` and an
@@ -4193,10 +4195,10 @@ output, always runs eagerly because it measures every row before printing one. A
 through `--server` runs in the server's default mode. A streamed `text` result is printed
 as TSV. A local `sparkles query --timeout` that streams its answer counts the time its
 output is blocked, for example by a slow pipe, because the command has no reader to
-separate that time from the query's own. Rust callers choose a mode with `Dataset::query_execution_with`, and
-`Dataset::query_execution` runs in `ExecutionMode::Auto`, the default of `ExecutionMode`.
-`Dataset::query` and `Dataset::query_with` return a collected result and always run
-eagerly.
+separate that time from the query's own. Rust callers choose a mode with
+`Dataset::query_execution_with`, and `Dataset::query_execution` runs in
+`ExecutionMode::Auto`, the default of `ExecutionMode`. `Dataset::query` and
+`Dataset::query_with` return a collected result and always run eagerly.
 
 Python has `Dataset.select_cursor` and `Dataset.graph_cursor`. A Python cursor can be
 iterated, closed with `close()`, used as a context manager, asked for stats and

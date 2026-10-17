@@ -308,6 +308,18 @@ legitimately do different physical work, so semantic parity does not require ide
 counters. In access-filtered plans and reports, checks of hidden candidates do not
 reveal hidden cardinalities.
 
+The Timeout row changed on 2026-10-17, when automatic execution became the default. It
+used to read that consumer waits and transport backpressure do not suspend the deadline.
+That rule made a large default export to a slow but steady client fail where eager
+execution, whose deadline ends before the transfer starts, had succeeded. The deadline
+now leaves out the time a cursor waits for its reader over HTTP and in Node, and so does
+every copy of the deadline that a SERVICE call, an algorithm run or a history service
+takes when it starts. The stall bound limits one wait, not the whole transfer, so a
+client that takes a chunk just often enough keeps the stream and its snapshot, memory
+grant and producer thread for as long as it reads, as an eager answer always did. A
+limit on the whole transfer belongs to the `--stream-idle-timeout` follow-up under
+[Roadmap follow-ups](#roadmap-follow-ups-2026-10-12).
+
 Allocated column capacity is charged before it grows, including the overhead of
 zero-column rows. Accounting covers parent and child batches, materialized fallback
 tables, hash, group, deduplication and path state, sort buffers, decoded terms,
@@ -369,9 +381,9 @@ The producer does not retry a cursor that has already advanced after a serializa
 trial. Streaming uses a single-use writer path, and the repeatable quick-result
 serializer remains for eager results. The producer can run ahead by a finite amount of
 queued bytes and one batch in progress. Once those fill, it stops pulling. Channel waits
-observe cancellation, the deadline and the stall bound, and never wait indefinitely for
-another write.
-When the receiver drops, blocked sends wake up and the producer is released. The
+observe cancellation, the deadline and the stall bound. A request with a timeout never
+waits longer than that timeout for another write, and one without a timeout waits until
+the client reads or disconnects. When the receiver drops, blocked sends wake up and the producer is released. The
 disconnect guard belongs to the lifetime of the body and the producer, not only to the
 handler future, so returning response headers cannot cancel the running query.
 
@@ -475,12 +487,12 @@ documented acceptance decision.
   path may bypass the budget unseen.
 - **A8 — Deadline and cancellation:** cancel during rejected scan candidates, during
   filtering and callback work, and between pulls. Consumer sleep does not reset the
-  deadline. Check that work checks happen at bounded intervals rather than relying on a
+  deadline, and since 2026-10-17 it does not count against it either. Check that work checks happen at bounded intervals rather than relying on a
   test that hangs indefinitely.
 - **A9 — Backpressure:** stall an HTTP reader until the bounded channel fills, and
   verify that examined and emitted rows stop growing beyond the bounded producer
-  allowance. Disconnect, and let a deadline expire, during a blocked send. The producer
-  is reaped and its resources are released.
+  allowance. Disconnect, and let the stall bound expire, during a blocked send. The
+  producer is reaped and its resources are released.
 - **A10 — HTTP failures:** inject errors before and after header commitment,
   result-byte overflow, partial CSV and TSV output, and a serializer failure after
   execution completes. Assert the proper early status or late body error, no success
