@@ -250,6 +250,17 @@ impl QueryBatch {
         self.ctx.batch_term(id)
     }
 
+    /// A key of the cell's term that is the same for every cell of the query that holds
+    /// the same internal id, so that a writer can encode each term once without decoding
+    /// it first. UNDEF is None. Two keys can still name equal terms.
+    pub fn key(&self, row: usize, column: usize) -> Result<Option<u64>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        let id = self.id(row, column);
+        Ok((!id.is_undef()).then_some(id.0))
+    }
+
     pub fn row(&self, row: usize) -> Result<Vec<Option<Term>>> {
         if row >= self.len() {
             return Err(Error::invalid("query batch row is out of bounds"));
@@ -758,6 +769,11 @@ pub enum ExecutionMode {
     Auto,
 }
 
+/// The estimated rows from which automatic execution streams a plain scan. A cursor
+/// writes a scan's results faster than eager execution from about a hundred rows on, at
+/// one Rayon thread and at twelve, and costs a query of fewer rows a microsecond or two.
+pub(super) const AUTO_SCAN_ROWS: f64 = 1_000.0;
+
 /// Production-allocator admission for immutable scans and uncached large
 /// OPTIONAL counts. Other plans retain eager execution.
 pub(super) fn auto_streaming(
@@ -819,7 +835,7 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
-    let scans = if node.est.is_finite() && node.est >= 1_000_000.0 && scan(ctx, node) {
+    let scans = if node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node) {
         // A scan expected to pass the row budgets stays eager, so that it fails before
         // the first byte of output with an error status rather than partway through a
         // stream. A count returns one row, so its errors always come before output.
@@ -3186,6 +3202,29 @@ mod tests {
         let p = prepare(store.snapshot(), &Default::default());
         let options = CursorOptions::default();
         assert!(auto_streaming(&p.ctx, &p.node, p.kind, &options));
+        // a scan streams from the measured size on
+        let mut small = prepare(store.snapshot(), &Default::default());
+        small.node.est = AUTO_SCAN_ROWS;
+        assert!(auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
+        small.node.est = AUTO_SCAN_ROWS - 1.0;
+        assert!(!auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
+        small.node.est = f64::INFINITY;
+        assert!(!auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
         assert!(!auto_streaming(
             &p.ctx,
             &p.node,

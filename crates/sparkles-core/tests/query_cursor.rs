@@ -3575,7 +3575,7 @@ fn a_failure_while_decoding_ahead_comes_after_the_rows_before_it() {
         let text = String::from_utf8(output).unwrap();
         let rows = text.lines().count() - 1;
         assert!(
-            rows >= 1000 && rows < 5000 && rows % 1000 == 0,
+            (1000..5000).contains(&rows) && rows.is_multiple_of(1000),
             "{rows} rows"
         );
     }
