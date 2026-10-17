@@ -1105,9 +1105,10 @@ enum Cmd {
         /// with `Retry-After`
         #[arg(long, default_value_t = 2.0)]
         query_admission_wait: f64,
-        /// Whether a streamed sort that outgrows its memory budget writes sorted runs to
-        /// disk (`on`) or fails with its memory budget (`off`)
-        #[arg(long, value_enum, default_value_t = SpillMode::On)]
+        /// Whether streamed sorts, groupings and DISTINCT that outgrow their memory
+        /// budget write their excess to disk (`on`) or fail with their memory budget
+        /// (`off`, the default until hash joins spill too)
+        #[arg(long, value_enum, default_value_t = SpillMode::Off)]
         spill: SpillMode,
         /// Directory of the spill files, on a local file system (default:
         /// `<data>/.spill`)
