@@ -250,11 +250,56 @@ impl QueryBatch {
         self.ctx.batch_term(id)
     }
 
+    /// The term of a key that [`QueryBatch::key`] gave for a cell of this batch, decoded
+    /// without the checks against the query's memory budget, for a caller that drops the
+    /// term at once, such as an encoder that writes it out. The charges of
+    /// [`QueryBatch::term`] for the term and its vocabulary block's scratch end with the
+    /// call, so they only refuse a term that does not fit in what remains of the budget,
+    /// and eager execution decodes its results the same way.
+    pub fn transient_term(&self, key: u64) -> Option<Term> {
+        self.ctx.transient_batch_term(Id(key))
+    }
+
+    /// A key of the cell's term that is the same for every cell of the query that holds
+    /// the same internal id, so that a writer can encode each term once without decoding
+    /// it first. UNDEF is None. Two keys can still name equal terms.
+    pub fn key(&self, row: usize, column: usize) -> Result<Option<u64>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        let id = self.id(row, column);
+        Ok((!id.is_undef()).then_some(id.0))
+    }
+
     pub fn row(&self, row: usize) -> Result<Vec<Option<Term>>> {
         if row >= self.len() {
             return Err(Error::invalid("query batch row is out of bounds"));
         }
         (0..self.width()).map(|c| self.term(row, c)).collect()
+    }
+
+    /// [`QueryBatch::term`] for a writer that has reserved [`QueryBatch::cell_bytes`] for
+    /// the cell, through [`QueryBatch::row_bytes`] or [`DecodedBatch::row_bytes`].
+    pub(super) fn reserved_term(&self, row: usize, column: usize) -> Result<Option<Term>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        self.ctx.reserved_batch_term(self.id(row, column))
+    }
+
+    /// [`QueryBatch::term`] for a writer that holds one reservation for its row: `cover`
+    /// is asked for the cell's [`QueryBatch::cell_bytes`] before the term is built, and
+    /// the key is decoded once.
+    pub(super) fn covered_term(
+        &self,
+        row: usize,
+        column: usize,
+        cover: impl FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Term>> {
+        if row >= self.len() || column >= self.width() {
+            return Err(Error::invalid("query batch cell is out of bounds"));
+        }
+        self.ctx.covered_batch_term(self.id(row, column), cover)
     }
 
     pub(super) fn row_bytes(&self, row: usize) -> Result<u64> {
@@ -287,8 +332,16 @@ impl QueryBatch {
     /// sorted order. Its terms and construction scratch stay on this query's
     /// budget. A refused cache is discarded before returning the row-wise path.
     pub(super) fn decoded(&self) -> Result<Option<DecodedBatch<'_>>> {
-        match DecodedBatch::new(self) {
-            Ok(decoded) => Ok(Some(decoded)),
+        Ok(self
+            .term_cache()?
+            .map(|cache| DecodedBatch { batch: self, cache }))
+    }
+
+    /// The terms of [`QueryBatch::decoded`] without the borrow of the batch, so that
+    /// another thread can build them while the writer serializes the batch before it.
+    pub(super) fn term_cache(&self) -> Result<Option<TermCache>> {
+        match TermCache::new(self) {
+            Ok(cache) => Ok(Some(cache)),
             Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory => Ok(None),
             Err(error) => Err(error),
         }
@@ -297,16 +350,21 @@ impl QueryBatch {
 
 /// The smallest step in which a decoded batch reserves memory for its terms.
 const TERM_RESERVE: u64 = 64 << 10;
-
 pub(super) struct DecodedBatch<'a> {
     batch: &'a QueryBatch,
-    terms: Vec<Term>,
-    slots: Vec<u32>,
-    _charge: super::ctx::Charge<'a>,
+    cache: TermCache,
 }
 
-impl<'a> DecodedBatch<'a> {
-    fn new(batch: &'a QueryBatch) -> Result<Self> {
+/// The decoded base-vocabulary terms of one batch, each decoded once in key order, and
+/// the term of each cell. It holds its reservation until it is dropped.
+pub(super) struct TermCache {
+    terms: Vec<Term>,
+    slots: Vec<u32>,
+    _charge: OwnedCharge,
+}
+
+impl TermCache {
+    fn new(batch: &QueryBatch) -> Result<Self> {
         let ctx = &batch.ctx;
         ctx.check()?;
         let cells = batch
@@ -316,7 +374,8 @@ impl<'a> DecodedBatch<'a> {
             .ok_or_else(|| Error::invalid("query batch has too many cells"))?;
         // Pairs, slots, unique IDs, term capacity and row adapters coexist during
         // construction. Reserve before allocating, including reconstruction.
-        let charge = ctx.charge((cells as u64).saturating_mul(128).saturating_add(1024))?;
+        let mut held = (cells as u64).saturating_mul(128).saturating_add(1024);
+        let mut charge = OwnedCharge::new(ctx, held)?;
         let mut pairs = Vec::with_capacity(cells);
         for column in 0..batch.width() {
             for row in 0..batch.len() {
@@ -368,14 +427,18 @@ impl<'a> DecodedBatch<'a> {
                 let bytes = (key.len() as u64).saturating_mul(8).saturating_add(128);
                 if bytes > ahead {
                     let more = bytes.max(TERM_RESERVE);
-                    match charge.add(more) {
-                        Ok(()) => ahead = ahead.saturating_add(more),
+                    match charge.resize(held.saturating_add(more)) {
+                        Ok(()) => {
+                            held = held.saturating_add(more);
+                            ahead = ahead.saturating_add(more);
+                        }
                         // A refused charge leaves the ledger unchanged, so this term can
                         // still reserve what the leftover of the last chunk lacks.
                         Err(Error::BudgetExceeded(b))
                             if b.kind == crate::error::BudgetKind::Memory && more > bytes =>
                         {
-                            charge.add(bytes - ahead)?;
+                            charge.resize(held.saturating_add(bytes - ahead))?;
+                            held = held.saturating_add(bytes - ahead);
                             ahead = bytes;
                         }
                         Err(e) => return Err(e),
@@ -387,22 +450,29 @@ impl<'a> DecodedBatch<'a> {
             },
         )?;
         Ok(Self {
-            batch,
             terms,
             slots,
             _charge: charge,
         })
     }
+}
+
+impl<'a> DecodedBatch<'a> {
+    /// A batch with the terms that [`QueryBatch::term_cache`] built for it.
+    pub(super) fn new(batch: &'a QueryBatch, cache: TermCache) -> Self {
+        Self { batch, cache }
+    }
 
     fn cached(&self, row: usize, column: usize) -> Option<&Term> {
-        self.terms
-            .get(self.slots[column * self.batch.len() + row] as usize)
+        self.cache
+            .terms
+            .get(self.cache.slots[column * self.batch.len() + row] as usize)
     }
 
     pub(super) fn term(&self, row: usize, column: usize) -> Result<Option<Cow<'_, Term>>> {
         match self.cached(row, column) {
             Some(term) => Ok(Some(Cow::Borrowed(term))),
-            None => Ok(self.batch.term(row, column)?.map(Cow::Owned)),
+            None => Ok(self.batch.reserved_term(row, column)?.map(Cow::Owned)),
         }
     }
 
@@ -704,13 +774,25 @@ pub type AskResult = MaterializedResult;
 pub enum ExecutionMode {
     Eager,
     Streaming,
-    /// Use pull execution for measured large immutable scans and uncached OPTIONAL counts.
+    /// Use pull execution for plain immutable scans of an estimated thousand rows or more.
     #[default]
     Auto,
 }
 
-/// Production-allocator admission for immutable scans and uncached large
-/// OPTIONAL counts. Other plans retain eager execution.
+/// The estimated rows from which automatic execution streams a plain scan. A cursor
+/// writes a scan's results faster than eager execution from about a hundred rows on, at
+/// one Rayon thread and at twelve, and costs a query of fewer rows a microsecond or two.
+pub(super) const AUTO_SCAN_ROWS: f64 = 1_000.0;
+
+/// Production-allocator admission for immutable scans. Other plans retain eager
+/// execution.
+///
+/// An uncached OPTIONAL count on a single key streamed from an estimated million input
+/// rows until 2026-10-17. The cursor counts the join with a branching merge, which on the
+/// AMD EPYC hosts of the Namespace screens took 1.19 to 1.23 times as long as eager
+/// execution's branch-free merge at 10.5M, and on forge's Intel CPU 0.99 times as long.
+/// Such a count now runs eagerly. Eager execution holds both sides of the join, 20.8 MB at
+/// 10.5M where the cursor held 2.2 MB.
 pub(super) fn auto_streaming(
     ctx: &Ctx,
     node: &Node,
@@ -736,53 +818,14 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
-    fn count(ctx: &Ctx, node: &Node) -> bool {
-        match &node.kind {
-            Kind::Project(_)
-            | Kind::Slice { offset: 0, .. }
-            | Kind::Extend(_, super::expr::Expr::Var(_))
-                if node.children.len() == 1 =>
-            {
-                count(ctx, &node.children[0])
-            }
-            Kind::Group { keys, aggs } if keys.is_empty() && group::eligible(node) => {
-                let child = &node.children[0];
-                let rows = child.est + child.children.iter().map(|child| child.est).sum::<f64>();
-                aggs.iter().all(|(_, agg)| {
-                    agg.expr.is_none()
-                        && !agg.distinct
-                        && matches!(agg.func, spargebra::algebra::AggregateFunction::Count)
-                }) && matches!(child.kind, Kind::LeftJoin { expr: None })
-                    && merge::eligible(child)
-                    && child.children[0]
-                        .vars
-                        .iter()
-                        .filter(|v| child.children[1].vars.contains(v))
-                        .count()
-                        == 1
-                    && child
-                        .children
-                        .iter()
-                        .all(|child| matches!(child.kind, Kind::Scan(_)) && scan(ctx, child))
-                    && rows.is_finite()
-                    && rows >= 1_000_000.0
-            }
-            _ => false,
-        }
-    }
-    let scans = if node.est.is_finite() && node.est >= 1_000_000.0 && scan(ctx, node) {
-        // A scan expected to pass the row budgets stays eager, so that it fails before
-        // the first byte of output with an error status rather than partway through a
-        // stream. A count returns one row, so its errors always come before output.
-        if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
-            return false;
-        }
-        1
-    } else if (!ctx.use_cache || !ctx.snap.results.enabled()) && count(ctx, node) {
-        2
-    } else {
+    if !(node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node)) {
         return false;
-    };
+    }
+    // A scan expected to pass the row budgets stays eager, so that it fails before the
+    // first byte of output with an error status rather than partway through a stream.
+    if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
+        return false;
+    }
     let cap = options
         .batch_rows
         .min(options.batch_bytes / node.vars.len().max(1).saturating_mul(8));
@@ -792,12 +835,11 @@ pub(super) fn auto_streaming(
             .map(width)
             .fold(node.vars.len(), usize::max)
     }
-    // Aggregate output can be narrower than either scan or the join layout.
-    // Admission must leave room for their input batches as well as the result.
+    // A projection can be narrower than its scan. Admission must leave room for the
+    // scan's input batches as well as the result.
     let row_bytes = (width(node) as u64).saturating_mul(8).saturating_add(16);
     let headroom = (crate::index::BLOCK_ROWS as u64 * 32 + 512)
-        .saturating_mul(scans)
-        .saturating_add((cap as u64).saturating_mul(row_bytes).saturating_mul(scans))
+        .saturating_add((cap as u64).saturating_mul(row_bytes))
         .saturating_add((ctx.nvars() as u64).saturating_mul(16))
         .saturating_add(4096);
     kind == QueryKind::Select
@@ -1070,6 +1112,92 @@ impl QueryCursor {
 
     pub fn next_batch(&mut self) -> Result<Option<QueryBatch>> {
         self.next_batch_at_most(self.options.batch_rows)
+    }
+
+    /// Hand each batch, with the terms of its base-vocabulary cells decoded once in key
+    /// order, to `each`, until `send` rows have been pulled or the cursor ends. Returns the
+    /// rows of `send` left over, which without `send` count down from `usize::MAX`, so that
+    /// 0 means the writer stopped at `send`.
+    ///
+    /// With `decode_ahead` and more than one Rayon worker, every batch after the first is
+    /// pulled before `each` handles the one before it, and its terms are decoded on the pool
+    /// while `each` runs. Two batches and their terms are then live at once, both charged.
+    /// The first batch goes to `each` before the second is pulled, so the first rows of an
+    /// answer wait for one batch only, however slowly the plan produces the next. Decoding
+    /// ahead then starts only when the memory budget has room for twice what the first
+    /// batch took, and the writer otherwise goes on in turn.
+    ///
+    /// An error while pulling a batch ahead is returned after `each` has been called with the
+    /// batch before it. A memory budget failure inside the plan also fails every later
+    /// check of the query, so `each` then stops at its first check, and the rows of that
+    /// batch are not written. Without decoding ahead those rows would be written before the
+    /// pull that fails. The answer is an error either way.
+    pub(super) fn for_each_decoded(
+        &mut self,
+        send: Option<usize>,
+        mut each: impl FnMut(&Self, &QueryBatch, Option<&DecodedBatch<'_>>) -> Result<()>,
+    ) -> Result<usize> {
+        let mut remaining = send.unwrap_or(usize::MAX);
+        let mut ahead = self.ctx.opt.decode_ahead && rayon::current_num_threads() >= 2;
+        // In turn: every batch without decoding ahead, and the first batch with it.
+        let mut first = true;
+        while remaining > 0 && (first || !ahead) {
+            let before = self.ctx.live_bytes();
+            let Some(batch) = self.next_batch_at_most(remaining)? else {
+                return Ok(remaining);
+            };
+            let decoded = batch.decoded()?;
+            each(self, &batch, decoded.as_ref())?;
+            remaining -= batch.len().min(remaining);
+            if first {
+                first = false;
+                // Decoding ahead holds a second batch and its terms. It starts only when
+                // the memory budget has room for twice what the first batch took at its
+                // peak, so that a budget the writer fits in turn does not fail it.
+                let took = self.ctx.mem_peak().saturating_sub(before);
+                ahead = ahead && self.ctx.memory_remaining() >= took.saturating_mul(2);
+            }
+        }
+        if remaining == 0 {
+            return Ok(remaining);
+        }
+        let mut current = match self.next_batch_at_most(remaining)? {
+            Some(batch) => {
+                let cache = batch.term_cache()?;
+                Some((batch, cache))
+            }
+            None => None,
+        };
+        while let Some((batch, cache)) = current.take() {
+            remaining -= batch.len().min(remaining);
+            let next = if remaining > 0 {
+                self.next_batch_at_most(remaining)
+            } else {
+                Ok(None)
+            };
+            let decoded = cache.map(|cache| DecodedBatch::new(&batch, cache));
+            match next {
+                Ok(Some(next)) => {
+                    let mut built = None;
+                    let (slot, upcoming, this) = (&mut built, &next, &*self);
+                    let written = rayon::in_place_scope(|scope| {
+                        scope.spawn(move |_| *slot = Some(upcoming.term_cache()));
+                        each(this, &batch, decoded.as_ref())
+                    });
+                    drop(decoded);
+                    drop(batch);
+                    written?;
+                    let cache = built.expect("the decoding task ran")?;
+                    current = Some((next, cache));
+                }
+                Ok(None) => each(self, &batch, decoded.as_ref())?,
+                Err(error) => {
+                    each(self, &batch, decoded.as_ref())?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(remaining)
     }
 
     pub(super) fn next_batch_at_most(&mut self, rows: usize) -> Result<Option<QueryBatch>> {
@@ -2985,8 +3113,11 @@ mod tests {
         evicted_skipped_read_ahead_column("count");
     }
 
+    /// The decision table of automatic execution for an OPTIONAL count on a single key:
+    /// eager whether results are cached or not and however many rows it reads, since the
+    /// cursor's count measured up to 1.23 times as long as eager's on AMD hosts.
     #[test]
-    fn automatic_counts_preserve_enabled_result_caches() {
+    fn automatic_execution_keeps_optional_counts_eager() {
         use crate::io::Source;
         use crate::store::{Store, StoreOptions};
         let store = Store::in_memory(StoreOptions::default());
@@ -3003,45 +3134,34 @@ mod tests {
             &[],
         )
         .unwrap();
-        let options = QueryOptions {
-            no_cache: true,
-            ..Default::default()
-        };
-        let mut p =
-            super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
-        let mut group = &mut p.node;
-        while matches!(
-            group.kind,
-            Kind::Project(_)
-                | Kind::Slice { offset: 0, .. }
-                | Kind::Extend(_, super::super::expr::Expr::Var(_))
-        ) {
-            group = &mut group.children[0];
+        for no_cache in [true, false] {
+            for est in [1_000.0, 1_000_000.0, 100_000_000.0] {
+                let options = QueryOptions {
+                    no_cache,
+                    ..Default::default()
+                };
+                let mut p = super::super::prepare_query(store.snapshot(), &q, &options, None, None)
+                    .unwrap();
+                let mut group = &mut p.node;
+                while matches!(
+                    group.kind,
+                    Kind::Project(_)
+                        | Kind::Slice { offset: 0, .. }
+                        | Kind::Extend(_, super::super::expr::Expr::Var(_))
+                ) {
+                    group = &mut group.children[0];
+                }
+                assert!(matches!(group.kind, Kind::Group { .. }));
+                group.children[0].est = est;
+                for child in &mut group.children[0].children {
+                    child.est = est;
+                }
+                assert!(
+                    !auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()),
+                    "no_cache {no_cache}, {est} rows"
+                );
+            }
         }
-        assert!(matches!(group.kind, Kind::Group { .. }));
-        group.children[0].est = 1_000_000.0;
-        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()));
-        let cached =
-            super::super::prepare_query(store.snapshot(), &q, &Default::default(), None, None)
-                .unwrap();
-        assert!(!auto_streaming(
-            &cached.ctx,
-            &p.node,
-            p.kind,
-            &Default::default()
-        ));
-        let low = QueryOptions {
-            no_cache: true,
-            max_memory_bytes: Some(2 << 20),
-            ..Default::default()
-        };
-        let low = super::super::prepare_query(store.snapshot(), &q, &low, None, None).unwrap();
-        assert!(!auto_streaming(
-            &low.ctx,
-            &p.node,
-            p.kind,
-            &Default::default()
-        ));
     }
 
     #[test]
@@ -3067,6 +3187,29 @@ mod tests {
         let p = prepare(store.snapshot(), &Default::default());
         let options = CursorOptions::default();
         assert!(auto_streaming(&p.ctx, &p.node, p.kind, &options));
+        // a scan streams from the measured size on
+        let mut small = prepare(store.snapshot(), &Default::default());
+        small.node.est = AUTO_SCAN_ROWS;
+        assert!(auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
+        small.node.est = AUTO_SCAN_ROWS - 1.0;
+        assert!(!auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
+        small.node.est = f64::INFINITY;
+        assert!(!auto_streaming(
+            &small.ctx,
+            &small.node,
+            small.kind,
+            &options
+        ));
         assert!(!auto_streaming(
             &p.ctx,
             &p.node,
@@ -3234,5 +3377,89 @@ mod tests {
     fn successor_carries_and_stops_at_maximum() {
         assert_eq!(successor([7, 9, u64::MAX, u64::MAX]), Some([7, 10, 0, 0]));
         assert_eq!(successor([u64::MAX; 4]), None);
+    }
+
+    /// A writer that decodes ahead pulls each batch after the first before it writes the
+    /// one before, and it writes the first batch before it pulls the second, so that the
+    /// first rows wait for one batch only. Its batches and term caches go back to the
+    /// ledger as they do without decoding ahead.
+    #[test]
+    fn decoding_ahead_writes_the_first_batch_before_pulling_the_second() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let data = (0..10_000)
+            .map(|i| format!("<urn:s:{i}> <urn:p> \"v{i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let run = |ahead: bool, send: Option<usize>| {
+            let mut opt = crate::sparql::Optimizations::default();
+            if !ahead {
+                opt = opt.disable("decode_ahead").unwrap();
+            }
+            let options = QueryOptions {
+                optimizations: Some(opt),
+                ..Default::default()
+            };
+            let mut cursor = select_cursor(
+                store.snapshot(),
+                "SELECT ?s ?o {?s <urn:p> ?o}",
+                &options,
+                &CursorOptions {
+                    batch_rows: 1000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut produced = Vec::new();
+            let mut rows = 0;
+            let left = pool
+                .install(|| {
+                    cursor.for_each_decoded(send, |cursor, batch, decoded| {
+                        assert!(decoded.is_some(), "the terms of every batch are decoded");
+                        produced.push(cursor.ctx.rows_produced());
+                        rows += batch.len();
+                        Ok(())
+                    })
+                })
+                .unwrap();
+            (produced, rows, left, cursor.ctx.live_bytes())
+        };
+        let (serial, rows, left, serial_live) = run(false, None);
+        assert_eq!((rows, left), (10_000, usize::MAX - 10_000));
+        // the operators' rows of one batch
+        let unit = serial[0];
+        assert!(unit >= 1000);
+        assert_eq!(serial, (1..=10).map(|i| i * unit).collect::<Vec<u64>>());
+        let (ahead, rows, left, ahead_live) = run(true, None);
+        assert_eq!((rows, left), (10_000, usize::MAX - 10_000));
+        // the first batch alone, then each batch with the next one pulled
+        let mut want = vec![unit, 3 * unit];
+        want.extend((4..=10).map(|i| i * unit));
+        want.push(10 * unit);
+        assert_eq!(ahead, want);
+        assert_eq!(
+            ahead_live, serial_live,
+            "decoding ahead holds nothing afterwards"
+        );
+        // `send` stops the pulls at its rows
+        for send in [0, 1, 999, 1000, 1001, 2500, 10_000] {
+            let (serial, rows, left, _) = run(false, Some(send));
+            let (ahead, ahead_rows, ahead_left, _) = run(true, Some(send));
+            assert_eq!((rows, left), (send, 0), "send {send}");
+            assert_eq!((ahead_rows, ahead_left), (send, 0), "send {send}");
+            assert_eq!(ahead.first(), serial.first(), "send {send}");
+            assert_eq!(ahead.last(), serial.last(), "send {send}");
+        }
     }
 }

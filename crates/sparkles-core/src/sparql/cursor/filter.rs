@@ -8,6 +8,12 @@ use crate::sparql::plan::{Kind, Node};
 use std::sync::Arc;
 
 const INPUT_ROWS: usize = 32_768;
+/// The largest input the filter reads at once. Its input doubles from [`INPUT_ROWS`]
+/// with each pull up to this size, so a short answer still starts after one small read
+/// while a long scan pays for fewer parallel key tests. With 32,768 rows per read, waking
+/// the pool and copying the filter for each read took about a sixth of the time of a
+/// substring filter over a million names on 12 cores.
+const MAX_INPUT_ROWS: usize = 1 << 18;
 
 pub(super) fn eligible(node: &Node, children: &[Operator]) -> bool {
     let Kind::Filter(exprs) = &node.kind else {
@@ -28,6 +34,8 @@ pub(super) struct Filter {
     node: Node,
     pending: Option<Buffer>,
     at: usize,
+    /// the rows of the next enlarged read
+    input: usize,
 }
 
 impl Filter {
@@ -36,6 +44,7 @@ impl Filter {
             node,
             pending: None,
             at: 0,
+            input: INPUT_ROWS,
         }
     }
 
@@ -67,15 +76,26 @@ impl Filter {
             let row_bytes = (child.vars.len() as u64 * 16).saturating_add(192);
             // Include simultaneous input, pending/output copies, key-test reuse,
             // and the decoded block. Every actual allocation is also charged.
-            let headroom = (INPUT_ROWS as u64)
-                .saturating_mul(row_bytes)
-                .saturating_add(crate::index::BLOCK_ROWS as u64 * 32 + 8192);
-            let enlarge = cap >= 4096
-                && ctx.max_rows_produced == u64::MAX
-                && ctx.max_rows.saturating_sub(child.rows) >= INPUT_ROWS
-                && ctx.memory_remaining() >= headroom;
+            let headroom = |rows: usize| {
+                (rows as u64)
+                    .saturating_mul(row_bytes)
+                    .saturating_add(crate::index::BLOCK_ROWS as u64 * 32 + 8192)
+            };
+            let fits = |rows: usize| {
+                ctx.max_rows.saturating_sub(child.rows) >= rows
+                    && ctx.memory_remaining() >= headroom(rows)
+            };
+            // A read larger than the first is taken only when its headroom fits too.
+            let mut input = self.input;
+            while input > INPUT_ROWS && (!ctx.opt.grow_input || !fits(input)) {
+                input /= 2;
+            }
+            let enlarge = cap >= 4096 && ctx.max_rows_produced == u64::MAX && fits(input);
+            if enlarge {
+                self.input = (input * 2).min(MAX_INPUT_ROWS);
+            }
             let mut input_options = options.clone();
-            let demand = if enlarge { INPUT_ROWS.max(cap) } else { cap };
+            let demand = if enlarge { input.max(cap) } else { cap };
             input_options.batch_rows = demand.max(options.batch_rows);
             let Some(mut buffer) = child.next(ctx, &input_options, demand)? else {
                 return Ok(None);

@@ -203,10 +203,16 @@ pub struct Optimizations {
     /// the columns of the blocks that an index join has asked the kernel for are decoded
     /// in parallel on a pool of the cache's own, before the reader gets to them
     pub parallel_decode: bool,
+    /// a streamed result writer decodes the terms of the next batch on the Rayon pool
+    /// while it writes the current one
+    pub decode_ahead: bool,
+    /// cursor operators that read their whole input before output, and filters over a
+    /// scan, read larger inputs as a long input goes on
+    pub grow_input: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 38] = [
+    pub const NAMES: [&str; 40] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -245,6 +251,8 @@ impl Optimizations {
         "prefetch_terms",
         "prefetch_first_scan",
         "parallel_decode",
+        "decode_ahead",
+        "grow_input",
     ];
 
     /// Everything on.
@@ -287,6 +295,8 @@ impl Optimizations {
         prefetch_terms: true,
         prefetch_first_scan: true,
         parallel_decode: true,
+        decode_ahead: true,
+        grow_input: true,
     };
 
     /// Everything off: the generic operators only.
@@ -329,6 +339,8 @@ impl Optimizations {
         prefetch_terms: false,
         prefetch_first_scan: false,
         parallel_decode: false,
+        decode_ahead: false,
+        grow_input: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -371,6 +383,8 @@ impl Optimizations {
             "prefetch_terms" => &mut self.prefetch_terms,
             "prefetch_first_scan" => &mut self.prefetch_first_scan,
             "parallel_decode" => &mut self.parallel_decode,
+            "decode_ahead" => &mut self.decode_ahead,
+            "grow_input" => &mut self.grow_input,
             _ => return None,
         })
     }
@@ -748,7 +762,7 @@ impl Ctx {
 
     /// The query's live estimate, from the ledger once it exists.
     #[inline]
-    fn live_bytes(&self) -> u64 {
+    pub(super) fn live_bytes(&self) -> u64 {
         match self.memory.get() {
             Some(ledger) => ledger.live.load(Ordering::Relaxed),
             None => self.fast.live.load(Ordering::Relaxed) & !PROMOTED,
@@ -1778,6 +1792,65 @@ impl Ctx {
             Tag::Undef | Tag::Special => Ok(None),
             _ => {
                 let _charge = self.charge(128)?;
+                Ok(self.snap.term(id))
+            }
+        }
+    }
+
+    /// The term of an id as eager execution decodes it, without charging the scratch of
+    /// a vocabulary block or the term, for a caller that drops the term at once.
+    pub(super) fn transient_batch_term(&self, id: Id) -> Option<Term> {
+        match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map(id::key_to_term),
+            Tag::Undef | Tag::Special => None,
+            _ => self.snap.term(id),
+        }
+    }
+
+    /// [`Ctx::batch_term`] for a caller that has already reserved
+    /// [`Ctx::decoded_bytes`] for the term, as the result writers do for a row's cells.
+    /// It takes no reservation of its own, which cost an inline number one pass through
+    /// the memory ledger per cell.
+    pub(super) fn reserved_batch_term(&self, id: Id) -> Result<Option<Term>> {
+        let decode = |key: &[u8]| Some(id::key_to_term(key));
+        Ok(match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).and_then(decode),
+            Tag::Vocab => self.with_cursor_vocab_key(id.payload(), decode)?.flatten(),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(id.payload()).and_then(decode)),
+            Tag::Undef | Tag::Special => None,
+            _ => self.snap.term(id),
+        })
+    }
+
+    /// [`Ctx::batch_term`] that asks `cover` for the [`Ctx::decoded_bytes`] of the term
+    /// before it builds it, so that a result writer can hold one reservation for its row
+    /// and decode each key once.
+    pub(super) fn covered_batch_term(
+        &self,
+        id: Id,
+        mut cover: impl FnMut(u64) -> Result<()>,
+    ) -> Result<Option<Term>> {
+        let mut decode = |key: &[u8]| -> Result<Option<Term>> {
+            cover((key.len() as u64).saturating_mul(8).saturating_add(128))?;
+            Ok(Some(id::key_to_term(key)))
+        };
+        match id.tag() {
+            Tag::Local => self.local.read().get(id.payload()).map_or(Ok(None), decode),
+            Tag::Vocab => self
+                .with_cursor_vocab_key(id.payload(), decode)?
+                .unwrap_or(Ok(None)),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(id.payload()).map_or(Ok(None), &mut decode)),
+            Tag::Undef | Tag::Special => Ok(None),
+            _ => {
+                cover(128)?;
                 Ok(self.snap.term(id))
             }
         }

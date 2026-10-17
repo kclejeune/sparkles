@@ -1448,6 +1448,7 @@ pub(crate) async fn run_query(
             Ok((Ran::Eager(r), seq, resolved, t0))
         }
     };
+    let began = std::time::Instant::now();
     let ran = if in_place {
         inline::note_in_place(quick_key);
         inline::run(run).and_then(|r| r)
@@ -1481,6 +1482,7 @@ pub(crate) async fn run_query(
                     timeout,
                     with_extra,
                     t0,
+                    quick: Some((quick_key, began)),
                 },
             )
             .await;

@@ -70,6 +70,19 @@ impl FfiSelectCursor {
     /// Encoding dictionaries restart every batch, bounding both native and JVM
     /// decoder state. The returned bytes use the existing row-batch encoding.
     pub fn next_batch(&self, max_rows: u32) -> FfiResult<Batch> {
+        self.fill(max_rows, None)
+    }
+}
+
+impl FfiSelectCursor {
+    /// The next batch. With `shared`, the batch shares its term dictionary with the
+    /// batches before it, as an eager result's batches do, up to the table's limit.
+    /// Without, the batch restarts the dictionary.
+    pub(crate) fn fill(
+        &self,
+        max_rows: u32,
+        shared: Option<&mut TermTable<u64>>,
+    ) -> FfiResult<Batch> {
         let mut state = self.state.try_lock().ok_or_else(|| {
             FfiError::new(ErrorKind::Invalid, "a cursor operation is in progress")
         })?;
@@ -91,8 +104,13 @@ impl FfiSelectCursor {
         let result: sparkles::Result<Batch> = self.labels.with(|_, label| {
             // A fresh table forces self-contained wire batches. The first frame
             // also explicitly restarts the JVM dictionary (bit zero).
-            let mut table = TermTable::new(1);
-            let mut writer = RowWriter::new(&mut table, self.variables.len() as u16);
+            let restart = shared.is_none();
+            let mut fresh = TermTable::new(1);
+            let table = match shared {
+                Some(table) => table,
+                None => &mut fresh,
+            };
+            let mut writer = RowWriter::new(table, self.variables.len() as u16);
             let mut row = vec![0; self.variables.len()];
             while writer.rows() < limit as u32 && writer.bytes() < 1 << 20 {
                 if self.closed.load(Ordering::Relaxed) || self.cancel.load(Ordering::Relaxed) {
@@ -105,8 +123,12 @@ impl FfiSelectCursor {
                 }
                 let Some(batch) = &state.batch else { break };
                 for (column, cell) in row.iter_mut().enumerate() {
-                    let term = batch.term(state.row, column)?;
-                    *cell = term.map_or(0, |term| writer.cell(term.clone(), || Some(term), label));
+                    // a term is decoded only when its key is new to the dictionary
+                    let Some(key) = batch.key(state.row, column)? else {
+                        *cell = 0;
+                        continue;
+                    };
+                    *cell = writer.cell(key, || batch.transient_term(key), label);
                 }
                 writer.push_row(&row);
                 state.row += 1;
@@ -118,7 +140,9 @@ impl FfiSelectCursor {
                 state.batch = None;
             }
             let mut bytes = writer.finish();
-            bytes[1] |= 1;
+            if restart {
+                bytes[1] |= 1;
+            }
             Ok(Batch { batch: bytes, done })
         });
         if let Err(error) = &result {
@@ -134,7 +158,10 @@ impl FfiSelectCursor {
         }
         result.map_err(Into::into)
     }
+}
 
+#[uniffi::export]
+impl FfiSelectCursor {
     pub fn status(&self) -> FfiResult<String> {
         let state = self.state.try_lock().ok_or_else(|| {
             FfiError::new(ErrorKind::Invalid, "a cursor operation is in progress")

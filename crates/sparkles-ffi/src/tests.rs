@@ -358,7 +358,7 @@ fn queries_and_cancellation() {
         let mut out = rows(&e.batch, &mut table);
         let mut done = e.done;
         while !done {
-            let b = q.next_batch(1);
+            let b = q.next_batch(1).unwrap();
             out.extend(rows(&b.batch, &mut table));
             done = b.done;
         }
@@ -598,4 +598,107 @@ fn select_cursor_pending_batch_is_open_until_delivered_or_closed() {
     cursor.release();
     assert_eq!(cursor.status().unwrap(), "stopped");
     assert!(cursor.next_batch(1).unwrap().done);
+}
+
+#[test]
+fn automatic_execution_streams_large_scans_with_the_rows_of_eager() {
+    let ds = FfiDataset::memory(opts(BlankNodeMode::Dataset));
+    let data = (0..5000)
+        .map(|i| format!("<http://ex.org/s{i}> <http://ex.org/p> {} .\n", i % 7))
+        .collect::<String>();
+    ds.load_bytes(data.into_bytes(), "text/turtle".into(), None, None)
+        .unwrap();
+    let run = |q: &FfiQuery, auto: bool| {
+        let e = q.execute_with(10, auto).unwrap();
+        let streams = q.streams();
+        let mut table = Vec::new();
+        let mut out = rows(&e.batch, &mut table);
+        let mut done = e.done;
+        while !done {
+            let b = q.next_batch(777).unwrap();
+            out.extend(rows(&b.batch, &mut table));
+            done = b.done;
+        }
+        assert!(!q.streams(), "the last batch frees the cursor");
+        out.sort_by_key(|row| format!("{row:?}"));
+        (e.variables, out, streams)
+    };
+    let text = "SELECT ?s ?o { ?s <http://ex.org/p> ?o }";
+    let (vars, eager, streamed) = run(&ds.prepare_query(text.into(), qopts()).unwrap(), false);
+    assert!(!streamed);
+    let (auto_vars, auto, streamed) = run(&ds.prepare_query(text.into(), qopts()).unwrap(), true);
+    assert!(streamed, "a scan of 5000 rows streams");
+    assert_eq!((auto_vars, auto.len()), (vars, 5000));
+    assert_eq!(auto, eager);
+    // a small result and an ASK stay eager
+    let (_, small, streamed) = run(
+        &ds.prepare_query(
+            "SELECT ?s { ?s <http://ex.org/p> 3 } LIMIT 20".into(),
+            qopts(),
+        )
+        .unwrap(),
+        true,
+    );
+    assert!(!streamed);
+    assert_eq!(small.len(), 20);
+    let ask = ds
+        .prepare_query("ASK { ?s <http://ex.org/p> 3 }".into(), qopts())
+        .unwrap();
+    assert!(ask.execute_with(10, true).unwrap().boolean);
+    // a write transaction has no cursors, so automatic execution runs eagerly there
+    let tx = ds.begin_write(None, true).unwrap().unwrap();
+    let q = tx.prepare_query(text.into(), qopts()).unwrap();
+    let e = q.execute_with(10, true).unwrap();
+    assert!(!e.done && !q.streams());
+    tx.abort();
+    // cancelling a streamed query fails its next batch, after which the rows end
+    let q = ds.prepare_query(text.into(), qopts()).unwrap();
+    assert!(!q.execute_with(10, true).unwrap().done);
+    q.cancel();
+    assert_eq!(q.next_batch(10).err().unwrap().kind(), ErrorKind::Cancelled);
+    assert!(q.next_batch(10).unwrap().done);
+    // releasing a streamed query closes its cursor
+    let q = ds.prepare_query(text.into(), qopts()).unwrap();
+    assert!(!q.execute_with(10, true).unwrap().done);
+    q.release();
+    assert!(!q.streams());
+    assert!(q.next_batch(10).unwrap().done);
+}
+
+/// A streamed query's batches share one term dictionary up to the dataset's term cache
+/// size. With more distinct terms than that, the dictionary restarts, and the rows read
+/// back are still those of eager execution.
+#[test]
+fn automatic_batches_restart_a_full_shared_dictionary() {
+    let ds = FfiDataset::memory(DatasetOptions {
+        term_cache_size: 100,
+        ..opts(BlankNodeMode::Dataset)
+    });
+    let data = (0..5000)
+        .map(|i| format!("<http://ex.org/s{i}> <http://ex.org/p> \"v{i}\" .\n"))
+        .collect::<String>();
+    ds.load_bytes(data.into_bytes(), "text/turtle".into(), None, None)
+        .unwrap();
+    let text = "SELECT ?s ?o { ?s <http://ex.org/p> ?o }";
+    let run = |auto: bool| {
+        let q = ds.prepare_query(text.into(), qopts()).unwrap();
+        let e = q.execute_with(10, auto).unwrap();
+        assert_eq!(q.streams(), auto);
+        let mut table = Vec::new();
+        let mut out = rows(&e.batch, &mut table);
+        let (mut done, mut restarts) = (e.done, 0);
+        while !done {
+            let b = q.next_batch(300).unwrap();
+            restarts += usize::from(b.batch[1] & encode::FLAG_RESTART != 0);
+            out.extend(rows(&b.batch, &mut table));
+            done = b.done;
+        }
+        out.sort_by_key(|row| format!("{row:?}"));
+        (out, restarts)
+    };
+    let (eager, _) = run(false);
+    let (auto, restarts) = run(true);
+    assert_eq!(auto.len(), 5000);
+    assert_eq!(auto, eager);
+    assert!(restarts > 0, "the dictionary restarted");
 }

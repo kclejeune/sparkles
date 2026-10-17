@@ -690,10 +690,10 @@ opt-in Jena WHERE execution on the JVM, and the CLI. Copies of rows and transpor
 in the foreign bindings follow their own bounded batching contract. Python rejects
 snapshot capture inside an owned transaction.
 
-Auto selects large plain immutable SELECT scans, and uncached eligible OPTIONAL COUNT
-queries on a single key, under the measured batch, graph-predicate and memory conditions
-that the API documents. Admitting aggregates in this way preserves enabled result
-caches. Over HTTP, auto falls back to eager execution when the negotiated encoding is
+Auto selects plain immutable SELECT scans under the measured batch, graph-predicate and
+memory conditions that the API documents. Until 2026-10-17 it also selected uncached
+OPTIONAL COUNT queries on a single key, which
+[the parity section](#streaming-parity-2026-10-17) explains. Over HTTP, auto falls back to eager execution when the negotiated encoding is
 SPARQL Results Thrift, which has no cursor writer. Auto became the default mode over
 HTTP, in the CLI and in Node on 2026-10-16, as
 [the section below](#automatic-execution-by-default-2026-10-16) describes.
@@ -976,7 +976,7 @@ entry point that picks a mode and what it does now.
 | Python `query`, `select` and the rdflib store | eager | They return collected values whose iteration cannot fail, and they also run inside transactions. `select_cursor` and `graph_cursor` stream on request. |
 | Node `query`, `select`, `construct`, `ask` and `queryToStream` | `auto` | Node results are already async iterators that pull batches, so a streamed result only loses `size` and can reject while it is read. A plan that stays eager keeps its size and its first batch from the call. |
 | Node transactions | eager | A cursor cannot read a transaction's state. |
-| JVM and Jena | eager | Eager is idiomatic there, and `Sparkles.STREAMING_EXECUTION` still opts in. |
+| JVM and Jena | `auto` since 2026-10-17 | ARQ result sets are lazy iterators that already fail from `hasNext`, so a streamed result keeps their contract. Write transactions run eagerly, and `Sparkles.STREAMING_EXECUTION` set to false opts out. |
 | TypeScript client | the server's default | It sends `execution` only when the caller sets it. |
 | MCP tools, GraphQL, SPARQL diffs, `/{ds}/explain`, Ask | eager | Each returns one document built from the whole result, such as an MCP answer with an exact total. |
 | SERVICE to Sparkles, including the same server | the remote server's default | The SERVICE client reads SPARQL JSON or XML as it arrives, so a cut-off answer fails the parse and the transfer and the SERVICE call fails. |
@@ -1042,6 +1042,148 @@ default name scan takes 547 ms in native JSON against 531 to 563 ms eagerly, 1.3
 1.41 s in SPARQL JSON and 273 ms against 357 ms in TSV. The final screens at 1.05M and
 10.5M found no query whose median server or wall time regressed by 10% or more, and the
 name scan's wall time matched the baseline's at 553 ms.
+
+### Streaming parity (2026-10-17)
+
+The first part of roadmap item 7 measured eager against streaming execution again on
+forge, at 10.5M with 12 Rayon threads and with one, and profiled each gap before changing
+anything. Most of the remaining eager wins at 12 threads come from parallelism inside
+eager operators, which run Rayon over the whole table, while a cursor works on one batch
+at a time. With one Rayon thread, the setting of the Namespace screens, streaming ties
+or wins on most shapes.
+
+Four changes closed the gaps that profiles traced to the cursor itself.
+
+* A result writer that reads a cursor decodes the terms of the next batch on another
+  Rayon thread while it writes the current one (`decode_ahead`), and charges each written
+  row's terms to the memory ledger once instead of once per cell. It writes the first
+  batch before it pulls the second, so the first rows wait for one batch only, and it
+  reads ahead only when the memory budget has room for twice what the first batch took.
+  An error from a batch read ahead reaches the writer after it has written the batch
+  before it. A memory budget failure inside the plan is the exception, since it fails
+  every later check of the query, and the writer then stops before writing that batch.
+* A cursor filter starts at 32,768 rows and doubles its row demand with each read up to
+  262,144 rows, and a cursor top-k doubles from the cursor's batch size up to 65,536 rows,
+  while the row budget and the memory ledger have room (`grow_input`). The scan under a
+  filter still stops at the caller's `batch_bytes`, so with the default 1 MiB a filter
+  over two columns reads at most 65,536 rows at once and over one column 131,072. A top-k
+  raises the byte cap with its demand. The tradeoff is memory. Over 300,000 rows a
+  substring filter peaked at 12.3 MB against 6.7 MB with fixed reads, and a top-k at
+  24.1 MB against 2.5 MB, both within the query's budgets.
+* A cursor top-k reuses the values it decoded for its prefilter instead of decoding them
+  again. When its first key holds one result per distinct value, its screen remembers
+  which values it rejected for the rest of the batch. A rejected value is worse than the
+  heap's worst row, which only improves, so it stays rejected.
+* The numeric columns of a cursor's expression cache are located in parallel when a
+  batch has at least 16,384 ids.
+
+The table gives the streaming time divided by the eager time, each measured in the same
+interleaved run of a probe binary. A ratio under 1 means streaming is faster.
+
+| 10.5M, ratio of streaming to eager | af4a79d6, 12 threads | Now, 12 threads | Now, 1 thread |
+|---|---:|---:|---:|
+| TSV, 500,000 rows | 1.80 | **0.86** | **0.83** |
+| TSV, name scan of 1.02M rows | 1.37 | **0.89** | **0.91** |
+| Native JSON, 500,000 rows | not measured | **0.47** | not measured |
+| Range top-k, rows only | 2.06 | 1.56 | **0.94** |
+| Expression ordering, rows only | 1.48 | 1.08 | **0.89** |
+| Substring filter, rows only | 1.60 | 1.45 | 1.02 |
+| Regular expression filter, rows only | 1.56 | 1.50 | 1.07 |
+
+The streamed TSV export of 500,000 rows went from 134.7 ms to 72 ms, where eager takes
+75 to 84 ms. The filters over a scan stay slower at 12 threads because the cursor scans,
+copies and filters one batch at a time, where eager filters the scan's runs in parallel.
+A morsel-parallel scan and filter in the cursor would close that gap and is left to the
+next part of item 7. Range top-k runs as an eager `IndexTopK` inside the cursor, so
+streaming it saves no memory. A filter over a scan in native JSON at one thread is also
+left open. It takes 1.35 to 1.39 times as long streamed, because the cursor's sorted batch
+decode of unique IRIs costs more than eager's per-row lookup.
+
+The first build of the writer pulled the second batch before it wrote the first, so the
+first rows of every streamed answer waited for two batches. With the first batch written
+in turn, on the development laptop at 10.5M with four threads on its performance cores,
+the first row of a substring filter came after 0.37 ms instead of 1.25 to 1.43 ms, and
+that of a regular expression matching two names after 9.0 ms instead of 15.6 ms. Scans of
+1,000 to 500,000 rows took the same time either way. Decoding ahead also made a tight
+memory budget fail a query that the writer in turn completed, which the room it now
+requires prevents. Decoding ahead runs on the global Rayon pool, so under many concurrent
+queries a writer can wait for its decoding task where decoding in turn would not wait.
+That case has not been measured and is left to item 7.
+
+Automatic execution now streams a plain scan, its projection or a `LIMIT` over it from an
+estimated thousand rows, where it needed a million before. On forge a cursor wrote such a
+scan faster than eager execution from about a hundred rows on, at one thread and at 12,
+in TSV and native JSON. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) gives the
+library times of one probe run, 0.259 ms streamed against 0.332 ms at 1,000 triples and
+1.126 ms against 1.604 ms at 5,000 with 12 threads. An earlier probe run measured 0.22
+against 0.24 ms and 0.85 against 1.10 ms. Filters, top-k and orderings stay eager by
+default, since streaming them is still slower at 12 threads.
+
+The server remembers a query that answered in under 10 ms as quick and runs its next
+request eagerly in place, without a thread hop or the automatic decision. Only eager
+answers were remembered at first, so a scan of a few thousand rows that streamed on its
+first run went through the blocking pool and the streamed writer on every run. A streamed
+answer that completes in one body, which the server buffers up to 1 MiB, is now
+remembered with its time as well. A stream that `send` stops early has not run the whole
+query and is not remembered. [BENCHMARKS](../BENCHMARKS.md#streaming-execution) measures the threshold
+over HTTP against af4a79d6, which ran these scans eagerly. With one Rayon thread on forge,
+scans of 20,000 and 50,000 rows answered 7% to 15% faster on their first run, and scans of
+1,000 and 5,000 rows matched. On a Namespace AMD EPYC instance every size was within 5%,
+and a repeated scan that answered in under 10 ms ran in place as fast as before.
+
+An uncached OPTIONAL COUNT on a single key, which automatic execution streamed from an
+estimated million rows, now runs eagerly. The pre-push screen of af4a79d6 measured the
+benchmark's `optional-count` at 10.5M 1.19 to 1.23 times slower under automatic execution
+on Namespace's AMD EPYC instances, while forge's i5-13500 measured 0.99. On a Namespace
+instance with one Rayon thread the cursor took 3.55 ms against 2.92 ms eagerly, both in
+place and on the blocking pool. `perf` put 83% of the cursor's samples in the merge count,
+whose branches on the comparison of the two key columns mispredict when the left and
+right keys interleave, as students and employees do in id order. Eager execution counts
+with a branch-free merge over several lanes. The tradeoff is memory, since the eager
+count held 20.8 MB at 10.5M where the cursor held 2.2 MB. A branch-free count in the
+cursor is left to the next part of item 7.
+
+The JVM library now runs queries in automatic mode by default as well. ARQ's result sets
+are lazy iterators that are valid only while their query execution and transaction are
+open, and errors already surface from `hasNext` and `next`, so a streamed result keeps the
+contract Jena callers rely on. Unset `Sparkles.STREAMING_EXECUTION` is automatic
+execution, true streams every SELECT and false runs every query eagerly. Queries in a write
+transaction still run eagerly, because a cursor cannot read the transaction's changes.
+`FfiQuery::execute_with` makes the decision, and when it streams, `FfiQuery::next_batch`
+reads the cursor and can fail. Its batches share one term dictionary up to the dataset's
+term cache size, as an eager result's batches do, and restart it when it is full. The
+encoder decodes a term it has not seen without charging it to the query's memory budget,
+as eager execution decodes its results, so a row of very large literals is held
+uncharged while it is encoded. That is the one exception to the cursor's budget
+accounting, and `QueryBatch::transient_term` is public only for this encoder. A query iterator now refuses to read
+once its transaction has ended and throws `JenaTransactionException`, eager or streamed,
+as Jena's own iterators do, instead of handing out the rest of an eager result.
+
+The first build of the JVM change exported 500,000 rows through JNI in 169 ms against
+126 ms eagerly on forge at 1.05M. Profiles of the native side put the gap in the select
+cursor's encoder. It decoded each cell and charged the term and its vocabulary block's
+scratch to the memory ledger, and it restarted its dictionary every batch. The encoder now
+keys its dictionary by id, decodes a term only when the dictionary lacks it, decodes it as
+eager execution does without the transient charges, and keeps the dictionary across
+batches. The native export then took 52.3 ms against 51.3 ms eagerly, and the JNI export
+130 ms against 126 ms on disk and 129 ms against 124 ms in memory. The binding comparison
+of `scripts/bench-bindings` ran every case twice in each mode in alternating processes.
+No other query, `find`, `contains` or `getProperty` moved by more than run-to-run noise,
+and the small-query latencies at one thread stayed within 2%. The Jena adapter tests now
+cover automatic execution: result iteration, early close, rewindable and copied result
+sets, `ResultSetFormatter` in TSV, JSON and XML, CONSTRUCT and DESCRIBE through graph
+iterators, timeouts and `abort` between reads, and reads after a read transaction ends.
+Jena's contract suites passed on the new default with and without the hand-written JNI
+calls.
+
+The regression of `regex-iri` by about 5% on forge since 6f0f928c has no source change
+behind it. `perf stat` over 2000 requests at 1.05M with one thread counted 3.7% more
+instructions and 5% to 10% more cycles for 6f0f928c than for bb379b91, while `contains`
+moved by 0.6%. In the slower build the regular expression search runs out of line, and
+`KeyFilter::test` shrank from 0xa48 to 0x82a bytes. Unrelated commits changed the
+inlining decisions of thin LTO with four codegen units. Giving the eager key filter
+explicit per-clone `regex_automata` caches, as the cursor's regular expression filter
+has, would make the call independent of that inlining, and is left to item 7.
 
 ### Large basic graph patterns
 

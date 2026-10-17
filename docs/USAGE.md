@@ -407,7 +407,7 @@ happens to materialized inferences, and the limits.
 | `--tls-cert FILE`, `--tls-key FILE` | | Serve HTTPS with this PEM certificate chain and key (see [TLS](#tls)). Both are re-read on SIGHUP and when they change. |
 | `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
-| `--default-execution MODE` | `auto` | How a query runs when its request has no `execution=`. `auto` streams the large scans and OPTIONAL counts that measured faster as cursors and runs the rest eagerly, and `eager` runs every query eagerly. See [incremental query execution](#incremental-query-execution). |
+| `--default-execution MODE` | `auto` | How a query runs when its request has no `execution=`. `auto` streams the plain scans of a thousand rows or more that measured faster as cursors and runs the rest eagerly, and `eager` runs every query eagerly. See [incremental query execution](#incremental-query-execution). |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
 | `--max-timeout S` | `1800` | Largest `timeout=` a query or update may ask for; `0` means unlimited. Never below `--timeout` or `--update-timeout`. |
 | `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
@@ -4150,14 +4150,12 @@ result it returns. `results::write_cursor_native_json` also writes the native sn
 metadata.
 
 HTTP queries run in automatic mode unless they ask otherwise. Automatic execution
-streams a plain SELECT of scans and projections when it expects at least one million
+streams a plain SELECT of scans and projections when it expects at least a thousand
 rows. The data must come from immutable blocks with no pending changes, any graph
 restriction must cover whole blocks, the query must have no restored initial bindings
 or offset, and its row budgets must cover the estimate. There must also be enough memory
-to own the blocks and to hold batches of at least 4,096 rows and 128 KiB. A `COUNT(*)`
-over a single-key OPTIONAL between two plain scans also streams when its estimated work
-reaches one million rows and the result cache is off or bypassed. Every other plan runs
-eagerly and answers exactly as `execution=eager` does. `execution=streaming` streams
+to own the blocks and to hold batches of at least 4,096 rows and 128 KiB. Every other
+plan runs eagerly and answers exactly as `execution=eager` does. `execution=streaming` streams
 every query, and `execution=eager` streams none:
 
 ```sh
@@ -4210,10 +4208,13 @@ results are collected values whose iteration cannot fail. Node runs `query`, `se
 `construct` and `queryToStream` in automatic mode by default and accepts
 `execution: 'eager' | 'streaming' | 'auto'` in its query options. A streamed Node result
 has no `size` and can reject while it is read. Queries in a Node transaction run eagerly.
-JVM callers keep eager execution by default and turn streaming on with the context
-symbol `Sparkles.STREAMING_EXECUTION`. Jena then reads SELECT results in batches and
-handles graph queries through its usual adapters. Close cursors and iterators when
-stopping early.
+JVM queries also run in automatic mode by default, and Jena reads a streamed SELECT in
+batches through its usual result sets and graph adapters. Setting the context symbol
+`Sparkles.STREAMING_EXECUTION` to false runs every query eagerly, and true streams every
+SELECT. A streamed result can throw `QueryCancelledException` or another query error from
+`hasNext()` partway through, as any ARQ result set can. Queries in a write transaction run
+eagerly, and reading a result after its transaction has ended throws
+`JenaTransactionException`. Close result sets and iterators when stopping early.
 
 ### Registered scalar functions
 

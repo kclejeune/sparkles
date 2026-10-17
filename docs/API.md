@@ -1609,18 +1609,18 @@ Query parameters beyond the standard protocol:
   Results Thrift is not supported in streaming mode and returns `501`. An invalid mode
   returns `400`.
 
-  `auto` streams a plain SELECT of scans and projections when it expects at least one
-  million rows and the data comes from immutable blocks with no pending changes. It also
-  streams a `COUNT(*)` over a single-key OPTIONAL between two plain scans when the
-  estimated work reaches one million rows and the result cache is off or bypassed. An
-  aggregate query that the cache serves still runs eagerly. In both cases, any graph
+  `auto` streams a plain SELECT of scans and projections when it expects at least a
+  thousand rows and the data comes from immutable blocks with no pending changes. Any graph
   restriction must cover whole blocks, the query must have no restored initial bindings
   or offset, and there must be enough memory to own the blocks and to hold batches of at
   least 4,096 rows and 128 KiB. A scan whose estimate exceeds the request's row budgets
   (`max-rows` or `max-rows-produced`) runs eagerly, so that the budget fails it with a
   status before any output. Every other plan runs eagerly, with the same response as
   `execution=eager`. A query that ran in under 10 ms the last time also runs eagerly
-  without being planned for the decision. A request for SPARQL Results Thrift runs
+  without being planned for the decision, also when its last run streamed and its answer
+  fit in one 1 MiB body. A `COUNT(*)` over a single-key OPTIONAL between two plain scans
+  streamed from an estimated million rows until 2026-10-17 and now runs eagerly, because
+  the cursor counted it up to 1.23 times slower on AMD EPYC hosts. A request for SPARQL Results Thrift runs
   eagerly because that encoding has no streaming writer. A stored-query run with
   parameter values also runs eagerly, because initial bindings rule out every automatic
   plan. A streamed answer that passes a lowered `max-result-mb` within its first

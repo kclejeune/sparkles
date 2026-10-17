@@ -39,6 +39,8 @@ const SAMPLE: usize = 4096;
 /// Most distinct values (estimated) that are collected by hashing instead of sorting a
 /// copy of the column.
 const HASH_DISTINCT: usize = 1 << 14;
+/// Sorted ids located in the numeric column by one parallel task of a cursor's decoding.
+const NUMERIC_PIECE: usize = 4096;
 
 /// What one operator's expressions did, for EXPLAIN.
 #[derive(Default, Debug)]
@@ -216,6 +218,24 @@ impl<T> Column<T> {
         match self {
             Column::Rows { vals: v, .. } => &v[row],
             Column::Values(p) => p.get(row),
+        }
+    }
+
+    /// The number of distinct results when the column stores one per distinct input
+    /// value, which [`Column::index`] then numbers.
+    pub fn distinct(&self) -> Option<usize> {
+        match self {
+            Column::Rows { .. } => None,
+            Column::Values(p) => Some(p.vals.len()),
+        }
+    }
+
+    /// The index of a row's result among the distinct results (see [`Column::distinct`]).
+    #[inline]
+    pub fn index(&self, row: usize) -> usize {
+        match self {
+            Column::Rows { .. } => row,
+            Column::Values(p) => p.index(row),
         }
     }
 
@@ -1197,7 +1217,23 @@ fn cursor_values(
     if let Some(num) = ctx.snap.generation.vocab.numeric()
         && !payloads.is_empty()
     {
-        let found = num.get_many(&payloads);
+        // Locating an id in the column counts the valued ids before it, which is most of
+        // the work for a large input. Pieces of the sorted ids are located on the pool,
+        // as eager execution decodes them, into the same vector of results.
+        let found = if payloads.len() >= 4 * NUMERIC_PIECE {
+            payloads
+                .par_chunks(NUMERIC_PIECE)
+                .map(|piece| {
+                    ctx.check()?;
+                    Ok(num.get_many(piece))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
+        } else {
+            num.get_many(&payloads)
+        };
         ctx.check()?;
         let (mut rest, mut rest_at) = (Vec::new(), Vec::new());
         for ((&p, &pos), n) in payloads.iter().zip(&positions).zip(found) {

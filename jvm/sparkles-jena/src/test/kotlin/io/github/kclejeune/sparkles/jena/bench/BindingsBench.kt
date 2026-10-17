@@ -243,7 +243,11 @@ internal object BindingsBench {
         val probes = cfg.probes.map { (s, p, o) -> Triple.create(iri(s), iri(p), iri(o)) }
         val name: Node = iri(FOAF_NAME)
         val nameProp = model.createProperty(FOAF_NAME)
-        val noCache: Context = Context().set(Sparkles.NO_CACHE, true)
+        // -Dsparkles.bench.streaming=false measures eager execution, and true a cursor for
+        // every query. Unset is the default, automatic execution.
+        val noCache: Context = Context().set(Sparkles.NO_CACHE, true).also { c ->
+            System.getProperty("sparkles.bench.streaming")?.let { c.set(Sparkles.STREAMING_EXECUTION, it.toBoolean()) }
+        }
         var addRound = 0
 
         /** The SELECT query through Jena's `QueryExec`, every row and term consumed. */

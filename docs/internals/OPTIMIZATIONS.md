@@ -403,3 +403,25 @@ little and change nothing. Each one has the same answers with it on and off.
   each spends most of its time decoding whole 32,768-row columns, and this spreads that
   time over several cores. Reads through a view that keeps no blocks, such as an export,
   skip it.
+* **Decoding the next cursor batch ahead** (`decode_ahead`). A result writer that reads
+  a cursor decodes the terms of the next batch on another Rayon thread while it writes the
+  current one. It writes the first batch before it pulls the second, so the first rows
+  wait for one batch only, and it reads ahead only when the memory budget has room for
+  twice what the first batch took. The decoded terms of a batch are charged to the
+  query's memory ledger, and a batch whose terms the ledger refuses is decoded cell by
+  cell as before. With one Rayon thread the writer decodes in turn. Together with
+  charging each written row's terms once, this took a streamed TSV export of 500,000 rows
+  on forge from 134.7 ms to 72 ms at 12 threads, where eager execution takes 84 ms.
+* **Growing filter and top-k inputs** (`grow_input`). A cursor filter starts by asking
+  for 32,768 rows and doubles its demand with each read up to 262,144 rows while the row
+  budget and the memory ledger have room. The scan below it still stops at the caller's
+  `batch_bytes`, so with the default 1 MiB a two-column read holds at most 65,536 rows. A
+  cursor top-k starts at the cursor's batch size and doubles up to 65,536 rows on the same
+  condition, raising the byte cap with it. Larger reads let the expression caches and the
+  top-k screen work on more rows at a time. The tradeoff is memory. Over 300,000 rows a
+  substring filter peaked at 12.3 MB against 6.7 MB, and a top-k at 24.1 MB against
+  2.5 MB, bounded by the query's budgets. Independently of the switch, when the first key
+  of a cursor top-k holds one result per distinct value, its screen remembers which
+  values it rejected for the rest of the batch, so a repeated value is screened once. A
+  rejected value is worse than the heap's worst row, which only improves as rows enter,
+  so it stays rejected.

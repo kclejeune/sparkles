@@ -249,9 +249,9 @@ fast paths, their applicability and the measurements behind cost-model choices.
 Most queries run eagerly, and their operators materialize their results within
 budgets. [X05](specs/X05-streaming-query-execution.md) adds explicit SELECT,
 graph and ASK execution with snapshot-owning cursors. Automatic execution is the
-default over HTTP, in the CLI and in Node. It selects large immutable scans and
-particular OPTIONAL COUNT plans under the documented conditions, and runs every other
-plan eagerly. It is not a universal switch to lazy execution.
+default over HTTP, in the CLI, in Node and in the JVM library. It selects plain
+immutable scans of an estimated thousand rows or more under the documented conditions,
+and runs every other plan eagerly. It is not a universal switch to lazy execution.
 
 Cursors pull bounded batches. Plain immutable scans can share read-only decoded
 columns, while resumable joins avoid materializing their complete output. Hash joins
