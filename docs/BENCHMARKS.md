@@ -989,9 +989,11 @@ and recovery recognizes a torn tail.
 
 ### Concurrent durable commits
 
-These runs measured the default writer and opt-in group commit, turned on by
-`--experimental-group-commit`, on `forge` on 2026-10-17, with the same binary at revision
-758a6a25. `forge` has an Intel Core i5-13500 and an NVMe drive with ext4. The server ran on six CPUs and the client on four, and nothing else ran on the
+These runs measured group commit, now the default, against the writer that
+`--no-group-commit` keeps, on `forge` on 2026-10-17, with the same binary at revision
+758a6a25. Group commit was then opt-in under the flag `--experimental-group-commit`, which
+the switch to the default removed, so the columns named default below are the
+`--no-group-commit` writer. `forge` has an Intel Core i5-13500 and an NVMe drive with ext4. The server ran on six CPUs and the client on four, and nothing else ran on the
 host. Six rounds alternated the two settings, each run in a fresh process on a fresh copy
 of the store. Each cell is the median over the rounds. Every run completed with distinct,
 contiguous receipts and the correct final state. No commit of any run fell back from the
@@ -1040,7 +1042,8 @@ ran on ephemeral Namespace instances (8 vCPUs, ext4, AMD EPYC) with `scripts/nsc
 which alternates the variants in one instance, the server on six CPUs and the client on two.
 The instances are shared, so ranges are wide, and a quiet run is the exception. The
 dataset is the 10.5M-triple one (1,000,000 people). The default writer is `off`. The
-group commit variant is `--experimental-group-commit`, which includes the idle fast path:
+group commit variant was then `--experimental-group-commit` and is now the default. It
+includes the idle fast path:
 a commit that finds no other writer waiting and no fence running synchronizes as the default
 writer does.
 

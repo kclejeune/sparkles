@@ -393,7 +393,7 @@ at the commit that introduces this test, labelled with that commit.
 |---|---|---|
 | HTTP | Paths, methods, parameters, request and response members, status codes and error `code`s in `docs/openapi.json` | The text of error messages, members marked `x-sparkles-experimental`, the UI's private routes |
 | SPARQL and Fuseki | Behaviour that matches Jena and Fuseki | Deliberate differences listed in COMPARISON.md, which change only with a CHANGELOG entry |
-| CLI | Subcommand names, flags, exit codes, `--format json` output | Human-readable output, hidden flags such as `--experimental-group-commit` |
+| CLI | Subcommand names, flags, exit codes, `--format json` output | Human-readable output, hidden flags such as `--no-group-commit-idle-direct` |
 | Rust | Public items of `sparkles` and `sparkles-client` | `sparkles-core` and the other internal crates, which are published only as dependencies |
 | Python, JVM, Node | Public API of the packages | Modules and classes whose names start with `_` or are under `internal` |
 | MCP | Tool names, input schemas and output members | Tool descriptions |

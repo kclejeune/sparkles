@@ -817,7 +817,7 @@ previews report their precondition result without changing the store.
   number.
 - `sparkles log` lists 20 commits unless `--limit` says otherwise.
 - Byte 28 of the commit record, reserved in §5.3 as first written, counts the commits
-  before it that may not have been durable yet. Experimental group commit writes up to
+  before it that may not have been durable yet. Group commit writes up to
   64 commits before their shared sync, so a crash can damage any of them, not just the
   last. Replay treats such damage as a torn tail unless a later commit record shows the
   damaged commit was durable. The count reaches the disk with the next sync, so the

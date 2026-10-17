@@ -38,15 +38,19 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
 * Durable commits. A commit is acknowledged after its WAL record and any new vocabulary
   entries are synchronized, with the two writes issued in parallel. The update vocabulary
   is written in checksummed chunks, so a torn tail is detected and trimmed at open.
-  Opt-in group commit, turned on by `--experimental-group-commit`, shares one
-  synchronization among concurrent writers. It takes SPARQL updates, Graph Store writes,
+  Group commit, on by default for persistent stores, shares one synchronization among
+  concurrent writers. `--no-group-commit` or `SPARKLES_GROUP_COMMIT=off` turns it off, and
+  the Node and Python bindings take a `groupCommit` and a `group_commit` option. A
+  persistent dataset holds up to 64 commits or 4 MiB of log records in its queue, which is
+  the memory this speed costs. It takes SPARQL updates, Graph Store writes,
   uploads, RDF Patch, commit messages and change digests, preconditions, graph-restricted
   writes, SHACL-guarded writes and writes during a compaction. ShEx-guarded datasets commit
   through the group path one commit at a time. A commit that does not qualify takes the
   ordinary path. Commits on a dataset with a full-text, spatial or embedding index are such
   commits. A commit by the only writer, with no fence running, is synchronized as the
-  default writer synchronizes it. `/$/metrics` and `/$/stats` report the synchronization
-  time, the commits per fence, the wait, and why commits fell back or failed.
+  default writer synchronizes it. `/$/metrics` reports the synchronization time, the
+  commits per fence, the wait, and why commits fell back or failed, and `/$/stats/{ds}`
+  whether the dataset groups commits.
   [X09](specs/X09-group-commit-by-default.md) has the design.
 * Strict framing of old logs. A WAL written before logs had a header record is strictly
   framed from the offset where this release first opened it for writing. The offset is
@@ -289,13 +293,10 @@ that work by priority and links each item to its design spec.
   body, so a slow client holds pool memory while it sends. With a pool set, an eager
   result keeps its query's peak estimate until the result object is released.
   [Roadmap](ROADMAP.md) item 7.
-* Group commit is opt-in. It meets the throughput, latency and fairness gates on `forge`,
-  but the switch to the default waits for the 1,000-point power-loss replays on ext4 and
-  XFS, which need a host with the device-mapper `log-writes` target. [Roadmap](ROADMAP.md)
-  item 3 and [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
 * A headerless WAL that this release has never opened for writing keeps the mixed legacy
   rules for the bytes it already holds. A torn record that an older build left there can
-  still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3.
+  still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3 and
+  [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
 * Group commit does not group commits on a dataset with a full-text, spatial or embedding
   index. Such a commit takes the ordinary path, so it is as fast as before but gains
   nothing. [Roadmap](ROADMAP.md) item 86 and

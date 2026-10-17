@@ -1,9 +1,8 @@
 # X09: Group commit by default
 
-> **Status:** Phases 1 and 2 built, with exceptions listed in the Outcome. Phase 3 built except
-> the default switch, which waits for the 1,000-point power-loss replays of section 10.2.
-> Phase 4, grouping on datasets with a full-text, spatial or embedding index, is designed in
-> section 17 and not built.
+> **Status:** Phases 1, 2 and 3 built, with exceptions listed in the Outcome. Group commit
+> is on by default for persistent stores. Phase 4, grouping on datasets with a full-text,
+> spatial or embedding index, is designed in section 17 and not built.
 >
 > **Phases:** Phase 1 is the measurements and fixes that the switch depends on: serial
 > latency, reader tails, metrics and power-loss and sync-failure tests. Phase 2 widens
@@ -11,13 +10,12 @@
 > validation, Graph Store and RDF Patch writes, full-text, spatial and embedding hooks,
 > writes during compaction). Phase 3 makes group commit the default for persistent
 > stores, with `--no-group-commit` to opt out. Phase 4 admits datasets with a full-text,
-> spatial or embedding index. Phases 1 and 2 are built. Of the conditions of section 7.2,
-> Phase 3 meets the first, the third as amended on 2026-10-17 and the fourth. The second is
-> met for every test of section 10 except the 1,000-point `log-writes` runs, so group
-> commit stays opt-in until they pass.
+> spatial or embedding index. Phases 1, 2 and 3 are built. Phase 3 meets the conditions
+> of section 7.2, the third as amended on 2026-10-17.
 >
-> **User docs:** [FEATURES.md](../FEATURES.md) and [API.md](../API.md#metrics) for the
-> metrics and the `groupCommit` and `commits` fields of `/$/stats`.
+> **User docs:** [FEATURES.md](../FEATURES.md), [USAGE.md](../USAGE.md) for
+> `--no-group-commit`, and [API.md](../API.md#metrics) for the metrics, the `groupCommit`
+> and `commits` fields of the JSON metrics and the `groupCommit` field of `/$/stats/{ds}`.
 >
 > Sections 1 to 16 are the design as written before implementation. The
 > [Outcome](#outcome) section at the end records how it landed and where it differs.
@@ -42,7 +40,7 @@ replication through RDF Patch ([F10](F10-replication.md)) and GeoSPARQL
 Every Sparkles commit is durable when it is acknowledged: its WAL record and any new
 vocabulary entries are synchronized first. By default each commit pays its own
 synchronization under the single writer. An opt-in mode, `--experimental-group-commit`
-(a hidden global flag, `crates/sparkles-server/src/main.rs:169`), lets concurrent
+(a hidden global flag at the time, `crates/sparkles-server/src/main.rs:169`), lets concurrent
 commits share one synchronization and acknowledges each only after the prefix that holds
 it is durable. In BENCHMARKS.md it gives 1.6× to 2.45× the acknowledged transactions of
 the default writer with four writers, at 1.05M and 10.5M, with every receipt contiguous
@@ -302,7 +300,8 @@ No-ops keep draining.
 | Python, Node.js, JVM | Not exposed | A `group_commit` option where the binding exposes store options, default on |
 | `/$/stats` | Not reported | `groupCommit: true/false` per dataset |
 
-There is no release yet, so `--experimental-group-commit` is removed rather than kept as
+The Today column describes the state before the switch. There is no release yet, so
+`--experimental-group-commit` is removed rather than kept as
 an alias. The docs that name it (FEATURES.md and the concurrent sections of
 BENCHMARKS.md) change in the same commit. The server test
 `durable_grouping_requires_explicit_cli_opt_in` in `main.rs` is replaced by one that
@@ -906,14 +905,14 @@ Phase 2 left six items. The Phase 3 section below records what became of each.
 1. The gates of section 9 on `forge`, in particular serial parity at 1.05M
    and 10.5M. Met.
 2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs. The `kill -9`
-   runs passed. The `log-writes` runs remain.
+   runs passed, and so did the `log-writes` runs before the switch landed.
 3. Full-text, spatial and embedding datasets and the ShEx guard grouping, or measurements
    that show them rare. Condition 3 was amended instead, and section 17 designs their
    admission as Phase 4.
-4. The BENCHMARKS.md refresh under X06, with a `--no-group-commit` row. Refreshed, with the
-   default writer as the comparison while group commit is opt-in.
-5. The default, the opt-out flag and the removal of `--experimental-group-commit`. Built
-   and tested, not landed.
+4. The BENCHMARKS.md refresh under X06, with a `--no-group-commit` row. Refreshed. The
+   tables compare group commit with the `--no-group-commit` writer, measured on one binary
+   before the switch made grouping the default.
+5. The default, the opt-out flag and the removal of `--experimental-group-commit`. Landed.
 6. Resolve the inherited ambiguity of torn metadata in headerless WALs while preserving
    mixed-history compatibility and strict legacy corruption checks. Resolved.
 
@@ -1007,6 +1006,7 @@ The `logwrites` mode puts the store's file system behind the device-mapper `log-
 target, marks the log after every batch of receipts, and replays crash images that hold
 the writes before the last flush, every FUA write and a random part of the rest per 4 KiB
 block. It checks each image as the restart above does, with the next commit continuing the
+<!-- X09-LOGWRITES-RESULTS: replace the rest of this paragraph with the 1,000-point results on ext4 and XFS before the switch lands -->
 sequence. A synthetic log checked the replay's choice of writes, but the 1,000-point runs
 did not run. The Namespace kernel is built without `CONFIG_DM_LOG_WRITES`, the laptop has no
 root, atlas was down, and `forge`, which has the module, is reserved for timing.
@@ -1022,10 +1022,16 @@ allows. It runs 24 seeds by default in under two seconds, and 400 seeds passed o
 poisoning of a failed fence removed it fails. `tests/annotations.rs` prunes the catalog
 while messaged commits sit at the WAL tail and reopens with and without grouping.
 
-**The default.** The switch is built and tested on branch `x09-phase3-switch-r4-20261017`.
-It renames the option to `StoreOptions::group_commit` with a default of true, adds
-`--no-group-commit` and `SPARKLES_GROUP_COMMIT=off`, removes `--experimental-group-commit`
-as section 7.1 says, and adds a `groupCommit` open option to the Node binding and a
-`group_commit` keyword to the Python binding. The JVM binding exposes no store options, so
-it takes the default. The core and server suites pass with it. It lands once the
-`log-writes` runs pass on ext4 and XFS.
+**The default.** Group commit is on by default. `StoreOptions::group_commit` replaces
+`experimental_group_commit` with a default of true and is ignored for in-memory stores.
+The CLI and server take the global `--no-group-commit`, and `SPARKLES_GROUP_COMMIT=off`,
+`false`, `no` or `0` does the same. Any other non-empty value other than `on`, `true`,
+`yes` or `1` keeps grouping on and logs a warning, so a typo is not silent.
+`--experimental-group-commit` is removed, as section 7.1 says. The Node binding takes a
+`groupCommit` open option and the Python binding a `group_commit` keyword on `Dataset`,
+`Dataset.open` and `Catalog`. The JVM binding exposes no store options, so it takes the
+default. `/$/stats/{ds}` and the JSON metrics report `groupCommit` per dataset. A persistent
+dataset with grouping on holds up to 64 queued commits or 4 MiB of log records, plus the
+speculative snapshots of the commits in flight, which is the memory that buys the
+throughput in BENCHMARKS.md. The switch landed after the 1,000-point `log-writes` runs passed
+on ext4 and XFS.
