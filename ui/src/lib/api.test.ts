@@ -110,10 +110,40 @@ describe('query', () => {
       reasoning: false,
       nocache: true,
     });
-    expect(calls[0].url).toBe('/my%20ds/sparql?nocache=true&send=10&reasoning=false');
+    // the table shows exact totals, so it asks for eager execution explicitly
+    expect(calls[0].url).toBe(
+      '/my%20ds/sparql?nocache=true&send=10&execution=eager&reasoning=false',
+    );
     expect((calls[0].init.headers as Record<string, string>).Accept).toBe(api.SPARKLES_JSON);
     expect(r.vars).toEqual(['s', 'o']);
     expect(r.meta.totalRows).toBe(0);
+  });
+
+  it('downloads leave the execution mode to the server', async () => {
+    const calls = stubFetch(() => new Response('s\n<urn:a>\n'));
+    await api.queryRaw('ds', 'SELECT ?s {}', 'text/tab-separated-values');
+    expect(calls[0].url).toBe('/ds/sparql');
+  });
+
+  it('a response cut off partway is an error, not a shorter answer', async () => {
+    // A server that fails after a streamed answer has started aborts the transfer, so
+    // the body ends in an error after rows that are each well formed.
+    const cut = (first: string) =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(first));
+            c.error(new TypeError('terminated'));
+          },
+        }),
+        { headers: { 'Content-Type': 'text/tab-separated-values' } },
+      );
+    stubFetch(() => cut('?s\n<urn:a>\n'));
+    await expect(api.queryRaw('ds', 'SELECT ?s {}', 'text/tab-separated-values')).rejects.toThrow(
+      'terminated',
+    );
+    stubFetch(() => cut('{"queryType":"SELECT","vars":["s"],"rows":[[{"type":"uri"'));
+    await expect(api.query('ds', 'SELECT ?s {}')).rejects.toThrow();
   });
 
   it('select maps rows to objects with undefined for unbound', async () => {

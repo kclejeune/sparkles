@@ -3530,7 +3530,7 @@ pub(super) fn join_algorithm_tables(ctx: &Ctx, l: &Table, r: &Table) -> Result<M
     let ctl = crate::algo::Control::with_cancellation(
         ctx.cancel.clone(),
         ctx.cancellation.clone(),
-        ctx.deadline,
+        ctx.current_deadline(),
         u64::MAX,
     );
     let mut sorted = memory::allocate("algorithm-join-order", sorted_len, &ctl)?;
@@ -6962,7 +6962,7 @@ pub(super) fn fetch(
     );
     let _entered = span.enter();
     // within the query's deadline too
-    let timeout = ctx.deadline.map_or(ctx.outbound.timeout, |d| {
+    let timeout = ctx.current_deadline().map_or(ctx.outbound.timeout, |d| {
         d.saturating_duration_since(Instant::now())
     });
     let resp = ctx

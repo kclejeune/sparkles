@@ -202,6 +202,28 @@ fn nested_queries_run_up_to_the_limit() {
     });
 }
 
+/// Automatic execution parses without measuring the text first when the thread has at
+/// least 2 MiB of stack left, as the thread of a server worker has. This is the 8 MiB
+/// case, and the 2 MiB thread of the test above takes the measuring branch.
+#[test]
+fn nested_queries_run_up_to_the_limit_automatically() {
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(|| {
+            let ds = dataset();
+            for (what, q) in &nested_queries(MAX_NESTING)[..4] {
+                ds.query_execution(q)
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+            }
+            for (what, q) in nested_queries(MAX_NESTING + 1) {
+                refused(ds.query_execution(&q), what, MAX_NESTING);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn nested_blank_node_plan_runs_on_a_small_stack() {
     on_small_stack(|| {

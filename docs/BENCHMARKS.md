@@ -1484,9 +1484,40 @@ processes at 10.5M, show the tradeoff:
 | TSV, 500,000 rows | **89.868** | 123.520 |
 
 For the complete scan, the query's allocation estimate peaks at 241.0 MiB for eager
-result columns and 1.0 MiB when streaming. Eager execution stays the default because it
-is faster on several shapes, and automatic selection streams only the large scans and
-OPTIONAL counts where streaming measured faster.
+result columns and 1.0 MiB when streaming. Automatic execution is the default over HTTP,
+in the CLI and in Node. It streams only the large scans and OPTIONAL counts where
+streaming measured faster and runs every other plan eagerly, because eager is faster on
+several shapes.
+
+The table below measures the change of default on forge at 10.5M. Each case is one
+request to a fresh server process, which reports the query's allocation estimate in the
+native metadata and its peak RSS in `VmHWM`. The baseline is 6f0f928c, whose default
+was eager, and the candidate runs the same scan by default and with `execution=eager`.
+
+| 10.5M, one request | Eager | Automatic |
+|---|---:|---:|
+| Full scan, first 10 rows, allocation estimate | 241.0 MiB | **1.0 to 1.1 MiB** |
+| Full scan, first 10 rows, server peak RSS | 804 MiB | **63 to 66 MiB** |
+| Full scan, first 10 rows, wall time | 240 to 320 ms | **2 to 5 ms** |
+| Full scan, 10.5M rows as TSV, server peak RSS | 881 to 889 MiB | **580 to 582 MiB** |
+| Full scan, 10.5M rows as TSV, wall time | 5.20 to 5.69 s | 4.87 to 5.46 s |
+| Name scan, 1.02M rows, allocation estimate | 16.3 MB | **5.0 MB** |
+| Name scan, 1.02M rows, server peak RSS | 140 MiB | **121 MiB** |
+
+A streamed answer stopped after `send` rows reports an unknown total, where the eager
+answer counted all 10.5M rows. The automatic decision costs a small query nothing that
+`perf stat` can see. Over 1000 requests each of `star-lookup`, `values-star`,
+`employee-docs` and `star-join` at 1.05M, with a unique comment so that no request takes
+the in-place path, the server's user-space instructions per request moved by -0.2% to
++0.1% against the baseline.
+
+Interleaved A/B screens on forge compared 210f52fc with 6f0f928c at 1.05M and 10.5M
+with the bench queries and a full scan. No query's median server or wall time regressed
+by 10% or more. At 10.5M, the server time of the name scan fell by 72%, because the
+cursor's batches no longer wait for the whole answer, and its wall time for all 1.02M
+rows in native JSON stayed at 553 ms. At 1.05M the full scan's server time fell by 81%
+with the same wall time. The geometric mean of the server times fell by 6.3% at 1.05M and
+5.2% at 10.5M, and that of the wall times moved by -0.7% and +0.1%.
 
 **mimalloc** keeps freed memory in per-thread heaps, and the server hands idle memory back
 to the OS after a second (`--idle-release-ms`). On the development laptop, a fresh 10.5M

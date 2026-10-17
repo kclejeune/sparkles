@@ -1,4 +1,5 @@
-//! Explicit native query execution with bounded response backpressure.
+//! Native query execution with bounded response backpressure, for a request that asks for
+//! streaming and for an answer that automatic execution streams.
 
 use super::*;
 use crate::obs::DeferredReport;
@@ -20,23 +21,29 @@ pub(super) struct Request {
     pub thrift: bool,
     pub rdf_format: OutFormat,
     pub native_graph: bool,
-    pub execution: ExecutionMode,
     /// the declared and runtime prefixes, for graph results (spec C20 §5)
     pub prefixes: std::collections::BTreeMap<String, String>,
     /// the I/O profile of the request (`profile=io`)
     pub io: Option<Arc<sparkles::ioacct::Profile>>,
 }
 
-/// The mode actually run for a request. Automatic execution falls back to eager
-/// when the negotiated encoding has no cursor writer, which today is SPARQL
-/// Results Thrift. An explicit streaming request keeps its mode so that the
-/// unsupported combination is reported as an error.
-pub(super) fn effective_mode(execution: ExecutionMode, thrift: bool) -> ExecutionMode {
-    if thrift && execution == ExecutionMode::Auto {
-        ExecutionMode::Eager
-    } else {
-        execution
-    }
+/// How an opened execution is answered: everything of [`Request`] except what opening
+/// it needed.
+pub(super) struct Serve {
+    pub params: Params,
+    pub uri: Uri,
+    pub guard: CancelOnDrop,
+    pub limit: Option<u64>,
+    pub format: SolutionsFormat,
+    pub thrift: bool,
+    pub rdf_format: OutFormat,
+    pub native_graph: bool,
+    pub prefixes: std::collections::BTreeMap<String, String>,
+    pub io: Option<Arc<sparkles::ioacct::Profile>>,
+    pub timeout: Option<std::time::Duration>,
+    pub with_extra: bool,
+    /// the start of the query, for the phase spans (`None` when OTel is off)
+    pub t0: Option<std::time::SystemTime>,
 }
 
 pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
@@ -51,24 +58,76 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         thrift,
         rdf_format,
         native_graph,
-        execution,
-        prefixes: prefix_map,
+        prefixes,
         io,
     } = request;
-    let execution = effective_mode(execution, thrift);
     let at = history::at_param(&params)?;
-    let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let timeout = options.timeout;
     let with_extra = !options.default_graph_extra.is_empty();
+    let t0 = crate::otel::start();
     let captured_ds = ds.clone();
-    let (mut cursor, seq, resolved) = blocking(move || {
+    let (cursor, seq, resolved) = blocking(move || {
         let (snapshot, resolved) = history::snapshot_for(&captured_ds, at.as_ref(), &options)?;
         let seq = snapshot.commit;
-        let cursor = query_execution(snapshot, &query, &options, &Default::default(), execution)?;
+        let cursor = query_execution(
+            snapshot,
+            &query,
+            &options,
+            &Default::default(),
+            ExecutionMode::Streaming,
+        )?;
         Ok((cursor, seq, resolved))
     })
     .await
     .map_err(|e| with_timeout(e, timeout))?;
+    serve(
+        ds,
+        cursor,
+        seq,
+        resolved,
+        Serve {
+            params,
+            uri,
+            guard,
+            limit,
+            format,
+            thrift,
+            rdf_format,
+            native_graph,
+            prefixes,
+            io,
+            timeout,
+            with_extra,
+            t0,
+        },
+    )
+    .await
+}
+
+/// Answer an opened execution, writing a cursor's batches as they come.
+pub(super) async fn serve(
+    ds: Arc<Dataset>,
+    mut cursor: QueryExecution,
+    seq: u64,
+    resolved: Option<sparkles::history::Resolved>,
+    serve: Serve,
+) -> ApiResult {
+    let Serve {
+        params,
+        uri,
+        guard,
+        limit,
+        format,
+        thrift,
+        rdf_format,
+        native_graph,
+        prefixes: prefix_map,
+        io,
+        timeout,
+        with_extra,
+        t0,
+    } = serve;
+    let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     if thrift && cursor.kind() == QueryKind::Select && !matches!(cursor, QueryExecution::Eager(_)) {
         return Err(Error::Unsupported(
             "streaming SELECT does not support Thrift; choose JSON, XML, CSV, TSV or native JSON"
@@ -77,6 +136,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         .into());
     }
     let graph = matches!(cursor.kind(), QueryKind::Construct | QueryKind::Describe);
+    let kind = cursor.kind();
     let content_type =
         if thrift && cursor.kind() == QueryKind::Select && format != SolutionsFormat::Sparkles {
             jena_formats::RESULTS_THRIFT
@@ -89,7 +149,12 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         .iter()
         .map(|(a, b)| (a.clone(), b.clone()))
         .collect::<Vec<_>>();
-    let control = stream::StreamControl::new(cursor.cancellation_token(), cursor.deadline());
+    let control = stream::StreamControl::new(
+        cursor.cancellation_token(),
+        cursor.deadline(),
+        cursor.deadline_pause(),
+        timeout,
+    );
     let completed: Arc<parking_lot::Mutex<Option<CursorStats>>> = Default::default();
     let stats_slot = completed.clone();
     // the plan as it stood when a native JSON stream failed before its first byte
@@ -189,6 +254,9 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
                 Some(_) => (Some(Outcome::Error), None),
                 None => (None, None),
             };
+            if let Some(stats) = &stats {
+                crate::otel::cursor_done(t0, kind, stats, serialize_ms);
+            }
             let mut timing = stats.as_ref().map(|s| s.timing.clone());
             if let Some(t) = &mut timing {
                 t.serialize_ms = serialize_ms;

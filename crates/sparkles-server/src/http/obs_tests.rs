@@ -1207,7 +1207,7 @@ async fn cursor_formats_send_and_deferred_completion_match_eager() {
     let s = server();
     for format in ["json", "xml", "csv", "tsv"] {
         let uri = format!("{ALL}&format={format}");
-        let eager = get(&s.app, &uri).await;
+        let eager = get(&s.app, &format!("{uri}&execution=eager")).await;
         let res = s
             .app
             .clone()
@@ -1423,7 +1423,7 @@ async fn cursor_graph_and_ask_formats_use_the_negotiated_query_form() {
             form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
         );
         for fmt in ["json", "xml", "csv", "tsv", "sparkles"] {
-            let eager = get(&s.app, &format!("{uri}&format={fmt}")).await;
+            let eager = get(&s.app, &format!("{uri}&format={fmt}&execution=eager")).await;
             let pull = get(&s.app, &format!("{uri}&format={fmt}&execution=streaming")).await;
             assert_eq!(pull.status, StatusCode::OK, "{}", pull.text());
             assert_eq!(pull.headers["content-type"], eager.headers["content-type"]);
@@ -1468,28 +1468,10 @@ async fn cursor_graph_and_ask_formats_use_the_negotiated_query_form() {
     assert_eq!(doc["meta"]["status"], "stopped");
 }
 
-#[test]
-fn automatic_execution_uses_eager_when_thrift_has_no_cursor_writer() {
-    use super::cursor::effective_mode;
-    use sparkles::sparql::ExecutionMode;
-    assert_eq!(
-        effective_mode(ExecutionMode::Auto, true),
-        ExecutionMode::Eager
-    );
-    assert_eq!(
-        effective_mode(ExecutionMode::Auto, false),
-        ExecutionMode::Auto
-    );
-    assert_eq!(
-        effective_mode(ExecutionMode::Streaming, true),
-        ExecutionMode::Streaming
-    );
-}
-
 #[tokio::test]
 async fn automatic_thrift_results_match_eager() {
     let s = server();
-    let eager = get(&s.app, &format!("{ALL}&format=thrift")).await;
+    let eager = get(&s.app, &format!("{ALL}&format=thrift&execution=eager")).await;
     let auto = get(&s.app, &format!("{ALL}&format=thrift&execution=auto")).await;
     assert_eq!(auto.status, StatusCode::OK, "{}", auto.text());
     assert_eq!(auto.headers["content-type"], eager.headers["content-type"]);
@@ -1500,7 +1482,7 @@ async fn automatic_thrift_results_match_eager() {
 async fn automatic_small_queries_preserve_eager_results() {
     let s = server();
     for fmt in ["json", "xml", "csv", "tsv"] {
-        let eager = get(&s.app, &format!("{ALL}&format={fmt}")).await;
+        let eager = get(&s.app, &format!("{ALL}&format={fmt}&execution=eager")).await;
         let auto = get(&s.app, &format!("{ALL}&format={fmt}&execution=auto")).await;
         assert_eq!(auto.status, StatusCode::OK, "{}", auto.text());
         assert_eq!(auto.body, eager.body);
@@ -1527,4 +1509,237 @@ async fn cache_capacities_are_server_wide_and_unlabelled() {
         assert!(sample(&m, &series).is_some(), "{series}");
     }
     assert!(!m.contains("sparkles_block_cache_capacity_bytes{"));
+}
+
+/// A dataset `big` of one million `<urn:s{i}> <urn:p> i` triples in one immutable base,
+/// the smallest scan that automatic execution streams.
+fn million(s: &Server) {
+    let mut data = String::with_capacity(32 << 20);
+    for i in 0..1_000_000 {
+        data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+    }
+    let ds = s.state.attach("big", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+}
+
+const BIG_SCAN: &str =
+    "/big/sparql?query=SELECT%20%3Fs%20%3Fo%20WHERE%20%7B%3Fs%20%3Curn%3Ap%3E%20%3Fo%7D";
+
+#[tokio::test]
+async fn the_default_streams_a_large_scan_and_eager_opts_out() {
+    let s = server();
+    million(&s);
+    // the default is automatic: the scan streams and stops after the rows it sends
+    let auto = get(&s.app, &format!("{BIG_SCAN}&format=sparkles&send=10")).await;
+    assert_eq!(auto.status, StatusCode::OK, "{}", auto.text());
+    let j = auto.json();
+    assert_eq!(j["meta"]["status"], "stopped");
+    assert_eq!(j["meta"]["totalRows"], J::Null);
+    assert_eq!(j["meta"]["sentRows"], 10);
+    // `execution=eager` runs the whole scan and reports its total
+    let eager = get(
+        &s.app,
+        &format!("{BIG_SCAN}&format=sparkles&send=10&execution=eager"),
+    )
+    .await;
+    assert_eq!(eager.status, StatusCode::OK, "{}", eager.text());
+    let j = eager.json();
+    assert_eq!(j["meta"]["totalRows"], 1_000_000);
+    assert_eq!(j["meta"]["sentRows"], 10);
+    // the whole streamed answer has the eager rows in the eager order
+    let streamed = get(&s.app, &format!("{BIG_SCAN}&format=tsv")).await;
+    let collected = get(&s.app, &format!("{BIG_SCAN}&format=tsv&execution=eager")).await;
+    assert_eq!(streamed.status, StatusCode::OK);
+    assert!(streamed.header("content-length").is_empty());
+    assert_eq!(streamed.body, collected.body);
+    // A request whose row budget the scan is expected to pass stays eager, so it fails
+    // with a status before any output instead of partway through a stream.
+    let capped = get(&s.app, &format!("{BIG_SCAN}&format=tsv&max-rows=500000")).await;
+    assert_eq!(
+        capped.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        capped.text()
+    );
+    // A lowered result-size budget does not keep a scan eager. It streams, and a result
+    // that passes the budget within the first 1 MiB is refused with a status before any
+    // output, as the server-wide budget refuses it.
+    let small = get(
+        &s.app,
+        &format!("{BIG_SCAN}&format=sparkles&send=10&max-result-mb=64"),
+    )
+    .await;
+    assert_eq!(small.status, StatusCode::OK, "{}", small.text());
+    assert_eq!(small.json()["meta"]["status"], "stopped");
+    let tiny = get(&s.app, &format!("{BIG_SCAN}&format=tsv&max-result-mb=1")).await;
+    assert_eq!(
+        tiny.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        tiny.text()
+    );
+    assert_eq!(tiny.json()["budget"], "result-bytes");
+    // a scan expected to pass `max-rows-produced` stays eager and fails before any output
+    let produced = get(
+        &s.app,
+        &format!("{BIG_SCAN}&format=tsv&max-rows-produced=500000"),
+    )
+    .await;
+    assert_eq!(
+        produced.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        produced.text()
+    );
+}
+
+#[tokio::test]
+async fn the_default_runs_thrift_eagerly() {
+    let s = server();
+    million(&s);
+    // the cursor writer has no Thrift encoding, so a streamed answer would be an error
+    let r = get(&s.app, &format!("{BIG_SCAN}&format=thrift")).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&r.body[..r.body.len().min(200)])
+    );
+    assert!(r.header("content-type").contains("thrift"));
+}
+
+#[tokio::test]
+async fn a_stored_query_with_values_runs_eagerly() {
+    let s = server();
+    million(&s);
+    let definition = serde_json::json!({
+        "query": "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+        "parameters": { "o": { "type": "integer", "required": false } }
+    });
+    let put = send(
+        &s.app,
+        Request::put("/$/queries/big/scan")
+            .header("content-type", "application/json")
+            .body(Body::from(definition.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(put.status, StatusCode::CREATED, "{}", put.text());
+    // a run with a value has initial bindings, which rule out every automatic plan
+    let bound = get(&s.app, "/big/queries/scan?o=5&format=sparkles&send=10").await;
+    assert_eq!(bound.status, StatusCode::OK, "{}", bound.text());
+    assert_eq!(bound.json()["meta"]["totalRows"], 1);
+    // without one the same query is a plain scan and streams
+    let free = get(&s.app, "/big/queries/scan?format=sparkles&send=10").await;
+    assert_eq!(free.status, StatusCode::OK, "{}", free.text());
+    assert_eq!(free.json()["meta"]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn a_server_can_default_to_eager_execution() {
+    let s = server_with(|st| st.default_execution = sparkles::sparql::ExecutionMode::Eager);
+    million(&s);
+    let eager = get(&s.app, &format!("{BIG_SCAN}&format=sparkles&send=10")).await;
+    assert_eq!(eager.json()["meta"]["totalRows"], 1_000_000);
+    let auto = get(
+        &s.app,
+        &format!("{BIG_SCAN}&format=sparkles&send=10&execution=auto"),
+    )
+    .await;
+    assert_eq!(auto.json()["meta"]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn a_slow_steady_reader_completes_a_stream() {
+    use futures_util::StreamExt;
+    let s = server();
+    let ds = s.state.attach("fat", DbType::Mem, None).unwrap();
+    // 400 literals of 10 KiB make about 4 MiB of TSV, far more than the buffered response
+    // and trivial work for the query
+    let payload = "x".repeat(10 << 10);
+    let mut data = String::new();
+    for i in 0..400 {
+        data.push_str(&format!("<urn:big{i}> <urn:p> \"{payload}\" .\n"));
+    }
+    ds.store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // The reader takes a chunk every 40 ms, so the transfer outlasts the one-second
+    // timeout, but the reader never makes the query wait for as long as the timeout.
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/fat/sparql?query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn%3Ap%3E%20%3Fo%7D&format=tsv&timeout=1&execution=streaming",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let began = std::time::Instant::now();
+    let mut body = res.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        bytes.extend_from_slice(&chunk.expect("a steady reader gets the whole answer"));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        began.elapsed() > Duration::from_millis(1200),
+        "the transfer must outlast the timeout, took {:?}",
+        began.elapsed()
+    );
+    assert_eq!(String::from_utf8(bytes).unwrap().lines().count(), 401);
+}
+
+#[tokio::test]
+async fn a_late_failure_of_a_default_stream_aborts_the_transfer() {
+    use futures_util::StreamExt;
+    let s = server();
+    million(&s);
+    // A reader that takes nothing for longer than the timeout gets a cut-off transfer
+    // after a successful status. The timeout leaves the scan room to send its first
+    // 1 MiB while the other tests load their own million rows in a debug build.
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!("{BIG_SCAN}&format=tsv&timeout=5"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "the scan must start within its timeout"
+    );
+    let mut body = res.into_body().into_data_stream();
+    let first = body.next().await.expect("a first chunk").unwrap();
+    assert!(first.starts_with(b"?s\t?o\n"));
+    tokio::time::sleep(Duration::from_millis(6500)).await;
+    let mut failed = false;
+    while let Some(chunk) = body.next().await {
+        if chunk.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(
+        failed,
+        "a stream past its deadline must not end successfully"
+    );
 }

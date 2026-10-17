@@ -407,6 +407,7 @@ happens to materialized inferences, and the limits.
 | `--tls-cert FILE`, `--tls-key FILE` | | Serve HTTPS with this PEM certificate chain and key (see [TLS](#tls)). Both are re-read on SIGHUP and when they change. |
 | `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
+| `--default-execution MODE` | `auto` | How a query runs when its request has no `execution=`. `auto` streams the large scans and OPTIONAL counts that measured faster as cursors and runs the rest eagerly, and `eager` runs every query eagerly. See [incremental query execution](#incremental-query-execution). |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
 | `--max-timeout S` | `1800` | Largest `timeout=` a query or update may ask for; `0` means unlimited. Never below `--timeout` or `--update-timeout`. |
 | `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
@@ -4134,7 +4135,7 @@ across batches. A hash join keeps its build side in memory, DISTINCT keeps the k
 has seen, and an eligible aggregate keeps its group state. Sorting and unsupported
 operators read their whole input first, and the plan marks where they do. Kept state
 and terms the query creates count against the budget. A query that exceeds the budget
-fails, and nothing spills to disk. The ordinary `query` and `select` calls still run
+fails, and nothing spills to disk. The ordinary `query` and `select` calls run
 eagerly. Cursors inside a native transaction are not supported.
 
 `graph_cursor` and `graph_cursor_with` return batches of decoded quads for CONSTRUCT
@@ -4148,43 +4149,71 @@ straight from the batches. A writer error can leave partial output, so check the
 result it returns. `results::write_cursor_native_json` also writes the native snapshot
 metadata.
 
-HTTP clients opt in explicitly:
+HTTP queries run in automatic mode unless they ask otherwise. Automatic execution
+streams a plain SELECT of scans and projections when it expects at least one million
+rows. The data must come from immutable blocks with no pending changes, any graph
+restriction must cover whole blocks, the query must have no restored initial bindings
+or offset, and its row budgets must cover the estimate. There must also be enough memory
+to own the blocks and to hold batches of at least 4,096 rows and 128 KiB. A `COUNT(*)`
+over a single-key OPTIONAL between two plain scans also streams when its estimated work
+reaches one million rows and the result cache is off or bypassed. Every other plan runs
+eagerly and answers exactly as `execution=eager` does. `execution=streaming` streams
+every query, and `execution=eager` streams none:
 
 ```sh
 curl --fail --get http://localhost:3030/ds/sparql \
   --data-urlencode 'query=SELECT ?s ?o { ?s <urn:p> ?o }' \
-  --data-urlencode 'execution=streaming' --data-urlencode 'format=json'
+  --data-urlencode 'execution=eager' --data-urlencode 'format=json'
 ```
 
-When a client reads slowly, the query pauses once the bounded output buffers are full.
-A disconnect or a deadline stops the query even while it waits. An error that happens
-after the response has started aborts the response, so only a transfer that finishes
-successfully is a complete answer. With `send=N`, the native metadata reports `stopped`
-and an unknown total when the cursor stops after the first N rows.
+`sparkles serve --default-execution eager` makes eager execution the default for every
+request that does not name a mode. The UI's result table asks for eager execution,
+because it shows the full row count, and its downloads use the server's default.
+
+When a client reads a streamed answer slowly, the query pauses once the bounded output
+buffers are full. A disconnect stops the query even while it waits. The query's
+`timeout` counts the time the query itself spends and not the time it waits for the
+client, so a slow reader does not run it out. A client that reads nothing for longer than
+the `timeout` ends the stream, and a request without a timeout has no such limit. The
+limit applies to each wait and not to the whole transfer, so a client that keeps reading,
+however slowly, keeps the query's snapshot and memory until it finishes. An error that
+happens after the first 1 MiB of the response has been sent aborts the response. The
+status was already `200`, and in a line format such as TSV or N-Triples the rows before
+the cut are well formed, so only a transfer that finishes successfully is a complete
+answer.
+`curl --fail` does not catch this case, but curl exits with an error for a transfer that
+ends early. The Rust client, the CLI, the TypeScript client and the UI report a cut-off
+transfer as an error. With `send=N`, the native metadata reports `stopped` and an
+unknown total when the cursor stops after the first N rows.
 [API.md](API.md#applicationx-sparklesjson-ui-result-format) describes the metadata and
 plan fields.
 
-The CLI accepts `sparkles query --execution streaming` or `--execution auto`, both
-locally and through `--server`, and HTTP accepts `execution=auto` as well. In auto mode,
-Sparkles streams a plain SELECT of scans and projections when it expects at least one
-million rows. The data must come from immutable blocks with no pending changes, any
-graph restriction must cover whole blocks, and the query must have no restored initial
-bindings or offset. There must also be enough memory to own the blocks and to hold
-batches of at least 4,096 rows and 128 KiB. A `COUNT(*)` over a single-key OPTIONAL
-between two plain scans also streams when its estimated work reaches one million rows
-and the result cache is off or bypassed. Every other plan runs eagerly. Rust callers
-choose the same policy with `query_execution_with` and `ExecutionMode::Auto`.
+`sparkles query` takes `--execution eager`, `streaming` or `auto`, both locally and
+through `--server`. Without it, a local query runs in automatic mode and prints what an
+eager query prints when its plan stays eager, except that the `text` table, the default
+output, always runs eagerly because it measures every row before printing one. A query
+through `--server` runs in the server's default mode. A streamed `text` result is printed
+as TSV. A local `sparkles query --timeout` that streams its answer counts the time its
+output is blocked, for example by a slow pipe, because the command has no reader to
+separate that time from the query's own. Rust callers choose a mode with
+`Dataset::query_execution_with`, and `Dataset::query_execution` runs in
+`ExecutionMode::Auto`, the default of `ExecutionMode`. `Dataset::query` and
+`Dataset::query_with` return a collected result and always run eagerly.
 
 Python has `Dataset.select_cursor` and `Dataset.graph_cursor`. A Python cursor can be
 iterated, closed with `close()`, used as a context manager, asked for stats and
 serialized directly. When a Python cursor fails, during iteration or in `serialize()`,
 its status becomes `failed` and every later `next()` raises `InvalidInputError`, so a
 loop cannot mistake it for a complete answer. `serialize()` responds to Ctrl-C as a
-query does. Node accepts `execution: 'streaming' | 'auto'` in its query options, and
-`queryToStream` returns serialized output. JVM callers turn streaming on with the
-context symbol `Sparkles.STREAMING_EXECUTION`. Jena then reads SELECT results in
-batches and handles graph queries through its usual adapters. Close cursors and
-iterators when stopping early.
+query does. `Dataset.query` and `Dataset.select` still run eagerly, because their
+results are collected values whose iteration cannot fail. Node runs `query`, `select`,
+`construct` and `queryToStream` in automatic mode by default and accepts
+`execution: 'eager' | 'streaming' | 'auto'` in its query options. A streamed Node result
+has no `size` and can reject while it is read. Queries in a Node transaction run eagerly.
+JVM callers keep eager execution by default and turn streaming on with the context
+symbol `Sparkles.STREAMING_EXECUTION`. Jena then reads SELECT results in batches and
+handles graph queries through its usual adapters. Close cursors and iterators when
+stopping early.
 
 ### Registered scalar functions
 

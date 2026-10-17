@@ -513,6 +513,19 @@ impl Dataset {
         )
     }
 
+    /// Run a query in the default [`ExecutionMode::Auto`](crate::sparql::ExecutionMode):
+    /// the plans that measured faster as cursors return
+    /// [`QueryExecution::Select`](crate::sparql::QueryExecution), and every other plan
+    /// runs eagerly. [`Dataset::query`] always runs eagerly.
+    pub fn query_execution(&self, query: &str) -> Result<crate::sparql::QueryExecution> {
+        self.query_execution_with(
+            query,
+            &self.query_options(),
+            &Default::default(),
+            Default::default(),
+        )
+    }
+
     /// Open eager, explicit pull, or conservatively selected automatic execution.
     pub fn query_execution_with(
         &self,

@@ -246,11 +246,12 @@ fast paths, their applicability and the measurements behind cost-model choices.
 
 ### Eager execution and cursors have different memory costs
 
-The ordinary query path remains eager: operators materialize their results within
+Most queries run eagerly, and their operators materialize their results within
 budgets. [X05](specs/X05-streaming-query-execution.md) adds explicit SELECT,
-graph and ASK execution with snapshot-owning cursors. Eligible automatic execution
-currently selects large immutable scans and particular OPTIONAL COUNT plans, under
-the documented conditions. It is not a universal switch to lazy execution.
+graph and ASK execution with snapshot-owning cursors. Automatic execution is the
+default over HTTP, in the CLI and in Node. It selects large immutable scans and
+particular OPTIONAL COUNT plans under the documented conditions, and runs every other
+plan eagerly. It is not a universal switch to lazy execution.
 
 Cursors pull bounded batches. Plain immutable scans can share read-only decoded
 columns, while resumable joins avoid materializing their complete output. Hash joins

@@ -1592,8 +1592,10 @@ Query parameters beyond the standard protocol:
   result. It needs the `metrics` permission, which every caller has without authentication,
   and answers `403` otherwise. Any other value of `profile` answers `400`. See
   [the I/O profile](#the-io-profile).
-* `execution=eager|streaming|auto` chooses how the query runs. The default is `eager`.
-  `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
+* `execution=eager|streaming|auto` chooses how the query runs. The default is `auto`, or
+  `eager` on a server started with `--default-execution eager`. `eager` materializes the
+  whole result before the response starts, and `streaming` writes every query from a
+  cursor. `streaming` supports SELECT in JSON, XML, CSV, TSV and native Sparkles JSON, ASK,
   and CONSTRUCT and DESCRIBE in RDF or native Sparkles JSON. The query reads from a
   snapshot taken when it starts, produces bounded batches, and pauses when the response
   buffers are full. Scans, FILTER and BIND without EXISTS, projection, OFFSET, LIMIT,
@@ -1614,21 +1616,40 @@ Query parameters beyond the standard protocol:
   aggregate query that the cache serves still runs eagerly. In both cases, any graph
   restriction must cover whole blocks, the query must have no restored initial bindings
   or offset, and there must be enough memory to own the blocks and to hold batches of at
-  least 4,096 rows and 128 KiB. Every other plan runs eagerly. A request for SPARQL
-  Results Thrift also runs eagerly, because that encoding has no streaming writer. The
-  policy is deliberately narrow, and it can widen as more query shapes prove faster when
-  streamed.
+  least 4,096 rows and 128 KiB. A scan whose estimate exceeds the request's row budgets
+  (`max-rows` or `max-rows-produced`) runs eagerly, so that the budget fails it with a
+  status before any output. Every other plan runs eagerly, with the same response as
+  `execution=eager`. A query that ran in under 10 ms the last time also runs eagerly
+  without being planned for the decision. A request for SPARQL Results Thrift runs
+  eagerly because that encoding has no streaming writer. A stored-query run with
+  parameter values also runs eagerly, because initial bindings rule out every automatic
+  plan. A streamed answer that passes a lowered `max-result-mb` within its first
+  1 MiB is refused with a status before any output, as an eager one is. The policy is
+  deliberately narrow, and it can widen as more query shapes prove faster when streamed.
 
-  The memory and work budgets cover the whole cursor, including batches it still holds
-  and terms it generates. The deadline includes time spent waiting for the client. An
-  error before the response starts gets the normal status and JSON error. A later error
-  aborts the body transfer, so treat a failed or truncated transfer as a partial answer.
-  The access log entry and the metrics are recorded once both the query and the response
-  body have finished. Streaming requests skip the full-result cache. Stored-query runs
-  accept the same option.
+  A streamed answer differs from an eager one in what the caller sees. The memory and
+  work budgets cover the whole cursor, including batches it still holds and terms it
+  generates. The deadline counts the query's own time and not the time spent waiting for
+  the client, so a slow reader does not run it out. A client that reads nothing for
+  longer than the request's `timeout` ends the stream as a timeout. That limit applies to
+  each wait and not to the whole transfer, and the snapshot and the query's memory grant
+  stay held until the body ends. An error before the response starts gets the normal
+  status and JSON error. An error after the first 1 MiB has been sent, such as a timeout
+  or an exhausted budget, aborts the body transfer. The client then sees a truncated
+  response with a `200` status, and in TSV, CSV or N-Triples the rows before
+  the cut are well formed, so only a transfer that completes is a complete answer. Treat
+  a failed or truncated transfer as an error. The clients Sparkles ships do. With `send`,
+  the native metadata reports `stopped` and an unknown total instead of the full count.
+  Rows come in the same order as eagerly. Streamed answers skip the full-result cache,
+  and the access log entry and the metrics are recorded once both the query and the
+  response body have finished. `execution=eager` restores the previous behaviour for one
+  request, and stored-query runs accept the same option. The MCP tools, GraphQL, SPARQL
+  diffs and `/{ds}/explain` always run eagerly, because each of them returns one
+  document built from the whole result.
 * `send=<n>` caps the number of rows serialized. The UI uses it so that a huge result does
-  not hang the browser. With eager execution, the native metadata reports the full count.
-  With streaming, the query stops after the first n rows. `meta.status` is then
+  not hang the browser, and asks for eager execution, because it shows the full count.
+  With eager execution, the native metadata reports the full count. With streaming,
+  including a scan that `auto` streams, the query stops after the first n rows. `meta.status` is then
   `stopped`, and `meta.totalRows` is `null` unless the cursor had already reached the
   end. A SPARQL LIMIT ends the query normally.
 * `reasoning=true|false` includes or excludes materialized inferences. The default is
@@ -7891,7 +7912,11 @@ as it is serialized, so server memory stays flat. An error after that point, suc
 budget running out at 1.2 GiB, aborts the transfer, and the client sees a truncated
 response instead of a status code. A query result whose smallest encoding already
 exceeds the budget is refused with `507` before anything is sent. A client that
-disconnects stops the serialization.
+disconnects stops the serialization. A query that runs as a cursor, which by default
+includes a scan of a million rows or more, is computed while it is sent, so its timeout
+and its memory and row budgets can also end the transfer after it has started. The
+`execution` parameter of [the query endpoint](#per-dataset-sparql-protocol-fuseki-compatible)
+describes when that happens, and `execution=eager` avoids it.
 
 **Large request bodies.** Graph Store PUT/POST bodies over 16 MiB, and upload files, are
 written to a temporary file as they arrive rather than held in memory. A large PUT,
