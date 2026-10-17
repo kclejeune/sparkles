@@ -1041,12 +1041,14 @@ fn pull(
     }
     let eager = matches!(c.rows, Rows::Query(_) | Rows::Collected(_) | Rows::Scan(_));
     let done = drained && eager;
+    let batch = table.finish(cells, rows, width, done);
     if done {
         lock.take();
     } else {
+        // stamped once the batch is built, which is the query's own time
         c.returned = Some(Instant::now());
     }
-    Ok(Some(table.finish(cells, rows, width, done)))
+    Ok(Some(batch))
 }
 
 struct SelectCursor {
@@ -1214,7 +1216,8 @@ impl NativeResult {
             cursor: Arc::new(Mutex::new(Some(Cursor {
                 rows,
                 pos: 0,
-                returned: None,
+                // the time until the first pull is the caller's too
+                returned: Some(Instant::now()),
             }))),
             metadata,
             statistics: Default::default(),

@@ -337,3 +337,26 @@ test('a slow consumer does not run out a streaming timeout', { timeout: 30000 },
     await ds.close();
   }
 });
+
+test(
+  'a streaming timeout leaves out the time before the first read',
+  { timeout: 30000 },
+  async () => {
+    const ds = Dataset.memory();
+    try {
+      const data = Array.from({ length: 200 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+      await ds.load(data, { format: 'ttl' });
+      const result = await ds.select('SELECT ?s ?o WHERE { ?s <urn:p> ?o }', {
+        execution: 'streaming',
+        timeout: 200,
+        batchSize: 10,
+      });
+      // The caller opens the result and does other work for longer than the timeout
+      // before it reads the first row.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      assert.equal((await result.toArray()).length, 200);
+    } finally {
+      await ds.close();
+    }
+  },
+);
