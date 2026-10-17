@@ -45,7 +45,7 @@ pub(super) struct Serve {
     /// the start of the query, for the phase spans (`None` when OTel is off)
     pub t0: Option<std::time::SystemTime>,
     /// The quick-query key of an answer that automatic execution chose to stream, and
-    /// when the request began to run it. A streamed answer that completes in one whole
+    /// when its run began on the thread that planned it. A streamed answer that completes in one whole
     /// body is remembered with its time, as an eager one is, so that a quick query runs
     /// in place again from its next run on.
     pub quick: Option<(u64, Instant)>,
@@ -292,6 +292,10 @@ pub(super) async fn serve(
     let serialized = match serialized {
         Ok(serialized) => serialized,
         Err(error) => {
+            // a failed run is not known to be quick, as for an eager answer
+            if let Some((key, _)) = quick {
+                QUICK.record(key, f64::INFINITY);
+            }
             let mut error = with_timeout(error, timeout);
             if let (Some(plan), Some(body)) = (failed_plan.lock().take(), error.1.as_object_mut()) {
                 body.insert("plan".into(), plan);
@@ -313,7 +317,13 @@ pub(super) async fn serve(
             }
             Body::from(body)
         }
-        stream::Serialized::Streamed(body) => body,
+        stream::Serialized::Streamed(body) => {
+            // a body too large to buffer is not quick, as for an eager answer
+            if let Some((key, _)) = quick {
+                QUICK.record(key, f64::INFINITY);
+            }
+            body
+        }
     };
     let ct = if params.has("force-accept") {
         "text/plain; charset=utf-8"

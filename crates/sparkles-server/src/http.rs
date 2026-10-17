@@ -1429,7 +1429,7 @@ pub(crate) async fn run_query(
                 sparkles::sparql::query_with_plan(snap, &query, &opts).map(Ran::Eager)
             };
             let r = match ran {
-                Ok(Ran::Cursor(cursor)) => return Ok((Ran::Cursor(cursor), seq, resolved, t0)),
+                Ok(Ran::Cursor(cursor)) => return Ok((Ran::Cursor(cursor), seq, resolved, t0, t)),
                 Ok(Ran::Eager(r)) => r,
                 Err(f) => {
                     let mut e: ApiError = f.error.into();
@@ -1445,10 +1445,9 @@ pub(crate) async fn run_query(
                 }
             };
             tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-            Ok((Ran::Eager(r), seq, resolved, t0))
+            Ok((Ran::Eager(r), seq, resolved, t0, t))
         }
     };
-    let began = std::time::Instant::now();
     let ran = if in_place {
         inline::note_in_place(quick_key);
         inline::run(run).and_then(|r| r)
@@ -1459,7 +1458,9 @@ pub(crate) async fn run_query(
         // a query that failed (a timeout, say) is not known to be quick any more
         QUICK.record(quick_key, f64::INFINITY);
     }
-    let (r, seq, resolved, t0) = ran.map_err(|e| with_timeout(e, timeout))?;
+    // `began` is when the run started on its thread, after any hop to the blocking pool,
+    // as the eager path's query and serialization times count
+    let (r, seq, resolved, t0, began) = ran.map_err(|e| with_timeout(e, timeout))?;
     let r = match r {
         Ran::Eager(r) => r,
         Ran::Cursor(cursor) => {
