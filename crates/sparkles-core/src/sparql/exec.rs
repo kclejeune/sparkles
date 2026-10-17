@@ -4605,22 +4605,18 @@ pub(super) fn offer_rows<P>(
         }
     };
     let mut ranked = 0;
-    // When the first key holds one result per distinct value, the heap's answer for each
-    // value is kept until a row enters the heap, which is the only change to the heap's
-    // worst row. A value screened out again costs a load instead of a comparison of sort
-    // keys. The answers are those of screening every row.
+    // When the first key holds one result per distinct value, a value the heap screened
+    // out is remembered, and its later rows cost a load instead of a comparison of sort
+    // keys. A rejected value is worse than the heap's worst row, and the worst row only
+    // improves as rows enter, so the value stays rejected. The answers are those of
+    // screening every row.
     let mut screened: Vec<bool> = match &sources[0] {
         HeapKey::Column(c) => vec![false; c.distinct().filter(|&n| n < t.len()).unwrap_or(0)],
         _ => Vec::new(),
     };
-    let mut entered = heap.entered();
     for i in 0..t.len() {
         if i.is_multiple_of(4096) {
             ctx.check()?;
-        }
-        if !screened.is_empty() && heap.entered() != entered {
-            screened.fill(false);
-            entered = heap.entered();
         }
         let first = match &sources[0] {
             HeapKey::Column(c) if !screened.is_empty() => {

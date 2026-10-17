@@ -3614,3 +3614,41 @@ fn long_filters_and_top_k_read_growing_inputs_with_the_answers_of_eager() {
         }
     }
 }
+
+/// A top-k over input that improves row by row, where nearly every row enters the heap and
+/// the first key holds each value twice, screens each value from the answers it gave
+/// before, which a row entering the heap does not change.
+#[test]
+fn top_k_over_improving_input_with_repeated_values_matches_eager() {
+    let s = Store::in_memory(StoreOptions::default());
+    let n = 60_000;
+    let data = (0..n)
+        .map(|i| format!("<urn:s:{i:07}> <urn:v> \"v{:07}\" .\n", i / 2))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for q in [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 10",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) ?s LIMIT 7",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 10",
+    ] {
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for opts in [QueryOptions::default(), without("grow_input")] {
+            let c = select_cursor(
+                s.snapshot(),
+                q,
+                &opts,
+                &CursorOptions {
+                    fallback: FallbackPolicy::AllowMaterialization,
+                    ..CursorOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(all(c), eager, "{q}");
+        }
+    }
+}
