@@ -173,6 +173,32 @@ fn core_numbers_and_triangles_poll_inside_a_hub_row() {
     });
 }
 
+/// Small nodes count their merges together after each node, and a node whose merges
+/// can pass the interval counts each merge before it starts.
+#[test]
+fn triangle_merges_poll_for_small_and_large_nodes() {
+    // disjoint triangles: many nodes with short merges
+    let edges: Vec<(u32, u32)> = (0..BIG / 3)
+        .flat_map(|t| {
+            let a = 3 * t;
+            [(a, a + 1), (a + 1, a + 2), (a, a + 2)]
+        })
+        .collect();
+    let g = ugraph(BIG, &edges);
+    stops_in("triangles-node", |ctl| {
+        triangles::count(&g, &Par::single(), ctl).map(drop)
+    });
+    // a clique: its first nodes have long lists of higher neighbours
+    let k = 400u32;
+    let edges: Vec<(u32, u32)> = (0..k)
+        .flat_map(|a| (a + 1..k).map(move |b| (a, b)))
+        .collect();
+    let g = ugraph(k, &edges);
+    stops_in("triangles-intersect", |ctl| {
+        triangles::count(&g, &Par::single(), ctl).map(drop)
+    });
+}
+
 #[test]
 fn pagerank_polls_inside_a_hub_row() {
     let g = star();

@@ -503,17 +503,27 @@ impl Graph {
         let mut off = Buffer::<u64>::zeroed("simple-offsets", n + 1, ctl)?;
         let mut adj = Buffer::<u32>::new("simple-edges", cap, ctl)?;
         let mut work = Work::new(ctl)?;
-        let mut last;
+        let mut counted = false;
         for u in 0..n as u32 {
+            // The rows of a block of a symmetric graph are counted at once while they
+            // stay within an interval. Other rows are counted one by one.
+            if (u as usize).is_multiple_of(super::BLOCK) {
+                let (lo, hi) = (u as usize, (u as usize + super::BLOCK).min(n));
+                counted = self.symmetric && work.rows(&self.out.off, lo, hi, "simple-rows")?;
+            }
+            if !counted {
+                let units = self.out.deg(u) + if self.symmetric { 0 } else { inn.deg(u) };
+                work.tick_n(units + 1, "simple-rows")?;
+            }
             let start = adj.len();
             if self.symmetric {
-                let row = self.out.row(u);
-                work.tick_n(row.len() + 1, "simple-rows")?;
-                adj.extend_within(row.iter().copied().filter(|&v| v != u))?;
+                for &v in self.out.row(u) {
+                    if v != u {
+                        adj.push(v)?;
+                    }
+                }
             } else {
-                let (a, b) = (self.out.row(u), inn.row(u));
-                work.tick_n(a.len() + b.len() + 1, "simple-rows")?;
-                merge_rows(a, b, &mut adj)?;
+                merge_rows(self.out.row(u), inn.row(u), &mut adj)?;
                 // the merge may hold u itself
                 let mut w = start;
                 for r in start..adj.len() {
@@ -525,7 +535,7 @@ impl Graph {
                 adj.truncate(w);
             }
             // sorted rows: drop repeats
-            last = u32::MAX;
+            let mut last = u32::MAX;
             let mut w = start;
             for r in start..adj.len() {
                 if adj[r] != last {

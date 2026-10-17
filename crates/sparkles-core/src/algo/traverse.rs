@@ -36,11 +36,23 @@ pub fn bfs(g: &Graph, sources: &[u32], par: &Par, ctl: &Control) -> Result<Vec<u
         let parts = par.blocks(frontier.len(), BLOCK / 8, |lo, hi| {
             let mut work = Work::new(ctl)?;
             let mut next = Growing::new("bfs-next", ctl)?;
-            for &u in &frontier[lo..hi] {
+            let block = &frontier[lo..hi];
+            // A block of rows that stays within one interval is counted, and its room
+            // charged, once before it is read. A larger block counts and charges each
+            // row before the row is read.
+            let units: usize = block.iter().map(|&u| g.out.deg(u) + 1).sum();
+            let at_once = units <= CHECK_EVERY;
+            if at_once {
+                work.tick_n(units, "bfs-frontier")?;
+                next.reserve(units - block.len())?;
+            }
+            for &u in block {
                 let row = g.out.row(u);
-                work.tick_n(row.len() + 1, "bfs-frontier")?;
-                // room for every neighbour, charged before the row is read
-                next.reserve(row.len())?;
+                if !at_once {
+                    work.tick_n(row.len() + 1, "bfs-frontier")?;
+                    // room for every neighbour, charged before the row is read
+                    next.reserve(row.len())?;
+                }
                 for &v in row {
                     if depth[v as usize]
                         .compare_exchange(UNREACHED, level, Ordering::Relaxed, Ordering::Relaxed)

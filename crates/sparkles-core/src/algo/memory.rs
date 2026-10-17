@@ -184,6 +184,7 @@ impl<T> Buffer<T> {
     pub(crate) fn drain(&mut self) -> std::vec::Drain<'_, T> {
         self.values.drain(..)
     }
+    #[inline]
     pub(crate) fn push(&mut self, value: T) -> Result<()> {
         if self.values.len() == self.values.capacity() {
             return Err(bad("memory", "fixed buffer capacity exceeded"));
@@ -315,16 +316,25 @@ impl<'a> Work<'a> {
             left: CHECK_EVERY,
         })
     }
-    #[inline]
+    #[inline(always)]
     pub(crate) fn tick(&mut self, phase: &'static str) -> Result<()> {
         #[cfg(test)]
         probe::at(probe::Point::Work(phase));
         let _ = phase;
         self.left -= 1;
         if self.left == 0 {
-            self.ctl.check()?;
-            self.left = CHECK_EVERY;
+            return self.refill();
         }
+        Ok(())
+    }
+
+    /// Check the control and start a new interval: the rare path of a count, kept out
+    /// of the loops that count.
+    #[cold]
+    #[inline(never)]
+    fn refill(&mut self) -> Result<()> {
+        self.ctl.check()?;
+        self.left = CHECK_EVERY;
         Ok(())
     }
 
@@ -332,18 +342,54 @@ impl<'a> Work<'a> {
     /// control when the count since the last check reaches [`CHECK_EVERY`]. A loop that
     /// counts a row at a time costs one subtraction per row, and a hub row is still
     /// polled before the next row starts.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn tick_n(&mut self, units: usize, phase: &'static str) -> Result<()> {
         #[cfg(test)]
         probe::at(probe::Point::Work(phase));
         let _ = phase;
         if units >= self.left {
-            self.ctl.check()?;
-            self.left = CHECK_EVERY;
-        } else {
-            self.left -= units;
+            return self.refill();
         }
+        self.left -= units;
         Ok(())
+    }
+
+    /// Count the rows `lo..hi` of a sparse row array with offsets `off` at once, each
+    /// row as its edges and one more, when together they hold at most [`CHECK_EVERY`]
+    /// units, so the loop over them needs no count per row. Returns false, counting
+    /// nothing, when they hold more: the caller then counts each row with
+    /// [`Work::row`] before it reads it, so a hub row is still polled before the next
+    /// row starts.
+    #[inline(always)]
+    pub(crate) fn rows(
+        &mut self,
+        off: &[u64],
+        lo: usize,
+        hi: usize,
+        phase: &'static str,
+    ) -> Result<bool> {
+        let units = (off[hi] - off[lo]) as usize + (hi - lo);
+        if units > CHECK_EVERY {
+            return Ok(false);
+        }
+        self.tick_n(units, phase)?;
+        Ok(true)
+    }
+
+    /// Count row `u` of a sparse row array with offsets `off`, unless [`Work::rows`]
+    /// counted its block already.
+    #[inline(always)]
+    pub(crate) fn row(
+        &mut self,
+        counted: bool,
+        off: &[u64],
+        u: usize,
+        phase: &'static str,
+    ) -> Result<()> {
+        if counted {
+            return Ok(());
+        }
+        self.tick_n((off[u + 1] - off[u]) as usize + 1, phase)
     }
 }
 

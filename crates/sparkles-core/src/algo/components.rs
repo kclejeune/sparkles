@@ -4,7 +4,7 @@
 //! are stable for a commit and a projection.
 
 use super::memory::{Buffer, Growing, Work};
-use super::{BLOCK, Control, Graph, Par};
+use super::{BLOCK, CHECK_EVERY, Control, Graph, Par};
 use crate::error::Result;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -21,14 +21,17 @@ fn number(n: usize, mut root: impl FnMut(usize) -> u32, ctl: &Control) -> Result
     let mut comp = Buffer::zeroed("components-output", n, ctl)?;
     let mut work = Work::new(ctl)?;
     let mut count = 0u32;
-    for v in 0..n {
-        work.tick("components-number")?;
-        let r = root(v) as usize;
-        if first[r] == u32::MAX {
-            first[r] = count;
-            count += 1;
+    for lo in (0..n).step_by(CHECK_EVERY) {
+        let hi = (lo + CHECK_EVERY).min(n);
+        work.tick_n(hi - lo, "components-number")?;
+        for v in lo..hi {
+            let r = root(v) as usize;
+            if first[r] == u32::MAX {
+                first[r] = count;
+                count += 1;
+            }
+            comp[v] = first[r];
         }
-        comp[v] = first[r];
     }
     ctl.check()?;
     Ok(Components {
@@ -42,7 +45,9 @@ fn number(n: usize, mut root: impl FnMut(usize) -> u32, ctl: &Control) -> Result
 /// node whatever the order of the unions.
 pub fn wcc(g: &Graph, par: &Par, ctl: &Control) -> Result<Components> {
     let n = g.n();
-    let parent = Buffer::collect("wcc-parent", n, (0..n as u32).map(AtomicU32::new), ctl)?;
+    let parent_buffer = Buffer::collect("wcc-parent", n, (0..n as u32).map(AtomicU32::new), ctl)?;
+    // the hot loops index a plain slice
+    let parent: &[AtomicU32] = &parent_buffer;
     let find = |mut x: u32| -> u32 {
         loop {
             let p = parent[x as usize].load(Ordering::Relaxed);
@@ -62,10 +67,10 @@ pub fn wcc(g: &Graph, par: &Par, ctl: &Control) -> Result<Components> {
     };
     par.blocks(n, BLOCK, |lo, hi| {
         let mut work = Work::new(ctl)?;
+        let counted = work.rows(&g.out.off, lo, hi, "wcc-union")?;
         for u in lo..hi {
-            let row = g.out.row(u as u32);
-            work.tick_n(row.len() + 1, "wcc-union")?;
-            for &v in row {
+            work.row(counted, &g.out.off, u, "wcc-union")?;
+            for &v in g.out.row(u as u32) {
                 let (mut a, mut b) = (find(u as u32), find(v));
                 while a != b {
                     let (hi, lo) = if a > b { (a, b) } else { (b, a) };
@@ -102,10 +107,16 @@ pub fn scc(g: &Graph, ctl: &Control) -> Result<Components> {
     let mut work = Work::new(ctl)?;
     let mut next = 0u32;
     for s in 0..n as u32 {
-        work.tick("scc-start")?;
+        // the starts are counted a block at a time
+        if (s as usize).is_multiple_of(CHECK_EVERY) {
+            work.tick_n(CHECK_EVERY, "scc-start")?;
+        }
         if index[s as usize] != UNSEEN {
             continue;
         }
+        // A node's row is counted when the search enters it, its edges and one more for
+        // finishing it, so the search polls once its work passes the interval.
+        work.tick_n(g.out.row(s).len() + 1, "scc-dfs")?;
         call.push((s, 0))?;
         index[s as usize] = next;
         low[s as usize] = next;
@@ -113,24 +124,31 @@ pub fn scc(g: &Graph, ctl: &Control) -> Result<Components> {
         stack.push(s)?;
         on_stack[s as usize] = true;
         while let Some(&(u, i)) = call.last() {
-            // one step reads one edge or finishes one node
-            work.tick("scc-dfs")?;
             let row = g.out.row(u);
-            if (i as usize) < row.len() {
-                let v = row[i as usize];
-                if let Some(top) = call.last_mut() {
-                    top.1 += 1;
-                }
+            // the next edge to a node not yet seen, updating `low` on the way
+            let mut i = i as usize;
+            let mut child = None;
+            while i < row.len() {
+                let v = row[i];
+                i += 1;
                 if index[v as usize] == UNSEEN {
-                    index[v as usize] = next;
-                    low[v as usize] = next;
-                    next += 1;
-                    stack.push(v)?;
-                    on_stack[v as usize] = true;
-                    call.push((v, 0))?;
+                    child = Some(v);
+                    break;
                 } else if on_stack[v as usize] {
                     low[u as usize] = low[u as usize].min(index[v as usize]);
                 }
+            }
+            if let Some(top) = call.last_mut() {
+                top.1 = i as u32;
+            }
+            if let Some(v) = child {
+                work.tick_n(g.out.row(v).len() + 1, "scc-dfs")?;
+                index[v as usize] = next;
+                low[v as usize] = next;
+                next += 1;
+                stack.push(v)?;
+                on_stack[v as usize] = true;
+                call.push((v, 0))?;
             } else {
                 call.pop();
                 if let Some(&(parent, _)) = call.last() {

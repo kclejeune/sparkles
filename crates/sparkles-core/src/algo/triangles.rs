@@ -6,7 +6,7 @@
 //! nodes with atomic adds, which do not depend on the order.
 
 use super::memory::{Buffer, Growing, Work};
-use super::{BLOCK, Control, Csr, Graph, Par};
+use super::{BLOCK, CHECK_EVERY, Control, Csr, Graph, Par};
 use crate::error::Result;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -25,76 +25,109 @@ fn count_in(s: &Csr, par: &Par, ctl: &Control) -> Result<Vec<u32>> {
     order.sort_unstable_by_key(|&u| (s.deg(u), u));
     ctl.check()?;
     let mut rank = Buffer::<u32>::zeroed("triangles-rank", n, ctl)?;
-    for (r, &u) in order.iter().enumerate() {
-        work.tick("triangles-rank")?;
-        rank[u as usize] = r as u32;
+    for (c, chunk) in order.chunks(CHECK_EVERY).enumerate() {
+        work.tick_n(chunk.len(), "triangles-rank")?;
+        for (i, &u) in chunk.iter().enumerate() {
+            rank[u as usize] = (c * CHECK_EVERY + i) as u32;
+        }
     }
     // the neighbours of higher rank, sorted by rank: half the stored edges
     let mut off = Buffer::<u64>::zeroed("triangles-offsets", n + 1, ctl)?;
     let mut adj = Buffer::<u32>::new("triangles-edges", s.nnz() / 2, ctl)?;
+    // the longest list of higher neighbours, which bounds the steps of one merge
+    let mut longest = 0usize;
     for u in 0..n as u32 {
         let start = adj.len();
         let row = s.row(u);
         work.tick_n(row.len() + 1, "triangles-orient")?;
         let ru = rank[u as usize];
-        adj.extend_within(row.iter().map(|&v| rank[v as usize]).filter(|&rv| rv > ru))?;
+        for &v in row {
+            let rv = rank[v as usize];
+            if rv > ru {
+                adj.push(rv)?;
+            }
+        }
         adj[start..].sort_unstable();
+        longest = longest.max(adj.len() - start);
         off[u as usize + 1] = adj.len() as u64;
     }
     // work in rank space: node r has the neighbours up[r]
-    let up = |r: u32| -> &[u32] {
-        let u = order[r as usize] as usize;
-        &adj[off[u] as usize..off[u + 1] as usize]
-    };
-    let tri = Buffer::collect(
+    let tri_buffer = Buffer::collect(
         "triangles-counts",
         n,
         (0..n).map(|_| AtomicU32::new(0)),
         ctl,
     )?;
+    // the hot loops index plain slices
+    let (order_s, adj_s, off_s, tri): (&[u32], &[u32], &[u64], &[AtomicU32]) =
+        (&order, &adj, &off, &tri_buffer);
+    let up = |r: u32| -> &[u32] {
+        let u = order_s[r as usize] as usize;
+        &adj_s[off_s[u] as usize..off_s[u + 1] as usize]
+    };
     par.blocks(n, BLOCK / 4, |lo, hi| {
         let mut work = Work::new(ctl)?;
-        for r in lo as u32..hi as u32 {
-            let a = up(r);
-            // a node counts its merge steps, checked before each merge once they pass
-            // the interval, so a node with long merges is polled between them
-            let mut steps = a.len() + 1;
-            for &q in a {
-                let b = up(q);
-                steps += a.len() + b.len();
-                if steps >= 4096 {
-                    work.tick_n(steps, "triangles-intersect")?;
-                    steps = 0;
-                }
-                // common elements of a and b
-                let (mut i, mut j) = (0, 0);
-                while i < a.len() && j < b.len() {
-                    match a[i].cmp(&b[j]) {
-                        std::cmp::Ordering::Less => i += 1,
-                        std::cmp::Ordering::Greater => j += 1,
-                        std::cmp::Ordering::Equal => {
-                            let t = a[i];
-                            for x in [r, q, t] {
-                                tri[order[x as usize] as usize].fetch_add(1, Ordering::Relaxed);
-                            }
-                            i += 1;
-                            j += 1;
+        // the common elements of a and b, each counted for r, q and itself
+        let merge = |r: u32, q: u32, a: &[u32], b: &[u32]| {
+            let (mut i, mut j) = (0, 0);
+            while i < a.len() && j < b.len() {
+                match a[i].cmp(&b[j]) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        let t = a[i];
+                        for x in [r, q, t] {
+                            tri[order_s[x as usize] as usize].fetch_add(1, Ordering::Relaxed);
                         }
+                        i += 1;
+                        j += 1;
                     }
                 }
             }
-            work.tick_n(steps, "triangles-node")?;
+        };
+        for r in lo as u32..hi as u32 {
+            let a = up(r);
+            // each merge takes at most a.len() + longest steps
+            let bound = a.len() * (a.len() + longest) + 1;
+            if bound <= CHECK_EVERY {
+                // the merges of a node this small stay within one interval: they are
+                // counted together by their bound before they start
+                work.tick_n(bound, "triangles-node")?;
+                for &q in a {
+                    merge(r, q, a, up(q));
+                }
+            } else {
+                large(&mut work, r, a, &up, &merge)?;
+            }
         }
         Ok(())
     })?;
     drop((order, rank, off, adj));
-    let out = Buffer::collect(
-        "triangles-output",
-        n,
-        tri.iter().map(|t| t.load(Ordering::Relaxed)),
-        ctl,
-    )?;
-    Ok(out.into_output())
+    // the counts become the output in place, keeping their charge
+    Ok(tri_buffer
+        .into_output()
+        .into_iter()
+        .map(AtomicU32::into_inner)
+        .collect())
+}
+
+/// The merges of a node whose merges can pass one polling interval: each merge is
+/// counted before it starts. Out of line, so the loop over small nodes stays compact.
+#[inline(never)]
+fn large<'a>(
+    work: &mut Work,
+    r: u32,
+    a: &[u32],
+    up: &impl Fn(u32) -> &'a [u32],
+    merge: &impl Fn(u32, u32, &[u32], &[u32]),
+) -> Result<()> {
+    work.tick_n(a.len() + 1, "triangles-node")?;
+    for &q in a {
+        let b = up(q);
+        work.tick_n(a.len() + b.len(), "triangles-intersect")?;
+        merge(r, q, a, b);
+    }
+    Ok(())
 }
 
 pub struct Clustering {

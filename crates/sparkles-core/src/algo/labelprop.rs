@@ -31,17 +31,23 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
             let mut work = Work::new(ctl)?;
             // the labels around one node, charged as the largest row needs
             let mut seen: Growing<(u32, f64)> = Growing::new("labelprop-seen", ctl)?;
+            let sides: &[&super::Csr] = if g.symmetric {
+                &[&g.out]
+            } else {
+                &[&g.out, inn]
+            };
+            // the rows of the chunk are counted at once while they stay within an interval
+            let hi = lo + chunk.len();
+            let mut counted = [true; 2];
+            for (c, csr) in counted.iter_mut().zip(sides) {
+                *c = work.rows(&csr.off, lo, hi, "labelprop-node")?;
+            }
             for (i, slot) in chunk.iter_mut().enumerate() {
                 let u = (lo + i) as u32;
                 seen.clear();
-                let sides: &[&super::Csr] = if g.symmetric {
-                    &[&g.out]
-                } else {
-                    &[&g.out, inn]
-                };
-                for csr in sides {
+                for (&counted, csr) in counted.iter().zip(sides) {
+                    work.row(counted, &csr.off, u as usize, "labelprop-node")?;
                     let (r, w) = (csr.row(u), csr.wrow(u));
-                    work.tick_n(r.len() + 1, "labelprop-node")?;
                     match w {
                         Some(w) => seen
                             .extend(r.iter().zip(w).map(|(&v, &w)| (prev[v as usize], w as f64)))?,
@@ -53,6 +59,7 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
                     continue;
                 }
                 seen.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+                let seen: &[(u32, f64)] = &seen;
                 let mut best = (prev[u as usize], -1.0f64);
                 let mut k = 0;
                 while k < seen.len() {
