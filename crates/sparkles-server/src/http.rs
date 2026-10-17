@@ -1485,6 +1485,7 @@ pub(crate) async fn run_query(
                     io,
                     timeout,
                     with_extra,
+                    t0,
                 },
             )
             .await;

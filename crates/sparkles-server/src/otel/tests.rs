@@ -267,6 +267,42 @@ async fn query_spans_follow_the_incoming_trace() {
 }
 
 #[tokio::test]
+async fn streamed_query_has_phase_spans() {
+    let s = server();
+    let t = trace_id();
+    let q = "SELECT ?n WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?n }";
+    let uri = format!(
+        "/ds/sparql?execution=streaming&query={}",
+        percent_encoding::utf8_percent_encode(q, percent_encoding::NON_ALPHANUMERIC)
+    );
+    let (status, _, body) = call(
+        &s.app,
+        HttpRequest::get(uri)
+            .header("traceparent", traceparent(t, true))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("Alice"));
+    let spans = spans_of(t, 1).await;
+    let server = named(&spans, "GET /{ds}/sparql");
+    let id = server.span_context.span_id();
+    for name in [
+        "sparql.parse",
+        "sparql.plan",
+        "sparql.execute",
+        "sparql.serialize",
+    ] {
+        assert_eq!(named(&spans, name).parent_span_id, id, "{name}");
+    }
+    assert_eq!(
+        attr(named(&spans, "sparql.execute"), "db.response.returned_rows"),
+        Some(&Value::I64(2))
+    );
+}
+
+#[tokio::test]
 async fn unsampled_parents_export_nothing() {
     let s = server();
     let t = trace_id();

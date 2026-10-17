@@ -265,6 +265,21 @@ pub fn query_done(t0: Option<SystemTime>, r: &sparkles::sparql::QueryResult, ser
     let _ = (t0, r, serialize_ms);
 }
 
+/// Phase spans of a query answered from a cursor, which has no operator spans.
+pub fn cursor_done(
+    t0: Option<SystemTime>,
+    kind: sparkles::sparql::QueryKind,
+    stats: &sparkles::sparql::CursorStats,
+    serialize_ms: f64,
+) {
+    #[cfg(feature = "otel")]
+    if let Some(t0) = t0 {
+        sdk::cursor_done(&Span::current(), t0, kind, stats, serialize_ms);
+    }
+    #[cfg(not(feature = "otel"))]
+    let _ = (t0, kind, stats, serialize_ms);
+}
+
 /// Phase spans and counts of an executed update.
 pub fn update_done(t0: Option<SystemTime>, stats: &sparkles::sparql::update::UpdateStats) {
     #[cfg(feature = "otel")]

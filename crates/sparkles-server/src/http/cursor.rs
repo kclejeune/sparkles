@@ -54,6 +54,8 @@ pub(super) struct Serve {
     pub io: Option<Arc<sparkles::ioacct::Profile>>,
     pub timeout: Option<std::time::Duration>,
     pub with_extra: bool,
+    /// the start of the query, for the phase spans (`None` when OTel is off)
+    pub t0: Option<std::time::SystemTime>,
 }
 
 pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
@@ -76,6 +78,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     let at = history::at_param(&params)?;
     let timeout = options.timeout;
     let with_extra = !options.default_graph_extra.is_empty();
+    let t0 = crate::otel::start();
     let captured_ds = ds.clone();
     let (cursor, seq, resolved) = blocking(move || {
         let (snapshot, resolved) = history::snapshot_for(&captured_ds, at.as_ref(), &options)?;
@@ -103,6 +106,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
             io,
             timeout,
             with_extra,
+            t0,
         },
     )
     .await
@@ -129,6 +133,7 @@ pub(super) async fn serve(
         io,
         timeout,
         with_extra,
+        t0,
     } = serve;
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     if thrift && cursor.kind() == QueryKind::Select && !matches!(cursor, QueryExecution::Eager(_)) {
@@ -139,6 +144,7 @@ pub(super) async fn serve(
         .into());
     }
     let graph = matches!(cursor.kind(), QueryKind::Construct | QueryKind::Describe);
+    let kind = cursor.kind();
     let content_type =
         if thrift && cursor.kind() == QueryKind::Select && format != SolutionsFormat::Sparkles {
             jena_formats::RESULTS_THRIFT
@@ -251,6 +257,9 @@ pub(super) async fn serve(
                 Some(_) => (Some(Outcome::Error), None),
                 None => (None, None),
             };
+            if let Some(stats) = &stats {
+                crate::otel::cursor_done(t0, kind, stats, serialize_ms);
+            }
             let mut timing = stats.as_ref().map(|s| s.timing.clone());
             if let Some(t) = &mut timing {
                 t.serialize_ms = serialize_ms;
