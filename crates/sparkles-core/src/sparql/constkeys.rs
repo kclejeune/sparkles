@@ -231,6 +231,56 @@ mod tests {
         assert!(!k.iter().any(|s| s.contains('7') && !s.contains("org7")));
     }
 
+    /// The keys written here are the vocabulary's own keys of the same terms, so the prefetch
+    /// asks for the groups the lookups read.
+    #[test]
+    fn keys_are_the_vocabulary_keys_of_the_terms() {
+        use oxrdf::{Literal, NamedNode, Term};
+        let xsd =
+            |t: &str| NamedNode::new(format!("http://www.w3.org/2001/XMLSchema#{t}")).unwrap();
+        let iri = NamedNode::new("http://example.org/a").unwrap();
+        let terms: Vec<Term> = vec![
+            iri.clone().into(),
+            Literal::new_simple_literal("plain").into(),
+            Literal::new_language_tagged_literal("chat", "fr")
+                .unwrap()
+                .into(),
+            Literal::new_typed_literal("2024-01-01T00:00:00Z", xsd("dateTimeStamp")).into(),
+            Literal::new_typed_literal("007", xsd("integer")).into(),
+            Literal::new_typed_literal("7", xsd("integer")).into(),
+        ];
+        let text = |t: &Term| match t {
+            Term::NamedNode(n) => format!("<{}>", n.as_str()),
+            Term::Literal(l) => l.to_string(),
+            _ => unreachable!(),
+        };
+        let values: Vec<String> = terms.iter().map(text).collect();
+        let parsed = spargebra::SparqlParser::new()
+            .parse_query(&format!(
+                "SELECT * WHERE {{ VALUES ?x {{ {} }} ?x <{}> ?y FILTER(?y = \"plain\") }}",
+                values.join(" "),
+                iri.as_str()
+            ))
+            .unwrap();
+        let spargebra::Query::Select { pattern, .. } = parsed else {
+            panic!()
+        };
+        let got = constant_keys(&pattern);
+        // the canonical integer is inline and has no key, the others each have theirs
+        let mut want: Vec<Vec<u8>> = terms
+            .iter()
+            .filter(|t| id::inline_id(t).is_none())
+            .map(id::term_key)
+            .collect();
+        want.push(id::term_key(&iri.clone().into()));
+        want.push(id::term_key(&Literal::new_simple_literal("plain").into()));
+        let (mut got_sorted, mut want_sorted) = (got.clone(), want.clone());
+        got_sorted.sort();
+        want_sorted.sort();
+        assert_eq!(got_sorted, want_sorted);
+        assert!(id::inline_id(&terms[5]).is_some() && id::inline_id(&terms[4]).is_none());
+    }
+
     #[test]
     fn collects_at_most_the_cap() {
         let values: String = (0..10_000).map(|i| format!("<urn:v{i}> ")).collect();

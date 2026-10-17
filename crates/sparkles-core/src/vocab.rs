@@ -1471,6 +1471,12 @@ impl AppendVocab {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// the keys [`KeyPrefetch::add`] searched the sparse index for on this thread
+    static KEY_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The sparse-index groups of keys given one at a time, asked for at once by
 /// [`KeyPrefetch::finish`] (see [`Vocab::prefetch_keys`]). A key seen before after its group
 /// was asked for costs a hash and a load, so a warm query with constants does not
@@ -1490,6 +1496,8 @@ impl KeyPrefetch<'_> {
             return;
         }
         let s = self.sparse;
+        #[cfg(test)]
+        KEY_SEARCHES.with(|n| n.set(n.get() + 1));
         // a key before the first group's has no group to ask for
         if let Some(g) = partition_point_by(s.len(), |g| s.key(g) <= key).checked_sub(1) {
             self.cold.push((g, h));
@@ -2348,6 +2356,67 @@ mod tests {
         }
         // keys outside the vocabulary, before its first key or in no group, do no harm
         v.prefetch_keys(&[b"".to_vec(), b"\xff\xff".to_vec()]);
+    }
+
+    /// Whether group `g` has been asked for.
+    fn group_hinted(s: &Sparse, g: usize) -> bool {
+        s.hinted[g / 64].load(AtomicOrdering::Relaxed) & (1 << (g % 64)) != 0
+    }
+
+    #[test]
+    fn a_warm_constant_costs_no_search() {
+        if !crate::index::io_hints() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 16 * FC_BLOCK * IDX_BLOCKS);
+        let v = Vocab::open(dir.path()).unwrap();
+        let searches = || KEY_SEARCHES.with(|n| n.get());
+        let picks = [keys[100].clone(), keys[5 * FC_BLOCK * IDX_BLOCKS].clone()];
+        let start = searches();
+        v.prefetch_keys(&picks);
+        assert_eq!(searches() - start, 2);
+        // the second batch of the same constants searches nothing
+        v.prefetch_keys(&picks);
+        v.prefetch_keys(&picks);
+        assert_eq!(searches() - start, 2);
+    }
+
+    #[test]
+    fn a_hash_collision_only_skips_a_hint() {
+        if !crate::index::io_hints() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let keys = write_keys(dir.path(), 16 * FC_BLOCK * IDX_BLOCKS);
+        let v = Vocab::open(dir.path()).unwrap();
+        let s = v.sparse.as_ref().unwrap();
+        let group = |i: usize| i / (FC_BLOCK * IDX_BLOCKS);
+        // a key whose hash another key took: it reads as warm, so its group is not asked
+        // for by the batch, and the lookup still finds it and asks for the group itself
+        let i = 9 * FC_BLOCK * IDX_BLOCKS + 7;
+        s.set_key_warm(warm_key_hash(&keys[i]));
+        let start = KEY_SEARCHES.with(|n| n.get());
+        v.prefetch_keys(&[keys[i].clone()]);
+        assert_eq!(KEY_SEARCHES.with(|n| n.get()), start);
+        assert!(!group_hinted(s, group(i)));
+        assert_eq!(v.find(&keys[i]), Ok(i as u64));
+        assert!(group_hinted(s, group(i)));
+        // two keys of one slot and different hashes take the slot in turn, and each is
+        // searched again after the other took it
+        let a = 3 * FC_BLOCK * IDX_BLOCKS;
+        let slot = |k: &[u8]| warm_key_hash(k) as usize % WARM_KEY_SLOTS;
+        let b = (a + 1..keys.len())
+            .find(|&b| slot(&keys[b]) == slot(&keys[a]))
+            .unwrap();
+        assert_ne!(warm_key_hash(&keys[a]), warm_key_hash(&keys[b]));
+        let start = KEY_SEARCHES.with(|n| n.get());
+        for k in [a, b, a] {
+            v.prefetch_keys(&[keys[k].clone()]);
+        }
+        assert_eq!(KEY_SEARCHES.with(|n| n.get()) - start, 3);
+        assert_eq!(v.find(&keys[a]), Ok(a as u64));
+        assert_eq!(v.find(&keys[b]), Ok(b as u64));
     }
 
     #[test]
