@@ -1485,9 +1485,11 @@ processes at 10.5M, show the tradeoff:
 
 For the complete scan, the query's allocation estimate peaks at 241.0 MiB for eager
 result columns and 1.0 MiB when streaming. Automatic execution is the default over HTTP,
-in the CLI, in Node and in the JVM library. It streams only the scans and OPTIONAL counts
-where streaming measured faster and runs every other plan eagerly, because eager is
-faster on several shapes at 12 threads.
+in the CLI, in Node and in the JVM library. It streams only plain scans, where streaming
+measured faster, and runs every other plan eagerly, because eager is faster on several
+shapes at 12 threads. The OPTIONAL count above streamed by default until 2026-10-17. On
+the AMD EPYC hosts of the Namespace screens it took 3.5 ms streamed against 2.9 ms
+eagerly at 10.5M with one thread, so it now runs eagerly.
 
 The table below measures the change of default on forge at 10.5M. Each case is one
 request to a fresh server process, which reports the query's allocation estimate in the

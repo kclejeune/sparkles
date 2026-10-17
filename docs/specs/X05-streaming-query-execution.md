@@ -690,10 +690,10 @@ opt-in Jena WHERE execution on the JVM, and the CLI. Copies of rows and transpor
 in the foreign bindings follow their own bounded batching contract. Python rejects
 snapshot capture inside an owned transaction.
 
-Auto selects large plain immutable SELECT scans, and uncached eligible OPTIONAL COUNT
-queries on a single key, under the measured batch, graph-predicate and memory conditions
-that the API documents. Admitting aggregates in this way preserves enabled result
-caches. Over HTTP, auto falls back to eager execution when the negotiated encoding is
+Auto selects plain immutable SELECT scans under the measured batch, graph-predicate and
+memory conditions that the API documents. Until 2026-10-17 it also selected uncached
+OPTIONAL COUNT queries on a single key, which
+[the parity section](#streaming-parity-2026-10-17) explains. Over HTTP, auto falls back to eager execution when the negotiated encoding is
 SPARQL Results Thrift, which has no cursor writer. Auto became the default mode over
 HTTP, in the CLI and in Node on 2026-10-16, as
 [the section below](#automatic-execution-by-default-2026-10-16) describes.

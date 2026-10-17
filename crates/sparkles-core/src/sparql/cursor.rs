@@ -774,7 +774,7 @@ pub type AskResult = MaterializedResult;
 pub enum ExecutionMode {
     Eager,
     Streaming,
-    /// Use pull execution for measured large immutable scans and uncached OPTIONAL counts.
+    /// Use pull execution for plain immutable scans of an estimated thousand rows or more.
     #[default]
     Auto,
 }
@@ -784,8 +784,15 @@ pub enum ExecutionMode {
 /// one Rayon thread and at twelve, and costs a query of fewer rows a microsecond or two.
 pub(super) const AUTO_SCAN_ROWS: f64 = 1_000.0;
 
-/// Production-allocator admission for immutable scans and uncached large
-/// OPTIONAL counts. Other plans retain eager execution.
+/// Production-allocator admission for immutable scans. Other plans retain eager
+/// execution.
+///
+/// An uncached OPTIONAL count on a single key streamed from an estimated million input
+/// rows until 2026-10-17. The cursor counts the join with a branching merge, which on the
+/// AMD EPYC hosts of the Namespace screens took 1.19 to 1.23 times as long as eager
+/// execution's branch-free merge at 10.5M, and on forge's Intel CPU 0.99 times as long.
+/// Such a count now runs eagerly. Eager execution holds both sides of the join, 20.8 MB at
+/// 10.5M where the cursor held 2.2 MB.
 pub(super) fn auto_streaming(
     ctx: &Ctx,
     node: &Node,
@@ -811,53 +818,14 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
-    fn count(ctx: &Ctx, node: &Node) -> bool {
-        match &node.kind {
-            Kind::Project(_)
-            | Kind::Slice { offset: 0, .. }
-            | Kind::Extend(_, super::expr::Expr::Var(_))
-                if node.children.len() == 1 =>
-            {
-                count(ctx, &node.children[0])
-            }
-            Kind::Group { keys, aggs } if keys.is_empty() && group::eligible(node) => {
-                let child = &node.children[0];
-                let rows = child.est + child.children.iter().map(|child| child.est).sum::<f64>();
-                aggs.iter().all(|(_, agg)| {
-                    agg.expr.is_none()
-                        && !agg.distinct
-                        && matches!(agg.func, spargebra::algebra::AggregateFunction::Count)
-                }) && matches!(child.kind, Kind::LeftJoin { expr: None })
-                    && merge::eligible(child)
-                    && child.children[0]
-                        .vars
-                        .iter()
-                        .filter(|v| child.children[1].vars.contains(v))
-                        .count()
-                        == 1
-                    && child
-                        .children
-                        .iter()
-                        .all(|child| matches!(child.kind, Kind::Scan(_)) && scan(ctx, child))
-                    && rows.is_finite()
-                    && rows >= 1_000_000.0
-            }
-            _ => false,
-        }
-    }
-    let scans = if node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node) {
-        // A scan expected to pass the row budgets stays eager, so that it fails before
-        // the first byte of output with an error status rather than partway through a
-        // stream. A count returns one row, so its errors always come before output.
-        if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
-            return false;
-        }
-        1
-    } else if (!ctx.use_cache || !ctx.snap.results.enabled()) && count(ctx, node) {
-        2
-    } else {
+    if !(node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node)) {
         return false;
-    };
+    }
+    // A scan expected to pass the row budgets stays eager, so that it fails before the
+    // first byte of output with an error status rather than partway through a stream.
+    if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
+        return false;
+    }
     let cap = options
         .batch_rows
         .min(options.batch_bytes / node.vars.len().max(1).saturating_mul(8));
@@ -867,12 +835,11 @@ pub(super) fn auto_streaming(
             .map(width)
             .fold(node.vars.len(), usize::max)
     }
-    // Aggregate output can be narrower than either scan or the join layout.
-    // Admission must leave room for their input batches as well as the result.
+    // A projection can be narrower than its scan. Admission must leave room for the
+    // scan's input batches as well as the result.
     let row_bytes = (width(node) as u64).saturating_mul(8).saturating_add(16);
     let headroom = (crate::index::BLOCK_ROWS as u64 * 32 + 512)
-        .saturating_mul(scans)
-        .saturating_add((cap as u64).saturating_mul(row_bytes).saturating_mul(scans))
+        .saturating_add((cap as u64).saturating_mul(row_bytes))
         .saturating_add((ctx.nvars() as u64).saturating_mul(16))
         .saturating_add(4096);
     kind == QueryKind::Select
@@ -3136,8 +3103,11 @@ mod tests {
         evicted_skipped_read_ahead_column("count");
     }
 
+    /// The decision table of automatic execution for an OPTIONAL count on a single key:
+    /// eager whether results are cached or not and however many rows it reads, since the
+    /// cursor's count measured up to 1.23 times as long as eager's on AMD hosts.
     #[test]
-    fn automatic_counts_preserve_enabled_result_caches() {
+    fn automatic_execution_keeps_optional_counts_eager() {
         use crate::io::Source;
         use crate::store::{Store, StoreOptions};
         let store = Store::in_memory(StoreOptions::default());
@@ -3154,45 +3124,34 @@ mod tests {
             &[],
         )
         .unwrap();
-        let options = QueryOptions {
-            no_cache: true,
-            ..Default::default()
-        };
-        let mut p =
-            super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
-        let mut group = &mut p.node;
-        while matches!(
-            group.kind,
-            Kind::Project(_)
-                | Kind::Slice { offset: 0, .. }
-                | Kind::Extend(_, super::super::expr::Expr::Var(_))
-        ) {
-            group = &mut group.children[0];
+        for no_cache in [true, false] {
+            for est in [1_000.0, 1_000_000.0, 100_000_000.0] {
+                let options = QueryOptions {
+                    no_cache,
+                    ..Default::default()
+                };
+                let mut p = super::super::prepare_query(store.snapshot(), &q, &options, None, None)
+                    .unwrap();
+                let mut group = &mut p.node;
+                while matches!(
+                    group.kind,
+                    Kind::Project(_)
+                        | Kind::Slice { offset: 0, .. }
+                        | Kind::Extend(_, super::super::expr::Expr::Var(_))
+                ) {
+                    group = &mut group.children[0];
+                }
+                assert!(matches!(group.kind, Kind::Group { .. }));
+                group.children[0].est = est;
+                for child in &mut group.children[0].children {
+                    child.est = est;
+                }
+                assert!(
+                    !auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()),
+                    "no_cache {no_cache}, {est} rows"
+                );
+            }
         }
-        assert!(matches!(group.kind, Kind::Group { .. }));
-        group.children[0].est = 1_000_000.0;
-        assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()));
-        let cached =
-            super::super::prepare_query(store.snapshot(), &q, &Default::default(), None, None)
-                .unwrap();
-        assert!(!auto_streaming(
-            &cached.ctx,
-            &p.node,
-            p.kind,
-            &Default::default()
-        ));
-        let low = QueryOptions {
-            no_cache: true,
-            max_memory_bytes: Some(2 << 20),
-            ..Default::default()
-        };
-        let low = super::super::prepare_query(store.snapshot(), &q, &low, None, None).unwrap();
-        assert!(!auto_streaming(
-            &low.ctx,
-            &p.node,
-            p.kind,
-            &Default::default()
-        ));
     }
 
     #[test]
