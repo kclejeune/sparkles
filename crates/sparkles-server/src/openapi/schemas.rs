@@ -993,7 +993,8 @@ pub(super) fn schemas() -> Map<String, J> {
             "required": ["operator", "description", "children"],
             "additionalProperties": true,
             "properties": {
-                "id": { "type": "string", "description": "The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response." },
+                "planFormat": { "type": "integer", "enum": [2], "description": "On the root only. A plan deeper than 256 levels is in plan format 2, whose nodes have no `id`, and a client derives each id from the shape of the plan. A plan without this member is in format 1. A reader refuses a format it does not know." },
+                "id": { "type": "string", "description": "The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response. Absent in plan format 2." },
                 "operator": { "type": "string" },
                 "description": { "type": "string" },
                 "columns": array(json!({ "type": "string" })),
@@ -1027,7 +1028,8 @@ pub(super) fn schemas() -> Map<String, J> {
                 "children",
             ],
             json!({
-                "id": { "type": "string", "description": "The node id, the same as the operator's." },
+                "planFormat": { "type": "integer", "enum": [2], "description": "On the root only. A plan deeper than 256 levels is in plan format 2, whose nodes have no `id`, and a client derives each id from the shape of the plan. A plan without this member is in format 1. A reader refuses a format it does not know." },
+                "id": { "type": "string", "description": "The node id, the same as the operator's. Absent in plan format 2." },
                 "operator": sref("PlanNode"),
                 "materializes": { "type": "boolean" },
                 "fullInputBeforeOutput": { "type": "boolean" },

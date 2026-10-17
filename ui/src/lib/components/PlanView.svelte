@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tick, type Snippet } from 'svelte';
-  import { planOf, type CursorPlan, type PlanNode } from '$lib/api';
+  import { planFormatProblem, planOf, type CursorPlan, type PlanNode } from '$lib/api';
   import type { Severity } from '$lib/explain';
   import { fmtCompact, fmtInt, fmtMs } from '$lib/format';
   import { shorten, type PrefixMap } from '$lib/rdf';
@@ -33,7 +33,24 @@
     toolbar?: Snippet;
   } = $props();
 
-  const plan = $derived(planOf(given));
+  /** Why the plan is not shown, when it is in a format this client does not know. */
+  const problem = $derived(planFormatProblem(given));
+  const plan = $derived(
+    problem
+      ? ({
+          operator: '',
+          description: '',
+          columns: [],
+          sortedOn: [],
+          estimatedRows: 0,
+          estimatedCost: 0,
+          actualRows: 0,
+          timeMs: 0,
+          cached: false,
+          children: [],
+        } satisfies PlanNode)
+      : planOf(given),
+  );
 
   /**
    * Operator description for display: `<iri>` as a prefixed name where a prefix matches,
@@ -155,196 +172,203 @@
   const hoveredNode = $derived(all.find((r) => r.id === hovered)?.node ?? null);
 </script>
 
-<div class="plan">
-  <div class="toolbar">
-    <div class="tabs" role="tablist">
-      <button
-        class="tab"
-        role="tab"
-        aria-selected={mode === 'tree'}
-        onclick={() => (mode = 'tree')}
-      >
-        <Icon name="tree" size={14} /> Tree
-      </button>
-      <button
-        class="tab"
-        role="tab"
-        aria-selected={mode === 'flame'}
-        onclick={() => (mode = 'flame')}
-      >
-        <Icon name="layers" size={14} /> Flame
-      </button>
-    </div>
-    <span class="spacer"></span>
-    {#if executed}
-      <span class="legend"><span class="sw hot0"></span>slowest self time</span>
-      <span class="legend"><span class="sw mis"></span>estimate off ≥10×</span>
-      {#if anyPartial}<span class="legend" title="Counted until the query stopped"
-          ><sup>p</sup> partial, counted until the query stopped</span
-        >{/if}
-    {:else}
-      <span class="faint">Not executed: widths show estimated cost</span>
-    {/if}
-    {#if toolbar}{@render toolbar()}{/if}
-  </div>
-
-  {#if mode === 'tree'}
-    <div class="tree scroll" bind:this={tree}>
-      <div class="thead" class:est={!executed}>
-        <span>Operator</span>
-        <span class="num">Est. rows</span>
-        {#if executed}
-          <span class="num">Actual rows</span>
-          <span class="num">Self</span>
-          <span class="num">Total</span>
-        {/if}
-        <span>Share of {executed ? 'time' : 'cost'}</span>
-      </div>
-      {#each rows as r (r.id)}
-        {@const h = hot.get(r.id)}
-        {@const mis = misestimate(r.node)}
-        {@const mark = marks.get(r.id)}
-        <div
-          class="tr"
-          class:hot={h != null}
-          class:est={!executed}
-          class:selected={selected === r.id}
-          class:lit={lit?.has(r.id)}
-          data-rank={h}
-          data-node={r.id}
-          role="group"
-          aria-label="{r.node.operator} {r.id}"
-          aria-current={selected === r.id ? 'true' : undefined}
-          onmouseenter={() => onhover?.(r.id)}
-          onmouseleave={() => onhover?.(null)}
+{#if problem}
+  <div class="error-box" role="alert">{problem}</div>
+{:else}
+  <div class="plan">
+    <div class="toolbar">
+      <div class="tabs" role="tablist">
+        <button
+          class="tab"
+          role="tab"
+          aria-selected={mode === 'tree'}
+          onclick={() => (mode = 'tree')}
         >
-          <div class="op" style:padding-left="{r.depth * 18 + 6}px">
-            {#each r.last as isLast, d (d)}
-              <span
-                class="guide"
-                style:left="{d * 18 + 14}px"
-                class:end={isLast && d === r.last.length - 1}
-              ></span>
-            {/each}
-            {#if r.hasKids}
-              <button
-                class="twisty"
-                class:open={!collapsed.has(r.id)}
-                onclick={() => toggle(r.id)}
-                aria-label="Toggle children"
-              >
-                <Icon name="chevron" size={12} />
-              </button>
-            {:else}
-              <span class="twisty-space"></span>
-            {/if}
-            {#if mark}<span class="mark {mark}" title="{mark} note">{MARK[mark]}</span>{/if}
-            <button class="name" onclick={() => onselect?.(r.id)} title="Node {r.id}"
-              >{r.node.operator}</button
-            >
-            <span class="desc" title={r.node.description}>{desc(r.node.description)}</span>
-            {#if r.node.cached}<span class="badge ok" title="Served from the result cache"
-                >cached</span
-              >{/if}
-            {#if r.node.skipped}<span class="badge" title={r.node.skipped}>skipped</span>{/if}
-            {#if r.node.stoppedEarly}<span
-                class="badge"
-                title="Stopped once it had enough rows for a LIMIT, ASK or EXISTS"
-                >stopped early</span
-              >{/if}
-            {#if r.node.runs && r.node.runs > 1}<span
-                class="badge"
-                title="Ran {r.node.runs} times as the executor grew its input">×{r.node.runs}</span
-              >{/if}
-            {#if r.node.materializes}<span
-                class="badge"
-                title={r.node.reason ?? 'Reads its whole input before its first row'}
-                >materializes</span
-              >{/if}
-            {#if h != null}<span class="badge spark">#{h + 1} slowest</span>{/if}
-          </div>
-          {#if r.node.estimatedRows < 0}
-            <span class="num faint" title="Estimates are hidden for your view">hidden</span>
-          {:else}
-            <span class="num faint" title={r.node.estimateGuessed ? 'A constant guess' : undefined}
-              >{r.node.estimateGuessed ? '~' : ''}{fmtCompact(r.node.estimatedRows)}</span
-            >
-          {/if}
-          {#if executed}
-            <span
-              class="num"
-              class:mis={mis != null}
-              title={mis ? `Off by ${mis.toFixed(0)}× vs estimate` : undefined}
-            >
-              {r.node.actualRows < 0 ? '—' : fmtInt(r.node.actualRows)}{#if partial(r.node)}<sup
-                  title="Partial: counted until the query stopped">p</sup
-                >{/if}
-            </span>
-            <span class="num">{fmtMs(r.self)}</span>
-            <span class="num faint">{fmtMs(r.node.timeMs)}</span>
-          {/if}
-          <div
-            class="bar"
-            title={executed
-              ? `${fmtMs(r.node.timeMs)} total, ${fmtMs(r.self)} self`
-              : `cost ${fmtInt(r.node.estimatedCost)}`}
-          >
-            <span class="total" style:width="{(metric(r.node) / rootMetric) * 100}%"></span>
-            {#if executed}<span class="self" style:width="{(r.self / rootMetric) * 100}%"
-              ></span>{/if}
-          </div>
-        </div>
-      {/each}
+          <Icon name="tree" size={14} /> Tree
+        </button>
+        <button
+          class="tab"
+          role="tab"
+          aria-selected={mode === 'flame'}
+          onclick={() => (mode = 'flame')}
+        >
+          <Icon name="layers" size={14} /> Flame
+        </button>
+      </div>
+      <span class="spacer"></span>
+      {#if executed}
+        <span class="legend"><span class="sw hot0"></span>slowest self time</span>
+        <span class="legend"><span class="sw mis"></span>estimate off ≥10×</span>
+        {#if anyPartial}<span class="legend" title="Counted until the query stopped"
+            ><sup>p</sup> partial, counted until the query stopped</span
+          >{/if}
+      {:else}
+        <span class="faint">Not executed: widths show estimated cost</span>
+      {/if}
+      {#if toolbar}{@render toolbar()}{/if}
     </div>
-  {:else}
-    <div class="flame scroll">
-      <div class="icicle" style:height="{depth * 26}px">
-        {#each boxes as b (b.id)}
-          {@const h = hot.get(b.id)}
-          <button
-            class="box"
+
+    {#if mode === 'tree'}
+      <div class="tree scroll" bind:this={tree}>
+        <div class="thead" class:est={!executed}>
+          <span>Operator</span>
+          <span class="num">Est. rows</span>
+          {#if executed}
+            <span class="num">Actual rows</span>
+            <span class="num">Self</span>
+            <span class="num">Total</span>
+          {/if}
+          <span>Share of {executed ? 'time' : 'cost'}</span>
+        </div>
+        {#each rows as r (r.id)}
+          {@const h = hot.get(r.id)}
+          {@const mis = misestimate(r.node)}
+          {@const mark = marks.get(r.id)}
+          <div
+            class="tr"
             class:hot={h != null}
-            class:thin={b.w < 0.04}
-            style:left="{b.x * 100}%"
-            style:width="calc({b.w * 100}% - 2px)"
-            style:top="{b.depth * 26}px"
-            onmouseenter={() => (hovered = b.id)}
-            onmouseleave={() => (hovered = null)}
-            onfocus={() => (hovered = b.id)}
-            title="{b.node.operator} {b.node.description}"
+            class:est={!executed}
+            class:selected={selected === r.id}
+            class:lit={lit?.has(r.id)}
+            data-rank={h}
+            data-node={r.id}
+            role="group"
+            aria-label="{r.node.operator} {r.id}"
+            aria-current={selected === r.id ? 'true' : undefined}
+            onmouseenter={() => onhover?.(r.id)}
+            onmouseleave={() => onhover?.(null)}
           >
-            <span>{b.node.operator}</span>
-            <span class="d">{desc(b.node.description)}</span>
-          </button>
+            <div class="op" style:padding-left="{r.depth * 18 + 6}px">
+              {#each r.last as isLast, d (d)}
+                <span
+                  class="guide"
+                  style:left="{d * 18 + 14}px"
+                  class:end={isLast && d === r.last.length - 1}
+                ></span>
+              {/each}
+              {#if r.hasKids}
+                <button
+                  class="twisty"
+                  class:open={!collapsed.has(r.id)}
+                  onclick={() => toggle(r.id)}
+                  aria-label="Toggle children"
+                >
+                  <Icon name="chevron" size={12} />
+                </button>
+              {:else}
+                <span class="twisty-space"></span>
+              {/if}
+              {#if mark}<span class="mark {mark}" title="{mark} note">{MARK[mark]}</span>{/if}
+              <button class="name" onclick={() => onselect?.(r.id)} title="Node {r.id}"
+                >{r.node.operator}</button
+              >
+              <span class="desc" title={r.node.description}>{desc(r.node.description)}</span>
+              {#if r.node.cached}<span class="badge ok" title="Served from the result cache"
+                  >cached</span
+                >{/if}
+              {#if r.node.skipped}<span class="badge" title={r.node.skipped}>skipped</span>{/if}
+              {#if r.node.stoppedEarly}<span
+                  class="badge"
+                  title="Stopped once it had enough rows for a LIMIT, ASK or EXISTS"
+                  >stopped early</span
+                >{/if}
+              {#if r.node.runs && r.node.runs > 1}<span
+                  class="badge"
+                  title="Ran {r.node.runs} times as the executor grew its input"
+                  >×{r.node.runs}</span
+                >{/if}
+              {#if r.node.materializes}<span
+                  class="badge"
+                  title={r.node.reason ?? 'Reads its whole input before its first row'}
+                  >materializes</span
+                >{/if}
+              {#if h != null}<span class="badge spark">#{h + 1} slowest</span>{/if}
+            </div>
+            {#if r.node.estimatedRows < 0}
+              <span class="num faint" title="Estimates are hidden for your view">hidden</span>
+            {:else}
+              <span
+                class="num faint"
+                title={r.node.estimateGuessed ? 'A constant guess' : undefined}
+                >{r.node.estimateGuessed ? '~' : ''}{fmtCompact(r.node.estimatedRows)}</span
+              >
+            {/if}
+            {#if executed}
+              <span
+                class="num"
+                class:mis={mis != null}
+                title={mis ? `Off by ${mis.toFixed(0)}× vs estimate` : undefined}
+              >
+                {r.node.actualRows < 0 ? '—' : fmtInt(r.node.actualRows)}{#if partial(r.node)}<sup
+                    title="Partial: counted until the query stopped">p</sup
+                  >{/if}
+              </span>
+              <span class="num">{fmtMs(r.self)}</span>
+              <span class="num faint">{fmtMs(r.node.timeMs)}</span>
+            {/if}
+            <div
+              class="bar"
+              title={executed
+                ? `${fmtMs(r.node.timeMs)} total, ${fmtMs(r.self)} self`
+                : `cost ${fmtInt(r.node.estimatedCost)}`}
+            >
+              <span class="total" style:width="{(metric(r.node) / rootMetric) * 100}%"></span>
+              {#if executed}<span class="self" style:width="{(r.self / rootMetric) * 100}%"
+                ></span>{/if}
+            </div>
+          </div>
         {/each}
       </div>
-      <div class="detail">
-        {#if hoveredNode}
-          <strong>{hoveredNode.operator}</strong>
-          <span class="mono">{desc(hoveredNode.description)}</span>
-          <span class="muted">
-            est {fmtInt(hoveredNode.estimatedRows)} rows{#if hoveredNode.actualRows >= 0}, actual {fmtInt(
-                hoveredNode.actualRows,
-              )}{/if}{#if executed},
-              {fmtMs(hoveredNode.timeMs)} total, {fmtMs(selfTime(hoveredNode))} self{/if}
-          </span>
-          {#if hoveredNode.columns.length}<span class="faint mono"
-              >→ {hoveredNode.columns.join(' ')}</span
-            >{/if}
-          {#if hoveredNode.sortedOn.length}<span class="faint"
-              >sorted on <span class="mono">{hoveredNode.sortedOn.join(', ')}</span></span
-            >{/if}
-        {:else}
-          <span class="faint"
-            >Hover a box for details. Width is proportional to {executed
-              ? 'wall time'
-              : 'estimated cost'}.</span
-          >
-        {/if}
+    {:else}
+      <div class="flame scroll">
+        <div class="icicle" style:height="{depth * 26}px">
+          {#each boxes as b (b.id)}
+            {@const h = hot.get(b.id)}
+            <button
+              class="box"
+              class:hot={h != null}
+              class:thin={b.w < 0.04}
+              style:left="{b.x * 100}%"
+              style:width="calc({b.w * 100}% - 2px)"
+              style:top="{b.depth * 26}px"
+              onmouseenter={() => (hovered = b.id)}
+              onmouseleave={() => (hovered = null)}
+              onfocus={() => (hovered = b.id)}
+              title="{b.node.operator} {b.node.description}"
+            >
+              <span>{b.node.operator}</span>
+              <span class="d">{desc(b.node.description)}</span>
+            </button>
+          {/each}
+        </div>
+        <div class="detail">
+          {#if hoveredNode}
+            <strong>{hoveredNode.operator}</strong>
+            <span class="mono">{desc(hoveredNode.description)}</span>
+            <span class="muted">
+              est {fmtInt(hoveredNode.estimatedRows)} rows{#if hoveredNode.actualRows >= 0}, actual {fmtInt(
+                  hoveredNode.actualRows,
+                )}{/if}{#if executed},
+                {fmtMs(hoveredNode.timeMs)} total, {fmtMs(selfTime(hoveredNode))} self{/if}
+            </span>
+            {#if hoveredNode.columns.length}<span class="faint mono"
+                >→ {hoveredNode.columns.join(' ')}</span
+              >{/if}
+            {#if hoveredNode.sortedOn.length}<span class="faint"
+                >sorted on <span class="mono">{hoveredNode.sortedOn.join(', ')}</span></span
+              >{/if}
+          {:else}
+            <span class="faint"
+              >Hover a box for details. Width is proportional to {executed
+                ? 'wall time'
+                : 'estimated cost'}.</span
+            >
+          {/if}
+        </div>
       </div>
-    </div>
-  {/if}
-</div>
+    {/if}
+  </div>
+{/if}
 
 <style>
   .plan {

@@ -371,6 +371,8 @@ export type Term =
   | { type: 'triple'; value: { subject: Term; predicate: Term; object: Term } };
 
 export type PlanNode = {
+  /** On the root only: 2 for a plan deeper than 256 levels, whose nodes have no `id`. Absent in format 1. */
+  planFormat?: number;
   operator: string;
   description: string;
   columns: string[];
@@ -406,6 +408,8 @@ export type PlanNode = {
 
 /** A node of a streamed plan (`meta.plan` of a streamed result). */
 export type CursorPlan = {
+  /** On the root only: 2 for a plan deeper than 256 levels, whose nodes have no `id`. Absent in format 1. */
+  planFormat?: number;
   id?: string;
   operator: PlanNode;
   materializes: boolean;
@@ -1257,10 +1261,24 @@ export function isCursorPlan(p: PlanNode | CursorPlan): p is CursorPlan {
 }
 
 /**
+ * Why this client cannot read the plan, or null when it can. It reads plan format 1, which
+ * writes the id of every node, and format 2, which leaves them out and has each id derived
+ * from the shape of the plan. A plan in any other format is not shown, as a newer format
+ * could change what the members mean.
+ */
+export function planFormatProblem(p: PlanNode | CursorPlan): string | null {
+  const f = p.planFormat;
+  if (f === undefined || f === 1 || f === 2) return null;
+  return `This plan is in format ${JSON.stringify(f)}, which this version of the UI cannot show. Update the UI to read it.`;
+}
+
+/**
  * A plan as `PlanView` reads it: a streamed `CursorPlan` becomes a `PlanNode` tree that
  * keeps `complete`, `materializes` and the reason, and every node gets its id.
  */
 export function planOf(p: PlanNode | CursorPlan, id = '0'): PlanNode {
+  const problem = planFormatProblem(p);
+  if (problem) throw new Error(problem);
   if (isCursorPlan(p)) {
     const op = p.operator;
     return {
@@ -1287,7 +1305,9 @@ export function normalizeResult(r: SparklesResult): SparklesResult {
   // Be lenient about variable names with a leading '?' and missing meta.
   if (r.vars) r.vars = r.vars.map((v) => v.replace(/^[?$]/, ''));
   // a streamed result's plan is read like an eager one
-  if (r.meta?.plan) r.meta.plan = planOf(r.meta.plan as PlanNode | CursorPlan);
+  // (a plan in a format this client does not know stays as it is, for `PlanView` to refuse)
+  const plan = r.meta?.plan as PlanNode | CursorPlan | undefined;
+  if (r.meta && plan && !planFormatProblem(plan)) r.meta.plan = planOf(plan);
   r.meta ??= {
     totalRows: r.rows?.length ?? r.triples?.length ?? 0,
     sentRows: r.rows?.length ?? r.triples?.length ?? 0,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CursorPlan, PlanNode } from './api';
-import { normalizeResult, type SparklesResult } from './api';
+import { normalizeResult, planFormatProblem, type SparklesResult } from './api';
 import { ancestors, cites, marks, planOf, type ExplainNote } from './explain';
 
 const node = (operator: string, children: PlanNode[] = []): PlanNode => ({
@@ -22,6 +22,39 @@ describe('planOf', () => {
     expect(p.id).toBe('0');
     expect(p.children[0].id).toBe('0.0');
     expect(p.children[0].children[1].id).toBe('0.0.1');
+  });
+
+  it('derives the ids of a plan in format 2, which has none', () => {
+    const root = {
+      ...node('Project', [node('Join', [node('Scan'), node('Scan')])]),
+      planFormat: 2,
+    };
+    expect(planFormatProblem(root)).toBeNull();
+    const p = planOf(root);
+    expect(p.id).toBe('0');
+    expect(p.children[0].children[1].id).toBe('0.0.1');
+  });
+
+  it('refuses a plan in a format it does not know', () => {
+    for (const planFormat of [3, 0, '2']) {
+      const root = { ...node('Project'), planFormat } as unknown as PlanNode;
+      expect(planFormatProblem(root)).toContain('cannot show');
+      expect(() => planOf(root)).toThrow(/format/);
+    }
+    // a result keeps such a plan as it is, for the plan view to refuse
+    const plan = { ...node('Scan'), planFormat: 3 };
+    const r = normalizeResult({
+      queryType: 'SELECT',
+      vars: [],
+      rows: [],
+      meta: {
+        totalRows: 0,
+        sentRows: 0,
+        timing: { parseMs: 0, planMs: 0, execMs: 0, serializeMs: 0, totalMs: 0 },
+        plan,
+      },
+    } as SparklesResult);
+    expect(r.meta.plan).toBe(plan);
   });
 
   it('reads a streamed plan like an eager one and keeps its streaming facts', () => {
