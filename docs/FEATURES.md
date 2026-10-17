@@ -261,10 +261,10 @@ that work by priority and links each item to its design spec.
   is refused. A basic graph pattern counts two levels per triple pattern, so it holds at
   most 1998 of them, and a path range counts its unrolled steps, multiplied through
   nested ranges. The [nesting limits](API.md#nesting-limits) give the rules. Planning
-  time grows with the square of the number of triple patterns, so a basic graph pattern at
-  the limit takes 1.3 to 1.7 s to plan in a release build, and shapes that mix OPTIONAL
-  or BIND with the chain take up to 7.6 s. Most shapes observe the timeout during
-  planning, but a plain chain does not. [Roadmap](ROADMAP.md) item 84.
+  time grows with the square of the number of triple patterns, and a basic graph pattern
+  at the limit takes up to about 0.5 s to plan in a release build. Planning observes the
+  timeout and cancellation. The explanation of `/{ds}/sparql/explain` reads plans of at
+  most 256 levels. [Roadmap](ROADMAP.md) item 84.
 * **Query memory pool.** A SERVICE call from a query to the same server is admitted like
   any request, so it waits behind its caller's grant and answers `503` after the
   admission wait, which `SILENT` turns into no rows. MCP tool calls are not admitted, so

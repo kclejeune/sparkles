@@ -120,7 +120,7 @@ These items are cheap or foundational.
 | 78 | Incremental write-time validation of recursive SHACL shapes and SHACL-SPARQL constraints not anchored at the focus node | [C10](specs/C10-write-time-validation.md#roadmap-follow-ups-2026-10-12) | M–L |
 | 82 | Cheaper vector catch-up and measured half-precision recall. Catch-up scans only new rows, binary16 recall is measured on Euclidean and dot-product data with an offset, a measurement picks the worker pool, and a test cancels a carry. | [F04](specs/F04-vector-search.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 83 | The ShEx guard checks the SHA-256 of its schema copy against `schema.sha256` in its `validation.json` when it loads, and refuses the guard or validates in full when they differ, so a copy edited outside Sparkles is not trusted with the stored baseline counts. | [C10](specs/C10-write-time-validation.md#known-gap-schema-copy-digest-2026-10-16) | S |
-| 84 | Large query plans. Planning time grows with the square of the number of triple patterns, and an iterative n-ary join would let the 4000-level plan limit rise. The deadline checks, the size of the plan JSON and the explanation reader are listed in X05. | [X05](specs/X05-streaming-query-execution.md#large-basic-graph-patterns) | M |
+| 84 | Large query plans. The deadline checks, the plan JSON without ids, the iterative explanation reader and the teardown of refused queries shipped. An n-ary join, designed in X05, would let the 4000-level plan limit rise, and planning time still grows with the square of the number of triple patterns. | [X05](specs/X05-streaming-query-execution.md#large-basic-graph-patterns) | M |
 
 ## Tier 5: backlog
 

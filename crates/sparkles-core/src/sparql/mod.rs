@@ -379,8 +379,7 @@ pub fn parse_query(q: &str, base: Option<&str>, prefixes: &[(String, String)]) -
             .with_prefix(k, v)
             .map_err(|e| Error::invalid(e.to_string()))?;
     }
-    let query = p.parse_query(q)?;
-    let depth = depth::check_query(&query)?;
+    let (query, depth) = depth::checked_query(p.parse_query(q)?)?;
     let (pattern, _, _) = split(&query);
     depth::with_stack(depth, || validate_scoping(pattern))?;
     Ok(query)
@@ -662,7 +661,12 @@ fn select_star_columns(q: &str, vars: &[String]) -> Option<Vec<usize>> {
             .unwrap_or(usize::MAX)
     };
     let mut order: Vec<usize> = (0..vars.len()).collect();
-    order.sort_by_key(|&i| pos(&vars[i]));
+    if vars.len() <= 16 {
+        order.sort_by_key(|&i| pos(&vars[i]));
+    } else {
+        // each position once, since finding one reads the query text
+        order.sort_by_cached_key(|&i| pos(&vars[i]));
+    }
     Some(order)
 }
 
@@ -981,7 +985,7 @@ pub fn explain(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<(Str
         let pattern = rdfs::apply(&ctx, &pattern);
         let node = planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?;
         depth::check_plan(node.depth())?;
-        let mut info = exec::describe(&ctx, &node);
+        let mut info = exec::try_describe(&ctx, &node)?;
         if matches!(kind, QueryKind::Construct | QueryKind::Describe) {
             info = graph_root(kind, info, Instant::now());
             info.time_ms = 0.0;

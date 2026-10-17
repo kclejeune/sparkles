@@ -689,6 +689,26 @@ struct Selection {
     pub variables: SelectionVariables,
 }
 
+/// Add `v` to the variables `pv` unless it is one of them already, and say whether it was
+/// added. A query can select thousands of variables, so past a few dozen a set of them,
+/// `seen`, answers whether one is there.
+fn add_var(pv: &mut Vec<Variable>, seen: &mut Option<HashSet<Variable>>, v: &Variable) -> bool {
+    let new = match seen {
+        Some(seen) => seen.insert(v.clone()),
+        None if pv.len() < 32 => !pv.contains(v),
+        None => {
+            let mut set: HashSet<Variable> = pv.iter().cloned().collect();
+            let new = set.insert(v.clone());
+            *seen = Some(set);
+            new
+        }
+    };
+    if new {
+        pv.push(v.clone());
+    }
+    new
+}
+
 fn build_select(
     select: Selection,
     r#where: GraphPattern,
@@ -739,6 +759,7 @@ fn build_select(
 
     // SELECT
     let mut pv = Vec::new();
+    let mut in_pv = None;
     let with_project = match select.variables {
         SelectionVariables::Explicit(sel_items) => {
             let mut visible = HashSet::new();
@@ -779,10 +800,9 @@ fn build_select(
                         variable
                     }
                 };
-                if pv.contains(&v) {
+                if !add_var(&mut pv, &mut in_pv, &v) {
                     return Err("Duplicated variable name in SELECT");
                 }
-                pv.push(v)
             }
             true
         }
@@ -792,9 +812,7 @@ fn build_select(
             }
             // TODO: is it really useful to do a projection?
             p.on_in_scope_variable(|v| {
-                if !pv.contains(v) {
-                    pv.push(v.clone());
-                }
+                add_var(&mut pv, &mut in_pv, v);
             });
             pv.sort();
             true

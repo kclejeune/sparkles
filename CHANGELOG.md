@@ -33,6 +33,12 @@ a default call costs about a third more. A call whose weights are all zero with 
 `nodeSelfInfluence` is refused. A write-back graph algorithm run now has the update
 timeout instead of the query timeout.
 
+A query plan deeper than 256 levels, as `/{ds}/explain`, the Sparkles result format and
+the cursor write it, is in plan format 2. Its root has `"planFormat": 2` and its nodes
+have no `id`, which a client derives from the shape. Shallower plans are unchanged.
+Planning a basic graph pattern near the plan limit is 3 to 12 times faster,
+and planning observes the request's timeout and cancellation throughout.
+
 ### Format
 
 The ShEx write guard's persisted typing, `validation-typing.bin`, is registered as the

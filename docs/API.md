@@ -7327,6 +7327,8 @@ type Term =
   | { type: "literal"; value: string; datatype?: string; "xml:lang"?: string }
   | { type: "triple"; value: { subject: Term; predicate: Term; object: Term } };
 type PlanNode = {
+  planFormat?: 2;            // root only: a plan deeper than 256 levels, whose nodes have no id
+  id?: string;               // the path of child indexes from the root, such as "0.1.2"
   operator: string;          // "IndexScan", "Join", "Sort", "Filter", ...
   description: string;       // human readable, e.g. "PSO ?s <p> ?o"
   columns: string[];         // variables produced
@@ -7445,7 +7447,11 @@ also lists the warnings that came up while it ran:
 
 Every node of a returned plan has an `id`, the path of child indexes from the root, such
 as `0.1.2`. A `CursorPlan` node and its operator share the id. Ids are valid only for
-the plan of the same response. The estimated plan of `/{ds}/explain` and the plan of an
+the plan of the same response. A plan deeper than 256 levels is written in plan format 2
+instead, whose root has `"planFormat": 2` and whose nodes have no `id`, because ids that
+are paths would make the JSON grow with the square of the depth. A client that needs the
+ids of such a plan derives them from its shape. A plan without `planFormat` is in format
+1, and a reader refuses a format it does not know. The estimated plan of `/{ds}/explain` and the plan of an
 executed query have the same shape, so an `ASK` has its `Slice` root and a `CONSTRUCT`
 or `DESCRIBE` has a `CONSTRUCT` or `DESCRIBE` root in both. A node can also carry these
 members.
@@ -7685,15 +7691,15 @@ more than 5 brackets deep, and the deepest algebra count is 29.
 
 A basic graph pattern at the plan limit is a chain of about 2000 triple patterns, and
 planning time grows with the square of the number of triple patterns. A release build
-explains a query at the limit in 1.3 to 1.7 s for a plain chain of 1998 triple
-patterns and in 2.8 s for a tree of 1998 or a MINUS after each of 790 patterns. A BIND
-after each of 790 patterns takes 6.9 s and an OPTIONAL after each of them 7.6 s. Most
-of these shapes observe the request's timeout during planning, but a plain chain and
-its reverse do not, so a timeout cannot cut those short. The JSON plan of a query at the
-limit, as `/{ds}/explain` and the Sparkles result format write it, reaches about 60 MB,
-because each node is named by its path from the root. A request body of about 40 KB can
-ask for that. [Roadmap](ROADMAP.md) item 84 covers a deadline in every planning loop
-and a plan that is linear in size.
+explains a plain chain of 1998 triple patterns in about 0.35 s, and the slowest shape
+measured, an OPTIONAL after each of 799 patterns, in about 0.5 s. Running such a query
+takes under 1 s. Planning and the description of the plan observe the request's timeout
+and cancellation, so every shape stops close to its timeout. The JSON plan of a query at
+the limit, as `/{ds}/explain` and the Sparkles result format write it, is up to about
+33 MB, because each node lists the variables it binds. A request body of about 40 KB can
+ask for that. The explanation of `/{ds}/sparql/explain` refuses a plan deeper than 256
+levels. [Roadmap](ROADMAP.md) item 84 keeps an n-ary join that would let the limit
+rise.
 
 Parsing a query at the bracket limit takes up to 1.5 MiB of stack, which fits the 2 MiB
 that Rust, tokio and rayon give the threads they start. The server runs requests on

@@ -5,7 +5,10 @@
 use spargebra::nesting::{MAX_DEPTH, MAX_NESTING, measure};
 use sparkles::Dataset;
 use sparkles::io::RdfFormat;
-use sparkles::sparql::depth::{MAX_PLAN_DEPTH, check_query, check_update, query_depth, with_stack};
+use sparkles::sparql::depth::{
+    MAX_PLAN_DEPTH, check_query, check_update, checked_query, checked_update, query_depth,
+    with_stack,
+};
 
 /// Run `f` on a thread with a 2 MiB stack.
 fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -717,6 +720,22 @@ fn plan_shapes(n: usize) -> Vec<(String, String)> {
                 )
             })),
         ),
+        (
+            "chain with minus",
+            select(each(&|i| {
+                format!(
+                    "?a{i} <urn:p> ?a{} . MINUS {{ ?a{} <urn:q> 3 }} ",
+                    i + 1,
+                    i + 1
+                )
+            })),
+        ),
+        (
+            "chain with binds",
+            select(each(&|i| {
+                format!("?a{i} <urn:p> ?a{} . BIND(?a{} AS ?b{i}) ", i + 1, i + 1)
+            })),
+        ),
     ];
     // shapes that do not grow with n
     if n == 100 {
@@ -732,6 +751,29 @@ fn plan_shapes(n: usize) -> Vec<(String, String)> {
     shapes
         .into_iter()
         .map(|(what, q)| (format!("{what} of {n}"), q))
+        .collect()
+}
+
+/// Each shape of [`plan_shapes`] with the most triple patterns the plan limit accepts.
+fn shapes_at_the_limit() -> Vec<(String, String)> {
+    let accepted = |q: &str| {
+        spargebra::SparqlParser::new()
+            .parse_query(q)
+            .is_ok_and(|parsed| check_query(&parsed).is_ok())
+    };
+    (0..plan_shapes(1).len())
+        .map(|i| {
+            let (mut lo, mut hi) = (1, MAX_PLAN_DEPTH / 2);
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if accepted(&plan_shapes(mid)[i].1) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            plan_shapes(lo).swap_remove(i)
+        })
         .collect()
 }
 
@@ -840,12 +882,20 @@ fn the_measured_plan_depth_bounds_the_plan() {
 /// and the plan JSON names each node by its path from the root. Run it in a release build
 /// for the numbers in the docs, with
 /// `cargo test --release -p sparkles --test nesting large_bgp_planning_time -- --ignored --nocapture`.
+/// It then does the same for each of the shapes of [`plan_shapes`] at the limit, or for the
+/// shapes whose name contains `SPARKLES_PLAN_SHAPE`.
 #[test]
 #[ignore = "measures time, not behaviour"]
 fn large_bgp_planning_time() {
     let ds = cyclic();
     let opts = sparkles::sparql::QueryOptions::default();
-    for n in [500, 1000, (MAX_PLAN_DEPTH - 3) / 2] {
+    let only = std::env::var("SPARKLES_PLAN_SHAPE").unwrap_or_default();
+    let sizes = if only.is_empty() {
+        &[500, 1000, (MAX_PLAN_DEPTH - 3) / 2][..]
+    } else {
+        &[]
+    };
+    for &n in sizes {
         let q = format!(
             "SELECT * {{ {} }}",
             (0..n)
@@ -863,6 +913,279 @@ fn large_bgp_planning_time() {
         );
         with_stack(plan.depth(), || drop(plan));
     }
+    for (what, q) in shapes_at_the_limit() {
+        if !what.contains(&only) {
+            continue;
+        }
+        let t = std::time::Instant::now();
+        let (_, plan) = sparkles::sparql::explain(ds.snapshot(), &q, &opts).unwrap();
+        let planned = t.elapsed();
+        let bytes = with_stack(plan.depth(), || serde_json::to_string(&plan).unwrap().len());
+        with_stack(plan.depth(), || drop(plan));
+        // the planner checks the timeout as it goes, so this stops after about half
+        let timed = sparkles::sparql::QueryOptions {
+            timeout: Some(planned / 2),
+            ..Default::default()
+        };
+        let t = std::time::Instant::now();
+        let r = sparkles::sparql::explain(ds.snapshot(), &q, &timed).map(|_| ());
+        let stopped = t.elapsed();
+        // on datasets of their own, since a run fills the result cache, which the
+        // planner reads
+        let t = std::time::Instant::now();
+        let rows = cyclic().query(&q).unwrap().len();
+        let ran = t.elapsed();
+        let t = std::time::Instant::now();
+        let cursor = sparkles::sparql::CursorOptions::default();
+        let exec = sparkles::sparql::query_cursor(cyclic().snapshot(), &q, &opts, &cursor).unwrap();
+        let opened = t.elapsed();
+        with_stack(MAX_PLAN_DEPTH, || drop(exec));
+        println!(
+            "{what}: explain {planned:?}, plan JSON {:.1} MB, with half that as the timeout \
+             {r:?} after {stopped:?}; query {ran:?} ({rows} rows), cursor opened in {opened:?}",
+            bytes as f64 / 1e6,
+        );
+    }
+}
+
+/// Every shape at the plan limit stops soon after its timeout or its cancellation, in
+/// planning as well as in running, since the planner checks them as it goes. Each shape
+/// gets a third and two thirds of the time `explain` takes for it as its timeout, and must
+/// stop within a quarter of that time past it, besides the time to parse it.
+#[test]
+fn planning_at_the_limit_stops_at_the_timeout() {
+    use std::time::Instant;
+    let ds = cyclic();
+    let cursor = sparkles::sparql::CursorOptions::default();
+    let stopped = |what: &str, r: sparkles::Result<()>, t: Instant, want: &str, by| {
+        let took = t.elapsed();
+        match r {
+            Err(e) => assert!(e.to_string().contains(want), "{what}: {e}"),
+            Ok(()) => panic!("{what}: not stopped, after {took:?}"),
+        }
+        assert!(took < by, "{what}: stopped after {took:?}, not by {by:?}");
+    };
+    let explain = |q: &str| {
+        let opts = sparkles::sparql::QueryOptions::default();
+        let t = Instant::now();
+        let (_, plan) = sparkles::sparql::explain(ds.snapshot(), q, &opts).unwrap();
+        let planned = t.elapsed();
+        with_stack(plan.depth(), || drop(plan));
+        planned
+    };
+    let shapes = shapes_at_the_limit();
+    explain(&shapes[0].1);
+    let parse = std::time::Duration::from_millis(if cfg!(debug_assertions) { 200 } else { 20 });
+    for (i, (what, q)) in shapes.iter().enumerate() {
+        let planned = explain(q);
+        // in planning, and in describing the plan
+        for part in [1, 2] {
+            let timeout = planned * part / 3;
+            // and the parse, before the timeout starts
+            let by = timeout + planned / 4 + parse;
+            let opts = sparkles::sparql::QueryOptions {
+                timeout: Some(timeout),
+                ..Default::default()
+            };
+            let t = Instant::now();
+            let r = sparkles::sparql::explain(ds.snapshot(), q, &opts).map(|_| ());
+            stopped(
+                &format!("{what}, explain in {part}/3"),
+                r,
+                t,
+                "timed out",
+                by,
+            );
+        }
+        let timeout = planned / 3;
+        let by = timeout + planned / 4 + parse;
+        let opts = sparkles::sparql::QueryOptions {
+            timeout: Some(timeout),
+            ..Default::default()
+        };
+        // a cancellation is checked at the same places
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = sparkles::sparql::QueryOptions {
+            cancel: Some(flag.clone()),
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let r = sparkles::sparql::explain(ds.snapshot(), q, &cancelled).map(|_| ());
+        cancel.join().unwrap();
+        stopped(&format!("{what}, cancelled explain"), r, t, "cancelled", by);
+        // the other ways to run a query plan it the same way
+        if i == 0 {
+            let t = Instant::now();
+            let r = ds.query_with(q, &opts).map(|_| ());
+            stopped(&format!("{what}, query"), r, t, "timed out", by);
+            let t = Instant::now();
+            let r = sparkles::sparql::query_cursor(ds.snapshot(), q, &opts, &cursor).map(|_| ());
+            stopped(&format!("{what}, cursor"), r, t, "timed out", by);
+            // and they finish in a few times as long as planning takes, on datasets of their
+            // own since a run fills the result cache: the keys of that cache and the
+            // operators of a cursor each describe one node, not the subtree below it
+            let opts = sparkles::sparql::QueryOptions {
+                timeout: Some(planned * 10),
+                ..Default::default()
+            };
+            assert_eq!(cyclic().query_with(q, &opts).unwrap().len(), 2, "{what}");
+            let t = Instant::now();
+            let exec = sparkles::sparql::query_cursor(cyclic().snapshot(), q, &opts, &cursor);
+            let opened = t.elapsed();
+            with_stack(MAX_PLAN_DEPTH, || drop(exec.unwrap()));
+            assert!(
+                opened < planned * 10,
+                "{what}: a cursor opened in {opened:?}"
+            );
+        }
+    }
+}
+
+/// Run the test `name` of this binary alone in a child process, where `CHILD` is set, and
+/// check that it passed, so that a stack overflow in it fails the test rather than abort
+/// the whole run.
+fn in_child(name: &str) -> bool {
+    const CHILD: &str = "SPARKLES_NESTING_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads", "1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "{name}: {}\n{stdout}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    false
+}
+
+/// A query or update refused for how deeply it nests is dropped without recursion, so a
+/// shape whose text the nesting scan undercounts cannot abort the process on the drop.
+/// Each algebra is built directly, since the scan refuses such a text.
+#[test]
+fn a_refused_query_is_dropped_without_recursion() {
+    use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
+    use spargebra::term::{NamedNode, TermPattern, Variable};
+    if !in_child("a_refused_query_is_dropped_without_recursion") {
+        return;
+    }
+    const N: usize = 1_000_000;
+    let deep = || {
+        let v = Variable::new_unchecked("x");
+        let p = NamedNode::new_unchecked("urn:p");
+        let mut expr = Expression::Variable(v.clone());
+        let mut path = PropertyPathExpression::NamedNode(p);
+        for _ in 0..N {
+            expr = Expression::Or(Box::new(expr), Box::new(Expression::Variable(v.clone())));
+            path = PropertyPathExpression::Reverse(Box::new(path));
+        }
+        let mut pattern = GraphPattern::Path {
+            subject: TermPattern::Variable(v.clone()),
+            path,
+            object: TermPattern::Variable(v),
+        };
+        pattern = GraphPattern::Filter {
+            expr: Expression::Exists(Box::new(GraphPattern::Filter {
+                expr,
+                inner: Box::new(pattern),
+            })),
+            inner: Box::new(GraphPattern::Bgp { patterns: vec![] }),
+        };
+        for _ in 0..N {
+            pattern = GraphPattern::Join {
+                left: Box::new(pattern),
+                right: Box::new(GraphPattern::Bgp { patterns: vec![] }),
+            };
+        }
+        pattern
+    };
+    let query = spargebra::Query::Select {
+        dataset: None,
+        pattern: deep(),
+        base_iri: None,
+    };
+    let update = spargebra::Update {
+        base_iri: None,
+        operations: vec![spargebra::GraphUpdateOperation::DeleteInsert {
+            delete: vec![],
+            insert: vec![],
+            using: None,
+            pattern: Box::new(deep()),
+        }],
+    };
+    let want = "query algebra nested deeper than";
+    let e = on_small_stack(move || checked_query(query).err().unwrap().to_string());
+    assert!(e.contains(want), "{e}");
+    let e = on_small_stack(move || checked_update(update).err().unwrap().to_string());
+    assert!(e.contains(want), "{e}");
+}
+
+/// A plan deeper than `MAX_ID_DEPTH` is written in plan format 2, without node ids, so
+/// that its JSON grows with the plan and not with the square of its depth. A shallower
+/// plan keeps its ids, the paths from the root. The eager and the streamed plan are
+/// written the same way.
+#[test]
+fn a_deep_plan_is_written_without_ids() {
+    use sparkles::sparql::exec::{MAX_ID_DEPTH, PLAN_FORMAT};
+    on_small_stack(|| {
+        let ds = cyclic();
+        let opts = sparkles::sparql::QueryOptions::default();
+        let chain = |n: usize| {
+            let body: String = (0..n)
+                .map(|i| format!("?a{i} <urn:p> ?a{} . ", i + 1))
+                .collect();
+            format!("SELECT * {{ {body} }}")
+        };
+        // the bytes of a node besides its columns, which name every variable it binds, and
+        // the nodes
+        let per_node = |plan: &sparkles::sparql::PlanInfo, text: &str| {
+            let (mut nodes, mut columns) = (0, 0);
+            let mut todo = vec![plan];
+            while let Some(n) = todo.pop() {
+                nodes += 1;
+                columns += n.columns.iter().map(|c| c.len() + 3).sum::<usize>();
+                todo.extend(&n.children);
+            }
+            (text.len().saturating_sub(columns) / nodes, nodes)
+        };
+        let (_, plan) = sparkles::sparql::explain(ds.snapshot(), &chain(50), &opts).unwrap();
+        assert!(plan.depth() <= MAX_ID_DEPTH);
+        let text = serde_json::to_string(&plan).unwrap();
+        assert!(text.starts_with(r#"{"id":"0","#), "{}", &text[..100]);
+        // every node, with its path
+        assert_eq!(text.matches(r#""id":"0"#).count(), per_node(&plan, "").1);
+        assert!(text.contains(r#""id":"0.0.1.0.1""#));
+        assert!(!text.contains("planFormat"));
+        let n = (MAX_PLAN_DEPTH - 3) / 2;
+        let (_, plan) = sparkles::sparql::explain(ds.snapshot(), &chain(n), &opts).unwrap();
+        assert!(plan.depth() > MAX_ID_DEPTH);
+        let text = serde_json::to_string(&plan).unwrap();
+        let start = format!(r#"{{"planFormat":{PLAN_FORMAT},"operator":"#);
+        assert!(text.starts_with(&start), "{}", &text[..100]);
+        assert!(!text.contains(r#""id":"#));
+        // (the ids made it about 4000 bytes a node)
+        let (bytes, _) = per_node(&plan, &text);
+        assert!(bytes < 400, "{bytes} bytes a node");
+        with_stack(plan.depth(), || drop(plan));
+        // a streamed plan
+        let cursor = sparkles::sparql::CursorOptions::default();
+        let exec =
+            sparkles::sparql::query_cursor(ds.snapshot(), &chain(n), &opts, &cursor).unwrap();
+        let text = exec.plan_json().unwrap();
+        let start = format!(r#"{{"planFormat":{PLAN_FORMAT},"operator":"#);
+        assert!(text.starts_with(&start), "{}", &text[..100]);
+        assert!(!text.contains(r#""id":"#));
+        with_stack(MAX_PLAN_DEPTH, || drop(exec));
+    });
 }
 
 #[test]

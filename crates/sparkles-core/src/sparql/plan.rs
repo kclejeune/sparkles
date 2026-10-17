@@ -2554,21 +2554,40 @@ impl<'a> Planner<'a> {
         // connected components by shared variables
         let mut comp: Vec<usize> = (0..n).collect();
         fn find(c: &mut [usize], x: usize) -> usize {
-            if c[x] != x {
-                let r = find(c, c[x]);
-                c[x] = r;
+            let mut r = x;
+            while c[r] != r {
+                r = c[r];
             }
-            c[x]
+            let mut y = x;
+            while c[y] != r {
+                (c[y], y) = (r, c[y]);
+            }
+            r
         }
-        for i in 0..n {
-            for j in i + 1..n {
-                if leaves[i][0]
-                    .vars
-                    .iter()
-                    .any(|v| leaves[j][0].vars.contains(v))
-                {
-                    let (a, b) = (find(&mut comp, i), find(&mut comp, j));
-                    comp[a] = b;
+        if n <= 32 {
+            for i in 0..n {
+                for j in i + 1..n {
+                    if leaves[i][0]
+                        .vars
+                        .iter()
+                        .any(|v| leaves[j][0].vars.contains(v))
+                    {
+                        let (a, b) = (find(&mut comp, i), find(&mut comp, j));
+                        comp[a] = b;
+                    }
+                }
+            }
+        } else {
+            // each leaf joins the component of the first leaf with each of its variables,
+            // since testing every pair costs the square of the leaves
+            let mut first: FxHashMap<VarId, usize> = FxHashMap::default();
+            for (i, l) in leaves.iter().enumerate() {
+                for &v in &l[0].vars {
+                    let j = *first.entry(v).or_insert(i);
+                    if j != i {
+                        let (a, b) = (find(&mut comp, j), find(&mut comp, i));
+                        comp[a] = b;
+                    }
                 }
             }
         }
@@ -3020,9 +3039,11 @@ pub(super) fn merge_dist(
     est: f64,
     model: Option<(VarId, JoinModel)>,
 ) -> FxHashMap<VarId, f64> {
+    let probes = a.vars.len() + b.vars.len();
+    let (in_a, in_b) = (VarSet::new(&a.vars, probes), VarSet::new(&b.vars, probes));
     let mut d = FxHashMap::default();
     for v in a.vars.iter().chain(b.vars.iter()) {
-        let x = match (a.vars.contains(v), b.vars.contains(v)) {
+        let x = match (in_a.contains(v), in_b.contains(v)) {
             (true, true) => match model {
                 Some((s, m)) if s == *v => m.distinct(a.d(*v), b.d(*v)),
                 _ => a.d(*v).min(b.d(*v)),
@@ -3075,12 +3096,9 @@ pub(super) fn join_est_with(
         if !ctx.opt.characteristic_sets {
             return None;
         }
-        let (mut qa, mut qb) = (Vec::new(), Vec::new());
-        super::charsets::of_node(ctx, a, &mut qa);
-        super::charsets::of_node(ctx, b, &mut qb);
         let (qa, qb) = (
-            super::charsets::mask_of(&qa, *v),
-            super::charsets::mask_of(&qb, *v),
+            super::charsets::mask_in(ctx, a, *v),
+            super::charsets::mask_in(ctx, b, *v),
         );
         super::charsets::factor(ctx, *v, qa, qb).map(|(rr, rd)| JoinModel::Star { rr, rd })
     };
@@ -3180,20 +3198,48 @@ pub(super) fn sort_cost(n: f64) -> f64 {
     n * n.max(2.0).log2() * 0.25
 }
 
+/// The variables of `a` followed by those of `b` that `a` does not have, in order.
+fn union_vars(a: &[VarId], b: &[VarId]) -> Vec<VarId> {
+    let mut out = a.to_vec();
+    if b.len() > 32 && a.len() + b.len() > 64 {
+        let mut seen: FxHashSet<VarId> = a.iter().copied().collect();
+        out.extend(b.iter().filter(|v| seen.insert(**v)));
+    } else {
+        for v in b {
+            if !out.contains(v) {
+                out.push(*v);
+            }
+        }
+    }
+    out
+}
+
+/// Whether variables are among `vars`: by a linear search, or by a hash set when
+/// `probes` searches of that many variables would cost more than building it. A join of
+/// two large plans otherwise costs the product of their numbers of variables.
+pub(super) struct VarSet<'a> {
+    vars: &'a [VarId],
+    set: Option<FxHashSet<VarId>>,
+}
+
+impl<'a> VarSet<'a> {
+    pub(super) fn new(vars: &'a [VarId], probes: usize) -> VarSet<'a> {
+        let set = (vars.len() > 32 && probes > 32).then(|| vars.iter().copied().collect());
+        VarSet { vars, set }
+    }
+
+    pub(super) fn contains(&self, v: &VarId) -> bool {
+        match &self.set {
+            Some(s) => s.contains(v),
+            None => self.vars.contains(v),
+        }
+    }
+}
+
 fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, ctx: &Ctx) -> Node {
     let (est, star) = join_est_with(&a, &b, &keys, ctx);
-    let mut vars = a.vars.clone();
-    for v in &b.vars {
-        if !vars.contains(v) {
-            vars.push(*v);
-        }
-    }
-    let mut certain = a.certain.clone();
-    for v in &b.certain {
-        if !certain.contains(v) {
-            certain.push(*v);
-        }
-    }
+    let vars = union_vars(&a.vars, &b.vars);
+    let certain = union_vars(&a.certain, &b.certain);
     let sorted = match algo {
         JoinAlgo::Merge => vec![keys[0]],
         JoinAlgo::Hash => {

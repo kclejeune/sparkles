@@ -944,28 +944,108 @@ pattern into a binary join tree with a join and a sort for each pattern, and the
 the executor and the plan description all recurse through it. A query is refused when its
 plan would nest deeper than 4000 levels, as the
 [nesting limits](../API.md#nesting-limits) describe, so a basic graph pattern holds at
-most 1998 triple patterns. Below that limit, planning time grows with the square of the
-number of triple patterns. The ignored test `large_bgp_planning_time` in
-`crates/sparkles/tests/nesting.rs` measures `explain` on chains of triple patterns in a
-release build. A chain of 500 plans in 70 ms and writes 3.5 MB of plan JSON, a chain of
-1000 takes 197 ms and 13.4 MB, and a chain of 1998 at the limit takes 1.1 s and 53.7 MB.
-The JSON grows with the square of the depth because each node is named by its path from
-the root. An n-ary join over all the triple patterns of a basic graph pattern, built and
-run iteratively, would make planning close to linear and the plan flat. The limit could
-then rise, or count only the levels that still nest.
+most 1998 triple patterns.
 
-The rest of item 84 is work that makes the limit less important. A release build
-explains a plain chain of 1998 in 1.3 to 1.7 s, a tree of 1998 or a MINUS after each of
-790 patterns in 2.8 s, a BIND after each of 790 patterns in 6.9 s and an OPTIONAL after
-each of them in 7.6 s. Most of these shapes observe the timeout during planning, because
-the greedy order calls `ctx.check()`, but a plain chain and its reverse do not. Every
-planning loop, including `joinorder::order` and the candidate loop of the greedy order,
-needs a deadline check, and the candidates should be built without cloning both subtrees. The
-plan JSON for `/{ds}/explain`, the Sparkles result format and its error body should be
-linear in size, by compact node ids or a node cap with a truncation flag. The explanation
-reader in `crates/sparkles-server/src/explain/mod.rs` should be iterative so that its
-256-level limit can rise. A parsed query that the nesting check refuses should be dropped
-without recursion, and the planner and executor could grow the stack at their recursion
-points or use an iterative clone and drop for plan nodes, so that the stack no longer
-depends on the count of the walk. The command-line plan printers are recursive too, but
-no request reaches them.
+Item 84 made the plans at that limit cheap to plan, run and write, and made planning stop
+at the request's timeout or cancellation. The ignored test `large_bgp_planning_time` in
+`crates/sparkles/tests/nesting.rs` measures each shape of `plan_shapes` at the limit in a
+release build. The table gives its numbers on the development laptop before and after the
+change. A shape's name gives its number of triple patterns, and the plan JSON is what
+`/{ds}/explain` writes. A chain of 500 now plans in 43 ms and writes 1.9 MB, against
+66 ms and 3.5 MB before, and a chain of 1000 in 92 ms and 7.4 MB, against 193 ms and
+13.4 MB. Other builds shared the laptop during both runs, so the times are good to
+about a fifth.
+
+| Shape at the limit | `explain` before | `explain` after | Plan JSON before | Plan JSON after |
+|---|---|---|---|---|
+| Chain of 1998 | 1.08 s | 0.35 s | 53.7 MB | 29.7 MB |
+| Reversed chain of 1998 | 1.01 s | 0.27 s | 64.5 MB | 32.5 MB |
+| Tree of 1998 | 2.24 s | 0.34 s | 37.4 MB | 22.4 MB |
+| Pairs of 999 | 1.36 s | 0.49 s | 34.1 MB | 18.1 MB |
+| Chain of 999 with a second predicate | 0.67 s | 0.19 s | 26.2 MB | 11.2 MB |
+| Chain of 571 with VALUES | 0.43 s | 0.11 s | 15.9 MB | 7.3 MB |
+| Chain of 1019 with filters | 71 ms | 34 ms | 1.3 MB | 1.3 MB |
+| Chain of 799 with OPTIONAL | 6.49 s | 0.53 s | 23.3 MB | 13.7 MB |
+| Chain of 799 with MINUS | 2.49 s | 0.15 s | 8.6 MB | 4.8 MB |
+| Chain of 799 with BIND | 5.88 s | 0.18 s | 21.2 MB | 13.5 MB |
+
+Before the change, a plain chain, its reverse and the chain with a second predicate ran
+past a timeout of half their planning time and returned a plan. Every shape now stops
+with `timed out` within a quarter of its planning time past the timeout, which the test
+`planning_at_the_limit_stops_at_the_timeout` checks at a third and at two thirds of it,
+and the same holds for a cancellation. The eager run of a chain at the limit did not finish
+in ten minutes, and a cursor over it took about four minutes to open. Each now takes
+0.12 to 0.91 s for every shape, and a cursor opens in 64 to 690 ms.
+
+The planner did several kinds of work for each join that grew with the plan below it.
+The join ordering copied an input that is a whole subtree, such as the plan of the
+patterns before an OPTIONAL, to cost it and again to build the plan, so an OPTIONAL
+after each pattern copied the plan once per OPTIONAL. It now moves each input into the
+plan it builds and copies one only to place a filter on it. The greedy ordering tested
+every pair of plans at every step. It now pairs only the plans that share a variable,
+which it finds through a list of the plans that bind each variable, and it keeps with each
+plan what its inputs hold on the join variables, the star masks and the probed sides, rather
+than gathering them from every input at each pairing. The estimate of a join read the
+star masks of every pattern below both sides and kept only those of its join variable.
+It now reads only those. The union of two plans' variables and their distinct-value
+estimates tested membership with a linear search, which costs the product of their
+variables near the root of a deep plan, and they use a hash set once both sides are large.
+The connected parts of a group of more than 32 inputs are found through a map of
+variables instead of a test of every pair of inputs. None of these changes a plan, since
+the costs, the estimates and the tie breaks are the same, and the planner tests pass
+unchanged.
+
+The greedy ordering checks the timeout and the cancellation for each input, for each
+plan whose pairs it costs and for each plan it builds, and the dynamic program for each
+plan it builds. `explain` checks them for each node it describes, describing a node
+before its children so that each check follows the work of one node. Each operator of a
+cursor describes its own node instead of the subtree below it, which it discarded. A key
+of the result cache writes the variables of every node of its subtree, so the keys of a
+deep plan grew with the cube of its depth. A subtree whose nodes hold more than 16,384
+variables in all, a key of about 100 KB, is no longer cached. The subtrees of ordinary
+queries hold far fewer. The order of the columns of a `SELECT *` result is found once per
+variable, and the parser tests whether a selected variable is new with a set once there
+are more than 32. A merge join of a cursor finds its columns in its inputs through a map
+when both are large.
+
+A plan deeper than 256 levels is written in plan format 2. Its root names
+`"planFormat": 2`, and its nodes have no `id`. The ids were paths from the root and took
+24 MB of the 53.7 MB of a chain at the limit, so the JSON grew with the square of the
+depth. A client derives the same ids from the shape, as the plan view of the
+UI already did and the reader of `/{ds}/sparql/explain` now does. A plan of 256 levels or fewer keeps its ids, and every
+query of the test suites plans far less deep. The columns of each node still name every
+variable it binds, so the JSON of a chain stays quadratic in the number of its triple
+patterns, as the plan's own size is. `/{ds}/sparql/explain` refuses a plan whose
+`planFormat` it does not know.
+
+A parsed query or update that the nesting check refuses is taken apart without
+recursion, so a shape whose text the nesting scan undercounts cannot overflow the stack
+when it is dropped. The explanation reader and its walk of the patterns use a list of the
+nodes still to visit, and so do the command-line plan printers. The explanation keeps its
+limit of 256 levels and 10,000 nodes, because it names each node by its path in its
+`nodes` and notes and in the `explain_query` text, which would grow with the square of
+the depth.
+
+The change costs ordinary queries nothing that a count of instructions shows. Eleven
+small queries, from a single triple pattern to a five-pattern join, an OPTIONAL with
+FILTER, ORDER BY and LIMIT, two property paths, a grouped COUNT and a UNION, ran between
+0.95 and 1.01 times the user-mode instructions per query of the base, counted in process
+as the best of five runs on one performance core. The one at 1.01 varied by 5% between
+runs of the base. A chain of 30 triple patterns ran 0.69 times the instructions of the
+base.
+
+Planning time still grows with the square of the triple patterns. Each join keeps a map
+of distinct-value estimates for all its variables, each estimate of a join walks the
+patterns below it for its star masks, and variable names are interned by a linear search.
+An n-ary join would let the limit count only the levels that nest. The planner would emit
+one join node for a basic graph pattern whose join tree is left-deep, holding its inputs
+in join order with the algorithm, the keys and the sort of each step, so the plan is one
+level with an input for each pattern. The eager executor would fold the inputs in a loop,
+a cursor would keep the binary operators of the steps in a list and pull through them
+without recursion, and the plan description would write the steps as the children of one
+node. The bushy trees that the greedy order makes for some shapes would stay binary. The
+depth walk would then count a basic graph pattern as two levels, and the limit could rise
+to what the text allows. That changes the planner, both executors and the plan format, so
+it stays on the roadmap. Growing the stack at the recursion points of the planner and the
+executor, or an iterative clone and drop of plan nodes, would also make the stack
+independent of the count of the walk.
