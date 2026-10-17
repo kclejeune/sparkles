@@ -1405,6 +1405,17 @@ pub fn verify_database_lock(root: &Path, lock: &File) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The durable steps of the opens on this thread, in order, for tests of their order.
+    pub(crate) static OPEN_STEPS: std::cell::RefCell<Vec<&'static str>> = Default::default();
+}
+
+#[cfg(test)]
+fn open_step(step: &'static str) {
+    OPEN_STEPS.with(|v| v.borrow_mut().push(step));
+}
+
 /// Take the exclusive process lock of a database directory.
 fn lock_dir(root: &Path) -> Result<File> {
     let path = root.join("sparkles.lock");
@@ -1773,6 +1784,16 @@ impl Store {
         // where a headerless log's strict framing starts, recorded once at the first write
         // open by a release that writes commit metadata (see `Framing`)
         let strict_from = commit::wal_strict_from(&root.join(&name))?;
+        // The member is recorded only for a log that exists, so a missing log is lost, not
+        // new: creating an empty one would silently drop every commit it held.
+        if let Some(m) = strict_from
+            && !wal_path.exists()
+        {
+            return Err(Error::Corrupt(format!(
+                "{}: commit.json records walStrictFrom {m}, but the log is missing",
+                wal_path.display()
+            )));
+        }
         let mut truncated = false;
         let mut headerless = false;
         if wal_path.exists() {
@@ -1800,7 +1821,9 @@ impl Store {
                     .set_len(r.good as u64)?;
                 truncated = true;
             }
-            headerless = buf.first() != Some(&WAL_HEADER);
+            // A log the replay cut to nothing, one that began with a torn header record
+            // included, gets this release's records only: it is strictly framed from 0.
+            headerless = r.good == 0 || buf.first() != Some(&WAL_HEADER);
             wal_len = r.good as u64;
             wal_index = r.index;
             delta = r.delta;
@@ -1851,19 +1874,31 @@ impl Store {
         // A truncation to an empty log must be durable too, before anything is appended.
         if wal_len > 0 || truncated {
             wal.sync_data()?;
-        }
-        // A headerless log written by an older release: everything it holds now was
-        // replayed, truncated and synced, so record where this release's strictly framed
-        // appends start, once, before the first of them (see `Framing`).
-        if wal_existed && headerless && strict_from.is_none() {
-            commit::set_wal_strict_from(&root.join(&name), wal_len)?;
+            #[cfg(test)]
+            open_step("wal-synced");
         }
         gen_.dvocab.settle()?;
+        #[cfg(test)]
+        open_step("vocab-settled");
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
         let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
         let annotations =
             crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
+        #[cfg(test)]
+        open_step("annotations-open");
+        // A headerless log written by an older release: everything it holds now was
+        // replayed, truncated and synced, and so were the vocabulary entries and the
+        // annotation records its commits name (`settle` and `Annotations::open` above),
+        // so record where this release's strictly framed appends start, once, before the
+        // first of them (see `Framing`). Recording it earlier would let a power loss
+        // leave a durable offset over commits whose terms or messages were still only in
+        // the page cache. Nothing has been appended to the log yet.
+        if wal_existed && headerless && strict_from.is_none() {
+            commit::set_wal_strict_from(&root.join(&name), wal_len)?;
+            #[cfg(test)]
+            open_step("strict-offset");
+        }
         let changelog = Some(changelog::ChangeLog::open(
             root,
             dataset_id,

@@ -612,8 +612,7 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
-        let mut f: GenCommitFile = serde_json::from_slice(&b)
-            .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+        let mut f = parse_gen_commit(&path, &b)?;
         if f.dataset_id == old_id {
             f.dataset_id = new_id;
             crate::store::write_atomic(&path, &serde_json::to_vec_pretty(&f).unwrap())?;
@@ -760,6 +759,10 @@ struct GenCommitFile {
     /// files written before the member existed, and for logs with a header record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wal_strict_from: Option<u64>,
+    /// Members this build does not know, added by a later release under the additive
+    /// rule of X12 section 4.3. They are kept when the file is rewritten.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -780,6 +783,9 @@ struct CommitJson {
     default_graph: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     unvalidated: bool,
+    /// members a later release added, kept on rewrite (see [`GenCommitFile`])
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn yes() -> bool {
@@ -793,6 +799,7 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
         base_seq: c.seq,
         origin: origin.to_string(),
         wal_strict_from: None,
+        extra: Default::default(),
         commit: CommitJson {
             seq: c.seq,
             timestamp: c.timestamp(),
@@ -806,6 +813,7 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
             reconstructed: c.reconstructed,
             default_graph: c.default_graph,
             unvalidated: c.unvalidated,
+            extra: Default::default(),
         },
     })
     .unwrap()

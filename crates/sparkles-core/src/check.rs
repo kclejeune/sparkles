@@ -1186,10 +1186,21 @@ impl Checker<'_> {
     fn wal_check(&mut self, dir: &Path, name: &str) {
         let mut run = Run::new("wal");
         let file = format!("{name}/wal.log");
+        let mut missing = false;
         let buf = match std::fs::read(dir.join("wal.log")) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                run.add(Issue::warning("missing: created on open").file(&file));
+                missing = true;
+                // a recorded strict-framing offset proves the log existed
+                match commit::wal_strict_from(dir) {
+                    Ok(Some(m)) => run.add(
+                        Issue::error(format!(
+                            "missing, but commit.json records walStrictFrom {m}: the log was lost, and open refuses the database"
+                        ))
+                        .file(&file),
+                    ),
+                    _ => run.add(Issue::warning("missing: created on open").file(&file)),
+                }
                 Vec::new()
             }
             Err(e) => {
@@ -1539,6 +1550,7 @@ impl Checker<'_> {
             );
         }
         if let Some(m) = strict_from
+            && !missing
             && version == 0
             && (good as u64) < m
         {

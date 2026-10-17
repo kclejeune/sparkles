@@ -3659,4 +3659,230 @@ mod tests {
         assert_eq!(guard.told.load(Ordering::SeqCst), 60);
         assert_eq!(guard.stale.load(Ordering::SeqCst), 0);
     }
+
+    /// Four messaged commits. Returns the headerless log of all four, and `delta.vocab`
+    /// and `annotations.bin` as they were after three, which is what a power loss can leave
+    /// of an older build's unsynced last commit.
+    fn upgrade_fixture() -> (tempfile::TempDir, PathBuf, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let store = Store::open(&root, options()).unwrap();
+        for name in ["one", "two", "three"] {
+            kind_insert(
+                &store,
+                CommitKind::Update,
+                message_options(name),
+                in_graph(name, "urn:g"),
+            )
+            .unwrap();
+        }
+        drop(store);
+        let gen_dir = wal_path(&root).parent().unwrap().to_path_buf();
+        let v3 = std::fs::read(gen_dir.join("delta.vocab")).unwrap();
+        let a3 = std::fs::read(root.join(crate::annotations::FILE)).unwrap();
+        let store = Store::open(&root, options()).unwrap();
+        kind_insert(
+            &store,
+            CommitKind::Update,
+            message_options("four"),
+            in_graph("four", "urn:g2"),
+        )
+        .unwrap();
+        drop(store);
+        let v4 = std::fs::read(gen_dir.join("delta.vocab")).unwrap();
+        assert!(v4.len() > v3.len(), "commit 4 adds delta terms");
+        let mut log = std::fs::read(wal_path(&root)).unwrap()[WAL_REC..].to_vec();
+        let txns = transactions(&log);
+        assert_eq!(txns.len(), 4);
+        log.truncate(txns[3].end * WAL_REC);
+        (dir, root, log, v3, a3)
+    }
+
+    /// A copy of `root` named `name` whose log is `log`, with `walStrictFrom` set to
+    /// `offset` when it is given.
+    fn upgrade_case(
+        dir: &tempfile::TempDir,
+        root: &Path,
+        name: &str,
+        log: &[u8],
+        offset: Option<u64>,
+    ) -> PathBuf {
+        let case = dir.path().join(name);
+        copy_dir(root, &case);
+        std::fs::write(wal_path(&case), log).unwrap();
+        if let Some(m) = offset {
+            let path = wal_path(&case).parent().unwrap().join("commit.json");
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            v["walStrictFrom"] = m.into();
+            std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        }
+        case
+    }
+
+    /// The offset says that every byte before it is durable together with the vocabulary
+    /// terms and annotation records it names, so the first write open records it only
+    /// after it has synced `delta.vocab` and `annotations.bin`. A power loss between an
+    /// earlier record and those syncs would leave a log that names lost terms before the
+    /// offset (refused as corrupt) or a resurrected commit without its message.
+    #[test]
+    fn the_strict_offset_is_recorded_after_the_vocabulary_and_annotations_are_durable() {
+        let (dir, root, log, _, _) = upgrade_fixture();
+        let case = upgrade_case(&dir, &root, "case", &log, None);
+        crate::store::OPEN_STEPS.with(|v| v.borrow_mut().clear());
+        drop(Store::open(&case, Default::default()).unwrap());
+        let steps = crate::store::OPEN_STEPS.with(|v| v.borrow().clone());
+        let at = |s: &str| {
+            steps
+                .iter()
+                .position(|x| *x == s)
+                .unwrap_or_else(|| panic!("no step {s} in {steps:?}"))
+        };
+        let offset = at("strict-offset");
+        for before in ["wal-synced", "vocab-settled", "annotations-open"] {
+            assert!(at(before) < offset, "{before} after the offset: {steps:?}");
+        }
+    }
+
+    /// What the offset means for the vocabulary: a commit before it that names terms
+    /// `delta.vocab` lacks is corruption, while without it the same bytes are a torn tail.
+    #[test]
+    fn a_vocabulary_gap_before_the_strict_offset_is_corruption() {
+        let (dir, root, log, v3, _) = upgrade_fixture();
+        for (name, offset) in [("unmarked", None), ("marked", Some(log.len() as u64))] {
+            let case = upgrade_case(&dir, &root, name, &log, offset);
+            std::fs::write(wal_path(&case).parent().unwrap().join("delta.vocab"), &v3).unwrap();
+            let opened = Store::open(&case, Default::default());
+            match offset {
+                None => assert_eq!(opened.unwrap().snapshot().commit, 3),
+                Some(_) => assert!(
+                    matches!(opened, Err(Error::Corrupt(_))),
+                    "{:?}",
+                    opened.err()
+                ),
+            }
+        }
+    }
+
+    /// Before the offset a flagged commit whose annotation is missing was durable when the
+    /// offset was recorded, so it is kept with a warning, as a proven commit is. Without
+    /// the `at < from` rule of `wal_torn_from` the replay would cut it as a torn tail and
+    /// the end-of-log check would refuse the store; this is the case that tells the two
+    /// apart. Without the offset the commit is a torn tail, as before.
+    #[test]
+    fn a_missing_annotation_before_the_strict_offset_keeps_the_commit() {
+        let (dir, root, log, _, a3) = upgrade_fixture();
+        let case = upgrade_case(&dir, &root, "marked", &log, Some(log.len() as u64));
+        std::fs::write(case.join(crate::annotations::FILE), &a3).unwrap();
+        let unmarked = upgrade_case(&dir, &root, "unmarked", &log, None);
+        std::fs::write(unmarked.join(crate::annotations::FILE), &a3).unwrap();
+        assert_eq!(wal_check(&case), crate::check::Status::Warning);
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, 4);
+        assert!(store.annotation(4).and_then(|a| a.message).is_none());
+        assert_eq!(insert(&store, "next").unwrap().commit.seq, 5);
+        drop(store);
+        let store = Store::open(&unmarked, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, 3);
+    }
+
+    /// A log that starts with a torn header record is truncated to nothing, and its next
+    /// commits must be strictly framed: it gets an offset of 0.
+    #[test]
+    fn a_torn_header_record_gets_a_strict_offset_of_zero() {
+        let (dir, root, _, _, _) = upgrade_fixture();
+        let case = dir.path().join("torn");
+        copy_dir(&root, &case);
+        let full = std::fs::read(wal_path(&case)).unwrap();
+        assert_eq!(full[0], WAL_HEADER);
+        std::fs::write(wal_path(&case), &full[..20]).unwrap();
+        let gen_dir = wal_path(&case).parent().unwrap().to_path_buf();
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(commit::wal_strict_from(&gen_dir).unwrap(), Some(0));
+        let seq = insert(&store, "first").unwrap().commit.seq;
+        insert(&store, "second").unwrap();
+        drop(store);
+        // the last commit's metadata did not reach the disk: under strict framing it is a
+        // torn tail, not a legacy commit
+        let mut buf = std::fs::read(wal_path(&case)).unwrap();
+        let txns = transactions(&buf);
+        buf.truncate(txns.last().unwrap().end * WAL_REC);
+        zero_commit_metadata(&mut buf, txns.last().unwrap());
+        std::fs::write(wal_path(&case), &buf).unwrap();
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, seq);
+        assert!(has(&store.snapshot(), "first"));
+        assert!(!has(&store.snapshot(), "second"));
+    }
+
+    /// The offset is recorded only for a log that exists, so a log missing after it was
+    /// recorded is lost, and open refuses the store as check says, instead of starting an
+    /// empty log at the base commit.
+    #[test]
+    fn a_missing_log_with_a_strict_offset_is_refused() {
+        let (dir, root, buf) = metadata_fixture();
+        let (case, _, _) = marked_headerless_case(&dir, &root, &buf, 0);
+        std::fs::remove_file(wal_path(&case)).unwrap();
+        assert_eq!(wal_check(&case), crate::check::Status::Error);
+        let e = Store::open(&case, Default::default()).err().unwrap();
+        assert!(matches!(e, Error::Corrupt(_)), "{e:?}");
+        assert!(!wal_path(&case).exists());
+    }
+
+    /// A closed store whose generation's `commit.json` is edited by `edit`.
+    fn edited_commit_json(
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let store = Store::open(&root, Default::default()).unwrap();
+        insert(&store, "one").unwrap();
+        drop(store);
+        let path = wal_path(&root).parent().unwrap().join("commit.json");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        edit(&mut v);
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        (dir, root, path)
+    }
+
+    fn fork_of(root: &Path) -> commit::ForkedFrom {
+        commit::ForkedFrom {
+            id: commit::read_dataset_file(root).unwrap().unwrap(),
+            seq: 1,
+        }
+    }
+
+    #[test]
+    fn reidentify_refuses_a_newer_commit_json_format() {
+        let (_dir, root, path) = edited_commit_json(|v| v["format"] = 2.into());
+        let before = std::fs::read(&path).unwrap();
+        let e = commit::reidentify(&root, uuid::Uuid::new_v4(), fork_of(&root)).unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn rewriting_commit_json_keeps_unknown_members() {
+        let (_dir, root, path) = edited_commit_json(|v| {
+            v["futureMember"] = 7.into();
+            v["commit"]["futureCommitMember"] = "x".into();
+        });
+        let member = |p: &Path| {
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+            (
+                v.get("futureMember").cloned(),
+                v["commit"].get("futureCommitMember").cloned(),
+            )
+        };
+        let kept = (Some(7.into()), Some("x".into()));
+        commit::set_wal_strict_from(path.parent().unwrap(), 0).unwrap();
+        assert_eq!(member(&path), kept);
+        commit::reidentify(&root, uuid::Uuid::new_v4(), fork_of(&root)).unwrap();
+        assert_eq!(member(&path), kept);
+        assert_eq!(
+            commit::wal_strict_from(path.parent().unwrap()).unwrap(),
+            Some(0)
+        );
+    }
 }
