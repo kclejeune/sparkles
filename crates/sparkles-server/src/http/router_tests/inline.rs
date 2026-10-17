@@ -238,3 +238,60 @@ async fn a_data_update_waits_for_a_busy_writer_on_the_blocking_pool() {
     assert_eq!(commit_header(&h), 2);
     holder.join().unwrap();
 }
+
+/// Automatic execution streams a scan of a few thousand rows on its first run. A streamed
+/// answer that completes in one whole body is remembered as quick like an eager one, so
+/// the next run of the same text runs in place, and a run that `send` stops early is not
+/// remembered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quick_streamed_scan_runs_in_place_the_second_time() {
+    let s = server();
+    let mut data = String::new();
+    for i in 0..3000 {
+        data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+    }
+    let ds = s.state.attach("scan", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let scan = |q: &str, extra: &str| {
+        Request::post(format!("/scan/sparql{extra}"))
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .header(header::ACCEPT, "application/x-sparkles+json")
+            .body(Body::from(q.to_string()))
+            .unwrap()
+    };
+    let rows = |r: &Resp| r.json()["rows"].as_array().unwrap().len();
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let key = crate::http::inline::QuickQueries::key("scan", q);
+    crate::http::QUICK.ignore_time(key);
+    let first = send(&s.app, scan(q, "")).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    assert_eq!(
+        first.json()["meta"]["status"],
+        "complete",
+        "the first run streams"
+    );
+    assert_eq!(rows(&first), 3000);
+    assert!(crate::http::QUICK.is_quick(key));
+    let second = send(&s.app, scan(q, "")).await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.text());
+    assert_eq!(
+        crate::http::inline::ran_by_key(key),
+        1,
+        "the second run is in place"
+    );
+    assert_eq!(second.json()["rows"], first.json()["rows"]);
+    // a stream that `send` stops has not run the whole query
+    let q = "SELECT ?o ?s WHERE { ?s <urn:p> ?o }";
+    let key = crate::http::inline::QuickQueries::key("scan", q);
+    crate::http::QUICK.ignore_time(key);
+    let stopped = send(&s.app, scan(q, "?send=10")).await;
+    assert_eq!(stopped.status, StatusCode::OK, "{}", stopped.text());
+    assert_eq!(stopped.json()["meta"]["status"], "stopped");
+    assert!(!crate::http::QUICK.is_quick(key));
+}

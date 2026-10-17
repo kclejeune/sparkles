@@ -44,6 +44,11 @@ pub(super) struct Serve {
     pub with_extra: bool,
     /// the start of the query, for the phase spans (`None` when OTel is off)
     pub t0: Option<std::time::SystemTime>,
+    /// The quick-query key of an answer that automatic execution chose to stream, and
+    /// when the request began to run it. A streamed answer that completes in one whole
+    /// body is remembered with its time, as an eager one is, so that a quick query runs
+    /// in place again from its next run on.
+    pub quick: Option<(u64, Instant)>,
 }
 
 pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
@@ -99,6 +104,7 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
             timeout,
             with_extra,
             t0,
+            quick: None,
         },
     )
     .await
@@ -126,6 +132,7 @@ pub(super) async fn serve(
         timeout,
         with_extra,
         t0,
+        quick,
     } = serve;
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     if thrift && cursor.kind() == QueryKind::Select && !matches!(cursor, QueryExecution::Eager(_)) {
@@ -157,6 +164,9 @@ pub(super) async fn serve(
     );
     let completed: Arc<parking_lot::Mutex<Option<CursorStats>>> = Default::default();
     let stats_slot = completed.clone();
+    // how the cursor ended, for the quick-query record of a whole body
+    let ended: Arc<parking_lot::Mutex<Option<sparkles::sparql::CursorStatus>>> = Default::default();
+    let ended_slot = ended.clone();
     // the plan as it stood when a native JSON stream failed before its first byte
     let failed_plan: Arc<parking_lot::Mutex<Option<serde_json::Value>>> = Default::default();
     let plan_slot = failed_plan.clone();
@@ -242,6 +252,7 @@ pub(super) async fn serve(
         },
         move |end| {
             let stats = completed.lock().take();
+            *ended_slot.lock() = stats.as_ref().map(|s| s.status);
             let wait_ms = waits.wait_ms();
             let exec_ms = stats.as_ref().map_or(0.0, |s| s.timing.exec_ms);
             let serialize_ms =
@@ -292,7 +303,16 @@ pub(super) async fn serve(
         }
     };
     let body = match serialized {
-        stream::Serialized::Whole { body, .. } => Body::from(body),
+        stream::Serialized::Whole { body, .. } => {
+            // A cursor that stopped at `send` has not run the whole query, so only a
+            // complete answer counts.
+            if let Some((key, began)) = quick
+                && *ended.lock() == Some(sparkles::sparql::CursorStatus::Complete)
+            {
+                QUICK.record(key, began.elapsed().as_secs_f64() * 1000.0);
+            }
+            Body::from(body)
+        }
         stream::Serialized::Streamed(body) => body,
     };
     let ct = if params.has("force-accept") {
