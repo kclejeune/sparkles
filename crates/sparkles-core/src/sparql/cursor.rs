@@ -764,6 +764,10 @@ pub fn query_execution(
     query_execution_with_plan(snapshot, query, options, cursor, mode).map_err(|f| f.error)
 }
 
+/// The stack left on a thread that parses without measuring the text first. It covers the
+/// parser at the deepest nesting spargebra accepts, about 1.5 MiB.
+const PARSE_STACK: usize = 2 << 20;
+
 /// [`query_execution`], with the plan of an eager query that failed while it ran, as
 /// [`super::query_with_plan`] gives it.
 pub fn query_execution_with_plan(
@@ -779,14 +783,24 @@ pub fn query_execution_with_plan(
         return Ok(query_cursor(snapshot, query, options, cursor)?);
     }
     let started = Instant::now();
-    let parser_depth = spargebra::nesting::measure(query)
-        .depth
-        .min(depth::MAX_ALGEBRA_DEPTH);
-    depth::with_stack(parser_depth, || {
+    // The parser recurses once per bracket, and spargebra refuses a text with more than
+    // MAX_NESTING of them, which takes about 1.5 MiB. A thread with more stack left than
+    // that, such as a server worker, parses as the eager query APIs do. Measuring the text
+    // first would scan it a second time, which costs a small query about 0.5% of its
+    // instructions. A smaller thread measures the text and grows its stack to fit.
+    let parser_depth = if stacker::remaining_stack().is_some_and(|left| left >= PARSE_STACK) {
+        0
+    } else {
+        spargebra::nesting::measure(query)
+            .depth
+            .min(depth::MAX_ALGEBRA_DEPTH)
+    };
+    depth::with_stack(parser_depth, move || {
         let parsed = super::parse_query(query, options.base_iri.as_deref(), &options.prefixes)?;
         let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
         let levels = depth::check_query(&parsed)?;
-        depth::with_stack(levels, || {
+        // the algebra is dropped on the stack sized for its depth
+        depth::with_stack(levels, move || {
             if mode == ExecutionMode::Eager {
                 let mut result =
                     super::execute_query_with_plan(snapshot, &parsed, options, parse_ms)?;
