@@ -1018,12 +1018,12 @@ under `--spill-dir`. The tests are `tests/spill_sort.rs`, `tests/spill_group.rs`
 unit tests of `spill.rs` and `http::budgets_tests`.
 
 **Files.** §6.6 is built as written. A process directory `<boot-id>-<pid>-<random>` with
-mode 0700 holds the flocked `SPARKLES-SPILL` marker. Files are `O_TMPFILE` or unlinked at
-creation, so dropping an operator on completion, error, cancellation, panic or close
+mode 0700 holds the flocked `SPARKLES-SPILL` marker. Files are `O_TMPFILE` or unlinked
+at creation, so dropping an operator on completion, error, cancellation, panic or close
 frees its space, and `Spill::open` sweeps directories of dead processes and leaves
 anything else with a warning. The format is registered in `formats.rs` as the derived
-kind `spill`, version 1. Frames hold at most 4,096 rows, and an operator may write
-smaller ones (below). Reservation takes 64 MiB extents from `--spill-max-mb`, checks
+kind `spill`, version 1. Frames hold at most 4,096 rows, and a sort writes smaller ones
+when memory is short. Reservation takes 64 MiB extents from `--spill-max-mb`, checks
 `--min-free-disk-mb` with `statvfs`, and fails with the new budget kind `spill` (`507`),
 as does `ENOSPC`. The extents are accounting, not preallocation.
 
