@@ -920,6 +920,21 @@ fn pull(
     let Some(c) = lock.as_mut() else {
         return Ok(None);
     };
+    // The time since the last batch went to JavaScript was spent by the caller, so the
+    // query's timeout does not count it.
+    if let Some(returned) = c.returned.take() {
+        let paused = match &c.rows {
+            Rows::Streaming(state) => Some(state.cursor.deadline_pause()),
+            Rows::Graph(state) => Some(state.cursor.deadline_pause()),
+            _ => None,
+        };
+        if let Some(paused) = paused {
+            let ns = returned.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let _ = paused.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(ns))
+            });
+        }
+    }
     let max_rows = max_rows.clamp(1, 65536) as usize;
     let mut table = TermTable::new(max_rows);
     let mut cells: Vec<u32> = Vec::new();
@@ -1028,6 +1043,8 @@ fn pull(
     let done = drained && eager;
     if done {
         lock.take();
+    } else {
+        c.returned = Some(Instant::now());
     }
     Ok(Some(table.finish(cells, rows, width, done)))
 }
@@ -1094,6 +1111,8 @@ enum Rows {
 struct Cursor {
     rows: Rows,
     pos: usize,
+    /// when the last batch was handed to JavaScript, until the next pull
+    returned: Option<Instant>,
 }
 /// A query result that JavaScript pulls in batches. A streaming cursor keeps its snapshot
 /// until it is drained, closed or collected, but it holds a reader permit only while a
@@ -1129,6 +1148,7 @@ impl NativeResult {
             cursor: Arc::new(Mutex::new(Some(Cursor {
                 rows: Rows::Query(Box::new(result)),
                 pos: 0,
+                returned: None,
             }))),
             metadata,
             statistics: Default::default(),
@@ -1191,7 +1211,11 @@ impl NativeResult {
             QueryExecution::Ask(result) => Rows::Ask(result),
         };
         Ok(Self {
-            cursor: Arc::new(Mutex::new(Some(Cursor { rows, pos: 0 }))),
+            cursor: Arc::new(Mutex::new(Some(Cursor {
+                rows,
+                pos: 0,
+                returned: None,
+            }))),
             metadata,
             statistics: Default::default(),
             cancel: Some(cancel),
@@ -1217,6 +1241,7 @@ impl NativeResult {
             cursor: Arc::new(Mutex::new(Some(Cursor {
                 rows: Rows::Scan(Box::new(scan)),
                 pos: 0,
+                returned: None,
             }))),
             metadata: r#"{"type":"quads"}"#.into(),
             statistics: Default::default(),

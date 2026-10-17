@@ -317,3 +317,23 @@ test(
     }
   },
 );
+
+test('a slow consumer does not run out a streaming timeout', { timeout: 30000 }, async () => {
+  const ds = Dataset.memory();
+  try {
+    const data = Array.from({ length: 200 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+    await ds.load(data, { format: 'ttl' });
+    const result = await ds.select('SELECT ?s ?o WHERE { ?s <urn:p> ?o }', {
+      execution: 'streaming',
+      timeout: 200,
+      batchSize: 10,
+    });
+    assert.ok(await result.next());
+    // The query computes batches for far less than its timeout, but the caller takes
+    // longer than the timeout to ask for the rest.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal((await result.toArray()).length, 199);
+  } finally {
+    await ds.close();
+  }
+});

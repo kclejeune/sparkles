@@ -127,6 +127,9 @@ struct Sink {
     sender: mpsc::Sender<sparkles::Result<Vec<u8>>>,
     buffer: Vec<u8>,
     reader: Option<ReaderSlot>,
+    /// the deadline pause of the query written to this sink, which a wait for JavaScript
+    /// to read adds to
+    pause: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 impl Sink {
     fn new(sender: mpsc::Sender<sparkles::Result<Vec<u8>>>, reader: Option<ReaderSlot>) -> Self {
@@ -134,6 +137,7 @@ impl Sink {
             sender,
             buffer: Vec::with_capacity(CHUNK),
             reader,
+            pause: None,
         }
     }
     fn flush_chunk(&mut self) -> std::io::Result<()> {
@@ -151,11 +155,22 @@ impl Sink {
         if let Some(reader) = &mut self.reader {
             reader.permit.take();
         }
-        self.sender.blocking_send(bytes).map_err(|_| closed())?;
-        if let Some(reader) = &mut self.reader {
-            reader.reacquire()?;
+        // the wait for JavaScript to read, and for a permit again, is not the query's own
+        // time, so the query's timeout does not count it
+        let waited = Instant::now();
+        let sent = self.sender.blocking_send(bytes).map_err(|_| closed());
+        let reacquired = match (&sent, &mut self.reader) {
+            (Ok(()), Some(reader)) => reader.reacquire(),
+            _ => Ok(()),
+        };
+        if let Some(pause) = &self.pause {
+            let ns = waited.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let _ = pause.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(ns))
+            });
         }
-        Ok(())
+        sent?;
+        reacquired
     }
 }
 impl Write for Sink {
@@ -475,6 +490,7 @@ impl NativeDataset {
                 match result {
                     StreamResult::Streaming(mut execution) => {
                         use sparkles::sparql::{QueryExecution, results};
+                        sink.pause = Some(execution.deadline_pause());
                         match &mut execution {
                             QueryExecution::Eager(result) => {
                                 let result = result.result();
