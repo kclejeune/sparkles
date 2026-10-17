@@ -1353,13 +1353,9 @@ pub(crate) async fn run_query(
     let thrift = results_thrift(&params, &headers);
     // Automatic execution decides once the query is planned, and a plan it keeps eager
     // continues below exactly as an eager request does. Some requests run eagerly
-    // without asking: SPARQL Results Thrift has no cursor writer, initial bindings rule
-    // out every automatic plan, and a lowered result-size budget needs the eager check
-    // that refuses an oversized result before its first byte.
-    let auto = execution == sparkles::sparql::ExecutionMode::Auto
-        && !thrift
-        && bindings.is_empty()
-        && !asked.asks_result_bytes();
+    // without asking. SPARQL Results Thrift has no cursor writer, and initial bindings
+    // rule out every automatic plan.
+    let auto = execution == sparkles::sparql::ExecutionMode::Auto && !thrift && bindings.is_empty();
     if execution == sparkles::sparql::ExecutionMode::Streaming {
         let rdf_format = rdf_format(&params, &headers, false);
         let native_graph = params_wants_sparkles(&headers);

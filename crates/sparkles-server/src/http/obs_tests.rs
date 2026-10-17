@@ -1585,13 +1585,24 @@ async fn the_default_streams_a_large_scan_and_eager_opts_out() {
         "{}",
         capped.text()
     );
-    // so does a request that lowers the result-size budget
+    // A lowered result-size budget does not keep a scan eager. It streams, and a result
+    // that passes the budget within the first 1 MiB is refused with a status before any
+    // output, as the server-wide budget refuses it.
     let small = get(
         &s.app,
         &format!("{BIG_SCAN}&format=sparkles&send=10&max-result-mb=64"),
     )
     .await;
-    assert_eq!(small.json()["meta"]["totalRows"], 1_000_000);
+    assert_eq!(small.status, StatusCode::OK, "{}", small.text());
+    assert_eq!(small.json()["meta"]["status"], "stopped");
+    let tiny = get(&s.app, &format!("{BIG_SCAN}&format=tsv&max-result-mb=1")).await;
+    assert_eq!(
+        tiny.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        tiny.text()
+    );
+    assert_eq!(tiny.json()["budget"], "result-bytes");
 }
 
 #[tokio::test]

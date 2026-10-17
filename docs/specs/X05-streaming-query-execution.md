@@ -950,7 +950,6 @@ entry point that picks a mode and what it does now.
 |---|---|---|
 | HTTP `/{ds}/sparql`, GET and POST, every result format | `auto` | The answer is a byte stream, and the cursor writer covers every format except SPARQL Results Thrift. `serve --default-execution eager` restores eager for a whole server. |
 | HTTP with SPARQL Results Thrift | eager | That encoding has no cursor writer. |
-| HTTP with `max-result-mb` | eager | Only the eager path refuses a result too large for the budget before its first byte. |
 | A query that ran in under 10 ms last time | eager, in place | The decision would cost more than any stream can save, and the in-place path stays as it was. |
 | Stored queries, `/{ds}/queries/{name}` | as `/{ds}/sparql` | A run with parameter values has initial bindings, which rule out every automatic plan, so it runs eagerly. |
 | Graph algorithms over HTTP | as `/{ds}/sparql` | Their plans never qualify, so they run eagerly. |
@@ -983,11 +982,13 @@ cached, so this matters only for its projection, which a cursor reads from decod
 blocks at about a third of the eager cost. The access log and the metrics record a
 streamed answer when its body ends.
 
-Two rules keep late errors rarer than in explicit streaming. A scan whose estimate passes
+One rule keeps late errors rarer than in explicit streaming. A scan whose estimate passes
 the request's `max-rows` or `max-rows-produced` stays eager, so the budget fails it with
-`507` before any output. A request that lowers `max-result-mb` stays eager for the same
-reason. A timeout cannot be predicted, so a slow reader of a streamed scan can still run
-out its `timeout` partway through.
+`507` before any output. A request that lowers `max-result-mb` does not stay eager. A
+streamed answer that passes the lowered budget within its first 1 MiB is refused with
+`507` before any output, and one that passes it later aborts the transfer, as an eager
+answer past 1 MiB already did. A timeout cannot be predicted, so a slow reader of a
+streamed scan can still run out its `timeout` partway through.
 
 Automatic execution plans the query once on the blocking pool. When it keeps the plan
 eager, the HTTP handler continues on the eager path with that result, so the response,

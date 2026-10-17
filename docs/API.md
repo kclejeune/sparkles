@@ -1621,9 +1621,10 @@ Query parameters beyond the standard protocol:
   status before any output. Every other plan runs eagerly, with the same response as
   `execution=eager`. A query that ran in under 10 ms the last time also runs eagerly
   without being planned for the decision. A request for SPARQL Results Thrift, a
-  stored-query run with parameter values and a request that lowers `max-result-mb` also
-  run eagerly, the first because that encoding has no streaming writer and the last so
-  that a result too large for the budget is refused before its first byte. The policy is
+  stored-query run with parameter values run eagerly, the first because that
+  encoding has no streaming writer and the second because initial bindings rule out every
+  automatic plan. A streamed answer that passes a lowered `max-result-mb` within its first
+  1 MiB is refused with a status before any output, as an eager one is. The policy is
   deliberately narrow, and it can widen as more query shapes prove faster when streamed.
 
   A streamed answer differs from an eager one in what the caller sees. The memory and
