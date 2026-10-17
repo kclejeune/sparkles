@@ -410,7 +410,7 @@ mod algo_catalog_admission {
     fn algo_catalog_root_future_refuses_before_writers() {
         assert!(open_refuses(
             "root",
-            br#"{"format":2,"projections":{}}"#,
+            br#"{"format":3,"projections":{}}"#,
             "root-future",
             true
         ));
@@ -419,7 +419,7 @@ mod algo_catalog_admission {
     fn algo_catalog_active_future_refuses_before_writers() {
         assert!(open_refuses(
             "active",
-            br#"{"format":2,"projections":{}}"#,
+            br#"{"format":3,"projections":{}}"#,
             "active-future",
             true
         ));
@@ -428,7 +428,7 @@ mod algo_catalog_admission {
     fn algo_catalog_retained_future_refuses_before_writers() {
         assert!(open_refuses(
             "retained",
-            br#"{"format":2,"projections":{}}"#,
+            br#"{"format":3,"projections":{}}"#,
             "retained-future",
             true
         ));
@@ -437,7 +437,7 @@ mod algo_catalog_admission {
     fn algo_catalog_unknown_future_shape_refuses_before_writers() {
         assert!(open_refuses(
             "root",
-            br#"{"format":2,"futureSchema":["not", "a", "FileDoc"]}"#,
+            br#"{"format":3,"futureSchema":["not", "a", "FileDoc"]}"#,
             "unknown-future-shape",
             true
         ));
@@ -463,7 +463,7 @@ mod algo_catalog_admission {
     fn algo_catalog_migration_plans_are_complete_and_read_only() {
         let mut admitted = Vec::new();
         for location in ["root", "active", "retained"] {
-            let (_dir, root) = fixture(location, br#"{"format":2,"futureShape":true}"#);
+            let (_dir, root) = fixture(location, br#"{"format":3,"futureShape":true}"#);
             let before = inventory(&root);
             let plan = crate::migrate::plan(&root).unwrap();
             let after = inventory(&root);

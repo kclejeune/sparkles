@@ -712,6 +712,10 @@ fn prepare_query(
         ctx.deadline = opts.effective_deadline(started)?;
     }
     ctx.configure_extensions(pattern);
+    // EXISTS is planned only when rows reach it, so the algebra decides, not the planner
+    if algosvc::calls_algorithm(pattern) {
+        ctx.note_algorithm_call();
+    }
     let mut ctx = Arc::new(ctx);
     if cursor_started.is_some() && automatic.is_none() {
         ctx.attach_cursor_owner();

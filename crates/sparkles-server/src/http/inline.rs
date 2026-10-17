@@ -47,6 +47,29 @@ pub fn available() -> bool {
 #[cfg(test)]
 pub static RAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Runs in place so far for each query key (for tests), so that a test counts the runs of
+/// its own text while other tests run in parallel.
+#[cfg(test)]
+pub static RAN_BY_KEY: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u64, u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Count one run in place of the query with this key (a test build only).
+pub fn note_in_place(key: u64) {
+    #[cfg(test)]
+    {
+        *RAN_BY_KEY.lock().entry(key).or_default() += 1;
+    }
+    #[cfg(not(test))]
+    let _ = key;
+}
+
+/// How many times the query with this key has run in place.
+#[cfg(test)]
+pub fn ran_by_key(key: u64) -> u64 {
+    RAN_BY_KEY.lock().get(&key).copied().unwrap_or(0)
+}
+
 /// Run `f` on this thread, after handing this worker's other tasks to another thread.
 /// A panic becomes a `500` response, as it does for work on the blocking pool.
 pub fn run<T>(f: impl FnOnce() -> T) -> super::ApiResult<T> {

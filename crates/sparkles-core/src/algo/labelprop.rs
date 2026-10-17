@@ -5,7 +5,8 @@
 //! label of the largest total edge weight. A directed projection counts the labels of
 //! the in-neighbours as well, once for each edge.
 
-use super::{BLOCK, Control, Graph, Par};
+use super::memory::{Buffer, Growing, Work};
+use super::{BLOCK, CHECK_EVERY, Control, Graph, Par};
 use crate::error::Result;
 
 pub struct Output {
@@ -17,9 +18,8 @@ pub struct Output {
 
 pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<Output> {
     let n = g.n();
-    ctl.charge(n as u64 * 8)?;
-    let mut label: Vec<u32> = (0..n as u32).collect();
-    let mut next = label.clone();
+    let mut label = Buffer::collect("labelprop-label", n, 0..n as u32, ctl)?;
+    let mut next = Buffer::<u32>::zeroed("labelprop-next", n, ctl)?;
     let incoming = g.inn(ctl)?;
     let inn = &*incoming;
     let mut iterations = 0;
@@ -28,19 +28,30 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
         ctl.check()?;
         let prev = &label;
         par.chunks_mut(&mut next, BLOCK, |lo, chunk| {
-            let mut seen: Vec<(u32, f64)> = Vec::new();
+            let mut work = Work::new(ctl)?;
+            // the labels around one node, charged as the largest row needs
+            let mut seen: Growing<(u32, f64)> = Growing::new("labelprop-seen", ctl)?;
+            let sides: &[&super::Csr] = if g.symmetric {
+                &[&g.out]
+            } else {
+                &[&g.out, inn]
+            };
+            // the rows of the chunk are counted at once while they stay within an interval
+            let hi = lo + chunk.len();
+            let mut counted = [true; 2];
+            for (c, csr) in counted.iter_mut().zip(sides) {
+                *c = work.rows(&csr.off, lo, hi, "labelprop-node")?;
+            }
             for (i, slot) in chunk.iter_mut().enumerate() {
                 let u = (lo + i) as u32;
                 seen.clear();
-                let sides: &[&super::Csr] = if g.symmetric {
-                    &[&g.out]
-                } else {
-                    &[&g.out, inn]
-                };
-                for csr in sides {
+                for (&counted, csr) in counted.iter().zip(sides) {
+                    work.row(counted, &csr.off, u as usize, "labelprop-node")?;
                     let (r, w) = (csr.row(u), csr.wrow(u));
-                    for (k, &v) in r.iter().enumerate() {
-                        seen.push((prev[v as usize], w.map_or(1.0, |w| w[k] as f64)));
+                    match w {
+                        Some(w) => seen
+                            .extend(r.iter().zip(w).map(|(&v, &w)| (prev[v as usize], w as f64)))?,
+                        None => seen.extend(r.iter().map(|&v| (prev[v as usize], 1.0)))?,
                     }
                 }
                 if seen.is_empty() {
@@ -48,6 +59,7 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
                     continue;
                 }
                 seen.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+                let seen: &[(u32, f64)] = &seen;
                 let mut best = (prev[u as usize], -1.0f64);
                 let mut k = 0;
                 while k < seen.len() {
@@ -67,7 +79,14 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
             Ok(())
         })?;
         iterations = it + 1;
-        let same = label == next;
+        let mut same = true;
+        for (a, b) in label.chunks(CHECK_EVERY).zip(next.chunks(CHECK_EVERY)) {
+            ctl.check()?;
+            if a != b {
+                same = false;
+                break;
+            }
+        }
         std::mem::swap(&mut label, &mut next);
         if same {
             converged = true;
@@ -75,7 +94,7 @@ pub fn run(g: &Graph, max_iterations: u32, par: &Par, ctl: &Control) -> Result<O
         }
     }
     Ok(Output {
-        label,
+        label: label.into_output(),
         iterations,
         converged,
     })
@@ -100,6 +119,69 @@ mod tests {
         let o = run(&g, 10, &Par::single(), &Control::unlimited()).unwrap();
         assert!(o.label[..4].iter().all(|&l| l == o.label[0]));
         assert!(o.label[4..].iter().all(|&l| l == o.label[4]));
+    }
+
+    /// The rule of the module, applied with a map per node over the edge list.
+    fn reference(n: usize, edges: &[(u32, u32)], symmetric: bool, rounds: u32) -> Vec<u32> {
+        let mut label: Vec<u32> = (0..n as u32).collect();
+        for _ in 0..rounds {
+            let mut count: Vec<std::collections::BTreeMap<u32, u32>> = vec![Default::default(); n];
+            for &(a, b) in edges {
+                // a symmetric graph holds both directions already; a directed one
+                // counts the in-neighbours too
+                *count[a as usize].entry(label[b as usize]).or_default() += 1;
+                if !symmetric {
+                    *count[b as usize].entry(label[a as usize]).or_default() += 1;
+                }
+            }
+            let next: Vec<u32> = (0..n)
+                .map(|u| {
+                    let mut best = (label[u], 0);
+                    // ascending labels: a later label wins only with more votes
+                    for (&l, &k) in &count[u] {
+                        if k > best.1 {
+                            best = (l, k);
+                        }
+                    }
+                    best.0
+                })
+                .collect();
+            if next == label {
+                break;
+            }
+            label = next;
+        }
+        label
+    }
+
+    #[test]
+    fn matches_a_reference_on_random_graphs() {
+        let mut rng = crate::algo::Rng::new(5);
+        for case in 0..30 {
+            let n = 20 + rng.below(30) as u32;
+            let mut e: Vec<(u32, u32)> = (0..2 * n)
+                .map(|_| (rng.below(n as usize) as u32, rng.below(n as usize) as u32))
+                .filter(|e| e.0 != e.1)
+                .collect();
+            e.sort_unstable();
+            e.dedup();
+            let rounds = 1 + case % 6;
+            for symmetric in [false, true] {
+                let (g, both) = if symmetric {
+                    // an edge given both ways is two edges, and each counts
+                    let both: Vec<(u32, u32)> =
+                        e.iter().flat_map(|&(a, b)| [(a, b), (b, a)]).collect();
+                    (ugraph(n, &e), both)
+                } else {
+                    (digraph(n, &e), e.clone())
+                };
+                let want = reference(n as usize, &both, symmetric, rounds);
+                for par in [Par::single(), Par::with_threads(3)] {
+                    let o = run(&g, rounds, &par, &Control::unlimited()).unwrap();
+                    assert_eq!(o.label, want, "case {case}, symmetric {symmetric}");
+                }
+            }
+        }
     }
 
     #[test]

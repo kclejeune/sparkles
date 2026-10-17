@@ -1,29 +1,38 @@
 //! k-core decomposition by Batagelj and Zaversnik's bucket algorithm (spec F14 §4).
 //! Linear in the number of edges. The graph is read as undirected and simple.
 
-use super::{CHECK_EVERY, Control, Graph};
+use super::memory::{Buffer, Work};
+use super::{Control, Graph};
 use crate::error::Result;
 
 /// The core number of each node.
 pub fn run(g: &Graph, ctl: &Control) -> Result<Vec<u32>> {
     let s = g.simple(ctl)?;
     let n = s.n();
-    ctl.charge(n as u64 * 16)?;
-    let mut deg: Vec<u32> = (0..n as u32).map(|u| s.deg(u) as u32).collect();
+    let mut work = Work::new(ctl)?;
+    let mut deg = Buffer::collect(
+        "kcore-degree",
+        n,
+        (0..n as u32).map(|u| s.deg(u) as u32),
+        ctl,
+    )?;
     let max_deg = deg.iter().copied().max().unwrap_or(0) as usize;
     // bin[d] = start of the nodes of degree d in `vert`
-    let mut bin = vec![0usize; max_deg + 2];
-    for &d in &deg {
+    let mut bin = Buffer::<usize>::zeroed("kcore-bins", max_deg + 2, ctl)?;
+    for &d in deg.iter() {
+        work.tick("kcore-bins")?;
         bin[d as usize + 1] += 1;
     }
     for d in 0..=max_deg {
+        work.tick("kcore-bins")?;
         bin[d + 1] += bin[d];
     }
-    let mut pos = vec![0usize; n];
-    let mut vert = vec![0u32; n];
+    let mut pos = Buffer::<usize>::zeroed("kcore-position", n, ctl)?;
+    let mut vert = Buffer::<u32>::zeroed("kcore-order", n, ctl)?;
     {
-        let mut at = bin.clone();
+        let mut at = Buffer::collect("kcore-cursor", bin.len(), bin.iter().copied(), ctl)?;
         for v in 0..n {
+            work.tick("kcore-order")?;
             let d = deg[v] as usize;
             pos[v] = at[d];
             vert[at[d]] = v as u32;
@@ -31,11 +40,10 @@ pub fn run(g: &Graph, ctl: &Control) -> Result<Vec<u32>> {
         }
     }
     for i in 0..n {
-        if i % CHECK_EVERY == 0 {
-            ctl.check()?;
-        }
         let v = vert[i];
-        for &u in s.row(v) {
+        let row = s.row(v);
+        work.tick_n(row.len() + 1, "kcore-peel")?;
+        for &u in row {
             let (du, dv) = (deg[u as usize], deg[v as usize]);
             if du > dv {
                 // move u to the front of its bin and shrink its degree
@@ -53,7 +61,8 @@ pub fn run(g: &Graph, ctl: &Control) -> Result<Vec<u32>> {
             }
         }
     }
-    Ok(deg)
+    ctl.check()?;
+    Ok(deg.into_output())
 }
 
 #[cfg(test)]

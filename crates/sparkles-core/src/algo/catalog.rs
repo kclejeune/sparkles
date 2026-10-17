@@ -14,8 +14,12 @@ use std::path::{Path, PathBuf};
 /// The file of a database directory that holds its named projections.
 pub const FILE: &str = "algo.json";
 
-/// Version of the file's JSON shape.
-pub const FORMAT: u32 = 1;
+/// The newest version of the file's JSON shape, which this build reads and can write.
+/// Format 2 added `deleted`. A format 1 file reads as one with no deleted projections.
+/// A file is written as format 2 only while `deleted` has an entry, and as format 1
+/// otherwise, so that a release that knows only format 1 still opens a dataset that has
+/// never deleted a projection.
+pub const FORMAT: u32 = 2;
 
 /// Longest projection name.
 pub const MAX_NAME: usize = 64;
@@ -173,6 +177,13 @@ struct FileDoc {
     format: u32,
     #[serde(default)]
     projections: BTreeMap<String, Stored>,
+    /// The last revision of each deleted projection, so that a projection created
+    /// again under the same name continues its revisions. A client that holds a
+    /// revision of the deleted projection cannot mistake the new one for it. The map
+    /// keeps one entry for every name deleted and not created again, and an entry takes
+    /// at most `MAX_NAME` characters and a number, so it grows slowly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    deleted: BTreeMap<String, u64>,
 }
 
 fn default_format() -> u32 {
@@ -214,6 +225,9 @@ impl Catalog {
                     // duplicate known fields are not discarded by Value parsing.
                     let d: FileDoc =
                         serde_json::from_slice(&b).map_err(|e| invalid(format!("{FILE}: {e}")))?;
+                    if let Some(n) = d.deleted.keys().find(|n| !valid_name(n)) {
+                        return Err(invalid(format!("{FILE}: invalid projection name '{n}'")));
+                    }
                     for (n, p) in &d.projections {
                         if !valid_name(n) {
                             return Err(invalid(format!("{FILE}: invalid projection name '{n}'")));
@@ -294,13 +308,14 @@ impl Catalog {
             return Ok(());
         };
         let path = root.join(FILE);
-        if doc.projections.is_empty() {
+        if doc.projections.is_empty() && doc.deleted.is_empty() {
             return match std::fs::remove_file(&path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
                 _ => Ok(()),
             };
         }
-        let bytes = crate::formats::settings_to_vec(FILE, doc)?;
+        let format = if doc.deleted.is_empty() { 1 } else { FORMAT };
+        let bytes = crate::formats::settings_to_vec_at(FILE, doc, format)?;
         crate::store::write_atomic(&path, &bytes)?;
         Ok(())
     }
@@ -330,14 +345,17 @@ impl Catalog {
                 "projection '{name}' is at revision {have}, not {want}"
             )));
         }
+        // a name used before continues from the last revision it had
+        let last = have.max(doc.deleted.get(name).copied().unwrap_or(0));
         let stored = Stored {
-            revision: have + 1,
+            revision: last + 1,
             updated: crate::guard::config::now_rfc3339(),
             author,
             definition: def,
         };
         let mut next = doc.clone();
         next.projections.insert(name.to_string(), stored.clone());
+        next.deleted.remove(name);
         self.save(&next)?;
         *doc = next;
         Ok((stored, have == 0))
@@ -356,8 +374,10 @@ impl Catalog {
             )));
         }
         let mut next = doc.clone();
-        let had = next.projections.remove(name).is_some();
-        if had {
+        let removed = next.projections.remove(name);
+        let had = removed.is_some();
+        if let Some(gone) = removed {
+            next.deleted.insert(name.to_string(), gone.revision);
             self.save(&next)?;
             *doc = next;
         }
@@ -395,7 +415,57 @@ mod tests {
         let again = Catalog::open(Some(dir.path())).unwrap();
         assert_eq!(again.get("people"), Some(def()));
         assert!(again.delete("people", Some(2)).unwrap());
-        assert!(!dir.path().join(FILE).exists());
+        assert!(again.list().is_empty());
+        // the file keeps the last revision of the deleted projection
+        let c = Catalog::open(Some(dir.path())).unwrap();
+        let (st, new) = c.put("people", def(), None, Some(0)).unwrap();
+        assert!(new);
+        assert_eq!(
+            st.revision, 3,
+            "a projection created again continues its revisions"
+        );
+        assert!(c.put("people", def(), None, Some(2)).is_err());
+        assert_eq!(c.put("people", def(), None, Some(3)).unwrap().0.revision, 4);
+        // in memory too
+        let m = Catalog::memory();
+        m.put("p", def(), None, None).unwrap();
+        m.delete("p", None).unwrap();
+        assert_eq!(m.put("p", def(), None, None).unwrap().0.revision, 2);
+    }
+
+    #[test]
+    fn a_file_is_format_2_only_while_it_holds_a_deleted_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap()
+        };
+        std::fs::write(
+            dir.path().join(FILE),
+            br#"{"format":1,"projections":{"keep":{"revision":4,"updated":"fixture","definition":{}}}}"#,
+        )
+        .unwrap();
+        let c = Catalog::open(Some(dir.path())).unwrap();
+        assert_eq!(c.get_stored("keep").unwrap().revision, 4);
+        // a change that deletes nothing keeps format 1, so an older release reads it
+        c.put("other", def(), None, None).unwrap();
+        assert_eq!(on_disk()["format"], 1);
+        assert!(on_disk().get("deleted").is_none());
+        // the first delete needs format 2
+        assert!(c.delete("keep", Some(4)).unwrap());
+        assert_eq!(on_disk()["format"], 2);
+        assert_eq!(on_disk()["deleted"]["keep"], 4);
+        let c = Catalog::open(Some(dir.path())).unwrap();
+        assert_eq!(c.put("keep", def(), None, None).unwrap().0.revision, 5);
+        // no deleted name is left, so the file is format 1 again
+        assert!(on_disk().get("deleted").is_none());
+        assert_eq!(on_disk()["format"], 1);
+        // a deleted name is checked like a projection name
+        std::fs::write(
+            dir.path().join(FILE),
+            br#"{"format":2,"deleted":{"bad name":1}}"#,
+        )
+        .unwrap();
+        assert!(Catalog::open(Some(dir.path())).is_err());
     }
 
     #[test]
@@ -431,8 +501,8 @@ mod algo_catalog_format_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut wrong = Vec::new();
         for doc in [
-            json!({"format":2,"projections":{}}),
-            json!({"format":2,"unknownFutureShape":[1,2]}),
+            json!({"format":FORMAT + 1,"projections":{}}),
+            json!({"format":FORMAT + 1,"unknownFutureShape":[1,2]}),
         ] {
             std::fs::write(dir.path().join(FILE), serde_json::to_vec(&doc).unwrap()).unwrap();
             let result = Catalog::open(Some(dir.path()));
@@ -488,7 +558,8 @@ mod algo_catalog_format_tests {
             .unwrap();
         let doc: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join(FILE)).unwrap()).unwrap();
-        assert_eq!(doc["format"], FORMAT);
+        // nothing was deleted, so the file stays at format 1
+        assert_eq!(doc["format"], 1);
     }
     #[test]
     fn algo_catalog_null_version_stays_broken_without_rewrite() {
@@ -499,10 +570,7 @@ mod algo_catalog_format_tests {
         std::fs::write(&path, &bytes).unwrap();
         // Compatibility probing is not typed schema acceptance. The existing
         // catalog reader rejects an explicit null rather than defaulting it.
-        assert_eq!(
-            crate::formats::check_settings(FILE, &value).unwrap(),
-            FORMAT
-        );
+        assert_eq!(crate::formats::check_settings(FILE, &value).unwrap(), 1);
         crate::formats::check_dataset_dir(dir.path()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(matches!(
@@ -732,8 +800,8 @@ mod duplicate_field_tests {
     #[test]
     fn future_duplicate_body_keeps_compatibility_precedence() {
         for raw in [
-            r#"{"format":2,"projections":{},"projections":{"future":null},"unknownFutureShape":true}"#,
-            r#"{"format":1,"format":2,"projections":{},"projections":{}}"#,
+            r#"{"format":3,"projections":{},"projections":{"future":null},"unknownFutureShape":true}"#,
+            r#"{"format":1,"format":3,"projections":{},"projections":{}}"#,
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(FILE);

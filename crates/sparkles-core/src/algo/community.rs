@@ -10,7 +10,8 @@
 //! Nodes move in index order and ties keep the current community, so a run is
 //! deterministic for a seed. The moving phases are sequential.
 
-use super::{CHECK_EVERY, Control, Csr, Graph, Rng, bad};
+use super::memory::{Buffer, Growing, Work};
+use super::{Control, Csr, Graph, Rng, bad};
 use crate::error::Result;
 
 #[derive(Clone, Debug)]
@@ -50,14 +51,15 @@ pub struct Output {
 }
 
 /// A weighted graph of one level: rows without self-loops, with the weight of the
-/// self-loops of each node held apart.
+/// self-loops of each node held apart. Every array is charged to the call and given
+/// back when the level drops.
 struct Level {
-    off: Vec<usize>,
-    adj: Vec<u32>,
-    w: Vec<f64>,
-    selfw: Vec<f64>,
+    off: Buffer<usize>,
+    adj: Growing<u32>,
+    w: Growing<f64>,
+    selfw: Buffer<f64>,
     /// the weighted degree: row sum plus twice the self-loop weight
-    k: Vec<f64>,
+    k: Buffer<f64>,
     /// the sum of the degrees
     m2: f64,
 }
@@ -72,74 +74,101 @@ impl Level {
         (&self.adj[r.clone()], &self.w[r])
     }
 
-    fn from_csr(c: &Csr) -> Level {
+    fn from_csr(c: &Csr, ctl: &Control) -> Result<Level> {
         let n = c.n();
-        let off: Vec<usize> = c.off.iter().map(|&o| o as usize).collect();
-        let w: Vec<f64> = match &c.w {
-            Some(w) => w.iter().map(|&x| x as f64).collect(),
-            None => vec![1.0; c.adj.len()],
-        };
-        let k: Vec<f64> = (0..n).map(|u| w[off[u]..off[u + 1]].iter().sum()).collect();
+        let mut work = Work::new(ctl)?;
+        let off = Buffer::collect(
+            "community-offsets",
+            n + 1,
+            c.off.iter().map(|&o| o as usize),
+            ctl,
+        )?;
+        let mut adj = Growing::new("community-edges", ctl)?;
+        adj.reserve(c.adj.len())?;
+        for row in c.adj.chunks(super::CHECK_EVERY) {
+            work.tick_n(row.len(), "community-edges")?;
+            for &v in row {
+                adj.push(v)?;
+            }
+        }
+        let mut w = Growing::new("community-weights", ctl)?;
+        w.reserve(c.adj.len())?;
+        for i in 0..c.adj.len() {
+            work.tick("community-weights")?;
+            w.push(c.w.as_ref().map_or(1.0, |w| w[i] as f64))?;
+        }
+        let mut k = Buffer::<f64>::zeroed("community-degrees", n, ctl)?;
+        for u in 0..n {
+            work.tick_n(off[u + 1] - off[u] + 1, "community-degrees")?;
+            k[u] = w[off[u]..off[u + 1]].iter().sum();
+        }
         let m2 = k.iter().sum();
-        Level {
+        Ok(Level {
             off,
-            adj: c.adj.clone(),
+            adj,
             w,
-            selfw: vec![0.0; n],
+            selfw: Buffer::zeroed("community-self-loops", n, ctl)?,
             k,
             m2,
-        }
+        })
     }
 
     /// The modularity of a partition, with community numbers below `n`.
-    fn modularity(&self, comm: &[u32], res: f64) -> f64 {
+    fn modularity(&self, comm: &[u32], res: f64, ctl: &Control) -> Result<f64> {
         if self.m2 <= 0.0 {
-            return 0.0;
+            return Ok(0.0);
         }
         let n = self.n();
-        let mut inside = vec![0f64; n];
-        let mut tot = vec![0f64; n];
+        let mut inside = Buffer::<f64>::zeroed("community-inside", n, ctl)?;
+        let mut tot = Buffer::<f64>::zeroed("community-totals", n, ctl)?;
+        let mut work = Work::new(ctl)?;
         for u in 0..n {
             let c = comm[u] as usize;
             tot[c] += self.k[u];
             inside[c] += 2.0 * self.selfw[u];
             let (r, w) = self.row(u);
+            work.tick_n(r.len() + 1, "community-modularity")?;
             for (i, &v) in r.iter().enumerate() {
                 if comm[v as usize] as usize == c {
                     inside[c] += w[i];
                 }
             }
         }
-        (0..n)
+        Ok((0..n)
             .map(|c| inside[c] / self.m2 - res * (tot[c] / self.m2).powi(2))
-            .sum()
+            .sum())
     }
 
     /// Merge the nodes of each community into one node. `comm` has dense numbers.
-    fn aggregate(&self, comm: &[u32], count: usize) -> Level {
+    fn aggregate(&self, comm: &[u32], count: usize, ctl: &Control) -> Result<Level> {
         let n = self.n();
+        let mut work = Work::new(ctl)?;
         // members by community
-        let mut start = vec![0usize; count + 1];
+        let mut start = Buffer::<usize>::zeroed("community-start", count + 1, ctl)?;
         for &c in comm {
+            work.tick("community-start")?;
             start[c as usize + 1] += 1;
         }
         for c in 0..count {
+            work.tick("community-start")?;
             start[c + 1] += start[c];
         }
-        let mut at = start.clone();
-        let mut members = vec![0u32; n];
+        let mut at = Buffer::collect("community-cursor", count + 1, start.iter().copied(), ctl)?;
+        let mut members = Buffer::<u32>::zeroed("community-members", n, ctl)?;
         for u in 0..n {
+            work.tick("community-members")?;
             members[at[comm[u] as usize]] = u as u32;
             at[comm[u] as usize] += 1;
         }
-        let mut off = vec![0usize; count + 1];
-        let mut adj = Vec::new();
-        let mut w = Vec::new();
-        let mut selfw = vec![0f64; count];
-        let mut k = vec![0f64; count];
-        let mut acc = vec![0f64; count];
-        let mut stamp = vec![usize::MAX; count];
-        let mut touched: Vec<u32> = Vec::new();
+        drop(at);
+        let mut off = Buffer::<usize>::zeroed("community-offsets", count + 1, ctl)?;
+        let mut adj = Growing::new("community-edges", ctl)?;
+        let mut w = Growing::new("community-weights", ctl)?;
+        let mut selfw = Buffer::<f64>::zeroed("community-self-loops", count, ctl)?;
+        let mut k = Buffer::<f64>::zeroed("community-degrees", count, ctl)?;
+        let mut acc = Buffer::<f64>::zeroed("community-accumulator", count, ctl)?;
+        let mut stamp = Buffer::splat("community-stamp", count, usize::MAX, ctl)?;
+        let mut touched: Growing<u32> = Growing::new("community-touched", ctl)?;
         for c in 0..count {
             touched.clear();
             let mut internal = 0.0;
@@ -148,6 +177,7 @@ impl Level {
                 selfw[c] += self.selfw[u];
                 k[c] += self.k[u];
                 let (r, ws) = self.row(u);
+                work.tick_n(r.len() + 1, "community-aggregate")?;
                 for (i, &v) in r.iter().enumerate() {
                     let d = comm[v as usize] as usize;
                     if d == c {
@@ -156,7 +186,7 @@ impl Level {
                         if stamp[d] != c {
                             stamp[d] = c;
                             acc[d] = 0.0;
-                            touched.push(d as u32);
+                            touched.push(d as u32)?;
                         }
                         acc[d] += ws[i];
                     }
@@ -165,35 +195,39 @@ impl Level {
             // an internal edge is seen from both ends
             selfw[c] += internal / 2.0;
             touched.sort_unstable();
-            for &d in &touched {
-                adj.push(d);
-                w.push(acc[d as usize]);
+            adj.reserve(touched.len())?;
+            w.reserve(touched.len())?;
+            for &d in touched.iter() {
+                adj.push(d)?;
+                w.push(acc[d as usize])?;
             }
             off[c + 1] = adj.len();
         }
-        Level {
+        Ok(Level {
             off,
             adj,
             w,
             selfw,
             k,
             m2: self.m2,
-        }
+        })
     }
 }
 
 /// Number the communities by first appearance. Returns the count.
-fn renumber(comm: &mut [u32]) -> usize {
-    let mut map = vec![u32::MAX; comm.len()];
+fn renumber(comm: &mut [u32], ctl: &Control) -> Result<usize> {
+    let mut map = Buffer::splat("community-renumber", comm.len(), u32::MAX, ctl)?;
+    let mut work = Work::new(ctl)?;
     let mut next = 0u32;
     for c in comm.iter_mut() {
+        work.tick("community-renumber")?;
         if map[*c as usize] == u32::MAX {
             map[*c as usize] = next;
             next += 1;
         }
         *c = map[*c as usize];
     }
-    next as usize
+    Ok(next as usize)
 }
 
 /// Move nodes to the neighbouring community of the best modularity gain until a sweep
@@ -206,22 +240,22 @@ fn local_moving(
     ctl: &Control,
 ) -> Result<bool> {
     let n = lv.n();
-    let mut tot = vec![0f64; n];
+    let mut tot = Buffer::<f64>::zeroed("community-totals", n, ctl)?;
+    let mut work = Work::new(ctl)?;
     for u in 0..n {
+        work.tick("community-totals")?;
         tot[comm[u] as usize] += lv.k[u];
     }
-    let mut acc = vec![0f64; n];
-    let mut stamp = vec![usize::MAX; n];
-    let mut touched: Vec<u32> = Vec::new();
+    let mut acc = Buffer::<f64>::zeroed("community-accumulator", n, ctl)?;
+    let mut stamp = Buffer::splat("community-stamp", n, usize::MAX, ctl)?;
+    let mut touched: Growing<u32> = Growing::new("community-touched", ctl)?;
     let mut any = false;
     for _ in 0..max_sweeps {
         ctl.check()?;
         let mut moved = false;
         for u in 0..n {
-            if u % CHECK_EVERY == 0 {
-                ctl.check()?;
-            }
             let (r, ws) = lv.row(u);
+            work.tick_n(r.len() + 1, "community-local-moving")?;
             if r.is_empty() {
                 continue;
             }
@@ -231,7 +265,7 @@ fn local_moving(
                 if stamp[c] != u {
                     stamp[c] = u;
                     acc[c] = 0.0;
-                    touched.push(c as u32);
+                    touched.push(c as u32)?;
                 }
                 acc[c] += ws[i];
             }
@@ -241,7 +275,7 @@ fn local_moving(
             let own = if stamp[cu] == u { acc[cu] } else { 0.0 };
             let mut best = cu;
             let mut best_gain = own - res * tot[cu] * ku / lv.m2;
-            for &c in &touched {
+            for &c in touched.iter() {
                 let c = c as usize;
                 let gain = acc[c] - res * tot[c] * ku / lv.m2;
                 if gain > best_gain + 1e-12 {
@@ -265,37 +299,54 @@ fn local_moving(
 
 /// Leiden's refinement: inside each community, singletons merge into well-connected
 /// parts of it. Returns the refined partition with dense numbers, and its count.
-fn refine(lv: &Level, comm: &[u32], res: f64, theta: f64, rng: &mut Rng) -> (Vec<u32>, usize) {
+///
+/// A singleton chooses among the parts it may join with probability proportional to
+/// `exp(gain / theta)`. The gain is measured in units of edge weight, so multiplying
+/// every weight by a factor has the effect of dividing `theta` by it.
+fn refine(
+    lv: &Level,
+    comm: &[u32],
+    res: f64,
+    theta: f64,
+    rng: &mut Rng,
+    ctl: &Control,
+) -> Result<(Buffer<u32>, usize)> {
     let n = lv.n();
-    let mut refined: Vec<u32> = (0..n as u32).collect();
-    let mut size = vec![1u32; n];
+    let mut work = Work::new(ctl)?;
+    let mut refined = Buffer::collect("leiden-refined", n, 0..n as u32, ctl)?;
+    let mut size = Buffer::splat("leiden-size", n, 1u32, ctl)?;
     // K_R: the degree of each refined community
-    let mut kr: Vec<f64> = lv.k.clone();
+    let mut kr = Buffer::collect("leiden-degrees", n, lv.k.iter().copied(), ctl)?;
     // the degree of each community of the partition
-    let mut kc = vec![0f64; n];
+    let mut kc = Buffer::<f64>::zeroed("leiden-community-degrees", n, ctl)?;
     for u in 0..n {
+        work.tick("leiden-community-degrees")?;
         kc[comm[u] as usize] += lv.k[u];
     }
     // E(R, C - R): the weight between a refined community and the rest of its community
-    let mut ext = vec![0f64; n];
+    let mut ext = Buffer::<f64>::zeroed("leiden-external", n, ctl)?;
     for u in 0..n {
         let (r, ws) = lv.row(u);
+        work.tick_n(r.len() + 1, "leiden-external")?;
         for (i, &v) in r.iter().enumerate() {
             if comm[v as usize] == comm[u] {
                 ext[u] += ws[i];
             }
         }
     }
-    let mut order: Vec<u32> = (0..n as u32).collect();
+    let mut order = Buffer::collect("leiden-order", n, 0..n as u32, ctl)?;
     for i in (1..n).rev() {
+        work.tick("leiden-order")?;
         order.swap(i, rng.below(i + 1));
     }
-    let mut acc = vec![0f64; n];
-    let mut stamp = vec![usize::MAX; n];
-    let mut touched: Vec<u32> = Vec::new();
-    let mut cand: Vec<(u32, f64)> = Vec::new();
+    let mut acc = Buffer::<f64>::zeroed("leiden-accumulator", n, ctl)?;
+    let mut stamp = Buffer::splat("leiden-stamp", n, usize::MAX, ctl)?;
+    let mut touched: Growing<u32> = Growing::new("leiden-touched", ctl)?;
+    let mut cand: Growing<(u32, f64)> = Growing::new("leiden-candidates", ctl)?;
+    let mut weights: Growing<f64> = Growing::new("leiden-weights", ctl)?;
     for (step, &v) in order.iter().enumerate() {
         let v = v as usize;
+        work.tick("leiden-refine")?;
         if size[refined[v] as usize] != 1 {
             continue;
         }
@@ -307,6 +358,7 @@ fn refine(lv: &Level, comm: &[u32], res: f64, theta: f64, rng: &mut Rng) -> (Vec
         }
         touched.clear();
         let (r, ws) = lv.row(v);
+        work.tick_n(r.len(), "leiden-refine")?;
         for (i, &x) in r.iter().enumerate() {
             if comm[x as usize] != c {
                 continue;
@@ -315,13 +367,13 @@ fn refine(lv: &Level, comm: &[u32], res: f64, theta: f64, rng: &mut Rng) -> (Vec
             if stamp[rr] != step {
                 stamp[rr] = step;
                 acc[rr] = 0.0;
-                touched.push(rr as u32);
+                touched.push(rr as u32)?;
             }
             acc[rr] += ws[i];
         }
         cand.clear();
         let mut top = 0.0f64;
-        for &rr in &touched {
+        for &rr in touched.iter() {
             let rr = rr as usize;
             if rr == refined[v] as usize {
                 continue;
@@ -330,17 +382,21 @@ fn refine(lv: &Level, comm: &[u32], res: f64, theta: f64, rng: &mut Rng) -> (Vec
             if ext[rr] < res * kr[rr] * (kc[c as usize] - kr[rr]) / lv.m2 {
                 continue;
             }
+            // the gain of the move in units of edge weight, as local moving measures it
             let gain = acc[rr] - res * kr[rr] * kv / lv.m2;
             if gain >= 0.0 {
                 top = top.max(gain);
-                cand.push((rr as u32, gain));
+                cand.push((rr as u32, gain))?;
             }
         }
         if cand.is_empty() {
             continue;
         }
         // staying alone has gain 0 and is a choice too
-        let weights: Vec<f64> = cand.iter().map(|c| ((c.1 - top) / theta).exp()).collect();
+        weights.clear();
+        for c in cand.iter() {
+            weights.push(((c.1 - top) / theta).exp())?;
+        }
         let stay = ((0.0 - top) / theta).exp();
         let total: f64 = weights.iter().sum::<f64>() + stay;
         let mut pick = rng.next_f64() * total;
@@ -363,33 +419,37 @@ fn refine(lv: &Level, comm: &[u32], res: f64, theta: f64, rng: &mut Rng) -> (Vec
         kr[target] += kv;
         ext[target] = ext[target] + ext[old] - 2.0 * to_target;
     }
-    let count = renumber(&mut refined);
-    (refined, count)
+    let count = renumber(&mut refined, ctl)?;
+    Ok((refined, count))
 }
 
 /// Split each community into its connected pieces in `g`.
-fn split_connected(g: &Csr, labels: &[u32]) -> Vec<u32> {
+fn split_connected(g: &Csr, labels: &[u32], ctl: &Control) -> Result<Buffer<u32>> {
     let n = g.n();
-    let mut out = vec![u32::MAX; n];
+    let mut out = Buffer::splat("community-pieces", n, u32::MAX, ctl)?;
+    let mut work = Work::new(ctl)?;
     let mut next = 0u32;
-    let mut stack: Vec<u32> = Vec::new();
+    let mut stack: Growing<u32> = Growing::new("community-piece-stack", ctl)?;
     for s in 0..n {
+        work.tick("community-pieces")?;
         if out[s] != u32::MAX {
             continue;
         }
         out[s] = next;
-        stack.push(s as u32);
+        stack.push(s as u32)?;
         while let Some(u) = stack.pop() {
-            for &v in g.row(u) {
+            let row = g.row(u);
+            work.tick_n(row.len() + 1, "community-pieces")?;
+            for &v in row {
                 if out[v as usize] == u32::MAX && labels[v as usize] == labels[s] {
                     out[v as usize] = next;
-                    stack.push(v);
+                    stack.push(v)?;
                 }
             }
         }
         next += 1;
     }
-    out
+    Ok(out)
 }
 
 pub fn run(g: &Graph, p: &Params, ctl: &Control) -> Result<Output> {
@@ -398,36 +458,41 @@ pub fn run(g: &Graph, p: &Params, ctl: &Control) -> Result<Output> {
     }
     let sym = g.weighted_sym(ctl)?;
     let n = sym.n();
-    ctl.charge(sym.bytes() * 3 + n as u64 * 48)?;
-    let base = Level::from_csr(&sym);
     let mut levels: Vec<Vec<u32>> = Vec::new();
     let mut modularity: Vec<f64> = Vec::new();
     if n == 0 {
         return Ok(Output { levels, modularity });
     }
+    let base = Level::from_csr(&sym, ctl)?;
     let mut rng = Rng::new(p.seed);
-    let mut lv = Level::from_csr(&sym);
-    let mut comm: Vec<u32> = (0..n as u32).collect();
+    let mut lv = Level::from_csr(&sym, ctl)?;
+    let mut comm = Buffer::collect("community-membership", n, 0..n as u32, ctl)?;
     // the node of the current level that each original node is in
-    let mut node_of: Vec<u32> = (0..n as u32).collect();
+    let mut node_of = Buffer::collect("community-node-of", n, 0..n as u32, ctl)?;
     let mut last_q = f64::NEG_INFINITY;
     for level in 0..p.max_levels.max(1) {
         ctl.check()?;
         local_moving(&lv, &mut comm, p.resolution, p.max_sweeps, ctl)?;
-        let mut dense = comm.clone();
-        let count = renumber(&mut dense);
-        let mut flat: Vec<u32> = node_of.iter().map(|&x| dense[x as usize]).collect();
+        let mut dense = Buffer::collect("community-dense", comm.len(), comm.iter().copied(), ctl)?;
+        let count = renumber(&mut dense, ctl)?;
+        let mut flat = Buffer::collect(
+            "community-level",
+            n,
+            node_of.iter().map(|&x| dense[x as usize]),
+            ctl,
+        )?;
         if p.leiden {
-            flat = split_connected(&sym, &flat);
+            // Leiden reports each community split into its connected pieces
+            flat = split_connected(&sym, &flat, ctl)?;
         }
-        renumber(&mut flat);
-        let q = base.modularity(&flat, p.resolution);
+        renumber(&mut flat, ctl)?;
+        let q = base.modularity(&flat, p.resolution, ctl)?;
         // a later level that changes nothing ends the run
-        if level > 0 && levels.last() == Some(&flat) {
+        if level > 0 && levels.last().is_some_and(|l| l[..] == flat[..]) {
             break;
         }
         let gain = q - last_q;
-        levels.push(flat);
+        levels.push(flat.into_output());
         modularity.push(q);
         last_q = q;
         if level > 0 && gain < p.tolerance {
@@ -438,21 +503,31 @@ pub fn run(g: &Graph, p: &Params, ctl: &Control) -> Result<Output> {
         }
         // aggregate: by the communities (Louvain) or by the refinement of them (Leiden)
         let (parts, pcount) = if p.leiden {
-            refine(&lv, &dense, p.resolution, p.randomness.max(1e-9), &mut rng)
+            refine(
+                &lv,
+                &dense,
+                p.resolution,
+                p.randomness.max(1e-9),
+                &mut rng,
+                ctl,
+            )?
         } else {
-            (dense.clone(), count)
+            let copy = Buffer::collect("community-parts", dense.len(), dense.iter().copied(), ctl)?;
+            (copy, count)
         };
         if pcount == lv.n() {
             // nothing merged: another level would be the same
             break;
         }
-        let next = lv.aggregate(&parts, pcount);
+        let next = lv.aggregate(&parts, pcount, ctl)?;
         // each aggregated node starts in the community its members were in
-        let mut start = vec![0u32; pcount];
+        let mut start = Buffer::<u32>::zeroed("community-membership", pcount, ctl)?;
         for u in 0..lv.n() {
             start[parts[u] as usize] = dense[u];
         }
+        let mut work = Work::new(ctl)?;
         for x in node_of.iter_mut() {
+            work.tick("community-node-of")?;
             *x = parts[*x as usize];
         }
         lv = next;
@@ -490,7 +565,11 @@ mod tests {
 
     fn connected(g: &Graph, labels: &[u32]) -> bool {
         let s = g.simple(&Control::unlimited()).unwrap();
-        split_connected(&s, labels).iter().max() == labels.iter().max()
+        split_connected(&s, labels, &Control::unlimited())
+            .unwrap()
+            .iter()
+            .max()
+            == labels.iter().max()
     }
 
     #[test]
@@ -565,6 +644,150 @@ mod tests {
             assert!(qe >= ql - 0.01, "n={n}: leiden {qe} against louvain {ql}");
             for l in &lei.levels {
                 assert!(connected(&g, l), "n={n}: a community is split");
+            }
+        }
+    }
+
+    /// Modularity from its definition over an undirected edge list without repeats.
+    fn reference_modularity(n: usize, edges: &[(u32, u32)], labels: &[u32], res: f64) -> f64 {
+        let m = edges.len() as f64;
+        let mut deg = vec![0.0; n];
+        let mut inside = std::collections::BTreeMap::<u32, f64>::new();
+        let mut tot = std::collections::BTreeMap::<u32, f64>::new();
+        for &(a, b) in edges {
+            deg[a as usize] += 1.0;
+            deg[b as usize] += 1.0;
+            if labels[a as usize] == labels[b as usize] {
+                *inside.entry(labels[a as usize]).or_default() += 1.0;
+            }
+        }
+        for u in 0..n {
+            *tot.entry(labels[u]).or_default() += deg[u];
+        }
+        tot.iter()
+            .map(|(c, t)| inside.get(c).unwrap_or(&0.0) / m - res * (t / (2.0 * m)).powi(2))
+            .sum()
+    }
+
+    fn edges_of(g: &Graph) -> Vec<(u32, u32)> {
+        (0..g.n() as u32)
+            .flat_map(|u| g.out.row(u).iter().map(move |&v| (u, v)))
+            .filter(|&(u, v)| u < v)
+            .collect()
+    }
+
+    /// The modularity a run reports for each level is the modularity of that level's
+    /// partition of the original graph, for Louvain and for Leiden, at several
+    /// resolutions. Louvain reaches the known optimum region on the karate club.
+    #[test]
+    fn reported_modularity_matches_a_recomputation() {
+        let mut graphs = vec![ugraph(34, &karate())];
+        for (n, groups, seed) in [(200, 5, 21), (300, 8, 22), (150, 3, 23)] {
+            graphs.push(planted(n, groups, seed));
+        }
+        for g in &graphs {
+            let e = edges_of(g);
+            for leiden in [false, true] {
+                for resolution in [0.5, 1.0, 2.0] {
+                    let p = Params {
+                        leiden,
+                        resolution,
+                        seed: 4,
+                        ..Params::default()
+                    };
+                    let o = run(g, &p, &Control::unlimited()).unwrap();
+                    assert!(!o.levels.is_empty());
+                    for (l, q) in o.levels.iter().zip(&o.modularity) {
+                        let want = reference_modularity(g.n(), &e, l, resolution);
+                        assert!(
+                            (q - want).abs() < 1e-9,
+                            "n={} leiden={leiden} res={resolution}: {q} against {want}",
+                            g.n()
+                        );
+                    }
+                    // each level is no worse than the one below it
+                    for w in o.modularity.windows(2) {
+                        assert!(w[1] >= w[0] - 1e-12, "{:?}", o.modularity);
+                    }
+                }
+            }
+        }
+        let karate = run(&graphs[0], &Params::default(), &Control::unlimited()).unwrap();
+        assert!(*karate.modularity.last().unwrap() >= 0.41);
+    }
+
+    /// Each part of `refined` is connected through edges inside it.
+    fn parts_are_connected(lv: &Level, refined: &[u32]) -> bool {
+        let n = lv.n();
+        let mut seen = vec![false; n];
+        let mut pieces = std::collections::BTreeMap::<u32, u32>::new();
+        for s in 0..n {
+            if seen[s] {
+                continue;
+            }
+            *pieces.entry(refined[s]).or_default() += 1;
+            seen[s] = true;
+            let mut stack = vec![s];
+            while let Some(u) = stack.pop() {
+                for &v in lv.row(u).0 {
+                    let v = v as usize;
+                    if !seen[v] && refined[v] == refined[s] {
+                        seen[v] = true;
+                        stack.push(v);
+                    }
+                }
+            }
+        }
+        pieces.values().all(|&k| k == 1)
+    }
+
+    /// Leiden's refinement on its own, without the split that `run` applies to what it
+    /// reports. Each refined part lies inside one community and is connected inside it,
+    /// even when a community is given as two pieces with no edge between them, and the
+    /// refinement merges nodes rather than leaving every node alone.
+    #[test]
+    fn refinement_parts_are_connected_and_inside_their_communities() {
+        let ctl = Control::unlimited();
+        let mut cases = Vec::new();
+        // two cliques with no edge between them, given as one community
+        let mut e = Vec::new();
+        for a in 0..5u32 {
+            for b in a + 1..5 {
+                e.push((a, b));
+                e.push((a + 5, b + 5));
+            }
+        }
+        cases.push((ugraph(10, &e), Some(vec![0u32; 10])));
+        cases.push((ugraph(34, &karate()), None));
+        for (n, groups, seed) in [(200, 5, 31), (300, 8, 32), (400, 4, 33)] {
+            cases.push((planted(n, groups, seed), None));
+        }
+        for (g, given) in cases {
+            let lv = Level::from_csr(&g.weighted_sym(&ctl).unwrap(), &ctl).unwrap();
+            let comm = match given {
+                Some(c) => c,
+                None => {
+                    let mut c: Vec<u32> = (0..lv.n() as u32).collect();
+                    local_moving(&lv, &mut c, 1.0, 50, &ctl).unwrap();
+                    c
+                }
+            };
+            for (seed, theta) in [(1, 0.01), (2, 0.01), (3, 0.5)] {
+                let (refined, count) =
+                    refine(&lv, &comm, 1.0, theta, &mut Rng::new(seed), &ctl).unwrap();
+                assert!(count < lv.n(), "the refinement merged nothing");
+                for u in 0..lv.n() {
+                    for v in 0..lv.n() {
+                        if refined[u] == refined[v] {
+                            assert_eq!(comm[u], comm[v], "a part spans two communities");
+                        }
+                    }
+                }
+                assert!(
+                    parts_are_connected(&lv, &refined),
+                    "a refined part is disconnected (n={}, seed {seed})",
+                    lv.n()
+                );
             }
         }
     }

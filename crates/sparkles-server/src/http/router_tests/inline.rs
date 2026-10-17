@@ -62,6 +62,92 @@ async fn a_quick_query_runs_in_place_the_second_time_with_the_same_answer() {
     assert_eq!(lines(&second).len(), 2);
 }
 
+/// A graph-algorithm call can take milliseconds on a cached projection and much longer
+/// after a commit, and work in place cannot stop when its client goes away. A query
+/// that calls an algorithm is never remembered as quick, so it never runs in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_algorithm_query_is_never_run_in_place() {
+    let s = server();
+    let q = "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:node ?n ; algo:component ?c } }";
+    ignore_time(q);
+    for _ in 0..2 {
+        let r = select(&s.app, q, "application/sparql-results+json").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    }
+    let key = crate::http::inline::QuickQueries::key("ds", q);
+    assert!(!crate::http::QUICK.is_quick(key));
+    assert_eq!(
+        crate::http::inline::ran_by_key(key),
+        0,
+        "no run was in place"
+    );
+}
+
+/// The algorithm namespace is found in the parsed query, not in its text. A prefixed
+/// name can spell the IRI of the service without the namespace appearing in the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_algorithm_named_by_a_prefix_is_never_run_in_place() {
+    let s = server();
+    for q in [
+        // `\#` in a local name is the `#` of the namespace
+        "PREFIX a: <urn:x-sparkles:> SELECT ?n ?c WHERE { SERVICE a:algo\\#wcc { [] a:algo\\#node ?n ; a:algo\\#component ?c } }",
+        // the namespace is split between the prefix and the local name
+        "PREFIX a: <urn:x-sparkles:algo> SELECT ?n ?c WHERE { SERVICE a:\\#wcc { [] a:\\#node ?n ; a:\\#component ?c } }",
+    ] {
+        assert!(!q.contains(sparkles::sparql::algosvc::NS), "{q}");
+        ignore_time(q);
+        for _ in 0..3 {
+            let r = select(&s.app, q, "application/sparql-results+json").await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            assert!(
+                !r.json()["results"]["bindings"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let key = crate::http::inline::QuickQueries::key("ds", q);
+        assert!(!crate::http::QUICK.is_quick(key), "{q}");
+        assert_eq!(
+            crate::http::inline::ran_by_key(key),
+            0,
+            "no run was in place: {q}"
+        );
+    }
+}
+
+/// `EXISTS` is planned only when rows reach it, so over an empty outer pattern the
+/// planner never meets the call. The algebra decides, and the text is never quick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_algorithm_inside_exists_over_an_empty_pattern_is_never_run_in_place() {
+    let s = server();
+    for q in [
+        "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?s WHERE { ?s <urn:no:rows> ?o FILTER EXISTS { SERVICE algo:bfs { [] algo:source ?s ; algo:node ?n } } }",
+        "PREFIX algo: <urn:x-sparkles:algo#> SELECT ?s WHERE { ?s <urn:no:rows> ?o FILTER NOT EXISTS { SERVICE algo:bfs { [] algo:source ?s ; algo:node ?n } } }",
+        // spelled with a prefix that hides the namespace
+        "PREFIX a: <urn:x-sparkles:> SELECT ?s WHERE { ?s <urn:no:rows> ?o FILTER EXISTS { SERVICE a:algo\\#bfs { [] a:algo\\#source ?s ; a:algo\\#node ?n } } }",
+    ] {
+        ignore_time(q);
+        for _ in 0..3 {
+            let r = select(&s.app, q, "application/sparql-results+json").await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+            assert!(
+                r.json()["results"]["bindings"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let key = crate::http::inline::QuickQueries::key("ds", q);
+        assert!(!crate::http::QUICK.is_quick(key), "{q}");
+        assert_eq!(
+            crate::http::inline::ran_by_key(key),
+            0,
+            "no run was in place: {q}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_quick_query_reports_its_error_and_runs_on_the_pool_next() {
     let s = server();

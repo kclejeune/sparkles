@@ -10,11 +10,11 @@
 //! additions that cannot retain a strict increase in f64 arithmetic.
 
 use super::Rng;
+use super::memory::{Buffer, Heap, Work};
 use super::traverse::OrdF64;
 use super::{CHECK_EVERY, Control, Graph, Par, bad};
 use crate::error::Result;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 
 #[derive(Clone, Debug, Default)]
 pub struct Params {
@@ -39,11 +39,13 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
             }
         }
     }
-    let mut sources: Vec<u32> = (0..n as u32).collect();
+    let mut sources = Buffer::collect("betweenness-sources", n, 0..n as u32, ctl)?;
+    let mut work = Work::new(ctl)?;
     if p.samples > 0 && p.samples < n {
         let mut rng = Rng::new(p.seed);
         // a partial Fisher-Yates shuffle
         for i in 0..p.samples {
+            work.tick("betweenness-sample")?;
             let j = i + rng.below(n - i);
             sources.swap(i, j);
         }
@@ -53,29 +55,31 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
     let incoming = g.inn(ctl)?;
     let inn = &*incoming;
     let threads = par.threads();
-    // per thread: the score array and the working arrays of one source
-    ctl.charge(threads as u64 * n as u64 * (8 + 8 + 8 + 4 + 8))?;
     let per = sources.len().div_ceil(threads.max(1)).max(1);
+    // per block of sources: the score array and the working arrays of one source, each
+    // charged before it is allocated, and the Dijkstra heap as it grows
     let parts = par.blocks(sources.len(), per, |lo, hi| {
-        let mut acc = vec![0f64; n];
-        let mut w = Work::new(n);
-        for (k, &s) in sources[lo..hi].iter().enumerate() {
-            if k % 16 == 0 {
-                ctl.check()?;
-            }
+        let mut acc = Buffer::<f64>::zeroed("betweenness-scores", n, ctl)?;
+        let mut w = Search::new(n, ctl)?;
+        let mut work = Work::new(ctl)?;
+        for &s in &sources[lo..hi] {
+            work.tick("betweenness-source")?;
             if weighted {
-                w.dijkstra(g, s)?;
+                w.dijkstra(g, s, &mut work)?;
             } else {
-                w.bfs(g, s);
+                w.bfs(g, s, &mut work)?;
             }
-            w.accumulate(inn, s, &mut acc);
+            w.accumulate(inn, s, &mut acc, &mut work)?;
         }
         Ok(acc)
     })?;
-    let mut score = vec![0f64; n];
+    let mut score = Buffer::<f64>::zeroed("betweenness-output", n, ctl)?;
     for part in parts {
-        for (s, x) in score.iter_mut().zip(part) {
-            *s += x;
+        for (s, x) in score.chunks_mut(CHECK_EVERY).zip(part.chunks(CHECK_EVERY)) {
+            ctl.check()?;
+            for (s, x) in s.iter_mut().zip(x) {
+                *s += x;
+            }
         }
     }
     let mut scale = 1.0;
@@ -86,82 +90,91 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f64>> 
         scale *= 0.5;
     }
     if scale != 1.0 {
-        for s in &mut score {
+        for s in score.iter_mut() {
             *s *= scale;
         }
     }
-    Ok(score)
+    Ok(score.into_output())
 }
 
 /// The arrays of one single-source search.
-struct Work {
-    dist: Vec<f64>,
-    sigma: Vec<f64>,
-    delta: Vec<f64>,
-    /// nodes in the order they were settled
-    order: Vec<u32>,
-    done: Vec<bool>,
+struct Search {
+    dist: Buffer<f64>,
+    sigma: Buffer<f64>,
+    delta: Buffer<f64>,
+    /// nodes in the order they were settled; each settles once
+    order: Buffer<u32>,
+    done: Buffer<bool>,
+    heap: Heap<Reverse<(OrdF64, u32)>>,
 }
 
-impl Work {
-    fn new(n: usize) -> Work {
-        Work {
-            dist: vec![f64::INFINITY; n],
-            sigma: vec![0.0; n],
-            delta: vec![0.0; n],
-            order: Vec::new(),
-            done: vec![false; n],
-        }
+impl Search {
+    fn new(n: usize, ctl: &Control) -> Result<Search> {
+        Ok(Search {
+            dist: Buffer::splat("betweenness-distance", n, f64::INFINITY, ctl)?,
+            sigma: Buffer::zeroed("betweenness-paths", n, ctl)?,
+            delta: Buffer::zeroed("betweenness-dependency", n, ctl)?,
+            order: Buffer::new("betweenness-order", n, ctl)?,
+            done: Buffer::splat("betweenness-settled", n, false, ctl)?,
+            heap: Heap::new(ctl)?,
+        })
     }
 
-    fn reset(&mut self) {
-        for &v in &self.order {
+    fn reset(&mut self, work: &mut Work<'_>) -> Result<()> {
+        work.tick_n(self.order.len() + 1, "betweenness-reset")?;
+        for &v in self.order.iter() {
             self.dist[v as usize] = f64::INFINITY;
             self.sigma[v as usize] = 0.0;
             self.delta[v as usize] = 0.0;
             self.done[v as usize] = false;
         }
         self.order.clear();
+        self.heap.clear();
+        Ok(())
     }
 
-    fn bfs(&mut self, g: &Graph, s: u32) {
-        self.reset();
+    fn bfs(&mut self, g: &Graph, s: u32, work: &mut Work<'_>) -> Result<()> {
+        self.reset(work)?;
         self.dist[s as usize] = 0.0;
         self.sigma[s as usize] = 1.0;
-        self.order.push(s);
+        self.order.push(s)?;
         let mut head = 0;
         while head < self.order.len() {
             let u = self.order[head];
             head += 1;
             let du = self.dist[u as usize];
-            for &v in g.out.row(u) {
+            let row = g.out.row(u);
+            work.tick_n(row.len() + 1, "betweenness-bfs")?;
+            for &v in row {
                 if self.dist[v as usize].is_infinite() {
                     self.dist[v as usize] = du + 1.0;
-                    self.order.push(v);
+                    self.order.push_within(v);
                 }
                 if self.dist[v as usize] == du + 1.0 {
                     self.sigma[v as usize] += self.sigma[u as usize];
                 }
             }
         }
+        Ok(())
     }
 
-    fn dijkstra(&mut self, g: &Graph, s: u32) -> Result<()> {
-        self.reset();
+    fn dijkstra(&mut self, g: &Graph, s: u32, work: &mut Work<'_>) -> Result<()> {
+        self.reset(work)?;
         self.dist[s as usize] = 0.0;
         self.sigma[s as usize] = 1.0;
-        let mut heap = BinaryHeap::new();
-        heap.push(Reverse((OrdF64(0.0), s)));
+        self.heap.push(Reverse((OrdF64(0.0), s)))?;
         // nodes settle in order of distance and are collected in `order` as they do
-        while let Some(Reverse((OrdF64(d), u))) = heap.pop() {
+        while let Some(Reverse((OrdF64(d), u))) = self.heap.pop() {
             // a stale entry, or a node reached by two paths of equal length that already
             // settled
             if d > self.dist[u as usize] || self.done[u as usize] {
+                work.tick("betweenness-stale")?;
                 continue;
             }
             self.done[u as usize] = true;
-            self.order.push(u);
-            let (row, ws) = (g.out.row(u), g.out.wrow(u).unwrap());
+            self.order.push_within(u);
+            let (row, ws) = (g.out.row(u), g.out.wrow(u).unwrap_or_default());
+            work.tick_n(row.len() + 1, "betweenness-dijkstra")?;
             for (i, &v) in row.iter().enumerate() {
                 let nd = d + ws[i] as f64;
                 let dv = self.dist[v as usize];
@@ -179,7 +192,7 @@ impl Work {
                 if nd < dv {
                     self.dist[v as usize] = nd;
                     self.sigma[v as usize] = self.sigma[u as usize];
-                    heap.push(Reverse((OrdF64(nd), v)));
+                    self.heap.push(Reverse((OrdF64(nd), v)))?;
                 } else if nd == dv {
                     self.sigma[v as usize] += self.sigma[u as usize];
                 }
@@ -189,12 +202,19 @@ impl Work {
     }
 
     /// Add the dependencies of source `s` to `acc`, walking the settled nodes backwards.
-    fn accumulate(&mut self, inn: &super::Csr, s: u32, acc: &mut [f64]) {
+    fn accumulate(
+        &mut self,
+        inn: &super::Csr,
+        s: u32,
+        acc: &mut [f64],
+        work: &mut Work<'_>,
+    ) -> Result<()> {
         for i in (0..self.order.len()).rev() {
             let w = self.order[i];
             // the predecessors of w: nodes u with an edge u -> w on a shortest path. Walk
             // the in-edges.
             let (row, ws) = (inn.row(w), inn.wrow(w));
+            work.tick_n(row.len() + 1, "betweenness-accumulate")?;
             let dw = self.dist[w as usize];
             let coeff = (1.0 + self.delta[w as usize]) / self.sigma[w as usize];
             for (k, &u) in row.iter().enumerate() {
@@ -211,6 +231,7 @@ impl Work {
                 acc[w as usize] += self.delta[w as usize];
             }
         }
+        Ok(())
     }
 }
 
@@ -324,6 +345,168 @@ mod tests {
                 assert!((got4[v] - b).abs() < 1e-9);
             }
         }
+    }
+
+    /// A directed graph with a weight on each edge.
+    fn weighted(n: u32, edges: &[(u32, u32, f32)]) -> Graph {
+        let raw = super::super::RawEdges {
+            nodes: (0..n as u64).collect(),
+            src: edges.iter().map(|e| e.0 as u64).collect(),
+            dst: edges.iter().map(|e| e.1 as u64).collect(),
+            w: Some(edges.iter().map(|e| e.2).collect()),
+            symmetric: false,
+        };
+        Graph::build(
+            raw,
+            super::super::Aggregate::None,
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap()
+    }
+
+    /// Betweenness from the distances and path counts of every pair, found by relaxing
+    /// every edge until nothing changes (Bellman and Ford).
+    fn reference(n: usize, edges: &[(u32, u32, f32)]) -> Vec<f64> {
+        let inf = f64::INFINITY;
+        let mut d = vec![vec![inf; n]; n];
+        for (s, row) in d.iter_mut().enumerate() {
+            row[s] = 0.0;
+            loop {
+                let mut changed = false;
+                for &(a, b, w) in edges {
+                    let via = row[a as usize] + w as f64;
+                    if via < row[b as usize] {
+                        row[b as usize] = via;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        // the shortest paths from s to t, counted over the nodes in order of distance
+        let mut c = vec![vec![0f64; n]; n];
+        for s in 0..n {
+            let mut by_distance: Vec<usize> = (0..n).filter(|&t| d[s][t] < inf).collect();
+            by_distance.sort_by(|&x, &y| d[s][x].total_cmp(&d[s][y]));
+            c[s][s] = 1.0;
+            for &u in &by_distance {
+                for &(a, b, w) in edges {
+                    if a as usize == u && d[s][u] + w as f64 == d[s][b as usize] {
+                        c[s][b as usize] += c[s][u];
+                    }
+                }
+            }
+        }
+        (0..n)
+            .map(|v| {
+                let mut b = 0.0;
+                for s in 0..n {
+                    for t in 0..n {
+                        if s != v
+                            && t != v
+                            && s != t
+                            && d[s][t] < inf
+                            && d[s][v] + d[v][t] == d[s][t]
+                        {
+                            b += c[s][v] * c[v][t] / c[s][t];
+                        }
+                    }
+                }
+                b
+            })
+            .collect()
+    }
+
+    fn random_weighted(seed: u64, n: u32, m: usize) -> Vec<(u32, u32, f32)> {
+        let mut rng = Rng::new(seed);
+        let mut e: Vec<(u32, u32, f32)> = Vec::new();
+        while e.len() < m {
+            let (a, b) = (rng.below(n as usize) as u32, rng.below(n as usize) as u32);
+            if a == b || e.iter().any(|x| (x.0, x.1) == (a, b)) {
+                continue;
+            }
+            // small dyadic weights: every path length is exact, and equal lengths
+            // are common, so the path counts are tested
+            e.push((a, b, [0.5f32, 1.0, 1.5, 2.0, 0.25][rng.below(5)]));
+        }
+        e
+    }
+
+    /// Weighted Brandes against the definition. Weights that are sums of powers of two
+    /// make every path length exact in f64, so the equality of two path lengths that
+    /// `accumulate` relies on holds exactly on both sides.
+    #[test]
+    fn weighted_betweenness_matches_a_reference() {
+        for seed in 1..=20u64 {
+            let n = 10 + (seed % 5) as u32;
+            let e = random_weighted(seed, n, 3 * n as usize);
+            let g = weighted(n, &e);
+            let want = reference(n as usize, &e);
+            for par in [Par::single(), Par::with_threads(3)] {
+                let got = run(&g, &Params::default(), &par, &Control::unlimited()).unwrap();
+                for v in 0..n as usize {
+                    assert!(
+                        (got[v] - want[v]).abs() < 1e-9,
+                        "seed {seed}, node {v}: {} against {}",
+                        got[v],
+                        want[v]
+                    );
+                }
+            }
+        }
+    }
+
+    /// A sampled run scales the dependencies of its sources by `n / samples`, so its
+    /// average over many seeds approaches the exact score.
+    #[test]
+    fn sampled_betweenness_estimates_the_exact_score() {
+        let n = 12u32;
+        let e = random_weighted(7, n, 40);
+        let g = weighted(n, &e);
+        let exact = run(
+            &g,
+            &Params::default(),
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        let runs = 600;
+        let mut mean = vec![0.0; n as usize];
+        for seed in 0..runs {
+            let p = Params {
+                samples: n as usize - 1,
+                seed,
+            };
+            let s = run(&g, &p, &Par::single(), &Control::unlimited()).unwrap();
+            for (m, x) in mean.iter_mut().zip(&s) {
+                *m += x / runs as f64;
+            }
+        }
+        let top = exact.iter().copied().fold(0.0, f64::max);
+        assert!(top > 0.0);
+        for v in 0..n as usize {
+            assert!(
+                (mean[v] - exact[v]).abs() <= 0.03 * top,
+                "node {v}: mean {} against {}",
+                mean[v],
+                exact[v]
+            );
+        }
+        // a single sampled run is not the exact score, or the test proves nothing
+        let one = run(
+            &g,
+            &Params {
+                samples: n as usize - 1,
+                seed: 1,
+            },
+            &Par::single(),
+            &Control::unlimited(),
+        )
+        .unwrap();
+        assert_ne!(one, exact);
     }
 
     #[test]

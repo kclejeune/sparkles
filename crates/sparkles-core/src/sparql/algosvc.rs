@@ -50,6 +50,108 @@ pub fn is_algo(name: &NamedNodePattern) -> bool {
     matches!(name, NamedNodePattern::NamedNode(n) if Algo::from_iri(n.as_str()).is_some())
 }
 
+/// Whether a parsed pattern has a `SERVICE` of the algorithm namespace anywhere, also
+/// inside `EXISTS` and `NOT EXISTS` of a filter, a bind, an order, an aggregate or a
+/// projection, which the planner plans only when rows reach them. Prefixes and the base
+/// are already resolved in the algebra. The walk stops at the first match and allocates
+/// nothing.
+pub(super) fn calls_algorithm(p: &GraphPattern) -> bool {
+    #[cfg(test)]
+    WALKS.with(|w| w.set(w.get() + 1));
+    pattern_calls(p)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// how many times [`calls_algorithm`] ran on this thread
+    pub(super) static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn pattern_calls(p: &GraphPattern) -> bool {
+    use GraphPattern as P;
+    use spargebra::algebra::{AggregateExpression, OrderExpression};
+    let order = |o: &OrderExpression| match o {
+        OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr_calls(e),
+    };
+    match p {
+        P::Bgp { .. } | P::Path { .. } | P::Values { .. } => false,
+        P::Join { left, right }
+        | P::Lateral { left, right }
+        | P::Union { left, right }
+        | P::Minus { left, right }
+        | P::SemiJoin { left, right }
+        | P::AntiJoin { left, right } => pattern_calls(left) || pattern_calls(right),
+        P::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            pattern_calls(left)
+                || pattern_calls(right)
+                || expression.as_ref().is_some_and(expr_calls)
+        }
+        P::Filter { inner, expr } => pattern_calls(inner) || expr_calls(expr),
+        P::Extend {
+            inner, expression, ..
+        }
+        | P::Assign {
+            inner, expression, ..
+        }
+        | P::Unfold {
+            inner, expression, ..
+        } => pattern_calls(inner) || expr_calls(expression),
+        P::OrderBy { inner, expression } => pattern_calls(inner) || expression.iter().any(order),
+        P::Group {
+            inner, aggregates, ..
+        } => {
+            pattern_calls(inner)
+                || aggregates.iter().any(|(_, a)| match a {
+                    AggregateExpression::CountSolutions { .. } => false,
+                    AggregateExpression::FunctionCall { expr, .. } => expr_calls(expr),
+                    AggregateExpression::Fold {
+                        expr,
+                        value,
+                        order: os,
+                        ..
+                    } => expr_calls(expr) || value.iter().any(expr_calls) || os.iter().any(order),
+                })
+        }
+        P::Service { name, inner, .. } => {
+            matches!(name, NamedNodePattern::NamedNode(n) if n.as_str().starts_with(NS))
+                || pattern_calls(inner)
+        }
+        P::Graph { inner, .. }
+        | P::Project { inner, .. }
+        | P::Distinct { inner }
+        | P::Reduced { inner }
+        | P::Slice { inner, .. } => pattern_calls(inner),
+    }
+}
+
+fn expr_calls(e: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::Expression as E;
+    match e {
+        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
+        E::Exists(p) => pattern_calls(p),
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => expr_calls(a) || expr_calls(b),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_calls(a),
+        E::In(a, list) => expr_calls(a) || list.iter().any(expr_calls),
+        E::If(a, b, c) => expr_calls(a) || expr_calls(b) || expr_calls(c),
+        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expr_calls),
+    }
+}
+
 fn bad(m: impl std::fmt::Display) -> Error {
     Error::invalid(format!("algo: {m}"))
 }
@@ -351,12 +453,38 @@ impl Outs {
     }
 }
 
+/// The value of a numeric parameter. An integer parameter keeps its exact value, so
+/// two seeds above 2^53 stay apart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Num {
+    Int(u64),
+    Float(f64),
+}
+
+impl Num {
+    /// The value as a number, for bounds and floating-point parameters.
+    pub fn f64(self) -> f64 {
+        match self {
+            Num::Int(v) => v as f64,
+            Num::Float(v) => v,
+        }
+    }
+
+    /// The value of an integer parameter.
+    pub fn u64(self) -> u64 {
+        match self {
+            Num::Int(v) => v,
+            Num::Float(v) => v as u64,
+        }
+    }
+}
+
 /// A planned algorithm call.
 #[derive(Clone, Debug)]
 pub struct AlgoSpec {
     pub algo: Algo,
     pub proj: ProjectionSpec,
-    pub nums: BTreeMap<String, f64>,
+    pub nums: BTreeMap<String, Num>,
     pub metric: Option<algo::similarity::Metric>,
     pub graphalytics: bool,
     pub iteration_weights: Option<Vec<f64>>,
@@ -373,16 +501,22 @@ impl AlgoSpec {
         self.sources.iter().any(|s| matches!(s, PathEnd::Var(_)))
     }
 
-    fn num(&self, name: &str) -> Option<f64> {
+    fn num(&self, name: &str) -> Option<Num> {
         self.nums.get(name).copied()
     }
 
     fn int(&self, name: &str, default: u64) -> u64 {
-        self.num(name).map_or(default, |x| x as u64)
+        self.num(name).map_or(default, Num::u64)
+    }
+
+    /// A count that the algorithm holds in 32 bits. Planning refuses a larger value, so
+    /// the clamp only guards a spec that was built without planning.
+    fn int_u32(&self, name: &str, default: u64) -> u32 {
+        u32::try_from(self.int(name, default)).unwrap_or(u32::MAX)
     }
 
     fn float(&self, name: &str, default: f64) -> f64 {
-        self.num(name).unwrap_or(default)
+        self.num(name).map_or(default, Num::f64)
     }
 
     fn direction(&self) -> Dir {
@@ -415,6 +549,65 @@ fn number(t: &TermPattern, name: &str, kind: Kd) -> Result<f64> {
     Ok(v)
 }
 
+/// The datatypes of exact integers, `xsd:integer` and the types derived from it.
+const INTEGER_TYPES: &[&str] = &[
+    "http://www.w3.org/2001/XMLSchema#integer",
+    "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+    "http://www.w3.org/2001/XMLSchema#positiveInteger",
+    "http://www.w3.org/2001/XMLSchema#nonPositiveInteger",
+    "http://www.w3.org/2001/XMLSchema#negativeInteger",
+    "http://www.w3.org/2001/XMLSchema#long",
+    "http://www.w3.org/2001/XMLSchema#int",
+    "http://www.w3.org/2001/XMLSchema#short",
+    "http://www.w3.org/2001/XMLSchema#byte",
+    "http://www.w3.org/2001/XMLSchema#unsignedLong",
+    "http://www.w3.org/2001/XMLSchema#unsignedInt",
+    "http://www.w3.org/2001/XMLSchema#unsignedShort",
+    "http://www.w3.org/2001/XMLSchema#unsignedByte",
+];
+
+/// 2^53. A double holds every integer up to it exactly.
+const EXACT_DOUBLE: f64 = 9_007_199_254_740_992.0;
+
+/// The value of a numeric parameter. An integer parameter written as an integer keeps
+/// its exact value. One written as a decimal or a double must be a whole number of at
+/// most 2^53, which a double holds exactly.
+fn param(t: &TermPattern, name: &str, kind: Kd) -> Result<Num> {
+    if kind == Kd::Float {
+        return number(t, name, kind).map(Num::Float);
+    }
+    if let TermPattern::Literal(l) = t
+        && INTEGER_TYPES.contains(&l.datatype().as_str())
+    {
+        // an exact integer outside 0..=i64::MAX is refused by name, not as "not a number"
+        let text = l.value().trim();
+        let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+        if !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && text.parse::<i64>().map_or(true, |v| v < 0)
+        {
+            return Err(bad(format!(
+                "algo:{name} takes an integer from 0 to {}",
+                i64::MAX
+            )));
+        }
+    }
+    if let TermPattern::Literal(l) = t
+        && let Value::Integer(i) = Value::from_literal(l)
+    {
+        return u64::try_from(i64::from(i))
+            .map(Num::Int)
+            .map_err(|_| bad(format!("algo:{name} takes a non-negative integer")));
+    }
+    let v = number(t, name, kind)?;
+    if v > EXACT_DOUBLE {
+        return Err(bad(format!(
+            "algo:{name} is above 2^53, where a decimal or a double is not exact; write it as an integer"
+        )));
+    }
+    Ok(Num::Int(v as u64))
+}
+
 fn dir_of(t: &TermPattern, name: &str) -> Result<Dir> {
     match t {
         TermPattern::NamedNode(n) => match n.as_str().strip_prefix(NS) {
@@ -439,6 +632,7 @@ pub(super) fn algo_leaf(
     let NamedNodePattern::NamedNode(sn) = service else {
         return Err(bad("the service must be an algo: IRI"));
     };
+    p.ctx.note_algorithm_call();
     let algo = Algo::from_iri(sn.as_str()).ok_or_else(|| bad(format!("unknown algorithm {sn}")))?;
     let what = format!("algo:{}", algo.name());
     let (patterns, edge_gp) = super::pathsearch::split_block(inner, NS, &what)?;
@@ -456,7 +650,7 @@ pub(super) fn algo_leaf(
         rdf_type: ctx.snap.lookup_iri(RDF_TYPE).map(|i| i.0),
         reifies: ctx.snap.lookup_iri(RDF_REIFIES).map(|i| i.0),
     };
-    let mut nums: BTreeMap<String, f64> = BTreeMap::new();
+    let mut nums: BTreeMap<String, Num> = BTreeMap::new();
     let mut metric = None;
     let mut graphalytics = false;
     let mut iteration_weights = None;
@@ -652,7 +846,7 @@ pub(super) fn algo_leaf(
                 let Some((n, kind)) = NUMERIC.iter().find(|(n, _)| *n == name) else {
                     return Err(bad(format!("unknown parameter algo:{name}")));
                 };
-                nums.insert(n.to_string(), number(o, name, *kind)?);
+                nums.insert(n.to_string(), param(o, name, *kind)?);
             }
         }
     }
@@ -774,8 +968,8 @@ pub(super) fn algo_leaf(
     {
         return Err(bad("at most one algo:source can be a variable"));
     }
-    if let Some(m) = nums.get("dampingFactor")
-        && !(0.0..1.0).contains(m)
+    if let Some(m) = nums.get("dampingFactor").map(|v| v.f64())
+        && !(0.0..1.0).contains(&m)
     {
         return Err(bad("algo:dampingFactor must be in [0, 1)"));
     }
@@ -788,13 +982,22 @@ pub(super) fn algo_leaf(
         ("epochs", 1.0),
         ("maxLevels", 1.0),
     ] {
-        if nums.get(name).is_some_and(|v| *v < min) {
+        if nums.get(name).is_some_and(|v| v.f64() < min) {
             return Err(bad(format!("algo:{name} must be at least {min}")));
+        }
+    }
+    // these counts are 32-bit; a larger value is refused, not wrapped
+    for name in ["maxIterations", "maxLevels"] {
+        if nums
+            .get(name)
+            .is_some_and(|v| v.u64() > u64::from(u32::MAX))
+        {
+            return Err(bad(format!("algo:{name} must be at most {}", u32::MAX)));
         }
     }
     // an embedding is a `spk:vector`, which a vector index caps at the same value
     if let Some(d) = nums.get("dimension")
-        && *d > crate::vector::MAX_DIM as f64
+        && d.u64() > crate::vector::MAX_DIM as u64
     {
         return Err(bad(format!(
             "algo:dimension must be at most {}",
@@ -954,7 +1157,7 @@ pub(super) fn run(
     vars: &[VarId],
 ) -> Result<(Materialized, serde_json::Map<String, serde_json::Value>)> {
     let started = Instant::now();
-    let limit = spec.num("maxMemory").map_or(u64::MAX, |m| m as u64);
+    let limit = spec.num("maxMemory").map_or(u64::MAX, Num::u64);
     let ctl = Control::for_query(ctx, limit)?;
     let par = Par::acquire(spec.int("concurrency", 0) as usize, &ctl)?;
     let mut result_vars = Buffer::new("algorithm-result-vars", vars.len(), &ctl)?;
@@ -1005,7 +1208,16 @@ pub(super) fn run(
                     if let Some(t) = input.as_ref()
                         && let Some(c) = t.col_of(*v)
                     {
-                        for &id in &t.cols[c] {
+                        // a row of the group bound to another graph is not a source of
+                        // this graph's run
+                        let scope = match (gid, spec.graph_var) {
+                            (Some(g), Some(gv)) => t.col_of(gv).map(|cg| (cg, g)),
+                            _ => None,
+                        };
+                        for (i, &id) in t.cols[c].iter().enumerate() {
+                            if scope.is_some_and(|(cg, g)| t.cols[cg][i] != g) {
+                                continue;
+                            }
                             if !id.is_undef() {
                                 add(id)?;
                             }
@@ -1169,18 +1381,24 @@ fn append(
                     return Err(error);
                 }
                 #[cfg(test)]
-                memory::probe::at(memory::probe::Point::Work("algorithm-append-transferred"));
+                memory::probe::at(memory::probe::Point::Work(
+                    "algorithm-append-transferred",
+                    0,
+                ));
                 let old = std::mem::replace(&mut left.table.cols[c], replacement);
                 drop(old); // Backing dies before its capacity leaves the lease.
                 #[cfg(test)]
-                memory::probe::at(memory::probe::Point::Work("algorithm-append-old-dropped"));
+                memory::probe::at(memory::probe::Point::Work(
+                    "algorithm-append-old-dropped",
+                    0,
+                ));
                 let bytes = table_capacity(&left.table)?;
                 left.lease
                     .as_mut()
                     .expect("admitted accumulator")
                     .resize(ctx.mem_limit, bytes)?;
                 #[cfg(test)]
-                memory::probe::at(memory::probe::Point::Work("algorithm-append-resized"));
+                memory::probe::at(memory::probe::Point::Work("algorithm-append-resized", 0));
             }
         }
     }
@@ -1488,7 +1706,9 @@ fn rows(
     let o = &spec.outs;
     // a call that asks for the summary alone reports one row (GDS's stats mode)
     let stats_only = spec.stats_only();
-    let limit = spec.num("limit").map(|l| l as usize);
+    let limit = spec
+        .num("limit")
+        .map(|l| usize::try_from(l.u64()).unwrap_or(usize::MAX));
     let mut b = Builder::new(vars, ctl)?;
     let c_node = b.col(o.node);
     let c_summary = b.col(o.summary);
@@ -1515,7 +1735,7 @@ fn rows(
         Algo::PageRank => {
             let p = algo::pagerank::Params {
                 damping: spec.float("dampingFactor", 0.85),
-                max_iterations: spec.int("maxIterations", 20) as u32,
+                max_iterations: spec.int_u32("maxIterations", 20),
                 tolerance: spec.float("tolerance", 1e-7),
                 sources: copied("algorithm-pagerank-sources", sources, ctl)?.into_output(),
                 fixed: spec.graphalytics,
@@ -1585,7 +1805,7 @@ fn rows(
             })
         }
         Algo::LabelPropagation => {
-            let r = algo::labelprop::run(g, spec.int("maxIterations", 10) as u32, par, ctl)?;
+            let r = algo::labelprop::run(g, spec.int_u32("maxIterations", 10), par, ctl)?;
             // the community is the node it is named for, as a store term
             let c = b.col(o.community);
             let mut stats = algo::Stats::new();
@@ -1605,12 +1825,12 @@ fn rows(
         Algo::Louvain | Algo::Leiden => {
             let p = algo::community::Params {
                 resolution: spec.float("resolution", 1.0),
-                max_levels: spec.int("maxLevels", 10) as u32,
+                max_levels: spec.int_u32("maxLevels", 10),
                 tolerance: spec.float("tolerance", 1e-4),
                 leiden: spec.algo == Algo::Leiden,
                 randomness: spec.float("randomness", 0.01),
                 seed: spec.int("seed", 0),
-                max_sweeps: spec.int("maxIterations", 100) as u32,
+                max_sweeps: spec.int_u32("maxIterations", 100),
             };
             let r = algo::community::run(g, &p, ctl)?;
             let mut stats = algo::Stats::new();
@@ -2377,9 +2597,26 @@ fn build_graph_in_graph(
             ));
         };
         let cw = w.and_then(|v| t.col_of(v));
+        // Under `GRAPH ?g` the call runs once for each graph, and the nested pattern's
+        // rows of the other graphs are not edges of this one. The planner gives each
+        // graph its own call with a constant graph, so this applies only when a call
+        // carries the graph variable itself.
+        let scope = match (spec.graph_var, filter) {
+            (Some(gv), GraphFilter::One(g)) => Some((
+                t.col_of(gv).ok_or_else(|| {
+                    bad("the nested pattern does not bind the graph variable of GRAPH")
+                })?,
+                *g,
+            )),
+            (Some(_), _) => return Err(bad("a call under GRAPH runs for one graph at a time")),
+            (None, _) => None,
+        };
         let mut seen = Distinct::new(ctl)?;
         for i in 0..t.len() {
             work.tick("projection-pattern")?;
+            if scope.is_some_and(|(c, g)| t.cols[c][i].0 != g) {
+                continue;
+            }
             let (a, b) = (t.cols[cs][i], t.cols[ce][i]);
             if !resource(ctx, a, ctl)? || !resource(ctx, b, ctl)? || !allowed(a.0, b.0) {
                 continue;
@@ -2400,49 +2637,10 @@ fn build_graph_in_graph(
             col.push(a.0, b.0, value, call_dir)?;
         }
     } else {
-        let mut scan_work = Work::new(ctl)?;
-        let mut scan = |lo: u64, hi: u64, dir: Dir| -> Result<()> {
-            let mut last = None;
-            ctx.snap.scan_between_cols(
-                Perm::Pso,
-                pad(&[lo], 0),
-                pad(&[hi], u64::MAX),
-                0b1111,
-                |chunk| {
-                    let mut each = |k: [u64; 4]| -> Result<()> {
-                        scan_work.tick("projection-edge")?;
-                        let [p, s, o, g] = k;
-                        if !filter.accepts(g) || last == Some((p, s, o)) {
-                            return Ok(());
-                        }
-                        last = Some((p, s, o));
-                        if !resource(ctx, Id(s), ctl)?
-                            || !resource(ctx, Id(o), ctl)?
-                            || !allowed(s, o)
-                        {
-                            return Ok(());
-                        }
-                        let value = if has_weights {
-                            weight_in_graph(ctx, proj, s, p, o, ctl, filter)?
-                        } else {
-                            0.0
-                        };
-                        col.push(s, o, value, dir)
-                    };
-                    match chunk {
-                        Chunk::Block(b, s, e) => {
-                            for i in s..e {
-                                each([b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]])?;
-                            }
-                        }
-                        Chunk::Row(k) => each(k)?,
-                    }
-                    Ok(true)
-                },
-            )
-        };
+        // the direction of each projected predicate: the last listing of one wins
+        let listed = proj.predicates.as_ref().map_or(0, Vec::len);
+        let mut dirs = Buffer::new("projection-predicates", listed, ctl)?;
         if let Some(ps) = &proj.predicates {
-            let mut dirs = Buffer::new("projection-predicates", ps.len(), ctl)?;
             for (i, &(p, d)) in ps.iter().enumerate() {
                 work.tick("projection-predicates")?;
                 dirs.push((p, i, d.unwrap_or(call_dir)))?;
@@ -2450,29 +2648,112 @@ fn build_graph_in_graph(
             ctl.check()?;
             dirs.sort_unstable_by_key(|d| (d.0, d.1));
             ctl.check()?;
-            let mut i = 0;
-            while i < dirs.len() {
+            let mut kept = 0;
+            for i in 0..dirs.len() {
                 work.tick("projection-predicates")?;
-                let mut j = i + 1;
-                while j < dirs.len() && dirs[j].0 == dirs[i].0 {
-                    work.tick("projection-predicates")?;
-                    j += 1;
+                if i + 1 == dirs.len() || dirs[i + 1].0 != dirs[i].0 {
+                    dirs[kept] = dirs[i];
+                    kept += 1;
                 }
-                let (p, _, d) = dirs[j - 1];
-                scan(p, p, d)?;
-                i = j;
             }
-        } else {
-            match proj.rdf_type {
-                Some(t) => {
-                    if t > 0 {
-                        scan(0, t - 1, call_dir)?;
+            dirs.truncate(kept);
+        }
+        let direction_of = |p: u64| -> Option<Dir> {
+            match &proj.predicates {
+                Some(_) => dirs
+                    .binary_search_by_key(&p, |d| d.0)
+                    .ok()
+                    .map(|i| dirs[i].2),
+                None => (Some(p) != proj.rdf_type).then_some(call_dir),
+            }
+        };
+        let edge = |col: &mut Collect<'_>, p: u64, s: u64, o: u64, dir: Dir| -> Result<()> {
+            if !resource(ctx, Id(s), ctl)? || !resource(ctx, Id(o), ctl)? || !allowed(s, o) {
+                return Ok(());
+            }
+            let value = if has_weights {
+                weight_in_graph(ctx, proj, s, p, o, ctl, filter)?
+            } else {
+                0.0
+            };
+            col.push(s, o, value, dir)
+        };
+        let mut scan_work = Work::new(ctl)?;
+        // A call for one graph reads that graph's own quads when they are fewer than the
+        // quads of its predicates in all graphs. The calls of `GRAPH ?g` then read each
+        // graph once between them, instead of every graph's edges once per graph.
+        let graph_first = match filter {
+            GraphFilter::One(g) => {
+                let in_graph = ctx.snap.count(Perm::Gspo, &[*g])?;
+                let mut by_predicate = 0u64;
+                if proj.predicates.is_some() {
+                    for d in dirs.iter() {
+                        work.tick("projection-predicates")?;
+                        by_predicate =
+                            by_predicate.saturating_add(ctx.snap.count(Perm::Pso, &[d.0])?);
                     }
-                    if t < u64::MAX {
-                        scan(t + 1, u64::MAX, call_dir)?;
-                    }
+                } else {
+                    by_predicate = ctx.snap.count(Perm::Pso, &[])?;
                 }
-                None => scan(0, u64::MAX, call_dir)?,
+                (in_graph < by_predicate).then_some(*g)
+            }
+            _ => None,
+        };
+        if let Some(g) = graph_first {
+            projection_rows(ctx, Perm::Gspo, &[g], |k| {
+                scan_work.tick("projection-edge")?;
+                let [_, s, p, o] = k;
+                match direction_of(p) {
+                    Some(dir) => edge(&mut col, p, s, o, dir),
+                    None => Ok(()),
+                }
+            })?;
+        } else {
+            let mut scan = |lo: u64, hi: u64, dir: Dir| -> Result<()> {
+                let mut last = None;
+                ctx.snap.scan_between_cols(
+                    Perm::Pso,
+                    pad(&[lo], 0),
+                    pad(&[hi], u64::MAX),
+                    0b1111,
+                    |chunk| {
+                        let mut each = |k: [u64; 4]| -> Result<()> {
+                            scan_work.tick("projection-edge")?;
+                            let [p, s, o, g] = k;
+                            if !filter.accepts(g) || last == Some((p, s, o)) {
+                                return Ok(());
+                            }
+                            last = Some((p, s, o));
+                            edge(&mut col, p, s, o, dir)
+                        };
+                        match chunk {
+                            Chunk::Block(b, s, e) => {
+                                for i in s..e {
+                                    each([b.cols[0][i], b.cols[1][i], b.cols[2][i], b.cols[3][i]])?;
+                                }
+                            }
+                            Chunk::Row(k) => each(k)?,
+                        }
+                        Ok(true)
+                    },
+                )
+            };
+            if proj.predicates.is_some() {
+                for &(p, _, d) in dirs.iter() {
+                    scan(p, p, d)?;
+                }
+            } else {
+                match proj.rdf_type {
+                    Some(t) => {
+                        if t > 0 {
+                            scan(0, t - 1, call_dir)?;
+                        }
+                        if t < u64::MAX {
+                            scan(t + 1, u64::MAX, call_dir)?;
+                        }
+                    }
+                    None => scan(0, u64::MAX, call_dir)?,
+                }
             }
         }
     }
@@ -2616,6 +2897,7 @@ mod projection_capacity_tests {
                         | "algorithm-append-copy"
                         | "algorithm-append-relocate"
                         | "buffer-fill",
+                        _,
                     ) => v.set(v.get() + 1),
                     memory::probe::Point::Allocation(
                         "algorithm-column" | "algorithm-graph-column" | "algorithm-append-column",
@@ -2950,7 +3232,8 @@ mod projection_capacity_tests {
                 assert!(!new_events.iter().any(|p| matches!(
                     p,
                     memory::probe::Point::Work(
-                        "algorithm-append-copy" | "algorithm-append-relocate"
+                        "algorithm-append-copy" | "algorithm-append-relocate",
+                        _
                     )
                 )));
             }
@@ -3079,7 +3362,8 @@ mod projection_capacity_tests {
                                 | memory::probe::Point::Work(
                                     "algorithm-append-transferred"
                                         | "algorithm-append-old-dropped"
-                                        | "algorithm-append-resized"
+                                        | "algorithm-append-resized",
+                                    _
                                 )
                         ) {
                             captured.borrow_mut().push((
@@ -3214,7 +3498,10 @@ mod projection_capacity_tests {
             let hook = memory::probe::install(
                 move |p| {
                     if mode == "unwind"
-                        && matches!(p, memory::probe::Point::Work("algorithm-append-relocate"))
+                        && matches!(
+                            p,
+                            memory::probe::Point::Work("algorithm-append-relocate", _)
+                        )
                     {
                         panic!("caught actual relocation unwind");
                     }
@@ -3268,7 +3555,7 @@ mod projection_capacity_tests {
             let visits = seen.clone();
             let scope = memory::probe::install(
                 move |p| {
-                    if matches!(p, memory::probe::Point::Work("algorithm-append-copy")) {
+                    if matches!(p, memory::probe::Point::Work("algorithm-append-copy", _)) {
                         visits.set(visits.get() + 1);
                         if let Some(deadline) = deadline {
                             while Instant::now() < deadline {
@@ -3396,7 +3683,7 @@ mod projection_capacity_tests {
             match case {
                 1 => {
                     spec.outs.embedding = Some(1);
-                    spec.nums.insert("dimension".into(), 8.0);
+                    spec.nums.insert("dimension".into(), Num::Int(8));
                 }
                 2 => {
                     spec.outs.depth = Some(1);
@@ -3405,7 +3692,7 @@ mod projection_capacity_tests {
                 _ => spec.outs.component = Some(1),
             }
             if case == 0 {
-                spec.nums.insert("limit".into(), 1.0);
+                spec.nums.insert("limit".into(), Num::Int(1));
             }
             if case == 3 {
                 spec.graph_var = Some(3);
@@ -3704,7 +3991,7 @@ mod projection_capacity_tests {
             component: Some(1),
             ..Default::default()
         };
-        spec.nums.insert("maxMemory".into(), 2048.0);
+        spec.nums.insert("maxMemory".into(), Num::Int(2048));
         let pool = QueryPool::new(64 << 20);
         let grant = Arc::new(pool.empty_grant());
         ctx.set_grant(Some(grant.clone()));
@@ -3768,7 +4055,7 @@ mod projection_capacity_tests {
             "aggregate GRAPH/output overlap must exceed one isolated graph: {first}/{all}"
         );
         let mut limited = spec.clone();
-        limited.nums.insert("maxMemory".into(), first as f64);
+        limited.nums.insert("maxMemory".into(), Num::Int(first));
         assert!(
             matches!(run(&ctx_all,&limited,None,None,&[0,1,3]),Err(Error::BudgetExceeded(b)) if b.kind==crate::error::BudgetKind::Memory && b.limit==first)
         );
@@ -3908,7 +4195,7 @@ mod projection_capacity_tests {
             let prior = ctl.remaining();
             let scope = memory::probe::install(
                 move |point| {
-                    if let memory::probe::Point::Work("projection-distinct-move") = point {
+                    if let memory::probe::Point::Work("projection-distinct-move", _) = point {
                         if unwind {
                             panic!("distinct migration unwind");
                         } else {
@@ -4023,7 +4310,7 @@ mod projection_capacity_tests {
             let ctl = Control::new(cancel.clone(), None, 1 << 20);
             let scope = memory::probe::install(
                 move |point| {
-                    if let memory::probe::Point::Work(p) = point
+                    if let memory::probe::Point::Work(p, _) = point
                         && p == phase
                     {
                         cancel.store(true, Ordering::Relaxed);
@@ -4077,14 +4364,16 @@ mod projection_capacity_tests {
         spec.proj.node_classes.clear();
         spec.proj.node_class_names.clear();
         spec.proj.weight = None;
-        spec.proj.graph = GraphFilter::One(0);
+        // a set of graphs reads by predicate and rejects every row; a single empty
+        // graph would read its own quads, which are none
+        spec.proj.graph = GraphFilter::Set(vec![0]);
         let cancel = Arc::new(AtomicBool::new(false));
         let ctl = Control::new(cancel.clone(), None, 64);
         let observed = std::rc::Rc::new(std::cell::Cell::new(0));
         let count = observed.clone();
         let scope = memory::probe::install(
             move |point| {
-                if let memory::probe::Point::Work("projection-edge") = point {
+                if let memory::probe::Point::Work("projection-edge", _) = point {
                     count.set(count.get() + 1);
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -4096,7 +4385,9 @@ mod projection_capacity_tests {
             Err(Error::Cancelled)
         ));
         drop(scope);
-        assert_eq!(observed.get(), algo::CHECK_EVERY);
+        // the probe sees each row that is allowed to run, and the count of the last row
+        // of the interval checks the control and stops the call
+        assert_eq!(observed.get(), algo::CHECK_EVERY - 1);
         assert_eq!(ctl.remaining(), 64);
     }
     #[test]
@@ -4115,5 +4406,213 @@ mod projection_capacity_tests {
         assert!(warm.remaining() < prior);
         drop(incoming);
         assert_eq!(warm.remaining(), prior);
+    }
+}
+
+/// A call that carries the graph variable of `GRAPH ?g` itself. Query text never plans
+/// one, because the planner gives each graph its own call, so these tests plan the
+/// pattern under the variable directly.
+#[cfg(test)]
+mod graph_variable_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn store(data: &str) -> crate::store::Store {
+        use crate::io::{RdfFormat, Source};
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions {
+            result_cache_bytes: 0,
+            ..Default::default()
+        });
+        store
+            .load(&[Source::from_bytes(
+                format!("@prefix ex:<http://ex/>.\n{data}").into_bytes(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        store
+    }
+
+    /// The rows of `query` planned under `GRAPH ?g`, as local names and integers.
+    fn rows_under_graph_var(store: &crate::store::Store, query: &str) -> BTreeSet<Vec<String>> {
+        let text = format!("PREFIX ex:<http://ex/> PREFIX algo:<urn:x-sparkles:algo#> {query}");
+        let parsed = super::super::parse_query(&text, None, &[]).unwrap();
+        let spargebra::Query::Select { pattern, .. } = &parsed else {
+            panic!("SELECT");
+        };
+        let snapshot = store.snapshot();
+        let ctx = Ctx::new(snapshot.clone());
+        let mut planner = Planner::new(&ctx);
+        planner.source = Some(&parsed);
+        let node = planner
+            .plan(pattern, &ActiveGraph::Var(ctx.var("g")), Vec::new())
+            .unwrap();
+        let (out, _) = super::super::exec::execute_owned(&ctx, &node).unwrap();
+        let name = |id: Id| -> String {
+            if let Some(i) = (0..10).find(|&i| Id::from_i64(i) == Some(id)) {
+                return i.to_string();
+            }
+            for local in ["a", "b", "c", "d", "g1", "g2"] {
+                if snapshot.lookup_iri(&format!("http://ex/{local}")) == Some(id) {
+                    return local.to_string();
+                }
+            }
+            format!("{id:?}")
+        };
+        let wanted: Vec<usize> = ["g", "n", "d"]
+            .iter()
+            .filter_map(|v| out.table.col_of(ctx.var(v)))
+            .collect();
+        (0..out.table.len)
+            .map(|i| wanted.iter().map(|&c| name(out.table.cols[c][i])).collect())
+            .collect()
+    }
+
+    fn set(rows: &[&[&str]]) -> BTreeSet<Vec<String>> {
+        rows.iter()
+            .map(|r| r.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_nested_pattern_gives_each_graph_its_own_edges() {
+        let s = store("ex:g1 { ex:a ex:p ex:b } ex:g2 { ex:c ex:p ex:d }");
+        let got = rows_under_graph_var(
+            &s,
+            "SELECT ?g ?n WHERE { SERVICE algo:wcc { [] algo:start ?s ; algo:end ?e ; algo:node ?n ; algo:component ?c . ?s ex:p ?e } }",
+        );
+        assert_eq!(
+            got,
+            set(&[&["g1", "a"], &["g1", "b"], &["g2", "c"], &["g2", "d"]])
+        );
+    }
+
+    #[test]
+    fn a_variable_source_uses_the_rows_of_its_own_graph() {
+        let s = store(
+            "ex:g1 { ex:a ex:p ex:b . ex:b ex:p ex:c . ex:a a ex:Seed } ex:g2 { ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c a ex:Seed }",
+        );
+        let got = rows_under_graph_var(
+            &s,
+            "SELECT ?g ?n ?d WHERE { ?s a ex:Seed . SERVICE algo:bfs { [] algo:predicate ex:p ; algo:source ?s ; algo:node ?n ; algo:depth ?d } }",
+        );
+        assert_eq!(
+            got,
+            set(&[
+                &["g1", "a", "0"],
+                &["g1", "b", "1"],
+                &["g1", "c", "2"],
+                &["g2", "c", "0"],
+            ])
+        );
+    }
+
+    /// Under `GRAPH ?g` the call of each graph reads that graph's quads, so the edges
+    /// read grow with the data and not with the data times the graphs.
+    #[test]
+    fn the_calls_of_graph_g_read_each_graph_once() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let graphs = 40;
+        let mut data = String::new();
+        for g in 0..graphs {
+            data.push_str(&format!(
+                "ex:g{g:03} {{ ex:a ex:p ex:b{g} . ex:b{g} ex:q ex:c }}"
+            ));
+        }
+        let s = store(&data);
+        let read = Rc::new(Cell::new(0usize));
+        let r = read.clone();
+        let hook = memory::probe::install(
+            move |point| {
+                if let memory::probe::Point::Work("projection-edge", _) = point {
+                    r.set(r.get() + 1);
+                }
+            },
+            None,
+        );
+        let q = "PREFIX ex:<http://ex/> PREFIX algo:<urn:x-sparkles:algo#> SELECT ?g ?n ?c WHERE { GRAPH ?g { SERVICE algo:wcc { [] algo:predicate ex:p ; algo:concurrency 1 ; algo:node ?n ; algo:component ?c } } }";
+        let o = super::super::QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let result = super::super::query(s.snapshot(), q, &o).unwrap();
+        drop(hook);
+        assert_eq!(result.len(), 2 * graphs);
+        // two quads in each graph, read once
+        assert!(
+            read.get() <= 2 * graphs,
+            "{} edges read for {graphs} graphs",
+            read.get()
+        );
+        // a predicate with fewer quads than the graph still reads by predicate
+        let read = Rc::new(Cell::new(0usize));
+        let r = read.clone();
+        let hook = memory::probe::install(
+            move |point| {
+                if let memory::probe::Point::Work("projection-edge", _) = point {
+                    r.set(r.get() + 1);
+                }
+            },
+            None,
+        );
+        let q = "PREFIX ex:<http://ex/> PREFIX algo:<urn:x-sparkles:algo#> SELECT ?n WHERE { GRAPH ex:g000 { SERVICE algo:wcc { [] algo:predicate ex:missing ; algo:concurrency 1 ; algo:node ?n ; algo:component ?c } } }";
+        let result = super::super::query(s.snapshot(), q, &o).unwrap();
+        drop(hook);
+        assert_eq!(result.len(), 0);
+        assert_eq!(read.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod calls_algorithm_tests {
+    use super::*;
+    use crate::sparql::{QueryOptions, query};
+    use crate::store::{Store, StoreOptions};
+
+    const CALL: &str = "SERVICE algo:bfs { [] algo:source ?s ; algo:node ?n }";
+
+    fn flagged(store: &Store, body: &str) -> bool {
+        let q = format!("PREFIX algo: <urn:x-sparkles:algo#> {body}");
+        query(store.snapshot(), &q, &QueryOptions::default())
+            .unwrap()
+            .ctx
+            .calls_algorithm()
+    }
+
+    /// The flag comes from the algebra, so a call that the planner reaches only when rows
+    /// arrive still sets it, here with no row at all.
+    #[test]
+    fn an_algorithm_inside_an_expression_is_found_on_an_empty_store() {
+        let s = Store::in_memory(StoreOptions::default());
+        for body in [
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o FILTER EXISTS {{ {CALL} }} }}"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o FILTER NOT EXISTS {{ {CALL} }} }}"),
+            format!("SELECT ?s ?b WHERE {{ ?s <urn:t> ?o BIND(EXISTS {{ {CALL} }} AS ?b) }}"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o }} ORDER BY (EXISTS {{ {CALL} }})"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o }} GROUP BY ?s HAVING (EXISTS {{ {CALL} }})"),
+            format!("SELECT (EXISTS {{ {CALL} }} AS ?b) WHERE {{ ?s <urn:t> ?o }}"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o FILTER(!EXISTS {{ {CALL} }} || ?o = 1) }}"),
+            format!("SELECT ?s WHERE {{ ?s <urn:t> ?o OPTIONAL {{ {CALL} }} }}"),
+        ] {
+            assert!(flagged(&s, &body), "{body}");
+        }
+    }
+
+    /// A plain query is not flagged, and the walk runs once for each query.
+    #[test]
+    fn a_plain_query_is_not_flagged_and_the_walk_runs_once() {
+        let s = Store::in_memory(StoreOptions::default());
+        WALKS.with(|w| w.set(0));
+        assert!(!flagged(
+            &s,
+            "SELECT ?s WHERE { ?s <urn:t> ?o FILTER EXISTS { ?o <urn:u> ?x } }"
+        ));
+        assert_eq!(WALKS.with(|w| w.get()), 1);
+        assert!(flagged(
+            &s,
+            &format!("SELECT ?s WHERE {{ ?s <urn:t> ?o FILTER EXISTS {{ {CALL} }} }}")
+        ));
+        assert_eq!(WALKS.with(|w| w.get()), 2);
     }
 }

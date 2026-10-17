@@ -3558,7 +3558,7 @@ export interface components {
             author?: string;
             definition: components["schemas"]["AlgoProjectionDefinition"];
             name: string;
-            /** @description 1 for a new projection, one more for each replacement. */
+            /** @description 1 for a new projection, one more for each replacement. A projection created again after a delete continues from the revision it had. */
             revision: number;
             updated: string;
         };
@@ -3578,9 +3578,9 @@ export interface components {
             /** @description The property of an edge's reifier that holds its weight. */
             weight?: string;
         };
-        /** @description A dataset's named projections and the size of the cache of built projections. */
+        /** @description A dataset's named projections. A server administrator also sees `cache`, the size of the cache of built projections, which every dataset shares. */
         AlgoProjectionList: {
-            cache: {
+            cache?: {
                 bytes: number;
                 entries: number;
             };

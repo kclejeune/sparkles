@@ -15,6 +15,8 @@
 
 pub mod betweenness;
 pub mod cache;
+#[cfg(test)]
+mod cancel_tests;
 pub mod catalog;
 pub mod community;
 pub mod components;

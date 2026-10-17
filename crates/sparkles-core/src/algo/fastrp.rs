@@ -12,7 +12,7 @@
 //! iteration weight for a 0th iteration. The embedding is the sum of the L2-normalized
 //! rounds, each times its weight, normalized once more.
 
-use super::memory::Buffer;
+use super::memory::{Buffer, Work};
 use super::{BLOCK, Control, Graph, Par, Rng, bad};
 use crate::error::Result;
 
@@ -77,9 +77,13 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
     // before it is allocated
     let sqrt_s = 3f32.sqrt();
     let mut prev = Buffer::<f32>::zeroed("fastrp-round", len, ctl)?;
+    // one polling unit per 128 values of a vector, so a node of a wide embedding counts
+    // for more than one of a narrow embedding
+    let units = d.div_ceil(128);
     par.chunks_mut(&mut prev, (BLOCK / 8).max(1) * d, |lo, chunk| {
-        ctl.check()?;
+        let mut work = Work::new(ctl)?;
         for (i, v) in chunk.chunks_mut(d).enumerate() {
+            work.tick_n(units, "fastrp-initialize")?;
             let u = lo / d + i;
             let mut rng = Rng::for_item(p.seed, u as u64);
             for x in v.iter_mut() {
@@ -108,11 +112,20 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
             return Ok(());
         }
         par.chunks_mut(sum, (BLOCK / 8).max(1) * d, |lo, chunk| {
+            let mut work = Work::new(ctl)?;
             for (i, v) in chunk.chunks_mut(d).enumerate() {
+                work.tick_n(units, "fastrp-add")?;
                 let u = lo / d + i;
-                let mut r = round[u * d..(u + 1) * d].to_vec();
-                normalize(&mut r);
-                for (s, x) in v.iter_mut().zip(&r) {
+                let r = &round[u * d..(u + 1) * d];
+                // the round's vector normalized, in the same arithmetic as `normalize`
+                let norm = r.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+                let inv = if norm > 0.0 {
+                    Some((1.0 / norm) as f32)
+                } else {
+                    None
+                };
+                for (s, &x) in v.iter_mut().zip(r) {
+                    let x = inv.map_or(x, |inv| x * inv);
                     *s += x * weight as f32;
                 }
             }
@@ -134,10 +147,12 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
         ctl.check()?;
         let prev_ref = &*prev;
         par.chunks_mut(&mut cur, (BLOCK / 8).max(1) * d, |lo, chunk| {
+            let mut work = Work::new(ctl)?;
             for (i, v) in chunk.chunks_mut(d).enumerate() {
                 let u = (lo / d + i) as u32;
                 v.fill(0.0);
                 let (row, w) = (g.out.row(u), g.out.wrow(u));
+                work.tick_n((row.len() + 1).saturating_mul(units), "fastrp-propagate")?;
                 let total: f64 = match w {
                     Some(w) => w.iter().map(|&x| x as f64).sum(),
                     None => row.len() as f64,
@@ -159,7 +174,9 @@ pub fn run(g: &Graph, p: &Params, par: &Par, ctl: &Control) -> Result<Vec<f32>> 
         add(&mut sum, &prev, weight, par)?;
     }
     par.chunks_mut(&mut sum, (BLOCK / 8).max(1) * d, |_, chunk| {
+        let mut work = Work::new(ctl)?;
         for v in chunk.chunks_mut(d) {
+            work.tick_n(units, "fastrp-normalize")?;
             normalize(v);
         }
         Ok(())

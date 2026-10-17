@@ -17,6 +17,7 @@
 //! the written predicates of the nodes in the result, read inside each batch's own
 //! transaction.
 
+use super::pool::PoolGrant;
 use super::{QueryOptions, query};
 use crate::algo::catalog::{PredicateDef, ProjectionDef};
 use crate::commit::CommitKind;
@@ -37,6 +38,8 @@ use std::sync::Arc;
 pub const SPK: &str = "urn:x-sparkles:";
 const PROV: &str = "http://www.w3.org/ns/prov#";
 const SKOS_BROADER: &str = "http://www.w3.org/2004/02/skos/core#broader";
+/// The values of the `metric` parameter of node similarity.
+const METRICS: &[&str] = &["jaccard", "overlap"];
 /// Triples in a batch when a request gives no `batchSize`.
 pub const DEFAULT_BATCH: usize = 100_000;
 
@@ -118,9 +121,10 @@ pub fn expand_iri(s: &str, prefixes: &[(String, String)]) -> Result<String> {
         // The expansion is spliced into query text between `<` and `>`, so it must be a
         // valid absolute IRI on its own. A local part with `>` or a space is refused.
         let full = format!("{ns}{local}");
-        return oxiri::Iri::parse(full.as_str())
-            .map(|_| full.clone())
-            .map_err(|_| not_an_iri(s));
+        if oxiri::Iri::parse(full.as_str()).is_err() {
+            return Err(not_an_iri(s));
+        }
+        return Ok(full);
     }
     oxiri::Iri::parse(bare)
         .map(|_| bare.to_string())
@@ -241,10 +245,13 @@ fn build(
     let mut triples: Vec<String> = Vec::new();
     match &req.projection {
         None => {}
-        Some(ProjectionRef::Named(n)) => triples.push(format!(
-            "algo:projection {}",
-            serde_json::to_string(n).unwrap()
-        )),
+        Some(ProjectionRef::Named(n)) => {
+            // only a catalog name reaches the text, so its quoting never matters
+            if !crate::algo::catalog::valid_name(n) {
+                return Err(invalid(format!("'{n}' is not a valid projection name")));
+            }
+            triples.push(format!("algo:projection \"{n}\""))
+        }
         Some(ProjectionRef::Inline(d)) => {
             d.check()?;
             triples.extend(projection_triples(d, prefixes)?);
@@ -269,7 +276,14 @@ fn build(
                 }
             }
             ("metric", Value::String(s)) => {
-                triples.push(format!("algo:metric {}", serde_json::to_string(s).unwrap()))
+                // a known word only, written as the algo: name of the metric
+                if !METRICS.contains(&s.as_str()) {
+                    return Err(invalid(format!(
+                        "metric is one of {}, not '{s}'",
+                        METRICS.join(", ")
+                    )));
+                }
+                triples.push(format!("algo:metric algo:{s}"))
             }
             ("graphalytics", Value::Bool(b)) => triples.push(format!("algo:graphalytics {b}")),
             ("iterationWeights", Value::Array(items)) => {
@@ -317,8 +331,6 @@ pub struct RunReport {
     pub status: String,
 }
 
-type Group = (NamedOrBlankNode, Vec<(NamedNode, Term)>);
-
 fn subject_of(t: &Term) -> Result<NamedOrBlankNode> {
     match t {
         Term::NamedNode(n) => Ok(NamedOrBlankNode::NamedNode(n.clone())),
@@ -335,16 +347,56 @@ fn int(n: u64) -> Term {
     Term::Literal(Literal::new_typed_literal(n.to_string(), xsd::INTEGER))
 }
 
-/// The triples of the rows, grouped by node: every node's values together.
-fn groups(
+/// The integer of a literal of the result, or 0.
+fn integer_of(t: Option<Term>) -> i64 {
+    match t {
+        Some(Term::Literal(l)) => l.value().parse::<i64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Terms of the result decoded so far on this thread, and how many were decoded when
+    /// the first batch committed.
+    static DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DECODED_AT_FIRST_COMMIT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// The bytes charged to the run's grant before the plan was made, and when the
+    /// first batch committed.
+    static CHARGED_BEFORE_PLAN: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    static CHARGED_AT_FIRST_COMMIT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One term of the result, decoded when a batch needs it.
+fn decode(result: &super::QueryResult, id: Id) -> Option<Term> {
+    #[cfg(test)]
+    DECODED.with(|d| d.set(d.get() + 1));
+    result.term(id)
+}
+
+/// How the rows of a result become triples: the column of the node, and for each
+/// written output its column and predicate, in the order of the output names.
+struct Layout {
+    node: usize,
+    /// column, predicate, and whether the column holds the community of a hierarchical
+    /// run, which is written as a community resource
+    outputs: Vec<(usize, NamedNode, bool)>,
+    level: Option<usize>,
+    level_pred: Option<NamedNode>,
+    /// the predicates written for each node, which merge mode replaces
+    node_preds: Vec<NamedNode>,
+}
+
+fn layout(
     req: &AlgoRequest,
     w: &WriteSpec,
     vars: &[String],
-    rows: &[Vec<Option<Term>>],
-    run: &str,
     prefixes: &[(String, String)],
     control: &WriteOptions,
-) -> Result<(Vec<Group>, Vec<NamedNode>)> {
+) -> Result<Layout> {
     let col = |name: &str| vars.iter().position(|v| v == name);
     let mut preds: BTreeMap<&str, NamedNode> = BTreeMap::new();
     check_write_outputs(req, w)?;
@@ -360,89 +412,286 @@ fn groups(
     }
     let node = col("node").ok_or_else(|| invalid("the run has no nodes"))?;
     let hierarchical = matches!(req.algorithm.as_str(), "louvain" | "leiden");
-    let mut out: Vec<Group> = Vec::new();
-    let mut index: std::collections::HashMap<Term, usize> = Default::default();
-    let mut resources: BTreeMap<(i64, i64), Option<(i64, i64)>> = BTreeMap::new();
-    let level_pred = preds.get("level").cloned();
-    // the community of each node at each level, to link a community to its parent
-    let mut last: std::collections::HashMap<(Term, i64), i64> = Default::default();
-    for row in rows {
-        control.check()?;
-        let Some(n) = &row[node] else { continue };
-        let subject = subject_of(n)?;
-        let at = *index.entry(n.clone()).or_insert_with(|| {
-            out.push((subject, Vec::new()));
-            out.len() - 1
-        });
-        for (name, pred) in &preds {
-            control.check()?;
-            if *name == "level" {
-                continue;
-            }
-            let Some(c) = col(name) else { continue };
-            let Some(v) = &row[c] else { continue };
-            if hierarchical && *name == "community" {
-                let level = col("level")
-                    .and_then(|l| row[l].as_ref())
-                    .and_then(|t| match t {
-                        Term::Literal(l) => l.value().parse::<i64>().ok(),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let id = match v {
-                    Term::Literal(l) => l.value().parse::<i64>().unwrap_or(0),
-                    _ => 0,
-                };
-                let res = NamedNode::new_unchecked(format!("{SPK}algo:{run}:{level}:{id}"));
-                out[at].1.push((pred.clone(), Term::NamedNode(res)));
-                last.insert((n.clone(), level), id);
-                resources.entry((level, id)).or_insert(None);
-            } else {
-                out[at].1.push((pred.clone(), v.clone()));
-            }
+    let mut outputs = Vec::new();
+    for (name, pred) in &preds {
+        if *name == "level" {
+            continue;
+        }
+        if let Some(c) = col(name) {
+            outputs.push((c, pred.clone(), hierarchical && *name == "community"));
         }
     }
-    if hierarchical {
-        // a community's parent is the community of the next level that holds its nodes
-        for ((n, level), id) in &last {
-            control.check()?;
-            if let Some(parent) = last.get(&(n.clone(), level + 1)) {
-                resources.insert((*level, *id), Some((level + 1, *parent)));
+    let mut node_preds: Vec<NamedNode> = preds
+        .iter()
+        .filter(|(n, _)| **n != "level")
+        .map(|(_, p)| p.clone())
+        .collect();
+    node_preds.dedup();
+    Ok(Layout {
+        node,
+        outputs,
+        level: col("level").filter(|_| hierarchical),
+        level_pred: preds.get("level").cloned().filter(|_| hierarchical),
+        node_preds,
+    })
+}
+
+/// A community of a hierarchical run: its level and number, and the community of the
+/// next level that holds its nodes.
+type Communities = BTreeMap<(i64, i64), Option<(i64, i64)>>;
+
+/// The plan of a write-back, made in one pass over the result's identifiers without
+/// decoding the result: the rows of each node together, the communities of a
+/// hierarchical run, and where each batch ends.
+struct Batches {
+    /// the rows with a node, ordered by node, keeping the order of a node's rows
+    order: Vec<usize>,
+    /// the bytes of `order` charged to the run's grant, given back when the plan drops
+    _charge: Option<Charged>,
+    communities: Communities,
+    /// the groups (nodes, then community resources) written up to the end of each batch
+    ends: Vec<usize>,
+    triples: u64,
+}
+
+/// Bytes charged to a grant for as long as this value lives.
+struct Charged {
+    grant: Arc<PoolGrant>,
+    bytes: u64,
+}
+
+impl Charged {
+    fn new(grant: &Arc<PoolGrant>, bytes: u64) -> Result<Charged> {
+        grant.charge(bytes)?;
+        Ok(Charged {
+            grant: grant.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for Charged {
+    fn drop(&mut self) {
+        self.grant.release(self.bytes);
+    }
+}
+
+impl Layout {
+    /// The triples of one row.
+    fn triples(&self, table: &super::table::Table, i: usize) -> usize {
+        self.outputs
+            .iter()
+            .filter(|(c, _, _)| !table.cols[*c][i].is_undef())
+            .count()
+    }
+
+    /// The triples of a community resource: its level and its parent.
+    fn resource_triples(&self, parent: &Option<(i64, i64)>) -> usize {
+        usize::from(self.level_pred.is_some()) + usize::from(parent.is_some())
+    }
+
+    fn community_column(&self) -> Option<usize> {
+        self.outputs.iter().find(|o| o.2).map(|o| o.0)
+    }
+
+    fn batches(
+        &self,
+        result: &super::QueryResult,
+        w: &WriteSpec,
+        control: &WriteOptions,
+        grant: Option<&Arc<PoolGrant>>,
+    ) -> Result<Batches> {
+        let table = &result.table;
+        let nodes = &table.cols[self.node];
+        // one index entry for each row, charged before it is built
+        let charge = match grant {
+            Some(g) => Some(Charged::new(
+                g,
+                (table.len() as u64).saturating_mul(std::mem::size_of::<usize>() as u64),
+            )?),
+            None => None,
+        };
+        let mut order = Vec::new();
+        order
+            .try_reserve_exact(table.len())
+            .map_err(|e| invalid(format!("the run's row order does not fit: {e}")))?;
+        for (i, node) in nodes.iter().enumerate().take(table.len()) {
+            if i % CHECK_ROWS == 0 {
+                control.check()?;
+            }
+            if !node.is_undef() {
+                order.push(i);
             }
         }
-        let broader = NamedNode::new_unchecked(SKOS_BROADER);
-        let name = |l: i64, i: i64| {
-            Term::NamedNode(NamedNode::new_unchecked(format!("{SPK}algo:{run}:{l}:{i}")))
+        control.check()?;
+        // The row number breaks ties, so a node's rows keep their order without the
+        // buffer of a stable sort.
+        order.sort_unstable_by_key(|&i| (nodes[i], i));
+        control.check()?;
+        let size = w.batch_size.unwrap_or(DEFAULT_BATCH).max(1);
+        let mut communities: Communities = BTreeMap::new();
+        let mut ends = Vec::new();
+        let (mut groups, mut pending, mut triples) = (0usize, 0usize, 0u64);
+        let cut = |groups: usize, n: usize, pending: &mut usize, ends: &mut Vec<usize>| {
+            *pending += n;
+            if !w.atomic && *pending >= size {
+                ends.push(groups);
+                *pending = 0;
+            }
         };
-        for ((level, id), parent) in &resources {
+        let community = self.community_column();
+        let mut levels: Vec<(i64, i64)> = Vec::new();
+        let mut start = 0;
+        while start < order.len() {
             control.check()?;
-            let mut po: Vec<(NamedNode, Term)> = Vec::new();
-            if let Some(lp) = &level_pred {
+            let id = nodes[order[start]];
+            let mut stop = start;
+            let mut n = 0;
+            levels.clear();
+            while stop < order.len() && nodes[order[stop]] == id {
+                let i = order[stop];
+                n += self.triples(table, i);
+                if let Some(c) = community
+                    && !table.cols[c][i].is_undef()
+                {
+                    // the level and number of the node's community in this row
+                    let level = self.level.map_or(0, |l| {
+                        if table.cols[l][i].is_undef() {
+                            0
+                        } else {
+                            integer_of(decode(result, table.cols[l][i]))
+                        }
+                    });
+                    levels.push((level, integer_of(decode(result, table.cols[c][i]))));
+                }
+                stop += 1;
+            }
+            // a community's parent is the community of the next level that holds its
+            // nodes; the last row of a node at a level counts
+            for &key in &levels {
+                communities.entry(key).or_insert(None);
+            }
+            levels.sort_by_key(|l| l.0);
+            let mut kept = 0;
+            for k in 0..levels.len() {
+                if k + 1 == levels.len() || levels[k + 1].0 != levels[k].0 {
+                    levels[kept] = levels[k];
+                    kept += 1;
+                }
+            }
+            levels.truncate(kept);
+            for (k, &(level, id)) in levels.iter().enumerate() {
+                if let Some(&next) = levels.get(k + 1)
+                    && next.0 == level + 1
+                {
+                    communities.insert((level, id), Some(next));
+                }
+            }
+            groups += 1;
+            triples += n as u64;
+            cut(groups, n, &mut pending, &mut ends);
+            start = stop;
+        }
+        for parent in communities.values() {
+            let n = self.resource_triples(parent);
+            if n > 0 {
+                groups += 1;
+                triples += n as u64;
+                cut(groups, n, &mut pending, &mut ends);
+            }
+        }
+        if ends.last() != Some(&groups) || ends.is_empty() {
+            ends.push(groups);
+        }
+        Ok(Batches {
+            order,
+            _charge: charge,
+            communities,
+            ends,
+            triples,
+        })
+    }
+}
+
+/// How often a pass over the rows checks the cancel flag and the deadline.
+const CHECK_ROWS: usize = 1 << 12;
+
+/// The groups of a write-back in order, each built when its batch is written: the
+/// triples of a node, then those of each community resource.
+struct Groups<'a> {
+    result: &'a super::QueryResult,
+    layout: &'a Layout,
+    plan: &'a Batches,
+    run: &'a str,
+    /// the next row of `plan.order`
+    at: usize,
+    communities: std::collections::btree_map::Iter<'a, (i64, i64), Option<(i64, i64)>>,
+}
+
+impl Groups<'_> {
+    /// The next group: its subject and its predicates and objects in `po`.
+    fn next(&mut self, po: &mut Vec<(NamedNode, Term)>) -> Result<Option<NamedOrBlankNode>> {
+        po.clear();
+        let table = &self.result.table;
+        let nodes = &table.cols[self.layout.node];
+        let order = &self.plan.order;
+        if self.at < order.len() {
+            let id = nodes[order[self.at]];
+            let subject = subject_of(
+                &decode(self.result, id)
+                    .ok_or_else(|| invalid("a node of the result has no term"))?,
+            )?;
+            while self.at < order.len() && nodes[order[self.at]] == id {
+                let i = order[self.at];
+                for (c, pred, community) in &self.layout.outputs {
+                    let v = table.cols[*c][i];
+                    if v.is_undef() {
+                        continue;
+                    }
+                    let Some(term) = decode(self.result, v) else {
+                        continue;
+                    };
+                    if *community {
+                        let level = self.layout.level.map_or(0, |l| {
+                            if table.cols[l][i].is_undef() {
+                                0
+                            } else {
+                                integer_of(decode(self.result, table.cols[l][i]))
+                            }
+                        });
+                        let number = integer_of(Some(term));
+                        let res = format!("{SPK}algo:{}:{level}:{number}", self.run);
+                        po.push((pred.clone(), Term::NamedNode(NamedNode::new_unchecked(res))));
+                    } else {
+                        po.push((pred.clone(), term));
+                    }
+                }
+                self.at += 1;
+            }
+            return Ok(Some(subject));
+        }
+        for ((level, id), parent) in self.communities.by_ref() {
+            if self.layout.resource_triples(parent) == 0 {
+                continue;
+            }
+            if let Some(lp) = &self.layout.level_pred {
                 po.push((lp.clone(), int(*level as u64)));
             }
             if let Some((pl, pi)) = parent {
-                po.push((broader.clone(), name(*pl, *pi)));
-            }
-            if !po.is_empty() {
-                out.push((
-                    NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
-                        "{SPK}algo:{run}:{level}:{id}"
+                po.push((
+                    NamedNode::new_unchecked(SKOS_BROADER),
+                    Term::NamedNode(NamedNode::new_unchecked(format!(
+                        "{SPK}algo:{}:{pl}:{pi}",
+                        self.run
                     ))),
-                    po,
                 ));
             }
+            return Ok(Some(NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(
+                format!("{SPK}algo:{}:{level}:{id}", self.run),
+            ))));
         }
+        Ok(None)
     }
-    let node_preds: Vec<NamedNode> = {
-        let mut v: Vec<NamedNode> = preds
-            .iter()
-            .filter(|(n, _)| **n != "level")
-            .map(|(_, p)| p.clone())
-            .collect();
-        v.dedup();
-        v
-    };
-    Ok((out, node_preds))
 }
 
 fn now() -> Term {
@@ -496,46 +745,29 @@ pub fn run_write(
     o.timeout = None;
     o.deadline = deadline;
     o.cancellation = Some(cancellation.clone());
+    // The run's grant, which the plan of the write-back charges its row index to.
+    let grant = o.query_grant();
+    o.grant = grant.clone();
     let result = query(snap, &q, &o)?;
     operation.check()?;
-    let mut rows = Vec::with_capacity(result.len());
-    for i in 0..result.table.len() {
-        operation.check()?;
-        let mut row = Vec::with_capacity(result.table.cols.len());
-        for col in &result.table.cols {
-            operation.check()?;
-            row.push(result.term(col[i]));
-        }
-        rows.push(row);
-    }
     let run = uuid::Uuid::new_v4().to_string();
     let run_iri = NamedNode::new_unchecked(format!("urn:uuid:{run}"));
-    let (groups, node_preds) = groups(req, w, &result.vars, &rows, &run, prefixes, &operation)?;
-    let mut total_triples = 0;
-    for group in &groups {
-        operation.check()?;
-        total_triples += group.1.len() as u64;
-    }
-    // batches of whole groups
-    let size = w.batch_size.unwrap_or(DEFAULT_BATCH).max(1);
-    let mut batches: Vec<std::ops::Range<usize>> = Vec::new();
-    if w.atomic || groups.is_empty() {
-        batches.push(0..groups.len());
-    } else {
-        let (mut start, mut n) = (0usize, 0usize);
-        for (i, g) in groups.iter().enumerate() {
-            operation.check()?;
-            n += g.1.len();
-            if n >= size {
-                batches.push(start..i + 1);
-                start = i + 1;
-                n = 0;
-            }
-        }
-        if start < groups.len() {
-            batches.push(start..groups.len());
-        }
-    }
+    // The result stays as identifiers. Each batch decodes the terms of its own nodes
+    // when it is written, so the memory of a run is the result and one batch.
+    let layout = layout(req, w, &result.vars, prefixes, &operation)?;
+    #[cfg(test)]
+    CHARGED_BEFORE_PLAN.with(|d| d.set(grant.as_ref().map(|g| g.used())));
+    let plan = layout.batches(&result, w, &operation, grant.as_ref())?;
+    let total_triples = plan.triples;
+    let mut groups = Groups {
+        result: &result,
+        layout: &layout,
+        plan: &plan,
+        run: &run,
+        at: 0,
+        communities: plan.communities.iter(),
+    };
+    let node_preds = &layout.node_preds;
     let params_json = serde_json::to_string(&serde_json::json!({
         "params": req.params,
     }))
@@ -559,12 +791,13 @@ pub fn run_write(
             started.clone(),
         ));
         t.push((spk("triplesPlanned"), int(total_triples)));
-        t.push((spk("batchesPlanned"), int(batches.len() as u64)));
+        t.push((spk("batchesPlanned"), int(plan.ends.len() as u64)));
     };
     let (mut written, mut commits) = (0u64, 0u64);
-    let n_batches = batches.len();
+    let n_batches = plan.ends.len();
     let outcome = (|| -> Result<()> {
-        for (bi, range) in batches.iter().enumerate() {
+        let mut group = 0usize;
+        for (bi, &end) in plan.ends.iter().enumerate() {
             operation.check()?;
             operation.check()?;
             ctl.progress.report(
@@ -620,15 +853,20 @@ pub fn run_write(
                     put(&mut txn, rec, p, o)?;
                 }
             }
-            for (s, po) in &groups[range.clone()] {
+            let mut po = Vec::new();
+            while group < end {
                 operation.check()?;
+                let Some(s) = groups.next(&mut po)? else {
+                    return Err(invalid("the run has fewer groups than it planned"));
+                };
+                group += 1;
                 let sid = txn.intern(&match s {
-                    NamedOrBlankNode::NamedNode(n) => Term::NamedNode(n.clone()),
-                    NamedOrBlankNode::BlankNode(b) => Term::BlankNode(b.clone()),
+                    NamedOrBlankNode::NamedNode(n) => Term::NamedNode(n),
+                    NamedOrBlankNode::BlankNode(b) => Term::BlankNode(b),
                 })?;
                 if w.mode == WriteMode::Merge {
                     // read in this transaction: the values another writer added are replaced too
-                    for p in &node_preds {
+                    for p in node_preds {
                         operation.check()?;
                         let pid = txn.intern(&Term::NamedNode(p.clone()))?;
                         let view = txn.view();
@@ -650,7 +888,7 @@ pub fn run_write(
                         }
                     }
                 }
-                for (p, o) in po {
+                for (p, o) in &po {
                     operation.check()?;
                     put(&mut txn, sid, p, o)?;
                     written += 1;
@@ -693,6 +931,11 @@ pub fn run_write(
                 put(&mut txn, rec, &spk("status"), &lit("complete"))?;
             }
             operation.check()?;
+            #[cfg(test)]
+            if bi == 0 {
+                DECODED_AT_FIRST_COMMIT.with(|d| d.set(Some(DECODED.with(|n| n.get()))));
+                CHARGED_AT_FIRST_COMMIT.with(|d| d.set(grant.as_ref().map(|g| g.used())));
+            }
             txn.commit()?;
             commits += 1;
             // The next batch starts with its own check. After the last commit the run is
@@ -747,7 +990,7 @@ pub fn run_write(
         run: run_iri.as_str().to_string(),
         algorithm: req.algorithm.clone(),
         source_commit,
-        rows: rows.len() as u64,
+        rows: result.table.len() as u64,
         triples: written,
         commits,
         status: "complete".into(),
@@ -765,4 +1008,150 @@ pub fn inline(predicates: &[&str]) -> ProjectionRef {
         ),
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{RdfFormat, Source};
+    use crate::store::StoreOptions;
+
+    fn chain(n: usize) -> Store {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("@prefix ex: <http://ex/> .\n");
+        for i in 0..n {
+            data.push_str(&format!("ex:n{i} ex:p ex:n{} .\n", i + 1));
+        }
+        s.load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        s
+    }
+
+    fn request(algorithm: &str, outputs: serde_json::Value, batch: usize) -> AlgoRequest {
+        AlgoRequest::from_json(serde_json::json!({
+            "algorithm": algorithm,
+            "projection": {"predicates": ["http://ex/p"]},
+            "write": {"graph": "http://ex/out", "predicates": outputs, "batchSize": batch}
+        }))
+        .unwrap()
+    }
+
+    /// A write-back decodes the terms of a batch when it writes the batch. Before its
+    /// first commit it has decoded the first batch's nodes, not the whole result.
+    #[test]
+    fn write_back_decodes_one_batch_at_a_time() {
+        let s = chain(300);
+        let req = request("wcc", serde_json::json!({"component": "http://ex/c"}), 10);
+        DECODED.with(|d| d.set(0));
+        DECODED_AT_FIRST_COMMIT.with(|d| d.set(None));
+        let rep = run_write(
+            &s,
+            &req,
+            &[],
+            &QueryOptions::default(),
+            None,
+            &Control::none(),
+        )
+        .unwrap();
+        assert_eq!((rep.rows, rep.triples, rep.commits), (301, 301, 31));
+        let first = DECODED_AT_FIRST_COMMIT.with(|d| d.get()).unwrap();
+        // ten nodes, each with its term and its component's
+        assert!(
+            first <= 2 * 10,
+            "{first} terms decoded before the first commit"
+        );
+        assert_eq!(DECODED.with(|d| d.get()), 2 * 301);
+    }
+
+    /// The row index of the write-back plan is charged to the run's grant while the plan
+    /// lives, so the grant's peak covers it, and it is given back when the run ends.
+    #[test]
+    fn write_back_charges_its_row_index_to_the_grant() {
+        use crate::sparql::pool::QueryPool;
+        let s = chain(300);
+        let req = request("wcc", serde_json::json!({"component": "http://ex/c"}), 10);
+        let pool = QueryPool::new(256 << 20);
+        let grant = Arc::new(pool.try_grant(16 << 20).unwrap());
+        let opts = QueryOptions {
+            grant: Some(grant.clone()),
+            ..Default::default()
+        };
+        CHARGED_BEFORE_PLAN.with(|d| d.set(None));
+        CHARGED_AT_FIRST_COMMIT.with(|d| d.set(None));
+        let rep = run_write(&s, &req, &[], &opts, None, &Control::none()).unwrap();
+        assert_eq!(rep.rows, 301);
+        let before = CHARGED_BEFORE_PLAN.with(|d| d.get()).unwrap();
+        let at_commit = CHARGED_AT_FIRST_COMMIT.with(|d| d.get()).unwrap();
+        let index = 301 * std::mem::size_of::<usize>() as u64;
+        assert!(
+            at_commit - before >= index,
+            "the plan charged {} bytes, its index takes {index}",
+            at_commit - before
+        );
+        assert_eq!(grant.used(), 0, "the run gave its charges back");
+    }
+
+    /// Hierarchical communities are written as resources after the nodes, with their
+    /// level and the community of the next level, as before the batches streamed.
+    #[test]
+    fn hierarchical_write_back_links_each_community_to_its_parent() {
+        let s = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("@prefix ex: <http://ex/> .\n");
+        // two cliques of five joined by one edge, then a pair far away
+        for (base, size) in [(0, 5), (5, 5)] {
+            for a in 0..size {
+                for b in a + 1..size {
+                    data.push_str(&format!("ex:n{} ex:p ex:n{} .\n", base + a, base + b));
+                }
+            }
+        }
+        data.push_str("ex:n4 ex:p ex:n5 .\n");
+        s.load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+        let req = request(
+            "louvain",
+            serde_json::json!({"community": "http://ex/c", "level": "http://ex/l"}),
+            3,
+        );
+        let rep = run_write(
+            &s,
+            &req,
+            &[],
+            &QueryOptions::default(),
+            None,
+            &Control::none(),
+        )
+        .unwrap();
+        let q = "SELECT ?n ?c WHERE { GRAPH <http://ex/out> { ?n <http://ex/c> ?c } }";
+        let r = query(s.snapshot(), q, &QueryOptions::default()).unwrap();
+        // every node has one community resource for each level
+        let levels = r.len() / 10;
+        assert!(levels >= 1 && r.len() == 10 * levels, "{}", r.len());
+        let q = "SELECT ?c ?l WHERE { GRAPH <http://ex/out> { ?c <http://ex/l> ?l } }";
+        let communities = query(s.snapshot(), q, &QueryOptions::default())
+            .unwrap()
+            .len();
+        let q = "SELECT ?c ?p WHERE { GRAPH <http://ex/out> { ?c <http://www.w3.org/2004/02/skos/core#broader> ?p } }";
+        let links = query(s.snapshot(), q, &QueryOptions::default())
+            .unwrap()
+            .len();
+        // every community but those of the top level has a parent
+        assert!(communities >= 2, "{communities}");
+        if levels > 1 {
+            assert!(links > 0 && links < communities, "{links} of {communities}");
+        }
+        assert_eq!(
+            rep.triples,
+            (r.len() + communities + links) as u64,
+            "{rep:?}"
+        );
+    }
 }

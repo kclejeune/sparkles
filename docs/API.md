@@ -5389,6 +5389,14 @@ for all its values and joins its rows with the group's. Under `GRAPH ?g`, the ca
 once for each named graph, and `algo:limit` applies to the rows of each graph, not to
 all of them together.
 
+An integer parameter such as `seed` or `maxIterations` keeps its exact value when it is
+written as an integer, also above 2^53. A decimal or double value is accepted for an
+integer parameter only when it is whole and at most 2^53, where it is exact, and is
+refused otherwise. An integer written as an integer ranges from 0 to 2^63 - 1, and a
+larger one is refused with a message that names that range. `maxIterations` and
+`maxLevels` are held in 32 bits, so a value above 4294967295 is refused and not
+reduced.
+
 FastRP takes `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
 Neo4j GDS. The list has one weight for each propagation, and the weight at index `i`
 applies to the embedding after `i + 1` propagations. The default propagates three times
@@ -5514,16 +5522,31 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
   Symmetric graphs reuse outgoing rows. PageRank also reserves its five vector arrays,
   personalized-source copy and one reusable reduction buffer before allocation. Its
   temporary reservations end after the buffers are dropped, while returned scores stay
-  charged to the call. These Vec-capacity bounds exclude allocator and Rayon bookkeeping,
-  small summary metadata and other algorithm workspaces outside those bounds.
-  PageRank checks cancellation and deadlines before each node in its four iteration
-  passes and around the passes and their reductions. These checks do not bound edge
-  work inside one incoming row or the ordered outgoing-weight sum, strengthen setup
-  polling or guarantee wall-clock preemption.
+  charged to the call. Every other algorithm charges its workspaces the same way,
+  including the heap of single-source shortest paths, search stacks and per-thread
+  scratch, and grows them only after charging the new capacity. These Vec-capacity
+  bounds exclude allocator and Rayon bookkeeping and small summary metadata.
+* **Cancellation.** Every long loop of an algorithm over nodes, rows or heap entries
+  counts its work in units, where a node, an edge of a row and a heap entry are one unit
+  each, and checks cancellation and the deadline once the count reaches 64K units.
+  Consecutive rows that hold at most 64K units together are counted at once before the
+  first of them, so at most 128K units pass between two checks. Rows that hold more are
+  counted one at a time before each is read, so a node of high degree is checked before
+  the next row starts. The search of strongly connected components also checks every
+  64K edges within one row. Triangle counting counts a node's merges by a bound before they start, and
+  counts each merge of a node whose bound passes 64K units. PageRank counts the rows of
+  each block in its four iteration passes. These are work bounds, and they do not
+  preempt one row's edges or guarantee a wall-clock bound. A sort runs as one step that
+  cannot be interrupted. Triangle counting sorts all node indexes by degree, which takes
+  time proportional to `n log n`, and a few algorithms sort one row, the neighbouring
+  communities of one community or the labels around one node, which the degree of that
+  row bounds. Building a projection sorts all of its edge keys. A cancel that arrives in
+  a sort takes effect when the sort ends.
 * **Threads and cache.** `--algo-threads` and `--algo-max-threads-per-call` limit the
   threads of all calls and of each call. A one-thread call runs on the caller and
   holds one slot in that shared budget. Calls waiting for slots check cancellation and
-  their deadline before admission. `--algo-cache-mb` sizes the cache of built projections. Committed views can reuse a built projection independently of the query
+  their deadline before admission. Admission has no queue order, so a call that asks
+  for several slots can wait while one-thread calls keep taking single free slots. `--algo-cache-mb` sizes the cache of built projections. Committed views can reuse a built projection independently of the query
   result cache. A committed write changes the key. Queries over pending transaction
   changes neither read nor populate the projection cache, including through masked
   or derived views. The cache reserves fixed base and possible incoming storage once.
@@ -5537,10 +5560,13 @@ compute an unpersonalized ranking. Omitting the source still runs ordinary PageR
 
 `POST /$/algo/{ds}/run` takes a JSON request and runs it as the query it stands for.
 Read-only requests, including `summary=true`, require `read` through the `query`
-endpoint. Requests with `write` require `write` through the `update` endpoint. The
-server parses the bounded body once and checks that grant before looking up the
-dataset or disclosing a restore task. Input projections and output writes retain the
-selected endpoint's graph and triple restrictions. Both forms use the admin-body
+endpoint. Requests with `write` require `write` through the `update` endpoint. A caller
+that has neither grant is refused before the body is read. The server then parses the
+bounded body once and checks the grant that the body selects before looking up the
+dataset or disclosing a restore task. A dataset that does not exist, or that the caller
+may not see, answers `404` before the contents of the body are checked, so a malformed
+body sent to a missing dataset gets `404` where earlier builds answered `400`. Input
+projections and output writes retain the selected endpoint's graph and triple restrictions. Both forms use the admin-body
 ceiling, including after request decompression. Projection-management permissions
 are unchanged.
 
@@ -5556,8 +5582,16 @@ Without a `write` member the answer is the result of the query, in the format th
 `Accept` header or `format` parameter asks for, and the request parameters of
 `/{ds}/sparql` apply (`timeout`, `execution` and the budget overrides). With
 `summary=true` the answer holds only the summary. The `projection` is the name of a stored
-projection or a definition, and its `predicates` may be bare IRIs. Prefixed names in
-`params` and `write` use the standard prefixes and the dataset's.
+projection or a definition, and its `predicates` may be bare IRIs. A name that is not a
+valid projection name and a `metric` other than `jaccard` and `overlap` are refused with
+`400`. Prefixed names in `params` and `write` use the standard prefixes and the
+dataset's. Integer parameters follow the rule of the SERVICE form above.
+
+A query that calls an algorithm never runs on the thread that received it, even when an
+earlier run of the same text was quick, because a cached projection can make one run
+quick and the next slow. On a server with a query memory pool, a read-only request waits
+for its initial grant up to `--query-admission-wait`, as a query does, and answers `503`
+when the pool stays full.
 
 Read-only requests use the Query rate and concurrency policy. The permit covers
 computation and the response body. Blocking and streaming producers keep their
@@ -5571,6 +5605,8 @@ background task does not retain that HTTP permit. It uses the existing task queu
 with four running tasks by default, configurable with `--max-tasks`, a precheck
 that refuses when 1,000 tasks are queued, per-dataset algorithm-task checks and
 algorithm-thread admission. These checks do not form a new atomic task reservation.
+On a server with a query memory pool, the task takes its initial grant when it starts,
+waiting up to `--query-admission-wait`, and fails when the pool stays full.
 Other task kinds and task polling or cancellation permissions are unchanged.
 
 ```json
@@ -5639,8 +5675,8 @@ once, at the price of one large commit.
 
 | Route | Needs | Meaning |
 |---|---|---|
-| `GET /$/algo/{ds}/projections` | read | The definitions, and the size of the projection cache. |
-| `GET /$/algo/{ds}/projections/{name}` | read | One definition with its revision, as the `ETag` `"r3"`. |
+| `GET /$/algo/{ds}/projections` | read | The definitions. A server administrator also gets the size of the projection cache, which all datasets share. |
+| `GET /$/algo/{ds}/projections/{name}` | read | One definition with its revision, as the `ETag` `"r3"`. A definition created again after a delete continues from the revision it had. |
 | `PUT /$/algo/{ds}/projections/{name}` | admin | Create or replace a definition. `If-Match: "r3"` replaces only that revision and `If-None-Match: *` only creates. A bare string in `predicates` means that predicate in the algorithm's direction. |
 | `DELETE /$/algo/{ds}/projections/{name}` | admin | Remove a definition. |
 
@@ -5653,8 +5689,12 @@ They read the definition as it is when the query is planned, so a query at an ol
 uses today's definitions.
 
 The definitions are kept in `algo.json` of a persistent dataset, which backups and
-clones include. Its registered format is 1, and a missing format marker also reads as
-1 without rewriting the file. A newer version returns `Unsupported` before dataset
+clones include. Its registered format is 2, which keeps the last revision of each
+deleted definition, with one entry for each name that was deleted and not created again.
+A file is written as format 2 only while it holds such an entry, and as format 1 otherwise.
+A format 1 file still reads, and a missing format marker reads as 1 without rewriting the
+file. A release that knows only format 1 refuses format 2 with `Unsupported`, so it opens
+the dataset until the first projection is deleted. A newer version returns `Unsupported` before dataset
 metadata changes, including when it belongs to an active or retained branch.
 `sparkles migrate --check` applies the same version check without changing files.
 Malformed JSON, duplicate known struct fields or malformed current definitions leave

@@ -483,6 +483,9 @@ pub struct Ctx {
     pub geo: crate::geo::memo::GeoMemo,
     /// notes for the plan's reader, without duplicates (see [`Ctx::warn`])
     warnings: parking_lot::Mutex<Vec<PlanWarning>>,
+    /// the planner met a `SERVICE` of the graph-algorithm namespace (see
+    /// [`Ctx::calls_algorithm`])
+    algorithmic: AtomicBool,
     /// The plan of the operator that failed, as far as it ran, keyed by the address of
     /// its node, until its parent takes it (see [`Ctx::take_failed`]). Execution state:
     /// a plan shared between executions must not keep it.
@@ -791,6 +794,7 @@ impl Ctx {
                 .then(|| Box::new(crate::ioacct::IoSnapshot::now())),
             geo: Default::default(),
             warnings: Default::default(),
+            algorithmic: AtomicBool::new(false),
             failed: Default::default(),
             sampled: Default::default(),
             stars: Default::default(),
@@ -990,6 +994,17 @@ impl Ctx {
     /// recorded one.
     pub fn failed_plan(&self) -> Option<super::exec::PlanInfo> {
         self.failed.lock().take().map(|(_, i)| i)
+    }
+
+    /// Whether the parsed query calls a graph algorithm, that is, has a `SERVICE` whose
+    /// IRI is in the algorithm namespace once prefixes and the base are resolved. The
+    /// planner decides it from the algebra, so a prefixed name counts like the full IRI.
+    pub fn calls_algorithm(&self) -> bool {
+        self.algorithmic.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn note_algorithm_call(&self) {
+        self.algorithmic.store(true, Ordering::Relaxed);
     }
 
     /// The warnings recorded so far.

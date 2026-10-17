@@ -1381,6 +1381,11 @@ pub(crate) async fn run_query(
         inline::QuickQueries::key(&ds.name, &format!("{query}\n{}", values.join("\n")))
     };
     opts.initial_bindings = bindings;
+    // A graph-algorithm call can take milliseconds on a cached projection and much
+    // longer after a commit, and work in place cannot stop when its client goes away.
+    // The first run of a query decides from its parsed algebra whether it has a SERVICE
+    // of the algorithm namespace, so a prefixed name counts like the full IRI, and a
+    // query that does is never remembered as quick and so never runs in place.
     let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
@@ -1411,6 +1416,7 @@ pub(crate) async fn run_query(
         }
     };
     let ran = if in_place {
+        inline::note_in_place(quick_key);
         inline::run(run).and_then(|r| r)
     } else {
         blocking(run).await
@@ -1420,6 +1426,7 @@ pub(crate) async fn run_query(
         QUICK.record(quick_key, f64::INFINITY);
     }
     let (r, seq, resolved, t0) = ran.map_err(|e| with_timeout(e, timeout))?;
+    let algorithmic = r.ctx.calls_algorithm();
     let query_ms = r.timing.total_ms;
     let cells = r.len().saturating_mul(r.vars.len().max(3));
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
@@ -1516,7 +1523,14 @@ pub(crate) async fn run_query(
     };
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
-            QUICK.record(quick_key, query_ms + serialize_ms);
+            QUICK.record(
+                quick_key,
+                if algorithmic {
+                    f64::INFINITY
+                } else {
+                    query_ms + serialize_ms
+                },
+            );
             let report = RequestReport {
                 response_bytes: Some(body.len() as u64),
                 serialize_ms: Some(serialize_ms),

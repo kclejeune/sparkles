@@ -1,6 +1,6 @@
 //! The projection: compressed sparse rows over dense node indexes (spec F14 §3).
 
-use super::memory::{self, Buffer, Reservation, Work};
+use super::memory::{self, Buffer, Growing, Reservation, Work};
 use super::{Control, Par};
 use crate::error::Result;
 use std::sync::OnceLock;
@@ -489,29 +489,41 @@ impl Graph {
     }
 
     /// The graph read as undirected, simple and unweighted: rows without repeats or
-    /// self-loops, holding an edge in both rows.
+    /// self-loops, holding an edge in both rows. The rows are charged to the call for
+    /// the whole call.
     pub fn simple(&self, ctl: &Control) -> Result<Csr> {
-        ctl.charge(self.out.bytes() * 2)?;
         let n = self.n();
         let incoming = self.inn(ctl)?;
         let inn = &*incoming;
-        let mut off = vec![0u64; n + 1];
-        let mut adj: Vec<u32> =
-            Vec::with_capacity(self.out.nnz() * if self.symmetric { 1 } else { 2 });
-        let mut last;
+        let cap = self
+            .out
+            .nnz()
+            .checked_mul(if self.symmetric { 1 } else { 2 })
+            .ok_or_else(|| super::bad("projection", "edge count overflows"))?;
+        let mut off = Buffer::<u64>::zeroed("simple-offsets", n + 1, ctl)?;
+        let mut adj = Buffer::<u32>::new("simple-edges", cap, ctl)?;
+        let mut work = Work::new(ctl)?;
+        let mut counted = false;
         for u in 0..n as u32 {
-            if (u as usize).is_multiple_of(super::CHECK_EVERY) {
-                ctl.check()?;
+            // The rows of a block of a symmetric graph are counted at once while they
+            // stay within an interval. Other rows are counted one by one.
+            if (u as usize).is_multiple_of(super::BLOCK) {
+                let (lo, hi) = (u as usize, (u as usize + super::BLOCK).min(n));
+                counted = self.symmetric && work.rows(&self.out.off, lo, hi, "simple-rows")?;
+            }
+            if !counted {
+                let units = self.out.deg(u) + if self.symmetric { 0 } else { inn.deg(u) };
+                work.tick_n(units + 1, "simple-rows")?;
             }
             let start = adj.len();
             if self.symmetric {
                 for &v in self.out.row(u) {
                     if v != u {
-                        adj.push(v);
+                        adj.push(v)?;
                     }
                 }
             } else {
-                merge_rows(self.out.row(u), inn.row(u), &mut adj);
+                merge_rows(self.out.row(u), inn.row(u), &mut adj)?;
                 // the merge may hold u itself
                 let mut w = start;
                 for r in start..adj.len() {
@@ -523,7 +535,7 @@ impl Graph {
                 adj.truncate(w);
             }
             // sorted rows: drop repeats
-            last = u32::MAX;
+            let mut last = u32::MAX;
             let mut w = start;
             for r in start..adj.len() {
                 if adj[r] != last {
@@ -535,26 +547,31 @@ impl Graph {
             adj.truncate(w);
             off[u as usize + 1] = adj.len() as u64;
         }
-        Ok(Csr { off, adj, w: None })
+        Ok(Csr {
+            off: off.into_output(),
+            adj: adj.into_output(),
+            w: None,
+        })
     }
 
     /// The graph read as undirected and weighted: rows without self-loops, parallel edges
     /// merged by summing their weights (1 for an edge without one). An edge of a directed
-    /// graph is held in both rows.
+    /// graph is held in both rows. The rows are charged to the call for the whole call.
     pub fn weighted_sym(&self, ctl: &Control) -> Result<Csr> {
-        ctl.charge(self.out.bytes() * 3)?;
         let n = self.n();
         let incoming = self.inn(ctl)?;
         let inn = &*incoming;
-        let mut off = vec![0u64; n + 1];
-        let cap = self.out.nnz() * if self.symmetric { 1 } else { 2 };
-        let mut adj: Vec<u32> = Vec::with_capacity(cap);
-        let mut ws: Vec<f32> = Vec::with_capacity(cap);
-        let mut tmp: Vec<(u32, f32)> = Vec::new();
+        let cap = self
+            .out
+            .nnz()
+            .checked_mul(if self.symmetric { 1 } else { 2 })
+            .ok_or_else(|| super::bad("projection", "edge count overflows"))?;
+        let mut off = Buffer::<u64>::zeroed("weighted-offsets", n + 1, ctl)?;
+        let mut adj = Buffer::<u32>::new("weighted-edges", cap, ctl)?;
+        let mut ws = Buffer::<f32>::new("weighted-weights", cap, ctl)?;
+        let mut tmp: Growing<(u32, f32)> = Growing::new("weighted-row", ctl)?;
+        let mut work = Work::new(ctl)?;
         for u in 0..n as u32 {
-            if (u as usize).is_multiple_of(super::CHECK_EVERY) {
-                ctl.check()?;
-            }
             tmp.clear();
             let rows: &[&Csr] = if self.symmetric {
                 &[&self.out]
@@ -563,9 +580,11 @@ impl Graph {
             };
             for csr in rows {
                 let (r, w) = (csr.row(u), csr.wrow(u));
+                work.tick_n(r.len() + 1, "weighted-rows")?;
+                tmp.reserve(r.len())?;
                 for (i, &v) in r.iter().enumerate() {
                     if v != u {
-                        tmp.push((v, w.map_or(1.0, |w| w[i])));
+                        tmp.push((v, w.map_or(1.0, |w| w[i])))?;
                     }
                 }
             }
@@ -578,33 +597,35 @@ impl Graph {
                     s += tmp[i].1;
                     i += 1;
                 }
-                adj.push(v);
-                ws.push(s);
+                adj.push(v)?;
+                ws.push(s)?;
             }
             off[u as usize + 1] = adj.len() as u64;
         }
         Ok(Csr {
-            off,
-            adj,
-            w: Some(ws),
+            off: off.into_output(),
+            adj: adj.into_output(),
+            w: Some(ws.into_output()),
         })
     }
 }
 
 /// Append the merge of two sorted rows.
-fn merge_rows(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+fn merge_rows(a: &[u32], b: &[u32], out: &mut Buffer<u32>) -> Result<()> {
+    if out.room() < a.len() + b.len() {
+        return Err(super::bad("memory", "fixed buffer capacity exceeded"));
+    }
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if a[i] <= b[j] {
-            out.push(a[i]);
+            out.push_within(a[i]);
             i += 1;
         } else {
-            out.push(b[j]);
+            out.push_within(b[j]);
             j += 1;
         }
     }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
+    out.extend_within(a[i..].iter().chain(&b[j..]).copied())
 }
 
 #[cfg(test)]

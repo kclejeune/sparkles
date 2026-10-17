@@ -68,6 +68,25 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
         )
         .into_response();
     };
+    // Authorize before the body is read: a caller that can neither read the dataset
+    // through the query endpoint nor write it through the update endpoint can run
+    // nothing here, and does not get the body buffered and parsed.
+    #[cfg(test)]
+    probe::event(&parts.extensions, "pre-grant");
+    if let Some(denied) =
+        crate::auth::dataset_denial(&st, p, &parts.headers, &name, Level::Read, Endpoint::Query)
+        && crate::auth::dataset_denial(
+            &st,
+            p,
+            &parts.headers,
+            &name,
+            Level::Write,
+            Endpoint::Update,
+        )
+        .is_some()
+    {
+        return denied;
+    }
     let body =
         match super::read_body(body, st.limits.max_admin_body_bytes, "--max-admin-body-mb").await {
             Ok(body) => body,
@@ -123,10 +142,21 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
     };
     parts.extensions.insert(prepared);
     let req = Request::from_parts(parts, axum::body::Body::empty());
+    // A read run is a query and waits for its initial grant of the memory pool as one
+    // does. A write-back run takes its grant when its task starts (see `run`).
+    let query = matches!(class, crate::ratelimit::Class::Query);
+    let state = st.clone();
+    let admitted = |req: Request| async move {
+        if query {
+            crate::server_memory::granted(&state, req, next).await
+        } else {
+            next.run(req).await
+        }
+    };
     match &st.rate_limit {
         Some(rl) => {
             crate::ratelimit::limit_as(rl, class, Some(name), req, |req| async move {
-                let mut resp = next.run(req).await;
+                let mut resp = admitted(req).await;
                 // Outer JSON/Turtle formatting must not replace PermitBody after
                 // admission, including when only the raw Body remains with a client.
                 super::finalize_error_response(&mut resp, id, turtle);
@@ -134,7 +164,7 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
             })
             .await
         }
-        None => next.run(req).await,
+        None => admitted(req).await,
     }
 }
 
@@ -197,6 +227,17 @@ pub(super) async fn run(
     // server's query timeout does not apply.
     opts.timeout = super::update_timeout(&st, &params);
     crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Update);
+    // The run takes its initial grant of the memory pool when its task starts, waiting
+    // in arrival order up to `--query-admission-wait` as a request does, so that a run
+    // queued behind others holds no memory while it waits.
+    opts.grant = None;
+    let admission = st.catalog.pool().map(|pool| {
+        (
+            pool.clone(),
+            crate::server_memory::initial_grant(&st, pool),
+            st.admission.wait,
+        )
+    });
     let author = super::author(&p);
     #[cfg(test)]
     prepared.probe.events.lock().push("task-id");
@@ -204,6 +245,12 @@ pub(super) async fn run(
     let key = ds.name.clone();
     let d = ds.clone();
     let task = st.start_task_opts(id, TASK, &key, None, true, move |h| {
+        let mut opts = opts;
+        if let Some((pool, want, wait)) = admission {
+            let control = h.control();
+            let grant = pool.admit_blocking(want, wait, || control.cancel.is_cancelled())?;
+            opts.grant = Some(Arc::new(grant));
+        }
         let rep = d
             .dataset
             .algorithms()
@@ -217,8 +264,13 @@ pub(super) async fn run(
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
-/// `GET /$/algo/{ds}/projections`
-pub(super) async fn list(st: St, Path(name): Path<String>) -> ApiResult<Json<J>> {
+/// `GET /$/algo/{ds}/projections`. The projection cache is shared by every dataset,
+/// so only a server administrator sees its size.
+pub(super) async fn list(
+    st: St,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<J>> {
     let ds = dataset(&st, &name)?;
     let projections: Vec<J> = ds
         .dataset
@@ -228,12 +280,14 @@ pub(super) async fn list(st: St, Path(name): Path<String>) -> ApiResult<Json<J>>
         .iter()
         .map(|(n, s)| stored_json(n, s))
         .collect();
-    let (bytes, entries) = sparkles::algo::cache::stats();
     let mut out = json!({
         "dataset": ds.name,
         "projections": projections,
-        "cache": { "bytes": bytes, "entries": entries },
     });
+    if p.has(crate::auth::ServerPerm::ServerAdmin) {
+        let (bytes, entries) = sparkles::algo::cache::stats();
+        out["cache"] = json!({ "bytes": bytes, "entries": entries });
+    }
     if let Some(e) = ds.dataset.algorithms().projections().error() {
         out["warning"] = e.into();
     }

@@ -586,6 +586,62 @@ because the bidirectional search stops where its frontiers meet. Searching from 
 person to everyone costs 1.4–1.8× the `+` count, since it also keeps path parents and
 levels, and weighted search costs 5.6–6.3× the unweighted search.
 
+### Graph algorithm polling
+
+Roadmap item 8 moved the cancellation and deadline checks of the graph algorithms
+inside every long loop and charged every workspace to the call. This A/B measures what
+that costs. Both builds ran the ignored `polling_cost` test of
+`tests/graph_algorithms_scale.rs` on forge, an Intel i5-13500 with nothing else running,
+pinned to four cores. The build before is 824b7238 with the same test file. The graph is
+random with 1,000,000 nodes and 5,000,000 edges, and each call ran under a far deadline,
+so every check reads the clock. The builds ran in eight ABBA pairs at one and four
+threads. Each run is the fastest of three calls, and the table gives the median of the
+eight runs of each build, with the slowest and fastest run.
+
+| algorithm | threads | before | range | after | range | change |
+|---|---:|---:|---|---:|---|---:|
+| PageRank, 20 iterations | 1 | 1956.7 | 1920.0–2022.5 | 505.5 | 488.0–523.7 | -74.2% |
+| Weakly connected components | 1 | 145.7 | 144.8–153.0 | 142.8 | 140.8–145.2 | -2.0% |
+| Strongly connected components | 1 | 236.2 | 214.9–246.0 | 219.9 | 211.6–265.1 | -6.9% |
+| Breadth-first search | 1 | 137.9 | 122.2–141.2 | 117.5 | 111.1–128.0 | -14.8% |
+| Label propagation | 1 | 694.8 | 693.3–700.6 | 704.4 | 700.1–711.5 | +1.4% |
+| Triangle count | 1 | 489.3 | 467.9–493.1 | 494.0 | 469.4–500.0 | +1.0% |
+| K-core | 1 | 252.6 | 250.8–255.6 | 251.8 | 224.5–252.9 | -0.4% |
+| FastRP | 1 | 2300.4 | 2298.8–2302.8 | 2310.0 | 2123.9–2313.3 | +0.4% |
+| PageRank, 20 iterations | 4 | 543.2 | 533.6–552.6 | 161.6 | 153.0–167.3 | -70.2% |
+| Weakly connected components | 4 | 40.8 | 39.5–41.2 | 40.2 | 38.9–40.5 | -1.3% |
+| Strongly connected components | 4 | 238.7 | 223.2–260.2 | 221.6 | 189.3–245.9 | -7.2% |
+| Breadth-first search | 4 | 39.2 | 37.7–41.9 | 35.3 | 33.9–36.8 | -10.1% |
+| Label propagation | 4 | 182.2 | 181.6–182.8 | 183.4 | 182.5–184.8 | +0.7% |
+| Triangle count | 4 | 239.9 | 234.9–257.5 | 241.5 | 237.0–250.1 | +0.6% |
+| K-core | 4 | 252.9 | 251.4–253.5 | 252.3 | 251.4–254.5 | -0.2% |
+| FastRP | 4 | 997.9 | 994.8–1004.5 | 1009.4 | 1003.0–1015.1 | +1.1% |
+
+Times are in milliseconds. PageRank is 3.4 to 3.9 times faster because it read the
+clock before every node, and now counts its rows and checks once per 64K units. A first
+build that counted every row and every merge cost triangle counting 5 to 7.5% and the
+connected components about 5% on one thread. The build measured here counts a block of
+rows at once while it holds at most 64K units, keeps the check out of the inner loops,
+and lets the search of strongly connected components scan a node's edges in one inner
+loop, which also makes that search and breadth-first search faster than before. A
+repeat of eight pairs for label propagation and FastRP measured +0.6% and +0.9% for
+label propagation and +0.6% and +0.4% for FastRP at one and four threads, so their
+changes in the table are within the noise of the measurement.
+
+The rows for strongly connected components, breadth-first search and triangle counting
+come from a later run of eight pairs against the same build before. In that build the
+search of strongly connected components also checks every 64K edges within one row,
+and breadth-first search charges the room of the next frontier one row at a time again
+instead of one block of rows at a time. The triangle rows changed by +1.0% and +0.6%
+against -0.2% and +0.3% in the first run, with ranges that overlap, after a change that
+only made one bound saturate. Breadth-first search charges at most 9.1 MB at its peak on
+this graph, against 8.0 MB in the build before, which charged the depths and the output
+but not the frontiers. A charge per block of rows had raised the peak to 14.5 MB from
+1.09 MB on a graph of 100,000 nodes of degree 50, and a unit test now keeps it under 16
+bytes a node there. The graph is uniform random, so it has no node of very high degree.
+The checks inside a long row are covered by the cancellation tests and by the 64K split
+of strongly connected components, and this measurement does not time them.
+
 ### Spatial queries
 
 This Sparkles-only run uses the geo fixture with 100,000 points, its polygons and 180,640

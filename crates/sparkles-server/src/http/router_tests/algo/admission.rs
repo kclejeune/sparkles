@@ -466,7 +466,14 @@ async fn body_aware_parse_grant_restore_lookup_order_and_denials() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(
         *p.events.lock(),
-        ["parse", "grant", "restore", "lookup", "projection"]
+        [
+            "pre-grant",
+            "parse",
+            "grant",
+            "restore",
+            "lookup",
+            "projection"
+        ]
     );
     for (name, body, token, status, events) in [
         (
@@ -474,52 +481,54 @@ async fn body_aware_parse_grant_restore_lookup_order_and_denials() {
             READ,
             Some('J'),
             StatusCode::FORBIDDEN,
-            vec!["parse", "grant"],
+            // a caller that can neither query nor update is refused before its body
+            // is read
+            vec!["pre-grant"],
         ),
         (
             "other",
             READ,
             Some('H'),
             StatusCode::NOT_FOUND,
-            vec!["parse", "grant"],
+            vec!["pre-grant"],
         ),
         (
             "missing",
             READ,
             Some('H'),
             StatusCode::NOT_FOUND,
-            vec!["parse", "grant"],
+            vec!["pre-grant"],
         ),
-        ("g", "{", Some('H'), StatusCode::BAD_REQUEST, vec!["parse"]),
+        (
+            "g",
+            "{",
+            Some('H'),
+            StatusCode::BAD_REQUEST,
+            vec!["pre-grant", "parse"],
+        ),
         (
             "missing",
             "{}",
             Some('H'),
-            StatusCode::BAD_REQUEST,
-            vec!["parse"],
+            StatusCode::NOT_FOUND,
+            vec!["pre-grant"],
         ),
         (
             "g",
             r#"{"algorithm":"wcc","write":{"graph":"urn:o","mode":"bad","predicates":{}}}"#,
             Some('I'),
             StatusCode::BAD_REQUEST,
-            vec!["parse"],
+            vec!["pre-grant", "parse"],
         ),
         (
             "g",
             r#"{"algorithm":"wcc","unknown":true}"#,
             Some('H'),
             StatusCode::BAD_REQUEST,
-            vec!["parse"],
+            vec!["pre-grant", "parse"],
         ),
         ("g", READ, Some('Z'), StatusCode::UNAUTHORIZED, vec![]),
-        (
-            "g",
-            READ,
-            None,
-            StatusCode::UNAUTHORIZED,
-            vec!["parse", "grant"],
-        ),
+        ("g", READ, None, StatusCode::UNAUTHORIZED, vec!["pre-grant"]),
     ] {
         let p = Probe::default();
         let r = send(
@@ -528,7 +537,7 @@ async fn body_aware_parse_grant_restore_lookup_order_and_denials() {
         )
         .await;
         assert_eq!(r.status, status, "{}", r.text());
-        assert_eq!(*p.events.lock(), events);
+        assert_eq!(*p.events.lock(), events, "{name} {token:?} {body}");
         assert!(s.state.tasks.lock().is_empty());
     }
     // Exact POST only. Projection policy stays Info for reads and Admin for writes.
@@ -627,7 +636,7 @@ async fn body_aware_read_only_writes_refuse_before_restore_or_task() {
         .unwrap();
     let r = send(&s.app, probed("/$/algo/g/run", WRITE, None, &p)).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
-    assert_eq!(*p.events.lock(), ["parse", "grant"]);
+    assert_eq!(*p.events.lock(), ["pre-grant", "parse", "grant"]);
     assert!(!r.text().contains("not-for-readonly"));
     assert!(s.state.tasks.lock().is_empty());
 }
@@ -658,7 +667,14 @@ async fn body_aware_caps_and_compression_preserve_request_parts() {
     assert!(r.text().contains("component"));
     assert_eq!(
         *p.events.lock(),
-        ["parse", "grant", "restore", "lookup", "projection"]
+        [
+            "pre-grant",
+            "parse",
+            "grant",
+            "restore",
+            "lookup",
+            "projection"
+        ]
     );
     for compressed in [false, true] {
         let p = Probe::default();
@@ -674,7 +690,11 @@ async fn body_aware_caps_and_compression_preserve_request_parts() {
         }
         let r = send(&s.app, req).await;
         assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", r.text());
-        assert!(p.events.lock().is_empty());
+        assert_eq!(
+            *p.events.lock(),
+            ["pre-grant"],
+            "authorization precedes the body"
+        );
     }
     let p = Probe::default();
     let mut req = probed("/$/algo/g/run", READ, None, &p);
@@ -686,7 +706,7 @@ async fn body_aware_caps_and_compression_preserve_request_parts() {
         send(&s.app, req).await.status,
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    assert!(p.events.lock().is_empty());
+    assert_eq!(*p.events.lock(), ["pre-grant"]);
     let mut req = request("/$/algo/g/run", "invalid gzip", None);
     req.headers_mut()
         .insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
@@ -852,7 +872,7 @@ async fn body_aware_anonymous_and_error_headers_keep_outer_auth() {
         .await
         .unwrap();
     assert_eq!(serde_json::from_slice::<J>(&body).unwrap()["requestId"], id);
-    assert_eq!(*p.events.lock(), ["parse", "grant"]);
+    assert_eq!(*p.events.lock(), ["pre-grant", "parse", "grant"]);
     assert!(s.state.tasks.lock().is_empty());
     for path in ["/$/algo/other/run", "/$/algo/missing/run"] {
         assert_eq!(
@@ -1126,7 +1146,10 @@ async fn body_aware_queue_full_refuses_before_new_task_id() {
     let before = s.state.tasks.lock().len();
     let r = send(&s.app, probed("/$/algo/g/run", WRITE, None, &p)).await;
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
-    assert_eq!(*p.events.lock(), ["parse", "grant", "restore", "lookup"]);
+    assert_eq!(
+        *p.events.lock(),
+        ["pre-grant", "parse", "grant", "restore", "lookup"]
+    );
     assert_eq!(s.state.tasks.lock().len(), before);
     for id in ids {
         assert!(s.state.cancel_task(&id).unwrap().is_ok());
@@ -1168,5 +1191,26 @@ impl Drop for TaskCleanup {
         for id in ids {
             self.0.cancel_task(&id);
         }
+    }
+}
+
+/// The projection cache is shared by every dataset, so its size is a server-wide figure
+/// that only a server administrator sees.
+#[cfg(feature = "auth")]
+#[tokio::test]
+async fn only_a_server_administrator_sees_the_projection_cache() {
+    let admin = format!(
+        "\n[[tokens]]\nname = \"admin\"\nhash = \"{}\"\nserver = [\"server-admin\"]\n",
+        crate::auth::token_hash(&token_text('A'))
+    );
+    let s = policy_fixture(&[], true, false, &admin, |_| {});
+    for (token, cache) in [('J', false), ('A', true)] {
+        let mut req = request("/$/algo/g/projections", "", Some(token));
+        *req.method_mut() = axum::http::Method::GET;
+        let r = send(&s.app, req).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let j = r.json();
+        assert_eq!(j["dataset"], "g");
+        assert_eq!(j.get("cache").is_some(), cache, "{token}: {j}");
     }
 }
