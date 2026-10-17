@@ -2491,13 +2491,16 @@ impl Operator {
                             *external = Some(sort);
                             break 'blocking batch;
                         };
-                        // Row reordering/output copies and their index arrays can
-                        // coexist with the input columns. Reserve before sorting.
-                        input.charge.resize(
-                            capacity_bytes(&input.table)
-                                .saturating_mul(3)
-                                .saturating_add(input.table.len as u64 * 24 + 1024),
-                        )?;
+                        // Row reordering, output copies and their index arrays can
+                        // coexist with the input columns. ORDER BY charges them itself,
+                        // and a Sort reserves them here before sorting.
+                        if matches!(node.kind, Kind::Sort(_)) {
+                            input.charge.resize(
+                                capacity_bytes(&input.table)
+                                    .saturating_mul(3)
+                                    .saturating_add(input.table.len as u64 * 24 + 1024),
+                            )?;
+                        }
                         let mut report = ExprReport::default();
                         input.table = exec::apply_blocking(ctx, node, input.table, &mut report)?;
                         input.reconcile()?;
