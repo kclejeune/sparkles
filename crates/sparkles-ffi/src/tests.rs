@@ -664,3 +664,41 @@ fn automatic_execution_streams_large_scans_with_the_rows_of_eager() {
     assert!(!q.streams());
     assert!(q.next_batch(10).unwrap().done);
 }
+
+/// A streamed query's batches share one term dictionary up to the dataset's term cache
+/// size. With more distinct terms than that, the dictionary restarts, and the rows read
+/// back are still those of eager execution.
+#[test]
+fn automatic_batches_restart_a_full_shared_dictionary() {
+    let ds = FfiDataset::memory(DatasetOptions {
+        term_cache_size: 100,
+        ..opts(BlankNodeMode::Dataset)
+    });
+    let data = (0..5000)
+        .map(|i| format!("<http://ex.org/s{i}> <http://ex.org/p> \"v{i}\" .\n"))
+        .collect::<String>();
+    ds.load_bytes(data.into_bytes(), "text/turtle".into(), None, None)
+        .unwrap();
+    let text = "SELECT ?s ?o { ?s <http://ex.org/p> ?o }";
+    let run = |auto: bool| {
+        let q = ds.prepare_query(text.into(), qopts()).unwrap();
+        let e = q.execute_with(10, auto).unwrap();
+        assert_eq!(q.streams(), auto);
+        let mut table = Vec::new();
+        let mut out = rows(&e.batch, &mut table);
+        let (mut done, mut restarts) = (e.done, 0);
+        while !done {
+            let b = q.next_batch(300).unwrap();
+            restarts += usize::from(b.batch[1] & encode::FLAG_RESTART != 0);
+            out.extend(rows(&b.batch, &mut table));
+            done = b.done;
+        }
+        out.sort_by_key(|row| format!("{row:?}"));
+        (out, restarts)
+    };
+    let (eager, _) = run(false);
+    let (auto, restarts) = run(true);
+    assert_eq!(auto.len(), 5000);
+    assert_eq!(auto, eager);
+    assert!(restarts > 0, "the dictionary restarted");
+}
