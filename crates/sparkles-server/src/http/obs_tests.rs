@@ -1207,7 +1207,7 @@ async fn cursor_formats_send_and_deferred_completion_match_eager() {
     let s = server();
     for format in ["json", "xml", "csv", "tsv"] {
         let uri = format!("{ALL}&format={format}");
-        let eager = get(&s.app, &uri).await;
+        let eager = get(&s.app, &format!("{uri}&execution=eager")).await;
         let res = s
             .app
             .clone()
@@ -1423,7 +1423,7 @@ async fn cursor_graph_and_ask_formats_use_the_negotiated_query_form() {
             form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
         );
         for fmt in ["json", "xml", "csv", "tsv", "sparkles"] {
-            let eager = get(&s.app, &format!("{uri}&format={fmt}")).await;
+            let eager = get(&s.app, &format!("{uri}&format={fmt}&execution=eager")).await;
             let pull = get(&s.app, &format!("{uri}&format={fmt}&execution=streaming")).await;
             assert_eq!(pull.status, StatusCode::OK, "{}", pull.text());
             assert_eq!(pull.headers["content-type"], eager.headers["content-type"]);
@@ -1489,7 +1489,7 @@ fn automatic_execution_uses_eager_when_thrift_has_no_cursor_writer() {
 #[tokio::test]
 async fn automatic_thrift_results_match_eager() {
     let s = server();
-    let eager = get(&s.app, &format!("{ALL}&format=thrift")).await;
+    let eager = get(&s.app, &format!("{ALL}&format=thrift&execution=eager")).await;
     let auto = get(&s.app, &format!("{ALL}&format=thrift&execution=auto")).await;
     assert_eq!(auto.status, StatusCode::OK, "{}", auto.text());
     assert_eq!(auto.headers["content-type"], eager.headers["content-type"]);
@@ -1500,7 +1500,7 @@ async fn automatic_thrift_results_match_eager() {
 async fn automatic_small_queries_preserve_eager_results() {
     let s = server();
     for fmt in ["json", "xml", "csv", "tsv"] {
-        let eager = get(&s.app, &format!("{ALL}&format={fmt}")).await;
+        let eager = get(&s.app, &format!("{ALL}&format={fmt}&execution=eager")).await;
         let auto = get(&s.app, &format!("{ALL}&format={fmt}&execution=auto")).await;
         assert_eq!(auto.status, StatusCode::OK, "{}", auto.text());
         assert_eq!(auto.body, eager.body);
@@ -1527,4 +1527,118 @@ async fn cache_capacities_are_server_wide_and_unlabelled() {
         assert!(sample(&m, &series).is_some(), "{series}");
     }
     assert!(!m.contains("sparkles_block_cache_capacity_bytes{"));
+}
+
+/// A dataset `big` of one million `<urn:s{i}> <urn:p> i` triples in one immutable base,
+/// the smallest scan that automatic execution streams.
+fn million(s: &Server) {
+    let mut data = String::with_capacity(32 << 20);
+    for i in 0..1_000_000 {
+        data.push_str(&format!("<urn:s{i}> <urn:p> {i} .\n"));
+    }
+    let ds = s.state.attach("big", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+}
+
+const BIG_SCAN: &str =
+    "/big/sparql?query=SELECT%20%3Fs%20%3Fo%20WHERE%20%7B%3Fs%20%3Curn%3Ap%3E%20%3Fo%7D";
+
+#[tokio::test]
+async fn the_default_streams_a_large_scan_and_eager_opts_out() {
+    let s = server();
+    million(&s);
+    // the default is automatic: the scan streams and stops after the rows it sends
+    let auto = get(&s.app, &format!("{BIG_SCAN}&format=sparkles&send=10")).await;
+    assert_eq!(auto.status, StatusCode::OK, "{}", auto.text());
+    let j = auto.json();
+    assert_eq!(j["meta"]["status"], "stopped");
+    assert_eq!(j["meta"]["totalRows"], J::Null);
+    assert_eq!(j["meta"]["sentRows"], 10);
+    // `execution=eager` runs the whole scan and reports its total
+    let eager = get(
+        &s.app,
+        &format!("{BIG_SCAN}&format=sparkles&send=10&execution=eager"),
+    )
+    .await;
+    assert_eq!(eager.status, StatusCode::OK, "{}", eager.text());
+    let j = eager.json();
+    assert_eq!(j["meta"]["totalRows"], 1_000_000);
+    assert_eq!(j["meta"]["sentRows"], 10);
+    // the whole streamed answer has the eager rows in the eager order
+    let streamed = get(&s.app, &format!("{BIG_SCAN}&format=tsv")).await;
+    let collected = get(&s.app, &format!("{BIG_SCAN}&format=tsv&execution=eager")).await;
+    assert_eq!(streamed.status, StatusCode::OK);
+    assert!(streamed.header("content-length").is_empty());
+    assert_eq!(streamed.body, collected.body);
+    // A request whose row budget the scan is expected to pass stays eager, so it fails
+    // with a status before any output instead of partway through a stream.
+    let capped = get(&s.app, &format!("{BIG_SCAN}&format=tsv&max-rows=500000")).await;
+    assert_eq!(
+        capped.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        capped.text()
+    );
+    // so does a request that lowers the result-size budget
+    let small = get(
+        &s.app,
+        &format!("{BIG_SCAN}&format=sparkles&send=10&max-result-mb=64"),
+    )
+    .await;
+    assert_eq!(small.json()["meta"]["totalRows"], 1_000_000);
+}
+
+#[tokio::test]
+async fn a_server_can_default_to_eager_execution() {
+    let s = server_with(|st| st.default_execution = sparkles::sparql::ExecutionMode::Eager);
+    million(&s);
+    let eager = get(&s.app, &format!("{BIG_SCAN}&format=sparkles&send=10")).await;
+    assert_eq!(eager.json()["meta"]["totalRows"], 1_000_000);
+    let auto = get(
+        &s.app,
+        &format!("{BIG_SCAN}&format=sparkles&send=10&execution=auto"),
+    )
+    .await;
+    assert_eq!(auto.json()["meta"]["status"], "stopped");
+}
+
+#[tokio::test]
+async fn a_late_failure_of_a_default_stream_aborts_the_transfer() {
+    use futures_util::StreamExt;
+    let s = server();
+    million(&s);
+    // The deadline of a streamed answer includes the time its reader takes, so a reader
+    // that stalls past it gets a cut-off transfer after a successful status.
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!("{BIG_SCAN}&format=tsv&timeout=1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut body = res.into_body().into_data_stream();
+    let first = body.next().await.expect("a first chunk").unwrap();
+    assert!(first.starts_with(b"?s\t?o\n"));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut failed = false;
+    while let Some(chunk) = body.next().await {
+        if chunk.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(
+        failed,
+        "a stream past its deadline must not end successfully"
+    );
 }

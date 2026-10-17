@@ -1299,6 +1299,15 @@ async fn query_endpoint(
     run_query(st, ds, p, uri, headers, params, query, Vec::new()).await
 }
 
+/// What the blocking part of a query gave: a materialized result, or a cursor that
+/// automatic execution opened. The result stays unboxed: it is moved once, and every
+/// eager query would pay for a box.
+#[allow(clippy::large_enum_variant)]
+enum Ran {
+    Eager(sparkles::sparql::QueryResult),
+    Cursor(Box<sparkles::sparql::QueryExecution>),
+}
+
 /// Run a query as `/{ds}/sparql` does: the request's budgets, graph view, result format
 /// and history parameters, with `bindings` as initial bindings (stored queries).
 #[allow(clippy::too_many_arguments)]
@@ -1314,7 +1323,8 @@ pub(crate) async fn run_query(
 ) -> ApiResult {
     let io = io_profile(&params, &p)?;
     let execution = match params.get("execution") {
-        None | Some("eager") => sparkles::sparql::ExecutionMode::Eager,
+        None => st.default_execution,
+        Some("eager") => sparkles::sparql::ExecutionMode::Eager,
         Some("streaming") => sparkles::sparql::ExecutionMode::Streaming,
         Some("auto") => sparkles::sparql::ExecutionMode::Auto,
         Some(_) => {
@@ -1341,7 +1351,16 @@ pub(crate) async fn run_query(
     let limit = asked.result_limit(st.limits.max_result_bytes);
     let sfmt = solutions_format(&params, &headers);
     let thrift = results_thrift(&params, &headers);
-    if execution != sparkles::sparql::ExecutionMode::Eager {
+    // Automatic execution decides once the query is planned, and a plan it keeps eager
+    // continues below exactly as an eager request does. Some requests run eagerly
+    // without asking: SPARQL Results Thrift has no cursor writer, initial bindings rule
+    // out every automatic plan, and a lowered result-size budget needs the eager check
+    // that refuses an oversized result before its first byte.
+    let auto = execution == sparkles::sparql::ExecutionMode::Auto
+        && !thrift
+        && bindings.is_empty()
+        && !asked.asks_result_bytes();
+    if execution == sparkles::sparql::ExecutionMode::Streaming {
         let rdf_format = rdf_format(&params, &headers, false);
         let native_graph = params_wants_sparkles(&headers);
         opts.initial_bindings = bindings;
@@ -1387,6 +1406,9 @@ pub(crate) async fn run_query(
     // of the algorithm namespace, so a prefixed name counts like the full IRI, and a
     // query that does is never remembered as quick and so never runs in place.
     let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
+    // A query known to be quick ran eagerly in well under the time a stream pays off,
+    // so it skips the automatic decision and keeps running in place.
+    let auto = auto && !in_place;
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
@@ -1396,8 +1418,24 @@ pub(crate) async fn run_query(
             let t0 = crate::otel::start();
             let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
             let seq = snap.commit;
-            let r = match sparkles::sparql::query_with_plan(snap, &query, &opts) {
-                Ok(r) => r,
+            let ran = if auto {
+                sparkles::sparql::query_execution_with_plan(
+                    snap,
+                    &query,
+                    &opts,
+                    &Default::default(),
+                    sparkles::sparql::ExecutionMode::Auto,
+                )
+                .map(|execution| match execution {
+                    sparkles::sparql::QueryExecution::Eager(r) => Ran::Eager(r.into_result()),
+                    cursor => Ran::Cursor(Box::new(cursor)),
+                })
+            } else {
+                sparkles::sparql::query_with_plan(snap, &query, &opts).map(Ran::Eager)
+            };
+            let r = match ran {
+                Ok(Ran::Cursor(cursor)) => return Ok((Ran::Cursor(cursor), seq, resolved, t0)),
+                Ok(Ran::Eager(r)) => r,
                 Err(f) => {
                     let mut e: ApiError = f.error.into();
                     if failed_plan && let (Some(plan), Some(body)) = (f.plan, e.1.as_object_mut()) {
@@ -1412,7 +1450,7 @@ pub(crate) async fn run_query(
                 }
             };
             tracing::debug!("query executed in {:?} ({} results)", t.elapsed(), r.len());
-            Ok((r, seq, resolved, t0))
+            Ok((Ran::Eager(r), seq, resolved, t0))
         }
     };
     let ran = if in_place {
@@ -1426,6 +1464,32 @@ pub(crate) async fn run_query(
         QUICK.record(quick_key, f64::INFINITY);
     }
     let (r, seq, resolved, t0) = ran.map_err(|e| with_timeout(e, timeout))?;
+    let r = match r {
+        Ran::Eager(r) => r,
+        Ran::Cursor(cursor) => {
+            return cursor::serve(
+                ds,
+                *cursor,
+                seq,
+                resolved,
+                cursor::Serve {
+                    params,
+                    uri,
+                    guard: _cancel_on_drop,
+                    limit,
+                    format: sfmt,
+                    thrift,
+                    rdf_format: rfmt,
+                    native_graph: params_wants_sparkles(&headers),
+                    prefixes,
+                    io,
+                    timeout,
+                    with_extra,
+                },
+            )
+            .await;
+        }
+    };
     let algorithmic = r.ctx.calls_algorithm();
     let query_ms = r.timing.total_ms;
     let cells = r.len().saturating_mul(r.vars.len().max(3));

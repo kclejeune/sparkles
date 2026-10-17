@@ -39,6 +39,23 @@ pub(super) fn effective_mode(execution: ExecutionMode, thrift: bool) -> Executio
     }
 }
 
+/// How an opened execution is answered: everything of [`Request`] except what opening
+/// it needed.
+pub(super) struct Serve {
+    pub params: Params,
+    pub uri: Uri,
+    pub guard: CancelOnDrop,
+    pub limit: Option<u64>,
+    pub format: SolutionsFormat,
+    pub thrift: bool,
+    pub rdf_format: OutFormat,
+    pub native_graph: bool,
+    pub prefixes: std::collections::BTreeMap<String, String>,
+    pub io: Option<Arc<sparkles::ioacct::Profile>>,
+    pub timeout: Option<std::time::Duration>,
+    pub with_extra: bool,
+}
+
 pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     let Request {
         query,
@@ -52,16 +69,15 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
         rdf_format,
         native_graph,
         execution,
-        prefixes: prefix_map,
+        prefixes,
         io,
     } = request;
     let execution = effective_mode(execution, thrift);
     let at = history::at_param(&params)?;
-    let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     let timeout = options.timeout;
     let with_extra = !options.default_graph_extra.is_empty();
     let captured_ds = ds.clone();
-    let (mut cursor, seq, resolved) = blocking(move || {
+    let (cursor, seq, resolved) = blocking(move || {
         let (snapshot, resolved) = history::snapshot_for(&captured_ds, at.as_ref(), &options)?;
         let seq = snapshot.commit;
         let cursor = query_execution(snapshot, &query, &options, &Default::default(), execution)?;
@@ -69,6 +85,52 @@ pub(super) async fn run(ds: Arc<Dataset>, request: Request) -> ApiResult {
     })
     .await
     .map_err(|e| with_timeout(e, timeout))?;
+    serve(
+        ds,
+        cursor,
+        seq,
+        resolved,
+        Serve {
+            params,
+            uri,
+            guard,
+            limit,
+            format,
+            thrift,
+            rdf_format,
+            native_graph,
+            prefixes,
+            io,
+            timeout,
+            with_extra,
+        },
+    )
+    .await
+}
+
+/// Answer an opened execution, writing a cursor's batches as they come.
+pub(super) async fn serve(
+    ds: Arc<Dataset>,
+    mut cursor: QueryExecution,
+    seq: u64,
+    resolved: Option<sparkles::history::Resolved>,
+    serve: Serve,
+) -> ApiResult {
+    let Serve {
+        params,
+        uri,
+        guard,
+        limit,
+        format,
+        thrift,
+        rdf_format,
+        native_graph,
+        prefixes: prefix_map,
+        io,
+        timeout,
+        with_extra,
+    } = serve;
+    let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     if thrift && cursor.kind() == QueryKind::Select && !matches!(cursor, QueryExecution::Eager(_)) {
         return Err(Error::Unsupported(
             "streaming SELECT does not support Thrift; choose JSON, XML, CSV, TSV or native JSON"

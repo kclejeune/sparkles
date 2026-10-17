@@ -329,6 +329,8 @@ pub struct AppState {
     /// the memory profile and the admission wait of the query memory pool
     pub admission: crate::server_memory::Admission,
     pub default_timeout: std::time::Duration,
+    /// how a query runs when its request names no `execution` (`serve --default-execution`)
+    pub default_execution: sparkles::sparql::ExecutionMode,
     pub read_only: bool,
     /// honor `validate=false` on writes (skips write-time validation)
     pub allow_unvalidated_writes: bool,
@@ -607,6 +609,7 @@ impl AppState {
             started_at: now(),
             store_opts,
             default_timeout,
+            default_execution: Default::default(),
             read_only: false,
             allow_service: true,
             outbound: Default::default(),
@@ -667,6 +670,7 @@ impl AppState {
             started_at: now(),
             store_opts,
             default_timeout,
+            default_execution: Default::default(),
             read_only: false,
             allow_service: false,
             outbound: Default::default(),

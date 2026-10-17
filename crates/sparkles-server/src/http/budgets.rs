@@ -63,6 +63,10 @@ impl Overrides {
     }
 
     /// The result-size budget of the response.
+    /// Whether the request lowered the result-size budget itself.
+    pub(super) fn asks_result_bytes(&self) -> bool {
+        self.result_bytes.is_some()
+    }
     pub(super) fn result_limit(&self, server: Option<u64>) -> Option<u64> {
         lower(server, self.result_bytes)
     }

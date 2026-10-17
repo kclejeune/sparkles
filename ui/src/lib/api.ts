@@ -1121,6 +1121,12 @@ export async function schema(
 
 export type QueryOptions = {
   send?: number;
+  /**
+   * How the server runs the query. The table view asks for `eager`, because it shows the
+   * total row count and compares totals, which a streamed result stopped after `send`
+   * rows does not know. Downloads leave it to the server, whose default is `auto`.
+   */
+  execution?: 'eager' | 'auto' | 'streaming';
   timeout?: number;
   reasoning?: boolean;
   /** Bypass the server's result cache. */
@@ -1135,6 +1141,7 @@ function queryParams(opts: QueryOptions): string {
   if (opts.at) p.set('at', opts.at);
   if (opts.nocache) p.set('nocache', 'true');
   if (opts.send != null) p.set('send', String(opts.send));
+  if (opts.execution) p.set('execution', opts.execution);
   if (opts.timeout != null) p.set('timeout', String(opts.timeout));
   if (opts.reasoning != null) p.set('reasoning', String(opts.reasoning));
   const s = p.toString();
@@ -1147,7 +1154,7 @@ export async function query(
   sparql: string,
   opts: QueryOptions = {},
 ): Promise<SparklesResult> {
-  const res = await request(`/${enc(ds)}/sparql${queryParams(opts)}`, {
+  const res = await request(`/${enc(ds)}/sparql${queryParams({ execution: 'eager', ...opts })}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/sparql-query',
@@ -3246,15 +3253,18 @@ export async function runStoredQuery(
   values: Record<string, string>,
   opts: QueryOptions = {},
 ): Promise<SparklesResult> {
-  const res = await request(`/${enc(ds)}/queries/${enc(name)}${queryParams(opts)}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Accept: SPARKLES_JSON,
+  const res = await request(
+    `/${enc(ds)}/queries/${enc(name)}${queryParams({ execution: 'eager', ...opts })}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: SPARKLES_JSON,
+      },
+      body: new URLSearchParams(values).toString(),
+      signal: opts.signal,
     },
-    body: new URLSearchParams(values).toString(),
-    signal: opts.signal,
-  });
+  );
   const body = (await res.json()) as SparklesResult;
   const inferences = parseInferencesHeader(res.headers.get('Sparkles-Inferences'));
   if (inferences) body.inferences = inferences;
