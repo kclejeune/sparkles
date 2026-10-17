@@ -106,6 +106,21 @@ class StreamingQueryTest {
         }
     }
 
+    /**
+     * Automatic execution streams a large scan. Under a memory budget that a batch fits and
+     * the whole result does not, the automatic read completes where the eager one fails.
+     */
+    @Test fun automatic_execution_streams_a_scan_that_eager_execution_cannot_hold() {
+        people(150000).use { ds ->
+            fun count(streaming: Boolean?): Int =
+                QueryExecution.dataset(DatasetFactory.wrap(ds)).query(scan)
+                    .context(context(streaming).set(Sparkles.MAX_MEMORY_BYTES, 2L shl 20)).build()
+                    .use { ResultSetFormatter.consume(it.execSelect()) }
+            assertEquals(150000, count(null))
+            assertThrows(SparklesBudgetExceededException::class.java) { count(false) }
+        }
+    }
+
     @Test fun closing_a_streamed_result_early_frees_it_and_the_dataset_keeps_answering() {
         people(5000).use { ds ->
             repeat(50) {
