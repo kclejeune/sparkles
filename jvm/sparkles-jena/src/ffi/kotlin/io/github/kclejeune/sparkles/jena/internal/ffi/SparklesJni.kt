@@ -27,7 +27,7 @@ import java.nio.ByteBuffer
  */
 public object SparklesJni {
     /** The entry points' version, which `jni_calls.rs` must return. */
-    private const val ABI_VERSION = 2
+    private const val ABI_VERSION = 3
 
     private val groups: Set<String> = System.getProperty("sparkles.jni")?.trim()?.lowercase().let { p ->
         when (p) {
@@ -148,10 +148,14 @@ public object SparklesJni {
         return FfiQuery(UniffiWithHandle, h)
     }
 
-    public fun execute(q: FfiQuery, firstRows: Int): Execution {
-        if (!QUERY) return q.execute(firstRows.toUInt())
+    /**
+     * Run a prepared query. With `auto`, Sparkles streams the plans that measured faster
+     * as cursors, and the query's later batches can then fail as the rows are read.
+     */
+    public fun execute(q: FfiQuery, firstRows: Int, auto: Boolean = false): Execution {
+        if (!QUERY) return q.executeWith(firstRows.toUInt(), auto)
         // counted native call
-        val bytes = q.uniffiBorrowHandle { jni { execute(it, firstRows) } }
+        val bytes = q.uniffiBorrowHandle { jni { execute(it, firstRows, auto) } }
         return FfiConverterTypeExecution.read(ByteBuffer.wrap(bytes))
     }
 
@@ -209,7 +213,7 @@ public object SparklesJni {
     @JvmStatic private external fun cursorNext(cursor: Long, maxRows: Int, out: LongArray): ByteArray
     @JvmStatic private external fun prepareHead(dataset: Long, text: ByteArray, options: ByteArray): Long
     @JvmStatic private external fun prepareRead(txn: Long, text: ByteArray, options: ByteArray): Long
-    @JvmStatic private external fun execute(query: Long, firstRows: Int): ByteArray
+    @JvmStatic private external fun execute(query: Long, firstRows: Int, auto: Boolean): ByteArray
 
     @JvmStatic private external fun freeReadTxnNative(txn: Long)
     @JvmStatic private external fun freeQueryNative(query: Long)

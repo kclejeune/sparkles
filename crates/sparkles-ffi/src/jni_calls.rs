@@ -30,7 +30,7 @@ use uniffi::{Handle, HandleAlloc, Lift, Lower};
 
 /// Changes when an entry point's signature changes; the Kotlin side checks it before it
 /// turns these calls on.
-const ABI_VERSION: jint = 2;
+const ABI_VERSION: jint = 3;
 
 type Env = *mut JNIEnv;
 
@@ -342,17 +342,18 @@ pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_Spark
     })
 }
 
-/// `FfiQuery::execute`, its `Execution` in UniFFI's serialization of the record.
+/// `FfiQuery::execute_with`, its `Execution` in UniFFI's serialization of the record.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_kclejeune_sparkles_jena_internal_ffi_SparklesJni_execute(
     env: Env,
     _class: jclass,
     query: jlong,
     first_rows: jint,
+    auto: jboolean,
 ) -> jbyteArray {
     call(env, null_mut(), || {
         let q = unsafe { borrow::<FfiQuery>(query) };
-        let e = q.execute(first_rows.max(0) as u32)?;
+        let e = q.execute_with(first_rows.max(0) as u32, auto)?;
         let mut buf = Vec::with_capacity(e.batch.len() + 64);
         <Execution as Lower<UniFfiTag>>::write(e, &mut buf);
         Ok(unsafe { new_bytes(env, &buf) })

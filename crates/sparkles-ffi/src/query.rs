@@ -18,6 +18,8 @@ pub const INFERRED_GRAPH: &str = "urn:x-sparkles:inferred";
 /// Rows of a later batch at most, and its size in bytes at most.
 const MAX_ROWS: u32 = 1 << 16;
 const MAX_BATCH_BYTES: usize = 1 << 20;
+/// The rows of a cursor batch that automatic execution reads, as the server's cursors.
+const CURSOR_ROWS: usize = 4096;
 
 /// The options of one query or update.
 #[derive(uniffi::Record)]
@@ -110,6 +112,8 @@ pub struct Execution {
 
 enum Rows {
     Select(Box<QueryResult>, TermTable<u64>),
+    /// the solutions of a SELECT that automatic execution streams
+    Cursor(Box<crate::FfiSelectCursor>),
     /// CONSTRUCT and DESCRIBE quads; `None` keys the default graph
     Quads(Vec<(Option<Term>, [Term; 3])>, TermTable<Option<Term>>),
 }
@@ -168,113 +172,17 @@ impl FfiQuery {
         self.cursor_allowed = false;
     }
 
-    fn batch(&self, st: &mut State, max: u32) -> Vec<u8> {
-        let max = max.clamp(1, MAX_ROWS) as usize;
-        self.labels.with(|_, label| match &mut st.rows {
-            Rows::Select(r, table) => {
-                let cols = r.table.cols.len();
-                let n = r.table.len();
-                let mut w = RowWriter::new(table, cols as u16);
-                let mut row = vec![0u32; cols];
-                while st.pos < n && (w.rows() as usize) < max && w.bytes() < MAX_BATCH_BYTES {
-                    let i = st.pos;
-                    for (c, cell) in row.iter_mut().enumerate() {
-                        let id = r.table.cols[c][i];
-                        *cell = if id.is_undef() {
-                            0
-                        } else {
-                            w.cell(id.0, || r.term(id), label)
-                        };
-                    }
-                    w.push_row(&row);
-                    st.pos += 1;
-                }
-                w.finish()
-            }
-            Rows::Quads(quads, table) => {
-                let mut w = RowWriter::new(table, 4);
-                while st.pos < quads.len()
-                    && (w.rows() as usize) < max
-                    && w.bytes() < MAX_BATCH_BYTES
-                {
-                    let (g, [s, p, o]) = &quads[st.pos];
-                    let gc = match g {
-                        None => w.default_graph(None),
-                        Some(g) => w.cell(Some(g.clone()), || Some(g.clone()), label),
-                    };
-                    let sc = w.cell(Some(s.clone()), || Some(s.clone()), label);
-                    let pc = w.cell(Some(p.clone()), || Some(p.clone()), label);
-                    let oc = w.cell(Some(o.clone()), || Some(o.clone()), label);
-                    w.push_row(&[gc, sc, pc, oc]);
-                    st.pos += 1;
-                }
-                w.finish()
-            }
-        })
+    /// Whether the rows still to come are read from a cursor.
+    #[cfg(test)]
+    pub(crate) fn streams(&self) -> bool {
+        self.state
+            .lock()
+            .as_ref()
+            .is_some_and(|st| matches!(st.rows, Rows::Cursor(_)))
     }
 
-    fn remaining(st: &State) -> bool {
-        match &st.rows {
-            Rows::Select(r, _) => st.pos < r.table.len(),
-            Rows::Quads(q, _) => st.pos < q.len(),
-        }
-    }
-}
-
-#[uniffi::export]
-impl FfiQuery {
-    /// Open an opt-in SELECT cursor without executing the whole result. The
-    /// prepared query's snapshot, defaults, bindings and cancellation are reused.
-    pub fn open_cursor(
-        &self,
-        batch_rows: u32,
-        batch_bytes: u64,
-        allow_materialization: bool,
-    ) -> FfiResult<Arc<crate::FfiSelectCursor>> {
-        if !self.cursor_allowed {
-            return Err(FfiError::new(
-                ErrorKind::Invalid,
-                "finish the transaction before opening a streaming cursor",
-            ));
-        }
-        if self.executed.swap(true, Ordering::SeqCst) {
-            return Err(FfiError::new(
-                ErrorKind::Invalid,
-                "the query has been executed already",
-            ));
-        }
-        let options = sparkles::sparql::CursorOptions {
-            batch_rows: batch_rows as usize,
-            batch_bytes: batch_bytes
-                .try_into()
-                .map_err(|_| FfiError::new(ErrorKind::Invalid, "batch_bytes is too large"))?,
-            fallback: if allow_materialization {
-                sparkles::sparql::FallbackPolicy::AllowMaterialization
-            } else {
-                sparkles::sparql::FallbackPolicy::RejectMaterialization
-            },
-        };
-        let cursor =
-            sparkles::sparql::select_cursor(self.snap.clone(), &self.text, &self.opts, &options)?;
-        Ok(Arc::new(crate::FfiSelectCursor::new(
-            cursor,
-            self.labels.clone(),
-            self.cancel.clone(),
-        )))
-    }
-    /// Run the query and return the first `first_rows` rows. The result table is freed
-    /// in the same call when no rows remain.
-    pub fn execute(&self, first_rows: u32) -> FfiResult<Execution> {
-        if self.executed.swap(true, Ordering::SeqCst) {
-            return Err(FfiError::new(
-                ErrorKind::Invalid,
-                "the query has been executed already",
-            ));
-        }
-        if self.cancel.load(Ordering::Relaxed) {
-            return Err(sparkles::Error::Cancelled.into());
-        }
-        let r = sparkles::sparql::query(self.snap.clone(), &self.text, &self.opts)?;
+    /// The execution of a materialized result, with its first `first_rows` rows.
+    fn finish(&self, r: QueryResult, first_rows: u32) -> FfiResult<Execution> {
         let t = &r.timing;
         let timing = Timing {
             parse_ms: t.parse_ms,
@@ -335,21 +243,207 @@ impl FfiQuery {
         })
     }
 
-    /// The next batch of up to `max_rows` rows (fewer when the batch reaches 1 MiB).
-    pub fn next_batch(&self, max_rows: u32) -> Batch {
+    fn batch(&self, st: &mut State, max: u32) -> Vec<u8> {
+        let max = max.clamp(1, MAX_ROWS) as usize;
+        self.labels.with(|_, label| match &mut st.rows {
+            Rows::Select(r, table) => {
+                let cols = r.table.cols.len();
+                let n = r.table.len();
+                let mut w = RowWriter::new(table, cols as u16);
+                let mut row = vec![0u32; cols];
+                while st.pos < n && (w.rows() as usize) < max && w.bytes() < MAX_BATCH_BYTES {
+                    let i = st.pos;
+                    for (c, cell) in row.iter_mut().enumerate() {
+                        let id = r.table.cols[c][i];
+                        *cell = if id.is_undef() {
+                            0
+                        } else {
+                            w.cell(id.0, || r.term(id), label)
+                        };
+                    }
+                    w.push_row(&row);
+                    st.pos += 1;
+                }
+                w.finish()
+            }
+            Rows::Quads(quads, table) => {
+                let mut w = RowWriter::new(table, 4);
+                while st.pos < quads.len()
+                    && (w.rows() as usize) < max
+                    && w.bytes() < MAX_BATCH_BYTES
+                {
+                    let (g, [s, p, o]) = &quads[st.pos];
+                    let gc = match g {
+                        None => w.default_graph(None),
+                        Some(g) => w.cell(Some(g.clone()), || Some(g.clone()), label),
+                    };
+                    let sc = w.cell(Some(s.clone()), || Some(s.clone()), label);
+                    let pc = w.cell(Some(p.clone()), || Some(p.clone()), label);
+                    let oc = w.cell(Some(o.clone()), || Some(o.clone()), label);
+                    w.push_row(&[gc, sc, pc, oc]);
+                    st.pos += 1;
+                }
+                w.finish()
+            }
+            // next_batch reads a cursor itself
+            Rows::Cursor(_) => encode::empty_batch(0),
+        })
+    }
+
+    fn remaining(st: &State) -> bool {
+        match &st.rows {
+            Rows::Select(r, _) => st.pos < r.table.len(),
+            Rows::Quads(q, _) => st.pos < q.len(),
+            Rows::Cursor(_) => true,
+        }
+    }
+}
+
+#[uniffi::export]
+impl FfiQuery {
+    /// Open an opt-in SELECT cursor without executing the whole result. The
+    /// prepared query's snapshot, defaults, bindings and cancellation are reused.
+    pub fn open_cursor(
+        &self,
+        batch_rows: u32,
+        batch_bytes: u64,
+        allow_materialization: bool,
+    ) -> FfiResult<Arc<crate::FfiSelectCursor>> {
+        if !self.cursor_allowed {
+            return Err(FfiError::new(
+                ErrorKind::Invalid,
+                "finish the transaction before opening a streaming cursor",
+            ));
+        }
+        if self.executed.swap(true, Ordering::SeqCst) {
+            return Err(FfiError::new(
+                ErrorKind::Invalid,
+                "the query has been executed already",
+            ));
+        }
+        let options = sparkles::sparql::CursorOptions {
+            batch_rows: batch_rows as usize,
+            batch_bytes: batch_bytes
+                .try_into()
+                .map_err(|_| FfiError::new(ErrorKind::Invalid, "batch_bytes is too large"))?,
+            fallback: if allow_materialization {
+                sparkles::sparql::FallbackPolicy::AllowMaterialization
+            } else {
+                sparkles::sparql::FallbackPolicy::RejectMaterialization
+            },
+        };
+        let cursor =
+            sparkles::sparql::select_cursor(self.snap.clone(), &self.text, &self.opts, &options)?;
+        Ok(Arc::new(crate::FfiSelectCursor::new(
+            cursor,
+            self.labels.clone(),
+            self.cancel.clone(),
+        )))
+    }
+    /// Run the query and return the first `first_rows` rows. The result table is freed
+    /// in the same call when no rows remain.
+    pub fn execute(&self, first_rows: u32) -> FfiResult<Execution> {
+        if self.executed.swap(true, Ordering::SeqCst) {
+            return Err(FfiError::new(
+                ErrorKind::Invalid,
+                "the query has been executed already",
+            ));
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(sparkles::Error::Cancelled.into());
+        }
+        let r = sparkles::sparql::query(self.snap.clone(), &self.text, &self.opts)?;
+        self.finish(r, first_rows)
+    }
+
+    /// Run the query as `execute` does, or in [`ExecutionMode::Auto`] when `auto` is set
+    /// and the query is outside a write transaction. Automatic execution streams the plans
+    /// that measured faster as cursors, and `next_batch` then reads the cursor, so a
+    /// failure can come from a later batch as well as from this call.
+    ///
+    /// [`ExecutionMode::Auto`]: sparkles::sparql::ExecutionMode::Auto
+    pub fn execute_with(&self, first_rows: u32, auto: bool) -> FfiResult<Execution> {
+        if !auto || !self.cursor_allowed {
+            return self.execute(first_rows);
+        }
+        if self.executed.swap(true, Ordering::SeqCst) {
+            return Err(FfiError::new(
+                ErrorKind::Invalid,
+                "the query has been executed already",
+            ));
+        }
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(sparkles::Error::Cancelled.into());
+        }
+        let options = sparkles::sparql::CursorOptions {
+            batch_rows: CURSOR_ROWS,
+            batch_bytes: MAX_BATCH_BYTES,
+            fallback: sparkles::sparql::FallbackPolicy::AllowMaterialization,
+        };
+        let execution = sparkles::sparql::query_execution(
+            self.snap.clone(),
+            &self.text,
+            &self.opts,
+            &options,
+            sparkles::sparql::ExecutionMode::Auto,
+        )?;
+        match execution {
+            sparkles::sparql::QueryExecution::Select(cursor) => {
+                let cursor =
+                    crate::FfiSelectCursor::new(*cursor, self.labels.clone(), self.cancel.clone());
+                let variables = cursor.variables();
+                let first = cursor.next_batch(first_rows)?;
+                if !first.done {
+                    *self.state.lock() = Some(State {
+                        rows: Rows::Cursor(Box::new(cursor)),
+                        pos: 0,
+                    });
+                }
+                Ok(Execution {
+                    kind: FfiQueryKind::Select,
+                    variables,
+                    boolean: false,
+                    batch: first.batch,
+                    done: first.done,
+                    timing: Timing::default(),
+                })
+            }
+            sparkles::sparql::QueryExecution::Eager(result) => {
+                self.finish(result.into_result(), first_rows)
+            }
+            sparkles::sparql::QueryExecution::Ask(result) => {
+                self.finish(result.into_result(), first_rows)
+            }
+            sparkles::sparql::QueryExecution::Graph(_) => Err(FfiError::new(
+                ErrorKind::Invalid,
+                "automatic execution returned a graph cursor",
+            )),
+        }
+    }
+
+    /// The next batch of up to `max_rows` rows (fewer when the batch reaches 1 MiB). Only
+    /// a query that `execute_with` streams can fail here, and its rows then end.
+    pub fn next_batch(&self, max_rows: u32) -> FfiResult<Batch> {
         let mut guard = self.state.lock();
         let Some(st) = guard.as_mut() else {
-            return Batch {
+            return Ok(Batch {
                 batch: encode::empty_batch(0),
                 done: true,
-            };
+            });
         };
+        if let Rows::Cursor(cursor) = &st.rows {
+            let batch = cursor.next_batch(max_rows);
+            if !matches!(&batch, Ok(b) if !b.done) {
+                *guard = None;
+            }
+            return batch;
+        }
         let batch = self.batch(st, max_rows);
         let done = !Self::remaining(st);
         if done {
             *guard = None;
         }
-        Batch { batch, done }
+        Ok(Batch { batch, done })
     }
 
     /// Ask a running `execute` to stop; it fails with `Cancelled`.

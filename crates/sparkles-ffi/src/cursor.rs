@@ -105,8 +105,25 @@ impl FfiSelectCursor {
                 }
                 let Some(batch) = &state.batch else { break };
                 for (column, cell) in row.iter_mut().enumerate() {
-                    let term = batch.term(state.row, column)?;
-                    *cell = term.map_or(0, |term| writer.cell(term.clone(), || Some(term), label));
+                    // a term is decoded only the first time its key is in the batch
+                    let Some(key) = batch.key(state.row, column)? else {
+                        *cell = 0;
+                        continue;
+                    };
+                    let mut failed = None;
+                    *cell = writer.cell(
+                        key,
+                        || {
+                            batch.term(state.row, column).unwrap_or_else(|e| {
+                                failed = Some(e);
+                                None
+                            })
+                        },
+                        label,
+                    );
+                    if let Some(e) = failed {
+                        return Err(e);
+                    }
                 }
                 writer.push_row(&row);
                 state.row += 1;

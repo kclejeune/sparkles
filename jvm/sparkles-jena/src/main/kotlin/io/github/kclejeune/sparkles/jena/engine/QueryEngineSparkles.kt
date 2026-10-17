@@ -21,6 +21,7 @@ import org.apache.jena.graph.Node
 import org.apache.jena.query.Query
 import org.apache.jena.query.QueryExecException
 import org.apache.jena.query.Syntax
+import org.apache.jena.sparql.JenaTransactionException
 import org.apache.jena.sparql.algebra.Algebra
 import org.apache.jena.sparql.algebra.Op
 import org.apache.jena.sparql.algebra.Transformer
@@ -230,6 +231,8 @@ internal class QueryIterSparkles(
     private val cancelSignal = Context.getCancelSignal(context)
     private val parent: Binding? = input.takeUnless { it.isEmpty }
     private var ffiQuery: FfiQuery? = dsg.source().prepareQuery(text, opts)
+    /** The transaction the query runs in, after whose end the iterator refuses to read. */
+    private val txn = dsg.txn()
     private var cursor: FfiSelectCursor? = null
     private var started = false
     private var done = false
@@ -248,15 +251,17 @@ internal class QueryIterSparkles(
     private fun start() {
         started = true
         val q = ffiQuery ?: return
-        // an ASK has one boolean to return, which needs no cursor
-        if (context.get<Boolean>(Sparkles.STREAMING_EXECUTION) == true && !query.isAskType) {
+        // Unset is automatic execution, true is a cursor for every plan, and false is
+        // eager execution. An ASK has one boolean to return, which needs no cursor.
+        val streaming = context.get<Boolean>(Sparkles.STREAMING_EXECUTION)
+        if (streaming == true && !query.isAskType) {
             startCursor(q)
             return
         }
         val signal = cancelSignal
         if (signal != null) CancelWatcher.watch(q, signal)
         val e = try {
-            SparklesJni.execute(q, FIRST_ROWS)
+            SparklesJni.execute(q, FIRST_ROWS, auto = streaming == null)
         } catch (e: FfiException.Engine) {
             if (e.kind == ErrorKind.SPARQL_SYNTAX || e.kind == ErrorKind.UNSUPPORTED) {
                 fallBack(e.detail)
@@ -333,13 +338,17 @@ internal class QueryIterSparkles(
     private fun fetch(): Boolean {
         if (done) return false
         val q = ffiQuery ?: return false
-        val watch = cursor != null && cancelSignal != null
+        // an automatic query can be streaming, and then its batches run the query
+        val watch = cancelSignal != null
         if (watch) CancelWatcher.watch(q, cancelSignal)
         val b = try {
             cursor?.nextBatch(LATER_ROWS.toUInt()) ?: q.nextBatch(LATER_ROWS.toUInt())
         } catch (e: FfiException.Engine) {
             release()
             throw mapError(e)
+        } catch (e: InternalException) {
+            release()
+            throw SparklesInternalException("Internal", e.message ?: "a failure in the native library")
         } finally {
             if (watch) CancelWatcher.unwatch(q)
         }
@@ -354,6 +363,10 @@ internal class QueryIterSparkles(
     }
 
     override fun hasNextBinding(): Boolean {
+        if (txn != null && !txn.active) {
+            closeIterator()
+            throw JenaTransactionException("the transaction of this query has ended")
+        }
         if (!started) start()
         delegate?.let { return it.hasNext() }
         val b = batch ?: return false
