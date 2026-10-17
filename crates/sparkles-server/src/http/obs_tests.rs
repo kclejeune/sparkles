@@ -1710,22 +1710,27 @@ async fn a_late_failure_of_a_default_stream_aborts_the_transfer() {
     let s = server();
     million(&s);
     // A reader that takes nothing for longer than the timeout gets a cut-off transfer
-    // after a successful status.
+    // after a successful status. The timeout leaves the scan room to send its first
+    // 1 MiB while the other tests load their own million rows in a debug build.
     let res = s
         .app
         .clone()
         .oneshot(
-            Request::get(format!("{BIG_SCAN}&format=tsv&timeout=1"))
+            Request::get(format!("{BIG_SCAN}&format=tsv&timeout=5"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "the scan must start within its timeout"
+    );
     let mut body = res.into_body().into_data_stream();
     let first = body.next().await.expect("a first chunk").unwrap();
     assert!(first.starts_with(b"?s\t?o\n"));
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(6500)).await;
     let mut failed = false;
     while let Some(chunk) = body.next().await {
         if chunk.is_err() {
