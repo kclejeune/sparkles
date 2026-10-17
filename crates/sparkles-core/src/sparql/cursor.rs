@@ -342,13 +342,13 @@ impl<'a> DecodedBatch<'a> {
                     let more = bytes.max(TERM_RESERVE);
                     match charge.add(more) {
                         Ok(()) => ahead = ahead.saturating_add(more),
-                        // a refused charge leaves the ledger unchanged, so this term can
-                        // still reserve alone
+                        // A refused charge leaves the ledger unchanged, so this term can
+                        // still reserve what the leftover of the last chunk lacks.
                         Err(Error::BudgetExceeded(b))
                             if b.kind == crate::error::BudgetKind::Memory && more > bytes =>
                         {
-                            charge.add(bytes)?;
-                            ahead = ahead.saturating_add(bytes);
+                            charge.add(bytes - ahead)?;
+                            ahead = bytes;
                         }
                         Err(e) => return Err(e),
                     }
