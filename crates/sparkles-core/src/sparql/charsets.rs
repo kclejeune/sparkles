@@ -354,48 +354,67 @@ pub(super) fn of_node(ctx: &Ctx, n: &Node, out: &mut Vec<(VarId, u64)>) {
         return;
     }
     let rdf_type = ctx.snap.generation.charsets.get().and_then(|i| i.rdf_type);
-    walk(&reg, n, rdf_type, out);
+    // the place of each variable in `out`, since a plan can hold thousands of patterns
+    let mut at: FxHashMap<VarId, usize> =
+        out.iter().enumerate().map(|(i, &(v, _))| (v, i)).collect();
+    walk(&reg, n, rdf_type, None, &mut |v, bit| match at.get(&v) {
+        Some(&i) => out[i].1 = merge(out[i].1, bit),
+        None => {
+            at.insert(v, out.len());
+            out.push((v, bit));
+        }
+    });
 }
 
+/// The star mask of `v` among the patterns of plan `n` (0 when it has none): its entry
+/// in [`of_node`], found without collecting the others.
+pub(super) fn mask_in(ctx: &Ctx, n: &Node, v: VarId) -> u64 {
+    let reg = ctx.stars.lock();
+    if reg.is_empty() {
+        return 0;
+    }
+    let rdf_type = ctx.snap.generation.charsets.get().and_then(|i| i.rdf_type);
+    let mut m = 0;
+    walk(&reg, n, rdf_type, Some(v), &mut |_, bit| m = merge(m, bit));
+    m
+}
+
+/// Call `add` with the variable and bit of each star pattern of plan `n`, or of those on
+/// `only`.
 fn walk(
     reg: &FxHashMap<VarId, StarVar>,
     n: &Node,
     rdf_type: Option<u64>,
-    out: &mut Vec<(VarId, u64)>,
+    only: Option<VarId>,
+    add: &mut dyn FnMut(VarId, u64),
 ) {
-    let mut add = |spec: &ScanSpec| {
-        if let Some((v, p)) = star_of(spec, rdf_type) {
+    let mut scan = |spec: &ScanSpec| {
+        if let Some((v, p)) = star_of(spec, rdf_type)
+            && only.is_none_or(|o| o == v)
+        {
             let bit = reg
                 .get(&v)
                 .and_then(|sv| sv.preds.iter().position(|&x| x == p))
                 .map_or(BAD, |i| 1 << i);
-            match out.iter_mut().find(|(x, _)| *x == v) {
-                Some((_, m)) => *m = merge(*m, bit),
-                None => out.push((v, bit)),
-            }
+            add(v, bit);
         }
     };
     match &n.kind {
-        Kind::Scan(spec) | Kind::RangeScan(spec, _) => add(spec),
-        Kind::SpatialScan(s) => add(&s.scan),
+        Kind::Scan(spec) | Kind::RangeScan(spec, _) => scan(spec),
+        Kind::SpatialScan(s) => scan(&s.scan),
         Kind::IndexJoin(j) => {
             for p in &j.probes {
-                add(&p.scan);
+                scan(&p.scan);
             }
-            walk(reg, &n.children[0], rdf_type, out);
+            walk(reg, &n.children[0], rdf_type, only, add);
         }
         Kind::Join { .. } | Kind::Filter(_) | Kind::Sort(_) => {
             for c in &n.children {
-                walk(reg, c, rdf_type, out);
+                walk(reg, c, rdf_type, only, add);
             }
         }
         _ => {}
     }
-}
-
-/// The star mask of `v` among `masks` (0 when it has none).
-pub(super) fn mask_of(masks: &[(VarId, u64)], v: VarId) -> u64 {
-    masks.iter().find(|(x, _)| *x == v).map_or(0, |(_, m)| *m)
 }
 
 /// For a join on `v` of inputs with the star predicates `qa` and `qb`: the share of the

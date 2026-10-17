@@ -80,7 +80,9 @@ impl CursorStatus {
 /// retain growing state (for example query-created strings).
 ///
 /// A written node and its operator carry the same `id`, the path of child indexes from
-/// the root, as the nodes of an eager plan do (see [`PlanInfo`]).
+/// the root, as the nodes of an eager plan do (see [`PlanInfo`]). A plan deeper than
+/// [`MAX_ID_DEPTH`](super::exec::MAX_ID_DEPTH) levels is written without ids, in plan
+/// format 2.
 #[derive(Clone, Debug)]
 pub struct CursorPlan {
     pub operator: PlanInfo,
@@ -95,14 +97,35 @@ pub struct CursorPlan {
 
 impl Serialize for CursorPlan {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        self.write("0", s)
+        if self.depth() <= super::exec::MAX_ID_DEPTH {
+            self.write(Some("0"), false, s)
+        } else {
+            self.write(None, true, s)
+        }
     }
 }
 
 impl CursorPlan {
-    fn write<S: serde::Serializer>(&self, id: &str, s: S) -> std::result::Result<S::Ok, S::Error> {
+    /// The levels of the plan: 1 for a plan of one node.
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut todo = vec![(self, 1)];
+        while let Some((n, d)) = todo.pop() {
+            deepest = deepest.max(d);
+            todo.extend(n.children.iter().map(|c| (c, d + 1)));
+        }
+        deepest
+    }
+
+    /// Write the node `id` and its children, or the plan without ids from its `root`.
+    fn write<S: serde::Serializer>(
+        &self,
+        id: Option<&str>,
+        root: bool,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        struct Operator<'a>(&'a PlanInfo, &'a str);
+        struct Operator<'a>(&'a PlanInfo, Option<&'a str>);
         impl Serialize for Operator<'_> {
             fn serialize<S: serde::Serializer>(
                 &self,
@@ -114,13 +137,13 @@ impl CursorPlan {
                 m.end()
             }
         }
-        struct Child<'a>(&'a CursorPlan, String);
+        struct Child<'a>(&'a CursorPlan, Option<String>);
         impl Serialize for Child<'_> {
             fn serialize<S: serde::Serializer>(
                 &self,
                 s: S,
             ) -> std::result::Result<S::Ok, S::Error> {
-                self.0.write(&self.1, s)
+                self.0.write(self.1.as_deref(), false, s)
             }
         }
         // a plan nests up to `MAX_PLAN_DEPTH` levels, as in `PlanWithId`
@@ -129,7 +152,12 @@ impl CursorPlan {
             super::exec::PLAN_STACK_SEGMENT,
             || {
                 let mut m = s.serialize_map(None)?;
-                m.serialize_entry("id", id)?;
+                if root {
+                    m.serialize_entry("planFormat", &super::exec::PLAN_FORMAT)?;
+                }
+                if let Some(id) = id {
+                    m.serialize_entry("id", id)?;
+                }
                 m.serialize_entry("operator", &Operator(&self.operator, id))?;
                 m.serialize_entry("materializes", &self.materializes)?;
                 m.serialize_entry("fullInputBeforeOutput", &self.full_input_before_output)?;
@@ -140,7 +168,7 @@ impl CursorPlan {
                     .children
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| Child(c, format!("{id}.{i}")))
+                    .map(|(i, c)| Child(c, id.map(|id| format!("{id}.{i}"))))
                     .collect();
                 m.serialize_entry("children", &children)?;
                 m.end()
@@ -1456,11 +1484,10 @@ impl Operator {
                 node.operator()
             )));
         }
-        let mut info = exec::describe(ctx, &node);
+        let mut info = exec::describe_node(ctx, &node);
         if ctx.graphs.is_some() {
             info.redact();
         }
-        info.children.clear();
         info.actual_rows = 0;
         let vars = node.vars.clone();
         // A fallback materializes only its own operator when it reads its children as

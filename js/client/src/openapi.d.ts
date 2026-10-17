@@ -4780,10 +4780,15 @@ export interface components {
             complete: boolean;
             fullInputBeforeOutput: boolean;
             growingState: boolean;
-            /** @description The node id, the same as the operator's. */
+            /** @description The node id, the same as the operator's. Absent in plan format 2. */
             id?: string;
             materializes: boolean;
             operator: components["schemas"]["PlanNode"];
+            /**
+             * @description On the root only. A plan deeper than 256 levels is in plan format 2, whose nodes have no `id`, and a client derives each id from the shape of the plan. A plan without this member is in format 1. A reader refuses a format it does not know.
+             * @enum {integer}
+             */
+            planFormat?: 2;
             reason?: string | null;
         };
         DatasetInfo: {
@@ -6430,9 +6435,14 @@ export interface components {
             estimatedCost?: number;
             /** @description `-1` when the caller's view hides estimates. */
             estimatedRows?: number;
-            /** @description The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response. */
+            /** @description The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response. Absent in plan format 2. */
             id?: string;
             operator: string;
+            /**
+             * @description On the root only. A plan deeper than 256 levels is in plan format 2, whose nodes have no `id`, and a client derives each id from the shape of the plan. A plan without this member is in format 1. A reader refuses a format it does not know.
+             * @enum {integer}
+             */
+            planFormat?: 2;
             pushedFilters?: string[];
             /** @description How often the node ran, when more than once. Its counts are of the last run and its time spans all of them. */
             runs?: number;

@@ -801,6 +801,38 @@ The rest of the gap to 20f01c82 on values-star is the fast memory account of F14
 4 thousand instructions on every query, and the warm checks that the X07 hints need. These
 are a hash per constant, a bit test per answer term and one cache lookup per scan.
 
+### Planning large basic graph patterns
+
+[Roadmap](ROADMAP.md) item 84 made the plan of a basic graph pattern near the 4000-level
+plan limit cheap to build. These are measurements on the development laptop in a release
+build, and other builds shared the machine, so the times are good to about a fifth. They
+are not forge numbers. The ignored test `large_bgp_planning_time` in
+`crates/sparkles/tests/nesting.rs` ran `explain` on each shape of `plan_shapes` at the
+limit over a dataset of four triples, and the star and hub rows also ran on a build of
+the commit before the change. [X05](specs/X05-streaming-query-execution.md#large-basic-graph-patterns)
+has the design and the shapes.
+
+| Shape at the limit | `explain` before | `explain` after | Plan JSON before | Plan JSON after |
+|---|---|---|---|---|
+| Chain of 1998 | 1.08 s | 0.35 s | 53.7 MB | 29.7 MB |
+| Reversed chain of 1998 | 1.01 s | 0.27 s | 64.5 MB | 32.5 MB |
+| Tree of 1998 | 2.24 s | 0.34 s | 37.4 MB | 22.4 MB |
+| Star of 1998 | 3.35 s | 0.73 s | 23.1 MB | 15.1 MB |
+| Hub of 1998 | 0.98 s | 0.77 s | 53.8 MB | 29.8 MB |
+| Pairs of 999 | 1.36 s | 0.49 s | 34.1 MB | 18.1 MB |
+| Chain of 999 with a second predicate | 0.67 s | 0.19 s | 26.2 MB | 11.2 MB |
+| Chain of 571 with VALUES | 0.43 s | 0.11 s | 15.9 MB | 7.3 MB |
+| Chain of 1019 with filters | 71 ms | 34 ms | 1.3 MB | 1.3 MB |
+| Chain of 799 with OPTIONAL | 6.49 s | 0.53 s | 23.3 MB | 13.7 MB |
+| Chain of 799 with MINUS | 2.49 s | 0.15 s | 8.6 MB | 4.8 MB |
+| Chain of 799 with BIND | 5.88 s | 0.18 s | 21.2 MB | 13.5 MB |
+
+A star of 1998 patterns on `foaf:knows` over the 31,815 triples of
+`scripts/gen-data.py 3000` took 2.9 to 3.0 s to plan before and 2.6 to 2.8 s after, so
+the data decides how much a star gains. The change keeps the star masks and probed sides
+with each plan, which costs 2.6 to 3.2% more planning instructions for a snowflake of
+12 patterns and up to 64 MB while the greedy order runs on a plan of 1998 inputs.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all

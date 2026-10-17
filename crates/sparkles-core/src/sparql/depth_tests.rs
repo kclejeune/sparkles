@@ -108,6 +108,66 @@ fn a_plan_deeper_than_the_limit_is_refused_after_planning() {
     query(s.snapshot(), &q, &opts).unwrap();
 }
 
+/// Describing a plan for `explain` checks the deadline and the cancellation for each node,
+/// which a clock cannot test reliably: here the deadline has passed before the description
+/// starts, and the check count shows that every node is checked.
+#[test]
+fn describing_a_plan_observes_a_deadline_that_has_passed() {
+    use std::time::{Duration, Instant};
+    let s = store();
+    let q = chain(40);
+    let parsed = parsed(&q);
+    let (pattern, dataset, base) = split(&parsed);
+    let opts = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    let mut ctx = make_ctx(s.snapshot(), &opts, dataset, base).unwrap();
+    let checks = || ctx::CHECKS.with(|n| n.get());
+    let before = checks();
+    let node = Planner::new(&ctx)
+        .plan(pattern, &ActiveGraph::Default, Vec::new())
+        .unwrap();
+    let planning = checks() - before;
+    let nodes = {
+        let mut n = 0;
+        let mut todo = vec![&node];
+        while let Some(x) = todo.pop() {
+            n += 1;
+            todo.extend(&x.children);
+        }
+        n
+    };
+    assert!(nodes > 40, "{nodes}");
+    // a deadline in the future describes every node, checking at each one
+    ctx.deadline = Some(Instant::now() + Duration::from_secs(600));
+    let before = checks();
+    let info = exec::try_describe(&ctx, &node).unwrap();
+    assert!(checks() - before >= nodes);
+    assert_eq!(info.depth(), node.depth());
+    // `explain` describes the plan this way: it checks at least once for each node beyond
+    // the checks that planning makes
+    let before = checks();
+    explain(s.snapshot(), &q, &opts).unwrap();
+    let explaining = checks() - before;
+    assert!(
+        explaining >= planning + nodes,
+        "{explaining} checks for {planning} in planning and {nodes} nodes"
+    );
+    // one that has passed stops the description at the root
+    ctx.deadline = Instant::now().checked_sub(Duration::from_secs(1));
+    assert!(ctx.deadline.is_some());
+    let before = checks();
+    let e = exec::try_describe(&ctx, &node).unwrap_err();
+    assert!(matches!(e, Error::Timeout), "{e}");
+    assert_eq!(checks() - before, 1);
+    // and so does a cancellation
+    ctx.deadline = None;
+    ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let e = exec::try_describe(&ctx, &node).unwrap_err();
+    assert!(matches!(e, Error::Cancelled), "{e}");
+}
+
 #[test]
 fn the_walk_bounds_the_plan_of_a_group_without_a_triple_pattern() {
     let s = store();

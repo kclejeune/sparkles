@@ -334,7 +334,59 @@ struct Models {
     probed: bool,
 }
 
+/// What the inputs of one side of a join hold on a join variable: their star mask and
+/// how they hold the leaves on it if it was probed.
+#[derive(Clone, Copy, Default)]
+struct Held {
+    star: u64,
+    side: Side,
+}
+
+impl Held {
+    fn merge(self, o: Held) -> Held {
+        Held {
+            star: super::charsets::merge(self.star, o.star),
+            side: self.side.merge(o.side),
+        }
+    }
+}
+
 impl Models {
+    /// What the inputs `ins` hold on join variable `j`.
+    fn held<I: Iterator<Item = usize>>(&self, j: u32, ins: I) -> Held {
+        let mut h = Held::default();
+        for i in ins {
+            if self.starred {
+                for &(x, s) in &self.stars[i] {
+                    if x == j {
+                        h.star = super::charsets::merge(h.star, s);
+                    }
+                }
+            }
+            if self.probed {
+                for &(x, t) in &self.sides[i] {
+                    if x == j {
+                        h.side = h.side.merge(t);
+                    }
+                }
+            }
+        }
+        h
+    }
+
+    /// What input `i` holds on each join variable, by join variable index.
+    fn held_by(&self, i: usize) -> Vec<(u32, Held)> {
+        let stars = self.stars.get(i).map_or(&[][..], Vec::as_slice);
+        let sides = self.sides.get(i).map_or(&[][..], Vec::as_slice);
+        let mut js: Vec<u32> = stars.iter().map(|x| x.0).collect();
+        js.extend(sides.iter().map(|x| x.0));
+        js.sort_unstable();
+        js.dedup();
+        js.into_iter()
+            .map(|j| (j, self.held(j, std::iter::once(i))))
+            .collect()
+    }
+
     /// How a join on join variable `j` (variable `v`) of the inputs `a` and `b` is
     /// estimated, the same way as [`plan::join_est_with`] estimates it.
     fn of<I: Iterator<Item = usize> + Clone>(
@@ -345,66 +397,67 @@ impl Models {
         a: I,
         b: I,
     ) -> Option<JoinModel> {
+        self.of_held(ctx, v, self.held(j, a), self.held(j, b))
+    }
+
+    /// [`Models::of`] for sides that hold `a` and `b` on the variable.
+    fn of_held(&self, ctx: &Ctx, v: VarId, a: Held, b: Held) -> Option<JoinModel> {
+        let probe = || {
+            if !self.probed {
+                return None;
+            }
+            super::keyprobe::applies(ctx, v, a.side, b.side)
+                .map(|(m, a_src)| JoinModel::Probe { m, a_src })
+        };
         let first = self.probed && super::keyprobe::first(ctx, v);
-        if first && let Some(m) = self.probe(ctx, v, j, a.clone(), b.clone()) {
+        if first && let Some(m) = probe() {
             return Some(m);
         }
-        if self.starred {
-            let mask = |ins: I| {
-                let mut m = 0;
-                for i in ins {
-                    for &(x, s) in &self.stars[i] {
-                        if x == j {
-                            m = super::charsets::merge(m, s);
-                        }
-                    }
-                }
-                m
-            };
-            let (qa, qb) = (mask(a.clone()), mask(b.clone()));
-            if qa != 0
-                && qb != 0
-                && let Some((rr, rd)) = super::charsets::factor(ctx, v, qa, qb)
-            {
-                return Some(JoinModel::Star { rr, rd });
-            }
+        if self.starred
+            && a.star != 0
+            && b.star != 0
+            && let Some((rr, rd)) = super::charsets::factor(ctx, v, a.star, b.star)
+        {
+            return Some(JoinModel::Star { rr, rd });
         }
         if first {
             return None;
         }
-        self.probe(ctx, v, j, a, b)
-    }
-
-    /// The estimate of the join from probed values, if one applies.
-    fn probe<I: Iterator<Item = usize> + Clone>(
-        &self,
-        ctx: &Ctx,
-        v: VarId,
-        j: u32,
-        a: I,
-        b: I,
-    ) -> Option<JoinModel> {
-        if !self.probed {
-            return None;
-        }
-        let side = |ins: I| {
-            let mut s = Side::default();
-            for i in ins {
-                for &(x, t) in &self.sides[i] {
-                    if x == j {
-                        s = s.merge(t);
-                    }
-                }
-            }
-            s
-        };
-        super::keyprobe::applies(ctx, v, side(a), side(b))
-            .map(|(m, a_src)| JoinModel::Probe { m, a_src })
+        probe()
     }
 }
 
+/// The merge of two lists of what plans hold by join variable, each sorted by it.
+fn merge_held(a: &[(u32, Held)], b: &[(u32, Held)]) -> Vec<(u32, Held)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut k) = (0, 0);
+    while i < a.len() || k < b.len() {
+        match (a.get(i), b.get(k)) {
+            (Some(&(ja, ha)), Some(&(jb, hb))) if ja == jb => {
+                out.push((ja, ha.merge(hb)));
+                i += 1;
+                k += 1;
+            }
+            (Some(&x), Some(&(jb, _))) if x.0 < jb => {
+                out.push(x);
+                i += 1;
+            }
+            (Some(&x), None) => {
+                out.push(x);
+                i += 1;
+            }
+            (_, Some(&y)) => {
+                out.push(y);
+                k += 1;
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    out
+}
+
 impl Group {
-    fn new(items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Group {
+    fn new(items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Result<Group> {
         let mut idx: FxHashMap<VarId, u32> = FxHashMap::default();
         let mut vars = Vec::new();
         let mut count: Vec<u32> = Vec::new();
@@ -452,7 +505,8 @@ impl Group {
             })
             .collect();
         let mut models = Models::default();
-        for it in items {
+        for (i, it) in items.iter().enumerate() {
+            ctx.check()?;
             let mut masks = Vec::new();
             if ctx.opt.characteristic_sets {
                 super::charsets::of_node(ctx, &it[0], &mut masks);
@@ -468,9 +522,18 @@ impl Group {
             );
             let mut sides = Vec::new();
             if ctx.opt.probed_keys {
-                for (j, &l) in jvars.iter().enumerate() {
-                    if let Some(s) = super::keyprobe::side(ctx, &it[0], vars[l as usize]) {
-                        sides.push((j as u32, s));
+                // an input without the variable holds no leaf on it, and its side merges
+                // as nothing
+                let mut own: Vec<u32> = item_vars[i]
+                    .iter()
+                    .map(|&l| join[l as usize])
+                    .filter(|&j| j != u32::MAX)
+                    .collect();
+                own.sort_unstable();
+                for j in own {
+                    let v = vars[jvars[j as usize] as usize];
+                    if let Some(s) = super::keyprobe::side(ctx, &it[0], v) {
+                        sides.push((j, s));
                     }
                 }
             }
@@ -478,7 +541,7 @@ impl Group {
         }
         models.starred = models.stars.iter().any(|s| !s.is_empty());
         models.probed = models.sides.iter().any(|s| !s.is_empty());
-        Group {
+        Ok(Group {
             vars,
             idx,
             join,
@@ -486,7 +549,7 @@ impl Group {
             item_vars,
             filters,
             models,
-        }
+        })
     }
 }
 
@@ -507,10 +570,10 @@ fn bits_of(mut m: u32) -> impl Iterator<Item = usize> + Clone {
 /// variables shared between inputs), for the exhaustive program to plan.
 pub(super) fn order(
     pl: &Planner,
-    items: Vec<Vec<Node>>,
+    mut items: Vec<Vec<Node>>,
     filters: &mut Vec<Expr>,
 ) -> Result<std::result::Result<Node, Vec<Vec<Node>>>> {
-    let g = Group::new(&items, filters, pl.ctx);
+    let g = Group::new(&items, filters, pl.ctx)?;
     let dp = Dp::prepare(&g, &items);
     if dp.is_none() && items.len() <= 12 {
         return Ok(Err(items));
@@ -519,7 +582,7 @@ pub(super) fn order(
     if let Some(mut dp) = dp {
         let bound = greedy.cost();
         if let Some(best) = dp.run(&items, filters, bound, pl)? {
-            let (node, applied) = dp.build(best, &items, filters, pl);
+            let (node, applied) = dp.build(best, &mut items, filters, pl)?;
             debug_assert!(
                 node.cost <= bound.unwrap_or(f64::INFINITY),
                 "plan dearer than the bound"
@@ -534,7 +597,7 @@ pub(super) fn order(
             return Ok(Ok(node));
         }
     }
-    Ok(Ok(greedy.build(filters, pl)))
+    Ok(Ok(greedy.build(items, filters, pl)?))
 }
 
 // ------------------------------------------------------------------------------
@@ -595,12 +658,21 @@ struct Unit {
     from: From,
     /// the filters placed on top, by index
     filters: Vec<usize>,
+    /// what its inputs hold on the join variables, by join variable index, when the
+    /// group has star masks or probed variables (see [`Models`])
+    held: Vec<(u32, Held)>,
 }
 
 impl Unit {
     fn d(&self, j: u32) -> f64 {
         let i = self.d.binary_search_by_key(&j, |x| x.0).unwrap();
         self.d[i].1
+    }
+
+    fn held_on(&self, j: u32) -> Held {
+        self.held
+            .binary_search_by_key(&j, |x| x.0)
+            .map_or_else(|_| Held::default(), |i| self.held[i].1)
     }
 }
 
@@ -646,7 +718,10 @@ impl Ord for Pair {
 /// list of plans, so ties break the same way.
 struct Greedy {
     units: Vec<Unit>,
-    leaves: Vec<Node>,
+    /// per input, its cheapest access path, and the plan with the filters on it when it
+    /// has any (an input without filters is moved out of the inputs when the plan is
+    /// built, not copied, since it can be a whole subtree)
+    leaves: Vec<(usize, Option<Node>)>,
     /// the plans left, in order
     alive: Vec<usize>,
     /// filters placed, by index
@@ -661,12 +736,14 @@ impl Greedy {
         let mut units: Vec<Unit> = Vec::with_capacity(2 * items.len());
         let mut leaves = Vec::with_capacity(items.len());
         for (i, opts) in items.iter().enumerate() {
-            let mut best = &opts[0];
-            for o in &opts[1..] {
-                if o.cost.total_cmp(&best.cost) == Ordering::Less {
-                    best = o;
+            ctx.check()?;
+            let mut at = 0;
+            for (k, o) in opts.iter().enumerate().skip(1) {
+                if o.cost.total_cmp(&opts[at].cost) == Ordering::Less {
+                    at = k;
                 }
             }
+            let best = &opts[at];
             let mut has = Bits::new(nv);
             for &l in &g.item_vars[i] {
                 has.set(l);
@@ -678,18 +755,19 @@ impl Greedy {
                         && g.filters[f].vars.iter().all(|&l| has.get(l))
                 })
                 .collect();
-            let node = if now.is_empty() {
-                best.clone()
+            let filtered = if now.is_empty() {
+                None
             } else {
                 for &f in &now {
                     placed[f] = true;
                 }
-                plan::filter(
+                Some(plan::filter(
                     best.clone(),
                     now.iter().map(|&f| filters[f].clone()).collect(),
                     ctx,
-                )
+                ))
             };
+            let node = filtered.as_ref().unwrap_or(best);
             let mut certain = Bits::new(nv);
             let mut d = Vec::new();
             let vars: Vec<u32> = node.vars.iter().map(|v| g.idx[v]).collect();
@@ -706,21 +784,26 @@ impl Greedy {
             let mut inputs = Bits::new(items.len());
             inputs.set(i as u32);
             units.push(Unit {
-                sum: Sum::of(&node),
+                sum: Sum::of(node),
                 inputs,
                 vars,
                 has,
                 certain,
                 d,
                 probe: if batched.index_joins {
-                    indexjoin::probe_side(&node, ctx)
+                    indexjoin::probe_side(node, ctx)
                 } else {
                     None
                 },
                 from: From::Leaf,
                 filters: Vec::new(),
+                held: if g.models.starred || g.models.probed {
+                    g.models.held_by(i)
+                } else {
+                    Vec::new()
+                },
             });
-            leaves.push(node);
+            leaves.push((at, filtered));
         }
         let mut gr = Greedy {
             units,
@@ -731,8 +814,28 @@ impl Greedy {
         let mut heap = BinaryHeap::new();
         let mut cands = Vec::new();
         let mut shared = Vec::new();
+        // the plans left that bind each variable, so that only plans sharing a variable
+        // are paired: testing every pair costs the square of the inputs at each step
+        let mut holders: Vec<Vec<usize>> = vec![Vec::new(); nv];
+        for (u, unit) in gr.units.iter().enumerate() {
+            for l in unit.has.ones() {
+                holders[l].push(u);
+            }
+        }
+        // when each plan was last paired with the plan being paired
+        let mut seen = vec![usize::MAX; 2 * gr.units.len()];
         for b in 0..gr.units.len() {
-            for a in 0..b {
+            ctx.check()?;
+            let mut with = Vec::new();
+            for l in gr.units[b].has.ones() {
+                for &a in &holders[l] {
+                    if a < b && seen[a] != b {
+                        seen[a] = b;
+                        with.push(a);
+                    }
+                }
+            }
+            for a in with {
                 gr.push_pair(g, a, b, batched, ctx, &mut heap, &mut cands, &mut shared);
             }
         }
@@ -749,8 +852,22 @@ impl Greedy {
             dead[p.b as usize] = true;
             dead.push(false);
             gr.alive.retain(|&u| u != p.a as usize && u != p.b as usize);
-            for i in 0..gr.alive.len() {
-                let u = gr.alive[i];
+            if seen.len() <= w {
+                seen.resize(w + 1, usize::MAX);
+            }
+            let mut with = Vec::new();
+            for l in gr.units[w].has.ones() {
+                let h = &mut holders[l];
+                h.retain(|&u| u != p.a as usize && u != p.b as usize);
+                for &u in h.iter() {
+                    if seen[u] != w {
+                        seen[u] = w;
+                        with.push(u);
+                    }
+                }
+                h.push(w);
+            }
+            for u in with {
                 gr.push_pair(g, u, w, batched, ctx, &mut heap, &mut cands, &mut shared);
             }
             gr.alive.push(w);
@@ -792,7 +909,7 @@ impl Greedy {
             [s] => {
                 let j = g.join[g.idx[&s.v] as usize];
                 g.models
-                    .of(ctx, s.v, j, ua.inputs.ones(), ub.inputs.ones())
+                    .of_held(ctx, s.v, ua.held_on(j), ub.held_on(j))
                     .map(|m| (j, m))
             }
             _ => None,
@@ -912,6 +1029,7 @@ impl Greedy {
             probe: None,
             from: From::Join(p.a as usize, p.b as usize, p.how),
             filters: now,
+            held: merge_held(&a.held, &b.held),
         });
         self.units.len() - 1
     }
@@ -924,14 +1042,18 @@ impl Greedy {
         }
     }
 
-    /// Build the plan tree, removing the placed filters from `filters`.
-    fn build(self, filters: &mut Vec<Expr>, pl: &Planner) -> Node {
+    /// Build the plan tree from the inputs, removing the placed filters from `filters`.
+    fn build(self, items: Vec<Vec<Node>>, filters: &mut Vec<Expr>, pl: &Planner) -> Result<Node> {
         let ctx = pl.ctx;
         let mut nodes: Vec<Option<Node>> = Vec::with_capacity(self.units.len());
-        let mut leaves = self.leaves.into_iter();
+        let mut leaves = self.leaves.into_iter().zip(items);
         for u in &self.units {
+            ctx.check()?;
             let n = match u.from {
-                From::Leaf => leaves.next().unwrap(),
+                From::Leaf => match leaves.next().unwrap() {
+                    ((_, Some(filtered)), _) => filtered,
+                    ((at, None), mut opts) => opts.swap_remove(at),
+                },
                 From::Join(a, b, how) => {
                     let (na, nb) = (nodes[a].take().unwrap(), nodes[b].take().unwrap());
                     let n = build_join(na, nb, how, ctx);
@@ -967,7 +1089,7 @@ impl Greedy {
             let n = nodes[u].take().unwrap();
             acc = pl.place_filters(plan::join(acc, n, ctx), filters);
         }
-        acc
+        Ok(acc)
     }
 }
 
@@ -1240,7 +1362,18 @@ impl Dp {
             let bnd = self.bnd(m);
             let mut ents = Vec::with_capacity(opts.len());
             for (k, o) in opts.iter().enumerate() {
-                let (o, _) = pl.apply_dp_filters(o.clone(), 0, filters, &fvars);
+                // copied only to place filters on, since an input can be a whole subtree
+                let filtered;
+                let o = if fvars
+                    .iter()
+                    .take(64)
+                    .any(|fv| !fv.is_empty() && fv.iter().all(|v| o.vars.contains(v)))
+                {
+                    filtered = pl.apply_dp_filters(o.clone(), 0, filters, &fvars).0;
+                    &filtered
+                } else {
+                    o
+                };
                 let d = self.dval.len() as u32;
                 let mut rest = bnd;
                 while rest != 0 {
@@ -1250,14 +1383,14 @@ impl Dp {
                 }
                 ents.push(self.ents.len() as u32);
                 self.ents.push(Ent {
-                    sum: Sum::of(&o),
+                    sum: Sum::of(o),
                     mask: m,
                     d,
                     how: How::Hash,
                     a: i as u32,
                     b: k as u32,
                     probe: if batched.index_joins {
-                        indexjoin::probe_side(&o, ctx)
+                        indexjoin::probe_side(o, ctx)
                     } else {
                         None
                     },
@@ -1653,7 +1786,15 @@ impl Dp {
     }
 
     /// Build the plan of entry `root`, with the mask of the filters it placed.
-    fn build(&self, root: u32, items: &[Vec<Node>], filters: &[Expr], pl: &Planner) -> (Node, u64) {
+    /// Each input is used once, and is moved out of `items` rather than copied, since it
+    /// can be a whole subtree.
+    fn build(
+        &self,
+        root: u32,
+        items: &mut [Vec<Node>],
+        filters: &[Expr],
+        pl: &Planner,
+    ) -> Result<(Node, u64)> {
         let ctx = pl.ctx;
         let fvars = dp_filter_vars(filters);
         // the entries of the plan, children before parents
@@ -1670,14 +1811,11 @@ impl Dp {
         need.sort_unstable();
         let mut built: FxHashMap<u32, (Node, u64)> = FxHashMap::default();
         for &x in &need {
+            ctx.check()?;
             let e = self.ents[x as usize];
             let (n, f) = if e.mask.is_power_of_two() {
-                pl.apply_dp_filters(
-                    items[e.a as usize][e.b as usize].clone(),
-                    0,
-                    filters,
-                    &fvars,
-                )
+                let leaf = std::mem::replace(&mut items[e.a as usize][e.b as usize], Node::unit());
+                pl.apply_dp_filters(leaf, 0, filters, &fvars)
             } else {
                 let (na, fa) = built.remove(&e.a).unwrap();
                 let (nb, fb) = built.remove(&e.b).unwrap();
@@ -1692,7 +1830,7 @@ impl Dp {
             );
             built.insert(x, (n, f));
         }
-        built.remove(&root).unwrap()
+        Ok(built.remove(&root).unwrap())
     }
 }
 

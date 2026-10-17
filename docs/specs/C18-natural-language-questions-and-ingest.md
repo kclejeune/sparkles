@@ -1087,7 +1087,9 @@ when the `explain` role runs on a provider.
 Each operator is named by a **node id**, the path of child indexes from the root, such
 as `0.1.2`. That is the id `PlanView` already derives. The server adds it to every node
 it returns (§6.6.5), so a note, a sentence and a row of the tree agree on which node
-they mean. Ids are only valid for the plan returned in the same response.
+they mean. Ids are only valid for the plan returned in the same response. Since
+[ROADMAP](../ROADMAP.md) item 84, a plan deeper than 256 levels is written in plan
+format 2 without ids, and the reader derives them from the shape.
 
 #### 6.6.2 The notes
 

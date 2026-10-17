@@ -3380,7 +3380,7 @@ fn run() -> Result<()> {
             if explain {
                 let (sse, plan) = sparkles::sparql::explain(snap, &q, &qopts)?;
                 println!("{sse}\n");
-                print_plan(&plan, 0);
+                print_plan(&plan);
                 return Ok(());
             }
             let r = sparkles::sparql::query(snap, &q, &qopts)?;
@@ -3422,7 +3422,7 @@ fn run() -> Result<()> {
                     "\nparse {:.2} ms · plan {:.2} ms · exec {:.2} ms · total {:.2} ms",
                     r.timing.parse_ms, r.timing.plan_ms, r.timing.exec_ms, r.timing.total_ms
                 );
-                print_plan_stderr(&r.plan, 0);
+                print_plan_stderr(&r.plan);
             }
             Ok(())
         }
@@ -5013,33 +5013,44 @@ fn shacl_parse(
     Ok(())
 }
 
-fn print_plan(p: &sparkles::sparql::PlanInfo, depth: usize) {
-    println!(
-        "{}{} {}  [est {} rows, cost {}]",
-        "  ".repeat(depth),
-        p.operator,
-        p.description,
-        p.estimated_rows,
-        p.estimated_cost
-    );
-    for c in &p.children {
-        print_plan(c, depth + 1);
+/// Each operator of plan `p` with its depth, in tree order, without recursion, since a
+/// plan nests up to `MAX_PLAN_DEPTH` levels.
+fn plan_walk(
+    p: &sparkles::sparql::PlanInfo,
+    mut f: impl FnMut(&sparkles::sparql::PlanInfo, usize),
+) {
+    let mut todo = vec![(p, 0)];
+    while let Some((p, depth)) = todo.pop() {
+        f(p, depth);
+        todo.extend(p.children.iter().rev().map(|c| (c, depth + 1)));
     }
 }
 
-fn print_plan_stderr(p: &sparkles::sparql::PlanInfo, depth: usize) {
-    eprintln!(
-        "{}{} {}  [{} rows (est {}), {:.2} ms]",
-        "  ".repeat(depth),
-        p.operator,
-        p.description,
-        p.actual_rows,
-        p.estimated_rows,
-        p.time_ms
-    );
-    for c in &p.children {
-        print_plan_stderr(c, depth + 1);
-    }
+fn print_plan(p: &sparkles::sparql::PlanInfo) {
+    plan_walk(p, |p, depth| {
+        println!(
+            "{}{} {}  [est {} rows, cost {}]",
+            "  ".repeat(depth),
+            p.operator,
+            p.description,
+            p.estimated_rows,
+            p.estimated_cost
+        )
+    });
+}
+
+fn print_plan_stderr(p: &sparkles::sparql::PlanInfo) {
+    plan_walk(p, |p, depth| {
+        eprintln!(
+            "{}{} {}  [{} rows (est {}), {:.2} ms]",
+            "  ".repeat(depth),
+            p.operator,
+            p.description,
+            p.actual_rows,
+            p.estimated_rows,
+            p.time_ms
+        )
+    });
 }
 
 /// Jena-style text table (`ResultSetFormatter.out`).

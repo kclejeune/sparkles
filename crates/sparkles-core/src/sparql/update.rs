@@ -53,8 +53,7 @@ pub fn update_as(
     kind: crate::commit::CommitKind,
 ) -> Result<UpdateStats> {
     let t0 = Instant::now();
-    let parsed = parse_update(u, opts)?;
-    let depth = super::depth::check_update(&parsed)?;
+    let (parsed, depth) = super::depth::checked_update(parse_update(u, opts)?)?;
     super::depth::with_stack(depth, || run_update(store, &parsed, opts, kind, t0))
 }
 
@@ -66,8 +65,7 @@ pub fn update_as(
 /// transaction has changed data, because the full-text index covers committed data only.
 pub fn update_in(txn: &mut WriteTxn<'_>, u: &str, opts: &QueryOptions) -> Result<UpdateStats> {
     let t0 = Instant::now();
-    let parsed = parse_update(u, opts)?;
-    let depth = super::depth::check_update(&parsed)?;
+    let (parsed, depth) = super::depth::checked_update(parse_update(u, opts)?)?;
     super::depth::with_stack(depth, || {
         validate_geometry(&parsed)?;
         if let Some(access) = opts.graphs.as_ref() {
