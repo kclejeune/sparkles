@@ -22,6 +22,13 @@
 # it needs root to make and mount the file system on a loop device. With --fs DIR it runs
 # in that directory, on whatever file system holds it, without root.
 #
+#   scripts/power-loss.sh selftest --fs DIR --sparkles BIN --harness BIN --work DIR
+#
+# selftest needs no root. It checks that the driver fails a load whose writes the server
+# refuses and passes a working one. kill9 fails a kill whose driver reports failed writes
+# or stops with an error, and a store that took no receipt over its 20 kills. logwrites
+# refuses to replay a load without receipts or with failed writes.
+#
 # --flags are global flags given to `sparkles` before `serve`, to run the crashes with
 # and without group commit. Results go to DIR/results.tsv and DIR/summary.json, and the
 # exit status is 0 only when every check passed.
@@ -85,7 +92,7 @@ start_server() { # <store>
   # the test file systems are small, so the server keeps only 64 MiB free instead of 1 GiB
   # shellcheck disable=SC2086 # the flags are a command line
   "$BIN" $FLAGS serve --data "$WORK/srv" --loc "ds=$1" --port "$PORT" --no-access-log \
-    --min-free-disk-mb 64 > "$WORK/server.log" 2>&1 &
+    --min-free-disk-mb "${MIN_FREE_MB:-64}" > "$WORK/server.log" 2>&1 &
   SPID=$!
   for _ in $(seq 1 300); do
     curl -sf "http://127.0.0.1:$PORT/\$/ping" > /dev/null 2>&1 && return 0
@@ -156,8 +163,13 @@ case $MODE in
     echo "M start 0" > "$WORK/receipts.txt"
     dmsetup message "$DM" 0 mark start
     start_server "$MNT/db"
+    drc=0
     "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/receipts.txt" \
-      --clients "$CLIENTS" --seconds "$SECONDS_RUN" --mark-cmd "dmsetup message $DM 0 mark" | tee "$WORK/drive.json"
+      --clients "$CLIENTS" --seconds "$SECONDS_RUN" --mark-cmd "dmsetup message $DM 0 mark" \
+      > "$WORK/drive.json" || drc=$?
+    cat "$WORK/drive.json"
+    # a load without receipts, or with failed writes, would make every image pass vacuously
+    [ "$drc" = 0 ] || die "the driver failed with status $drc: $(cat "$WORK/drive.json")"
     kill_server
     umount "$MNT"
     dmsetup remove "$DM"
@@ -208,13 +220,32 @@ case $MODE in
       # a random moment between 0.2 and 2.2 seconds into the load
       sleep "$(awk -v r="$RANDOM" 'BEGIN { printf "%.3f", 0.2 + (r % 2000) / 1000 }')"
       kill_server
-      wait "$DPID" || true
+      # The driver ends on its own when the server dies. Status 3 with failed writes, or
+      # any other failure, fails the kill. Status 3 without receipts only means the kill
+      # came before the first acknowledgement, which the per-store check below bounds.
+      drc=0
+      wait "$DPID" || drc=$?
+      dfail=$(sed -n 's/.*"failed": \([0-9]*\).*/\1/p' "$WORK/drive.json")
+      if [ "$drc" = 3 ] && [ "${dfail:-0}" = 0 ]; then
+        log "kill $i: no receipt before the kill"
+      elif [ "$drc" != 0 ]; then
+        log "kill $i: the driver failed with status $drc: $(cat "$WORK/drive.json" "$WORK/drive.err")"
+        fails=$((fails + 1))
+      fi
       # every receipt logged in this store so far, after each restart
       out=$("$HARNESS" verify --sparkles "$BIN" --loc "$db" --receipts "$receipts") || fails=$((fails + 1))
       printf '%s\t%s\n' "$i" "$out" >> "$WORK/results.tsv"
       [ $((i % 20)) = 0 ] && log "kill $i: $out"
     done
-    total=$(cat "$WORK"/receipts-*.txt | grep -c '^R ')
+    # every store must have taken writes, or its checks verified nothing
+    for f in "$WORK"/receipts-*.txt; do
+      n=$(grep -c '^R ' "$f" || true)
+      if [ "$n" = 0 ]; then
+        log "$f: no receipts in the whole store"
+        fails=$((fails + 1))
+      fi
+    done
+    total=$(cat "$WORK"/receipts-*.txt | grep -c '^R ' || true)
     echo "{\"kills\": $KILLS, \"failed\": $fails, \"receipts\": $total}" | tee "$WORK/summary.json"
     if [ "$MNT_OWNED" = 1 ]; then
       umount "$MNT"
@@ -222,6 +253,30 @@ case $MODE in
       MNT=
     else rm -rf "$MNT"; fi
     [ "$fails" = 0 ]
+    ;;
+  selftest)
+    # The driver must fail a run in which the server refuses every write, as the 507s of a
+    # free-space reserve larger than the file system did once, and pass a working one.
+    [ -d "$FS" ] || die "selftest needs --fs DIR"
+    db=$(readlink -f "$FS")/x09-selftest-$$
+    mkdir -p "$WORK/srv"
+    seed "$WORK/seed.nt"
+    "$BIN" load --loc "$db" "$WORK/seed.nt" > "$WORK/load.log" 2>&1
+    MIN_FREE_MB=1000000000 start_server "$db"
+    drc=0
+    timeout 60 "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/selftest-refused.txt" \
+      --clients 2 --seconds 2 > "$WORK/drive.json" 2> "$WORK/drive.err" || drc=$?
+    kill_server
+    [ "$drc" != 0 ] || die "the driver passed a run in which every write was refused: $(cat "$WORK/drive.json")"
+    log "refused writes: driver status $drc, as it should be"
+    start_server "$db"
+    drc=0
+    timeout 60 "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/selftest-ok.txt" \
+      --clients 2 --seconds 2 > "$WORK/drive.json" 2> "$WORK/drive.err" || drc=$?
+    kill_server
+    rm -rf "$db"
+    [ "$drc" = 0 ] || die "the driver failed a working run with status $drc: $(cat "$WORK/drive.json" "$WORK/drive.err")"
+    log "working run: $(cat "$WORK/drive.json")"
     ;;
   *)
     sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'

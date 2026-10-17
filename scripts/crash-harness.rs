@@ -8,7 +8,7 @@
 //! Commands
 //!
 //!   drive --addr A --ds D --receipts FILE [--clients 16] [--seconds S] [--run R]
-//!         [--message-every N] [--mark-cmd CMD] [--mark-ms 50]
+//!         [--message-every N] [--mark-cmd CMD] [--mark-ms 50] [--allow-empty]
 //!       `--clients` writers insert one new triple per request, `<urn:x09:R:W:K>
 //!       <urn:x09:p> "v-R-W-K"`, every `--message-every`th with a commit message, until
 //!       `--seconds` pass or the server stops answering. Each acknowledged receipt (the
@@ -18,6 +18,9 @@
 //!       `M <name> <receipts so far>` follows, and then `CMD <name>` runs (for example
 //!       `dmsetup message lw 0 mark`). Every receipt counted in a mark was acknowledged
 //!       before the mark reached the log, so it must survive a crash at any later point.
+//!       Prints `{"receipts": N, "failed": F}`. A 4xx answer or a 507 ends the run with
+//!       status 2. Another 5xx ends that writer and counts in F. The status is 3 when F is
+//!       above 0, or when no receipt was acknowledged and `--allow-empty` is not given.
 //!
 //!   verify --sparkles BIN --loc DIR --receipts FILE [--mark NAME] [--write]
 //!       Checks a recovered store: `sparkles check` reports no error before and after the
@@ -146,6 +149,7 @@ fn drive(a: &Args) {
     let every = a.num("--message-every", 4);
     let mark_cmd = a.get("--mark-cmd");
     let mark_ms = a.num("--mark-ms", 50);
+    let allow_empty = a.flag("--allow-empty");
     let file = Arc::new(Mutex::new(
         OpenOptions::new()
             .create(true)
@@ -203,7 +207,9 @@ fn drive(a: &Args) {
                         .lock()
                         .unwrap()
                         .push(format!("R {c} {s} {o} {}", m.as_deref().unwrap_or("-"))),
-                    Ok((status, _)) if status == 503 || status >= 500 => {
+                    // 507 is the server's free-space reserve refusing every write, a
+                    // setup error that would make the whole run vacuous
+                    Ok((status, _)) if status >= 500 && status != 507 => {
                         failed.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -245,10 +251,13 @@ fn drive(a: &Args) {
         m.join().unwrap();
     }
     let n = flush(None);
-    println!(
-        "{{\"receipts\": {n}, \"failed\": {}}}",
-        failed.load(Ordering::Relaxed)
-    );
+    let failed = failed.load(Ordering::Relaxed);
+    println!("{{\"receipts\": {n}, \"failed\": {failed}}}");
+    // A run without receipts checks nothing, and a failed write is not a crash outcome.
+    if failed > 0 || (n == 0 && !allow_empty) {
+        eprintln!("crash-harness: {n} receipts, {failed} failed writes");
+        std::process::exit(3);
+    }
 }
 
 // ----------------------------------------------------------------- verify ------
