@@ -266,6 +266,9 @@ impl QueryBatch {
     }
 }
 
+/// The smallest step in which a decoded batch reserves memory for its terms.
+const TERM_RESERVE: u64 = 64 << 10;
+
 pub(super) struct DecodedBatch<'a> {
     batch: &'a QueryBatch,
     terms: Vec<Term>,
@@ -313,6 +316,11 @@ impl<'a> DecodedBatch<'a> {
         let mut terms = Vec::with_capacity(ids.len());
         let scratch = ctx.charge(0)?;
         let mut reserved = 0;
+        // Terms are reserved ahead in chunks of at least TERM_RESERVE bytes. A cursor's
+        // charge goes through the memory ledger, and one reservation per term cost a
+        // large native JSON answer about 15% of its time. The reservation still comes
+        // before each term's allocation and overstates the batch by under one chunk.
+        let mut ahead = 0u64;
         ctx.snap.generation.vocab.get_sorted_checked(
             &ids,
             |need| {
@@ -326,7 +334,13 @@ impl<'a> DecodedBatch<'a> {
                 if terms.len() % 1024 == 0 {
                     ctx.check()?;
                 }
-                charge.add((key.len() as u64).saturating_mul(8).saturating_add(128))?;
+                let bytes = (key.len() as u64).saturating_mul(8).saturating_add(128);
+                if bytes > ahead {
+                    let more = bytes.max(TERM_RESERVE);
+                    charge.add(more)?;
+                    ahead = ahead.saturating_add(more);
+                }
+                ahead -= bytes;
                 terms.push(crate::id::key_to_term(key));
                 Ok::<(), Error>(())
             },
