@@ -154,7 +154,7 @@
         }
       },
       "execution": {
-        "description": "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams large immutable SELECT scans and eligible uncached OPTIONAL counts and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline includes blocked response writes, and a failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out.",
+        "description": "Query execution mode. Streaming consumes bounded SELECT or graph batches with visible, budgeted materialization barriers; ASK stops after a qualifying solution. Auto, the default unless the server runs with `--default-execution eager`, streams large immutable SELECT scans and eligible uncached OPTIONAL counts and runs every other plan eagerly. Auto runs eagerly for SPARQL Results Thrift and initial bindings, and explicit streaming SELECT does not support Thrift. A streamed answer's deadline counts the query's own time, and a client that reads nothing for longer than the timeout ends it. A failure after the response has started aborts the body, so only a transfer that completes is a complete answer. `eager` opts out.",
         "in": "query",
         "name": "execution",
         "schema": {

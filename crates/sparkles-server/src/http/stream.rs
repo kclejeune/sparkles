@@ -64,19 +64,33 @@ pub struct SwitchWriter {
 
 /// Controls for a native cursor's producer, including time spent waiting for a
 /// slow reader. Eager serialization keeps its existing blocking-send path.
+///
+/// The deadline counts the query's own time. A wait for room in the channel is added to
+/// the query's deadline pause, and one wait that lasts longer than the stall bound ends
+/// the stream as a timeout.
 #[derive(Clone)]
 pub(super) struct StreamControl {
     cancel: Arc<AtomicBool>,
     deadline: Option<Instant>,
+    /// The nanoseconds the producer spent waiting for the reader. It is the query's
+    /// deadline pause, so a wait does not count against the deadline.
     wait_ns: Arc<AtomicU64>,
+    /// The longest the producer may wait for room in one stretch.
+    stall: Option<Duration>,
 }
 
 impl StreamControl {
-    pub(super) fn new(cancel: Arc<AtomicBool>, deadline: Option<Instant>) -> Self {
+    pub(super) fn new(
+        cancel: Arc<AtomicBool>,
+        deadline: Option<Instant>,
+        pause: Arc<AtomicU64>,
+        stall: Option<Duration>,
+    ) -> Self {
         Self {
             cancel,
             deadline,
-            wait_ns: Default::default(),
+            wait_ns: pause,
+            stall,
         }
     }
     fn check_cancel(&self) -> io::Result<()> {
@@ -90,8 +104,14 @@ impl StreamControl {
     }
     fn check(&self) -> io::Result<()> {
         self.check_cancel()?;
-        if self.deadline.is_some_and(|d| Instant::now() >= d) {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"));
+        if let Some(d) = self.deadline {
+            // the deadline counts the query's own time, not the time it waited for the
+            // reader, and a deadline too far out to represent never passes
+            let paused = Duration::from_nanos(self.wait_ns.load(Ordering::Relaxed));
+            let now = Instant::now();
+            if now >= d && d.checked_add(paused).is_some_and(|end| now >= end) {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"));
+            }
         }
         Ok(())
     }
@@ -144,6 +164,9 @@ impl SwitchWriter {
             return tx.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| gone());
         };
         let mut item = Ok(Bytes::from(chunk));
+        // Each chunk starts its own stall clock, so a reader that takes a chunk now and
+        // then never stalls, however slowly it reads.
+        let stalled = Instant::now();
         loop {
             control.check()?;
             match tx.try_send(item) {
@@ -171,7 +194,14 @@ impl SwitchWriter {
                             return Ok(());
                         }
                         Ok(Err(_)) => return Err(gone()),
-                        Err(_) => (),
+                        Err(_) => {
+                            if control.stall.is_some_and(|s| stalled.elapsed() >= s) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "the client read nothing for longer than the query timeout",
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -768,11 +798,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controlled_waits_expire_without_reading_or_terminal_channel_space() {
+    async fn a_reader_that_stalls_past_the_stall_bound_times_out() {
         let (seen, on_end) = ends();
         let control = StreamControl::new(
             Default::default(),
-            Some(Instant::now() + Duration::from_millis(150)),
+            None,
+            Default::default(),
+            Some(Duration::from_millis(150)),
         );
         let waits = control.clone();
         let Ok(Serialized::Streamed(body)) =
@@ -786,7 +818,7 @@ mod tests {
             }
         })
         .await
-        .expect("a stalled reader must not hold the producer past its deadline");
+        .expect("a stalled reader must not hold the producer past the stall bound");
         assert!(matches!(
             seen.lock().unwrap()[0].error,
             Some(Error::Timeout)
@@ -799,13 +831,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controlled_waits_do_not_count_against_the_deadline() {
+        use futures_util::StreamExt;
+        let (seen, on_end) = ends();
+        let control = StreamControl::new(
+            Default::default(),
+            Some(Instant::now() + Duration::from_millis(150)),
+            Default::default(),
+            Some(Duration::from_secs(1)),
+        );
+        let Ok(Serialized::Streamed(body)) =
+            serialize_inner(100, None, Some(control), write_n(400_000, None), on_end).await
+        else {
+            panic!("expected a stream");
+        };
+        // a reader that takes a chunk every 10 ms needs far longer than the deadline
+        let began = Instant::now();
+        let mut stream = body.into_data_stream();
+        let mut bytes = 0;
+        while let Some(chunk) = stream.next().await {
+            bytes += chunk
+                .expect("a slow steady reader gets the whole body")
+                .len();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(bytes, 4_000_000);
+        assert!(began.elapsed() > Duration::from_millis(300));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the stream ends");
+        assert!(seen.lock().unwrap()[0].error.is_none());
+    }
+
+    #[tokio::test]
     async fn controlled_waits_observe_cancellation_and_report_only_once() {
         let (seen, on_end) = ends();
         let cancel = Arc::new(AtomicBool::new(false));
         let Ok(Serialized::Streamed(body)) = serialize_inner(
             100,
             None,
-            Some(StreamControl::new(cancel.clone(), None)),
+            Some(StreamControl::new(
+                cancel.clone(),
+                None,
+                Default::default(),
+                None,
+            )),
             write_n(10_000_000, None),
             on_end,
         )
@@ -826,7 +900,12 @@ mod tests {
         let r = serialize_inner(
             100,
             Some(50),
-            Some(StreamControl::new(Default::default(), None)),
+            Some(StreamControl::new(
+                Default::default(),
+                None,
+                Default::default(),
+                None,
+            )),
             write_n(20, None),
             on_end,
         )

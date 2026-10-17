@@ -1629,8 +1629,10 @@ Query parameters beyond the standard protocol:
 
   A streamed answer differs from an eager one in what the caller sees. The memory and
   work budgets cover the whole cursor, including batches it still holds and terms it
-  generates. The deadline includes time spent waiting for the client, so a client that
-  reads slowly can run out the `timeout`. The snapshot and the query's memory grant stay
+  generates. The deadline counts the query's own time and not the time spent waiting for
+  the client, so a slow reader does not run it out. A client that reads nothing for
+  longer than the request's `timeout` ends the stream as a timeout. The snapshot and the
+  query's memory grant stay
   held until the body ends. An error before the response starts gets the normal status
   and JSON error. An error after the first 1 MiB has been sent, such as a timeout or an
   exhausted budget, aborts the body transfer. The client then sees a

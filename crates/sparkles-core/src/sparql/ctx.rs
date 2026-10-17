@@ -430,7 +430,16 @@ pub struct Ctx {
     /// the blank nodes that labels inside the composite literals of the query text name
     /// (see [`Ctx::query_literal`])
     literal_bnodes: parking_lot::Mutex<FxHashMap<String, Id>>,
+    /// The query's deadline. The readers that copy it raw (`algo`, `history_svc`) are
+    /// stricter than [`Ctx::check`], which also counts [`Ctx::deadline_pause`], and no
+    /// automatic plan reaches them.
     pub deadline: Option<Instant>,
+    /// Nanoseconds the query spent waiting for its consumer, which the deadline does not
+    /// count. The thread that drives the cursor adds to it, after each stretch of waiting
+    /// for its consumer, and the same thread runs every check, so a check never misses a
+    /// wait that is still in progress. A background reader of the deadline would need to
+    /// credit a wait before it starts.
+    pub deadline_pause: Arc<AtomicU64>,
     pub cancel: Arc<AtomicBool>,
     pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
@@ -769,6 +778,7 @@ impl Ctx {
             outside_bnodes: Default::default(),
             literal_bnodes: Default::default(),
             deadline: None,
+            deadline_pause: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             cancellation: None,
             dataset: DatasetSpec::default(),
@@ -1045,12 +1055,25 @@ impl Ctx {
         if let Some(cancellation) = &self.cancellation {
             cancellation.check()?;
         }
-        if let Some(d) = self.deadline
-            && Instant::now() >= d
-        {
+        if self.past_deadline() {
             return Err(Error::Timeout);
         }
         Ok(())
+    }
+
+    /// Whether the deadline has passed, not counting the time the query spent waiting
+    /// for its consumer. The counter is read only once the raw deadline has passed, which
+    /// keeps the atomic load off the common path.
+    pub fn past_deadline(&self) -> bool {
+        let Some(d) = self.deadline else {
+            return false;
+        };
+        let now = Instant::now();
+        if now < d {
+            return false;
+        }
+        let paused = std::time::Duration::from_nanos(self.deadline_pause.load(Ordering::Relaxed));
+        d.checked_add(paused).is_some_and(|end| now >= end)
     }
 
     pub(super) fn enable_cursor_accounting(&mut self) -> Result<()> {

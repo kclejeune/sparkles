@@ -296,7 +296,7 @@ existing limits.
 | `max_rows_produced` and shared `work` | Sum of rows produced by physical operators, kept on the existing shared request counter |
 | `max_memory_bytes` | Estimated query-owned capacity and retained data that are live at the same time, including outstanding batches |
 | Result-byte budget | Serialized uncompressed bytes actually written, independent of row and batch counts |
-| Timeout | One absolute query deadline. Consumer waits and transport backpressure do not reset or suspend it. |
+| Timeout | One query deadline that counts the query's own time. Time blocked on the reader is added to a per-query pause and does not count, and one wait longer than the request's timeout ends the stream. |
 | Cancellation | Checked during production, decoding, serialization and interruptible transport waits |
 
 Counters use checked or saturating arithmetic and fail on overflow. Counts are updated
@@ -369,7 +369,8 @@ The producer does not retry a cursor that has already advanced after a serializa
 trial. Streaming uses a single-use writer path, and the repeatable quick-result
 serializer remains for eager results. The producer can run ahead by a finite amount of
 queued bytes and one batch in progress. Once those fill, it stops pulling. Channel waits
-observe cancellation and the deadline and never wait indefinitely for another write.
+observe cancellation, the deadline and the stall bound, and never wait indefinitely for
+another write.
 When the receiver drops, blocked sends wake up and the producer is released. The
 disconnect guard belongs to the lifetime of the body and the producer, not only to the
 handler future, so returning response headers cannot cancel the running query.
@@ -932,8 +933,9 @@ the rest are sketched here.
 * **Earlier first bytes.** Explicit streaming commits the response after the first
   batch or 64 KiB, whichever comes first, instead of after 1 MiB. A later failure aborts
   the transport as §6 specifies. Slow streaming bodies count against the X08 pool through
-  their retained batches, and a `--stream-idle-timeout` (default 60 s) ends a body whose
-  reader takes nothing for that long.
+  their retained batches. The stall bound is now the request's timeout, and a
+  `--stream-idle-timeout` (default 60 s) would replace it with its own limit on how long a
+  body's reader may take nothing.
 * **Broader automatic selection.** X08 §6.8 lets `auto` stream SELECT plans whose
   estimate exceeds half the memory budget, and retries an eager query that fails its
   budget before output as a cursor with spill. Each widening needs the matched
@@ -974,8 +976,9 @@ CSV or N-Triples the rows before the cut are well formed. The Rust client, the C
 TypeScript client and the UI report the cut-off transfer as an error, and new tests serve
 such a response to each of them. They all already did, through the transfer errors of
 reqwest and of fetch, so none of those tests failed before the change. The deadline
-includes the time the client takes to read, and the snapshot and the query's memory
-grant stay held until the body ends. With `send`, the native metadata reports `stopped`
+counts the query's own time and not the time the client takes to read, a client that reads
+nothing for longer than the timeout ends the stream, and the snapshot and the query's
+memory grant stay held until the body ends. With `send`, the native metadata reports `stopped`
 and an unknown total. Rows come in the same order as eagerly, which a test checks over a
 million-row scan. Streamed answers skip the full-result cache. A plain scan is never
 cached, so this matters only for its projection, which a cursor reads from decoded
@@ -987,8 +990,9 @@ the request's `max-rows` or `max-rows-produced` stays eager, so the budget fails
 `507` before any output. A request that lowers `max-result-mb` does not stay eager. A
 streamed answer that passes the lowered budget within its first 1 MiB is refused with
 `507` before any output, and one that passes it later aborts the transfer, as an eager
-answer past 1 MiB already did. A timeout cannot be predicted, so a slow reader of a
-streamed scan can still run out its `timeout` partway through.
+answer past 1 MiB already did. A streamed scan can still run out its `timeout`
+partway through when the query itself is slow, and a reader that takes nothing for
+longer than the timeout is cut off.
 
 Automatic execution plans the query once on the blocking pool. When it keeps the plan
 eager, the HTTP handler continues on the eager path with that result, so the response,

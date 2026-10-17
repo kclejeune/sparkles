@@ -1656,12 +1656,61 @@ async fn a_server_can_default_to_eager_execution() {
 }
 
 #[tokio::test]
+async fn a_slow_steady_reader_completes_a_stream() {
+    use futures_util::StreamExt;
+    let s = server();
+    let ds = s.state.attach("fat", DbType::Mem, None).unwrap();
+    // 400 literals of 10 KiB make about 4 MiB of TSV, far more than the buffered response
+    // and trivial work for the query
+    let payload = "x".repeat(10 << 10);
+    let mut data = String::new();
+    for i in 0..400 {
+        data.push_str(&format!("<urn:big{i}> <urn:p> \"{payload}\" .\n"));
+    }
+    ds.store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // The reader takes a chunk every 40 ms, so the transfer outlasts the one-second
+    // timeout, but the reader never makes the query wait for as long as the timeout.
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get(
+                "/fat/sparql?query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn%3Ap%3E%20%3Fo%7D&format=tsv&timeout=1&execution=streaming",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let began = std::time::Instant::now();
+    let mut body = res.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        bytes.extend_from_slice(&chunk.expect("a steady reader gets the whole answer"));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        began.elapsed() > Duration::from_millis(1200),
+        "the transfer must outlast the timeout, took {:?}",
+        began.elapsed()
+    );
+    assert_eq!(String::from_utf8(bytes).unwrap().lines().count(), 401);
+}
+
+#[tokio::test]
 async fn a_late_failure_of_a_default_stream_aborts_the_transfer() {
     use futures_util::StreamExt;
     let s = server();
     million(&s);
-    // The deadline of a streamed answer includes the time its reader takes, so a reader
-    // that stalls past it gets a cut-off transfer after a successful status.
+    // A reader that takes nothing for longer than the timeout gets a cut-off transfer
+    // after a successful status.
     let res = s
         .app
         .clone()

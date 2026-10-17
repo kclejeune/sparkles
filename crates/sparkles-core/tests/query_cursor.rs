@@ -3437,3 +3437,31 @@ fn streaming_top_k_keeps_only_its_rows_within_the_memory_budget() {
         Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
     ));
 }
+
+#[test]
+fn a_cursor_deadline_excludes_time_its_consumer_paused() {
+    let s = store(200);
+    let opts = QueryOptions {
+        timeout: Some(Duration::from_millis(200)),
+        ..Default::default()
+    };
+    let open = || select_cursor(s.snapshot(), "SELECT * {?s ?p ?o}", &opts, &options(16)).unwrap();
+    let (mut slow, mut paused) = (open(), open());
+    for c in [&mut slow, &mut paused] {
+        assert!(c.next_batch().unwrap().is_some());
+        assert_eq!(c.status(), CursorStatus::Open);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    // a consumer that kept the cursor waiting for as long as it slept has not used up
+    // the deadline, and one that did not report its wait has
+    assert!(matches!(slow.next_batch(), Err(Error::Timeout)));
+    paused
+        .deadline_pause()
+        .fetch_add(300_000_000, Ordering::Relaxed);
+    let mut rows = 16;
+    while let Some(batch) = paused.next_batch().unwrap() {
+        rows += batch.len();
+    }
+    assert_eq!(rows, 200);
+    assert_eq!(paused.status(), CursorStatus::Complete);
+}

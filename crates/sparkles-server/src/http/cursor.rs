@@ -149,7 +149,12 @@ pub(super) async fn serve(
         .iter()
         .map(|(a, b)| (a.clone(), b.clone()))
         .collect::<Vec<_>>();
-    let control = stream::StreamControl::new(cursor.cancellation_token(), cursor.deadline());
+    let control = stream::StreamControl::new(
+        cursor.cancellation_token(),
+        cursor.deadline(),
+        cursor.deadline_pause(),
+        timeout,
+    );
     let completed: Arc<parking_lot::Mutex<Option<CursorStats>>> = Default::default();
     let stats_slot = completed.clone();
     // the plan as it stood when a native JSON stream failed before its first byte

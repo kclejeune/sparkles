@@ -4171,8 +4171,11 @@ request that does not name a mode. The UI's result table asks for eager executio
 because it shows the full row count, and its downloads use the server's default.
 
 When a client reads a streamed answer slowly, the query pauses once the bounded output
-buffers are full. A disconnect or a deadline stops the query even while it waits, so the
-query's `timeout` also covers the time the client takes to read. An error that happens
+buffers are full. A disconnect or a deadline stops the query even while it waits. The
+query's `timeout` counts the time the query itself spends and not the time it waits for
+the client, so a slow reader does not run it out. A client that reads nothing for longer
+than the `timeout` ends the stream, and a request without a timeout has no such limit.
+An error that happens
 after the first 1 MiB of the response has been sent aborts the response. The status was
 already `200`, and in a line format such as TSV or N-Triples the rows before the cut are
 well formed, so only a transfer that finishes successfully is a complete answer.
@@ -4188,7 +4191,9 @@ through `--server`. Without it, a local query runs in automatic mode and prints 
 eager query prints when its plan stays eager, except that the `text` table, the default
 output, always runs eagerly because it measures every row before printing one. A query
 through `--server` runs in the server's default mode. A streamed `text` result is printed
-as TSV. Rust callers choose a mode with `Dataset::query_execution_with`, and
+as TSV. A local `sparkles query --timeout` that streams its answer counts the time its
+output is blocked, for example by a slow pipe, because the command has no reader to
+separate that time from the query's own. Rust callers choose a mode with `Dataset::query_execution_with`, and
 `Dataset::query_execution` runs in `ExecutionMode::Auto`, the default of `ExecutionMode`.
 `Dataset::query` and `Dataset::query_with` return a collected result and always run
 eagerly.

@@ -15,6 +15,7 @@ use oxrdf::Term;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 mod binary;
@@ -910,11 +911,22 @@ impl QueryExecution {
             Self::Eager(r) | Self::Ask(r) => r.result().ctx.cancel.clone(),
         }
     }
+    /// The deadline without the time the query spent waiting for its consumer. The
+    /// effective deadline is `deadline() + deadline_pause()`.
     pub fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Select(c) => c.deadline(),
             Self::Graph(c) => c.deadline(),
             Self::Eager(r) | Self::Ask(r) => r.result().ctx.deadline,
+        }
+    }
+    /// The nanoseconds the query spent waiting for its consumer. Adding to the counter
+    /// moves the effective deadline back by as much.
+    pub fn deadline_pause(&self) -> Arc<AtomicU64> {
+        match self {
+            Self::Select(c) => c.deadline_pause(),
+            Self::Graph(c) => c.deadline_pause(),
+            Self::Eager(r) | Self::Ask(r) => r.result().ctx.deadline_pause.clone(),
         }
     }
     pub fn plan_json(&self) -> Result<String> {
@@ -984,6 +996,11 @@ impl QueryCursor {
     }
     pub fn deadline(&self) -> Option<Instant> {
         self.ctx.deadline
+    }
+    /// The nanoseconds this cursor's consumer kept it waiting, which its deadline does
+    /// not count.
+    pub fn deadline_pause(&self) -> Arc<AtomicU64> {
+        self.ctx.deadline_pause.clone()
     }
 
     pub(super) fn check(&self) -> Result<()> {
