@@ -602,7 +602,10 @@ export interface OperationOptions {
   timeout?: number;
 }
 export interface QueryOptions extends OperationOptions {
-  /** Opt-in engine cursor; existing calls use eager execution. */
+  /**
+   * How the query runs. `auto`, the default, streams the plans that measured faster and
+   * runs the rest eagerly. A streamed result can fail while it is read. `eager` opts out.
+   */
   execution?: 'eager' | 'streaming' | 'auto';
   allowMaterialization?: boolean;
   unionDefaultGraph?: boolean;

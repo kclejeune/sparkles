@@ -445,7 +445,7 @@ impl NativeDataset {
             let shared = shared.clone();
             let flag = flag.clone();
             let v = v.clone();
-            move || match v["execution"].as_str().unwrap_or("eager") {
+            move || match v["execution"].as_str().unwrap_or("auto") {
                 "streaming" | "auto" => {
                     open_query_cursor(&shared.ds, &text, &v, flag).map(StreamResult::Streaming)
                 }

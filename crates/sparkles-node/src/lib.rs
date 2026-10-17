@@ -248,10 +248,11 @@ fn open_query_cursor(
     flag: Arc<AtomicBool>,
 ) -> sparkles::Result<sparkles::sparql::QueryExecution> {
     let opts = query_options(v, flag)?;
-    let mode = if v["execution"].as_str() == Some("auto") {
-        sparkles::sparql::ExecutionMode::Auto
-    } else {
+    // callers open a cursor for `streaming` and for `auto`, the default
+    let mode = if v["execution"].as_str() == Some("streaming") {
         sparkles::sparql::ExecutionMode::Streaming
+    } else {
+        sparkles::sparql::ExecutionMode::Auto
     };
     let cursor_opts = sparkles::sparql::CursorOptions {
         batch_rows: v["batchSize"]
@@ -515,9 +516,28 @@ impl NativeDataset {
         let shared = self.get(false)?;
         let v = parse(&options)?;
         let flag = cancel.flag.clone();
-        match v["execution"].as_str().unwrap_or("eager") {
+        match v["execution"].as_str().unwrap_or("auto") {
             "eager" => {}
-            "streaming" | "auto" => {
+            "auto" => {
+                // A plan that automatic execution keeps eager returns the same result as
+                // an eager query, with its first batch computed in this call.
+                let permit = query_permit(&v, &flag).await?;
+                let first = first_batch_option(&v);
+                let cancellation = flag.clone();
+                let result =
+                    blocking(
+                        move || match open_query_cursor(&shared.ds, &text, &v, flag)? {
+                            sparkles::sparql::QueryExecution::Eager(result) => {
+                                NativeResult::query(result.into_result()).with_first(first)
+                            }
+                            cursor => NativeResult::streaming(cursor, cancellation),
+                        },
+                    )
+                    .await?;
+                drop(permit);
+                return Ok(result);
+            }
+            "streaming" => {
                 let permit = query_permit(&v, &flag).await?;
                 let cancellation = flag.clone();
                 let cursor =
