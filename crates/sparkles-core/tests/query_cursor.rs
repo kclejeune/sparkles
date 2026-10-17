@@ -3761,3 +3761,51 @@ fn decoding_ahead_under_tight_budgets_and_failing_writers() {
         }
     }
 }
+
+/// Three dateTimes that `ORDER BY` does not order totally: p is before q by value, and q
+/// is before a and a before p by their lexical forms, since a has no timezone and lies
+/// within 14 hours of both. The top-k's screen cannot remember a rejected value of such a
+/// key, because a later heap can rank it again, so every batch size gives eager's answer.
+#[test]
+fn top_k_over_a_cycle_of_partially_ordered_keys_matches_eager_at_every_batch_size() {
+    let s = Store::in_memory(StoreOptions::default());
+    let dt = |v: &str| format!("\"{v}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>");
+    let (p, q, a) = (
+        dt("2020-01-02T01:00:00+05:00"),
+        dt("2020-01-01T23:00:00Z"),
+        dt("2020-01-01T23:30:00"),
+    );
+    let mut data = String::new();
+    for (i, v) in [&p, &q, &a, &q].into_iter().enumerate() {
+        data.push_str(&format!("<urn:s:{:05}> <urn:v> {v} .\n", i + 1));
+    }
+    for i in 5..3001 {
+        data.push_str(&format!("<urn:s:{i:05}> <urn:v> {p} .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    for q in [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 1",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v ?s LIMIT 2",
+    ] {
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for rows in [1, 512, 1024, 4096] {
+            let c = select_cursor(
+                s.snapshot(),
+                q,
+                &QueryOptions::default(),
+                &CursorOptions {
+                    batch_rows: rows,
+                    fallback: FallbackPolicy::AllowMaterialization,
+                    ..CursorOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(all(c), eager, "{q}; batch {rows}");
+        }
+    }
+}
