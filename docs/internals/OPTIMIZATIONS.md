@@ -354,8 +354,10 @@ little and change nothing. Each one has the same answers with it on and off.
   the constants of a query one by one, it collects the IRIs and literals of the patterns,
   paths, VALUES rows, graph names and the common FILTER comparisons. It asks for the
   sparse-index group of every one of them in one pass (`Vocab::prefetch_keys`), so the
-  group reads overlap instead of following each other. It collects at most 4,096 keys,
-  and it does nothing without a sparse index or with the read hints off.
+  group reads overlap instead of following each other. It visits at most 4,096 keys,
+  and it does nothing without a sparse index or with the read hints off. A table of
+  1,024 key hashes per vocabulary remembers the keys whose group was already asked for,
+  so a warm constant costs a hash and a load instead of a search of the sparse index.
 * **Scans requested before they run** (`prefetch_first_scan`). When the plan is built,
   every scan of 64 blocks or fewer asks the kernel for the columns the reader will decode.
   A block inside the key range needs the scan's columns, and a block at an end of the range
