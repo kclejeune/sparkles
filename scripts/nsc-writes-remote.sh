@@ -147,6 +147,8 @@ for round in $(seq "$ROUNDS"); do
         out="{\"error\":true}"
       }
       curl -s "localhost:$PORT/\$/metrics" | grep -E '^sparkles_(group_commit|commit_sync)' > "$R/metrics-$run.txt" || true
+      # the server's peak resident memory, which includes the speculative index state
+      grep -E '^VmHWM' "/proc/$SPID/status" >> "$R/metrics-$run.txt" 2> /dev/null || true
       kill "$SPID"
       wait "$SPID" 2> /dev/null || true
       SPID=
