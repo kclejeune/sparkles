@@ -436,8 +436,10 @@ fn verify(a: &Args) {
             ));
         }
     }
+    // After open only leftovers may remain: a newer generation of a compaction that a
+    // crash interrupted stays until the next rebuild replaces it.
     let (code, out, err) = sparkles(&bin, &["check", "--loc", &loc, "--format", "json"]);
-    if code != 0 {
+    if code != 0 && !(code == 2 && only_leftovers(&out)) {
         problems.push(format!(
             "check after open exited {code}: {}{}",
             whole(&out),
@@ -451,6 +453,23 @@ fn verify(a: &Args) {
         problems
     );
     std::process::exit(if ok { 0 } else { 1 });
+}
+
+/// Whether every issue in a `sparkles check --format json` report is a warning about a
+/// leftover file, such as a generation newer than CURRENT. Each issue object names its
+/// status before its message.
+fn only_leftovers(json: &str) -> bool {
+    let mut any = false;
+    for (i, _) in json.match_indices("\"message\": \"") {
+        let status = json[..i]
+            .rfind("\"status\": \"")
+            .and_then(|j| json[j + 11..].split('"').next());
+        if status != Some("warning") || !json[i + 12..].starts_with("leftover:") {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 // all of a failed check's report, so that its finding is never cut off

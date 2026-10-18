@@ -30,13 +30,15 @@
 # refuses to replay a load without receipts or with failed writes.
 #
 # --flags are global flags given to `sparkles` before `serve`, to run the crashes with
-# and without group commit. Results go to DIR/results.tsv and DIR/summary.json, and the
+# and without group commit. --serve-flags are options of `serve`, for example a lower
+# --auto-compact-min-quads so that a short load crosses a compaction. Results go to
+# DIR/results.tsv and DIR/summary.json, and the
 # exit status is 0 only when every check passed.
 set -euo pipefail
 
 MODE=${1:-}
 [ -n "$MODE" ] && shift
-FS='' BIN='' HARNESS='' WORK='' POINTS=1000 KILLS=200 SECONDS_RUN=20 CLIENTS=16 JOBS=8 FLAGS=''
+FS='' BIN='' HARNESS='' WORK='' POINTS=1000 KILLS=200 SECONDS_RUN=20 CLIENTS=16 JOBS=8 FLAGS='' SERVE_FLAGS=''
 PORT=${PORT:-3931}
 POS=()
 while [ $# -gt 0 ]; do
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
     --clients) CLIENTS=$2 ;;
     --jobs) JOBS=$2 ;;
     --flags) FLAGS=$2 ;;
+    --serve-flags) SERVE_FLAGS=$2 ;;
     -*)
       echo "power-loss: unknown option $1" >&2
       exit 2
@@ -92,7 +95,7 @@ start_server() { # <store>
   # the test file systems are small, so the server keeps only 64 MiB free instead of 1 GiB
   # shellcheck disable=SC2086 # the flags are a command line
   "$BIN" $FLAGS serve --data "$WORK/srv" --loc "ds=$1" --port "$PORT" --no-access-log \
-    --min-free-disk-mb "${MIN_FREE_MB:-64}" > "$WORK/server.log" 2>&1 &
+    --min-free-disk-mb "${MIN_FREE_MB:-64}" $SERVE_FLAGS > "$WORK/server.log" 2>&1 &
   SPID=$!
   for _ in $(seq 1 300); do
     curl -sf "http://127.0.0.1:$PORT/\$/ping" > /dev/null 2>&1 && return 0
