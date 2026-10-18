@@ -38,11 +38,17 @@ Three tracks run through the tiers:
 
 | Track | Items | Spec order |
 |---|---|---|
-| **Performance** | 1 → 2 → 3 → 86 → 4 → 7 → 16 | X06 → X08 → X09 → X09 Phase 4 → X07 → X08 Phase 2 → X11 |
+| **Performance** | 3 → 2 → 1 → 7 and 86 → 4 → 16 | X09 → X08 → X06 → X08 Phase 2 and X09 Phase 4 → X07 → X11 |
 | **Graph features** | 8 → 12 → 20 | F14 → C22 → F01 |
 | **Reasoning** | 9 → 19 → 18, with 17 before F18 Phase 3 | F16 → F17 → F18 Phases 1–2 → F13 → F18 Phase 3 |
 
 The UI items (11, 21, 27–31) fill time when a track is waiting on benchmark results.
+
+Item 2's gates run before item 1's benchmark refresh, so that the refresh measures the
+settled defaults. Item 86 and the rest of item 7 then run in parallel, since they change
+different parts of the engine. The removal at open of a leftover generation, from item 14,
+runs early with the other durability follow-ups, and the rest of item 14 waits for the
+sustained-write results of item 1.
 
 Two decisions depend on what item 1 measures:
 
