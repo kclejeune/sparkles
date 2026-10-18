@@ -456,11 +456,15 @@ fn verify(a: &Args) {
 }
 
 /// The leftover warnings that `sparkles check` may still give after an open. Open removes
-/// generations newer than CURRENT, `text.new`, `text.old` and `.tmp` files and finishes
-/// interrupted removals, so only an old generation that something still holds can remain.
-/// Any other leftover, a set-aside `commits.bin.corrupt-*` catalog above all, is a finding.
-const ACCEPTED_LEFTOVERS: &[&str] =
-    &["leftover: an old generation whose removal after a compaction was interrupted"];
+/// unfinished builds above CURRENT, `text.new`, `text.old` and the store's own `.tmp`
+/// files and finishes interrupted removals. Two generation leftovers remain possible: an
+/// old generation that something still holds, and a complete build above CURRENT that a
+/// power loss kept from being switched to, which open sets aside rather than deletes. Any
+/// other leftover, a set-aside `commits.bin.corrupt-*` catalog above all, is a finding.
+const ACCEPTED_LEFTOVERS: &[&str] = &[
+    "leftover: an old generation whose removal after a compaction was interrupted",
+    "leftover: a generation above CURRENT that open set aside instead of removing",
+];
 
 /// Whether every issue in a `sparkles check --format json` report is one of the
 /// `ACCEPTED_LEFTOVERS` warnings, and there is at least one. Each issue object names its
@@ -757,11 +761,13 @@ mod tests {
     }
 
     #[test]
-    fn only_the_old_generation_leftover_passes() {
+    fn only_the_generation_leftovers_that_open_keeps_pass() {
         let old = "leftover: an old generation whose removal after a compaction was interrupted; safe to remove";
+        let aside = "leftover: a generation above CURRENT that open set aside instead of removing; inspect it, then rename it back and point CURRENT at it, or delete it";
         assert!(only_leftovers(&report(&[("warning", old)])));
+        assert!(only_leftovers(&report(&[("warning", old), ("warning", aside)])));
         for other in [
-            "leftover: newer than CURRENT, an interrupted rebuild that the next open removes",
+            "leftover: newer than CURRENT, which the next open removes if it is an unfinished rebuild and sets aside otherwise",
             "leftover: a damaged commit catalog an earlier open set aside",
             "leftover: a temporary file of an interrupted write, which the next open removes",
             "leftover: left by an interrupted full-text rebuild; removed on open",

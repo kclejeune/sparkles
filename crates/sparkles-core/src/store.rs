@@ -1421,6 +1421,36 @@ fn open_step(step: &'static str) {
     OPEN_STEPS.with(|v| v.borrow_mut().push(step));
 }
 
+/// Refuse to create a new database in `root`, which has no `CURRENT`, when it holds
+/// generations: `CURRENT` was lost, and a new database would hide them and let a later
+/// open remove them. The only generation a creation that a crash interrupted leaves is an
+/// empty `gen-0001` without a log, which the creation builds again.
+fn refuse_generations_without_current(root: &Path) -> Result<()> {
+    let mut found: Vec<String> = std::fs::read_dir(root)?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| {
+            n.strip_prefix("gen-").is_some_and(|d| {
+                !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+                    || d.contains(crate::history::SET_ASIDE)
+            })
+        })
+        .collect();
+    found.sort();
+    let interrupted_creation = found == ["gen-0001"] && !root.join("gen-0001/wal.log").exists();
+    if found.is_empty() || interrupted_creation {
+        return Ok(());
+    }
+    Err(Error::Corrupt(format!(
+        "{} has no CURRENT but holds {}; refusing to create a new database over them. \
+         Run `sparkles check --loc {}` and write the name of the generation to open into \
+         CURRENT, or restore the dataset from a backup",
+        root.display(),
+        found.join(", "),
+        root.display()
+    )))
+}
+
 /// Take the exclusive process lock of a database directory.
 fn lock_dir(root: &Path) -> Result<File> {
     let path = root.join("sparkles.lock");
@@ -1647,6 +1677,7 @@ impl Store {
         }
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
+            refuse_generations_without_current(root)?;
             // a new database: its id, an empty generation holding the root commit, the
             // catalog, and CURRENT last (the commit point of the creation)
             let id = match commit::read_dataset_file(root)? {
@@ -4660,12 +4691,14 @@ impl Store {
                 annotation = self.annotate(&head, message.clone(), || None)?;
             }
             if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
-                let switched =
-                    std::fs::read_to_string(root.join("CURRENT")).is_ok_and(|c| c.trim() == name);
-                if switched {
-                    // The next open uses the new generation, so the bulk commit may come
-                    // back and keeps its annotation. Later commits to the old generation
-                    // would be lost, so the writer takes no more.
+                // CURRENT may name the new generation, or a read that fails leaves it
+                // unknown
+                let maybe_switched = std::fs::read_to_string(root.join("CURRENT"))
+                    .map_or(true, |c| c.trim() == name);
+                if maybe_switched {
+                    // The next open may use the new generation, so the bulk commit may
+                    // come back and keeps its annotation. Later commits to the old
+                    // generation would be lost, so the writer takes no more.
                     w.poisoned = true;
                 } else if !annotation.is_empty() && self.annotations.lock().undo(head.seq).is_err()
                 {
@@ -6388,8 +6421,8 @@ impl Drop for Store {
 
 /// The history state of a store being opened: pins and retention from
 /// `history.json`, and the table of this dataset's generation directories. Finishes
-/// interrupted collections and removes interrupted rebuilds (generations newer than
-/// the current one).
+/// interrupted collections, and removes or sets aside the generations newer than the
+/// current one (see `history::settle_newer_generations`).
 fn open_history(
     root: &Path,
     dataset_id: uuid::Uuid,
@@ -6399,7 +6432,7 @@ fn open_history(
 ) -> Result<crate::history::HistoryState> {
     use crate::history;
     history::remove_deleting(root)?;
-    history::remove_newer_generations(root, current);
+    history::settle_newer_generations(root, dataset_id, current, head);
     history::remove_temp_files(root);
     let cfg = history::read_file(root, dataset_id)?;
     let mut h = history::HistoryState::new(cfg.pins, cfg.retention);
@@ -6407,10 +6440,8 @@ fn open_history(
     h.catalog = cfg.catalog;
     for (no, name, base, fold_legacy) in history::scan_generations(root, dataset_id)? {
         let dir = root.join(&name);
+        // one that could be neither removed nor set aside above stays where it is
         if no > current {
-            if let Err(e) = history::delete_generation(root, &dir) {
-                tracing::warn!(target: "sparkles::store", "could not remove the interrupted rebuild {name}: {e}");
-            }
             continue;
         }
         let end = if no == current {

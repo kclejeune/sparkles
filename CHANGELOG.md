@@ -95,11 +95,15 @@ distinct binding of the variables it shares with the outer rows, and once in all
 shares none. A streamed query whose memory budget was nearly spent used to call it once
 per row.
 
-Open removes generation directories newer than the one `CURRENT` names, and the
-temporary `.tmp` files of interrupted atomic writes in the dataset's directory. A power
-loss during a compaction or a bulk load can leave such a directory with an empty build
-marker, which earlier releases kept until the next rebuild reused its number, and a
-`CURRENT.tmp` beside it.
+Open deletes a generation directory newer than the one `CURRENT` names when it is an
+unfinished build of the dataset, and the deletion is permanent. A power loss during a
+compaction or a bulk load can leave such a directory with an empty build marker, which
+earlier releases kept until the next rebuild reused its number. Any other directory above
+`CURRENT`, such as one that a `CURRENT` restored from an older copy no longer names, is
+renamed to `gen-N.set-aside-<ms>` and kept, and `sparkles check` reports it. Open also
+deletes the store's own temporary files, such as a `CURRENT.tmp` left by an interrupted
+switch, and leaves every other `.tmp` file alone. A directory that holds generations but
+no `CURRENT` is now refused instead of opened as a new, empty database.
 
 A commit whose own log synchronization fails keeps its message, change digest and merge
 record. Such a commit can still come back after a restart, and it used to come back

@@ -1351,10 +1351,11 @@ impl Store {
                 }
             }
             if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
-                let switched =
-                    std::fs::read_to_string(root.join("CURRENT")).is_ok_and(|c| c.trim() == name);
-                if switched {
-                    // the next open uses the new generation, which lacks the commits
+                // a CURRENT that cannot be read may name the new generation
+                let maybe_switched = std::fs::read_to_string(root.join("CURRENT"))
+                    .map_or(true, |c| c.trim() == name);
+                if maybe_switched {
+                    // the next open may use the new generation, which lacks the commits
                     // this process would make to the old one: take no more writes
                     w.tap = None;
                     w.poisoned = true;

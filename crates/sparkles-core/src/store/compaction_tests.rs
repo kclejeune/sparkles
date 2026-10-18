@@ -1562,7 +1562,7 @@ fn open_removes_a_compaction_that_a_power_loss_left_without_its_marker() {
 }
 
 #[test]
-fn open_removes_only_generations_newer_than_current() {
+fn open_removes_only_unfinished_generations_newer_than_current() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("db");
     // every load a bulk commit, which builds a new generation
@@ -1586,7 +1586,7 @@ fn open_removes_only_generations_newer_than_current() {
     // an empty directory, as a power loss right after its creation leaves it
     let g2 = commit::generation_name(no + 7);
     std::fs::create_dir(root.join(&g2)).unwrap();
-    // another dataset's generation above CURRENT is a leftover too
+    // another dataset's generation above CURRENT is set aside, not removed
     let other = dir.path().join("other");
     let o = Store::open(&other, bulk.clone()).unwrap();
     o.load(&[nt(5, 0)]).unwrap();
@@ -1612,16 +1612,26 @@ fn open_removes_only_generations_newer_than_current() {
     std::fs::create_dir(root.join(&keep[2])).unwrap();
     std::fs::write(root.join(&keep[3]), b"x").unwrap();
     std::fs::write(root.join(&keep[4]), b"x").unwrap();
-    // the temporary copy of an interrupted CURRENT switch goes, a directory so named stays
+    // the temporary copy of an interrupted CURRENT switch goes, a user's file and a
+    // directory so named stay
     let tmp = "CURRENT.tmp".to_string();
     std::fs::write(root.join(&tmp), g1.as_bytes()).unwrap();
     std::fs::create_dir(root.join("x.tmp")).unwrap();
+    std::fs::write(root.join("notes.tmp"), b"mine").unwrap();
     let s = Store::open(&root, bulk).unwrap();
     assert_eq!(dump(&s), d);
     assert!(root.join("x.tmp").is_dir());
+    assert!(root.join("notes.tmp").is_file());
     for g in [&g1, &g2, &g3, &deleting, &tmp] {
         assert!(!root.join(g).exists(), "{g} is left");
     }
+    let aside = set_aside(&root);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(
+        aside[0].starts_with(&format!("{g3}.set-aside-")),
+        "{aside:?}"
+    );
+    assert!(root.join(&aside[0]).join("commit.json").is_file());
     for k in &keep {
         assert!(root.join(k).exists(), "{k} was removed");
     }
@@ -1629,4 +1639,143 @@ fn open_removes_only_generations_newer_than_current() {
     // the next bulk commit takes the next number
     s.load(&[nt(10, 100)]).unwrap();
     assert_eq!(current(&root), commit::generation_name(no + 1));
+}
+
+/// The generations open set aside in `root`.
+fn set_aside(root: &Path) -> Vec<String> {
+    gens(root)
+        .into_iter()
+        .filter(|g| g.contains(crate::history::SET_ASIDE))
+        .collect()
+}
+
+/// A dataset compacted three times, whose last generation took commits after its
+/// compaction, and a copy of its directory for each test to damage.
+fn compacted(dir: &Path) -> (std::path::PathBuf, String, Vec<String>, uuid::Uuid) {
+    let root = dir.join("db");
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    s.load(&[nt(100, 0)]).unwrap();
+    // a pinned commit keeps an older generation to point CURRENT at
+    churn(&s, 0);
+    s.create_snapshot("old", &At::Commit(s.head_commit().seq), None)
+        .unwrap();
+    s.compact().unwrap();
+    churn(&s, 1);
+    s.compact().unwrap();
+    churn(&s, 2);
+    s.compact().unwrap();
+    churn(&s, 3);
+    let d = dump(&s);
+    let id = s.dataset_id();
+    drop(s);
+    let cur = current(&root);
+    (root, cur, d, id)
+}
+
+#[test]
+fn open_refuses_to_create_a_database_over_generations_without_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, cur, d, _) = compacted(dir.path());
+    let before = gens(&root);
+    std::fs::remove_file(root.join("CURRENT")).unwrap();
+    let e = Store::open(&root, StoreOptions::default())
+        .err()
+        .expect("refused");
+    let m = e.to_string();
+    assert!(
+        m.contains("no CURRENT") && m.contains("sparkles check"),
+        "{m}"
+    );
+    assert!(m.contains(&cur), "{m}");
+    assert_eq!(gens(&root), before, "nothing moved or removed");
+    // writing CURRENT back recovers everything
+    std::fs::write(root.join("CURRENT"), cur.as_bytes()).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(dump(&s), d);
+    // a creation that a crash interrupted before CURRENT is finished by the next open
+    let fresh = dir.path().join("fresh");
+    drop(Store::open(&fresh, StoreOptions::default()).unwrap());
+    std::fs::remove_file(fresh.join("CURRENT")).unwrap();
+    std::fs::remove_dir_all(fresh.join("gen-0001").join("wal.log")).ok();
+    std::fs::remove_file(fresh.join("gen-0001").join("wal.log")).ok();
+    let s = Store::open(&fresh, StoreOptions::default()).unwrap();
+    assert_eq!(s.snapshot().len(), 0);
+}
+
+#[test]
+fn open_sets_aside_newer_generations_when_current_was_restored_older() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, cur, d, _) = compacted(dir.path());
+    let older: Vec<String> = gens(&root).into_iter().filter(|g| *g < cur).collect();
+    let old = older.last().expect("the pinned generation").clone();
+    // CURRENT restored from an older copy: the newest generation holds commits past it
+    std::fs::write(root.join("CURRENT"), old.as_bytes()).unwrap();
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+    assert!(!root.join(&cur).exists(), "{:?}", gens(&root));
+    let aside = set_aside(&root);
+    assert_eq!(aside.len(), 1, "{:?}", gens(&root));
+    assert!(
+        aside[0].starts_with(&format!("{cur}.set-aside-")),
+        "{aside:?}"
+    );
+    let kept = aside[0].clone();
+    // renaming it back and pointing CURRENT at it recovers everything
+    std::fs::rename(root.join(&kept), root.join(&cur)).unwrap();
+    std::fs::write(root.join("CURRENT"), cur.as_bytes()).unwrap();
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(dump(&s), d);
+}
+
+#[test]
+fn open_keeps_newer_generations_with_a_damaged_or_foreign_commit_json() {
+    for case in ["damaged", "foreign", "marker of another dataset"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, cur, _, id) = compacted(dir.path());
+        let no = commit::generation_number(&cur);
+        let g = commit::generation_name(no + 1);
+        copy_dir(&root.join(&cur), &root.join(&g));
+        let cj = root.join(&g).join("commit.json");
+        match case {
+            "damaged" => {
+                let mut b = std::fs::read(&cj).unwrap();
+                b.truncate(b.len() / 2);
+                std::fs::write(&cj, b).unwrap();
+            }
+            "foreign" => {
+                let other = Store::open(&dir.path().join("other"), StoreOptions::default())
+                    .unwrap()
+                    .dataset_id();
+                let b = std::fs::read_to_string(&cj).unwrap();
+                assert!(b.contains(&id.to_string()));
+                std::fs::write(&cj, b.replace(&id.to_string(), &other.to_string())).unwrap();
+            }
+            _ => std::fs::write(
+                root.join(&g).join("compacting"),
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .unwrap(),
+        }
+        let log = std::fs::read(root.join(&g).join("wal.log")).unwrap();
+        drop(Store::open(&root, StoreOptions::default()).unwrap());
+        assert!(!root.join(&g).exists(), "{case}: {:?}", gens(&root));
+        let aside = set_aside(&root);
+        assert_eq!(aside.len(), 1, "{case}: {aside:?}");
+        assert_eq!(
+            std::fs::read(root.join(&aside[0]).join("wal.log")).unwrap(),
+            log,
+            "{case}: the data is kept"
+        );
+        // the next compaction takes the number without touching it
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        s.compact().unwrap();
+        assert_eq!(current(&root), g, "{case}");
+        assert!(root.join(&aside[0]).is_dir(), "{case}");
+        // check reports it
+        drop(s);
+        assert!(
+            leftovers(&root).iter().any(|l| l.contains("set aside")),
+            "{case}: {:?}",
+            leftovers(&root)
+        );
+    }
 }
