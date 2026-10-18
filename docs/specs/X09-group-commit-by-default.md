@@ -1236,20 +1236,24 @@ of the data.
 
 **Crash runs.** On 2026-10-18 the `kill9` mode of `scripts/power-loss.sh` ran 200 kills
 with each index on a new ext4 and a new XFS file system of an 8-vCPU Namespace instance,
-every check comparing the index with the recovered data as well as every receipt. No kill
-failed.
+with a build of cf833158, which has the review's fixes, and the stricter text check. Every
+check compared the index with the recovered data as well as every receipt, and the text
+check first bounded the checkpoint by the head. No kill failed. A run before the fixes,
+with the old check, had no failure either.
 
 | Index | ext4 receipts | XFS receipts | Failed |
 |---|---:|---:|---:|
-| Full-text | 2,039,575 | 2,109,245 | 0 |
-| Spatial | 2,011,858 | 2,024,554 | 0 |
-| Embedding | 2,153,845 | 2,236,430 | 0 |
+| Full-text | 1,698,295 | 1,702,653 | 0 |
+| Spatial | 2,057,776 | 2,177,125 | 0 |
+| Embedding | 2,118,683 | 2,371,029 | 0 |
 
 The `logwrites` mode ran on `forge` on 2026-10-18 with a build of 80f19430, under the
 host's lock for heavy work. Each run replayed 1,000 crash images of a 20 s load of sixteen
 writers with a mark every 50 ms, and each image's check also compared the index with the
 recovered data. With the spatial index each request also inserted a point. Every image
-passed.
+passed. These runs predate the review's fixes and the text check that reads the
+checkpoint before the first open, so they would not have noticed an index ahead of the
+log that open rebuilt. A rerun with the fixes is queued on `forge` with the gates.
 
 | Run | Receipts | Marks | Log entries | Images | Failed |
 |---|---:|---:|---:|---:|---:|
