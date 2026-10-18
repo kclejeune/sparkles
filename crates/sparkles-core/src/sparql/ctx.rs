@@ -541,6 +541,13 @@ pub struct Ctx {
 /// Set in [`FastMemory::live`] once the ledger has taken the account over.
 const PROMOTED: u64 = 1 << 63;
 
+/// The step in which the fast account admits its eager contribution to the grant. A
+/// plain query's estimate grows by a few bytes at a time, and each growth past the
+/// contribution takes the account's lock and the grant's counters, so the account
+/// admits up to the next step at once. The contribution may then exceed the highest
+/// estimate by less than one step.
+const EAGER_STEP: u64 = 64 << 10;
+
 /// The memory account of an eager context until something needs the query ledger: a
 /// graph algorithm call, a lease that outlives an operator, cursor accounting or a
 /// change of the grant. Plain queries charge and check it with a few atomic operations
@@ -613,6 +620,8 @@ struct CursorMemory {
 thread_local! {
     /// [`Ctx::check`] calls on this thread (for tests of per-query overhead)
     pub(crate) static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// growths of a fast account's grant contribution on this thread
+    static FAST_GROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Ctx {
@@ -727,6 +736,8 @@ impl Ctx {
     #[cold]
     #[inline(never)]
     fn fast_grow(&self, grant: &Arc<PoolGrant>, bytes: u64, add: bool) -> Option<Result<()>> {
+        #[cfg(test)]
+        FAST_GROWS.with(|n| n.set(n.get() + 1));
         let fast = &self.fast;
         let _resize = fast.resize.lock();
         let mut cur = fast.live.load(Ordering::Acquire);
@@ -740,10 +751,22 @@ impl Ctx {
             }
             let eager = fast.eager.load(Ordering::Acquire);
             if need > eager {
-                if let Err(error) = grant.charge(need - eager) {
-                    return Some(Err(error));
-                }
-                fast.eager.store(need, Ordering::Release);
+                // Admit a step ahead, within the local budget, so that the next small
+                // increases stay on the lock-free path. When the pool cannot give the
+                // step, admit exactly what the estimate needs.
+                let ahead = need
+                    .next_multiple_of(EAGER_STEP)
+                    .min(self.mem_limit)
+                    .max(need);
+                let admitted = match grant.charge(ahead - eager) {
+                    Ok(()) => ahead,
+                    Err(_) if ahead > need => match grant.charge(need - eager) {
+                        Ok(()) => need,
+                        Err(error) => return Some(Err(error)),
+                    },
+                    Err(error) => return Some(Err(error)),
+                };
+                fast.eager.store(admitted, Ordering::Release);
             }
             if !add {
                 return Some(Ok(()));
@@ -2294,6 +2317,60 @@ mod charge_tests {
         let mut ctx = Ctx::new(store.snapshot());
         ctx.set_grant(Some(grant.clone()));
         ctx
+    }
+
+    /// A plain query's estimate grows a few bytes at a time. The fast account admits a
+    /// step from the grant at once, so the next small increases take neither its lock
+    /// nor the grant's counters.
+    #[test]
+    fn small_eager_growth_admits_one_step_from_the_grant() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.try_grant(16 * MIB).unwrap());
+        let ctx = pooled(&store, &grant);
+        let before = super::FAST_GROWS.with(|n| n.get());
+        let a = ctx.charge(8).unwrap();
+        let b = ctx.charge(24).unwrap();
+        ctx.check_output(100, 2).unwrap();
+        assert_eq!(super::FAST_GROWS.with(|n| n.get()) - before, 1);
+        assert_eq!(grant.used(), EAGER_STEP);
+        let c = ctx.charge(EAGER_STEP).unwrap();
+        assert_eq!(grant.used(), 2 * EAGER_STEP);
+        assert_eq!(super::FAST_GROWS.with(|n| n.get()) - before, 2);
+        assert_eq!(ctx.mem_peak(), 32 + EAGER_STEP);
+        drop((a, b, c));
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+    }
+
+    /// The step never takes the contribution past the local budget, and a pool that
+    /// cannot give the step still admits the exact estimate.
+    #[test]
+    fn the_eager_step_stays_within_the_budget_and_the_pool() {
+        let store = Store::in_memory(StoreOptions::default());
+        let pool = super::super::pool::QueryPool::new(128 * MIB);
+        let grant = Arc::new(pool.empty_grant());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 1000;
+        ctx.set_grant(Some(grant.clone()));
+        drop(ctx.charge(10).unwrap());
+        assert_eq!(grant.used(), 1000);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+
+        let small = super::super::pool::QueryPool::new(100_000);
+        let grant = Arc::new(small.empty_grant());
+        let ctx = pooled(&store, &grant);
+        let held = ctx.charge(70_000).unwrap();
+        assert_eq!(grant.used(), 70_000);
+        assert!(matches!(ctx.charge(40_000), Err(Error::BudgetExceeded(b))
+            if b.kind == BudgetKind::ServerMemory));
+        assert_eq!(grant.used(), 70_000);
+        drop(held);
+        drop(ctx);
+        assert_eq!(grant.used(), 0);
+        drop(grant);
+        assert_eq!(small.granted(), 0);
     }
 
     #[test]

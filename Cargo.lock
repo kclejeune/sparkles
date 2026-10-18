@@ -3170,15 +3170,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mimalloc"
-version = "0.1.52"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
-dependencies = [
- "libmimalloc-sys",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5544,6 +5535,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkles-alloc"
+version = "0.1.0"
+dependencies = [
+ "libmimalloc-sys",
+]
+
+[[package]]
 name = "sparkles-backup"
 version = "0.1.0"
 dependencies = [
@@ -5619,7 +5617,6 @@ dependencies = [
  "md-5",
  "memchr",
  "memmap2",
- "mimalloc",
  "oxiri",
  "oxrdf",
  "oxrdfio",
@@ -5643,6 +5640,7 @@ dependencies = [
  "sha2",
  "sparesults",
  "spargebra",
+ "sparkles-alloc",
  "stacker",
  "tantivy",
  "tantivy-fst",
@@ -5663,13 +5661,12 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "libc",
- "libmimalloc-sys",
- "mimalloc",
  "parking_lot",
  "rayon",
  "reqwest",
  "serde",
  "serde_json",
+ "sparkles-alloc",
  "sparkles-modelstore",
  "tempfile",
  "thiserror 2.0.21",
@@ -5808,10 +5805,8 @@ dependencies = [
  "ipnet",
  "jsonwebtoken",
  "libc",
- "libmimalloc-sys",
  "lsp-server",
  "lsp-types",
- "mimalloc",
  "mime_guess",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -5840,6 +5835,7 @@ dependencies = [
  "sparesults",
  "spargebra",
  "sparkles",
+ "sparkles-alloc",
  "sparkles-backup",
  "sparkles-client",
  "sparkles-embed",

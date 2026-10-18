@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: sparkles_alloc::Mimalloc = sparkles_alloc::Mimalloc;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static DIRTY: AtomicBool = AtomicBool::new(false);
@@ -93,10 +93,7 @@ pub fn start_idle_release(interval: Duration) {
 #[cfg_attr(not(feature = "embed-local"), allow(dead_code))]
 pub fn release_current_thread() {
     #[cfg(feature = "mimalloc")]
-    // SAFETY: mi_collect only returns free memory to the OS.
-    unsafe {
-        libmimalloc_sys::mi_collect(true)
-    };
+    sparkles_alloc::collect();
     #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "mimalloc")))]
     // SAFETY: malloc_trim only returns free memory to the OS.
     unsafe {
@@ -108,8 +105,8 @@ fn release() {
     #[cfg(feature = "mimalloc")]
     {
         // freed pages sit in per-thread heaps: collect on every query worker thread
-        rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
-        unsafe { libmimalloc_sys::mi_collect(true) };
+        rayon::broadcast(|_| sparkles_alloc::collect());
+        sparkles_alloc::collect();
     }
     #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "mimalloc")))]
     // SAFETY: malloc_trim only returns free memory to the OS.

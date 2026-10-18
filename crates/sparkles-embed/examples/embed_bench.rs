@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: sparkles_alloc::Mimalloc = sparkles_alloc::Mimalloc;
 
 use sparkles_embed::{Dtype, Embedder, Kind, ModelSpec, Options};
 use sparkles_modelstore::{HttpClient, HttpResponse, HubSource, ModelStore};
@@ -86,10 +86,9 @@ fn main() {
                 Options {
                     threads,
                     nice: 0,
-                    // SAFETY: mi_collect only returns free memory of the calling thread
-                    release: Some(sparkles_embed::Release(std::sync::Arc::new(|| unsafe {
-                        libmimalloc_sys::mi_collect(true)
-                    }))),
+                    release: Some(sparkles_embed::Release(std::sync::Arc::new(
+                        sparkles_alloc::collect,
+                    ))),
                     ..Options::default()
                 },
             )

@@ -24,6 +24,7 @@ sparkles-memory-import = { path = "crates/sparkles-memory-import" }
 sparkles-modelstore = { path = "crates/sparkles-modelstore" }
 sparkles-embed = { path = "crates/sparkles-embed" }
 sparkles-office = { path = "crates/sparkles-office" }
+sparkles-alloc = { path = "crates/sparkles-alloc" }
 oxrdf = { version = "0.3", features = ["rdfc-10", "rdf-12"] }
 oxrdfio = { version = "0.2", features = ["rdf-12"] }
 oxttl = { version = "0.2", features = ["rdf-12"] }

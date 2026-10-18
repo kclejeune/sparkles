@@ -45,8 +45,7 @@ form_urlencoded = "1"
 futures-util = { version = "0.3", default-features = false }
 httpdate = "1"
 base64 = "0.23"
-mimalloc = { version = "0.1.52", optional = true }
-libmimalloc-sys = { version = "0.1.49", optional = true, features = ["extended"] }
+sparkles-alloc = { workspace = true, optional = true }
 rayon.workspace = true
 ipnet = "2"
 arc-swap.workspace = true
@@ -200,7 +199,7 @@ fmt = [
 graphql = ["dep:sparkles-graphql", "sparkles/graphql"]
 # mimalloc as the global allocator (faster joins than glibc malloc under concurrency);
 # without it, glibc's malloc_trim releases idle heap memory instead
-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+mimalloc = ["dep:sparkles-alloc"]
 # OpenTelemetry: OTLP traces, metrics and logs (`serve --otel`, `OTEL_*`; off at run time
 # unless enabled)
 otel = [
