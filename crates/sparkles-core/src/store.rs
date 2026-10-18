@@ -138,6 +138,12 @@ pub struct Generation {
     pub counts: crate::sparql::stats::CountCache,
     /// the characteristic sets of the statistics by predicate, built on first use
     pub charsets: std::sync::OnceLock<crate::sparql::charsets::CharIndex>,
+    /// The ids of the base vocabulary's literals that `sparkles-reasoner`'s diagnostics
+    /// found ill-typed for their own datatype, in id order, and whether the list is
+    /// complete. The diagnostics fill it on first use and bound its length, and it lives
+    /// as long as the generation. The lock is held while the list is built, so a second
+    /// first use waits for the first instead of reading the vocabulary again.
+    pub ill_typed_literals: Mutex<Option<(Arc<[u64]>, bool)>>,
     /// where commits end in this generation's write-ahead log (`None` until built)
     pub(crate) wal_index: Mutex<Option<wal::WalIndex>>,
     /// a branch's linked generation: the upstream files it reads and its base delta
@@ -161,6 +167,7 @@ impl Generation {
             geo: Default::default(),
             counts: Default::default(),
             charsets: Default::default(),
+            ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
         }
@@ -183,6 +190,7 @@ impl Generation {
             geo: Default::default(),
             counts: Default::default(),
             charsets: Default::default(),
+            ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
         }
@@ -230,6 +238,7 @@ impl Generation {
             geo: Default::default(),
             counts: Default::default(),
             charsets: Default::default(),
+            ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
         })

@@ -948,3 +948,62 @@ fn f16_literal_typings_of_a_kept_closure() {
         assert!(findings(&r, ID).is_empty());
     }
 }
+
+/// P3-1 of the follow-up's review: the literal typings of the inferences are reported only
+/// for literals that the checked graphs hold, as the other sources of the check are. A
+/// typing whose literal is in a graph the options leave out, or was deleted since the
+/// run, is not reported.
+#[test]
+fn f16_typings_follow_the_checked_graphs() {
+    use sparkles_reasoner::diagnostics::diagnose_with;
+    use sparkles_reasoner::{Cache, Extras, Incremental, literal_typings, materialize_incremental};
+    const ID: &str = "literal-not-in-datatype";
+    let s = store(
+        r#"ex:D rdfs:subClassOf xsd:integer . ex:p rdfs:range ex:D .
+           ex:a ex:p "abc" . ex:b ex:p "def" ."#,
+    );
+    let u = |q: &str| {
+        sparkles_core::sparql::update::update(
+            &s,
+            &format!("PREFIX ex: <http://ex.org/>\n{q}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+    };
+    u(r#"INSERT DATA { GRAPH ex:other { ex:c ex:q "unrelated" } }"#);
+    let cache = Cache::default();
+    let r = materialize_incremental(
+        &s,
+        &Profile::Rdfs,
+        &Extras::default(),
+        Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &ReasonOptions::default(),
+    )
+    .unwrap();
+    let commit = r.receipt.unwrap().commit.seq;
+    let typings = literal_typings(&s, commit, Some(&cache)).unwrap().unwrap();
+    assert_eq!(typings.facts.len(), 2, "{typings:?}");
+    let foci = |graphs: &[&str]| {
+        let o = DiagnoseOptions {
+            inferences: true,
+            graphs: graphs.iter().map(|g| g.to_string()).collect(),
+            ..datatype_only(10)
+        };
+        let r = diagnose_with(s.snapshot(), &o, Some(&typings)).unwrap();
+        let mut f: Vec<String> = findings(&r, ID)
+            .iter()
+            .map(|f| f["focus"]["value"].as_str().unwrap().to_string())
+            .collect();
+        f.sort();
+        f
+    };
+    assert_eq!(foci(&[]), ["abc", "def"]);
+    assert_eq!(foci(&["default"]), ["abc", "def"]);
+    assert!(foci(&["http://ex.org/other"]).is_empty());
+    // a literal deleted since the run is not reported
+    u(r#"DELETE DATA { ex:a ex:p "abc" }"#);
+    assert_eq!(foci(&[]), ["def"]);
+}

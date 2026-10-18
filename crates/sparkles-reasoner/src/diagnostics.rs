@@ -751,14 +751,8 @@ const PAGE_MAX: usize = 16_384;
 const CANDIDATES_MAX: usize = 1 << 18;
 /// The ill-typed literals [`Run::ill_typed_into`] looks up with one query.
 const ILL_TYPED_BATCH: usize = 256;
-/// The generations whose ill-typed literals [`ill_typed`] remembers.
-const REMEMBERED_GENERATIONS: usize = 8;
-
-/// The ill-typed literals of the base vocabularies of the last generations read: the
-/// generation's id, the generation, and the literals in the order of their N-Triples
-/// form.
-type Remembered = Vec<(u64, std::sync::Weak<Generation>, Arc<Vec<Literal>>)>;
-static BASE_ILL_TYPED: std::sync::Mutex<Remembered> = std::sync::Mutex::new(Vec::new());
+/// The positions of the delta vocabulary [`ill_typed`] reads under one hold of its lock.
+const DELTA_CHUNK: u64 = 4_096;
 
 /// The literal of a vocabulary key when the table decides it is ill-typed for its own
 /// datatype: a typed literal of an XSD datatype the check implements, outside that
@@ -778,60 +772,137 @@ fn ill_typed_key(key: &[u8]) -> Option<Literal> {
     (in_value_space(&lit, dt) == Some(false)).then_some(lit)
 }
 
-/// The literals of `snap`'s vocabulary that are ill-typed for their own datatype (see
-/// [`ill_typed_key`]), in the order of their N-Triples form. The base vocabulary of a
-/// generation is read once and its result remembered for the generation; the delta
-/// vocabulary, which grows with each commit, is read each time. A deadline that passes
-/// during the read of the base vocabulary is a timeout, and nothing is remembered.
-fn ill_typed(snap: &Snapshot, deadline: Option<Instant>) -> sparkles_core::Result<Vec<Literal>> {
+/// The ids of the literals of a snapshot's vocabulary that are ill-typed for their own
+/// datatype (see [`ill_typed_key`]).
+struct IllTyped {
+    /// those of the base vocabulary, in id order, as the generation remembers them
+    base: Arc<[u64]>,
+    /// the positions of those of the delta vocabulary
+    delta: Vec<u64>,
+}
+
+impl IllTyped {
+    /// The ids, those of the base vocabulary first.
+    fn ids(&self) -> impl Iterator<Item = sparkles_core::id::Id> + '_ {
+        let base = self.base.iter().map(|&i| sparkles_core::id::Id::vocab(i));
+        base.chain(self.delta.iter().map(|&i| sparkles_core::id::Id::delta(i)))
+    }
+    fn len(&self) -> usize {
+        self.base.len() + self.delta.len()
+    }
+}
+
+/// The ids of the literals of `snap`'s vocabulary that are ill-typed for their own
+/// datatype, at most `max`, and a `max`th one more when there are more. The base
+/// vocabulary of a generation is read once and its ids are remembered with the generation
+/// ([`Generation::ill_typed_literals`]), so they are freed with it. The read holds the
+/// generation's lock, so a call that comes meanwhile waits for it, until its deadline,
+/// instead of reading the vocabulary again. The delta vocabulary, which grows with each
+/// commit, is read each time up to the snapshot's end, a chunk of positions to a hold of
+/// its lock, so a writer that adds terms waits for one chunk at most. A deadline that
+/// passes during a read is a timeout, and nothing is remembered.
+fn ill_typed(
+    snap: &Snapshot,
+    max: usize,
+    deadline: Option<Instant>,
+) -> sparkles_core::Result<IllTyped> {
     let generation = &snap.generation;
-    let known = {
-        let mut m = BASE_ILL_TYPED.lock().unwrap_or_else(|e| e.into_inner());
-        m.retain(|(_, g, _)| g.strong_count() > 0);
-        m.iter()
-            .find(|(uid, _, _)| *uid == generation.uid)
-            .map(|x| x.2.clone())
-    };
-    let base = match known {
-        Some(b) => b,
-        None => {
-            #[cfg(test)]
-            VOCAB_SCANS.with(|c| c.set(c.get() + 1));
-            let vocab = &generation.vocab;
-            let (lo, hi) = vocab.prefix_range(b"\"");
-            let mut found: Vec<Literal> = Vec::new();
-            let mut ids: Vec<u64> = Vec::new();
-            let mut at = lo;
-            while at < hi {
-                if deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Err(Error::Timeout);
-                }
-                let end = hi.min(at + (1 << 16));
-                ids.clear();
-                ids.extend(at..end);
-                vocab.get_sorted(&ids, |_, key| found.extend(ill_typed_key(key)));
-                at = end;
+    let base = {
+        let mut slot = match deadline {
+            None => generation.ill_typed_literals.lock(),
+            Some(d) => generation
+                .ill_typed_literals
+                .try_lock_for(d.saturating_duration_since(Instant::now()))
+                .ok_or(Error::Timeout)?,
+        };
+        match &*slot {
+            // a list that stopped early serves only a cap below its end
+            Some((ids, complete)) if *complete || ids.len() > max => ids.clone(),
+            _ => {
+                let (ids, complete) = scan_base(generation, max + 1, deadline)?;
+                let ids: Arc<[u64]> = ids.into();
+                *slot = Some((ids.clone(), complete));
+                ids
             }
-            found.sort_by_cached_key(Literal::to_string);
-            let found = Arc::new(found);
-            let mut m = BASE_ILL_TYPED.lock().unwrap_or_else(|e| e.into_inner());
-            if m.len() >= REMEMBERED_GENERATIONS {
-                m.remove(0);
-            }
-            m.push((generation.uid, Arc::downgrade(generation), found.clone()));
-            found
         }
     };
-    let mut all: Vec<Literal> = generation
-        .dvocab
-        .with(|v| v.iter().filter_map(|(_, k)| ill_typed_key(k)).collect());
-    if all.is_empty() {
-        return Ok(base.to_vec());
+    let room = (max + 1).saturating_sub(base.len());
+    let mut delta = Vec::new();
+    let mut at = 0;
+    while at < snap.dvocab_len && delta.len() < room {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Error::Timeout);
+        }
+        let end = snap.dvocab_len.min(at + DELTA_CHUNK);
+        generation.dvocab.with(|v| {
+            for i in at..end {
+                if delta.len() < room && v.get(i).and_then(ill_typed_key).is_some() {
+                    delta.push(i);
+                }
+            }
+        });
+        #[cfg(test)]
+        DELTA_CHUNK_HOOK.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f(generation);
+            }
+        });
+        at = end;
     }
-    all.extend(base.iter().cloned());
-    all.sort_by_cached_key(Literal::to_string);
-    all.dedup();
-    Ok(all)
+    Ok(IllTyped { base, delta })
+}
+
+/// The ids of the literals of `generation`'s base vocabulary that are ill-typed for their
+/// own datatype, in id order, at most `max`, and whether they are all of them.
+fn scan_base(
+    generation: &Generation,
+    max: usize,
+    deadline: Option<Instant>,
+) -> sparkles_core::Result<(Vec<u64>, bool)> {
+    #[cfg(test)]
+    scan_seam(generation);
+    let vocab = &generation.vocab;
+    let (lo, hi) = vocab.prefix_range(b"\"");
+    let mut found: Vec<u64> = Vec::new();
+    let mut ids: Vec<u64> = Vec::new();
+    let mut at = lo;
+    while at < hi {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Error::Timeout);
+        }
+        let end = hi.min(at + (1 << 16));
+        ids.clear();
+        ids.extend(at..end);
+        vocab.get_sorted(&ids, |id, key| {
+            if found.len() < max && ill_typed_key(key).is_some() {
+                found.push(id);
+            }
+        });
+        if found.len() >= max {
+            return Ok((found, false));
+        }
+        at = end;
+    }
+    Ok((found, true))
+}
+
+/// The ill-typed literals of `ids`, a batch of [`IllTyped::ids`], in its order. Each is
+/// judged again, so an id whose key is not an ill-typed literal is left out.
+fn ill_typed_literals(snap: &Snapshot, ids: &[sparkles_core::id::Id]) -> Vec<Literal> {
+    use sparkles_core::id::Tag;
+    let mut out = Vec::with_capacity(ids.len());
+    let base: Vec<u64> = ids
+        .iter()
+        .filter(|i| i.tag() == Tag::Vocab)
+        .map(|i| i.payload())
+        .collect();
+    snap.generation
+        .vocab
+        .get_sorted(&base, |_, key| out.extend(ill_typed_key(key)));
+    for i in ids.iter().filter(|i| i.tag() == Tag::Delta) {
+        out.extend(snap.key(*i).and_then(|k| ill_typed_key(&k)));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -841,8 +912,35 @@ thread_local! {
     static PAGE_TIMEOUT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Tests only: replaces [`CANDIDATES_MAX`].
     static CANDIDATES_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    /// Tests only: the reads of a base vocabulary that [`ill_typed`] made.
-    static VOCAB_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Tests only: called after each chunk of the delta vocabulary that [`ill_typed`]
+    /// reads, with the lock of the delta vocabulary released.
+    static DELTA_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Generation)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests only: the generations whose base vocabulary [`scan_base`] read, once per read,
+/// and the generation whose read sleeps first.
+#[cfg(test)]
+static SCANNED: std::sync::Mutex<(Vec<u64>, Option<u64>)> =
+    std::sync::Mutex::new((Vec::new(), None));
+
+#[cfg(test)]
+fn scan_seam(generation: &Generation) {
+    let slow = {
+        let mut s = SCANNED.lock().unwrap();
+        s.0.push(generation.uid);
+        s.1 == Some(generation.uid)
+    };
+    if slow {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Tests only: the reads of `generation`'s base vocabulary.
+#[cfg(test)]
+fn scans_of(generation: &Generation) -> usize {
+    let s = SCANNED.lock().unwrap();
+    s.0.iter().filter(|&&u| u == generation.uid).count()
 }
 
 /// [`CANDIDATES_MAX`], or the cap a test set.
@@ -989,21 +1087,28 @@ impl Run<'_> {
     /// The findings of the literals that are ill-typed for their own datatype
     /// (`dt-type2`): the literals of the vocabulary that the table decides are outside
     /// their datatype's value space, each with the subjects and properties that have it as
-    /// a value in the checked graphs. The literals are looked up in batches, in the order
-    /// of their N-Triples form, at most [`CANDIDATES_MAX`] of them. Returns whether the
-    /// check is truncated.
+    /// a value in the checked graphs. The literals are decoded and looked up in batches, in
+    /// the order of their ids, those of the base vocabulary first, at most
+    /// [`CANDIDATES_MAX`] of them. Returns whether the check is truncated.
     fn ill_typed_into(
         &self,
         limit: usize,
         out: &mut Vec<Finding>,
         seen: &mut HashSet<String>,
     ) -> sparkles_core::Result<bool> {
-        let mut lits = ill_typed(self.snap, self.deadline)?;
-        let truncated = lits.len() > candidates_max();
-        lits.truncate(candidates_max());
+        let max = candidates_max();
+        let found = ill_typed(self.snap, max, self.deadline)?;
+        let truncated = found.len() > max;
+        let ids: Vec<sparkles_core::id::Id> = found.ids().take(max).collect();
         let via = Term::Literal(Literal::new_simple_literal("datatype"));
-        for batch in lits.chunks(ILL_TYPED_BATCH) {
-            let values: Vec<String> = batch.iter().map(Literal::to_string).collect();
+        for batch in ids.chunks(ILL_TYPED_BATCH) {
+            let values: Vec<String> = ill_typed_literals(self.snap, batch)
+                .iter()
+                .map(Literal::to_string)
+                .collect();
+            if values.is_empty() {
+                continue;
+            }
             let text = format!(
                 "SELECT DISTINCT ?x ?p ?lit WHERE {{ VALUES ?lit {{ {} }} ?x ?p ?lit . }}\n\
                  ORDER BY ?x ?p STR(?lit) DATATYPE(?lit) LANG(?lit)\nLIMIT {}",
@@ -1050,8 +1155,11 @@ impl Run<'_> {
 
     /// The findings of the literal typings of the inferences that no finding before
     /// names with the same literal and range: each literal with the datatype that types it
-    /// and whose value space it is outside of, marked as using the inferences. Returns
-    /// whether the check is truncated.
+    /// and whose value space it is outside of, marked as using the inferences. Only the
+    /// literals that the checked graphs hold are reported, looked up
+    /// [`ILL_TYPED_BATCH`] at a time, so a typing of a literal in a graph the options leave
+    /// out, or deleted since the materialization, is not. Returns whether the check is
+    /// truncated.
     fn typings_into(&self, limit: usize, out: &mut Vec<Finding>) -> sparkles_core::Result<bool> {
         let Some(typings) = self.typings else {
             return Ok(false);
@@ -1073,30 +1181,49 @@ impl Run<'_> {
             .collect();
         facts.sort_by(|a, b| (&a.0, a.2.as_str()).cmp(&(&b.0, b.2.as_str())));
         facts.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
-        for (text, lit, dt) in facts {
-            if named.contains(&(text, Term::NamedNode(dt.clone()).to_string()))
-                || in_value_space(lit, dt.as_str()) != Some(false)
-            {
-                continue;
+        facts.retain(|(text, lit, dt)| {
+            !named.contains(&(text.clone(), Term::NamedNode((*dt).clone()).to_string()))
+                && in_value_space(lit, dt.as_str()) == Some(false)
+        });
+        // only the literals that the checked graphs hold, as for the other sources
+        for batch in facts.chunks(ILL_TYPED_BATCH) {
+            let mut values: Vec<&str> = batch.iter().map(|f| f.0.as_str()).collect();
+            values.dedup();
+            let text = format!(
+                "SELECT DISTINCT ?lit WHERE {{ VALUES ?lit {{ {} }} ?x ?p ?lit . }}",
+                values.join(" ")
+            );
+            let present: HashSet<String> = self
+                .select(&text, self.inferences, Vec::new())?
+                .into_iter()
+                .filter_map(|row| row.get("lit").map(Term::to_string))
+                .collect();
+            for (text, lit, dt) in batch {
+                if !present.contains(text) {
+                    continue;
+                }
+                if out.len() == limit {
+                    return Ok(true);
+                }
+                let (l, d) = (
+                    Term::Literal((*lit).clone()),
+                    Term::NamedNode((*dt).clone()),
+                );
+                let n = |t: &Term| self.names.show(t);
+                out.push(Finding {
+                    check: self.check.id,
+                    rule: self.check.rules[0],
+                    severity: self.check.severity,
+                    message: format!(
+                        "{}: the value is not in the value space of {}, which the inferences give as its type",
+                        n(&l),
+                        n(&d)
+                    ),
+                    focus: l.clone(),
+                    evidence: vec![("range", Evidence::One(d)), ("literal", Evidence::One(l))],
+                    basis: Basis::UsesInferences,
+                });
             }
-            if out.len() == limit {
-                return Ok(true);
-            }
-            let (l, d) = (Term::Literal(lit.clone()), Term::NamedNode(dt.clone()));
-            let n = |t: &Term| self.names.show(t);
-            out.push(Finding {
-                check: self.check.id,
-                rule: self.check.rules[0],
-                severity: self.check.severity,
-                message: format!(
-                    "{}: the value is not in the value space of {}, which the inferences give as its type",
-                    n(&l),
-                    n(&d)
-                ),
-                focus: l.clone(),
-                evidence: vec![("range", Evidence::One(d)), ("literal", Evidence::One(l))],
-                basis: Basis::UsesInferences,
-            });
         }
         Ok(false)
     }
@@ -1934,6 +2061,13 @@ fn family(local: &str) -> Option<Family> {
     })
 }
 
+/// Whether [`in_value_space`] can decide some literal for the datatype `range`: the
+/// ranges of the table.
+pub(crate) fn decidable_range(range: &str) -> bool {
+    matches!(range, RDF_LANG_STRING | RDF_PLAIN_LITERAL)
+        || range.strip_prefix(XSD).is_some_and(|l| family(l).is_some())
+}
+
 /// Whether `lit` is in the value space of the datatype `range` (OWL 2 RL `dt-not-type`),
 /// or `None` when the check does not decide it. It is undecided for a range outside the
 /// table and for a literal whose own datatype is outside it, such as xsd:date or a
@@ -2365,6 +2499,14 @@ mod paging_tests {
         (c.status, c.findings, r.status)
     }
 
+    /// The ill-typed literals remembered for `g`.
+    fn remembered(g: &Arc<Generation>) -> usize {
+        g.ill_typed_literals
+            .lock()
+            .as_ref()
+            .map_or(0, |e| e.0.len())
+    }
+
     /// Clears the test seams when it drops.
     struct Seams;
 
@@ -2372,6 +2514,7 @@ mod paging_tests {
         fn drop(&mut self) {
             PAGE_TIMEOUT.with(|c| c.set(None));
             CANDIDATES_CAP.with(|c| c.set(None));
+            DELTA_CHUNK_HOOK.with(|h| *h.borrow_mut() = None);
         }
     }
 
@@ -2433,6 +2576,120 @@ mod paging_tests {
         f
     }
 
+    /// A store with `n` ill-typed `xsd:int` literals in the default graph, and one valid.
+    fn ill_typed_store(n: usize) -> Store {
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let s = Store::in_memory(StoreOptions::default());
+        let mut nq = format!("<http://ex.org/k> <http://ex.org/v> \"7\"^^<{xsd}int> .\n");
+        for i in 0..n {
+            nq.push_str(&format!(
+                "<http://ex.org/s{i}> <http://ex.org/v> \"bad{i}\"^^<{xsd}int> .\n"
+            ));
+        }
+        s.load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        s
+    }
+
+    /// P2-1 of the follow-up's review: the ill-typed literals remembered for a generation
+    /// stop at the candidate cap, so a dataset full of them does not pin them all, and
+    /// the check reports itself truncated.
+    #[test]
+    fn f16_ill_typed_memory_is_bounded() {
+        let _seams = Seams;
+        let s = ill_typed_store(20);
+        CANDIDATES_CAP.with(|c| c.set(Some(5)));
+        assert_eq!(
+            run(&s, 100),
+            (CheckStatus::Truncated, 5, ReportStatus::ViolationsFound)
+        );
+        let held = remembered(&s.snapshot().generation);
+        assert!(held <= 6, "{held} ids remembered");
+    }
+
+    /// P3-3 of the follow-up's review: two first checks of one generation at once read its
+    /// base vocabulary once, the second waiting for the first.
+    #[test]
+    fn f16_concurrent_first_scans_share_one_read() {
+        let s = ill_typed_store(3);
+        let generation = s.snapshot().generation.clone();
+        SCANNED.lock().unwrap().1 = Some(generation.uid);
+        let want = (CheckStatus::Violations, 3, ReportStatus::ViolationsFound);
+        std::thread::scope(|t| {
+            let a = t.spawn(|| run(&s, 10));
+            let b = t.spawn(|| run(&s, 10));
+            assert_eq!(a.join().unwrap(), want);
+            assert_eq!(b.join().unwrap(), want);
+        });
+        SCANNED.lock().unwrap().1 = None;
+        assert_eq!(scans_of(&generation), 1);
+    }
+
+    /// P3-4 of the follow-up's review: the delta vocabulary is read in chunks, and its lock
+    /// is free between them, so a writer that adds a term waits for one chunk at most. The
+    /// hook adds a term on the reading thread, which would deadlock if the read still held
+    /// the lock.
+    #[test]
+    fn f16_delta_scan_releases_the_lock() {
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let s = ill_typed_store(0);
+        let mut u = String::from("INSERT DATA {");
+        for i in 0..5_000 {
+            u.push_str(&format!(
+                " <http://ex.org/d{i}> <http://ex.org/v> \"bad{i}\"^^<{xsd}int> ."
+            ));
+        }
+        u.push('}');
+        sparkles_core::sparql::update::update(&s, &u, &QueryOptions::default()).unwrap();
+        assert!(s.snapshot().dvocab_len > 2 * DELTA_CHUNK);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let snap = s.snapshot();
+        std::thread::spawn(move || {
+            let _seams = Seams;
+            let mut n = 0;
+            DELTA_CHUNK_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |g: &Generation| {
+                    let key = sparkles_core::id::iri_key(&format!("http://ex.org/w{n}"));
+                    g.dvocab.insert(&key).unwrap();
+                    n += 1;
+                }))
+            });
+            let r = diagnose(
+                snap,
+                &DiagnoseOptions {
+                    checks: vec![ID.into()],
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let c = r.checks.iter().find(|c| c.id == ID).unwrap();
+            let _ = tx.send((c.status, c.findings));
+        });
+        let Ok(got) = rx.recv_timeout(Duration::from_secs(60)) else {
+            // the reading thread is stuck holding the lock, which dropping the store
+            // would wait for
+            std::mem::forget(s);
+            panic!("the hook could not add a term while the delta vocabulary was read");
+        };
+        assert_eq!(got, (CheckStatus::Truncated, 10));
+    }
+
+    /// An ill-typed literal that only the delta vocabulary holds is found in the named
+    /// graph that holds it, and only there.
+    #[test]
+    fn f16_delta_literal_in_a_named_graph() {
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let s = ill_typed_store(0);
+        let u = format!(
+            "INSERT DATA {{ GRAPH <http://ex.org/g> {{ <http://ex.org/e> <http://ex.org/v> \"no\"^^<{xsd}int> }} }}"
+        );
+        sparkles_core::sparql::update::update(&s, &u, &QueryOptions::default()).unwrap();
+        assert_eq!(foci(&s, &["http://ex.org/g"]), ["<http://ex.org/e>"]);
+        assert!(foci(&s, &[]).is_empty());
+        assert!(foci(&s, &["default"]).is_empty());
+    }
+
     /// F16 §8: the literals that are ill-typed for their own datatype come from a scan of
     /// the vocabulary, which is read once per generation, and the delta vocabulary is
     /// read each time. Only literals that the checked graphs hold are reported.
@@ -2452,11 +2709,10 @@ mod paging_tests {
         )])
         .unwrap();
         let generation = s.snapshot().generation.clone();
-        VOCAB_SCANS.with(|c| c.set(0));
         assert_eq!(foci(&s, &[]), ["<http://ex.org/a>"]);
         assert_eq!(foci(&s, &[]), ["<http://ex.org/a>"]);
         assert_eq!(foci(&s, &["http://ex.org/g"]), ["<http://ex.org/b>"]);
-        assert_eq!(VOCAB_SCANS.with(std::cell::Cell::get), 1);
+        assert_eq!(scans_of(&generation), 1);
         // a literal that no graph holds any more is not reported, and one the delta
         // vocabulary holds is
         let u = format!(
@@ -2466,6 +2722,6 @@ mod paging_tests {
         sparkles_core::sparql::update::update(&s, &u, &QueryOptions::default()).unwrap();
         assert!(Arc::ptr_eq(&s.snapshot().generation, &generation));
         assert_eq!(foci(&s, &[]), ["<http://ex.org/c>"]);
-        assert_eq!(VOCAB_SCANS.with(std::cell::Cell::get), 1);
+        assert_eq!(scans_of(&generation), 1);
     }
 }
