@@ -294,11 +294,22 @@ def linked(meta, package):
     return [pkgs[i] for i in seen if i not in members and not pkgs[i]["manifest_path"].startswith(own)]
 
 
+# license files of C or C++ code that a crate builds from its own sources and links in,
+# which are not at the top of the package
+BUNDLED_LICENSES = {
+    "libmimalloc-sys": ["c_src/mimalloc/v3/LICENSE"],
+}
+
+
 def license_files(p):
-    """(name, text) of the license and notice files at the top of a package, and its
-    `license-file`."""
+    """(name, text) of the license and notice files at the top of a package, its
+    `license-file`, and the licenses of bundled native code in `BUNDLED_LICENSES`."""
     dir = os.path.dirname(p["manifest_path"])
     names = sorted(f for f in os.listdir(dir) if LICENSE_FILE.match(f) and os.path.isfile(os.path.join(dir, f)))
+    for rel in BUNDLED_LICENSES.get(p["name"], []):
+        if not os.path.isfile(os.path.join(dir, rel)):
+            sys.exit(f"{p['name']} {p['version']} has no {rel}: update BUNDLED_LICENSES")
+        names.append(rel)
     if p.get("license_file"):
         lf = os.path.normpath(p["license_file"])
         rel = os.path.relpath(lf if os.path.isabs(lf) else os.path.join(dir, lf), dir)

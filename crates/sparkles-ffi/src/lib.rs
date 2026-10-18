@@ -11,7 +11,7 @@ uniffi::setup_scaffolding!();
 /// own heap, so this changes only the native side's allocations.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: sparkles_alloc::Mimalloc = sparkles_alloc::Mimalloc;
 
 mod admin;
 pub mod encode;
