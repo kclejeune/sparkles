@@ -169,6 +169,10 @@ fn f16_shared_candidate_budget() {
         ttl.push_str(&format!("ex:i{i} a ex:A .\n"));
     }
     load(&s, &ttl);
+    // the store's change log writer encodes the load on a thread of its own, shortly
+    // after the commit: about 3 MB for these triples, which a busy machine can delay
+    // into the measured run, so it is written out first
+    s.flush_change_log().unwrap();
     let opts = ReasonOptions {
         max_memory: Some(LIMIT),
         threads: Some(16),

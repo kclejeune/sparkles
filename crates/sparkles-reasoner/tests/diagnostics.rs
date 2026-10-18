@@ -877,3 +877,133 @@ fn f16_datatype_limit_counts_violations() {
     assert_eq!(basis("q"), Some(json!("uses-inferences")));
     assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 2));
 }
+
+/// F16 §8: with the inferences, the check also reads the literal typings of the
+/// generalized facts of a kept closure, which RDF cannot state: here a range through a
+/// subclass of xsd:integer. The typings come from the closure in memory, or else from the
+/// generalized facts a persistent dataset saved, and their findings use the inferences.
+#[test]
+fn f16_literal_typings_of_a_kept_closure() {
+    use sparkles_reasoner::diagnostics::diagnose_with;
+    use sparkles_reasoner::{Cache, Extras, Incremental, literal_typings, materialize_incremental};
+    const ID: &str = "literal-not-in-datatype";
+    let ttl = r#"ex:D rdfs:subClassOf xsd:integer . ex:p rdfs:range ex:D .
+                 ex:a ex:p "abc" . ex:b ex:p 5 ."#;
+    let dir = tempfile::tempdir().unwrap();
+    for persistent in [false, true] {
+        let s = if persistent {
+            let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+            s.load(&[Source::from_bytes(
+                format!("{PREFIXES}{ttl}").into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+            s
+        } else {
+            store(ttl)
+        };
+        let cache = Cache::default();
+        let r = materialize_incremental(
+            &s,
+            &Profile::Rdfs,
+            &Extras::default(),
+            Incremental {
+                since: None,
+                cache: Some(&cache),
+            },
+            &ReasonOptions::default(),
+        )
+        .unwrap();
+        let commit = r.receipt.unwrap().commit.seq;
+        let from = if persistent { None } else { Some(&cache) };
+        let typings = literal_typings(&s, commit, from).unwrap().unwrap();
+        assert_eq!(typings.commit, commit);
+        assert_eq!(typings.facts.len(), 1, "{typings:?}");
+        assert_eq!(typings.facts[0].0.value(), "abc");
+        assert_eq!(
+            typings.facts[0].1.as_str(),
+            "http://www.w3.org/2001/XMLSchema#integer"
+        );
+        // another commit has none
+        assert_eq!(literal_typings(&s, commit + 1, from).unwrap(), None);
+        let with = DiagnoseOptions {
+            inferences: true,
+            ..datatype_only(10)
+        };
+        // the query and the vocabulary find nothing
+        assert!(findings(&check(&s, &with), ID).is_empty());
+        let r = diagnose_with(s.snapshot(), &with, Some(&typings)).unwrap();
+        let f = findings(&r, ID);
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert_eq!(f[0]["focus"]["value"], "abc");
+        assert_eq!(
+            f[0]["evidence"]["range"]["value"],
+            "http://www.w3.org/2001/XMLSchema#integer"
+        );
+        assert_eq!(f[0]["basis"], "uses-inferences");
+        assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 1));
+        // the typings are inferences: without them the check does not read them
+        let r = diagnose_with(s.snapshot(), &datatype_only(10), Some(&typings)).unwrap();
+        assert!(findings(&r, ID).is_empty());
+    }
+}
+
+/// P3-1 of the follow-up's review: the literal typings of the inferences are reported only
+/// for literals that the checked graphs hold, as the other sources of the check are. A
+/// typing whose literal is in a graph the options leave out, or was deleted since the
+/// run, is not reported.
+#[test]
+fn f16_typings_follow_the_checked_graphs() {
+    use sparkles_reasoner::diagnostics::diagnose_with;
+    use sparkles_reasoner::{Cache, Extras, Incremental, literal_typings, materialize_incremental};
+    const ID: &str = "literal-not-in-datatype";
+    let s = store(
+        r#"ex:D rdfs:subClassOf xsd:integer . ex:p rdfs:range ex:D .
+           ex:a ex:p "abc" . ex:b ex:p "def" ."#,
+    );
+    let u = |q: &str| {
+        sparkles_core::sparql::update::update(
+            &s,
+            &format!("PREFIX ex: <http://ex.org/>\n{q}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+    };
+    u(r#"INSERT DATA { GRAPH ex:other { ex:c ex:q "unrelated" } }"#);
+    let cache = Cache::default();
+    let r = materialize_incremental(
+        &s,
+        &Profile::Rdfs,
+        &Extras::default(),
+        Incremental {
+            since: None,
+            cache: Some(&cache),
+        },
+        &ReasonOptions::default(),
+    )
+    .unwrap();
+    let commit = r.receipt.unwrap().commit.seq;
+    let typings = literal_typings(&s, commit, Some(&cache)).unwrap().unwrap();
+    assert_eq!(typings.facts.len(), 2, "{typings:?}");
+    let foci = |graphs: &[&str]| {
+        let o = DiagnoseOptions {
+            inferences: true,
+            graphs: graphs.iter().map(|g| g.to_string()).collect(),
+            ..datatype_only(10)
+        };
+        let r = diagnose_with(s.snapshot(), &o, Some(&typings)).unwrap();
+        let mut f: Vec<String> = findings(&r, ID)
+            .iter()
+            .map(|f| f["focus"]["value"].as_str().unwrap().to_string())
+            .collect();
+        f.sort();
+        f
+    };
+    assert_eq!(foci(&[]), ["abc", "def"]);
+    assert_eq!(foci(&["default"]), ["abc", "def"]);
+    assert!(foci(&["http://ex.org/other"]).is_empty());
+    // a literal deleted since the run is not reported
+    u(r#"DELETE DATA { ex:a ex:p "abc" }"#);
+    assert_eq!(foci(&[]), ["def"]);
+}

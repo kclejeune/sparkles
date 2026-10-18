@@ -317,6 +317,11 @@ fn copy(s: &Store) -> Store {
 /// features whose geometry facts changed, with probes bound to the feature, when it
 /// continues from a closure kept in memory. A closure read back from the dataset does
 /// not know its default geometries, and that run reads them with one scan per property.
+///
+/// `baseScans` also counts the reads of the input graphs that rule evaluation makes, the
+/// same for both closures, so the test compares the two runs of each step: the closure
+/// read back costs the two scans of the default geometries more. Each step also reads
+/// less than a full run over the same data.
 #[test]
 fn f16_default_geometry_changed_subjects() {
     use sparkles_reasoner::{Cache, Incremental, Method, materialize_incremental};
@@ -343,7 +348,10 @@ fn f16_default_geometry_changed_subjects() {
         ("INSERT DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }", 2, 4),
         ("INSERT DATA { ex:z ex:unrelated 2 }", 0, 2),
     ];
+    // per closure, the scans of each step
+    let mut scans: Vec<Vec<u64>> = Vec::new();
     for (s, cache) in [(store(), Some(Cache::new(1 << 20))), (persistent, None)] {
+        scans.push(Vec::new());
         let extras = Extras::parse::<&str>(&[], true).unwrap();
         let go = |since: Option<u64>| {
             materialize_incremental(
@@ -369,16 +377,34 @@ fn f16_default_geometry_changed_subjects() {
             } else {
                 read_back
             };
-            assert_eq!(r.base_scans, want, "{u}");
+            assert!(r.base_scans >= want, "{u}: {} scans", r.base_scans);
+            scans.last_mut().unwrap().push(r.base_scans);
             since = r.receipt.unwrap().commit.seq;
             // a full run over a copy writes the same
             let mut got = select_all(&s);
             got.sort();
             let c = copy(&s);
-            materialize_with(&c, &Profile::Rdfs, &extras, &ReasonOptions::default()).unwrap();
+            let f =
+                materialize_with(&c, &Profile::Rdfs, &extras, &ReasonOptions::default()).unwrap();
             let mut full = select_all(&c);
             full.sort();
             assert_eq!(got, full, "{u}");
+            // and an incremental step reads the input graphs less often than a full run
+            assert!(
+                r.base_scans < f.base_scans,
+                "{u}: {} scans, {} for a full run",
+                r.base_scans,
+                f.base_scans
+            );
         }
+    }
+    for (i, (u, in_memory, read_back)) in steps.iter().enumerate() {
+        assert_eq!(
+            scans[1][i] - scans[0][i],
+            read_back - in_memory,
+            "{u}: {} scans with the closure in memory, {} with it read back",
+            scans[0][i],
+            scans[1][i]
+        );
     }
 }

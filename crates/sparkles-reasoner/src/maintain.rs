@@ -1,22 +1,25 @@
 //! Where an incremental run finds the previous closure, and what it keeps for the next.
 //!
 //! The explicit facts are the union of the input graphs (the default graph unless the run
-//! names others). The previous closure comes from memory when the caller keeps a
-//! [`Cache`] (the server does), and otherwise from the dataset: the input graphs and the
-//! inferred graph as of the previous run, recovered from their state now and the commit
-//! diff since, plus the
-//! derived facts that are not valid RDF. Those generalized facts (a literal subject, a
+//! names others). A closure holds them as its base tier, read from the store, and keeps
+//! only the derived facts in memory. The previous closure comes from memory when the
+//! caller keeps a [`Cache`] (the server does), and otherwise from the dataset: the
+//! inferred graph as of the previous run, recovered from its state now and the commit
+//! diff since, plus the derived facts that are not valid RDF. Those generalized facts (a literal subject, a
 //! blank node predicate) are never written to the inferred graph but can take part in
 //! derivations, so a persistent dataset keeps them in `reasoning-generalized.bin`, bound
 //! to the run's commit and rules by `reasoning-generalized.json`.
 
 use crate::INFERRED_GRAPH;
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity};
+use crate::diagnostics::LiteralTypings;
+use crate::facts::Base;
 use crate::graph::{Graph, Triple};
 use crate::incremental::{Closure, Fallback};
 use crate::inputs::GraphRef;
 use crate::terms::Terms;
-use oxrdf::{GraphName, NamedNode, Term};
+use oxrdf::vocab::rdf;
+use oxrdf::{GraphName, Literal, NamedNode, Term};
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::history::At;
@@ -30,8 +33,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The closure of a dataset's last materialization, kept in memory for the next run.
 ///
-/// A run that updates the closure takes it out and puts the new one back after its
-/// commit. Only closures of at most `max_triples` facts are kept.
+/// The closure keeps its derived facts in memory and reads the explicit facts from the
+/// snapshot of its commit. A run that updates the closure takes it out and puts the new
+/// one back after its commit. Only closures of at most `max_triples` derived facts are
+/// kept.
 pub struct Cache {
     kept: Mutex<Option<Kept>>,
     max_triples: AtomicUsize,
@@ -54,7 +59,8 @@ impl Default for Cache {
 }
 
 impl Cache {
-    /// A cache that keeps closures of at most `max_triples` facts (0 keeps none).
+    /// A cache that keeps closures of at most `max_triples` derived facts (0 keeps
+    /// none).
     pub fn new(max_triples: usize) -> Cache {
         Cache {
             kept: Mutex::new(None),
@@ -67,7 +73,7 @@ impl Cache {
         self.max_triples.store(n, Ordering::Relaxed);
     }
 
-    /// The largest closure kept, in facts.
+    /// The largest closure kept, in derived facts.
     pub(crate) fn limit(&self) -> usize {
         self.max_triples.load(Ordering::Relaxed)
     }
@@ -77,7 +83,7 @@ impl Cache {
         *self.kept.lock() = None;
     }
 
-    /// Facts in the kept closure, and the commit it belongs to.
+    /// Derived facts in the kept closure, and the commit it belongs to.
     pub fn kept(&self) -> Option<(usize, u64)> {
         self.kept
             .lock()
@@ -258,7 +264,8 @@ impl Changes {
 }
 
 /// Find the closure of the materialization at commit `since`, for an update with the
-/// `raw` changes from there to `snap`, charged to `budget`.
+/// `raw` changes from there to `snap`, charged to `budget`. Its base tier is the input
+/// graphs of `snap`, `ids` in the order the run resolved them.
 ///
 /// A closure kept in memory for this dataset, commit, generation, rules and inputs is
 /// taken out of the cache only when its heap fits the budget, and otherwise stays there
@@ -272,6 +279,7 @@ pub(crate) fn previous(
     since: u64,
     digest: u64,
     inputs: &[GraphRef],
+    run_ids: &[Id],
     cache: Option<&Cache>,
     raw: Result<RawChanges, String>,
     budget: &Arc<Budget>,
@@ -306,6 +314,7 @@ pub(crate) fn previous(
         held.grow(set_bytes(&generalized));
         let moved = closure.terms.rebase(snap.clone());
         closure.remap(&moved);
+        closure.set_inputs(snap.clone(), run_ids)?;
         remap_set(&mut generalized, &moved, None)?;
         held.set(set_bytes(&generalized));
         let changes = raw.resolve(&closure.terms, snap, &ids)?;
@@ -350,7 +359,7 @@ pub(crate) fn previous(
         .collect();
     held.set(changes.heap_bytes() + set_bytes(&generalized));
     budget.check()?;
-    let closure = reconstruct(snap, terms, &changes, &generalized, &ids, budget)?;
+    let closure = reconstruct(snap, terms, &changes, &generalized, run_ids, budget)?;
     Ok(Previous {
         closure,
         generalized,
@@ -387,8 +396,10 @@ fn remap_set(
     Ok(())
 }
 
-/// The closure as of the previous run: the input graphs and the inferred graph then, and
-/// the generalized facts.
+/// The closure as of the previous run, over the input graphs of `snap` (`inputs`, in the
+/// order the run resolved them): the inferred graph then and the generalized facts, as
+/// its derived tier. A fact the input graphs held then is not a derived fact, so the
+/// facts of the inferred graph are probed against the input graphs in one sorted pass.
 fn reconstruct(
     snap: &Arc<Snapshot>,
     terms: Terms,
@@ -397,10 +408,28 @@ fn reconstruct(
     inputs: &[Id],
     budget: &Arc<Budget>,
 ) -> anyhow::Result<Closure> {
-    let scan = |g: Id, skip: &FxHashSet<Triple>, out: &mut Vec<Triple>| -> anyhow::Result<()> {
+    let base = Arc::new(Base::new(snap.clone(), inputs)?);
+    let inferred = snap.lookup_iri(INFERRED_GRAPH);
+    let m = match inferred {
+        Some(g) => snap.count(Perm::Gspo, &[g.0])? as usize,
+        None => 0,
+    };
+    let fact = size_of::<Triple>();
+    let n = m + ch.inferred_removed.len();
+    // the facts read, the result of their probe, and the sets of changed facts
+    let held = Held::try_new(
+        budget,
+        n * (fact + 1)
+            + table_bytes(table_capacity(ch.inferred_added.len()), fact)
+            + table_bytes(table_capacity(ch.base_added.len()), fact)
+            + table_bytes(table_capacity(ch.base_removed.len()), fact),
+    )?;
+    let mut derived: Vec<Triple> = Vec::with_capacity(n);
+    if let Some(g) = inferred {
+        let skip: FxHashSet<Triple> = ch.inferred_added.iter().copied().collect();
         snap.scan(Perm::Gspo, &[g.0], |c| {
             match c {
-                Chunk::Block(b, s, e) => out.extend(
+                Chunk::Block(b, s, e) => derived.extend(
                     (s..e)
                         .map(|i| [b.cols[1][i], b.cols[2][i], b.cols[3][i]])
                         .filter(|t| !skip.contains(t)),
@@ -408,59 +437,34 @@ fn reconstruct(
                 Chunk::Row(k) => {
                     let t = [k[1], k[2], k[3]];
                     if !skip.contains(&t) {
-                        out.push(t);
+                        derived.push(t);
                     }
                 }
             }
             Ok(true)
         })?;
-        Ok(())
-    };
-    let mut n = 0;
-    for g in inputs {
-        n += snap.count(Perm::Gspo, &[g.0])? as usize;
-    }
-    let inferred = snap.lookup_iri(INFERRED_GRAPH);
-    let m = match inferred {
-        Some(g) => snap.count(Perm::Gspo, &[g.0])? as usize,
-        None => 0,
-    };
-    let fact = size_of::<Triple>();
-    let (nb, nd) = (
-        n + ch.base_removed.len(),
-        m + ch.inferred_removed.len() + generalized.len(),
-    );
-    // the facts read and the sets of facts they skip, charged before they are allocated
-    let mut held = Held::try_new(
-        budget,
-        (nb + nd) * fact
-            + table_bytes(table_capacity(ch.base_added.len()), fact)
-            + table_bytes(table_capacity(ch.inferred_added.len()), fact),
-    )?;
-    let mut base = Vec::with_capacity(nb);
-    let added: FxHashSet<Triple> = ch.base_added.iter().copied().collect();
-    for g in inputs {
-        scan(*g, &added, &mut base)?;
-    }
-    drop(added);
-    base.extend(&ch.base_removed);
-    let mut derived = Vec::with_capacity(nd);
-    if let Some(g) = inferred {
-        scan(
-            g,
-            &ch.inferred_added.iter().copied().collect(),
-            &mut derived,
-        )?;
     }
     derived.extend(&ch.inferred_removed);
-    derived.extend(generalized);
-    held.set((base.capacity() + derived.capacity()) * fact);
-    let mut graph = Graph::try_with_capacity(base.len() + derived.len(), budget)?;
-    graph.try_add_batch(base)?;
-    let n = graph.len();
+    derived.sort_unstable();
+    derived.dedup();
+    // a fact the input graphs held at the previous run is explicit there: one they hold
+    // now that was not added since, or one removed since
+    let now = base.contains_sorted(&derived)?;
+    let added: FxHashSet<Triple> = ch.base_added.iter().copied().collect();
+    let removed: FxHashSet<Triple> = ch.base_removed.iter().copied().collect();
+    let mut i = 0;
+    derived.retain(|t| {
+        let then = (now[i] && !added.contains(t)) || removed.contains(t);
+        i += 1;
+        !then
+    });
+    drop((now, added, removed));
+    let mut graph =
+        Graph::with_base(base).try_like(derived.len() + generalized.len(), budget, true)?;
     graph.try_add_batch(derived)?;
+    graph.try_add_batch(generalized.iter().copied())?;
     drop(held);
-    Ok(Closure::new(graph, terms, n))
+    Ok(Closure::new(graph, terms))
 }
 
 /// Changes as the commit diff reports them, or as ids of one generation.
@@ -703,6 +707,12 @@ pub(crate) fn keep(
     let mut moved: FxHashMap<u64, u64> = stored.iter().map(|(l, id)| (*l, id.0)).collect();
     moved.extend(closure.terms.rebase(snap.clone()));
     closure.try_remap(&moved)?;
+    // the input graphs of the commit, which are those the run read
+    let ids = match closure.graph.base() {
+        Some(b) => b.graph_ids(),
+        None => return Ok(false),
+    };
+    closure.set_inputs(snap.clone(), &ids)?;
     let mut held = Held::new(&budget);
     remap_set(&mut generalized, &moved, Some(&mut held))?;
     drop(held);
@@ -798,31 +808,123 @@ enum Saved {
     Missing,
 }
 
-/// Reads length-prefixed keys.
-struct Reader<'a>(&'a [u8]);
-
-impl Reader<'_> {
-    fn take(&mut self, n: usize) -> Option<&[u8]> {
-        let (a, b) = self.0.split_at_checked(n)?;
-        self.0 = b;
-        Some(a)
-    }
-
-    fn keys(&mut self) -> Option<Keys> {
-        let mut t: Keys = Default::default();
-        for k in &mut t {
-            let len = u32::from_le_bytes(self.take(4)?.try_into().ok()?) as usize;
-            *k = self.take(len)?.to_vec();
-        }
-        Some(t)
-    }
-}
-
 fn put_keys(out: &mut Vec<u8>, k: &Keys) {
     for x in k {
         out.extend((x.len() as u32).to_le_bytes());
         out.extend(x);
     }
+}
+
+/// The metadata of the generalized facts saved for the materialization at `commit` of
+/// the dataset `dataset_id`, whatever its rules.
+fn saved_meta(root: &Path, dataset_id: uuid::Uuid, commit: u64) -> Option<SavedMeta> {
+    let m = std::fs::read(root.join(SAVED_META)).ok()?;
+    let meta = serde_json::from_slice::<SavedMeta>(&m).ok()?;
+    (meta.dataset_id == dataset_id.to_string() && meta.commit == commit).then_some(meta)
+}
+
+/// A reader that hashes what it reads and counts it.
+struct Hashing<R> {
+    r: R,
+    h: u64,
+    n: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for Hashing<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.r.read(buf)?;
+        self.h = fnv(&buf[..n], self.h);
+        self.n += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: std::io::Read> Hashing<R> {
+    fn new(r: R) -> Self {
+        Hashing {
+            r,
+            h: FNV_START,
+            n: 0,
+        }
+    }
+
+    /// The next three length-prefixed keys, each at most what is left before `end`.
+    fn keys(&mut self, end: u64) -> Option<Keys> {
+        use std::io::Read as _;
+        let mut t: Keys = Default::default();
+        for k in &mut t {
+            let mut len = [0u8; 4];
+            self.read_exact(&mut len).ok()?;
+            let len = u32::from_le_bytes(len) as u64;
+            if len > end.saturating_sub(self.n) {
+                return None;
+            }
+            k.resize(len as usize, 0);
+            self.read_exact(k).ok()?;
+        }
+        Some(t)
+    }
+
+    fn checksum(&self) -> String {
+        format!("{:016x}", self.h)
+    }
+}
+
+/// Read the generalized facts that `meta` describes in one pass over the saved files,
+/// without holding them: `f(true, keys)` for each fact of the `.bin`, then `f(added,
+/// keys)` for each record of the log that belongs to it. Returns whether the files are
+/// consistent with `meta`. The checksums are known only at the end, so on `false` the
+/// caller drops what it collected.
+fn scan_saved(root: &Path, meta: &SavedMeta, mut f: impl FnMut(bool, Keys)) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(root.join(SAVED_BIN)) else {
+        return false;
+    };
+    if file.metadata().map(|m| m.len()).ok() != Some(meta.bytes) {
+        return false;
+    }
+    let mut r = Hashing::new(std::io::BufReader::new(file.take(meta.bytes)));
+    let mut head = [0u8; 16];
+    if r.read_exact(&mut head).is_err() || &head[..8] != MAGIC {
+        return false;
+    }
+    if u64::from_le_bytes(head[8..16].try_into().expect("8 bytes")) != meta.triples {
+        return false;
+    }
+    for _ in 0..meta.triples {
+        let Some(k) = r.keys(meta.bytes) else {
+            return false;
+        };
+        f(true, k);
+    }
+    if std::io::copy(&mut r, &mut std::io::sink()).is_err()
+        || r.n != meta.bytes
+        || r.checksum() != meta.checksum
+    {
+        return false;
+    }
+    if meta.log_bytes == 0 {
+        return true;
+    }
+    let Ok(log) = std::fs::File::open(root.join(SAVED_LOG)) else {
+        return false;
+    };
+    let mut r = Hashing::new(std::io::BufReader::new(log.take(meta.log_bytes)));
+    while r.n < meta.log_bytes {
+        let mut op = [0u8; 1];
+        if r.read_exact(&mut op).is_err() {
+            return false;
+        }
+        let Some(k) = r.keys(meta.log_bytes) else {
+            return false;
+        };
+        match op[0] {
+            b'+' => f(true, k),
+            b'-' => f(false, k),
+            _ => return false,
+        }
+    }
+    r.n == meta.log_bytes && r.checksum() == meta.log_checksum
 }
 
 /// The generalized facts saved for the materialization at `commit`, as term keys.
@@ -832,64 +934,160 @@ fn read_saved(
     commit: u64,
     digest: u64,
 ) -> anyhow::Result<Saved> {
-    let Ok(m) = std::fs::read(root.join(SAVED_META)) else {
+    let Some(meta) = saved_meta(root, dataset_id, commit) else {
         return Ok(Saved::Missing);
     };
-    let Ok(meta) = serde_json::from_slice::<SavedMeta>(&m) else {
-        return Ok(Saved::Missing);
-    };
-    if meta.dataset_id != dataset_id.to_string() || meta.commit != commit {
-        return Ok(Saved::Missing);
-    }
     if meta.rules != format!("{digest:016x}") {
         return Ok(Saved::OtherRules);
     }
-    let Ok(bin) = std::fs::read(root.join(SAVED_BIN)) else {
-        return Ok(Saved::Missing);
-    };
-    if bin.len() as u64 != meta.bytes || format!("{:016x}", fnv(&bin, FNV_START)) != meta.checksum {
-        return Ok(Saved::Missing);
-    }
-    let log = if meta.log_bytes > 0 {
-        let Ok(log) = std::fs::read(root.join(SAVED_LOG)) else {
-            return Ok(Saved::Missing);
-        };
-        let Some(log) = log.get(..meta.log_bytes as usize).map(<[u8]>::to_vec) else {
-            return Ok(Saved::Missing);
-        };
-        if format!("{:016x}", fnv(&log, FNV_START)) != meta.log_checksum {
-            return Ok(Saved::Missing);
+    let mut set: FxHashSet<Keys> = FxHashSet::default();
+    let consistent = scan_saved(root, &meta, |added, k| {
+        if added {
+            set.insert(k);
+        } else {
+            set.remove(&k);
         }
-        log
+    });
+    Ok(if consistent {
+        Saved::Found(meta, set.into_iter().collect())
     } else {
-        Vec::new()
-    };
-    let parse = || -> Option<Vec<Keys>> {
-        let mut r = Reader(bin.strip_prefix(MAGIC)?);
-        let n = u64::from_le_bytes(r.take(8)?.try_into().ok()?);
-        if n != meta.triples {
-            return None;
-        }
-        let mut set: FxHashSet<Keys> = FxHashSet::default();
-        for _ in 0..n {
-            set.insert(r.keys()?);
-        }
-        let mut r = Reader(&log);
-        while !r.0.is_empty() {
-            let op = r.take(1)?[0];
-            let k = r.keys()?;
-            match op {
-                b'+' => set.insert(k),
-                b'-' => set.remove(&k),
-                _ => return None,
-            };
-        }
-        Some(set.into_iter().collect())
-    };
-    Ok(match parse() {
-        Some(keys) => Saved::Found(meta, keys),
-        None => Saved::Missing,
+        Saved::Missing
     })
+}
+
+/// The literal typings among the generalized facts of the materialization at `commit` of
+/// `store`'s dataset (see [`LiteralTypings`]): from the closure that `cache` keeps for
+/// that commit, or else from the generalized facts a persistent dataset saved for it.
+/// `None` when neither has them. The typings are read whatever the rules of the
+/// materialization were, so a caller that reports them checks that its rules are sound
+/// for OWL 2.
+///
+/// The cache's lock is held only for a pass over the kept generalized facts that compares
+/// ids, which keeps the `rdf:type` facts with a literal subject and an object the check
+/// decides. Their subjects are decoded after the lock is released, so a run that waits
+/// for the cache, and the writers behind it, do not wait for the decoding. A typing whose
+/// subject is a term the rules made is decoded under the lock, since only the closure
+/// knows it. Nothing is kept between calls, and an in-memory dataset has no typings while
+/// a run has its closure out of the cache.
+pub fn literal_typings(
+    store: &Store,
+    commit: u64,
+    cache: Option<&Cache>,
+) -> anyhow::Result<Option<LiteralTypings>> {
+    if let Some(c) = cache {
+        let ty_term = Term::NamedNode(rdf::TYPE.into_owned());
+        // under the lock: typings decided at once, the others as (subject, datatype)
+        let mut found = Vec::new();
+        let mut pending: Vec<(u64, u64)> = Vec::new();
+        let mut datatypes: FxHashMap<u64, Option<NamedNode>> = FxHashMap::default();
+        let snap = 'kept: {
+            let k = c.kept.lock();
+            let Some(k) = k
+                .as_ref()
+                .filter(|k| k.dataset_id == store.dataset_id() && k.commit == commit)
+            else {
+                break 'kept None;
+            };
+            let terms = &k.closure.terms;
+            let ty = terms.snap.lookup_iri(rdf::TYPE.as_str()).map(|i| i.0);
+            let mut predicates: FxHashMap<u64, bool> = FxHashMap::default();
+            for t in &k.generalized {
+                let is_type = match ty {
+                    Some(ty) => t[1] == ty,
+                    None => *predicates
+                        .entry(t[1])
+                        .or_insert_with(|| terms.term(t[1]).as_ref() == Some(&ty_term)),
+                };
+                if !is_type || terms.kind(t[0]) != crate::terms::Kind::Literal {
+                    continue;
+                }
+                let dt = datatypes
+                    .entry(t[2])
+                    .or_insert_with(|| match terms.term(t[2]) {
+                        Some(Term::NamedNode(n))
+                            if crate::diagnostics::decidable_range(n.as_str()) =>
+                        {
+                            Some(n)
+                        }
+                        _ => None,
+                    });
+                let Some(dt) = dt else {
+                    continue;
+                };
+                if Id(t[0]).tag() == sparkles_core::id::Tag::Local {
+                    let Some(s) = terms.term(t[0]) else {
+                        continue;
+                    };
+                    found.extend(LiteralTypings::violation(
+                        &s,
+                        &ty_term,
+                        &Term::NamedNode(dt.clone()),
+                    ));
+                } else {
+                    pending.push((t[0], t[2]));
+                }
+            }
+            Some(terms.snap.clone())
+        };
+        // the saved files are read without the lock
+        let Some(snap) = snap else {
+            return saved(store, commit);
+        };
+        pending.sort_unstable();
+        for (s, dt) in pending {
+            let (Some(s), Some(Some(dt))) = (snap.term(Id(s)), datatypes.get(&dt)) else {
+                continue;
+            };
+            found.extend(LiteralTypings::violation(
+                &s,
+                &ty_term,
+                &Term::NamedNode(dt.clone()),
+            ));
+        }
+        return Ok(Some(LiteralTypings {
+            commit,
+            facts: found,
+        }));
+    }
+    saved(store, commit)
+}
+
+/// The literal typings that a persistent dataset saved for `commit`.
+fn saved(store: &Store, commit: u64) -> anyhow::Result<Option<LiteralTypings>> {
+    let Some(root) = store.root() else {
+        return Ok(None);
+    };
+    Ok(saved_typings(root, store.dataset_id(), commit)
+        .map(|facts| LiteralTypings { commit, facts }))
+}
+
+/// The literal typings among the generalized facts a persistent dataset saved for the
+/// materialization at `commit`, whatever its rules, read in one pass over the saved
+/// files that keeps only the typings. `None` when no consistent state is saved for that
+/// commit.
+fn saved_typings(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    commit: u64,
+) -> Option<Vec<(Literal, NamedNode)>> {
+    let meta = saved_meta(root, dataset_id, commit)?;
+    let ty_key = sparkles_core::id::iri_key(rdf::TYPE.as_str());
+    let ty_term = Term::NamedNode(rdf::TYPE.into_owned());
+    let mut found: FxHashMap<Keys, (Literal, NamedNode)> = FxHashMap::default();
+    let consistent = scan_saved(root, &meta, |added, k| {
+        if !added {
+            found.remove(&k);
+        } else if k[1] == ty_key && k[0].first() == Some(&b'"') {
+            let (s, o) = (
+                sparkles_core::id::key_to_term(&k[0]),
+                sparkles_core::id::key_to_term(&k[2]),
+            );
+            if let Some(x) = LiteralTypings::violation(&s, &ty_term, &o) {
+                found.insert(k, x);
+            }
+        }
+    });
+    consistent.then(|| found.into_values().collect())
 }
 
 /// Replace a file by renaming a new one over it. Nothing is synced: after a crash, a
