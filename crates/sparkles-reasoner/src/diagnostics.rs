@@ -2650,12 +2650,13 @@ mod paging_tests {
         let snap = s.snapshot();
         std::thread::spawn(move || {
             let _seams = Seams;
-            let mut n = 0;
+            let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let n = ran.clone();
             DELTA_CHUNK_HOOK.with(|h| {
                 *h.borrow_mut() = Some(Box::new(move |g: &Generation| {
-                    let key = sparkles_core::id::iri_key(&format!("http://ex.org/w{n}"));
+                    let i = n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let key = sparkles_core::id::iri_key(&format!("http://ex.org/w{i}"));
                     g.dvocab.insert(&key).unwrap();
-                    n += 1;
                 }))
             });
             let r = diagnose(
@@ -2668,7 +2669,8 @@ mod paging_tests {
             )
             .unwrap();
             let c = r.checks.iter().find(|c| c.id == ID).unwrap();
-            let _ = tx.send((c.status, c.findings));
+            let ran = ran.load(std::sync::atomic::Ordering::Relaxed) > 0;
+            let _ = tx.send((c.status, c.findings, ran));
         });
         let Ok(got) = rx.recv_timeout(Duration::from_secs(60)) else {
             // the reading thread is stuck holding the lock, which dropping the store
@@ -2676,7 +2678,75 @@ mod paging_tests {
             std::mem::forget(s);
             panic!("the hook could not add a term while the delta vocabulary was read");
         };
-        assert_eq!(got, (CheckStatus::Truncated, 10));
+        // the hook ran, on the reading thread
+        assert_eq!(got, (CheckStatus::Truncated, 10, true));
+    }
+
+    /// The key of an ill-typed `xsd:int` literal.
+    fn ill_typed_literal_key(lex: &str) -> Vec<u8> {
+        sparkles_core::id::term_key(&Term::Literal(Literal::new_typed_literal(lex, xsd::INT)))
+    }
+
+    /// P3-3 of the follow-up's re-review: the delta vocabulary is read up to the
+    /// snapshot's end, so ill-typed literals interned after it, by a later commit or by a
+    /// transaction in flight, are not counted for it.
+    #[test]
+    fn f16_delta_scan_stops_at_the_snapshot() {
+        let s = ill_typed_store(0);
+        let insert = |from: usize, n: usize| {
+            let mut u = String::from("INSERT DATA {");
+            for i in from..from + n {
+                u.push_str(&format!(
+                    " <http://ex.org/d{i}> <http://ex.org/v> \"bad{i}\"^^<{}> .",
+                    xsd::INT.as_str()
+                ));
+            }
+            u.push('}');
+            sparkles_core::sparql::update::update(&s, &u, &QueryOptions::default()).unwrap();
+        };
+        insert(0, 3);
+        let snap = s.snapshot();
+        assert_eq!(ill_typed(&snap, 100, None).unwrap().delta.len(), 3);
+        insert(3, 4);
+        snap.generation
+            .dvocab
+            .insert(&ill_typed_literal_key("in flight"))
+            .unwrap();
+        assert_eq!(ill_typed(&snap, 100, None).unwrap().delta.len(), 3);
+        // the snapshot of the later commit holds its literals, and the store hands it
+        // out until the next commit
+        assert_eq!(ill_typed(&s.snapshot(), 100, None).unwrap().delta.len(), 7);
+    }
+
+    /// P3-3 of the follow-up's re-review: a call whose deadline passes while another holds
+    /// the generation's list times out, and a list that stopped early serves a smaller
+    /// cap and is read again for a larger one.
+    #[test]
+    fn f16_ill_typed_list_waits_and_grows() {
+        let s = ill_typed_store(5);
+        let snap = s.snapshot();
+        let generation = snap.generation.clone();
+        {
+            let _held = generation.ill_typed_literals.lock();
+            let soon = Instant::now() + Duration::from_millis(50);
+            assert!(matches!(
+                ill_typed(&snap, 10, Some(soon)),
+                Err(Error::Timeout)
+            ));
+        }
+        assert_eq!(scans_of(&generation), 0);
+        // the list stops after 3, one past the cap
+        assert_eq!(ill_typed(&snap, 2, None).unwrap().len(), 3);
+        assert_eq!(remembered(&generation), 3);
+        assert_eq!(scans_of(&generation), 1);
+        // a smaller cap than the list is served from it
+        assert_eq!(ill_typed(&snap, 1, None).unwrap().len(), 3);
+        assert_eq!(scans_of(&generation), 1);
+        // a larger one reads the vocabulary again, and the whole list serves any cap
+        assert_eq!(ill_typed(&snap, 10, None).unwrap().len(), 5);
+        assert_eq!(scans_of(&generation), 2);
+        assert_eq!(ill_typed(&snap, 2, None).unwrap().len(), 5);
+        assert_eq!(scans_of(&generation), 2);
     }
 
     /// An ill-typed literal that only the delta vocabulary holds is found in the named
