@@ -1718,8 +1718,9 @@ idle release, and peaked at 1,682 MiB against 1,439 MiB. In exchange it served 1
 against 144, and `star-join` took 38 ms against 72 ms. The bindings make the same choice
 case by case. The Python package and the JVM library use mimalloc, which raises the
 Python benchmark process's peak RSS by about 20% and a mixed JVM run's from 653 to
-962 MiB. The Node.js addon keeps the system allocator, because mimalloc made no
-measurable difference there.
+962 MiB. The Node.js addon uses mimalloc as well, because single adds, bulk adds and
+`has()` took 15 to 20% less time with it, and the process keeps more memory in exchange
+([P05](specs/P05-node-bindings.md#outcome)).
 
 The server and the bindings call mimalloc through its plain entry points for buffers
 aligned to 8 bytes or less (`crates/sparkles-alloc`). The aligned entry point, which the
