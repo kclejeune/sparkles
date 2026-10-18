@@ -40,9 +40,10 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
   is written in checksummed chunks, so a torn tail is detected and trimmed at open.
   Group commit, on by default for persistent stores, shares one synchronization among
   concurrent writers. `--no-group-commit` or `SPARKLES_GROUP_COMMIT=off` turns it off, and
-  the Node and Python bindings take a `groupCommit` and a `group_commit` option. A
-  persistent dataset holds up to 64 commits or 4 MiB of log records in its queue, which is
-  the memory this speed costs. It takes SPARQL updates, Graph Store writes,
+  the Node and Python bindings take a `groupCommit` and a `group_commit` option. The JVM
+  library follows the default and has no option. A persistent dataset holds up to 64
+  commits or 4 MiB of log records in its queue, plus the speculative snapshots of the
+  commits in flight, which is the memory this speed costs. It takes SPARQL updates, Graph Store writes,
   uploads, RDF Patch, commit messages and change digests, preconditions, graph-restricted
   writes, SHACL-guarded writes and writes during a compaction. ShEx-guarded datasets commit
   through the group path one commit at a time. A commit that does not qualify takes the

@@ -5137,13 +5137,21 @@ fn group_commit_setting(no_flag: bool, env: Option<String>) -> (bool, Option<Str
     let (on, warning) = match v.as_deref() {
         None | Some("" | "on" | "true" | "yes" | "1") => (true, None),
         Some("off" | "false" | "no" | "0") => (false, None),
-        Some(_) => (
-            true,
-            Some(format!(
-                "SPARKLES_GROUP_COMMIT={} is not recognised, so group commit stays on; use off to turn it off",
-                env.as_deref().unwrap_or_default()
-            )),
-        ),
+        Some(_) => {
+            let v = env.as_deref().unwrap_or_default();
+            (
+                true,
+                Some(if no_flag {
+                    format!(
+                        "SPARKLES_GROUP_COMMIT={v} is not recognised and is ignored; --no-group-commit turns group commit off"
+                    )
+                } else {
+                    format!(
+                        "SPARKLES_GROUP_COMMIT={v} is not recognised, so group commit stays on; use off to turn it off"
+                    )
+                }),
+            )
+        }
     };
     (on && !no_flag, warning)
 }
@@ -5197,7 +5205,13 @@ mod group_options_tests {
             assert!(on, "{v}");
             assert!(warning.is_some_and(|w| w.contains(v)), "{v}");
         }
+        // with the flag the warning does not claim that grouping stays on
         let (on, warning) = group_commit_setting(true, Some("disabled".into()));
-        assert!(!on && warning.is_some());
+        assert!(!on);
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("--no-group-commit") && !warning.contains("stays on"),
+            "{warning}"
+        );
     }
 }

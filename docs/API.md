@@ -716,7 +716,7 @@ type DatasetStats = {
   geo: GeoStatus | null;   // the spatial index (see GeoSPARQL)
   datasets: { [path: string]: FusekiCounters };   // Fuseki's form, under "/ds"
   compaction: CompactionStatus;  // automatic compaction (see Automatic compaction)
-  groupCommit: boolean;          // concurrent commits share one synchronization; false in memory and with --no-group-commit
+  groupCommit: boolean;          // whether concurrent commits share one synchronization, false in memory and with --no-group-commit
 };
 
 type DatasetQuota = {

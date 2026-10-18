@@ -54,6 +54,20 @@ refuses until `sparkles migrate` runs without `--check`, and its JSON report add
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as
 the database's owner or as root.
 
+Group commit is on by default for persistent stores. Concurrent commits of a dataset share
+one synchronization of the log, and each commit is still acknowledged only once it is
+durable. On `forge` four writers commit about 1.8 times as fast as before and sixteen
+writers about 5.4 times as fast, while a single writer's latency is unchanged. A dataset with
+a full-text, spatial or embedding index keeps committing on its own. The global flag
+`--no-group-commit` or `SPARKLES_GROUP_COMMIT=off`, `false`, `no` or `0` turns grouping
+off, and an unrecognised value of the variable logs a warning and keeps it on. Node's
+`Dataset.open` and `Catalog.open` take `groupCommit`, and Python's `Dataset`,
+`Dataset.open` and `Catalog` take `group_commit`, both `true` by default. The JVM library
+follows the default and has no option. Embedded Rust sets `StoreOptions::group_commit`,
+which now defaults to `true`. Grouping costs memory: each persistent dataset may hold up
+to 64 queued commits or 4 MiB of log records, plus the snapshots of commits in flight. The
+hidden `--experimental-group-commit` flag is removed, and passing it is a usage error.
+
 ### Behavior
 
 FastRP follows the meaning of `iterationWeights` in Neo4j GDS. The list has one weight

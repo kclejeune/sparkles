@@ -589,7 +589,10 @@ existing invariant that `apply_commit` sees only durable commits.
 - `store/geo.rs`, `maintain_geo` and `index_commit`. Take the transaction's base as the
   state before the commit, instead of `self.current`. In the build thread of
   `spawn_geo_build`, replace `writer.lock()` with `guarded_writer()`, so that a build
-  installs its view only when no grouped commit is in flight.
+  installs its view only when no grouped commit is in flight. The thread holds weak
+  handles to the writer state and to `current`, not the `Store`, and `guarded_writer` and
+  `drain_group` are `Store` methods that need the coordinator. The thread therefore gets a
+  weak handle to the coordinator, or to the store, as well.
 - `text.rs`. Add `Overlay`, the documents a commit adds and the keys it removes, with
   `stage(snap, log) -> Overlay` and `apply_staged(&Overlay)`. `apply_commit` becomes
   `stage` followed by `apply_staged`, so the ordinary path keeps one code path. Text
@@ -622,6 +625,15 @@ The invariant is that no index's durable state names a commit above the durable 
 log. The text checkpoint is the only durable index state that names a commit, and step 3
 applies only fenced commits to it.
 
+Step 3 runs inside the coordinator's `drive`, which today holds the state mutex while it
+publishes, and `enqueue` takes the same mutex. A text `apply_staged` or an `embed_noted`
+there would block every writer's `enqueue`, and those writers hold the writer lock, so all
+new transactions would wait for the index work. Step 3 therefore publishes outside the
+state mutex. The leader takes the prefix out of the queue under the mutex, releases it,
+applies and publishes in order, and takes the mutex again only to update the queue's
+counts. Only the leader publishes, so the order of commits is unchanged. The gates of
+section 17.9 measure the cost.
+
 ### 17.5 Recovery after a crash at each step
 
 | Crash point | State on disk | What open does |
@@ -631,6 +643,8 @@ applies only fenced commits to it.
 | During step 3 | Some overlays applied in memory, none checkpointed | The same as above, since the live writer's memory is lost. |
 | During step 4 | A checkpoint at or below the published head, or the previous one | The catch-up of `open_text` covers the difference. |
 | A fence fails | The writer is poisoned and the overlays are dropped with the queue | No overlay was applied, so the live writer holds only durable commits and needs no recovery. |
+| The leader panics, or an apply fails, during step 3 | The prefix is durable. The live text index holds some of its overlays, and the writer is poisoned, so the prefix's later commits report `Poisoned` although they are durable | The text index is marked stale and rebuilt from its checkpoint and the WAL at the next open. It is at or below the durable head, so the invariant holds. |
+| The text index's own tick commits the live writer during step 3 | A checkpoint naming a commit of the prefix, which is durable | Nothing beyond the usual catch-up, because the checkpoint is at or below the durable head. |
 
 A power loss inside a fence's unfenced suffix can lose commits that a speculative
 transaction saw, but no index outlives them, because overlays and speculative spatial
@@ -670,7 +684,9 @@ measured amount.
   index. The model checks text queries against a scan of the model's literals, spatial
   queries against a brute-force distance over the model's points, and that embedding work
   is never scheduled for a commit above the published head. Faults include a failure of
-  `index_commit`, which `GeoIndex::fail_next` already injects, and a failed text apply.
+  `index_commit`, which `Store::fail_next_geo_commit` already injects through the
+  `GeoIndex::fail_next` field, a failed text commit through `Store::fail_next_text_commit`,
+  and a failed text apply.
 - **Admission tests.** One test per new fallback reason, and one per installer showing that
   a build, recovery or rebuild that finishes during a fence installs only after the fence.
 - **Power loss.** `tests/power_loss.rs` runs its crash images on a dataset with full-text
@@ -1032,12 +1048,12 @@ grouping.
 **The default.** Group commit is on by default. `StoreOptions::group_commit` replaces
 `experimental_group_commit` with a default of true and is ignored for in-memory stores.
 The CLI and server take the global `--no-group-commit`, and `SPARKLES_GROUP_COMMIT=off`,
-`false`, `no` or `0` does the same. Any other non-empty value other than `on`, `true`,
-`yes` or `1` keeps grouping on and logs a warning, so a typo is not silent.
+`false`, `no` or `0` does the same. Any non-empty value besides those and `on`, `true`,
+`yes` or `1` is ignored with a warning, so a typo is not silent.
 `--experimental-group-commit` is removed, as section 7.1 says. The Node binding takes a
 `groupCommit` open option and the Python binding a `group_commit` keyword on `Dataset`,
 `Dataset.open` and `Catalog`. The JVM binding exposes no store options, so it takes the
-default. `/$/stats/{ds}` and the JSON metrics report `groupCommit` per dataset. A persistent
+default and a JVM user cannot turn grouping off. `/$/stats/{ds}` and the JSON metrics report `groupCommit` per dataset. A persistent
 dataset with grouping on holds up to 64 queued commits or 4 MiB of log records, plus the
 speculative snapshots of the commits in flight, which is the memory that buys the
 throughput in BENCHMARKS.md. The switch landed after the 1,000-point `log-writes` runs passed
