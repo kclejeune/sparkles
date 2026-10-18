@@ -665,8 +665,18 @@ impl Checker<'_> {
             if *is_dir && is_gen_name(n) && retained.contains_key(&commit::generation_number(n)) {
                 continue;
             }
-            let msg = if n.ends_with(".tmp") {
+            let msg = if crate::history::STORE_TEMP_FILES.contains(&n.as_str()) {
+                Some(
+                    "a temporary file of an interrupted write, which the next open removes"
+                        .to_string(),
+                )
+            } else if n.ends_with(".tmp") {
                 Some("a temporary file of an interrupted write; safe to remove".to_string())
+            } else if *is_dir && n.starts_with("gen-") && n.contains(crate::history::SET_ASIDE) {
+                Some(
+                    "a generation above CURRENT that open set aside instead of removing; inspect it, then rename it back and point CURRENT at it, or delete it"
+                        .to_string(),
+                )
             } else if n == "text.new" || n == "text.old" {
                 Some("left by an interrupted full-text rebuild; removed on open".to_string())
             } else if n.ends_with(".deleting") {
@@ -678,7 +688,7 @@ impl Checker<'_> {
                 Some(if cur_no.is_some_and(|c| no < c) {
                     "an old generation whose removal after a compaction was interrupted; safe to remove".to_string()
                 } else {
-                    "newer than CURRENT: an interrupted rebuild, replaced by the next one"
+                    "newer than CURRENT, which the next open removes if it is an unfinished rebuild and sets aside otherwise"
                         .to_string()
                 })
             } else {

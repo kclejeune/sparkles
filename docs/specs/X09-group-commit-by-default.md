@@ -631,8 +631,14 @@ there would block every writer's `enqueue`, and those writers hold the writer lo
 new transactions would wait for the index work. Step 3 therefore publishes outside the
 state mutex. The leader takes the prefix out of the queue under the mutex, releases it,
 applies and publishes in order, and takes the mutex again only to update the queue's
-counts. Only the leader publishes, so the order of commits is unchanged. The gates of
-section 17.9 measure the cost.
+counts. Only the leader publishes, so the order of commits is unchanged. Today `drive`
+holds the mutex across `publish_group_prefix`, and `fail_locked` runs under the same mutex,
+so the change needs a
+second critical section that updates `commits`, `bytes` and the count of commits in flight
+after the prefix is published. A failure in step 3 comes after the first release, and the
+leader must then take the mutex again to fail the queue, so that no commit enqueued in
+between is acknowledged. Question 5 of section 17.10 asks how. The gates of section 17.9
+measure the cost.
 
 ### 17.5 Recovery after a crash at each step
 
@@ -643,7 +649,7 @@ section 17.9 measure the cost.
 | During step 3 | Some overlays applied in memory, none checkpointed | The same as above, since the live writer's memory is lost. |
 | During step 4 | A checkpoint at or below the published head, or the previous one | The catch-up of `open_text` covers the difference. |
 | A fence fails | The writer is poisoned and the overlays are dropped with the queue | No overlay was applied, so the live writer holds only durable commits and needs no recovery. |
-| The leader panics, or an apply fails, during step 3 | The prefix is durable. The live text index holds some of its overlays, and the writer is poisoned, so the prefix's later commits report `Poisoned` although they are durable | The text index is marked stale and rebuilt from its checkpoint and the WAL at the next open. It is at or below the durable head, so the invariant holds. |
+| The leader panics, or an apply fails, during step 3 | The prefix is durable. The live text index holds some of its overlays, and the writer is poisoned, so the prefix's later commits report `Poisoned` although they are durable | Nothing is marked. The live index holds only durable commits, and the catch-up of `open_text` at the next open brings the checkpoint to the head as after a crash between steps 2 and 3. The index is at or below the durable head, so the invariant holds. |
 | The text index's own tick commits the live writer during step 3 | A checkpoint naming a commit of the prefix, which is durable | Nothing beyond the usual catch-up, because the checkpoint is at or below the durable head. |
 
 A power loss inside a fence's unfenced suffix can lose commits that a speculative
@@ -724,6 +730,10 @@ index configured.
    in speculative snapshots, rather than falling back until the view is ready.
 4. Whether the leader's text apply in step 3 needs a separate thread when a prefix holds
    many large overlays, which the four-writer gate will show.
+5. How the leader updates the queue's counts and fails the queue after it released the
+   state mutex in step 3, as section 17.4 describes. Either `fail` takes the mutex itself
+   and marks the queue failed before any later fence can lead, or the leader holds a failure
+   flag that `enqueue` reads before it admits a commit.
 
 ## Outcome
 
@@ -921,7 +931,7 @@ Phase 2 left six items. The Phase 3 section below records what became of each.
 1. The gates of section 9 on `forge`, in particular serial parity at 1.05M
    and 10.5M. Met.
 2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs. Both passed,
-   the `log-writes` runs on `forge` on 2026-10-18 with the switched build.
+   the `log-writes` runs on `forge` on 2026-10-17 with the switched build.
 3. Full-text, spatial and embedding datasets and the ShEx guard grouping, or measurements
    that show them rare. Condition 3 was amended instead, and section 17 designs their
    admission as Phase 4.
@@ -1025,11 +1035,13 @@ block. It checks each image as the restart above does, with the next commit cont
 sequence. A run whose marks fail, or that makes none, fails too, since its images would be
 checked against no receipts.
 
-The `log-writes` runs ran on `forge` on 2026-10-18 with the switched build, 1,000 crash
-images per run, sixteen writers for 20 s and a mark every 50 ms. Each load crossed one
-automatic compaction. The `--no-group-commit` loads commit far fewer transactions through
-`log-writes`, so they ran with `--auto-compact-min-quads 1000` to cross one as well. Every
-image passed.
+The `log-writes` runs ran on `forge` on 2026-10-17 with a build of the switch branch at or
+after merge 62f2ada8, which brought in e9f4acb5 and 42c160a9. A run cannot pass without
+both, and the runs did not record the exact revision. Each run replayed 1,000 crash
+images of a load of sixteen writers for 20 s with a mark every 50 ms, and each load
+crossed one automatic compaction. The `--no-group-commit` loads commit far fewer
+transactions through `log-writes`, so they ran with `--auto-compact-min-quads 1000` to cross
+one as well. Every image passed.
 
 | Run | Receipts | Marks | Log entries | Images | Failed |
 |---|---:|---:|---:|---:|---:|
@@ -1047,8 +1059,9 @@ images in 1,000 with grouping and 26 in 1,000 without, and the harness now accep
 leftover warning after open, while any other warning or error still fails. One image held a
 log record torn at a 4 KiB block boundary after the last commit, with zeros where its ids
 were. Open truncated it with the incomplete transaction, but check called the ids errors.
-Check now reports them as warnings. Removing a leftover generation at open is
-[roadmap](../ROADMAP.md) item 14.
+Check now reports them as warnings. Since 2026-10-18 open removes a leftover generation
+that is an unfinished build and sets any other aside, as the C13 follow-up describes, and
+after open the harness accepts only an old generation or one set aside.
 
 **Tests.** `store/group_model.rs` is the model-based stress test of section 10.1. Four to
 eight threads issue random inserts, deletes, multi-quad transactions, no-ops, dry runs and
@@ -1058,15 +1071,25 @@ vocabulary. It checks unique commit numbers, a poisoned writer after a failed
 synchronization, that every snapshot a reader saw is the model's state at its commit, and
 that the reopened store holds every acknowledged commit and message in an order the model
 allows. After a failed synchronization it also checks that no reader saw a commit past the
-last acknowledged one and that no commit after an uncertain one was acknowledged. A commit
-whose own synchronization failed on the ordinary path rolls back its annotation but can keep
-its log record, so it may come back without its message. Section 3 leaves the outcome of
-that commit open, and the model accepts it for an operation that failed with an error. It
-runs 24 seeds by default in under two seconds, and twelve invocations of 300 seeds each
-passed. Publishing the commits of a failed fence before failing them makes it fail in every
-invocation, and so does removing the poisoning of a failed fence. `tests/annotations.rs`
-prunes the catalog while messaged commits sit at the WAL tail and reopens with and without
-grouping.
+last acknowledged one and that no commit after an uncertain one was acknowledged. Every
+recovered commit must carry its message. It runs 24 seeds by default in under two seconds,
+and twelve invocations of 300 seeds each passed. Publishing the commits of a failed fence
+before failing them makes it fail in every invocation, and so does removing the poisoning of
+a failed fence. `tests/annotations.rs` prunes the catalog while messaged commits sit at the
+WAL tail and reopens with and without grouping.
+
+**Annotations after a failed synchronization.** The ordinary path used to take a
+commit's annotation and merge record back when the synchronization of its log records
+failed. The records could still reach the disk, so the commit could come back after a
+restart without its message or change digest, and with digests on the next commit then
+hashed against a zero parent. A failed synchronization poisons the writer, and open drops
+the records of commits above the recovered head, so the path now keeps both records. A
+recovered commit has its message, digest and merge parent, and a commit that did not
+survive leaves nothing behind. The model test above now requires every recovered commit to
+carry its message, and `a_commit_kept_after_a_failed_sync_keeps_its_message_and_digest`
+checks the digest chain across such a commit. A bulk commit whose `CURRENT` switch reports
+an error after the rename took effect now poisons the writer and keeps its annotation, as a
+compaction already did. Nothing on disk changed.
 
 **The default.** Group commit is on by default. `StoreOptions::group_commit` replaces
 `experimental_group_commit` with a default of true and is ignored for in-memory stores.
@@ -1076,8 +1099,9 @@ The CLI and server take the global `--no-group-commit`, and `SPARKLES_GROUP_COMM
 `--experimental-group-commit` is removed, as section 7.1 says. The Node binding takes a
 `groupCommit` open option and the Python binding a `group_commit` keyword on `Dataset`,
 `Dataset.open` and `Catalog`. The JVM binding exposes no store options, so it takes the
-default and a JVM user cannot turn grouping off. `/$/stats/{ds}` and the JSON metrics report `groupCommit` per dataset. A persistent
-dataset with grouping on holds up to 64 queued commits or 4 MiB of log records, plus the
-speculative snapshots of the commits in flight, which is the memory that buys the
-throughput in BENCHMARKS.md. The 1,000-point `log-writes` runs on ext4 and XFS passed with
-it on 2026-10-18.
+default and a JVM user cannot turn grouping off. `/$/stats/{ds}` and the JSON metrics
+report `groupCommit` per dataset. A persistent dataset with grouping on holds up to 64
+queued commits or 4 MiB of log records, plus the speculative snapshots of the commits in
+flight, which is the memory that buys the throughput in BENCHMARKS.md. The size of those
+snapshots was not measured. The 1,000-point `log-writes` runs on ext4 and XFS passed with
+it on 2026-10-17.

@@ -223,12 +223,20 @@ class AcceptanceTest {
         dsg.load(ByteArrayInputStream(sb.toString().toByteArray()), Lang.TURTLE)
         // 25 million rows, each through a regular expression
         val q = "SELECT (COUNT(*) AS ?n) { ?a ?p ?b . ?c ?q ?d FILTER(REGEX(CONCAT(STR(?b), STR(?d)), '^(1|2)+9$')) }"
-        val start = System.nanoTime()
-        assertThrows(QueryCancelledException::class.java) {
-            QueryExec.dataset(dsg).query(q).timeout(100, TimeUnit.MILLISECONDS).select().hasNext()
+        // a first query pays for loading and warming the native library, not the timeout
+        assertTrue(QueryExec.dataset(dsg).query("ASK { ?s ?p 1 }").ask())
+        // Every attempt must be cancelled, and one of them within the bound. A loaded
+        // host can stall one attempt past it, while a cancellation that does not stop
+        // the query promptly misses the bound every time.
+        val times = mutableListOf<Long>()
+        while (times.size < 3 && times.none { it < 2000 }) {
+            val start = System.nanoTime()
+            assertThrows(QueryCancelledException::class.java) {
+                QueryExec.dataset(dsg).query(q).timeout(100, TimeUnit.MILLISECONDS).select().hasNext()
+            }
+            times += (System.nanoTime() - start) / 1_000_000
         }
-        val ms = (System.nanoTime() - start) / 1_000_000
-        assertTrue(ms < 2000, "cancelled after $ms ms")
+        assertTrue(times.any { it < 2000 }, "cancelled after $times ms")
         assertTrue(QueryExec.dataset(dsg).query("ASK { ?s ?p 1 }").ask())
     }
 

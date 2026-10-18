@@ -31,6 +31,7 @@ use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity, t
 use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step};
 use crate::facts::Base;
 use crate::graph::{Cands, Graph, Triple};
+use crate::lookups::{self, Lookups};
 use crate::terms::Terms;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -121,21 +122,48 @@ impl Defaults {
 impl Closure {
     /// The closure of `graph`, whose base tier holds the explicit facts and whose
     /// derived tier holds the derived ones, none of them flagged.
-    pub fn new(graph: Graph, terms: Terms) -> Closure {
+    pub fn new(mut graph: Graph, terms: Terms) -> anyhow::Result<Closure> {
         let flags_held = Held::new(graph.budget());
-        Closure {
+        if graph.base().is_some() {
+            let lookups = Lookups::new(graph.budget(), lookups::DEFAULT_MAX_BYTES);
+            match graph.base_mut() {
+                // the closure holds the only reference to its tier
+                Some(b) => b.set_lookups(lookups),
+                // a tier shared with others gets a copy of its own, whose count of the
+                // input graphs reads the store and can fail
+                None => {
+                    let b = graph.base().expect("checked above");
+                    let b = Base::new(b.snap.clone(), &b.graph_ids())?;
+                    graph.set_base(Arc::new(b.with_lookups(lookups)));
+                }
+            }
+        }
+        Ok(Closure {
             graph,
             terms,
             flags: Vec::new(),
             flags_held,
             defaults: None,
-        }
+        })
     }
 
-    /// The heap of the closure: its derived tier, its local terms, the flags and the
-    /// default geometries. The base tier is the store's.
+    /// The heap of the closure: its derived tier, its local terms, the flags, the default
+    /// geometries and the remembered lookups. The base tier is the store's.
     pub fn heap_bytes(&self) -> usize {
-        self.graph.heap_bytes() + self.terms.heap_bytes() + self.own_bytes()
+        self.graph.heap_bytes()
+            + self.terms.heap_bytes()
+            + self.own_bytes()
+            + self.lookups().map_or(0, Lookups::bytes)
+    }
+
+    /// The lookups of the base tier the closure remembers.
+    pub fn lookups(&self) -> Option<&Lookups> {
+        self.graph.base().and_then(Base::lookups)
+    }
+
+    /// The remembered lookups, to change between runs, while no run shares the tier.
+    pub fn lookups_mut(&mut self) -> Option<&mut Lookups> {
+        self.graph.base_mut().and_then(Base::lookups_mut)
     }
 
     fn own_bytes(&self) -> usize {
@@ -148,6 +176,13 @@ impl Closure {
         let held = Held::try_new(budget, self.own_bytes())?;
         self.graph.set_budget(budget)?;
         self.terms.set_budget(budget)?;
+        if self.lookups().is_some() {
+            match self.lookups_mut() {
+                Some(l) => l.set_budget(budget)?,
+                // a shared tier would keep its answers charged to the old budget
+                None => debug_assert!(false, "the remembered lookups of a shared base tier"),
+            }
+        }
         self.flags_held = held;
         Ok(())
     }
@@ -168,11 +203,36 @@ impl Closure {
     }
 
     /// Replace the base tier by the input graphs `graphs` of `snap`, a later snapshot of
-    /// the same generation, in the order the run resolved them.
-    pub fn set_inputs(&mut self, snap: Arc<Snapshot>, graphs: &[Id]) -> anyhow::Result<()> {
+    /// the same generation, in the order the run resolved them. The new tier starts with
+    /// no remembered lookups. Those of the old tier are returned frozen, and they hold
+    /// for the old snapshot only. A caller that brings them up to date with the changes
+    /// since gives them back with [`put_lookups`](Self::put_lookups), and any other
+    /// caller drops them.
+    pub fn set_inputs(
+        &mut self,
+        snap: Arc<Snapshot>,
+        graphs: &[Id],
+    ) -> anyhow::Result<Option<Lookups>> {
         let base = Base::new(snap, graphs)?;
-        self.graph.set_base(Arc::new(base));
-        Ok(())
+        let fresh = Lookups::new(self.graph.budget(), lookups::DEFAULT_MAX_BYTES);
+        let old = self.graph.swap_base(Arc::new(base.with_lookups(fresh)));
+        // the lookups move over only when no one else shares the old tier, which holds
+        // between runs
+        let mut lookups = old
+            .and_then(|b| Arc::try_unwrap(b).ok())
+            .and_then(|mut b| b.take_lookups());
+        if let Some(l) = &mut lookups {
+            l.freeze();
+        }
+        Ok(lookups)
+    }
+
+    /// Give the base tier remembered lookups that hold for its snapshot, in place of
+    /// those it has.
+    pub fn put_lookups(&mut self, lookups: Lookups) {
+        if let Some(b) = self.graph.base_mut() {
+            b.set_lookups(lookups);
+        }
     }
 
     /// Whether row `row` of the derived tier is flagged explicit.
@@ -471,7 +531,11 @@ pub(crate) fn update(
             )?;
             let mut seen: FxHashSet<Triple> =
                 FxHashSet::with_capacity_and_hasher(queue.len(), Default::default());
-            {
+            if rayon::current_num_threads() > 1 && queue.len() >= PAR_SEARCH {
+                // the searches of a round are independent: see `prove_all`
+                let facts: Vec<Triple> = queue.drain(..).filter(|t| seen.insert(*t)).collect();
+                dead = prove_all(c, rules, &plans, &abort, limits, &mut search, &facts)?;
+            } else {
                 let cx = Cx {
                     c: &*c,
                     rules,
@@ -479,6 +543,7 @@ pub(crate) fn update(
                     abort: &abort,
                     cancel: limits.cancel.as_deref(),
                     budget,
+                    known: None,
                 };
                 for t in queue.drain(..) {
                     if seen.insert(t) && !search.prove(&cx, t) {
@@ -809,6 +874,82 @@ fn consequences(
 
 // ------------------------------------------------------------------ proofs ----
 
+/// The fewest facts a round of the deletion searches in parallel.
+const PAR_SEARCH: usize = 2;
+
+/// Search for other proofs of `facts`, the distinct facts of one round of the deletion,
+/// in parallel, and return those without one, in the order of `facts`.
+///
+/// The searches of one round see the same live facts, since the round deletes its
+/// unprovable facts only after every search, and a search's answer does not depend on
+/// what the others learned: a fact is proved from explicit facts only, and a fact is
+/// unprovable when a search explored everything it reached without a proof. The
+/// searches therefore split into chunks, each searched in order by a [`Search`] of its
+/// own that also reads what `search` learned in earlier rounds, and what the chunks
+/// learn joins `search` afterwards. The chunks repeat some work that one search would
+/// share, and they read the base tier on every thread, which matters most when its
+/// blocks are not decoded yet.
+fn prove_all(
+    c: &Closure,
+    rules: &[CRule],
+    plans: &Plans,
+    abort: &AtomicBool,
+    limits: &Limits,
+    search: &mut Search,
+    facts: &[Triple],
+) -> anyhow::Result<Vec<Triple>> {
+    let budget = &limits.budget;
+    let chunk = facts
+        .len()
+        .div_ceil(rayon::current_num_threads() * 4)
+        .max(1);
+    let parts: Vec<(Vec<bool>, Search)> = {
+        let cx = Cx {
+            c,
+            rules,
+            plans,
+            abort,
+            cancel: limits.cancel.as_deref(),
+            budget,
+            known: Some(&*search),
+        };
+        facts
+            .par_chunks(chunk)
+            .map(|ch| {
+                let mut s = Search::new(budget);
+                let mut found = Vec::with_capacity(ch.len());
+                for &t in ch {
+                    if s.err.is_some() || abort.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    found.push(s.prove(&cx, t));
+                }
+                if s.err.is_some() {
+                    abort.store(true, Ordering::Relaxed);
+                }
+                (found, s)
+            })
+            .collect()
+    };
+    let mut dead = Vec::new();
+    let mut first_err = None;
+    for (ch, (found, mut s)) in facts.chunks(chunk).zip(parts) {
+        if let Some(e) = s.err.take() {
+            first_err.get_or_insert(e);
+            continue;
+        }
+        dead.extend(ch.iter().zip(&found).filter(|x| !*x.1).map(|x| *x.0));
+        search.absorb(s)?;
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    if cancelled(limits) {
+        anyhow::bail!("reasoning cancelled");
+    }
+    Ok(dead)
+}
+
 /// How deep the search recurses before it queues the facts it reaches instead.
 const MAX_DEPTH: u32 = 32;
 
@@ -844,6 +985,9 @@ struct Cx<'a> {
     abort: &'a AtomicBool,
     cancel: Option<&'a AtomicBool>,
     budget: &'a Arc<Budget>,
+    /// what the searches of earlier rounds learned, when this search is one of a round's
+    /// parallel ones
+    known: Option<&'a Search>,
 }
 
 /// Provability of facts among the live ones: what is known across the searches of one
@@ -901,6 +1045,39 @@ impl Search {
         }
     }
 
+    /// Whether this search, or the searches of earlier rounds, proved `t`.
+    #[inline]
+    fn is_proved(&self, cx: &Cx<'_>, t: &Triple) -> bool {
+        self.proved.contains(t) || cx.known.is_some_and(|k| k.proved.contains(t))
+    }
+
+    /// Whether this search, or the searches of earlier rounds, found `t` unprovable.
+    #[inline]
+    fn is_unprovable(&self, cx: &Cx<'_>, t: &Triple) -> bool {
+        self.unprovable.contains(t) || cx.known.is_some_and(|k| k.unprovable.contains(t))
+    }
+
+    /// Take in what another search of the same round learned, charging the growth of
+    /// the sets before it is allocated.
+    fn absorb(&mut self, other: Search) -> Result<(), MemoryExceeded> {
+        let fact = size_of::<Triple>();
+        for (mine, theirs) in [
+            (&mut self.proved, &other.proved),
+            (&mut self.unprovable, &other.unprovable),
+        ] {
+            let (cap, len) = (mine.capacity(), mine.len());
+            let to = table_grown(cap, len, theirs.len());
+            if to != cap {
+                self.held.try_grow(table_bytes(to, fact))?;
+                mine.reserve(theirs.len());
+                self.held.shrink(table_bytes(cap, fact));
+            }
+            mine.extend(theirs.iter().copied());
+        }
+        self.checked += other.checked;
+        Ok(())
+    }
+
     /// Charge `n` bytes; false when they do not fit, and the search stops.
     fn charge(&mut self, n: usize) -> bool {
         if self.err.is_some() {
@@ -942,10 +1119,10 @@ impl Search {
         if self.err.is_some() {
             return false;
         }
-        if self.proved.contains(&t) {
+        if self.is_proved(cx, &t) {
             return true;
         }
-        if self.unprovable.contains(&t) {
+        if self.is_unprovable(cx, &t) {
             return false;
         }
         let Some(row) = cx.c.graph.position(&t) else {
@@ -1161,14 +1338,14 @@ impl Search {
         }
         let t = self.nodes[n as usize].t;
         let body = matched.iter().chain(implicit).copied();
-        let mut facts: Vec<Triple> = Vec::with_capacity(matched.len() + implicit.len());
+        let mut facts: smallvec::SmallVec<[Triple; 4]> = smallvec::SmallVec::new();
         for u in body {
             // an instance that uses its own head or an unprovable fact proves nothing
-            if u == t || self.unprovable.contains(&u) {
+            if u == t || self.is_unprovable(cx, &u) {
                 return true;
             }
             // a body fact the derived tier does not hold is from the base tier
-            if self.proved.contains(&u) || cx.c.explicit_held(&u) {
+            if self.is_proved(cx, &u) || cx.c.explicit_held(&u) {
                 continue;
             }
             facts.push(u);
@@ -1179,7 +1356,7 @@ impl Search {
         let inst = self.insts.len() as u32;
         self.insts.push(Inst { head: n, open: 0 });
         let mut open = 0;
-        let mut fresh: Vec<u32> = Vec::new();
+        let mut fresh: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
         for u in facts {
             let known = self.node_of.contains_key(&u);
             let Some(m) = self.node(u) else {
@@ -1217,11 +1394,16 @@ impl Search {
 
 /// Bindings of rule `ri`'s head `hi` unified with `t` (only the variables in `pre`), or
 /// `None` when a constant differs.
-fn bind_head(rule: &CRule, hi: usize, pre: &[usize], t: Triple) -> Option<Vec<u64>> {
+fn bind_head(
+    rule: &CRule,
+    hi: usize,
+    pre: &[usize],
+    t: Triple,
+) -> Option<smallvec::SmallVec<[u64; 16]>> {
     let CHead::Triple(s, p, o) = &rule.head[hi] else {
         return None;
     };
-    let mut b = vec![0u64; rule.nvars];
+    let mut b = smallvec::smallvec![0u64; rule.nvars];
     for (slot, v) in [(s, t[0]), (p, t[1]), (o, t[2])] {
         match *slot {
             Slot::Const(c) if c != v => return None,
@@ -1508,7 +1690,7 @@ mod tests {
         let b = Base::new(snap, &[Id::DEFAULT_GRAPH]).unwrap();
         let mut g = Graph::with_base(Arc::new(b));
         engine::run(&mut g, &rules, &terms, &limits(), None).unwrap();
-        Closure::new(g, terms)
+        Closure::new(g, terms).unwrap()
     }
 
     /// The facts of both tiers as text, explicit ones marked. A fact both tiers hold
@@ -1537,6 +1719,39 @@ mod tests {
         out
     }
 
+    /// Check every lookup the closure remembers against a scan of the input graphs of
+    /// `snap`, and return the number of answers checked.
+    fn check_lookups(c: &Closure, snap: &Arc<Snapshot>, what: &str) -> usize {
+        let Some(l) = c.lookups() else {
+            return 0;
+        };
+        let plain = Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap();
+        let answers = l.answers();
+        for (k, facts, complete) in &answers {
+            let at = |x: u64| (x != 0).then_some(x);
+            let mut all = Vec::new();
+            plain
+                .for_each(at(k[0]), at(k[1]), at(k[2]), |t| {
+                    all.push(t);
+                    true
+                })
+                .unwrap();
+            let ok = if *complete {
+                *facts == all
+            } else {
+                all.starts_with(facts)
+            };
+            assert!(
+                ok,
+                "{what}: lookup {k:?} kept {facts:?} ({complete}), scan gives {all:?}"
+            );
+        }
+        answers.len()
+    }
+
+    /// Random changes, each followed by an incremental run checked against a full run.
+    /// Some steps undo the previous one, and some reach their state through an earlier
+    /// commit, so the remembered lookups take in several commits at once.
     fn differential(text: &str, owl: bool, lists: bool, seed: u64, steps: usize) -> (usize, usize) {
         let v = Vocab::new();
         let mut r = Rng(seed);
@@ -1546,43 +1761,80 @@ mod tests {
         }
         let mut c = full(&v, text, &base);
         let (mut incremental, mut fallbacks) = (0, 0);
+        let mut checked = 0;
+        let mut last: Option<(Vec<Triple>, Vec<Triple>)> = None;
         for step in 0..steps {
             let mut removed = Vec::new();
             let mut inserted = Vec::new();
-            let current: Vec<Triple> = {
-                let mut x: Vec<Triple> = base.iter().copied().collect();
-                x.sort_unstable();
-                x
-            };
-            for _ in 0..r.below(4) {
-                if !current.is_empty() {
-                    let t = r.pick(&current);
-                    if base.remove(&t) {
-                        removed.push(t);
+            match last.take() {
+                Some((ins, rem)) if r.below(4) == 0 => {
+                    // undo the previous step
+                    for t in ins {
+                        if base.remove(&t) {
+                            removed.push(t);
+                        }
+                    }
+                    for t in rem {
+                        if base.insert(t) {
+                            inserted.push(t);
+                        }
+                    }
+                }
+                _ => {
+                    let current: Vec<Triple> = {
+                        let mut x: Vec<Triple> = base.iter().copied().collect();
+                        x.sort_unstable();
+                        x
+                    };
+                    for _ in 0..r.below(4) {
+                        if !current.is_empty() {
+                            let t = r.pick(&current);
+                            if base.remove(&t) {
+                                removed.push(t);
+                            }
+                        }
+                    }
+                    for _ in 0..r.below(5) {
+                        let t = v.triple(&mut r, owl);
+                        if base.insert(t) {
+                            inserted.push(t);
+                        }
+                    }
+                    if lists && r.below(6) == 0 {
+                        for t in v.list(&mut r) {
+                            if base.insert(t) {
+                                inserted.push(t);
+                            }
+                        }
                     }
                 }
             }
-            for _ in 0..r.below(5) {
-                let t = v.triple(&mut r, owl);
-                if base.insert(t) {
-                    inserted.push(t);
+            last = Some((inserted.clone(), removed.clone()));
+            if r.below(3) == 0 {
+                // an earlier commit with triples that the next one takes back
+                let mut between = base.clone();
+                for _ in 0..3 {
+                    between.insert(v.triple(&mut r, owl));
                 }
-            }
-            if lists && r.below(6) == 0 {
-                for t in v.list(&mut r) {
-                    if base.insert(t) {
-                        inserted.push(t);
-                    }
-                }
+                set_default_graph(&v, &between);
             }
             // the closure reads the input graphs of the new state, as an update does
             let snap = set_default_graph(&v, &base);
             let moved = c.terms.rebase(snap.clone());
             c.remap(&moved);
-            c.set_inputs(snap, &[Id::DEFAULT_GRAPH]).unwrap();
+            // the remembered lookups take the changes in, as `maintain::previous` does
+            if let Some(mut l) = c.set_inputs(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap() {
+                l.update(&inserted, &removed, crate::facts::rank);
+                c.put_lookups(l);
+            }
+            let what = format!("seed {seed} step {step}");
+            checked += check_lookups(&c, &snap, &what);
             let rules = compiled(text, &c.terms);
             match update(&mut c, &rules, &limits(), &inserted, &removed) {
-                Ok(_) => incremental += 1,
+                Ok(_) => {
+                    incremental += 1;
+                    checked += check_lookups(&c, &snap, &what);
+                }
                 Err(e) => {
                     assert!(e.downcast_ref::<Fallback>().is_some(), "{e:#}");
                     fallbacks += 1;
@@ -1601,6 +1853,7 @@ mod tests {
             }
             c.compact_if_needed(false).unwrap();
         }
+        assert!(checked > 0, "seed {seed}: no lookup was remembered");
         (incremental, fallbacks)
     }
 
@@ -1626,6 +1879,47 @@ mod tests {
             n = (n.0 + i, n.1 + f);
         }
         assert!(n.0 > n.1, "{n:?}");
+    }
+
+    /// A closure remembers lookups whether or not its base tier is shared: a tier it
+    /// holds alone takes them in place, and a shared one is copied, so the other holder
+    /// never sees them.
+    #[test]
+    fn closures_get_lookups_of_their_own() {
+        let v = Vocab::new();
+        let base: FxHashSet<Triple> = FxHashSet::default();
+        let snap = set_default_graph(&v, &base);
+        let terms = Terms::new(snap.clone());
+        let tier = Arc::new(Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap());
+        let alone = Closure::new(Graph::with_base(tier.clone()), terms).unwrap();
+        // the graph and `tier` share it, so the closure copies it
+        assert!(tier.lookups().is_none());
+        assert!(alone.lookups().is_some());
+        assert!(!Arc::ptr_eq(&alone.graph.base_arc().unwrap(), &tier));
+        drop(alone);
+        let g = Graph::with_base(tier);
+        let before = Arc::as_ptr(&g.base_arc().unwrap());
+        let c = Closure::new(g, Terms::new(snap)).unwrap();
+        assert!(c.lookups().is_some());
+        assert_eq!(Arc::as_ptr(&c.graph.base_arc().unwrap()), before);
+    }
+
+    /// The searches of a deletion round run in parallel when the run has threads, and one
+    /// after the other when it has one: both match a full run.
+    #[test]
+    fn serial_and_parallel_searches_match_full() {
+        for threads in [1, 6] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                for seed in 30..38 {
+                    differential(crate::RDFS_RULES, false, false, seed, 15);
+                    differential(crate::OWL_RL_RULES, true, true, seed, 15);
+                }
+            });
+        }
     }
 
     #[test]

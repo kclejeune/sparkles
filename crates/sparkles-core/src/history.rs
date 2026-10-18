@@ -1015,6 +1015,181 @@ pub(crate) fn remove_deleting(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What open does with a generation directory above the one `CURRENT` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Newer {
+    /// An unfinished build of this dataset, deleted.
+    Removed(String),
+    /// Anything else, renamed to the second name and kept.
+    SetAside(String, String),
+}
+
+/// The infix of the name a generation above `CURRENT` gets when open keeps it aside.
+pub(crate) const SET_ASIDE: &str = ".set-aside-";
+
+/// Whether `dir`, a generation above `CURRENT`, is an unfinished build of this dataset, and
+/// why not when it is not. A build is unfinished when its compaction marker is empty or
+/// names this dataset, or when it has no marker and its `commit.json` is missing, empty or
+/// all zeros, which is how a power loss leaves the files that a rebuild writes last. A
+/// missing `commit.json` counts only when the current generation has one, so that a
+/// dataset written by a release before commit metadata keeps its generations. A complete
+/// build of this dataset that a power loss kept `CURRENT` from switching to counts as
+/// well when neither its base commit nor any commit in its log is past `head`, the head
+/// recovered from the current generation, so it holds nothing the store lacks. Every other
+/// case may be data that a wrong or restored `CURRENT` hides.
+fn unfinished(
+    dir: &Path,
+    dataset_id: uuid::Uuid,
+    modern: bool,
+    head: u64,
+) -> std::result::Result<(), String> {
+    let blank = |b: &[u8]| b.iter().all(|c| *c == 0 || c.is_ascii_whitespace());
+    match std::fs::read(dir.join("compacting")) {
+        Ok(b) if blank(&b) || String::from_utf8_lossy(&b).trim() == dataset_id.to_string() => {
+            return Ok(());
+        }
+        Ok(_) => return Err("its compaction marker names another dataset".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("its compaction marker cannot be read: {e}")),
+    }
+    match std::fs::read(dir.join("commit.json")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && modern => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err("it has no commit.json, like the generations of this older dataset".into())
+        }
+        Err(e) => Err(format!("its commit.json cannot be read: {e}")),
+        Ok(b) if blank(&b) => Ok(()),
+        Ok(_) => match commit::read_gen_commit(dir) {
+            Ok(Some((id, c, origin))) if id == dataset_id => {
+                let end = crate::store::wal_end(dir, &c, origin == "baseline");
+                if c.seq <= head && end <= head {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "it is a complete generation of this dataset with commits up to {end}, past the head {head} of the current one"
+                    ))
+                }
+            }
+            Ok(Some((id, _, _))) => Err(format!("it belongs to dataset {id}")),
+            Ok(None) => Err("its commit.json disappeared".into()),
+            Err(e) => Err(format!("its commit.json is damaged: {e}")),
+        },
+    }
+}
+
+/// Settle the generation directories newer than `current`, the generation `CURRENT`
+/// names. `modern` says whether the current generation had a `commit.json` when the open
+/// began, before the open recorded a baseline in it. Only the open that holds the dataset's exclusive lock calls this, so no rebuild
+/// can be writing one. An unfinished build of this dataset (see [`unfinished`]) is a
+/// rebuild that a crash or a power loss interrupted before `CURRENT` switched to it, and
+/// it is renamed to `*.deleting`, the root synced, and deleted, so a crash part way leaves
+/// what the next open finishes. Any other directory may hold data that a wrong or restored
+/// `CURRENT` no longer names, so it is renamed to `gen-NNNN.set-aside-<ms>` and kept with a
+/// warning, out of the way of the next rebuild, which would replace a directory of its
+/// number. Only directories named `gen-` and digits whose number is above `current` are
+/// touched, and nothing is touched when `current` is not a generation number.
+pub(crate) fn settle_newer_generations(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    current: u32,
+    head: u64,
+    modern: bool,
+) -> Vec<Newer> {
+    let mut out = Vec::new();
+    if current == 0 {
+        return out;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    let mut newer: Vec<(u32, String)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let num = name.strip_prefix("gen-")?;
+            if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let no: u32 = num.parse().ok()?;
+            (no > current).then_some((no, name))
+        })
+        .collect();
+    newer.sort();
+    for (_, name) in newer {
+        let dir = root.join(&name);
+        match unfinished(&dir, dataset_id, modern, head) {
+            Ok(()) => match delete_generation(root, &dir) {
+                Ok(()) => {
+                    tracing::warn!(
+                        target: "sparkles::store",
+                        "removed {name}, an unfinished rebuild above the current generation that a crash interrupted"
+                    );
+                    out.push(Newer::Removed(name));
+                }
+                Err(e) => tracing::warn!(
+                    target: "sparkles::store",
+                    "could not remove {name}, an unfinished rebuild above the current generation: {e}"
+                ),
+            },
+            Err(why) => {
+                let aside = format!("{name}{SET_ASIDE}{}", commit::now_ms());
+                let moved = std::fs::rename(&dir, root.join(&aside))
+                    .map_err(crate::error::Error::from)
+                    .and_then(|_| crate::store::sync_dir(root));
+                match moved {
+                    Ok(()) => {
+                        tracing::warn!(
+                            target: "sparkles::store",
+                            "{name} is above the generation CURRENT names, but {why}; kept as {aside}. Inspect it with `sparkles check`, then rename it back and point CURRENT at it, or delete it"
+                        );
+                        out.push(Newer::SetAside(name, aside));
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "sparkles::store",
+                        "{name} is above the generation CURRENT names, but {why}, and it could not be set aside: {e}"
+                    ),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The temporary files of the atomic replacements (`write_atomic`) that the store makes
+/// at the dataset root under its writer lock: `CURRENT`, `dataset.json`, `commits.bin`
+/// and `annotations.bin`. Settings files that a server or the reasoner may write without
+/// the store's lock are not among them.
+pub(crate) const STORE_TEMP_FILES: &[&str] = &[
+    "CURRENT.tmp",
+    "dataset.tmp",
+    "commits.tmp",
+    "annotations.tmp",
+];
+
+/// Remove the [`STORE_TEMP_FILES`] of the dataset root that are regular files, and return
+/// their names. Each is the copy of an atomic replacement that a crash interrupted before
+/// or after its rename. The file it was to replace is intact in either case, so the copy
+/// is never needed. Only the open that holds the dataset's exclusive lock calls this, so
+/// no such replacement can be in progress. Other `.tmp` files stay.
+pub(crate) fn remove_temp_files(root: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    for name in STORE_TEMP_FILES {
+        let path = root.join(name);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(name.to_string()),
+            Err(err) => tracing::warn!(
+                target: "sparkles::store",
+                "could not remove {name}, the temporary file of an interrupted write: {err}"
+            ),
+        }
+    }
+    removed
+}
+
 /// Remove a generation directory crash-safely: rename, sync the parent, delete.
 pub(crate) fn delete_generation(root: &Path, dir: &Path) -> Result<()> {
     if let Some(doomed) = retire_generation(root, dir)? {

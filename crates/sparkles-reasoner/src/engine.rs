@@ -581,17 +581,19 @@ pub(crate) struct Eval<'a> {
     ticks: u32,
     pub mode: Mode<'a>,
     /// facts matched by the atoms of the current partial instance ([`Mode::Instances`])
-    trail: Vec<Triple>,
+    trail: smallvec::SmallVec<[Triple; 4]>,
     /// facts read by builtins of the current partial instance ([`Mode::Instances`])
-    pub implicit: Vec<Triple>,
+    pub implicit: smallvec::SmallVec<[Triple; 2]>,
     stop: bool,
     /// heads emitted so far ([`Mode::New`]), so that each goes out once
     seen: FxHashSet<Triple>,
     /// the first error of a base-tier scan
     pub err: Option<anyhow::Error>,
-    /// per plan step: the base-tier blocks it read last
+    /// per plan step: the base-tier blocks it read last, made at the first read of the
+    /// base tier (most evaluations of a backward search read none)
     memos: Vec<Memo>,
-    /// per plan step: the base-tier facts of its recent lookups with few results
+    /// per plan step: the base-tier facts of its recent lookups with few results, made at
+    /// the first such lookup; unused when the base tier remembers lookups itself
     looked: Vec<FxHashMap<Triple, std::rc::Rc<[Triple]>>>,
     /// per plan step: a buffer for the facts of a lookup
     scratch: Vec<Vec<Triple>>,
@@ -603,7 +605,9 @@ pub(crate) struct Eval<'a> {
     pub collect_at: Option<(usize, usize)>,
     pub collected: Vec<Vec<u64>>,
     /// the heap of the buffers and caches above, charged to the run's budget
-    held: Held,
+    held: Option<Held>,
+    /// the run's budget, which `held` charges once the evaluation charges anything
+    budget: &'a Arc<Budget>,
     /// of `held`: the remembered lookups and lists
     cached: usize,
 }
@@ -628,6 +632,14 @@ impl Drop for Eval<'_> {
 }
 
 impl<'a> Eval<'a> {
+    /// The charges of the evaluation's buffers, made at the first one: most evaluations
+    /// of a backward search charge nothing, and a holder shares the budget's count.
+    #[inline]
+    fn held(&mut self) -> &mut Held {
+        let budget = self.budget;
+        self.held.get_or_insert_with(|| Held::new(budget))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         g: &'a Graph,
@@ -639,10 +651,11 @@ impl<'a> Eval<'a> {
         cancel: Option<&'a AtomicBool>,
         max_out: usize,
         mode: Mode<'a>,
-        budget: &Arc<Budget>,
+        budget: &'a Arc<Budget>,
     ) -> Eval<'a> {
         Eval {
-            held: Held::new(budget),
+            held: None,
+            budget,
             cached: 0,
             g,
             terms,
@@ -655,14 +668,14 @@ impl<'a> Eval<'a> {
             max_out,
             ticks: 0,
             mode,
-            trail: Vec::new(),
-            implicit: Vec::new(),
+            trail: smallvec::SmallVec::new(),
+            implicit: smallvec::SmallVec::new(),
             stop: false,
             seen: FxHashSet::default(),
             err: None,
-            memos: (0..steps.len()).map(|_| Memo::default()).collect(),
-            looked: (0..steps.len()).map(|_| FxHashMap::default()).collect(),
-            scratch: (0..steps.len()).map(|_| Vec::new()).collect(),
+            memos: Vec::new(),
+            looked: Vec::new(),
+            scratch: Vec::new(),
             bmemo: Memo::default(),
             lists: FxHashMap::default(),
             collect_at: None,
@@ -691,7 +704,7 @@ impl<'a> Eval<'a> {
             self.forget();
         }
         let bytes = l.as_ref().map_or(0, |m| m.len() * 8 + 16) + REMEMBERED_ENTRY;
-        if let Err(e) = self.held.try_grow(bytes) {
+        if let Err(e) = self.held().try_grow(bytes) {
             self.fail(e);
             return None;
         }
@@ -706,7 +719,8 @@ impl<'a> Eval<'a> {
             l.clear();
         }
         self.lists.clear();
-        self.held.shrink(self.cached);
+        let cached = self.cached;
+        self.held().shrink(cached);
         self.cached = 0;
     }
 
@@ -726,14 +740,15 @@ impl<'a> Eval<'a> {
         let cap = self.out.capacity();
         if self.out.len() == cap {
             let next = (cap * 2).max(64);
-            if let Err(e) = self.held.try_grow(next * TRIPLE) {
+            if let Err(e) = self.held().try_grow(next * TRIPLE) {
                 self.fail(e);
                 return false;
             }
             self.out.reserve_exact(next - self.out.len());
             // the old buffer is freed
-            self.held.shrink(cap * TRIPLE);
-            self.held.grow((self.out.capacity() - next) * TRIPLE);
+            self.held().shrink(cap * TRIPLE);
+            let spare = self.out.capacity() - next;
+            self.held().grow(spare * TRIPLE);
         }
         self.out.push(t);
         true
@@ -745,13 +760,14 @@ impl<'a> Eval<'a> {
         let (cap, len) = (self.seen.capacity(), self.seen.len());
         if len == cap {
             let next = table_bytes(table_grown(cap, len, 1), TRIPLE);
-            if let Err(e) = self.held.try_grow(next) {
+            if let Err(e) = self.held().try_grow(next) {
                 self.fail(e);
                 return None;
             }
             self.seen.reserve(1);
-            self.held.shrink(table_bytes(cap, TRIPLE) + next);
-            self.held.grow(table_bytes(self.seen.capacity(), TRIPLE));
+            self.held().shrink(table_bytes(cap, TRIPLE) + next);
+            let cap = self.seen.capacity();
+            self.held().grow(table_bytes(cap, TRIPLE));
         }
         Some(self.seen.insert(t))
     }
@@ -759,7 +775,7 @@ impl<'a> Eval<'a> {
     /// The candidates, with the charge of their buffer.
     pub fn take_out(&mut self) -> (Vec<Triple>, Held) {
         let out = std::mem::take(&mut self.out);
-        let held = self.held.split(out.capacity() * TRIPLE);
+        let held = self.held().split(out.capacity() * TRIPLE);
         (out, held)
     }
 
@@ -820,7 +836,10 @@ impl<'a> Eval<'a> {
         {
             if self.collected.len() < cap {
                 // the bindings and their slot, with room for the vector's doubling
-                if let Err(e) = self.held.try_grow(b.len() * 8 + 2 * size_of::<Vec<u64>>()) {
+                if let Err(e) = self
+                    .held()
+                    .try_grow(b.len() * 8 + 2 * size_of::<Vec<u64>>())
+                {
                     self.fail(e);
                     return;
                 }
@@ -883,6 +902,35 @@ impl<'a> Eval<'a> {
     ) {
         let g: &'a Graph = self.g;
         let Some(base) = g.base() else { return };
+        if r.is_none() && base.lookups().is_some() && self.collecting() {
+            // the tier remembers its lookups, and the evaluations of a backward search
+            // are short: they read the tier's lookups directly, with one memo for every
+            // step
+            let mut memo = std::mem::take(&mut self.bmemo);
+            let res = base.for_each_with(&mut memo, s, p, o, |t| {
+                if self.aborted() {
+                    return false;
+                }
+                self.fact(k, atom, b, t);
+                !self.stop
+            });
+            // a nested lookup may have put its memo back meanwhile: its scans count
+            memo.scans += self.bmemo.scans;
+            self.bmemo = memo;
+            if let Err(e) = res {
+                self.err.get_or_insert(e);
+                self.stop = true;
+            }
+            return;
+        }
+        if self.memos.is_empty() {
+            self.memos.resize_with(self.steps.len(), Memo::default);
+        }
+        if self.looked.is_empty() {
+            self.looked
+                .resize_with(self.steps.len(), FxHashMap::default);
+            self.scratch.resize_with(self.steps.len(), Vec::new);
+        }
         let key = [s.unwrap_or(0), p.unwrap_or(0), o.unwrap_or(0)];
         if r.is_none()
             && let Some(facts) = self.looked[k].get(&key).cloned()
@@ -927,7 +975,7 @@ impl<'a> Eval<'a> {
                     self.forget();
                 }
                 let bytes = few.len() * TRIPLE + 16 + REMEMBERED_ENTRY;
-                match self.held.try_grow(bytes) {
+                match self.held().try_grow(bytes) {
                     Ok(()) => {
                         self.cached += bytes;
                         self.looked[k].insert(key, few.as_slice().into());
@@ -1171,7 +1219,7 @@ fn split_at<'g>(
             }
             let collected = std::mem::take(&mut ev.collected);
             // the bindings keep their charge
-            let held = ev.held.split(collected.len() * per);
+            let held = ev.held().split(collected.len() * per);
             Ok((collected.len() < MAX_SPLIT_BINDINGS).then_some((collected, held)))
         })
         .collect();

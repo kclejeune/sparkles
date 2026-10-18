@@ -28,6 +28,14 @@ pub struct ExistsSpec {
     /// table no longer holds them as columns, but they are part of the outer solution
     pub bound: Vec<(VarId, Id)>,
     pub memo: Mutex<FxHashMap<Vec<Id>, bool>>,
+    /// The answer for a row that binds none of `vars`, which is the same for every such
+    /// row. It is kept apart from `memo` because it costs no memory worth charging, so a
+    /// cursor whose budget refuses `memo` still evaluates the pattern, and calls any
+    /// SERVICE in it, once rather than once per row.
+    unbound: std::sync::OnceLock<bool>,
+    /// The pattern calls a SERVICE, so evaluating it again costs a remote request and
+    /// `memo` keeps an answer even when the cursor's budget is low.
+    calls_service: bool,
     /// The memory of `memo` in a cursor, which charges every entry to the query budget
     /// and stops memoizing when the budget has no room for another one.
     memo_charge: Mutex<Option<super::ctx::RetainedCharge>>,
@@ -43,11 +51,13 @@ impl ExistsSpec {
         bound: Vec<(VarId, Id)>,
     ) -> ExistsSpec {
         ExistsSpec {
+            calls_service: super::cursor::calls_service(&pattern),
             pattern,
             graph,
             vars,
             bound,
             memo: Mutex::new(FxHashMap::default()),
+            unbound: Default::default(),
             memo_charge: Mutex::new(None),
             decor: Default::default(),
         }
@@ -56,14 +66,16 @@ impl ExistsSpec {
     /// Memoize the answer for `key` in a cursor, charging the entry first. The memo
     /// takes at most an eighth of the query's memory budget and leaves the evaluation of
     /// later rows room to run. An entry that does not fit is not kept, and that key is
-    /// evaluated again when it recurs.
+    /// evaluated again when it recurs. A pattern that calls a SERVICE keeps its entries
+    /// while the budget can charge them, even below the quarter it otherwise leaves free,
+    /// because a repeated evaluation is a repeated remote request.
     fn remember(&self, ctx: &super::ctx::Ctx, key: Vec<Id>, found: bool) {
         // The key's heap allocation plus the map's slot, control byte and growth.
         let bytes = key.len() as u64 * 8 + 64;
         let mut charge = self.memo_charge.lock();
         let held = charge.as_ref().map_or(0, |c| c.bytes());
         if held.saturating_add(bytes) > ctx.mem_limit / 8
-            || ctx.memory_remaining() < ctx.mem_limit / 4
+            || (!self.calls_service && ctx.memory_remaining() < ctx.mem_limit / 4)
         {
             return;
         }
@@ -671,6 +683,11 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
         }
         Expr::Exists(spec) => {
             let key: Vec<Id> = spec.vars.iter().map(|&v| spec.value(row, v)).collect();
+            // nothing to substitute: one answer for every such row
+            let unbound = !ctx.calls_extensions && key.iter().all(|id| id.is_undef());
+            if unbound && let Some(&r) = spec.unbound.get() {
+                return Ok(b(r));
+            }
             if !ctx.calls_extensions
                 && let Some(&r) = spec.memo.lock().get(&key)
             {
@@ -686,7 +703,9 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                 }
                 TypeError
             })?;
-            if !ctx.calls_extensions {
+            if unbound {
+                let _ = spec.unbound.set(r);
+            } else if !ctx.calls_extensions {
                 if ctx.is_cursor() {
                     spec.remember(ctx, key, r);
                 } else {

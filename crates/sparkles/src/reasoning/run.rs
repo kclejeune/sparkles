@@ -374,17 +374,24 @@ const SOUND_PROFILES: &[&str] = &["rdfs", "rdfs-simple", "owl-rl"];
 /// [`diagnose`], with the closure `cache` keeps. When `opts.inferences` reads the
 /// inferences of a built-in profile, `literal-not-in-datatype` also reads the literal
 /// typings of the generalized facts of the materialization `record` describes, from that
-/// closure or else from those a persistent dataset saved.
+/// closure or else from those a persistent dataset saved. They are read only when that
+/// check runs, and the time they take counts toward `opts.timeout`.
 pub fn diagnose_with(
     store: &Store,
     record: Option<&ReasoningRecord>,
     cache: Option<&sparkles_reasoner::Cache>,
     opts: &DiagnoseOptions,
 ) -> Result<Diagnostics> {
+    let start = std::time::Instant::now();
     let snap = store.snapshot();
     let commit = snap.commit;
+    let checked = opts.checks.is_empty()
+        || opts
+            .checks
+            .iter()
+            .any(|c| c == sparkles_reasoner::diagnostics::LITERAL_NOT_IN_DATATYPE);
     let typings = match record {
-        Some(r) if opts.inferences && SOUND_PROFILES.contains(&r.profile.as_str()) => {
+        Some(r) if checked && opts.inferences && SOUND_PROFILES.contains(&r.profile.as_str()) => {
             r.commit.and_then(
                 |c| match sparkles_reasoner::literal_typings(store, c, cache) {
                     Ok(t) => t,
@@ -396,6 +403,18 @@ pub fn diagnose_with(
             )
         }
         _ => None,
+    };
+    // the checks have what is left of the timeout
+    let left;
+    let opts = match opts.timeout {
+        Some(t) => {
+            left = DiagnoseOptions {
+                timeout: Some(t.saturating_sub(start.elapsed())),
+                ..opts.clone()
+            };
+            &left
+        }
+        _ => opts,
     };
     let report = sparkles_reasoner::diagnostics::diagnose_with(snap, opts, typings.as_ref())
         .map_err(from_anyhow)?;

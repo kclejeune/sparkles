@@ -344,8 +344,11 @@ description = "shexTest conformance (syntax, negative syntax and structure, repr
 run = "cargo test -p sparkles-shex --test shextest -- --nocapture"
 
 [tasks."test:bench-scripts"]
-description = "Unit tests of the benchmark record builder and the record comparison (scripts/bench-record.py, bench-regressions.py compare)"
-run = "python3 -m unittest discover -s scripts/bench-tests"
+description = "Unit tests of the benchmark record builder and the record comparison (scripts/bench-record.py, bench-regressions.py compare), and the crash harness's own tests (scripts/crash-harness.rs)"
+run = [
+  "python3 -m unittest discover -s scripts/bench-tests",
+  'out="${CARGO_TARGET_DIR:-{{config_root}}/target}/crash-harness-test" && mkdir -p "$(dirname "$out")" && rustc --edition 2024 --test -o "$out" scripts/crash-harness.rs && "$out"',
+]
 
 [tasks."test:jena-clients"]
 description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectionFuseki, GSP, DSP, QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against a debug server on a temporary directory; Jena and a JDK come from nixpkgs unless JENA_HOME and JAVA are set (not part of ci; also the flake's jena-clients check)"

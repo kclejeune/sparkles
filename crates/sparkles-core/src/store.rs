@@ -1430,6 +1430,70 @@ fn open_step(step: &'static str) {
     OPEN_STEPS.with(|v| v.borrow_mut().push(step));
 }
 
+/// Refuse to create a new database in `root`, which has no `CURRENT`, when it holds
+/// generations: `CURRENT` was lost, and a new database would hide them and let a later
+/// open remove them. The only generation a creation that a crash interrupted leaves is an
+/// empty `gen-0001` without a log, which the creation builds again. It is empty when its
+/// `meta.json` counts no quads, or when it holds no file at all.
+fn refuse_generations_without_current(root: &Path) -> Result<()> {
+    let mut found: Vec<String> = std::fs::read_dir(root)?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| {
+            n.strip_prefix("gen-").is_some_and(|d| {
+                !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+                    || d.contains(crate::history::SET_ASIDE)
+            })
+        })
+        .collect();
+    found.sort();
+    let interrupted_creation = found == ["gen-0001"] && empty_creation(&root.join("gen-0001"));
+    if found.is_empty() || interrupted_creation {
+        return Ok(());
+    }
+    let only_set_aside = found.iter().all(|n| n.contains(crate::history::SET_ASIDE));
+    let advice = if only_set_aside {
+        "rename the generation to use back to its gen-NNNN name, then write that name into \
+         CURRENT"
+    } else {
+        "write the name of the gen-NNNN generation to open into CURRENT"
+    };
+    Err(Error::Corrupt(format!(
+        "{} has no CURRENT but holds {}; refusing to create a new database over them. \
+         Run `sparkles check --loc {}` and {advice}, or restore the dataset from a backup",
+        root.display(),
+        found.join(", "),
+        root.display()
+    )))
+}
+
+/// Whether `dir` is the `gen-0001` of a creation that a crash interrupted: no log, and
+/// either a `meta.json` that counts no quads or no file at all.
+fn empty_creation(dir: &Path) -> bool {
+    if dir.join("wal.log").exists() {
+        return false;
+    }
+    match std::fs::read(dir.join("meta.json")) {
+        Ok(b) => {
+            serde_json::from_slice::<serde_json::Value>(&b)
+                .ok()
+                .and_then(|v| v.get("quads").and_then(|q| q.as_u64()))
+                == Some(0)
+        }
+        Err(_) => !has_files(dir),
+    }
+}
+
+/// Whether `dir` holds a file anywhere below it.
+fn has_files(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map_or(true, |rd| {
+        rd.flatten().any(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => has_files(&e.path()),
+            _ => true,
+        })
+    })
+}
+
 /// Take the exclusive process lock of a database directory.
 fn lock_dir(root: &Path) -> Result<File> {
     let path = root.join("sparkles.lock");
@@ -1656,6 +1720,7 @@ impl Store {
         }
         let current_file = root.join("CURRENT");
         if !current_file.exists() {
+            refuse_generations_without_current(root)?;
             // a new database: its id, an empty generation holding the root commit, the
             // catalog, and CURRENT last (the commit point of the creation)
             let id = match commit::read_dataset_file(root)? {
@@ -1896,7 +1961,7 @@ impl Store {
         open_step("vocab-settled");
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
-        let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
+        let history = open_history(root, dataset_id, gen_no, head.seq, !rebased, &catalog)?;
         let annotations =
             crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
         #[cfg(test)]
@@ -4669,7 +4734,17 @@ impl Store {
                 annotation = self.annotate(&head, message.clone(), || None)?;
             }
             if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
-                if !annotation.is_empty() && self.annotations.lock().undo(head.seq).is_err() {
+                // CURRENT may name the new generation, or a read that fails leaves it
+                // unknown
+                let maybe_switched = std::fs::read_to_string(root.join("CURRENT"))
+                    .map_or(true, |c| c.trim() == name);
+                if maybe_switched {
+                    // The next open may use the new generation, so the bulk commit may
+                    // come back and keeps its annotation. Later commits to the old
+                    // generation would be lost, so the writer takes no more.
+                    w.poisoned = true;
+                } else if !annotation.is_empty() && self.annotations.lock().undo(head.seq).is_err()
+                {
                     w.poisoned = true;
                 }
                 return Err(e);
@@ -5952,9 +6027,12 @@ impl WriteTxn<'_> {
                 synced
             });
             if let Err(e) = written {
+                // The records may have reached the file, and the commit may then come back
+                // at the next open. Its annotation and merge record stay, so a recovered
+                // commit keeps its message, its change digest and its merge parent. The
+                // writer takes no more commits, and the next open drops both records if the
+                // commit did not survive, because they lie above the recovered head.
                 w.poisoned = true;
-                let _ = self.store.annotations.lock().undo(c.seq);
-                let _ = self.store.branching.merges.lock().undo(c.seq);
                 return Err(e);
             }
             // the bytes the file grew by: the records past its end and any zeros after,
@@ -6386,28 +6464,28 @@ impl Drop for Store {
 
 /// The history state of a store being opened: pins and retention from
 /// `history.json`, and the table of this dataset's generation directories. Finishes
-/// interrupted collections and removes interrupted rebuilds (generations newer than
-/// the current one).
+/// interrupted collections, and removes or sets aside the generations newer than the
+/// current one (see `history::settle_newer_generations`).
 fn open_history(
     root: &Path,
     dataset_id: uuid::Uuid,
     current: u32,
     head: u64,
+    modern: bool,
     catalog: &Catalog,
 ) -> Result<crate::history::HistoryState> {
     use crate::history;
     history::remove_deleting(root)?;
-    compaction::remove_interrupted(root, dataset_id, current);
+    history::settle_newer_generations(root, dataset_id, current, head, modern);
+    history::remove_temp_files(root);
     let cfg = history::read_file(root, dataset_id)?;
     let mut h = history::HistoryState::new(cfg.pins, cfg.retention);
     h.schedules = cfg.schedules;
     h.catalog = cfg.catalog;
     for (no, name, base, fold_legacy) in history::scan_generations(root, dataset_id)? {
         let dir = root.join(&name);
+        // one that could be neither removed nor set aside above stays where it is
         if no > current {
-            if let Err(e) = history::delete_generation(root, &dir) {
-                tracing::warn!(target: "sparkles::store", "could not remove the interrupted rebuild {name}: {e}");
-            }
             continue;
         }
         let end = if no == current {
@@ -7292,6 +7370,55 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         let store = Store::open(&root, Default::default()).unwrap();
         assert_eq!(store.head_commit().seq, head + 1);
         assert_eq!(insert(&store, "n3").unwrap().commit.seq, head + 2);
+    }
+
+    #[test]
+    fn a_commit_kept_after_a_failed_sync_keeps_its_message_and_digest() {
+        // The ordinary path: the annotation is synced before the WAL records, then the
+        // commit's sync fails after its records reached the file. The commit comes back at
+        // the next open, and so must its message and its change digest, or the digest
+        // chain has a hole and the next commit hashes against a zero parent.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let opts = StoreOptions {
+            commit_digests: true,
+            group_commit: false,
+            ..Default::default()
+        };
+        let store = Store::open(&root, opts.clone()).unwrap();
+        let insert = |store: &Store, s: &str| {
+            let o = crate::guard::WriteOptions {
+                message: Some(format!("add {s}").into()),
+                ..Default::default()
+            };
+            let mut t = store.write_with(CommitKind::Update, o);
+            let q = t.encode_quad(&quad(s, "p", "o"), &mut Default::default())?;
+            assert!(t.insert(q)?);
+            t.commit()
+        };
+        let head = insert(&store, "n1").unwrap().commit.seq;
+        store.snapshot().generation.dvocab.fail_next_sync();
+        assert!(insert(&store, "n2").is_err());
+        assert!(matches!(insert(&store, "n3"), Err(Error::Poisoned)));
+        drop(store);
+        let store = Store::open(&root, opts).unwrap();
+        let kept = store.head_commit();
+        assert_eq!(kept.seq, head + 1, "the failed commit's records survived");
+        let a = store.annotation(kept.seq).unwrap_or_default();
+        assert_eq!(a.message.as_deref(), Some("add n2"));
+        let parent = a
+            .digest
+            .expect("the recovered commit has its change digest");
+        let r = insert(&store, "n3").unwrap();
+        let line = "<http://ex.org/n3> <http://ex.org/p> <http://ex.org/o> .".to_string();
+        let want = crate::annotations::change_digest(
+            store.dataset_id(),
+            &r.commit,
+            Some(&parent),
+            vec![],
+            vec![line],
+        );
+        assert_eq!(r.annotation.digest, Some(want), "the chain has no hole");
     }
 
     #[test]

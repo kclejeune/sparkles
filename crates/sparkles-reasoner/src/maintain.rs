@@ -184,6 +184,9 @@ pub(crate) struct Kept {
 pub(crate) struct Changes {
     pub base_added: Vec<Triple>,
     pub base_removed: Vec<Triple>,
+    /// with several input graphs, the triples that an input graph gained or lost while
+    /// the union kept or lacked them: their place in a scan of the base tier changed
+    pub base_moved: Vec<Triple>,
     pub inferred_added: Vec<Triple>,
     pub inferred_removed: Vec<Triple>,
 }
@@ -257,6 +260,7 @@ impl Changes {
     fn heap_bytes(&self) -> usize {
         (self.base_added.capacity()
             + self.base_removed.capacity()
+            + self.base_moved.capacity()
             + self.inferred_added.capacity()
             + self.inferred_removed.capacity())
             * size_of::<Triple>()
@@ -314,10 +318,31 @@ pub(crate) fn previous(
         held.grow(set_bytes(&generalized));
         let moved = closure.terms.rebase(snap.clone());
         closure.remap(&moved);
-        closure.set_inputs(snap.clone(), run_ids)?;
+        let old_lookups = closure.set_inputs(snap.clone(), run_ids)?;
         remap_set(&mut generalized, &moved, None)?;
         held.set(set_bytes(&generalized));
         let changes = raw.resolve(&closure.terms, snap, &ids)?;
+        // the remembered lookups follow the changes: with one input graph they take them
+        // in, and with several the answers they touch are dropped
+        if let Some(mut l) = old_lookups {
+            let single = closure.graph.base().is_some_and(|b| b.one_graph());
+            if single {
+                l.update(
+                    &changes.base_added,
+                    &changes.base_removed,
+                    crate::facts::rank,
+                );
+            } else {
+                l.forget(
+                    changes
+                        .base_added
+                        .iter()
+                        .chain(&changes.base_removed)
+                        .chain(&changes.base_moved),
+                );
+            }
+            closure.put_lookups(l);
+        }
         held.grow(changes.heap_bytes());
         closure.settle();
         budget.check()?;
@@ -464,7 +489,7 @@ fn reconstruct(
     graph.try_add_batch(derived)?;
     graph.try_add_batch(generalized.iter().copied())?;
     drop(held);
-    Ok(Closure::new(graph, terms))
+    Closure::new(graph, terms)
 }
 
 /// Changes as the commit diff reports them, or as ids of one generation.
@@ -541,7 +566,7 @@ impl RawChanges {
                         match (before, after) {
                             (false, true) => c.base_added.push(t),
                             (true, false) => c.base_removed.push(t),
-                            _ => {}
+                            _ => c.base_moved.push(t),
                         }
                     }
                 } else {
@@ -657,6 +682,16 @@ fn delta_changes(
                 match (in_union(old, &t)?, in_union(new, &t)?) {
                     (false, true) => c.base_added.push(t),
                     (true, false) => c.base_removed.push(t),
+                    _ if ids.len() > 1 => {
+                        // a graph's change that the union does not show
+                        for g in &ids {
+                            let q = [Id(t[0]), Id(t[1]), Id(t[2]), *g];
+                            if old.contains(&q)? != new.contains(&q)? {
+                                c.base_moved.push(t);
+                                break;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -712,7 +747,16 @@ pub(crate) fn keep(
         Some(b) => b.graph_ids(),
         None => return Ok(false),
     };
-    closure.set_inputs(snap.clone(), &ids)?;
+    let old_lookups = closure.set_inputs(snap.clone(), &ids)?;
+    // the commit changed only the inferred graph, so the remembered lookups hold when
+    // the inputs leave it out, and are dropped otherwise
+    if let Some(l) = old_lookups
+        && !snap
+            .lookup_iri(INFERRED_GRAPH)
+            .is_some_and(|g| ids.contains(&g))
+    {
+        closure.put_lookups(l);
+    }
     let mut held = Held::new(&budget);
     remap_set(&mut generalized, &moved, Some(&mut held))?;
     drop(held);
@@ -723,6 +767,12 @@ pub(crate) fn keep(
     // indexes now, after the commit, rather than in the next run
     closure.graph.ensure_index(true, true)?;
     closure.graph.ensure_index(false, true)?;
+    // room for the rows of the next small runs, so that they do not wait for the rows to
+    // be copied and the triple index rehashed
+    let live = closure.graph.live();
+    closure
+        .graph
+        .try_reserve_rows((live / 64).max(1024), (live / 16).max(4096))?;
     budget.check_peak()?;
     cache.put(Kept {
         dataset_id: receipt.dataset_id,
@@ -897,10 +947,9 @@ fn scan_saved(root: &Path, meta: &SavedMeta, mut f: impl FnMut(bool, Keys)) -> b
         };
         f(true, k);
     }
-    if std::io::copy(&mut r, &mut std::io::sink()).is_err()
-        || r.n != meta.bytes
-        || r.checksum() != meta.checksum
-    {
+    // the facts end the file
+    let mut rest = [0u8; 1];
+    if !matches!(r.read(&mut rest), Ok(0)) || r.n != meta.bytes || r.checksum() != meta.checksum {
         return false;
     }
     if meta.log_bytes == 0 {
@@ -1192,5 +1241,107 @@ pub(crate) fn remove_saved(store: &Store) {
         for f in [SAVED_META, SAVED_BIN, SAVED_LOG] {
             let _ = std::fs::remove_file(root.join(f));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(s: &str) -> Keys {
+        [s.as_bytes().to_vec(), b"p".to_vec(), b"o".to_vec()]
+    }
+
+    /// A `.bin` whose header gives `count` facts.
+    fn bin(facts: &[Keys], count: u64) -> Vec<u8> {
+        let mut out = MAGIC.to_vec();
+        out.extend(count.to_le_bytes());
+        for k in facts {
+            put_keys(&mut out, k);
+        }
+        out
+    }
+
+    fn record(out: &mut Vec<u8>, op: u8, k: &Keys) {
+        out.push(op);
+        put_keys(out, k);
+    }
+
+    fn checksum(bytes: &[u8]) -> String {
+        format!("{:016x}", fnv(bytes, FNV_START))
+    }
+
+    /// Write the files and a description that matches them, with `log_bytes` claimed for
+    /// the log, and scan them: whether they are accepted, and the facts passed on.
+    fn scan(bin: &[u8], triples: u64, log: &[u8], log_bytes: u64) -> (bool, Vec<(bool, Keys)>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SAVED_BIN), bin).unwrap();
+        std::fs::write(dir.path().join(SAVED_LOG), log).unwrap();
+        let meta = SavedMeta {
+            dataset_id: String::new(),
+            commit: 1,
+            rules: String::new(),
+            triples,
+            bytes: bin.len() as u64,
+            checksum: checksum(bin),
+            log_bytes,
+            log_checksum: checksum(&log[..(log_bytes as usize).min(log.len())]),
+            inputs: None,
+        };
+        let mut seen = Vec::new();
+        let ok = scan_saved(dir.path(), &meta, |added, k| seen.push((added, k)));
+        (ok, seen)
+    }
+
+    /// The saved generalized facts are read back when they are consistent, and refused
+    /// when a key is longer than the file, a log record has an unknown op, the count of
+    /// facts is wrong or the log is shorter than its description.
+    #[test]
+    fn corrupt_saved_files_are_refused() {
+        let (a, b) = (key("a"), key("b"));
+        let good = bin(&[a.clone(), b.clone()], 2);
+        let mut log = Vec::new();
+        record(&mut log, b'-', &a);
+        record(&mut log, b'+', &key("c"));
+        let n = log.len() as u64;
+        let (ok, seen) = scan(&good, 2, &log, n);
+        assert!(ok);
+        assert_eq!(
+            seen,
+            vec![
+                (true, a.clone()),
+                (true, b.clone()),
+                (false, a.clone()),
+                (true, key("c"))
+            ]
+        );
+
+        // a key whose length prefix passes the end of the `.bin`, before it allocates
+        let mut long = MAGIC.to_vec();
+        long.extend(1u64.to_le_bytes());
+        long.extend(0xFFFF_FFF0u32.to_le_bytes());
+        long.extend(b"abc");
+        let (ok, seen) = scan(&long, 1, &[], 0);
+        assert!(!ok && seen.is_empty());
+        // and of the log
+        let mut bad = vec![b'+'];
+        bad.extend(0xFFFF_FFF0u32.to_le_bytes());
+        bad.extend(b"abc");
+        assert!(!scan(&good, 2, &bad, bad.len() as u64).0);
+
+        // an unknown op
+        let mut bad = Vec::new();
+        record(&mut bad, b'*', &a);
+        assert!(!scan(&good, 2, &bad, bad.len() as u64).0);
+
+        // a header that disagrees with the description, and a count past the facts
+        assert!(!scan(&good, 3, &log, n).0);
+        assert!(!scan(&bin(&[a.clone(), b.clone()], 3), 3, &log, n).0);
+        // a count short of the facts leaves bytes the description does not cover
+        assert!(!scan(&bin(&[a.clone(), b.clone()], 1), 1, &log, n).0);
+
+        // a log shorter than its description, and one cut inside a record
+        assert!(!scan(&good, 2, &log, n + 5).0);
+        assert!(!scan(&good, 2, &log[..log.len() - 2], n - 2).0);
     }
 }
