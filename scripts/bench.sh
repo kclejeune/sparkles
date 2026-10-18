@@ -34,7 +34,8 @@
 # (BUSL-1.1, not in nixpkgs) is the checksum-verified release binary, downloaded to WORKDIR
 # (Linux x86_64 / aarch64, macOS) unless FLUREE points at one.
 # Env: WARMUP (default 2), RUNS (default 10), SKIP_LOAD=1 to reuse existing indexes,
-# SKIP_QUERIES=1 to reuse existing per-query results (re-runs updates/throughput/RSS),
+# SKIP_QUERIES=1 to reuse a query's existing results when they hold every engine of the run
+# (re-runs updates/throughput/RSS),
 # SKIP_PROBE=1 to skip the Sparkles memory probe (scripts/rss-probe.sh),
 # ANSWERS_ONLY=1 to re-check answers and rebuild the summary without timing anything,
 # ENGINES="sparkles jena qlever fluree oxigraph" (default) to run a subset. Results are merged per engine
@@ -143,9 +144,22 @@ suite() {
   # clears QLever's result cache before every run (a no-op without QLever)
   local clear=true
   has qlever && clear="curl -sf -o /dev/null 'localhost:${PORT[qlever]}/?cmd=clear-cache&access-token=bench'"
+  # timed_all <hyperfine json>: true when it has a result for every engine of ENGINES
+  timed_all() {
+    [ -f "$1" ] || return 1
+    local names=() e
+    for e in $ENGINES; do names+=("${NAME[$e]}"); done
+    python3 -I - "$1" "${names[@]}" << 'EOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    have = {r.get("command") for r in json.load(f).get("results", [])}
+sys.exit(0 if set(sys.argv[2:]) <= have else 1)
+EOF
+  }
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
-    [ -n "${SKIP_QUERIES:-}" ] && [ -f "$RES/$n.json" ] && continue
+    # SKIP_QUERIES: a query is skipped only when its results hold every engine of this run
+    [ -n "${SKIP_QUERIES:-}" ] && timed_all "$RES/$n.json" && continue
     echo
     echo "== $n"
     # shellcheck disable=SC2329 # called by engine_args
