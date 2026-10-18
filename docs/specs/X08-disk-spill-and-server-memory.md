@@ -1025,14 +1025,16 @@ anything else with a warning. The format is registered in `formats.rs` as the de
 kind `spill`, version 1. Frames hold at most 4,096 rows, and a sort writes smaller ones
 when memory is short. Reservation takes 64 MiB extents from `--spill-max-mb`, checks
 `--min-free-disk-mb` with `statvfs`, and fails with the new budget kind `spill` (`507`),
-as do `ENOSPC`, `EDQUOT` and `EFBIG`. Another I/O error fails the query with that error.
-The extents are accounting, not preallocation, and a query gives back the extents its
-open files no longer need whenever one of its files closes. The process locks its marker
-before it writes the format into it, so a sweep by a process starting at the same time
-never takes the directory for a dead one. The spill directory is created with mode 0700
-and refused unless the server's user owns it and no other user can write it. `serve
---spill on` fails to start when the directory cannot be used or sits on tmpfs or ramfs,
-where spilled state would take memory, and warns on a network file system.
+as do `ENOSPC`, `EDQUOT` and `EFBIG` on a write or when a file is created. Another I/O
+error fails the query with that error. The extents are accounting, not preallocation, and
+a query gives back the extents its open files no longer need whenever one of its files
+closes. The process locks its marker before it writes the format into it, so a sweep by a
+process starting at the same time never takes the directory for a dead one. The spill
+directory is created with mode 0700 and refused unless the server's user owns it and no
+other user can write it. A failed start removes its process directory, and a sweep also
+removes a process directory whose marker is missing or empty once it is a minute old.
+`serve --spill on` fails to start when the directory cannot be used or sits on tmpfs or
+ramfs, where spilled state would take memory, and warns on a network file system.
 
 **External sort.** The decisions below depart from §6.4.
 
@@ -1075,9 +1077,11 @@ where spilled state would take memory, and warns on a network file system.
   the order the cursor claims for its output holds. In `SELECT DISTINCT … ORDER BY` the
   DISTINCT sits above the sort, as SPARQL's algebra places it, so it also keeps its whole
   set in memory and fails with the `memory` budget when the set does not fit. The same
-  holds above a ranking such as a text search. The test is
-  `distinct_over_order_by_keeps_the_order_or_fails`. Deduplicating below the sort is
-  item 85.
+  holds above a ranking such as a text search, and when the ordered rows reach the
+  DISTINCT through a join, OPTIONAL, MINUS, EXISTS, LATERAL or a path that passes an
+  input's order on. The tests are `distinct_over_order_by_keeps_the_order_or_fails` and
+  `distinct_over_a_join_of_an_ordered_subquery_keeps_the_order_or_fails`. Deduplicating
+  below the sort is item 85.
 
 **Eager queries.** Both paths of §6.8 are built. With spill, automatic execution streams a
 SELECT whose operators all have cursor implementations when the largest operator output
