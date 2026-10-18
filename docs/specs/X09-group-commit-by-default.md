@@ -631,8 +631,9 @@ there would block every writer's `enqueue`, and those writers hold the writer lo
 new transactions would wait for the index work. Step 3 therefore publishes outside the
 state mutex. The leader takes the prefix out of the queue under the mutex, releases it,
 applies and publishes in order, and takes the mutex again only to update the queue's
-counts. Only the leader publishes, so the order of commits is unchanged. Today `drive` and
-`fail_locked` both hold the mutex across `publish_group_prefix`, so the change needs a
+counts. Only the leader publishes, so the order of commits is unchanged. Today `drive`
+holds the mutex across `publish_group_prefix`, and `fail_locked` runs under the same mutex,
+so the change needs a
 second critical section that updates `commits`, `bytes` and the count of commits in flight
 after the prefix is published. A failure in step 3 comes after the first release, and the
 leader must then take the mutex again to fail the queue, so that no commit enqueued in
@@ -730,7 +731,7 @@ index configured.
 4. Whether the leader's text apply in step 3 needs a separate thread when a prefix holds
    many large overlays, which the four-writer gate will show.
 5. How the leader updates the queue's counts and fails the queue after it released the
-   state mutex in step 3 (section 17.4). Either `fail` takes the mutex itself and marks the
+   state mutex in step 3, as section 17.4 describes. Either `fail` takes the mutex itself and marks the
    queue failed before any later fence can lead, or the leader holds a failure flag that
    `enqueue` reads before it admits a commit.
 
@@ -1058,9 +1059,9 @@ images in 1,000 with grouping and 26 in 1,000 without, and the harness now accep
 leftover warning after open, while any other warning or error still fails. One image held a
 log record torn at a 4 KiB block boundary after the last commit, with zeros where its ids
 were. Open truncated it with the incomplete transaction, but check called the ids errors.
-Check now reports them as warnings. Since 2026-10-18 open removes a leftover generation,
-as the C13 follow-up describes, and after open the harness accepts only the leftover of an
-old generation.
+Check now reports them as warnings. Since 2026-10-18 open removes a leftover generation
+that is an unfinished build and sets any other aside, as the C13 follow-up describes, and
+after open the harness accepts only an old generation or one set aside.
 
 **Tests.** `store/group_model.rs` is the model-based stress test of section 10.1. Four to
 eight threads issue random inserts, deletes, multi-quad transactions, no-ops, dry runs and

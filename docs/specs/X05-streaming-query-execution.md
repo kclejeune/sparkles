@@ -641,7 +641,10 @@ budget, each distinct outer key is evaluated once and its answer is kept in a me
 memo is charged per entry. It stops growing at an eighth of the memory budget, or when
 less than a quarter of the budget remains, so that it cannot exhaust the query's
 memory. A pattern that calls a SERVICE ignores the second limit while the budget can
-charge an entry, since evaluating a key again sends the request again. A row that binds
+charge an entry, since evaluating a key again sends the request again. The cost is that
+such a query can leave less than a quarter of its budget free, up to the eighth that the
+memo may hold, so a later operator of the same query can fail on memory where it would
+not have. The memo stays charged, so the query never exceeds its budget. A row that binds
 none of the pattern's variables has the same answer as every other such row, and that one
 answer is kept outside the memo without a charge. Before this, a cursor whose budget had
 no room for the memo called a SERVICE inside such an EXISTS once per row, 60,000 times for

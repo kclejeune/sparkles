@@ -98,7 +98,9 @@ fn a_service_in_an_exists_without_shared_variables_is_called_once() {
                     let n = rows_with(&s, &q, mode, &o);
                     let made = calls.load(Ordering::SeqCst) - before;
                     let what = format!("{q} {mode:?} {memory:?}");
-                    // a failed SILENT call is one empty solution, so EXISTS holds
+                    // A filter with an EXISTS runs its rows on one thread (`Expr::parallel`),
+                    // so exactly one call is made. A failed SILENT call is one empty
+                    // solution, so EXISTS holds.
                     assert_eq!(n, if found != negated { ROWS } else { 0 }, "{what}");
                     assert_eq!(made, 1, "{what}: {made} calls for {ROWS} rows");
                 }
