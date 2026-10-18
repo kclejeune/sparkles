@@ -414,8 +414,8 @@ happens to materialized inferences, and the limits.
 | `--total-query-memory-mb N` | half the available memory, less the caches (`small`: `2048`) | The query memory pool, the estimated memory of all queries and updates together. A request waits for a share of it before it runs. `0` turns the pool off. See [Memory and caches](#memory-and-caches). |
 | `--query-admission-wait S` | `2` | Seconds a request waits for its share of the pool before it answers `503` with `Retry-After: 1`. |
 | `--spill MODE` | `off` | `on` lets a streamed sort, grouping or DISTINCT that outgrows its memory budget write the excess to disk. See [Memory and caches](#memory-and-caches). |
-| `--spill-dir DIR` | `<data>/.spill` | Directory of the spill files, on a local file system. |
-| `--spill-max-mb N` | a quarter of the free space, at most 65536 | Disk that all queries' spill files may reserve together. |
+| `--spill-dir DIR` | `<data>/.spill` | Directory of the spill files, on a local disk. The server's user must own it and no other user may write it. A directory on tmpfs or ramfs, or one that cannot be used, fails the start. |
+| `--spill-max-mb N` | a quarter of the free space, at most 65536 | Disk that all queries' spill files may reserve together, at least 1. Queries take it in 64 MiB extents, first come first served, and give each back once their open files no longer need it. |
 | `--query-spill-mb N` | `16384` | Disk that one query's spill files may reserve. A request may lower it with `spill-mb`. |
 | `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
 | `--max-export-mb N` | `0` | Budget for the body of a Graph Store GET, which exports a graph or the whole dataset; `0` means unlimited. |
@@ -4178,7 +4178,10 @@ streams a grouping, counts over OPTIONAL and MINUS among them, that reads an est
 20,000 rows or more when every operator has a cursor implementation, since such
 groupings measured 0.50 to 0.91 times the eager time. Every other plan runs eagerly and
 answers exactly as `execution=eager` does, except on a server with spill on, described
-under [Memory and caches](#memory-and-caches). `execution=streaming` streams
+under [Memory and caches](#memory-and-caches). A streamed grouping can concatenate a
+`GROUP_CONCAT` in another order than an eager one when its input comes from a join,
+since SPARQL leaves that order open. Concatenating over an ordered subquery fixes the
+order in both. `execution=streaming` streams
 every query, and `execution=eager` streams none:
 
 ```sh

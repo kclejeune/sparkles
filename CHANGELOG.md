@@ -57,8 +57,15 @@ server and `--query-spill-mb` for one query, a request may lower the latter with
 `spill-mb`, and a query over it fails with the new `spill` budget and `507`. With spill
 on, automatic execution also streams a query that eager execution would hold in more
 than half its budget, and runs an eager SELECT that exceeds its memory budget once more
-as a cursor. Spill is off by default until hash joins spill too. `/$/server/memory` adds
-a `spill` object and `/$/metrics` the `sparkles_spill_*` series. Rust callers set
+as a cursor unless it calls SERVICE anywhere. Spill is off by default until hash joins
+spill too. A DISTINCT above an ORDER BY keeps its rows in memory so that their order
+holds. `serve --spill on` fails to start when the spill directory cannot be used, sits
+on tmpfs or ramfs, is not owned by the server's user or is writable by others, and
+`--spill-max-mb 0` is refused. `/$/server/memory` adds a `spill` object and
+`/$/metrics` the `sparkles_spill_*` series, `sparkles_spill_eager_retries_total`
+among them. A streamed grouping over a join can concatenate a `GROUP_CONCAT` in another
+order than an eager one, which SPARQL allows, and an ordered subquery fixes the order in
+both. Rust callers set
 `QueryOptions::spill` and `max_spill_bytes`, and `BudgetKind::Spill` is a new variant.
 
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server

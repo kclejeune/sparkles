@@ -160,7 +160,7 @@ fn server_memory(put: &mut dyn FnMut(&str, J)) {
                         "admissionWaitSeconds": num(),
                     })),
                     "spill": obj(&["enabled"], json!({
-                        "enabled": { "type": "boolean", "description": "Whether streamed sorts may write sorted runs to disk (`--spill`)." },
+                        "enabled": { "type": "boolean", "description": "Whether streamed sorts, groupings and unordered DISTINCT may write what outgrows their memory budget to disk (`--spill`)." },
                         "capacityBytes": { "type": "integer", "description": "The disk all queries' spill files may reserve together (`--spill-max-mb`)." },
                         "queryBytes": { "type": ["integer", "null"], "description": "The disk one query may reserve (`--query-spill-mb`), `null` when only the total limits it." },
                         "reservedBytes": int(),

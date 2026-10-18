@@ -1025,7 +1025,14 @@ anything else with a warning. The format is registered in `formats.rs` as the de
 kind `spill`, version 1. Frames hold at most 4,096 rows, and a sort writes smaller ones
 when memory is short. Reservation takes 64 MiB extents from `--spill-max-mb`, checks
 `--min-free-disk-mb` with `statvfs`, and fails with the new budget kind `spill` (`507`),
-as does `ENOSPC`. The extents are accounting, not preallocation.
+as do `ENOSPC`, `EDQUOT` and `EFBIG`. Another I/O error fails the query with that error.
+The extents are accounting, not preallocation, and a query gives back the extents its
+open files no longer need whenever one of its files closes. The process locks its marker
+before it writes the format into it, so a sweep by a process starting at the same time
+never takes the directory for a dead one. The spill directory is created with mode 0700
+and refused unless the server's user owns it and no other user can write it. `serve
+--spill on` fails to start when the directory cannot be used or sits on tmpfs or ramfs,
+where spilled state would take memory, and warns on a network file system.
 
 **External sort.** The decisions below depart from §6.4.
 
@@ -1042,8 +1049,9 @@ as does `ENOSPC`. The extents are accounting, not preallocation.
   compares what the run was sorted by. Those computed terms stay interned for the query,
   so such a sort does not shed their memory.
 * Equal keys keep input order without sequence numbers. A run holds earlier input than
-  every later run, the in-memory sort is stable, and the merge takes the earliest run on
-  a tie. A pass that merges the first runs puts its output first.
+  every later run, the in-memory sort of an ORDER BY is stable, and the merge takes the
+  earliest run on a tie. The id sort that feeds a merge join sorts its runs unstably,
+  since only its sort variables carry an order. A pass that merges the first runs puts its output first.
 * A run's frames are sized so that 64 of them share a quarter of the starting room, at
   least 64 rows, which replaces the fixed 256 KiB read buffers. The fan-in is the number
   of such frames that half the room holds, at most 64, and more runs merge in passes.
@@ -1064,16 +1072,21 @@ as does `ENOSPC`. The extents are accounting, not preallocation.
 * DISTINCT spills the same way with a hash of the whole row, and only over input with no
   order, because rows from the files come after the others. Input ordered on every output
   column needs no memory. Input ordered on some columns keeps its in-memory set, so that
-  the order the cursor claims for its output holds. `SELECT DISTINCT … ORDER BY` keeps its
-  order either way, since the sort is above the DISTINCT.
+  the order the cursor claims for its output holds. In `SELECT DISTINCT … ORDER BY` the
+  DISTINCT sits above the sort, as SPARQL's algebra places it, so it also keeps its whole
+  set in memory and fails with the `memory` budget when the set does not fit. The same
+  holds above a ranking such as a text search. The test is
+  `distinct_over_order_by_keeps_the_order_or_fails`. Deduplicating below the sort is
+  item 85.
 
 **Eager queries.** Both paths of §6.8 are built. With spill, automatic execution streams a
 SELECT whose operators all have cursor implementations when the largest operator output
 the plan estimates would take more than half of the memory left. An eager SELECT that
 fails its `memory` budget runs once more as a cursor within the first run's deadline,
-unless it calls SERVICE or a graph algorithm or has extension functions or initial
-bindings. The cursor plan counts `eagerMemoryRetry`. The access log does not record the
-retry separately.
+unless it calls SERVICE or a graph algorithm anywhere, inside an EXISTS included, or has
+extension functions or initial bindings. The cursor plan counts `eagerMemoryRetry`, and
+`/$/metrics` counts retries in `sparkles_spill_eager_retries_total`. The access log does
+not record the retry separately.
 
 **Not built.** Hash-join spill (§6.3) and the merge-join run spool, and `--spill
 encrypted` (§6.7), are roadmap item 85. Until they land, `--spill` is off by default, as
@@ -1083,7 +1096,7 @@ update's WHERE clause (open question 3) is not offered, because updates run eage
 
 **Gates.**
 
-* **A8 to A10, A14.** Not met, item 85.
+* **A8 to A10, A14.** These gates are not met and move to item 85.
 * **A11.** `spilled_order_by_matches_eager_order_with_ties_and_expressions` sorts 60,000
   rows of integers, strings, language strings, IRIs, decimals and dates, with OPTIONAL
   unbound values, under 768 KiB, and a total order matches eager row for row.
@@ -1097,7 +1110,7 @@ update's WHERE clause (open question 3) is not offered, because updates run eage
   matches eager. `spilled_distinct_emits_each_row_once` covers DISTINCT under 256 KiB. At
   10.5M on Namespace, 833,177 groups held 38 MB under 64 MiB and took 1.54 times the eager
   time. The 10-million-group run was not made.
-* **A13.** Covered by `spill_limits_fail_the_query_with_a_spill_budget` (reservation),
+* **A13.** The tests are `spill_limits_fail_the_query_with_a_spill_budget` (reservation),
   the unit tests of `spill.rs` (injected write, read and reservation faults, an unknown
   version, kind, codec or encryption flag, a damaged frame, and the sweep of dead, live
   and foreign directories),

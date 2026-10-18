@@ -1761,8 +1761,9 @@ so only its row count is checked.
 
 * **Larger scale.** The largest dataset is English DBpedia at 1.24 billion triples. QLever
   is built for 10⁹–10¹¹ triples and runs Wikidata and UniProt, and its lazy evaluation,
-  FSST vocabulary compression and IRI encoding matter more as data grows. Sparkles has no
-  disk spill, so a query whose operator state outgrows its budget fails.
+  FSST vocabulary compression and IRI encoding matter more as data grows. Sparkles spills
+  only cursor sorts, groupings and unordered DISTINCT, and only behind
+  `serve --spill on`, so a query whose join or eager state outgrows its budget fails.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of
   28.7 GiB under a 14 GiB limit.
 * **Other standard benchmarks.** The tables above include no figures for LUBM, BSBM or

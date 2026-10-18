@@ -1623,8 +1623,8 @@ Query parameters beyond the standard protocol:
   server with spill on, a SELECT of cursor operators that eager execution would hold in
   more than half its memory budget streams too, and an eager SELECT that exceeds its
   memory budget runs once more as a cursor within the same deadline, unless it calls
-  SERVICE, a graph algorithm or an extension function. The cursor plan then counts
-  `eagerMemoryRetry`. A plan whose estimate exceeds the request's row budgets
+  SERVICE anywhere, inside an EXISTS included, a graph algorithm or an extension function.
+  The cursor plan then counts `eagerMemoryRetry`. A plan whose estimate exceeds the request's row budgets
   (`max-rows` or `max-rows-produced`) runs eagerly, so that the budget fails it with a
   status before any output. Every other plan runs eagerly, with the same response as
   `execution=eager`. A query that ran in under 10 ms the last time also runs eagerly
@@ -7923,22 +7923,38 @@ Three operators spill.
   sent, so every aggregate, `GROUP_CONCAT` order and DISTINCT included, sees the rows it
   would see in memory.
 * A DISTINCT over unordered input does the same with a hash of the whole row, and the rows
-  from the files come after the others. Over ordered input it needs no memory and never
-  spills.
+  from the files come after the others. Over input ordered on all its columns it needs no
+  memory. Over any other ordered input, and in `SELECT DISTINCT … ORDER BY`, where the
+  DISTINCT comes after the sort, it keeps its whole set in memory so that the order holds,
+  and it fails with the `memory` budget when the set does not fit.
+
+`GROUP_CONCAT` joins a group's values in the order its input gives them, in memory and
+after a spill alike. SPARQL leaves that order open, and a streamed join can give a group's
+rows in another order than an eager one, so the same query can concatenate in another
+order when it runs as a cursor. A query that needs an order concatenates over an ordered
+subquery, as in Jena, and both kinds of execution keep that order.
 
 Spill files live in a directory per server process under `--spill-dir`, which defaults
-to `<data>/.spill` and must be on a local file system. A file has no name while it is
-written, so it disappears when it is closed or when the process dies, and the next start
+to `<data>/.spill` and must be on a local disk. The directory is created with mode 0700,
+and the server refuses to start with spill on when its user does not own the directory,
+another user can write it, it cannot be created, or it sits on tmpfs or ramfs, whose files
+would take the memory that spill saves. A network file system gets a warning. A file has
+no name while it is written, so it disappears when it is closed or when the process dies, and the next start
 removes the directories of processes that are gone. The format is versioned, every frame
 carries a CRC-32, and a reader refuses a version, kind or codec it does not know. All
 queries together reserve at most `--spill-max-mb`, which defaults to a quarter of the
 free space of the directory at start, at most 64 GiB, and the server keeps
-`--min-free-disk-mb` free. One query reserves at most `--query-spill-mb`, and a request
-may lower that with `spill-mb`. The plan of an operator that spilled counts
+`--min-free-disk-mb` free. `--spill-max-mb` must be at least 1. Queries reserve the disk in
+64 MiB extents, first come first served, and a query gives an extent back as soon as its
+open files no longer need it, so a query that cannot get an extent fails with the `spill`
+budget rather than wait. A write that fails with `ENOSPC`, `EDQUOT` or `EFBIG` fails with
+that budget too. One query reserves at most `--query-spill-mb`, and a request may lower
+that with `spill-mb`. The plan of an operator that spilled counts
 `spilledBytes` and either `spillRuns` and `mergePasses` for a sort or `spillPasses` for
 a grouping or DISTINCT. `/$/server/memory` reports the directory's use, and
 `/$/metrics` adds `sparkles_spill_capacity_bytes`, `sparkles_spill_reserved_bytes`,
-`sparkles_spill_written_bytes_total` and `sparkles_spill_queries_total`.
+`sparkles_spill_written_bytes_total`, `sparkles_spill_queries_total` and
+`sparkles_spill_eager_retries_total`, the eager queries that ran again as cursors.
 
 Spill files hold ids, and inline ids carry literal values such as numbers and dates. The
 files are not encrypted, so a deployment that must not write query data to disk keeps

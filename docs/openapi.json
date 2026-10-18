@@ -14047,7 +14047,7 @@
                 "type": "integer"
               },
               "enabled": {
-                "description": "Whether streamed sorts may write sorted runs to disk (`--spill`).",
+                "description": "Whether streamed sorts, groupings and unordered DISTINCT may write what outgrows their memory budget to disk (`--spill`).",
                 "type": "boolean"
               },
               "queryBytes": {

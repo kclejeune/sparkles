@@ -4724,7 +4724,6 @@ fn first_key_candidates(
     Ok((cand.len() < t.len()).then_some(cand))
 }
 
-/// The value of an ORDER BY key on every row (`None`: an error).
 /// The value of an ORDER BY key on each row of `t`, for a merge that compares rows
 /// read back from disk. Values the key computes are not interned.
 pub(super) fn key_values(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Option<Value>>> {
