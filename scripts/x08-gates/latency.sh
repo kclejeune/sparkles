@@ -26,7 +26,10 @@ run() { # <name> <flags of A> <flags of B>
   cp "$d/bin-A.zst" "$d/bin-B.zst"
   ln -s "$W/data.nt.zst" "$d/data.nt.zst"
   cp "$W/nsc-bench-remote.sh" "$d/"
+  # the build runs on the host it was built for, so it needs no other loader
   cat > "$d/run.env" << ENV
+DYNAMIC_A=0
+DYNAMIC_B=0
 ROUNDS=$ROUNDS
 REPS=$REPS
 WARMUP=3

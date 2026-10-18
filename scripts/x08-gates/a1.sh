@@ -3,7 +3,8 @@
 # against one with a single dataset, at `--cache-mb 256` and 32, after the suite ran
 # against every dataset and with no query at all. Each case reads VmRSS, RssAnon, RssFile
 # and RssShmem from /proc and the cache bytes from /$/server/memory into WORK/a1/a1.tsv,
-# and a1-bound.py applies the gate to that table.
+# with the sum of the datasets' block bytes, and a1-bound.py applies the gate to that
+# table.
 #
 #   scripts/x08-gates/a1.sh WORK BIN [REPEATS]   (after prepare.sh WORK)
 #
@@ -27,7 +28,7 @@ fi
 mapfile -t QUERIES < <(cd "$W/queries" && for f in *.rq; do echo "${f%.rq}"; done)
 SPID=
 trap '[ -n "$SPID" ] && kill "$SPID" 2> /dev/null; true' EXIT
-printf 'case\tdatasets\tcache_mb\tsuite\trep\tVmRSS_kB\tRssAnon_kB\tRssFile_kB\tRssShmem_kB\tblock_bytes\tresult_bytes\tservice_bytes\thistory_bytes\tblock_entries\terrors\n' > "$O/a1.tsv"
+printf 'case\tdatasets\tcache_mb\tsuite\trep\tVmRSS_kB\tRssAnon_kB\tRssFile_kB\tRssShmem_kB\tblock_bytes\tresult_bytes\tservice_bytes\thistory_bytes\tblock_entries\tdataset_block_bytes\terrors\n' > "$O/a1.tsv"
 run_case() { # <datasets> <cache-mb> <suite 0|1> <rep>
   local n=$1 mb=$2 suite=$3 rep=$4 locs=() errs=0 st mem cb
   for i in $(seq 0 $((n - 1))); do locs+=(--loc "ds$i=$O/stores/s$i"); done
@@ -52,7 +53,7 @@ run_case() { # <datasets> <cache-mb> <suite 0|1> <rep>
   st=$(awk '/^(VmRSS|RssAnon|RssFile|RssShmem):/ {printf "%s\t", $2}' "/proc/$SPID/status")
   mem=$(curl -sf "localhost:$PORT/\$/server/memory")
   echo "$mem" > "$O/memory-$n-$mb-$suite-$rep.json"
-  cb=$(python3 -c 'import json,sys; c=json.loads(sys.argv[1])["caches"]; print("\t".join(str(c[k].get("bytes",0)) for k in ("block","result","service","history")) + "\t" + str(c["block"].get("entries",0)))' "$mem")
+  cb=$(python3 -c 'import json,sys; c=json.loads(sys.argv[1])["caches"]; print("\t".join(str(c[k].get("bytes",0)) for k in ("block","result","service","history")) + "\t" + str(c["block"].get("entries",0)) + "\t" + str(sum(d.get("blockBytes",0) for d in json.loads(sys.argv[1])["datasets"])))' "$mem")
   printf '%s\t%s\t%s\t%s\t%s\t%s%s\t%s\n' "$n-$mb-$suite" "$n" "$mb" "$suite" "$rep" "$st" "$cb" "$errs" >> "$O/a1.tsv"
   kill "$SPID"
   wait "$SPID" 2> /dev/null || true
