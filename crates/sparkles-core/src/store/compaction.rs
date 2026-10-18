@@ -1123,8 +1123,13 @@ impl Store {
             #[cfg(feature = "text")]
             if let Some(ti) = self.text.load_full() {
                 // the writer lock is held with the group drained (X09 section 17.3), so
-                // the index holds no commit above the durable, published head
-                debug_assert!(ti.applied() <= self.current.load().commit);
+                // the index holds no commit above the published head. A leader that failed
+                // between the apply and the publication can leave one durable commit
+                // applied but unpublished, which is why a failed group is exempt.
+                debug_assert!(
+                    self.group.as_ref().is_some_and(|g| g.failed())
+                        || ti.applied() <= self.current.load().commit
+                );
                 ti.checkpoint()?;
             }
             let snap = self.snapshot();

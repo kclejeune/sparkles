@@ -548,6 +548,22 @@ impl UnavailableState {
 }
 
 impl TextView {
+    /// How many grouped commits' outcomes a search on this view may go through before
+    /// it reaches a ready or unavailable view.
+    #[cfg(test)]
+    pub(crate) fn pending_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut view = self;
+        while let ViewSource::Pending(p) = &view.source {
+            depth += 1;
+            match p.get() {
+                Some(Some(next)) => view = next,
+                _ => break,
+            }
+        }
+        depth
+    }
+
     #[cfg(feature = "text")]
     pub(crate) fn is_available(&self) -> bool {
         match &self.source {
@@ -972,6 +988,9 @@ mod imp {
         }
     }
 
+    /// How long a search on a speculative view waits for its commit's publication.
+    const PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Where a grouped commit's view learns how its publication ended: the view the
     /// live index gave the commit, or `None` when its fence failed and the commit was
     /// never published.
@@ -997,12 +1016,20 @@ mod imp {
         /// from the speculative head of a group searches before that, and every commit in
         /// flight is published or failed by the thread that queued it, so the wait ends
         /// with the commit's fence. A view that the live index could not bring to `seq`
-        /// is stale, as on the ordinary path.
+        /// is stale, as on the ordinary path. The wait is bounded by [`PUBLISH_WAIT`]: a
+        /// commit whose thread panicked after queueing it waits for the next writer to
+        /// lead its fence, and the searching transaction may be that writer, holding the
+        /// writer lock. The search then fails with a timeout instead of hanging.
         pub(super) fn published(&self, seq: u64, data_seq: u64) -> Result<&super::TextView> {
             if self.view.get().is_none() {
+                let deadline = std::time::Instant::now() + PUBLISH_WAIT;
                 let mut g = self.lock.lock();
                 while self.view.get().is_none() {
-                    self.set.wait(&mut g);
+                    if self.set.wait_until(&mut g, deadline).timed_out()
+                        && self.view.get().is_none()
+                    {
+                        return Err(Error::Timeout);
+                    }
                 }
             }
             match self.view.get() {
@@ -1011,6 +1038,23 @@ mod imp {
                 _ => Err(Error::Poisoned),
             }
         }
+    }
+
+    /// `view` without a link through another commit's [`Outcome`]. A commit that keeps
+    /// its base's view, because the index is stale or its apply failed, must not keep
+    /// the base's pending view: that view holds the base's outcome, which holds the view
+    /// before it, and a stale index would grow the chain by one link per commit until
+    /// dropping it overflows the stack. Every view an outcome holds is settled, so one
+    /// step suffices. The base of a commit being published was published before it, so
+    /// its outcome is set.
+    pub(super) fn settled(view: Option<Arc<super::TextView>>) -> Option<Arc<super::TextView>> {
+        let v = view?;
+        if let super::ViewSource::Pending(p) = &v.source
+            && let Some(Some(published)) = p.get()
+        {
+            return Some(published.clone());
+        }
+        Some(v)
     }
 
     /// One document change of a staged commit: the document of a quad the commit
@@ -1052,7 +1096,7 @@ mod imp {
                 j.extend(self.touched.iter().map(|(q, _)| *q));
             }
             let view = if !inner.healthy() {
-                self.prev.clone()
+                settled(self.prev.take())
             } else {
                 let current = inner.live.lock().shared.clone();
                 let docs = match self.docs.take() {
@@ -1063,7 +1107,7 @@ mod imp {
                     Ok(v) => Some(v),
                     Err(e) => {
                         inner.fail_locked(&mut inner.live.lock(), &e);
-                        self.prev.clone()
+                        settled(self.prev.take())
                     }
                 }
             };
@@ -2069,14 +2113,14 @@ mod imp {
                 j.extend(log.iter().map(|(_, q)| *q));
             }
             if !inner.healthy() {
-                return prev.cloned();
+                return settled(prev.cloned());
             }
             let touched = touched_of(log);
             match inner.apply(snap, &touched) {
                 Ok(v) => Some(v),
                 Err(e) => {
                     inner.fail_locked(&mut inner.live.lock(), &e);
-                    prev.cloned()
+                    settled(prev.cloned())
                 }
             }
         }

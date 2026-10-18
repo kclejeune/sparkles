@@ -243,6 +243,55 @@ fn a_failed_text_update_at_publication_leaves_the_commit_and_marks_the_index_sta
     }
 }
 
+/// Commits on a stale index keep their base's view without a link to the base's
+/// outcome, so the views of a long run of commits do not form a chain whose drop
+/// recurses once per commit (review P2-1 of item 86).
+#[cfg(feature = "text")]
+#[test]
+fn a_stale_text_index_keeps_no_chain_of_views_across_grouped_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), options()).unwrap();
+    s.enable_text(Default::default()).unwrap();
+    label(&s, "a", "alpha").unwrap();
+    s.fail_next_text_commit();
+    label(&s, "b", "bravo").unwrap();
+    assert_eq!(s.text_status().unwrap().state, "stale");
+    for i in 0..20 {
+        label(&s, &format!("c{i}"), "charlie").unwrap();
+    }
+    assert!(grouped(&s) >= 20);
+    let head = s.snapshot();
+    assert!(head.text.as_ref().unwrap().pending_depth() <= 1);
+    drop(head);
+
+    // the same through the index directly, at a length whose drop overflowed a small
+    // stack when every view held the one before it
+    let ti = s.text.load_full().unwrap();
+    let snap = s.snapshot();
+    let mut prev = snap.text.clone();
+    for _ in 0..20_000 {
+        let (staged, view) = ti.stage(&snap, &[], prev.as_ref());
+        staged.apply(&snap);
+        prev = Some(view);
+    }
+    assert!(prev.as_ref().unwrap().pending_depth() <= 1);
+    thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(move || drop(prev))
+        .unwrap()
+        .join()
+        .unwrap();
+    drop(snap);
+    // a rebuild replaces the stale index and drops the head's views
+    thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || s.rebuild_text().map(|_| ()))
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+}
+
 #[cfg(feature = "text")]
 #[test]
 fn an_online_text_rebuild_keeps_commits_out_of_groups_until_it_installs() {
@@ -382,6 +431,68 @@ fn a_spatial_build_installs_its_view_only_after_the_fence() {
     assert_eq!(window(snap, [1.5, 1.5, 2.5, 2.5]).0.len(), 1);
 }
 
+/// A spatial build installs under sixteen writers whose fences each take 80 ms, longer
+/// than the wait of the first installer, which gave up after 50 ms, released the writer
+/// lock and let the next commits in, so it never installed (review P2-2 of item 86).
+#[cfg(feature = "geo")]
+#[test]
+fn a_spatial_build_installs_under_writers_with_slow_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Arc::new(Store::open(dir.path(), options()).unwrap());
+    point(&s, "seed", 0.0, 0.0).unwrap();
+    s.enable_geo(Default::default()).unwrap();
+    s.wait_geo();
+    let epoch = s.snapshot().geo.as_ref().unwrap().epoch;
+    s.set_failpoint(
+        "group-synced",
+        Some(Arc::new(|_| thread::sleep(Duration::from_millis(80)))),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..16)
+        .map(|t| {
+            let (s, stop) = (s.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut i = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    point(&s, &format!("w{t}-{i}"), t as f64, i as f64 / 100.0).unwrap();
+                    i += 1;
+                }
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    // `rebuild_geo` waits for the build, so it runs beside the clock
+    let rebuild = {
+        let s = s.clone();
+        thread::spawn(move || s.rebuild_geo().map(|_| ()))
+    };
+    let until = started + Duration::from_secs(10);
+    while s.snapshot().geo.as_ref().unwrap().epoch == epoch && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let took = started.elapsed();
+    // the writers stop before any assertion, so a failure cannot leave them running
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+    s.set_failpoint("group-synced", None);
+    rebuild.join().unwrap().unwrap();
+    assert!(
+        took < Duration::from_secs(10),
+        "not installed after {took:?}"
+    );
+    s.wait_geo();
+    // the installed view covers every commit made under it
+    let snap = s.snapshot();
+    let v = snap.geo.as_ref().unwrap();
+    assert_eq!(v.epoch, epoch + 1);
+    let (hits, scanned) = window(snap.clone(), [-1.0, -1.0, 16.0, 1000.0]);
+    assert!(!scanned);
+    assert_eq!(hits.len() as u64, snap.commit, "{} points", hits.len());
+}
+
 #[cfg(feature = "geo")]
 #[test]
 fn a_building_or_failed_spatial_index_keeps_commits_out_of_groups() {
@@ -392,7 +503,7 @@ fn a_building_or_failed_spatial_index_keeps_commits_out_of_groups() {
     s.enable_geo(Default::default()).unwrap();
     let before = grouped(&s);
     point(&s, "during", 1.0, 1.0).unwrap();
-    assert_eq!(fell_back(&s, Fallback::GeoBuilding), 1);
+    assert_eq!(fell_back(&s, Fallback::GeoUnavailable), 1);
     assert_eq!(grouped(&s), before);
     s.pause_geo_build(false);
     s.wait_geo();
@@ -408,10 +519,10 @@ fn a_building_or_failed_spatial_index_keeps_commits_out_of_groups() {
         crate::geo::IndexState::Failed
     ));
     point(&s, "while-failed", 4.0, 4.0).unwrap();
-    assert_eq!(fell_back(&s, Fallback::GeoBuilding), 2);
+    assert_eq!(fell_back(&s, Fallback::GeoUnavailable), 2);
     s.rebuild_geo().unwrap();
     point(&s, "rebuilt", 5.0, 5.0).unwrap();
-    assert_eq!(fell_back(&s, Fallback::GeoBuilding), 2);
+    assert_eq!(fell_back(&s, Fallback::GeoUnavailable), 2);
     let (hits, scanned) = window(s.snapshot(), [-1.0, -1.0, 6.0, 6.0]);
     assert!(!scanned);
     assert_eq!(hits.len(), 6, "{hits:?}");

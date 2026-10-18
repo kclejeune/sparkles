@@ -73,24 +73,32 @@ impl Coordinator {
         !s.active && s.queue.is_empty() && !s.failed
     }
 
-    /// Wait up to `timeout`, without leading a fence, until no commit is in flight: no
-    /// fence runs, and the queue is empty or failed. The caller holds the writer lock,
-    /// so nothing new is queued, and the thread of each queued commit leads its own
-    /// fence. A background installer that holds no `Store` to drain with, such as the
-    /// spatial index build, uses this before it installs a view, so that no grouped
-    /// commit publishes an older view over it. `false` when commits are still in flight
-    /// at the timeout. The caller then releases the writer lock and tries again, since a
-    /// commit whose thread panicked after queueing it waits for the next writer to lead
-    /// it.
+    /// Wait, without leading a fence, until no commit is in flight: no fence runs, and
+    /// the queue is empty or failed. The caller holds the writer lock, so nothing new is
+    /// queued, and the thread of each queued commit leads its own fence, so the wait
+    /// ends however long the fences take. A background installer that holds no `Store`
+    /// to drain with, such as the spatial index build, uses this before it installs a
+    /// view, so that no grouped commit publishes an older view over it. `false` when
+    /// `stall` passes with no commit leaving the group. The caller then releases the
+    /// writer lock and tries again, since a commit whose thread panicked after queueing
+    /// it waits for the next writer to lead it. The bound is on a stall rather than on
+    /// the whole wait, because an installer that gave up after a fixed time and released
+    /// the lock would let new commits in, and with fences longer than that time it would
+    /// never install (review P2-2 of item 86).
     #[cfg_attr(not(feature = "geo"), allow(dead_code))]
-    pub fn settle(&self, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+    pub fn settle(&self, stall: Duration) -> bool {
         let mut s = self.state.lock();
+        let mut left = s.commits;
+        let mut deadline = std::time::Instant::now() + stall;
         loop {
             if !s.active && (s.failed || s.queue.is_empty()) {
                 return true;
             }
-            if self.changed.wait_until(&mut s, deadline).timed_out() {
+            if s.commits < left {
+                left = s.commits;
+                deadline = std::time::Instant::now() + stall;
+            }
+            if self.changed.wait_until(&mut s, deadline).timed_out() && s.commits >= left {
                 return !s.active && (s.failed || s.queue.is_empty());
             }
         }
@@ -535,8 +543,25 @@ impl WriteTxn<'_> {
         // with the snapshot. The full-text changes are only staged here, and nothing of
         // either reaches the disk.
         store.maintain_geo(&mut snapshot, &self.base, &self.log);
+        // The commit's record is already in the log, so a panic while staging must not
+        // unwind past the queue: no fence would cover the record and the next commit
+        // would reuse its number. The writer is poisoned instead, as after a failed write.
         #[cfg(feature = "text")]
-        let text = store.stage_text(&mut snapshot, &self.log);
+        let text = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.stage_text(&mut snapshot, &self.log)
+        })) {
+            Ok(text) => text,
+            Err(_) => {
+                tracing::error!(
+                    target: "sparkles::store",
+                    seq = c.seq,
+                    "staging a grouped commit's full-text changes panicked; writes are refused until the store is reopened"
+                );
+                w.poisoned = true;
+                group.fail();
+                return Err(Error::Poisoned);
+            }
+        };
         let snapshot = Arc::new(snapshot);
         // A compaction that is building carries this commit into its new generation. It
         // takes commits only after the writer lock's drain has made the queue durable, so
@@ -1483,7 +1508,7 @@ mod tests {
                 "kind",
                 "text-recovering",
                 "text-rebuilding",
-                "geo-building",
+                "geo-unavailable",
                 "bulk",
                 "size",
                 "noop"

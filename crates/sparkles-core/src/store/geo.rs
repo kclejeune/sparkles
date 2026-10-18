@@ -620,7 +620,7 @@ impl Store {
                         return;
                     }
                     match group.as_ref().and_then(std::sync::Weak::upgrade) {
-                        Some(g) if !g.settle(std::time::Duration::from_millis(50)) => {
+                        Some(g) if !g.settle(std::time::Duration::from_secs(2)) => {
                             drop(w);
                             std::thread::sleep(std::time::Duration::from_millis(2));
                         }

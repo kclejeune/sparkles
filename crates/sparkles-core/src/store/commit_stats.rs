@@ -50,7 +50,7 @@ pub enum Fallback {
     /// an online rebuild of the full-text index runs
     TextRebuilding,
     /// the spatial index builds, or its build failed
-    GeoBuilding,
+    GeoUnavailable,
     Bulk,
     Size,
     Noop,
@@ -62,7 +62,7 @@ impl Fallback {
         Fallback::Kind,
         Fallback::TextRecovering,
         Fallback::TextRebuilding,
-        Fallback::GeoBuilding,
+        Fallback::GeoUnavailable,
         Fallback::Bulk,
         Fallback::Size,
         Fallback::Noop,
@@ -74,7 +74,7 @@ impl Fallback {
             Fallback::Kind => "kind",
             Fallback::TextRecovering => "text-recovering",
             Fallback::TextRebuilding => "text-rebuilding",
-            Fallback::GeoBuilding => "geo-building",
+            Fallback::GeoUnavailable => "geo-unavailable",
             Fallback::Bulk => "bulk",
             Fallback::Size => "size",
             Fallback::Noop => "noop",

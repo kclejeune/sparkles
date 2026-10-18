@@ -1139,9 +1139,10 @@ pub struct StoreOptions {
     pub wal_direct_writes: bool,
     /// Group commit: concurrent commits of a persistent store share one synchronization,
     /// and each is acknowledged once the prefix that holds it is durable. On by default,
-    /// and ignored for in-memory stores. Writes the group does not admit (on datasets with
-    /// a full-text, spatial or embedding index, merges, forced and bulk commits) drain it
-    /// and take the ordinary path.
+    /// and ignored for in-memory stores. Writes the group does not admit (merges, forced
+    /// and bulk commits, and commits while a full-text index recovers or rebuilds or a
+    /// spatial index builds or has failed) drain it and take the ordinary path. Datasets
+    /// with a full-text, spatial or embedding index otherwise group their commits.
     pub group_commit: bool,
     /// With group commit on, a commit that is the only writer (nothing queued, no fence
     /// running, no transaction waiting for the writer lock) takes the ordinary path with
@@ -3525,6 +3526,17 @@ impl Store {
         }
     }
 
+    /// Test hook: checkpoint the full-text index now, as its background tick does about
+    /// once a second, so that a short run writes checkpoints that name its commits.
+    #[cfg(feature = "text")]
+    #[doc(hidden)]
+    pub fn checkpoint_text(&self) -> Result<()> {
+        match self.text.load_full() {
+            Some(ti) => ti.checkpoint(),
+            None => Ok(()),
+        }
+    }
+
     /// Test hook: pause (or resume) the full-text index's background tick, so staged
     /// documents stay uncommitted until a search, compaction or close.
     #[cfg(feature = "text")]
@@ -4055,14 +4067,14 @@ impl Store {
             }
         }
         if self.geo.load().is_some() {
-            let building = self.current.load().geo.as_ref().is_none_or(|v| {
+            let unavailable = self.current.load().geo.as_ref().is_none_or(|v| {
                 matches!(
                     v.state(),
                     crate::geo::IndexState::Building(_) | crate::geo::IndexState::Failed
                 )
             });
-            if building {
-                return Some(Fallback::GeoBuilding);
+            if unavailable {
+                return Some(Fallback::GeoUnavailable);
             }
         }
         None
@@ -4578,8 +4590,13 @@ impl Store {
             #[cfg(feature = "text")]
             if let Some(ti) = self.text.load_full() {
                 // the writer lock is held with the group drained (X09 section 17.3), so
-                // the index holds no commit above the durable, published head
-                debug_assert!(ti.applied() <= self.current.load().commit);
+                // the index holds no commit above the published head. A leader that failed
+                // between the apply and the publication can leave one durable commit
+                // applied but unpublished, which is why a failed group is exempt.
+                debug_assert!(
+                    self.group.as_ref().is_some_and(|g| g.failed())
+                        || ti.applied() <= self.current.load().commit
+                );
                 ti.checkpoint()?;
             }
         }
