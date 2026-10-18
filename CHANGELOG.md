@@ -94,9 +94,14 @@ triples it took 918 MiB instead of 2,267 MiB for RDFS and 1,226 MiB instead of 2
 for OWL 2 RL, and a run that reads the closure back from a persistent dataset took 40% to
 73% of its previous time. This trades speed for memory. A change of 1,000 triples with a
 kept closure took 1.3 to 4.9 times longer at 16 threads, up to 142 ms on that data,
-because it reads the input graphs from compressed blocks. Roadmap item 87 is to win that
-time back with a cache of the input facts that the backward search reads, sized by the
-memory budget. `serve --reason-cache-triples` now counts derived triples only, so the
+because it reads the input graphs from compressed blocks. The kept closure now remembers
+the answers of its lookups of the input graphs between runs, up to 64 MiB charged to the
+memory budget, and the searches of a deletion round run in parallel. That brings such a
+change to 12 to 31 ms for RDFS and 51 to 88 ms for OWL 2 RL at 16 threads on that data, 1.0
+to 1.6 and 1.5 to 2.4 times its time before the closure dropped the explicit facts, for 10
+to 18 MiB more kept memory. The goal of roadmap item 87 is 1.2 times, so the item stays
+open. A read that the remembered answers serve counts in `baseScans` as the scan it
+saves. `serve --reason-cache-triples` now counts derived triples only, so the
 same limit keeps the closure of a larger input, and `baseScans` of an incremental run
 counts every read of the input graphs.
 

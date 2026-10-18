@@ -530,3 +530,80 @@ fn fallbacks() {
     assert_eq!(r.method, Method::Full);
     assert!(r.fallback.is_some());
 }
+
+/// Roadmap item 87: a closure kept in memory remembers lookups of the input graphs
+/// between runs. Runs that take in several commits at once, steps that undo the previous
+/// one, and runs that are cancelled or fail for memory in between still match a full
+/// run, and the runs after them still continue from memory.
+#[test]
+fn kept_lookups_follow_commits_undos_and_failed_runs() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    for (p, owl) in profiles() {
+        for seed in 1..4 {
+            let s = Store::in_memory(StoreOptions::default());
+            let cache = Cache::default();
+            let mut r = Rng(seed);
+            let first: Vec<Triple> = (0..30).map(|_| random_triple(&mut r, owl)).collect();
+            change(&s, &first, &[]);
+            let rep = run(&s, &p, None, Some(&cache));
+            let mut since = rep.receipt.unwrap().commit.seq;
+            let mut last: (Vec<Triple>, Vec<Triple>) = (Vec::new(), Vec::new());
+            let mut memory = 0;
+            for step in 0..12 {
+                let commits = 1 + r.below(3);
+                for c in 0..commits {
+                    if c == 0 && step % 4 == 3 {
+                        // undo the previous step's last commit
+                        let (add, del) = std::mem::take(&mut last);
+                        change(&s, &del, &add);
+                        continue;
+                    }
+                    let now = base(&s);
+                    let del: Vec<Triple> = (0..r.below(3))
+                        .filter(|_| !now.is_empty())
+                        .map(|_| now[r.below(now.len())].clone())
+                        .collect();
+                    let add: Vec<Triple> = (0..r.below(4))
+                        .map(|_| random_triple(&mut r, owl))
+                        .collect();
+                    change(&s, &add, &del);
+                    last = (add, del);
+                }
+                let what = format!("{p} seed {seed} step {step}");
+                // a cancelled run and a run out of memory change nothing
+                let opts = if step % 2 == 0 {
+                    ReasonOptions {
+                        cancel: Some(Arc::new(AtomicBool::new(true))),
+                        ..Default::default()
+                    }
+                } else {
+                    ReasonOptions {
+                        max_memory: Some(4096),
+                        ..Default::default()
+                    }
+                };
+                let before = inferred(&s);
+                let failed = materialize_incremental(
+                    &s,
+                    &p,
+                    &Extras::default(),
+                    Incremental {
+                        since: Some(since),
+                        cache: Some(&cache),
+                    },
+                    &opts,
+                );
+                assert!(failed.is_err(), "{what}: the failing run succeeded");
+                assert_eq!(inferred(&s), before, "{what}: the failed run wrote");
+                let rep = run(&s, &p, Some(since), Some(&cache));
+                check(&s, &p, &rep, &what);
+                if rep.changes.as_ref().is_some_and(|c| c.source == "memory") {
+                    memory += 1;
+                }
+                since = rep.receipt.unwrap().commit.seq;
+            }
+            assert!(memory > 0, "{p} seed {seed}: no run continued from memory");
+        }
+    }
+}
