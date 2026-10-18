@@ -1,8 +1,9 @@
 # X09: Group commit by default
 
-> **Status:** Phases 1 to 4 built, with exceptions listed in the Outcome. Group commit
-> is on by default for persistent stores, and since Phase 4 it also groups the commits of
-> datasets with a full-text, spatial or embedding index.
+> **Status:** Phases 1, 2 and 3 built, with exceptions listed in the Outcome. Group
+> commit is on by default for persistent stores. Phase 4 is built and passes its crash
+> runs, so it also groups the commits of datasets with a full-text, spatial or embedding
+> index, but its performance gates of section 17.9 have not run on `forge`.
 >
 > **Phases:** Phase 1 is the measurements and fixes that the switch depends on: serial
 > latency, reader tails, metrics and power-loss and sync-failure tests. Phase 2 widens
@@ -10,7 +11,8 @@
 > validation, Graph Store and RDF Patch writes, full-text, spatial and embedding hooks,
 > writes during compaction). Phase 3 makes group commit the default for persistent
 > stores, with `--no-group-commit` to opt out. Phase 4 admits datasets with a full-text,
-> spatial or embedding index. All four phases are built. Phase 3 meets the conditions
+> spatial or embedding index. Phases 1 to 3 are done, and Phase 4 is built with its
+> gates pending. Phase 3 meets the conditions
 > of section 7.2, the third as amended on 2026-10-17.
 >
 > **User docs:** [FEATURES.md](../FEATURES.md), [USAGE.md](../USAGE.md) for
@@ -575,6 +577,9 @@ existing invariant that `apply_commit` sees only durable commits.
 
 ### 17.3 Changes by file
 
+The build differs from this list in the overlay search, the spatial installer and the
+order of embedding work. The [Phase 4 Outcome](#phase-4) describes what was built.
+
 - `store.rs`, `group_check`. Remove `Text`, `Geo` and `Embed` as unconditional reasons.
   Keep a fallback while text recovery has a pending job, while the
   spatial view is building or failed, and while a text rebuild runs. Name these
@@ -659,6 +664,9 @@ views live only in memory and are dropped.
 
 ### 17.6 Background maintenance
 
+The spatial build was built with a wait on the coordinator rather than
+`guarded_writer`, as the [Phase 4 Outcome](#phase-4) describes.
+
 - **Spatial build.** The build thread installs its view under `guarded_writer` after this
   change, so it never meets a grouped commit in flight. Commits made during the build are
   admitted only once the view is ready. Until then they fall back with `geo-building`, and
@@ -678,6 +686,8 @@ views live only in memory and are dropped.
 
 A speculative snapshot holds a spatial view and a text overlay for each commit in flight.
 The queue limits of section 6 bound them, 64 commits or 4 MiB of WAL records per dataset.
+The bound is on records, so on documents and not on bytes. A staged document holds its
+whole literal, and a queue of long literals can hold far more than 4 MiB of them.
 A spatial view is a clone of the previous one, which shares its base and copies the rows
 of the commits since the last build. A text overlay holds the documents of the commit's
 touched quads. Both are freed when their commit publishes or its fence fails. The extra
@@ -995,8 +1005,8 @@ dataset takes exactly the path that the default writer takes, so grouping cannot
 down, and it only misses the gain. Admitting it needs index state in speculative
 snapshots, because without it every fence would hold one commit. The user amended
 condition 3 of section 7.2 on 2026-10-17 to accept this, and section 17 designs the
-admission as Phase 4, [roadmap](../ROADMAP.md) item 86, which was built on 2026-10-18. In every measured workload below no
-commit fell back from the group for any reason, and `sparkles_group_commit_fallbacks_total`
+admission as Phase 4, [roadmap](../ROADMAP.md) item 86, which was built on 2026-10-18.
+In every measured workload below no commit fell back from the group for any reason, and `sparkles_group_commit_fallbacks_total`
 had no series. None of those workloads had an index, so they say nothing about indexed
 datasets. ShEx-guarded datasets take the group path with one commit per fence, as Phase 2
 left them.
@@ -1114,23 +1124,33 @@ Phase 4 was built on 2026-10-18 as [roadmap](../ROADMAP.md) item 86. Datasets wi
 full-text, spatial or embedding index now group their commits. The placement of section
 17.2 holds for each index, and the differences from sections 17.3 to 17.6 are listed below.
 Nothing on disk changed, so no format version moved. Every index stays derived from the
-log, and no index file joins the fence.
+log, and no index file joins the fence. A review of the branch found no way for an index
+to name a commit above the durable log, and its other findings were fixed before the
+branch landed, as the paragraphs below note, or are listed as open at the end.
 
 **Admission.** `group_check` no longer refuses a dataset for having an index. A commit falls
 back with `text-recovering` while a full-text recovery job is pending, with
 `text-rebuilding` while an online rebuild of the full-text index runs, and with
-`geo-building` while the spatial view builds or after its build failed. The reasons
+`geo-unavailable` while the spatial view builds or after its build failed. The reasons
 `text`, `geo` and `embed` are gone from `sparkles_group_commit_fallbacks_total`.
 
 **Spatial views.** `maintain_geo` takes the transaction's base as the state before the
 commit, and `publish_grouped` puts the resulting view in the speculative snapshot, as
 section 17.2 recommends. The build thread of `spawn_geo_build` does not call
 `guarded_writer`, because that needs the `Store` and the thread holds only weak handles.
-It holds a weak handle to the coordinator instead. It takes the writer lock, and while a
-fence is running or commits are queued it releases the lock, waits for the coordinator to
-settle and tries again. It installs its view only under the writer lock with the queue
-empty, so no grouped commit can publish an older view over it. Commits made during a build
-fall back with `geo-building`, which answers question 3 of section 17.10 for this phase.
+It holds a weak handle to the coordinator instead. It takes the writer lock, which keeps
+new commits out, and waits for the coordinator to settle, while the threads of the queued
+commits lead their own fences. It installs its view only under the writer lock with the
+queue empty, so no grouped commit can publish an older view over it. The wait gives up
+only when 2 s pass with no commit leaving the group, which a commit whose thread panicked
+after queueing it causes, and then the thread releases the lock so that a writer can
+lead that commit, and tries again. The first build gave up after 50 ms in all cases, and
+a review found that with fences longer than that, as an indexed dataset's publication
+can make them, the install never happened while writers kept committing. A test now
+installs a build under sixteen writers whose fences take 80 ms each. Commits made during a
+build, or after a build failed, fall back with `geo-unavailable`, which answers question 3
+of section 17.10 for this phase. Section 17.3 named this reason `geo-building`, which
+misnamed the failed case.
 
 **Full-text changes.** Section 17.3 described an overlay that queries on a speculative
 snapshot would search after the published view. The built design keeps the staging and
@@ -1142,10 +1162,18 @@ published and then searches the published view of exactly that commit, so its re
 BM25 scores are those of the commit after publication. This answers question 1 of section
 17.10 without a second scoring rule. A search on a speculative snapshot can therefore wait
 for one fence, which only a transaction that started from the speculative head can meet.
-If the fence fails, the search reports that the writer is poisoned. If the commit's
-documents fail to apply, the index is marked stale, the commit stays acknowledged, and the
-search reports the index as unavailable, as on the ordinary path. A staged change computed
-before a change of the index's configuration is computed again at publication.
+If the fence fails, the search reports that the writer is poisoned. The wait is bounded at
+30 s and then reports a timeout, since a commit whose thread panicked after queueing it
+waits for the next writer, and that writer may be the searching transaction. If the
+commit's documents fail to apply, the index is marked stale, the commit stays
+acknowledged, and the search reports the index as unavailable, as on the ordinary path.
+Such a commit keeps its base's view resolved to the published view behind it, never the
+base's pending view. A review found that the first build kept the pending view, so on a
+stale index each commit's view held the previous one, and dropping the chain after tens of
+thousands of commits overflowed the stack. A staged change computed before a change of the
+index's configuration is computed again at publication. A panic while a commit's changes
+are staged poisons the writer, because the commit's record is already in the log and no
+fence would cover it.
 
 **Embedding work.** `publish_group_prefix` calls `embed_noted` for each commit after its
 snapshot is published, not before as section 17.3 orders it. The worker then reads the
@@ -1165,7 +1193,9 @@ had not yet published report `Poisoned`, although they are durable, as section 1
 **Text recovery.** `Recovery::record` was left unchanged. A pending recovery job keeps
 every commit out of the group with `text-recovering`, so the job never sees a grouped
 commit and needs no record at publication. A debug assertion before each compaction's
-text checkpoint checks that the index holds no commit above the published head.
+text checkpoint checks that the index holds no commit above the published head, unless
+the group failed, since a leader that fails between the apply and the publication leaves
+one durable commit applied but unpublished.
 
 **Tests.** `store/group_index_tests.rs` has one test for each new fallback reason, tests
 that a staged text change reaches the live index only after its fence and that a search on
@@ -1191,9 +1221,18 @@ replays them into each crash image, with a directory sync making them durable. T
 full-text index's atomic metadata writes now rename through `std::fs::rename`, so the shim
 sees them. `crash_images_of_a_dataset_with_full_text_search` checks each image's text
 checkpoint against the recovered head and text search results against a scan, with
-grouping on and off. `scripts/power-loss.sh` and `scripts/crash-harness.rs` take
-`--index text|geo|embed`, and after each crash `crash-harness verify` checks a sample of
-receipts through a text or spatial query, or the embedding index's applied commit.
+grouping on and off. Its writer checkpoints the index at every fence before the
+synchronization and from a side thread, and the test requires an image whose checkpoint
+names a commit of the run and a recorded rename of `meta.json`. Applying text changes
+before their fence makes it fail. The first version took no checkpoint during its short
+run, so every image held the setup's checkpoint, which a review found. The module comment
+lists the limits of the shim's model of directory operations. `scripts/power-loss.sh` and
+`scripts/crash-harness.rs` take `--index text|geo|embed`, and after each crash
+`crash-harness verify` checks a sample of receipts through a text or spatial query, or the
+embedding index's applied commit. Before anything opens the store, which would rebuild an
+index found ahead of the log, `verify --index text` reads the commit that the checkpoint
+names and fails when it is above the head or when `sparkles check` reports the index ahead
+of the data.
 
 **Crash runs.** On 2026-10-18 the `kill9` mode of `scripts/power-loss.sh` ran 200 kills
 with each index on a new ext4 and a new XFS file system of an 8-vCPU Namespace instance,
@@ -1226,14 +1265,32 @@ Namespace screens of every index against origin/main and against `--no-group-com
 With 4 ms added to every synchronization on the 10.5M-triple dataset, four writers ran
 2.0 to 2.2 times and sixteen writers 7.7 to 8.5 times the transactions per second of
 origin/main, where every commit fell back, and none fell back after the change. Serial p50
-and p90 stayed within 3.2% of grouping off. The gates of section 17.9 are defined on
-`forge`, which item 1's benchmarks held while this phase was built, so they have not run.
-The text and spatial query latency during a four-writer load was not measured, because
-`write-bench` reads with a count query.
+and p90 stayed within 3.2% of grouping off. On the instances' own synchronization of about
+0.1 ms, four writers with the full-text index ran at 1.005 times grouping off, below the
+gate of 1.5, and sixteen writers at 1.6 times. The gates of section 17.9 are defined on
+`forge`, which item 1's benchmarks held while this phase was built, so they have not run,
+and Namespace effects under about 5% do not settle a gate. The text and spatial query
+latency during a four-writer load was not measured, because `write-bench` reads with a
+count query. The spatial screens had no geometries, and the embedding screens ran with
+`--no-embedding`, so neither measured the cost of the index's own work.
 
 **Memory.** With four writers, the servers' peak resident memory with grouping on was
 within 5 MiB of grouping off for every index. With sixteen writers it was 15 MiB higher
 with the full-text index, 18 MiB higher with the embedding index and 21 MiB higher with the
 spatial index. That is the memory the speculative views, staged documents and queued
-commits cost in exchange for the throughput above, and it is within the 64 MiB of section
-17.9.
+commits cost in exchange for the throughput above. The four-writer figure is the one the
+64 MiB gate of section 17.9 names, and it was measured on Namespace, not `forge`. The
+screens used short literals, and the staged documents are bounded in number, not in bytes,
+as section 17.7 now says.
+
+**Open under item 86.** The gates of section 17.9 run on `forge` after item 1's runs
+there, with the text and spatial query latency under a four-writer load, a spatial dataset
+with geometries and an embedding index whose worker runs. Until they pass the item stays
+partly done, or the user amends a gate as for Phase 3. Three findings of the review are
+deferred to that work. Staged documents could count their bytes in the queue's limit,
+since a queue of long literals now holds more than 4 MiB of them. The leader applies a
+prefix's text changes, a Tantivy commit included when the batch is full, while its fence
+is still active, which delays the next fence and is question 4 of section 17.10, and the
+text p99 gate will show whether it needs its own thread. The model test has no write
+transaction that searches text, so the wait of a search on a speculative head has only
+unit tests.

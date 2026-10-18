@@ -317,6 +317,12 @@ that work by priority and links each item to its design spec.
   rules for the bytes it already holds. A torn record that an older build left there can
   still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3 and
   [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
+* Group commit on datasets with a full-text, spatial or embedding index has passed its
+  crash runs, but its performance gates have not run on `forge`. Only Namespace screens
+  exist, which show the gain on a device with 4 ms synchronizations and none for four
+  writers on the instances' own fast synchronization. The latency of full-text and spatial
+  queries during a write load has not been measured. [Roadmap](ROADMAP.md) item 86 and
+  [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates).
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
