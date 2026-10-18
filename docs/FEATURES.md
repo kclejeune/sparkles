@@ -43,9 +43,10 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
   the Node and Python bindings take a `groupCommit` and a `group_commit` option. The JVM
   library follows the default and has no option. A persistent dataset holds up to 64
   commits or 4 MiB of log records in its queue, plus the speculative snapshots of the
-  commits in flight, which is the memory this speed costs. It takes SPARQL updates, Graph Store writes,
-  uploads, RDF Patch, commit messages and change digests, preconditions, graph-restricted
-  writes, SHACL-guarded writes and writes during a compaction. ShEx-guarded datasets commit
+  commits in flight, which is the memory this speed costs. The size of those snapshots was
+  not measured. It takes SPARQL updates, Graph Store writes, uploads, RDF Patch, commit
+  messages and change digests, preconditions, graph-restricted writes, SHACL-guarded
+  writes and writes during a compaction. ShEx-guarded datasets commit
   through the group path one commit at a time. A commit that does not qualify takes the
   ordinary path. Commits on a dataset with a full-text, spatial or embedding index are such
   commits. A commit by the only writer, with no fence running, is synchronized as the
