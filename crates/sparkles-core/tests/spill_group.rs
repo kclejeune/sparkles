@@ -173,3 +173,115 @@ fn spilled_distinct_emits_each_row_once() {
         assert_eq!(spill.reserved_bytes(), 0, "{q}");
     }
 }
+
+/// The rows of `q` in the order the cursor gives them.
+fn run_in_order(
+    s: &Store,
+    q: &str,
+    memory: u64,
+    spill: Option<Arc<Spill>>,
+) -> Result<Vec<String>, Error> {
+    let opts = QueryOptions {
+        max_memory_bytes: Some(memory),
+        spill,
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 1000,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let mut c = select_cursor(s.snapshot(), q, &opts, &cursor)?;
+    let mut rows = Vec::new();
+    while let Some(b) = c.next_batch()? {
+        for i in 0..b.len() {
+            rows.push(format!("{:?}", b.row(i).unwrap()));
+        }
+    }
+    Ok(rows)
+}
+
+/// A DISTINCT above an ORDER BY never sends rows to a later pass, since rows read back
+/// from disk would come after rows that sort after them. It keeps every row in its set
+/// and fails on memory when the set does not fit, rather than answer out of order.
+#[test]
+fn distinct_over_order_by_keeps_the_order_or_fails() {
+    let s = store(20_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    for q in [
+        "SELECT DISTINCT ?s { { ?s <urn:p> ?v } UNION { ?s <urn:t> ?t } } ORDER BY ?s",
+        "SELECT DISTINCT ?s ?v { { ?s <urn:p> ?v } UNION { ?s <urn:p> ?v } } \
+         ORDER BY DESC(?v) ?s",
+        "SELECT DISTINCT ?s ?v { { ?s <urn:p> ?v } UNION { ?s <urn:p> ?v } } \
+         ORDER BY DESC(?v) ?s LIMIT 5 OFFSET 30000",
+        "SELECT ?s { { SELECT DISTINCT ?s { { ?s <urn:p> ?v } UNION { ?s <urn:t> ?t } } \
+         ORDER BY ?s LIMIT 10 OFFSET 15000 } }",
+    ] {
+        let expected: Vec<String> = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .rows()
+            .into_iter()
+            .map(|r: Vec<Option<Term>>| format!("{r:?}"))
+            .collect();
+        for memory in [256 << 10, 64 << 20] {
+            match run_in_order(&s, q, memory, Some(spill.clone())) {
+                Ok(rows) => {
+                    let first = rows.iter().zip(&expected).position(|(a, b)| a != b);
+                    assert_eq!(
+                        (rows.len(), first),
+                        (expected.len(), None),
+                        "{q} under {memory} bytes"
+                    );
+                }
+                Err(Error::BudgetExceeded(b)) => {
+                    assert_eq!(b.kind, BudgetKind::Memory, "{q}");
+                    assert!(memory < 64 << 20, "{q} fails with room to spare");
+                }
+                Err(e) => panic!("{q}: {e}"),
+            }
+        }
+        assert_eq!(spill.reserved_bytes(), 0, "{q}");
+    }
+}
+
+/// GROUP_CONCAT joins a group's values in the order its input gives them, so an ordered
+/// subquery orders the concatenation, as in Jena. A streamed grouping keeps that order
+/// whether it fits in memory or passes groups to later passes.
+#[test]
+fn group_concat_follows_an_ordered_subquery_in_every_mode() {
+    let s = store(20_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    for q in [
+        "SELECT ?s (GROUP_CONCAT(STR(?v); separator=\",\") AS ?all) \
+         { { SELECT ?s ?v { ?s <urn:p> ?v } ORDER BY DESC(?v) } } GROUP BY ?s",
+        "SELECT ?s (GROUP_CONCAT(STR(?v); separator=\",\") AS ?all) \
+         { { SELECT ?s ?v { ?s <urn:p> ?v } ORDER BY ?v } } GROUP BY ?s",
+    ] {
+        let expected = eager(&s, q);
+        // Every concatenation of the eager answer is in the subquery's order.
+        let descending = q.contains("DESC");
+        let mut checked = 0;
+        for row in &expected {
+            let start =
+                row.find("String(\"").unwrap_or_else(|| panic!("{row}")) + "String(\"".len();
+            let all = &row[start..start + row[start..].find('"').unwrap()];
+            let values: Vec<i64> = all.split(',').map(|v| v.parse().unwrap()).collect();
+            let mut sorted = values.clone();
+            sorted.sort_unstable();
+            if descending {
+                sorted.reverse();
+            }
+            assert_eq!(values, sorted, "{q}: {row}");
+            checked += usize::from(values.len() > 1 && values[0] != values[values.len() - 1]);
+        }
+        assert!(checked > 1000, "{q}");
+        for (memory, spill) in [(64 << 20, None), (MEMORY, Some(spill.clone()))] {
+            let spills = spill.is_some();
+            let (rows, plan) = run(&s, q, memory, spill).unwrap();
+            assert_eq!(rows, expected, "{q} under {memory} bytes");
+            assert_eq!(plan.contains("\"spillPasses\""), spills, "{q}: {plan}");
+        }
+    }
+}

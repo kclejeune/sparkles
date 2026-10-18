@@ -79,7 +79,14 @@ const PARTITIONS: usize = 16;
 const MIN_PASS_BYTES: u64 = 256 << 10;
 
 impl Distinct {
-    pub(super) fn new(ctx: &Ctx, vars: &[VarId], input_order: &[VarId]) -> Result<Self> {
+    /// `value_ordered` tells that the input is in an order that operator orders do not
+    /// record, such as an ORDER BY's, which forbids passing rows to later passes.
+    pub(super) fn new(
+        ctx: &Ctx,
+        vars: &[VarId],
+        input_order: &[VarId],
+        value_ordered: bool,
+    ) -> Result<Self> {
         let adjacent = !vars.is_empty() && vars.iter().all(|v| input_order.contains(v));
         let base = 256 + vars.len() as u64 * 8;
         Ok(Self {
@@ -91,7 +98,7 @@ impl Distinct {
             bytes: base,
             base,
             // Rows read back from disk come last, which only unordered input allows.
-            query: if adjacent || vars.is_empty() || !input_order.is_empty() {
+            query: if adjacent || vars.is_empty() || !input_order.is_empty() || value_ordered {
                 None
             } else {
                 ctx.spill.clone()

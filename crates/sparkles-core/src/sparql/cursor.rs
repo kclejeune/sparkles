@@ -1733,6 +1733,33 @@ fn ranked(kind: &Kind) -> bool {
     )
 }
 
+/// Whether the rows of `node` come in an order a caller observes that operator orders
+/// do not record, such as an ORDER BY's or a ranking's, through the operators that pass
+/// rows on in their input's order. A DISTINCT over such rows must not pass rows to a
+/// later pass, which would emit them after rows that come after them.
+fn value_ordered(node: &Node) -> bool {
+    let mut node = node;
+    loop {
+        if ranked(&node.kind) {
+            return true;
+        }
+        match &node.kind {
+            Kind::Project(_)
+            | Kind::Distinct
+            | Kind::Filter(_)
+            | Kind::Extend(..)
+            | Kind::Assign(..)
+            | Kind::Slice { .. }
+                if node.children.len() == 1 =>
+            {
+                node = &node.children[0]
+            }
+            Kind::Union if node.children.len() == 1 => node = &node.children[0],
+            _ => return false,
+        }
+    }
+}
+
 /// The order an operator's output keeps, from its plan node (whose children are
 /// shells carrying the order of their operators) and its child operators.
 fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
@@ -1843,6 +1870,8 @@ impl Operator {
         }
         info.actual_rows = 0;
         let vars = node.vars.clone();
+        // Read before the children below become shells that keep only their order.
+        let value_ordered_input = node.children.first().is_some_and(value_ordered);
         // A fallback materializes only its own operator when it reads its children as
         // input tables. Those children then stream as cursors of their own.
         let inputs = materializes
@@ -2029,6 +2058,7 @@ impl Operator {
                     ctx,
                     &node.vars,
                     &children[0].order,
+                    value_ordered_input,
                 )?),
                 Kind::Slice { offset, limit } => State::Slice {
                     offset: *offset,
