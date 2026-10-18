@@ -1239,6 +1239,50 @@ inside the cursor. EXISTS and DESCRIBE still read their whole input first. The e
 join that read larger input batches, so that it seeks its index less often, was tried
 and set aside unmeasured, since automatic execution runs those joins eagerly.
 
+### Parallel cursor filters (2026-10-18)
+
+A cursor FILTER over an index scan now reads the scan itself in morsels of whole index
+blocks and filters each morsel in parallel, as eager execution filters a whole scan. The
+filter chooses morsels on its first read when eager execution would filter the same scan
+by key runs, the scan reads only immutable blocks over exact key ranges, the first demand
+is at least 4,096 rows, and some conjunct of the filter reads only the scan's first free
+key column. The Rayon tasks of a morsel each take a piece of a block. A task gathers the
+piece's distinct values of that column, tests each once, either against the vocabulary
+through a key filter or through the expression cache for inline values, and gathers the
+rows that pass without branches. The other conjuncts run on each output batch. Morsels
+follow the filter's input size, from 32,768 rows up to 262,144, and only those parts of
+a morsel that a STRSTARTS prefix range can match are read. Output keeps the scan's
+order, so a LIMIT stops after the morsel that fills it.
+
+Each worker keeps its own copy of the key filter in a pool that lives as long as the
+cursor. A copy of a regular expression filter starts with a cold matching cache, and
+copying the filter for each morsel kept the regular expression query slower streamed
+than eager at eight threads. When the row budget or the memory ledger no longer has room
+for a block, the filter hands the rest of the scan back to the scan's own batches from the
+next unread block.
+
+A morsel charges its input columns, the passing rows it holds until they are written and
+a scratch area of 32 bytes per block row for each worker. On an 8-vCPU AMD EPYC Namespace
+instance at 10.5M the cursor's ledger peaked at 13.5 MB for the CONTAINS filter with
+eight threads, against 11.8 MB before and 15.6 MB eagerly, and at 5.2 MB with one
+thread. More threads hold more morsel scratch at once, which is the memory this speed
+costs.
+
+Two designs were measured before this one. Reading each morsel in three parallel passes
+with a barrier after each was slower than eager execution at eight threads. Copying the
+rows of each run of equal values was slow for a column whose runs are mostly one row
+long, such as language-tagged names. The single pass over distinct values replaced both.
+
+The table gives the streaming time divided by the eager time at 10.5M on the same
+instance, the median of seven rounds, reading every row. The base is 5c73ced6.
+
+| Ratio of streaming to eager | Base, 8 threads | Now, 8 threads | Base, 1 thread | Now, 1 thread |
+|---|---:|---:|---:|---:|
+| CONTAINS on names, 49,837 rows | 1.95 | **0.91** | **0.95** | 1.00 |
+| REGEX on subject IRIs, 1,000 rows | 2.11 | 1.08 | 1.14 | 1.15 |
+| STRSTARTS on names, 49,837 rows | 7.99 | **0.94** | 2.98 | **0.90** |
+| LANGMATCHES on titles, 500,000 rows | 1.48 | **0.95** | **0.84** | **0.88** |
+
 ### Large basic graph patterns
 
 [ROADMAP](../ROADMAP.md) item 84. The planner joins the triple patterns of a basic graph

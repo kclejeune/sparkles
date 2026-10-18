@@ -1704,6 +1704,26 @@ grouping held 38 MB against 130 MB eagerly and took 1.5 to 1.7 times as long, an
 at 16 MiB 4.4 MB at 1.7 times the eager time. A budget near a tenth of the state's size
 thus costs 1.7 to 2.8 times the time, and one near half of it costs little.
 
+<a id="parallel-cursor-filters"></a>
+
+**Parallel cursor filters.** On 2026-10-18 a cursor filter over an index scan began to
+read the scan in morsels of whole blocks and filter each morsel in parallel
+([X05](specs/X05-streaming-query-execution.md#parallel-cursor-filters-2026-10-18)). The
+probe binary interleaved eager and cursor runs over 10.5M triples on an 8-vCPU AMD EPYC
+Namespace instance, reading every row. The table gives the cursor's time divided by the
+eager time, the median of seven rounds, against 5c73ced6.
+
+| Ratio of streaming to eager | 5c73ced6, 8 threads | 2026-10-18, 8 threads | 5c73ced6, 1 thread | 2026-10-18, 1 thread |
+|---|---:|---:|---:|---:|
+| CONTAINS on names, 49,837 rows | 1.95 | **0.91** | **0.95** | 1.00 |
+| REGEX on subject IRIs, 1,000 rows | 2.11 | 1.08 | 1.14 | 1.15 |
+| STRSTARTS on names, 49,837 rows | 7.99 | **0.94** | 2.98 | **0.90** |
+| LANGMATCHES on titles, 500,000 rows | 1.48 | **0.95** | **0.84** | **0.88** |
+
+The cursor's ledger peaked at 13.5 MB for the CONTAINS filter with eight threads, against
+11.8 MB before and 15.6 MB eagerly, and at 5.2 MB with one thread, since each worker holds
+its own morsel scratch.
+
 The JVM library also runs in automatic mode by default since 2026-10-17. In the binding
 comparison of `scripts/bench-bindings` at 1.05M on forge, with every case run twice in
 each mode in alternating processes, the JNI export of 500,000 rows took 130 ms against

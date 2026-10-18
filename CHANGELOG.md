@@ -75,6 +75,13 @@ order than an eager one, which SPARQL allows, and an ordered subquery fixes the 
 both. Rust callers set
 `QueryOptions::spill` and `max_spill_bytes`, and `BudgetKind::Spill` is a new variant.
 
+A streamed FILTER over an index scan reads the scan in morsels of whole index blocks and
+filters each morsel in parallel when a conjunct reads only the scan's key column, and a
+STRSTARTS filter reads only the blocks its prefix can match. At 10.5M with eight threads,
+CONTAINS, STRSTARTS and LANGMATCHES filters over names and titles now take 0.91 to 0.95
+times their eager time, where they took 1.48 to 7.99 times. More threads hold more morsel
+scratch at once, 13.5 MB in the ledger at eight threads against 11.8 MB before.
+
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server
 refuses until `sparkles migrate` runs without `--check`, and its JSON report adds `opens`.
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as

@@ -1530,7 +1530,7 @@ fn whole_range(spec: &ScanSpec) -> (Key, Key) {
 /// the base-vocabulary ids of the keys with that start, and every id outside the base
 /// vocabulary (inline values, terms added by updates), which are tested as usual.
 /// Otherwise the whole scan.
-fn key_ranges(
+pub(super) fn key_ranges(
     ctx: &Ctx,
     spec: &ScanSpec,
     kf: Option<&super::keyfilter::KeyFilter>,
@@ -1897,6 +1897,166 @@ fn filter_scan_runs(
         rest,
         read,
         note,
+    }))
+}
+
+/// The variable of a scan's first free key column and the FILTER conjuncts that read only
+/// it, which [`filter_scan_morsel`] tests once per run of its values, with the other
+/// conjuncts. `None` when the first free column does not follow the bound prefix, when
+/// union-graph dedup compares neighbouring rows or when no conjunct reads only that
+/// variable.
+pub(super) fn run_filter_split(
+    spec: &ScanSpec,
+    exprs: &[Expr],
+) -> Option<(VarId, Vec<Expr>, Vec<Expr>)> {
+    let &(kc, key) = spec.cols.first()?;
+    if spec.dedup || exprs.is_empty() || kc != spec.prefix.len() {
+        return None;
+    }
+    let (on_key, rest): (Vec<Expr>, Vec<Expr>) = exprs
+        .iter()
+        .cloned()
+        .partition(|e| super::exprcache::input(&[e]) == Ok(Some(key)));
+    (!on_key.is_empty()).then_some((key, on_key, rest))
+}
+
+/// The columns a task of [`filter_scan_morsel`] copied out, one per output variable.
+pub(super) type MorselPart = Vec<Vec<Id>>;
+
+/// One morsel of a cursor's FILTER over a scan: the rows of the scan in the key `ranges`
+/// (sorted, disjoint and within the scan) whose first free key column, bound to `key`,
+/// passes the key filter `kf` of the conjuncts `on_key`, whose copies `filters` keeps
+/// between tasks and morsels. Each parallel task takes a piece
+/// of an index block, finds the runs of the column's values, tests each run's value once
+/// on its vocabulary key and copies the rows of the runs that pass, so the morsel is read,
+/// tested and copied in one pass. Values outside the base vocabulary are tested as
+/// [`super::exprcache::filter_values`] tests them. Output column `i` is read from key
+/// column `cols[i]`. Returns the parts in key order and the rows read, or `None` when
+/// the delta has keys in a range.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn filter_scan_morsel(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    cols: &[usize],
+    key: VarId,
+    on_key: &[Expr],
+    kf: &super::keyfilter::KeyFilter,
+    filters: &parking_lot::Mutex<Vec<super::keyfilter::KeyFilter>>,
+    ranges: &[(Key, Key)],
+) -> Result<Option<(Vec<MorselPart>, u64)>> {
+    use crate::id::Tag;
+    let kc = spec.cols[0].0;
+    let vocab = &ctx.snap.generation.vocab;
+    let width = cols.len();
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        ranges,
+        scan_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            let mut out: MorselPart = vec![Vec::new(); width];
+            if s >= e {
+                return Ok((out, 0));
+            }
+            // The rows of the piece that pass the scan's graph filter and repeated
+            // variable checks, when not all of them do.
+            let sel: Option<Vec<u32>> = (!block_passes(spec, b, s, e)).then(|| {
+                (s..e)
+                    .filter(|&i| {
+                        let k = b.key(i);
+                        spec.graph.accepts(k[spec.graph_col])
+                            && spec.eqs.iter().all(|&(x, y)| k[x] == k[y])
+                    })
+                    .map(|i| i as u32)
+                    .collect()
+            });
+            let col = &b.cols[kc];
+            let n = sel.as_ref().map_or(e - s, Vec::len);
+            let row = |j: usize| sel.as_ref().map_or(s + j, |v| v[j] as usize);
+            let _scratch = ctx.charge((n as u64).saturating_mul(24).saturating_add(1024))?;
+            // The distinct values of the sorted column, in order. Raw ids sort by tag, so
+            // the base-vocabulary values are one stretch of them.
+            let mut values: Vec<u64> = Vec::new();
+            for j in 0..n {
+                let v = col[row(j)];
+                if values.last() != Some(&v) {
+                    values.push(v);
+                }
+            }
+            let lo = values.partition_point(|&v| Id(v).tag() < Tag::Vocab);
+            let hi = lo + values[lo..].partition_point(|&v| Id(v).tag() == Tag::Vocab);
+            let payloads: Vec<u64> = values[lo..hi].iter().map(|&v| Id(v).payload()).collect();
+            let mut pass = vec![false; values.len()];
+            // A copy of the filter per task: tasks sharing a regular expression contend
+            // for its match caches. The copies are kept for later tasks, whose regular
+            // expressions then start with warm caches.
+            let kf = filters.lock().pop().unwrap_or_else(|| kf.clone());
+            let scratch = ctx.charge(0)?;
+            let mut reserved = 0;
+            let mut at = 0;
+            vocab.get_sorted_checked(
+                &payloads,
+                |need| {
+                    ctx.check()?;
+                    let bytes = (need as u64).saturating_mul(2);
+                    scratch.add(bytes.saturating_sub(reserved))?;
+                    reserved = bytes;
+                    Ok::<(), Error>(())
+                },
+                |p, k| {
+                    while payloads[at] != p {
+                        at += 1;
+                    }
+                    pass[lo + at] = kf.test(k);
+                    Ok::<(), Error>(())
+                },
+            )?;
+            drop(payloads);
+            filters.lock().push(kf);
+            if lo > 0 || hi < values.len() {
+                let other: Vec<Id> = values[..lo]
+                    .iter()
+                    .chain(&values[hi..])
+                    .map(|&v| Id(v))
+                    .collect();
+                let (hit, _) = super::exprcache::filter_values(ctx, &other, key, on_key)?;
+                for (i, h) in (0..lo).chain(hi..values.len()).zip(hit) {
+                    pass[i] = h;
+                }
+            }
+            // The passing rows, gathered without a branch per row, then each column.
+            let mut at: Vec<u32> = vec![0; n];
+            let mut w = 0;
+            let mut k = 0;
+            for j in 0..n {
+                let i = row(j);
+                if col[i] != values[k] {
+                    k += 1;
+                }
+                at[w] = i as u32;
+                w += usize::from(pass[k]);
+            }
+            at.truncate(w);
+            if w > 0 {
+                for (to, &from) in out.iter_mut().zip(cols) {
+                    let column = &b.cols[from];
+                    to.extend(at.iter().map(|&i| Id(column[i as usize])));
+                }
+            }
+            ctx.check()?;
+            Ok((out, n as u64))
+        },
+    )?;
+    Ok(parts.map(|parts| {
+        let read = parts.iter().map(|p| p.1).sum();
+        (
+            parts
+                .into_iter()
+                .filter(|p| p.0.first().is_some_and(|c| !c.is_empty()))
+                .map(|p| p.0)
+                .collect(),
+            read,
+        )
     }))
 }
 

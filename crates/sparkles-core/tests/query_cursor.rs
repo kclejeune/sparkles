@@ -3883,3 +3883,69 @@ fn decoding_ahead_with_growing_batches_under_tight_budgets() {
         "decoding ahead failed at {mismatches:?} KiB"
     );
 }
+
+/// The rows the leaf scan of a cursor plan read.
+fn leaf_rows(plan: &sparkles_core::sparql::CursorPlan) -> i64 {
+    match plan.children.first() {
+        Some(child) => leaf_rows(child),
+        None => plan.operator.actual_rows,
+    }
+}
+
+/// A filter over a scan on the variable it tests reads the scan in morsels of whole
+/// blocks, in parallel, and answers what eager execution answers in the same order:
+/// across block and morsel boundaries, under a small LIMIT and OFFSET, with a fixed start
+/// that skips whole key ranges, and when the row budget hands the rest of the scan back
+/// to the scan's own batches partway.
+#[test]
+fn morsel_filters_over_scans_match_eager_in_order() {
+    let s = named(150_000);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let queries = [
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) }",
+        "SELECT ?n ?s WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"9\")) }",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(STRSTARTS(?n, \"Ada 1\")) }",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(REGEX(STR(?s), \"s:1[0-9]{3}$\")) }",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) } LIMIT 3",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) } OFFSET 40000 LIMIT 5000",
+        "SELECT ?s WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"nobody\")) }",
+    ];
+    for q in queries {
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for (opts, batch) in [
+            (QueryOptions::default(), 4096),
+            (QueryOptions::default(), 100_000),
+            (without("filter_scan_runs"), 4096),
+            (without("grow_input"), 5000),
+            (
+                QueryOptions {
+                    max_rows: Some(160_000),
+                    ..Default::default()
+                },
+                4096,
+            ),
+        ] {
+            let c = select_cursor(s.snapshot(), q, &opts, &options(batch)).unwrap();
+            let rows = pool.install(|| all(c));
+            assert_eq!(rows, eager, "{q} at {batch} rows");
+        }
+    }
+    // A fixed start reads only the key ranges that can pass, which the scan's own
+    // batches do not skip.
+    let q = queries[2];
+    let read = |opts: &QueryOptions| {
+        let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+        while c.next_batch().unwrap().is_some() {}
+        leaf_rows(c.plan())
+    };
+    assert!(read(&QueryOptions::default()) < 150_000 / 7);
+    assert_eq!(read(&without("filter_scan_runs")), 150_000);
+    // A small first demand keeps the scan's own batches.
+    let limited = format!("{} LIMIT 2", queries[0]);
+    let mut c = select_cursor(s.snapshot(), &limited, &Default::default(), &options(4096)).unwrap();
+    while c.next_batch().unwrap().is_some() {}
+    assert!(leaf_rows(c.plan()) < 1000, "{}", leaf_rows(c.plan()));
+}
