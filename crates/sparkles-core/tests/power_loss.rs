@@ -13,7 +13,14 @@
 //!    synchronization or a write-through (`O_DSYNC`) write that had not returned may have
 //!    covered nothing. Every image must open, hold a prefix of the commits that includes
 //!    every commit acknowledged before the crash, pass `sparkles check`, and take a new
-//!    write at the next sequence number.
+//!    write at the next sequence number. The shim also records the creation, renaming and
+//!    unlinking of files. Such an operation is durable once a synchronization of its
+//!    directory has returned, and of those that are not, an image keeps a prefix, as a
+//!    file system that journals its metadata in order would.
+//!    `crash_images_of_a_dataset_with_full_text_search` runs the same images on a dataset
+//!    with full-text search, whose index replaces its metadata file by a rename, and checks
+//!    that the index never names a commit above the recovered log and that its results
+//!    match the recovered data (X09 section 17.8).
 //!  * `failed_synchronizations_*` fail one call and check that every commit that was not
 //!    acknowledged fails, that nothing past the last acknowledged commit is published, and
 //!    that the store reopens to a prefix that holds every acknowledged commit.
@@ -239,7 +246,7 @@ fn copy_dir(from: &Path, to: &Path) {
 /// Prepare a store of `base` commits, copy it to `base-db`, and run the writer on the
 /// original under the shim, recording its I/O when `record` is set and failing the calls
 /// named by `fault`.
-fn run_writer(name: &str, cfg: Config, base: u32, record: bool, fault: &str) -> Run {
+fn run_writer(name: &str, cfg: Config, base: u32, record: bool, fault: &str, text: bool) -> Run {
     let root = work_root().join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("ack")).unwrap();
@@ -247,6 +254,11 @@ fn run_writer(name: &str, cfg: Config, base: u32, record: bool, fault: &str) -> 
     {
         let s = Store::open(&db, StoreOptions::default()).unwrap();
         base_commit(&s, base);
+        // the writer opens the full-text index from its checkpoint and maintains it
+        if text {
+            #[cfg(feature = "text")]
+            s.enable_text(Default::default()).unwrap();
+        }
     }
     copy_dir(&db, &root.join("base-db"));
     let mut cmd = Command::new(std::env::current_exe().unwrap());
@@ -312,6 +324,16 @@ enum Rec {
         path: String,
         failed: bool,
     },
+    Rename {
+        path: String,
+        to: String,
+    },
+    Unlink {
+        path: String,
+    },
+    Create {
+        path: String,
+    },
 }
 
 fn parse_log(buf: &[u8]) -> Vec<Rec> {
@@ -350,6 +372,13 @@ fn parse_log(buf: &[u8]) -> Vec<Rec> {
                 path,
                 failed: flag == 1,
             },
+            6 => {
+                let to = String::from_utf8_lossy(&buf[p..p + len as usize]).to_string();
+                p += len as usize;
+                Rec::Rename { path, to }
+            }
+            7 => Rec::Unlink { path },
+            8 => Rec::Create { path },
             k => panic!("unknown record kind {k}"),
         });
     }
@@ -379,13 +408,76 @@ struct FileModel {
     covered: Vec<usize>,
 }
 
+enum DirKind {
+    Create,
+    Rename(String),
+    Unlink,
+}
+
+/// A directory operation: durable once a synchronization of its directory that began
+/// after it succeeds.
+struct DirOp {
+    kind: DirKind,
+    path: String,
+    state: State,
+}
+
+impl DirOp {
+    /// The directory whose synchronization makes the operation durable: the new name's
+    /// for a rename.
+    fn dir(&self) -> &str {
+        let p = match &self.kind {
+            DirKind::Rename(to) => to,
+            _ => &self.path,
+        };
+        Path::new(p).parent().and_then(Path::to_str).unwrap_or("")
+    }
+}
+
+/// One step of the replay, in the order the process issued it.
+enum Ev {
+    /// the `n`th operation on a file's data
+    Data(String, usize),
+    /// the `n`th directory operation
+    Dir(usize),
+}
+
 /// The files of the store as the writer process left them in the page cache and on the
 /// device, rebuilt record by record.
 struct Model {
     files: BTreeMap<String, FileModel>,
+    dirs: Vec<DirOp>,
+    /// per directory, the directory operations its running synchronization covers
+    dir_covered: BTreeMap<String, Vec<usize>>,
+    events: Vec<Ev>,
 }
 
 impl Model {
+    fn new() -> Model {
+        Model {
+            files: BTreeMap::new(),
+            dirs: Vec::new(),
+            dir_covered: BTreeMap::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn push_op(&mut self, path: &str, op: Op) {
+        let f = self.files.entry(path.to_string()).or_default();
+        f.ops.push(op);
+        self.events
+            .push(Ev::Data(path.to_string(), f.ops.len() - 1));
+    }
+
+    fn push_dir(&mut self, kind: DirKind, path: &str) {
+        self.dirs.push(DirOp {
+            kind,
+            path: path.to_string(),
+            state: State::Pending,
+        });
+        self.events.push(Ev::Dir(self.dirs.len() - 1));
+    }
+
     fn apply(&mut self, r: &Rec) {
         match r {
             Rec::Write {
@@ -393,13 +485,16 @@ impl Model {
                 off,
                 data,
                 dsync,
-            } => self.files.entry(path.clone()).or_default().ops.push(Op {
-                off: *off,
-                data: Some(data.clone()),
-                state: State::Pending,
-                dsync: *dsync,
-                returned: false,
-            }),
+            } => self.push_op(
+                path,
+                Op {
+                    off: *off,
+                    data: Some(data.clone()),
+                    state: State::Pending,
+                    dsync: *dsync,
+                    returned: false,
+                },
+            ),
             Rec::WriteEnd { path, off, failed } => {
                 let f = self.files.entry(path.clone()).or_default();
                 if let Some(op) = f
@@ -415,95 +510,239 @@ impl Model {
                     }
                 }
             }
-            Rec::Trunc { path, len } => self.files.entry(path.clone()).or_default().ops.push(Op {
-                off: *len,
-                data: None,
-                state: State::Pending,
-                dsync: false,
-                returned: true,
-            }),
+            Rec::Trunc { path, len } => self.push_op(
+                path,
+                Op {
+                    off: *len,
+                    data: None,
+                    state: State::Pending,
+                    dsync: false,
+                    returned: true,
+                },
+            ),
             Rec::Sync { path } => {
                 let f = self.files.entry(path.clone()).or_default();
                 f.covered = (0..f.ops.len())
                     .filter(|i| f.ops[*i].returned && f.ops[*i].state == State::Pending)
                     .collect();
+                let covered = (0..self.dirs.len())
+                    .filter(|i| {
+                        self.dirs[*i].state == State::Pending && self.dirs[*i].dir() == path
+                    })
+                    .collect();
+                self.dir_covered.insert(path.clone(), covered);
             }
             Rec::SyncEnd { path, failed } => {
+                let covered = self.dir_covered.remove(path).unwrap_or_default();
                 if !failed {
                     let f = self.files.entry(path.clone()).or_default();
                     for i in std::mem::take(&mut f.covered) {
                         f.ops[i].state = State::Durable;
                     }
+                    for i in covered {
+                        self.dirs[i].state = State::Durable;
+                    }
                 }
             }
+            Rec::Rename { path, to } => self.push_dir(DirKind::Rename(to.clone()), path),
+            Rec::Unlink { path } => self.push_dir(DirKind::Unlink, path),
+            Rec::Create { path } => self.push_dir(DirKind::Create, path),
         }
     }
 
-    /// The bytes of every tracked file: the base content, then the durable operations,
-    /// then the pending ones that `keep` chooses (or part of them, per 4 KiB page).
-    /// Pending page selections are independent per write, a conservative overapproximation
-    /// that need not describe a coherent physical page or sector snapshot.
+    /// The number of directory operations not yet durable.
+    fn pending_dirs(&self) -> usize {
+        self.dirs
+            .iter()
+            .filter(|d| d.state == State::Pending)
+            .count()
+    }
+
+    /// The files of the store: the base content, then the durable operations, then the
+    /// pending ones that `keep` chooses (or part of them, per 4 KiB page), in the order the
+    /// process issued them. Of the directory operations that are not durable, the first
+    /// `dir_prefix` survive and the rest are lost, as a file system that journals its
+    /// metadata in order keeps a prefix of it. Data written to a file whose creation was
+    /// lost is lost with it. Pending page selections are independent per write, a
+    /// conservative overapproximation that need not describe a coherent physical page or
+    /// sector snapshot.
     fn image(
         &self,
         base: &Path,
         root: &Path,
         out: &Path,
+        dir_prefix: usize,
         mut keep: impl FnMut(&Op) -> Option<Vec<bool>>,
     ) {
         let _ = std::fs::remove_dir_all(out);
         copy_dir(base, out);
-        for (path, f) in &self.files {
-            let Ok(rel) = Path::new(path).strip_prefix(root.join("db")) else {
-                continue;
-            };
-            let target = out.join(rel);
-            // a directory that was only synchronized
-            if f.ops.is_empty() || target.is_dir() {
-                continue;
+        let db = root.join("db");
+        let rel = |p: &str| -> Option<PathBuf> {
+            Path::new(p).strip_prefix(&db).ok().map(Path::to_path_buf)
+        };
+        // the image's files by their path under `out`: `None` once removed
+        let mut ns: BTreeMap<PathBuf, Option<Vec<u8>>> = BTreeMap::new();
+        fn load<'a>(
+            ns: &'a mut BTreeMap<PathBuf, Option<Vec<u8>>>,
+            out: &Path,
+            r: &Path,
+        ) -> &'a mut Option<Vec<u8>> {
+            ns.entry(r.to_path_buf()).or_insert_with(|| {
+                let p = out.join(r);
+                if p.is_file() {
+                    Some(std::fs::read(p).unwrap())
+                } else {
+                    None
+                }
+            })
+        }
+        // every file under `r` that the base copy holds and the map does not yet
+        fn load_tree(ns: &mut BTreeMap<PathBuf, Option<Vec<u8>>>, out: &Path, r: &Path) {
+            let p = out.join(r);
+            if p.is_dir() {
+                for e in std::fs::read_dir(&p).unwrap() {
+                    let e = e.unwrap();
+                    load_tree(ns, out, &r.join(e.file_name()));
+                }
+            } else if p.is_file() {
+                load(ns, out, r);
             }
-            let mut bytes = std::fs::read(&target).unwrap_or_default();
-            for op in &f.ops {
-                let pages = match op.state {
-                    State::Dropped => continue,
-                    State::Durable => None,
-                    State::Pending => match keep(op) {
-                        None => continue,
-                        some => some,
-                    },
-                };
-                match &op.data {
-                    None => bytes.resize(op.off as usize, 0),
-                    Some(d) => {
-                        let end = op.off as usize + d.len();
-                        if bytes.len() < end {
-                            bytes.resize(end, 0);
-                        }
-                        match &pages {
-                            None => bytes[op.off as usize..end].copy_from_slice(d),
-                            Some(chosen) => {
-                                // chosen[i]: the i'th 4 KiB page the write touches
-                                let first = op.off as usize / 4096;
-                                let n = end.div_ceil(4096) - first;
-                                for i in 0..n {
-                                    // an empty list keeps every page
-                                    if !chosen.get(i).copied().unwrap_or(chosen.is_empty()) {
-                                        continue;
+        }
+        let mut pending_dirs = 0usize;
+        // names whose rename was lost: the data the process wrote under the new name
+        // went to the file that is still under the old one
+        let mut alias: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+        // names whose creation was lost
+        let mut lost: std::collections::BTreeSet<PathBuf> = Default::default();
+        for ev in &self.events {
+            match ev {
+                Ev::Data(path, i) => {
+                    let Some(r) = rel(path) else { continue };
+                    let op = &self.files[path].ops[*i];
+                    let pages = match op.state {
+                        State::Dropped => continue,
+                        State::Durable => None,
+                        State::Pending => match keep(op) {
+                            None => continue,
+                            some => some,
+                        },
+                    };
+                    let r = alias.get(&r).cloned().unwrap_or(r);
+                    if lost.contains(&r) || out.join(&r).is_dir() {
+                        continue;
+                    }
+                    let bytes = load(&mut ns, out, &r).get_or_insert_with(Vec::new);
+                    match &op.data {
+                        None => bytes.resize(op.off as usize, 0),
+                        Some(d) => {
+                            let end = op.off as usize + d.len();
+                            if bytes.len() < end {
+                                bytes.resize(end, 0);
+                            }
+                            match &pages {
+                                None => bytes[op.off as usize..end].copy_from_slice(d),
+                                Some(chosen) => {
+                                    // chosen[i]: the i'th 4 KiB page the write touches
+                                    let first = op.off as usize / 4096;
+                                    let n = end.div_ceil(4096) - first;
+                                    for i in 0..n {
+                                        // an empty list keeps every page
+                                        if !chosen.get(i).copied().unwrap_or(chosen.is_empty()) {
+                                            continue;
+                                        }
+                                        let lo = ((first + i) * 4096).max(op.off as usize);
+                                        let hi = ((first + i + 1) * 4096).min(end);
+                                        bytes[lo..hi].copy_from_slice(
+                                            &d[lo - op.off as usize..hi - op.off as usize],
+                                        );
                                     }
-                                    let lo = ((first + i) * 4096).max(op.off as usize);
-                                    let hi = ((first + i + 1) * 4096).min(end);
-                                    bytes[lo..hi].copy_from_slice(
-                                        &d[lo - op.off as usize..hi - op.off as usize],
-                                    );
                                 }
                             }
                         }
                     }
                 }
+                Ev::Dir(i) => {
+                    let d = &self.dirs[*i];
+                    let Some(r) = rel(&d.path) else { continue };
+                    let kept = match d.state {
+                        State::Durable => true,
+                        _ => {
+                            pending_dirs += 1;
+                            pending_dirs <= dir_prefix
+                        }
+                    };
+                    match (&d.kind, kept) {
+                        (DirKind::Create, true) => {
+                            lost.remove(&r);
+                            let f = load(&mut ns, out, &r);
+                            if f.is_none() {
+                                *f = Some(Vec::new());
+                            }
+                        }
+                        (DirKind::Create, false) => {
+                            // a file of the same name that existed before stays
+                            if load(&mut ns, out, &r).is_none() {
+                                lost.insert(r);
+                            }
+                        }
+                        (DirKind::Unlink, true) => {
+                            load_tree(&mut ns, out, &r);
+                            let under: Vec<PathBuf> =
+                                ns.keys().filter(|k| k.starts_with(&r)).cloned().collect();
+                            for k in under {
+                                ns.insert(k, None);
+                            }
+                            ns.insert(r, None);
+                        }
+                        (DirKind::Unlink, false) => {}
+                        (DirKind::Rename(to), true) => {
+                            let Some(to) = rel(to) else { continue };
+                            load_tree(&mut ns, out, &r);
+                            load_tree(&mut ns, out, &to);
+                            // the target is replaced, a directory with its contents
+                            let old: Vec<PathBuf> =
+                                ns.keys().filter(|k| k.starts_with(&to)).cloned().collect();
+                            for k in old {
+                                ns.insert(k, None);
+                            }
+                            let moved: Vec<PathBuf> =
+                                ns.keys().filter(|k| k.starts_with(&r)).cloned().collect();
+                            for k in moved {
+                                let v = ns.insert(k.clone(), None).flatten();
+                                let dest = to.join(k.strip_prefix(&r).unwrap());
+                                ns.insert(dest, v);
+                            }
+                            alias.remove(&to);
+                            if lost.remove(&r) {
+                                lost.insert(to);
+                            }
+                        }
+                        (DirKind::Rename(to), false) => {
+                            if let Some(to) = rel(to) {
+                                alias.insert(to, r);
+                            }
+                        }
+                    }
+                }
             }
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+        }
+        for (r, v) in ns {
+            let p = out.join(&r);
+            match v {
+                Some(bytes) => {
+                    if let Some(parent) = p.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    if p.is_dir() {
+                        std::fs::remove_dir_all(&p).unwrap();
+                    }
+                    std::fs::write(&p, bytes).unwrap();
+                }
+                None if p.is_dir() => std::fs::remove_dir_all(&p).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
-            std::fs::write(&target, bytes).unwrap();
         }
     }
 }
@@ -528,10 +767,73 @@ fn env_num(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The commit the full-text index's metadata names, when it can be read.
+#[cfg(feature = "text")]
+fn text_payload_seq(db: &Path) -> Option<u64> {
+    let meta = std::fs::read(db.join("text/meta.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_slice(&meta).ok()?;
+    let payload: serde_json::Value = serde_json::from_str(meta["payload"].as_str()?).ok()?;
+    payload["seq"].as_u64()
+}
+
+/// Wait for the full-text index of `s` to be ready, then check that a search for the word
+/// every value has finds exactly the subjects that hold one.
+#[cfg(feature = "text")]
+fn check_text(s: &Store, what: &str) {
+    use sparkles_core::sparql::query;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let st = s.text_status().expect("full-text search is configured");
+        if st.state == "ready" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until && st.state == "rebuilding",
+            "{what}: the full-text index is {} ({:?})",
+            st.state,
+            st.message
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let subjects = |q: &str| -> std::collections::BTreeSet<String> {
+        query(s.snapshot(), q, &Default::default())
+            .unwrap_or_else(|e| panic!("{what}: {q}: {e}"))
+            .rows()
+            .into_iter()
+            .filter_map(|r| r[0].as_ref().map(|t| t.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        subjects(
+            "PREFIX text:<http://jena.apache.org/text#> SELECT ?s { ?s text:query \"value\" }"
+        ),
+        subjects("SELECT ?s { ?s <urn:p> ?o }"),
+        "{what}: full-text search after recovery"
+    );
+}
+
 /// Check one image against the commits acknowledged before the crash.
-fn check_image(img: &Path, base: u32, acked: &[(u64, u32, u32)], what: &str) {
+fn check_image(img: &Path, base: u32, acked: &[(u64, u32, u32)], text: bool, what: &str) {
+    // The full-text index's checkpoint never names a commit above the recovered log, so
+    // the index either opens from it and catches up, or is rebuilt when its files were
+    // left unsynced. Either way its results match the recovered data.
+    #[cfg(feature = "text")]
+    let payload = text.then(|| text_payload_seq(img)).flatten();
+    #[cfg(not(feature = "text"))]
+    let _ = text;
     let s = Store::open(img, StoreOptions::default())
         .unwrap_or_else(|e| panic!("{what}: the image does not open: {e}"));
+    #[cfg(feature = "text")]
+    if text {
+        let head = s.snapshot().commit;
+        if let Some(seq) = payload {
+            assert!(
+                seq <= head,
+                "{what}: the text index names {seq}, the log ends at {head}"
+            );
+        }
+        check_text(&s, what);
+    }
     let snap = s.snapshot();
     let head = snap.commit;
     let top = acked
@@ -576,15 +878,13 @@ fn check_image(img: &Path, base: u32, acked: &[(u64, u32, u32)], what: &str) {
     assert_eq!(w.commit().unwrap().commit.seq, head + 1, "{what}");
 }
 
-fn crash_images(name: &str, cfg: Config) {
+fn crash_images(name: &str, cfg: Config, text: bool) {
     let base = 3;
-    let run = run_writer(name, cfg, base, true, "");
+    let run = run_writer(name, cfg, base, true, "", text);
     let log = parse_log(&std::fs::read(run.log()).unwrap());
     let root = run.root.canonicalize().unwrap();
     // the paths in the log are canonical
-    let mut model = Model {
-        files: BTreeMap::new(),
-    };
+    let mut model = Model::new();
     let points = env_num("SPARKLES_POWER_LOSS_POINTS", 60) as usize;
     let stride = (log.len() / points.max(1)).max(1);
     let mut rng = Rng(env_num("SPARKLES_POWER_LOSS_SEED", 0x9e3779b97f4a7c15) | 1);
@@ -607,14 +907,22 @@ fn crash_images(name: &str, cfg: Config) {
         }
         let what = format!("{name}: crash after record {i} of {}", log.len());
         // everything still unsynchronized is lost
-        model.image(&base_db, &root, &img, |_| None);
-        check_image(&img, base, &acked, &format!("{what}, unsynced writes lost"));
+        model.image(&base_db, &root, &img, 0, |_| None);
+        check_image(
+            &img,
+            base,
+            &acked,
+            text,
+            &format!("{what}, unsynced writes lost"),
+        );
         // everything is kept, as after a process crash
-        model.image(&base_db, &root, &img, |_| Some(Vec::new()));
-        check_image(&img, base, &acked, &format!("{what}, nothing lost"));
-        // a random part of what is pending survives, in whole writes or single pages
+        model.image(&base_db, &root, &img, usize::MAX, |_| Some(Vec::new()));
+        check_image(&img, base, &acked, text, &format!("{what}, nothing lost"));
+        // a random part of what is pending survives, in whole writes or single pages, and
+        // a random prefix of the directory operations
         for _ in 0..2 {
-            model.image(&base_db, &root, &img, |op| {
+            let dirs = (rng.next() % (model.pending_dirs() as u64 + 1)) as usize;
+            model.image(&base_db, &root, &img, dirs, |op| {
                 if !rng.coin(50) {
                     return None;
                 }
@@ -627,12 +935,35 @@ fn crash_images(name: &str, cfg: Config) {
                     (0..n).map(|_| rng.coin(50)).collect()
                 })
             });
-            check_image(&img, base, &acked, &format!("{what}, random pages lost"));
+            check_image(
+                &img,
+                base,
+                &acked,
+                text,
+                &format!("{what}, random pages lost"),
+            );
         }
         images += 4;
     }
     assert!(images > 0);
     assert!(!acked.is_empty(), "the writer acknowledged no commit");
+    // the full-text index makes segment files and replaces its metadata by a rename
+    if text {
+        let renames = model
+            .dirs
+            .iter()
+            .filter(|d| matches!(d.kind, DirKind::Rename(_)))
+            .count();
+        let creates = model
+            .dirs
+            .iter()
+            .filter(|d| matches!(d.kind, DirKind::Create))
+            .count();
+        assert!(
+            renames > 0 && creates > 0,
+            "{name}: {renames} renames and {creates} creations recorded"
+        );
+    }
     let _ = std::fs::remove_dir_all(&run.root);
 }
 
@@ -680,7 +1011,40 @@ fn crash_images_keep_every_acknowledged_commit() {
             },
         ),
     ] {
-        crash_images(name, cfg);
+        crash_images(name, cfg, false);
+    }
+}
+
+/// The crash images of a dataset with full-text search (X09 section 17.8). The writer's
+/// commits group, and the full-text index applies them only after their fence. Each image
+/// checks, besides the commits, that the index's checkpoint names no commit above the
+/// recovered log and that full-text search finds exactly the recovered data.
+#[cfg(feature = "text")]
+#[test]
+fn crash_images_of_a_dataset_with_full_text_search() {
+    for (name, cfg) in [
+        (
+            "text-group",
+            Config {
+                group: true,
+                direct: false,
+                idle_direct: false,
+                threads: 4,
+                commits: 25,
+            },
+        ),
+        (
+            "text-ordinary",
+            Config {
+                group: false,
+                direct: false,
+                idle_direct: true,
+                threads: 2,
+                commits: 15,
+            },
+        ),
+    ] {
+        crash_images(name, cfg, true);
     }
 }
 
@@ -794,7 +1158,7 @@ fn a_failed_first_annotation_sync_keeps_later_messages() {
 /// section 4.3.
 fn failed_sync(name: &str, cfg: Config, fault: &str) {
     let base = 3;
-    let run = run_writer(name, cfg, base, false, fault);
+    let run = run_writer(name, cfg, base, false, fault, false);
     let mut acked = Vec::new();
     let (mut head, mut after) = (None, None);
     let mut errors = 0;
