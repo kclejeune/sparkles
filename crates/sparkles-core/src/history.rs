@@ -1063,6 +1063,35 @@ pub(crate) fn remove_newer_generations(root: &Path, current: u32) -> Vec<String>
     removed
 }
 
+/// Remove the regular files of the dataset root whose names end in `.tmp`, and return
+/// their names. Each is the temporary copy of an atomic replacement (`write_atomic`) that
+/// a crash interrupted before or after its rename. The file it was to replace is intact
+/// in either case, so the copy is never needed. Only the open that holds the dataset's
+/// exclusive lock calls this, so no replacement can be in progress.
+pub(crate) fn remove_temp_files(root: &Path) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return removed;
+    };
+    for e in entries.flatten() {
+        let Ok(name) = e.file_name().into_string() else {
+            continue;
+        };
+        if !name.ends_with(".tmp") || !e.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        match std::fs::remove_file(e.path()) {
+            Ok(()) => removed.push(name),
+            Err(err) => tracing::warn!(
+                target: "sparkles::store",
+                "could not remove {name}, the temporary file of an interrupted write: {err}"
+            ),
+        }
+    }
+    removed.sort();
+    removed
+}
+
 /// Remove a generation directory crash-safely: rename, sync the parent, delete.
 pub(crate) fn delete_generation(root: &Path, dir: &Path) -> Result<()> {
     if let Some(doomed) = retire_generation(root, dir)? {

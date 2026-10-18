@@ -456,9 +456,9 @@ fn verify(a: &Args) {
 }
 
 /// The leftover warnings that `sparkles check` may still give after an open. Open removes
-/// generations newer than CURRENT, `text.new` and `text.old` and finishes interrupted
-/// removals, so only an old generation that something still holds can remain. Any other
-/// leftover, a set-aside `commits.bin.corrupt-*` catalog above all, is a finding.
+/// generations newer than CURRENT, `text.new`, `text.old` and `.tmp` files and finishes
+/// interrupted removals, so only an old generation that something still holds can remain.
+/// Any other leftover, a set-aside `commits.bin.corrupt-*` catalog above all, is a finding.
 const ACCEPTED_LEFTOVERS: &[&str] =
     &["leftover: an old generation whose removal after a compaction was interrupted"];
 
@@ -763,7 +763,7 @@ mod tests {
         for other in [
             "leftover: newer than CURRENT, an interrupted rebuild that the next open removes",
             "leftover: a damaged commit catalog an earlier open set aside",
-            "leftover: a temporary file of an interrupted write; safe to remove",
+            "leftover: a temporary file of an interrupted write, which the next open removes",
             "leftover: left by an interrupted full-text rebuild; removed on open",
             "leftover: left by an interrupted deletion; safe to remove",
             "a torn tail",

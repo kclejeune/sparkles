@@ -95,9 +95,11 @@ distinct binding of the variables it shares with the outer rows, and once in all
 shares none. A streamed query whose memory budget was nearly spent used to call it once
 per row.
 
-Open removes generation directories newer than the one `CURRENT` names. A power loss
-during a compaction or a bulk load can leave such a directory with an empty build marker,
-which earlier releases kept until the next rebuild reused its number.
+Open removes generation directories newer than the one `CURRENT` names, and the
+temporary `.tmp` files of interrupted atomic writes in the dataset's directory. A power
+loss during a compaction or a bulk load can leave such a directory with an empty build
+marker, which earlier releases kept until the next rebuild reused its number, and a
+`CURRENT.tmp` beside it.
 
 A commit whose own log synchronization fails keeps its message, change digest and merge
 record. Such a commit can still come back after a restart, and it used to come back

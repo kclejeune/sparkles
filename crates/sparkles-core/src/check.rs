@@ -666,7 +666,10 @@ impl Checker<'_> {
                 continue;
             }
             let msg = if n.ends_with(".tmp") {
-                Some("a temporary file of an interrupted write; safe to remove".to_string())
+                Some(
+                    "a temporary file of an interrupted write, which the next open removes"
+                        .to_string(),
+                )
             } else if n == "text.new" || n == "text.old" {
                 Some("left by an interrupted full-text rebuild; removed on open".to_string())
             } else if n.ends_with(".deleting") {

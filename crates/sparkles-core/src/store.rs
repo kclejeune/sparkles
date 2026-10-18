@@ -6400,6 +6400,7 @@ fn open_history(
     use crate::history;
     history::remove_deleting(root)?;
     history::remove_newer_generations(root, current);
+    history::remove_temp_files(root);
     let cfg = history::read_file(root, dataset_id)?;
     let mut h = history::HistoryState::new(cfg.pins, cfg.retention);
     h.schedules = cfg.schedules;

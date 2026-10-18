@@ -938,7 +938,11 @@ elsewhere and rename or switch it into place, so they leave nothing above `CURRE
 existing root. Each directory is renamed to `gen-N.deleting` and the root synced before its
 contents are deleted, and the next open finishes a removal that a crash interrupted. Older
 generations, files with a generation's name, other names and `commits.bin.corrupt-*` stay,
-and nothing is removed when `CURRENT` does not name a numbered generation. Compaction still
+and nothing is removed when `CURRENT` does not name a numbered generation. Open also
+deletes the regular files of the root whose names end in `.tmp`. Each is the copy that an
+atomic replacement writes before its rename, and the file it was to replace is intact
+whether or not the rename survived. A `log-writes` image showed a `CURRENT.tmp` that a
+power loss during a compaction's switch had left. Compaction still
 writes its build marker so that an earlier release opening the dataset removes an
 interrupted build as before. `sparkles check` still reports such a directory, since it does
 not open the dataset, and its message now says the next open removes it. Two tests in

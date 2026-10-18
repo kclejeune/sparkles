@@ -1612,9 +1612,14 @@ fn open_removes_only_generations_newer_than_current() {
     std::fs::create_dir(root.join(&keep[2])).unwrap();
     std::fs::write(root.join(&keep[3]), b"x").unwrap();
     std::fs::write(root.join(&keep[4]), b"x").unwrap();
+    // the temporary copy of an interrupted CURRENT switch goes, a directory so named stays
+    let tmp = "CURRENT.tmp".to_string();
+    std::fs::write(root.join(&tmp), g1.as_bytes()).unwrap();
+    std::fs::create_dir(root.join("x.tmp")).unwrap();
     let s = Store::open(&root, bulk).unwrap();
     assert_eq!(dump(&s), d);
-    for g in [&g1, &g2, &g3, &deleting] {
+    assert!(root.join("x.tmp").is_dir());
+    for g in [&g1, &g2, &g3, &deleting, &tmp] {
         assert!(!root.join(g).exists(), "{g} is left");
     }
     for k in &keep {
