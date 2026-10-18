@@ -1018,9 +1018,16 @@ at one of the group's four failpoints or a failed synchronization of the log or 
 vocabulary. It checks unique commit numbers, a poisoned writer after a failed
 synchronization, that every snapshot a reader saw is the model's state at its commit, and
 that the reopened store holds every acknowledged commit and message in an order the model
-allows. It runs 24 seeds by default in under two seconds, and 400 seeds passed once. With the
-poisoning of a failed fence removed it fails. `tests/annotations.rs` prunes the catalog
-while messaged commits sit at the WAL tail and reopens with and without grouping.
+allows. After a failed synchronization it also checks that no reader saw a commit past the
+last acknowledged one and that no commit after an uncertain one was acknowledged. A commit
+whose own synchronization failed on the ordinary path rolls back its annotation but can keep
+its log record, so it may come back without its message. Section 3 leaves the outcome of
+that commit open, and the model accepts it for an operation that failed with an error. It
+runs 24 seeds by default in under two seconds, and twelve invocations of 300 seeds each
+passed. Publishing the commits of a failed fence before failing them makes it fail in every
+invocation, and so does removing the poisoning of a failed fence. `tests/annotations.rs`
+prunes the catalog while messaged commits sit at the WAL tail and reopens with and without
+grouping.
 
 **The default.** The switch is built and tested on branch `x09-phase3-switch-r4-20261017`.
 It renames the option to `StoreOptions::group_commit` with a default of true, adds

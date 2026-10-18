@@ -8,7 +8,8 @@
 //!
 //! `SPARKLES_GROUP_MODEL_RUNS` sets the number of runs (default 24) and
 //! `SPARKLES_GROUP_MODEL_SEED` the seed of the first one. A failure names the seed of its
-//! run, which `SPARKLES_GROUP_MODEL_SEED` with one run reproduces.
+//! run. `SPARKLES_GROUP_MODEL_SEED` with one run repeats that run's inputs, its threads,
+//! operations and fault, but not the interleaving that the scheduler chose.
 use super::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
@@ -279,7 +280,7 @@ fn run(dir: &Path, seed: u64, opts: StoreOptions, messages: bool, fault: Fault) 
             while !stop.load(Ordering::Relaxed) {
                 let snap = s.snapshot();
                 seen.push((snap.commit, snap.len()));
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_micros(50));
             }
             seen
         })
@@ -329,7 +330,7 @@ fn apply<'a>(ops: impl IntoIterator<Item = &'a Op>) -> BTreeSet<String> {
     state
 }
 
-fn check_run(dir: &Path, r: &RunResult, messages: bool, what: &str) {
+fn check_run(dir: &Path, r: &RunResult, messages: bool, fault: Fault, what: &str) {
     let acked: Vec<(u64, &Op)> = r
         .ops
         .iter()
@@ -363,6 +364,15 @@ fn check_run(dir: &Path, r: &RunResult, messages: bool, what: &str) {
         .iter()
         .filter(|o| matches!(o.outcome, Outcome::Uncertain(_)) && o.kind.commits())
         .collect();
+    // guarantee 3: a commit whose synchronization failed is never published. Only a panic
+    // after publication can show readers a commit that is not acknowledged.
+    if fault.syncs() && !uncertain.is_empty() {
+        let seen = r.seen.iter().map(|s| s.0).max().unwrap_or(0);
+        assert!(
+            seen <= top,
+            "{what}: a reader saw commit {seen}, past the last acknowledged commit {top}"
+        );
+    }
     // every name an operation touched
     let names: BTreeSet<&String> = r
         .ops
@@ -380,11 +390,33 @@ fn check_run(dir: &Path, r: &RunResult, messages: bool, what: &str) {
             .collect();
         let mut used = BTreeSet::new();
         let mut order = Vec::new();
+        // the commit number of each uncertain operation found in the log
+        let mut uncertain_at = Vec::new();
         for seq in 1..=head {
-            let m = s
-                .annotation(seq)
-                .and_then(|a| a.message)
-                .unwrap_or_else(|| panic!("{what}: commit {seq} has no message"));
+            let Some(m) = s.annotation(seq).and_then(|a| a.message) else {
+                // An ordinary-path commit whose own synchronization failed rolls back its
+                // annotation but may leave its log record, and section 3 leaves the outcome
+                // of that commit open. It comes back without its message, so it can only be
+                // an uncertain operation that failed with an error, whose effect is in the
+                // store. A thread stops at its first uncertain operation, so nothing later
+                // touches the names it wrote.
+                let op = uncertain
+                    .iter()
+                    .copied()
+                    .find(|o| {
+                        !used.contains(&(o.thread, o.k))
+                            && matches!(&o.outcome, Outcome::Uncertain(e) if e != "panicked")
+                            && o.inserts.iter().all(|n| holds(&snap, n))
+                            && !o.deletes.iter().any(|n| holds(&snap, n))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{what}: commit {seq} has no message and no failed operation")
+                    });
+                used.insert((op.thread, op.k));
+                uncertain_at.push(seq);
+                order.push(op);
+                continue;
+            };
             let op = by_msg
                 .get(m.as_ref())
                 .unwrap_or_else(|| panic!("{what}: commit {seq} has an unknown message {m}"));
@@ -394,7 +426,7 @@ fn check_run(dir: &Path, r: &RunResult, messages: bool, what: &str) {
             );
             match op.outcome {
                 Outcome::Acked(a) => assert_eq!(a, seq, "{what}: {m} acknowledged as {a}"),
-                Outcome::Uncertain(_) => {}
+                Outcome::Uncertain(_) => uncertain_at.push(seq),
                 Outcome::NoCommit => panic!("{what}: {m} made no commit but is commit {seq}"),
             }
             order.push(*op);
@@ -405,6 +437,15 @@ fn check_run(dir: &Path, r: &RunResult, messages: bool, what: &str) {
                 *seq <= head && used.contains(&(op.thread, op.k)),
                 "{what}: {seq} lost"
             );
+        }
+        // guarantee 2: after a failed synchronization no later commit is acknowledged
+        if fault.syncs() {
+            for &u in &uncertain_at {
+                assert!(
+                    top < u,
+                    "{what}: commit {top} was acknowledged after uncertain commit {u}"
+                );
+            }
         }
         // guarantee 3: every snapshot a reader saw was the model's state at its commit
         let mut lens = vec![0u64];
@@ -530,7 +571,7 @@ fn concurrent_random_writes_match_a_sequential_model() {
         let w = what.clone();
         std::thread::spawn(move || {
             let r = run(&path, seed, opts, messages, fault);
-            check_run(&path, &r, messages, &w);
+            check_run(&path, &r, messages, fault, &w);
             if std::env::var_os("SPARKLES_GROUP_MODEL_VERBOSE").is_some() {
                 let acked = r
                     .ops
