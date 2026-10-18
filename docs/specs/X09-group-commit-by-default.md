@@ -727,11 +727,11 @@ index configured.
 
 ## Outcome
 
-Phases 1 and 2 are built behind `--experimental-group-commit`, with the exceptions below.
-Phase 3 met conditions 1, 3 and 4 of section 7.2 and the `kill -9` part of condition 2, and
-resolved the ambiguity of headerless logs. The 1,000-point `log-writes` runs of condition 2
-did not run, because no host available to the lane had both root and the device-mapper
-`log-writes` target, so the default stays off. See [ROADMAP](../ROADMAP.md) item 3.
+Phases 1 and 2 were built behind `--experimental-group-commit`, with the exceptions below.
+Phase 3 meets the conditions of section 7.2, the third as amended on 2026-10-17. It passed
+the `kill -9` runs and the 1,000-point `log-writes` runs on ext4 and XFS, resolved the
+ambiguity of headerless logs, and made group commit the default. See
+[ROADMAP](../ROADMAP.md) item 3.
 
 ### Phase 1
 
@@ -920,8 +920,8 @@ Phase 2 left six items. The Phase 3 section below records what became of each.
 
 1. The gates of section 9 on `forge`, in particular serial parity at 1.05M
    and 10.5M. Met.
-2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs. The `kill -9`
-   runs passed, and so did the `log-writes` runs before the switch landed.
+2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs. Both passed,
+   the `log-writes` runs on `forge` on 2026-10-18 with the switched build.
 3. Full-text, spatial and embedding datasets and the ShEx guard grouping, or measurements
    that show them rare. Condition 3 was amended instead, and section 17 designs their
    admission as Phase 4.
@@ -1022,10 +1022,33 @@ The `logwrites` mode puts the store's file system behind the device-mapper `log-
 target, marks the log after every batch of receipts, and replays crash images that hold
 the writes before the last flush, every FUA write and a random part of the rest per 4 KiB
 block. It checks each image as the restart above does, with the next commit continuing the
-<!-- X09-LOGWRITES-RESULTS: replace the rest of this paragraph with the 1,000-point results on ext4 and XFS before the switch lands -->
-sequence. A synthetic log checked the replay's choice of writes, but the 1,000-point runs
-did not run. The Namespace kernel is built without `CONFIG_DM_LOG_WRITES`, the laptop has no
-root, atlas was down, and `forge`, which has the module, is reserved for timing.
+sequence. A run whose marks fail, or that makes none, fails too, since its images would be
+checked against no receipts.
+
+The `log-writes` runs ran on `forge` on 2026-10-18 with the switched build, 1,000 crash
+images per run, sixteen writers for 20 s and a mark every 50 ms. Each load crossed one
+automatic compaction. The `--no-group-commit` loads commit far fewer transactions through
+`log-writes`, so they ran with `--auto-compact-min-quads 1000` to cross one as well. Every
+image passed.
+
+| Run | Receipts | Marks | Log entries | Images | Failed |
+|---|---:|---:|---:|---:|---:|
+| ext4, group commit | 47,383 | 369 | 66,463 | 1,000 | 0 |
+| XFS, group commit | 29,135 | 358 | 24,868 | 1,000 | 0 |
+| ext4, `--no-group-commit` | 9,394 | 367 | 36,824 | 1,000 | 0 |
+| XFS, `--no-group-commit` | 4,859 | 361 | 14,248 | 1,000 | 0 |
+
+Two earlier runs found two disagreements between `sparkles check` and open, and no lost
+commit. An image of a power loss during a compaction can keep `CURRENT` on the old
+generation and hold the new one's directory, which check reports as a leftover warning
+until the next rebuild replaces it. With `kill -9` the switch of `CURRENT` survives in the
+page cache, so only `log-writes` showed it. It appeared with and without group commit, 7
+images in 1,000 with grouping and 26 in 1,000 without, and the harness now accepts a
+leftover warning after open, while any other warning or error still fails. One image held a
+log record torn at a 4 KiB block boundary after the last commit, with zeros where its ids
+were. Open truncated it with the incomplete transaction, but check called the ids errors.
+Check now reports them as warnings. Removing a leftover generation at open is
+[roadmap](../ROADMAP.md) item 14.
 
 **Tests.** `store/group_model.rs` is the model-based stress test of section 10.1. Four to
 eight threads issue random inserts, deletes, multi-quad transactions, no-ops, dry runs and
@@ -1056,5 +1079,5 @@ The CLI and server take the global `--no-group-commit`, and `SPARKLES_GROUP_COMM
 default and a JVM user cannot turn grouping off. `/$/stats/{ds}` and the JSON metrics report `groupCommit` per dataset. A persistent
 dataset with grouping on holds up to 64 queued commits or 4 MiB of log records, plus the
 speculative snapshots of the commits in flight, which is the memory that buys the
-throughput in BENCHMARKS.md. The switch landed after the 1,000-point `log-writes` runs passed
-on ext4 and XFS.
+throughput in BENCHMARKS.md. The 1,000-point `log-writes` runs on ext4 and XFS passed with
+it on 2026-10-18.
