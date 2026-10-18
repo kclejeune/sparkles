@@ -300,10 +300,9 @@ fn distinct_over_a_join_of_an_ordered_subquery_keeps_the_order_or_fails() {
         format!("SELECT DISTINCT ?s ?v ?t {{ {ordered} OPTIONAL {{ ?s <urn:t> ?t }} }}"),
         format!("SELECT DISTINCT ?s ?v {{ {ordered} MINUS {{ ?s <urn:t> \"t1\" }} }}"),
         format!("SELECT DISTINCT ?s ?v {{ {ordered} FILTER EXISTS {{ ?s <urn:t> ?t }} }}"),
-        format!(
-            "SELECT DISTINCT ?s ?l {{ {{ SELECT ?s {{ ?s <urn:p> ?v }} ORDER BY ?s LIMIT 100 }} \
-             ?s <urn:t> ?l }}"
-        ),
+        "SELECT DISTINCT ?s ?l { { SELECT ?s { ?s <urn:p> ?v } ORDER BY ?s LIMIT 100 } \
+         ?s <urn:t> ?l }"
+            .to_string(),
     ] {
         let expected = run_in_order(&s, &q, 256 << 20, None).unwrap();
         for memory in [512 << 10, 2 << 20, 8 << 20] {
