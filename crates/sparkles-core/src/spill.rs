@@ -149,6 +149,13 @@ fn io(error: std::io::Error, what: &str) -> Error {
 /// The failure of a write to a spill file: the `spill` budget when the file system has
 /// no room for it (`ENOSPC`, `EDQUOT` or `EFBIG`), and an I/O error otherwise.
 fn written(error: std::io::Error, limit: u64, bytes: u64) -> Error {
+    failed(error, "write", limit, bytes)
+}
+
+/// The failure of `what` on a spill file: the `spill` budget when the file system has no
+/// room or the quota is spent, with the cause logged since the budget error cannot carry
+/// it, and an I/O error otherwise.
+fn failed(error: std::io::Error, what: &str, limit: u64, bytes: u64) -> Error {
     #[cfg(unix)]
     let full = matches!(
         error.raw_os_error(),
@@ -157,9 +164,10 @@ fn written(error: std::io::Error, limit: u64, bytes: u64) -> Error {
     #[cfg(not(unix))]
     let full = error.kind() == std::io::ErrorKind::StorageFull;
     if full {
+        tracing::warn!(target: "sparkles::spill", "spill {what} failed: {error}");
         refused(limit, bytes)
     } else {
-        io(error, "write")
+        io(error, what)
     }
 }
 
@@ -243,13 +251,16 @@ fn private_root(dir: &Path) -> Result<PathBuf> {
         let uid = unsafe { libc::geteuid() };
         if !meta.is_dir() || meta.uid() != uid {
             return Err(Error::invalid(format!(
-                "the spill directory {} must be a directory owned by user {uid}",
+                "the spill directory {} must be a directory owned by user {uid}; give \
+                 --spill-dir a new subdirectory, which the server creates with mode 0700",
                 root.display()
             )));
         }
         if meta.mode() & 0o022 != 0 {
             return Err(Error::invalid(format!(
-                "the spill directory {} must not be writable by other users (mode {:o})",
+                "the spill directory {} must not be writable by other users (mode {:o}); \
+                 run chmod go-w on it, or give --spill-dir a new subdirectory, which the \
+                 server creates with mode 0700",
                 root.display(),
                 meta.mode() & 0o7777
             )));
@@ -262,6 +273,12 @@ impl Spill {
     /// Create this process's directory under `options.dir`, after removing the
     /// directories that dead processes left there.
     pub fn open(options: &SpillOptions) -> Result<Arc<Spill>> {
+        Self::open_with(options, |_| {})
+    }
+
+    /// [`Spill::open`], calling `before_marker` with the marker's path before the marker
+    /// is made, so that tests can make that step fail.
+    fn open_with(options: &SpillOptions, before_marker: impl FnOnce(&Path)) -> Result<Arc<Spill>> {
         if !cfg!(unix) {
             return Err(Error::Unsupported(
                 "disk spill needs a Unix file system".into(),
@@ -281,6 +298,31 @@ impl Spill {
         builder
             .create(&dir)
             .map_err(|e| io(e, "process directory"))?;
+        before_marker(&dir.join(MARKER));
+        let marker = Self::mark(&dir).inspect_err(|_| {
+            // A directory without a written marker would stay until a sweep finds it old.
+            // It was made by this call with mode 0700, so nothing else is in it.
+            let _ = std::fs::remove_dir_all(&dir);
+        })?;
+        Ok(Arc::new(Spill {
+            dir,
+            _marker: marker,
+            max_bytes: options.max_bytes,
+            query_bytes: options.query_bytes,
+            min_free_bytes: options.min_free_bytes,
+            reserved: AtomicU64::new(0),
+            files: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
+            written: AtomicU64::new(0),
+            spilled_queries: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
+            fault: Mutex::new(None),
+            faults: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    /// Create, lock and write the marker of the process directory `dir`.
+    fn mark(dir: &Path) -> Result<File> {
         // The marker is locked before it names the format, so that a sweep by another
         // process starting at the same time never takes this directory for a dead one.
         let mut marker = {
@@ -313,21 +355,7 @@ impl Spill {
             .as_bytes(),
         )
         .map_err(|e| io(e, "marker"))?;
-        Ok(Arc::new(Spill {
-            dir,
-            _marker: marker,
-            max_bytes: options.max_bytes,
-            query_bytes: options.query_bytes,
-            min_free_bytes: options.min_free_bytes,
-            reserved: AtomicU64::new(0),
-            files: AtomicU64::new(0),
-            queries: AtomicU64::new(0),
-            written: AtomicU64::new(0),
-            spilled_queries: AtomicU64::new(0),
-            retries: AtomicU64::new(0),
-            fault: Mutex::new(None),
-            faults: std::sync::atomic::AtomicBool::new(false),
-        }))
+        Ok(marker)
     }
 
     /// The directory of this process's spill files.
@@ -454,7 +482,7 @@ impl Spill {
                         e.raw_os_error(),
                         Some(libc::EOPNOTSUPP) | Some(libc::EISDIR) | Some(libc::EINVAL)
                     ) => {}
-                Err(e) => return Err(io(e, "file")),
+                Err(e) => return Err(failed(e, "file", self.max_bytes, self.reserved_bytes())),
             }
         }
         let path = self.dir.join(format!("q{query}-{n}.spl"));
@@ -465,7 +493,9 @@ impl Spill {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(&path).map_err(|e| io(e, "file"))?;
+        let file = options
+            .open(&path)
+            .map_err(|e| failed(e, "file", self.max_bytes, self.reserved_bytes()))?;
         std::fs::remove_file(&path).map_err(|e| io(e, "file"))?;
         Ok(file)
     }
@@ -477,6 +507,23 @@ impl Drop for Spill {
         let _ = std::fs::remove_file(self.dir.join(MARKER));
         let _ = std::fs::remove_dir(&self.dir);
     }
+}
+
+/// How long a process directory may go without a written marker before a sweep takes
+/// it for the remains of a start that died.
+const UNWRITTEN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether the directory `dir`, and its marker when there is one, were last changed more
+/// than [`UNWRITTEN_GRACE`] ago.
+fn unwritten_long_ago(dir: &Path, marker: Option<&Path>) -> bool {
+    let old = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > UNWRITTEN_GRACE)
+    };
+    old(dir) && marker.is_none_or(old)
 }
 
 /// Remove the process directories under `root` that dead processes left. A directory
@@ -497,12 +544,24 @@ pub fn sweep(root: &Path) -> usize {
         }
         let marker_path = path.join(MARKER);
         let ok = (|| {
-            let text = std::fs::read_to_string(&marker_path).ok()?;
-            if !text.starts_with(&format!("{FORMAT_NAME} ")) {
-                return None;
-            }
-            let marker = File::open(&marker_path).ok()?;
-            if !try_lock(&marker) {
+            let marker = match std::fs::read_to_string(&marker_path) {
+                Ok(text) if text.starts_with(&format!("{FORMAT_NAME} ")) => {
+                    Some(File::open(&marker_path).ok()?)
+                }
+                // A start that died before it wrote its marker, long enough ago that no
+                // process is still filling it in.
+                Ok(text) if text.is_empty() && unwritten_long_ago(&path, Some(&marker_path)) => {
+                    Some(File::open(&marker_path).ok()?)
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && unwritten_long_ago(&path, None) =>
+                {
+                    None
+                }
+                _ => return None,
+            };
+            if marker.as_ref().is_some_and(|m| !try_lock(m)) {
                 // A live process holds it.
                 return None;
             }
@@ -521,7 +580,9 @@ pub fn sweep(root: &Path) -> usize {
             for file in files {
                 std::fs::remove_file(file).ok()?;
             }
-            std::fs::remove_file(&marker_path).ok()?;
+            if marker.is_some() {
+                std::fs::remove_file(&marker_path).ok()?;
+            }
             drop(marker);
             std::fs::remove_dir(&path).ok()
         })();
@@ -755,7 +816,7 @@ impl SpillWriter {
     pub fn finish(mut self) -> Result<SpillRun> {
         let file = self.file.take().expect("an open spill file");
         Ok(SpillRun {
-            file,
+            file: Some(file),
             query: self.query.clone(),
             kind: self.kind,
             columns: self.columns,
@@ -768,6 +829,8 @@ impl SpillWriter {
 
 impl Drop for SpillWriter {
     fn drop(&mut self) {
+        // Closing frees the disk, which must come before the extent is given back.
+        drop(self.file.take());
         self.query.release(self.bytes);
     }
 }
@@ -783,7 +846,8 @@ fn frame_crc(header: &[u8; FRAME_HEADER_BYTES], payload: &[u8]) -> u32 {
 
 /// A finished spill file. Dropping it closes the file, which frees its space.
 pub struct SpillRun {
-    file: File,
+    /// Always open until the run drops.
+    file: Option<File>,
     query: Arc<QuerySpill>,
     kind: SpillKind,
     columns: usize,
@@ -802,6 +866,10 @@ impl std::fmt::Debug for SpillRun {
 }
 
 impl SpillRun {
+    fn file(&self) -> &File {
+        self.file.as_ref().expect("an open spill run")
+    }
+
     pub fn rows(&self) -> u64 {
         self.rows
     }
@@ -817,7 +885,7 @@ impl SpillRun {
     /// A reader from the first frame. Several readers of one file are independent.
     pub fn reader(self: &Arc<Self>) -> Result<SpillReader> {
         let mut header = [0u8; HEADER_BYTES];
-        read_at(&self.file, &mut header, 0)?;
+        read_at(self.file(), &mut header, 0)?;
         if header[..8] != MAGIC {
             return Err(Error::Corrupt("spill file: not a spill file".into()));
         }
@@ -857,6 +925,8 @@ impl SpillRun {
 
 impl Drop for SpillRun {
     fn drop(&mut self) {
+        // Closing frees the disk, which must come before the extent is given back.
+        drop(self.file.take());
         self.query.release(self.bytes);
     }
 }
@@ -895,7 +965,7 @@ impl SpillReader {
             return Ok(None);
         }
         let mut header = [0u8; FRAME_HEADER_BYTES];
-        read_at(&self.run.file, &mut header, self.offset)?;
+        read_at(self.run.file(), &mut header, self.offset)?;
         let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
         let rows = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -907,7 +977,7 @@ impl SpillReader {
         }
         self.payload.resize(len, 0);
         read_at(
-            &self.run.file,
+            self.run.file(),
             &mut self.payload,
             self.offset + FRAME_HEADER_BYTES as u64,
         )?;
@@ -1024,22 +1094,22 @@ mod tests {
         let run = Arc::new(writer.finish().unwrap());
         use std::os::unix::fs::FileExt;
         // An unknown version.
-        run.file.write_all_at(&9u16.to_le_bytes(), 8).unwrap();
+        run.file().write_all_at(&9u16.to_le_bytes(), 8).unwrap();
         assert!(matches!(run.reader(), Err(Error::Corrupt(m)) if m.contains("version 9")));
-        run.file
+        run.file()
             .write_all_at(&FORMAT_VERSION.to_le_bytes(), 8)
             .unwrap();
         // An unknown operator kind, codec or encryption flag.
         for (at, byte) in [(10u64, 99u8), (11, 9), (12, 1)] {
             let mut was = [0u8];
-            run.file.read_exact_at(&mut was, at).unwrap();
-            run.file.write_all_at(&[byte], at).unwrap();
+            run.file().read_exact_at(&mut was, at).unwrap();
+            run.file().write_all_at(&[byte], at).unwrap();
             assert!(matches!(run.reader(), Err(Error::Corrupt(_))), "byte {at}");
-            run.file.write_all_at(&was, at).unwrap();
+            run.file().write_all_at(&was, at).unwrap();
         }
         assert!(run.reader().is_ok());
         // A flipped payload byte.
-        run.file
+        run.file()
             .write_all_at(&[0xff], (HEADER_BYTES + FRAME_HEADER_BYTES + 6) as u64)
             .unwrap();
         let mut reader = run.reader().unwrap();
@@ -1235,5 +1305,52 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sweep_removes_old_directories_whose_marker_was_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = |r: &str| format!("{}-1-{r}", "0".repeat(32));
+        // No marker, and an empty marker, both from a start that died long ago.
+        let bare = dir.path().join(name(&"a".repeat(16)));
+        std::fs::create_dir(&bare).unwrap();
+        let empty = dir.path().join(name(&"b".repeat(16)));
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::write(empty.join(MARKER), b"").unwrap();
+        // The same, just made, which a process may still be filling in.
+        let fresh = dir.path().join(name(&"c".repeat(16)));
+        std::fs::create_dir(&fresh).unwrap();
+        std::fs::write(fresh.join(MARKER), b"").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for d in [&bare, &empty] {
+            File::open(d).unwrap().set_modified(old).unwrap();
+        }
+        File::options()
+            .write(true)
+            .open(empty.join(MARKER))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(sweep(dir.path()), 2);
+        assert!(!bare.exists() && !empty.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn a_failed_open_leaves_no_process_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the marker would go makes its creation fail.
+        let error = Spill::open_with(
+            &SpillOptions {
+                dir: dir.path().to_path_buf(),
+                max_bytes: 1 << 30,
+                query_bytes: 1 << 30,
+                min_free_bytes: 0,
+            },
+            |marker: &Path| std::fs::create_dir(marker).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("marker"), "{error}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
