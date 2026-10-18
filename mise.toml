@@ -761,12 +761,38 @@ flag "--answers-only" help="only check answers across engines; time nothing"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run (empty: only generate and materialize)"
 flag "--queries <list>" help="only these queries (q1 q9 …)"
 flag "--port-base <port>" default="48300" help="the first of the five server ports"
+flag "--infer-profiles <list>" default="rdfs owl-rl" help="the materializations to run and record"
+flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-micro, owl-mini, owl"
 '''
 run = '''
 PROFILE="$usage_profile" RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" \
 ENGINES="$usage_engines" QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" \
+INFER_PROFILES="$usage_infer_profiles" JENA_REASONERS="${usage_jena_reasoners:-}" \
 scripts/bench-lubm.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
+'''
+
+[tasks."bench:owl2bench"]
+description = "OWL2Bench (OWL 2 RL): Sparkles materializes the data (and Jena's rule reasoners on request), then the RL queries run on the five engines of bench over the same materialized data"
+depends = ["build"]
+usage = '''
+arg "[universities]" default="1" help="OWL2Bench scale: 1 (smoke), 2, 5, 10, 20, 50, 100 or 200"
+arg "[workdir]" default="target/bench-owl2bench" help="generator, data, materialized files, indexes and results/ (summary.md, record.json, inference.json)"
+flag "--runs <n>" default="10" help="measured runs per query"
+flag "--warmup <n>" default="2" help="warm-up runs per query"
+flag "--cold-runs <n>" default="0" help="restarts per query for the cold measurement (0: none)"
+flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
+flag "--answers-only" help="only check answers across engines; time nothing"
+flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run (empty: only generate and materialize)"
+flag "--queries <list>" help="only these queries (q2 q12 …)"
+flag "--port-base <port>" default="48300" help="the first of the five server ports"
+flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-micro, owl-mini, owl"
+'''
+run = '''
+RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" \
+ENGINES="$usage_engines" QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" \
+ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" JENA_REASONERS="${usage_jena_reasoners:-}" \
+scripts/bench-owl2bench.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
 '''
 
 [tasks."bench:bsbm"]

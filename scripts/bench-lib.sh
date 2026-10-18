@@ -183,7 +183,9 @@ start() {
       ready="localhost:$p/\$/ping"
       ;;
     jena)
-      JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "${CAP[@]}" "$FUSEKI" --update --timeout="$((SERVER_TIMEOUT * 1000))" --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
+      # Jena's scripts prefer JAVA_HOME over the JDK that the nixpkgs wrapper puts on PATH,
+      # and a developer's JAVA_HOME may name a JDK too old for the jars
+      env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "${CAP[@]}" "$FUSEKI" --update --timeout="$((SERVER_TIMEOUT * 1000))" --port "$p" --loc "$(store_of jena)" /bench > "$STORE/fuseki.log" 2>&1 &
       URL[$e]=localhost:$p/bench/sparql
       UPDURL[$e]=localhost:$p/bench/update
       ready="localhost:$p/\$/ping"
@@ -340,7 +342,7 @@ load_all() {
   for e in $ENGINES; do
     case $e in
       sparkles) cmd="'$SPARKLES' load --loc sparkles.db $df" ;;
-      jena) cmd="'$TDBLOADER' --loc jena.db $df" ;;
+      jena) cmd="env -u JAVA_HOME '$TDBLOADER' --loc jena.db $df" ;;
       qlever)
         cmd="mkdir -p qlever-index && cd qlever-index && echo '{\"num-triples-per-batch\": 1000000}' > settings.json &&
           '$QINDEX' -i bench -F nt -f ../$df -p true -s settings.json"

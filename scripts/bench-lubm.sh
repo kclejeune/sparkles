@@ -15,14 +15,19 @@
 # 1. Inference. The generated data and the ontology load into a Sparkles database, and
 #    `sparkles infer` materializes it with the rdfs profile and with the owl-rl profile, each
 #    on its own copy. WORKDIR/results/inference.json gets the time, the peak RSS and the number
-#    of derived triples of each. Sparkles is the only engine here with a reasoner that runs
-#    on this data in one command. Jena's rule reasoners are not run by this script.
+#    of derived triples of each, with the reasoner's own peak heap estimate.
 # 2. Queries. Sparkles dumps the data with the inferred triples of PROFILE (default owl-rl),
 #    and every engine loads that same N-Triples file, so the comparison is over equal data.
 #    Answers are fingerprinted and compared before any timing, as in scripts/bench.sh, and
 #    the majority of the engines is the reference.
 #
 # Results go to WORKDIR/results (manifest.json, record.json, summary.md, hyperfine's JSON).
+#
+# INFER_PROFILES (default "rdfs owl-rl") picks the materializations, INFER_THREADS sets their
+# threads and DERIVED_DIGEST=0 skips the digest of the derived triples (a sort of the whole
+# closure). JENA_REASONERS (for example "rdfs owl-mini") also times Jena's rule reasoners on
+# the same data (scripts/bench-suite-lib.sh, jena_reason), within JENA_REASON_TIMEOUT and
+# JENA_HEAP. ENGINES="" with INFER_PROFILES=rdfs is F16's acceptance run A1.
 #
 # Env: PROFILE (owl-rl or rdfs), WARMUP (default 2), RUNS (default 10), COLD_RUNS (default 0),
 # SKIP_LOAD=1, ANSWERS_ONLY=1, QUERIES="q1 q9 …", ENGINES="sparkles jena qlever fluree oxigraph"
@@ -103,42 +108,20 @@ fi
 log "generated data and ontology: $(wc -l < base.nt) triples"
 
 # --------------------------------------------------------------------------- inference
-# infer_profile <profile>: materialize a copy of the loaded data; <profile>.nt gets the data
-# with its inferred triples, and results/inference.json the cost
-infer_profile() {
-  local p=$1 gtime out derived t0 t1
-  gtime=$(gnu_time)
-  [ -d base.db ] || "$SPARKLES" load --loc base.db base.nt > logs/load-base.log 2>&1
-  rm -rf "infer-$p.db"
-  cp -a --reflink=auto base.db "infer-$p.db"
-  t0=$(date +%s.%N)
-  "$gtime" -v -o "logs/infer-$p.time" "$SPARKLES" infer --loc "infer-$p.db" --profile "$p" > "logs/infer-$p.log" 2>&1 ||
-    die "infer --profile $p failed, see logs/infer-$p.log"
-  t1=$(date +%s.%N)
-  derived=$(sed -n 's/^\([0-9]*\) inferred triples.*/\1/p' "logs/infer-$p.log" | tail -1)
-  out="$p.nt"
-  "$SPARKLES" dump --loc "infer-$p.db" --merge --format nt --out "$out.tmp.nt" > /dev/null 2>&1
-  mv "$out.tmp.nt" "$out"
-  python3 -I - "$RES_DIR/inference.json" "$p" "$(awk "BEGIN {print $t1 - $t0}")" "logs/infer-$p.time" "${derived:-0}" "$(wc -l < base.nt)" "$(wc -l < "$out")" << 'EOF'
-import json, os, re, sys
-f, p, secs, timef, derived, base, total = sys.argv[1:]
-rss = int(re.search(r"Maximum resident set size \(kbytes\): (\d+)", open(timef).read()).group(1))
-d = json.load(open(f)) if os.path.exists(f) else {}
-d[p] = {"seconds": float(secs), "max_rss_kib": rss, "derived_triples": int(derived),
-        "base_triples": int(base), "total_triples": int(total)}
-d["notes"] = ["Sparkles' reasoner (sparkles infer); Jena's rule reasoners were not run",
-              "QLever and Oxigraph have no reasoner. Fluree documents query-time reasoning but it is not enabled here. All three answer over the materialized file"]
-json.dump(d, open(f, "w"), indent=1)
-print(f"{p}: {float(secs):.1f} s, peak RSS {rss >> 10} MiB, {derived} derived triples")
-EOF
-  rm -rf "infer-$p.db"
-}
 RES_DIR=$WORK/results
-for p in rdfs owl-rl; do
-  [ -f "$p.nt" ] && [ -f "$RES_DIR/inference.json" ] && grep -q "\"$p\"" "$RES_DIR/inference.json" && continue
+INFER_NOTES="Sparkles' reasoner (sparkles infer); Jena's rule reasoners run only when JENA_REASONERS names them
+QLever and Oxigraph have no reasoner. Fluree documents query-time reasoning but it is not enabled here. All three answer over the materialized file"
+for p in ${INFER_PROFILES:-rdfs owl-rl}; do
+  [ -f "$p.nt" ] && inferred "$p" && continue
   log "materializing with the $p profile"
-  infer_profile "$p"
+  suite_infer "$p"
 done
+for r in ${JENA_REASONERS:-}; do
+  inferred "jena-$r" && continue
+  case $r in rdfs) jp=rdfs ;; *) jp=owl-rl ;; esac
+  jena_reason "$jp" "$r"
+done
+[ -z "${ENGINES// /}" ] || [ -f "$PROFILE.nt" ] || die "$PROFILE.nt is missing: INFER_PROFILES must include $PROFILE"
 
 # --------------------------------------------------------------------------- the suite
 DATAFILE=$PROFILE.nt

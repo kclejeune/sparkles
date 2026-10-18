@@ -1,0 +1,16 @@
+# name	url	sha256	license
+# OWL2Bench (Singh, Bhatia and Mutharaju, ISWC 2020), Apache-2.0, at commit b23e3b0f of its
+# repository (2020-05-27), the generator of the paper's datasets. It runs on Java 8. The jar
+# of the later commit 5a27536c (2026-07-24, for Java 17) writes the ABox in the namespace
+# https://kracr.iiitd.edu.in/OWL2Bench# while its TBoxes stay in http://benchmark/OWL2Bench#,
+# so no TBox axiom applies to its data, and it is not used. The 22 SPARQL queries are a
+# separate Zenodo record under CC-BY-4.0. Everything is fetched at run time and never
+# committed.
+OWL2Bench.jar	https://raw.githubusercontent.com/kracr/owl2bench/b23e3b0f66249cd1d207f884ff1bae90b670362f/OWL2Bench.jar	1f2d6013cfdc679550cb5c5c11ccca40849f63ac595c887b13c55c76ff06370d	Apache-2.0
+RandomNames.xlsx	https://raw.githubusercontent.com/kracr/owl2bench/b23e3b0f66249cd1d207f884ff1bae90b670362f/RandomNames.xlsx	7eee6b5e3c3ae45dd460a8ddbc1389bdde1d18ee589b25a54419ea10030f6a31	Apache-2.0
+UNIV-BENCH-OWL2RL.owl	https://raw.githubusercontent.com/kracr/owl2bench/b23e3b0f66249cd1d207f884ff1bae90b670362f/UNIV-BENCH-OWL2RL.owl	8235753c8128c66259af8b56040969ae062ad627cda8c5ed385692eaed1e4fd2	Apache-2.0
+UNIV-BENCH-OWL2EL.owl	https://raw.githubusercontent.com/kracr/owl2bench/b23e3b0f66249cd1d207f884ff1bae90b670362f/UNIV-BENCH-OWL2EL.owl	6a4c722b868653f7550fb4c60b14611eb2284957ac2c729e7a8f987a9ff98b1b	Apache-2.0
+UNIV-BENCH-OWL2QL.owl	https://raw.githubusercontent.com/kracr/owl2bench/b23e3b0f66249cd1d207f884ff1bae90b670362f/UNIV-BENCH-OWL2QL.owl	c70b68f1c21cd44e828bf9cb8b1b89f7bc1ba5ede06d7b534cc61d4d9b7a01d5	Apache-2.0
+UNIV-BENCH-OWL2DL.owl	https://raw.githubusercontent.com/kracr/owl2bench/b23e3b0f66249cd1d207f884ff1bae90b670362f/UNIV-BENCH-OWL2DL.owl	3c65d9dfddbc757e8de941ca269b58611110e84ba8d5f935f7eadaa24f0a964e	Apache-2.0
+LICENSE	https://raw.githubusercontent.com/kracr/owl2bench/b23e3b0f66249cd1d207f884ff1bae90b670362f/LICENSE	c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4	Apache-2.0
+queries.txt	https://zenodo.org/api/records/3838735/files/OWL2BENCH_SPARQL_Queries.txt/content	87af702049661ae9c2979dd59281d83985aed8900bbcc682f5556058c0dbdb56	CC-BY-4.0
