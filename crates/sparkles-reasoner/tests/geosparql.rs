@@ -320,7 +320,8 @@ fn copy(s: &Store) -> Store {
 ///
 /// `baseScans` also counts the reads of the input graphs that rule evaluation makes, the
 /// same for both closures, so the test compares the two runs of each step: the closure
-/// read back costs the two scans of the default geometries more.
+/// read back costs the two scans of the default geometries more. Each step also reads
+/// less than a full run over the same data.
 #[test]
 fn f16_default_geometry_changed_subjects() {
     use sparkles_reasoner::{Cache, Incremental, Method, materialize_incremental};
@@ -383,10 +384,18 @@ fn f16_default_geometry_changed_subjects() {
             let mut got = select_all(&s);
             got.sort();
             let c = copy(&s);
-            materialize_with(&c, &Profile::Rdfs, &extras, &ReasonOptions::default()).unwrap();
+            let f =
+                materialize_with(&c, &Profile::Rdfs, &extras, &ReasonOptions::default()).unwrap();
             let mut full = select_all(&c);
             full.sort();
             assert_eq!(got, full, "{u}");
+            // and an incremental step reads the input graphs less often than a full run
+            assert!(
+                r.base_scans < f.base_scans,
+                "{u}: {} scans, {} for a full run",
+                r.base_scans,
+                f.base_scans
+            );
         }
     }
     for (i, (u, in_memory, read_back)) in steps.iter().enumerate() {

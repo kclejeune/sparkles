@@ -606,6 +606,51 @@ fn reasoning_runs_records_and_reports_freshness() {
     assert!(ds.reasoning().status().is_none());
 }
 
+/// F16 §8: the literal typings of the generalized facts join the diagnostics only for the
+/// profiles whose rules OWL 2 entails. A Jena rule can type a literal with any datatype,
+/// so the same typing from a rules profile is not reported.
+#[cfg(feature = "reasoning")]
+#[test]
+fn literal_typings_come_only_from_sound_profiles() {
+    use sparkles::reasoning::ReasonRequest;
+    use sparkles::reasoning::reasoner::Profile;
+    let (_dir, ds) = persistent();
+    ds.update(
+        "PREFIX ex: <http://ex.org/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA { ex:D rdfs:subClassOf <http://www.w3.org/2001/XMLSchema#integer> .
+                       ex:p rdfs:range ex:D . ex:a ex:p \"abc\" }",
+    )
+    .unwrap();
+    let typed = |profile: Profile| {
+        ds.reasoning()
+            .run(&ReasonRequest {
+                profile,
+                ..ReasonRequest::default()
+            })
+            .unwrap();
+        let d = ds
+            .reasoning()
+            .diagnostics(
+                &sparkles::reasoning::reasoner::diagnostics::DiagnoseOptions {
+                    checks: vec!["literal-not-in-datatype".into()],
+                    ..sparkles_reasoner_options()
+                },
+            )
+            .unwrap();
+        d.report
+            .findings
+            .iter()
+            .filter(|f| f.focus.to_string() == "\"abc\"")
+            .count()
+    };
+    assert_eq!(typed(Profile::Rdfs), 1);
+    let rule = "[t: (?x <http://ex.org/p> ?v) -> \
+                (?v <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                 <http://www.w3.org/2001/XMLSchema#integer>)]";
+    assert_eq!(typed(Profile::Rules(rule.into())), 0);
+    assert_eq!(typed(Profile::Rdfs), 1);
+}
+
 #[cfg(feature = "reasoning")]
 fn sparkles_reasoner_options() -> sparkles::reasoning::reasoner::diagnostics::DiagnoseOptions {
     sparkles::reasoning::reasoner::diagnostics::DiagnoseOptions {
