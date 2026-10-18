@@ -640,8 +640,13 @@ the outer rows have fewer distinct keys than that, or the key set does not fit t
 budget, each distinct outer key is evaluated once and its answer is kept in a memo. The
 memo is charged per entry. It stops growing at an eighth of the memory budget, or when
 less than a quarter of the budget remains, so that it cannot exhaust the query's
-memory. A variable that only a FILTER inside the EXISTS reads still forces evaluation
-per row, as it does in eager execution.
+memory. A pattern that calls a SERVICE ignores the second limit while the budget can
+charge an entry, since evaluating a key again sends the request again. A row that binds
+none of the pattern's variables has the same answer as every other such row, and that one
+answer is kept outside the memo without a charge. Before this, a cursor whose budget had
+no room for the memo called a SERVICE inside such an EXISTS once per row, 60,000 times for
+60,000 rows in one test. A variable that only a FILTER inside the EXISTS reads still
+forces evaluation per row, as it does in eager execution.
 
 A transitive path over a sequence or alternative reads its edge relation from a child
 cursor into charged adjacency maps on first demand. Without a bound input it then walks

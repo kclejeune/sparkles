@@ -90,6 +90,11 @@ passing it is a usage error.
 
 ### Behavior
 
+A SERVICE inside an EXISTS that the query evaluates per row is called once for each
+distinct binding of the variables it shares with the outer rows, and once in all when it
+shares none. A streamed query whose memory budget was nearly spent used to call it once
+per row.
+
 Open removes generation directories newer than the one `CURRENT` names. A power loss
 during a compaction or a bulk load can leave such a directory with an empty build marker,
 which earlier releases kept until the next rebuild reused its number.
