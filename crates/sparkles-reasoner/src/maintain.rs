@@ -184,6 +184,9 @@ pub(crate) struct Kept {
 pub(crate) struct Changes {
     pub base_added: Vec<Triple>,
     pub base_removed: Vec<Triple>,
+    /// with several input graphs, the triples that an input graph gained or lost while
+    /// the union kept or lacked them: their place in a scan of the base tier changed
+    pub base_moved: Vec<Triple>,
     pub inferred_added: Vec<Triple>,
     pub inferred_removed: Vec<Triple>,
 }
@@ -257,6 +260,7 @@ impl Changes {
     fn heap_bytes(&self) -> usize {
         (self.base_added.capacity()
             + self.base_removed.capacity()
+            + self.base_moved.capacity()
             + self.inferred_added.capacity()
             + self.inferred_removed.capacity())
             * size_of::<Triple>()
@@ -314,10 +318,31 @@ pub(crate) fn previous(
         held.grow(set_bytes(&generalized));
         let moved = closure.terms.rebase(snap.clone());
         closure.remap(&moved);
-        closure.set_inputs(snap.clone(), run_ids)?;
+        let old_lookups = closure.set_inputs(snap.clone(), run_ids)?;
         remap_set(&mut generalized, &moved, None)?;
         held.set(set_bytes(&generalized));
         let changes = raw.resolve(&closure.terms, snap, &ids)?;
+        // the remembered lookups follow the changes: with one input graph they take them
+        // in, and with several the answers they touch are dropped
+        if let Some(mut l) = old_lookups {
+            let single = closure.graph.base().is_some_and(|b| b.one_graph());
+            if single {
+                l.update(
+                    &changes.base_added,
+                    &changes.base_removed,
+                    crate::facts::rank,
+                );
+            } else {
+                l.forget(
+                    changes
+                        .base_added
+                        .iter()
+                        .chain(&changes.base_removed)
+                        .chain(&changes.base_moved),
+                );
+            }
+            closure.put_lookups(l);
+        }
         held.grow(changes.heap_bytes());
         closure.settle();
         budget.check()?;
@@ -541,7 +566,7 @@ impl RawChanges {
                         match (before, after) {
                             (false, true) => c.base_added.push(t),
                             (true, false) => c.base_removed.push(t),
-                            _ => {}
+                            _ => c.base_moved.push(t),
                         }
                     }
                 } else {
@@ -657,6 +682,16 @@ fn delta_changes(
                 match (in_union(old, &t)?, in_union(new, &t)?) {
                     (false, true) => c.base_added.push(t),
                     (true, false) => c.base_removed.push(t),
+                    _ if ids.len() > 1 => {
+                        // a graph's change that the union does not show
+                        for g in &ids {
+                            let q = [Id(t[0]), Id(t[1]), Id(t[2]), *g];
+                            if old.contains(&q)? != new.contains(&q)? {
+                                c.base_moved.push(t);
+                                break;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -712,7 +747,16 @@ pub(crate) fn keep(
         Some(b) => b.graph_ids(),
         None => return Ok(false),
     };
-    closure.set_inputs(snap.clone(), &ids)?;
+    let old_lookups = closure.set_inputs(snap.clone(), &ids)?;
+    // the commit changed only the inferred graph, so the remembered lookups hold when
+    // the inputs leave it out, and are dropped otherwise
+    if let Some(l) = old_lookups
+        && !snap
+            .lookup_iri(INFERRED_GRAPH)
+            .is_some_and(|g| ids.contains(&g))
+    {
+        closure.put_lookups(l);
+    }
     let mut held = Held::new(&budget);
     remap_set(&mut generalized, &moved, Some(&mut held))?;
     drop(held);
@@ -723,6 +767,12 @@ pub(crate) fn keep(
     // indexes now, after the commit, rather than in the next run
     closure.graph.ensure_index(true, true)?;
     closure.graph.ensure_index(false, true)?;
+    // room for the rows of the next small runs, so that they do not wait for the rows to
+    // be copied and the triple index rehashed
+    let live = closure.graph.live();
+    closure
+        .graph
+        .try_reserve_rows((live / 64).max(1024), (live / 16).max(4096))?;
     budget.check_peak()?;
     cache.put(Kept {
         dataset_id: receipt.dataset_id,

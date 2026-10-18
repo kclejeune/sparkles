@@ -21,8 +21,12 @@
 //! through a [`Memo`] of the blocks the caller read last: a lookup in one of them is a
 //! binary search, without the shared block cache and its reference counts. Key ranges
 //! with changes in the snapshot's delta are read with the snapshot's merging scan.
+//!
+//! The base tier of a kept closure also has the closure's [`Lookups`], which answer
+//! lookups with few facts without reading a block (see [`crate::lookups`]).
 
 use crate::graph::Triple;
+use crate::lookups::{self, Lookups, Read};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use sparkles_core::id::{Id, Tag};
@@ -99,6 +103,8 @@ pub(crate) struct Base {
     /// per predicate: quads in the store (an upper bound of the tier's)
     counts: RwLock<FxHashMap<u64, u64>>,
     scans: AtomicU64,
+    /// the remembered lookups of a kept closure
+    lookups: Option<Lookups>,
 }
 
 /// The positions of a key's columns: `at[c]` is the key column holding quad component
@@ -121,6 +127,28 @@ fn pred(mut k: Key) -> Key {
         k[c] = u64::MAX;
     }
     k
+}
+
+/// With one input graph, the place of `t` in the scan of the lookup with the bound
+/// positions of `k`: its components in the order of the permutation the lookup reads (see
+/// [`Base::access`]), which sorts as the scan visits them.
+pub(crate) fn rank(k: &lookups::Pattern, t: &Triple) -> Triple {
+    let perm = match (k[0] != 0, k[1] != 0, k[2] != 0) {
+        (true, _, _) => Perm::Gspo,
+        (false, true, true) => Perm::Pos,
+        (false, true, false) => Perm::Pso,
+        (false, false, true) => Perm::Osp,
+        (false, false, false) => Perm::Gspo,
+    };
+    let mut r = [0; 3];
+    let mut i = 0;
+    for c in perm.order() {
+        if c < 3 {
+            r[i] = t[c];
+            i += 1;
+        }
+    }
+    r
 }
 
 /// Whether the delta of `snap` changes a key of `perm` in `[lo, hi]`.
@@ -156,7 +184,40 @@ impl Base {
             len: n as u32,
             counts: RwLock::new(FxHashMap::default()),
             scans: AtomicU64::new(0),
+            lookups: None,
         })
+    }
+
+    /// This tier, answering its lookups with few facts from `lookups` and keeping their
+    /// answers there.
+    pub fn with_lookups(mut self, lookups: Lookups) -> Base {
+        self.lookups = Some(lookups);
+        self
+    }
+
+    /// The remembered lookups, to change between runs.
+    pub fn lookups_mut(&mut self) -> Option<&mut Lookups> {
+        self.lookups.as_mut()
+    }
+
+    /// Give the tier remembered lookups.
+    pub fn set_lookups(&mut self, lookups: Lookups) {
+        self.lookups = Some(lookups);
+    }
+
+    /// The remembered lookups, taken out of the tier.
+    pub fn take_lookups(&mut self) -> Option<Lookups> {
+        self.lookups.take()
+    }
+
+    /// Whether the tier reads one input graph, whose scans visit facts in key order.
+    pub fn one_graph(&self) -> bool {
+        self.single().is_some()
+    }
+
+    /// The remembered lookups, when the tier has them.
+    pub fn lookups(&self) -> Option<&Lookups> {
+        self.lookups.as_ref()
     }
 
     /// An upper bound of the number of facts.
@@ -247,8 +308,66 @@ impl Base {
         o: Option<u64>,
         f: impl FnMut(Triple) -> bool,
     ) -> anyhow::Result<bool> {
-        let (perm, lo, hi) = self.access(s, p, o);
         let mut f = f;
+        if let Some(l) = &self.lookups
+            && let Some(k) = Lookups::pattern(s, p, o)
+        {
+            // the kept first facts, then the blocks past them
+            let mut buf = [[0u64; 3]; lookups::COPY_FACTS];
+            let (kept, complete): (&[Triple], bool) = match l.read(&k, &mut buf) {
+                Some(Read::Frozen(a)) => (&a.facts, a.complete),
+                Some(Read::Copied(n, complete)) => (&buf[..n], complete),
+                None => (&[], false),
+            };
+            for t in kept {
+                if !f(*t) {
+                    return Ok(false);
+                }
+            }
+            if complete {
+                return Ok(true);
+            }
+            let skip = kept.len();
+            // the answer's first facts, while they can be kept
+            let keep = skip < lookups::MAX_FACTS;
+            let mut few: smallvec::SmallVec<[Triple; 16]> = smallvec::SmallVec::new();
+            if keep {
+                few.extend_from_slice(kept);
+            }
+            let mut seen = 0;
+            let mut many = !keep;
+            let done = self.scan_all(memo, s, p, o, |t| {
+                seen += 1;
+                if seen <= skip {
+                    return true;
+                }
+                if !many {
+                    if few.len() < lookups::MAX_FACTS {
+                        few.push(t);
+                    } else {
+                        many = true;
+                    }
+                }
+                f(t)
+            })?;
+            if keep {
+                l.put(k, &few, done && !many);
+            }
+            return Ok(done);
+        }
+        self.scan_all(memo, s, p, o, f)
+    }
+
+    /// Every pass of a pattern's scan, in order.
+    fn scan_all(
+        &self,
+        memo: &mut Memo,
+        s: Option<u64>,
+        p: Option<u64>,
+        o: Option<u64>,
+        mut f: impl FnMut(Triple) -> bool,
+    ) -> anyhow::Result<bool> {
+        let (perm, lo, hi) = self.access(s, p, o);
         for pass in 0..self.passes() {
             if !self.scan(memo, perm, lo, hi, [s, p, o], Some(pass), &mut f)? {
                 return Ok(false);
@@ -266,6 +385,23 @@ impl Base {
         p: Option<u64>,
         o: Option<u64>,
     ) -> anyhow::Result<bool> {
+        if let Some(l) = &self.lookups
+            && let Some(k) = Lookups::pattern(s, p, o)
+        {
+            if let Some((any, complete)) = l.peek(&k)
+                && (complete || any)
+            {
+                return Ok(any);
+            }
+            // the first fact is enough
+            let mut few: Vec<Triple> = Vec::new();
+            let done = self.scan_all(memo, s, p, o, |t| {
+                few.push(t);
+                false
+            })?;
+            l.put(k, &few, done);
+            return Ok(!few.is_empty());
+        }
         let (perm, lo, hi) = self.access(s, p, o);
         Ok(!self.scan(memo, perm, lo, hi, [s, p, o], None, |_| false)?)
     }
@@ -473,6 +609,20 @@ impl Base {
         if t.iter().any(|&x| Id(x).tag() == Tag::Local) {
             return Ok(false);
         }
+        let Some(l) = &self.lookups else {
+            return self.probe(memo, t);
+        };
+        let k = *t;
+        if let Some((any, _)) = l.peek(&k) {
+            return Ok(any);
+        }
+        let found = self.probe(memo, t)?;
+        l.put(k, if found { std::slice::from_ref(t) } else { &[] }, true);
+        Ok(found)
+    }
+
+    /// Whether an input graph holds `t`, read from the blocks.
+    fn probe(&self, memo: &mut Memo, t: &Triple) -> anyhow::Result<bool> {
         let snap = &*self.snap;
         for &g in &self.graphs {
             let (perm, key) = if self.single().is_some() {

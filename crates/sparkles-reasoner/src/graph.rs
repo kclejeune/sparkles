@@ -371,6 +371,36 @@ impl Graph {
         n + self.spilled
     }
 
+    /// Make room for at least `want` more rows, in the rows' buffer and in each shard of
+    /// the triple index, when there is less than `min` room. Growing them later copies the
+    /// rows and rehashes the index while a run waits, so a closure kept for small runs
+    /// gets this room once, after its commit. The growth is charged before it is
+    /// allocated, and a charge past the limit fails.
+    pub fn try_reserve_rows(&mut self, min: usize, want: usize) -> Result<(), MemoryExceeded> {
+        let (len, cap) = (self.triples.len(), self.triples.capacity());
+        if cap - len < min {
+            let new = len + want.max(min);
+            self.held.try_grow(new * size_of::<Triple>())?;
+            self.triples.reserve_exact(new - len);
+            self.held.shrink(cap * size_of::<Triple>());
+        }
+        let (min, want) = (min.div_ceil(SHARDS), want.div_ceil(SHARDS));
+        let off = self.offset;
+        for s in 0..SHARDS {
+            let t = &self.index[s];
+            if t.capacity() - t.len() >= min {
+                continue;
+            }
+            let (old, len) = (t.capacity(), t.len());
+            let to = table_grown(old, len, want.max(min));
+            self.held.try_grow(table_bytes(to, size_of::<u32>()))?;
+            let triples = &self.triples;
+            self.index[s].reserve(to - len, |&r| hash3(&triples[(r - off) as usize]));
+            self.held.shrink(table_bytes(old, size_of::<u32>()));
+        }
+        self.try_settle()
+    }
+
     /// A graph whose rows `[0, base.len)` are the base tier (at least one row, so that
     /// a base tier that grows later, see [`set_base`](Self::set_base), is still read).
     pub fn with_base(base: Arc<Base>) -> Graph {
@@ -420,6 +450,18 @@ impl Graph {
             *k = FxHashSet::default();
         }
         self.settle();
+    }
+
+    /// [`set_base`](Self::set_base), returning the tier it replaced.
+    pub fn swap_base(&mut self, base: Arc<Base>) -> Option<Arc<Base>> {
+        let old = self.base.clone();
+        self.set_base(base);
+        old
+    }
+
+    /// The base tier, to change, while no one else shares it.
+    pub fn base_mut(&mut self) -> Option<&mut Base> {
+        self.base.as_mut().and_then(Arc::get_mut)
     }
 
     /// The base tier, if the graph has one.
@@ -1340,6 +1382,45 @@ mod tests {
             b.peak(),
             g.heap_bytes()
         );
+    }
+
+    /// Room made ahead is charged, later rows fit it without growing the buffers, and a
+    /// reservation the budget refuses fails without a charge.
+    #[test]
+    fn reserved_rows_are_charged() {
+        let b = Budget::unlimited();
+        let mut g = Graph::try_with_capacity(0, &b).unwrap();
+        g.try_add_batch((0..10_000u64).map(|i| [i, 1, i + 7]))
+            .unwrap();
+        g.try_reserve_rows(1_000, 5_000).unwrap();
+        let cap = g.triples.capacity();
+        assert!(cap - g.triples.len() >= 5_000);
+        assert!(b.used() >= cap * size_of::<Triple>() + 5_000 * size_of::<u32>());
+        let shards: Vec<usize> = g.index.iter().map(|t| t.capacity()).collect();
+        g.try_add_batch((0..1_000u64).map(|i| [i, 2, i + 7]))
+            .unwrap();
+        assert_eq!(g.triples.capacity(), cap);
+        assert_eq!(
+            g.index.iter().map(|t| t.capacity()).collect::<Vec<_>>(),
+            shards
+        );
+        // enough room already: nothing changes
+        let used = b.used();
+        g.try_reserve_rows(1_000, 5_000).unwrap();
+        assert_eq!((g.triples.capacity(), b.used()), (cap, used));
+
+        let tight = Budget::new(Some(4 << 20));
+        let mut g = Graph::try_with_capacity(0, &tight).unwrap();
+        g.try_add_batch((0..10_000u64).map(|i| [i, 1, i + 7]))
+            .unwrap();
+        let used = tight.used();
+        assert!(g.try_reserve_rows(1 << 20, 1 << 20).is_err());
+        assert!(
+            tight.used() <= used,
+            "{} after the refusal, {used} before",
+            tight.used()
+        );
+        assert!(tight.peak() <= 4 << 20);
     }
 
     #[test]

@@ -24,6 +24,7 @@ mod facts;
 mod graph;
 mod incremental;
 pub mod inputs;
+mod lookups;
 mod maintain;
 pub mod parser;
 mod pool;

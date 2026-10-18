@@ -318,9 +318,11 @@ fn copy(s: &Store) -> Store {
 /// continues from a closure kept in memory. A closure read back from the dataset does
 /// not know its default geometries, and that run reads them with one scan per property.
 ///
-/// `baseScans` also counts the reads of the input graphs that rule evaluation makes, the
-/// same for both closures, so the test compares the two runs of each step: the closure
-/// read back costs the two scans of the default geometries more. Each step also reads
+/// `baseScans` also counts the reads of the input graphs that rule evaluation makes. A
+/// closure kept in memory answers some of those from the lookups it remembers (roadmap
+/// item 87), so the two closures differ by more than the scans of the default
+/// geometries. The test checks that the closure read back makes at least those scans,
+/// that the closure kept in memory never reads more than it, and that each step reads
 /// less than a full run over the same data.
 #[test]
 fn f16_default_geometry_changed_subjects() {
@@ -334,19 +336,18 @@ fn f16_default_geometry_changed_subjects() {
             None,
         )])
         .unwrap();
-    // (update, scans with the closure in memory, scans with the closure read back)
+    // (update, the fewest scans with the closure read back)
     let steps = [
-        ("INSERT DATA { ex:z ex:unrelated 1 }", 0, 2),
-        ("INSERT DATA { ex:p1 geo:hasGeometry ex:g1b }", 2, 4),
-        ("DELETE DATA { ex:p2 geo:hasGeometry ex:g2b }", 2, 4),
+        ("INSERT DATA { ex:z ex:unrelated 1 }", 2),
+        ("INSERT DATA { ex:p1 geo:hasGeometry ex:g1b }", 4),
+        ("DELETE DATA { ex:p2 geo:hasGeometry ex:g2b }", 4),
         (
             "INSERT DATA { ex:p4 geo:hasGeometry ex:g4 . ex:p3 geo:hasGeometry ex:g3c }",
-            4,
             6,
         ),
-        ("DELETE DATA { ex:p3 geo:hasDefaultGeometry ex:g3b }", 2, 4),
-        ("INSERT DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }", 2, 4),
-        ("INSERT DATA { ex:z ex:unrelated 2 }", 0, 2),
+        ("DELETE DATA { ex:p3 geo:hasDefaultGeometry ex:g3b }", 4),
+        ("INSERT DATA { ex:p4 geo:hasDefaultGeometry ex:g4 }", 4),
+        ("INSERT DATA { ex:z ex:unrelated 2 }", 2),
     ];
     // per closure, the scans of each step
     let mut scans: Vec<Vec<u64>> = Vec::new();
@@ -367,17 +368,14 @@ fn f16_default_geometry_changed_subjects() {
             .unwrap_or_else(|e| panic!("{e:#}"))
         };
         let mut since = go(None).receipt.unwrap().commit.seq;
-        for (u, in_memory, read_back) in steps {
+        for (u, read_back) in steps {
             sparkles_core::sparql::update::update(&s, &format!("{P}{u}"), &QueryOptions::default())
                 .unwrap();
             let r = go(Some(since));
             assert_eq!(r.method, Method::Incremental, "{u}: {:?}", r.fallback);
-            let want = if cache.is_some() {
-                in_memory
-            } else {
-                read_back
-            };
-            assert!(r.base_scans >= want, "{u}: {} scans", r.base_scans);
+            if cache.is_none() {
+                assert!(r.base_scans >= read_back, "{u}: {} scans", r.base_scans);
+            }
             scans.last_mut().unwrap().push(r.base_scans);
             since = r.receipt.unwrap().commit.seq;
             // a full run over a copy writes the same
@@ -398,10 +396,9 @@ fn f16_default_geometry_changed_subjects() {
             );
         }
     }
-    for (i, (u, in_memory, read_back)) in steps.iter().enumerate() {
-        assert_eq!(
-            scans[1][i] - scans[0][i],
-            read_back - in_memory,
+    for (i, (u, _)) in steps.iter().enumerate() {
+        assert!(
+            scans[0][i] <= scans[1][i],
             "{u}: {} scans with the closure in memory, {} with it read back",
             scans[0][i],
             scans[1][i]
