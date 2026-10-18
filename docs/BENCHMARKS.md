@@ -1767,8 +1767,9 @@ so only its row count is checked.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of
   28.7 GiB under a 14 GiB limit.
 * **Other standard benchmarks.** The tables above include no figures for LUBM, BSBM or
-  SP²Bench. F16's Outcome records development runs of a LUBM-style generator on atlas,
-  which are not comparisons with other engines and are not repeated here. The harnesses
+  SP²Bench. F16's Outcome records development runs of a LUBM-style generator on atlas
+  and on Namespace instances, among them the memory of the closure kept for incremental
+  runs. They are not comparisons with other engines and are not repeated here. The harnesses
   for all three exist and are described in [BENCHMARKING.md](BENCHMARKING.md), but their
   comparisons have not been run on the reference machine. OWL2Bench, LDBC, WatDiv's stress
   testing and the Wikidata query log have no harness yet. The synthetic suite has a

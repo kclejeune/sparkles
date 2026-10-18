@@ -691,9 +691,9 @@ without reasoning, and the status is fresh within 10 s after the writes stop.
 ## Outcome
 
 **Phase 1 built** on 2026-10-13. A review on 2026-10-16 led to the fixes recorded below.
-Its acceptance runs are open under [ROADMAP](../ROADMAP.md) item 1, and two parts of the
-phase, listed under "Open parts of Phase 1", stay open under item 9. Phases 2, 3 and 4 are
-not built.
+Its acceptance runs are open under [ROADMAP](../ROADMAP.md) item 1. A follow-up of item 9
+built §3.5 and §8's coverage on 2026-10-18, as recorded under "Kept closure without the
+explicit facts" and "`dt-not-type` coverage" below. Phases 2, 3 and 4 are not built.
 
 * **Base tier.** `crates/sparkles-reasoner/src/facts.rs` reads the input graphs from the
   snapshot's permutations. A lookup with one input graph and a bound subject uses GSPO.
@@ -731,7 +731,8 @@ not built.
   The closure remembers its default geometries, so an update reads only the changed
   features, with two probes bound to the feature and the property. A closure read back
   from the dataset does not know them, and that run reads them with one scan of each
-  property. `baseScans` counts these reads for incremental runs.
+  property. `baseScans` of an incremental run counts these reads together with every
+  other read of the input graphs.
 * **`dt-not-type`.** The check `literal-not-in-datatype` and `datatype-range.rq` follow §8,
   with the corrections under "Diagnostics" below.
 * **LUBM.** `cargo run --release -p sparkles-reasoner --example lubm` generates
@@ -766,10 +767,9 @@ merge is now the larger part of an OWL 2 RL iteration.
 
 **Memory tradeoffs.** The derived tier costs about 135 bytes per derived fact, which is
 what the in-memory graph cost per fact before. Each iteration's candidate buffers live
-until the merge copies them. A kept closure still holds the explicit facts in memory, so
-when `--reason-cache-triples` admits the closure, the run reads the input graphs into
-memory at its end and the server keeps the same memory as before. The memory saving
-applies to the run itself, and to the server only for closures the cache does not keep.
+until the merge copies them. Since the follow-up of item 9, a kept closure holds the
+derived facts only, so the memory saving applies to the closure a server keeps as well as
+to the run.
 
 **Reasoning pool admission.** The review found that a run called on a rayon worker could
 deadlock. While it held the writer lock, the waiting worker could take another queued job
@@ -875,23 +875,124 @@ candidate cap through test-only switches.
 
 **Build.** `Cargo.lock` is current again, so `cargo metadata --locked` succeeds.
 
-**Open parts of Phase 1.** The first two parts are left to a follow-up of
-[ROADMAP](../ROADMAP.md) item 9, and the third moved to item 1.
+**Kept closure without the explicit facts.** The follow-up built §3.5. A kept closure, the
+closure of `Derivation::into_closure` and the closure read back from the dataset hold the
+derived facts only, over the input graphs of the closure's commit as their base tier. A
+fact of the closure is explicit when the base tier holds it, or when its derived row is
+flagged, which only GeoSPARQL default geometries and the inserted facts of a running update
+are. An incremental run first moves the closure's base tier to the snapshot it runs on.
+Removed input facts join the derived tier as candidates of the backward search, so a
+removed fact that still follows from the rules stays as a derived fact. Inserted input
+facts join it as flagged rows, which start the semi-naive insertion, and at the end of the
+run one sorted pass over the base tier drops those that the input graphs hold. When a
+default geometry becomes a stated fact or the reverse, the fact moves between the tiers.
+A closure read back from the dataset starts from the inferred graph as of the recorded
+commit, drops the facts that the input graphs held at that commit, found with one sorted
+probe of the base tier, and adds the saved generalized facts. The saved files already held
+only the generalized facts, so no on-disk format changed. `--reason-cache-triples` counts
+derived facts, and the memory budget charges only the derived tier. `baseScans` of an
+incremental run now counts every read of the input graphs, where it counted only the reads
+of default geometries.
 
-1. §3.5, the kept closure without the explicit facts. The kept closure still holds them,
-   and so do `Derivation::into_closure` and the closure read back from the dataset. The
-   memory budget charges them.
-2. §8's coverage. Ill-typed literals are found among the literal objects that the query
-   returns, not by a scan of the vocabulary remembered per generation, and the check does
-   not read the generalized facts of a kept closure.
-3. The acceptance runs of §11 and §12 moved to [ROADMAP](../ROADMAP.md) item 1. They are
-   A1 at 1,000 universities, OWL2Bench, and the LUBM and OWL2Bench runs in X06's harness.
-   The measurements above come from the example's own LUBM-style generator at 100
-   universities.
+The example's `keep` subcommand measures this as a server sees it. It runs in full, runs
+again without changes so that the closure is kept, measures the kept closure, and then
+runs incrementally after a change that removes 1,000 triples of the first university and
+adds 1,000, after the change is undone and after it is made again, all with the kept
+closure, and once more after a second undo with the closure read back from the dataset.
+The data has 100 universities, 13.1 million triples. The runs were made on a Namespace
+instance with 16 vCPUs and 32 GiB on 2026-10-18, comparing `a6179e58`, the commit of main
+the work started from, with the follow-up, each with the same example. Each build ran
+three times at 16 threads and twice at 1 thread, interleaved, on a fresh copy of the
+dataset. These are development A/B measurements, not published benchmarks. The table gives
+the range of the runs.
+
+| Run | Before | After |
+|---|---|---|
+| RDFS, kept closure | 19.97 million facts, 2,267 MiB | 6.84 million facts, 918 MiB |
+| OWL 2 RL, kept closure | 25.60 million facts, 2,654 MiB | 12.48 million facts, 1,226 MiB |
+| RDFS, full run, 16 threads | 12.3 to 13.3 s, 3,313 MiB peak | 10.7 to 11.7 s, 2,409 MiB peak |
+| OWL 2 RL, full run, 16 threads | 17.9 to 18.5 s, 3,910 MiB peak | 14.9 to 15.1 s, 3,351 MiB peak |
+| RDFS, run without changes from the dataset, 16 threads | 5.7 to 6.1 s, 2,719 MiB peak | 3.4 to 4.1 s, 1,334 MiB peak |
+| OWL 2 RL, run without changes from the dataset, 16 threads | 4.1 to 4.5 s, 2,878 MiB peak | 1.8 to 2.0 s, 1,450 MiB peak |
+| RDFS, change read back from the dataset, 16 threads | 5.6 to 6.3 s, 2,735 MiB peak | 3.5 to 4.1 s, 1,079 MiB peak |
+| OWL 2 RL, change read back from the dataset, 16 threads | 4.1 to 4.7 s, 3,248 MiB peak | 2.3 to 2.4 s, 1,528 MiB peak |
+| RDFS, first change with the kept closure, 16 threads | 18 to 34 ms, 462 MiB peak | 72 to 89 ms, 177 MiB peak |
+| RDFS, later changes with the kept closure, 16 threads | 14 to 18 ms | 24 to 56 ms |
+| OWL 2 RL, first change with the kept closure, 16 threads | 34 to 41 ms, 595 MiB peak | 133 to 142 ms, 304 MiB peak |
+| OWL 2 RL, later changes with the kept closure, 16 threads | 26 to 45 ms | 87 to 115 ms |
+| RDFS, full run, 1 thread | 24.3 and 25.1 s | 20.8 and 22.4 s |
+| RDFS, change read back from the dataset, 1 thread | 7.6 and 7.9 s | 4.4 and 4.5 s |
+| RDFS, first change with the kept closure, 1 thread | 193 and 245 ms | 81 and 82 ms |
+| RDFS, later changes with the kept closure, 1 thread | 13 to 16 ms | 30 to 85 ms |
+
+The peaks are the process's allocations during the run, which include the data the run
+returns, and the kept closure is the heap it holds after the run.
+
+**Memory tradeoffs of the kept closure.** The kept closure takes 40% of its previous
+memory for RDFS and 46% for OWL 2 RL on this data, and a run that reads it back from the
+dataset peaks at 39% to 47% of its previous heap and finishes in 49% to 73% of the time.
+Small changes with a kept closure became slower, 2 to 5 times at 16 threads and up to 5
+times at 1 thread for the later changes, though the first change at 1 thread became
+faster. The backward search and the insertion now read the input graphs from the store's
+compressed blocks, where the previous closure answered them from its own hash tables. The
+first change after the closure is kept decodes most of the blocks it reads, and later
+changes find more of them in the block cache. On LUBM-style data with 20 universities on a
+16-thread development machine, the backward search of a change took about 30 ms when its
+blocks were not decoded and 6 to 9 ms when they were. Handing the decoded blocks of one
+rule evaluation of the backward search to the next did not change the time measurably, so
+the follow-up does not do it. The tradeoff is the opposite of the one the engineering
+rules prefer by default. It was taken because the kept closure is what bounds the number
+of datasets a server can keep warm, and a change of 1,000 triples still finishes in under
+150 ms.
+
+**`dt-not-type` coverage.** The follow-up built §8's coverage. `literal-not-in-datatype`
+finds the literals that are ill-typed for their own datatype by a scan of the vocabulary.
+The scan reads the literal keys of a generation's base vocabulary once and remembers the
+ill-typed ones for the last eight generations read, and it reads the delta vocabulary each
+time. Literals inlined in their ids take only canonical, valid forms and are not read. The
+check then looks up the subjects and properties that have each ill-typed literal as a value
+in the checked graphs, 256 literals to a query, so a literal that no checked graph holds is
+not reported. `datatype-range.rq` keeps only its range branch. With the inferences, the
+check also reads the literal typings, the facts `lt rdf:type DT` with a literal subject,
+among the generalized facts of the materialization. It reads them from the closure the
+dataset keeps for the recorded commit, or else from the generalized facts that a persistent
+dataset saved. These typings come from rules such as a range through a subclass of a
+datatype, and RDF cannot state them, so they never reach the inferred graph. Their
+findings have the literal as their focus and the basis `uses-inferences`. The typings are
+read only for the RDFS, RDFS simple and OWL 2 RL profiles, whose rules OWL 2 entails, so a
+literal typed outside its value space is one OWL 2 reports too, and the check stays sound.
+Jena rules can type a literal with any datatype, so their typings are not read. The test
+`f16_ill_typed_literals_come_from_the_vocabulary` in `diagnostics.rs` counts the scans of
+the base vocabulary, and `f16_literal_typings_of_a_kept_closure` in `tests/diagnostics.rs`
+reads typings from a kept closure and from saved files.
+
+The example's `diag` subcommand runs the check twice on the same snapshot. On the same
+instance and data, with 100 universities and no ill-typed literals, the first check took
+10.9 to 11.6 s with a peak heap of 1,098 MiB before, when a query read every literal value,
+and 9 to 17 ms with 1.5 MiB after. A second check on the same generation took 10.7 to
+12.5 s before and under 1 ms after. The remembered result holds only the ill-typed
+literals, so its memory follows their number.
+
+**The flaky budget test.** `f16_shared_candidate_budget` in `tests/memory.rs` failed now and
+then under load, when the heap it measured grew by 1.4 to 3 MB past its bound. The
+reasoner's own charges were not the cause. Each strict charge is taken from the shared
+counter before the allocation it covers, so a thread that is descheduled between the two
+holds its charge and cannot let another thread pass the limit. Allocation backtraces showed
+the store's change log writer thread, which encodes the loaded triples in the background
+and so allocated during the measured window whenever the scheduler delayed it. The test
+now writes the change log out before it measures. Under 32 busy processes on a 16-thread
+development machine, 3 of about 40 runs failed before the fix. After it, 60 runs grew by at
+most 162 KB, against a bound of the 48,000-byte limit plus 256 KiB.
+
+**Open parts of Phase 1.** The acceptance runs of §11 and §12 moved to
+[ROADMAP](../ROADMAP.md) item 1. They are A1 at 1,000 universities, OWL2Bench, and the
+LUBM and OWL2Bench runs in X06's harness. The measurements above come from the example's
+own LUBM-style generator at 100 universities.
 
 **Deviations.**
-* §3.5 is not built, as listed under the open parts. The kept closure holds the explicit
-  facts with a flag, as before, and the cache limit counts them.
+* §3.5 expected the same cache limit to keep the closure of an input about four times
+  larger on RDFS. On the LUBM-style data a closure of 19.97 million facts became one of
+  6.84 million, so the same limit keeps the closure of an input about 2.9 times larger.
 * The LUBM data comes from the example's own generator, with about 131,000 triples per
   university, not from the UBA generator.
 * `literal-not-in-datatype` narrows the candidates with one SPARQL query per page of

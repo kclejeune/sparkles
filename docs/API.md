@@ -6389,8 +6389,9 @@ triples.
 
 The run needs the closure of the previous run, which includes the derived triples that
 are not valid RDF and so never reach the inferred graph. Each dataset of a server keeps
-it in memory after a run, up to `serve --reason-cache-triples` triples (10 million by
-default, about 135 bytes each). After a restart, and in `sparkles infer`, the run builds
+it in memory after a run, up to `serve --reason-cache-triples` derived triples (10
+million by default, about 135 bytes each). The kept closure holds only the derived
+triples and reads the input graphs from the store's indexes. After a restart, and in `sparkles infer`, the run builds
 it again from the input graphs and the inferred graph of the recorded commit. A
 persistent dataset keeps the derived triples that are not valid RDF in its
 `reasoning-generalized.*` files for that purpose. An in-memory dataset without a kept
@@ -6502,7 +6503,13 @@ values with a timezone are in `xsd:dateTimeStamp`, `xsd:hexBinary` and
 literals of the types derived from `xsd:string`. `xsd:double` and `xsd:float` are
 treated as one value space. The finding limit counts findings, not candidates, and the
 check reads at most 262,144 candidate rows. It is truncated when it stops there, and a
-truncated check without findings makes the report incomplete.
+truncated check without findings makes the report incomplete. Ill-typed literals come
+from a scan of the vocabulary that is remembered per generation. With the inferences
+included, a materialization by the RDFS or OWL 2 RL profile also gives the check the
+literal typings among its generalized triples, which RDF cannot state, such as a range
+through a subclass of `xsd:integer`. They are read from the closure the dataset keeps
+for the recorded commit, or else from the generalized triples a persistent dataset saved,
+and their findings have the literal as focus and the basis `uses-inferences`.
 
 There is no unique name assumption. Two IRIs count as different individuals only through
 `owl:differentFrom` or `owl:AllDifferent`. Literal values of a functional property are compared with SPARQL
