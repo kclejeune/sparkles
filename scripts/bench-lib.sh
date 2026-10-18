@@ -409,6 +409,11 @@ q() { # curl command for endpoint + query name (fails on HTTP errors)
 }
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
+# time_query, which records a query that fails on its first request without timing it and
+# restarts an engine that stops answering
+# shellcheck source=scripts/bench-probe.sh
+source "$ROOT/scripts/bench-probe.sh"
+
 # the rise a - b as JSON (0 if negative: the kernel's RSS counters are approximate), or "?"
 minus() { if [[ $1 =~ ^[0-9]+$ && $2 =~ ^[0-9]+$ ]]; then echo $(($1 > $2 ? $1 - $2 : 0)); else echo '"?"'; fi; }
 # a reading as JSON: the number, or "?"

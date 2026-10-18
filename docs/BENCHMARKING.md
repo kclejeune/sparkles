@@ -195,7 +195,24 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   after `MAX_TIME`, and every server's query timeout is `MAX_TIME` plus a margin of 15
   seconds (`TIMEOUT_MARGIN`), so a server stops a query that the client has abandoned. A
   run that fails after taking as long as `MAX_TIME` is recorded as a `timeout`, whichever
-  side stopped it. The options are the
+  side stopped it.
+
+  Every timing loop, in these suites and in `scripts/bench.sh`, `scripts/bench-watdiv.sh`
+  and `scripts/bench-billion.sh`, sends each query once more untimed just before
+  hyperfine runs it (`scripts/bench-probe.sh`). An engine whose request fails or reaches
+  `MAX_TIME` there is recorded with that one sample, as an `error` or a `timeout`, and
+  hyperfine leaves it out, so a query that cannot finish costs `MAX_TIME` once rather than
+  12 times. After a failure and after each query's timed runs, every engine must answer a
+  one-row query within 30 seconds. An engine that does not is restarted, and
+  `results/restarts.json` names it and the query after which it stopped answering. WatDiv
+  runs its engines together and cannot restart one alone, so there such an engine is left
+  out of the remaining queries and recorded as an error for them. This check exists
+  because Fuseki 5.1 can answer its ping while every query waits forever. At 10.5M
+  triples, a `StackOverflowError` in its property path engine during `knows-reach` left
+  TDB2's node table cache locked, and `jstack` reported a deadlock between the cache's
+  monitor and Caffeine's eviction lock. Every later Jena query then ran into `MAX_TIME`.
+
+  The options are the
   ones of `scripts/bench.sh`, which are
   `ENGINES`, `QUERIES`, `RUNS`, `WARMUP`, `SKIP_LOAD`, `ANSWERS_ONLY`, `PORT_BASE`,
   `SERVER_MEM_MAX` and `CLIENT_CPU`. `COLD_RUNS=3` adds the cold measurement, a restart
