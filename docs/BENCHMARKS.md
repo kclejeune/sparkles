@@ -1133,6 +1133,53 @@ the idle path and group commit with it, and in a later run 0.91 and 1.09 ms for 
 writer and group commit, with ranges of 0.66 to 2.56 and 0.73 to 1.87 ms. These overlap, so
 the tail needed `forge` to settle.
 
+### Group commit on indexed datasets
+
+These screens compare origin/main 23075691, where a dataset with a full-text, spatial or
+embedding index takes the ordinary path, with the [X09 Phase 4](specs/X09-group-commit-by-default.md#phase-4)
+branch at 80f19430 with grouping on and with `--no-group-commit`. They ran on 2026-10-18
+with `scripts/nsc-writes.sh --index` on 8-vCPU Namespace instances, as in the previous
+section, so they are approximate. The dataset is the 10.5M-triple one with the index built
+after the load, and 4 ms are added to every synchronization (`delay-us=4000`). The
+full-text index covers every literal, so each write adds a document. The embedding index
+embeds the writers' literals, and the server runs with `--no-embedding`, so its work only
+queues. The generated data has no geometries and the writers add none, so the spatial rows
+measure admission alone. Each row is the median of four rounds of transactions per second.
+Before the change every commit of these runs fell back with reason `text`, `geo` or
+`embed`, and after it none fell back.
+
+| 10.5M, 4 ms synchronization | Index | origin/main | Grouping off | Grouping on | On / origin/main |
+|---|---|---:|---:|---:|---:|
+| Serial literal inserts | Full-text | 194.5 | 210.6 | 209.0 | 1.07 |
+| Four writers | Full-text | 203.2 | 215.2 | 441.4 | 2.17 |
+| Sixteen writers | Full-text | 202.0 | 215.6 | 1,718.0 | 8.51 |
+| Four writers with two readers | Full-text | 203.8 | 218.5 | 439.1 | 2.15 |
+| Serial literal inserts | Spatial | 213.5 | 214.4 | 207.5 | 0.97 |
+| Four writers | Spatial | 230.6 | 230.7 | 466.6 | 2.02 |
+| Sixteen writers | Spatial | 229.8 | 230.9 | 1,805.6 | 7.86 |
+| Serial literal inserts | Embedding | 217.8 | 218.8 | 220.3 | 1.01 |
+| Four writers | Embedding | 232.9 | 232.5 | 469.6 | 2.02 |
+| Sixteen writers | Embedding | 233.9 | 232.1 | 1,802.3 | 7.71 |
+
+The serial p50 and p90 with grouping on were within 3.2% of grouping off for every index.
+The four-writer p50 fell from about 17 ms to 8.5 ms, and the sixteen-writer p50 from about
+64 ms to 8.8 ms. With the full-text index, the reader p99 of the mixed run was 1.9 ms with
+grouping on and 1.1 ms with it off, with ranges of 0.9 to 2.9 ms and 1.0 to 1.3 ms. The
+Phase 3 reader tail did not settle on these instances either, so this needs `forge`.
+
+On the instances' own synchronization of about 0.1 ms, five rounds with the full-text index
+gave 14,488 transactions per second for sixteen writers with grouping on against 9,146 with
+it off, and 9,611 against 9,560 for four writers. Serial inserts commit in about 0.12 ms
+there, and ten interleaved rounds of 5,000 at 1.05M gave a median per-round ratio of p50 on
+to p50 off of 1.035, with single rounds from 0.86 to 1.58. That is within the noise of
+these instances, and the serial gate of X09 section 17.9 needs `forge`.
+
+The servers' peak resident memory, read from `VmHWM` after each run, measures what the
+speculative index state costs. With four writers grouping on peaked within 5 MiB of
+grouping off for every index. With sixteen writers it peaked 15 MiB higher with the
+full-text index, 18 MiB higher with the embedding index and 21 MiB higher with the spatial
+index, at 210, 188 and 174 MiB.
+
 ### Reader tail of group commit on forge
 
 Four writers and two readers ran against the 10.5M dataset on `forge` with its NVMe device,

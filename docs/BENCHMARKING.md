@@ -524,6 +524,10 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   built snapshots with their supplied path and staged hash. The launcher gives each
   default run a unique results directory. `--out` requires a new destination and
   refuses any existing file, directory or symlink before opening evidence files.
+  `--index text`, `geo` or `embed` builds a full-text, spatial or embedding index on each
+  store after loading it, and with `embed` the servers run with `--no-embedding`, so
+  nothing leaves the instance. Each run's `metrics-<run>.txt` also records the server's
+  peak resident memory.
 * `scripts/write-bench.rs` is the client of `scripts/nsc-writes.sh`. It sends each update
   as one request on a kept-alive connection and requires distinct, contiguous receipts.
   It sends a request again on a new connection only when writing it failed or the server

@@ -67,7 +67,18 @@ for v in $VARIANTS; do
     rm -rf "stores/$b"
     # shellcheck disable=SC2046 # the loader is a command line
     taskset -c "$ALL" $(loader "${!d}" "$b/sparkles") load --loc "stores/$b" data.nt > "$R/load-$b.log" 2>&1 || fail "load $b, see load-$b.log"
-    log "$b loaded"
+    # shellcheck disable=SC2046 # the loader is a command line
+    case ${INDEX:-none} in
+      none) ;;
+      text) taskset -c "$ALL" $(loader "${!d}" "$b/sparkles") text-index --loc "stores/$b" >> "$R/load-$b.log" 2>&1 ;;
+      geo) taskset -c "$ALL" $(loader "${!d}" "$b/sparkles") geo-index --loc "stores/$b" >> "$R/load-$b.log" 2>&1 ;;
+      # the endpoint is never called: the servers run with --no-embedding
+      embed) taskset -c "$ALL" $(loader "${!d}" "$b/sparkles") vector create --loc "stores/$b" --name docs \
+        --predicate urn:wb:emb --dim 8 --embed-url http://127.0.0.1:9/v1/embeddings --embed-model none \
+        --embed-from urn:wb:p >> "$R/load-$b.log" 2>&1 ;;
+      *) false ;;
+    esac || fail "index ${INDEX:-none} on $b, see load-$b.log"
+    log "$b loaded, index ${INDEX:-none}"
   fi
 done
 
@@ -106,6 +117,8 @@ for round in $(seq "$ROUNDS"); do
       b=${!b}
       f=V_${v}_FLAGS
       flags=
+      sflags=
+      [ "${INDEX:-none}" = embed ] && sflags=--no-embedding
       venv=()
       # the token delay-us=N adds N microseconds to every sync and write-through write of
       # the store's files (tests/support/iofault.c), standing in for a slower device
@@ -121,7 +134,7 @@ for round in $(seq "$ROUNDS"); do
       cp -r "stores/$b" work/store
       # shellcheck disable=SC2046,SC2086 # the loader and the flags are command lines
       taskset -c "$SERVER_CPUS" env ${venv[@]+"${venv[@]}"} $(loader "${!d}" "$b/sparkles") --result-cache-mb 0 $flags serve --data srv \
-        --loc bench=work/store --port "$PORT" --timeout 600 --no-access-log > "$R/server-$run.log" 2>&1 &
+        --loc bench=work/store --port "$PORT" --timeout 600 --no-access-log $sflags > "$R/server-$run.log" 2>&1 &
       SPID=$!
       for _ in $(seq 300); do
         curl -sf -o /dev/null "localhost:$PORT/\$/ping" && break
@@ -134,6 +147,8 @@ for round in $(seq "$ROUNDS"); do
         out="{\"error\":true}"
       }
       curl -s "localhost:$PORT/\$/metrics" | grep -E '^sparkles_(group_commit|commit_sync)' > "$R/metrics-$run.txt" || true
+      # the server's peak resident memory, which includes the speculative index state
+      grep -E '^VmHWM' "/proc/$SPID/status" >> "$R/metrics-$run.txt" 2> /dev/null || true
       kill "$SPID"
       wait "$SPID" 2> /dev/null || true
       SPID=

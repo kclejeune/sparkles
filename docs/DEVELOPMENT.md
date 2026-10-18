@@ -199,8 +199,10 @@ after each restart. With a directory in place of `ext4` or `xfs` it needs no roo
 mode is part of `mise run ci`. A load that took no receipt, had a failed write or, in
 `logwrites`, failed to mark the log fails the run, because its checks would pass without
 testing anything. A failed `logwrites` run keeps its log and the first three failing images,
-and `crash-harness replay --only` with the same seed rebuilds any other failing image. The
-`selftest` mode needs no root. It checks that the driver fails a load whose writes the
+and `crash-harness replay --only` with the same seed rebuilds any other failing image.
+`--index text`, `geo` or `embed` configures a full-text, spatial or embedding index on each
+store before the load, as section 17.8 asks, and every check then also compares that index
+with the recovered data. The `selftest` mode needs no root. It checks that the driver fails a load whose writes the
 server refuses with a 507, passes a working one, and fails one whose marks all fail. Run it
 after changing the harness. The harness's own tests, which check which `sparkles check`
 warnings a recovered store may still show after an open, run in the `test:bench-scripts`

@@ -4,6 +4,19 @@
 
 ### Changed
 
+Group commit now covers datasets with a full-text, spatial or embedding index, which used
+to take the ordinary path. On a Namespace instance whose synchronizations were slowed to
+4 ms each, four writers on such a dataset committed about twice as fast and sixteen
+writers about eight times as fast. On the instance's own synchronization of about 0.1 ms,
+four writers gained nothing and sixteen writers about 1.6 times. These are approximate
+screens, and the gates on `forge` have not run. A commit falls back only while a full-text index
+recovers or rebuilds or while a spatial index builds, and
+`sparkles_group_commit_fallbacks_total` reports these as `text-recovering`,
+`text-rebuilding` and `geo-unavailable` in place of the old `text`, `geo` and `embed`
+reasons. A full-text search on a transaction that started from a commit still in flight
+waits for that commit's fence. `--no-group-commit` and `SPARKLES_GROUP_COMMIT=off` still
+turn grouping off.
+
 The server's query memory pool is on by default. It holds half of the memory the process
 may use, less the configured caches, and at least 256 MiB. Each query and update request
 reserves 16 MiB when it is admitted, so a host whose pool sits at the 256 MiB floor serves

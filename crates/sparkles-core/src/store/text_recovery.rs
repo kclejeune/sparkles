@@ -905,6 +905,10 @@ mod tests {
                 r#"INSERT DATA { _:kitten <http://www.w3.org/2000/01/rdf-schema#label> "fox kitten"@fr . GRAPH <http://ex/g> { <http://ex/named> <http://www.w3.org/2000/01/rdf-schema#label> "fox named" } }"#,
             );
             let head = s.snapshot().commit;
+            // commits made while the index recovers take the ordinary path (X09 17.3)
+            let recovering =
+                |s: &Store| s.commit_metrics().fallbacks[Fallback::TextRecovering as usize];
+            assert_eq!(recovering(&s), 3);
             pause.resume();
             wait(&s);
             assert_eq!(count(&s), 3);
@@ -927,6 +931,13 @@ mod tests {
             let recovered = bag(s.snapshot());
             s.rebuild_text().unwrap();
             assert_eq!(bag(s.snapshot()), recovered);
+            // once recovered, the index admits grouping again
+            update(
+                &s,
+                r#"INSERT DATA { <http://ex/late> <http://www.w3.org/2000/01/rdf-schema#label> "fox late" }"#,
+            );
+            assert_eq!(recovering(&s), 3);
+            assert_eq!(count(&s), 4);
         }
     }
 

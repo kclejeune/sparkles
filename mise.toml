@@ -1018,6 +1018,7 @@ flag "--changes <n>" default="3000" help="requests of the serial scenarios"
 flag "--writer-changes <n>" default="20000" help="requests of the writers scenarios"
 flag "--mixed-changes <n>" default="5000" help="requests of the mixed scenario"
 flag "--write-rate <n>" default="0" help="pace the writers of writers and mixed to this many requests per second in total (0: unpaced)"
+flag "--index <kind>" default="none" help="an index configured on every store after loading: none, text, geo or embed"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default target/nsc-writes/<UTC time>)"
@@ -1026,7 +1027,7 @@ run = '''
 # shellcheck disable=SC2154,SC2086 # usage_variants is a list of variants
 scripts/nsc-writes.sh --people "$usage_people" --scenarios "$usage_scenarios" --rounds "$usage_rounds" \
   --changes "$usage_changes" --writer-changes "$usage_writer_changes" --mixed-changes "$usage_mixed_changes" \
-  --write-rate "$usage_write_rate" --duration "$usage_duration" ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
+  --write-rate "$usage_write_rate" --index "$usage_index" --duration "$usage_duration" ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
   ${usage_out:+--out "$usage_out"} $usage_variants
 '''
 
