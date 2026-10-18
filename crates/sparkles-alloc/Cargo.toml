@@ -1,0 +1,10 @@
+[package]
+name = "sparkles-alloc"
+description = "The mimalloc global allocator of the Sparkles server and language bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No workspace dependencies, so the bindings' own workspaces can take this crate by path.
+[dependencies]
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }

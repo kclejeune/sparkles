@@ -512,11 +512,45 @@ pub fn bound_cols(lo: &Key, hi: &Key) -> ColMask {
     ((1u16 << n) - 1) as ColMask
 }
 
+/// A decoded column, shared by the block cache and its readers.
+///
+/// The values live in an allocation of their own, apart from the reference count. A full
+/// column is 256 KiB, and a shared slice with its counts in front would ask for 16 bytes
+/// more, which mimalloc serves from its 320 KiB size class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Col(Arc<Box<[u64]>>);
+
+impl Col {
+    fn new(values: Box<[u64]>) -> Col {
+        Col(Arc::new(values))
+    }
+}
+
+impl std::ops::Deref for Col {
+    type Target = [u64];
+    #[inline]
+    fn deref(&self) -> &[u64] {
+        &self.0
+    }
+}
+
+impl From<Vec<u64>> for Col {
+    fn from(values: Vec<u64>) -> Col {
+        Col::new(values.into_boxed_slice())
+    }
+}
+
+impl FromIterator<u64> for Col {
+    fn from_iter<I: IntoIterator<Item = u64>>(iter: I) -> Col {
+        Col::new(iter.into_iter().collect())
+    }
+}
+
 /// A decoded block: four columns of equal length. Columns a reader did not ask for (see
 /// [`BlockCache::get_cols`]) are empty and read as 0 through [`Block::key`].
 #[derive(Clone)]
 pub struct Block {
-    pub cols: [Arc<[u64]>; 4],
+    pub cols: [Col; 4],
     rows: usize,
 }
 
@@ -660,7 +694,7 @@ pub(crate) fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
 /// Decode one compressed column of `rows` values. Damaged input is an error, never a
 /// panic: the size prefix must fit `rows` varints, and the values must use exactly the
 /// decompressed bytes.
-pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Arc<[u64]>> {
+pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Col> {
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
     let size = bytes
         .get(..4)
@@ -696,12 +730,12 @@ pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Arc<[u64]>> {
 }
 
 /// The `rows` zigzag-delta varints that make up all of `raw`.
-fn decode_varints(raw: &[u8], rows: usize) -> Result<Arc<[u64]>> {
+fn decode_varints(raw: &[u8], rows: usize) -> Result<Col> {
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
-    // Allocated as the shared slice the block cache keeps: decoding into a Vec and
-    // converting it copied every column into a second fresh allocation.
-    let mut col: Arc<[u64]> = std::iter::repeat_n(0, rows).collect();
-    let out = Arc::get_mut(&mut col).expect("a new Arc is unique");
+    // Allocated as the buffer the block cache keeps, so that nothing is copied after
+    // decoding.
+    let mut col: Box<[u64]> = vec![0u64; rows].into_boxed_slice();
+    let out = &mut col[..];
     let mut pos = 0;
     let mut prev = 0u64;
     let mut i = 0;
@@ -739,7 +773,7 @@ fn decode_varints(raw: &[u8], rows: usize) -> Result<Arc<[u64]>> {
             raw.len() - pos
         )));
     }
-    Ok(col)
+    Ok(Col::new(col))
 }
 
 /// [`read_varint_checked`] on a buffer known to hold the 10 bytes a varint can take.
@@ -970,7 +1004,7 @@ impl PermIndex {
 
     pub fn decode_block(&self, b: usize) -> Result<Block> {
         let m = &self.blocks[b];
-        let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
+        let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
         for (c, col) in cols.iter_mut().enumerate() {
             *col = self.decode_col(b, c)?;
         }
@@ -1017,13 +1051,13 @@ impl PermIndex {
     }
 
     /// Decode one column of a block (columns are compressed separately).
-    pub fn decode_col(&self, b: usize, c: usize) -> Result<Arc<[u64]>> {
+    pub fn decode_col(&self, b: usize, c: usize) -> Result<Col> {
         self.decode_col_hinted(b, c, true)
     }
 
     /// [`decode_col`](Self::decode_col), asking the kernel for the column's bytes first
     /// only when `hint`: a pass that has read ahead (see [`ReadAhead`]) has asked already.
-    pub fn decode_col_hinted(&self, b: usize, c: usize, hint: bool) -> Result<Arc<[u64]>> {
+    pub fn decode_col_hinted(&self, b: usize, c: usize, hint: bool) -> Result<Col> {
         let m = &self.blocks[b];
         let data = self
             .data
@@ -1091,7 +1125,7 @@ pub(crate) fn next_uid() -> u64 {
 /// store that decoded it above them. A permutation instance (`uid`) is unique in the
 /// process, so the namespace only attributes an entry to a dataset. It never separates
 /// entries that would otherwise collide.
-type ColumnCache = quick_cache::sync::Cache<(u64, u32, u32), Arc<[u64]>, BlockWeighter>;
+type ColumnCache = quick_cache::sync::Cache<(u64, u32, u32), Col, BlockWeighter>;
 
 /// The decoded-column storage that stores can share. A server holds one for all its
 /// datasets, and each store reads through its own [`BlockCache`] view of it.
@@ -1200,15 +1234,15 @@ fn decode_pool() -> Option<&'static rayon::ThreadPool> {
 
 #[derive(Clone)]
 struct BlockWeighter;
-impl quick_cache::Weighter<(u64, u32, u32), Arc<[u64]>> for BlockWeighter {
-    fn weight(&self, _k: &(u64, u32, u32), v: &Arc<[u64]>) -> u64 {
+impl quick_cache::Weighter<(u64, u32, u32), Col> for BlockWeighter {
+    fn weight(&self, _k: &(u64, u32, u32), v: &Col) -> u64 {
         (v.len() * 8).max(1) as u64
     }
 }
 
-fn empty_col() -> Arc<[u64]> {
-    static EMPTY: std::sync::OnceLock<Arc<[u64]>> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(|| Arc::from(Vec::new())).clone()
+fn empty_col() -> Col {
+    static EMPTY: std::sync::OnceLock<Col> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Col::from(Vec::new())).clone()
 }
 
 impl BlockCache {
@@ -1275,7 +1309,7 @@ impl BlockCache {
         mask: ColMask,
         hint: bool,
     ) -> Result<Block> {
-        let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
+        let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
         for (c, col) in cols.iter_mut().enumerate() {
             if mask & (1 << c) == 0 {
                 continue;
@@ -1311,7 +1345,7 @@ impl BlockCache {
     /// a hit for each, and nothing otherwise (no miss, no hit, no decode). A pass uses it
     /// to skip its read-ahead bookkeeping for warm blocks.
     pub fn get_cols_cached(&self, idx: &PermIndex, b: usize, mask: ColMask) -> Option<Block> {
-        let mut cols: [Arc<[u64]>; 4] = std::array::from_fn(|_| empty_col());
+        let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
         let mut found = 0u64;
         for (c, col) in cols.iter_mut().enumerate() {
             if mask & (1 << c) == 0 {

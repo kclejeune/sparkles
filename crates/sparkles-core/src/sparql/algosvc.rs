@@ -3863,6 +3863,9 @@ mod projection_capacity_tests {
             let mut other = Ctx::new(ctx.snap.clone());
             other.set_grant(Some(grant.clone()));
             let other_held = other.charge(135).unwrap();
+            // the other context's admitted contribution, a step of the fast account
+            let other_bytes = grant.used();
+            assert!(other_bytes >= 135);
             let scope = memory::probe::install(
                 move |point| {
                     if unwind
@@ -3885,7 +3888,7 @@ mod projection_capacity_tests {
             }
             assert_eq!(ctx.memory().live.load(Ordering::Acquire), 0);
             drop(ctx);
-            assert_eq!(grant.used(), 135);
+            assert_eq!(grant.used(), other_bytes);
             assert_eq!(other.memory().live.load(Ordering::Acquire), 135);
             drop(other_held);
             drop(other);

@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sparkles-shacl = { path = "../sparkles-shacl", optional = true }
 sparkles-shex = { path = "../sparkles-shex", optional = true }
-mimalloc = { version = "0.1.52", optional = true }
+sparkles-alloc = { path = "../sparkles-alloc", optional = true }
 sparkles-reasoner = { path = "../sparkles-reasoner", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
@@ -47,7 +47,7 @@ graphql = ["sparkles/graphql"]
 # mimalloc as the global allocator of the library's own allocations, as in the server. It is
 # on by default, because single adds, bulk adds and has() took 15 to 20% less time with it.
 # The process keeps more memory in exchange (P05 Outcome).
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:sparkles-alloc"]
 
 [workspace]
 

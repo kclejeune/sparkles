@@ -2424,7 +2424,7 @@ fn scan_block(
         hash: (0, 0),
     };
     let n = m.rows as usize;
-    let mut cols: Vec<std::sync::Arc<[u64]>> = Vec::with_capacity(4);
+    let mut cols: Vec<crate::index::Col> = Vec::with_capacity(4);
     let mut off = m.offset as usize;
     for c in 0..4 {
         let len = m.col_len[c] as usize;

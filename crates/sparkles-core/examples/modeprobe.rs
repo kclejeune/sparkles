@@ -17,7 +17,7 @@ use sparkles_core::store::{Store, StoreOptions};
 use std::time::Instant;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: sparkles_alloc::Mimalloc = sparkles_alloc::Mimalloc;
 
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.total_cmp(b));

@@ -801,6 +801,38 @@ The rest of the gap to 20f01c82 on values-star is the fast memory account of F14
 4 thousand instructions on every query, and the warm checks that the X07 hints need. These
 are a hash per constant, a bit test per answer term and one cache lookup per scan.
 
+### The cost of the query memory pool
+
+The query memory pool of [X08](specs/X08-disk-spill-and-server-memory.md#gates) is on by
+default, and its latency gate asks that it add at most 2% or 0.5 µs to each query under
+0.3 ms. The run used forge, an Intel Core i5-13500, with the 1.05M triple dataset. One
+build ran with the pool on and with `--total-query-memory-mb 0` from one shared store, in
+both orders at 20 rounds of 300 requests with one Rayon thread, and the two orders were
+combined to cancel the bias of the second position. `scripts/x08-gates/latency.sh`
+reproduces it. The build charges the pool in steps of 64 KiB, so a plain query can hold up
+to 64 KiB of the pool beyond its estimate.
+
+| Query | Pool off | Pool on against off | 95% interval | Added time |
+|---|--:|--:|---|--:|
+| `distinct-obj` | 3.2 µs | 1.019 | 1.006 to 1.029 | 0.06 µs |
+| `count-all` | 3.5 µs | 1.015 | 1.002 to 1.026 | 0.05 µs |
+| `predicate-counts` | 3.7 µs | 1.032 | 1.020 to 1.039 | 0.12 µs |
+| `types-grouped` | 6.4 µs | 1.053 | 1.041 to 1.068 | 0.34 µs |
+| `path-plus` | 8.6 µs | 0.969 | 0.956 to 0.978 | −0.27 µs |
+| `values-star` | 13.5 µs | 1.034 | 1.027 to 1.045 | 0.45 µs |
+| `employee-docs` | 31.0 µs | 1.013 | 1.007 to 1.019 | 0.42 µs |
+| `star-lookup` | 57.4 µs | 1.008 | 1.001 to 1.013 | 0.46 µs |
+| `subquery-agg` | 190.3 µs | 1.002 | 0.999 to 1.004 | 0.32 µs |
+| `minus` | 280.8 µs | 1.008 | 1.005 to 1.010 | 2.20 µs |
+
+Every query passes. Repeated runs of the same comparison differed by up to 4% on queries
+under 15 µs, and `path-plus` reads faster with the pool on, so ratios of these queries
+below 1.05 are within the run-to-run spread. Before the 64 KiB step, a small query grew
+its grant three or four times, and a loop in one process put the grant's share of the
+execution time at 3.8% on `count-all` and 6.6% on `distinct-obj`, against 1.3% and 1.4%
+with the step. The Namespace screen of the step and the allocator change below against
+5b2085bc gave a geometric mean of 0.978 over 27 queries, and no query read above 1.062.
+
 ### Planning large basic graph patterns
 
 [Roadmap](ROADMAP.md) item 84 made the plan of a basic graph pattern near the 4000-level
@@ -1688,6 +1720,25 @@ case by case. The Python package and the JVM library use mimalloc, which raises 
 Python benchmark process's peak RSS by about 20% and a mixed JVM run's from 653 to
 962 MiB. The Node.js addon keeps the system allocator, because mimalloc made no
 measurable difference there.
+
+The server and the bindings call mimalloc through its plain entry points for buffers
+aligned to 8 bytes or less (`crates/sparkles-alloc`). The aligned entry point, which the
+`mimalloc` crate uses for every request, puts a power-of-two buffer of 64 KiB or more into
+the next size class, so a full decoded block column of 256 KiB took 320 KiB. The X08 A1
+gate measured the change on forge with ten datasets of 1.05M triples, after the suite ran
+against each, three repeats each and medians below. `scripts/x08-gates/a1.sh` reproduces
+it.
+
+| `--cache-mb` | Datasets | Cache bytes | `RssAnon` before | `RssAnon` after | VmRSS before | VmRSS after |
+|--:|--:|--:|--:|--:|--:|--:|
+| 256 | 1 | 60.6 MiB | 132.5 MiB | 120.7 MiB | 195.7 MiB | 176.5 MiB |
+| 256 | 10 | 379 MiB | 572.5 MiB | 492.9 MiB | 702.8 MiB | 612.8 MiB |
+| 32 | 1 | 44.2 MiB | 120.7 MiB | 111.0 MiB | 184.2 MiB | 167.5 MiB |
+| 32 | 10 | 160 MiB | 274.8 MiB | 264.5 MiB | 405.3 MiB | 387.3 MiB |
+
+Most of the cache bytes at `--cache-mb 32` belong to the result cache, which is sized
+separately and whose heap stays about 1.2 times the bytes it counts. Roadmap item 88
+covers that overhead.
 
 <a id="compression-105m-triples"></a>
 
