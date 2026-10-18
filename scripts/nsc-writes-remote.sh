@@ -77,7 +77,7 @@ for v in $VARIANTS; do
         --predicate urn:wb:emb --dim 8 --embed-url http://127.0.0.1:9/v1/embeddings --embed-model none \
         --embed-from urn:wb:p >> "$R/load-$b.log" 2>&1 ;;
       *) false ;;
-    esac || fail "index $INDEX on $b, see load-$b.log"
+    esac || fail "index ${INDEX:-none} on $b, see load-$b.log"
     log "$b loaded, index ${INDEX:-none}"
   fi
 done

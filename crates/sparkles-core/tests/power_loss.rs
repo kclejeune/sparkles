@@ -25,6 +25,16 @@
 //!    acknowledged fails, that nothing past the last acknowledged commit is published, and
 //!    that the store reopens to a prefix that holds every acknowledged commit.
 //!
+//! The model of directory operations has limits, so it covers the reorderings that the
+//! store's own files meet, not every one a file system allows. The shim records a file's
+//! creation after its `open` returns, and decides that a file is new by a check before
+//! the open, so a concurrent first write to the new file can be logged before its
+//! creation. A lost rename is modelled for the exact path it moved, so writes under a
+//! renamed directory are not redirected, and no test renames a directory. Writes to a
+//! file after its unlink are logged under its `(deleted)` path. `mkdir` is not recorded,
+//! so a lost directory creation is not modelled. Pending directory operations survive as
+//! an in-order prefix, as in the metadata journals of ext4 and XFS.
+//!
 //! `SPARKLES_POWER_LOSS_POINTS` sets the number of crash points per configuration (default
 //! 60) and `SPARKLES_POWER_LOSS_SEED` the seed of the random choices.
 #![cfg(target_os = "linux")]
@@ -197,8 +207,41 @@ fn child_writer() {
             }
         }));
     }
+    // The run is far shorter than the full-text index's one-second tick, so a side
+    // thread checkpoints the index while the writers run. The checkpoints then name
+    // commits of the run, and the images check them against the recovered log.
+    // With grouping, every fence also checkpoints the index after it took its commits
+    // and before it synchronizes them, the moment at which an index that applied
+    // commits before their fence would name a commit that the crash can still lose.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    if s.text_enabled() {
+        s.set_failpoint(
+            "group-sealed",
+            Some(Arc::new(|s: &Store| {
+                let _ = s.checkpoint_text();
+            })),
+        );
+    }
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(feature = "text")]
+    let checkpointer = s.text_enabled().then(|| {
+        let (s, done) = (s.clone(), done.clone());
+        std::thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                if s.checkpoint_text().is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    });
     for h in hs {
         h.join().unwrap();
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "text")]
+    if let Some(c) = checkpointer {
+        c.join().unwrap();
     }
     for l in out.lock().unwrap().iter() {
         println!("LINE {l}");
@@ -812,15 +855,22 @@ fn check_text(s: &Store, what: &str) {
     );
 }
 
-/// Check one image against the commits acknowledged before the crash.
-fn check_image(img: &Path, base: u32, acked: &[(u64, u32, u32)], text: bool, what: &str) {
+/// Check one image against the commits acknowledged before the crash. Returns the
+/// commit that the image's full-text checkpoint names, if any.
+fn check_image(
+    img: &Path,
+    base: u32,
+    acked: &[(u64, u32, u32)],
+    text: bool,
+    what: &str,
+) -> Option<u64> {
     // The full-text index's checkpoint never names a commit above the recovered log, so
     // the index either opens from it and catches up, or is rebuilt when its files were
     // left unsynced. Either way its results match the recovered data.
     #[cfg(feature = "text")]
     let payload = text.then(|| text_payload_seq(img)).flatten();
     #[cfg(not(feature = "text"))]
-    let _ = text;
+    let (_, payload) = (text, None::<u64>);
     let s = Store::open(img, StoreOptions::default())
         .unwrap_or_else(|e| panic!("{what}: the image does not open: {e}"));
     #[cfg(feature = "text")]
@@ -876,6 +926,7 @@ fn check_image(img: &Path, base: u32, acked: &[(u64, u32, u32)], text: bool, wha
         .unwrap();
     w.insert(ids).unwrap();
     assert_eq!(w.commit().unwrap().commit.seq, head + 1, "{what}");
+    payload
 }
 
 fn crash_images(name: &str, cfg: Config, text: bool) {
@@ -891,6 +942,8 @@ fn crash_images(name: &str, cfg: Config, text: bool) {
     let mut acked: Vec<(u64, u32, u32)> = Vec::new();
     let img = run.root.join("image");
     let mut images = 0;
+    // the highest commit an image's full-text checkpoint named
+    let mut named = 0;
     let base_db = run.root.join("base-db");
     for (i, rec) in log.iter().enumerate() {
         if let Rec::Write { path, data, .. } = rec
@@ -908,16 +961,18 @@ fn crash_images(name: &str, cfg: Config, text: bool) {
         let what = format!("{name}: crash after record {i} of {}", log.len());
         // everything still unsynchronized is lost
         model.image(&base_db, &root, &img, 0, |_| None);
-        check_image(
+        let p = check_image(
             &img,
             base,
             &acked,
             text,
             &format!("{what}, unsynced writes lost"),
         );
+        named = named.max(p.unwrap_or(0));
         // everything is kept, as after a process crash
         model.image(&base_db, &root, &img, usize::MAX, |_| Some(Vec::new()));
-        check_image(&img, base, &acked, text, &format!("{what}, nothing lost"));
+        let p = check_image(&img, base, &acked, text, &format!("{what}, nothing lost"));
+        named = named.max(p.unwrap_or(0));
         // a random part of what is pending survives, in whole writes or single pages, and
         // a random prefix of the directory operations
         for _ in 0..2 {
@@ -935,24 +990,31 @@ fn crash_images(name: &str, cfg: Config, text: bool) {
                     (0..n).map(|_| rng.coin(50)).collect()
                 })
             });
-            check_image(
+            let p = check_image(
                 &img,
                 base,
                 &acked,
                 text,
                 &format!("{what}, random pages lost"),
             );
+            named = named.max(p.unwrap_or(0));
         }
         images += 4;
     }
     assert!(images > 0);
     assert!(!acked.is_empty(), "the writer acknowledged no commit");
-    // the full-text index makes segment files and replaces its metadata by a rename
+    // The full-text index makes segment files and replaces its metadata by a rename,
+    // and the images held checkpoints of the run's own commits, so the bound on the
+    // checkpoint was checked against commits that a crash could lose.
     if text {
+        assert!(
+            named > u64::from(base),
+            "{name}: no image held a full-text checkpoint past the setup's commit {base}"
+        );
         let renames = model
             .dirs
             .iter()
-            .filter(|d| matches!(d.kind, DirKind::Rename(_)))
+            .filter(|d| matches!(&d.kind, DirKind::Rename(to) if to.ends_with("meta.json")))
             .count();
         let creates = model
             .dirs
@@ -961,7 +1023,7 @@ fn crash_images(name: &str, cfg: Config, text: bool) {
             .count();
         assert!(
             renames > 0 && creates > 0,
-            "{name}: {renames} renames and {creates} creations recorded"
+            "{name}: {renames} renames of meta.json and {creates} creations recorded"
         );
     }
     let _ = std::fs::remove_dir_all(&run.root);
@@ -1018,7 +1080,10 @@ fn crash_images_keep_every_acknowledged_commit() {
 /// The crash images of a dataset with full-text search (X09 section 17.8). The writer's
 /// commits group, and the full-text index applies them only after their fence. Each image
 /// checks, besides the commits, that the index's checkpoint names no commit above the
-/// recovered log and that full-text search finds exactly the recovered data.
+/// recovered log and that full-text search finds exactly the recovered data. The writer
+/// checkpoints the index at every fence before its synchronization and from a side
+/// thread, so the images hold checkpoints of the run's own commits. Applying text changes
+/// before their fence makes this test fail.
 #[cfg(feature = "text")]
 #[test]
 fn crash_images_of_a_dataset_with_full_text_search() {

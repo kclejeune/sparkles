@@ -375,6 +375,28 @@ fn verify(a: &Args) {
             tail(&err)
         ));
     }
+    // A full-text index that names a commit above the log is rebuilt by the first open,
+    // which would hide it from the search check below, so it is read before anything
+    // opens the store: from the checkpoint itself, and from `sparkles check`.
+    let text_named = if a.get("--index").as_deref() == Some("text") {
+        if out.contains("ahead of the data") {
+            problems.push(format!(
+                "the full-text index is ahead of the log before open: {}",
+                whole(&out)
+            ));
+        }
+        let named = text_payload_seq(&loc);
+        // a checkpoint whose payload this reader misses would pass every bound check
+        let meta = std::path::Path::new(&loc).join("text/meta.json");
+        if named.is_none()
+            && std::fs::read_to_string(&meta).is_ok_and(|m| m.contains("seq"))
+        {
+            problems.push(format!("cannot read the payload of {}", meta.display()));
+        }
+        named
+    } else {
+        None
+    };
     let q = "SELECT ?s ?o WHERE { ?s <urn:x09:p> ?o }";
     let (code, out, err) = sparkles(&bin, &["query", "--loc", &loc, "--results", "tsv", q]);
     if code != 0 {
@@ -418,6 +440,11 @@ fn verify(a: &Args) {
         (head, messages)
     };
     let (head, messages) = history(&mut problems);
+    if let Some(named) = text_named.filter(|&n| n > head) {
+        problems.push(format!(
+            "the full-text checkpoint names commit {named}, the log ends at {head}"
+        ));
+    }
     let need = receipts[..bound]
         .iter()
         .map(|r| r.commit)
@@ -503,6 +530,20 @@ fn column(out: &str) -> std::collections::BTreeSet<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.trim_start_matches('<').trim_end_matches('>').to_string())
         .collect()
+}
+
+/// The commit that the full-text checkpoint of the store at `loc` names: the `seq` of
+/// the payload in `text/meta.json`, which holds the payload as an escaped JSON string.
+fn text_payload_seq(loc: &str) -> Option<u64> {
+    let meta = std::fs::read_to_string(std::path::Path::new(loc).join("text/meta.json")).ok()?;
+    let payload = &meta[meta.find("\"payload\"")?..];
+    let at = payload.find("seq")? + 3;
+    let digits: String = payload[at..]
+        .trim_start_matches(|c: char| c == '\\' || c == '"' || c == ':' || c.is_whitespace())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Under `--index text`: the full-text index, recovered or rebuilt by `sparkles
@@ -942,5 +983,20 @@ mod tests {
         }
         assert!(!only_leftovers(&report(&[("error", old)])));
         assert!(!only_leftovers("{}"));
+    }
+
+    #[test]
+    fn the_full_text_checkpoint_names_the_seq_of_its_payload() {
+        let dir = std::env::temp_dir().join(format!("crash-harness-meta-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("text")).unwrap();
+        let loc = dir.to_str().unwrap();
+        assert_eq!(super::text_payload_seq(loc), None);
+        std::fs::write(
+            dir.join("text/meta.json"),
+            "{\n  \"segments\": [],\n  \"opstamp\": 41,\n  \"payload\": \"{\\\"format\\\":1,\\\"seq\\\":23,\\\"epoch\\\":2,\\\"config\\\":\\\"x\\\"}\"\n}",
+        )
+        .unwrap();
+        assert_eq!(super::text_payload_seq(loc), Some(23));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
