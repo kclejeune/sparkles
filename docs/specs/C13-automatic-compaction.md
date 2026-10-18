@@ -953,3 +953,20 @@ stay. After open, `scripts/crash-harness.rs` now accepts only the leftover of an
 generation, so a generation newer than `CURRENT`, a `commits.bin.corrupt-*` file or any
 other leftover fails a crash run, and `rustc --edition 2024 --test` on the file runs a test
 of that rule.
+
+The `log-writes` replays of [X09](X09-group-commit-by-default.md) section 10.2 ran on
+`forge` on 2026-10-18 with group commit on, 1,000 crash images per file system, sixteen
+writers for 20 s and `--serve-flags "--auto-compact-min-quads 1000"`, so that each load
+crossed one automatic compaction. A first pair of runs with revision 759e52c2 failed one
+ext4 image of 1,000, where a power loss during the compaction's `CURRENT` switch had left
+`CURRENT.tmp`, and passed all 1,000 XFS images. The removal of `.tmp` files came from that
+image. With the source of revision d5a817a9 every image passed.
+
+| Run | Receipts | Marks | Log entries | Images | Failed |
+|---|---:|---:|---:|---:|---:|
+| ext4, 759e52c2 | 68,970 | 378 | 95,868 | 1,000 | 1 |
+| XFS, 759e52c2 | 57,717 | 368 | — | 1,000 | 0 |
+| ext4, d5a817a9 | 21,612 | 355 | 24,333 | 1,000 | 0 |
+| XFS, d5a817a9 | 33,427 | 358 | 28,593 | 1,000 | 0 |
+
+The log of the first XFS run was not kept, so its entry count is missing.
