@@ -30,13 +30,15 @@
 # refuses to replay a load without receipts or with failed writes.
 #
 # --flags are global flags given to `sparkles` before `serve`, to run the crashes with
-# and without group commit. Results go to DIR/results.tsv and DIR/summary.json, and the
+# and without group commit. --serve-flags are options of `serve`, for example a lower
+# --auto-compact-min-quads so that a short load crosses a compaction. Results go to
+# DIR/results.tsv and DIR/summary.json, and the
 # exit status is 0 only when every check passed.
 set -euo pipefail
 
 MODE=${1:-}
 [ -n "$MODE" ] && shift
-FS='' BIN='' HARNESS='' WORK='' POINTS=1000 KILLS=200 SECONDS_RUN=20 CLIENTS=16 JOBS=8 FLAGS=''
+FS='' BIN='' HARNESS='' WORK='' POINTS=1000 KILLS=200 SECONDS_RUN=20 CLIENTS=16 JOBS=8 FLAGS='' SERVE_FLAGS=''
 PORT=${PORT:-3931}
 POS=()
 while [ $# -gt 0 ]; do
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
     --clients) CLIENTS=$2 ;;
     --jobs) JOBS=$2 ;;
     --flags) FLAGS=$2 ;;
+    --serve-flags) SERVE_FLAGS=$2 ;;
     -*)
       echo "power-loss: unknown option $1" >&2
       exit 2
@@ -92,7 +95,7 @@ start_server() { # <store>
   # the test file systems are small, so the server keeps only 64 MiB free instead of 1 GiB
   # shellcheck disable=SC2086 # the flags are a command line
   "$BIN" $FLAGS serve --data "$WORK/srv" --loc "ds=$1" --port "$PORT" --no-access-log \
-    --min-free-disk-mb "${MIN_FREE_MB:-64}" > "$WORK/server.log" 2>&1 &
+    --min-free-disk-mb "${MIN_FREE_MB:-64}" $SERVE_FLAGS > "$WORK/server.log" 2>&1 &
   SPID=$!
   for _ in $(seq 1 300); do
     curl -sf "http://127.0.0.1:$PORT/\$/ping" > /dev/null 2>&1 && return 0
@@ -170,6 +173,9 @@ case $MODE in
     cat "$WORK/drive.json"
     # a load without receipts, or with failed writes, would make every image pass vacuously
     [ "$drc" = 0 ] || die "the driver failed with status $drc: $(cat "$WORK/drive.json")"
+    # the start mark and at least one mark of the load, or no image checks a receipt
+    nmarks=$(grep -c '^M ' "$WORK/receipts.txt" || true)
+    [ "${nmarks:-0}" -ge 2 ] || die "only ${nmarks:-0} marks in $WORK/receipts.txt"
     kill_server
     umount "$MNT"
     dmsetup remove "$DM"
@@ -179,10 +185,13 @@ case $MODE in
     log "replaying"
     rc=0
     "$HARNESS" replay --log "$WORK/log.img" --size "$(stat -c %s "$WORK/data.img")" --out "$WORK/replay" \
-      --points "$POINTS" --from-mark start --jobs "$JOBS" --seed "${SEED:-$$}" \
+      --points "$POINTS" --from-mark start --jobs "$JOBS" --seed "${SEED:-$$}" --keep-failed 3 \
       -- "$0" check-image --fs "$FS" --sparkles "$BIN" --harness "$HARNESS" --work "$WORK" > "$WORK/summary.json" || rc=$?
     cp "$WORK/replay/results.tsv" "$WORK/results.tsv"
-    rm -f "$WORK/log.img" "$WORK/data.img"
+    # A failed run keeps the log, so that `crash-harness replay --only` with the same seed
+    # rebuilds any failing image. The first three failing images stay as they were checked.
+    if [ "$rc" = 0 ]; then rm -f "$WORK/log.img"; fi
+    rm -f "$WORK/data.img"
     log "done: $(cat "$WORK/summary.json")"
     exit $rc
     ;;
@@ -204,7 +213,8 @@ case $MODE in
     log "kill9 in $MNT: $KILLS kills of $CLIENTS writers, flags '$FLAGS'"
     seed "$WORK/seed.nt"
     : > "$WORK/results.tsv"
-    fails=0 total=0
+    rm -f "$WORK"/receipts-*.txt
+    fails=0 total=0 empty=0
     for i in $(seq 1 "$KILLS"); do
       # a new store every 20 kills, so a check reads a bounded history
       n=$(((i - 1) / 20))
@@ -228,6 +238,7 @@ case $MODE in
       dfail=$(sed -n 's/.*"failed": \([0-9]*\).*/\1/p' "$WORK/drive.json")
       if [ "$drc" = 3 ] && [ "${dfail:-0}" = 0 ]; then
         log "kill $i: no receipt before the kill"
+        empty=$((empty + 1))
       elif [ "$drc" != 0 ]; then
         log "kill $i: the driver failed with status $drc: $(cat "$WORK/drive.json" "$WORK/drive.err")"
         fails=$((fails + 1))
@@ -236,11 +247,19 @@ case $MODE in
       out=$("$HARNESS" verify --sparkles "$BIN" --loc "$db" --receipts "$receipts") || fails=$((fails + 1))
       printf '%s\t%s\n' "$i" "$out" >> "$WORK/results.tsv"
       [ $((i % 20)) = 0 ] && log "kill $i: $out"
+      # a store whose server stopped taking writes after its first kills must not pass
+      if [ $((i % 20)) = 0 ] || [ "$i" = "$KILLS" ]; then
+        if [ $((empty * 4)) -gt 20 ]; then
+          log "store $n: $empty of its kills came before any receipt"
+          fails=$((fails + 1))
+        fi
+        empty=0
+      fi
     done
     # every store must have taken writes, or its checks verified nothing
     for f in "$WORK"/receipts-*.txt; do
       n=$(grep -c '^R ' "$f" || true)
-      if [ "$n" = 0 ]; then
+      if [ "${n:-0}" = 0 ]; then
         log "$f: no receipts in the whole store"
         fails=$((fails + 1))
       fi
@@ -267,16 +286,24 @@ case $MODE in
     timeout 60 "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/selftest-refused.txt" \
       --clients 2 --seconds 2 > "$WORK/drive.json" 2> "$WORK/drive.err" || drc=$?
     kill_server
-    [ "$drc" != 0 ] || die "the driver passed a run in which every write was refused: $(cat "$WORK/drive.json")"
-    log "refused writes: driver status $drc, as it should be"
+    if [ "$drc" != 2 ] || ! grep -q 'HTTP 507' "$WORK/drive.err"; then
+      die "the driver gave status $drc, not 2 with a 507, when every write was refused: $(cat "$WORK/drive.json" "$WORK/drive.err")"
+    fi
+    log "refused writes: driver status $drc with a 507, as it should be"
     start_server "$db"
     drc=0
     timeout 60 "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/selftest-ok.txt" \
       --clients 2 --seconds 2 > "$WORK/drive.json" 2> "$WORK/drive.err" || drc=$?
-    kill_server
-    rm -rf "$db"
     [ "$drc" = 0 ] || die "the driver failed a working run with status $drc: $(cat "$WORK/drive.json" "$WORK/drive.err")"
     log "working run: $(cat "$WORK/drive.json")"
+    # a run whose marks all fail would replay every image against no receipts
+    drc=0
+    timeout 60 "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/selftest-marks.txt" \
+      --clients 2 --seconds 2 --mark-cmd false > "$WORK/drive.json" 2> "$WORK/drive.err" || drc=$?
+    kill_server
+    rm -rf "$db"
+    [ "$drc" = 3 ] || die "the driver gave status $drc, not 3, for a run whose marks all failed: $(cat "$WORK/drive.json")"
+    log "failed marks: driver status $drc, as it should be"
     ;;
   *)
     sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'

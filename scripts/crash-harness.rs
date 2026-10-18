@@ -18,9 +18,11 @@
 //!       `M <name> <receipts so far>` follows, and then `CMD <name>` runs (for example
 //!       `dmsetup message lw 0 mark`). Every receipt counted in a mark was acknowledged
 //!       before the mark reached the log, so it must survive a crash at any later point.
-//!       Prints `{"receipts": N, "failed": F}`. A 4xx answer or a 507 ends the run with
-//!       status 2. Another 5xx ends that writer and counts in F. The status is 3 when F is
-//!       above 0, or when no receipt was acknowledged and `--allow-empty` is not given.
+//!       Prints `{"receipts": N, "failed": F}`, with `"marks"` and `"failedMarks"` under
+//!       `--mark-cmd`. A 4xx answer or a 507 ends the run with status 2. Another 5xx ends
+//!       that writer and counts in F. The status is 3 when F is above 0, when no receipt was
+//!       acknowledged and `--allow-empty` is not given, or under `--mark-cmd` when a mark
+//!       failed or none was made.
 //!
 //!   verify --sparkles BIN --loc DIR --receipts FILE [--mark NAME] [--write]
 //!       Checks a recovered store: `sparkles check` reports no error before and after the
@@ -30,7 +32,7 @@
 //!       continues the sequence at head + 1. Prints one JSON line and exits 1 on failure.
 //!
 //!   replay --log FILE --size BYTES --out DIR --points N [--seed S] [--from-mark NAME]
-//!         [--jobs J] -- CMD...
+//!         [--jobs J] [--keep-failed K] [--only N,...] -- CMD...
 //!       Reads a `log-writes` log (kernel Documentation/admin-guide/device-mapper/
 //!       log-writes.rst) and builds N crash images of the logged device, at random entries
 //!       after mark NAME. An image holds every write logged before the last flush at or
@@ -38,7 +40,9 @@
 //!       that flush and the entry is kept or dropped per 4 KiB block, at random with a
 //!       probability drawn per image. For each image, `CMD IMAGE MARK` runs, where MARK is
 //!       the last mark before the entry, and its exit status and output are recorded in
-//!       DIR/results.tsv.
+//!       DIR/results.tsv. `--keep-failed K` keeps the images of the first K failing points
+//!       as DIR/fail-N.img, as the command left them. `--only N,...` builds and checks only
+//!       those points, the same images that a full run with the same seed builds.
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -148,6 +152,7 @@ fn drive(a: &Args) {
     let run = a.get("--run").unwrap_or_else(|| "0".into());
     let every = a.num("--message-every", 4);
     let mark_cmd = a.get("--mark-cmd");
+    let marking = mark_cmd.is_some();
     let mark_ms = a.num("--mark-ms", 50);
     let allow_empty = a.flag("--allow-empty");
     let file = Arc::new(Mutex::new(
@@ -162,6 +167,7 @@ fn drive(a: &Args) {
     let stop = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let failed = Arc::new(AtomicUsize::new(0));
+    let (marks_ok, marks_failed) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     // write the receipts acknowledged so far, synced, and return how many there are
     let flush = {
         let (file, acked, written) = (file.clone(), acked.clone(), written.clone());
@@ -223,6 +229,7 @@ fn drive(a: &Args) {
     }
     let marker = mark_cmd.map(|cmd| {
         let (stop, flush) = (stop.clone(), flush.clone());
+        let (marks_ok, marks_failed) = (marks_ok.clone(), marks_failed.clone());
         std::thread::spawn(move || {
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
@@ -236,8 +243,11 @@ fn drive(a: &Args) {
                     .arg(&name)
                     .status()
                     .is_ok_and(|s| s.success());
-                if !ok {
+                if ok {
+                    marks_ok.fetch_add(1, Ordering::SeqCst);
+                } else {
                     eprintln!("crash-harness: mark {name} failed");
+                    marks_failed.fetch_add(1, Ordering::SeqCst);
                 }
                 n += 1;
             }
@@ -252,10 +262,25 @@ fn drive(a: &Args) {
     }
     let n = flush(None);
     let failed = failed.load(Ordering::Relaxed);
-    println!("{{\"receipts\": {n}, \"failed\": {failed}}}");
-    // A run without receipts checks nothing, and a failed write is not a crash outcome.
-    if failed > 0 || (n == 0 && !allow_empty) {
-        eprintln!("crash-harness: {n} receipts, {failed} failed writes");
+    let (marks, marks_failed) = (
+        marks_ok.load(Ordering::SeqCst),
+        marks_failed.load(Ordering::SeqCst),
+    );
+    if marking {
+        println!(
+            "{{\"receipts\": {n}, \"failed\": {failed}, \"marks\": {marks}, \"failedMarks\": {marks_failed}}}"
+        );
+    } else {
+        println!("{{\"receipts\": {n}, \"failed\": {failed}}}");
+    }
+    // A run without receipts checks nothing, and a failed write is not a crash outcome. A
+    // failed mark leaves receipts that no image is checked against, and a run without
+    // marks checks every image against no receipts at all.
+    let unmarked = marking && (marks_failed > 0 || marks == 0);
+    if failed > 0 || (n == 0 && !allow_empty) || unmarked {
+        eprintln!(
+            "crash-harness: {n} receipts, {failed} failed writes, {marks} marks, {marks_failed} failed marks"
+        );
         std::process::exit(3);
     }
 }
@@ -323,7 +348,7 @@ fn verify(a: &Args) {
     if code != 0 && code != 2 {
         problems.push(format!(
             "check before open exited {code}: {}{}",
-            tail(&out),
+            whole(&out),
             tail(&err)
         ));
     }
@@ -411,11 +436,13 @@ fn verify(a: &Args) {
             ));
         }
     }
+    // After open only leftovers may remain: a newer generation of a compaction that a
+    // crash interrupted stays until the next rebuild replaces it.
     let (code, out, err) = sparkles(&bin, &["check", "--loc", &loc, "--format", "json"]);
-    if code != 0 {
+    if code != 0 && !(code == 2 && only_leftovers(&out)) {
         problems.push(format!(
             "check after open exited {code}: {}{}",
-            tail(&out),
+            whole(&out),
             tail(&err)
         ));
     }
@@ -426,6 +453,28 @@ fn verify(a: &Args) {
         problems
     );
     std::process::exit(if ok { 0 } else { 1 });
+}
+
+/// Whether every issue in a `sparkles check --format json` report is a warning about a
+/// leftover file, such as a generation newer than CURRENT. Each issue object names its
+/// status before its message.
+fn only_leftovers(json: &str) -> bool {
+    let mut any = false;
+    for (i, _) in json.match_indices("\"message\": \"") {
+        let status = json[..i]
+            .rfind("\"status\": \"")
+            .and_then(|j| json[j + 11..].split('"').next());
+        if status != Some("warning") || !json[i + 12..].starts_with("leftover:") {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+// all of a failed check's report, so that its finding is never cut off
+fn whole(s: &str) -> String {
+    s.trim().replace('\n', " | ")
 }
 
 fn tail(s: &str) -> String {
@@ -533,6 +582,16 @@ fn replay(a: &Args, cmd: Vec<String>) {
     let points = a.num("--points", 1000) as usize;
     let mut rng = Rng(a.num("--seed", 1));
     let jobs = a.num("--jobs", 4) as usize;
+    let keep_failed = a.num("--keep-failed", 0) as usize;
+    let only: Option<Vec<usize>> = a.get("--only").map(|l| {
+        l.split(',')
+            .map(|n| {
+                n.trim()
+                    .parse()
+                    .unwrap_or_else(|_| die(format!("bad --only {l}")))
+            })
+            .collect()
+    });
     if cmd.is_empty() {
         die("replay needs a command after --");
     }
@@ -587,12 +646,16 @@ fn replay(a: &Args, cmd: Vec<String>) {
             .rev()
             .find_map(|e| e.mark.clone())
             .unwrap_or_else(|| "-".into());
+        // drawn for every point, so that --only rebuilds the same images
+        let keep_p = rng.unit();
+        let mut r = Rng(rng.next());
+        if only.as_ref().is_some_and(|o| !o.contains(&n)) {
+            continue;
+        }
         let img_path = format!("{out}/img-{n}.img");
         base.sync_data().ok();
         std::fs::copy(&base_path, &img_path).unwrap();
         let img = OpenOptions::new().write(true).open(&img_path).unwrap();
-        let keep_p = rng.unit();
-        let mut r = Rng(rng.next());
         for e in &entries[flush..=p] {
             if e.flags & FUA != 0 {
                 apply(&log, &img, e, &mut || true);
@@ -620,8 +683,10 @@ fn replay(a: &Args, cmd: Vec<String>) {
                 .output()
                 .unwrap_or_else(|e| die(format!("{}: {e}", cmd[0])));
             let ok = o.status.success();
-            if !ok {
-                fails.fetch_add(1, Ordering::SeqCst);
+            // the image of one of the first --keep-failed failures stays as fail-N.img
+            let mut kept = false;
+            if !ok && fails.fetch_add(1, Ordering::SeqCst) < keep_failed {
+                kept = std::fs::rename(&img_path, img_path.replace("img-", "fail-")).is_ok();
             }
             let text = String::from_utf8_lossy(&o.stdout).replace(['\n', '\t'], " ");
             let err = String::from_utf8_lossy(&o.stderr).replace(['\n', '\t'], " ");
@@ -633,7 +698,9 @@ fn replay(a: &Args, cmd: Vec<String>) {
                 err.trim()
             )
             .unwrap();
-            let _ = std::fs::remove_file(&img_path);
+            if !kept {
+                let _ = std::fs::remove_file(&img_path);
+            }
         });
         running.lock().unwrap().push(h);
     }
