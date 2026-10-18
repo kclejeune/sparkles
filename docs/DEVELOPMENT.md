@@ -192,14 +192,18 @@ write, flush and FUA of a file system under a 16-writer load and then replays cr
 from the log, 1,000 by default, checking each recovered store. Its `kill9` mode kills the
 server at random moments of the same load, 200 times by default, and checks every receipt
 after each restart. With a directory in place of `ext4` or `xfs` it needs no root. Neither
-mode is part of `mise run ci`. A load that took no receipt or had a failed write fails the
-run, because its checks would pass without testing anything. The `selftest` mode needs no
-root and checks that the driver fails a load whose writes the server refuses and passes a
-working one. Run it after changing the harness:
+mode is part of `mise run ci`. A load that took no receipt, had a failed write or, in
+`logwrites`, failed to mark the log fails the run, because its checks would pass without
+testing anything. A failed `logwrites` run keeps its log and the first three failing images,
+and `crash-harness replay --only` with the same seed rebuilds any other failing image. The
+`selftest` mode needs no root. It checks that the driver fails a load whose writes the
+server refuses with a 507, passes a working one, and fails one whose marks all fail. Run it
+after changing the harness. The `--fs` and `--work` directories must exist:
 
 ```sh
-scripts/power-loss.sh selftest --fs /tmp/plt --sparkles target/debug/sparkles \
-  --harness ./crash-harness --work /tmp/plt-work
+mkdir -p /tmp/plt
+scripts/power-loss.sh selftest --fs /tmp/plt --sparkles target/release/sparkles \
+  --harness ./crash-harness --work /tmp/plt
 ```
 
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
