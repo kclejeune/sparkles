@@ -1054,18 +1054,119 @@ million triples, a change of 1,000 triples took 1.3 to 4.9 times longer at 16 th
 when the closure held the explicit facts. Handing decoded blocks from one rule evaluation
 to the next did not change the time measurably.
 
-The design keeps a cache of input facts with the closure. Each probe of the base tier that
-the backward search or the insertion makes is answered from the cache when it holds the
-probe's key range, and otherwise from the blocks, after which the facts read join the
-cache. The cache is charged to the run's memory budget before it grows, it moves to the
-cache of kept closures with the closure, and its size counts against the kept closure's
-heap when a later run takes it. A later snapshot of the same generation invalidates the
-key ranges that the snapshot's delta touches, and a generation switch drops the cache. When
-the budget leaves no room, the run reads the blocks as it does now, so the cache changes
-speed and never results.
+The work was to be done when a change of 1,000 triples with a kept closure on the same
+data and instance took at most 1.2 times its time before the follow-up, at 16 threads, and
+the kept closure's memory stayed under 60% of the closure that held the explicit facts. The
+differential tests of `incremental.rs` and the multi-commit runs of the follow-up's review
+were to pass unchanged.
 
-The work is done when a change of 1,000 triples with a kept closure on the same data and
-instance takes at most 1.2 times its time before the follow-up, at 16 threads, and the kept
-closure's memory with its cache stays under 60% of the closure that held the explicit
-facts. The differential tests of `incremental.rs` and the multi-commit runs of the
-follow-up's review must pass unchanged.
+**What was built.** Profiles of the change showed that most of the backward search's time
+went to the first read of each block, which decodes it, and that the searches made those
+reads one after another on one thread. A kept closure's cache of decoded blocks does not
+fit that pattern, since a search reads a few rows from each of many blocks. The work
+therefore remembers answers instead of blocks, and spreads the remaining reads over the
+threads.
+
+* The base tier of a kept closure remembers its lookups. A lookup is keyed by its bound
+  positions. Its answer is kept whole when it has at most 64 facts, and otherwise as its
+  first facts, up to 64. A later lookup with the same bindings reads the kept facts first
+  and reads the blocks only for the facts after them. Most lookups of the backward search
+  find a few facts or stop at the first, so they read no block once their answer is kept.
+  The answers of earlier runs are in a table that the run's threads read without a lock,
+  and the answers a run finds go to 64 shards behind locks until the closure is kept again.
+* The answers are charged to the run's memory budget before they are kept, they are capped
+  at 64 MiB per closure, and they count in the kept closure's heap. A lookup whose answer
+  does not fit reads the blocks as before, so the answers change speed and never results.
+* The answers follow the input graphs from one snapshot to the next. When the closure moves
+  to a later snapshot of the same generation, each triple that the input graphs gained or
+  lost updates the answers of the seven patterns it matches. With one input graph a scan
+  visits the facts in key order, so a gained triple joins an answer at its place. With
+  several input graphs the order depends on the graphs, so the answers those triples match
+  are dropped. A closure of another generation is dropped with its answers, and a lookup
+  with a term that the rules made is not kept. `Closure::set_inputs` hands the old answers
+  to its caller, which puts them back only after it has brought them up to date.
+* The searches of one deletion round run in parallel. The round deletes its unprovable
+  facts only after every search, so all its searches see the same live facts and none
+  depends on what another learns. They split into chunks, each searched by a search of its
+  own that also reads what earlier rounds learned, and the chunks' results join afterwards.
+* A closure kept after its commit gets room for more rows in its row buffer and its index
+  shards, a 64th to a 16th of its rows. Without it, the first change doubled the row buffer
+  and rehashed the index while the run waited, 12 ms on LUBM-style data with 20
+  universities.
+* An evaluation of the backward search allocates its per-step caches and its memory
+  charges on first use, since most evaluations read no block.
+
+Two other approaches were measured and dropped. A bounded search run ahead of the first
+change, to decode the blocks it would read, cut the first change but slowed the later ones.
+Reading the remembered answers in the insertion's rule evaluations too left the OWL 2 RL
+change at the same time, so the insertion reads the blocks through its per-step caches as
+before.
+
+**Outcome.** The runs repeat the follow-up's `keep` measurement on the same 16-vCPU
+Namespace instance shape and data on 2026-10-18. They compare `a6179e58`, before the
+follow-up, with `5b2085bc`, the follow-up, and with this work, interleaved on fresh copies
+of the dataset, three times at 16 threads and twice at 1 thread. These are development A/B
+measurements, not published benchmarks. The table gives the range of the runs.
+
+| Run | Before the follow-up | Follow-up | Item 87 |
+|---|---|---|---|
+| RDFS, kept closure | 2,267 MiB | 918 MiB | 927 MiB |
+| OWL 2 RL, kept closure | 2,654 MiB | 1,226 MiB | 1,244 MiB |
+| RDFS, first change, 16 threads | 18 to 20 ms, 462 MiB peak | 77 to 90 ms, 172 MiB peak | 26 to 31 ms, 22 to 24 MiB peak |
+| RDFS, undo, 16 threads | 11 to 14 ms | 28 to 29 ms | 15 to 17 ms |
+| RDFS, change again, 16 threads | 11 to 19 ms | 46 to 60 ms | 12 to 13 ms |
+| OWL 2 RL, first change, 16 threads | 34 to 36 ms, 595 MiB peak | 140 to 165 ms, 303 MiB peak | 82 to 88 ms, 35 to 52 MiB peak |
+| OWL 2 RL, undo, 16 threads | 40 to 44 ms | 109 to 116 ms | 61 to 65 ms |
+| OWL 2 RL, change again, 16 threads | 21 to 26 ms | 88 to 97 ms | 51 to 54 ms |
+| RDFS, full run, 16 threads | 11.8 to 12.5 s | 9.8 to 10.3 s | 10.4 to 10.6 s |
+| OWL 2 RL, full run, 16 threads | 16.1 to 16.3 s | 13.9 to 14.5 s | 14.2 to 14.9 s |
+| RDFS, change read back from the dataset, 16 threads | 5.4 to 5.7 s | 3.3 to 3.8 s | 3.4 to 3.6 s |
+| OWL 2 RL, change read back from the dataset, 16 threads | 4.0 to 4.1 s | 2.2 to 2.4 s | 2.1 to 2.2 s |
+| RDFS, first change, 1 thread | 234 and 235 ms | 80 and 86 ms | 74 and 80 ms |
+| RDFS, undo and change again, 1 thread | 12 ms | 29 to 47 ms | 11 to 16 ms |
+| OWL 2 RL, first change, 1 thread | 274 and 284 ms | 132 and 142 ms | 137 and 143 ms |
+| OWL 2 RL, undo and change again, 1 thread | 26 to 45 ms | 78 to 113 ms | 51 to 73 ms |
+| RDFS, full run, 1 thread | 22.4 and 22.6 s | 18.6 and 19.0 s | 18.9 and 20.4 s |
+| OWL 2 RL, full run, 1 thread | 38.4 and 44.8 s | 33.6 and 34.0 s | 36.9 and 37.7 s |
+
+The goal is met for memory and for the RDFS changes after the first, and missed for the
+first RDFS change and for OWL 2 RL. The kept closure grew by 10 MiB for RDFS and 18 MiB for
+OWL 2 RL, mostly the room for more rows, and stays at 41% and 47% of the closure that held
+the explicit facts, under the 60% bound even with the full 64 MiB of answers. The first
+RDFS change takes about 1.5 times its time before the follow-up by the medians of the
+runs, the undo about 1.25 times and the change made again the same time. The OWL 2 RL
+changes take 1.5 to 2.4 times their time before the follow-up, where the follow-up took
+2.7 to 4.3 times. Full runs and runs that read the
+closure back from the dataset did not change beyond the noise of the instance.
+At 1 thread the RDFS changes after the first are back to their time before the follow-up,
+and the first change stays well under it. The OWL 2 RL changes after the first take about
+twice their time before the follow-up, and the first change is as it was after the
+follow-up. The OWL 2 RL full runs at 1 thread took 36.9 and 37.7 s, against 33.6 and 34.0 s
+for the follow-up. Full runs of one build at 1 thread differed by up to 17% on this
+instance, and a full run executes only a few added checks per rule evaluation of this
+work, so two runs cannot tell a regression from noise. More runs are needed before item 87
+closes.
+
+Two costs remain. The first change of a kept closure still decodes blocks that no answer
+covers, and a few of its lookups read long ranges in one thread, such as the members of a
+class that the inferred graph's rows interleave with, through rule `rdfs3`. In the OWL 2 RL
+changes, the insertion takes about 30 ms at 16 threads. Its rule evaluations read the input
+graphs from the blocks for each of the 2,000 changed facts, where they probed the closure's
+hash tables before the follow-up, and the evaluations' allocations and shared counters
+contend at 16 threads. [ROADMAP](../ROADMAP.md) item 87 stays open for them.
+
+The tests check the answers for coherence as well as the results. The differential tests
+of `incremental.rs` now check every remembered answer against a scan of the input graphs
+after each step, and they gain steps that undo the previous one, steps whose state is
+reached through an earlier commit, and runs on one thread and on six. A test that skips
+the update of the answers fails them. `kept_lookups_follow_commits_undos_and_failed_runs`
+in `tests/incremental.rs` interleaves cancelled runs and runs that fail for memory with
+several commits and undos for every profile. The unit tests of `lookups.rs` cover the
+budget, the cap, the order of updated answers and the move to another budget. A failed or
+cancelled run cannot leave a wrong answer behind, because an answer is a fact of the
+snapshot it was read from, and the closure that a run takes out of the cache is dropped
+when the run fails. `f16_default_geometry_changed_subjects` in `tests/geosparql.rs` pinned
+the difference in `baseScans` between the kept and the read-back closure. The kept
+closure's answers now save it some reads, so the test checks that the kept closure never
+reads more than the read-back one and that the read-back one makes at least the scans of
+the default geometries.
