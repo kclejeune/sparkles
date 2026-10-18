@@ -7,6 +7,7 @@
 //! cargo run --release -p sparkles-reasoner --example lubm -- infer /tmp/lubm/db10 rdfs
 //! cargo run --release -p sparkles-reasoner --example lubm -- materialize /tmp/lubm/db10 owl-rl
 //! cargo run --release -p sparkles-reasoner --example lubm -- keep /tmp/lubm/db10 rdfs 1000
+//! cargo run --release -p sparkles-reasoner --example lubm -- diag /tmp/lubm/db10
 //! ```
 //!
 //! `RAYON_NUM_THREADS` sets the number of threads. The peak heap counts every allocation
@@ -18,6 +19,9 @@
 //! triples of the first university and adds `K` new ones, after it is undone and after it
 //! is made again, and one that reads the closure back from the dataset after the change
 //! is undone once more. The dataset is changed, so it should be a fresh copy.
+//!
+//! `diag` runs the check `literal-not-in-datatype` twice on the same snapshot and reports
+//! the time and the peak heap of each run.
 
 use oxrdf::{GraphName, NamedNode, Quad, Triple};
 use sparkles_core::io::Source;
@@ -311,9 +315,28 @@ fn main() {
                 vm_hwm()
             );
         }
+        "diag" => {
+            let db = PathBuf::from(&args[2]);
+            let store = Store::open(&db, StoreOptions::default()).unwrap();
+            let opts = sparkles_reasoner::diagnostics::DiagnoseOptions {
+                checks: vec!["literal-not-in-datatype".into()],
+                ..Default::default()
+            };
+            for round in ["first", "second"] {
+                let before = reset_peak();
+                let t = Instant::now();
+                let r = sparkles_reasoner::diagnostics::diagnose(store.snapshot(), &opts).unwrap();
+                println!(
+                    "diag {round} ms={} findings={} peak_heap_mib={:.1}",
+                    t.elapsed().as_millis(),
+                    r.findings.len(),
+                    mib(PEAK.load(Ordering::Relaxed) - before)
+                );
+            }
+        }
         _ => {
             eprintln!(
-                "usage: lubm gen U DIR | load DIR U DB | infer DB PROFILE | materialize DB PROFILE | keep DB PROFILE [K]"
+                "usage: lubm gen U DIR | load DIR U DB | infer DB PROFILE | materialize DB PROFILE | keep DB PROFILE [K] | diag DB"
             );
             std::process::exit(2);
         }
