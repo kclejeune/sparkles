@@ -4660,7 +4660,15 @@ impl Store {
                 annotation = self.annotate(&head, message.clone(), || None)?;
             }
             if let Err(e) = write_atomic(&root.join("CURRENT"), name.as_bytes()) {
-                if !annotation.is_empty() && self.annotations.lock().undo(head.seq).is_err() {
+                let switched =
+                    std::fs::read_to_string(root.join("CURRENT")).is_ok_and(|c| c.trim() == name);
+                if switched {
+                    // The next open uses the new generation, so the bulk commit may come
+                    // back and keeps its annotation. Later commits to the old generation
+                    // would be lost, so the writer takes no more.
+                    w.poisoned = true;
+                } else if !annotation.is_empty() && self.annotations.lock().undo(head.seq).is_err()
+                {
                     w.poisoned = true;
                 }
                 return Err(e);
@@ -5943,9 +5951,12 @@ impl WriteTxn<'_> {
                 synced
             });
             if let Err(e) = written {
+                // The records may have reached the file, and the commit may then come back
+                // at the next open. Its annotation and merge record stay, so a recovered
+                // commit keeps its message, its change digest and its merge parent. The
+                // writer takes no more commits, and the next open drops both records if the
+                // commit did not survive, because they lie above the recovered head.
                 w.poisoned = true;
-                let _ = self.store.annotations.lock().undo(c.seq);
-                let _ = self.store.branching.merges.lock().undo(c.seq);
                 return Err(e);
             }
             // the bytes the file grew by: the records past its end and any zeros after,
@@ -7283,6 +7294,55 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         let store = Store::open(&root, Default::default()).unwrap();
         assert_eq!(store.head_commit().seq, head + 1);
         assert_eq!(insert(&store, "n3").unwrap().commit.seq, head + 2);
+    }
+
+    #[test]
+    fn a_commit_kept_after_a_failed_sync_keeps_its_message_and_digest() {
+        // The ordinary path: the annotation is synced before the WAL records, then the
+        // commit's sync fails after its records reached the file. The commit comes back at
+        // the next open, and so must its message and its change digest, or the digest
+        // chain has a hole and the next commit hashes against a zero parent.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let opts = StoreOptions {
+            commit_digests: true,
+            group_commit: false,
+            ..Default::default()
+        };
+        let store = Store::open(&root, opts.clone()).unwrap();
+        let insert = |store: &Store, s: &str| {
+            let o = crate::guard::WriteOptions {
+                message: Some(format!("add {s}").into()),
+                ..Default::default()
+            };
+            let mut t = store.write_with(CommitKind::Update, o);
+            let q = t.encode_quad(&quad(s, "p", "o"), &mut Default::default())?;
+            assert!(t.insert(q)?);
+            t.commit()
+        };
+        let head = insert(&store, "n1").unwrap().commit.seq;
+        store.snapshot().generation.dvocab.fail_next_sync();
+        assert!(insert(&store, "n2").is_err());
+        assert!(matches!(insert(&store, "n3"), Err(Error::Poisoned)));
+        drop(store);
+        let store = Store::open(&root, opts).unwrap();
+        let kept = store.head_commit();
+        assert_eq!(kept.seq, head + 1, "the failed commit's records survived");
+        let a = store.annotation(kept.seq).unwrap_or_default();
+        assert_eq!(a.message.as_deref(), Some("add n2"));
+        let parent = a
+            .digest
+            .expect("the recovered commit has its change digest");
+        let r = insert(&store, "n3").unwrap();
+        let line = "<http://ex.org/n3> <http://ex.org/p> <http://ex.org/o> .".to_string();
+        let want = crate::annotations::change_digest(
+            store.dataset_id(),
+            &r.commit,
+            Some(&parent),
+            vec![],
+            vec![line],
+        );
+        assert_eq!(r.annotation.digest, Some(want), "the chain has no hole");
     }
 
     #[test]

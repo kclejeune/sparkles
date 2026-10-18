@@ -16,7 +16,10 @@
 //!
 //! An ordinary commit appends and syncs its record *before* the commit point (the WAL
 //! write, or the `CURRENT` switch of a bulk commit), so a durable commit always has its
-//! annotation. A commit of a group (see `store/group.rs`) appends its record without a
+//! annotation. When the sync of an ordinary commit's WAL records fails, the commit may
+//! still come back at the next open, so its record is not taken back. The writer refuses
+//! further commits, and the next open drops the record if the commit did not survive. A
+//! commit of a group (see `store/group.rs`) appends its record without a
 //! sync, before it writes its WAL records, and the group's fence syncs the file together
 //! with the log. An acknowledged commit therefore has its annotation too, but a commit
 //! that was not acknowledged can reach the disk without it. Its commit record carries
@@ -205,8 +208,8 @@ impl Annotations {
     }
 
     /// Record `a` for commit `seq` (the next commit, not yet durable) and, for a
-    /// persistent store, sync it to disk. Undo it with [`Annotations::undo`] if the
-    /// commit does not happen.
+    /// persistent store, sync it to disk. Undo it with [`Annotations::undo`] when the
+    /// commit fails before any of its WAL records is written.
     pub fn append(&mut self, seq: u64, a: Annotation, dataset_id: uuid::Uuid) -> Result<()> {
         if let Some((f, at)) = self.append_unsynced(seq, a, dataset_id)?
             && let Err(e) = f.sync_data()

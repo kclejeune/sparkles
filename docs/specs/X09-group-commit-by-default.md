@@ -1058,15 +1058,25 @@ vocabulary. It checks unique commit numbers, a poisoned writer after a failed
 synchronization, that every snapshot a reader saw is the model's state at its commit, and
 that the reopened store holds every acknowledged commit and message in an order the model
 allows. After a failed synchronization it also checks that no reader saw a commit past the
-last acknowledged one and that no commit after an uncertain one was acknowledged. A commit
-whose own synchronization failed on the ordinary path rolls back its annotation but can keep
-its log record, so it may come back without its message. Section 3 leaves the outcome of
-that commit open, and the model accepts it for an operation that failed with an error. It
-runs 24 seeds by default in under two seconds, and twelve invocations of 300 seeds each
+last acknowledged one and that no commit after an uncertain one was acknowledged. Every
+recovered commit must carry its message. It runs 24 seeds by default in under two seconds, and twelve invocations of 300 seeds each
 passed. Publishing the commits of a failed fence before failing them makes it fail in every
 invocation, and so does removing the poisoning of a failed fence. `tests/annotations.rs`
 prunes the catalog while messaged commits sit at the WAL tail and reopens with and without
 grouping.
+
+**Annotations after a failed synchronization.** The ordinary path used to take a
+commit's annotation and merge record back when the synchronization of its log records
+failed. The records could still reach the disk, so the commit could come back after a
+restart without its message or change digest, and with digests on the next commit then
+hashed against a zero parent. A failed synchronization poisons the writer, and open drops
+the records of commits above the recovered head, so the path now keeps both records. A
+recovered commit has its message, digest and merge parent, and a commit that did not
+survive leaves nothing behind. The model test above now requires every recovered commit to
+carry its message, and `a_commit_kept_after_a_failed_sync_keeps_its_message_and_digest`
+checks the digest chain across such a commit. A bulk commit whose `CURRENT` switch reports
+an error after the rename took effect now poisons the writer and keeps its annotation, as a
+compaction already did. Nothing on disk changed.
 
 **The default.** Group commit is on by default. `StoreOptions::group_commit` replaces
 `experimental_group_commit` with a default of true and is ignored for in-memory stores.

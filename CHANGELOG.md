@@ -89,6 +89,12 @@ hidden `--experimental-group-commit` flag is removed, and passing it is a usage 
 
 ### Behavior
 
+A commit whose own log synchronization fails keeps its message, change digest and merge
+record. Such a commit can still come back after a restart, and it used to come back
+without them, which left a hole in the digest chain of a dataset with `--commit-digests`.
+The writer stops taking commits after the failure as before, and open drops the records
+of a commit that did not survive.
+
 FastRP follows the meaning of `iterationWeights` in Neo4j GDS. The list has one weight
 for each propagation, and the new `nodeSelfInfluence` parameter weights the random
 starting vectors. The default `(0.0, 1.0, 1.0)` now propagates three times where it
