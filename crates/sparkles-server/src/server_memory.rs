@@ -389,6 +389,12 @@ fn render_spill(st: &AppState, o: &mut String) {
         "Queries that wrote a spill file.",
         s.spilled_queries(),
     );
+    family(
+        "sparkles_spill_eager_retries_total",
+        "counter",
+        "Eager queries that exceeded their memory budget and ran again as cursors that may spill.",
+        s.eager_retries(),
+    );
 }
 
 /// The pool's series for `/$/metrics`.

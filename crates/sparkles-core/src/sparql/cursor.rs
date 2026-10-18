@@ -1156,6 +1156,9 @@ fn retry_as_cursor(
     cursor: &CursorOptions,
     started: Instant,
 ) -> std::result::Result<QueryExecution, Box<super::Failed>> {
+    if let Some(spill) = &options.spill {
+        spill.count_eager_retry();
+    }
     let mut options = options.clone();
     if let Some(timeout) = options.timeout {
         let deadline = started + timeout;

@@ -503,6 +503,10 @@ async fn streamed_sorts_spill_within_the_memory_budget_and_fail_with_the_spill_b
         metrics.contains("sparkles_spill_queries_total 1"),
         "{metrics}"
     );
+    assert!(
+        metrics.contains("sparkles_spill_eager_retries_total 0"),
+        "{metrics}"
+    );
     // The run files take about 260 KiB, which `spill-mb=1` holds.
     let r = query(
         &app,

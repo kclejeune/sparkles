@@ -123,6 +123,7 @@ pub struct Spill {
     queries: AtomicU64,
     written: AtomicU64,
     spilled_queries: AtomicU64,
+    retries: AtomicU64,
     fault: Mutex<Option<(Fault, u64)>>,
     /// Whether a fault is injected, read before `fault` is locked.
     faults: std::sync::atomic::AtomicBool,
@@ -323,6 +324,7 @@ impl Spill {
             queries: AtomicU64::new(0),
             written: AtomicU64::new(0),
             spilled_queries: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
             fault: Mutex::new(None),
             faults: std::sync::atomic::AtomicBool::new(false),
         }))
@@ -351,6 +353,17 @@ impl Spill {
     /// How many queries wrote a spill file.
     pub fn spilled_queries(&self) -> u64 {
         self.spilled_queries.load(Ordering::Relaxed)
+    }
+
+    /// How many eager SELECT queries exceeded their memory budget and ran again as
+    /// cursors that may spill.
+    pub fn eager_retries(&self) -> u64 {
+        self.retries.load(Ordering::Relaxed)
+    }
+
+    /// Count an eager query that runs again as a cursor.
+    pub fn count_eager_retry(&self) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The reservation of one query, whose files may take `limit` bytes when it is

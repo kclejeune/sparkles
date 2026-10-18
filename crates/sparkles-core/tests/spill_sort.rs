@@ -407,6 +407,7 @@ fn automatic_execution_streams_or_retries_sorts_that_outgrow_memory() {
     assert_eq!(rows, expected);
     let plan = plan.expect("a retried cursor");
     assert!(plan.contains("\"eagerMemoryRetry\":1"), "{plan}");
+    assert_eq!(spill.eager_retries(), 1);
     assert_eq!(spill.reserved_bytes(), 0);
     assert!(leftovers(tmp.path()).is_empty());
     // A small sort stays eager.
@@ -494,5 +495,6 @@ fn automatic_execution_never_retries_a_query_that_calls_a_service() {
         }
         assert_eq!(calls.load(Ordering::SeqCst) - before, eager_calls, "{q}");
     }
+    assert_eq!(spill.eager_retries(), 0);
     assert_eq!(spill.reserved_bytes(), 0);
 }
