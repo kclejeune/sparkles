@@ -389,7 +389,10 @@ impl TermCache {
                 }
             }
         }
-        pairs.sort_unstable();
+        // A column read in index order is often already ascending, so the pairs are a
+        // few sorted runs, which the run-detecting stable sort merges in near-linear
+        // time. The pairs are distinct, so its order is that of an unstable sort.
+        pairs.sort();
         ctx.check()?;
         let mut slots = vec![u32::MAX; cells];
         let mut ids = Vec::with_capacity(pairs.len());

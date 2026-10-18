@@ -87,6 +87,11 @@ value order into memory. It ranks them in parallel morsels of one index block an
 only its best rows, so its memory no longer grows with the range. At 10.5M with eight
 threads it takes 1.06 times its eager time, where it took 1.33 times.
 
+A streamed answer's term cache sorts its vocabulary ids with a stable sort that merges
+the columns already in index order. With the parallel filter, a STRSTARTS filter over
+names in native JSON at one thread takes 1.01 to 1.03 times its eager time, where it
+took 1.30 times.
+
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server
 refuses until `sparkles migrate` runs without `--check`, and its JSON report adds `opens`.
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as

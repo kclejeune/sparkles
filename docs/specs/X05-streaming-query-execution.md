@@ -1311,6 +1311,29 @@ top-k over salaries measured 1.06 times eager execution at eight threads, the me
 cursor's ledger peaked at 6.1 MB with eight threads against 5.6 MB before, and at 3.3 MB
 with one thread.
 
+### Native JSON of a streamed filter (2026-10-18)
+
+A filter over a scan written as native JSON at one thread had taken 1.35 to 1.39 times as
+long streamed as eagerly. Two changes brought it to parity. The parallel cursor filter
+above reads only the blocks a STRSTARTS prefix can match, which removed most of the gap.
+Profiles of what remained showed the cursor writer's term cache spending about a tenth of
+its time sorting the pairs of vocabulary id and cell of each batch. A column read in
+index order is already ascending, so the cache now sorts those pairs with Rust's stable
+sort, which finds such runs and merges them in close to linear time. The pairs are
+distinct, so the order is the same as before.
+
+The table gives the streaming time divided by the eager time in native JSON at 10.5M with
+one thread on the Namespace instance, the median of 15 rounds in two processes each.
+
+| Native JSON, ratio of streaming to eager | 5c73ced6 | Parallel filter | With the stable sort |
+|---|---:|---:|---:|
+| STRSTARTS on names, 49,837 rows | 1.30 | 1.07 | 1.01 to 1.03 |
+| CONTAINS on names, 49,837 rows | **0.91** | **0.93** | **0.93** |
+| LANGMATCHES on titles, 500,000 rows | **0.90** | **0.91** | **0.85** |
+
+The stable sort also took the streamed scan of 1.02M names from 0.94 to 0.88 to 0.90
+times eager execution.
+
 ### Large basic graph patterns
 
 [ROADMAP](../ROADMAP.md) item 84. The planner joins the triple patterns of a basic graph

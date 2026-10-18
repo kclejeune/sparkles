@@ -1732,6 +1732,14 @@ eight threads, the median of 21 rounds, against 1.33 at 5c73ced6, and 0.88 at on
 thread against 0.93. Its ledger peaked at 6.1 MB at eight threads and 3.3 MB at one,
 against 5.6 MB before at both.
 
+In native JSON at one thread, the STRSTARTS filter over names took 1.30 times its eager
+time at 5c73ced6 and takes 1.01 to 1.03 times now, the median of 15 rounds in two
+processes. The parallel filter reads fewer blocks, and the cursor writer's term cache
+sorts its ids with a stable sort that merges the already ascending columns
+([X05](specs/X05-streaming-query-execution.md#native-json-of-a-streamed-filter-2026-10-18)).
+That sort also took the streamed name scan of 1.02M rows from 0.94 to 0.88 to 0.90 times
+eager execution.
+
 The JVM library also runs in automatic mode by default since 2026-10-17. In the binding
 comparison of `scripts/bench-bindings` at 1.05M on forge, with every case run twice in
 each mode in alternating processes, the JNI export of 500,000 rows took 130 ms against
