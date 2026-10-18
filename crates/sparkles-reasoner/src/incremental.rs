@@ -2,11 +2,14 @@
 //! (Motik, Nenov, Piro, Horrocks: *Incremental Update of Datalog Materialisation: the
 //! Backward/Forward Algorithm*, AAAI 2015).
 //!
-//! The closure of the previous run is kept as an in-memory [`Closure`]: every derived
-//! fact, the generalized ones included, with a flag on the explicit facts (the default
-//! graph). Given the explicit facts deleted and inserted since, an update
+//! The closure of the previous run is a [`Closure`]: the input graphs of a snapshot as
+//! its base tier, and every derived fact, the generalized ones included, in memory as its
+//! derived tier. An update reads the input graphs of the snapshot it brings the closure
+//! to, so the inserted facts are in the base tier from its start and the deleted ones are
+//! not. Given the explicit facts deleted and inserted since, an update
 //!
-//! 1. **deletes** what no longer follows. A deleted explicit fact is a candidate. Before a
+//! 1. **deletes** what no longer follows. A deleted explicit fact is a candidate, held
+//!    in the derived tier while the search decides whether it still follows. Before a
 //!    candidate is deleted, a backward search looks for another proof of it among the
 //!    facts not deleted, and keeps it if one exists. Only facts without a proof are
 //!    deleted, and the heads of the rule instances that used them become candidates.
@@ -14,7 +17,9 @@
 //!    derive the survivors again; with RDFS that deletes most of the closure for a single
 //!    `rdf:type` triple, through `rdfs:Resource` and the class axioms;
 //! 2. **inserts** the new explicit facts and runs the rules semi-naively from them, with
-//!    the closure that remains as the old facts.
+//!    the closure that remains as the old facts. The inserted facts are delta rows of the
+//!    derived tier, flagged explicit, for the length of the run, and leave it at its
+//!    end, since the base tier holds them.
 //!
 //! The backward search decides provability exactly. It explores the rule instances that
 //! derive a fact, depth first, and counts for each instance the body facts not proved
@@ -24,10 +29,13 @@
 
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity, table_grown};
 use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step};
+use crate::facts::Base;
 use crate::graph::{Cands, Graph, Triple};
 use crate::terms::Terms;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use sparkles_core::id::Id;
+use sparkles_core::store::Snapshot;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,14 +45,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[error("{0}")]
 pub(crate) struct Fallback(pub String);
 
-/// A materialization in memory: the closure, with the explicit facts flagged.
+/// A materialization: the input graphs of a snapshot as the base tier of its graph (see
+/// [`crate::facts`]), and the derived facts in memory as its derived tier.
+///
+/// A fact is explicit when the base tier holds it. The derived tier holds the facts the
+/// base tier does not, and a flag marks those of them that count as explicit too: the
+/// GeoSPARQL default geometries, and for the length of an update the inserted facts.
+/// Whether a fact of the closure is explicit therefore needs no read of the store: it
+/// is explicit when the derived tier does not hold it, or holds it flagged.
 pub(crate) struct Closure {
     pub graph: Graph,
     pub terms: Terms,
-    /// one bit per row: the row holds an explicit fact
-    base: Vec<u64>,
-    /// the heap of `base`, charged to the budget of the graph
-    base_held: Held,
+    /// one bit per row of the derived tier, from the graph's offset on: the row holds a
+    /// fact that counts as explicit
+    flags: Vec<u64>,
+    /// the heap of `flags`, charged to the budget of the graph
+    flags_held: Held,
     /// the GeoSPARQL default geometries the closure holds as explicit facts, when they
     /// are known (see [`crate::default_geometry_changes`])
     pub defaults: Option<Defaults>,
@@ -103,133 +119,127 @@ impl Defaults {
 }
 
 impl Closure {
-    /// A closure whose rows before `base_len` are the explicit facts.
-    pub fn new(graph: Graph, terms: Terms, base_len: u32) -> Closure {
-        let base_held = Held::new(graph.budget());
-        let mut c = Closure {
+    /// The closure of `graph`, whose base tier holds the explicit facts and whose
+    /// derived tier holds the derived ones, none of them flagged.
+    pub fn new(graph: Graph, terms: Terms) -> Closure {
+        let flags_held = Held::new(graph.budget());
+        Closure {
             graph,
             terms,
-            base: Vec::new(),
-            base_held,
+            flags: Vec::new(),
+            flags_held,
             defaults: None,
-        };
-        for r in 0..base_len {
-            c.set_base(r, true);
         }
-        c
     }
 
-    /// [`new`](Self::new), charging the flags of the explicit facts before they are
-    /// allocated and failing when they do not fit.
-    pub fn try_new(graph: Graph, terms: Terms, base_len: u32) -> Result<Closure, MemoryExceeded> {
-        let mut base_held = Held::new(graph.budget());
-        let words = (base_len as usize).div_ceil(64);
-        base_held.try_grow(words * size_of::<u64>())?;
-        let mut base = Vec::new();
-        base.reserve_exact(words);
-        let mut c = Closure {
-            graph,
-            terms,
-            base,
-            base_held,
-            defaults: None,
-        };
-        for r in 0..base_len {
-            c.set_base(r, true);
-        }
-        Ok(c)
-    }
-
-    /// The heap of the closure: its graph, its local terms, the flags of its explicit
-    /// facts and its default geometries.
+    /// The heap of the closure: its derived tier, its local terms, the flags and the
+    /// default geometries. The base tier is the store's.
     pub fn heap_bytes(&self) -> usize {
-        self.graph.heap_bytes()
-            + self.terms.heap_bytes()
-            + self.base.capacity() * size_of::<u64>()
-            + self.defaults_bytes()
+        self.graph.heap_bytes() + self.terms.heap_bytes() + self.own_bytes()
     }
 
-    fn defaults_bytes(&self) -> usize {
-        self.defaults.as_ref().map_or(0, Defaults::heap_bytes)
+    fn own_bytes(&self) -> usize {
+        self.flags.capacity() * size_of::<u64>()
+            + self.defaults.as_ref().map_or(0, Defaults::heap_bytes)
     }
 
     /// Charge the closure to `budget` from now on, or fail when it does not fit.
     pub fn set_budget(&mut self, budget: &Arc<Budget>) -> Result<(), MemoryExceeded> {
-        let own = self.base.capacity() * size_of::<u64>() + self.defaults_bytes();
-        let held = Held::try_new(budget, own)?;
+        let held = Held::try_new(budget, self.own_bytes())?;
         self.graph.set_budget(budget)?;
         self.terms.set_budget(budget)?;
-        self.base_held = held;
+        self.flags_held = held;
         Ok(())
     }
 
-    /// Charge the change of the closure's own buffers (the explicit flags and the
-    /// default geometries) since the last call.
+    /// Charge the change of the closure's own buffers (the flags and the default
+    /// geometries) since the last call.
     pub fn settle(&mut self) {
-        let own = self.base.capacity() * size_of::<u64>() + self.defaults_bytes();
-        self.base_held.set(own);
+        let own = self.own_bytes();
+        self.flags_held.set(own);
         self.graph.settle();
     }
 
     /// [`settle`](Self::settle), failing instead of charging past the limit.
     pub fn try_settle(&mut self) -> Result<(), MemoryExceeded> {
-        let own = self.base.capacity() * size_of::<u64>() + self.defaults_bytes();
-        self.base_held.try_set(own)?;
+        let own = self.own_bytes();
+        self.flags_held.try_set(own)?;
         self.graph.try_settle()
     }
 
-    #[inline]
-    pub fn is_base(&self, row: u32) -> bool {
-        self.base
-            .get(row as usize / 64)
-            .is_some_and(|w| w & (1 << (row % 64)) != 0)
+    /// Replace the base tier by the input graphs `graphs` of `snap`, a later snapshot of
+    /// the same generation, in the order the run resolved them.
+    pub fn set_inputs(&mut self, snap: Arc<Snapshot>, graphs: &[Id]) -> anyhow::Result<()> {
+        let base = Base::new(snap, graphs)?;
+        self.graph.set_base(Arc::new(base));
+        Ok(())
     }
 
-    pub fn set_base(&mut self, row: u32, on: bool) {
-        let done = self.set_base_with(row, on, false);
+    /// Whether row `row` of the derived tier is flagged explicit.
+    #[inline]
+    pub fn flagged(&self, row: u32) -> bool {
+        let Some(i) = row.checked_sub(self.graph.offset()) else {
+            return false;
+        };
+        self.flags
+            .get(i as usize / 64)
+            .is_some_and(|w| w & (1 << (i % 64)) != 0)
+    }
+
+    pub fn set_flag(&mut self, row: u32, on: bool) {
+        let done = self.set_flag_with(row, on, false);
         debug_assert!(done.is_ok(), "charges that may pass the limit do not fail");
     }
 
-    /// [`set_base`](Self::set_base), charging the growth of the flags before it is
+    /// [`set_flag`](Self::set_flag), charging the growth of the flags before it is
     /// allocated, and with `strict` failing when it does not fit.
-    pub fn set_base_with(
+    pub fn set_flag_with(
         &mut self,
         row: u32,
         on: bool,
         strict: bool,
     ) -> Result<(), MemoryExceeded> {
-        let w = row as usize / 64;
-        if self.base.len() <= w {
-            let cap = self.base.capacity();
+        let i = row - self.graph.offset();
+        let w = i as usize / 64;
+        if self.flags.len() <= w {
+            if !on {
+                return Ok(());
+            }
+            let cap = self.flags.capacity();
             if w + 1 > cap {
                 let new = (cap * 2).max(w + 1).max(4);
                 let bytes = (new - cap) * size_of::<u64>();
                 if strict {
-                    self.base_held.try_grow(bytes)?;
+                    self.flags_held.try_grow(bytes)?;
                 } else {
-                    self.base_held.grow(bytes);
+                    self.flags_held.grow(bytes);
                 }
-                self.base.reserve_exact(new - self.base.len());
+                self.flags.reserve_exact(new - self.flags.len());
             }
-            self.base.resize(w + 1, 0);
+            self.flags.resize(w + 1, 0);
         }
         if on {
-            self.base[w] |= 1 << (row % 64);
+            self.flags[w] |= 1 << (i % 64);
         } else {
-            self.base[w] &= !(1 << (row % 64));
+            self.flags[w] &= !(1 << (i % 64));
         }
         Ok(())
     }
 
-    /// Whether a live triple is explicit.
-    pub fn explicit(&self, t: &Triple) -> bool {
-        self.graph.position(t).is_some_and(|r| self.is_base(r))
+    /// Whether a fact of the closure is explicit: the base tier holds it when the
+    /// derived tier does not, and a fact of the derived tier is explicit when it is
+    /// flagged. A triple that is not in the closure counts as explicit, so the caller
+    /// asks only about facts it read from the closure.
+    #[inline]
+    pub fn explicit_held(&self, t: &Triple) -> bool {
+        self.graph.position(t).is_none_or(|r| self.flagged(r))
     }
 
-    /// The live triples, explicit ones first, each group in row order.
+    /// The live facts of the derived tier, in row order, with their flags.
     pub fn live(&self) -> impl Iterator<Item = (Triple, bool)> + '_ {
-        let rows = (0..self.graph.len()).filter(|&r| self.graph.alive(r));
-        rows.map(|r| (self.graph.triple(r), self.is_base(r)))
+        let g = &self.graph;
+        let rows = (g.offset()..g.len()).filter(|&r| g.alive(r));
+        rows.map(|r| (g.triple(r), self.flagged(r)))
     }
 
     /// Replace local ids by store ids (`moved`) in every live row.
@@ -279,14 +289,17 @@ impl Closure {
             hit.push(x);
         }
         for (t, _) in &hit {
+            if let Some(r) = self.graph.position(t) {
+                self.set_flag(r, false);
+            }
             self.graph.kill(t);
         }
-        for (t, base) in hit {
+        for (t, flag) in hit {
             let n = [m(t[0]), m(t[1]), m(t[2])];
             match self.graph.position(&n) {
                 Some(r) => {
-                    if base {
-                        self.set_base_with(r, true, strict)?;
+                    if flag {
+                        self.set_flag_with(r, true, strict)?;
                     }
                 }
                 None => {
@@ -296,19 +309,20 @@ impl Closure {
                         self.graph.add_batch([n]);
                     }
                     let r = self.graph.len() - 1;
-                    self.set_base_with(r, base, strict)?;
+                    self.set_flag_with(r, flag, strict)?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Rebuild the graph without its dead rows when they are a quarter of it or more.
-    /// The new graph is built beside the old one, charged as it grows; with `strict`,
-    /// failing past the limit (the closure is unusable then).
+    /// Rebuild the derived tier without its dead rows when they are a quarter of it or
+    /// more. The new tier is built beside the old one, charged as it grows; with
+    /// `strict`, failing past the limit (the closure is unusable then).
     pub fn compact_if_needed(&mut self, strict: bool) -> Result<(), MemoryExceeded> {
         let g = &self.graph;
-        if (g.dead_rows() as usize) * 4 < g.len() as usize {
+        let rows = (g.len() - g.offset()) as usize;
+        if (g.dead_rows() as usize) * 4 < rows {
             return Ok(());
         }
         let budget = g.budget().clone();
@@ -321,26 +335,20 @@ impl Closure {
             held.grow(list);
         }
         let live: Vec<(Triple, bool)> = self.live().collect();
-        let mut graph = if strict {
-            Graph::try_with_capacity(live.len(), &budget)?
-        } else {
-            let mut g = Graph::with_capacity(live.len());
-            g.charge_to(&budget);
-            g
-        };
+        let mut graph = g.try_like(live.len(), &budget, strict)?;
         if strict {
             graph.try_add_batch(live.iter().map(|x| x.0))?;
         } else {
             graph.add_batch(live.iter().map(|x| x.0));
         }
-        let mut base = vec![0u64; live.len().div_ceil(64)];
+        let mut flags = vec![0u64; live.len().div_ceil(64)];
         for (r, (_, b)) in live.iter().enumerate() {
             if *b {
-                base[r / 64] |= 1 << (r % 64);
+                flags[r / 64] |= 1 << (r % 64);
             }
         }
         self.graph = graph;
-        self.base = base;
+        self.flags = flags;
         drop(live);
         drop(held);
         self.settle();
@@ -381,7 +389,10 @@ fn cancelled(limits: &Limits) -> bool {
 }
 
 /// Bring `c` from the closure of the old explicit facts to that of the new ones:
-/// `removed` explicit facts are no longer explicit, `inserted` ones are.
+/// `removed` explicit facts are no longer explicit, `inserted` ones are. The base tier of
+/// `c` holds the new explicit facts already: the inserted ones and not the removed ones,
+/// except for explicit facts the store does not hold, such as default geometries, which
+/// the derived tier holds flagged.
 ///
 /// Returns [`Fallback`] (as the error) when the rules read RDF lists and a list fact is
 /// derived, removed or added: what list builtins see then depends on the order of
@@ -405,7 +416,7 @@ pub(crate) fn update(
             let rows = g.cands(None, Some(p), None, 0, g.len());
             if (0..rows.len())
                 .map(|i| rows.get(i))
-                .any(|r| g.alive(r) && !c.is_base(r))
+                .any(|r| g.alive(r) && !c.flagged(r))
             {
                 return Err(Fallback("the rules read RDF lists that are derived".into()).into());
             }
@@ -418,17 +429,28 @@ pub(crate) fn update(
     budget.check()?;
     let mut held = Held::new(budget);
 
-    // ---- deletion
-    held.try_grow(2 * removed.len() * size_of::<Triple>())?;
-    let mut queue: Vec<Triple> = Vec::new();
-    for t in removed {
-        if let Some(r) = c.graph.position(t)
-            && c.is_base(r)
-        {
-            c.set_base(r, false);
-            queue.push(*t);
+    // the inserted facts the derived tier holds are explicit from the start, as the base
+    // tier's copies of them are
+    for t in inserted {
+        if let Some(r) = c.graph.position(t) {
+            c.set_flag_with(r, true, true)?;
         }
     }
+
+    // ---- deletion
+    held.try_grow(3 * removed.len() * size_of::<Triple>())?;
+    let mut queue: Vec<Triple> = Vec::new();
+    // the removed facts that were in the base tier: they join the derived tier as
+    // candidates, and stay there when they still follow
+    let mut back: Vec<Triple> = Vec::new();
+    for t in removed {
+        match c.graph.position(t) {
+            Some(r) => c.set_flag(r, false),
+            None => back.push(*t),
+        }
+        queue.push(*t);
+    }
+    c.graph.try_add_batch(back)?;
     if !queue.is_empty() {
         let plans = Plans::new(&mut c.graph, rules)?;
         held.try_grow(plans.bytes)?;
@@ -508,25 +530,40 @@ pub(crate) fn update(
     let start = c.graph.len();
     out.added_from = start;
     held.try_grow(std::mem::size_of_val(inserted))?;
-    let mut fresh: Vec<Triple> = Vec::new();
-    for t in inserted {
-        match c.graph.position(t) {
-            Some(r) => c.set_base(r, true),
-            None => fresh.push(*t),
-        }
-    }
+    let fresh: Vec<Triple> = inserted
+        .iter()
+        .filter(|t| c.graph.position(t).is_none())
+        .copied()
+        .collect();
     c.graph.try_add_batch(fresh)?;
     for r in start..c.graph.len() {
-        c.set_base(r, true);
+        c.set_flag_with(r, true, true)?;
     }
     budget.check()?;
     if c.graph.len() > start {
         let o = engine::run(&mut c.graph, rules, &c.terms, limits, Some(start))?;
         out.iterations = o.iterations;
-        if lists && out.added(c).any(|t| is_list(&t) && !c.explicit(&t)) {
+        if lists && out.added(c).any(|t| is_list(&t) && !c.explicit_held(&t)) {
             return Err(Fallback("an RDF list fact was derived".into()).into());
         }
     }
+    // the inserted facts that the base tier holds leave the derived tier, found with one
+    // sorted pass over the base tier
+    held.try_grow(std::mem::size_of_val(inserted) + inserted.len())?;
+    let mut ins: Vec<Triple> = inserted.to_vec();
+    ins.sort_unstable();
+    ins.dedup();
+    let in_base = match c.graph.base() {
+        Some(b) => b.contains_sorted(&ins)?,
+        None => vec![false; ins.len()],
+    };
+    for (t, _) in ins.iter().zip(in_base).filter(|x| x.1) {
+        if let Some(r) = c.graph.position(t) {
+            c.set_flag(r, false);
+            c.graph.kill(t);
+        }
+    }
+    drop(ins);
     // the removed facts stay with the update
     out.held = Some(held);
     Ok(out)
@@ -541,6 +578,13 @@ pub(crate) fn dred_overdeletion(
     limits: &Limits,
     removed: &[Triple],
 ) -> usize {
+    // the removed facts of the base tier, as derived facts that are deleted first
+    let back: Vec<Triple> = removed
+        .iter()
+        .filter(|t| c.graph.position(t).is_none())
+        .copied()
+        .collect();
+    c.graph.add_batch(back);
     let plans = Plans::new(&mut c.graph, rules).expect("an unlimited budget");
     let mut gone: FxHashSet<Triple> = FxHashSet::default();
     let mut frontier: Vec<Triple> = removed
@@ -908,7 +952,7 @@ impl Search {
             return false;
         };
         let fact = size_of::<Triple>();
-        if cx.c.is_base(row) {
+        if cx.c.flagged(row) {
             let (cap, len) = (self.proved.capacity(), self.proved.len());
             let Some(old) = self.table_growth(cap, len, 1, fact) else {
                 return false;
@@ -1123,7 +1167,8 @@ impl Search {
             if u == t || self.unprovable.contains(&u) {
                 return true;
             }
-            if self.proved.contains(&u) || cx.c.explicit(&u) {
+            // a body fact the derived tier does not hold is from the base tier
+            if self.proved.contains(&u) || cx.c.explicit_held(&u) {
                 continue;
             }
             facts.push(u);
@@ -1222,6 +1267,9 @@ mod tests {
     }
 
     struct Vocab {
+        /// the vocabulary in a named graph, and the explicit facts of a test in the
+        /// default graph
+        store: Store,
         snap: Arc<Snapshot>,
         classes: Vec<u64>,
         props: Vec<u64>,
@@ -1283,14 +1331,20 @@ mod tests {
                 names.push(format!("{OWL}{l}"));
             }
             for n in &names {
-                ttl.push_str(&format!("<urn:v> <urn:has> <{n}> .\n"));
+                ttl.push_str(&format!("<urn:v> <urn:has> <{n}> <urn:vocab> .\n"));
             }
-            ttl.push_str("<urn:v> <urn:has> \"a\", \"b\", 7 .\n");
+            for l in [
+                "\"a\"",
+                "\"b\"",
+                "\"7\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            ] {
+                ttl.push_str(&format!("<urn:v> <urn:has> {l} <urn:vocab> .\n"));
+            }
             let store = Store::in_memory(StoreOptions::default());
             store
                 .load(&[Source::from_bytes(
                     ttl.into_bytes(),
-                    RdfFormat::Turtle,
+                    RdfFormat::NQuads,
                     None,
                 )])
                 .unwrap();
@@ -1319,6 +1373,7 @@ mod tests {
                 .chain([sparkles_core::id::Id::from_i64(7).unwrap().0])
                 .collect();
             Vocab {
+                store,
                 classes: get("C"),
                 props: get("p"),
                 inds: get("i"),
@@ -1417,32 +1472,69 @@ mod tests {
         c
     }
 
-    fn full(v: &Vocab, text: &str, base: &FxHashSet<Triple>) -> Closure {
-        let terms = Terms::new(v.snap.clone());
-        let rules = compiled(text, &terms);
-        let mut sorted: Vec<Triple> = base.iter().copied().collect();
-        sorted.sort_unstable();
-        let mut g = Graph::default();
-        g.add_batch(sorted);
-        let n = g.len();
-        engine::run(&mut g, &rules, &terms, &limits(), None).unwrap();
-        Closure::new(g, terms, n)
+    /// Make the default graph hold exactly `base`, and return its snapshot.
+    fn set_default_graph(v: &Vocab, base: &FxHashSet<Triple>) -> Arc<Snapshot> {
+        let now = v.store.snapshot();
+        let g = Id::DEFAULT_GRAPH;
+        let mut txn = v.store.write();
+        let have: Vec<[u64; 4]> = now
+            .scan_keys(sparkles_core::index::Perm::Gspo, &[g.0])
+            .unwrap()
+            .iter()
+            .map(|k| [k[1], k[2], k[3], k[0]])
+            .collect();
+        for q in &have {
+            if !base.contains(&[q[0], q[1], q[2]]) {
+                txn.delete([Id(q[0]), Id(q[1]), Id(q[2]), g]).unwrap();
+            }
+        }
+        for t in base {
+            assert!(
+                t.iter()
+                    .all(|&x| Id(x).tag() != sparkles_core::id::Tag::Local)
+            );
+            txn.insert([Id(t[0]), Id(t[1]), Id(t[2]), g]).unwrap();
+        }
+        txn.commit().unwrap();
+        let snap = v.store.snapshot();
+        assert!(Arc::ptr_eq(&snap.generation, &v.snap.generation));
+        snap
     }
 
-    /// The live facts as text, explicit ones marked.
+    fn full(v: &Vocab, text: &str, base: &FxHashSet<Triple>) -> Closure {
+        let snap = set_default_graph(v, base);
+        let terms = Terms::new(snap.clone());
+        let rules = compiled(text, &terms);
+        let b = Base::new(snap, &[Id::DEFAULT_GRAPH]).unwrap();
+        let mut g = Graph::with_base(Arc::new(b));
+        engine::run(&mut g, &rules, &terms, &limits(), None).unwrap();
+        Closure::new(g, terms)
+    }
+
+    /// The facts of both tiers as text, explicit ones marked. A fact both tiers hold
+    /// appears twice when the derived tier does not flag it.
     fn render(c: &Closure) -> std::collections::BTreeSet<String> {
         let s = |x: u64| c.terms.term(x).map_or(format!("?{x:x}"), |t| t.to_string());
-        c.live()
-            .map(|(t, b)| {
-                format!(
-                    "{} {} {}{}",
-                    s(t[0]),
-                    s(t[1]),
-                    s(t[2]),
-                    if b { " ." } else { "" }
-                )
+        let line = |t: Triple, b: bool| {
+            format!(
+                "{} {} {}{}",
+                s(t[0]),
+                s(t[1]),
+                s(t[2]),
+                if b { " ." } else { "" }
+            )
+        };
+        let mut out: std::collections::BTreeSet<String> =
+            c.live().map(|(t, b)| line(t, b)).collect();
+        c.graph
+            .base()
+            .unwrap()
+            .for_each(None, None, None, |t| {
+                out.insert(line(t, true));
+                true
             })
-            .collect()
+            .unwrap();
+        out
     }
 
     fn differential(text: &str, owl: bool, lists: bool, seed: u64, steps: usize) -> (usize, usize) {
@@ -1483,6 +1575,11 @@ mod tests {
                     }
                 }
             }
+            // the closure reads the input graphs of the new state, as an update does
+            let snap = set_default_graph(&v, &base);
+            let moved = c.terms.rebase(snap.clone());
+            c.remap(&moved);
+            c.set_inputs(snap, &[Id::DEFAULT_GRAPH]).unwrap();
             let rules = compiled(text, &c.terms);
             match update(&mut c, &rules, &limits(), &inserted, &removed) {
                 Ok(_) => incremental += 1,

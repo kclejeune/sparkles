@@ -80,7 +80,7 @@ pub struct DatasetOptions {
     pub store: StoreOptions,
     /// the name a catalog or a server gives the dataset (see [`Dataset::name`])
     pub name: Option<String>,
-    /// the largest closure kept in memory for incremental reasoning, in triples
+    /// the largest closure kept in memory for incremental reasoning, in derived triples
     /// (`serve --reason-cache-triples`)
     pub closure_cache_triples: usize,
     /// the origin of an in-memory clone, which has no `origin.json`

@@ -1177,8 +1177,8 @@ enum Cmd {
         #[arg(long, value_name = "SECS", requires = "auto_reason")]
         auto_reason_max_delay: Option<f64>,
         /// Keep the closure of each dataset's last materialization in memory, up to this
-        /// many triples, so that the next run updates it incrementally (0: keep none; a
-        /// run then reads it back from a persistent dataset)
+        /// many derived triples, so that the next run updates it incrementally (0: keep
+        /// none; a run then reads it back from a persistent dataset)
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_CACHE_TRIPLES)]
         reason_cache_triples: usize,
         /// Threads that materializations evaluate rules on, shared by all runs (default:

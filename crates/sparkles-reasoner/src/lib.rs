@@ -279,37 +279,6 @@ struct Derivation {
     threads: usize,
 }
 
-/// The union of the triples of graphs `graphs`, in memory, with room for `extra` more,
-/// charged to `budget` before it is allocated.
-fn load_graphs(
-    snap: &Snapshot,
-    graphs: &[Id],
-    extra: usize,
-    budget: &Arc<Budget>,
-) -> anyhow::Result<graph::Graph> {
-    let mut n = 0;
-    for g in graphs {
-        n += snap.count(Perm::Gspo, &[g.0]).unwrap_or(0) as usize;
-    }
-    let read = Held::try_new(budget, n * size_of::<[u64; 3]>())?;
-    let mut triples = Vec::with_capacity(n);
-    for g in graphs {
-        snap.scan(Perm::Gspo, &[g.0], |c| {
-            match c {
-                Chunk::Block(b, s, e) => {
-                    triples.extend((s..e).map(|i| [b.cols[1][i], b.cols[2][i], b.cols[3][i]]));
-                }
-                Chunk::Row(k) => triples.push([k[1], k[2], k[3]]),
-            }
-            Ok(true)
-        })?;
-    }
-    let mut g = graph::Graph::try_with_capacity(n + extra, budget)?;
-    g.try_add_batch(triples)?;
-    drop(read);
-    Ok(g)
-}
-
 pub use pool::ReasoningPool;
 
 /// A reasoning pool of `threads` threads, for [`ReasonOptions::pool`].
@@ -579,7 +548,7 @@ fn default_geometry_changes(
         }
         for d in defaults.facts() {
             if let Some(r) = closure.graph.position(&d) {
-                closure.set_base(r, true);
+                closure.set_flag(r, true);
             }
         }
     }
@@ -593,11 +562,17 @@ fn default_geometry_changes(
     closure.settle();
     budget.check()?;
     let touched: Vec<[u64; 3]> = gone.iter().chain(&new).copied().collect();
-    // a default geometry that is also stated, or no longer stated, does not change
+    // a default geometry that is also stated, or no longer stated, does not change. It
+    // only moves between the tiers: a stated one is in the base tier, and the derived
+    // tier holds the others, flagged explicit
     for d in gone {
         match ch.base_added.iter().position(|t| *t == d) {
             Some(i) => {
                 ch.base_added.swap_remove(i);
+                if let Some(r) = closure.graph.position(&d) {
+                    closure.set_flag(r, false);
+                    closure.graph.kill(&d);
+                }
             }
             None => ch.base_removed.push(d),
         }
@@ -606,10 +581,17 @@ fn default_geometry_changes(
         match ch.base_removed.iter().position(|t| *t == d) {
             Some(i) => {
                 ch.base_removed.swap_remove(i);
+                if closure.graph.position(&d).is_none() {
+                    closure.graph.try_add_batch([d])?;
+                }
+                if let Some(r) = closure.graph.position(&d) {
+                    closure.set_flag_with(r, true, true)?;
+                }
             }
             None => ch.base_added.push(d),
         }
     }
+    closure.settle();
     Ok(touched)
 }
 
@@ -623,14 +605,14 @@ impl Derivation {
         self.terms.valid(t)
     }
 
-    /// The facts of the base tier and the derived ones.
+    /// The derived facts.
     fn closure_len(&self) -> usize {
-        self.graph.len() as usize
+        self.graph.derived().len()
     }
 
-    /// The closure in memory, for incremental runs: the input graphs, read into memory,
-    /// then the derived facts, with the default geometries flagged explicit. Its graph is
-    /// charged to the run's budget before it is allocated, beside the derivation's.
+    /// The closure, for incremental runs: the derivation's graph as it is, the input
+    /// graphs as its base tier and the derived facts in memory, with the default
+    /// geometries flagged explicit.
     fn into_closure(self) -> anyhow::Result<incremental::Closure> {
         let Derivation {
             graph,
@@ -639,15 +621,10 @@ impl Derivation {
             defaults,
             ..
         } = self;
-        let derived = graph.derived();
-        let Some(base) = graph.base() else {
+        if graph.base().is_none() {
             anyhow::bail!("a derivation without a base tier");
-        };
-        let mut g = load_graphs(&base.snap, &base.graph_ids(), derived.len(), &budget)?;
-        let n = g.len();
-        g.try_add_batch(derived.iter().copied())?;
-        drop(graph);
-        let mut c = incremental::Closure::try_new(g, terms, n)?;
+        }
+        let mut c = incremental::Closure::new(graph, terms);
         if let Some((d, _held)) = defaults {
             let (_, pred) = geo_ids(&c.terms);
             let d = incremental::Defaults {
@@ -656,7 +633,7 @@ impl Derivation {
             };
             for t in d.facts() {
                 if let Some(r) = c.graph.position(&t) {
-                    c.set_base_with(r, true, true)?;
+                    c.set_flag_with(r, true, true)?;
                 }
             }
             c.defaults = Some(d);
@@ -895,10 +872,9 @@ fn lock_with_changes<'s>(
 
 /// The closure a run ends with, for the next incremental run.
 enum ClosureState {
-    /// in memory, explicit facts included (an incremental run's)
+    /// an incremental run's
     Ready(incremental::Closure),
-    /// the derived facts over the input graphs (a full run's), read into memory only
-    /// when the closure is kept
+    /// a full run's derived facts over the input graphs
     Derived(Derivation),
 }
 
@@ -1218,18 +1194,28 @@ fn update_closure(
     }
     progress(opts, 0.0, "reading the previous closure");
     let budget = Budget::new(opts.max_memory);
-    let prev = maintain::previous(store, snap, since, digest, &graphs, inc.cache, raw, &budget)?;
+    let prev = maintain::previous(
+        store,
+        snap,
+        since,
+        digest,
+        &graphs,
+        &resolved.ids(snap),
+        inc.cache,
+        raw,
+        &budget,
+    )?;
     let mut closure = prev.closure;
     let mut ch = prev.changes;
     let _prev_held = prev.held;
+    // the input graphs now, the closure's base tier, whose scans the run reports
+    let Some(base) = closure.graph.base_arc() else {
+        anyhow::bail!("a closure without a base tier");
+    };
     // the default geometries count as explicit facts, so that the update keeps the facts
     // derived from them; those of the changed features change with the explicit ones
-    let mut base_scans = 0;
     let touched = if extras.geo_default_geometry {
-        let base = facts::Base::new(snap.clone(), &resolved.ids(snap))?;
-        let touched = default_geometry_changes(&base, &mut closure, &mut ch, &budget)?;
-        base_scans = base.scans();
-        touched
+        default_geometry_changes(&base, &mut closure, &mut ch, &budget)?
     } else {
         Vec::new()
     };
@@ -1255,6 +1241,8 @@ fn update_closure(
         (up, rayon::current_num_threads())
     });
     let up = up?;
+    let base_scans = base.scans();
+    drop(base);
     let mut generalized = prev.generalized;
     let mut gen_changes = maintain::GeneralizedChanges::default();
     for t in &up.deleted {
@@ -1268,7 +1256,7 @@ fn update_closure(
     )?;
     let added: Vec<[u64; 3]> = up.added(&closure).collect();
     for t in &added {
-        if !closure.explicit(t) && !closure.terms.valid(t) && generalized.insert(*t) {
+        if !closure.explicit_held(t) && !closure.terms.valid(t) && generalized.insert(*t) {
             gen_changes.added.push(*t);
         }
     }
@@ -1345,7 +1333,7 @@ fn write_changes<'a>(
         let want = c
             .graph
             .position(t)
-            .is_some_and(|r| !c.is_base(r) || defaults.is_some_and(|d| d.contains(t)))
+            .is_some_and(|r| !c.flagged(r) || defaults.is_some_and(|d| d.contains(t)))
             && c.terms.valid(t);
         let local = t.iter().any(|&x| Id(x).tag() == Tag::Local);
         let have = match graph {

@@ -371,19 +371,66 @@ impl Graph {
         n + self.spilled
     }
 
-    /// A graph whose rows `[0, base.len)` are the base tier.
+    /// A graph whose rows `[0, base.len)` are the base tier (at least one row, so that
+    /// a base tier that grows later, see [`set_base`](Self::set_base), is still read).
     pub fn with_base(base: Arc<Base>) -> Graph {
         Graph {
-            offset: base.len(),
+            offset: base.len().max(1),
             base: Some(base),
             ..Graph::default()
         }
+    }
+
+    /// A graph over the same base tier and row numbers as this one, with room for `n`
+    /// in-memory rows, charged to `budget` before it allocates when `strict` (and
+    /// otherwise even past the limit).
+    pub fn try_like(
+        &self,
+        n: usize,
+        budget: &Arc<Budget>,
+        strict: bool,
+    ) -> Result<Graph, MemoryExceeded> {
+        let mut g = if strict {
+            Graph::try_with_capacity(n, budget)?
+        } else {
+            let mut g = Graph::with_capacity(n);
+            g.charge_to(budget);
+            g
+        };
+        g.offset = self.offset;
+        g.base = self.base.clone();
+        Ok(g)
+    }
+
+    /// Replace the base tier by `base`, the input graphs of a later snapshot of the same
+    /// generation. The in-memory rows keep their numbers: the base tier stays the rows
+    /// before [`offset`](Self::offset), which are only read as a whole, so the new tier
+    /// may hold more facts than that. The cache of base facts that merges found is
+    /// emptied, since the new tier may not hold them.
+    pub fn set_base(&mut self, base: Arc<Base>) {
+        debug_assert!(self.base.is_some() && self.offset > 0);
+        self.base = Some(base);
+        for k in &mut self.in_base {
+            *k = FxHashSet::default();
+        }
+        self.settle();
     }
 
     /// The base tier, if the graph has one.
     #[inline]
     pub fn base(&self) -> Option<&Base> {
         self.base.as_deref()
+    }
+
+    /// The base tier, shared.
+    pub fn base_arc(&self) -> Option<Arc<Base>> {
+        self.base.clone()
+    }
+
+    /// The first in-memory row: the rows before it are the base tier.
+    #[inline]
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
 
     #[inline]

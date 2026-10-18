@@ -375,7 +375,7 @@ pub struct AppState {
     /// automatic re-materialization of stale inferences (`serve --auto-reason`)
     pub auto_reason: Option<crate::reasoning::AutoReason>,
     /// the largest closure a dataset keeps in memory for incremental reasoning, in
-    /// triples (`serve --reason-cache-triples`)
+    /// derived triples (`serve --reason-cache-triples`)
     pub reason_cache_triples: usize,
     /// automatic compaction (`serve --auto-compact-*`) and what is known of each
     /// dataset's compactions

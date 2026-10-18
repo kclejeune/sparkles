@@ -180,8 +180,8 @@ pub struct AutoSetting {
     pub max_delay_seconds: Option<f64>,
 }
 
-/// The largest closure a dataset keeps in memory for incremental reasoning, in triples,
-/// by default (`serve --reason-cache-triples`).
+/// The largest closure a dataset keeps in memory for incremental reasoning, in derived
+/// triples, by default (`serve --reason-cache-triples`).
 pub const DEFAULT_CLOSURE_CACHE_TRIPLES: usize = 10_000_000;
 
 /// The record kept in a database directory, if it has one that reads. The record lives

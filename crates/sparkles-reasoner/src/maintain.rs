@@ -1,17 +1,18 @@
 //! Where an incremental run finds the previous closure, and what it keeps for the next.
 //!
 //! The explicit facts are the union of the input graphs (the default graph unless the run
-//! names others). The previous closure comes from memory when the caller keeps a
-//! [`Cache`] (the server does), and otherwise from the dataset: the input graphs and the
-//! inferred graph as of the previous run, recovered from their state now and the commit
-//! diff since, plus the
-//! derived facts that are not valid RDF. Those generalized facts (a literal subject, a
+//! names others). A closure holds them as its base tier, read from the store, and keeps
+//! only the derived facts in memory. The previous closure comes from memory when the
+//! caller keeps a [`Cache`] (the server does), and otherwise from the dataset: the
+//! inferred graph as of the previous run, recovered from its state now and the commit
+//! diff since, plus the derived facts that are not valid RDF. Those generalized facts (a literal subject, a
 //! blank node predicate) are never written to the inferred graph but can take part in
 //! derivations, so a persistent dataset keeps them in `reasoning-generalized.bin`, bound
 //! to the run's commit and rules by `reasoning-generalized.json`.
 
 use crate::INFERRED_GRAPH;
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity};
+use crate::facts::Base;
 use crate::graph::{Graph, Triple};
 use crate::incremental::{Closure, Fallback};
 use crate::inputs::GraphRef;
@@ -30,8 +31,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The closure of a dataset's last materialization, kept in memory for the next run.
 ///
-/// A run that updates the closure takes it out and puts the new one back after its
-/// commit. Only closures of at most `max_triples` facts are kept.
+/// The closure keeps its derived facts in memory and reads the explicit facts from the
+/// snapshot of its commit. A run that updates the closure takes it out and puts the new
+/// one back after its commit. Only closures of at most `max_triples` derived facts are
+/// kept.
 pub struct Cache {
     kept: Mutex<Option<Kept>>,
     max_triples: AtomicUsize,
@@ -54,7 +57,8 @@ impl Default for Cache {
 }
 
 impl Cache {
-    /// A cache that keeps closures of at most `max_triples` facts (0 keeps none).
+    /// A cache that keeps closures of at most `max_triples` derived facts (0 keeps
+    /// none).
     pub fn new(max_triples: usize) -> Cache {
         Cache {
             kept: Mutex::new(None),
@@ -67,7 +71,7 @@ impl Cache {
         self.max_triples.store(n, Ordering::Relaxed);
     }
 
-    /// The largest closure kept, in facts.
+    /// The largest closure kept, in derived facts.
     pub(crate) fn limit(&self) -> usize {
         self.max_triples.load(Ordering::Relaxed)
     }
@@ -77,7 +81,7 @@ impl Cache {
         *self.kept.lock() = None;
     }
 
-    /// Facts in the kept closure, and the commit it belongs to.
+    /// Derived facts in the kept closure, and the commit it belongs to.
     pub fn kept(&self) -> Option<(usize, u64)> {
         self.kept
             .lock()
@@ -258,7 +262,8 @@ impl Changes {
 }
 
 /// Find the closure of the materialization at commit `since`, for an update with the
-/// `raw` changes from there to `snap`, charged to `budget`.
+/// `raw` changes from there to `snap`, charged to `budget`. Its base tier is the input
+/// graphs of `snap`, `ids` in the order the run resolved them.
 ///
 /// A closure kept in memory for this dataset, commit, generation, rules and inputs is
 /// taken out of the cache only when its heap fits the budget, and otherwise stays there
@@ -272,6 +277,7 @@ pub(crate) fn previous(
     since: u64,
     digest: u64,
     inputs: &[GraphRef],
+    run_ids: &[Id],
     cache: Option<&Cache>,
     raw: Result<RawChanges, String>,
     budget: &Arc<Budget>,
@@ -306,6 +312,7 @@ pub(crate) fn previous(
         held.grow(set_bytes(&generalized));
         let moved = closure.terms.rebase(snap.clone());
         closure.remap(&moved);
+        closure.set_inputs(snap.clone(), run_ids)?;
         remap_set(&mut generalized, &moved, None)?;
         held.set(set_bytes(&generalized));
         let changes = raw.resolve(&closure.terms, snap, &ids)?;
@@ -350,7 +357,7 @@ pub(crate) fn previous(
         .collect();
     held.set(changes.heap_bytes() + set_bytes(&generalized));
     budget.check()?;
-    let closure = reconstruct(snap, terms, &changes, &generalized, &ids, budget)?;
+    let closure = reconstruct(snap, terms, &changes, &generalized, run_ids, budget)?;
     Ok(Previous {
         closure,
         generalized,
@@ -387,8 +394,10 @@ fn remap_set(
     Ok(())
 }
 
-/// The closure as of the previous run: the input graphs and the inferred graph then, and
-/// the generalized facts.
+/// The closure as of the previous run, over the input graphs of `snap` (`inputs`, in the
+/// order the run resolved them): the inferred graph then and the generalized facts, as
+/// its derived tier. A fact the input graphs held then is not a derived fact, so the
+/// facts of the inferred graph are probed against the input graphs in one sorted pass.
 fn reconstruct(
     snap: &Arc<Snapshot>,
     terms: Terms,
@@ -397,10 +406,28 @@ fn reconstruct(
     inputs: &[Id],
     budget: &Arc<Budget>,
 ) -> anyhow::Result<Closure> {
-    let scan = |g: Id, skip: &FxHashSet<Triple>, out: &mut Vec<Triple>| -> anyhow::Result<()> {
+    let base = Arc::new(Base::new(snap.clone(), inputs)?);
+    let inferred = snap.lookup_iri(INFERRED_GRAPH);
+    let m = match inferred {
+        Some(g) => snap.count(Perm::Gspo, &[g.0])? as usize,
+        None => 0,
+    };
+    let fact = size_of::<Triple>();
+    let n = m + ch.inferred_removed.len();
+    // the facts read, the result of their probe, and the sets of changed facts
+    let held = Held::try_new(
+        budget,
+        n * (fact + 1)
+            + table_bytes(table_capacity(ch.inferred_added.len()), fact)
+            + table_bytes(table_capacity(ch.base_added.len()), fact)
+            + table_bytes(table_capacity(ch.base_removed.len()), fact),
+    )?;
+    let mut derived: Vec<Triple> = Vec::with_capacity(n);
+    if let Some(g) = inferred {
+        let skip: FxHashSet<Triple> = ch.inferred_added.iter().copied().collect();
         snap.scan(Perm::Gspo, &[g.0], |c| {
             match c {
-                Chunk::Block(b, s, e) => out.extend(
+                Chunk::Block(b, s, e) => derived.extend(
                     (s..e)
                         .map(|i| [b.cols[1][i], b.cols[2][i], b.cols[3][i]])
                         .filter(|t| !skip.contains(t)),
@@ -408,59 +435,34 @@ fn reconstruct(
                 Chunk::Row(k) => {
                     let t = [k[1], k[2], k[3]];
                     if !skip.contains(&t) {
-                        out.push(t);
+                        derived.push(t);
                     }
                 }
             }
             Ok(true)
         })?;
-        Ok(())
-    };
-    let mut n = 0;
-    for g in inputs {
-        n += snap.count(Perm::Gspo, &[g.0])? as usize;
-    }
-    let inferred = snap.lookup_iri(INFERRED_GRAPH);
-    let m = match inferred {
-        Some(g) => snap.count(Perm::Gspo, &[g.0])? as usize,
-        None => 0,
-    };
-    let fact = size_of::<Triple>();
-    let (nb, nd) = (
-        n + ch.base_removed.len(),
-        m + ch.inferred_removed.len() + generalized.len(),
-    );
-    // the facts read and the sets of facts they skip, charged before they are allocated
-    let mut held = Held::try_new(
-        budget,
-        (nb + nd) * fact
-            + table_bytes(table_capacity(ch.base_added.len()), fact)
-            + table_bytes(table_capacity(ch.inferred_added.len()), fact),
-    )?;
-    let mut base = Vec::with_capacity(nb);
-    let added: FxHashSet<Triple> = ch.base_added.iter().copied().collect();
-    for g in inputs {
-        scan(*g, &added, &mut base)?;
-    }
-    drop(added);
-    base.extend(&ch.base_removed);
-    let mut derived = Vec::with_capacity(nd);
-    if let Some(g) = inferred {
-        scan(
-            g,
-            &ch.inferred_added.iter().copied().collect(),
-            &mut derived,
-        )?;
     }
     derived.extend(&ch.inferred_removed);
-    derived.extend(generalized);
-    held.set((base.capacity() + derived.capacity()) * fact);
-    let mut graph = Graph::try_with_capacity(base.len() + derived.len(), budget)?;
-    graph.try_add_batch(base)?;
-    let n = graph.len();
+    derived.sort_unstable();
+    derived.dedup();
+    // a fact the input graphs held at the previous run is explicit there: one they hold
+    // now that was not added since, or one removed since
+    let now = base.contains_sorted(&derived)?;
+    let added: FxHashSet<Triple> = ch.base_added.iter().copied().collect();
+    let removed: FxHashSet<Triple> = ch.base_removed.iter().copied().collect();
+    let mut i = 0;
+    derived.retain(|t| {
+        let then = (now[i] && !added.contains(t)) || removed.contains(t);
+        i += 1;
+        !then
+    });
+    drop((now, added, removed));
+    let mut graph =
+        Graph::with_base(base).try_like(derived.len() + generalized.len(), budget, true)?;
     graph.try_add_batch(derived)?;
+    graph.try_add_batch(generalized.iter().copied())?;
     drop(held);
-    Ok(Closure::new(graph, terms, n))
+    Ok(Closure::new(graph, terms))
 }
 
 /// Changes as the commit diff reports them, or as ids of one generation.
@@ -703,6 +705,12 @@ pub(crate) fn keep(
     let mut moved: FxHashMap<u64, u64> = stored.iter().map(|(l, id)| (*l, id.0)).collect();
     moved.extend(closure.terms.rebase(snap.clone()));
     closure.try_remap(&moved)?;
+    // the input graphs of the commit, which are those the run read
+    let ids = match closure.graph.base() {
+        Some(b) => b.graph_ids(),
+        None => return Ok(false),
+    };
+    closure.set_inputs(snap.clone(), &ids)?;
     let mut held = Held::new(&budget);
     remap_set(&mut generalized, &moved, Some(&mut held))?;
     drop(held);
