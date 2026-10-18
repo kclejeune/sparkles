@@ -46,13 +46,27 @@ suite_infer() {
     die "infer --profile $p failed, see logs/infer-$p.log"
   t1=$(date +%s.%N)
   derived=$(sed -n 's/^\([0-9]*\) inferred triples.*/\1/p' "logs/infer-$p.log" | tail -1)
-  status=$("$SPARKLES" infer --loc "infer-$p.db" --status --format json 2> /dev/null) || status='{}'
+  [[ $derived =~ ^[0-9]+$ ]] || die "infer --profile $p did not report its inferred triples, see logs/infer-$p.log"
+  status=$("$SPARKLES" infer --loc "infer-$p.db" --status --format json 2> "logs/infer-$p-status.log") || status='{}'
   if [ "${DERIVED_DIGEST:-1}" != 0 ]; then
-    "$SPARKLES" dump --loc "infer-$p.db" --graph urn:x-sparkles:inferred --merge --format nt --out "derived-$p.tmp.nt" > /dev/null 2>&1
-    digest=\"$(LC_ALL=C sort -S 25% -T . "derived-$p.tmp.nt" | sha256sum | cut -d' ' -f1)\"
-    rm -f "derived-$p.tmp.nt"
+    # The derived graph streams from the dump through sort into one pass that counts and
+    # hashes it, so no copy of it is written. sort still spills to temporary files in the
+    # workdir, which take about the size of the derived graph in N-Triples.
+    local hashed
+    hashed=$("$SPARKLES" dump --loc "infer-$p.db" --graph urn:x-sparkles:inferred --merge --format nt 2> "logs/dump-derived-$p.log" |
+      LC_ALL=C sort -S 25% -T . | python3 -I -c '
+import hashlib, sys
+h, n = hashlib.sha256(), 0
+for b in iter(lambda: sys.stdin.buffer.read(1 << 20), b""):
+    h.update(b)
+    n += b.count(b"\n")
+print(n, h.hexdigest())') || die "dumping the derived graph of $p failed, see logs/dump-derived-$p.log"
+    [ "${hashed% *}" = "$derived" ] ||
+      die "the derived graph of $p has ${hashed% *} triples, but infer reported $derived (logs/dump-derived-$p.log)"
+    digest=\"${hashed#* }\"
   fi
-  "$SPARKLES" dump --loc "infer-$p.db" --merge --format nt --out "$p.tmp.nt" > /dev/null 2>&1
+  "$SPARKLES" dump --loc "infer-$p.db" --merge --format nt --out "$p.tmp.nt" > /dev/null 2> "logs/dump-$p.log" ||
+    die "dumping the closure of $p failed, see logs/dump-$p.log"
   mv "$p.tmp.nt" "$p.nt"
   python3 -I - "$RES_DIR/inference.json" "$p" "$(awk "BEGIN {print $t1 - $t0}")" "logs/infer-$p.time" "${derived:-0}" \
     "$(wc -l < base.nt)" "$(wc -l < "$p.nt")" "$status" "$digest" "${INFER_NOTES:-}" << 'EOF'
@@ -138,18 +152,19 @@ EOF
   t0=$(date +%s.%N)
   # The nixpkgs wrapper puts its JDK first on PATH, but Jena's scripts prefer JAVA_HOME,
   # which a developer's environment may point at an older JDK than the jars need.
-  env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" timeout "${JENA_REASON_TIMEOUT:-3600}" "$sparql" --desc=jena-reason/plain.ttl \
+  env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" timeout -k 30 "${JENA_REASON_TIMEOUT:-3600}" "$sparql" --desc=jena-reason/plain.ttl \
     --query=jena-reason/count.rq --results=csv > "logs/jena-plain.out" 2> "logs/jena-plain.log" || die "Jena could not count base.nt, see logs/jena-plain.log"
   t1=$(date +%s.%N)
   tl=$(awk "BEGIN {print $t1 - $t0}")
   base_n=$(tail -1 logs/jena-plain.out | tr -d '\r')
   rc=0
   t0=$(date +%s.%N)
-  env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "$gtime" -v -o "logs/jena-$r.time" "${CAP[@]}" timeout "${JENA_REASON_TIMEOUT:-3600}" "$sparql" \
+  env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "$gtime" -v -o "logs/jena-$r.time" "${CAP[@]}" timeout -k 30 "${JENA_REASON_TIMEOUT:-3600}" "$sparql" \
     --desc="jena-reason/$r.ttl" --query=jena-reason/count.rq --results=csv > "logs/jena-$r.out" 2> "logs/jena-$r.log" || rc=$?
   t1=$(date +%s.%N)
   n=$(tail -1 "logs/jena-$r.out" 2> /dev/null | tr -d '\r')
-  if [ "$rc" = 124 ]; then
+  # timeout exits with 124, or with 137 when the JVM ignored SIGTERM and needed SIGKILL
+  if [ "$rc" = 124 ] || { [ "$rc" = 137 ] && awk "BEGIN {exit !($t1 - $t0 >= ${JENA_REASON_TIMEOUT:-3600})}"; }; then
     st=timeout
   elif grep -q OutOfMemoryError "logs/jena-$r.log" || [ "$rc" = 137 ]; then
     st=oom

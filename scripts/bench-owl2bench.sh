@@ -71,7 +71,9 @@ for f in "${GENFILES[@]}" LICENSE queries.txt; do
   fetch_pinned "$PINS" "$f" "gen/$f"
 done
 rm -f queries/*.rq
-read -r -a NAMES <<< "$(python3 -I "$ROOT/scripts/bench-owl2bench/queries.py" gen/queries.txt queries RL)"
+qnames=$(python3 -I "$ROOT/scripts/bench-owl2bench/queries.py" gen/queries.txt queries RL) || die "could not extract the RL queries"
+read -r -a NAMES <<< "$qnames"
+[ ${#NAMES[@]} -gt 0 ] || die "gen/queries.txt has no RL queries"
 
 if [ -z "${JAVA8:-}" ]; then
   # not nixbin: the java on PATH is usually newer, and the jar's dependency injection
@@ -97,6 +99,7 @@ if [ ! -f base.nt ]; then
   # the jar of 2020 writes its data in the TBox's namespace; a jar that does not would
   # leave the reasoner nothing to do, so the run stops
   grep -q 'kracr.iiitd.edu.in' "gen/run/OWL2RL-$UNIV.owl" && die "the generated ABox is not in the TBox's namespace"
+  grep -q 'http://benchmark/OWL2Bench#' "gen/run/OWL2RL-$UNIV.owl" || die "the generated ABox does not use the TBox's namespace"
   "$SPARKLES" convert --syntax rdfxml "gen/run/OWL2RL-$UNIV.owl" -o base.raw.nt 2> logs/convert.log
   # The converter picks random blank node labels; relabel them by order of appearance.
   awk '{
