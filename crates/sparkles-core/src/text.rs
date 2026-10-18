@@ -550,7 +550,7 @@ impl UnavailableState {
 impl TextView {
     /// How many grouped commits' outcomes a search on this view may go through before
     /// it reaches a ready or unavailable view.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "text"))]
     pub(crate) fn pending_depth(&self) -> usize {
         let mut depth = 0;
         let mut view = self;
