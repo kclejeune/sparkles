@@ -5285,11 +5285,20 @@ mod spill_options_tests {
     #[test]
     fn a_relative_spill_dir_that_does_not_exist_measures_the_working_directory() {
         let cwd = std::env::current_dir().unwrap();
-        let expected =
-            sparkles::disk::free_bytes(&cwd).map_or(16 << 30, |free| (free / 4).min(64 << 30));
+        let capacity =
+            |free: std::io::Result<u64>| free.map_or(16 << 30, |free| (free / 4).min(64 << 30));
         let relative = std::path::Path::new("no-such-spill-dir/below");
         assert!(!relative.exists());
-        assert_eq!(default_spill_capacity(relative), expected);
+        // other tests write to the same file system meanwhile, so the free space can move
+        // between the two measurements by a little
+        let before = capacity(sparkles::disk::free_bytes(&cwd));
+        let got = default_spill_capacity(relative);
+        let after = capacity(sparkles::disk::free_bytes(&cwd));
+        let slack = 64 << 20;
+        assert!(
+            got + slack >= before.min(after) && got <= before.max(after) + slack,
+            "{got} is not near {before} or {after}"
+        );
     }
 
     #[test]
