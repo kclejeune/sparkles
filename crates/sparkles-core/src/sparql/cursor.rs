@@ -1831,28 +1831,39 @@ fn ranked(kind: &Kind) -> bool {
 
 /// Whether the rows of `node` come in an order a caller observes that operator orders
 /// do not record, such as an ORDER BY's or a ranking's, through the operators that pass
-/// rows on in their input's order. A DISTINCT over such rows must not pass rows to a
-/// later pass, which would emit them after rows that come after them.
+/// an input's order on, as [`output_order`] lists them. A DISTINCT over such rows must
+/// not pass rows to a later pass, which would emit them after rows that come after them.
+/// A join is followed into every input whose order its output may keep, whichever way
+/// the cursor runs it, so the answer errs on the side of keeping rows in memory.
 fn value_ordered(node: &Node) -> bool {
-    let mut node = node;
-    loop {
-        if ranked(&node.kind) {
-            return true;
-        }
-        match &node.kind {
-            Kind::Project(_)
-            | Kind::Distinct
-            | Kind::Filter(_)
-            | Kind::Extend(..)
-            | Kind::Assign(..)
-            | Kind::Slice { .. }
-                if node.children.len() == 1 =>
-            {
-                node = &node.children[0]
-            }
-            Kind::Union if node.children.len() == 1 => node = &node.children[0],
-            _ => return false,
-        }
+    if ranked(&node.kind) {
+        return true;
+    }
+    let first = || node.children.first().is_some_and(value_ordered);
+    match &node.kind {
+        Kind::Project(_)
+        | Kind::Distinct
+        | Kind::Filter(_)
+        | Kind::Extend(..)
+        | Kind::Assign(..)
+        | Kind::Slice { .. }
+        | Kind::IndexJoin(_)
+        | Kind::Unfold { .. }
+        | Kind::Unpack { .. }
+        | Kind::HalfJoin { .. }
+        | Kind::Minus
+        | Kind::LeftJoin { .. }
+        | Kind::Lateral(_) => first(),
+        Kind::Union => node.children.len() == 1 && first(),
+        // A merge join keeps its left input's order, and a hash join its probe side's,
+        // which may be either input.
+        Kind::Join { .. } => node.children.iter().any(value_ordered),
+        // A path over its input expands each input row in place.
+        Kind::Path {
+            bound_from_left: true,
+            ..
+        } => node.children.last().is_some_and(value_ordered),
+        _ => false,
     }
 }
 
@@ -1967,7 +1978,8 @@ impl Operator {
         info.actual_rows = 0;
         let vars = node.vars.clone();
         // Read before the children below become shells that keep only their order.
-        let value_ordered_input = node.children.first().is_some_and(value_ordered);
+        let value_ordered_input =
+            matches!(node.kind, Kind::Distinct) && node.children.first().is_some_and(value_ordered);
         // A fallback materializes only its own operator when it reads its children as
         // input tables. Those children then stream as cursors of their own.
         let inputs = materializes

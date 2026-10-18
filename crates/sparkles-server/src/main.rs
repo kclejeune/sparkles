@@ -884,6 +884,17 @@ enum SpillMode {
     Off,
 }
 
+/// The disk all queries' spill files may reserve when `--spill-max-mb` is not given: a
+/// quarter of the free space where the spill directory goes, at most 64 GiB, or 16 GiB
+/// when that cannot be measured. The directory may not exist yet, so the nearest
+/// existing directory above it is measured, a relative path counting from the working
+/// directory.
+fn default_spill_capacity(dir: &std::path::Path) -> u64 {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let measured = dir.ancestors().find(|d| d.is_dir()).unwrap_or(&dir);
+    sparkles::disk::free_bytes(measured).map_or(16 << 30, |free| (free / 4).min(64 << 30))
+}
+
 /// Open the spill directory for `serve --spill on`, removing what dead processes left in
 /// it. Spill is asked for explicitly, so a directory that cannot be used fails the start,
 /// as does one on a file system that keeps its files in memory, where spilled state
@@ -902,11 +913,7 @@ fn open_spill(
     let max_bytes = match max_mb {
         Some(0) => bail!("--spill-max-mb must be positive; use --spill off to turn spill off"),
         Some(mb) => mib("spill-max-mb", mb)?,
-        None => {
-            // The directory may not exist yet, so measure the nearest one that does.
-            let measured = dir.ancestors().find(|d| d.is_dir()).unwrap_or(dir);
-            sparkles::disk::free_bytes(measured).map_or(16 << 30, |free| (free / 4).min(64 << 30))
-        }
+        None => default_spill_capacity(dir),
     };
     let options = sparkles::spill::SpillOptions {
         dir: dir.to_path_buf(),
@@ -930,7 +937,11 @@ fn open_spill(
             "the spill directory {} is on {fs}; spill files belong on a local disk",
             dir.display()
         ),
-        Ok(None) | Err(_) => {}
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            "could not tell the file system of the spill directory {}: {e}",
+            dir.display()
+        ),
     }
     tracing::info!(
         "spill directory {}, {} MiB for all queries",
@@ -5216,9 +5227,38 @@ fn print_table(
 mod spill_options_tests {
     use super::*;
 
+    /// A directory for the test's spill files on a file system that spill accepts: the
+    /// temporary directory, unless it is tmpfs or ramfs, and otherwise the crate's own
+    /// directory.
+    fn disk_tempdir() -> Option<tempfile::TempDir> {
+        let on_disk = |d: &std::path::Path| {
+            !sparkles::disk::special_file_system(d)
+                .ok()
+                .flatten()
+                .is_some_and(sparkles::disk::in_memory_file_system)
+        };
+        let base = [std::env::temp_dir(), env!("CARGO_MANIFEST_DIR").into()]
+            .into_iter()
+            .find(|d| on_disk(d))?;
+        Some(tempfile::tempdir_in(base).unwrap())
+    }
+
+    #[test]
+    fn a_relative_spill_dir_that_does_not_exist_measures_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected =
+            sparkles::disk::free_bytes(&cwd).map_or(16 << 30, |free| (free / 4).min(64 << 30));
+        let relative = std::path::Path::new("no-such-spill-dir/below");
+        assert!(!relative.exists());
+        assert_eq!(default_spill_capacity(relative), expected);
+    }
+
     #[test]
     fn spill_that_cannot_be_used_fails_the_start() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(tmp) = disk_tempdir() else {
+            eprintln!("skipped: no temporary directory outside tmpfs or ramfs");
+            return;
+        };
         let dir = tmp.path().join("spill");
         let error = open_spill(&dir, Some(0), 0, 0).unwrap_err();
         assert!(error.to_string().contains("--spill-max-mb"), "{error}");

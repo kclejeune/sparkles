@@ -285,3 +285,37 @@ fn group_concat_follows_an_ordered_subquery_in_every_mode() {
         }
     }
 }
+
+/// A DISTINCT never spills above an ORDER BY that reaches it through a join, MINUS,
+/// OPTIONAL or EXISTS that passes its first input's order on, so a spilled cursor gives
+/// the rows in the order the same cursor gives them in memory.
+#[test]
+fn distinct_over_a_join_of_an_ordered_subquery_keeps_the_order_or_fails() {
+    let s = store(20_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let ordered = "{ SELECT ?s ?v { ?s <urn:p> ?v } ORDER BY DESC(?v) ?s }";
+    for q in [
+        format!("SELECT DISTINCT ?s ?v ?t {{ {ordered} ?s <urn:t> ?t }}"),
+        format!("SELECT DISTINCT ?s ?v ?t {{ {ordered} OPTIONAL {{ ?s <urn:t> ?t }} }}"),
+        format!("SELECT DISTINCT ?s ?v {{ {ordered} MINUS {{ ?s <urn:t> \"t1\" }} }}"),
+        format!("SELECT DISTINCT ?s ?v {{ {ordered} FILTER EXISTS {{ ?s <urn:t> ?t }} }}"),
+        "SELECT DISTINCT ?s ?l { { SELECT ?s { ?s <urn:p> ?v } ORDER BY ?s LIMIT 100 } \
+         ?s <urn:t> ?l }"
+            .to_string(),
+    ] {
+        let expected = run_in_order(&s, &q, 256 << 20, None).unwrap();
+        for memory in [512 << 10, 2 << 20, 8 << 20] {
+            let r = run_in_order(&s, &q, memory, Some(spill.clone()));
+            match r {
+                Ok(rows) => {
+                    let first = rows.iter().zip(&expected).position(|(a, b)| a != b);
+                    assert_eq!((rows.len(), first), (expected.len(), None), "{q}");
+                }
+                Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory, "{q}"),
+                Err(e) => panic!("{q}: {e}"),
+            }
+        }
+        assert_eq!(spill.reserved_bytes(), 0, "{q}");
+    }
+}
