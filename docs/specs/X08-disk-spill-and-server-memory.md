@@ -724,9 +724,10 @@ These capacity and ownership checks retain the existing estimates for other exec
 kernels and decoded terms. They exclude allocator metadata, size classes and process
 RSS, and do not establish a performance result.
 
-Phase 1 is done (roadmap item 2), and its gates were met on 2026-10-18. Phase 2 is built for sorts, groupings and DISTINCT
-(item 7), and hash-join spill and encryption remain (item 85). Phase 3 is not built
-(item 40).
+Roadmap item 2 finished Phase 1 on 2026-10-18, when its A1 and latency gates were met.
+The Phase 1a suite runs at 10.5M and on DBpedia remain, and roadmap item 1 takes them.
+Phase 2 is built for sorts, groupings and DISTINCT under item 7, and item 85 takes
+hash-join spill and encryption. Phase 3 is not built and belongs to item 40.
 
 ### Phase 1a: shared caches
 
@@ -875,7 +876,7 @@ missing charge-based CONSTRUCT retention, uncharged eager DESCRIBE and the missi
 retained contexts on one grant. Regression tests cover oversubscribed concurrent growth,
 fitting output estimates, separate context lifetimes, graph lexical payload, budget
 failure cleanup and conversion from eager preparation to cursor accounting. The profile
-runs at 10.5M and DBpedia remain pending as described below.
+runs at 10.5M and DBpedia remain, and roadmap item 1 takes them.
 
 A plain query charges the lock-free fast account and never takes the ledger lock. Once a
 query is promoted to the ledger, the ledger serializes admission and successful
@@ -883,7 +884,7 @@ ownership publication for its charges and adapted algorithm buffers. Pool releas
 wakeups run after that lock is released. This changes the retained-estimate path from the earlier fast
 read and separate growth helper. The earlier isolated Intel comparison covered only
 `types-grouped` and does not measure this repair. The Gates section records the A1 and
-latency gates, and the 10.5M and DBpedia profile runs remain pending as described below.
+latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
 
 ### Gates
 
@@ -900,8 +901,8 @@ latency gates, and the 10.5M and DBpedia profile runs remain pending as describe
   the kernel can reclaim and which Sparkles does not own, and §1 already says that mapped
   pages are bounded separately.
 
-  Decided on 2026-10-13: the gate is restated in terms of `RssAnon`, as §10 now says. The
-  design of this spec is unchanged, and only the gate that measures it moved.
+  On 2026-10-13 the gate was restated in terms of `RssAnon`, as §10 now says. The design
+  of this spec is unchanged, and only the gate that measures it moved.
 
   The restated bound was measured on forge on 2026-10-18 with `scripts/x08-gates/a1.sh`,
   three repeats of each case. It reads `VmRSS`, `RssAnon`, `RssFile` and `RssShmem` from
@@ -933,9 +934,11 @@ latency gates, and the 10.5M and DBpedia profile runs remain pending as describe
   | With the allocator fix | 32 | 111.0 MiB | 264.5 MiB | 44.3 and 159.9 MiB | 1.157 | 1.027 |
 
   The allocator fix lowered VmRSS with ten datasets at 256 MiB from 702.8 to 612.8 MiB.
-  Decided on 2026-10-18: the bound counts 1.25 bytes of anonymous memory for each cached
-  byte, as §10 now says, and the gate passes. Roadmap item 88 covers the remaining
-  overhead.
+  On 2026-10-18 the user decided that the bound counts 1.25 bytes of anonymous memory for
+  each cached byte, as §10 now says, and the gate passes. Roadmap item 88 covers the
+  remaining overhead. The 12 MiB and the 1.2 bytes per cached byte above come from the
+  same script run with `A1_SERVE_ARGS=--result-cache-mb 0`, which turns the result cache
+  off.
 * **A2.** Covered by `shared_caches.rs`. Clearing one namespace leaves the other's entries,
   and only its own queries miss afterwards. The HTTP route reports the namespace's counts.
 * **A3.** `serve --memory-profile small --cache-mb 512` logs `block cache 512 MiB, result
@@ -973,8 +976,8 @@ latency gates, and the 10.5M and DBpedia profile runs remain pending as describe
   microseconds by 5 to 14%, and the second position of each A, B, B, A round ran 1 to 5%
   faster.
 
-  Decided on 2026-10-18: the gate compares the shipped build with the pool on against the
-  same build with `--total-query-memory-mb 0`. Both read one shared store, the comparison
+  On 2026-10-18 the user decided that the gate compares the shipped build with the pool on
+  against the same build with `--total-query-memory-mb 0`. Both read one shared store, the comparison
   runs in both orders at 20 rounds of 300 requests with one Rayon thread, and
   `scripts/x08-gates/combine.py` combines the two orders to cancel the position bias. A
   query passes when the upper end of its 95% interval is at most 1.02 or its median added
@@ -1008,8 +1011,8 @@ latency gates, and the 10.5M and DBpedia profile runs remain pending as describe
 
 ### What remains
 
-* Roadmap item 88. The allocator overhead of cached bytes, which the amended A1 bound
-  allows for. Freed cache pages stay in the heaps of the tokio and Rayon threads, and the
+* Roadmap item 88 takes the allocator overhead of cached bytes, which the amended A1
+  bound allows for. Freed cache pages stay in the heaps of the tokio and Rayon threads, and the
   heap behind the result cache is about 1.2 times the bytes it counts. The idle release
   could collect on the tokio workers as well, or the caches could charge the sizes that
   mimalloc reports. The item also covers the 3% of extra instructions on queries of a few
@@ -1030,8 +1033,9 @@ latency gates, and the 10.5M and DBpedia profile runs remain pending as describe
   object is collected.
 * A lock-free `try_grant` when no request waits, measured with the latency gate above.
   Admission takes the queue's lock on every request.
-* The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold. Only the
-  1.05M screen ran.
+* The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold, which the Phase
+  1a gate requires. Only the 1.05M screen ran, and roadmap item 1 runs them on forge with
+  its benchmark refresh.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
