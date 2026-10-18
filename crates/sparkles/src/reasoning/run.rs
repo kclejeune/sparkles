@@ -382,11 +382,14 @@ pub fn diagnose_with(
     cache: Option<&sparkles_reasoner::Cache>,
     opts: &DiagnoseOptions,
 ) -> Result<Diagnostics> {
-    const TYPINGS_CHECK: &str = "literal-not-in-datatype";
     let start = std::time::Instant::now();
     let snap = store.snapshot();
     let commit = snap.commit;
-    let checked = opts.checks.is_empty() || opts.checks.iter().any(|c| c == TYPINGS_CHECK);
+    let checked = opts.checks.is_empty()
+        || opts
+            .checks
+            .iter()
+            .any(|c| c == sparkles_reasoner::diagnostics::LITERAL_NOT_IN_DATATYPE);
     let typings = match record {
         Some(r) if checked && opts.inferences && SOUND_PROFILES.contains(&r.profile.as_str()) => {
             r.commit.and_then(

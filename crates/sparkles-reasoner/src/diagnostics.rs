@@ -182,7 +182,7 @@ pub const CHECKS: &[Check] = &[
         query: include_str!("../diagnostics/thing-empty.rq"),
     },
     Check {
-        id: "literal-not-in-datatype",
+        id: LITERAL_NOT_IN_DATATYPE,
         rules: &["dt-not-type", "dt-type2", "prp-rng"],
         severity: Severity::Inconsistency,
         query: include_str!("../diagnostics/datatype-range.rq"),
@@ -194,6 +194,9 @@ pub const CHECKS: &[Check] = &[
         query: include_str!("../diagnostics/unsatisfiable-class.rq"),
     },
 ];
+
+/// The id of the check of literals outside the value space of their datatype.
+pub const LITERAL_NOT_IN_DATATYPE: &str = "literal-not-in-datatype";
 
 /// The checks named by `ids` (all of them when empty), in report order, or the first
 /// unknown id.
@@ -675,7 +678,7 @@ pub fn diagnose_with(
             names: &names,
             typings: typings.filter(|_| opts.inferences),
         };
-        let found = if check.id == "literal-not-in-datatype" {
+        let found = if check.id == LITERAL_NOT_IN_DATATYPE {
             run.paged_findings(limit)
         } else {
             run.findings(limit)
@@ -1357,7 +1360,7 @@ impl Run<'_> {
                 format!("{} {} {} {}", t("d")?, t("x")?, t("y")?, pair("p1", "p2")?)
             }
             "negative-property-assertion" => t("a")?,
-            "literal-not-in-datatype" => {
+            LITERAL_NOT_IN_DATATYPE => {
                 format!("{} {} {} {}", t("x")?, t("p")?, t("lit")?, t("range")?)
             }
             _ => return None,
@@ -1711,7 +1714,7 @@ impl Run<'_> {
                     msg,
                 )
             }
-            "literal-not-in-datatype" => {
+            LITERAL_NOT_IN_DATATYPE => {
                 let (Some(x), Some(p), Some(range), Some(Term::Literal(lit))) =
                     (get("x"), get("p"), get("range"), get("lit"))
                 else {
@@ -2460,7 +2463,7 @@ mod paging_tests {
     use sparkles_core::io::{RdfFormat, Source};
     use sparkles_core::store::{Store, StoreOptions};
 
-    const ID: &str = "literal-not-in-datatype";
+    const ID: &str = LITERAL_NOT_IN_DATATYPE;
 
     /// `count` integer literals under a range of non-negative integers, those at the
     /// positions of `negative` negative.

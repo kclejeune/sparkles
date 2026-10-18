@@ -50,6 +50,12 @@ const ENTRY: usize = 96;
 
 const SHARDS: usize = 64;
 
+/// Past this many changed triples, and more than the answers kept, the answers are
+/// dropped instead of brought up to date: each change costs seven table lookups, which a
+/// bulk load of millions of triples would spend before the run's first check of its
+/// cancel flag.
+const BULK_CHANGES: usize = 1 << 16;
+
 /// The default limit of the lookups of one closure.
 pub(crate) const DEFAULT_MAX_BYTES: usize = 64 << 20;
 
@@ -156,19 +162,31 @@ impl Lookups {
     }
 
     /// The kept answer of a lookup: one of an earlier run as it is, without a lock, and
-    /// otherwise this run's first facts, copied into `buf` under the shard's lock (at most
-    /// [`COPY_FACTS`] of them; a longer answer of this run is read from the blocks again).
+    /// otherwise this run's first facts, copied into `buf` under the shard's lock. At most
+    /// [`COPY_FACTS`] facts are copied, and a longer answer of this run is read from the
+    /// blocks again. This run's answer is preferred to an earlier run's first facts that
+    /// it extends, which takes the lock only for answers that stopped short of
+    /// [`MAX_FACTS`].
     #[inline]
     pub fn read<'a>(&'a self, k: &Pattern, buf: &mut [Triple; COPY_FACTS]) -> Option<Read<'a>> {
-        if let Some(a) = self.frozen.get(k) {
+        let frozen = self.frozen.get(k);
+        if let Some(a) = frozen
+            && (a.complete || a.facts.len() >= MAX_FACTS)
+        {
             self.count(true);
             return Some(Read::Frozen(a));
         }
-        let r = self.hot[shard(k)].lock().get(k).map(|a| {
+        let kept = frozen.map_or(0, |a| a.facts.len());
+        let copied = self.hot[shard(k)].lock().get(k).and_then(|a| {
             let n = a.facts.len().min(COPY_FACTS);
-            buf[..n].copy_from_slice(&a.facts[..n]);
-            Read::Copied(n, a.complete && n == a.facts.len())
+            let complete = a.complete && n == a.facts.len();
+            // the copy serves when it says more than the earlier run's facts
+            (frozen.is_none() || complete || n > kept).then(|| {
+                buf[..n].copy_from_slice(&a.facts[..n]);
+                Read::Copied(n, complete)
+            })
         });
+        let r = copied.or(frozen.map(Read::Frozen));
         self.count(r.is_some());
         r
     }
@@ -268,7 +286,7 @@ impl Lookups {
     /// is in. A gained triple joins a whole answer at its place, and the first facts of an
     /// answer when it comes before the last of them; an answer that grows past
     /// [`MAX_FACTS`] keeps its first facts. An answer whose growth the budget refuses is
-    /// dropped.
+    /// dropped, and a bulk change drops every answer.
     pub fn update(
         &mut self,
         added: &[Triple],
@@ -277,6 +295,10 @@ impl Lookups {
     ) {
         self.freeze();
         if self.frozen.is_empty() {
+            return;
+        }
+        if self.bulk(added.len() + removed.len()) {
+            self.clear();
             return;
         }
         let (mut grown, mut freed) = (0, 0);
@@ -334,9 +356,14 @@ impl Lookups {
     }
 
     /// Drop the answers that a change of the triples `ts` may make wrong: those of every
-    /// pattern each triple matches.
+    /// pattern each triple matches, or all of them for a bulk change.
     pub fn forget<'a>(&mut self, ts: impl IntoIterator<Item = &'a Triple>) {
         self.freeze();
+        let ts = ts.into_iter();
+        if self.bulk(ts.size_hint().0) {
+            self.clear();
+            return;
+        }
         let mut freed = 0;
         for t in ts {
             for k in patterns(t) {
@@ -348,8 +375,12 @@ impl Lookups {
         self.release(freed);
     }
 
+    /// Whether `changes` triples are too many to bring the answers up to date with.
+    fn bulk(&self, changes: usize) -> bool {
+        changes > BULK_CHANGES && changes > self.frozen.len()
+    }
+
     /// Drop every answer.
-    #[cfg(test)]
     pub fn clear(&mut self) {
         self.freeze();
         let freed: usize = self.frozen.values().map(|v| bytes_of(v.facts.len())).sum();
@@ -608,6 +639,45 @@ mod tests {
         assert_eq!(l.peek(&[v(9), 0, 0]), Some((false, true)));
         l.clear();
         assert_eq!((l.len(), l.bytes(), budget.used()), (0, 0, 0));
+    }
+
+    /// A bulk change drops the answers instead of bringing them up to date, and a smaller
+    /// one updates them.
+    #[test]
+    fn bulk_changes_drop_the_answers() {
+        let budget = Budget::unlimited();
+        let mut l = Lookups::new(&budget, DEFAULT_MAX_BYTES);
+        let k = [0, v(1), 0];
+        l.put(k, &[[v(5), v(1), v(2)]], true);
+        l.freeze();
+        let small: Vec<Triple> = (0..1000).map(|i| [v(100 + i), v(9), v(2)]).collect();
+        l.update(&small, &[], by_subject);
+        assert_eq!(l.len(), 1);
+        let many: Vec<Triple> = (0..BULK_CHANGES as u64 + 1)
+            .map(|i| [v(100 + i), v(9), v(2)])
+            .collect();
+        l.update(&many, &[], by_subject);
+        assert_eq!((l.len(), l.bytes(), budget.used()), (0, 0, 0));
+        l.put(k, &[[v(5), v(1), v(2)]], true);
+        l.freeze();
+        l.forget(&many);
+        assert_eq!(l.len(), 0);
+    }
+
+    /// An earlier run's first facts give way to a longer answer of this run.
+    #[test]
+    fn a_longer_answer_of_this_run_is_read_first() {
+        let budget = Budget::unlimited();
+        let mut l = Lookups::new(&budget, DEFAULT_MAX_BYTES);
+        let k = [0, v(1), 0];
+        let (a, b) = ([v(2), v(1), v(9)], [v(3), v(1), v(9)]);
+        l.put(k, &[a], false);
+        l.freeze();
+        l.put(k, &[a, b], true);
+        assert_eq!(answer(&l, &k), Some((vec![a, b], true)));
+        // a whole answer of an earlier run is read without the lock
+        l.freeze();
+        assert_eq!(answer(&l, &k), Some((vec![a, b], true)));
     }
 
     #[test]
