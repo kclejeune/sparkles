@@ -1098,9 +1098,9 @@ threads.
 
 Two other approaches were measured and dropped. A bounded search run ahead of the first
 change, to decode the blocks it would read, cut the first change but slowed the later ones.
-Reading the remembered answers in the insertion's rule evaluations too left the OWL 2 RL
-change at the same time, so the insertion reads the blocks through its per-step caches as
-before.
+The insertion's rule evaluations look in their own per-step caches first and read the
+remembered answers when those miss. Making them read the remembered answers directly, as
+the backward search does, left the OWL 2 RL change at the same time.
 
 **Outcome.** The runs repeat the follow-up's `keep` measurement on the same 16-vCPU
 Namespace instance shape and data on 2026-10-18. They compare `a6179e58`, before the
@@ -1132,41 +1132,70 @@ measurements, not published benchmarks. The table gives the range of the runs.
 The goal is met for memory and for the RDFS changes after the first, and missed for the
 first RDFS change and for OWL 2 RL. The kept closure grew by 10 MiB for RDFS and 18 MiB for
 OWL 2 RL, mostly the room for more rows, and stays at 41% and 47% of the closure that held
-the explicit facts, under the 60% bound even with the full 64 MiB of answers. The first
-RDFS change takes about 1.5 times its time before the follow-up by the medians of the
-runs, the undo about 1.25 times and the change made again the same time. The OWL 2 RL
-changes take 1.5 to 2.4 times their time before the follow-up, where the follow-up took
-2.7 to 4.3 times. Full runs and runs that read the
-closure back from the dataset did not change beyond the noise of the instance.
-At 1 thread the RDFS changes after the first are back to their time before the follow-up,
-and the first change stays well under it. The OWL 2 RL changes after the first take about
-twice their time before the follow-up, and the first change is as it was after the
-follow-up. The OWL 2 RL full runs at 1 thread took 36.9 and 37.7 s, against 33.6 and 34.0 s
-for the follow-up. Full runs of one build at 1 thread differed by up to 17% on this
-instance, and a full run executes only a few added checks per rule evaluation of this
-work, so two runs cannot tell a regression from noise. More runs are needed before item 87
-closes.
+the explicit facts, against 40% and 46% after the follow-up. That is under the 60% bound
+even with the full 64 MiB of answers. The first RDFS change takes about 1.5 times its time
+before the follow-up by the medians of the runs, the undo about 1.25 times and the change
+made again the same time. The OWL 2 RL changes take 1.5 to 2.4 times their time before the
+follow-up, where the follow-up took 2.7 to 4.3 times. Full runs and runs that read the
+closure back from the dataset did not change beyond the noise of the instance at 16
+threads. At 1 thread the RDFS changes after the first are back to their time before the
+follow-up, and the first change stays well under it. The OWL 2 RL changes after the first
+take about twice their time before the follow-up, and the first change is as it was after
+the follow-up. The OWL 2 RL full runs at 1 thread took 36.9 and 37.7 s, against 33.6 and
+34.0 s for the follow-up, 10% to 12% more. Full runs of one build at 1 thread differed by
+up to 17% on this instance, and a full run executes only a few added checks per rule
+evaluation of this work, so two runs cannot tell a regression from noise. The difference is
+past the 5% that an AMD Namespace instance resolves, so it has to be measured again on an
+Intel host before item 87 closes.
 
 Two costs remain. The first change of a kept closure still decodes blocks that no answer
 covers, and a few of its lookups read long ranges in one thread, such as the members of a
 class that the inferred graph's rows interleave with, through rule `rdfs3`. In the OWL 2 RL
 changes, the insertion takes about 30 ms at 16 threads. Its rule evaluations read the input
-graphs from the blocks for each of the 2,000 changed facts, where they probed the closure's
-hash tables before the follow-up, and the evaluations' allocations and shared counters
-contend at 16 threads. [ROADMAP](../ROADMAP.md) item 87 stays open for them.
+graphs from the blocks or the remembered answers for each of the 2,000 changed facts, where
+they probed the closure's hash tables before the follow-up. The evaluations' allocations
+and shared counters contend at 16 threads, and so may the locks of the answers that the run
+finds, which were not measured on their own. [ROADMAP](../ROADMAP.md) item 87 stays open
+for them.
 
-The tests check the answers for coherence as well as the results. The differential tests
-of `incremental.rs` now check every remembered answer against a scan of the input graphs
-after each step, and they gain steps that undo the previous one, steps whose state is
-reached through an earlier commit, and runs on one thread and on six. A test that skips
-the update of the answers fails them. `kept_lookups_follow_commits_undos_and_failed_runs`
-in `tests/incremental.rs` interleaves cancelled runs and runs that fail for memory with
+The tests check the answers for coherence as well as the results. The differential tests of
+`incremental.rs` now check every remembered answer against a scan of the input graphs after
+each step, and they gain steps that undo the previous one, steps whose state is reached
+through an earlier commit, and runs on one thread and on six. A test that skips the update
+of the answers fails them. `kept_lookups_follow_commits_undos_and_failed_runs` in
+`tests/incremental.rs` interleaves cancelled runs and runs that fail for memory with
 several commits and undos for every profile. The unit tests of `lookups.rs` cover the
-budget, the cap, the order of updated answers and the move to another budget. A failed or
-cancelled run cannot leave a wrong answer behind, because an answer is a fact of the
-snapshot it was read from, and the closure that a run takes out of the cache is dropped
-when the run fails. `f16_default_geometry_changed_subjects` in `tests/geosparql.rs` pinned
-the difference in `baseScans` between the kept and the read-back closure. The kept
-closure's answers now save it some reads, so the test checks that the kept closure never
-reads more than the read-back one and that the read-back one makes at least the scans of
-the default geometries.
+budget, the cap, the order of updated answers, bulk changes and the move to another budget.
+A failed or cancelled run cannot leave a wrong answer behind, because an answer is a fact
+of the snapshot it was read from, and the closure that a run takes out of the cache is
+dropped when the run fails. A read that the remembered answers serve counts in `baseScans`
+as the scan it saves, so with one input graph the count does not depend on what is
+remembered. `f16_default_geometry_changed_subjects` in `tests/geosparql.rs` therefore still
+pins the difference in `baseScans` between the kept and the read-back closure, and it fails
+when the kept closure scans its default geometries again.
+
+**Review of item 87.** A review found no defect in the results and three P2s. The GeoSPARQL
+scan test had been relaxed so far that it no longer caught a kept closure that scans its
+default geometries again, which the count of remembered reads above restores.
+`Closure::new` rebuilt the base tier with a panic on an I/O error, and it now attaches the
+answers to a tier it holds alone and returns the error of a rebuild. This section had said
+that the insertion does not read the remembered answers, and the text above is corrected.
+Of the P3s, a read now prefers a longer answer that the run found to an earlier run's first
+facts, a change of more than 65,536 triples and more than the answers kept drops the
+answers instead of bringing them up to date, `set_budget` asserts that it can move the
+answers, and the id of `literal-not-in-datatype` is exported for the typings gate. A check
+of a contains answer against a scan with several input graphs found no difference, since
+such a scan emits each triple once. A Namespace A/B of these fixes against the commit
+before them measured no change in the small runs at 16 threads.
+
+Some points stay open under item 87. The 64 MiB cap is checked before each answer without a
+reservation, so threads can pass it by one answer each, and an update can grow the answers
+past it until the closure is kept again, when they are dropped. Only the run's budget
+bounds that growth, and it has no limit unless `max_memory` sets one. The answers and the
+room for more rows are not counted by `--reason-cache-triples`, which counts derived
+triples, and a run with a tight `max_memory` can now be refused when it takes a closure
+whose answers do not fit. Bringing the answers up to date has no cancel check below the
+bulk threshold. `checked` in the report of an incremental run now depends on the thread
+count, since the chunks of a round do not share what they learn, and no test proves that
+the parallel round search runs. The answers are checked against a scan only with one input
+graph.
