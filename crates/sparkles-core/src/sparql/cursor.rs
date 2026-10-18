@@ -940,6 +940,98 @@ fn retryable(node: &Node) -> bool {
         && node.children.iter().all(retryable)
 }
 
+/// Whether `pattern` holds a SERVICE anywhere, in an EXISTS, an OPTIONAL condition, a
+/// LATERAL, an aggregate or an ORDER BY key as well as in the pattern itself. The plan
+/// keeps an EXISTS that it evaluates per row as a pattern, so [`retryable`] does not
+/// see a SERVICE there.
+fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::{AggregateExpression, GraphPattern as P, OrderExpression};
+    let order = |keys: &[OrderExpression]| {
+        keys.iter().any(|k| match k {
+            OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr_calls_service(e),
+        })
+    };
+    match pattern {
+        P::Service { .. } => true,
+        P::Bgp { .. } | P::Path { .. } | P::Values { .. } => false,
+        P::Join { left, right }
+        | P::Union { left, right }
+        | P::Minus { left, right }
+        | P::SemiJoin { left, right }
+        | P::AntiJoin { left, right }
+        | P::Lateral { left, right } => calls_service(left) || calls_service(right),
+        P::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            calls_service(left)
+                || calls_service(right)
+                || expression.as_ref().is_some_and(expr_calls_service)
+        }
+        P::Filter { expr, inner } => expr_calls_service(expr) || calls_service(inner),
+        P::Extend {
+            inner, expression, ..
+        }
+        | P::Assign {
+            inner, expression, ..
+        }
+        | P::Unfold {
+            inner, expression, ..
+        } => expr_calls_service(expression) || calls_service(inner),
+        P::OrderBy { inner, expression } => order(expression) || calls_service(inner),
+        P::Group {
+            inner, aggregates, ..
+        } => {
+            calls_service(inner)
+                || aggregates.iter().any(|(_, agg)| match agg {
+                    AggregateExpression::CountSolutions { .. } => false,
+                    AggregateExpression::FunctionCall { expr, .. } => expr_calls_service(expr),
+                    AggregateExpression::Fold {
+                        expr,
+                        value,
+                        order: keys,
+                        ..
+                    } => {
+                        expr_calls_service(expr)
+                            || value.as_ref().is_some_and(expr_calls_service)
+                            || order(keys)
+                    }
+                })
+        }
+        P::Graph { inner, .. }
+        | P::Project { inner, .. }
+        | P::Distinct { inner }
+        | P::Reduced { inner }
+        | P::Slice { inner, .. } => calls_service(inner),
+    }
+}
+
+/// Whether `expr` holds an EXISTS whose pattern holds a SERVICE.
+fn expr_calls_service(expr: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::Expression as E;
+    match expr {
+        E::Exists(pattern) => calls_service(pattern),
+        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => expr_calls_service(a) || expr_calls_service(b),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_calls_service(a),
+        E::In(a, list) => expr_calls_service(a) || list.iter().any(expr_calls_service),
+        E::If(a, b, c) => expr_calls_service(a) || expr_calls_service(b) || expr_calls_service(c),
+        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expr_calls_service),
+    }
+}
+
 /// Select execution without parsing or planning twice in automatic mode.
 pub fn query_execution(
     snapshot: Arc<Snapshot>,
@@ -1017,7 +1109,8 @@ pub fn query_execution_with_plan(
                 && options.spill.is_some()
                 && options.extensions.is_none()
                 && options.initial_bindings.is_empty()
-                && retryable(&prepared.node);
+                && retryable(&prepared.node)
+                && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.is_cursor() {
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,

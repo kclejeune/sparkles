@@ -414,3 +414,85 @@ fn automatic_execution_streams_or_retries_sorts_that_outgrow_memory() {
     let (_, plan) = automatic(&s, small, &opts).unwrap();
     assert!(plan.is_none());
 }
+
+/// A query that calls a SERVICE anywhere, even inside an EXISTS, is not run a second
+/// time after its eager run exceeds the memory budget, since the retry would call the
+/// service again.
+#[test]
+fn automatic_execution_never_retries_a_query_that_calls_a_service() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let s = store(60_000);
+    // A store with uncompacted changes keeps automatic execution eager.
+    sparkles_core::sparql::update::update(
+        &s,
+        "INSERT DATA { <urn:x> <urn:q> 1 }",
+        &Default::default(),
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    // An endpoint that counts its calls and answers each with a server error.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/sparql", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        }
+    });
+    let opts = QueryOptions {
+        max_memory_bytes: Some(3 * MEMORY / 2),
+        spill: Some(spill.clone()),
+        allow_service: true,
+        outbound: sparkles_core::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for q in [
+        // The EXISTS calls the service for one row only.
+        format!(
+            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o \
+             FILTER (?s != <urn:s:1> || EXISTS {{ SERVICE SILENT <{endpoint}> {{ ?s <urn:b> ?x }} }}) }} \
+             ORDER BY DESC(?o) ?s"
+        ),
+        format!(
+            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o \
+             FILTER (?s != <urn:s:1> || NOT EXISTS {{ SERVICE SILENT <{endpoint}> {{ ?s <urn:b> ?x }} }}) }} \
+             ORDER BY DESC(?o) ?s"
+        ),
+    ] {
+        // The calls of the eager run alone, without spill and so without a retry.
+        let before = calls.load(Ordering::SeqCst);
+        let without = QueryOptions {
+            spill: None,
+            ..opts.clone()
+        };
+        assert!(matches!(
+            automatic(&s, &q, &without),
+            Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
+        ));
+        let eager_calls = calls.load(Ordering::SeqCst) - before;
+        assert!(eager_calls >= 1, "{q}: the service was never called");
+        let before = calls.load(Ordering::SeqCst);
+        match automatic(&s, &q, &opts) {
+            Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory, "{q}"),
+            Ok((rows, plan)) => panic!(
+                "{q}: expected the eager memory failure, got {} rows from {plan:?}",
+                rows.len()
+            ),
+            Err(e) => panic!("{q}: {e}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst) - before, eager_calls, "{q}");
+    }
+    assert_eq!(spill.reserved_bytes(), 0);
+}
