@@ -18,6 +18,13 @@ from 512 MiB to 256 MiB and the default history cache from 1 GiB to 512 MiB.
 defaults for library users. `--memory-profile small` sets smaller sizes for constrained
 hosts.
 
+A plain query takes memory from the query pool in steps of 64 KiB, so it can hold up to
+64 KiB of the pool beyond its estimate. That removed most of the pool's cost on queries of
+a few microseconds. The server and the Python, JVM and Node.js libraries call mimalloc
+through its plain entry points, so a full decoded block column takes 256 KiB of heap
+instead of 320 KiB. A server with ten datasets at `--cache-mb 256` used 493 MiB of
+anonymous memory after the suite instead of 573 MiB.
+
 Queries over HTTP, in the local CLI, in Node and in the JVM library now run in automatic
 mode by default. A plain scan that is expected to return at least a thousand rows from
 immutable blocks streams as a cursor, and so does a grouping that reads an estimated

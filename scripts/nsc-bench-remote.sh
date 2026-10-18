@@ -25,6 +25,9 @@ cd "$(dirname "$0")"
 source ./run.env
 : "${ROUNDS:=4}" "${REPS:=20}" "${WARMUP:=3}" "${SERVER_CPU:=2}" "${CLIENT_CPU:=4}"
 : "${RAYON_THREADS:=1}" "${PORT:=3999}" "${SERVE_ARGS:=}" "${EXECUTION:=}" "${MAX_TIME:=300}" "${SPIN:=1}"
+# SERVE_ARGS_A and SERVE_ARGS_B add flags for one variant. SHARE_STORE=1 serves B from A's
+# store, which compares settings of one binary without the differences between two stores.
+: "${SERVE_ARGS_A:=}" "${SERVE_ARGS_B:=}" "${SHARE_STORE:=0}"
 R=results
 mkdir -p "$R"
 # this script, its curl client and the log writer run on the client CPU, each server on its
@@ -74,6 +77,10 @@ log "data: $(wc -l < data.nt) triples"
 for v in A B; do
   rm -rf "stores/$v"
   mkdir -p stores
+  if [ "$v" = B ] && [ "$SHARE_STORE" = 1 ]; then
+    ln -s A "stores/B"
+    continue
+  fi
   t0=$EPOCHREALTIME
   # shellcheck disable=SC2086 # BIN is a command line
   taskset -c "$ALL" ${BIN[$v]} load --loc "stores/$v" data.nt > "$R/load-$v.log" 2>&1 || fail "load $v, see load-$v.log"
@@ -91,15 +98,15 @@ URL=localhost:$PORT/bench/sparql
 EXEC_FIELD=()
 SPID=
 start_server() { # <variant> <epoch>
-  local env=() mode=${EXECUTION%%,*}
-  [ "$1" = B ] && mode=${EXECUTION#*,}
+  local env=() mode=${EXECUTION%%,*} extra=$SERVE_ARGS_A
+  [ "$1" = B ] && mode=${EXECUTION#*,} && extra=$SERVE_ARGS_B
   EXEC_FIELD=()
   [ -z "$mode" ] || EXEC_FIELD=(--data-urlencode "execution=$mode")
   [ "$RAYON_THREADS" != default ] && env=(RAYON_NUM_THREADS="$RAYON_THREADS")
   rm -rf "srv"
-  # shellcheck disable=SC2086 # BIN is a command line and SERVE_ARGS a list of flags
+  # shellcheck disable=SC2086 # BIN is a command line and the SERVE_ARGS lists of flags
   taskset -c "$SERVER_CPU" env "${env[@]}" ${BIN[$1]} --result-cache-mb 0 serve --data srv \
-    --loc bench="stores/$1" --port "$PORT" --timeout 600 --no-access-log $SERVE_ARGS > "$R/server-$2-$1.log" 2>&1 &
+    --loc bench="stores/$1" --port "$PORT" --timeout 600 --no-access-log $SERVE_ARGS $extra > "$R/server-$2-$1.log" 2>&1 &
   SPID=$!
   for _ in $(seq 300); do
     curl -sf -o /dev/null "localhost:$PORT/\$/ping" && return
