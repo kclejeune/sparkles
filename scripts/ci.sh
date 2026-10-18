@@ -20,7 +20,9 @@
 #   --fail-fast  stop the remaining tasks after the first failure
 #   --force      run every check even when the task cache has a pass for it
 #   --jobs N     tasks run at once (default 2). Cargo tasks share one build lock, so more
-#                jobs mostly help the UI, JVM and Node tasks.
+#                jobs mostly help the UI, JVM and Node tasks. `test` and `node:test` never
+#                run at the same time, because each links target/debug/sparkles with other
+#                features (see links_server below).
 #   task...      run only these CI tasks
 set -euo pipefail
 
@@ -167,6 +169,42 @@ main() {
   declare -A pids=()
   stop=
 
+  # links_server <task>: whether the task links target/debug/sparkles. `test` builds it
+  # with the features of the workspace's dev-dependencies (sparkles-fmt's fault-injection
+  # among them), which tests such as the formatter's refused-output checks rely on, and
+  # `node:test` builds the server alone without them. Cargo replaces the one file with
+  # whichever link finishes last, so two such tasks at once would run one's tests on the
+  # other's binary. Building each into its own target directory would cost a second
+  # build of the server, so they take turns instead.
+  links_server() {
+    case "$1" in
+      test | node:test) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  # can_start <task>: no running task links the server binary when this one does.
+  can_start() {
+    local pid
+    links_server "$1" || return 0
+    for pid in "${!pids[@]}"; do
+      links_server "${pids[$pid]}" && return 1
+    done
+    return 0
+  }
+  # reap: wait for one running task and record its result.
+  reap() {
+    set +e
+    wait -n -p done_pid
+    rc=$?
+    set -e
+    write_summary
+    if [ $rc -ne 0 ]; then
+      failed+=("${pids[$done_pid]}")
+      [ -z "$fail_fast" ] || stop=1
+    fi
+    unset "pids[$done_pid]"
+  }
+
   # stop_all: end every running task's process group and mark it stopped.
   stop_all() {
     local pid
@@ -176,21 +214,28 @@ main() {
     done
   }
   trap 'stop_all; write_summary; exit 130' INT TERM
-  for t in "${tasks[@]}"; do
-    [ -z "$stop" ] || break
+  # Tasks start in their listed order, except that one whose server link would clash
+  # with a running task's waits, and the next task that can start takes its turn.
+  queue=("${tasks[@]}")
+  while [ ${#queue[@]} -gt 0 ] && [ -z "$stop" ]; do
     while [ ${#pids[@]} -ge "$jobs" ]; do
-      set +e
-      wait -n -p done_pid
-      rc=$?
-      set -e
-      write_summary
-      if [ $rc -ne 0 ]; then
-        failed+=("${pids[$done_pid]}")
-        [ -z "$fail_fast" ] || stop=1
-      fi
-      unset "pids[$done_pid]"
+      reap
     done
     [ -z "$stop" ] || break
+    next=
+    for i in "${!queue[@]}"; do
+      if can_start "${queue[$i]}"; then
+        next=$i
+        break
+      fi
+    done
+    if [ -z "$next" ]; then
+      reap
+      continue
+    fi
+    t=${queue[$next]}
+    unset "queue[$next]"
+    queue=("${queue[@]}")
     run_task "$t" --skip-deps "${force[@]}" &
     pids[$!]="$t"
     write_summary

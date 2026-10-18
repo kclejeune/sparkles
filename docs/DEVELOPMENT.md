@@ -144,7 +144,10 @@ it writes each task's output to `target/ci/logs/<task>.log`. While it runs,
 their times. Every task runs to the end, and the final summary repeats the last lines of
 each failed task's log. `--fail-fast` stops after the first failure, `--jobs N` runs more
 tasks at once, and naming tasks runs only those, as in `mise run ci lint test`. Only
-one run at a time can use a checkout.
+one run at a time can use a checkout. `test` and `node:test` take turns whatever the
+`--jobs` value, because each links `target/debug/sparkles` with other features. The
+binary of `test` has the formatter's fault injection, which its refused-output tests
+need, and a concurrent `node:test` used to replace it with a build without it.
 
 The checks declare their input files in `mise.toml`, and mise's task cache records each
 pass under a key made from the contents of those files, the task's definition, the tool
