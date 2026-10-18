@@ -310,7 +310,7 @@ that work by priority and links each item to its design spec.
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
   first run after a compaction without retained history, compute everything again.
-  Inconsistency checks cover a fixed subset of OWL 2 RL. Small incremental runs over a kept closure are slower than when the closure held the explicit facts. [Roadmap](ROADMAP.md) items 9, 17, 19, 53, 87.
+  Inconsistency checks cover a fixed subset of OWL 2 RL. Small incremental runs over a kept closure read the input graphs from the indexes, which made them 1.3 to 4.9 times slower at 16 threads on LUBM-style data. [Roadmap](ROADMAP.md) items 9, 17, 19, 53, 87.
 * **SPARQL extensions.** Sparkles has ARQ's query language and function library apart
   from JavaScript functions, `afn:context`, the Leviathan `lfn:` library, the `JSON`
   query form and evaluation of `shortest(…)` paths, which ARQ does not evaluate either.
