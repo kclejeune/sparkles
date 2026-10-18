@@ -8,7 +8,8 @@
 > The standard refresh of the existing suites at one head, the published comparisons of the
 > new suites and the regeneration of the BENCHMARKS.md tables from records are not done.
 > Phase 2 adds comparative spatial and vector runs, OWL2Bench and long write runs
-> with compaction. Phase 3 adds LDBC SNB Interactive and BI and the Wikidata query-log
+> with compaction. Its OWL2Bench driver, the Jena rule reasoner comparison and the long
+> write harness are built and ran at smoke scale, and its measurements are not done. Phase 3 adds LDBC SNB Interactive and BI and the Wikidata query-log
 > replay above 1.24 billion triples. Phase 4 adds LDBC Graphalytics once the graph
 > algorithms of F14 exist, and the wider hardware matrix.
 >
@@ -684,6 +685,54 @@ which looks like the engine's own behavior. The synthetic data and WatDiv contai
 nodes, and the DBpedia load already read standard input, so no published Oxigraph result
 needs a rerun. Sparkles was slow on q5a and q12a at this size, which a run on the
 reference host should confirm before it is listed under "Where Sparkles loses".
+
+**Phase 2 tooling.** Built on 2026-10-18 under roadmap item 1, with no published figures
+yet.
+
+* *Materialization.* The LUBM and OWL2Bench drivers share `suite_infer` and `jena_reason`
+  in `scripts/bench-suite-lib.sh`. Each materialization records, beside its time, peak RSS
+  and derived triples, the reasoner's own peak heap estimate and thread count from
+  `sparkles infer --status`, and the SHA-256 of the sorted derived triples, which are what
+  F16's acceptance run A1 compares between the head and the commit before F16's Phase 1.
+  `INFER_PROFILES` limits the materializations, which LUBM(1000) needs for disk space.
+  Jena's rule reasoners (`rdfs`, `owl-micro`, `owl-mini`, `owl`) run through `sparql` over
+  an inference model of an in-memory copy of the data, with the start of the JVM and the
+  parse measured apart, within a time and heap limit. A run that hits a limit is recorded
+  with its status. On LUBM(1) the `rdfs` profile derives 43,557 triples with a peak heap
+  estimate of 11 MiB.
+* *OWL2Bench* (`scripts/bench-owl2bench.sh`). The generator and the TBoxes are Apache-2.0
+  and the queries CC-BY-4.0, so open question 1 is settled for OWL2Bench, and both are
+  still fetched at run time. The current release jar of the generator, from July 2026,
+  writes its ABox in the namespace `https://kracr.iiitd.edu.in/OWL2Bench#` while the TBoxes
+  use `http://benchmark/OWL2Bench#`, so no TBox axiom applies to its data. The script pins
+  the jar of 2020 that made the paper's datasets, runs it on Java 8 from nixpkgs, and refuses
+  data in the other namespace. Two generations of one university gave the same file of
+  54,815 triples. The 18 queries whose profile list contains RL run over the `owl-rl`
+  materialization. At one university Sparkles derived 1,399,968 triples in 5 to 6 seconds
+  with a peak heap estimate of 499 MiB on a loaded development machine. Of these, 1,311,932
+  are `hasSameHomeTownWith`, a symmetric and transitive property whose closure is a clique
+  per home town. All five engines loaded the materialized file and agreed on every query.
+  Jena's `rdfs` reasoner finished in about a second, and its OWL Micro reasoner did not
+  finish within 28 minutes on the same data. Queries q5, q9, q13 and q14 return no rows on
+  every engine, because the RL TBox does not define the classes or values they ask for.
+* *Long writes* (`scripts/bench-longwrite.sh`, `scripts/bench-longwrite/longrun.py`). The
+  writers generate their own triples with a fixed seed rather than through
+  `scripts/bench-writes.py`, so that the expected final state follows from the
+  acknowledged requests of each writer. The harness records the per-minute series of §3.9,
+  Sparkles' compaction events and counters, the device writes and flushes per write
+  request, and the state check before and after a restart. The record gets the mode
+  `longrun`. The kernel counts a journal commit as a write with a flush flag, so on the
+  development machine 500 `fdatasync` calls added one flush and the device writes per
+  commit, not the flushes, are what tell the durability classes apart for A6. A two-minute
+  Sparkles smoke run on 210,509 triples with 4 readers and 2 writers committed 121,585
+  write requests (6.1 million triples written), ran 3 automatic compactions, and passed the
+  state check before and after the restart. Its store grew from 16 MiB to 557 MiB with
+  39,330 live triples of the writers. In a shorter repeat, 90% of the store was the change
+  log under `changes/`, which keeps the commits for point-in-time reads, so the four-hour
+  runs report the disk use with that history kept at its default.
+* `scripts/bench-lib.sh` runs Jena's tools without `JAVA_HOME`, because Jena's scripts
+  prefer it to the JDK of the nixpkgs wrapper, and a developer's `JAVA_HOME` may name a JDK
+  older than the jars need.
 
 **Left for Phase 1.**
 
