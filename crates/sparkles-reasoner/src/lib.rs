@@ -216,7 +216,8 @@ pub struct ReasonReport {
     /// [`ReasonOptions::max_memory`] when the run succeeds
     pub peak_bytes: u64,
     /// index scans of the input graphs the run issued: rule evaluation and the GeoSPARQL
-    /// default geometries
+    /// default geometries. A read that the answers a kept closure remembers serve counts
+    /// as the scan it saves.
     pub base_scans: u64,
     /// threads the rules were evaluated on
     pub threads: usize,
@@ -625,7 +626,7 @@ impl Derivation {
         if graph.base().is_none() {
             anyhow::bail!("a derivation without a base tier");
         }
-        let mut c = incremental::Closure::new(graph, terms);
+        let mut c = incremental::Closure::new(graph, terms)?;
         if let Some((d, _held)) = defaults {
             let (_, pred) = geo_ids(&c.terms);
             let d = incremental::Defaults {

@@ -489,7 +489,7 @@ fn reconstruct(
     graph.try_add_batch(derived)?;
     graph.try_add_batch(generalized.iter().copied())?;
     drop(held);
-    Ok(Closure::new(graph, terms))
+    Closure::new(graph, terms)
 }
 
 /// Changes as the commit diff reports them, or as ids of one generation.

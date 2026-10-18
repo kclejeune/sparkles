@@ -319,12 +319,17 @@ impl Base {
                 Some(Read::Copied(n, complete)) => (&buf[..n], complete),
                 None => (&[], false),
             };
+            // a read the kept facts answer counts as the scans it saves, so that the
+            // count does not depend on what is remembered: exactly with one input graph,
+            // and as one scan when the reader stops early with several
             for t in kept {
                 if !f(*t) {
+                    memo.scans += 1;
                     return Ok(false);
                 }
             }
             if complete {
+                memo.scans += self.passes() as u64;
                 return Ok(true);
             }
             let skip = kept.len();
@@ -391,6 +396,8 @@ impl Base {
             if let Some((any, complete)) = l.peek(&k)
                 && (complete || any)
             {
+                // counted as the scan it saves
+                memo.scans += 1;
                 return Ok(any);
             }
             // the first fact is enough

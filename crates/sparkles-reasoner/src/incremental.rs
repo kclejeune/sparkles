@@ -122,21 +122,29 @@ impl Defaults {
 impl Closure {
     /// The closure of `graph`, whose base tier holds the explicit facts and whose
     /// derived tier holds the derived ones, none of them flagged.
-    pub fn new(mut graph: Graph, terms: Terms) -> Closure {
+    pub fn new(mut graph: Graph, terms: Terms) -> anyhow::Result<Closure> {
         let flags_held = Held::new(graph.budget());
-        if let Some(b) = graph.base() {
+        if graph.base().is_some() {
             let lookups = Lookups::new(graph.budget(), lookups::DEFAULT_MAX_BYTES);
-            let b = Base::new(b.snap.clone(), &b.graph_ids())
-                .expect("the tier was made from the same snapshot and graphs");
-            graph.set_base(Arc::new(b.with_lookups(lookups)));
+            match graph.base_mut() {
+                // the closure holds the only reference to its tier
+                Some(b) => b.set_lookups(lookups),
+                // a tier shared with others gets a copy of its own, whose count of the
+                // input graphs reads the store and can fail
+                None => {
+                    let b = graph.base().expect("checked above");
+                    let b = Base::new(b.snap.clone(), &b.graph_ids())?;
+                    graph.set_base(Arc::new(b.with_lookups(lookups)));
+                }
+            }
         }
-        Closure {
+        Ok(Closure {
             graph,
             terms,
             flags: Vec::new(),
             flags_held,
             defaults: None,
-        }
+        })
     }
 
     /// The heap of the closure: its derived tier, its local terms, the flags, the default
@@ -168,8 +176,12 @@ impl Closure {
         let held = Held::try_new(budget, self.own_bytes())?;
         self.graph.set_budget(budget)?;
         self.terms.set_budget(budget)?;
-        if let Some(l) = self.lookups_mut() {
-            l.set_budget(budget)?;
+        if self.lookups().is_some() {
+            match self.lookups_mut() {
+                Some(l) => l.set_budget(budget)?,
+                // a shared tier would keep its answers charged to the old budget
+                None => debug_assert!(false, "the remembered lookups of a shared base tier"),
+            }
         }
         self.flags_held = held;
         Ok(())
@@ -1678,7 +1690,7 @@ mod tests {
         let b = Base::new(snap, &[Id::DEFAULT_GRAPH]).unwrap();
         let mut g = Graph::with_base(Arc::new(b));
         engine::run(&mut g, &rules, &terms, &limits(), None).unwrap();
-        Closure::new(g, terms)
+        Closure::new(g, terms).unwrap()
     }
 
     /// The facts of both tiers as text, explicit ones marked. A fact both tiers hold
@@ -1867,6 +1879,29 @@ mod tests {
             n = (n.0 + i, n.1 + f);
         }
         assert!(n.0 > n.1, "{n:?}");
+    }
+
+    /// A closure remembers lookups whether or not its base tier is shared: a tier it
+    /// holds alone takes them in place, and a shared one is copied, so the other holder
+    /// never sees them.
+    #[test]
+    fn closures_get_lookups_of_their_own() {
+        let v = Vocab::new();
+        let base: FxHashSet<Triple> = FxHashSet::default();
+        let snap = set_default_graph(&v, &base);
+        let terms = Terms::new(snap.clone());
+        let tier = Arc::new(Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap());
+        let alone = Closure::new(Graph::with_base(tier.clone()), terms).unwrap();
+        // the graph and `tier` share it, so the closure copies it
+        assert!(tier.lookups().is_none());
+        assert!(alone.lookups().is_some());
+        assert!(!Arc::ptr_eq(&alone.graph.base_arc().unwrap(), &tier));
+        drop(alone);
+        let g = Graph::with_base(tier);
+        let before = Arc::as_ptr(&g.base_arc().unwrap());
+        let c = Closure::new(g, Terms::new(snap)).unwrap();
+        assert!(c.lookups().is_some());
+        assert_eq!(Arc::as_ptr(&c.graph.base_arc().unwrap()), before);
     }
 
     /// The searches of a deletion round run in parallel when the run has threads, and one
