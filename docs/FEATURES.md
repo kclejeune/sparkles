@@ -298,7 +298,7 @@ that work by priority and links each item to its design spec.
   still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3.
 * Group commit does not group commits on a dataset with a full-text, spatial or embedding
   index. Such a commit takes the ordinary path, so it is as fast as before but gains
-  nothing. [Roadmap](ROADMAP.md) item 85 and
+  nothing. [Roadmap](ROADMAP.md) item 86 and
   [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets).
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,

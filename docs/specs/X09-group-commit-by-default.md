@@ -968,7 +968,7 @@ dataset takes exactly the path that the default writer takes, so grouping cannot
 down, and it only misses the gain. Admitting it needs index state in speculative
 snapshots, because without it every fence would hold one commit. The user amended
 condition 3 of section 7.2 on 2026-10-17 to accept this, and section 17 designs the
-admission as Phase 4, [roadmap](../ROADMAP.md) item 85. In every measured workload below no
+admission as Phase 4, [roadmap](../ROADMAP.md) item 86. In every measured workload below no
 commit fell back from the group for any reason, and `sparkles_group_commit_fallbacks_total`
 had no series. None of those workloads had an index, so they say nothing about indexed
 datasets. ShEx-guarded datasets take the group path with one commit per fence, as Phase 2
@@ -1022,7 +1022,7 @@ allows. It runs 24 seeds by default in under two seconds, and 400 seeds passed o
 poisoning of a failed fence removed it fails. `tests/annotations.rs` prunes the catalog
 while messaged commits sit at the WAL tail and reopens with and without grouping.
 
-**The default.** The switch is built and tested on branch `x09-phase3-switch-r3-20261017`.
+**The default.** The switch is built and tested on branch `x09-phase3-switch-r4-20261017`.
 It renames the option to `StoreOptions::group_commit` with a default of true, adds
 `--no-group-commit` and `SPARKLES_GROUP_COMMIT=off`, removes `--experimental-group-commit`
 as section 7.1 says, and adds a `groupCommit` open option to the Node binding and a
