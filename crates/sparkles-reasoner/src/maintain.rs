@@ -12,12 +12,14 @@
 
 use crate::INFERRED_GRAPH;
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity};
+use crate::diagnostics::LiteralTypings;
 use crate::facts::Base;
 use crate::graph::{Graph, Triple};
 use crate::incremental::{Closure, Fallback};
 use crate::inputs::GraphRef;
 use crate::terms::Terms;
-use oxrdf::{GraphName, NamedNode, Term};
+use oxrdf::vocab::rdf;
+use oxrdf::{GraphName, Literal, NamedNode, Term};
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sparkles_core::history::At;
@@ -898,6 +900,169 @@ fn read_saved(
         Some(keys) => Saved::Found(meta, keys),
         None => Saved::Missing,
     })
+}
+
+/// The literal typings among the generalized facts of the materialization at `commit` of
+/// `store`'s dataset (see [`LiteralTypings`]): from the closure that `cache` keeps for
+/// that commit, or else from the generalized facts a persistent dataset saved for it.
+/// `None` when neither has them.
+pub fn literal_typings(
+    store: &Store,
+    commit: u64,
+    cache: Option<&Cache>,
+) -> anyhow::Result<Option<LiteralTypings>> {
+    if let Some(c) = cache {
+        let k = c.kept.lock();
+        if let Some(k) = k
+            .as_ref()
+            .filter(|k| k.dataset_id == store.dataset_id() && k.commit == commit)
+        {
+            let terms = &k.closure.terms;
+            let ty_term = Term::NamedNode(rdf::TYPE.into_owned());
+            let ty = terms.snap.lookup_iri(rdf::TYPE.as_str()).map(|i| i.0);
+            let mut facts = Vec::new();
+            for t in &k.generalized {
+                let is_type = match ty {
+                    Some(ty) => t[1] == ty,
+                    None => terms.term(t[1]).as_ref() == Some(&ty_term),
+                };
+                if !is_type {
+                    continue;
+                }
+                let (Some(s), Some(o)) = (terms.term(t[0]), terms.term(t[2])) else {
+                    continue;
+                };
+                facts.extend(LiteralTypings::violation(&s, &ty_term, &o));
+            }
+            return Ok(Some(LiteralTypings { commit, facts }));
+        }
+    }
+    let Some(root) = store.root() else {
+        return Ok(None);
+    };
+    Ok(saved_typings(root, store.dataset_id(), commit)?
+        .map(|facts| LiteralTypings { commit, facts }))
+}
+
+/// The literal typings among the generalized facts a persistent dataset saved for the
+/// materialization at `commit`, whatever its rules, read in one pass over the saved
+/// files that keeps only the typings. `None` when no consistent state is saved for that
+/// commit.
+fn saved_typings(
+    root: &Path,
+    dataset_id: uuid::Uuid,
+    commit: u64,
+) -> anyhow::Result<Option<Vec<(Literal, NamedNode)>>> {
+    use std::io::Read as _;
+    let Ok(m) = std::fs::read(root.join(SAVED_META)) else {
+        return Ok(None);
+    };
+    let Ok(meta) = serde_json::from_slice::<SavedMeta>(&m) else {
+        return Ok(None);
+    };
+    if meta.dataset_id != dataset_id.to_string() || meta.commit != commit {
+        return Ok(None);
+    }
+    let ty_key = sparkles_core::id::iri_key(rdf::TYPE.as_str());
+    let ty_term = Term::NamedNode(rdf::TYPE.into_owned());
+    // the typing of a fact's keys, when it is one the check reports
+    let typing = |k: &Keys| -> Option<(Literal, NamedNode)> {
+        if k[1] != ty_key || k[0].first() != Some(&b'"') {
+            return None;
+        }
+        let (s, o) = (
+            sparkles_core::id::key_to_term(&k[0]),
+            sparkles_core::id::key_to_term(&k[2]),
+        );
+        LiteralTypings::violation(&s, &ty_term, &o)
+    };
+    let Ok(f) = std::fs::File::open(root.join(SAVED_BIN)) else {
+        return Ok(None);
+    };
+    // the `.bin`, read in a stream with its checksum
+    struct Hashing<R> {
+        r: R,
+        h: u64,
+        n: u64,
+    }
+    impl<R: std::io::Read> std::io::Read for Hashing<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.r.read(buf)?;
+            self.h = fnv(&buf[..n], self.h);
+            self.n += n as u64;
+            Ok(n)
+        }
+    }
+    let mut r = Hashing {
+        r: std::io::BufReader::new(f),
+        h: FNV_START,
+        n: 0,
+    };
+    let keys = |r: &mut dyn std::io::Read| -> std::io::Result<Keys> {
+        let mut t: Keys = Default::default();
+        for k in &mut t {
+            let mut len = [0u8; 4];
+            r.read_exact(&mut len)?;
+            k.resize(u32::from_le_bytes(len) as usize, 0);
+            r.read_exact(k)?;
+        }
+        Ok(t)
+    };
+    let mut found: FxHashMap<Keys, (Literal, NamedNode)> = FxHashMap::default();
+    let mut head = [0u8; 16];
+    if r.read_exact(&mut head).is_err() || &head[..8] != MAGIC {
+        return Ok(None);
+    }
+    let n = u64::from_le_bytes(head[8..16].try_into()?);
+    if n != meta.triples {
+        return Ok(None);
+    }
+    for _ in 0..n {
+        let Ok(k) = keys(&mut r) else {
+            return Ok(None);
+        };
+        if let Some(x) = typing(&k) {
+            found.insert(k, x);
+        }
+    }
+    let mut rest = Vec::new();
+    r.read_to_end(&mut rest)?;
+    if r.n != meta.bytes || format!("{:016x}", r.h) != meta.checksum {
+        return Ok(None);
+    }
+    if meta.log_bytes > 0 {
+        let Ok(log) = std::fs::read(root.join(SAVED_LOG)) else {
+            return Ok(None);
+        };
+        let Some(log) = log.get(..meta.log_bytes as usize) else {
+            return Ok(None);
+        };
+        if format!("{:016x}", fnv(log, FNV_START)) != meta.log_checksum {
+            return Ok(None);
+        }
+        let mut r = log;
+        while !r.is_empty() {
+            let mut op = [0u8; 1];
+            if r.read_exact(&mut op).is_err() {
+                return Ok(None);
+            }
+            let Ok(k) = keys(&mut r) else {
+                return Ok(None);
+            };
+            match op[0] {
+                b'+' => {
+                    if let Some(x) = typing(&k) {
+                        found.insert(k, x);
+                    }
+                }
+                b'-' => {
+                    found.remove(&k);
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(found.into_values().collect()))
 }
 
 /// Replace a file by renaming a new one over it. Nothing is synced: after a crash, a

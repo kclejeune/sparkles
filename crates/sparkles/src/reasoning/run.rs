@@ -364,9 +364,41 @@ pub fn diagnose(
     record: Option<&ReasoningRecord>,
     opts: &DiagnoseOptions,
 ) -> Result<Diagnostics> {
+    diagnose_with(store, record, None, opts)
+}
+
+/// The profiles whose rules are sound for OWL 2: the literal typings of their generalized
+/// facts join the diagnostics.
+const SOUND_PROFILES: &[&str] = &["rdfs", "rdfs-simple", "owl-rl"];
+
+/// [`diagnose`], with the closure `cache` keeps. When `opts.inferences` reads the
+/// inferences of a built-in profile, `literal-not-in-datatype` also reads the literal
+/// typings of the generalized facts of the materialization `record` describes, from that
+/// closure or else from those a persistent dataset saved.
+pub fn diagnose_with(
+    store: &Store,
+    record: Option<&ReasoningRecord>,
+    cache: Option<&sparkles_reasoner::Cache>,
+    opts: &DiagnoseOptions,
+) -> Result<Diagnostics> {
     let snap = store.snapshot();
     let commit = snap.commit;
-    let report = sparkles_reasoner::diagnostics::diagnose(snap, opts).map_err(from_anyhow)?;
+    let typings = match record {
+        Some(r) if opts.inferences && SOUND_PROFILES.contains(&r.profile.as_str()) => {
+            r.commit.and_then(
+                |c| match sparkles_reasoner::literal_typings(store, c, cache) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("reading the literal typings of the inferences: {e:#}");
+                        None
+                    }
+                },
+            )
+        }
+        _ => None,
+    };
+    let report = sparkles_reasoner::diagnostics::diagnose_with(snap, opts, typings.as_ref())
+        .map_err(from_anyhow)?;
     let inferences = record
         .filter(|_| opts.inferences)
         .map(|r| (r.profile.clone(), freshness(r, store, commit)));

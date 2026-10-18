@@ -877,3 +877,74 @@ fn f16_datatype_limit_counts_violations() {
     assert_eq!(basis("q"), Some(json!("uses-inferences")));
     assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 2));
 }
+
+/// F16 §8: with the inferences, the check also reads the literal typings of the
+/// generalized facts of a kept closure, which RDF cannot state: here a range through a
+/// subclass of xsd:integer. The typings come from the closure in memory, or else from the
+/// generalized facts a persistent dataset saved, and their findings use the inferences.
+#[test]
+fn f16_literal_typings_of_a_kept_closure() {
+    use sparkles_reasoner::diagnostics::diagnose_with;
+    use sparkles_reasoner::{Cache, Extras, Incremental, literal_typings, materialize_incremental};
+    const ID: &str = "literal-not-in-datatype";
+    let ttl = r#"ex:D rdfs:subClassOf xsd:integer . ex:p rdfs:range ex:D .
+                 ex:a ex:p "abc" . ex:b ex:p 5 ."#;
+    let dir = tempfile::tempdir().unwrap();
+    for persistent in [false, true] {
+        let s = if persistent {
+            let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+            s.load(&[Source::from_bytes(
+                format!("{PREFIXES}{ttl}").into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+            s
+        } else {
+            store(ttl)
+        };
+        let cache = Cache::default();
+        let r = materialize_incremental(
+            &s,
+            &Profile::Rdfs,
+            &Extras::default(),
+            Incremental {
+                since: None,
+                cache: Some(&cache),
+            },
+            &ReasonOptions::default(),
+        )
+        .unwrap();
+        let commit = r.receipt.unwrap().commit.seq;
+        let from = if persistent { None } else { Some(&cache) };
+        let typings = literal_typings(&s, commit, from).unwrap().unwrap();
+        assert_eq!(typings.commit, commit);
+        assert_eq!(typings.facts.len(), 1, "{typings:?}");
+        assert_eq!(typings.facts[0].0.value(), "abc");
+        assert_eq!(
+            typings.facts[0].1.as_str(),
+            "http://www.w3.org/2001/XMLSchema#integer"
+        );
+        // another commit has none
+        assert_eq!(literal_typings(&s, commit + 1, from).unwrap(), None);
+        let with = DiagnoseOptions {
+            inferences: true,
+            ..datatype_only(10)
+        };
+        // the query and the vocabulary find nothing
+        assert!(findings(&check(&s, &with), ID).is_empty());
+        let r = diagnose_with(s.snapshot(), &with, Some(&typings)).unwrap();
+        let f = findings(&r, ID);
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert_eq!(f[0]["focus"]["value"], "abc");
+        assert_eq!(
+            f[0]["evidence"]["range"]["value"],
+            "http://www.w3.org/2001/XMLSchema#integer"
+        );
+        assert_eq!(f[0]["basis"], "uses-inferences");
+        assert_eq!(check_outcome(&r, ID), (CheckStatus::Violations, 1));
+        // the typings are inferences: without them the check does not read them
+        let r = diagnose_with(s.snapshot(), &datatype_only(10), Some(&typings)).unwrap();
+        assert!(findings(&r, ID).is_empty());
+    }
+}

@@ -18,7 +18,7 @@ use serde_json::{Value as J, json};
 use sparkles_core::Error;
 use sparkles_core::sparql::QueryOptions;
 use sparkles_core::sparql::results::term_json;
-use sparkles_core::store::Snapshot;
+use sparkles_core::store::{Generation, Snapshot};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -598,9 +598,48 @@ fn sh(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{SH}{local}"))
 }
 
+/// Literals that a materialization's generalized facts type with a datatype outside of
+/// whose value space they are: the facts `lit rdf:type DT`, with `DT` in the OWL 2 RL
+/// datatype map, which RDF cannot state and the inferred graph therefore lacks. See
+/// [`crate::literal_typings`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiteralTypings {
+    /// the commit of the materialization
+    pub commit: u64,
+    /// the literal and the datatype, each literal outside the datatype's value space
+    pub facts: Vec<(Literal, NamedNode)>,
+}
+
+impl LiteralTypings {
+    /// The typings among `facts` that the check reports: a literal subject, `rdf:type`,
+    /// and a datatype the literal's value is decided to be outside of.
+    pub fn violation(s: &Term, p: &Term, o: &Term) -> Option<(Literal, NamedNode)> {
+        match (s, p, o) {
+            (Term::Literal(l), Term::NamedNode(p), Term::NamedNode(dt))
+                if p.as_str() == rdf::TYPE.as_str()
+                    && in_value_space(l, dt.as_str()) == Some(false) =>
+            {
+                Some((l.clone(), dt.clone()))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Run the checks on one snapshot. Unknown check ids are an error; a failing or timed
 /// out check is reported in its outcome instead.
 pub fn diagnose(snap: Arc<Snapshot>, opts: &DiagnoseOptions) -> anyhow::Result<DiagnosticsReport> {
+    diagnose_with(snap, opts, None)
+}
+
+/// [`diagnose`], with the literal typings of a materialization's generalized facts for
+/// `literal-not-in-datatype` when the checks read the inferences. Their findings are
+/// marked [`Basis::UsesInferences`].
+pub fn diagnose_with(
+    snap: Arc<Snapshot>,
+    opts: &DiagnoseOptions,
+    typings: Option<&LiteralTypings>,
+) -> anyhow::Result<DiagnosticsReport> {
     let checks = select_checks(&opts.checks)
         .map_err(|bad| anyhow::anyhow!("unknown diagnostics check '{bad}'"))?;
     let limit = opts.limit.clamp(1, MAX_LIMIT);
@@ -634,6 +673,7 @@ pub fn diagnose(snap: Arc<Snapshot>, opts: &DiagnoseOptions) -> anyhow::Result<D
             inferences: opts.inferences,
             graphs: &opts.graphs,
             names: &names,
+            typings: typings.filter(|_| opts.inferences),
         };
         let found = if check.id == "literal-not-in-datatype" {
             run.paged_findings(limit)
@@ -696,6 +736,8 @@ struct Run<'a> {
     inferences: bool,
     graphs: &'a [String],
     names: &'a Names,
+    /// the literal typings of the inferences, when the check reads them
+    typings: Option<&'a LiteralTypings>,
 }
 
 type Row = BTreeMap<String, Term>;
@@ -705,8 +747,92 @@ type Row = BTreeMap<String, Term>;
 const PAGE_FIRST: usize = 256;
 const PAGE_MAX: usize = 16_384;
 /// The candidate rows [`Run::paged_findings`] reads at most before it stops and reports
-/// the check truncated.
+/// the check truncated, and the ill-typed literals it looks up at most.
 const CANDIDATES_MAX: usize = 1 << 18;
+/// The ill-typed literals [`Run::ill_typed_into`] looks up with one query.
+const ILL_TYPED_BATCH: usize = 256;
+/// The generations whose ill-typed literals [`ill_typed`] remembers.
+const REMEMBERED_GENERATIONS: usize = 8;
+
+/// The ill-typed literals of the base vocabularies of the last generations read: the
+/// generation's id, the generation, and the literals in the order of their N-Triples
+/// form.
+type Remembered = Vec<(u64, std::sync::Weak<Generation>, Arc<Vec<Literal>>)>;
+static BASE_ILL_TYPED: std::sync::Mutex<Remembered> = std::sync::Mutex::new(Vec::new());
+
+/// The literal of a vocabulary key when the table decides it is ill-typed for its own
+/// datatype: a typed literal of an XSD datatype the check implements, outside that
+/// datatype's value space. Simple and language-tagged literals are well typed, and so are
+/// the literals inlined in their ids, which take only canonical, valid lexical forms.
+fn ill_typed_key(key: &[u8]) -> Option<Literal> {
+    if key.first() != Some(&b'"') {
+        return None;
+    }
+    let sep = key.iter().rposition(|&b| b == sparkles_core::id::KEY_SEP)?;
+    let dt = key[sep + 1..].strip_prefix(b"^")?;
+    let local = std::str::from_utf8(dt.strip_prefix(XSD.as_bytes())?).ok()?;
+    family(local)?;
+    let lex = std::str::from_utf8(&key[1..sep]).ok()?;
+    let dt = std::str::from_utf8(dt).ok()?;
+    let lit = Literal::new_typed_literal(lex, NamedNode::new_unchecked(dt));
+    (in_value_space(&lit, dt) == Some(false)).then_some(lit)
+}
+
+/// The literals of `snap`'s vocabulary that are ill-typed for their own datatype (see
+/// [`ill_typed_key`]), in the order of their N-Triples form. The base vocabulary of a
+/// generation is read once and its result remembered for the generation; the delta
+/// vocabulary, which grows with each commit, is read each time. A deadline that passes
+/// during the read of the base vocabulary is a timeout, and nothing is remembered.
+fn ill_typed(snap: &Snapshot, deadline: Option<Instant>) -> sparkles_core::Result<Vec<Literal>> {
+    let generation = &snap.generation;
+    let known = {
+        let mut m = BASE_ILL_TYPED.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|(_, g, _)| g.strong_count() > 0);
+        m.iter()
+            .find(|(uid, _, _)| *uid == generation.uid)
+            .map(|x| x.2.clone())
+    };
+    let base = match known {
+        Some(b) => b,
+        None => {
+            #[cfg(test)]
+            VOCAB_SCANS.with(|c| c.set(c.get() + 1));
+            let vocab = &generation.vocab;
+            let (lo, hi) = vocab.prefix_range(b"\"");
+            let mut found: Vec<Literal> = Vec::new();
+            let mut ids: Vec<u64> = Vec::new();
+            let mut at = lo;
+            while at < hi {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    return Err(Error::Timeout);
+                }
+                let end = hi.min(at + (1 << 16));
+                ids.clear();
+                ids.extend(at..end);
+                vocab.get_sorted(&ids, |_, key| found.extend(ill_typed_key(key)));
+                at = end;
+            }
+            found.sort_by_cached_key(Literal::to_string);
+            let found = Arc::new(found);
+            let mut m = BASE_ILL_TYPED.lock().unwrap_or_else(|e| e.into_inner());
+            if m.len() >= REMEMBERED_GENERATIONS {
+                m.remove(0);
+            }
+            m.push((generation.uid, Arc::downgrade(generation), found.clone()));
+            found
+        }
+    };
+    let mut all: Vec<Literal> = generation
+        .dvocab
+        .with(|v| v.iter().filter_map(|(_, k)| ill_typed_key(k)).collect());
+    if all.is_empty() {
+        return Ok(base.to_vec());
+    }
+    all.extend(base.iter().cloned());
+    all.sort_by_cached_key(Literal::to_string);
+    all.dedup();
+    Ok(all)
+}
 
 #[cfg(test)]
 thread_local! {
@@ -715,6 +841,8 @@ thread_local! {
     static PAGE_TIMEOUT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Tests only: replaces [`CANDIDATES_MAX`].
     static CANDIDATES_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests only: the reads of a base vocabulary that [`ill_typed`] made.
+    static VOCAB_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`CANDIDATES_MAX`], or the cap a test set.
@@ -728,7 +856,7 @@ fn candidates_max() -> usize {
 /// A total order of the rows of `datatype-range.rq`. Every key is an IRI, a blank node
 /// or a simple literal, which compare by their strings, and together the keys identify a
 /// row of the DISTINCT projection. Pages of this order therefore neither skip nor repeat
-/// a row, and the rows of one finding, which differ only in `?via`, are adjacent.
+/// a row, and the rows of one finding are adjacent.
 const CANDIDATE_ORDER: &str = "ORDER BY ?x ?p ?range STR(?lit) DATATYPE(?lit) LANG(?lit) ?via";
 
 impl Run<'_> {
@@ -828,28 +956,166 @@ impl Run<'_> {
         Ok((out, truncated))
     }
 
-    /// The findings of a check whose query returns candidates that are often not
-    /// findings (`literal-not-in-datatype`), at most `limit`, and whether more may
-    /// exist. Each candidate is judged before it counts toward the limit. The candidates
-    /// are read in pages of one total order ([`CANDIDATE_ORDER`]). Each page holds its
-    /// rows, and the query's sort keeps the rows up to the end of the page, at most
-    /// 278,528. Every page runs the query and its sort again, which trades repeated
-    /// query work for that bound. The check stops at the first finding past the limit,
-    /// when the candidates run out, at the deadline, or after [`CANDIDATES_MAX`]
-    /// candidate rows, and it reports itself truncated in the first and the last case. A
-    /// deadline after at least one finding returns the findings found, truncated.
+    /// The findings of `literal-not-in-datatype`, at most `limit`, and whether more may
+    /// exist. They come from three sources, in this order, and a finding of a later one
+    /// that an earlier one reported is left out:
+    ///
+    /// 1. the literals that are ill-typed for their own datatype, found by a scan of the
+    ///    vocabulary ([`ill_typed`]) and then looked up in the checked graphs;
+    /// 2. the candidates of the range query, judged one by one ([`Run::paged_into`]);
+    /// 3. the literal typings of the inferences' generalized facts, when the check reads
+    ///    the inferences and the caller has them.
+    ///
+    /// A deadline after at least one finding returns the findings found, truncated.
     fn paged_findings(&self, limit: usize) -> sparkles_core::Result<(Vec<Finding>, bool)> {
         let mut out = Vec::new();
-        match self.paged_into(limit, &mut out) {
+        let mut seen = HashSet::new();
+        let r = (|| {
+            if self.ill_typed_into(limit, &mut out, &mut seen)? {
+                return Ok(true);
+            }
+            if self.paged_into(limit, &mut out, &mut seen)? {
+                return Ok(true);
+            }
+            self.typings_into(limit, &mut out)
+        })();
+        match r {
             Ok(truncated) => Ok((out, truncated)),
             Err(Error::Timeout) if !out.is_empty() => Ok((out, true)),
             Err(e) => Err(e),
         }
     }
 
-    /// The pages of [`paged_findings`](Self::paged_findings), adding the findings to
-    /// `out` as they are judged. Returns whether the check is truncated.
-    fn paged_into(&self, limit: usize, out: &mut Vec<Finding>) -> sparkles_core::Result<bool> {
+    /// The findings of the literals that are ill-typed for their own datatype
+    /// (`dt-type2`): the literals of the vocabulary that the table decides are outside
+    /// their datatype's value space, each with the subjects and properties that have it as
+    /// a value in the checked graphs. The literals are looked up in batches, in the order
+    /// of their N-Triples form, at most [`CANDIDATES_MAX`] of them. Returns whether the
+    /// check is truncated.
+    fn ill_typed_into(
+        &self,
+        limit: usize,
+        out: &mut Vec<Finding>,
+        seen: &mut HashSet<String>,
+    ) -> sparkles_core::Result<bool> {
+        let mut lits = ill_typed(self.snap, self.deadline)?;
+        let truncated = lits.len() > candidates_max();
+        lits.truncate(candidates_max());
+        let via = Term::Literal(Literal::new_simple_literal("datatype"));
+        for batch in lits.chunks(ILL_TYPED_BATCH) {
+            let values: Vec<String> = batch.iter().map(Literal::to_string).collect();
+            let text = format!(
+                "SELECT DISTINCT ?x ?p ?lit WHERE {{ VALUES ?lit {{ {} }} ?x ?p ?lit . }}\n\
+                 ORDER BY ?x ?p STR(?lit) DATATYPE(?lit) LANG(?lit)\nLIMIT {}",
+                values.join(" "),
+                limit - out.len() + 1
+            );
+            for mut row in self.select(&text, self.inferences, Vec::new())? {
+                let Some(Term::Literal(l)) = row.get("lit") else {
+                    continue;
+                };
+                let range = Term::NamedNode(l.datatype().into_owned());
+                row.insert("range".into(), range);
+                row.insert("via".into(), via.clone());
+                let Some(key) = self.key(&row) else { continue };
+                if seen.contains(&key) {
+                    continue;
+                }
+                let Some(mut f) = self.finding(std::slice::from_ref(&row), Basis::Asserted)? else {
+                    continue;
+                };
+                if out.len() == limit {
+                    return Ok(true);
+                }
+                if self.inferences && !self.occurs_asserted(&row)? {
+                    f.basis = Basis::UsesInferences;
+                }
+                seen.insert(key);
+                out.push(f);
+            }
+        }
+        Ok(truncated)
+    }
+
+    /// Whether the asserted data has the row's literal as the value of its subject and
+    /// property.
+    fn occurs_asserted(&self, row: &Row) -> sparkles_core::Result<bool> {
+        let bindings = ["x", "p", "lit"]
+            .iter()
+            .filter_map(|v| Some((v.to_string(), row.get(*v)?.clone())))
+            .collect();
+        let rows = self.select("SELECT * WHERE { ?x ?p ?lit } LIMIT 1", false, bindings)?;
+        Ok(!rows.is_empty())
+    }
+
+    /// The findings of the literal typings of the inferences that no finding before
+    /// names with the same literal and range: each literal with the datatype that types it
+    /// and whose value space it is outside of, marked as using the inferences. Returns
+    /// whether the check is truncated.
+    fn typings_into(&self, limit: usize, out: &mut Vec<Finding>) -> sparkles_core::Result<bool> {
+        let Some(typings) = self.typings else {
+            return Ok(false);
+        };
+        let one = |f: &Finding, name: &str| {
+            f.evidence.iter().find_map(|(n, e)| match e {
+                Evidence::One(t) if *n == name => Some(t.to_string()),
+                _ => None,
+            })
+        };
+        let named: HashSet<(String, String)> = out
+            .iter()
+            .filter_map(|f| Some((one(f, "literal")?, one(f, "range")?)))
+            .collect();
+        let mut facts: Vec<(String, &Literal, &NamedNode)> = typings
+            .facts
+            .iter()
+            .map(|(l, dt)| (l.to_string(), l, dt))
+            .collect();
+        facts.sort_by(|a, b| (&a.0, a.2.as_str()).cmp(&(&b.0, b.2.as_str())));
+        facts.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
+        for (text, lit, dt) in facts {
+            if named.contains(&(text, Term::NamedNode(dt.clone()).to_string()))
+                || in_value_space(lit, dt.as_str()) != Some(false)
+            {
+                continue;
+            }
+            if out.len() == limit {
+                return Ok(true);
+            }
+            let (l, d) = (Term::Literal(lit.clone()), Term::NamedNode(dt.clone()));
+            let n = |t: &Term| self.names.show(t);
+            out.push(Finding {
+                check: self.check.id,
+                rule: self.check.rules[0],
+                severity: self.check.severity,
+                message: format!(
+                    "{}: the value is not in the value space of {}, which the inferences give as its type",
+                    n(&l),
+                    n(&d)
+                ),
+                focus: l.clone(),
+                evidence: vec![("range", Evidence::One(d)), ("literal", Evidence::One(l))],
+                basis: Basis::UsesInferences,
+            });
+        }
+        Ok(false)
+    }
+
+    /// The candidates of the range query, at most `limit` findings in `out` with those
+    /// found before, leaving out the findings whose keys are in `seen`. Each candidate is
+    /// judged before it counts toward the limit. The candidates are read in pages of one
+    /// total order ([`CANDIDATE_ORDER`]). Each page holds its rows, and the query's sort
+    /// keeps the rows up to the end of the page, at most 278,528. Every page runs the
+    /// query and its sort again, which trades repeated query work for that bound. The
+    /// pages stop at the first finding past the limit, when the candidates run out, at
+    /// the deadline, or after [`CANDIDATES_MAX`] candidate rows. Returns whether the
+    /// check is truncated, which it is in the first and the last case.
+    fn paged_into(
+        &self,
+        limit: usize,
+        out: &mut Vec<Finding>,
+        seen: &mut HashSet<String>,
+    ) -> sparkles_core::Result<bool> {
         let mut offset = 0usize;
         let mut page = (2 * limit + 2).clamp(PAGE_FIRST, PAGE_MAX);
         #[cfg(test)]
@@ -891,8 +1157,11 @@ impl Run<'_> {
                     continue;
                 }
             }
-            for (_, _, rows) in &groups {
-                let Some(mut f) = self.finding(rows, Basis::Asserted)? else {
+            for (key, _, rows) in groups {
+                if seen.contains(&key) {
+                    continue;
+                }
+                let Some(mut f) = self.finding(&rows, Basis::Asserted)? else {
                     continue;
                 };
                 if out.len() == limit {
@@ -901,6 +1170,7 @@ impl Run<'_> {
                 if self.inferences && !self.holds_asserted(&rows[0])? {
                     f.basis = Basis::UsesInferences;
                 }
+                seen.insert(key);
                 out.push(f);
             }
             if !full {
@@ -2145,5 +2415,57 @@ mod paging_tests {
             run(&s, 10),
             (CheckStatus::Truncated, 0, ReportStatus::Incomplete)
         );
+    }
+
+    /// The foci of the check's findings over `graphs`, sorted.
+    fn foci(s: &Store, graphs: &[&str]) -> Vec<String> {
+        let r = diagnose(
+            s.snapshot(),
+            &DiagnoseOptions {
+                checks: vec![ID.into()],
+                graphs: graphs.iter().map(|g| g.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut f: Vec<String> = r.findings.iter().map(|f| f.focus.to_string()).collect();
+        f.sort();
+        f
+    }
+
+    /// F16 §8: the literals that are ill-typed for their own datatype come from a scan of
+    /// the vocabulary, which is read once per generation, and the delta vocabulary is
+    /// read each time. Only literals that the checked graphs hold are reported.
+    #[test]
+    fn f16_ill_typed_literals_come_from_the_vocabulary() {
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            format!(
+                "<http://ex.org/a> <http://ex.org/v> \"x\"^^<{xsd}int> .
+                 <http://ex.org/k> <http://ex.org/v> \"7\"^^<{xsd}int> .
+                 <http://ex.org/b> <http://ex.org/v> \"y\"^^<{xsd}short> <http://ex.org/g> .\n"
+            )
+            .into_bytes(),
+            RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+        let generation = s.snapshot().generation.clone();
+        VOCAB_SCANS.with(|c| c.set(0));
+        assert_eq!(foci(&s, &[]), ["<http://ex.org/a>"]);
+        assert_eq!(foci(&s, &[]), ["<http://ex.org/a>"]);
+        assert_eq!(foci(&s, &["http://ex.org/g"]), ["<http://ex.org/b>"]);
+        assert_eq!(VOCAB_SCANS.with(std::cell::Cell::get), 1);
+        // a literal that no graph holds any more is not reported, and one the delta
+        // vocabulary holds is
+        let u = format!(
+            "DELETE DATA {{ <http://ex.org/a> <http://ex.org/v> \"x\"^^<{xsd}int> }} ;
+             INSERT DATA {{ <http://ex.org/c> <http://ex.org/v> \"300\"^^<{xsd}unsignedByte> }}"
+        );
+        sparkles_core::sparql::update::update(&s, &u, &QueryOptions::default()).unwrap();
+        assert!(Arc::ptr_eq(&s.snapshot().generation, &generation));
+        assert_eq!(foci(&s, &[]), ["<http://ex.org/c>"]);
+        assert_eq!(VOCAB_SCANS.with(std::cell::Cell::get), 1);
     }
 }

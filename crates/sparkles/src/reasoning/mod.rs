@@ -14,8 +14,8 @@ pub mod run;
 pub use freshness::{Freshness, ReasoningStatus, freshness, watched_graphs};
 #[cfg(feature = "reasoning")]
 pub use run::{
-    Diagnostics, ReasonOutcome, ReasonRequest, diagnose, incremental_since, record_inputs,
-    recorded, run_info, run_text,
+    Diagnostics, ReasonOutcome, ReasonRequest, diagnose, diagnose_with, incremental_since,
+    record_inputs, recorded, run_info, run_text,
 };
 /// The reasoner (feature `reasoning`): its profiles, extras, input graphs, reports and
 /// diagnostics, which the requests and results of [`run`] use.

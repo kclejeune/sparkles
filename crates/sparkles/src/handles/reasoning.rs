@@ -70,7 +70,13 @@ impl Reasoning {
         &self,
         opts: &sparkles_reasoner::diagnostics::DiagnoseOptions,
     ) -> Result<crate::reasoning::Diagnostics> {
-        crate::reasoning::diagnose(self.ds.store(), self.record().as_ref(), opts)
+        let state = self.ds.state();
+        crate::reasoning::diagnose_with(
+            self.ds.store(),
+            self.record().as_ref(),
+            Some(&state.closure),
+            opts,
+        )
     }
 
     /// Remove the materialized inferences and the record; the triples removed.

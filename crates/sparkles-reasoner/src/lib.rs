@@ -33,7 +33,7 @@ pub use extras::{Extras, UnknownVocabulary, Vocabulary};
 pub use inputs::{
     Fetched, GraphRef, Import, ImportMode, Inputs, LocationMapping, Resolved, fetch_imports,
 };
-pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES};
+pub use maintain::{Cache, DEFAULT_CACHE_TRIPLES, literal_typings};
 pub use parser::{
     BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
 };
