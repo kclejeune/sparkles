@@ -76,16 +76,17 @@ the database's owner or as root.
 Group commit is on by default for persistent stores. Concurrent commits of a dataset share
 one synchronization of the log, and each commit is still acknowledged only once it is
 durable. On `forge` four writers commit about 1.8 times as fast as before and sixteen
-writers about 5.4 times as fast, while a single writer's latency is unchanged. A dataset with
-a full-text, spatial or embedding index keeps committing on its own. The global flag
+writers about 5.4 times as fast, while a single writer's latency is unchanged. A dataset
+with a full-text, spatial or embedding index keeps committing on its own. The global flag
 `--no-group-commit` or `SPARKLES_GROUP_COMMIT=off`, `false`, `no` or `0` turns grouping
 off, and an unrecognised value of the variable logs a warning and keeps it on. Node's
 `Dataset.open` and `Catalog.open` take `groupCommit`, and Python's `Dataset`,
 `Dataset.open` and `Catalog` take `group_commit`, both `true` by default. The JVM library
 follows the default and has no option. Embedded Rust sets `StoreOptions::group_commit`,
-which now defaults to `true`. Grouping costs memory: each persistent dataset may hold up
-to 64 queued commits or 4 MiB of log records, plus the snapshots of commits in flight. The
-hidden `--experimental-group-commit` flag is removed, and passing it is a usage error.
+which now defaults to `true`. Grouping costs memory. Each persistent dataset may hold up
+to 64 queued commits or 4 MiB of log records, plus the snapshots of commits in flight,
+whose size was not measured. The hidden `--experimental-group-commit` flag is removed, and
+passing it is a usage error.
 
 The closure a dataset keeps for incremental reasoning runs holds only the derived triples
 and reads the input graphs from the store's indexes. On LUBM-style data with 13.1 million
@@ -111,6 +112,30 @@ literals that the checked graphs hold. For Rust callers,
 `sparkles_reasoner::literal_typings` reads them.
 
 ### Behavior
+
+A SERVICE inside an EXISTS that the query evaluates per row is called once for each
+distinct binding of the variables it shares with the outer rows, and once in all when it
+shares none. A streamed query whose memory budget was nearly spent used to call it once
+per row.
+
+Open deletes a generation directory newer than the one `CURRENT` names when it is an
+unfinished build of the dataset, and the deletion is permanent. A power loss during a
+compaction or a bulk load can leave such a directory with an empty build marker, which
+earlier releases kept until the next rebuild reused its number. Any other directory above
+`CURRENT`, such as one that a `CURRENT` restored from an older copy no longer names, is
+renamed to `gen-N.set-aside-<ms>` and kept, and `sparkles check` reports it. A bulk build
+that a crash stopped before its switch is always set aside, as a full copy of the indexes.
+Set-aside directories count toward the byte quota and appear in `sparkles migrate`'s list
+of generations until an operator deletes them or renames one back. Open also
+deletes the store's own temporary files, such as a `CURRENT.tmp` left by an interrupted
+switch, and leaves every other `.tmp` file alone. A directory that holds generations but
+no `CURRENT` is now refused instead of opened as a new, empty database.
+
+A commit whose own log synchronization fails keeps its message, change digest and merge
+record. Such a commit can still come back after a restart, and it used to come back
+without them, which left a hole in the digest chain of a dataset with `--commit-digests`.
+The writer stops taking commits after the failure as before, and open drops the records
+of a commit that did not survive.
 
 FastRP follows the meaning of `iterationWeights` in Neo4j GDS. The list has one weight
 for each propagation, and the new `nodeSelfInfluence` parameter weights the random

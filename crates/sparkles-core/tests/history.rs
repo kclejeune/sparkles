@@ -268,19 +268,20 @@ fn interrupted_collections_and_rebuilds_are_finished_at_open() {
         s.compact().unwrap();
         assert_eq!(gens(&root), ["gen-0001", "gen-0002"]);
     }
-    // a half-deleted generation, an interrupted rebuild, and a foreign directory
+    // a half-deleted generation, an interrupted rebuild, and one whose files a power loss
+    // emptied: every generation above CURRENT is an interrupted rebuild
     std::fs::create_dir(root.join("gen-0009.deleting")).unwrap();
     std::fs::write(root.join("gen-0009.deleting/x"), b"x").unwrap();
     copy_dir(&root.join("gen-0002"), &root.join("gen-0003"));
     std::fs::create_dir(root.join("gen-0007")).unwrap();
     let s = Store::open(&root, StoreOptions::default()).unwrap();
-    assert_eq!(gens(&root), ["gen-0001", "gen-0002", "gen-0007"]);
+    assert_eq!(gens(&root), ["gen-0001", "gen-0002"]);
     assert_eq!(at(&s, "snapshot:v1").unwrap(), ["<urn:a>"]);
     drop(s);
     // a generation left behind by a crash after the switch is collected unless pinned
     std::fs::remove_file(root.join("history.json")).unwrap();
     let s = Store::open(&root, StoreOptions::default()).unwrap();
-    assert_eq!(gens(&root), ["gen-0002", "gen-0007"]);
+    assert_eq!(gens(&root), ["gen-0002"]);
     assert!(s.snapshots().is_empty());
 }
 

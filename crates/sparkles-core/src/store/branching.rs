@@ -398,20 +398,6 @@ impl MergeLog {
         Ok(())
     }
 
-    /// Take back the last record, for commit `seq` that failed.
-    pub fn undo(&mut self, seq: u64) -> Result<()> {
-        if self.recs.last().is_some_and(|m| m.seq == seq) {
-            self.recs.pop();
-            if let Some(path) = &self.path {
-                OpenOptions::new()
-                    .write(true)
-                    .open(path)?
-                    .set_len((self.recs.len() * MERGE_REC) as u64)?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn get(&self, seq: u64) -> Option<MergeRec> {
         self.recs
             .binary_search_by_key(&seq, |m| m.seq)

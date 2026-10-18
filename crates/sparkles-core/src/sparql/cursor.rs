@@ -944,7 +944,7 @@ fn retryable(node: &Node) -> bool {
 /// LATERAL, an aggregate or an ORDER BY key as well as in the pattern itself. The plan
 /// keeps an EXISTS that it evaluates per row as a pattern, so [`retryable`] does not
 /// see a SERVICE there.
-fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
     use spargebra::algebra::{AggregateExpression, GraphPattern as P, OrderExpression};
     let order = |keys: &[OrderExpression]| {
         keys.iter().any(|k| match k {

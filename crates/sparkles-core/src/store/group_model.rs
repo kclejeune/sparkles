@@ -393,30 +393,13 @@ fn check_run(dir: &Path, r: &RunResult, messages: bool, fault: Fault, what: &str
         // the commit number of each uncertain operation found in the log
         let mut uncertain_at = Vec::new();
         for seq in 1..=head {
-            let Some(m) = s.annotation(seq).and_then(|a| a.message) else {
-                // An ordinary-path commit whose own synchronization failed rolls back its
-                // annotation but may leave its log record, and section 3 leaves the outcome
-                // of that commit open. It comes back without its message, so it can only be
-                // an uncertain operation that failed with an error, whose effect is in the
-                // store. A thread stops at its first uncertain operation, so nothing later
-                // touches the names it wrote.
-                let op = uncertain
-                    .iter()
-                    .copied()
-                    .find(|o| {
-                        !used.contains(&(o.thread, o.k))
-                            && matches!(&o.outcome, Outcome::Uncertain(e) if e != "panicked")
-                            && o.inserts.iter().all(|n| holds(&snap, n))
-                            && !o.deletes.iter().any(|n| holds(&snap, n))
-                    })
-                    .unwrap_or_else(|| {
-                        panic!("{what}: commit {seq} has no message and no failed operation")
-                    });
-                used.insert((op.thread, op.k));
-                uncertain_at.push(seq);
-                order.push(op);
-                continue;
-            };
+            // Every commit's annotation reaches the disk before the commit does (the
+            // ordinary path syncs it first and keeps it when its own sync fails, and a
+            // grouped commit without it is a torn tail), so every commit has its message.
+            let m = s
+                .annotation(seq)
+                .and_then(|a| a.message)
+                .unwrap_or_else(|| panic!("{what}: commit {seq} has no message"));
             let op = by_msg
                 .get(m.as_ref())
                 .unwrap_or_else(|| panic!("{what}: commit {seq} has an unknown message {m}"));

@@ -436,8 +436,8 @@ fn verify(a: &Args) {
             ));
         }
     }
-    // After open only leftovers may remain: a newer generation of a compaction that a
-    // crash interrupted stays until the next rebuild replaces it.
+    // After open only an old generation may remain. Open removes every generation newer
+    // than CURRENT, so a crash image can no longer show one afterwards.
     let (code, out, err) = sparkles(&bin, &["check", "--loc", &loc, "--format", "json"]);
     if code != 0 && !(code == 2 && only_leftovers(&out)) {
         problems.push(format!(
@@ -455,8 +455,19 @@ fn verify(a: &Args) {
     std::process::exit(if ok { 0 } else { 1 });
 }
 
-/// Whether every issue in a `sparkles check --format json` report is a warning about a
-/// leftover file, such as a generation newer than CURRENT. Each issue object names its
+/// The leftover warnings that `sparkles check` may still give after an open. Open removes
+/// unfinished builds above CURRENT, `text.new`, `text.old` and the store's own `.tmp`
+/// files and finishes interrupted removals. Two generation leftovers remain possible: an
+/// old generation that something still holds, and a complete build above CURRENT that a
+/// power loss kept from being switched to, which open sets aside rather than deletes. Any
+/// other leftover, a set-aside `commits.bin.corrupt-*` catalog above all, is a finding.
+const ACCEPTED_LEFTOVERS: &[&str] = &[
+    "leftover: an old generation whose removal after a compaction was interrupted",
+    "leftover: a generation above CURRENT that open set aside instead of removing",
+];
+
+/// Whether every issue in a `sparkles check --format json` report is one of the
+/// `ACCEPTED_LEFTOVERS` warnings, and there is at least one. Each issue object names its
 /// status before its message.
 fn only_leftovers(json: &str) -> bool {
     let mut any = false;
@@ -464,7 +475,9 @@ fn only_leftovers(json: &str) -> bool {
         let status = json[..i]
             .rfind("\"status\": \"")
             .and_then(|j| json[j + 11..].split('"').next());
-        if status != Some("warning") || !json[i + 12..].starts_with("leftover:") {
+        let message = &json[i + 12..];
+        if status != Some("warning") || !ACCEPTED_LEFTOVERS.iter().any(|m| message.starts_with(m))
+        {
             return false;
         }
         any = true;
@@ -729,5 +742,41 @@ fn main() {
         "verify" => verify(&a),
         "replay" => replay(&a, cmd),
         _ => die(format!("unknown command {sub}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::only_leftovers;
+
+    fn report(issues: &[(&str, &str)]) -> String {
+        let mut s = String::from("{\n  \"status\": \"warning\",\n  \"checks\": [\n    {\n      \"issues\": [\n");
+        for (status, message) in issues {
+            s.push_str(&format!(
+                "        {{\n          \"status\": \"{status}\",\n          \"message\": \"{message}\"\n        }},\n"
+            ));
+        }
+        s.push_str("      ]\n    }\n  ]\n}\n");
+        s
+    }
+
+    #[test]
+    fn only_the_generation_leftovers_that_open_keeps_pass() {
+        let old = "leftover: an old generation whose removal after a compaction was interrupted; safe to remove";
+        let aside = "leftover: a generation above CURRENT that open set aside instead of removing; inspect it, then rename it back and point CURRENT at it, or delete it";
+        assert!(only_leftovers(&report(&[("warning", old)])));
+        assert!(only_leftovers(&report(&[("warning", old), ("warning", aside)])));
+        for other in [
+            "leftover: newer than CURRENT, which the next open removes if it is an unfinished rebuild and sets aside otherwise",
+            "leftover: a damaged commit catalog an earlier open set aside",
+            "leftover: a temporary file of an interrupted write, which the next open removes",
+            "leftover: left by an interrupted full-text rebuild; removed on open",
+            "leftover: left by an interrupted deletion; safe to remove",
+            "a torn tail",
+        ] {
+            assert!(!only_leftovers(&report(&[("warning", old), ("warning", other)])), "{other}");
+        }
+        assert!(!only_leftovers(&report(&[("error", old)])));
+        assert!(!only_leftovers("{}"));
     }
 }

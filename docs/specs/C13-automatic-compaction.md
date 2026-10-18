@@ -922,4 +922,102 @@ has a spec of its own yet. These are design sketches.
   commit. Open holds the dataset's exclusive lock, so no rebuild can be running then, and
   it could remove a generation newer than `CURRENT` as it removes `text.new` and
   `text.old`. The change needs a test for each path that writes generation directories,
-  such as compaction, bulk loads and restores.
+  such as compaction, bulk loads and restores. This one is built, and its outcome follows
+  the list.
+
+**Outcome of the leftover removal.** Since 2026-10-18 open settles every directory of the
+dataset root whose name is `gen-` followed by digits and whose number is above the
+generation `CURRENT` names, after it finishes interrupted collections and before it scans
+the generations for history. It deletes such a directory only when it is an unfinished
+build of this dataset. That is the case when its compaction marker is empty or names this
+dataset, when it has no marker and its `commit.json` is missing, empty or all zeros, or
+when its `commit.json` names this dataset and neither its base commit nor any commit in its
+log is past the head that open recovered. A power loss leaves the first two, since a
+rebuild writes the marker and `commit.json` without syncing them until the end, and the
+third when it strikes between `commit.json` and the switch of `CURRENT`. A missing
+`commit.json` counts only when the current generation had one before the open began,
+because generations of a dataset written before commit metadata have none. Open decides
+this before it records a baseline `commit.json` in such a current generation. The directory is renamed to
+`gen-N.deleting` and the root synced before its contents are deleted, and the next open
+finishes a removal that a crash interrupted. Earlier releases removed only a directory
+whose marker or `commit.json` named the dataset, and kept the rest until the next rebuild
+of that number deleted it.
+
+Any other directory above `CURRENT` may hold data that a wrong `CURRENT` hides, for
+example one restored from an older copy, or one with a damaged `commit.json` or a
+`commit.json` of another dataset. Open renames it to `gen-N.set-aside-<ms>`, syncs the root
+and logs a warning, and deletes nothing. The new name keeps it out of the way of the next
+rebuild, which takes the number again. `sparkles check` reports it until an operator
+renames it back and points `CURRENT` at it, or deletes it.
+
+A generation set aside costs disk space until an operator acts on it. A bulk build that
+a crash stopped after its `commit.json` but before the switch of `CURRENT` is always set
+aside, because its base commit is past the head that open recovered, and it is a full copy
+of the dataset's indexes. Set-aside directories count toward the dataset's byte quota, so
+one can make a later commit fail with a budget error, and `sparkles migrate` lists them
+among the generations. The store keeps them anyway, because deleting a generation that
+might hold the only copy of committed data is worse than the space it takes.
+
+A directory with generations but no `CURRENT` is no longer treated as a new database. Open
+refuses it with an error that names the generations and points to `sparkles check`, and
+writing the right name into `CURRENT` recovers it. When only set-aside generations remain,
+the error says to rename one back to its `gen-NNNN` name before writing that name into
+`CURRENT`. The one exception is a lone `gen-0001` without a log whose `meta.json` counts no
+quads, or which holds no file at all. That is what a creation that a crash interrupted
+before its `CURRENT` leaves, and open finishes that creation.
+
+The rule needs no marker for an unfinished build because open holds the dataset's
+exclusive lock, so no rebuild can be writing such a directory, and every path that
+publishes a generation inside an existing root switches `CURRENT` to it. Compaction and
+bulk commits build in the root. A restore, a clone and a new branch build a whole root
+elsewhere and rename or switch it into place, so they leave nothing above `CURRENT` in an
+existing root. Older generations, files with a generation's name, other names and
+`commits.bin.corrupt-*` stay, and nothing is touched when `CURRENT` does not name a
+numbered generation. Compaction still writes its build marker, so that an earlier release
+opening the dataset removes an interrupted build as before.
+
+Open also deletes `CURRENT.tmp`, `dataset.tmp`, `commits.tmp` and `annotations.tmp` when
+they are regular files. They are the copies that the store's atomic replacements of its
+own files write before the rename, under the writer lock, and the file each was to
+replace is intact whether or not the rename survived. A `log-writes` image showed a
+`CURRENT.tmp` that a power loss during a compaction's switch had left. Other `.tmp` files
+stay, because the reasoner and a server write settings files in the dataset directory
+without the store's lock, and a user may keep files there. `sparkles check` still reports
+every leftover, since it does not open the dataset.
+
+Tests in `store/compaction_tests.rs` cover a compaction interrupted at three points with an
+empty marker and `commit.json`, an interrupted bulk build, an empty directory and an
+interrupted removal, which open deletes, and another dataset's generation, a damaged
+`commit.json`, a marker of another dataset and a `CURRENT` restored older than the newest
+generation, which it sets aside with their data. Two more tests check that a copy of the
+current generation with a complete `commit.json` is deleted while one whose log goes past
+the head is set aside, and that a newer generation of a dataset without commit metadata is
+set aside. A further test removes `CURRENT` from a compacted dataset and checks that open
+refuses it, moves nothing, and opens it again once `CURRENT` is written back. It also
+checks that a lone `gen-0001` holding quads is refused, and that the error for set-aside
+generations alone asks for a rename first. After open, `scripts/crash-harness.rs` accepts only two
+leftovers, an old generation and a generation set aside, so a generation still above
+`CURRENT`, a `commits.bin.corrupt-*` file or any other leftover fails a crash run. The
+`test:bench-scripts` task of `mise run ci` runs the harness's own test of that rule.
+
+The `log-writes` replays of [X09](X09-group-commit-by-default.md) section 10.2 ran on
+`forge` on 2026-10-18 with group commit on, 1,000 crash images per file system, sixteen
+writers for 20 s and `--serve-flags "--auto-compact-min-quads 1000"`, so that each load
+crossed one automatic compaction. A first pair of runs with revision 759e52c2 failed one
+ext4 image of 1,000, where a power loss during the compaction's `CURRENT` switch had left
+`CURRENT.tmp`, and passed all 1,000 XFS images. The removal of `CURRENT.tmp` came from that
+image. With the source of revision d5a817a9 every image passed. Those builds removed every
+generation above `CURRENT`. The rule above replaced that removal after a review, and a
+third pair of runs with the source of revision 8ef44fca, which has it, passed every image.
+No image of that pair needed a generation set aside.
+
+| Run | Receipts | Marks | Log entries | Images | Failed |
+|---|---:|---:|---:|---:|---:|
+| ext4, 759e52c2 | 68,970 | 378 | 95,868 | 1,000 | 1 |
+| XFS, 759e52c2 | 57,717 | 368 | — | 1,000 | 0 |
+| ext4, d5a817a9 | 21,612 | 355 | 24,333 | 1,000 | 0 |
+| XFS, d5a817a9 | 33,427 | 358 | 28,593 | 1,000 | 0 |
+| ext4, 8ef44fca | 69,423 | 378 | 96,739 | 1,000 | 0 |
+| XFS, 8ef44fca | 42,562 | 364 | 37,341 | 1,000 | 0 |
+
+The log of the first XFS run was not kept, so its entry count is missing.
