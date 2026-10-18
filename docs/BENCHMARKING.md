@@ -249,7 +249,12 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   `results/inference.json` and the record get the wall time, the peak RSS, the number of
   derived triples, the reasoner's own estimate of its peak heap and its thread count from
   `sparkles infer --status`, and the SHA-256 of the sorted derived triples. The digest lets
-  two builds' closures be compared, and `DERIVED_DIGEST=0` skips the sort it needs.
+  two builds' closures be compared, and `DERIVED_DIGEST=0` skips the sort it needs. The
+  derived graph streams from `sparkles dump` through `sort` into one pass that counts and
+  hashes it, and the run stops when the count differs from the derived triples that
+  `infer` reported or the dump fails, with the dump's errors in `logs/`. No copy of the
+  derived graph is written, but `sort` spills temporary files into the workdir that take
+  about the size of the derived graph in N-Triples.
   `INFER_THREADS` sets `--threads`. A Sparkles build that does not report the peak heap gets
   `null` there, and its peak RSS still compares. Then the script dumps the data with the
   inferred triples of `--profile` (default `owl-rl`), and every engine loads that one file.
@@ -320,18 +325,23 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   `--usecase bi` runs the Business Intelligence use case instead of Explore. The Explore
   and Update mix is not run yet.
 
-* `scripts/bench-longwrite.sh` (`mise run bench:longwrite [data] [workdir]`) runs hours of
-  concurrent reads and writes against each engine of `scripts/bench.sh` in turn, with
+* `scripts/bench-longwrite.sh` (`mise run bench:longwrite [data] [workdir]`) runs an hour
+  or more of concurrent reads and writes against each engine of `scripts/bench.sh` in turn, with
   compaction under load. The data is a person count for `scripts/gen-data.py` (default
   1,000,000, which is 10.5M triples), an N-Triples file, or a directory of `.nt.zst` files
   such as a slice of `scripts/bench-billion.sh`, which is decompressed once. Every engine
-  loads the same file. Then, for one engine at a time, the script copies its store, serves
-  the copy and runs `scripts/bench-longwrite/longrun.py` against it for `--seconds`
-  (default four hours).
+  loads the same file. A workdir keeps the data it was made with and refuses other data.
+  Every engine then answers the readers' queries on its loaded store, and an engine whose
+  answers differ from the majority, or fail, is recorded as `wrong-answer` and not run,
+  unless `IGNORE_ANSWERS=1` is set. Then, for one engine at a time, the script copies its
+  store, serves the copy and runs `scripts/bench-longwrite/longrun.py` against it for
+  `--seconds` (default one hour). The published runs are one hour per engine on the 10.5M
+  store, and one four-hour run of Sparkles on the same store.
 
   ```sh
   mise run bench:longwrite 20000 target/lw-smoke --engines sparkles --seconds 120   # smoke
-  mise run bench:longwrite                                    # 10.5M, five engines, 4 h each
+  mise run bench:longwrite                                    # 10.5M, five engines, 1 h each
+  mise run bench:longwrite 1000000 target/lw-4h --engines sparkles --seconds 14400   # 4 h
   mise run bench:longwrite ~/.cache/sparkles-bench/billion/50m/data target/lw-dbpedia \
       --engines "sparkles qlever oxigraph"                    # the DBpedia 50M slice
   ```
@@ -344,28 +354,59 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   with a fixed seed, and deletes only while it holds more than 200,000 of them, so the data
   stays near its size while every commit leaves work for compaction. `--write-rate` paces
   the writers. Without it each writer sends its next request when the last one is
-  answered. Every request opens a new connection, as the rest of the harness does. The
-  load generator runs pinned to the last quarter of the CPUs (`CLIENT_CPUS`).
+  answered. Every request opens a new connection, as the rest of the harness does. After
+  an error a reader or writer waits 10 ms, doubling up to one second, before it tries
+  again. A writer keeps at most 100,000 triples whose writes failed as uncertain and counts
+  the rest as overflow. On a host with 4 or more CPUs the load generator runs pinned to the
+  last quarter of them (`CLIENT_CPUS`), and on a smaller host it is not pinned. The
+  generator runs in its own session under a time limit of the run plus 15 minutes, its
+  workers exit when it dies, and the script kills the session when it exits.
 
-  A monitor samples the server every 5 seconds: its RSS, the disk use of its store, the
-  write requests and flushes completed by the block device that holds the store, and for
+  A monitor samples the server every 5 seconds: its RSS, the disk space allocated to its
+  store, the write requests completed by the block device that holds the store, the
+  flushes completed by the whole disks under that device, and for
   Sparkles the `compaction` object of `/$/stats/bench`, whose `last` entry gives each
   compaction's start, kind, duration and writer lock time. `results/longwrite.json` gets one
   entry per minute with the committed writes and triples, the write and read p50 and p99,
   the errors and timeouts, the RSS, the disk use, the device counters and whether a
-  compaction ran. The device counters separate the durability classes of X06 §5.1, since an
-  engine that synchronizes each commit makes at least one device write per commit. The
-  kernel counts a journal commit with a flush flag as a write, so the flush count alone
-  does not show it.
+  compaction ran. The disk space is read by a separate thread every 60 seconds
+  (`--disk-every`), because `du` over a large store can take longer than a sample. The
+  device counters separate the durability classes of X06 §5.1. An engine that synchronizes
+  each commit makes at least one device write per commit, made durable either by a flush
+  or by a write with forced unit access, which the kernel does not count as a flush.
+  Sparkles writes its log with `O_DIRECT` and `O_DSYNC`, so in a one-minute smoke run it
+  made 1.6 device writes but only 0.03 disk flushes per commit. The summary therefore
+  shows both per write request, and the flushes alone do not decide the class. The kernel
+  counts flushes only on whole disks, not on partitions or device-mapper nodes, so the
+  monitor follows the store's device down to its disks through `/sys/block`. On the
+  development machine 500 `fdatasync` calls on an LVM volume gave 500 flushes on the NVMe
+  disk and none on the volume. The summary gives the median of the per-minute values from the second minute on,
+  since the first minute starts on a cold read set.
 
   After the run the script compares the engine's `lwValue` triples with the state the
-  writers were told about. A write that failed leaves its triples uncertain, and the check
-  accepts them either way. Then it restarts the server, records the time to its first
-  answer, and checks again. Sparkles runs with automatic compaction at its defaults. TDB2
-  is not compacted, because its compaction needs the server stopped or an administrative
-  request, so its disk growth is reported instead. QLever keeps updates in memory, and its
-  check after the restart fails by design. `results/summary.md` has one row per engine,
-  and `results/record.json` one `longrun` result for the writes and one for the reads.
+  writers were told about, reading SPARQL JSON results. A write that failed leaves its
+  triples uncertain, and the check accepts them either way. A value that is not the plain
+  or `xsd:string` literal the writer sent counts as extra. Then the script kills the server
+  with SIGKILL, starts it again, which replays the engine's log, and checks again. Last, it
+  stops the server normally, starts it, records the time from the start to the first
+  answered query, and checks a third time. A server that does not start is recorded as a
+  failed check and the run goes on to the next engine. Sparkles runs with automatic
+  compaction at its defaults. TDB2 is not compacted, because its compaction needs the
+  server stopped or an administrative request, so its disk growth is reported instead.
+  QLever keeps updates in memory, and its checks after the restarts fail by design. In a
+  one-minute smoke run on 210,000 triples with two writers, QLever's RSS reached 27 GiB
+  after about 2,300 write requests and the kernel killed it, so a long run sets
+  `SERVER_MEM_MAX` to keep an engine that outgrows its limit from taking the host down,
+  and such an engine gets the status `error`. The servers' logs are copied to `logs/`
+  before each store copy is removed.
+
+  Each engine gets a status. It is `error` when the state check failed or could not decide,
+  when no write succeeded, when more than 1% of the reads or writes failed, when the server
+  went away during the run, or when a `synced` or `written` engine lost acknowledged writes
+  after the SIGKILL or the restart. It is `wrong-answer` when the engine was not run because
+  of its answers, and `ok` otherwise. `results/summary.md` has one row per engine with the
+  status and the checks, and `results/record.json` one `longrun` result for the writes and
+  one for the reads.
 
 * `scripts/bench-record.py` writes and checks the common result record that the standard
   suites produce, and `scripts/bench-regressions.py compare` compares records.
@@ -373,8 +414,10 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   count with the samples in milliseconds, the median, the p95, the answer fingerprint and
   whether it agrees with the majority, a status (`ok`, `timeout`, `error`, `oom` or
   `wrong-answer`), and for write results the durability class. A long write run has the
-  mode `longrun`, its samples are the per-minute medians, and its write result carries the
-  per-minute series, the compactions and the state checks. `results/manifest.json` next
+  mode `longrun`, which needs record version 2, its samples are the per-minute medians
+  from the second minute on, and its write result carries the per-minute series, the
+  compactions, the state checks and the reasons for its status. `compare` refuses a record
+  whose version it does not know. `results/manifest.json` next
   to it records the commit of the checkout that holds the scripts, the Sparkles binary's
   checksum and, when the caller sets `SPARKLES_COMMIT`, the commit it was built from, each
   engine's version, binary checksum and license (with the store path for an engine from

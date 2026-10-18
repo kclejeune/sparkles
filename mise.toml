@@ -796,12 +796,12 @@ scripts/bench-owl2bench.sh "$usage_universities" "$(realpath -m "$usage_workdir"
 '''
 
 [tasks."bench:longwrite"]
-description = "Sustained writes with compaction: hours of concurrent readers and writers on each engine of bench in turn, with a per-minute series, Sparkles' compactions, and state checks before and after a restart"
+description = "Sustained writes with compaction: an hour or more of concurrent readers and writers on each engine of bench in turn, with a per-minute series, Sparkles' compactions, and state checks after the run, a SIGKILL and a restart"
 depends = ["build"]
 usage = '''
 arg "[data]" default="1000000" help="a person count for gen-data.py (1000000 is 10.5M triples), an N-Triples file, or a directory of .nt.zst files"
 arg "[workdir]" default="target/bench-longwrite" help="data, indexes, store copies and results/ (summary.md, longwrite.json, record.json)"
-flag "--seconds <n>" default="14400" help="length of each engine's run"
+flag "--seconds <n>" default="3600" help="length of each engine's run"
 flag "--readers <n>" default="16" help="reader processes"
 flag "--writers <n>" default="1" help="writer processes"
 flag "--write-rate <n>" default="0" help="write requests per second in all (0: as fast as the engine answers)"
