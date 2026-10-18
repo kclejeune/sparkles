@@ -2,9 +2,12 @@
 //! ([X08](../../../docs/specs/X08-disk-spill-and-server-memory.md) §6).
 //!
 //! A [`Spill`] owns one directory per process under the configured spill directory,
-//! named `<boot-id>-<pid>-<random>` and created with mode 0700. It holds a marker file,
-//! [`MARKER`], that names the format and the process's start, and the process keeps an
-//! exclusive `flock` on the marker for its life. Spill files are opened with `O_TMPFILE`
+//! named `<boot-id>-<pid>-<random>` and created with mode 0700. The spill directory itself
+//! must belong to the server's user and be writable by no one else, and it is created
+//! with mode 0700 when it does not exist. The process directory holds a marker file,
+//! [`MARKER`], that names the format and the process's start. The process locks the
+//! marker with an exclusive `flock` before it writes the format into it and keeps the
+//! lock for its life. Spill files are opened with `O_TMPFILE`
 //! where the file system supports it, so they have no name and the kernel frees them
 //! when they are closed or the process dies. Elsewhere a file is created as
 //! `q<query>-<n>.spl` and unlinked at once. A file belongs to the operator that wrote
@@ -15,9 +18,11 @@
 //! `*.spl` files. Anything else stays, with a warning.
 //!
 //! Disk is reserved before it is written. A query takes 64 MiB extents from the server's
-//! reservation as its files grow, up to its own limit, and the server keeps the
-//! configured free space on the spill file system. A refused reservation, `ENOSPC` or
-//! another I/O error fails the query with the budget kind `spill`.
+//! reservation as its files grow, up to its own limit, and gives back the extents its
+//! open files no longer need whenever a file closes. The server keeps the configured
+//! free space on the spill file system. A refused reservation, or a write that fails
+//! with `ENOSPC`, `EDQUOT` or `EFBIG`, fails the query with the budget kind `spill`.
+//! Another I/O error fails it with that error.
 //!
 //! The file format is private to one process, but it is versioned like every on-disk
 //! format: a 32-byte header holds the magic `SPKSPL01`, the format version, the kind of
@@ -82,7 +87,8 @@ impl SpillKind {
 /// Where spill files go and how much disk they may take.
 #[derive(Clone, Debug)]
 pub struct SpillOptions {
-    /// The directory of the process directories. It must be on a local file system.
+    /// The directory of the process directories. It must be on a local file system,
+    /// belong to the server's user and be writable by no other user.
     pub dir: PathBuf,
     /// The disk all queries together may reserve.
     pub max_bytes: u64,
@@ -118,6 +124,8 @@ pub struct Spill {
     written: AtomicU64,
     spilled_queries: AtomicU64,
     fault: Mutex<Option<(Fault, u64)>>,
+    /// Whether a fault is injected, read before `fault` is locked.
+    faults: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Spill {
@@ -135,6 +143,23 @@ fn io(error: std::io::Error, what: &str) -> Error {
         error.kind(),
         format!("spill {what}: {error}"),
     ))
+}
+
+/// The failure of a write to a spill file: the `spill` budget when the file system has
+/// no room for it (`ENOSPC`, `EDQUOT` or `EFBIG`), and an I/O error otherwise.
+fn written(error: std::io::Error, limit: u64, bytes: u64) -> Error {
+    #[cfg(unix)]
+    let full = matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) | Some(libc::EFBIG)
+    );
+    #[cfg(not(unix))]
+    let full = error.kind() == std::io::ErrorKind::StorageFull;
+    if full {
+        refused(limit, bytes)
+    } else {
+        io(error, "write")
+    }
 }
 
 /// The failure of a refused disk reservation.
@@ -195,6 +220,43 @@ fn free_bytes(_dir: &Path) -> Option<u64> {
     None
 }
 
+/// Create the spill directory `dir` with mode 0700 where it does not exist, and check
+/// that it is a directory this process's user owns and that no other user may write,
+/// so that no one else can place or swap entries in it. A symbolic link is resolved
+/// once here, and the directory it leads to must pass the same checks.
+fn private_root(dir: &Path) -> Result<PathBuf> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir).map_err(|e| io(e, "directory"))?;
+    let root = dir.canonicalize().map_err(|e| io(e, "directory"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&root).map_err(|e| io(e, "directory"))?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        if !meta.is_dir() || meta.uid() != uid {
+            return Err(Error::invalid(format!(
+                "the spill directory {} must be a directory owned by user {uid}",
+                root.display()
+            )));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(Error::invalid(format!(
+                "the spill directory {} must not be writable by other users (mode {:o})",
+                root.display(),
+                meta.mode() & 0o7777
+            )));
+        }
+    }
+    Ok(root)
+}
+
 impl Spill {
     /// Create this process's directory under `options.dir`, after removing the
     /// directories that dead processes left there.
@@ -204,11 +266,11 @@ impl Spill {
                 "disk spill needs a Unix file system".into(),
             ));
         }
-        std::fs::create_dir_all(&options.dir).map_err(|e| io(e, "directory"))?;
-        sweep(&options.dir);
+        let root = private_root(&options.dir)?;
+        sweep(&root);
         let random: u64 = rand::random();
         let name = format!("{}-{}-{random:016x}", boot_id(), std::process::id());
-        let dir = options.dir.join(name);
+        let dir = root.join(name);
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -218,25 +280,38 @@ impl Spill {
         builder
             .create(&dir)
             .map_err(|e| io(e, "process directory"))?;
-        let marker_path = dir.join(MARKER);
-        let started = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        std::fs::write(
-            &marker_path,
-            format!(
-                "{FORMAT_NAME} {FORMAT_VERSION}\nstarted {started}\npid {}\n",
-                std::process::id()
-            ),
-        )
-        .map_err(|e| io(e, "marker"))?;
-        let marker = File::open(&marker_path).map_err(|e| io(e, "marker"))?;
+        // The marker is locked before it names the format, so that a sweep by another
+        // process starting at the same time never takes this directory for a dead one.
+        let mut marker = {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(dir.join(MARKER))
+                .map_err(|e| io(e, "marker"))?
+        };
         if !try_lock(&marker) {
             return Err(Error::invalid(format!(
                 "could not lock the spill marker in {}",
                 dir.display()
             )));
         }
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        std::io::Write::write_all(
+            &mut marker,
+            format!(
+                "{FORMAT_NAME} {FORMAT_VERSION}\nstarted {started}\npid {}\n",
+                std::process::id()
+            )
+            .as_bytes(),
+        )
+        .map_err(|e| io(e, "marker"))?;
         Ok(Arc::new(Spill {
             dir,
             _marker: marker,
@@ -249,6 +324,7 @@ impl Spill {
             written: AtomicU64::new(0),
             spilled_queries: AtomicU64::new(0),
             fault: Mutex::new(None),
+            faults: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -292,9 +368,13 @@ impl Spill {
     #[doc(hidden)]
     pub fn inject_fault(&self, fault: Fault, after: u64) {
         *self.fault.lock() = Some((fault, after));
+        self.faults.store(true, Ordering::Release);
     }
 
     fn faulted(&self, op: Fault) -> bool {
+        if !self.faults.load(Ordering::Acquire) {
+            return false;
+        }
         let mut fault = self.fault.lock();
         match &mut *fault {
             Some((kind, n)) if *kind == op => {
@@ -501,9 +581,17 @@ impl QuerySpill {
         Ok(())
     }
 
+    /// Free `bytes` of the query's files, and give the server back the extents the
+    /// files still open no longer need.
     fn release(&self, bytes: u64) {
         let mut state = self.state.lock();
         state.used = state.used.saturating_sub(bytes);
+        let needed = state.used.div_ceil(EXTENT) * EXTENT;
+        if state.reserved > needed {
+            let spare = state.reserved - needed;
+            state.reserved = needed;
+            self.spill.reserved.fetch_sub(spare, Ordering::AcqRel);
+        }
     }
 
     /// Start a spill file of `columns` columns.
@@ -584,13 +672,8 @@ impl SpillWriter {
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         use std::io::Write;
         let file = self.file.as_mut().expect("an open spill file");
-        file.write_all(bytes).map_err(|e| {
-            if e.raw_os_error() == Some(28) {
-                refused(self.query.limit, self.bytes)
-            } else {
-                io(e, "write")
-            }
-        })
+        file.write_all(bytes)
+            .map_err(|e| written(e, self.query.limit, self.bytes))
     }
 
     /// The rows written so far.
@@ -1047,5 +1130,97 @@ mod tests {
             "0".repeat(32),
             "f".repeat(16)
         )));
+    }
+
+    #[test]
+    fn a_query_returns_extents_once_its_files_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = spill(dir.path(), 1 << 30, 1 << 30);
+        let query = Arc::new(spill.query(None));
+        let column = ids(4096, 1 << 50);
+        let mut writer = query.create(SpillKind::SortRun, 1).unwrap();
+        writer.write(&[&column], 4096).unwrap();
+        let run = writer.finish().unwrap();
+        assert_eq!(spill.reserved_bytes(), EXTENT);
+        drop(run);
+        // The query is still running, but holds no file.
+        assert_eq!(spill.reserved_bytes(), 0);
+        let mut writer = query.create(SpillKind::SortRun, 1).unwrap();
+        writer.write(&[&column], 4096).unwrap();
+        assert_eq!(spill.reserved_bytes(), EXTENT);
+        drop(writer);
+        assert_eq!(spill.reserved_bytes(), 0);
+        drop(query);
+        assert_eq!(spill.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn a_full_disk_or_quota_fails_with_the_spill_budget() {
+        for errno in [libc::ENOSPC, libc::EDQUOT, libc::EFBIG] {
+            let error = written(std::io::Error::from_raw_os_error(errno), 64, 32);
+            assert!(
+                matches!(&error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Spill),
+                "{errno}: {error}"
+            );
+        }
+        let error = written(std::io::Error::from_raw_os_error(libc::EIO), 64, 32);
+        assert!(matches!(error, Error::Io(_)), "{error}");
+    }
+
+    #[test]
+    fn the_spill_root_must_be_private_to_the_server() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let open = |root: &Path| {
+            Spill::open(&SpillOptions {
+                dir: root.to_path_buf(),
+                max_bytes: 1 << 30,
+                query_bytes: 1 << 30,
+                min_free_bytes: 0,
+            })
+        };
+        let error = open(&shared).unwrap_err();
+        assert!(error.to_string().contains("writable"), "{error}");
+        // A root it creates is private.
+        let private = dir.path().join("private");
+        drop(open(&private).unwrap());
+        let mode = std::fs::metadata(&private).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A link to a private directory opens that directory.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+        assert!(open(&link).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        let spill = open(&link).unwrap();
+        assert!(spill.dir().starts_with(private.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn processes_starting_together_never_sweep_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..400 {
+                        let spill = spill(&root, 1 << 30, 1 << 30);
+                        let query = Arc::new(spill.query(None));
+                        let mut writer = query.create(SpillKind::SortRun, 1).unwrap();
+                        writer.write(&[&ids(10, 1)], 10).unwrap();
+                        drop(writer.finish().unwrap());
+                        assert!(spill.dir().join(MARKER).exists());
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 }
