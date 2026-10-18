@@ -14,10 +14,10 @@
 //!
 //! `keep` measures the closure kept for incremental runs, as a server keeps it: a full
 //! run, a run without changes that keeps the closure in memory, the heap the closure
-//! holds, then an incremental run with the kept closure after a change that removes `K`
-//! triples of the first university and adds `K` new ones, and one that reads the closure
-//! back from the dataset after the change is undone. The dataset is changed, so it
-//! should be a fresh copy.
+//! holds, then incremental runs with the kept closure after a change that removes `K`
+//! triples of the first university and adds `K` new ones, after it is undone and after it
+//! is made again, and one that reads the closure back from the dataset after the change
+//! is undone once more. The dataset is changed, so it should be a fresh copy.
 
 use oxrdf::{GraphName, NamedNode, Quad, Triple};
 use sparkles_core::io::Source;
@@ -291,10 +291,20 @@ fn main() {
             let (r, peak) = run(Some(since), Some(&cache));
             line("change", &r, peak);
             since = r.receipt.unwrap().commit.seq;
+            // the same changes again, undone and redone, with the kept closure and the
+            // blocks the first change read
+            change(&store, &del, &add);
+            let (r, peak) = run(Some(since), Some(&cache));
+            line("revert", &r, peak);
+            since = r.receipt.unwrap().commit.seq;
+            change(&store, &add, &del);
+            let (r, peak) = run(Some(since), Some(&cache));
+            line("change-again", &r, peak);
+            since = r.receipt.unwrap().commit.seq;
             cache.clear();
             change(&store, &del, &add);
             let (r, peak) = run(Some(since), None);
-            line("revert", &r, peak);
+            line("revert-from-store", &r, peak);
             println!(
                 "keep {} threads={threads} vm_hwm={}",
                 profile.name(),
