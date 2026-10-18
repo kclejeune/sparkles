@@ -33,7 +33,7 @@ file that does not conform.
 
 Record 1 (every field is required unless marked optional):
 
-    record      1 or 2 (2 when a result has the mode longrun); other versions are refused
+    record      2 for every new record (1 is still read, without the mode longrun); other versions are refused
     suite       string, for example "bsbm-explore"
     scale       string, for example "10m"
     manifest    object (see `manifest`)
@@ -71,7 +71,8 @@ import statistics
 import subprocess
 import sys
 
-# 2 added the mode `longrun` and its fields; 1 is read as before (docs/specs/X06 section 7)
+# Every new record is version 2, which added the mode `longrun` and its fields, so a checkout
+# that knows only version 1 refuses it. Version 1 records are still read (docs/specs/X06 section 7).
 RECORD = 2
 KNOWN_RECORDS = (1, 2)
 ENGINE_NAMES = {"jena-fuseki": "jena", "jena-tdb2": "jena"}
@@ -382,9 +383,10 @@ def longrun_results(lw):
             }
             if kind == "write":
                 r.update({k: v.get(k) for k in ("series", "compactions", "compaction_counters", "check",
-                                                 "check_crash", "check_reopen", "restart_s", "device",
-                                                 "flush_disks", "device_writes", "device_flushes", "totals",
-                                                 "settings", "stopped_early")})
+                                                 "check_crash", "check_reopen", "restart_s", "crash_restart_s",
+                                                 "device", "flush_disks", "device_writes", "device_flushes",
+                                                 "device_seconds", "device_baseline", "device_writes_net",
+                                                 "device_flushes_net", "totals", "settings", "stopped_early")})
             out.append(r)
     return out
 

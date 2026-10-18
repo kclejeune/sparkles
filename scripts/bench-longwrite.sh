@@ -13,7 +13,7 @@
 # refuses other data. Every engine loads the same file, as in scripts/bench.sh. Then every
 # engine answers the read set on its loaded store, one at a time, and the answers are
 # compared: an engine whose answers differ from the majority is not run and is recorded as
-# wrong-answer, unless IGNORE_ANSWERS=1. Then, one engine at a time:
+# wrong-answer, and one that fails a query is recorded as error, unless IGNORE_ANSWERS=1. Then, one engine at a time:
 #
 # 1. its loaded store is copied (reflinks where the file system has them) and served;
 # 2. scripts/bench-longwrite/longrun.py runs READERS readers (default 16) and WRITERS writers
@@ -142,7 +142,7 @@ resolve_tools
 GENPID=""
 # the servers, and the load generator's whole session
 cleanup() {
-  [ -n "$GENPID" ] && kill -KILL -- "-$GENPID" 2> /dev/null
+  [ -n "$GENPID" ] && { kill -KILL -- "-$GENPID" 2> /dev/null || true; }
   stop_all
 }
 trap cleanup EXIT
@@ -168,9 +168,11 @@ for e in $all; do
   stop "$e"
 done
 ENGINES=$all
-# the engines whose answers differ from the majority, or that failed, by the agreement rule of
-# the record (scripts/bench-record.py fingerprints)
-mapfile -t WRONG < <(
+# By the agreement rule of the record (scripts/bench-record.py fingerprints), one line per
+# engine that failed a query of the read set ("error <engine> <query>") or whose answer
+# differs from the majority ("wrong <engine> <query>"), and one per query on which two or
+# more engines disagree with no majority ("nomajority <query>"), which needs three engines.
+verdicts=$(
   python3 -I - "$ROOT/scripts/bench-record.py" "$RES/answers.json" << 'EOF'
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("bench_record", sys.argv[1])
@@ -179,12 +181,29 @@ spec.loader.exec_module(br)
 with open(sys.argv[2]) as f:
     ans = json.load(f)
 fp = br.fingerprints(ans)
-wrong = {e for q, per in ans.items() for e in per
-         if fp.get((q, br.engine_name(e))) is None or fp[q, br.engine_name(e)]["agrees"] is False}
-print("\n".join(sorted(wrong)))
+for q, per in sorted(ans.items()):
+    hashes = set()
+    for e in sorted(per):
+        v = fp.get((q, br.engine_name(e)))
+        if v is None:
+            print("error", e, q)
+        else:
+            hashes.add(v["hash"])
+            if v["agrees"] is False:
+                print("wrong", e, q)
+    if len(hashes) > 1 and all((fp.get((q, br.engine_name(e))) or {}).get("agrees") is None for e in per):
+        print("nomajority", q)
 EOF
-)
-[ ${#WRONG[@]} -gt 0 ] && log "answers of the read set differ from the majority or failed: ${WRONG[*]}"
+) || die "could not compare the answers of the read set"
+declare -A VERDICT=()
+while read -r kind a b; do
+  case $kind in
+    error) [ -n "${VERDICT[$a]:-}" ] || VERDICT[$a]="error:failed $b" ;;
+    wrong) VERDICT[$a]="wrong-answer:differs from the majority on $b" ;;
+    nomajority) log "the engines disagree on $a with no majority; every engine runs" ;;
+  esac
+done <<< "$verdicts"
+for k in "${!VERDICT[@]}"; do log "$k: ${VERDICT[$k]#*:} of the read set"; done
 
 # --------------------------------------------------------------------------- the runs
 # check <engine> <run file>: the state check's JSON, or a failure object
@@ -218,9 +237,10 @@ fail_json() { echo "{\"ok\": false, \"error\": \"$1\"}"; }
 
 STORE=$WORK/scratch
 for e in $all; do
-  if [[ " ${WRONG[*]} " == *" ${NAME[$e]} "* ]] && [ -z "${IGNORE_ANSWERS:-}" ]; then
-    log "$e: not run, its answers to the read set differ from the majority"
-    python3 "$LW" merge --into "$RES/longwrite.json" --engine "$e" --answers wrong-answer
+  v=${VERDICT[${NAME[$e]}]:-}
+  if [ -n "$v" ] && [ -z "${IGNORE_ANSWERS:-}" ]; then
+    log "$e: not run, it ${v#*:} of the read set"
+    python3 "$LW" merge --into "$RES/longwrite.json" --engine "$e" --answers "${v%%:*}" --answers-reason "${v#*:}"
     continue
   fi
   ENGINES=$e
@@ -237,7 +257,7 @@ for e in $all; do
   setsid timeout -k 30 $((SECONDS_RUN + 900)) "${GEN[@]}" python3 "$LW" run --query-url "${URL[$e]}" \
     --update-url "${UPDURL[$e]}" "${fields[@]}" --queries queries --names "${NAMES[*]}" --seconds "$SECONDS_RUN" \
     --readers "${READERS:-16}" --writers "${WRITERS:-1}" --batch "${BATCH:-100}" --live-max "${LIVE_MAX:-200000}" \
-    --write-rate "${WRITE_RATE:-0}" --seed "${SEED:-20261018}" --sample "${SAMPLE:-5}" --port "${PORT[$e]}" \
+    --write-rate "${WRITE_RATE:-0}" --baseline "${BASELINE:-60}" --seed "${SEED:-20261018}" --sample "${SAMPLE:-5}" --port "${PORT[$e]}" \
     --store "$(store_of "$e")" "${comp[@]}" --read-timeout "$MAX_TIME" --out "$out" > "logs/longwrite-$e.log" 2>&1 &
   GENPID=$!
   wait "$GENPID" || log "$e: the load generator failed, see logs/longwrite-$e.log"
@@ -247,7 +267,7 @@ for e in $all; do
   log "$e: state check $c1"
   # a crash: the recovery of the engine's log
   pid=$(pid_on "${PORT[$e]}")
-  [ -n "$pid" ] && kill -KILL "$pid" 2> /dev/null
+  [ -n "$pid" ] && { kill -KILL "$pid" 2> /dev/null || true; }
   stop "$e"
   if restart "$e"; then
     c2=$(check "$e" "$out")
@@ -266,7 +286,7 @@ for e in $all; do
   log "$e: after a restart, ready in ${RESTART_S:-?} s, state check $c3"
   stop "$e"
   python3 "$LW" merge --into "$RES/longwrite.json" --engine "$e" --run "$out" --check "$c1" --check-crash "$c2" \
-    --check-reopen "$c3" --restart-s "${RESTART_S:-}"
+    --check-reopen "$c3" --restart-s "${RESTART_S:-}" --crash-restart-s "$s2"
   # the servers' logs outlive the store copy
   while IFS= read -r -d '' f; do cp "$f" "logs/$e-$(basename "$f")"; done < <(find "$STORE" -maxdepth 3 -name '*.log' -print0)
   [ -n "${KEEP_SCRATCH:-}" ] || rm -rf "$STORE"

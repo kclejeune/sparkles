@@ -419,6 +419,18 @@ def cmd_run(a):
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     stop = CTX.Event()
     q = CTX.Queue()
+    dev = block_device(a.store) if a.store else None
+    disks = whole_disks(dev) if dev else []
+    # The device and its disks carry every process's I/O, so their rate with the server idle
+    # is measured first and subtracted from the run's counts (device_*_net).
+    baseline = None
+    if a.baseline > 0 and dev:
+        b0, tb0 = devstats(dev, disks), time.time()
+        time.sleep(a.baseline)
+        b1, tb1 = devstats(dev, disks), time.time()
+        if b0 and b1:
+            baseline = {"seconds": round(tb1 - tb0, 1), "device_writes": delta(b1[0], b0[0]),
+                        "device_flushes": delta(b1[1], b0[1])}
     t0 = time.time() + 3  # time for the workers to start
     me = os.getpid()
     states = [f"{a.out}.writer-{w}.json" for w in range(a.writers)]
@@ -436,9 +448,7 @@ def cmd_run(a):
         p.start()
     minutes = collections.defaultdict(lambda: {"read": [[], 0, 0, 0], "write": [[], 0, 0, 0], "samples": []})
     events, seen_last = [], None
-    dev = block_device(a.store) if a.store else None
-    disks = whole_disks(dev) if dev else []
-    f0 = devstats(dev, disks)
+    f0, tf0 = devstats(dev, disks), time.time()
     first_compaction = last_compaction = None
     du = DiskSampler(a.store, a.disk_every) if a.store else None
     if du:
@@ -498,7 +508,17 @@ def cmd_run(a):
     drain()
     if du:
         du.halt.set()
-    f_end = devstats(dev, disks)
+    f_end, tf_end = devstats(dev, disks), time.time()
+
+    def net(i):
+        # the run's count less the idle rate over the same time, or None
+        if not (f0 and f_end and baseline) or delta(f_end[i], f0[i]) is None:
+            return None
+        idle = baseline["device_writes" if i == 0 else "device_flushes"]
+        if idle is None or not baseline["seconds"]:
+            return None
+        return round(delta(f_end[i], f0[i]) - idle / baseline["seconds"] * (tf_end - tf0), 1)
+
     series = []
     prev_dev = f0
     for m in sorted(minutes):
@@ -541,6 +561,10 @@ def cmd_run(a):
         "device": dev, "flush_disks": disks,
         "device_writes": delta(f_end[0], f0[0]) if f0 and f_end else None,
         "device_flushes": delta(f_end[1], f0[1]) if f0 and f_end else None,
+        "device_seconds": round(tf_end - tf0, 1),
+        "device_baseline": baseline,
+        "device_writes_net": net(0),
+        "device_flushes_net": net(1),
         "totals": {
             "writes": sum(s["writes"] for s in series), "triples_written": sum(s["triples_written"] for s in series),
             "write_errors": sum(s["write_errors"] + s["write_timeouts"] for s in series),
@@ -562,7 +586,8 @@ def cmd_run(a):
     print(json.dumps({"writes": t["writes"], "triples": t["triples_written"], "reads": t["reads"],
                       "write_errors": t["write_errors"], "read_errors": t["read_errors"] + t["read_timeouts"],
                       "compactions": len(events), "device_writes": out["device_writes"],
-                      "disk_flushes": out["device_flushes"], "stopped_early": stopped["reason"]}))
+                      "disk_flushes": out["device_flushes"], "device_writes_net": out["device_writes_net"],
+                      "disk_flushes_net": out["device_flushes_net"], "stopped_early": stopped["reason"]}))
 
 
 def cmd_check(a):
@@ -654,10 +679,12 @@ def cmd_merge(a):
         return json.loads(x) if x and x != "null" else None
 
     r.update({"durability": dur.get(a.engine), "check": load(a.check), "check_crash": load(a.check_crash),
-              "check_reopen": load(a.check_reopen), "restart_s": float(a.restart_s) if a.restart_s else None})
+              "check_reopen": load(a.check_reopen), "restart_s": float(a.restart_s) if a.restart_s else None,
+              "crash_restart_s": float(a.crash_restart_s) if a.crash_restart_s else None})
     r["status"], r["status_reasons"] = run_status(r)
-    if a.answers == "wrong-answer":
-        r["status"], r["status_reasons"] = "wrong-answer", ["the read set's answers differ from the majority"]
+    if a.answers in ("wrong-answer", "error"):
+        why = a.answers_reason or ("differs from the majority" if a.answers == "wrong-answer" else "failed a query")
+        r["status"], r["status_reasons"] = a.answers, [f"not run: it {why} of the read set"]
     d[a.engine] = r
     with open(a.into, "w") as f:
         json.dump(d, f, indent=1)
@@ -676,11 +703,16 @@ def check_text(c):
     return f"failed ({c.get('error', 'unknown')})"
 
 
+def opt(x):
+    return "" if x is None else x
+
+
 def cmd_summary(a):
     print("| Engine | Durability | Status | Writes/s | Triples/s | Write p50 / p99 (ms) | Reads/s "
           "| Read p50 / p99 (ms) | Failed requests (w / r) | RSS end / max (MiB) | Disk start / end (MiB) "
-          "| Device writes / disk flushes per write | Compactions | State | After SIGKILL | After restart | Restart (s) |")
-    print("|---|---|---|---:|---:|---|---:|---|---|---|---|---:|---:|---|---|---|---:|")
+          "| Device writes / disk flushes per write, net of idle | Compactions | State | After SIGKILL "
+          "| After restart | Recovery after SIGKILL (s) | Restart (s) |")
+    print("|---|---|---|---:|---:|---|---:|---|---|---|---|---:|---:|---|---|---|---:|---:|")
     for path in a.files:
         with open(path) as f:
             d = json.load(f)
@@ -699,7 +731,7 @@ def cmd_summary(a):
             def per_write(k):
                 return f"{v[k] / t['writes']:.2f}" if v.get(k) is not None and t["writes"] else "?"
 
-            fpw = f"{per_write('device_writes')} / {per_write('device_flushes')}"
+            fpw = f"{per_write('device_writes_net')} / {per_write('device_flushes_net')}"
             runs = (v.get("compaction_counters") or {}).get("automaticRuns")
             print(f"| {e} | {v.get('durability') or ''} | {v.get('status', '')} | {t['writes'] / secs:.1f} "
                   f"| {t['triples_written'] / secs:.1f} | {med('write_p50_ms')} / {med('write_p99_ms')} "
@@ -708,16 +740,18 @@ def cmd_summary(a):
                   f"| {rss[-1] if rss else ''} / {max(rmax) if rmax else ''} "
                   f"| {disk[0] if disk else ''} / {disk[-1] if disk else ''} | {fpw} | {'' if runs is None else runs} "
                   f"| {check_text(v.get('check'))} | {check_text(v.get('check_crash'))} "
-                  f"| {check_text(v.get('check_reopen'))} | {v.get('restart_s', '')} |")
+                  f"| {check_text(v.get('check_reopen'))} | {opt(v.get('crash_restart_s'))} "
+                  f"| {opt(v.get('restart_s'))} |")
     print("\nThe percentiles are the medians of the per-minute values from the second minute on, over "
           "successful requests; failed requests are counted apart. Disk use is the allocated bytes of the "
           "store. Device writes are those of the device that holds the store and disk flushes those of the "
-          "whole disks under it, during the run and divided by the committed write requests, and other "
-          "processes' I/O on them counts too. A write with forced unit access, such as an O_DSYNC write, "
-          "is durable without a flush, so a synced engine shows at least one device write per commit but "
-          "not always a flush. The state is "
+          "whole disks under it, during the run, less the rate measured with the server idle before the "
+          "run, divided by the committed write requests. A write with forced unit access, such as an "
+          "O_DIRECT and O_DSYNC write, is durable without a flush, and group commit lets several writers "
+          "share one write, so the ratios show the class only with one writer. The state is "
           "checked at the end of the run, after the server was killed with SIGKILL and started again, and "
-          "after a normal stop and start. Restart is the time from a start to the first answered query.")
+          "after a normal stop and start. Recovery and restart are the times from a start to the first "
+          "answered query, after the SIGKILL and after the normal stop.")
 
 
 def main():
@@ -740,6 +774,8 @@ def main():
     r.add_argument("--read-timeout", type=float, default=60.0)
     r.add_argument("--write-timeout", type=float, default=120.0)
     r.add_argument("--sample", type=float, default=5.0, help="seconds between monitor samples")
+    r.add_argument("--baseline", type=float, default=0.0,
+                   help="seconds of idle device counts before the run, subtracted from the run's")
     r.add_argument("--disk-every", type=float, default=60.0, help="seconds between measurements of the store's size")
     r.add_argument("--port", type=int, default=0, help="the server's port, for its RSS and liveness")
     r.add_argument("--store", default="", help="the server's store, for disk use and device counters")
@@ -759,8 +795,10 @@ def main():
     m.add_argument("--check", default="")
     m.add_argument("--check-crash", default="")
     m.add_argument("--check-reopen", default="")
-    m.add_argument("--restart-s", default="")
-    m.add_argument("--answers", default="", help="ok or wrong-answer: the read set's answer check")
+    m.add_argument("--restart-s", default="", help="seconds to the first answer after a normal restart")
+    m.add_argument("--crash-restart-s", default="", help="seconds to the first answer after the SIGKILL")
+    m.add_argument("--answers", default="", help="ok, wrong-answer or error: the read set's answer check")
+    m.add_argument("--answers-reason", default="", help="the query that failed or differed")
     m.set_defaults(f=cmd_merge)
     s = sub.add_parser("summary")
     s.add_argument("files", nargs="+", help="longwrite.json files: {engine: run file contents with checks}")

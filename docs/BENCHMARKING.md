@@ -331,10 +331,12 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   1,000,000, which is 10.5M triples), an N-Triples file, or a directory of `.nt.zst` files
   such as a slice of `scripts/bench-billion.sh`, which is decompressed once. Every engine
   loads the same file. A workdir keeps the data it was made with and refuses other data.
-  Every engine then answers the readers' queries on its loaded store, and an engine whose
-  answers differ from the majority, or fail, is recorded as `wrong-answer` and not run,
-  unless `IGNORE_ANSWERS=1` is set. Then, for one engine at a time, the script copies its
-  store, serves the copy and runs `scripts/bench-longwrite/longrun.py` against it for
+  Every engine then answers the readers' queries on its loaded store. An engine whose
+  answers differ from the majority is recorded as `wrong-answer` and not run, and one that
+  fails a query is recorded as `error` and not run, unless `IGNORE_ANSWERS=1` is set. A
+  majority needs three engines, so when two engines disagree both run and the script says
+  so. Then, for one engine at a time, the script copies its store, serves the copy and
+  runs `scripts/bench-longwrite/longrun.py` against it for
   `--seconds` (default one hour). The published runs are one hour per engine on the 10.5M
   store, and one four-hour run of Sparkles on the same store.
 
@@ -371,12 +373,16 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   the errors and timeouts, the RSS, the disk use, the device counters and whether a
   compaction ran. The disk space is read by a separate thread every 60 seconds
   (`--disk-every`), because `du` over a large store can take longer than a sample. The
-  device counters separate the durability classes of X06 §5.1. An engine that synchronizes
-  each commit makes at least one device write per commit, made durable either by a flush
-  or by a write with forced unit access, which the kernel does not count as a flush.
-  Sparkles writes its log with `O_DIRECT` and `O_DSYNC`, so in a one-minute smoke run it
-  made 1.6 device writes but only 0.03 disk flushes per commit. The summary therefore
-  shows both per write request, and the flushes alone do not decide the class. The kernel
+  device counters separate the durability classes of X06 §5.1. The device and its disks
+  carry every process's I/O, so before the run the monitor counts them for 60 seconds with
+  the server idle (`BASELINE`), and the summary reports the run's counts net of that rate,
+  per committed write request. With one writer, an engine that synchronizes each commit
+  makes at least one device write per commit, made durable either by a flush or by a write
+  with forced unit access, which the kernel does not count as a flush. Sparkles writes its
+  log with `O_DIRECT` and `O_DSYNC`, so in a one-minute smoke run it made 1.6 device writes
+  but only 0.03 disk flushes per commit. With several writers, group commit lets commits
+  share one write, so the ratio is read from a single-writer run. The summary shows both
+  ratios, and the flushes alone do not decide the class. The kernel
   counts flushes only on whole disks, not on partitions or device-mapper nodes, so the
   monitor follows the store's device down to its disks through `/sys/block`. On the
   development machine 500 `fdatasync` calls on an LVM volume gave 500 flushes on the NVMe
@@ -388,9 +394,10 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   triples uncertain, and the check accepts them either way. A value that is not the plain
   or `xsd:string` literal the writer sent counts as extra. Then the script kills the server
   with SIGKILL, starts it again, which replays the engine's log, and checks again. Last, it
-  stops the server normally, starts it, records the time from the start to the first
-  answered query, and checks a third time. A server that does not start is recorded as a
-  failed check and the run goes on to the next engine. Sparkles runs with automatic
+  stops the server normally, starts it and checks a third time. Both restarts record the
+  time from the start to the first answered query, so the summary gives the recovery time
+  after the SIGKILL beside the time of a normal restart. A server that does not start is
+  recorded as a failed check and the run goes on to the next engine. Sparkles runs with automatic
   compaction at its defaults. TDB2 is not compacted, because its compaction needs the
   server stopped or an administrative request, so its disk growth is reported instead.
   QLever keeps updates in memory, and its checks after the restarts fail by design. In a

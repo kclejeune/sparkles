@@ -136,6 +136,19 @@ class LongrunTests(unittest.TestCase):
         # deletes keep each writer near its limit: 40 live triples and one batch of 5
         self.assertLessEqual(len(srv.subjects), 2 * (40 + 5))
 
+    def test_idle_baseline_is_subtracted(self):
+        _, url = self.serve()
+        out = os.path.join(self.tmp.name, "run.json")
+        self.run_load(url, out, "--store", self.tmp.name, "--baseline", "0.5")
+        d = jload(out)
+        if d["device"] is None:
+            self.skipTest("the temporary directory is not on a block device")
+        b = d["device_baseline"]
+        self.assertGreaterEqual(b["seconds"], 0.5)
+        if d["device_writes"] is not None:
+            idle = b["device_writes"] / b["seconds"] * d["device_seconds"]
+            self.assertAlmostEqual(d["device_writes_net"], d["device_writes"] - idle, delta=0.3 * idle + 1)  # the seconds are rounded
+
     def test_failed_writes_are_uncertain_not_wrong(self):
         srv, url = self.serve(fail_every=7)
         out = os.path.join(self.tmp.name, "run.json")
@@ -254,7 +267,8 @@ def run_file(path, writes=300, write_errors=0):
     with open(path, "w") as f:
         json.dump({
             "settings": {"seconds": 180, "readers": 16, "writers": 2}, "device": "dm-0", "flush_disks": ["nvme0n1"],
-            "device_writes": 450, "device_flushes": 300, "stopped_early": None,
+            "device_writes": 450, "device_flushes": 300, "device_writes_net": 300, "device_flushes_net": 150,
+            "device_baseline": {"seconds": 60.0, "device_writes": 50, "device_flushes": 50}, "stopped_early": None,
             "totals": {"writes": writes, "triples_written": 50 * writes, "write_errors": write_errors, "reads": 600,
                        "read_errors": 0, "read_timeouts": 0},
             "series": series(3), "compactions": [{"seen_at_s": 70.0, "mode": "full", "seconds": 0.2, "lockMs": 4.0}],
@@ -279,7 +293,8 @@ class LongwriteRecordTests(unittest.TestCase):
             run_file(path, **(run or {}))
         p = subprocess.run([sys.executable, LONGRUN, "merge", "--into", self.lw, "--engine", engine, "--run",
                             path if run is not False else "", "--check", check, "--check-crash", crash,
-                            "--check-reopen", reopen, "--restart-s", "0.5", "--answers", answers],
+                            "--check-reopen", reopen, "--restart-s", "0.5", "--crash-restart-s", "2.5",
+                            "--answers", answers, "--answers-reason", kw.get("why", "")],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
         return jload(self.lw)[engine]
@@ -301,6 +316,9 @@ class LongwriteRecordTests(unittest.TestCase):
         self.assertIn("state check indeterminate", v["status_reasons"])
         self.assertEqual(self.merge("sparkles", run=False)["status"], "error")
         self.assertEqual(self.merge("sparkles", answers="wrong-answer")["status"], "wrong-answer")
+        v = self.merge("qlever", answers="error", why="failed path-plus")
+        self.assertEqual(v["status"], "error")
+        self.assertEqual(v["status_reasons"], ["not run: it failed path-plus of the read set"])
 
     def test_record_and_summary(self):
         self.merge("sparkles")
@@ -328,7 +346,8 @@ class LongwriteRecordTests(unittest.TestCase):
         s = subprocess.run([sys.executable, LONGRUN, "summary", self.lw], capture_output=True, text=True)
         self.assertEqual(s.returncode, 0, s.stderr)
         self.assertIn("| sparkles | synced | ok | 1.7 |", s.stdout)
-        self.assertIn("| 1.50 / 1.00 | 1 | ok | ok | ok | 0.5 |", s.stdout)
+        self.assertIn("| 1.00 / 0.50 | 1 | ok | ok | ok | 2.5 | 0.5 |", s.stdout)
+        self.assertEqual((w["crash_restart_s"], w["device_writes_net"]), (2.5, 300))
         self.assertIn("| qlever | memory | ok |", s.stdout)
         self.assertIn("failed (1 missing, 0 extra)", s.stdout)
 

@@ -244,9 +244,9 @@ stop() {
   done
   if [ -n "$(pid_on "${PORT[$e]}")" ] || { [ -n "$pid" ] && alive "$pid"; }; then
     log "$e: still running 60 s after SIGTERM, sending SIGKILL"
-    [ -n "$pid" ] && kill -KILL "$pid" 2> /dev/null
+    [ -n "$pid" ] && { kill -KILL "$pid" 2> /dev/null || true; }
     pid=$(pid_on "${PORT[$e]}")
-    [ -n "$pid" ] && kill -KILL "$pid" 2> /dev/null
+    [ -n "$pid" ] && { kill -KILL "$pid" 2> /dev/null || true; }
     for _ in $(seq 1 40); do
       [ -z "$(pid_on "${PORT[$e]}")" ] && { [ -z "$pid" ] || ! alive "$pid"; } && break
       sleep 0.25

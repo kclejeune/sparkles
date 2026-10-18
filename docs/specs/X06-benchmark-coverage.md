@@ -296,8 +296,16 @@ Sparkles acknowledges a write after its WAL record and new terms are synchronize
 Oxigraph writes its RocksDB WAL without synchronizing it, QLever keeps updates in
 memory, and TDB2 synchronizes. Every write table carries a *durability* column with one
 of `synced`, `written` (in the OS cache) or `memory`, taken from each engine's
-documentation and confirmed by counting device flushes during the run (as the durable
-commit section does today with device cache flushes). Rankings of write throughput and
+documentation. The long write run checks the class from the device counters. Before each
+run it records the writes of the device that holds the store and the flushes of the disks
+under it for 60 seconds with the server idle, and it reports the run's counts net of that
+rate, per committed write request. With one writer, an engine that synchronizes each commit
+makes at least one device write per commit beyond the idle rate, and an engine that leaves
+its log in the OS cache makes far fewer. The flushes alone do not decide the class, because
+a write with forced unit access, such as an `O_DIRECT` and `O_DSYNC` write, is durable
+without a flush. With several writers, group commit lets concurrent commits share one write,
+so a `synced` engine may show fewer than one write per commit, and the ratio is read only
+from a single-writer run. Rankings of write throughput and
 latency are made within a durability class. A comparison across classes is printed, but
 it is not counted as a loss or a win in the summary, and the loss table names the class.
 
@@ -497,8 +505,10 @@ one ranking.
   every suite in its row of §8, a manifest naming that commit, and a BENCHMARKS.md diff
   whose figures all come from those records.
 - **A6 — Durability classes.** The long write run's tables put Sparkles and TDB2 in the
-  `synced` class and Oxigraph in `written`, with flush counts that confirm it, and the
-  summary does not rank across classes.
+  `synced` class and Oxigraph in `written`. A single-writer run confirms it by the device
+  writes per commit net of the idle baseline (§5.1), at least one for the `synced` engines
+  and well below one for Oxigraph, with the flushes reported beside them. The summary does
+  not rank across classes.
 - **A7 — GeoSPARQL comparison.** The compliance benchmark runs against Sparkles and Jena
   GeoSPARQL Fuseki from one command, gated by `SPARKLES_ALLOW_GPL_BENCHMARK=1`, and
   reports per-requirement scores for both.
@@ -733,8 +743,10 @@ yet.
   withdrawn. Flushes alone do not confirm the `synced` class for A6, because a write with
   forced unit access is durable without one. Sparkles writes its log with `O_DIRECT` and
   `O_DSYNC`, and in a one-minute smoke run it made 1.6 device writes but 0.03 disk flushes
-  per commit. A6 is therefore read from the device writes and the flushes per commit
-  together. A two-minute
+  per commit. A6 and §5.1 therefore read the class from the device writes per commit net
+  of a 60-second idle baseline, in a single-writer run, with the flushes beside them. The
+  smoke figures below are gross counts on a busy laptop, and Jena's 107 writes per commit
+  are mostly other processes' I/O divided by its low commit rate. A two-minute
   Sparkles smoke run on 210,509 triples with 4 readers and 2 writers committed 121,585
   write requests (6.1 million triples written), ran 3 automatic compactions, and passed the
   state check before and after the restart. Its store grew from 16 MiB to 557 MiB with
