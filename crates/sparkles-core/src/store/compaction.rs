@@ -1122,6 +1122,9 @@ impl Store {
             self.catalog.lock().sync()?;
             #[cfg(feature = "text")]
             if let Some(ti) = self.text.load_full() {
+                // the writer lock is held with the group drained (X09 section 17.3), so
+                // the index holds no commit above the durable, published head
+                debug_assert!(ti.applied() <= self.current.load().commit);
                 ti.checkpoint()?;
             }
             let snap = self.snapshot();
