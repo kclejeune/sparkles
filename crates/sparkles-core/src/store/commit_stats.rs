@@ -38,14 +38,19 @@ impl SyncPath {
 /// Why a commit of a store with group commit on took the ordinary path: the first
 /// condition of admission that failed. Commit messages, preconditions, guards,
 /// compaction, change digests, bypassed validation and graph restrictions were reasons
-/// before Phase 2 admitted them, and are no longer.
+/// before Phase 2 admitted them, and are no longer. Datasets with a full-text, spatial or
+/// embedding index fell back as `text`, `geo` and `embed` until Phase 4 admitted them.
+/// They now fall back only while an index recovers, rebuilds or builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {
     Poisoned,
     Kind,
-    Text,
-    Geo,
-    Embed,
+    /// the full-text index recovers at open
+    TextRecovering,
+    /// an online rebuild of the full-text index runs
+    TextRebuilding,
+    /// the spatial index builds, or its build failed
+    GeoBuilding,
     Bulk,
     Size,
     Noop,
@@ -55,9 +60,9 @@ impl Fallback {
     pub const ALL: [Fallback; 8] = [
         Fallback::Poisoned,
         Fallback::Kind,
-        Fallback::Text,
-        Fallback::Geo,
-        Fallback::Embed,
+        Fallback::TextRecovering,
+        Fallback::TextRebuilding,
+        Fallback::GeoBuilding,
         Fallback::Bulk,
         Fallback::Size,
         Fallback::Noop,
@@ -67,9 +72,9 @@ impl Fallback {
         match self {
             Fallback::Poisoned => "poisoned",
             Fallback::Kind => "kind",
-            Fallback::Text => "text",
-            Fallback::Geo => "geo",
-            Fallback::Embed => "embed",
+            Fallback::TextRecovering => "text-recovering",
+            Fallback::TextRebuilding => "text-rebuilding",
+            Fallback::GeoBuilding => "geo-building",
             Fallback::Bulk => "bulk",
             Fallback::Size => "size",
             Fallback::Noop => "noop",

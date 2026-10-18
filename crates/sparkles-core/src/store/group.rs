@@ -31,6 +31,9 @@ pub(super) struct Pending {
     pub annotation: crate::annotations::Annotation,
     /// the annotations file, when this commit's record in it is not synced yet
     pub ann_file: Option<Arc<File>>,
+    /// the commit's full-text changes, applied to the live index at publication
+    #[cfg(feature = "text")]
+    pub text: Option<crate::text::Staged>,
 }
 
 #[derive(Default)]
@@ -68,6 +71,29 @@ impl Coordinator {
     pub fn idle(&self) -> bool {
         let s = self.state.lock();
         !s.active && s.queue.is_empty() && !s.failed
+    }
+
+    /// Wait up to `timeout`, without leading a fence, until no commit is in flight: no
+    /// fence runs, and the queue is empty or failed. The caller holds the writer lock,
+    /// so nothing new is queued, and the thread of each queued commit leads its own
+    /// fence. A background installer that holds no `Store` to drain with, such as the
+    /// spatial index build, uses this before it installs a view, so that no grouped
+    /// commit publishes an older view over it. `false` when commits are still in flight
+    /// at the timeout. The caller then releases the writer lock and tries again, since a
+    /// commit whose thread panicked after queueing it waits for the next writer to lead
+    /// it.
+    #[cfg_attr(not(feature = "geo"), allow(dead_code))]
+    pub fn settle(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut s = self.state.lock();
+        loop {
+            if !s.active && (s.failed || s.queue.is_empty()) {
+                return true;
+            }
+            if self.changed.wait_until(&mut s, deadline).timed_out() {
+                return !s.active && (s.failed || s.queue.is_empty());
+            }
+        }
     }
 
     pub fn full(&self, bytes: u64) -> bool {
@@ -188,7 +214,7 @@ impl Coordinator {
     /// Seal exactly the ready prefix. Appends during the fence belong to the next
     /// fence even if the kernel happened to sync their bytes too.
     fn drive(&self, store: &Store, ticket: Option<&Ticket>) -> Result<bool> {
-        let batch = {
+        let mut batch = {
             let mut s = self.state.lock();
             // Completion and prefix selection share this mutex. An old waiter
             // must not become responsible for an unrelated later prefix.
@@ -255,27 +281,40 @@ impl Coordinator {
         #[cfg(test)]
         self.fences.fetch_add(1, Ordering::Relaxed);
         store.failpoint("group-synced");
-        let mut s = self.state.lock();
-        let outcome = match synced {
+        let (mut s, outcome) = match synced {
             // A later write may have failed during the fence. That poisons the
             // writer and fails the queue, but this prefix is durable all the same.
+            //
+            // The prefix is published outside the state mutex (X09 section 17.4),
+            // because publication applies the commits' full-text changes and schedules
+            // their embedding work, and `enqueue` takes the same mutex while its caller
+            // holds the writer lock. `active` stays set until the end, so no other fence
+            // leads meanwhile and only this leader publishes, in commit order. Each
+            // ticket is set under the mutex, so a waiter that checked its ticket before
+            // parking is woken, and an old waiter never leads an unrelated prefix.
             Ok(()) => {
-                // Keep failure/admission state serialized with publication. The
-                // writer itself remains free, including while a later txn is held.
-                for p in &batch {
+                for p in &mut batch {
                     store.publish_group_prefix(p);
-                    p.ticket.0.store(1, Ordering::Release);
+                    {
+                        let _s = self.state.lock();
+                        p.ticket.0.store(1, Ordering::Release);
+                        self.changed.notify_all();
+                    }
                     store.failpoint("group-published");
                 }
+                let mut s = self.state.lock();
                 store.commit_stats.fenced(batch.len());
+                // `fail` takes only queued commits out of the counts, and a failure of
+                // this leader ends in `Leader::drop`, which never comes here
                 s.commits -= batch.len();
                 s.bytes -= batch.iter().map(|p| p.bytes).sum::<u64>();
-                Ok(())
+                (s, Ok(()))
             }
             // Every commit of the fence reports the same failure, the one that led it
             // included. The cause is logged, since the error says only that the writer
             // is poisoned.
             Err(e) => {
+                let mut s = self.state.lock();
                 store.commit_stats.failed();
                 Self::fail_locked(&mut s);
                 tracing::error!(
@@ -283,10 +322,10 @@ impl Coordinator {
                     error = %e,
                     commits = batch.len(),
                     first = batch[0].info.seq,
-                    last = last.info.seq,
+                    last = batch[batch.len() - 1].info.seq,
                     "group commit fence failed to synchronize; writes are refused until the store is reopened"
                 );
-                Err(Error::Poisoned)
+                (s, Err(Error::Poisoned))
             }
         };
         s.inflight.clear();
@@ -323,11 +362,18 @@ impl Store {
         }
     }
 
-    /// Publish only a successfully fenced prefix, in commit order. Auxiliary indexes
-    /// remain excluded at admission and drain first. Grouped guard notifications run
-    /// before publication.
-    fn publish_group_prefix(&self, p: &Pending) {
+    /// Publish only a successfully fenced prefix, in commit order. The commit's full-text
+    /// changes reach the live index first, so the published snapshot's view is resolved
+    /// before any reader sees it, and its embedding work is scheduled after publication,
+    /// so the worker reads the state that names its pairs (X09 section 17.4). The spatial
+    /// view was computed when the commit was queued and is already in the snapshot.
+    /// Grouped guard notifications run before publication.
+    fn publish_group_prefix(&self, p: &mut Pending) {
         let c = p.info;
+        #[cfg(feature = "text")]
+        if let Some(staged) = p.text.take() {
+            staged.apply(&p.snapshot);
+        }
         let generation = &p.snapshot.generation;
         self.wal_end.store(p.wal_end, Ordering::Release);
         if let Some(ix) = generation.wal_index.lock().as_mut() {
@@ -359,6 +405,8 @@ impl Store {
         }
         self.current.store(p.snapshot.clone());
         self.commits.send_replace(c.seq);
+        // after the publication: a worker that takes these pairs reads this state
+        self.embed_noted(&p.snapshot, &p.changes, c.seq, c.kind);
     }
 }
 
@@ -463,7 +511,7 @@ impl WriteTxn<'_> {
         store
             .quota
             .set_vocab_preallocated(generation.dvocab.preallocated());
-        let snapshot = Arc::new(Snapshot {
+        let mut snapshot = Snapshot {
             cacheable: true,
             dataset_id: self.base.dataset_id,
             generation: generation.clone(),
@@ -473,15 +521,23 @@ impl WriteTxn<'_> {
             results: self.base.results.clone(),
             dvocab_len: generation.dvocab.len(),
             commit: c.seq,
-            text: None,
-            geo: None,
+            text: self.base.text.clone(),
+            geo: self.base.geo.clone(),
             union_default_graph: self.base.union_default_graph,
             geo_op_vertices: self.base.geo_op_vertices,
             counts: Default::default(),
             mask: None,
             historical: false,
             change_log: self.base.change_log.clone(),
-        });
+        };
+        // The index state of the speculative snapshot (X09 section 17.4, step 1). The
+        // spatial view is a value computed from the base's, which a failed fence drops
+        // with the snapshot. The full-text changes are only staged here, and nothing of
+        // either reaches the disk.
+        store.maintain_geo(&mut snapshot, &self.base, &self.log);
+        #[cfg(feature = "text")]
+        let text = store.stage_text(&mut snapshot, &self.log);
+        let snapshot = Arc::new(snapshot);
         // A compaction that is building carries this commit into its new generation. It
         // takes commits only after the writer lock's drain has made the queue durable, so
         // a commit that a failed fence drops never reaches the new generation: the drain
@@ -510,6 +566,8 @@ impl WriteTxn<'_> {
             validation: validation.clone(),
             annotation: annotation.clone(),
             ann_file,
+            #[cfg(feature = "text")]
+            text,
         };
         w.head = c;
         w.staged = Some(snapshot);
@@ -1421,7 +1479,14 @@ mod tests {
         assert_eq!(
             Fallback::ALL.map(Fallback::as_str),
             [
-                "poisoned", "kind", "text", "geo", "embed", "bulk", "size", "noop"
+                "poisoned",
+                "kind",
+                "text-recovering",
+                "text-rebuilding",
+                "geo-building",
+                "bulk",
+                "size",
+                "noop"
             ]
         );
         // a store without group commit counts nothing

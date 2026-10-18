@@ -10,6 +10,11 @@
 //! `SPARKLES_GROUP_MODEL_SEED` the seed of the first one. A failure names the seed of its
 //! run. `SPARKLES_GROUP_MODEL_SEED` with one run repeats that run's inputs, its threads,
 //! operations and fault, but not the interleaving that the scheduler chose.
+//!
+//! A second test runs the same model on a dataset with a full-text, a spatial and an
+//! embedding index (X09 section 17.8), with failed index updates among its faults, and
+//! checks every index against the data of each snapshot a reader sees.
+#![cfg_attr(not(all(feature = "text", feature = "geo")), allow(dead_code))]
 use super::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
@@ -84,6 +89,10 @@ enum Fault {
     Panic(&'static str),
     GroupSync,
     VocabSync,
+    /// the spatial index's next update fails (`GeoIndex::fail_next`)
+    GeoUpdate,
+    /// the full-text index's next update fails, when the leader applies it
+    TextUpdate,
 }
 
 impl Fault {
@@ -101,6 +110,155 @@ fn quad(name: &str) -> Quad {
     )
 }
 
+const LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+const AS_WKT: &str = "http://www.opengis.net/ont/geosparql#asWKT";
+
+/// The point of `name` on an indexed dataset, from its hash.
+fn coords(name: &str) -> (f64, f64) {
+    let mut h = Rng(name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    }) | 1);
+    (
+        (h.below(3600) as f64) / 10.0 - 180.0,
+        (h.below(1800) as f64) / 10.0 - 90.0,
+    )
+}
+
+/// The quads an operation on `name` writes: its plain quad, and on an indexed dataset a
+/// label that full-text search finds by the word `common` and its own word, and a point.
+fn quads(name: &str, indexed: bool) -> Vec<Quad> {
+    let mut v = vec![quad(name)];
+    if indexed {
+        let s = NamedNode::new(format!("urn:m:{name}")).unwrap();
+        let word = name.replace('-', "x");
+        v.push(Quad::new(
+            s.clone(),
+            NamedNode::new(LABEL).unwrap(),
+            oxrdf::Literal::new_simple_literal(format!("common w{word}")),
+            GraphName::DefaultGraph,
+        ));
+        let (x, y) = coords(name);
+        v.push(Quad::new(
+            s,
+            NamedNode::new(AS_WKT).unwrap(),
+            oxrdf::Literal::new_typed_literal(
+                format!("POINT({x} {y})"),
+                NamedNode::new("http://www.opengis.net/ont/geosparql#wktLiteral").unwrap(),
+            ),
+            GraphName::DefaultGraph,
+        ));
+    }
+    v
+}
+
+/// The subjects with a quad of predicate `p` in `snap`, by a scan.
+#[cfg(all(feature = "text", feature = "geo"))]
+fn subjects_of(snap: &Snapshot, p: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if let Some(p) = snap.lookup_iri(p) {
+        snap.scan(crate::index::Perm::Pso, &[p.0], |c| {
+            let mut add = |k: &[u64; 4]| {
+                let q = crate::index::Perm::Pso.to_quad(k);
+                out.insert(snap.term(q[0]).unwrap().to_string());
+            };
+            match c {
+                Chunk::Block(b, s, e) => (s..e).for_each(|i| add(&b.key(i))),
+                Chunk::Row(k) => add(&k),
+            }
+            Ok(true)
+        })
+        .unwrap();
+    }
+    out
+}
+
+/// The subjects that full-text search for `word` finds in `snap`, or `None` when the
+/// index cannot answer (stale after an injected failure).
+#[cfg(all(feature = "text", feature = "geo"))]
+fn text_subjects(snap: Arc<Snapshot>, word: &str) -> Option<BTreeSet<String>> {
+    let q = format!(
+        "PREFIX text:<http://jena.apache.org/text#> SELECT ?s {{ ?s text:query \"{word}\" }}"
+    );
+    match crate::sparql::query(snap, &q, &Default::default()) {
+        Ok(r) => Some(
+            r.rows()
+                .into_iter()
+                .filter_map(|row| row[0].as_ref().map(|t| t.to_string()))
+                .collect(),
+        ),
+        Err(Error::TextUnavailable(_)) => None,
+        Err(e) => panic!("text search: {e}"),
+    }
+}
+
+/// The subjects whose point lies in `w`, by the spatial index (which scans when its view
+/// failed).
+#[cfg(all(feature = "text", feature = "geo"))]
+fn spatial_subjects(snap: Arc<Snapshot>, w: [f64; 4]) -> BTreeSet<String> {
+    let ctx = crate::sparql::ctx::Ctx::new(snap.clone());
+    let mut st = crate::geo::search::SearchStats::default();
+    let preds: Vec<Id> = snap.lookup_iri(AS_WKT).into_iter().collect();
+    let mut out = BTreeSet::new();
+    crate::geo::search::window(
+        &ctx,
+        &preds,
+        &[w],
+        &crate::sparql::plan::GraphFilter::All,
+        &mut st,
+        &mut |hits| {
+            for h in hits {
+                out.insert(snap.term(h.s).unwrap().to_string());
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    out
+}
+
+/// Check that the full-text and spatial indexes of `snap` agree with its data, and that
+/// no embedding work names a commit above the published head of `s`.
+#[cfg(all(feature = "text", feature = "geo"))]
+fn check_indexes(s: &Store, snap: Arc<Snapshot>, rng: &mut Rng, what: &str) {
+    let labelled = subjects_of(&snap, LABEL);
+    if let Some(hits) = text_subjects(snap.clone(), "common") {
+        assert_eq!(hits, labelled, "{what}: text search at {}", snap.commit);
+    }
+    let located = subjects_of(&snap, AS_WKT);
+    let (x, y) = (
+        // half a grid step off the points, so no point lies on an edge, where the index's
+        // rounded boxes and the exact test may differ
+        rng.below(3000) as f64 / 10.0 - 179.95,
+        rng.below(1400) as f64 / 10.0 - 89.95,
+    );
+    let w = [x, y, x + 60.0, y + 40.0];
+    let inside: BTreeSet<String> = located
+        .into_iter()
+        .filter(|n| {
+            let (px, py) = coords(n.trim_matches(['<', '>']).trim_start_matches("urn:m:"));
+            px >= w[0] && py >= w[1] && px <= w[2] && py <= w[3]
+        })
+        .collect();
+    assert_eq!(
+        spatial_subjects(snap.clone(), w),
+        inside,
+        "{what}: window {w:?} at {}",
+        snap.commit
+    );
+    // the head is read after the work is locked: work is queued after its commit is
+    // published, so any work in the queue now names a commit at or below this head
+    let works = s.embed.works.lock();
+    let head = s.current.load().commit;
+    for work in works.values() {
+        for (_, seq) in &work.queue {
+            assert!(
+                *seq <= head,
+                "{what}: embedding work of {seq} above head {head}"
+            );
+        }
+    }
+}
+
 fn holds(snap: &Snapshot, name: &str) -> bool {
     let Some(s) = snap.lookup_iri(&format!("urn:m:{name}")) else {
         return false;
@@ -112,7 +270,7 @@ fn holds(snap: &Snapshot, name: &str) -> bool {
 }
 
 /// Run one operation, returning its outcome.
-fn run_op(s: &Store, op: &Op) -> Outcome {
+fn run_op(s: &Store, op: &Op, indexed: bool) -> Outcome {
     let mut opts = crate::guard::WriteOptions {
         message: op.message.as_deref().map(Into::into),
         ..Default::default()
@@ -142,12 +300,16 @@ fn run_op(s: &Store, op: &Op) -> Outcome {
         // the fallible form, which checks the options (`write_with` takes none of them)
         let mut t = s.try_write_with(CommitKind::Update, opts)?;
         for n in &op.inserts {
-            let ids = t.encode_quad(&quad(n), &mut Default::default())?;
-            t.insert(ids)?;
+            for q in quads(n, indexed) {
+                let ids = t.encode_quad(&q, &mut Default::default())?;
+                t.insert(ids)?;
+            }
         }
         for n in &op.deletes {
-            let ids = t.encode_quad(&quad(n), &mut Default::default())?;
-            t.delete(ids)?;
+            for q in quads(n, indexed) {
+                let ids = t.encode_quad(&q, &mut Default::default())?;
+                t.delete(ids)?;
+            }
         }
         t.commit()
     }));
@@ -180,6 +342,7 @@ fn worker(
     counter: &AtomicU64,
     fault_at: u64,
     fault: Fault,
+    indexed: bool,
 ) -> Vec<Op> {
     let mut rng = Rng(seed | 1);
     let mut live: Vec<String> = Vec::new();
@@ -226,7 +389,7 @@ fn worker(
             message,
             outcome: Outcome::NoCommit,
         };
-        op.outcome = run_op(s, &op);
+        op.outcome = run_op(s, &op, indexed);
         match &op.outcome {
             Outcome::Acked(_) if op.kind.commits() => live.extend(op.inserts.iter().cloned()),
             Outcome::Acked(_) | Outcome::NoCommit => {}
@@ -256,7 +419,31 @@ fn arm(s: &Store, fault: Fault) {
         }
         Fault::GroupSync => s.fail_next_group_sync(),
         Fault::VocabSync => s.snapshot().generation.dvocab.fail_next_sync(),
+        Fault::GeoUpdate => s.fail_next_geo_commit(),
+        Fault::TextUpdate => {
+            #[cfg(feature = "text")]
+            s.fail_next_text_commit();
+        }
     }
+}
+
+/// Configure every index a grouped commit has to maintain: full-text search, the
+/// spatial index and an embedding index whose work is only queued (no provider runs).
+#[cfg(all(feature = "text", feature = "geo"))]
+fn configure_indexes(s: &Store) {
+    s.enable_text(Default::default()).unwrap();
+    s.enable_geo(Default::default()).unwrap();
+    let mut c = crate::vector::VectorIndexConfig::new("http://example.org/emb", 8);
+    c.embedding = Some(
+        crate::vector::embed::EmbeddingConfig::new("http://127.0.0.1:9/v1", "m")
+            .from_predicates(&[LABEL]),
+    );
+    s.create_vector_index("docs", c).unwrap();
+}
+
+#[cfg(not(all(feature = "text", feature = "geo")))]
+fn configure_indexes(_: &Store) {
+    unreachable!("indexed runs need the text and geo features")
 }
 
 struct RunResult {
@@ -265,23 +452,41 @@ struct RunResult {
     seen: Vec<(u64, u64)>,
 }
 
-fn run(dir: &Path, seed: u64, opts: StoreOptions, messages: bool, fault: Fault) -> RunResult {
+fn run(
+    dir: &Path,
+    seed: u64,
+    opts: StoreOptions,
+    messages: bool,
+    fault: Fault,
+    indexed: bool,
+) -> RunResult {
     let mut rng = Rng(seed | 1);
     let threads = 4 + rng.below(5) as u32;
     let per = 20 + rng.below(41) as u32;
     let fault_at = rng.below(u64::from(threads * per));
     let s = Arc::new(Store::open(dir, opts).unwrap());
+    if indexed {
+        configure_indexes(&s);
+    }
     let counter = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let reader = {
         let (s, stop) = (s.clone(), stop.clone());
+        let mut rseed = Rng(rng.next() | 1);
+        let what = format!("seed {seed:#x}");
         std::thread::spawn(move || {
             let mut seen = Vec::new();
             while !stop.load(Ordering::Relaxed) {
                 let snap = s.snapshot();
-                seen.push((snap.commit, snap.len()));
-                std::thread::sleep(Duration::from_micros(50));
+                seen.push((snap.commit, snap.len() / quads_per_name(indexed)));
+                if indexed {
+                    #[cfg(all(feature = "text", feature = "geo"))]
+                    check_indexes(&s, snap, &mut rseed, &what);
+                } else {
+                    std::thread::sleep(Duration::from_micros(50));
+                }
             }
+            let _ = (&mut rseed, &what);
             seen
         })
     };
@@ -290,7 +495,9 @@ fn run(dir: &Path, seed: u64, opts: StoreOptions, messages: bool, fault: Fault) 
             let (s, counter) = (s.clone(), counter.clone());
             let wseed = rng.next();
             std::thread::spawn(move || {
-                worker(&s, t, per, wseed, messages, &counter, fault_at, fault)
+                worker(
+                    &s, t, per, wseed, messages, &counter, fault_at, fault, indexed,
+                )
             })
         })
         .collect();
@@ -330,7 +537,11 @@ fn apply<'a>(ops: impl IntoIterator<Item = &'a Op>) -> BTreeSet<String> {
     state
 }
 
-fn check_run(dir: &Path, r: &RunResult, messages: bool, fault: Fault, what: &str) {
+fn quads_per_name(indexed: bool) -> u64 {
+    if indexed { 3 } else { 1 }
+}
+
+fn check_run(dir: &Path, r: &RunResult, messages: bool, fault: Fault, indexed: bool, what: &str) {
     let acked: Vec<(u64, &Op)> = r
         .ops
         .iter()
@@ -490,7 +701,30 @@ fn check_run(dir: &Path, r: &RunResult, messages: bool, fault: Fault, what: &str
     for n in &names {
         assert_eq!(holds(&snap, n), state.contains(*n), "{what}: quad {n}");
     }
-    assert_eq!(snap.len(), state.len() as u64, "{what}: quad count");
+    assert_eq!(
+        snap.len(),
+        state.len() as u64 * quads_per_name(indexed),
+        "{what}: quad count"
+    );
+    // The indexes of the recovered store agree with its data, which the checks above
+    // compared with the model: the full-text index caught up from the log, and the
+    // spatial view was built from the recovered state.
+    #[cfg(all(feature = "text", feature = "geo"))]
+    if indexed {
+        if let Some(job) = s.text_recovery.load_full() {
+            job.wait().unwrap();
+        }
+        s.wait_geo();
+        assert_eq!(s.text_status().unwrap().state, "ready", "{what}");
+        let snap = s.snapshot();
+        let expected: BTreeSet<String> = state.iter().map(|n| format!("<urn:m:{n}>")).collect();
+        assert_eq!(
+            text_subjects(snap.clone(), "common"),
+            Some(expected),
+            "{what}: text search after reopening"
+        );
+        check_indexes(&s, snap, &mut Rng(0x5eed | 1), what);
+    }
     // guarantee 1: acknowledged messages survive
     for (seq, op) in &acked {
         if let Some(m) = &op.message {
@@ -527,16 +761,28 @@ const FAULTS: [Fault; 7] = [
     Fault::VocabSync,
 ];
 
-#[test]
-fn concurrent_random_writes_match_a_sequential_model() {
-    let runs = env_num("SPARKLES_GROUP_MODEL_RUNS", 24);
-    let first = env_num("SPARKLES_GROUP_MODEL_SEED", 0x005e_ed0f_9a7e);
+/// The faults of a run on an indexed dataset: those of [`FAULTS`], and a failed update of
+/// the spatial view or of the full-text index.
+const INDEX_FAULTS: [Fault; 9] = [
+    Fault::None,
+    Fault::Panic("group-appended"),
+    Fault::Panic("group-sealed"),
+    Fault::Panic("group-synced"),
+    Fault::Panic("group-published"),
+    Fault::GroupSync,
+    Fault::VocabSync,
+    Fault::GeoUpdate,
+    Fault::TextUpdate,
+];
+
+/// Run `runs` seeded runs from `first`, with or without indexes.
+fn model_runs(runs: u64, first: u64, faults: &'static [Fault], indexed: bool) {
     let mut seeds = Rng(first | 1);
     for i in 0..runs {
         let seed = if i == 0 { first } else { seeds.next() };
         let mut rng = Rng(seed | 1);
         let messages = rng.below(4) != 0;
-        let fault = FAULTS[rng.below(FAULTS.len() as u64) as usize];
+        let fault = faults[rng.below(faults.len() as u64) as usize];
         let opts = StoreOptions {
             group_commit: true,
             group_commit_idle_direct: rng.below(2) == 0,
@@ -544,7 +790,7 @@ fn concurrent_random_writes_match_a_sequential_model() {
             ..Default::default()
         };
         let what = format!(
-            "seed {seed:#x} (messages {messages}, {fault:?}, idle direct {}, direct {})",
+            "seed {seed:#x} (messages {messages}, {fault:?}, idle direct {}, direct {}, indexed {indexed})",
             opts.group_commit_idle_direct, opts.wal_direct_writes
         );
         let dir = tempfile::tempdir().unwrap();
@@ -553,8 +799,8 @@ fn concurrent_random_writes_match_a_sequential_model() {
         let (tx, rx) = mpsc::channel();
         let w = what.clone();
         std::thread::spawn(move || {
-            let r = run(&path, seed, opts, messages, fault);
-            check_run(&path, &r, messages, fault, &w);
+            let r = run(&path, seed, opts, messages, fault, indexed);
+            check_run(&path, &r, messages, fault, indexed, &w);
             if std::env::var_os("SPARKLES_GROUP_MODEL_VERBOSE").is_some() {
                 let acked = r
                     .ops
@@ -582,4 +828,31 @@ fn concurrent_random_writes_match_a_sequential_model() {
             Err(mpsc::RecvTimeoutError::Timeout) => panic!("{what}: did not finish"),
         }
     }
+}
+
+#[test]
+fn concurrent_random_writes_match_a_sequential_model() {
+    model_runs(
+        env_num("SPARKLES_GROUP_MODEL_RUNS", 24),
+        env_num("SPARKLES_GROUP_MODEL_SEED", 0x005e_ed0f_9a7e),
+        &FAULTS,
+        false,
+    );
+}
+
+/// The same model on a dataset with a full-text, a spatial and an embedding index (X09
+/// section 17.8). Every snapshot a reader sees is also searched: full-text search must
+/// find exactly the labelled subjects of the snapshot, a random spatial window exactly
+/// the points a brute-force test puts inside it, and no queued embedding work may name a
+/// commit above the published head. After reopening, the indexes must agree with the
+/// model. `SPARKLES_GROUP_MODEL_INDEX_RUNS` sets the number of runs (default 12).
+#[cfg(all(feature = "text", feature = "geo"))]
+#[test]
+fn concurrent_random_writes_on_an_indexed_dataset_match_a_sequential_model() {
+    model_runs(
+        env_num("SPARKLES_GROUP_MODEL_INDEX_RUNS", 12),
+        env_num("SPARKLES_GROUP_MODEL_SEED", 0x1d_e7ed_5eed),
+        &INDEX_FAULTS,
+        true,
+    );
 }
