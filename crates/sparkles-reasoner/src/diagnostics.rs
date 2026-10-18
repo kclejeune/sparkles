@@ -905,6 +905,10 @@ fn ill_typed_literals(snap: &Snapshot, ids: &[sparkles_core::id::Id]) -> Vec<Lit
     out
 }
 
+/// Tests only: what [`ill_typed`] calls after each chunk of the delta vocabulary.
+#[cfg(test)]
+type ChunkHook = Box<dyn FnMut(&Generation)>;
+
 #[cfg(test)]
 thread_local! {
     /// Tests only: the page of [`Run::paged_findings`] (counted from 0) that fails with a
@@ -914,7 +918,7 @@ thread_local! {
     static CANDIDATES_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Tests only: called after each chunk of the delta vocabulary that [`ill_typed`]
     /// reads, with the lock of the delta vocabulary released.
-    static DELTA_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Generation)>>> =
+    static DELTA_CHUNK_HOOK: std::cell::RefCell<Option<ChunkHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
