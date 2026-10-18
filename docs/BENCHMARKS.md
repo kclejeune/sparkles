@@ -1012,6 +1012,15 @@ group.
 With sixteen writers, no writer's share of the commits differed from the mean by more than
 1.2% with group commit, and by 0.3% with the default writer.
 
+A short confirmation on 2026-10-18 ran the switched build at revision 8bea2951, where group
+commit is the default, against the same build with `--no-group-commit`, at 1.05M with three
+rounds. It repeated the tables above. Serial literal inserts took 0.422 / 0.456 ms at p50 /
+p90 with grouping and 0.424 / 0.459 ms without. Four writers reached 6,139.6 transactions/s
+against 3,392.8, and sixteen writers 18,211.3 against 3,341.5, with no share more than 1.1%
+from the mean. An earlier attempt right after the `log-writes` crash runs, which wrote and
+deleted several GiB on the same drive, was four times slower in both settings, with the
+same ratios.
+
 A single writer gains nothing from grouping, so the idle fast path commits it as the
 default writer does. These serial runs send 5,000 single-triple commits.
 
