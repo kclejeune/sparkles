@@ -33,7 +33,7 @@ file that does not conform.
 
 Record 1 (every field is required unless marked optional):
 
-    record      1
+    record      1 or 2 (2 when a result has the mode longrun); other versions are refused
     suite       string, for example "bsbm-explore"
     scale       string, for example "10m"
     manifest    object (see `manifest`)
@@ -71,7 +71,9 @@ import statistics
 import subprocess
 import sys
 
-RECORD = 1
+# 2 added the mode `longrun` and its fields; 1 is read as before (docs/specs/X06 section 7)
+RECORD = 2
+KNOWN_RECORDS = (1, 2)
 ENGINE_NAMES = {"jena-fuseki": "jena", "jena-tdb2": "jena"}
 LICENSES = {
     "sparkles": "the repository's",
@@ -358,8 +360,13 @@ def longrun_results(lw):
     for e, v in (lw or {}).items():
         en = engine_name(e)
         s, st = v.get("series", []), v.get("settings", {})
-        check = v.get("check")
-        status = "ok" if check and check.get("ok") else "error"
+        # the status and its reasons come from longrun.py merge (run_status)
+        status = v.get("status") or "error"
+        if status not in STATUSES:
+            status = "error"
+        # the first minute runs on a server that has not yet seen the read set, so the
+        # samples are the per-minute medians from the second minute on
+        s = [x for x in s if x.get("minute", 0) >= 1] or s
         for kind, clients in (("write", st.get("writers", 1)), ("read", st.get("readers", 1))):
             samples = [x[f"{kind}_p50_ms"] for x in s if x.get(f"{kind}_p50_ms") is not None]
             p99 = [x[f"{kind}_p99_ms"] for x in s if x.get(f"{kind}_p99_ms") is not None]
@@ -370,13 +377,14 @@ def longrun_results(lw):
                 "median_ms": round(statistics.median(samples), 3) if samples else None,
                 "p95_ms": round(percentile(samples, 0.95), 3) if samples else None,
                 "p99_ms_median": round(statistics.median(p99), 3) if p99 else None,
-                "answer": None, "status": status,
+                "answer": None, "status": status, "status_reasons": v.get("status_reasons", []),
                 "qps": round(v["totals"][f"{kind}s"] / st["seconds"], 2) if st.get("seconds") else None,
             }
             if kind == "write":
                 r.update({k: v.get(k) for k in ("series", "compactions", "compaction_counters", "check",
-                                                 "check_reopen", "restart_ready_s", "device", "device_flushes",
-                                                 "totals", "settings")})
+                                                 "check_crash", "check_reopen", "restart_s", "device",
+                                                 "flush_disks", "device_writes", "device_flushes", "totals",
+                                                 "settings", "stopped_early")})
             out.append(r)
     return out
 
@@ -484,8 +492,11 @@ def check(rec):
     p = []
     if not isinstance(rec, dict):
         return ["not an object"]
-    if rec.get("record") != RECORD:
-        p.append(f"record must be {RECORD}")
+    if rec.get("record") not in KNOWN_RECORDS:
+        return [f"record version {rec.get('record')!r} is not one this tool knows ({', '.join(map(str, KNOWN_RECORDS))})"]
+    if rec.get("record") == 1 and any(isinstance(r, dict) and r.get("mode") == "longrun"
+                                      for r in rec.get("results") or []):
+        p.append("mode longrun needs record 2")
     for k, t in (("suite", str), ("scale", str), ("manifest", dict), ("settings", dict), ("results", list)):
         if not isinstance(rec.get(k), t):
             p.append(f"{k} must be a {t.__name__}")

@@ -47,7 +47,15 @@ def compare_main(argv):
     a = ap.parse_args(argv)
     if len(a.records) < 2:
         ap.error('compare needs at least two records')
-    recs = [json.load(open(f)) for f in a.records]
+    recs = []
+    for f in a.records:
+        with open(f) as fh:
+            rec = json.load(fh)
+        # the record versions of scripts/bench-record.py that this comparison understands
+        if rec.get('record') not in (1, 2):
+            print(f'{f}: record version {rec.get("record")!r} is not one this tool knows (1, 2)', file=sys.stderr)
+            return 2
+        recs.append(rec)
 
     def key(rec, r):
         return (rec['suite'], rec['scale'], r['engine'], r['query'], r['mode'], r['clients'])

@@ -191,7 +191,7 @@ start() {
       ready="localhost:$p/\$/ping"
       ;;
     qlever)
-      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m 8G -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 > server.log 2>&1) &
+      (cd "$(store_of qlever)" && exec "${CAP[@]}" "$QSERVER" -i bench -p "$p" -m 8G -c 2G -e 0B -s "${SERVER_TIMEOUT}s" -a bench -j 16 >> server.log 2>&1) &
       URL[$e]=localhost:$p/
       UPDURL[$e]=localhost:$p/
       UPDFIELD[$e]=access-token=bench
@@ -226,17 +226,41 @@ start() {
   done
   die "$e: server did not start"
 }
-# stop <engine>: by port, since wrapper scripts (fuseki-server) may outlive their JVM
+# alive <pid>: the process exists and is not a zombie
+alive() { case $(ps -o stat= -p "$1" 2> /dev/null) in "" | Z*) return 1 ;; esac }
+# stop <engine>: by port, since wrapper scripts (fuseki-server) may outlive their JVM. It
+# waits for the listening process to exit, not only to close its port, because a server may
+# still write its store after that. A server that is still running 60 s after SIGTERM gets
+# SIGKILL, and so does a launcher that has not exited 10 s later, so a stop never waits
+# without bound.
 stop() {
   local e=$1 pid
   pid=$(pid_on "${PORT[$e]}")
   [ -n "$pid" ] && { kill "$pid" 2> /dev/null || true; }
   [ -n "${PID[$e]:-}" ] && { kill "${PID[$e]}" 2> /dev/null || true; }
   for _ in $(seq 1 240); do
-    [ -z "$(pid_on "${PORT[$e]}")" ] && break
+    [ -z "$(pid_on "${PORT[$e]}")" ] && { [ -z "$pid" ] || ! alive "$pid"; } && break
     sleep 0.25
   done
-  [ -n "${PID[$e]:-}" ] && { wait "${PID[$e]}" 2> /dev/null || true; }
+  if [ -n "$(pid_on "${PORT[$e]}")" ] || { [ -n "$pid" ] && alive "$pid"; }; then
+    log "$e: still running 60 s after SIGTERM, sending SIGKILL"
+    [ -n "$pid" ] && kill -KILL "$pid" 2> /dev/null
+    pid=$(pid_on "${PORT[$e]}")
+    [ -n "$pid" ] && kill -KILL "$pid" 2> /dev/null
+    for _ in $(seq 1 40); do
+      [ -z "$(pid_on "${PORT[$e]}")" ] && { [ -z "$pid" ] || ! alive "$pid"; } && break
+      sleep 0.25
+    done
+  fi
+  if [ -n "${PID[$e]:-}" ]; then
+    for _ in $(seq 1 40); do
+      # a launcher that exited is a zombie until the wait below reaps it
+      alive "${PID[$e]}" || break
+      sleep 0.25
+    done
+    kill -KILL "${PID[$e]}" 2> /dev/null || true
+    wait "${PID[$e]}" 2> /dev/null || true
+  fi
   unset "PID[$e]"
   true
 }

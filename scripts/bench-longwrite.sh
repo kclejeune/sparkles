@@ -1,47 +1,56 @@
 #!/usr/bin/env bash
-# Sustained writes with compaction (docs/specs/X06 section 3.9): hours of concurrent reads and
-# writes against one engine at a time, on Sparkles, Apache Jena (TDB2 + Fuseki), QLever,
-# Fluree and Oxigraph, with a per-minute time series, the compactions Sparkles ran, a final
-# state check and a check after a restart.
+# Sustained writes with compaction (docs/specs/X06 section 3.9): an hour or more of concurrent
+# reads and writes against one engine at a time, on Sparkles, Apache Jena (TDB2 + Fuseki),
+# QLever, Fluree and Oxigraph, with a per-minute time series, the compactions Sparkles ran,
+# and state checks at the end, after a SIGKILL and after a normal restart.
 #
 #   scripts/bench-longwrite.sh [DATA] [WORKDIR]
 #
 # DATA is a person count for scripts/gen-data.py (default 1000000, 10.5M triples), an
 # N-Triples file, or a directory of .nt.zst files such as a scale directory of
 # scripts/bench-billion.sh (WORKDIR/<scale>/data, for example the 50m slice), which is
-# decompressed into WORKDIR/data.nt once. Every engine loads the same file, as in
-# scripts/bench.sh, and then, one engine at a time:
+# decompressed into WORKDIR/data.nt once. A workdir keeps the data it was made with and
+# refuses other data. Every engine loads the same file, as in scripts/bench.sh. Then every
+# engine answers the read set on its loaded store, one at a time, and the answers are
+# compared: an engine whose answers differ from the majority is not run and is recorded as
+# wrong-answer, unless IGNORE_ANSWERS=1. Then, one engine at a time:
 #
 # 1. its loaded store is copied (reflinks where the file system has them) and served;
 # 2. scripts/bench-longwrite/longrun.py runs READERS readers (default 16) and WRITERS writers
-#    (default 1) for SECONDS (default 14400, four hours). The readers run the queries of
-#    READ_QUERIES in rotation, and the writers commit inserts and deletes of single triples
-#    and of BATCH (default 100) triples with a fixed seed (SEED), at WRITE_RATE requests per
-#    second in all (default 0: as fast as the engine answers). Each writer deletes only above
-#    LIVE_MAX (default 200000) of its own triples, so the data stays near its size while every
-#    commit leaves work for compaction;
-# 3. the state the writers were told about is checked against the engine's answer, the
-#    server is stopped and started again (the time to its first answer is recorded), and the
-#    state is checked again.
+#    (default 1) for SECONDS_RUN (default 3600). The readers run the queries of READ_QUERIES
+#    in rotation, and the writers commit inserts and deletes of single triples and of BATCH
+#    (default 100) triples with a fixed seed (SEED), at WRITE_RATE requests per second in all
+#    (default 0: as fast as the engine answers). Each writer deletes only above LIVE_MAX
+#    (default 200000) of its own triples, so the data stays near its size while every commit
+#    leaves work for compaction. The load generator runs in its own session under a time
+#    limit, and the script's exit trap kills that session;
+# 3. the state the writers were told about is checked against the engine's answer. Then the
+#    server is killed with SIGKILL, started again and checked, which exercises the recovery
+#    of the engine's log, and finally stopped normally, started again and checked. Each
+#    restart records the time from the start to the first answered query.
 #
 # Sparkles runs with automatic compaction at its defaults. The other engines run with the
-# settings of scripts/bench.sh and their own background maintenance. TDB2 is not compacted:
-# its compaction (tdb2.tdbcompact) needs the server stopped or an administrative request, and
-# the run reports its disk growth instead. QLever keeps updates in memory, so its state after
-# a restart is the loaded data, which the check reports as missing triples. Every result
-# carries the durability class of docs/specs/X06 section 5.1, and the device flushes per write
-# request confirm it (/proc/diskstats of the device that holds the store).
+# settings of scripts/bench.sh and their own background maintenance. TDB2 is not compacted,
+# because its compaction (tdb2.tdbcompact) needs the server stopped or an administrative
+# request, and the run reports its disk growth instead. QLever keeps updates in memory, so its
+# state after a restart is the loaded data, which its documented durability class allows.
+# Every result carries the durability class of docs/specs/X06 section 5.1, and the disk
+# flushes per write request show it. `longrun.py merge` gives each engine a status: `error`
+# when a check failed, no write succeeded, more than 1% of the requests failed, the run
+# stopped early, or a synced or written engine lost acknowledged writes in a restart.
 #
 # Results go to WORKDIR/results: longwrite.json (per engine: the series, the compactions, the
-# checks, the time to restart), summary.md, manifest.json and record.json.
+# checks, the restart times, the status), summary.md, answers.json, manifest.json and
+# record.json.
 #
-# Env: ENGINES (default the five), SECONDS_RUN (default 14400), READERS, WRITERS, BATCH,
+# Env: ENGINES (default the five), SECONDS_RUN (default 3600), READERS, WRITERS, BATCH,
 # LIVE_MAX, WRITE_RATE, SEED, READ_QUERIES (names; default every query of the set),
 # QUERY_SET (synthetic or dbpedia; default synthetic for a person count, dbpedia otherwise),
-# SAMPLE (seconds between samples, default 5), SKIP_LOAD=1, PORT_BASE (default 48400),
-# SPARKLES, SPARKLES_ARGS, SERVER_MEM_MAX, CLIENT_CPU, FLUREE and FLUREE_VERSION as in
-# scripts/bench.sh. CLIENT_CPUS (default the last quarter of the CPUs) pins the load
-# generator, so it does not compete with the server for the same cores.
+# SAMPLE (seconds between samples, default 5), SKIP_LOAD=1, IGNORE_ANSWERS=1, PORT_BASE
+# (default 48400), SPARKLES, SPARKLES_ARGS, SERVER_MEM_MAX, FLUREE and FLUREE_VERSION as in
+# scripts/bench.sh. CLIENT_CPUS pins the load generator (default the last quarter of the
+# CPUs on a host with 4 or more, none otherwise; "none" turns it off). The servers are not
+# pinned, so the pinning only keeps the generator's own processes together.
 set -euo pipefail
 
 DATA=${1:-1000000}
@@ -50,7 +59,7 @@ WORK=${2:-$ROOT/target/bench-longwrite}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
 PORT_BASE=${PORT_BASE:-48400}
-SECONDS_RUN=${SECONDS_RUN:-14400}
+SECONDS_RUN=${SECONDS_RUN:-3600}
 MAX_TIME=${MAX_TIME:-120}
 export MAX_TIME
 
@@ -61,8 +70,12 @@ cd "$WORK"
 # shellcheck source=scripts/bench-lib.sh
 source "$ROOT/scripts/bench-lib.sh"
 RES=results
+LW=$ROOT/scripts/bench-longwrite/longrun.py
 
 # ------------------------------------------------------------------------------ data
+if [ -f data.label ] && [ "$(cat data.label)" != "$DATA" ]; then
+  die "$WORK holds the data of $(cat data.label), not $DATA; use another workdir"
+fi
 if [[ $DATA =~ ^[0-9]+$ ]]; then
   QUERY_SET=${QUERY_SET:-synthetic}
   if [ ! -f data.nt ]; then
@@ -86,6 +99,7 @@ else
     fi
   fi
 fi
+echo "$DATA" > data.label
 log "data: $(wc -l < data.nt) triples"
 
 # ---------------------------------------------------------------------------- queries
@@ -106,17 +120,32 @@ case $QUERY_SET in
   *) die "QUERY_SET must be synthetic or dbpedia" ;;
 esac
 if [ -n "${READ_QUERIES:-}" ]; then
-  NAMES=$READ_QUERIES
+  read -r -a NAMES <<< "$READ_QUERIES"
 else
-  NAMES=$(find queries -name '*.rq' -printf '%f\n' | sed 's/\.rq$//' | sort | tr '\n' ' ')
+  mapfile -t NAMES < <(find queries -name '*.rq' -printf '%f\n' | sed 's/\.rq$//' | sort)
 fi
-for n in $NAMES; do [ -f "queries/$n.rq" ] || die "no query $n in the $QUERY_SET set"; done
+for n in "${NAMES[@]}"; do [ -f "queries/$n.rq" ] || die "no query $n in the $QUERY_SET set"; done
+selected() { true; }
 
-# ------------------------------------------------------------------------- the runs
+# ------------------------------------------------------------------- generator CPUs
+if [ -z "${CLIENT_CPUS:-}" ] && command -v taskset > /dev/null; then
+  n=$(nproc)
+  if [ "$n" -ge 4 ]; then CLIENT_CPUS="$((n - n / 4))-$((n - 1))"; else CLIENT_CPUS=none; fi
+fi
+GEN=()
+[ -n "${CLIENT_CPUS:-}" ] && [ "$CLIENT_CPUS" != none ] && GEN=(taskset -c "$CLIENT_CPUS")
+
+# ------------------------------------------------------------------- load and answers
 DATAFILE=data.nt
 LOADRES=$RES
 resolve_tools
-trap stop_all EXIT
+GENPID=""
+# the servers, and the load generator's whole session
+cleanup() {
+  [ -n "$GENPID" ] && kill -KILL -- "-$GENPID" 2> /dev/null
+  stop_all
+}
+trap cleanup EXIT
 args=(--out "$RES/manifest.json" --suite longwrite --sparkles "$SPARKLES" --workdir "$WORK"
   --memory-limit "${SERVER_MEM_MAX:-}" --client-cpu "${CLIENT_CPUS:-}"
   --data "longwrite-$SCALE=$WORK/data.nt|see the source|$QUERY_SET data")
@@ -127,17 +156,73 @@ has fluree && args+=(--engine "fluree=$FLUREE")
 python3 "$ROOT/scripts/bench-record.py" manifest "${args[@]}" > /dev/null
 [ -n "${SKIP_LOAD:-}" ] || load_all
 
-# the load generator's CPUs: the last quarter, away from the servers' first cores
-if [ -z "${CLIENT_CPUS:-}" ] && command -v taskset > /dev/null; then
-  n=$(nproc)
-  CLIENT_CPUS="$((n - n / 4))-$((n - 1))"
-fi
-GEN=()
-[ -n "${CLIENT_CPUS:-}" ] && [ "$CLIENT_CPUS" != none ] && GEN=(taskset -c "$CLIENT_CPUS")
-
-STORE=$WORK/scratch
+# the read set's answers on every engine's loaded store, one engine at a time
+rm -f "$RES/answers.json"
+COUNT_ONLY=${COUNT_ONLY:-}
+NO_CHECK=${NO_CHECK:-}
 all=$ENGINES
 for e in $all; do
+  ENGINES=$e
+  start "$e"
+  answer_check
+  stop "$e"
+done
+ENGINES=$all
+# the engines whose answers differ from the majority, or that failed, by the agreement rule of
+# the record (scripts/bench-record.py fingerprints)
+mapfile -t WRONG < <(
+  python3 -I - "$ROOT/scripts/bench-record.py" "$RES/answers.json" << 'EOF'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("bench_record", sys.argv[1])
+br = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(br)
+with open(sys.argv[2]) as f:
+    ans = json.load(f)
+fp = br.fingerprints(ans)
+wrong = {e for q, per in ans.items() for e in per
+         if fp.get((q, br.engine_name(e))) is None or fp[q, br.engine_name(e)]["agrees"] is False}
+print("\n".join(sorted(wrong)))
+EOF
+)
+[ ${#WRONG[@]} -gt 0 ] && log "answers of the read set differ from the majority or failed: ${WRONG[*]}"
+
+# --------------------------------------------------------------------------- the runs
+# check <engine> <run file>: the state check's JSON, or a failure object
+check() {
+  local fields=()
+  [ -n "${UPDFIELD[$1]:-}" ] && fields=(--field "${UPDFIELD[$1]}")
+  python3 "$LW" check --query-url "${URL[$1]}" "${fields[@]}" --state "$2" || true
+}
+# restart <engine>: start the server in a subshell, so a failed start is recorded rather than
+# ending the run; RESTART_S gets the seconds from the start to the first answered query
+restart() {
+  local e=$1 t0 t1
+  t0=$(date +%s.%N)
+  if ! (start "$e") > "logs/restart-$e.log" 2>&1; then
+    RESTART_S=""
+    return 1
+  fi
+  for _ in $(seq 1 1200); do
+    if curl -sf -o /dev/null --max-time 10 -H 'Accept: application/sparql-results+json' \
+      --data-urlencode 'query=SELECT * WHERE { ?s ?p ?o } LIMIT 1' "${URL[$e]}"; then
+      t1=$(date +%s.%N)
+      RESTART_S=$(awk "BEGIN {printf \"%.3f\", $t1 - $t0}")
+      return 0
+    fi
+    sleep 0.1
+  done
+  RESTART_S=""
+  return 1
+}
+fail_json() { echo "{\"ok\": false, \"error\": \"$1\"}"; }
+
+STORE=$WORK/scratch
+for e in $all; do
+  if [[ " ${WRONG[*]} " == *" ${NAME[$e]} "* ]] && [ -z "${IGNORE_ANSWERS:-}" ]; then
+    log "$e: not run, its answers to the read set differ from the majority"
+    python3 "$LW" merge --into "$RES/longwrite.json" --engine "$e" --answers wrong-answer
+    continue
+  fi
   ENGINES=$e
   log "$e: copying its store"
   copy_stores
@@ -147,37 +232,48 @@ for e in $all; do
   comp=()
   [ "$e" = sparkles ] && comp=(--compaction-url "localhost:${PORT[$e]}/\$/stats/bench")
   out=$RES/run-$e.json
+  rm -f "$out"
   log "$e: $SECONDS_RUN s of ${READERS:-16} readers and ${WRITERS:-1} writers"
-  "${GEN[@]}" python3 "$ROOT/scripts/bench-longwrite/longrun.py" run --query-url "${URL[$e]}" \
-    --update-url "${UPDURL[$e]}" "${fields[@]}" --queries queries --names "$NAMES" --seconds "$SECONDS_RUN" \
+  setsid timeout -k 30 $((SECONDS_RUN + 900)) "${GEN[@]}" python3 "$LW" run --query-url "${URL[$e]}" \
+    --update-url "${UPDURL[$e]}" "${fields[@]}" --queries queries --names "${NAMES[*]}" --seconds "$SECONDS_RUN" \
     --readers "${READERS:-16}" --writers "${WRITERS:-1}" --batch "${BATCH:-100}" --live-max "${LIVE_MAX:-200000}" \
     --write-rate "${WRITE_RATE:-0}" --seed "${SEED:-20261018}" --sample "${SAMPLE:-5}" --port "${PORT[$e]}" \
-    --store "$(store_of "$e")" "${comp[@]}" --read-timeout "$MAX_TIME" --out "$out" | tee "logs/longwrite-$e.log"
-  check=$(python3 "$ROOT/scripts/bench-longwrite/longrun.py" check --query-url "${URL[$e]}" "${fields[@]}" --state "$out") || true
-  log "$e: state check $check"
+    --store "$(store_of "$e")" "${comp[@]}" --read-timeout "$MAX_TIME" --out "$out" > "logs/longwrite-$e.log" 2>&1 &
+  GENPID=$!
+  wait "$GENPID" || log "$e: the load generator failed, see logs/longwrite-$e.log"
+  GENPID=""
+  cat "logs/longwrite-$e.log"
+  c1=$(check "$e" "$out")
+  log "$e: state check $c1"
+  # a crash: the recovery of the engine's log
+  pid=$(pid_on "${PORT[$e]}")
+  [ -n "$pid" ] && kill -KILL "$pid" 2> /dev/null
   stop "$e"
-  start "$e"
-  restart_s=${READY_S[$e]}
-  check2=$(python3 "$ROOT/scripts/bench-longwrite/longrun.py" check --query-url "${URL[$e]}" "${fields[@]}" --state "$out") || true
-  log "$e: restart in $restart_s s, state check $check2"
+  if restart "$e"; then
+    c2=$(check "$e" "$out")
+    s2=$RESTART_S
+  else
+    c2=$(fail_json "the server did not start after SIGKILL")
+    s2=""
+  fi
+  log "$e: after SIGKILL, ready in ${s2:-?} s, state check $c2"
   stop "$e"
-  python3 -I - "$RES/longwrite.json" "$e" "$out" "${check:-null}" "${check2:-null}" "$restart_s" << 'EOF'
-import json, os, sys
-f, e, run, c1, c2, ready = sys.argv[1:]
-dur = {"sparkles": "synced", "jena": "synced", "fluree": "synced", "oxigraph": "written", "qlever": "memory"}
-d = json.load(open(f)) if os.path.exists(f) else {}
-r = json.load(open(run))
-r.pop("state", None)
-load = lambda s: json.loads(s) if s and s != "null" else None
-r.update({"durability": dur.get(e), "check": load(c1), "check_reopen": load(c2), "restart_ready_s": float(ready)})
-d[e] = r
-json.dump(d, open(f, "w"), indent=1)
-EOF
+  if restart "$e"; then
+    c3=$(check "$e" "$out")
+  else
+    c3=$(fail_json "the server did not start after a normal stop")
+  fi
+  log "$e: after a restart, ready in ${RESTART_S:-?} s, state check $c3"
+  stop "$e"
+  python3 "$LW" merge --into "$RES/longwrite.json" --engine "$e" --run "$out" --check "$c1" --check-crash "$c2" \
+    --check-reopen "$c3" --restart-s "${RESTART_S:-}"
+  # the servers' logs outlive the store copy
+  while IFS= read -r -d '' f; do cp "$f" "logs/$e-$(basename "$f")"; done < <(find "$STORE" -maxdepth 3 -name '*.log' -print0)
   [ -n "${KEEP_SCRATCH:-}" ] || rm -rf "$STORE"
 done
 ENGINES=$all
 python3 "$ROOT/scripts/bench-record.py" finish "$RES/manifest.json"
-python3 "$ROOT/scripts/bench-longwrite/longrun.py" summary "$RES/longwrite.json" > "$RES/summary.md"
+python3 "$LW" summary "$RES/longwrite.json" > "$RES/summary.md"
 python3 "$ROOT/scripts/bench-record.py" build --suite longwrite --scale "$SCALE" --results "$RES" \
   --manifest "$RES/manifest.json" --out "$RES/record.json" --queries --timer longrun.py
 log "record: $WORK/$RES/record.json, table: $WORK/$RES/summary.md"
