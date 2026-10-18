@@ -13,7 +13,7 @@
 # adds N microseconds to every synchronization and write-through write of the store's files
 # (through tests/support/iofault.c), to stand in for a device slower than the instance's:
 #
-#   scripts/nsc-writes.sh off=HEAD on=HEAD:--experimental-group-commit
+#   scripts/nsc-writes.sh off=HEAD:--no-group-commit on=HEAD
 #   scripts/nsc-writes.sh base=main head=HEAD
 #
 # Revisions are built here with `cargo build --release -p sparkles-server` from a

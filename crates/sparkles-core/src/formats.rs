@@ -220,7 +220,7 @@ pub const DELTA_VOCAB: FileKind = FileKind {
 pub const WAL: FileKind = FileKind {
     id: "wal",
     files: "gen-*/wal.log",
-    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version); version 0 is a log without it. Commit-record flag bits in byte 27 are added compatibly",
+    marker: "a 33-byte header record (magic `\\x89SPKWAL\\n` and the version); version 0 is a log without it. Commit-record flag bits in byte 27 are added compatibly. A version 0 log is strictly framed from `walStrictFrom` of its generation's `commit.json`, an additive member",
     class: Class::Primary,
     writes: WAL_VERSION,
     reads: &[0, 1],

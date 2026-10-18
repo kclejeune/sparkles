@@ -612,8 +612,7 @@ pub fn reidentify(root: &Path, new_id: uuid::Uuid, forked_from: ForkedFrom) -> R
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
-        let mut f: GenCommitFile = serde_json::from_slice(&b)
-            .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+        let mut f = parse_gen_commit(&path, &b)?;
         if f.dataset_id == old_id {
             f.dataset_id = new_id;
             crate::store::write_atomic(&path, &serde_json::to_vec_pretty(&f).unwrap())?;
@@ -754,6 +753,16 @@ struct GenCommitFile {
     /// `create`, `baseline`, `bulk`, `compaction` or `clone`
     origin: String,
     commit: CommitJson,
+    /// Where strict framing starts in the generation's headerless (version 0) log, in
+    /// bytes. A release that writes commit metadata records the log's logical end here
+    /// once, at its first write open of the log, before it appends anything. Absent in
+    /// files written before the member existed, and for logs with a header record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wal_strict_from: Option<u64>,
+    /// Members this build does not know, added by a later release under the additive
+    /// rule of X12 section 4.3. They are kept when the file is rewritten.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -774,6 +783,9 @@ struct CommitJson {
     default_graph: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     unvalidated: bool,
+    /// members a later release added, kept on rewrite (see [`GenCommitFile`])
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn yes() -> bool {
@@ -786,6 +798,8 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
         dataset_id,
         base_seq: c.seq,
         origin: origin.to_string(),
+        wal_strict_from: None,
+        extra: Default::default(),
         commit: CommitJson {
             seq: c.seq,
             timestamp: c.timestamp(),
@@ -799,6 +813,7 @@ pub(crate) fn gen_commit_bytes(dataset_id: uuid::Uuid, origin: &str, c: &CommitI
             reconstructed: c.reconstructed,
             default_graph: c.default_graph,
             unvalidated: c.unvalidated,
+            extra: Default::default(),
         },
     })
     .unwrap()
@@ -813,8 +828,8 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    let f = parse_gen_commit(&path, &b)?;
     let bad = |m: &str| Error::Corrupt(format!("{}: {m}", path.display()));
-    let f: GenCommitFile = serde_json::from_slice(&b).map_err(|e| bad(&e.to_string()))?;
     let c = f.commit;
     Ok(Some((
         f.dataset_id,
@@ -834,6 +849,42 @@ pub(crate) fn read_gen_commit(dir: &Path) -> Result<Option<(uuid::Uuid, CommitIn
         },
         f.origin,
     )))
+}
+
+/// Parse `gen-NNNN/commit.json`, refusing a `format` this build does not read.
+fn parse_gen_commit(path: &Path, b: &[u8]) -> Result<GenCommitFile> {
+    let f: GenCommitFile = serde_json::from_slice(b)
+        .map_err(|e| Error::Corrupt(format!("{}: {e}", path.display())))?;
+    if f.format != 1 {
+        return Err(Error::Unsupported(format!(
+            "{} has format {}; this release reads format 1",
+            path.display(),
+            f.format
+        )));
+    }
+    Ok(f)
+}
+
+/// The strict-framing offset of a generation's headerless log (`walStrictFrom` of
+/// `gen-NNNN/commit.json`, see [`GenCommitFile`]): `None` when the file or the member is
+/// missing.
+pub(crate) fn wal_strict_from(dir: &Path) -> Result<Option<u64>> {
+    let path = dir.join("commit.json");
+    match std::fs::read(&path) {
+        Ok(b) => Ok(parse_gen_commit(&path, &b)?.wal_strict_from),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Record `at` as the strict-framing offset of the generation in `dir`, keeping every
+/// other member of its `commit.json`, durably (the file is replaced atomically and the
+/// directory synced) before the caller appends to the log.
+pub(crate) fn set_wal_strict_from(dir: &Path, at: u64) -> Result<()> {
+    let path = dir.join("commit.json");
+    let mut f = parse_gen_commit(&path, &std::fs::read(&path)?)?;
+    f.wal_strict_from = Some(at);
+    crate::store::write_atomic(&path, &serde_json::to_vec_pretty(&f).unwrap())
 }
 
 // ----------------------------------------------------------------- catalog ------

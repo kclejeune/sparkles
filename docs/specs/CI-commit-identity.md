@@ -533,6 +533,17 @@ last one.
   to an upgraded database. Each gets `seq = prev + 1`, kind `unknown`, the parent's
   timestamp and the `reconstructed` flag. The rule is deterministic, so every replay
   assigns the same ids. Downgrading is still unsupported, but it corrupts nothing.
+* **Strict framing of a headerless log.** A torn version-2 commit record can be
+  byte-identical to a legacy one. The first write open of a headerless log by a release
+  with [X09](X09-group-commit-by-default.md) Phase 3 records the log's logical end as
+  `walStrictFrom` in the generation's `commit.json`. It does so after replay, truncation,
+  the log's sync and the syncs of `delta.vocab` and `annotations.bin`, so the terms and
+  annotations of the commits before the offset are durable with them. A log cut to nothing
+  records 0, and a recorded offset whose log is missing is corruption.
+  Records before it keep the rules above. Records after it follow the rules of a log with
+  a header record, so a commit record without metadata there is damage, and damage before
+  the offset is corruption. Legacy records that a downgraded binary appends after the
+  offset are therefore treated as damage.
 
 ### 5.7 Server plumbing
 
@@ -806,7 +817,7 @@ previews report their precondition result without changing the store.
   number.
 - `sparkles log` lists 20 commits unless `--limit` says otherwise.
 - Byte 28 of the commit record, reserved in §5.3 as first written, counts the commits
-  before it that may not have been durable yet. Experimental group commit writes up to
+  before it that may not have been durable yet. Group commit writes up to
   64 commits before their shared sync, so a crash can damage any of them, not just the
   last. Replay treats such damage as a torn tail unless a later commit record shows the
   damaged commit was durable. The count reaches the disk with the next sync, so the

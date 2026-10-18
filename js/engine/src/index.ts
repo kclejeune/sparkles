@@ -109,6 +109,11 @@ export interface DatasetOptions {
   unionDefaultGraph?: boolean;
   cacheBytes?: number;
   /**
+   * Whether concurrent commits of a persistent dataset share one synchronization (group
+   * commit). On by default. Each commit is still acknowledged only once it is durable.
+   */
+  groupCommit?: boolean;
+  /**
    * Catalog only: the bytes of estimated memory that all of the catalog's queries may
    * hold together. A query that the pool cannot cover fails with a server-memory budget
    * error. Without it, only each query's own budget applies.

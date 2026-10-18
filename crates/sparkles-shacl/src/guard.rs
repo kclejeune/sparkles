@@ -1546,7 +1546,7 @@ mod pending_tests {
         let store = Store::open(
             dir.path(),
             StoreOptions {
-                experimental_group_commit: grouped,
+                group_commit: grouped,
                 group_commit_idle_direct: false,
                 ..Default::default()
             },

@@ -329,10 +329,11 @@ The commit catalog can be repaired from durable storage.
 
 The bulk path builds and validates a replacement generation, then atomically
 switches `CURRENT`. It does not append one WAL operation for every bulk quad.
-Experimental, opt-in group commit shares a durability fence across admitted writes
-and publishes only the durable prefix. It preserves durability rather than
-acknowledging unsynchronized writes, and guarded or otherwise ineligible writes
-use the ordinary path. In-memory stores share the commit and snapshot model without
+Group commit, on by default for persistent stores, shares a durability fence across
+admitted writes and publishes only the durable prefix. It preserves durability rather
+than acknowledging unsynchronized writes, and ineligible writes, such as those on a
+dataset with a full-text, spatial or embedding index, use the ordinary path.
+`--no-group-commit` turns it off. In-memory stores share the commit and snapshot model without
 disk durability.
 
 **Validation belongs at this boundary.** The engine invokes a configured write guard

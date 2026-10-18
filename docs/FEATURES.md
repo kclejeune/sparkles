@@ -35,7 +35,28 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
 * CSV and TSV imports ([C05](specs/C05-tabular-imports.md)). `sparkles load`, `sparkles csv`, `POST /{ds}/upload` and the web UI's upload form map tables to triples with a default mapping (a key column or the row number names each row), with W3C CSVW metadata (datatypes and formats, null values, defaults, lists, virtual columns and RFC 6570 URI templates), or with Tarql-style CONSTRUCT templates run in batches by the SPARQL engine. Tables stream, compressed or not, and an invalid cell stops the load with its row and column ([USAGE.md](USAGE.md#loading-csv-and-tsv)).
 * Planner statistics for predicates (counts, distinct subjects and objects), classes and graphs.
 * MVCC snapshots with a single writer (MR+SW), and a WAL with crash-safe replay.
-* Durable commits. A commit is acknowledged after its WAL record and any new vocabulary entries are synchronized, with the two writes issued in parallel. The update vocabulary is written in checksummed chunks, so a torn tail is detected and trimmed at open. Opt-in group commit (`--experimental-group-commit`) shares one synchronization among concurrent writers. It takes SPARQL updates, Graph Store writes, uploads, RDF Patch, commit messages and change digests, preconditions, graph-restricted writes, SHACL-guarded writes and writes during a compaction. A commit that does not qualify, such as one on a dataset with a full-text, spatial or embedding index, takes the ordinary path. A commit by the only writer, with no fence running, is synchronized as the default writer synchronizes it. ShEx-guarded datasets commit through the group path one at a time. `/$/metrics` and `/$/stats` report the synchronization time, the commits per fence, the wait, and why commits fell back or failed ([X09](specs/X09-group-commit-by-default.md)).
+* Durable commits. A commit is acknowledged after its WAL record and any new vocabulary
+  entries are synchronized, with the two writes issued in parallel. The update vocabulary
+  is written in checksummed chunks, so a torn tail is detected and trimmed at open.
+  Group commit, on by default for persistent stores, shares one synchronization among
+  concurrent writers. `--no-group-commit` or `SPARKLES_GROUP_COMMIT=off` turns it off, and
+  the Node and Python bindings take a `groupCommit` and a `group_commit` option. The JVM
+  library follows the default and has no option. A persistent dataset holds up to 64
+  commits or 4 MiB of log records in its queue, plus the speculative snapshots of the
+  commits in flight, which is the memory this speed costs. It takes SPARQL updates, Graph Store writes,
+  uploads, RDF Patch, commit messages and change digests, preconditions, graph-restricted
+  writes, SHACL-guarded writes and writes during a compaction. ShEx-guarded datasets commit
+  through the group path one commit at a time. A commit that does not qualify takes the
+  ordinary path. Commits on a dataset with a full-text, spatial or embedding index are such
+  commits. A commit by the only writer, with no fence running, is synchronized as the
+  default writer synchronizes it. `/$/metrics` reports the synchronization time, the
+  commits per fence, the wait, and why commits fell back or failed, and `/$/stats/{ds}`
+  whether the dataset groups commits.
+  [X09](specs/X09-group-commit-by-default.md) has the design.
+* Strict framing of old logs. A WAL written before logs had a header record is strictly
+  framed from the offset where this release first opened it for writing. The offset is
+  recorded in the generation's `commit.json` once the log, its vocabulary and its
+  annotations are durable, so a torn modern record after it is never read as a legacy one.
 * Durable commit ids. Each dataset has a UUID and a gap-free commit sequence with timestamps and net counts. Writes return receipts and `Sparkles-Commit` headers, and the commit catalog is available through `/$/commits` and `sparkles log`.
 * Commit messages and change digests. A write's `Sparkles-Commit-Message` header, or `--message` on `update` and `load`, is stored with its commit and shown in receipts, `/$/commits` and `sparkles log`. An optional SHA-256 digest chains each commit's net changes (`--commit-digests`).
 * Entity tags on Graph Store GET and HEAD, named after the commit read. `If-None-Match` answers `304`, and `If-Match` on PUT, POST and DELETE is an optimistic-concurrency check made under the writer lock (`412` on a mismatch).
@@ -48,7 +69,7 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
 * Applying RDF Patch ([F10](specs/F10-replication.md)). `POST` and `PATCH /{ds}/patch`, a patch sent to `/{ds}`, `sparkles patch`, `Store::apply_patch` and the Python `Dataset.apply_patch` apply a patch in the text or the binary form as one commit of kind `patch`, as Fuseki's `patch` operation does. `TA` aborts the whole patch, `PA` and `PD` change the prefixes, and a `prev` header that names a commit of the dataset applies the patch only while that commit is the head. Write-time validation, quotas, graph-limited grants, dry runs and receipts apply as to other writes ([API.md](API.md#applying-rdf-patch)).
 * Branches and merges ([F09](specs/F09-branches-and-merges.md)). A persistent branch starts from any readable commit of another branch and shares that generation's index files until it compacts, so creating one writes a few kilobytes. Memory branches share immutable base state and copy their inherited append vocabulary. Branches have their own commits, history, snapshots, write guard and writer lock, and requests choose one with `?branch=`, the path form `/{ds}@{branch}/…` or `--branch`. A merge finds the merge base, fast-forwards or merges quad sets three ways, reports conflicts by cell or subject with the base, ours and theirs objects, and takes resolutions per graph, subject or cell, a rule for the rest, and the heads the caller saw. It is one commit of kind `merge` that passes the target's write-time validation, and a dry run previews it. Blank nodes keep their labels across branches. Merges can also squash a branch into one commit, replay its commits one by one, run as cancellable tasks, and keep both sides' changes to exempt predicates. Reverts and cherry-picks are merges of one commit. Branches can be protected, renamed, deleted (re-parenting the branches created from them) and limited by grants, and `/$/branches`, `/$/merge`, `/$/revert`, `/$/cherry-pick`, `sparkles branch`, `sparkles merge`, `sparkles revert`, `sparkles cherry-pick`, and the web UI's Branches panel and merge page manage them ([API.md](API.md#branches-and-merges)). The History panel draws every branch as a commit graph. In-memory branches share immutable state and keep their writes and validation state separate. A branch backup restores as an independent dataset.
 * A commit catalog horizon (`catalog` in `PUT /$/history/{ds}`, `sparkles snapshot catalog`) that prunes the records, messages and digests of commits older than both the readable history and the horizon.
-* Compaction into a new generation (`gen-NNNN`), published by an atomic `CURRENT` switch. The build reads a snapshot while writes go on. The commits made meanwhile are carried into the new generation's log, and the writer lock is held only for the switch.
+* Compaction into a new generation (`gen-NNNN`), published by an atomic `CURRENT` switch. The build reads a snapshot while writes go on. The commits made meanwhile are carried into the new generation's log, and the writer lock is held only for the switch. A power loss during a compaction can leave the new generation's directory behind while `CURRENT` still names the old one. `sparkles check` reports it as a leftover warning, and the next rebuild replaces it ([roadmap](ROADMAP.md) item 14).
 * Automatic compaction ([C13](specs/C13-automatic-compaction.md)). A server compacts a dataset when its delta reaches a share of the base index or a size, its log a size, its oldest change an age, or after a quiet period. Flags set the policy, and `compaction.json` (`/$/compaction/{ds}`, `sparkles compaction`) overrides it per dataset. It waits for bulk loads, backups, restores, the retention window and free disk space, takes a task slot only when one is free, and builds with fewer threads at a lower priority. A delta that adds no terms is compacted partially, rewriting only the index blocks it touches. The spatial index's base is built with the new generation, so the writer lock is held for a few milliseconds. The status is in `/$/stats`, the metrics and the dataset page. See [API.md](API.md#automatic-compaction).
 * Clone a dataset into an independent sandbox from one snapshot (`POST /$/datasets/{ds}/clone`, `sparkles clone`). The clone has the same quads and blank-node ids, and a new dataset id with `forkedFrom`. Inferences are copied or dropped. A source with no changes since its last compaction is cloned by sharing its index files, by reflink where the file system supports it, by copy otherwise, or by hard link on request. Other clones are rebuilt. A clone can copy some graphs only, can be an in-memory dataset, and waits for one of the `--max-clones` slots.
 * N-Quads backups (`/$/backup`) and dumps, compressed with zstd by default or with gzip, xz, bzip2, brotli or LZ4. Request bodies and responses can be compressed with `zstd`, `br` or `gzip`.
@@ -277,11 +298,14 @@ that work by priority and links each item to its design spec.
   body, so a slow client holds pool memory while it sends. With a pool set, an eager
   result keeps its query's peak estimate until the result object is released.
   [Roadmap](ROADMAP.md) item 7.
-* Headerless WALs preserve legacy-record interpretation even after v2 metadata, so
-  existing mixed histories remain readable. Torn modern metadata can be byte-identical
-  to legacy metadata, and the existing rules may reconstruct it or conservatively refuse
-  the image. [Roadmap](ROADMAP.md) item 3 and
-  [X09 Phase 3](specs/X09-group-commit-by-default.md#left-for-phase-3).
+* A headerless WAL that this release has never opened for writing keeps the mixed legacy
+  rules for the bytes it already holds. A torn record that an older build left there can
+  still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3 and
+  [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
+* Group commit does not group commits on a dataset with a full-text, spatial or embedding
+  index. Such a commit takes the ordinary path, so it is as fast as before but gains
+  nothing. [Roadmap](ROADMAP.md) item 86 and
+  [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets).
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the

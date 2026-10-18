@@ -217,6 +217,29 @@ test('stream inputs/dumps and path loads round trip; malformed loads are atomic'
     await rm(temp, { recursive: true, force: true });
   }
 });
+test('groupCommit is on by default and part of the open options', async (t) => {
+  const path = await mkdtemp(join(tmpdir(), 'sparkles-node-group-'));
+  const other = await mkdtemp(join(tmpdir(), 'sparkles-node-group-'));
+  try {
+    const ds = t.resource(await Dataset.open(path));
+    await ds.add(quad(1));
+    // the default is groupCommit: true, so naming it shares the handle
+    const same = t.resource(await Dataset.open(path, { groupCommit: true }));
+    assert.equal(same.id, ds.id);
+    await assert.rejects(Dataset.open(path, { groupCommit: false }), InvalidInputError);
+    // grouping off still commits durably
+    const off = t.resource(await Dataset.open(other, { groupCommit: false }));
+    await off.add(quad(2));
+    assert.equal(await off.count(), 1n);
+    await assert.rejects(Dataset.open(other), InvalidInputError);
+    const again = t.resource(await Dataset.open(other, { groupCommit: false }));
+    assert.equal(again.id, off.id);
+  } finally {
+    await t.cleanup();
+    await rm(path, { recursive: true, force: true });
+    await rm(other, { recursive: true, force: true });
+  }
+});
 test(
   'persistent registry shares Rust stores across worker environments and clean shutdown',
   { timeout: 15000 },

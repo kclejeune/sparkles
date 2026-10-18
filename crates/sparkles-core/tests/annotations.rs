@@ -476,3 +476,74 @@ fn the_catalog_horizon_prunes_old_commits() {
     s.compact().unwrap();
     assert_eq!(s.prune_commits().unwrap(), 0);
 }
+
+/// A prune rewrites `annotations.bin` while flagged commits sit at the tail of the log,
+/// and a commit after it appends to the new file. Each must keep its message through a
+/// reopen, which checks every flagged commit of the log against the file, with and
+/// without group commit (X09 Phase 2 left this case unwritten).
+#[test]
+fn a_pruned_catalog_reopens_flagged_commits_at_the_wal_tail() {
+    use sparkles_core::history::CatalogHorizon;
+    for group in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let opts = StoreOptions {
+            group_commit: group,
+            ..Default::default()
+        };
+        let s = Store::open(&root, opts.clone()).unwrap();
+        for i in 1..=30 {
+            upd_with(
+                &s,
+                &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"),
+                with_message(&format!("write {i}")),
+            )
+            .unwrap();
+        }
+        s.set_catalog_horizon(CatalogHorizon {
+            keep_commits: Some(5),
+            keep_age_ms: None,
+        })
+        .unwrap();
+        s.compact().unwrap();
+        // flagged commits in the new generation's log, then the prune rewrites the file
+        for i in 31..=32 {
+            upd_with(
+                &s,
+                &format!("INSERT DATA {{ <urn:s{i}> <urn:p> {i} }}"),
+                with_message(&format!("write {i}")),
+            )
+            .unwrap();
+        }
+        assert!(s.prune_commits().unwrap() > 0, "group {group}");
+        assert_eq!(message(&s, 31).as_deref(), Some("write 31"));
+        let r = upd_with(
+            &s,
+            "INSERT DATA { <urn:s33> <urn:p> 33 }",
+            with_message("write 33"),
+        )
+        .unwrap();
+        assert_eq!(r.commit.seq, 33);
+        let first = s.history().first_commit;
+        drop(s);
+        let report = sparkles_core::check::check(&root, &Default::default()).unwrap();
+        assert_eq!(report.errors, 0, "group {group}: {:?}", report.checks);
+        let s = Store::open(&root, opts).unwrap();
+        assert_eq!(s.head_commit().seq, 33, "group {group}");
+        assert_eq!(s.history().first_commit, first);
+        for i in 31..=33 {
+            assert_eq!(
+                message(&s, i).as_deref(),
+                Some(format!("write {i}").as_str()),
+                "group {group}: commit {i}"
+            );
+        }
+        assert_eq!(
+            upd_with(&s, "INSERT DATA { <urn:t> <urn:p> 1 }", Default::default())
+                .unwrap()
+                .commit
+                .seq,
+            34
+        );
+    }
+}

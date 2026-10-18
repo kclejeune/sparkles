@@ -121,15 +121,17 @@ impl PyCatalog {
 #[pymethods]
 impl PyCatalog {
     #[new]
-    #[pyo3(signature=(path,*,union_default_graph=false,total_query_memory_bytes=None))]
+    #[pyo3(signature=(path,*,union_default_graph=false,total_query_memory_bytes=None,group_commit=true))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         union_default_graph: bool,
         total_query_memory_bytes: Option<u64>,
+        group_commit: bool,
     ) -> PyResult<Self> {
         let mut opts = CatalogOptions::from(sparkles::store::StoreOptions {
             union_default_graph,
+            group_commit,
             ..Default::default()
         });
         opts.memory.pool_bytes = total_query_memory_bytes;

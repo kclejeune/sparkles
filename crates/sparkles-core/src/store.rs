@@ -30,6 +30,8 @@ mod diff;
 mod embed;
 mod geo;
 mod group;
+#[cfg(test)]
+mod group_model;
 mod history_query;
 pub mod keyset;
 mod link;
@@ -1124,9 +1126,12 @@ pub struct StoreOptions {
     /// whole cache. Where the file system does not take direct I/O, commits use the
     /// buffered path. On by default.
     pub wal_direct_writes: bool,
-    /// Experimental durable prefix grouping for ordinary persistent WAL writes.
-    /// Off by default; unsupported operations drain and use the ordinary commit path.
-    pub experimental_group_commit: bool,
+    /// Group commit: concurrent commits of a persistent store share one synchronization,
+    /// and each is acknowledged once the prefix that holds it is durable. On by default,
+    /// and ignored for in-memory stores. Writes the group does not admit (on datasets with
+    /// a full-text, spatial or embedding index, merges, forced and bulk commits) drain it
+    /// and take the ordinary path.
+    pub group_commit: bool,
     /// With group commit on, a commit that is the only writer (nothing queued, no fence
     /// running, no transaction waiting for the writer lock) takes the ordinary path with
     /// its write-through writes, which need no cache flush. On by default; off, every
@@ -1201,7 +1206,7 @@ impl Default for StoreOptions {
             commit_digests: false,
             wal_prealloc_bytes: DEFAULT_WAL_PREALLOC_BYTES,
             wal_direct_writes: true,
-            experimental_group_commit: false,
+            group_commit: true,
             group_commit_idle_direct: true,
             change_log: true,
             change_log_max_bytes: DEFAULT_CHANGE_LOG_MAX_BYTES,
@@ -1403,6 +1408,17 @@ pub fn verify_database_lock(root: &Path, lock: &File) -> Result<()> {
         return Err(stale());
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The durable steps of the opens on this thread, in order, for tests of their order.
+    pub(crate) static OPEN_STEPS: std::cell::RefCell<Vec<&'static str>> = Default::default();
+}
+
+#[cfg(test)]
+fn open_step(step: &'static str) {
+    OPEN_STEPS.with(|v| v.borrow_mut().push(step));
 }
 
 /// Take the exclusive process lock of a database directory.
@@ -1770,6 +1786,21 @@ impl Store {
         let mut wal_len = 0u64;
         let mut wal_index = wal::WalIndex::new(base.seq, fold_legacy);
         let annotated = crate::annotations::seqs_of(root, dataset_id);
+        // where a headerless log's strict framing starts, recorded once at the first write
+        // open by a release that writes commit metadata (see `Framing`)
+        let strict_from = commit::wal_strict_from(&root.join(&name))?;
+        // The member is recorded only for a log that exists, so a missing log is lost, not
+        // new: creating an empty one would silently drop every commit it held.
+        if let Some(m) = strict_from
+            && !wal_path.exists()
+        {
+            return Err(Error::Corrupt(format!(
+                "{}: commit.json records walStrictFrom {m}, but the log is missing",
+                wal_path.display()
+            )));
+        }
+        let mut truncated = false;
+        let mut headerless = false;
         if wal_path.exists() {
             let mut buf = Vec::new();
             File::open(&wal_path)?.read_to_end(&mut buf)?;
@@ -1785,6 +1816,7 @@ impl Store {
                 path: &wal_path,
                 start: gen_.base_delta(),
                 annotated: annotated.as_ref(),
+                strict_from,
             };
             let r = replay_wal(&from, &buf, &mut |_, _| Ok(()))?;
             if r.good != buf.len() {
@@ -1792,7 +1824,11 @@ impl Store {
                     .write(true)
                     .open(&wal_path)?
                     .set_len(r.good as u64)?;
+                truncated = true;
             }
+            // A log the replay cut to nothing, one that began with a torn header record
+            // included, gets this release's records only: it is strictly framed from 0.
+            headerless = r.good == 0 || buf.first() != Some(&WAL_HEADER);
             wal_len = r.good as u64;
             wal_index = r.index;
             delta = r.delta;
@@ -1840,15 +1876,34 @@ impl Store {
         // in the page cache, and a direct write after them would be durable while
         // they are not. The delta vocabulary also drops anything past its complete
         // entries here, after the replay has accepted them.
-        if wal_len > 0 {
+        // A truncation to an empty log must be durable too, before anything is appended.
+        if wal_len > 0 || truncated {
             wal.sync_data()?;
+            #[cfg(test)]
+            open_step("wal-synced");
         }
         gen_.dvocab.settle()?;
+        #[cfg(test)]
+        open_step("vocab-settled");
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
         let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
         let annotations =
             crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
+        #[cfg(test)]
+        open_step("annotations-open");
+        // A headerless log written by an older release: everything it holds now was
+        // replayed, truncated and synced, and so were the vocabulary entries and the
+        // annotation records its commits name (`settle` and `Annotations::open` above),
+        // so record where this release's strictly framed appends start, once, before the
+        // first of them (see `Framing`). Recording it earlier would let a power loss
+        // leave a durable offset over commits whose terms or messages were still only in
+        // the page cache. Nothing has been appended to the log yet.
+        if wal_existed && headerless && strict_from.is_none() {
+            commit::set_wal_strict_from(&root.join(&name), wal_len)?;
+            #[cfg(test)]
+            open_step("strict-offset");
+        }
         let changelog = Some(changelog::ChangeLog::open(
             root,
             dataset_id,
@@ -1880,7 +1935,7 @@ impl Store {
         let store = Store {
             root: Some(root.to_path_buf()),
             group: opts
-                .experimental_group_commit
+                .group_commit
                 .then(|| Box::new(group::Coordinator::default())),
             commit_stats: Default::default(),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
@@ -3759,7 +3814,7 @@ impl Store {
     }
 
     /// Whether this store groups commits
-    /// ([`StoreOptions::experimental_group_commit`] on a persistent store).
+    /// ([`StoreOptions::group_commit`] on a persistent store).
     pub fn groups_commits(&self) -> bool {
         self.group.is_some()
     }
@@ -6535,6 +6590,8 @@ pub(crate) struct ReplayFrom<'a> {
     pub start: Delta,
     /// the commits that have a record in `annotations.bin`, when the file can be read
     pub annotated: Option<&'a std::collections::BTreeSet<u64>>,
+    /// `walStrictFrom` of the generation's `commit.json`, for a headerless log
+    pub strict_from: Option<u64>,
 }
 
 /// What a WAL replay yields.
@@ -6568,11 +6625,18 @@ pub(crate) struct Replay {
 /// commit writes up to a bounded number of commits before their shared sync, and their
 /// records admit it, so damage anywhere in that unsynced suffix is a torn tail.
 ///
-/// A record from a release without commit metadata carries no count. It is taken to
-/// prove its predecessors durable in a headerless log, even after v2 records (CI 5.6).
-/// Only a validated v1 header establishes strict modern framing, where absent metadata
-/// may be torn. Headerless modern partial records remain ambiguous with legacy data.
-pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64, framed_metadata: bool) -> bool {
+/// A record from a release without commit metadata carries no count. Where `framing`
+/// is mixed it is taken to prove its predecessors durable, even after v2 records (CI
+/// 5.6). In the strictly framed part of a log a commit record without metadata is
+/// damage and proves nothing, and damage before that part is always corruption, because
+/// the part before it was replayed and synced before anything was appended (see
+/// [`Framing`]).
+pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64, framing: Framing) -> bool {
+    if let Framing::Strict { from } = framing
+        && at < from
+    {
+        return false;
+    }
     let recs = buf.as_chunks::<WAL_REC>().0;
     for (i, rec) in recs.iter().enumerate().skip(at + 1) {
         if rec[0] != WAL_COMMIT {
@@ -6593,11 +6657,60 @@ pub(crate) fn wal_torn_from(buf: &[u8], at: usize, seq: u64, framed_metadata: bo
                     return false;
                 }
             }
-            None if !framed_metadata => return false,
-            None => {}
+            None if framing.strict_at(i) => {}
+            None => return false,
         }
     }
     true
+}
+
+/// How a generation's log tells a commit record from a release without commit metadata
+/// (a legacy record, CI 5.6) from a modern record whose metadata a crash tore away. The
+/// two can be byte-identical: a legacy record has zeros after byte 9, and so does a
+/// modern one whose bytes after a sector boundary did not reach the disk.
+///
+/// A log with a version 1 header record was created by a release that writes metadata
+/// on every commit, so every record after the header is strictly framed. A headerless
+/// log (version 0) is mixed up to `walStrictFrom` of its generation's `commit.json`, the
+/// logical end at the first write open by a release that records it, and strictly framed
+/// after it. That release replayed, truncated and synced everything before the offset,
+/// with the vocabulary terms and annotation records it names, before it recorded it, so
+/// damage there is corruption, and it writes metadata on every commit after it. A headerless log without the member is mixed throughout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Framing {
+    /// a commit record without metadata is a legacy commit, and proves its predecessors
+    /// durable
+    Mixed,
+    /// records from index `from` on are strictly framed, and the records before it are
+    /// durable
+    Strict { from: usize },
+}
+
+impl Framing {
+    /// The framing of a log whose replay starts: `strict_from` is the generation's
+    /// `walStrictFrom` in bytes, already checked to be a whole number of records.
+    pub(crate) fn of(strict_from: Option<u64>) -> Framing {
+        strict_from.map_or(Framing::Mixed, |m| Framing::Strict {
+            from: (m / WAL_REC as u64) as usize,
+        })
+    }
+
+    /// Whether record `i` is strictly framed.
+    pub(crate) fn strict_at(self, i: usize) -> bool {
+        matches!(self, Framing::Strict { from } if i >= from)
+    }
+}
+
+/// Check a generation's `walStrictFrom` against its log: `Corrupt` unless it is a whole
+/// number of records.
+pub(crate) fn check_strict_from(path: &Path, strict_from: Option<u64>) -> Result<()> {
+    match strict_from {
+        Some(m) if m % WAL_REC as u64 != 0 => Err(Error::Corrupt(format!(
+            "{}: walStrictFrom {m} of commit.json is not a whole number of {WAL_REC}-byte records",
+            path.display()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Replay the records of a generation's WAL (`buf`) onto its base index, when the store
@@ -6651,7 +6764,8 @@ pub(crate) fn replay_wal(
     };
     let mut quads = out.base_quads;
     let mut seen_v2 = false;
-    let mut framed_metadata = false;
+    check_strict_from(from.path, from.strict_from)?;
+    let mut framing = Framing::of(from.strict_from);
     // the commit the transaction being read would be
     let next_seq = |out: &Replay| out.commits.last().map_or(from.base.seq, |c| c.seq) + 1;
     for (i, rec) in recs.iter().enumerate() {
@@ -6668,14 +6782,18 @@ pub(crate) fn replay_wal(
             // the header record that starts a log written by this release: the replay
             // accepts it as the log's first complete part
             WAL_HEADER if i == 0 => {
-                framed_metadata = wal::header_version(rec, from.path)? == 1;
+                // every record after a version 1 header is strictly framed, and a
+                // `walStrictFrom` (which only headerless logs get) does not apply
+                if wal::header_version(rec, from.path)? == 1 {
+                    framing = Framing::Strict { from: 1 };
+                }
                 txn_start = 1;
                 out.good = WAL_REC;
             }
             WAL_COMMIT => {
                 let meta = commit::open_wal_commit(rec, &buf[txn_start * WAL_REC..i * WAL_REC]);
-                if meta.is_none() && framed_metadata {
-                    if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
+                if meta.is_none() && framing.strict_at(i) {
+                    if wal_torn_from(buf, i, next_seq(&out), framing) {
                         break;
                     }
                     return Err(Error::Corrupt(format!(
@@ -6685,7 +6803,7 @@ pub(crate) fn replay_wal(
                     )));
                 }
                 if matches!(meta, Some(Err(()))) {
-                    if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
+                    if wal_torn_from(buf, i, next_seq(&out), framing) {
                         break;
                     }
                     return Err(Error::Corrupt(format!(
@@ -6699,7 +6817,7 @@ pub(crate) fn replay_wal(
                 // may name terms that did not reach `delta.vocab`.
                 let needs = delta_ids_end(pending.iter().map(|(_, q)| q));
                 if needs > dvocab_len {
-                    if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
+                    if wal_torn_from(buf, i, next_seq(&out), framing) {
                         break;
                     }
                     return Err(Error::Corrupt(format!(
@@ -6719,7 +6837,7 @@ pub(crate) fn replay_wal(
                     && flags & commit::WAL_FLAG_ANNOTATED != 0
                     && !set.contains(seq)
                 {
-                    if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
+                    if wal_torn_from(buf, i, next_seq(&out), framing) {
                         break;
                     }
                     tracing::warn!(
@@ -6818,7 +6936,7 @@ pub(crate) fn replay_wal(
             // Truncating damage that a later record proves durable would drop the
             // committed transactions after it.
             op => {
-                if wal_torn_from(buf, i, next_seq(&out), framed_metadata) {
+                if wal_torn_from(buf, i, next_seq(&out), framing) {
                     break;
                 }
                 return Err(Error::Corrupt(format!(
@@ -6828,6 +6946,17 @@ pub(crate) fn replay_wal(
                 )));
             }
         }
+    }
+    // the bytes before `walStrictFrom` were durable when it was recorded
+    if let Some(m) = from.strict_from
+        && buf.first() != Some(&WAL_HEADER)
+        && (out.good as u64) < m
+    {
+        return Err(Error::Corrupt(format!(
+            "{}: the log ends at byte {}, before byte {m}, which commit.json records as durable",
+            from.path.display(),
+            out.good
+        )));
     }
     Ok(out)
 }
@@ -8088,7 +8217,7 @@ mod ordinary_sync_tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let opts = StoreOptions {
-                experimental_group_commit: group,
+                group_commit: group,
                 bulk_threshold: if bulk { 0 } else { 250_000 },
                 group_commit_idle_direct: false,
                 ..Default::default()
@@ -8261,7 +8390,7 @@ mod ordinary_sync_tests {
         let store = Store::open(
             dir.path(),
             StoreOptions {
-                experimental_group_commit: true,
+                group_commit: true,
                 group_commit_idle_direct: true,
                 wal_direct_writes: false,
                 ..Default::default()

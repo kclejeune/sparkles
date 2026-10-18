@@ -187,9 +187,11 @@ struct Cli {
     /// direct writes with O_DSYNC (Linux), for comparing the two
     #[arg(long, global = true, hide = true)]
     no_wal_direct_writes: bool,
-    /// Experimental durable grouping of concurrent ordinary WAL commits
-    #[arg(long, global = true, hide = true)]
-    experimental_group_commit: bool,
+    /// Commit each write with its own synchronization instead of letting concurrent
+    /// commits share one (group commit, on by default). SPARKLES_GROUP_COMMIT=off does the
+    /// same
+    #[arg(long, global = true)]
+    no_group_commit: bool,
     /// With group commit on, send every commit through the group, including one that is
     /// the only writer (which otherwise commits with write-through writes), for comparing
     #[arg(long, global = true, hide = true)]
@@ -2074,7 +2076,16 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         commit_digests: cli.commit_digests,
         wal_prealloc_bytes: cli.wal_prealloc_kb << 10,
         wal_direct_writes: !cli.no_wal_direct_writes,
-        experimental_group_commit: cli.experimental_group_commit,
+        group_commit: {
+            let (on, warning) = group_commit_setting(
+                cli.no_group_commit,
+                std::env::var("SPARKLES_GROUP_COMMIT").ok(),
+            );
+            if let Some(w) = warning {
+                tracing::warn!(target: "sparkles::server", "{w}");
+            }
+            on
+        },
         group_commit_idle_direct: !cli.no_group_commit_idle_direct,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,
@@ -5223,6 +5234,34 @@ fn print_table(
     Ok(())
 }
 
+/// Whether persistent stores group commits: on unless `--no-group-commit` is given or
+/// `SPARKLES_GROUP_COMMIT` is `off`, `false`, `no` or `0`. `on`, `true`, `yes`, `1` and an
+/// empty value keep it on. Any other value keeps it on too, with a warning to log, so a
+/// typo in an attempt to turn it off is not silent.
+fn group_commit_setting(no_flag: bool, env: Option<String>) -> (bool, Option<String>) {
+    let v = env.as_deref().map(|v| v.trim().to_ascii_lowercase());
+    let (on, warning) = match v.as_deref() {
+        None | Some("" | "on" | "true" | "yes" | "1") => (true, None),
+        Some("off" | "false" | "no" | "0") => (false, None),
+        Some(_) => {
+            let v = env.as_deref().unwrap_or_default();
+            (
+                true,
+                Some(if no_flag {
+                    format!(
+                        "SPARKLES_GROUP_COMMIT={v} is not recognised and is ignored; --no-group-commit turns group commit off"
+                    )
+                } else {
+                    format!(
+                        "SPARKLES_GROUP_COMMIT={v} is not recognised, so group commit stays on; use off to turn it off"
+                    )
+                }),
+            )
+        }
+    };
+    (on && !no_flag, warning)
+}
+
 #[cfg(test)]
 mod spill_options_tests {
     use super::*;
@@ -5282,24 +5321,61 @@ mod spill_options_tests {
 }
 
 #[cfg(test)]
-mod experimental_group_options_tests {
+mod group_options_tests {
     use super::*;
     #[test]
-    fn durable_grouping_requires_explicit_cli_opt_in() {
+    fn group_commit_is_on_by_default_and_turned_off_by_flag_or_variable() {
         // The complete CLI parser needs the same stack as the server workers,
         // rather than the test harness's smaller default thread stack.
         std::thread::Builder::new()
             .stack_size(THREAD_STACK)
             .spawn(|| {
-                let ordinary = Cli::try_parse_from(["sparkles", "serve"]).unwrap();
-                assert!(!store_opts(&ordinary).experimental_group_commit);
-                let grouped =
+                let default = Cli::try_parse_from(["sparkles", "serve"]).unwrap();
+                assert!(!default.no_group_commit);
+                let off = Cli::try_parse_from(["sparkles", "--no-group-commit", "serve"]).unwrap();
+                assert!(off.no_group_commit);
+                let after =
+                    Cli::try_parse_from(["sparkles", "serve", "--no-group-commit"]).unwrap();
+                assert!(after.no_group_commit);
+                // the experimental opt-in is gone, now that grouping is the default
+                assert!(
                     Cli::try_parse_from(["sparkles", "--experimental-group-commit", "serve"])
-                        .unwrap();
-                assert!(store_opts(&grouped).experimental_group_commit);
+                        .is_err()
+                );
             })
             .unwrap()
             .join()
             .unwrap();
+        assert_eq!(group_commit_setting(false, None), (true, None));
+        assert_eq!(group_commit_setting(true, None), (false, None));
+        for v in ["off", "OFF", "false", "no", " 0 "] {
+            assert_eq!(
+                group_commit_setting(false, Some(v.into())),
+                (false, None),
+                "{v}"
+            );
+        }
+        for v in ["on", "1", "true", "yes", ""] {
+            assert_eq!(
+                group_commit_setting(false, Some(v.into())),
+                (true, None),
+                "{v}"
+            );
+        }
+        assert_eq!(group_commit_setting(true, Some("on".into())), (false, None));
+        // an unrecognised value keeps the default and says so
+        for v in ["disabled", "none", "of"] {
+            let (on, warning) = group_commit_setting(false, Some(v.into()));
+            assert!(on, "{v}");
+            assert!(warning.is_some_and(|w| w.contains(v)), "{v}");
+        }
+        // with the flag the warning does not claim that grouping stays on
+        let (on, warning) = group_commit_setting(true, Some("disabled".into()));
+        assert!(!on);
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("--no-group-commit") && !warning.contains("stays on"),
+            "{warning}"
+        );
     }
 }

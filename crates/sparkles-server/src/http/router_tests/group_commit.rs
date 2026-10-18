@@ -1,5 +1,5 @@
-//! The experimental option reaches real persistent HTTP updates; every request
-//! retains its receipt and the final durable dataset survives reopening.
+//! Group commit reaches real persistent HTTP updates; every request retains its receipt
+//! and the final durable dataset survives reopening.
 use super::*;
 
 /// Wait for actual enqueue events without occupying a Tokio worker.
@@ -17,18 +17,18 @@ async fn append_events(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn opt_in_persistent_updates_keep_independent_durable_receipts() {
+async fn persistent_updates_keep_independent_durable_receipts() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dataset");
     let opts = StoreOptions {
-        experimental_group_commit: true,
+        group_commit: true,
         ..Default::default()
     };
     let state = Arc::new(
         AppState::new(&temp.path().join("server"), opts, Duration::from_secs(30)).unwrap(),
     );
     let dataset = state.attach("ds", DbType::Persistent, Some(&root)).unwrap();
-    assert!(dataset.store.options().experimental_group_commit);
+    assert!(dataset.store.options().group_commit);
     let app = router(state.clone());
     let mut writers = tokio::task::JoinSet::new();
     for n in 0..32 {
@@ -86,7 +86,7 @@ async fn a_failed_fence_fails_every_request_of_its_group_with_503() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dataset");
     let opts = StoreOptions {
-        experimental_group_commit: true,
+        group_commit: true,
         group_commit_idle_direct: false,
         ..Default::default()
     };
@@ -237,7 +237,7 @@ async fn every_http_write_kind_groups_and_keeps_its_receipt_and_message() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("dataset");
         let opts = StoreOptions {
-            experimental_group_commit: true,
+            group_commit: true,
             group_commit_idle_direct: false,
             ..Default::default()
         };
@@ -400,7 +400,7 @@ async fn http_patch_abort_case(fail: bool) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("dataset");
     let opts = StoreOptions {
-        experimental_group_commit: true,
+        group_commit: true,
         group_commit_idle_direct: false,
         ..Default::default()
     };
@@ -552,4 +552,86 @@ async fn http_plain_patch_abort_reports_published_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_plain_patch_abort_reports_published_failure() {
     http_patch_abort_case(true).await;
+}
+
+/// A10: `/$/stats/{ds}` and the JSON metrics snapshot report `groupCommit` per dataset.
+/// Persistent datasets group commits by default, the option off (`--no-group-commit`)
+/// turns it off, and an in-memory dataset never groups. Two datasets with different
+/// settings share one server, so each answer must come from its own dataset's entry.
+#[tokio::test]
+async fn metrics_report_group_commit_on_by_default_and_off_when_asked() {
+    for (opts, other_opts) in [
+        (
+            StoreOptions::default(),
+            StoreOptions {
+                group_commit: false,
+                ..Default::default()
+            },
+        ),
+        (
+            StoreOptions {
+                group_commit: false,
+                ..Default::default()
+            },
+            StoreOptions::default(),
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            AppState::new(
+                &temp.path().join("server"),
+                opts.clone(),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        let ds = state
+            .attach("ds", DbType::Persistent, Some(&temp.path().join("ds")))
+            .unwrap();
+        // another dataset of the same server with the opposite setting, attached with
+        // its own defaults (`AppState::attach` uses the server's)
+        state.catalog.set_defaults(sparkles::DatasetOptions {
+            store: other_opts.clone(),
+            ..Default::default()
+        });
+        state
+            .catalog
+            .attach(
+                "other",
+                sparkles::catalog::Attach::Directory(temp.path().join("other")),
+            )
+            .unwrap();
+        let other = state.get("other").unwrap();
+        let mem = state.attach("mem", DbType::Mem, None).unwrap();
+        let expected = [
+            ("ds", opts.group_commit),
+            ("other", other_opts.group_commit),
+            ("mem", false),
+        ];
+        assert_eq!(ds.store.groups_commits(), opts.group_commit);
+        assert_eq!(other.store.groups_commits(), other_opts.group_commit);
+        assert!(!mem.store.groups_commits());
+        let app = router(state.clone());
+        let (metrics, _) = super::branches::get(&app, "/$/metrics?format=json").await;
+        let metrics = metrics.json();
+        for (name, on) in expected {
+            let (stats, _) = super::branches::get(&app, &format!("/$/stats/{name}")).await;
+            assert_eq!(
+                stats.json()["groupCommit"],
+                serde_json::json!(on),
+                "/$/stats/{name}"
+            );
+            let entry = metrics["datasets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == name)
+                .unwrap_or_else(|| panic!("no metrics entry for {name}: {metrics}"));
+            assert_eq!(
+                entry["groupCommit"],
+                serde_json::json!(on),
+                "metrics of {name}"
+            );
+        }
+    }
 }

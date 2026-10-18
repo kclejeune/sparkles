@@ -372,6 +372,7 @@ pub(super) fn schemas() -> Map<String, J> {
                 "quota": { "oneOf": [{ "type": "null" }, sref("DatasetQuota")] },
                 "cache": counts(),
                 "compaction": sref("CompactionStatus"),
+                "groupCommit": { "type": "boolean", "description": "Whether concurrent commits of this dataset share one synchronization. False for an in-memory dataset." },
             },
             "externalDocs": { "url": api_doc("datasets-admin") },
         }),

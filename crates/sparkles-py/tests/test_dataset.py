@@ -95,6 +95,20 @@ def test_a3_persistent_dataset(tmp_path: Path) -> None:
     again.close()
 
 
+def test_group_commit_keyword(tmp_path: Path) -> None:
+    """Group commit is on by default; ``group_commit=False`` gives every commit its own
+    synchronization, and both settings commit durably."""
+    for on in (True, False):
+        db = tmp_path / f"db-{on}"
+        with Dataset(db, group_commit=on) as ds:
+            ds.load(TURTLE, "turtle")
+            n = len(ds)
+        with Dataset.open(db, group_commit=on) as again:
+            assert len(again) == n
+    with sparkles.Catalog(tmp_path / "catalog", group_commit=False) as cat:
+        assert cat.list() == []
+
+
 def test_quads_for_pattern(ds: Dataset) -> None:
     assert len(list(ds.quads_for_pattern(ex("alice")))) == 4
     names = {q.object for q in ds.quads_for_pattern(None, foaf("name"))}

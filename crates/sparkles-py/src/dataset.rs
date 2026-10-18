@@ -231,9 +231,15 @@ impl PyDataset {
         }
     }
 
-    fn open_at(py: Python<'_>, path: PathBuf, union_default_graph: bool) -> PyResult<PyDataset> {
+    fn open_at(
+        py: Python<'_>,
+        path: PathBuf,
+        union_default_graph: bool,
+        group_commit: bool,
+    ) -> PyResult<PyDataset> {
         let opts = StoreOptions {
             union_default_graph,
+            group_commit,
             ..Default::default()
         };
         let shown = path.display().to_string();
@@ -365,10 +371,15 @@ pub fn query_args<'py>(
 impl PyDataset {
     /// `Dataset()` is in memory; `Dataset(path)` opens or creates a database directory.
     #[new]
-    #[pyo3(signature = (path = None, *, union_default_graph = false))]
-    fn new(py: Python<'_>, path: Option<PathBuf>, union_default_graph: bool) -> PyResult<Self> {
+    #[pyo3(signature = (path = None, *, union_default_graph = false, group_commit = true))]
+    fn new(
+        py: Python<'_>,
+        path: Option<PathBuf>,
+        union_default_graph: bool,
+        group_commit: bool,
+    ) -> PyResult<Self> {
         match path {
-            Some(p) => PyDataset::open_at(py, p, union_default_graph),
+            Some(p) => PyDataset::open_at(py, p, union_default_graph, group_commit),
             None => Ok(PyDataset::in_memory(union_default_graph)),
         }
     }
@@ -382,9 +393,14 @@ impl PyDataset {
 
     /// Open (or create) a database directory; it stays locked while open.
     #[staticmethod]
-    #[pyo3(signature = (path, *, union_default_graph = false))]
-    fn open(py: Python<'_>, path: PathBuf, union_default_graph: bool) -> PyResult<Self> {
-        PyDataset::open_at(py, path, union_default_graph)
+    #[pyo3(signature = (path, *, union_default_graph = false, group_commit = true))]
+    fn open(
+        py: Python<'_>,
+        path: PathBuf,
+        union_default_graph: bool,
+        group_commit: bool,
+    ) -> PyResult<Self> {
+        PyDataset::open_at(py, path, union_default_graph, group_commit)
     }
 
     /// The database directory, or `None` in memory.

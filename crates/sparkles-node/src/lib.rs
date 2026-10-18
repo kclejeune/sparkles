@@ -296,6 +296,9 @@ fn normalize_store_options(mut v: Value) -> Value {
     if v["cacheBytes"].is_null() {
         v["cacheBytes"] = json!(defaults.cache_bytes)
     }
+    if v["groupCommit"].is_null() {
+        v["groupCommit"] = json!(defaults.group_commit)
+    }
     v
 }
 struct Shared {
@@ -461,6 +464,7 @@ impl NativeDataset {
             if let Some(shared) = stores.get(&key).and_then(Weak::upgrade) {
                 if shared.options["unionDefaultGraph"] != v["unionDefaultGraph"]
                     || shared.options["cacheBytes"] != v["cacheBytes"]
+                    || shared.options["groupCommit"] != v["groupCommit"]
                 {
                     return Err(EngineError::invalid(
                         "dataset open options differ from the existing handle",
@@ -476,6 +480,7 @@ impl NativeDataset {
             let o = sparkles::store::StoreOptions {
                 union_default_graph: v["unionDefaultGraph"].as_bool().unwrap_or(false),
                 cache_bytes: v["cacheBytes"].as_u64().unwrap_or(defaults.cache_bytes),
+                group_commit: v["groupCommit"].as_bool().unwrap_or(defaults.group_commit),
                 ..defaults
             };
             let shared = Arc::new(Shared {

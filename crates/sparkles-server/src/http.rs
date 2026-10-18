@@ -4114,7 +4114,8 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
         let stats = ds.dataset.stats_of(&snap, resolved.as_ref())?;
         let mut body = serde_json::to_value(&stats).unwrap_or_default();
         // what the server adds: the name it serves the dataset under, its quota, the
-        // reasoning, spatial index and compaction status, and Fuseki's counters
+        // reasoning, spatial index and compaction status, whether it groups commits, and
+        // Fuseki's counters
         body["name"] = ds.name.clone().into();
         body["quota"] = (ds.kind == DbType::Persistent)
             .then(|| budgets::quota_json(&ds))
@@ -4123,6 +4124,7 @@ async fn stats(State(st): St, Path(name): Path<String>, uri: Uri) -> ApiResult {
         body["datasets"] = fuseki;
         body["geo"] = crate::geo::status_json(&ds);
         body["compaction"] = crate::compaction::status_json(&st, &ds);
+        body["groupCommit"] = ds.store.groups_commits().into();
         let resp = with_commit(Json(body).into_response(), &ds, snap.commit);
         Ok(history::history_headers(resp, resolved.as_ref(), &uri))
     })

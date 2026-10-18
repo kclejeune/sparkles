@@ -915,3 +915,11 @@ has a spec of its own yet. These are design sketches.
   (ROADMAP item 10) provides. The write-time ShEx typing cache and the full-text
   checkpoint get the same hook, so that the switch under the writer lock does only the
   swap.
+* **Leftover generations after a power loss.** A power loss during a compaction can lose
+  the `CURRENT` switch and keep the new generation's directory, which `sparkles check`
+  reports as a leftover warning until the next rebuild replaces it. The `log-writes` runs
+  of [X09](X09-group-commit-by-default.md) section 10.2 found this with and without group
+  commit. Open holds the dataset's exclusive lock, so no rebuild can be running then, and
+  it could remove a generation newer than `CURRENT` as it removes `text.new` and
+  `text.old`. The change needs a test for each path that writes generation directories,
+  such as compaction, bulk loads and restores.

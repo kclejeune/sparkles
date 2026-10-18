@@ -1,17 +1,21 @@
 # X09: Group commit by default
 
-> **Status:** Phases 1 and 2 built, with exceptions listed in the Outcome. Phase 3 not started.
+> **Status:** Phases 1, 2 and 3 built, with exceptions listed in the Outcome. Group commit
+> is on by default for persistent stores. Phase 4, grouping on datasets with a full-text,
+> spatial or embedding index, is designed in section 17 and not built.
 >
 > **Phases:** Phase 1 is the measurements and fixes that the switch depends on: serial
 > latency, reader tails, metrics and power-loss and sync-failure tests. Phase 2 widens
 > admission to the writes that fall back today (commit messages, preconditions,
 > validation, Graph Store and RDF Patch writes, full-text, spatial and embedding hooks,
 > writes during compaction). Phase 3 makes group commit the default for persistent
-> stores, with `--no-group-commit` to opt out. Phases 1 and 2 are built, and Phase 3 waits
-> on the conditions of section 7.2.
+> stores, with `--no-group-commit` to opt out. Phase 4 admits datasets with a full-text,
+> spatial or embedding index. Phases 1, 2 and 3 are built. Phase 3 meets the conditions
+> of section 7.2, the third as amended on 2026-10-17.
 >
-> **User docs:** [FEATURES.md](../FEATURES.md) and [API.md](../API.md#metrics) for the
-> metrics and the `groupCommit` and `commits` fields of `/$/stats`.
+> **User docs:** [FEATURES.md](../FEATURES.md), [USAGE.md](../USAGE.md) for
+> `--no-group-commit`, and [API.md](../API.md#metrics) for the metrics, the `groupCommit`
+> and `commits` fields of the JSON metrics and the `groupCommit` field of `/$/stats/{ds}`.
 >
 > Sections 1 to 16 are the design as written before implementation. The
 > [Outcome](#outcome) section at the end records how it landed and where it differs.
@@ -36,7 +40,7 @@ replication through RDF Patch ([F10](F10-replication.md)) and GeoSPARQL
 Every Sparkles commit is durable when it is acknowledged: its WAL record and any new
 vocabulary entries are synchronized first. By default each commit pays its own
 synchronization under the single writer. An opt-in mode, `--experimental-group-commit`
-(a hidden global flag, `crates/sparkles-server/src/main.rs:169`), lets concurrent
+(a hidden global flag at the time, `crates/sparkles-server/src/main.rs:169`), lets concurrent
 commits share one synchronization and acknowledges each only after the prefix that holds
 it is durable. In BENCHMARKS.md it gives 1.6× to 2.45× the acknowledged transactions of
 the default writer with four writers, at 1.05M and 10.5M, with every receipt contiguous
@@ -296,7 +300,8 @@ No-ops keep draining.
 | Python, Node.js, JVM | Not exposed | A `group_commit` option where the binding exposes store options, default on |
 | `/$/stats` | Not reported | `groupCommit: true/false` per dataset |
 
-There is no release yet, so `--experimental-group-commit` is removed rather than kept as
+The Today column describes the state before the switch. There is no release yet, so
+`--experimental-group-commit` is removed rather than kept as
 an alias. The docs that name it (FEATURES.md and the concurrent sections of
 BENCHMARKS.md) change in the same commit. The server test
 `durable_grouping_requires_explicit_cli_opt_in` in `main.rs` is replaced by one that
@@ -308,8 +313,11 @@ checks the default is on and that `--no-group-commit` turns it off.
 2. Every test of §10 passes on ext4 and XFS, and the power-loss test of §10.2 passes
    for 1,000 crash points per file system.
 3. The fallbacks of §6 that ordinary deployments hit (commit messages, preconditions,
-   guards, full-text, compaction) are admitted, or the metrics of §8 show they are rare
-   in the measured workloads.
+   guards, compaction) are admitted, or the metrics of §8 show they are rare in the
+   measured workloads. Amended on 2026-10-17. Datasets with a full-text, spatial or
+   embedding index keep the ordinary path under the default, because such a commit takes
+   exactly the path it takes today and only misses the gain. Section 17 designs their
+   admission as Phase 4.
 4. BENCHMARKS.md is refreshed under the protocol of [X06](X06-benchmark-coverage.md),
    with the write tables measured with the new default and a row for
    `--no-group-commit`.
@@ -411,6 +419,7 @@ logged receipt's commit is present.
 | 1 | §4: serial and reader measurements, the idle fast path if needed, reader-tail fixes, sync-failure and power-loss tests, metrics | S–M | A1–A5 |
 | 2 | §6: admission of messages, digests, preconditions, guards, Graph Store, uploads, RDF Patch, full-text, spatial, embeddings and compaction | M | A6–A9 |
 | 3 | §7: default on, opt-out flag, docs and BENCHMARKS.md refresh | S | A10 |
+| 4 | §17: grouping on datasets with a full-text, spatial or embedding index | M–L | §17.9 |
 
 ## 13. Acceptance examples
 
@@ -491,12 +500,238 @@ logged receipt's commit is present.
 - The Sparkles code named in §2 and §11, and the specs CI, C10, C12, C13, C15, C19, F03,
   F08, F10, G01 and X06.
 
+## 17. Phase 4: group commit for indexed datasets
+
+Phase 3 leaves datasets with a full-text, spatial or embedding index on the ordinary path.
+A commit on such a dataset takes exactly the path it takes with grouping off, so the
+default cannot slow it down, but it gains nothing either. This section designs their
+admission. It was written from the code at the end of Phase 3, and every function it names
+is at that revision.
+
+### 17.1 Why these datasets fall back
+
+`Store::group_check` in `store.rs` decides admission for both `speculative_base`, when a
+transaction starts, and `group_admitted`, when it commits. It returns `Fallback::Text` when
+`text_enabled()` holds, `Fallback::Geo` when `self.geo` is set and `Fallback::Embed` when an
+embedding index has work registered. No other index forces a fallback. HNSW vector indexes
+catch up in the background from published snapshots, as `store/vector.rs` builds them, and
+the ShEx guard takes the group path with one commit per fence.
+
+Three properties of the ordinary path stand in the way.
+
+1. **Maintenance reads the published head.** `WriteTxn::publish_log` calls
+   `maintain_text`, `maintain_geo` and `embed_noted` after the commit's synchronization and
+   before `current.store`. `maintain_geo` passes `self.current.load_full()` to
+   `index_commit` as the state the commit started from, which is true only when nothing is
+   in flight. `TextIndex::apply_commit` in `text.rs` changes the live index writer that
+   every view shares.
+2. **One installer does not drain.** The coordinator publishes without the writer lock.
+   Text recovery in `store/text_recovery.rs`, `enable_text` and the spatial
+   reconfiguration drain the group through `guarded_writer` before they install a view, so
+   no grouped commit can publish over it. The spatial build thread that `spawn_geo_build`
+   in `store/geo.rs` starts takes `writer.lock()` without draining. With grouped commits on
+   a spatial dataset, a fence could then publish a snapshot carrying an older view over the
+   one the build installed.
+3. **A speculative snapshot has no index view.** A transaction that starts from the
+   speculative head would see the index state of the published head, or none. Phase 2's
+   review found that admitting these datasets at publication alone would make every
+   transaction drain first, so each fence would hold one commit.
+
+### 17.2 Where index state goes
+
+There are three ways to place index state relative to the fence.
+
+- **Apply after the fence.** `publish_group_prefix` runs each index's maintenance for each
+  commit of the prefix, in commit order, after the synchronization. The live index then
+  only ever holds durable commits. The cost is that the index work of a whole prefix runs
+  in the leader after the synchronization, which delays every waiter. A transaction that
+  starts from a speculative base also needs the index state of its base, which this does
+  not give it.
+- **Carry speculative views.** `publish_grouped` runs maintenance under the writer lock,
+  against the transaction's base, as `publish_log` does, and puts the resulting view in the
+  staged snapshot. Readers of the published head never see it. A transaction that starts
+  from the speculative head sees it, as section 3 allows. This needs the index's view to be
+  a value that can be dropped when a fence fails, and it needs the index's own files never
+  to hold a commit above the durable head.
+- **Stage per group.** Speculative changes go to a small overlay that the speculative
+  snapshot carries. The leader applies the overlay to the live index at publication. Queries
+  on a speculative snapshot merge the published view with the overlay.
+
+The recommendation differs per index, because their state differs.
+
+| Index | State today | Recommended placement |
+|---|---|---|
+| Spatial, G01 | `GeoView` values in memory, cloned per commit by `maintain_geo`. The base is rebuilt in the background at open. | Carry speculative views. The view is already an immutable value, so a failed fence drops it with the snapshot. |
+| Full-text, F03 | One live index writer shared by all views, with disk commits by `commit_locked` and checkpoints that name the last applied commit. | Stage per group. The live writer only takes durable commits, so its disk state never runs ahead of the log. |
+| Embeddings, F08 | A work queue of pairs keyed by commit number. The embedder writes vectors back in its own `CommitKind::Embed` commits. | Apply after the fence. `embed_noted` only schedules background work, so it costs little in the leader, and it never needs speculative state. |
+
+For full-text, carrying speculative views was considered and rejected. `seal_for` serves
+read-your-writes by sealing a batch, and `settle_locked` commits it to disk when it has
+staged documents. A search on a speculative view would therefore write documents of a
+commit that a failed fence or a crash could still lose. After such a crash the index on
+disk is ahead of the log, and the only way back is a full rebuild. Staging keeps the
+existing invariant that `apply_commit` sees only durable commits.
+
+### 17.3 Changes by file
+
+- `store.rs`, `group_check`. Remove `Text`, `Geo` and `Embed` as unconditional reasons.
+  Keep a fallback while text recovery has a pending job, while the
+  spatial view is building or failed, and while a text rebuild runs. Name these
+  `text-recovering`, `geo-building` and `text-rebuilding` in `Fallback` and in the metrics of
+  section 8.
+- `store/group.rs`, `publish_grouped`. After the commit's records are written and before it
+  is enqueued, compute the speculative spatial view with `maintain_geo` and the text overlay
+  with a new `TextIndex::stage`, both against `self.base`, and store them in the staged
+  snapshot. Record the pairs for embeddings in the `Pending` entry.
+- `store/group.rs`, `publish_group_prefix`. For each commit in order, call
+  `TextIndex::apply_staged` with that commit's overlay, then `embed_noted` with
+  `p.snapshot`, then publish. The spatial view needs no work there.
+- `store/geo.rs`, `maintain_geo` and `index_commit`. Take the transaction's base as the
+  state before the commit, instead of `self.current`. In the build thread of
+  `spawn_geo_build`, replace `writer.lock()` with `guarded_writer()`, so that a build
+  installs its view only when no grouped commit is in flight. The thread holds weak
+  handles to the writer state and to `current`, not the `Store`, and `guarded_writer` and
+  `drain_group` are `Store` methods that need the coordinator. The thread therefore gets a
+  weak handle to the coordinator, or to the store, as well.
+- `text.rs`. Add `Overlay`, the documents a commit adds and the keys it removes, with
+  `stage(snap, log) -> Overlay` and `apply_staged(&Overlay)`. `apply_commit` becomes
+  `stage` followed by `apply_staged`, so the ordinary path keeps one code path. Text
+  queries on a snapshot with overlays search the view and then the overlays in commit
+  order, where a later overlay removes or replaces the documents of earlier ones.
+- `store/text_recovery.rs`, `Recovery::record`. A recovery job records commits at
+  publication, from the overlay, not at speculation.
+- `store/compaction.rs`. The checkpoint before a switch already runs under
+  `guarded_writer`, which drains, so it sees only durable commits. Add a debug assertion
+  that the text index's applied commit is at or below the published head there and in
+  `checkpoint_locked`.
+
+### 17.4 What a fence makes durable, and in what order
+
+A fence's synchronization does not change. It syncs the WAL, `delta.vocab` and
+`annotations.bin`, as section 6 and the Phase 2 Outcome describe. No index file joins the
+fence, because every index is derived from the log. The order of each commit's work is the
+following.
+
+1. Under the writer lock, the transaction writes its WAL records and terms, computes its
+   spatial view and text overlay from its base, and enqueues. Nothing of an index reaches
+   disk.
+2. The leader syncs the prefix.
+3. For each commit of the prefix, in order, the leader applies its text overlay to the live
+   writer, schedules its embedding pairs and publishes its snapshot.
+4. Later, the text checkpoint makes the live writer durable with a payload naming the last
+   applied commit, which step 3 bounds by the published head.
+
+The invariant is that no index's durable state names a commit above the durable head of the
+log. The text checkpoint is the only durable index state that names a commit, and step 3
+applies only fenced commits to it.
+
+Step 3 runs inside the coordinator's `drive`, which today holds the state mutex while it
+publishes, and `enqueue` takes the same mutex. A text `apply_staged` or an `embed_noted`
+there would block every writer's `enqueue`, and those writers hold the writer lock, so all
+new transactions would wait for the index work. Step 3 therefore publishes outside the
+state mutex. The leader takes the prefix out of the queue under the mutex, releases it,
+applies and publishes in order, and takes the mutex again only to update the queue's
+counts. Only the leader publishes, so the order of commits is unchanged. The gates of
+section 17.9 measure the cost.
+
+### 17.5 Recovery after a crash at each step
+
+| Crash point | State on disk | What open does |
+|---|---|---|
+| During step 1 | Part of the commit's records, with no index state | The replay truncates the torn tail. No index has seen the commit. |
+| After step 2, before step 3 | The prefix is durable and the text checkpoint is older | `open_text` catches up from the WAL after the checkpoint's commit, as today. The spatial view is rebuilt in the background, and the embedder's queue starts again from its pass. |
+| During step 3 | Some overlays applied in memory, none checkpointed | The same as above, since the live writer's memory is lost. |
+| During step 4 | A checkpoint at or below the published head, or the previous one | The catch-up of `open_text` covers the difference. |
+| A fence fails | The writer is poisoned and the overlays are dropped with the queue | No overlay was applied, so the live writer holds only durable commits and needs no recovery. |
+| The leader panics, or an apply fails, during step 3 | The prefix is durable. The live text index holds some of its overlays, and the writer is poisoned, so the prefix's later commits report `Poisoned` although they are durable | The text index is marked stale and rebuilt from its checkpoint and the WAL at the next open. It is at or below the durable head, so the invariant holds. |
+| The text index's own tick commits the live writer during step 3 | A checkpoint naming a commit of the prefix, which is durable | Nothing beyond the usual catch-up, because the checkpoint is at or below the durable head. |
+
+A power loss inside a fence's unfenced suffix can lose commits that a speculative
+transaction saw, but no index outlives them, because overlays and speculative spatial
+views live only in memory and are dropped.
+
+### 17.6 Background maintenance
+
+- **Spatial build.** The build thread installs its view under `guarded_writer` after this
+  change, so it never meets a grouped commit in flight. Commits made during the build are
+  admitted only once the view is ready. Until then they fall back with `geo-building`, and
+  the build brings its view up to them as it does for ordinary commits today.
+- **Text recovery and rebuild.** A dataset whose text index recovers or rebuilds falls back
+  until the job finishes. The job then installs under `guarded_writer`.
+- **HNSW catch-up.** Vector indexes read published snapshots only, so grouping does not
+  change them. `vectors_switched` runs under the writer lock with the group drained, at a
+  compaction or bulk commit.
+- **Compaction carry-over.** The compaction tap records grouped commits as they enqueue, as
+  Phase 2 built it. The text checkpoint and the HNSW carry-over before the switch run
+  under the drained writer lock.
+- **Embedding writes.** `CommitKind::Embed` commits keep the ordinary path, because they
+  come from one background worker and gain nothing from grouping.
+
+### 17.7 Memory
+
+A speculative snapshot holds a spatial view and a text overlay for each commit in flight.
+The queue limits of section 6 bound them, 64 commits or 4 MiB of WAL records per dataset.
+A spatial view is a clone of the previous one, which shares its base and copies the rows
+of the commits since the last build. A text overlay holds the documents of the commit's
+touched quads. Both are freed when their commit publishes or its fence fails. The extra
+memory is at most one fence's worth of index changes per dataset, which buys the
+throughput of grouping for indexed datasets. The Outcome of this phase will state the
+measured amount.
+
+### 17.8 Tests
+
+- **Model-based stress test.** `store/group_model.rs` gains runs on datasets with each
+  index. The model checks text queries against a scan of the model's literals, spatial
+  queries against a brute-force distance over the model's points, and that embedding work
+  is never scheduled for a commit above the published head. Faults include a failure of
+  `index_commit`, which `Store::fail_next_geo_commit` already injects through the
+  `GeoIndex::fail_next` field, a failed text commit through `Store::fail_next_text_commit`,
+  and a failed text apply.
+- **Admission tests.** One test per new fallback reason, and one per installer showing that
+  a build, recovery or rebuild that finishes during a fence installs only after the fence.
+- **Power loss.** `tests/power_loss.rs` runs its crash images on a dataset with full-text
+  search, and each image checks that text results match the recovered data. The shim in
+  `tests/support/iofault.c` records the text index's writes already, but it must learn
+  `rename` and directory synchronization first, because the index replaces its metadata
+  file atomically.
+- **`log-writes` and `kill -9`.** `scripts/power-loss.sh` gains a `--index text|geo|embed`
+  option that configures the index before the load. After each crash, `crash-harness
+  verify` runs a text or spatial query for a sample of receipts and checks their presence.
+  Each kind runs the 1,000-point replays on ext4 and XFS and 200 kills on each.
+
+### 17.9 Performance gates
+
+Measured on `forge` under the protocol of [X06](X06-benchmark-coverage.md), with each
+index configured.
+
+| Measurement | Gate |
+|---|---|
+| Serial commits, 1.05M and 10.5M | Median and p90 within 5% of the ordinary path on the same dataset |
+| Four writers, 50,000 changes | At least 1.5 times the ordinary path's transactions/s |
+| Text query p50 and p99 during a four-writer load | Within 10% of the same load with grouping off |
+| Spatial query p50 and p99 during a four-writer load | Within 10% of the same load with grouping off |
+| Memory | Peak RSS during the four-writer load within 64 MiB of grouping off |
+
+### 17.10 Open questions
+
+1. Whether a text overlay can be searched with the same scoring as the view. A document
+   in an overlay has no collection statistics of its own, so BM25 scores of overlay hits
+   may differ slightly from those after publication. Searching overlays only for matching,
+   with scores taken from the view's statistics, is the likely answer.
+2. Whether the ShEx guard should gain a pending list in the same phase, so that its fences
+   hold more than one commit. It does not fall back today, so it is not required here.
+3. Whether a spatial build should admit commits during the build by carrying its journal
+   in speculative snapshots, rather than falling back until the view is ready.
+4. Whether the leader's text apply in step 3 needs a separate thread when a prefix holds
+   many large overlays, which the four-writer gate will show.
+
 ## Outcome
 
-Phases 1 and 2 are built behind `--experimental-group-commit`, with the exceptions below.
-Phase 3 is not started, because conditions 1, 2 and 4 of section 7.2 need a quiet `forge`
-run and a host with device-mapper `log-writes`, and condition 3 is not yet met for
-full-text indexes. See [ROADMAP](../ROADMAP.md) item 3.
+Phases 1 and 2 were built behind `--experimental-group-commit`, with the exceptions below.
+Phase 3 meets the conditions of section 7.2, the third as amended on 2026-10-17. It passed
+the `kill -9` runs and the 1,000-point `log-writes` runs on ext4 and XFS, resolved the
+ambiguity of headerless logs, and made group commit the default. See
+[ROADMAP](../ROADMAP.md) item 3.
 
 ### Phase 1
 
@@ -676,18 +911,173 @@ preserves the new header for a later acknowledged message. The single-writer and
 annotation-fence cases explicitly disable idle direct commits. The crash harness selects
 pending pages independently for each write as a conservative overapproximation, which
 need not be a coherent physical page or sector snapshot. It is not physical crash proof.
-The model-based stress test
-of section 10.1, the `kill -9` runs of section 10.4, and a prune followed by reopening a
-flagged commit at the WAL tail remain unwritten.
+Phase 3 added the model-based stress test of section 10.1, the `kill -9` runs of section
+10.4, and a prune followed by reopening flagged commits at the WAL tail.
 
 ### Left for Phase 3
 
+Phase 2 left six items. The Phase 3 section below records what became of each.
+
 1. The gates of section 9 on `forge`, in particular serial parity at 1.05M
-   and 10.5M.
-2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs.
+   and 10.5M. Met.
+2. The 1,000-point `log-writes` runs on ext4 and XFS, and the `kill -9` runs. Both passed,
+   the `log-writes` runs on `forge` on 2026-10-18 with the switched build.
 3. Full-text, spatial and embedding datasets and the ShEx guard grouping, or measurements
-   that show them rare.
-4. The BENCHMARKS.md refresh under X06, with a `--no-group-commit` row.
-5. The default, the opt-out flag and the removal of `--experimental-group-commit`.
+   that show them rare. Condition 3 was amended instead, and section 17 designs their
+   admission as Phase 4.
+4. The BENCHMARKS.md refresh under X06, with a `--no-group-commit` row. Refreshed. The
+   tables compare group commit with the `--no-group-commit` writer, measured on one binary
+   before the switch made grouping the default.
+5. The default, the opt-out flag and the removal of `--experimental-group-commit`. Landed.
 6. Resolve the inherited ambiguity of torn metadata in headerless WALs while preserving
-   mixed-history compatibility and strict legacy corruption checks.
+   mixed-history compatibility and strict legacy corruption checks. Resolved.
+
+### Phase 3
+
+**Headerless logs.** A torn version-2 commit record whose bytes after a sector boundary
+read as zero is byte-identical to a legacy record. In a headerless log the old rules could
+recover such a record as a reconstructed legacy commit, with data records no checksum
+covers. They could also refuse the store after a power loss inside a group's unfenced
+suffix. The first write open of a headerless log now records the log's logical end as
+`walStrictFrom` in the generation's `commit.json`, once. It does so after replay, the
+truncation of any torn tail and a sync, and before anything is appended. Records after the
+offset follow the rules of a log with a header record. Damage before it is corruption,
+because those bytes were durable when the offset was recorded, and a log that ends before
+it is refused. Records before it keep the mixed interpretation of
+[CI section 5.6](CI-commit-identity.md#56-dataset-file-creation-migration), so existing
+mixed histories read as before. `sparkles check` applies the same rule, and it reads the
+offset after the log, so a live writer cannot append past an offset it has not seen. The
+member is additive under [X12 section 4.3](X12-release-engineering.md#43-how-a-format-changes).
+A release that predates it ignores it and reads the log with the old rules. `commit.json`
+now refuses a `format` other than 1. A truncation to an empty log is now synced before
+the first append. The design came from a consult on the ambiguity, which recommended
+setting the offset once rather than advancing it, so that damage below it stays
+detectable.
+
+The offset says that the bytes before it are durable together with the vocabulary terms
+and annotation records they name. The first write open therefore records it after
+`delta.vocab` is settled and `annotations.bin` is synced, not only after the log's own sync.
+A review found the earlier order. A power loss between a durable offset and those syncs,
+after an older build had left unsynced tails, made the store refuse to open, or brought back
+an unacknowledged commit without its message. A test checks the order of the durable steps
+of open. A log that the replay cuts to nothing, one that began with a torn header record
+included, records an offset of 0. A recorded offset with no `wal.log` is corruption in open
+as well as in `sparkles check`, because the member is recorded only for a log that exists.
+Before the offset, the `at < from` rule decides one case alone, a flagged commit whose
+annotation is missing, which is kept with a warning as a proven commit is, and a test pins
+it.
+
+The member adds no reader version. A build that predates it ignores it and reads the log
+by the rules it always used, and every build with the reader requirement of the dataset
+file writes metadata on every commit, so its appends after the offset are well framed. A
+version bump would only refuse builds that already read the log safely. `commit.json`
+refuses a `format` other than 1 in open, in `sparkles check` and in the restore path of
+`commit::reidentify`, and rewriting it keeps members that a later release added. Two cases remain. A headerless log that this release has never opened for
+writing keeps the mixed rules for the bytes it holds, so a torn record that an older
+build left there is still ambiguous. Legacy records that a downgraded build appends after
+the offset are treated as damage, and downgrading stays unsupported.
+
+**Indexed and ShEx-guarded datasets.** Datasets with a full-text, spatial or embedding
+index stay on the ordinary path. These indexes are opt-in per dataset. A commit on such a
+dataset takes exactly the path that the default writer takes, so grouping cannot slow it
+down, and it only misses the gain. Admitting it needs index state in speculative
+snapshots, because without it every fence would hold one commit. The user amended
+condition 3 of section 7.2 on 2026-10-17 to accept this, and section 17 designs the
+admission as Phase 4, [roadmap](../ROADMAP.md) item 86. In every measured workload below no
+commit fell back from the group for any reason, and `sparkles_group_commit_fallbacks_total`
+had no series. None of those workloads had an index, so they say nothing about indexed
+datasets. ShEx-guarded datasets take the group path with one commit per fence, as Phase 2
+left them.
+
+**Section 9 gates.** These runs used `forge` on 2026-10-17 with one binary at revision
+758a6a25, comparing the default writer with `--experimental-group-commit`, and nothing
+else running on the host. [BENCHMARKS.md](../BENCHMARKS.md#concurrent-durable-commits)
+has the tables.
+
+| Gate | 1.05M | 10.5M | Target |
+|---|---|---|---|
+| Serial literal, IRI and delete, p50 and p90 against the default writer | 0.996 to 1.012 | 0.981 to 1.009 | Within 5% |
+| Four writers, transactions/s | 6,174 | 6,160 | At least 529 and 402 |
+| Sixteen writers, largest share deviation | 1.0% | 1.2% | Within 25% |
+| bench.sh mixed reads/s and writes/s against the default writer | 1.015 and 1.023 | 1.034 and 1.018 | Reads within 5%, writes at least 1 |
+| bench.sh updates churn, commits/s against the default writer | 1.002 | 1.018 | Within 5% |
+
+The ratios are computed from the rounded medians in BENCHMARKS.md. The reader tail at an
+equal write rate was met before Phase 3.
+
+**Crash runs.** `scripts/power-loss.sh` and `scripts/crash-harness.rs` implement
+sections 10.2 and 10.4. The `kill9` mode starts sixteen writers that log every receipt,
+kills the server with SIGKILL at a random moment between 0.2 and 2.2 seconds, restarts it
+and checks every receipt logged in the store so far. It starts a new store every 20 kills.
+With grouping on, 200 kills on a new XFS file system and 200 on a new ext4 file system
+of an 8-vCPU Namespace instance had no failure, over 2,812,041 and 2,715,882 receipts. A
+further 200 kills on the laptop's ext4 had none over 1,625,905 receipts. Every check found
+the head at or after the last receipt, every receipt's triple and message, and
+`sparkles check` passing before and after the restart.
+A load that took no receipt, or had a failed write, now fails the run. Before this a server
+that refused every write passed with nothing checked, which happened once in the
+`logwrites` mode when the server's 1 GiB free-space reserve exceeded its 512 MiB file
+system. The `selftest` mode checks this without root.
+The `logwrites` mode puts the store's file system behind the device-mapper `log-writes`
+target, marks the log after every batch of receipts, and replays crash images that hold
+the writes before the last flush, every FUA write and a random part of the rest per 4 KiB
+block. It checks each image as the restart above does, with the next commit continuing the
+sequence. A run whose marks fail, or that makes none, fails too, since its images would be
+checked against no receipts.
+
+The `log-writes` runs ran on `forge` on 2026-10-18 with the switched build, 1,000 crash
+images per run, sixteen writers for 20 s and a mark every 50 ms. Each load crossed one
+automatic compaction. The `--no-group-commit` loads commit far fewer transactions through
+`log-writes`, so they ran with `--auto-compact-min-quads 1000` to cross one as well. Every
+image passed.
+
+| Run | Receipts | Marks | Log entries | Images | Failed |
+|---|---:|---:|---:|---:|---:|
+| ext4, group commit | 47,383 | 369 | 66,463 | 1,000 | 0 |
+| XFS, group commit | 29,135 | 358 | 24,868 | 1,000 | 0 |
+| ext4, `--no-group-commit` | 9,394 | 367 | 36,824 | 1,000 | 0 |
+| XFS, `--no-group-commit` | 4,859 | 361 | 14,248 | 1,000 | 0 |
+
+Two earlier runs found two disagreements between `sparkles check` and open, and no lost
+commit. An image of a power loss during a compaction can keep `CURRENT` on the old
+generation and hold the new one's directory, which check reports as a leftover warning
+until the next rebuild replaces it. With `kill -9` the switch of `CURRENT` survives in the
+page cache, so only `log-writes` showed it. It appeared with and without group commit, 7
+images in 1,000 with grouping and 26 in 1,000 without, and the harness now accepts a
+leftover warning after open, while any other warning or error still fails. One image held a
+log record torn at a 4 KiB block boundary after the last commit, with zeros where its ids
+were. Open truncated it with the incomplete transaction, but check called the ids errors.
+Check now reports them as warnings. Removing a leftover generation at open is
+[roadmap](../ROADMAP.md) item 14.
+
+**Tests.** `store/group_model.rs` is the model-based stress test of section 10.1. Four to
+eight threads issue random inserts, deletes, multi-quad transactions, no-ops, dry runs and
+writes whose precondition holds or fails, with and without messages. A run may arm a panic
+at one of the group's four failpoints or a failed synchronization of the log or of the
+vocabulary. It checks unique commit numbers, a poisoned writer after a failed
+synchronization, that every snapshot a reader saw is the model's state at its commit, and
+that the reopened store holds every acknowledged commit and message in an order the model
+allows. After a failed synchronization it also checks that no reader saw a commit past the
+last acknowledged one and that no commit after an uncertain one was acknowledged. A commit
+whose own synchronization failed on the ordinary path rolls back its annotation but can keep
+its log record, so it may come back without its message. Section 3 leaves the outcome of
+that commit open, and the model accepts it for an operation that failed with an error. It
+runs 24 seeds by default in under two seconds, and twelve invocations of 300 seeds each
+passed. Publishing the commits of a failed fence before failing them makes it fail in every
+invocation, and so does removing the poisoning of a failed fence. `tests/annotations.rs`
+prunes the catalog while messaged commits sit at the WAL tail and reopens with and without
+grouping.
+
+**The default.** Group commit is on by default. `StoreOptions::group_commit` replaces
+`experimental_group_commit` with a default of true and is ignored for in-memory stores.
+The CLI and server take the global `--no-group-commit`, and `SPARKLES_GROUP_COMMIT=off`,
+`false`, `no` or `0` does the same. Any non-empty value besides those and `on`, `true`,
+`yes` or `1` is ignored with a warning, so a typo is not silent.
+`--experimental-group-commit` is removed, as section 7.1 says. The Node binding takes a
+`groupCommit` open option and the Python binding a `group_commit` keyword on `Dataset`,
+`Dataset.open` and `Catalog`. The JVM binding exposes no store options, so it takes the
+default and a JVM user cannot turn grouping off. `/$/stats/{ds}` and the JSON metrics report `groupCommit` per dataset. A persistent
+dataset with grouping on holds up to 64 queued commits or 4 MiB of log records, plus the
+speculative snapshots of the commits in flight, which is the memory that buys the
+throughput in BENCHMARKS.md. The 1,000-point `log-writes` runs on ext4 and XFS passed with
+it on 2026-10-18.

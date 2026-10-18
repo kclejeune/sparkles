@@ -4887,6 +4887,8 @@ export interface components {
                 name: string | null;
                 quads: number;
             }[];
+            /** @description Whether concurrent commits of this dataset share one synchronization. False for an in-memory dataset. */
+            groupCommit?: boolean;
             name: string;
             quads: number;
             quota?: null | components["schemas"]["DatasetQuota"];
