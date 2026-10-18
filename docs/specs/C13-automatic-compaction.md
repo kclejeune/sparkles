@@ -993,7 +993,8 @@ ext4 image of 1,000, where a power loss during the compaction's `CURRENT` switch
 `CURRENT.tmp`, and passed all 1,000 XFS images. The removal of `CURRENT.tmp` came from that
 image. With the source of revision d5a817a9 every image passed. Those builds removed every
 generation above `CURRENT`. The rule above replaced that removal after a review, and a
-third pair of runs checked it.
+third pair of runs with the source of revision 8ef44fca, which has it, passed every image.
+No image of that pair needed a generation set aside.
 
 | Run | Receipts | Marks | Log entries | Images | Failed |
 |---|---:|---:|---:|---:|---:|
@@ -1001,5 +1002,7 @@ third pair of runs checked it.
 | XFS, 759e52c2 | 57,717 | 368 | — | 1,000 | 0 |
 | ext4, d5a817a9 | 21,612 | 355 | 24,333 | 1,000 | 0 |
 | XFS, d5a817a9 | 33,427 | 358 | 28,593 | 1,000 | 0 |
+| ext4, 8ef44fca | 69,423 | 378 | 96,739 | 1,000 | 0 |
+| XFS, 8ef44fca | 42,562 | 364 | 37,341 | 1,000 | 0 |
 
 The log of the first XFS run was not kept, so its entry count is missing.
