@@ -731,9 +731,9 @@ index configured.
 4. Whether the leader's text apply in step 3 needs a separate thread when a prefix holds
    many large overlays, which the four-writer gate will show.
 5. How the leader updates the queue's counts and fails the queue after it released the
-   state mutex in step 3, as section 17.4 describes. Either `fail` takes the mutex itself and marks the
-   queue failed before any later fence can lead, or the leader holds a failure flag that
-   `enqueue` reads before it admits a commit.
+   state mutex in step 3, as section 17.4 describes. Either `fail` takes the mutex itself
+   and marks the queue failed before any later fence can lead, or the leader holds a failure
+   flag that `enqueue` reads before it admits a commit.
 
 ## Outcome
 
@@ -1039,9 +1039,9 @@ The `log-writes` runs ran on `forge` on 2026-10-17 with a build of the switch br
 after merge 62f2ada8, which brought in e9f4acb5 and 42c160a9. A run cannot pass without
 both, and the runs did not record the exact revision. Each run replayed 1,000 crash
 images of a load of sixteen writers for 20 s with a mark every 50 ms, and each load
-crossed one automatic compaction. The `--no-group-commit` loads commit far fewer transactions through
-`log-writes`, so they ran with `--auto-compact-min-quads 1000` to cross one as well. Every
-image passed.
+crossed one automatic compaction. The `--no-group-commit` loads commit far fewer
+transactions through `log-writes`, so they ran with `--auto-compact-min-quads 1000` to cross
+one as well. Every image passed.
 
 | Run | Receipts | Marks | Log entries | Images | Failed |
 |---|---:|---:|---:|---:|---:|
@@ -1072,11 +1072,11 @@ synchronization, that every snapshot a reader saw is the model's state at its co
 that the reopened store holds every acknowledged commit and message in an order the model
 allows. After a failed synchronization it also checks that no reader saw a commit past the
 last acknowledged one and that no commit after an uncertain one was acknowledged. Every
-recovered commit must carry its message. It runs 24 seeds by default in under two seconds, and twelve invocations of 300 seeds each
-passed. Publishing the commits of a failed fence before failing them makes it fail in every
-invocation, and so does removing the poisoning of a failed fence. `tests/annotations.rs`
-prunes the catalog while messaged commits sit at the WAL tail and reopens with and without
-grouping.
+recovered commit must carry its message. It runs 24 seeds by default in under two seconds,
+and twelve invocations of 300 seeds each passed. Publishing the commits of a failed fence
+before failing them makes it fail in every invocation, and so does removing the poisoning of
+a failed fence. `tests/annotations.rs` prunes the catalog while messaged commits sit at the
+WAL tail and reopens with and without grouping.
 
 **Annotations after a failed synchronization.** The ordinary path used to take a
 commit's annotation and merge record back when the synchronization of its log records
