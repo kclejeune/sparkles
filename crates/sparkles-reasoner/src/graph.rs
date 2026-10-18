@@ -409,6 +409,12 @@ impl Graph {
     /// emptied, since the new tier may not hold them.
     pub fn set_base(&mut self, base: Arc<Base>) {
         debug_assert!(self.base.is_some() && self.offset > 0);
+        debug_assert!(
+            self.base
+                .as_ref()
+                .is_some_and(|old| Arc::ptr_eq(&old.snap.generation, &base.snap.generation)),
+            "a base tier of another generation"
+        );
         self.base = Some(base);
         for k in &mut self.in_base {
             *k = FxHashSet::default();
@@ -1206,8 +1212,14 @@ impl Graph {
         (base + mem).max(1)
     }
 
+    /// The size of the base tier now (an upper bound), which [`set_base`](Self::set_base)
+    /// may have changed since [`offset`](Self::offset) was set.
+    fn base_len(&self) -> usize {
+        self.base.as_ref().map_or(0, |b| b.len() as usize)
+    }
+
     pub fn distinct_subjects(&self) -> usize {
-        let base = self.offset as usize / 4;
+        let base = self.base_len() / 4;
         let mem = self
             .by_s
             .as_ref()
@@ -1216,7 +1228,7 @@ impl Graph {
     }
 
     pub fn distinct_objects(&self) -> usize {
-        let base = self.offset as usize / 4;
+        let base = self.base_len() / 4;
         let mem = self
             .by_o
             .as_ref()
@@ -1498,5 +1510,41 @@ mod tests {
             assert!(all.iter().all(|t| g.contains(t)));
             assert!(g.heap_bytes() < 2 << 20, "{} bytes", g.heap_bytes());
         }
+    }
+
+    /// P3-5 of the follow-up's review: after [`Graph::set_base`] the distinct-count
+    /// estimates follow the new base tier's size, not the size the graph was made with.
+    #[test]
+    fn f16_estimates_follow_the_new_base() {
+        use sparkles_core::io::{RdfFormat, Source};
+        use sparkles_core::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s0> <urn:p> <urn:o0> .\n".to_vec(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let graphs = [sparkles_core::id::Id::DEFAULT_GRAPH];
+        let mut g = Graph::with_base(Arc::new(Base::new(store.snapshot(), &graphs).unwrap()));
+        let before = (g.distinct_subjects(), g.distinct_objects());
+        let mut u = String::from("INSERT DATA {");
+        for i in 1..4_000 {
+            u.push_str(&format!(" <urn:s{i}> <urn:p> <urn:o{i}> ."));
+        }
+        u.push('}');
+        sparkles_core::sparql::update::update(
+            &store,
+            &u,
+            &sparkles_core::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        g.set_base(Arc::new(Base::new(store.snapshot(), &graphs).unwrap()));
+        assert_eq!(before, (1, 1));
+        assert_eq!(
+            (g.distinct_subjects(), g.distinct_objects()),
+            (1_000, 1_000)
+        );
     }
 }
