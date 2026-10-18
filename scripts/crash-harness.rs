@@ -9,8 +9,10 @@
 //!
 //!   drive --addr A --ds D --receipts FILE [--clients 16] [--seconds S] [--run R]
 //!         [--message-every N] [--mark-cmd CMD] [--mark-ms 50] [--allow-empty]
+//!         [--index geo]
 //!       `--clients` writers insert one new triple per request, `<urn:x09:R:W:K>
-//!       <urn:x09:p> "v-R-W-K"`, every `--message-every`th with a commit message, until
+//!       <urn:x09:p> "v-R-W-K"`, and with `--index geo` a `geo:asWKT` point of the same
+//!       subject, every `--message-every`th with a commit message, until
 //!       `--seconds` pass or the server stops answering. Each acknowledged receipt (the
 //!       `Sparkles-Commit` header of a 200 answer) is appended to FILE as
 //!       `R <commit> <subject> <object> <message or ->`. With `--mark-cmd`, every
@@ -25,11 +27,16 @@
 //!       failed or none was made.
 //!
 //!   verify --sparkles BIN --loc DIR --receipts FILE [--mark NAME] [--write]
+//!         [--index text|geo|embed]
 //!       Checks a recovered store: `sparkles check` reports no error before and after the
 //!       store is opened; the head is at or after the last receipt counted by mark NAME
 //!       (every receipt in the file without `--mark`); every receipt at or below the head
 //!       has its triple and, for a message, its message; with `--write`, a new commit
-//!       continues the sequence at head + 1. Prints one JSON line and exits 1 on failure.
+//!       continues the sequence at head + 1. With `--index` the index agrees with the
+//!       recovered data (X09 section 17.8): full-text search finds a sample of 48 receipts
+//!       by their words and nothing else, spatial windows find what a scan of the points
+//!       finds, and the embedding index names no commit above the head. Prints one JSON
+//!       line and exits 1 on failure.
 //!
 //!   replay --log FILE --size BYTES --out DIR --points N [--seed S] [--from-mark NAME]
 //!         [--jobs J] [--keep-failed K] [--only N,...] -- CMD...
@@ -108,6 +115,14 @@ impl Rng {
 
 // ------------------------------------------------------------------ drive ------
 
+const AS_WKT: &str = "http://www.opengis.net/ont/geosparql#asWKT";
+const WKT: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
+
+/// The point of writer `w`'s `k`th triple under `--index geo`, on a grid of 0.5 degrees.
+fn point(w: u64, k: u64) -> (f64, f64) {
+    (w as f64 * 0.5, (k % 300) as f64 * 0.5 - 75.0)
+}
+
 /// One request on its own connection: the status and the `Sparkles-Commit` header.
 fn post(
     addr: &str,
@@ -155,6 +170,7 @@ fn drive(a: &Args) {
     let marking = mark_cmd.is_some();
     let mark_ms = a.num("--mark-ms", 50);
     let allow_empty = a.flag("--allow-empty");
+    let geo = a.get("--index").as_deref() == Some("geo");
     let file = Arc::new(Mutex::new(
         OpenOptions::new()
             .create(true)
@@ -207,7 +223,14 @@ fn drive(a: &Args) {
                 let s = format!("urn:x09:{run}:{w}:{k}");
                 let o = format!("v-{run}-{w}-{k}");
                 let m = (every > 0 && k % every == 0).then(|| format!("m-{run}-{w}-{k}"));
-                let update = format!("INSERT DATA {{ <{s}> <urn:x09:p> \"{o}\" }}");
+                let update = if geo {
+                    let (x, y) = point(w, k);
+                    format!(
+                        "INSERT DATA {{ <{s}> <urn:x09:p> \"{o}\" . <{s}> <{AS_WKT}> \"POINT({x} {y})\"^^<{WKT}> }}"
+                    )
+                } else {
+                    format!("INSERT DATA {{ <{s}> <urn:x09:p> \"{o}\" }}")
+                };
                 match post(&addr, &ds, &update, m.as_deref()) {
                     Ok((200, Some(c))) => acked
                         .lock()
@@ -421,6 +444,17 @@ fn verify(a: &Args) {
             break;
         }
     }
+    // the indexes of the recovered store agree with its data
+    if problems.is_empty() {
+        let at_head: Vec<&Receipt> = receipts.iter().filter(|r| r.commit <= head).collect();
+        match a.get("--index").as_deref() {
+            Some("text") => check_text(&bin, &loc, &at_head, &mut problems),
+            Some("geo") => check_geo(&bin, &loc, &mut problems),
+            Some("embed") => check_embed(&bin, &loc, head, &mut problems),
+            Some("none") | None => {}
+            Some(i) => die(format!("unknown index {i}")),
+        }
+    }
     let mut next = None;
     if a.flag("--write") && problems.is_empty() {
         let update = format!("INSERT DATA {{ <urn:x09:after:{head}> <urn:x09:p> \"after\" }}");
@@ -453,6 +487,136 @@ fn verify(a: &Args) {
         problems
     );
     std::process::exit(if ok { 0 } else { 1 });
+}
+
+/// Every `step`th of `items`, at most `n` of them, spread over the whole list.
+fn sample<'a, T>(items: &'a [T], n: usize) -> Vec<&'a T> {
+    let step = items.len().div_ceil(n.max(1)).max(1);
+    items.iter().step_by(step).collect()
+}
+
+/// The first column of a TSV result, without the header.
+fn column(out: &str) -> std::collections::BTreeSet<String> {
+    out.lines()
+        .skip(1)
+        .filter_map(|l| l.split('\t').next())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches('<').trim_end_matches('>').to_string())
+        .collect()
+}
+
+/// Under `--index text`: the full-text index, recovered or rebuilt by `sparkles
+/// text-index`, finds each of a sample of the receipts by the words of its object, and
+/// nothing else.
+fn check_text(bin: &str, loc: &str, receipts: &[&Receipt], problems: &mut Vec<String>) {
+    // waits for a rebuild that open started, or retries a failed one
+    let (code, out, err) = sparkles(bin, &["text-index", "--loc", loc]);
+    if code != 0 {
+        problems.push(format!("text-index exited {code}: {}{}", tail(&out), tail(&err)));
+        return;
+    }
+    let picked = sample(receipts, 48);
+    if picked.is_empty() {
+        return;
+    }
+    let values: String = picked
+        .iter()
+        .map(|r| format!("\"\\\"{}\\\"\" ", r.object))
+        .collect();
+    let q = format!(
+        "PREFIX text: <http://jena.apache.org/text#> SELECT DISTINCT ?s WHERE {{ VALUES ?q {{ {values}}} ?s text:query ?q }}"
+    );
+    let (code, out, err) = sparkles(bin, &["query", "--loc", loc, "--results", "tsv", &q]);
+    if code != 0 {
+        problems.push(format!("text query exited {code}: {}", tail(&err)));
+        return;
+    }
+    let found = column(&out);
+    let wanted: std::collections::BTreeSet<String> =
+        picked.iter().map(|r| r.subject.clone()).collect();
+    if found != wanted {
+        let missing: Vec<_> = wanted.difference(&found).take(5).collect();
+        let extra: Vec<_> = found.difference(&wanted).take(5).collect();
+        problems.push(format!(
+            "full-text search found {} of {} sampled receipts, missing {missing:?}, extra {extra:?}",
+            found.intersection(&wanted).count(),
+            wanted.len()
+        ));
+    }
+}
+
+/// Under `--index geo`: the spatial index builds from the recovered store, and window
+/// queries answer what a scan of the points answers.
+fn check_geo(bin: &str, loc: &str, problems: &mut Vec<String>) {
+    let (code, out, err) = sparkles(bin, &["geo-index", "--loc", loc]);
+    if code != 0 {
+        problems.push(format!("geo-index exited {code}: {}{}", tail(&out), tail(&err)));
+        return;
+    }
+    let q = format!("SELECT ?s ?w WHERE {{ ?s <{AS_WKT}> ?w }}");
+    let (code, out, err) = sparkles(bin, &["query", "--loc", loc, "--results", "tsv", &q]);
+    if code != 0 {
+        problems.push(format!("point query exited {code}: {}", tail(&err)));
+        return;
+    }
+    let points: Vec<(String, f64, f64)> = out
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let (s, w) = l.split_once('\t')?;
+            let inner = w.split("POINT(").nth(1)?.split(')').next()?;
+            let mut xy = inner.split_whitespace().map(|v| v.parse::<f64>());
+            let (x, y) = (xy.next()?.ok()?, xy.next()?.ok()?);
+            Some((s.trim_matches(['<', '>']).to_string(), x, y))
+        })
+        .collect();
+    for &(x, y) in [(0.0, -75.0), (2.0, 0.0), (5.0, 40.0)].iter() {
+        let (x0, y0, x1, y1) = (x - 0.25, y - 0.25, x + 1.75, y + 10.25);
+        let poly = format!("POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))");
+        let q = format!(
+            "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> SELECT ?s WHERE {{ ?s <{AS_WKT}> ?w FILTER(geof:sfWithin(?w, \"{poly}\"^^<{WKT}>)) }}"
+        );
+        let (code, out, err) = sparkles(bin, &["query", "--loc", loc, "--results", "tsv", &q]);
+        if code != 0 {
+            problems.push(format!("window query exited {code}: {}", tail(&err)));
+            return;
+        }
+        let found = column(&out);
+        let wanted: std::collections::BTreeSet<String> = points
+            .iter()
+            .filter(|(_, px, py)| *px > x0 && *px < x1 && *py > y0 && *py < y1)
+            .map(|(s, _, _)| s.clone())
+            .collect();
+        if found != wanted {
+            problems.push(format!(
+                "window {poly} found {} points, a scan {}",
+                found.len(),
+                wanted.len()
+            ));
+        }
+    }
+}
+
+/// Under `--index embed`: the embedding index opens on the recovered store, and the commit
+/// its vectors are applied to is at or below the recovered head.
+fn check_embed(bin: &str, loc: &str, head: u64, problems: &mut Vec<String>) {
+    let (code, out, err) = sparkles(bin, &["vector", "status", "--loc", loc, "--name", "docs"]);
+    if code != 0 {
+        problems.push(format!("vector status exited {code}: {}{}", tail(&out), tail(&err)));
+        return;
+    }
+    let applied = out
+        .split("\"appliedSeq\":")
+        .nth(1)
+        .and_then(|v| v.trim().split([',', '}', '\n']).next())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    match applied {
+        Some(seq) if seq > head => problems.push(format!(
+            "the embedding index is applied to {seq}, above the head {head}"
+        )),
+        Some(_) => {}
+        None => problems.push(format!("no appliedSeq in the vector status: {}", tail(&out))),
+    }
 }
 
 /// The leftover warnings that `sparkles check` may still give after an open. Open removes
