@@ -339,6 +339,8 @@ pub struct AppState {
     pub allow_service: bool,
     /// where SERVICE and `LOAD <http…>` may connect (`serve --outbound-*`)
     pub outbound: sparkles::outbound::OutboundPolicy,
+    /// where cursor queries write their spill files (`serve --spill`; none when off)
+    pub spill: Option<Arc<sparkles::spill::Spill>>,
     /// which files `LOAD <file:…>` may read (`serve --load-dir`; none without it)
     pub file_loads: sparkles::sparql::FileLoads,
     /// cap on the classes, and separately the predicates, of one schema report
@@ -511,6 +513,8 @@ pub struct Limits {
     pub max_upload_bytes: Option<u64>,
     /// free space a spooled request body must leave in the temporary directory
     pub min_free_disk_bytes: Option<u64>,
+    /// the disk one query's spill files may reserve (`--query-spill-mb`)
+    pub query_spill_bytes: Option<u64>,
     /// the largest `timeout` a request may ask for (never below the server's default)
     pub max_timeout: Option<std::time::Duration>,
     /// commits one request of `GET /$/commits/{ds}/timeline` reads
@@ -533,6 +537,7 @@ impl Default for Limits {
             max_admin_body_bytes: Some(16 << 20),
             max_upload_bytes: Some(4 << 30),
             min_free_disk_bytes: Some(1 << 30),
+            query_spill_bytes: Some(16 << 30),
             max_timeout: Some(std::time::Duration::from_secs(1800)),
             max_timeline_commits: 10_000_000,
         }
@@ -613,6 +618,7 @@ impl AppState {
             read_only: false,
             allow_service: true,
             outbound: Default::default(),
+            spill: None,
             file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
             #[cfg(feature = "shex")]
@@ -674,6 +680,7 @@ impl AppState {
             read_only: false,
             allow_service: false,
             outbound: Default::default(),
+            spill: None,
             file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
             #[cfg(feature = "shex")]

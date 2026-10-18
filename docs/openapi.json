@@ -384,6 +384,15 @@
           "type": "integer"
         }
       },
+      "spillMb": {
+        "description": "A lower budget of the disk this query's spill files may reserve, in MiB.",
+        "in": "query",
+        "name": "spill-mb",
+        "schema": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "task": {
         "description": "The id of the ingestion task.",
         "in": "path",
@@ -3577,7 +3586,8 @@
                   "rows",
                   "rows-produced",
                   "dataset-bytes",
-                  "server-memory"
+                  "server-memory",
+                  "spill"
                 ],
                 "type": "string"
               },
@@ -3595,7 +3605,7 @@
             "type": "object"
           }
         ],
-        "description": "A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed.",
+        "description": "A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed. The `spill` budget is the disk a query's spill files may reserve.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#budgets"
         }
@@ -14029,6 +14039,39 @@
               "integer",
               "null"
             ]
+          },
+          "spill": {
+            "properties": {
+              "capacityBytes": {
+                "description": "The disk all queries' spill files may reserve together (`--spill-max-mb`).",
+                "type": "integer"
+              },
+              "enabled": {
+                "description": "Whether streamed sorts, groupings and unordered DISTINCT may write what outgrows their memory budget to disk (`--spill`).",
+                "type": "boolean"
+              },
+              "queryBytes": {
+                "description": "The disk one query may reserve (`--query-spill-mb`), `null` when only the total limits it.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "reservedBytes": {
+                "type": "integer"
+              },
+              "spilledQueries": {
+                "description": "Queries that wrote a spill file since the server started.",
+                "type": "integer"
+              },
+              "writtenBytes": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "enabled"
+            ],
+            "type": "object"
           }
         },
         "required": [
@@ -32411,6 +32454,9 @@
             "$ref": "#/components/parameters/memoryMb"
           },
           {
+            "$ref": "#/components/parameters/spillMb"
+          },
+          {
             "$ref": "#/components/parameters/maxRows"
           },
           {
@@ -32621,6 +32667,9 @@
           },
           {
             "$ref": "#/components/parameters/memoryMb"
+          },
+          {
+            "$ref": "#/components/parameters/spillMb"
           },
           {
             "$ref": "#/components/parameters/maxRows"
@@ -36537,6 +36586,9 @@
             "$ref": "#/components/parameters/memoryMb"
           },
           {
+            "$ref": "#/components/parameters/spillMb"
+          },
+          {
             "$ref": "#/components/parameters/maxRows"
           },
           {
@@ -36658,6 +36710,9 @@
           },
           {
             "$ref": "#/components/parameters/memoryMb"
+          },
+          {
+            "$ref": "#/components/parameters/spillMb"
           },
           {
             "$ref": "#/components/parameters/maxRows"
@@ -37406,6 +37461,9 @@
             "$ref": "#/components/parameters/memoryMb"
           },
           {
+            "$ref": "#/components/parameters/spillMb"
+          },
+          {
             "$ref": "#/components/parameters/maxRows"
           },
           {
@@ -37527,6 +37585,9 @@
           },
           {
             "$ref": "#/components/parameters/memoryMb"
+          },
+          {
+            "$ref": "#/components/parameters/spillMb"
           },
           {
             "$ref": "#/components/parameters/maxRows"

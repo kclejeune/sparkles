@@ -168,10 +168,12 @@ pub enum BudgetKind {
     /// the server-wide query memory pool could not admit a request or grow a query's
     /// grant; a retry can succeed when the server is less busy
     ServerMemory,
+    /// bytes of the temporary files a query's operators spilled to disk
+    Spill,
 }
 
 impl BudgetKind {
-    pub const ALL: [BudgetKind; 10] = [
+    pub const ALL: [BudgetKind; 11] = [
         BudgetKind::Rows,
         BudgetKind::Memory,
         BudgetKind::ResultBytes,
@@ -182,6 +184,7 @@ impl BudgetKind {
         BudgetKind::DatasetBytes,
         BudgetKind::HiddenQuads,
         BudgetKind::ServerMemory,
+        BudgetKind::Spill,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -196,6 +199,7 @@ impl BudgetKind {
             BudgetKind::DatasetBytes => "dataset-bytes",
             BudgetKind::HiddenQuads => "hidden-quads",
             BudgetKind::ServerMemory => "server-memory",
+            BudgetKind::Spill => "spill",
         }
     }
 }
@@ -263,6 +267,12 @@ impl std::fmt::Display for Budget {
                 "the server's query memory is in use (pool of {}, request needs about {}); retry shortly",
                 human_bytes(self.limit),
                 human_bytes(self.requested)
+            ),
+            BudgetKind::Spill => write!(
+                f,
+                "query exceeds its disk spill reservation: needs about {}, limit {}",
+                human_bytes(self.requested),
+                human_bytes(self.limit)
             ),
         }
     }

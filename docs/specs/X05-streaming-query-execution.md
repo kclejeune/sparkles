@@ -1192,6 +1192,45 @@ inlining decisions of thin LTO with four codegen units. Giving the eager key fil
 explicit per-clone `regex_automata` caches, as the cursor's regular expression filter
 has, would make the call independent of that inlining, and is left to item 7.
 
+### Batch kernels and disk spill (2026-10-17)
+
+X08 Phase 2 moved the cursor's joins, counts, groupings and DISTINCT to column kernels
+and added disk spill for sorts, groupings and unordered DISTINCT
+([X08 Outcome](X08-disk-spill-and-server-memory.md#phase-2a-batch-kernels-2026-10-17)).
+Three of the follow-ups above changed with it.
+
+* The cursor's merge count is branch-free. An OPTIONAL count measured 0.88 times eager
+  execution at 1.05M with one thread, and 0.80 and 0.79 at 10.5M with one and eight
+  threads, on an 8-vCPU AMD EPYC Namespace instance, where it had measured 1.19 to 1.23.
+  It streams again under automatic execution, now as one case of a wider rule.
+* Automatic execution streams a grouping whose input is estimated at 20,000 rows or more
+  when every operator of the plan has a cursor implementation, under Project, Slice, BIND,
+  FILTER and ORDER BY. Every grouped query of the screen, seven shapes including counts
+  over OPTIONAL and MINUS, measured 0.50 to 0.91 times eager execution at 1.05M and
+  10.5M, at one thread and at eight. Below 20,000 rows the cursor's fixed cost of a few
+  microseconds is not repaid, and the smallest measured input was 30,000 rows. Joins
+  without a grouping stay eager. `star-join` measured 1.03 to 1.16, `regex-iri` 1.26 to
+  1.30, and `x-join-out` and `x-hash-join` 0.98 to 1.28.
+* With spill configured, automatic execution also streams a SELECT of cursor operators
+  whose largest estimated operator output exceeds half of the memory left, and an eager
+  SELECT that fails its memory budget runs once more as a cursor
+  ([X08 §6.8](X08-disk-spill-and-server-memory.md#68-eager-queries)).
+
+`ExecutionMode::Auto` and `auto_streaming` in `cursor.rs` document the rules, and the
+decision tables are `automatic_admission_requires_the_measured_shared_scan_conditions`,
+`automatic_execution_streams_groupings_over_large_inputs` and
+`automatic_admission_streams_plans_expected_to_outgrow_memory_when_they_can_spill`.
+
+The in-memory cursor ORDER BY no longer reserves three times its input before the sort,
+which charges its own index, copy and key values. It had charged both.
+
+These follow-ups stay with roadmap item 7. A morsel-parallel cursor scan and filter would
+close the gap of filters and top-k at 12 threads. A range top-k still collects its range
+inside the cursor. EXISTS and DESCRIBE still read their whole input first. The eager
+`regex-iri` key filter still needs per-clone `regex_automata` caches. A one-key index
+join that read larger input batches, so that it seeks its index less often, was tried
+and set aside unmeasured, since automatic execution runs those joins eagerly.
+
 ### Large basic graph patterns
 
 [ROADMAP](../ROADMAP.md) item 84. The planner joins the triple patterns of a basic graph

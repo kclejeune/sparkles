@@ -217,8 +217,8 @@ orders every item by difficulty and impact and links each to its design spec.
   * Writes: group commit as the default.
   * Reads: faster cold sparse lookups.
 * **Next.**
-  * Execution: batch-oriented joins with disk spill, and QLever's predicate patterns
-    and FSST vocabulary compression.
+  * Execution: hash-join spill and encrypted spill, and QLever's predicate patterns and
+    FSST vocabulary compression.
   * Graph algorithms: the Graphalytics benchmark and the UI for the shipped library.
   * Reasoning: materialization fast enough to leave on, with `owl:sameAs` handled by
     representatives and rules evaluated over the compressed indexes.

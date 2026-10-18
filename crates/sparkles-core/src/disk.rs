@@ -28,6 +28,45 @@ pub fn free_bytes(_: &Path) -> std::io::Result<u64> {
     Ok(u64::MAX)
 }
 
+/// The name of the file system that holds `dir` when it is one whose files live in
+/// memory (`tmpfs`, `ramfs`) or on another machine (`nfs`, `fuse`, `9p`, `smb`, `cifs`),
+/// and `None` for any other. Only Linux reports it.
+#[cfg(target_os = "linux")]
+pub fn special_file_system(dir: &Path) -> std::io::Result<Option<&'static str>> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    let mut s = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `s` is valid for writes; statfs initializes it
+    // when it returns 0
+    if unsafe { libc::statfs(path.as_ptr(), s.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: initialized by the successful call above
+    let s = unsafe { s.assume_init() };
+    #[allow(clippy::unnecessary_cast)] // the field type differs between platforms
+    Ok(match (s.f_type as u64) & 0xffff_ffff {
+        0x0102_1994 => Some("tmpfs"),
+        0x8584_58f6 => Some("ramfs"),
+        0x6969 => Some("nfs"),
+        0x6573_5546 => Some("fuse"),
+        0x0102_1997 => Some("9p"),
+        0x517b | 0xfe53_4d42 => Some("smb"),
+        0xff53_4d42 => Some("cifs"),
+        _ => None,
+    })
+}
+
+/// File systems are not told apart on this platform.
+#[cfg(not(target_os = "linux"))]
+pub fn special_file_system(_: &Path) -> std::io::Result<Option<&'static str>> {
+    Ok(None)
+}
+
+/// Whether [`special_file_system`] names a file system that keeps its files in memory.
+pub fn in_memory_file_system(name: &str) -> bool {
+    matches!(name, "tmpfs" | "ramfs")
+}
+
 /// [`free_bytes`], measured at most once per `max_age` for each directory (small
 /// commits check it under the writer lock, many times a second).
 pub fn free_bytes_cached(dir: &Path, max_age: Duration) -> std::io::Result<u64> {

@@ -24,6 +24,7 @@ pub mod patch;
 pub mod preview;
 pub mod schema;
 pub mod sparql;
+pub mod spill;
 pub mod store;
 pub mod stored;
 pub mod tabular;

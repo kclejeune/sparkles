@@ -1432,7 +1432,7 @@ fn run_len(col: &[u64], v: u64) -> usize {
 /// End of the run of ids equal to `col[i]` in a sorted column: short runs are stepped
 /// through instead of binary-searching the rest of the column.
 #[inline]
-fn run_end(col: &[Id], i: usize) -> usize {
+pub(super) fn run_end(col: &[Id], i: usize) -> usize {
     const PROBE: usize = 16;
     let v = col[i];
     let end = col.len().min(i + PROBE);
@@ -4724,7 +4724,12 @@ fn first_key_candidates(
     Ok((cand.len() < t.len()).then_some(cand))
 }
 
-/// The value of an ORDER BY key on every row (`None`: an error).
+/// The value of an ORDER BY key on each row of `t`, for a merge that compares rows
+/// read back from disk. Values the key computes are not interned.
+pub(super) fn key_values(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Option<Value>>> {
+    key_rows(ctx, t, e, None)
+}
+
 fn key_rows(
     ctx: &Ctx,
     t: &Table,

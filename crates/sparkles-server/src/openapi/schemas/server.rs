@@ -159,6 +159,14 @@ fn server_memory(put: &mut dyn FnMut(&str, J)) {
                         "rejected": { "type": "integer", "description": "Requests answered `503` after the admission wait." },
                         "admissionWaitSeconds": num(),
                     })),
+                    "spill": obj(&["enabled"], json!({
+                        "enabled": { "type": "boolean", "description": "Whether streamed sorts, groupings and unordered DISTINCT may write what outgrows their memory budget to disk (`--spill`)." },
+                        "capacityBytes": { "type": "integer", "description": "The disk all queries' spill files may reserve together (`--spill-max-mb`)." },
+                        "queryBytes": { "type": ["integer", "null"], "description": "The disk one query may reserve (`--query-spill-mb`), `null` when only the total limits it." },
+                        "reservedBytes": int(),
+                        "writtenBytes": int(),
+                        "spilledQueries": { "type": "integer", "description": "Queries that wrote a spill file since the server started." },
+                    })),
                     "caches": obj(&[], json!({
                         "shared": boolean(),
                         "block": cache_use.clone(),

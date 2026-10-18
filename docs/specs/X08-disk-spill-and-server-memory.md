@@ -723,7 +723,9 @@ These capacity and ownership checks retain the existing estimates for other exec
 kernels and decoded terms. They exclude allocator metadata, size classes and process
 RSS, and do not establish a performance result.
 
-Phase 1 is built (roadmap item 2). Phases 2 and 3 are not (items 7 and 40).
+Phase 1 is built (roadmap item 2). Phase 2 is built for sorts, groupings and DISTINCT
+(item 7), and hash-join spill and encryption remain (item 85). Phase 3 is not built
+(item 40).
 
 ### Phase 1a: shared caches
 
@@ -963,3 +965,167 @@ comparing the baseline, fixed build and pool settings remain pending as describe
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
+
+### Phase 2a: batch kernels (2026-10-17)
+
+The kernels of §5 replaced the cursor's per-row paths. They did not land behind an
+`Optimizations` switch, as §5.3 planned, because every gated shape measured as fast or
+faster and the old paths had no remaining use.
+
+* The merge join (`cursor/merge.rs`) finds each left key's place in the right batch with
+  the branch-free multi-lane `zipper::lower_bounds`, collects (left, right) row pairs and
+  gathers each output column once. Semi, anti and MINUS joins build a keep mask and
+  compact branch-free. A count over the join adds the run lengths of equal right keys
+  without branching. That count is what X05 kept eager on AMD hosts, and it now measures
+  0.79 to 0.88 times eager execution there.
+* The hash join (`cursor/binary.rs`) groups build rows by key into one row vector with a
+  map from key to start and count, sized before it is built, and probes a batch in two
+  passes as §5.1 describes. An OPTIONAL with an expression evaluates it once per chunk of
+  candidate pairs. The pre-sized map costs up to 18 bytes per build row when keys repeat.
+* The grouping (`cursor/group.rs`) computes a slot per row of a batch and updates each
+  aggregate column-wise. COUNT, SUM and AVG take typed loops, and the other aggregates keep
+  the per-row path. A group's charge follows its layout. It had been charged about
+  1.3 KiB, so 833,177 groups reported 1,092 MB where eager grouping reports 130 MB.
+* DISTINCT keeps only the last row over input ordered on every output column. Otherwise
+  it keeps one flat arena of rows behind a `hashbrown` table, or a set of ids for one
+  column, and reserves room for a whole batch before it grows.
+
+The §5.3 gate asked for streaming within 10% of eager on `optional-chain`, `group-avg`,
+`minus`, `expr-bind-group` and `distinct-join` at 1.05M and 10.5M. On an 8-vCPU AMD EPYC
+Namespace instance, reading every row with eager and cursor runs interleaved in one
+process, the ratios of streaming to eager at 1.05M with one thread, 10.5M with one and
+10.5M with eight were 0.90, 0.61 and 0.71 for `group-avg`, 0.88, 0.82 and 0.83 for
+`minus`, 0.70, 0.66 and 0.78 for `expr-bind-group`, and 1.09, 0.95 and 0.99 for
+`distinct-join`. `optional-chain` read 1.00, 1.33 and 0.92, and an earlier run on another
+instance read 0.72 at 10.5M with one thread, so it is within the gate in two runs of three
+and noisy in the third. [BENCHMARKS.md](../BENCHMARKS.md#batch-kernels-and-disk-spill)
+has the full table. The second half of §5.3, no other query slower by more than the tie
+threshold, is checked by the screen in the gate below.
+
+Automatic execution widened with these measurements. It streams a grouping, under any of
+Project, Slice, BIND, FILTER and ORDER BY, whose input is estimated at 20,000 rows or more
+and whose operators all have cursor implementations, because every grouped query of the
+screen measured 0.50 to 0.91 times eager execution at every size and thread count. Joins
+without a grouping stay eager, since `star-join`, `regex-iri`, `x-join-out` and
+`x-hash-join` measured 1.0 to 1.3. The decision table is
+`automatic_execution_streams_groupings_over_large_inputs` in `cursor.rs`.
+
+### Phase 2b: disk spill (2026-10-17)
+
+`crate::spill` holds the files, and the sort, grouping and DISTINCT use them. A query
+spills only when `QueryOptions::spill` holds a `Spill`, which `serve --spill on` opens
+under `--spill-dir`. The tests are `tests/spill_sort.rs`, `tests/spill_group.rs`, the
+unit tests of `spill.rs` and `http::budgets_tests`.
+
+**Files.** §6.6 is built as written. A process directory `<boot-id>-<pid>-<random>` with
+mode 0700 holds the flocked `SPARKLES-SPILL` marker. Files are `O_TMPFILE` or unlinked
+at creation, so dropping an operator on completion, error, cancellation, panic or close
+frees its space, and `Spill::open` sweeps directories of dead processes and leaves
+anything else with a warning. The format is registered in `formats.rs` as the derived
+kind `spill`, version 1. Frames hold at most 4,096 rows, and a sort writes smaller ones
+when memory is short. Reservation takes 64 MiB extents from `--spill-max-mb`, checks
+`--min-free-disk-mb` with `statvfs`, and fails with the new budget kind `spill` (`507`),
+as do `ENOSPC`, `EDQUOT` and `EFBIG`. Another I/O error fails the query with that error.
+The extents are accounting, not preallocation, and a query gives back the extents its
+open files no longer need whenever one of its files closes. The process locks its marker
+before it writes the format into it, so a sweep by a process starting at the same time
+never takes the directory for a dead one. The spill directory is created with mode 0700
+and refused unless the server's user owns it and no other user can write it. `serve
+--spill on` fails to start when the directory cannot be used or sits on tmpfs or ramfs,
+where spilled state would take memory, and warns on a network file system.
+
+**External sort.** The decisions below depart from §6.4.
+
+* A run is written when the buffered input's sort would take half of the room the query
+  had when the sort started, and when a charge for the buffer fails. Runs are sorted in
+  pieces that the room left at that moment should hold, and a piece that still fails its
+  budget is tried again at half its size while the input stays buffered. Estimates of
+  the in-memory sort's footprint proved unreliable, and retrying a piece is not.
+* Runs store ids only. The merge decodes each frame's keys into `SortKey`s as it reads
+  the frame, instead of storing sort classes in the run, which keeps the format to plain
+  id columns. A key that is a pure expression is evaluated again on each frame, so its
+  computed values are never interned. A key that calls `RAND`, `BNODE`, `UUID` or
+  `STRUUID` is evaluated once into a hidden column that the run keeps, so the merge
+  compares what the run was sorted by. Those computed terms stay interned for the query,
+  so such a sort does not shed their memory.
+* Equal keys keep input order without sequence numbers. A run holds earlier input than
+  every later run, the in-memory sort of an ORDER BY is stable, and the merge takes the
+  earliest run on a tie. The id sort that feeds a merge join sorts its runs unstably,
+  since only its sort variables carry an order. A pass that merges the first runs puts its output first.
+* A run's frames are sized so that 64 of them share a quarter of the starting room, at
+  least 64 rows, which replaces the fixed 256 KiB read buffers. The fan-in is the number
+  of such frames that half the room holds, at most 64, and more runs merge in passes.
+
+**Grouping and DISTINCT.** The decisions below depart from §6.5.
+
+* A grouping does not write partial states. Once its groups hold half the starting room,
+  or the room left falls under a quarter of it, or a new group's charge fails, the pass
+  takes no new groups. Rows of the groups it holds are still aggregated, and rows of other
+  groups go in input order to one of 16 files by a seeded hash of their keys. After the
+  pass's groups are output and freed, each file is grouped by a pass of its own, which
+  partitions again with the next seed. Every row of a group reaches the same pass in input
+  order, so every admitted aggregate, `GROUP_CONCAT` order, DISTINCT and SAMPLE included,
+  needs no merge rule, and each pass takes at least one group. The cost is that rows of
+  passed groups are written whole rather than as partial states.
+* A grouping without keys never spills, since it holds one group. Growth of a held group's
+  state, such as a long `GROUP_CONCAT`, still fails at the budget.
+* DISTINCT spills the same way with a hash of the whole row, and only over input with no
+  order, because rows from the files come after the others. Input ordered on every output
+  column needs no memory. Input ordered on some columns keeps its in-memory set, so that
+  the order the cursor claims for its output holds. In `SELECT DISTINCT … ORDER BY` the
+  DISTINCT sits above the sort, as SPARQL's algebra places it, so it also keeps its whole
+  set in memory and fails with the `memory` budget when the set does not fit. The same
+  holds above a ranking such as a text search. The test is
+  `distinct_over_order_by_keeps_the_order_or_fails`. Deduplicating below the sort is
+  item 85.
+
+**Eager queries.** Both paths of §6.8 are built. With spill, automatic execution streams a
+SELECT whose operators all have cursor implementations when the largest operator output
+the plan estimates would take more than half of the memory left. An eager SELECT that
+fails its `memory` budget runs once more as a cursor within the first run's deadline,
+unless it calls SERVICE or a graph algorithm anywhere, inside an EXISTS included, or has
+extension functions or initial bindings. The cursor plan counts `eagerMemoryRetry`, and
+`/$/metrics` counts retries in `sparkles_spill_eager_retries_total`. The access log does
+not record the retry separately.
+
+**Not built.** Hash-join spill (§6.3) and the merge-join run spool, and `--spill
+encrypted` (§6.7), are roadmap item 85. Until they land, `--spill` is off by default, as
+§9 requires until every Phase 2b gate passes. The `NeedsSpill` signal of §4.1 is not
+needed, since an operator switches on its own budget error or threshold. Spill for an
+update's WHERE clause (open question 3) is not offered, because updates run eagerly.
+
+**Gates.**
+
+* **A8 to A10, A14.** These gates are not met and move to item 85.
+* **A11.** `spilled_order_by_matches_eager_order_with_ties_and_expressions` sorts 60,000
+  rows of integers, strings, language strings, IRIs, decimals and dates, with OPTIONAL
+  unbound values, under 768 KiB, and a total order matches eager row for row.
+  `many_runs_merge_in_passes_and_report_them_in_the_plan` sorts 150,000 rows in more than
+  one merge pass. At 10.5M on Namespace, a sort of 1.02M rows under 64 MiB held 45 MB and
+  took 0.85 times the unlimited eager time at one thread and 2.24 times at eight. The
+  20-million-row run of A11 was not made.
+* **A12.** `spilled_groupings_match_eager_aggregates` groups 60,000 rows into 20,000
+  groups with COUNT, SUM, MIN, MAX, AVG of an expression, SAMPLE, GROUP_CONCAT,
+  COUNT(DISTINCT) and COUNT(DISTINCT *), and two keys with an OPTIONAL, under 4 MiB, and
+  matches eager. `spilled_distinct_emits_each_row_once` covers DISTINCT under 256 KiB. At
+  10.5M on Namespace, 833,177 groups held 38 MB under 64 MiB and took 1.54 times the eager
+  time. The 10-million-group run was not made.
+* **A13.** The tests are `spill_limits_fail_the_query_with_a_spill_budget` (reservation),
+  the unit tests of `spill.rs` (injected write, read and reservation faults, an unknown
+  version, kind, codec or encryption flag, a damaged frame, and the sweep of dead, live
+  and foreign directories),
+  `cancelled_spilled_sorts_remove_their_files` and
+  `spilled_sorts_remove_their_files_when_dropped_early`. Files are nameless from creation,
+  so a SIGKILL leaves only the empty directory that the next start removes, which the
+  sweep test checks with a directory whose lock no process holds. A deadline during a
+  merge takes the same path as cancellation.
+
+* **Screen.** `mise run bench:nsc` of 0a81011c against 4391b74d, which has the kernels,
+  spill and the wider automatic execution, ran 27 queries in four A,B,B,A rounds on an
+  8-vCPU AMD EPYC instance. Both returned the same answers. At 1.05M the geometric mean
+  of the server times was 1.012 and of the wall times 1.007, and no query was 1.06 times
+  slower or more. At 10.5M the means were 0.972 and 0.957, `expr-agg-arg` fell to 0.51
+  and `group-avg` to 0.83, and the slowest ratio was 1.057 for `subquery-agg`, whose
+  servers spread by 34 to 40% between processes. No query reached the 1.10 flag, so no
+  query under 0.3 ms needed a check on forge. The commits after 4391b74d change the
+  charge of a group and the documentation.

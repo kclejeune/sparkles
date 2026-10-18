@@ -5619,6 +5619,7 @@ dependencies = [
  "md-5",
  "memchr",
  "memmap2",
+ "mimalloc",
  "oxiri",
  "oxrdf",
  "oxrdfio",

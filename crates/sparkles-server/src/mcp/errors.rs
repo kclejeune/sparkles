@@ -136,6 +136,7 @@ impl ErrorContext<'_> {
                     BudgetKind::DatasetBytes => ("budget-dataset-bytes", "dataset-bytes"),
                     BudgetKind::HiddenQuads => ("budget-hidden-quads", "hidden-quads"),
                     BudgetKind::ServerMemory => ("budget-server-memory", "server-memory"),
+                    BudgetKind::Spill => ("budget-spill", "spill"),
                 };
                 // the server's memory is in use, so a retry can succeed
                 let status = if b.kind == BudgetKind::ServerMemory { 503 } else { 507 };

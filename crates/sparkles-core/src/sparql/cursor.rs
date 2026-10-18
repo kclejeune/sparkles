@@ -22,6 +22,7 @@ mod binary;
 mod bind;
 mod distinct;
 mod expand;
+mod extsort;
 mod filter;
 pub mod graph;
 mod group;
@@ -774,7 +775,9 @@ pub type AskResult = MaterializedResult;
 pub enum ExecutionMode {
     Eager,
     Streaming,
-    /// Use pull execution for plain immutable scans of an estimated thousand rows or more.
+    /// Use pull execution for immutable scans of an estimated thousand rows or more,
+    /// groupings of large inputs, and plans that would outgrow memory when they may
+    /// spill. Run other plans eagerly.
     #[default]
     Auto,
 }
@@ -784,15 +787,17 @@ pub enum ExecutionMode {
 /// one Rayon thread and at twelve, and costs a query of fewer rows a microsecond or two.
 pub(super) const AUTO_SCAN_ROWS: f64 = 1_000.0;
 
-/// Production-allocator admission for immutable scans. Other plans retain eager
-/// execution.
+/// Production-allocator admission of plans over an immutable snapshot. Automatic
+/// execution streams plain scans from [`AUTO_SCAN_ROWS`] estimated rows, groupings from
+/// [`AUTO_GROUP_ROWS`] estimated input rows, and any plan of cursor operators that it
+/// expects to outgrow half its memory budget when the query may spill. Other plans run
+/// eagerly.
 ///
-/// An uncached OPTIONAL count on a single key streamed from an estimated million input
-/// rows until 2026-10-17. The cursor counts the join with a branching merge, which on the
-/// AMD EPYC hosts of the Namespace screens took 1.19 to 1.23 times as long as eager
-/// execution's branch-free merge at 10.5M, and on forge's Intel CPU 0.99 times as long.
-/// Such a count now runs eagerly. Eager execution holds both sides of the join, 20.8 MB at
-/// 10.5M where the cursor held 2.2 MB.
+/// An OPTIONAL count ran eagerly from 2026-10-17 because the cursor's branching merge
+/// count took up to 1.23 times as long as eager execution on AMD hosts. The cursor's
+/// count is now branch-free and measured 0.79 to 0.88 times eager execution's time at
+/// 1.05M and 10.5M, so it streams as a grouping again. It holds 2.2 MB where eager
+/// execution holds 19.8 MB at 10.5M.
 pub(super) fn auto_streaming(
     ctx: &Ctx,
     node: &Node,
@@ -818,12 +823,16 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
-    if !(node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node)) {
-        return false;
-    }
-    // A scan expected to pass the row budgets stays eager, so that it fails before the
+    // A plan expected to pass the row budgets stays eager, so that it fails before the
     // first byte of output with an error status rather than partway through a stream.
     if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
+        return false;
+    }
+    if spill_admitted(ctx, node, kind) {
+        return true;
+    }
+    let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
+    if !(scanned || grouped(node)) {
         return false;
     }
     let cap = options
@@ -848,6 +857,179 @@ pub(super) fn auto_streaming(
         && options.batch_bytes >= 4096 * 32
         && headroom < u64::MAX
         && ctx.memory_remaining() >= headroom
+}
+
+/// The estimated input rows from which automatic execution streams a grouping. The
+/// cursor's column-wise aggregation measured 0.50 to 0.91 times eager execution's time
+/// on every grouped query of the screen, from 30,000 input rows at 1.05M quads to 10M
+/// at 10.5M, at one Rayon thread and at eight, on the AMD EPYC hosts of the Namespace
+/// screens. Below the threshold the cursor's fixed cost of a few microseconds is not
+/// repaid.
+pub(super) const AUTO_GROUP_ROWS: f64 = 20_000.0;
+
+/// Whether `node`, under the operators that finish a grouped query, is a grouping that
+/// the cursor aggregates column-wise over an estimated [`AUTO_GROUP_ROWS`] input rows
+/// or more, with a cursor implementation for every operator. This covers counts over
+/// OPTIONAL and MINUS, which the cursor now joins and counts with branch-free kernels.
+fn grouped(node: &Node) -> bool {
+    let mut group = node;
+    while matches!(
+        group.kind,
+        Kind::Project(_)
+            | Kind::Slice { .. }
+            | Kind::Extend(..)
+            | Kind::Filter(_)
+            | Kind::OrderBy { .. }
+    ) && group.children.len() == 1
+    {
+        group = &group.children[0];
+    }
+    let rows = match &group.kind {
+        Kind::Group { .. } if group::eligible(group) => group.children[0].est,
+        Kind::GroupCountScan { .. } => group.est,
+        _ => return false,
+    };
+    rows.is_finite() && rows >= AUTO_GROUP_ROWS && native(node)
+}
+
+/// Whether automatic execution runs `node` as a cursor because eager execution is
+/// expected to outgrow the memory budget (X08 §6.8). The query must have somewhere to
+/// spill, read an immutable snapshot, and have a cursor implementation for every
+/// operator, and the largest operator output the plan estimates must exceed half of
+/// the memory left.
+fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
+    kind == QueryKind::Select
+        && ctx.spill.is_some()
+        && ctx.snap.delta.is_empty()
+        && native(node)
+        && {
+            let bytes = largest_output_bytes(node);
+            bytes.is_finite() && bytes * 2.0 > ctx.memory_remaining() as f64
+        }
+}
+
+/// The estimated bytes of the largest operator output in `node`, as eager execution
+/// would hold it.
+fn largest_output_bytes(node: &Node) -> f64 {
+    let own = node.est.max(0.0) * (node.vars.len().max(1) * 8) as f64;
+    node.children
+        .iter()
+        .map(largest_output_bytes)
+        .fold(own, f64::max)
+}
+
+/// Whether every operator of `node` has a cursor implementation, so that a cursor
+/// over it runs no eager subtree. An operator that evaluates EXISTS counts as not
+/// native here, since whether its patterns stream is known only once they are built.
+pub(super) fn native(node: &Node) -> bool {
+    !own_exprs(&node.kind).iter().any(|e| e.has_exists())
+        && (supported(&node.kind)
+            || binary::eligible(node)
+            || group::eligible(node)
+            || expand::eligible(node)
+            || walk::eligible(node)
+            || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
+                && node.children.len() == 1))
+        && node.children.iter().all(native)
+}
+
+/// Whether nothing in `node` has effects that running it twice would repeat or
+/// expose, so that a query that failed eagerly can run again as a cursor.
+fn retryable(node: &Node) -> bool {
+    !matches!(node.kind, Kind::Service { .. } | Kind::AlgoCall(_))
+        && node.children.iter().all(retryable)
+}
+
+/// Whether `pattern` holds a SERVICE anywhere, in an EXISTS, an OPTIONAL condition, a
+/// LATERAL, an aggregate or an ORDER BY key as well as in the pattern itself. The plan
+/// keeps an EXISTS that it evaluates per row as a pattern, so [`retryable`] does not
+/// see a SERVICE there.
+fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::{AggregateExpression, GraphPattern as P, OrderExpression};
+    let order = |keys: &[OrderExpression]| {
+        keys.iter().any(|k| match k {
+            OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr_calls_service(e),
+        })
+    };
+    match pattern {
+        P::Service { .. } => true,
+        P::Bgp { .. } | P::Path { .. } | P::Values { .. } => false,
+        P::Join { left, right }
+        | P::Union { left, right }
+        | P::Minus { left, right }
+        | P::SemiJoin { left, right }
+        | P::AntiJoin { left, right }
+        | P::Lateral { left, right } => calls_service(left) || calls_service(right),
+        P::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            calls_service(left)
+                || calls_service(right)
+                || expression.as_ref().is_some_and(expr_calls_service)
+        }
+        P::Filter { expr, inner } => expr_calls_service(expr) || calls_service(inner),
+        P::Extend {
+            inner, expression, ..
+        }
+        | P::Assign {
+            inner, expression, ..
+        }
+        | P::Unfold {
+            inner, expression, ..
+        } => expr_calls_service(expression) || calls_service(inner),
+        P::OrderBy { inner, expression } => order(expression) || calls_service(inner),
+        P::Group {
+            inner, aggregates, ..
+        } => {
+            calls_service(inner)
+                || aggregates.iter().any(|(_, agg)| match agg {
+                    AggregateExpression::CountSolutions { .. } => false,
+                    AggregateExpression::FunctionCall { expr, .. } => expr_calls_service(expr),
+                    AggregateExpression::Fold {
+                        expr,
+                        value,
+                        order: keys,
+                        ..
+                    } => {
+                        expr_calls_service(expr)
+                            || value.as_ref().is_some_and(expr_calls_service)
+                            || order(keys)
+                    }
+                })
+        }
+        P::Graph { inner, .. }
+        | P::Project { inner, .. }
+        | P::Distinct { inner }
+        | P::Reduced { inner }
+        | P::Slice { inner, .. } => calls_service(inner),
+    }
+}
+
+/// Whether `expr` holds an EXISTS whose pattern holds a SERVICE.
+fn expr_calls_service(expr: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::Expression as E;
+    match expr {
+        E::Exists(pattern) => calls_service(pattern),
+        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => expr_calls_service(a) || expr_calls_service(b),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_calls_service(a),
+        E::In(a, list) => expr_calls_service(a) || list.iter().any(expr_calls_service),
+        E::If(a, b, c) => expr_calls_service(a) || expr_calls_service(b) || expr_calls_service(c),
+        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expr_calls_service),
+    }
 }
 
 /// Select execution without parsing or planning twice in automatic mode.
@@ -892,6 +1074,7 @@ pub fn query_execution_with_plan(
             .depth
             .min(depth::MAX_ALGEBRA_DEPTH)
     };
+    let retry_snapshot = snapshot.clone();
     depth::with_stack(parser_depth, move || {
         let parsed = super::parse_query(query, options.base_iri.as_deref(), &options.prefixes)?;
         let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -919,6 +1102,15 @@ pub fn query_execution_with_plan(
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let kind = prepared.kind;
             let levels = levels.max(prepared.plan_depth);
+            // An eager SELECT that runs out of memory runs again once as a cursor that
+            // may spill (X08 §6.8). Eager execution writes nothing before it finishes,
+            // so the failure always comes before any output.
+            let retry = kind == QueryKind::Select
+                && options.spill.is_some()
+                && options.extensions.is_none()
+                && options.initial_bindings.is_empty()
+                && retryable(&prepared.node)
+                && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.is_cursor() {
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
@@ -926,9 +1118,21 @@ pub fn query_execution_with_plan(
                 )?;
                 Ok(QueryExecution::Select(Box::new(cursor)))
             } else {
-                let mut result = depth::with_stack(levels, || {
+                let ran = depth::with_stack(levels, || {
                     super::execute_prepared(&parsed, options, parse_ms, plan_ms, prepared)
-                })?;
+                });
+                let mut result = match ran {
+                    Err(failed)
+                        if retry
+                            && matches!(
+                                &failed.error,
+                                Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                            ) =>
+                    {
+                        return retry_as_cursor(retry_snapshot, query, options, cursor, started);
+                    }
+                    ran => ran?,
+                };
                 if result.kind == QueryKind::Select {
                     super::select_star_order(query, &mut result);
                 }
@@ -940,6 +1144,37 @@ pub fn query_execution_with_plan(
             }
         })
     })
+}
+
+/// Run `query` again as a cursor after its eager run exceeded the memory budget, within
+/// the deadline the first run started under. The root of the cursor plan counts the
+/// retry as `eagerMemoryRetry`.
+fn retry_as_cursor(
+    snapshot: Arc<Snapshot>,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    started: Instant,
+) -> std::result::Result<QueryExecution, Box<super::Failed>> {
+    if let Some(spill) = &options.spill {
+        spill.count_eager_retry();
+    }
+    let mut options = options.clone();
+    if let Some(timeout) = options.timeout {
+        let deadline = started + timeout;
+        options.deadline = Some(options.deadline.map_or(deadline, |d| d.min(deadline)));
+        options.timeout = None;
+    }
+    let mut execution = query_cursor(snapshot, query, &options, cursor)?;
+    if let QueryExecution::Select(cursor) = &mut execution {
+        let counters = cursor
+            .plan
+            .operator
+            .counters
+            .get_or_insert_with(Default::default);
+        counters.insert("eagerMemoryRetry".into(), 1.into());
+    }
+    Ok(execution)
 }
 
 /// Explicit execution of any query form. SELECT and graph output are pull
@@ -1453,6 +1688,8 @@ enum State {
         node: Node,
         loaded: Option<Buffer>,
         at: usize,
+        /// The external sort, once the input has spilled.
+        external: Option<Box<extsort::External>>,
     },
     TopK(Box<topk::TopK>),
 }
@@ -1592,6 +1829,33 @@ fn ranked(kind: &Kind) -> bool {
     )
 }
 
+/// Whether the rows of `node` come in an order a caller observes that operator orders
+/// do not record, such as an ORDER BY's or a ranking's, through the operators that pass
+/// rows on in their input's order. A DISTINCT over such rows must not pass rows to a
+/// later pass, which would emit them after rows that come after them.
+fn value_ordered(node: &Node) -> bool {
+    let mut node = node;
+    loop {
+        if ranked(&node.kind) {
+            return true;
+        }
+        match &node.kind {
+            Kind::Project(_)
+            | Kind::Distinct
+            | Kind::Filter(_)
+            | Kind::Extend(..)
+            | Kind::Assign(..)
+            | Kind::Slice { .. }
+                if node.children.len() == 1 =>
+            {
+                node = &node.children[0]
+            }
+            Kind::Union if node.children.len() == 1 => node = &node.children[0],
+            _ => return false,
+        }
+    }
+}
+
 /// The order an operator's output keeps, from its plan node (whose children are
 /// shells carrying the order of their operators) and its child operators.
 fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
@@ -1702,6 +1966,8 @@ impl Operator {
         }
         info.actual_rows = 0;
         let vars = node.vars.clone();
+        // Read before the children below become shells that keep only their order.
+        let value_ordered_input = node.children.first().is_some_and(value_ordered);
         // A fallback materializes only its own operator when it reads its children as
         // input tables. Those children then stream as cursors of their own.
         let inputs = materializes
@@ -1854,6 +2120,7 @@ impl Operator {
                 node,
                 loaded: None,
                 at: 0,
+                external: None,
             }
         } else if materializes {
             State::Fallback {
@@ -1883,7 +2150,12 @@ impl Operator {
                     loaded: None,
                     at: 0,
                 },
-                Kind::Distinct => State::Distinct(distinct::Distinct::new(ctx)?),
+                Kind::Distinct => State::Distinct(distinct::Distinct::new(
+                    ctx,
+                    &node.vars,
+                    &children[0].order,
+                    value_ordered_input,
+                )?),
                 Kind::Slice { offset, limit } => State::Slice {
                     offset: *offset,
                     remaining: *limit,
@@ -2017,6 +2289,9 @@ impl Operator {
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
         plan.complete = self.done;
+        if self.info.counters.is_some() {
+            plan.operator.counters.clone_from(&self.info.counters);
+        }
         fn update(info: &PlanInfo, plan: &mut CursorPlan) {
             plan.operator.actual_rows = info.actual_rows;
             plan.operator.time_ms = info.time_ms;
@@ -2240,7 +2515,14 @@ impl Operator {
                     binary.next(ctx, &mut self.children, options, &self.vars, cap)?
                 }
                 State::Group(group) => {
-                    group.next(ctx, &mut self.children[0], options, &self.vars, cap)?
+                    let batch = group.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
+                    if group.spilled > 0 {
+                        let mut counters = self.info.counters.take().unwrap_or_default();
+                        counters.insert("spilledBytes".into(), group.spilled.into());
+                        counters.insert("spillPasses".into(), (group.passes + 1).into());
+                        self.info.counters = Some(counters);
+                    }
+                    batch
                 }
                 State::Filter(filter) => {
                     let batch = filter.next(ctx, &mut self.children[0], options, cap)?;
@@ -2259,12 +2541,27 @@ impl Operator {
                     batch
                 }
                 State::Distinct(distinct) => {
-                    let Some(mut buffer) = self.children[0].next(ctx, options, cap)? else {
-                        return Ok(None);
+                    let batch = match self.children[0].next(ctx, options, cap)? {
+                        Some(mut buffer) => {
+                            distinct.apply(ctx, &mut buffer)?;
+                            Some(buffer)
+                        }
+                        // Rows that did not fit in memory are deduplicated last.
+                        None => distinct.drain(ctx, &self.vars)?,
                     };
-                    distinct.apply(ctx, &mut buffer)?;
-                    self.done = self.children[0].done;
-                    Some(buffer)
+                    if distinct.spilled > 0 {
+                        let mut counters = self.info.counters.take().unwrap_or_default();
+                        counters.insert("spilledBytes".into(), distinct.spilled.into());
+                        counters.insert("spillPasses".into(), (distinct.passes + 1).into());
+                        self.info.counters = Some(counters);
+                    }
+                    self.done = self.children[0].done && !distinct.has_more();
+                    match batch {
+                        Some(batch) => Some(batch),
+                        None if self.done => None,
+                        // A batch the set emptied is still a batch.
+                        None => Some(Buffer::new(ctx, &self.vars, 0)?),
+                    }
                 }
                 State::Empty => None,
                 State::Values { table, at } => {
@@ -2285,25 +2582,73 @@ impl Operator {
                     self.done = topk.done();
                     b
                 }
-                State::Blocking { node, loaded, at } => {
+                State::Blocking {
+                    node,
+                    loaded,
+                    at,
+                    external,
+                } => 'blocking: {
+                    if let Some(sort) = external {
+                        break 'blocking sort.next(ctx, cap)?;
+                    }
                     if loaded.is_none() {
-                        let mut input = Buffer::new(ctx, &self.children[0].vars, 0)?;
-                        // The concatenated input keeps the child's order, which lets a
-                        // sort on a prefix of it skip reordering.
-                        input.table.sorted.clone_from(&self.children[0].order);
-                        // Blocking input demand is independent of the requested output prefix.
-                        while let Some(batch) =
-                            self.children[0].next(ctx, options, options.batch_rows)?
-                        {
-                            merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
+                        // A sort with somewhere to spill writes sorted runs when its
+                        // input outgrows memory and then merges them.
+                        let mut spill = if extsort::eligible(node) {
+                            extsort::External::new(ctx, node, &self.children[0].vars)
+                        } else {
+                            None
+                        };
+                        let input = match &mut spill {
+                            Some(sort) => {
+                                let input =
+                                    extsort::load(ctx, sort, &mut self.children[0], options)?;
+                                if input.is_none() {
+                                    let mut counters =
+                                        self.info.counters.take().unwrap_or_default();
+                                    counters.insert("spilledBytes".into(), sort.written.into());
+                                    counters.insert("spillRuns".into(), sort.run_count.into());
+                                    counters.insert("mergePasses".into(), sort.passes.into());
+                                    self.info.counters = Some(counters);
+                                }
+                                input
+                            }
+                            None => {
+                                let mut input = Buffer::new(ctx, &self.children[0].vars, 0)?;
+                                // The concatenated input keeps the child's order, which
+                                // lets a sort on a prefix of it skip reordering.
+                                input.table.sorted.clone_from(&self.children[0].order);
+                                // Blocking input demand is independent of the requested
+                                // output prefix.
+                                while let Some(batch) =
+                                    self.children[0].next(ctx, options, options.batch_rows)?
+                                {
+                                    merge::append(
+                                        ctx,
+                                        &mut input,
+                                        &batch.table,
+                                        0..batch.table.len,
+                                    )?;
+                                }
+                                Some(input)
+                            }
+                        };
+                        let Some(mut input) = input else {
+                            let mut sort = Box::new(spill.expect("a spilled sort"));
+                            let batch = sort.next(ctx, cap)?;
+                            *external = Some(sort);
+                            break 'blocking batch;
+                        };
+                        // Row reordering, output copies and their index arrays can
+                        // coexist with the input columns. ORDER BY charges them itself,
+                        // and a Sort reserves them here before sorting.
+                        if matches!(node.kind, Kind::Sort(_)) {
+                            input.charge.resize(
+                                capacity_bytes(&input.table)
+                                    .saturating_mul(3)
+                                    .saturating_add(input.table.len as u64 * 24 + 1024),
+                            )?;
                         }
-                        // Row reordering/output copies and their index arrays can
-                        // coexist with the input columns. Reserve before sorting.
-                        input.charge.resize(
-                            capacity_bytes(&input.table)
-                                .saturating_mul(3)
-                                .saturating_add(input.table.len as u64 * 24 + 1024),
-                        )?;
                         let mut report = ExprReport::default();
                         input.table = exec::apply_blocking(ctx, node, input.table, &mut report)?;
                         input.reconcile()?;
@@ -3117,11 +3462,12 @@ mod tests {
         evicted_skipped_read_ahead_column("count");
     }
 
-    /// The decision table of automatic execution for an OPTIONAL count on a single key:
-    /// eager whether results are cached or not and however many rows it reads, since the
-    /// cursor's count measured up to 1.23 times as long as eager's on AMD hosts.
+    /// The decision table of automatic execution for groupings, counts over OPTIONAL
+    /// and MINUS among them: a cursor from [`AUTO_GROUP_ROWS`] estimated input rows on,
+    /// whether results are cached or not, and eager below it or with an operator the
+    /// cursor runs eagerly.
     #[test]
-    fn automatic_execution_keeps_optional_counts_eager() {
+    fn automatic_execution_streams_groupings_over_large_inputs() {
         use crate::io::Source;
         use crate::store::{Store, StoreOptions};
         let store = Store::in_memory(StoreOptions::default());
@@ -3132,38 +3478,59 @@ mod tests {
                 None,
             )])
             .unwrap();
-        let q = super::super::parse_query(
-            "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b}}",
-            None,
-            &[],
-        )
-        .unwrap();
-        for no_cache in [true, false] {
-            for est in [1_000.0, 1_000_000.0, 100_000_000.0] {
-                let options = QueryOptions {
-                    no_cache,
-                    ..Default::default()
-                };
-                let mut p = super::super::prepare_query(store.snapshot(), &q, &options, None, None)
-                    .unwrap();
-                let mut group = &mut p.node;
-                while matches!(
-                    group.kind,
-                    Kind::Project(_)
-                        | Kind::Slice { offset: 0, .. }
-                        | Kind::Extend(_, super::super::expr::Expr::Var(_))
-                ) {
-                    group = &mut group.children[0];
+        let cases = [
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b}}",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a MINUS {?s <urn:q> ?b}}",
+                true,
+            ),
+            (
+                "SELECT ?a (AVG(?b) AS ?m) {?s <urn:p> ?a ; <urn:q> ?b} GROUP BY ?a ORDER BY DESC(?m) LIMIT 3",
+                true,
+            ),
+            (
+                "SELECT ?a (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER EXISTS {?s <urn:q> ?b}} GROUP BY ?a",
+                false,
+            ),
+        ];
+        for (q, streams) in cases {
+            let q = super::super::parse_query(q, None, &[]).unwrap();
+            for no_cache in [true, false] {
+                for (est, large) in [
+                    (1_000.0, false),
+                    (AUTO_GROUP_ROWS - 1.0, false),
+                    (AUTO_GROUP_ROWS, true),
+                    (1_000_000.0, true),
+                    (f64::INFINITY, false),
+                ] {
+                    let options = QueryOptions {
+                        no_cache,
+                        ..Default::default()
+                    };
+                    let mut p =
+                        super::super::prepare_query(store.snapshot(), &q, &options, None, None)
+                            .unwrap();
+                    let mut group = &mut p.node;
+                    while !matches!(group.kind, Kind::Group { .. }) {
+                        group = &mut group.children[0];
+                    }
+                    fn scale(node: &mut Node, est: f64) {
+                        node.est = est;
+                        for child in &mut node.children {
+                            scale(child, est);
+                        }
+                    }
+                    scale(&mut group.children[0], est);
+                    group.est = 10.0;
+                    assert_eq!(
+                        auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()),
+                        streams && large,
+                        "{q}: no_cache {no_cache}, {est} rows"
+                    );
                 }
-                assert!(matches!(group.kind, Kind::Group { .. }));
-                group.children[0].est = est;
-                for child in &mut group.children[0].children {
-                    child.est = est;
-                }
-                assert!(
-                    !auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()),
-                    "no_cache {no_cache}, {est} rows"
-                );
             }
         }
     }
@@ -3304,6 +3671,79 @@ mod tests {
         ));
         // A retained immutable context stays admissible after a concurrent write.
         assert!(auto_streaming(&p.ctx, &p.node, p.kind, &Default::default()));
+    }
+
+    /// The decision table of spill admission (X08 §6.8): a query streams when it may
+    /// spill, reads an immutable snapshot, has only cursor operators and is expected
+    /// to hold more than half its memory budget eagerly.
+    #[test]
+    fn automatic_admission_streams_plans_expected_to_outgrow_memory_when_they_can_spill() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> 1 . <urn:s> <urn:q> 2 .".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+        })
+        .unwrap();
+        let decide = |q: &str, spill: Option<Arc<crate::spill::Spill>>, memory: u64, est: f64| {
+            let q = super::super::parse_query(q, None, &[]).unwrap();
+            let options = QueryOptions {
+                spill,
+                max_memory_bytes: Some(memory),
+                ..Default::default()
+            };
+            let mut p =
+                super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
+            fn scale(node: &mut Node, est: f64) {
+                node.est = est;
+                for child in &mut node.children {
+                    scale(child, est);
+                }
+            }
+            scale(&mut p.node, est);
+            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default())
+        };
+        let sort = "SELECT ?s ?o { ?s <urn:p> ?o } ORDER BY ?o";
+        let group = "SELECT ?o (COUNT(?s) AS ?n) { ?s <urn:p> ?o } GROUP BY ?o";
+        let join = "SELECT * { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } } ORDER BY ?x";
+        let exists = "SELECT ?s { ?s <urn:p> ?o FILTER EXISTS { ?s <urn:q> ?x } } ORDER BY ?s";
+        let service = "SELECT * { SERVICE <http://example.org/sparql> { ?s ?p ?o } } ORDER BY ?s";
+        let some = Some(spill.clone());
+        // 1M rows of two columns is 16 MB, more than half of 16 MiB.
+        // A large grouping streams by its own rule, with or without spill.
+        assert!(decide(group, None, u64::MAX, 1e6));
+        for q in [sort, join] {
+            assert!(decide(q, some.clone(), 16 << 20, 1e6), "{q}");
+            // without spill, or under half the budget, the plan stays eager
+            assert!(!decide(q, None, 16 << 20, 1e6), "{q}");
+            assert!(!decide(q, some.clone(), 64 << 20, 1e6), "{q}");
+            // an unlimited budget never admits by memory
+            assert!(!decide(q, some.clone(), u64::MAX, 1e6), "{q}");
+        }
+        // plans with an operator the cursor runs eagerly stay eager
+        assert!(!decide(exists, some.clone(), 16 << 20, 1e6));
+        assert!(!decide(service, some.clone(), 16 << 20, 1e6));
+        // an unknown estimate stays eager
+        assert!(!decide(sort, some.clone(), 16 << 20, f64::INFINITY));
+        // uncompacted changes keep the plan eager, and the eager run retries instead
+        super::super::update::update(
+            &store,
+            "INSERT DATA {<urn:new> <urn:p> 2}",
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!decide(sort, some, 16 << 20, 1e6));
     }
 
     /// A cursor over a few dozen distinct IRIs and literals, and its first batch of

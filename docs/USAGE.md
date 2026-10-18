@@ -407,12 +407,16 @@ happens to materialized inferences, and the limits.
 | `--tls-cert FILE`, `--tls-key FILE` | | Serve HTTPS with this PEM certificate chain and key (see [TLS](#tls)). Both are re-read on SIGHUP and when they change. |
 | `--cors-origin ORIGIN` | none | A browser origin, such as `https://yasgui.example`, whose pages may call the API cross-origin without credentials. Repeatable. With `--auth-config`, it is added to `cors.origins`. Without auth, such a page may do everything the server allows. |
 | `--timeout S` | `60` | Default query timeout in seconds. `timeout=` sets it per request. |
-| `--default-execution MODE` | `auto` | How a query runs when its request has no `execution=`. `auto` streams the plain scans of a thousand rows or more that measured faster as cursors and runs the rest eagerly, and `eager` runs every query eagerly. See [incremental query execution](#incremental-query-execution). |
+| `--default-execution MODE` | `auto` | How a query runs when its request has no `execution=`. `auto` streams the plain scans of a thousand rows or more and the groupings of 20,000 input rows or more, which measured faster as cursors, and runs the rest eagerly. `eager` runs every query eagerly. See [incremental query execution](#incremental-query-execution). |
 | `--update-timeout S` | `0` | Default SPARQL update timeout in seconds; `0` means none. `timeout=` sets it per request. An update that times out changes nothing. |
 | `--max-timeout S` | `1800` | Largest `timeout=` a query or update may ask for; `0` means unlimited. Never below `--timeout` or `--update-timeout`. |
 | `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
 | `--total-query-memory-mb N` | half the available memory, less the caches (`small`: `2048`) | The query memory pool, the estimated memory of all queries and updates together. A request waits for a share of it before it runs. `0` turns the pool off. See [Memory and caches](#memory-and-caches). |
 | `--query-admission-wait S` | `2` | Seconds a request waits for its share of the pool before it answers `503` with `Retry-After: 1`. |
+| `--spill MODE` | `off` | `on` lets a streamed sort, grouping or DISTINCT that outgrows its memory budget write the excess to disk. See [Memory and caches](#memory-and-caches). |
+| `--spill-dir DIR` | `<data>/.spill` | Directory of the spill files, on a local disk. The server's user must own it and no other user may write it. A directory on tmpfs or ramfs, or one that cannot be used, fails the start. |
+| `--spill-max-mb N` | a quarter of the free space, at most 65536 | Disk that all queries' spill files may reserve together, at least 1. Queries take it in 64 MiB extents, first come first served, and give each back once their open files no longer need it. |
+| `--query-spill-mb N` | `16384` | Disk that one query's spill files may reserve. A request may lower it with `spill-mb`. |
 | `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
 | `--max-export-mb N` | `0` | Budget for the body of a Graph Store GET, which exports a graph or the whole dataset; `0` means unlimited. |
 | `--max-rows N` | `200000000` | Rows in any intermediate result. |
@@ -496,8 +500,8 @@ schema limits.
 
 A request over budget fails with `507` and a JSON body that names the budget. The
 outbound total is named `outbound-bytes`. A query can lower its own budgets with the
-`memory-mb`, `max-rows`, `max-rows-produced` and `max-result-mb` parameters, but never
-raise them ([API.md](API.md#budgets)). A query or write stops as soon as its client
+`memory-mb`, `spill-mb`, `max-rows`, `max-rows-produced` and `max-result-mb` parameters,
+but never raise them ([API.md](API.md#budgets)). A query or write stops as soon as its client
 disconnects, and a write then commits nothing. `sparkles query --memory-mb N` applies the
 memory budget on the command line, where there is no limit by default.
 
@@ -541,6 +545,19 @@ Set `--total-query-memory-mb 0` to turn the pool off, which restores the earlier
 behaviour. A SERVICE call from a query to its own server counts as a request of its own,
 so it can wait while its caller holds memory and then answer `503`. The mechanism is
 described in [API.md](API.md#query-memory-pool).
+
+`--spill on` lets a streamed query that outgrows its memory budget finish by writing to
+disk. A sort without LIMIT writes sorted runs and merges them, and a grouping or a
+DISTINCT over unordered input keeps what fits and handles the rest in later passes over
+files partitioned by a hash. A hash join still keeps its build side in memory. With
+spill on, automatic execution also streams a query that eager execution would hold in
+more than half its memory budget, and runs an eager query that exceeds its budget once
+more as a cursor. The files go to `--spill-dir`, have no name while they are written,
+and disappear when the query ends or the process dies. They are not encrypted, so leave
+spill off where query data must not reach the disk. A sort that spills to a local SSD at
+10.5M triples took 0.72 to 0.85 times the eager time on one thread and 1.9 to 2.2 times
+on eight, holding about 50 MB where an in-memory sort holds 580 MB. The details are in
+[API.md](API.md#disk-spill).
 
 ## Command-line tools
 
@@ -4135,8 +4152,10 @@ across batches. A hash join keeps its build side in memory, DISTINCT keeps the k
 has seen, and an eligible aggregate keeps its group state. Sorting and unsupported
 operators read their whole input first, and the plan marks where they do. Kept state
 and terms the query creates count against the budget. A query that exceeds the budget
-fails, and nothing spills to disk. The ordinary `query` and `select` calls run
-eagerly. Cursors inside a native transaction are not supported.
+fails, unless `QueryOptions::spill` holds a `sparkles::spill::Spill` opened on a local
+directory. Then a sort without LIMIT, a grouping and a DISTINCT over unordered input
+write what does not fit to disk, as the server's `--spill on` does. The ordinary
+`query` and `select` calls run eagerly. Cursors inside a native transaction are not supported.
 
 `graph_cursor` and `graph_cursor_with` return batches of decoded quads for CONSTRUCT
 and DESCRIBE. CONSTRUCT reads WHERE solutions incrementally, and the set it uses to drop
@@ -4154,8 +4173,15 @@ streams a plain SELECT of scans and projections when it expects at least a thous
 rows. The data must come from immutable blocks with no pending changes, any graph
 restriction must cover whole blocks, the query must have no restored initial bindings
 or offset, and its row budgets must cover the estimate. There must also be enough memory
-to own the blocks and to hold batches of at least 4,096 rows and 128 KiB. Every other
-plan runs eagerly and answers exactly as `execution=eager` does. `execution=streaming` streams
+to own the blocks and to hold batches of at least 4,096 rows and 128 KiB. It also
+streams a grouping, counts over OPTIONAL and MINUS among them, that reads an estimated
+20,000 rows or more when every operator has a cursor implementation, since such
+groupings measured 0.50 to 0.91 times the eager time. Every other plan runs eagerly and
+answers exactly as `execution=eager` does, except on a server with spill on, described
+under [Memory and caches](#memory-and-caches). A streamed grouping can concatenate a
+`GROUP_CONCAT` in another order than an eager one when its input comes from a join,
+since SPARQL leaves that order open. Concatenating over an ordered subquery fixes the
+order in both. `execution=streaming` streams
 every query, and `execution=eager` streams none:
 
 ```sh

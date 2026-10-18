@@ -682,6 +682,7 @@ fn budget_index(k: BudgetKind) -> usize {
         BudgetKind::DatasetBytes => 7,
         BudgetKind::HiddenQuads => 8,
         BudgetKind::ServerMemory => 9,
+        BudgetKind::Spill => 10,
     }
 }
 

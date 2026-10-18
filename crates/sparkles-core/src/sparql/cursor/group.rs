@@ -1,15 +1,26 @@
 //! Incremental aggregate state over input batches. These operators consume all
 //! input before output; they retain groups and aggregates, not all source rows.
+//!
+//! A query that may spill aggregates in passes (X08 §6.5). Once the groups of a pass
+//! hold half the memory the query had when the grouping started, or a new group does
+//! not fit, the pass takes no new groups. Rows of groups it already holds are still
+//! aggregated, and rows of other groups are written in input order to one of
+//! [`PARTITIONS`] spill files chosen by a hash of their keys. After the pass's groups
+//! are output and freed, each file is read by a pass of its own, which partitions what
+//! it passes on with another hash. Every row of a group lands in the same pass, in
+//! input order, so each aggregate sees exactly the rows it would see in memory, and
+//! each pass takes at least one group.
 use super::{Buffer, CursorOptions, Operator};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::sparql::ctx::{Ctx, RetainedCharge};
+use crate::sparql::ctx::{Ctx, OwnedCharge, RetainedCharge};
 use crate::sparql::exec::{AggState, compute_column, stat_aggregate};
 use crate::sparql::expr::Expr;
 use crate::sparql::exprcache::Report;
 use crate::sparql::plan::{Agg, Kind, Node};
 use crate::sparql::table::{Table, VarId};
 use crate::sparql::value::Value;
+use crate::spill::{QuerySpill, SpillKind, SpillReader, SpillRun, SpillWriter};
 use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::algebra::AggregateFunction;
 use std::sync::Arc;
@@ -105,7 +116,42 @@ pub(super) struct Group {
     at: usize,
     charge: Option<RetainedCharge>,
     bytes: u64,
+    /// The bytes the charge holds, at least `bytes`.
+    reserved: u64,
+    /// The state's bytes before its first group.
+    base: u64,
+    /// The input's variables, which spilled rows keep.
+    input: Vec<VarId>,
+    /// Where rows of groups that do not fit go, when the query may spill.
+    query: Option<Arc<QuerySpill>>,
+    /// The state's bytes at which a pass takes no new groups, half the room the query
+    /// had when the grouping started.
+    threshold: u64,
+    /// Whether this pass takes no new groups.
+    frozen: bool,
+    /// The rows this pass passes on, by partition.
+    writers: Vec<Option<SpillWriter>>,
+    /// The partitions later passes read, each with how many times its rows were
+    /// partitioned, which seeds the hash of its own partitions.
+    pending: Vec<(Arc<SpillRun>, u64)>,
+    /// How many times the rows of this pass were partitioned.
+    depth: u64,
+    /// The rows this pass reads, after the first.
+    source: Option<SpillReader>,
+    /// What the plan reports.
+    pub(super) spilled: u64,
+    pub(super) passes: usize,
 }
+
+/// The slot of a row whose group this pass does not hold.
+const PASSED: u32 = u32::MAX;
+/// The spill files one pass divides the rows it passes on among.
+const PARTITIONS: usize = 16;
+/// The least state a pass holds before it takes no new groups.
+const MIN_PASS_BYTES: u64 = 256 << 10;
+
+/// The least step by which the retained charge of the group state grows.
+const RETAIN_STEP: u64 = 64 << 10;
 
 impl Group {
     pub(super) fn new(ctx: &Ctx, node: &Node) -> Result<Self> {
@@ -152,9 +198,23 @@ impl Group {
             at: 0,
             charge,
             bytes,
+            reserved: bytes,
+            base: bytes,
+            input: input.clone(),
+            query: None,
+            threshold: 0,
+            frozen: false,
+            writers: Vec::new(),
+            pending: Vec::new(),
+            depth: 0,
+            source: None,
+            spilled: 0,
+            passes: 0,
         };
         if group.keys.is_empty() {
             group.insert(ctx, &[])?;
+        } else {
+            group.query = ctx.spill.clone();
         }
         Ok(group)
     }
@@ -164,9 +224,13 @@ impl Group {
         let at = self.groups;
         let na = self.aggs.len();
         ctx.check_rows(at.saturating_add(1))?;
-        self.retain(
-            512 + key.len() as u64 * 24 + na as u64 * (size_of::<State>() as u64 * 4 + 128),
-        )?;
+        // The index entry, twice while the index grows, a boxed key for several key
+        // columns, the key in `order`, and each aggregate's state, twice while `states`
+        // grows, with its payload slot. Text and values that states own are charged as
+        // they grow.
+        let nk = key.len() as u64;
+        let entry = if nk == 1 { 17 } else { 8 * nk + 16 + 25 };
+        self.retain(entry * 2 + nk * 8 + na as u64 * (size_of::<State>() as u64 * 2 + 8) + 16)?;
         match &mut self.index {
             Index::One(index) => {
                 index.insert(key[0], at);
@@ -182,24 +246,151 @@ impl Group {
         Ok(at)
     }
 
+    /// Count `bytes` more of retained state. The charge grows ahead in steps of at
+    /// least 64 KiB, still before the state does, so that adding many small groups does
+    /// not update the memory ledger for each of them. It overstates the state by less
+    /// than one step.
     fn retain(&mut self, bytes: u64) -> Result<()> {
         let retained = self.bytes.saturating_add(bytes);
-        if let Some(charge) = &mut self.charge {
-            charge.resize(retained)?;
+        if retained > self.reserved {
+            let reserved = retained.saturating_add((retained / 8).max(RETAIN_STEP));
+            if let Some(charge) = &mut self.charge {
+                if charge.resize(reserved).is_err() {
+                    // Near the budget, reserve only what the state needs.
+                    charge.resize(retained)?;
+                    self.reserved = retained;
+                } else {
+                    self.reserved = reserved;
+                }
+            } else {
+                self.reserved = reserved;
+            }
         }
         self.bytes = retained;
         Ok(())
     }
 
-    fn find(&mut self, ctx: &Ctx, key: &[Id]) -> Result<usize> {
+    /// The slot of the group with these keys, adding the group unless this pass takes
+    /// no new groups, when the slot is [`PASSED`].
+    fn find(&mut self, ctx: &Ctx, key: &[Id]) -> Result<u32> {
         let found = match &self.index {
             Index::One(index) => index.get(&key[0]).copied(),
             Index::Many(index) => index.get(key).copied(),
         };
         match found {
-            Some(group) => Ok(group),
-            None => self.insert(ctx, key),
+            Some(group) => Ok(group as u32),
+            None => self.place(ctx, key),
         }
+    }
+
+    /// Add a group with these keys, or pass its rows on when the pass is full.
+    fn place(&mut self, ctx: &Ctx, key: &[Id]) -> Result<u32> {
+        // A pass also stops taking groups when what else the query holds leaves less
+        // than a quarter of the room it had, so that the batches in flight still fit.
+        if self.query.is_some()
+            && self.groups > 0
+            && (self.bytes >= self.threshold || ctx.memory_room() < self.threshold / 2)
+        {
+            self.frozen = true;
+        }
+        if self.frozen {
+            return Ok(PASSED);
+        }
+        match self.insert(ctx, key) {
+            Ok(group) => Ok(group as u32),
+            // A pass that holds a group passes on the groups that do not fit.
+            Err(Error::BudgetExceeded(b))
+                if self.query.is_some()
+                    && self.groups > 0
+                    && matches!(
+                        b.kind,
+                        crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+                    ) =>
+            {
+                self.frozen = true;
+                Ok(PASSED)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Write the rows of `table` whose slot is [`PASSED`] to the partitions of later
+    /// passes.
+    fn pass_on(&mut self, ctx: &Ctx, table: &Table, slots: &[u32], rows: usize) -> Result<()> {
+        use std::hash::{Hash, Hasher};
+        let query = self.query.clone().expect("a spilling grouping");
+        let _gather = ctx.charge(rows as u64 * (table.cols.len() as u64 * 8 + 8) + 256)?;
+        let seed = self.depth.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5bd1_e995;
+        let mut parts: Vec<Vec<usize>> = vec![Vec::new(); PARTITIONS];
+        for (row, _) in slots
+            .iter()
+            .enumerate()
+            .filter(|&(_, &slot)| slot == PASSED)
+        {
+            let mut hasher = rustc_hash::FxHasher::default();
+            seed.hash(&mut hasher);
+            for key in &self.keys {
+                key.map_or(Id::UNDEF, |c| table.cols[c][row])
+                    .hash(&mut hasher);
+            }
+            // The high bits mix best.
+            parts[(hasher.finish() >> 60) as usize % PARTITIONS].push(row);
+        }
+        if self.writers.is_empty() {
+            self.writers.resize_with(PARTITIONS, || None);
+        }
+        for (part, rows) in parts.iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let columns: Vec<Vec<Id>> = table
+                .cols
+                .iter()
+                .map(|column| rows.iter().map(|&row| column[row]).collect())
+                .collect();
+            let writer = &mut self.writers[part];
+            if writer.is_none() {
+                *writer = Some(query.create(SpillKind::GroupPartition, table.cols.len())?);
+            }
+            let slices: Vec<&[Id]> = columns.iter().map(Vec::as_slice).collect();
+            writer
+                .as_mut()
+                .expect("an open spill file")
+                .write(&slices, rows.len())?;
+        }
+        Ok(())
+    }
+
+    /// Forget the groups of a finished pass, keeping the aggregates' configuration.
+    fn reset(&mut self) -> Result<()> {
+        self.index = if self.keys.len() == 1 {
+            Index::One(Default::default())
+        } else {
+            Index::Many(Default::default())
+        };
+        self.order = Vec::new();
+        self.states = Vec::new();
+        self.payload = Vec::new();
+        self.groups = 0;
+        self.at = 0;
+        self.seen = self
+            .aggs
+            .iter()
+            .any(|agg| agg.distinct && agg.expr.is_some())
+            .then(Default::default);
+        self.rows_seen = self
+            .aggs
+            .iter()
+            .any(|agg| agg.distinct && agg.expr.is_none())
+            .then(Default::default);
+        self.loaded = false;
+        self.frozen = false;
+        self.bytes = self.base;
+        self.reserved = self.base;
+        if let Some(charge) = &mut self.charge {
+            charge.resize(self.base)?;
+        }
+        Ok(())
     }
 
     fn only_counts_rows(&self) -> bool {
@@ -247,9 +438,29 @@ impl Group {
             .any(|agg| matches!(agg.func, AggregateFunction::Min | AggregateFunction::Max));
         let mut key = vec![Id::UNDEF; self.keys.len()];
         let mut report = Report::default();
+        if self.query.is_some() && self.threshold == 0 {
+            self.threshold = (ctx.memory_room() / 2).max(MIN_PASS_BYTES);
+        }
         // Every input row contributes even when a parent requests a tiny prefix.
-        while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
-            let table = &batch.table;
+        loop {
+            let (table, _input_charge) = match &mut self.source {
+                Some(reader) => match reader.next_frame()? {
+                    Some((cols, len)) => {
+                        let charge =
+                            OwnedCharge::new(ctx, cols.len() as u64 * len as u64 * 8 + 256)?;
+                        let mut table = Table::new(self.input.clone());
+                        table.cols = cols;
+                        table.len = len;
+                        (table, charge)
+                    }
+                    None => break,
+                },
+                None => match child.next(ctx, options, options.batch_rows)? {
+                    Some(Buffer { table, charge }) => (table, charge),
+                    None => break,
+                },
+            };
+            let table = &table;
             if self.only_counts_rows() {
                 for state in &mut self.states {
                     if let State::Agg(AggState::Count(count)) = state {
@@ -258,6 +469,65 @@ impl Group {
                 }
                 continue;
             }
+            // The group of every row of the batch, then each aggregate over the whole
+            // batch, so that the kind of an aggregate is matched once per batch.
+            let _slots = ctx.charge(table.len as u64 * 4 + 64)?;
+            let mut slots: Vec<u32> = Vec::with_capacity(table.len);
+            if self.keys.is_empty() {
+                slots.resize(table.len, 0);
+            } else if let ([Some(column)], Index::One(_)) = (self.keys.as_slice(), &self.index) {
+                let column = &table.cols[*column];
+                for (row, &id) in column.iter().enumerate() {
+                    if row.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let found = match &self.index {
+                        Index::One(index) => index.get(&id).copied(),
+                        Index::Many(_) => unreachable!("a one-key index"),
+                    };
+                    slots.push(match found {
+                        Some(group) => group as u32,
+                        None => self.place(ctx, &[id])?,
+                    });
+                }
+            } else {
+                for row in 0..table.len {
+                    if row.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    for (k, column) in key.iter_mut().zip(&self.keys) {
+                        *k = column.map_or(Id::UNDEF, |c| table.cols[c][row]);
+                    }
+                    slots.push(self.find(ctx, &key)?);
+                }
+            }
+            // Rows of groups this pass does not hold go to the next pass.
+            let passed = if self.frozen {
+                slots.iter().filter(|&&slot| slot == PASSED).count()
+            } else {
+                0
+            };
+            let kept;
+            let table = if passed > 0 {
+                self.pass_on(ctx, table, &slots, passed)?;
+                let _kept =
+                    ctx.charge((table.len - passed) as u64 * table.cols.len() as u64 * 8 + 256)?;
+                let mut rows = Table::new(table.vars.clone());
+                for (to, from) in rows.cols.iter_mut().zip(&table.cols) {
+                    to.extend(
+                        from.iter()
+                            .zip(&slots)
+                            .filter(|&(_, &slot)| slot != PASSED)
+                            .map(|(&id, _)| id),
+                    );
+                }
+                rows.len = table.len - passed;
+                slots.retain(|&slot| slot != PASSED);
+                kept = (rows, _kept);
+                &kept.0
+            } else {
+                table
+            };
             // Expression arguments are evaluated once per batch into charged columns.
             let _scratch = ctx.charge(
                 self.args
@@ -274,19 +544,56 @@ impl Group {
                     _ => Ok(None),
                 })
                 .collect::<Result<Vec<Option<Vec<Id>>>>>()?;
-            for row in 0..table.len {
-                if row.is_multiple_of(1024) {
-                    ctx.check()?;
-                }
-                for (k, column) in key.iter_mut().zip(&self.keys) {
-                    *k = column.map_or(Id::UNDEF, |c| table.cols[c][row]);
-                }
-                let group = if self.keys.is_empty() {
-                    0
-                } else {
-                    self.find(ctx, &key)?
+            for (a, values) in computed.iter().enumerate() {
+                ctx.check()?;
+                let na = self.aggs.len();
+                let agg = &self.aggs[a];
+                let column = match (&self.args[a], values) {
+                    (_, Some(values)) => Some(values.as_slice()),
+                    (Arg::Column(Some(c)), _) => Some(table.cols[*c].as_slice()),
+                    _ => None,
                 };
-                for (a, values) in computed.iter().enumerate() {
+                let unbound = matches!(self.args[a], Arg::Column(None));
+                if !agg.distinct && !matches!(agg.func, AggregateFunction::GroupConcat { .. }) {
+                    // Running states that need no payload: counts and sums.
+                    match (&agg.func, column) {
+                        (AggregateFunction::Count, None) if !unbound => {
+                            for &slot in &slots {
+                                if let State::Agg(AggState::Count(n)) =
+                                    &mut self.states[slot as usize * na + a]
+                                {
+                                    *n += 1;
+                                }
+                            }
+                            continue;
+                        }
+                        (AggregateFunction::Count, Some(values)) => {
+                            for (&slot, id) in slots.iter().zip(values) {
+                                if let State::Agg(AggState::Count(n)) =
+                                    &mut self.states[slot as usize * na + a]
+                                {
+                                    *n += u64::from(!id.is_undef());
+                                }
+                            }
+                            continue;
+                        }
+                        (AggregateFunction::Sum | AggregateFunction::Avg, Some(values)) => {
+                            for (&slot, &id) in slots.iter().zip(values) {
+                                if let State::Agg(state) = &mut self.states[slot as usize * na + a]
+                                {
+                                    state.add(ctx, agg, Some(id));
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                for (row, &slot) in slots.iter().enumerate() {
+                    if row.is_multiple_of(1024) {
+                        ctx.check()?;
+                    }
+                    let group = slot as usize;
                     if matches!(self.args[a], Arg::Star)
                         && self.aggs[a].distinct
                         && !self.new_row(group, a, table, row)?
@@ -305,6 +612,12 @@ impl Group {
             }
         }
         ctx.check()?;
+        for writer in std::mem::take(&mut self.writers).into_iter().flatten() {
+            let run = writer.finish()?;
+            self.spilled = self.spilled.saturating_add(run.bytes());
+            self.pending.push((Arc::new(run), self.depth + 1));
+        }
+        self.source = None;
         self.loaded = true;
         Ok(())
     }
@@ -392,16 +705,26 @@ impl Group {
         vars: &[VarId],
         cap: usize,
     ) -> Result<Option<Buffer>> {
-        if !self.loaded {
-            self.load(ctx, child, options)?;
-            // The value sets are not needed for output.
-            self.seen = None;
-            self.rows_seen = None;
-        }
-        let n = cap.min(self.groups - self.at);
-        if n == 0 {
-            return Ok(None);
-        }
+        let n = loop {
+            if !self.loaded {
+                self.load(ctx, child, options)?;
+                // The value sets are not needed for output.
+                self.seen = None;
+                self.rows_seen = None;
+            }
+            let n = cap.min(self.groups - self.at);
+            if n > 0 {
+                break n;
+            }
+            // The pass is output: free it and read the rows it passed on.
+            let Some((run, depth)) = self.pending.pop() else {
+                return Ok(None);
+            };
+            self.reset()?;
+            self.depth = depth;
+            self.source = Some(run.reader()?);
+            self.passes += 1;
+        };
         let nk = self.keys.len();
         let na = self.aggs.len();
         let mut output = Buffer::new(ctx, vars, n)?;

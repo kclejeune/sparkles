@@ -116,6 +116,7 @@ fn query_params(o: Op) -> Op {
         "profile",
         "nocache",
         "memoryMb",
+        "spillMb",
         "maxRows",
         "maxRowsProduced",
         "maxResultMb",

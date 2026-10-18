@@ -474,6 +474,8 @@ pub struct Ctx {
     /// The grant the query charges, fixed before its first charge (see [`Ctx::set_grant`]).
     /// Contributions retain the grant they were admitted under.
     grant: Option<Arc<super::pool::PoolGrant>>,
+    /// The query's disk reservation for spill files, when spill is on.
+    pub(crate) spill: Option<Arc<crate::spill::QuerySpill>>,
     /// Budget for the rows all operators produce together (`u64::MAX`: unlimited). See
     /// [`Ctx::produced`].
     pub max_rows_produced: u64,
@@ -803,6 +805,7 @@ impl Ctx {
             max_rows: 200_000_000,
             mem_limit: u64::MAX,
             grant: None,
+            spill: None,
             max_rows_produced: u64::MAX,
             rows_produced: Arc::new(AtomicU64::new(0)),
             allow_service: true,
@@ -1196,6 +1199,21 @@ impl Ctx {
 
     pub(super) fn memory_remaining(&self) -> u64 {
         self.mem_limit.saturating_sub(self.live_bytes())
+    }
+
+    /// The bytes this query could still charge: what its own budget leaves, capped by
+    /// what the server pool has free plus the unused part of the query's grant.
+    pub(super) fn memory_room(&self) -> u64 {
+        let own = self.memory_remaining();
+        match &self.grant {
+            Some(grant) => {
+                let pool = grant.pool();
+                let free = pool.capacity().saturating_sub(pool.granted());
+                let spare = grant.granted().saturating_sub(grant.used());
+                own.min(free.saturating_add(spare))
+            }
+            None => own,
+        }
     }
 
     pub(super) fn release_cursor_work(&self) {
