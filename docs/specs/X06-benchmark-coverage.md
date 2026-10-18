@@ -737,9 +737,10 @@ yet.
 **Left for Phase 1.**
 
 * The standard refresh of every existing suite at one head (A5), and the regeneration of the
-  BENCHMARKS.md tables from records without a numeric change (A3). The per-engine loop of
-  `suite_run` is not in `bench.sh` yet, and adding it is part of this refresh. The published
-  runs invoke `bench.sh` once per engine, so each engine ran alone. `bench-record.py` reads
+  BENCHMARKS.md tables from records without a numeric change (A3). `bench.sh` starts,
+  checks and times one engine at a time in its default and `updates` modes since
+  2026-10-18, as `suite_run` does. The published runs invoked `bench.sh` once per engine,
+  so each engine ran alone there too. `bench-record.py` reads
   the results of `bench.sh` and of a small `bench-watdiv.sh` run, and both produce valid
   records. It does not read the DBpedia or full-text results yet, and `bench-summary.py`
   still reads the raw files.

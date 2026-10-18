@@ -15,13 +15,15 @@
 # WORKDIR/results/summary.md.
 #
 # MODE selects what runs (default: the load and the query suite):
-# * default: loads every engine (peak RSS under GNU time, index size), starts the servers
-#   on the loaded stores, checks answers (and each query's peak RSS), times the queries,
-#   the update latency and the throughput, and reads the servers' memory.
+# * default: loads every engine (peak RSS under GNU time, index size), then for one engine
+#   at a time starts its server on the loaded store with no other server running, checks
+#   its answers (and each query's peak RSS), times the queries, the update latency and the
+#   throughput, reads the server's memory and stops it.
 # * updates: serves a copy of every store (cp --reflink=auto into WORKDIR/scratch),
 #   commits CHURN (default 5000) single-triple updates to each engine, the same for all
 #   (scripts/bench-writes.py, WORKDIR/churn-CHURN.ru), then runs the query suite of the
-#   default mode on the changed stores into WORKDIR/results-updates.
+#   default mode on the changed stores into WORKDIR/results-updates, one engine at a time
+#   with the churn and the suite in the same server process.
 # * mixed: for each engine alone, on a fresh copy of its store: MIXED_SECONDS (default 30)
 #   of CONC readers running star-join (oha) while one writer commits single-triple
 #   INSERT DATA requests as fast as it can, or at WRITE_RATE per second.
@@ -146,6 +148,7 @@ suite() {
     [ -n "${SKIP_QUERIES:-}" ] && [ -f "$RES/$n.json" ] && continue
     echo
     echo "== $n"
+    # shellcheck disable=SC2329 # called by engine_args
     qcmd() { q "${URL[$1]}" "$n"; }
     mapfile -d '' ARGS < <(engine_args qcmd)
     "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
@@ -187,9 +190,11 @@ suite() {
   # NREQ star-join requests from CONC parallel clients (all engines without result caches,
   # so every request executes the query). Each server's peak RSS is reset before and read
   # after: each engine runs alone in its part of the hyperfine run.
+  # shellcheck disable=SC2329 # called by pcmd
   par() { echo "seq $NREQ | xargs -P $CONC -I{} $(q "$1" star-join)"; }
   echo
   echo "== throughput ($NREQ requests, $CONC clients)"
+  # shellcheck disable=SC2329 # called by engine_args
   pcmd() { par "${URL[$1]}"; }
   mapfile -d '' ARGS < <(engine_args pcmd)
   for e in $ENGINES; do reset_peak "$e"; done
@@ -264,13 +269,36 @@ EOF
 }
 
 # ---------------------------------------------------------------------------- run
+# each_alone <command>…: for every selected engine in turn, start its server alone, record
+# its RSS 2 s after the start, run the command with ENGINES set to that engine, and stop it.
+# No other engine's server runs while one is checked or timed (docs/specs/X06 section 5.3).
+# The answer check runs inside each engine's turn too, and bench-answers.py keeps every
+# engine's fingerprints in one answers.json, which the summary and the record compare.
+each_alone() {
+  local all=$ENGINES e
+  for e in $all; do
+    ENGINES=$e
+    start "$e"
+    sleep 2
+    setj "$RES/mem.json" idle "${NAME[$e]}=$(rss_of "$e")"
+    "$@"
+    stop "$e"
+  done
+  ENGINES=$all
+}
+# the churn and then the suite on the changed store, without a restart in between: QLever
+# keeps updates in memory and would lose them
+churn_suite() {
+  churn
+  suite
+}
+
 RES=results
 trap stop_all EXIT
 case $MODE in
   default)
     [ -n "${SKIP_LOAD:-}" ] || load_all
-    start_all
-    suite
+    each_alone suite
     # Sparkles memory probe (scripts/rss-probe.sh): a fresh server, every query once, then
     # 3 x 160 concurrent star-join requests; RSS at each step, block-cache bytes and peak RSS
     if [ -z "${ANSWERS_ONLY:-}" ] && has sparkles && [ -z "${SKIP_PROBE:-}" ]; then
@@ -288,9 +316,7 @@ case $MODE in
     mkdir -p "$RES"
     trap 'stop_all; [ -n "${KEEP_SCRATCH:-}" ] || rm -rf "$STORE"' EXIT
     copy_stores
-    start_all
-    churn
-    suite
+    each_alone churn_suite
     ;;
   mixed)
     [ -n "${ANSWERS_ONLY:-}" ] || {

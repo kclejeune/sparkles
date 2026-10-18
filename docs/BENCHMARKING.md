@@ -20,7 +20,12 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   ```
 
   The default mode loads every engine, checks the answers and times each query, a
-  single-triple update and the throughput of 16 concurrent clients. Each load runs under
+  single-triple update and the throughput of 16 concurrent clients. After the loads it
+  starts one engine's server at a time, with no other server running, checks that
+  engine's answers, times it and stops it. The fingerprints of all engines go to one
+  `answers.json`, which the summary and the record compare. The `updates` mode does the
+  same per engine, with the churn and the suite in one server process, because QLever
+  keeps updates in memory and would lose them in a restart. Each load runs under
   GNU `time`, which records its peak RSS, and the index size is the disk space the store
   takes. The harness reads each server's RSS 2 seconds after it starts, after every query
   has run once, and after the run. It also records the peak RSS during the throughput
