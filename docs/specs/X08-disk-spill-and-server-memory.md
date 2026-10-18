@@ -1107,3 +1107,12 @@ update's WHERE clause (open question 3) is not offered, because updates run eage
   sweep test checks with a directory whose lock no process holds. A deadline during a
   merge takes the same path as cancellation.
 
+* **Screen.** `mise run bench:nsc` of 0a81011c against 4391b74d, which has the kernels,
+  spill and the wider automatic execution, ran 27 queries in four A,B,B,A rounds on an
+  8-vCPU AMD EPYC instance. Both returned the same answers. At 1.05M the geometric mean
+  of the server times was 1.012 and of the wall times 1.007, and no query was 1.06 times
+  slower or more. At 10.5M the means were 0.972 and 0.957, `expr-agg-arg` fell to 0.51
+  and `group-avg` to 0.83, and the slowest ratio was 1.057 for `subquery-agg`, whose
+  servers spread by 34 to 40% between processes. No query reached the 1.10 flag, so no
+  query under 0.3 ms needed a check on forge. The commits after 4391b74d change the
+  charge of a group and the documentation.
