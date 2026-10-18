@@ -935,8 +935,9 @@ when its `commit.json` names this dataset and neither its base commit nor any co
 log is past the head that open recovered. A power loss leaves the first two, since a
 rebuild writes the marker and `commit.json` without syncing them until the end, and the
 third when it strikes between `commit.json` and the switch of `CURRENT`. A missing
-`commit.json` counts only when the current generation has one, because generations of a
-dataset written before commit metadata have none. The directory is renamed to
+`commit.json` counts only when the current generation had one before the open began,
+because generations of a dataset written before commit metadata have none. Open decides
+this before it records a baseline `commit.json` in such a current generation. The directory is renamed to
 `gen-N.deleting` and the root synced before its contents are deleted, and the next open
 finishes a removal that a crash interrupted. Earlier releases removed only a directory
 whose marker or `commit.json` named the dataset, and kept the rest until the next rebuild
@@ -949,11 +950,21 @@ and logs a warning, and deletes nothing. The new name keeps it out of the way of
 rebuild, which takes the number again. `sparkles check` reports it until an operator
 renames it back and points `CURRENT` at it, or deletes it.
 
+A generation set aside costs disk space until an operator acts on it. A bulk build that
+a crash stopped after its `commit.json` but before the switch of `CURRENT` is always set
+aside, because its base commit is past the head that open recovered, and it is a full copy
+of the dataset's indexes. Set-aside directories count toward the dataset's byte quota, so
+one can make a later commit fail with a budget error, and `sparkles migrate` lists them
+among the generations. The store keeps them anyway, because deleting a generation that
+might hold the only copy of committed data is worse than the space it takes.
+
 A directory with generations but no `CURRENT` is no longer treated as a new database. Open
 refuses it with an error that names the generations and points to `sparkles check`, and
-writing the right name into `CURRENT` recovers it. The one exception is an empty `gen-0001`
-without a log, which is what a creation that a crash interrupted before its `CURRENT`
-leaves, and open finishes that creation.
+writing the right name into `CURRENT` recovers it. When only set-aside generations remain,
+the error says to rename one back to its `gen-NNNN` name before writing that name into
+`CURRENT`. The one exception is a lone `gen-0001` without a log whose `meta.json` counts no
+quads, or which holds no file at all. That is what a creation that a crash interrupted
+before its `CURRENT` leaves, and open finishes that creation.
 
 The rule needs no marker for an unfinished build because open holds the dataset's
 exclusive lock, so no rebuild can be writing such a directory, and every path that
@@ -978,9 +989,13 @@ Tests in `store/compaction_tests.rs` cover a compaction interrupted at three poi
 empty marker and `commit.json`, an interrupted bulk build, an empty directory and an
 interrupted removal, which open deletes, and another dataset's generation, a damaged
 `commit.json`, a marker of another dataset and a `CURRENT` restored older than the newest
-generation, which it sets aside with their data. A further test removes `CURRENT` from a
-compacted dataset and checks that open refuses it, moves nothing, and opens it again once
-`CURRENT` is written back. After open, `scripts/crash-harness.rs` accepts only two
+generation, which it sets aside with their data. Two more tests check that a copy of the
+current generation with a complete `commit.json` is deleted while one whose log goes past
+the head is set aside, and that a newer generation of a dataset without commit metadata is
+set aside. A further test removes `CURRENT` from a compacted dataset and checks that open
+refuses it, moves nothing, and opens it again once `CURRENT` is written back. It also
+checks that a lone `gen-0001` holding quads is refused, and that the error for set-aside
+generations alone asks for a rename first. After open, `scripts/crash-harness.rs` accepts only two
 leftovers, an old generation and a generation set aside, so a generation still above
 `CURRENT`, a `commits.bin.corrupt-*` file or any other leftover fails a crash run. The
 `test:bench-scripts` task of `mise run ci` runs the harness's own test of that rule.

@@ -100,7 +100,10 @@ unfinished build of the dataset, and the deletion is permanent. A power loss dur
 compaction or a bulk load can leave such a directory with an empty build marker, which
 earlier releases kept until the next rebuild reused its number. Any other directory above
 `CURRENT`, such as one that a `CURRENT` restored from an older copy no longer names, is
-renamed to `gen-N.set-aside-<ms>` and kept, and `sparkles check` reports it. Open also
+renamed to `gen-N.set-aside-<ms>` and kept, and `sparkles check` reports it. A bulk build
+that a crash stopped before its switch is always set aside, as a full copy of the indexes.
+Set-aside directories count toward the byte quota and appear in `sparkles migrate`'s list
+of generations until an operator deletes them or renames one back. Open also
 deletes the store's own temporary files, such as a `CURRENT.tmp` left by an interrupted
 switch, and leaves every other `.tmp` file alone. A directory that holds generations but
 no `CURRENT` is now refused instead of opened as a new, empty database.

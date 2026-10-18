@@ -1078,7 +1078,8 @@ fn unfinished(
 }
 
 /// Settle the generation directories newer than `current`, the generation `CURRENT`
-/// names. Only the open that holds the dataset's exclusive lock calls this, so no rebuild
+/// names. `modern` says whether the current generation had a `commit.json` when the open
+/// began, before the open recorded a baseline in it. Only the open that holds the dataset's exclusive lock calls this, so no rebuild
 /// can be writing one. An unfinished build of this dataset (see [`unfinished`]) is a
 /// rebuild that a crash or a power loss interrupted before `CURRENT` switched to it, and
 /// it is renamed to `*.deleting`, the root synced, and deleted, so a crash part way leaves
@@ -1092,6 +1093,7 @@ pub(crate) fn settle_newer_generations(
     dataset_id: uuid::Uuid,
     current: u32,
     head: u64,
+    modern: bool,
 ) -> Vec<Newer> {
     let mut out = Vec::new();
     if current == 0 {
@@ -1114,10 +1116,6 @@ pub(crate) fn settle_newer_generations(
         })
         .collect();
     newer.sort();
-    let modern = root
-        .join(commit::generation_name(current))
-        .join("commit.json")
-        .exists();
     for (_, name) in newer {
         let dir = root.join(&name);
         match unfinished(&dir, dataset_id, modern, head) {

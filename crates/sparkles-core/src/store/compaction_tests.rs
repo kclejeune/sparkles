@@ -1692,14 +1692,50 @@ fn open_refuses_to_create_a_database_over_generations_without_current() {
     std::fs::write(root.join("CURRENT"), cur.as_bytes()).unwrap();
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     assert_eq!(dump(&s), d);
+    drop(s);
     // a creation that a crash interrupted before CURRENT is finished by the next open
     let fresh = dir.path().join("fresh");
     drop(Store::open(&fresh, StoreOptions::default()).unwrap());
     std::fs::remove_file(fresh.join("CURRENT")).unwrap();
-    std::fs::remove_dir_all(fresh.join("gen-0001").join("wal.log")).ok();
     std::fs::remove_file(fresh.join("gen-0001").join("wal.log")).ok();
     let s = Store::open(&fresh, StoreOptions::default()).unwrap();
     assert_eq!(s.snapshot().len(), 0);
+    drop(s);
+    // a lone gen-0001 without a log that holds quads is not an interrupted creation
+    let full = dir.path().join("full");
+    let s = Store::open(
+        &full,
+        StoreOptions {
+            bulk_threshold: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    s.load(&[nt(20, 0)]).unwrap();
+    drop(s);
+    let built = current(&full);
+    assert_ne!(built, "gen-0001");
+    std::fs::remove_dir_all(full.join("gen-0001")).ok();
+    std::fs::rename(full.join(&built), full.join("gen-0001")).unwrap();
+    std::fs::remove_file(full.join("gen-0001").join("wal.log")).unwrap();
+    std::fs::remove_file(full.join("CURRENT")).unwrap();
+    let m = Store::open(&full, StoreOptions::default())
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(m.contains("no CURRENT") && m.contains("gen-0001"), "{m}");
+    assert!(full.join("gen-0001").join("meta.json").is_file());
+    // when only set-aside generations remain, the advice is to rename one back first
+    std::fs::remove_file(root.join("CURRENT")).unwrap();
+    for g in gens(&root) {
+        std::fs::rename(root.join(&g), root.join(format!("{g}.set-aside-1"))).unwrap();
+    }
+    let m = Store::open(&root, StoreOptions::default())
+        .err()
+        .expect("refused")
+        .to_string();
+    assert!(m.contains("rename the generation"), "{m}");
+    assert!(!m.contains("generation to open into CURRENT"), "{m}");
 }
 
 #[test]
@@ -1724,6 +1760,81 @@ fn open_sets_aside_newer_generations_when_current_was_restored_older() {
     std::fs::write(root.join("CURRENT"), cur.as_bytes()).unwrap();
     let s = Store::open(&root, StoreOptions::default()).unwrap();
     assert_eq!(dump(&s), d);
+}
+
+#[test]
+fn open_sets_aside_a_newer_generation_of_a_dataset_without_commit_json() {
+    // A dataset from before commit.json, whose CURRENT names a generation older than
+    // one it built: the newer generation has no build marker and no commit.json, as
+    // every generation of such a dataset, so nothing shows that it is unfinished.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+    let cur = current(&root);
+    let no = commit::generation_number(&cur);
+    let g = commit::generation_name(no + 1);
+    copy_dir(&root.join(&cur), &root.join(&g));
+    for name in gens(&root) {
+        std::fs::remove_file(root.join(&name).join("commit.json")).ok();
+    }
+    std::fs::remove_file(root.join("dataset.json")).unwrap();
+    std::fs::remove_file(root.join("commits.bin")).ok();
+    assert!(!root.join(&g).join("compacting").exists());
+    let log = std::fs::read(root.join(&g).join("wal.log")).unwrap();
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+    assert!(
+        root.join(&cur).join("commit.json").is_file(),
+        "open records a baseline"
+    );
+    assert!(!root.join(&g).exists(), "{:?}", gens(&root));
+    let aside = set_aside(&root);
+    assert_eq!(aside.len(), 1, "{:?}", gens(&root));
+    assert!(
+        aside[0].starts_with(&format!("{g}.set-aside-")),
+        "{aside:?}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(&aside[0]).join("wal.log")).unwrap(),
+        log
+    );
+}
+
+#[test]
+fn open_removes_a_newer_generation_whose_commits_current_already_holds() {
+    // A compaction that a crash stopped after its commit.json but before CURRENT: its
+    // commit.json is complete and its log ends at or before the head, so CURRENT holds
+    // every commit it has, and open removes it. A generation whose log goes past the
+    // head is set aside instead.
+    let dir = tempfile::tempdir().unwrap();
+    let (root, cur, d, _) = compacted(dir.path());
+    let no = commit::generation_number(&cur);
+    let g = commit::generation_name(no + 1);
+    copy_dir(&root.join(&cur), &root.join(&g));
+    assert!(root.join(&g).join("commit.json").is_file());
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    assert_eq!(dump(&s), d);
+    assert!(!root.join(&g).exists(), "{:?}", gens(&root));
+    assert_eq!(set_aside(&root), Vec::<String>::new());
+    // the head moves on in a copy that CURRENT then stops naming
+    let ahead = commit::generation_name(no + 2);
+    churn(&s, 4);
+    drop(s);
+    copy_dir(&root.join(&cur), &root.join(&ahead));
+    let older: Vec<String> = gens(&root).into_iter().filter(|x| *x < cur).collect();
+    std::fs::write(root.join("CURRENT"), older.last().unwrap().as_bytes()).unwrap();
+    drop(Store::open(&root, StoreOptions::default()).unwrap());
+    let aside = set_aside(&root);
+    assert_eq!(aside.len(), 2, "{:?}", gens(&root));
+    assert!(
+        aside
+            .iter()
+            .any(|a| a.starts_with(&format!("{ahead}.set-aside-")))
+    );
+    assert!(
+        aside
+            .iter()
+            .any(|a| a.starts_with(&format!("{cur}.set-aside-")))
+    );
 }
 
 #[test]

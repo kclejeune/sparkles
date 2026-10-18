@@ -1424,7 +1424,8 @@ fn open_step(step: &'static str) {
 /// Refuse to create a new database in `root`, which has no `CURRENT`, when it holds
 /// generations: `CURRENT` was lost, and a new database would hide them and let a later
 /// open remove them. The only generation a creation that a crash interrupted leaves is an
-/// empty `gen-0001` without a log, which the creation builds again.
+/// empty `gen-0001` without a log, which the creation builds again. It is empty when its
+/// `meta.json` counts no quads, or when it holds no file at all.
 fn refuse_generations_without_current(root: &Path) -> Result<()> {
     let mut found: Vec<String> = std::fs::read_dir(root)?
         .flatten()
@@ -1437,18 +1438,51 @@ fn refuse_generations_without_current(root: &Path) -> Result<()> {
         })
         .collect();
     found.sort();
-    let interrupted_creation = found == ["gen-0001"] && !root.join("gen-0001/wal.log").exists();
+    let interrupted_creation = found == ["gen-0001"] && empty_creation(&root.join("gen-0001"));
     if found.is_empty() || interrupted_creation {
         return Ok(());
     }
+    let only_set_aside = found.iter().all(|n| n.contains(crate::history::SET_ASIDE));
+    let advice = if only_set_aside {
+        "rename the generation to use back to its gen-NNNN name, then write that name into \
+         CURRENT"
+    } else {
+        "write the name of the gen-NNNN generation to open into CURRENT"
+    };
     Err(Error::Corrupt(format!(
         "{} has no CURRENT but holds {}; refusing to create a new database over them. \
-         Run `sparkles check --loc {}` and write the name of the generation to open into \
-         CURRENT, or restore the dataset from a backup",
+         Run `sparkles check --loc {}` and {advice}, or restore the dataset from a backup",
         root.display(),
         found.join(", "),
         root.display()
     )))
+}
+
+/// Whether `dir` is the `gen-0001` of a creation that a crash interrupted: no log, and
+/// either a `meta.json` that counts no quads or no file at all.
+fn empty_creation(dir: &Path) -> bool {
+    if dir.join("wal.log").exists() {
+        return false;
+    }
+    match std::fs::read(dir.join("meta.json")) {
+        Ok(b) => {
+            serde_json::from_slice::<serde_json::Value>(&b)
+                .ok()
+                .and_then(|v| v.get("quads").and_then(|q| q.as_u64()))
+                == Some(0)
+        }
+        Err(_) => !has_files(dir),
+    }
+}
+
+/// Whether `dir` holds a file anywhere below it.
+fn has_files(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map_or(true, |rd| {
+        rd.flatten().any(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => has_files(&e.path()),
+            _ => true,
+        })
+    })
 }
 
 /// Take the exclusive process lock of a database directory.
@@ -1918,7 +1952,7 @@ impl Store {
         open_step("vocab-settled");
         let dvocab_len = gen_.dvocab.len();
         *gen_.wal_index.lock() = Some(wal_index);
-        let history = open_history(root, dataset_id, gen_no, head.seq, &catalog)?;
+        let history = open_history(root, dataset_id, gen_no, head.seq, !rebased, &catalog)?;
         let annotations =
             crate::annotations::Annotations::open(root, dataset_id, head.seq, opts.commit_digests)?;
         #[cfg(test)]
@@ -6428,11 +6462,12 @@ fn open_history(
     dataset_id: uuid::Uuid,
     current: u32,
     head: u64,
+    modern: bool,
     catalog: &Catalog,
 ) -> Result<crate::history::HistoryState> {
     use crate::history;
     history::remove_deleting(root)?;
-    history::settle_newer_generations(root, dataset_id, current, head);
+    history::settle_newer_generations(root, dataset_id, current, head, modern);
     history::remove_temp_files(root);
     let cfg = history::read_file(root, dataset_id)?;
     let mut h = history::HistoryState::new(cfg.pins, cfg.retention);
