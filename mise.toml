@@ -795,6 +795,26 @@ ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" JENA_REASON
 scripts/bench-owl2bench.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
 '''
 
+[tasks."bench:longwrite"]
+description = "Sustained writes with compaction: hours of concurrent readers and writers on each engine of bench in turn, with a per-minute series, Sparkles' compactions, and state checks before and after a restart"
+depends = ["build"]
+usage = '''
+arg "[data]" default="1000000" help="a person count for gen-data.py (1000000 is 10.5M triples), an N-Triples file, or a directory of .nt.zst files"
+arg "[workdir]" default="target/bench-longwrite" help="data, indexes, store copies and results/ (summary.md, longwrite.json, record.json)"
+flag "--seconds <n>" default="14400" help="length of each engine's run"
+flag "--readers <n>" default="16" help="reader processes"
+flag "--writers <n>" default="1" help="writer processes"
+flag "--write-rate <n>" default="0" help="write requests per second in all (0: as fast as the engine answers)"
+flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run, one after another"
+flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
+flag "--port-base <port>" default="48400" help="the first of the five server ports"
+'''
+run = '''
+SECONDS_RUN="$usage_seconds" READERS="$usage_readers" WRITERS="$usage_writers" WRITE_RATE="$usage_write_rate" \
+ENGINES="$usage_engines" SKIP_LOAD="${usage_skip_load:+1}" PORT_BASE="$usage_port_base" \
+scripts/bench-longwrite.sh "$usage_data" "$(realpath -m "$usage_workdir")"
+'''
+
 [tasks."bench:bsbm"]
 description = "BSBM Explore or Business Intelligence: per-template times and query mixes per hour with 1, 4 and 16 clients on the five engines of bench (the GPL-3.0 BSBM tools are downloaded when SPARKLES_ALLOW_GPL_BENCHMARK=1)"
 depends = ["build"]

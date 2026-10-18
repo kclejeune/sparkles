@@ -20,7 +20,8 @@ pinning, the data hashes and the start time. `finish` adds the end time.
 * `answers.json`: the answer fingerprints of bench-answers.py,
 * `qmph.json`: query mixes per hour, `{engine: {clients: {"qmph": …, …}}}` (bench-bsbm.sh),
 * `load.json`, `load-details.json`, `rss.json` and `mem.json`: loads and memory,
-* `inference.json`: the materialization of the LUBM suite,
+* `inference.json`: the materialization of the LUBM and OWL2Bench suites,
+* `longwrite.json`: the long write runs of bench-longwrite.sh (mode `longrun`),
 * `extra.json`: optional `{"settings": {…}, "results": [ … ]}` merged into the record.
 
 Which queries count is decided by `--queries` (a list of names). Without it every `*.json` file
@@ -40,8 +41,10 @@ Record 1 (every field is required unless marked optional):
     results     list of
         engine       sparkles | jena | qlever | fluree | oxigraph | …
         query        string
-        mode         warm | cold | update | throughput | qmph | load | answer
-                     (answer: a query that was only answer-checked, with no timing)
+        mode         warm | cold | update | throughput | qmph | load | answer | longrun
+                     (answer: a query that was only answer-checked, with no timing;
+                     longrun: a long write run, whose samples are per-minute medians and
+                     whose write result carries the per-minute `series`)
         clients      integer
         durability   synced | written | memory | null
         status       ok | timeout | error | oom | wrong-answer
@@ -52,7 +55,8 @@ Record 1 (every field is required unless marked optional):
         qps, qmph    numbers (optional; throughput results)
     load        optional: {engine: {seconds, max_rss_kib, index_bytes}}
     memory      optional: {engine: {rss_after_mib, peak_mib, cache_mib}}
-    inference   optional (LUBM): {profile: {seconds, max_rss_kib, derived_triples, …}, notes}
+    inference   optional (LUBM, OWL2Bench): {profile: {seconds, max_rss_kib, derived_triples,
+                peak_bytes, …}, jena-<reasoner>: {status, seconds, closure_triples, …}, notes}
 """
 
 import argparse
@@ -79,9 +83,9 @@ LICENSES = {
 # written (OS cache), synced or memory: docs/specs/X06 §5.1, from each engine's documentation
 DURABILITY = {"sparkles": "synced", "jena": "synced", "oxigraph": "written", "qlever": "memory", "fluree": "synced"}
 STATUSES = {"ok", "timeout", "error", "oom", "wrong-answer"}
-MODES = {"warm", "cold", "update", "throughput", "qmph", "load", "answer"}
+MODES = {"warm", "cold", "update", "throughput", "qmph", "load", "answer", "longrun"}
 AUX = {"load", "load-details", "answers", "mem", "rss", "rss-probe", "churn", "mixed", "cold", "cold-runs",
-       "qmph", "extra", "manifest", "record", "update-latency", "inference"}
+       "qmph", "extra", "manifest", "record", "update-latency", "inference", "longwrite"}
 CURL_TIMEOUT = 28
 MAX_TIME_S = None  # the harness's request limit in seconds, set by `build --max-time`
 
@@ -343,6 +347,40 @@ def pool(results):
     return out
 
 
+def longrun_results(lw):
+    """The long write runs of scripts/bench-longwrite.sh: per engine one `longwrite-write` result
+    (clients: the writers) and one `longwrite-read` result (clients: the readers). Their samples
+    are the per-minute medians, and the write result carries the whole per-minute series, the
+    compactions, the checks and the device flushes. The status is that of the state check at
+    the end of the run; the check after a restart is kept as `check_reopen`, since an engine of
+    the `memory` class loses its writes there by design."""
+    out = []
+    for e, v in (lw or {}).items():
+        en = engine_name(e)
+        s, st = v.get("series", []), v.get("settings", {})
+        check = v.get("check")
+        status = "ok" if check and check.get("ok") else "error"
+        for kind, clients in (("write", st.get("writers", 1)), ("read", st.get("readers", 1))):
+            samples = [x[f"{kind}_p50_ms"] for x in s if x.get(f"{kind}_p50_ms") is not None]
+            p99 = [x[f"{kind}_p99_ms"] for x in s if x.get(f"{kind}_p99_ms") is not None]
+            r = {
+                "engine": en, "query": f"longwrite-{kind}", "mode": "longrun", "clients": int(clients),
+                "durability": v.get("durability") if kind == "write" else None,
+                "samples_ms": samples,
+                "median_ms": round(statistics.median(samples), 3) if samples else None,
+                "p95_ms": round(percentile(samples, 0.95), 3) if samples else None,
+                "p99_ms_median": round(statistics.median(p99), 3) if p99 else None,
+                "answer": None, "status": status,
+                "qps": round(v["totals"][f"{kind}s"] / st["seconds"], 2) if st.get("seconds") else None,
+            }
+            if kind == "write":
+                r.update({k: v.get(k) for k in ("series", "compactions", "compaction_counters", "check",
+                                                 "check_reopen", "restart_ready_s", "device", "device_flushes",
+                                                 "totals", "settings")})
+            out.append(r)
+    return out
+
+
 def cmd_build(a):
     global MAX_TIME_S
     MAX_TIME_S = float(a.max_time) if a.max_time else None
@@ -350,8 +388,9 @@ def cmd_build(a):
     man = json.load(open(a.manifest)) if a.manifest else {}
     answers = load_json(d, "answers.json")
     fps = fingerprints(answers)
-    names = a.queries or sorted({f[:-5] for f in os.listdir(d)
+    names = a.queries if a.queries is not None else sorted({f[:-5] for f in os.listdir(d)
                                  if f.endswith(".json") and f[:-5] not in AUX and not f.startswith("throughput")
+                                 and not f.startswith("run-")
                                  and not f.endswith(".new.json")} | set(answers or {}))
     results = []
     for n in names:
@@ -404,6 +443,7 @@ def cmd_build(a):
                 "status": v.get("status", "ok"), "qmph": v.get("qmph"),
                 **{k: v[k] for k in ("qps", "runs", "timeouts", "seconds", "disagreeing_queries", "driver_status") if k in v},
             })
+    results += longrun_results(load_json(d, "longwrite.json"))
     if a.pool_instances:
         results = pool(results)
     extra = load_json(d, "extra.json") or {}
