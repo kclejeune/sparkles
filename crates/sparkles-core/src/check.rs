@@ -1530,11 +1530,17 @@ impl Checker<'_> {
                 }
             }
         }
-        // records after the last commit are truncated on open: the terms they name may
-        // not have reached delta.vocab, and other problems are reported as before
+        // Records after the last commit are truncated on open, whatever ids they name. The
+        // terms they name may not have reached delta.vocab, and a record that a power loss
+        // tore at a block boundary holds zeros where its ids were. Their other problems are
+        // warnings, since open drops the records whole.
         if !torn {
-            for issue in txn_issues {
+            for mut issue in txn_issues {
                 if !issue.message.contains("beyond the delta vocabulary") {
+                    issue.status = Status::Warning;
+                    issue
+                        .message
+                        .push_str(", in the incomplete transaction that open truncates");
                     run.add(issue);
                 }
             }

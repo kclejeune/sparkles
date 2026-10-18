@@ -2665,6 +2665,36 @@ mod tests {
         assert!(matches!(e, Error::Unsupported(_)), "{e:?}");
     }
 
+    /// A power loss can keep the first 4 KiB block of a record that straddles two blocks
+    /// and drop the second, as a `log-writes` replay of X09 section 10.2 did. A record after
+    /// the last commit then holds a type byte, a few id bytes and zeros. Open truncates the
+    /// incomplete transaction whole, so `sparkles check` must not call its ids an error.
+    #[test]
+    fn a_torn_record_after_the_last_commit_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let store = Store::open(&root, options()).unwrap();
+        insert(&store, "one").unwrap();
+        insert(&store, "two").unwrap();
+        drop(store);
+        let buf = std::fs::read(wal_path(&root)).unwrap();
+        let txns = transactions(&buf);
+        assert_eq!(txns.len(), 2);
+        let first_of_two = &buf[txns[1].start * WAL_REC..(txns[1].start + 1) * WAL_REC];
+        assert!(matches!(first_of_two[0], WAL_INSERT | WAL_DELETE));
+        let mut bad = buf[..txns[0].end * WAL_REC].to_vec();
+        bad.extend_from_slice(&first_of_two[..3]);
+        bad.resize(bad.len() + WAL_REC - 3, 0);
+        let case = dir.path().join("case");
+        copy_dir(&root, &case);
+        std::fs::write(wal_path(&case), &bad).unwrap();
+        assert_eq!(wal_check(&case), crate::check::Status::Warning);
+        let store = Store::open(&case, Default::default()).unwrap();
+        assert_eq!(store.snapshot().commit, 1);
+        drop(store);
+        assert_eq!(wal_check(&case), crate::check::Status::Ok);
+    }
+
     /// What `sparkles check` says about a WAL, which must agree with open.
     fn wal_check(root: &Path) -> crate::check::Status {
         let opts = crate::check::CheckOptions { quick: false };
