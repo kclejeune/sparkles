@@ -13,10 +13,11 @@
 //! of the process from the start of the run, so it includes the data the run returns.
 //!
 //! `keep` measures the closure kept for incremental runs, as a server keeps it: a full
-//! run that keeps the closure in memory, the heap the closure holds after it, then an
-//! incremental run with the kept closure and one that reads the closure back from the
-//! dataset, each after a change that removes `K` triples of the first university and adds
-//! `K` new ones. The dataset is changed, so it should be a fresh copy.
+//! run, a run without changes that keeps the closure in memory, the heap the closure
+//! holds, then an incremental run with the kept closure after a change that removes `K`
+//! triples of the first university and adds `K` new ones, and one that reads the closure
+//! back from the dataset after the change is undone. The dataset is changed, so it
+//! should be a fresh copy.
 
 use oxrdf::{GraphName, NamedNode, Quad, Triple};
 use sparkles_core::io::Source;
@@ -255,54 +256,48 @@ fn main() {
                 (r, PEAK.load(Ordering::Relaxed) - before)
             };
             let (del, add) = change_sets(k);
-            let start = CURRENT.load(Ordering::Relaxed);
+            let line = |what: &str, r: &ReasonReport, peak: usize| {
+                let source = r.changes.as_ref().map_or("", |c| c.source.as_str());
+                println!(
+                    "keep {} threads={threads} {what} method={} source={source} ms={} inferred={} peak_heap_mib={:.1} reasoner_peak_mib={:.1}",
+                    profile.name(),
+                    r.method.as_str(),
+                    r.millis,
+                    r.inferred,
+                    mib(peak),
+                    mib(r.peak_bytes as usize),
+                );
+            };
             let (r, peak) = run(None, Some(&cache));
-            let held = CURRENT.load(Ordering::Relaxed) - start;
-            let kept = cache.kept().map_or(0, |k| k.0);
-            println!(
-                "keep {} threads={threads} full ms={} inferred={} peak_heap_mib={:.1} reasoner_peak_mib={:.1} kept_facts={kept} heap_after_mib={:.1}",
-                profile.name(),
-                r.millis,
-                r.inferred,
-                mib(peak),
-                mib(r.peak_bytes as usize),
-                mib(held),
-            );
+            line("full", &r, peak);
             let mut since = r.receipt.unwrap().commit.seq;
-            change(&store, &add, &del);
+            // the full run's commit rebuilt the generation, so its closure is not kept: a
+            // run without changes keeps it
             let (r, peak) = run(Some(since), Some(&cache));
-            let c = r
-                .changes
-                .as_ref()
-                .map(|c| c.source.clone())
-                .unwrap_or_default();
-            println!(
-                "keep {} threads={threads} incremental source={c} method={} ms={} peak_heap_mib={:.1} reasoner_peak_mib={:.1}",
-                profile.name(),
-                r.method.as_str(),
-                r.millis,
-                mib(peak),
-                mib(r.peak_bytes as usize),
-            );
+            line("settle", &r, peak);
             since = r.receipt.unwrap().commit.seq;
+            let kept = cache.kept().map_or(0, |k| k.0);
             let with = CURRENT.load(Ordering::Relaxed);
             cache.clear();
             let closure = with.saturating_sub(CURRENT.load(Ordering::Relaxed));
+            println!(
+                "keep {} threads={threads} kept_facts={kept} kept_closure_mib={:.1}",
+                profile.name(),
+                mib(closure)
+            );
+            let (r, _) = run(Some(since), Some(&cache));
+            since = r.receipt.unwrap().commit.seq;
+            change(&store, &add, &del);
+            let (r, peak) = run(Some(since), Some(&cache));
+            line("change", &r, peak);
+            since = r.receipt.unwrap().commit.seq;
+            cache.clear();
             change(&store, &del, &add);
             let (r, peak) = run(Some(since), None);
-            let c = r
-                .changes
-                .as_ref()
-                .map(|c| c.source.clone())
-                .unwrap_or_default();
+            line("revert", &r, peak);
             println!(
-                "keep {} threads={threads} incremental source={c} method={} ms={} peak_heap_mib={:.1} reasoner_peak_mib={:.1} kept_closure_mib={:.1} vm_hwm={}",
+                "keep {} threads={threads} vm_hwm={}",
                 profile.name(),
-                r.method.as_str(),
-                r.millis,
-                mib(peak),
-                mib(r.peak_bytes as usize),
-                mib(closure),
                 vm_hwm()
             );
         }
