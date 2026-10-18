@@ -495,8 +495,10 @@ reading the literals of the vocabulary whose datatype is in the datatype map and
 each with the parser that SPARQL value comparison uses, which turns a lexical form it
 cannot parse into an "other" value (`Value` in
 `crates/sparkles-core/src/sparql/value.rs`). The scan reads the vocabulary once per
-generation and remembers the result, and the delta vocabulary's literals are checked
-each time. Ranges come from a SPARQL query, `datatype-range.rq`,
+generation and the generation remembers the ids it found, at most one more than the
+check's cap of 262,144. The delta vocabulary's literals are checked each time, a chunk
+of positions at a time, so the scan never holds the lock that writers need for longer
+than one chunk. Ranges come from a SPARQL query, `datatype-range.rq`,
 that finds `p rdfs:range DT` with `DT` in the datatype map, closed over
 `rdfs:subPropertyOf*` as `closure=subclass` closes types, and the literal objects of `p`.
 Rust code then decides value-space membership:
@@ -693,7 +695,8 @@ without reasoning, and the status is fresh within 10 s after the writes stop.
 **Phase 1 built** on 2026-10-13. A review on 2026-10-16 led to the fixes recorded below.
 Its acceptance runs are open under [ROADMAP](../ROADMAP.md) item 1. A follow-up of item 9
 built §3.5 and §8's coverage on 2026-10-18, as recorded under "Kept closure without the
-explicit facts" and "`dt-not-type` coverage" below. Phases 2, 3 and 4 are not built.
+explicit facts" and "`dt-not-type` coverage" below, with the fixes of its review under
+"Review of the follow-up". Phases 2, 3 and 4 are not built.
 
 * **Base tier.** `crates/sparkles-reasoner/src/facts.rs` reads the input graphs from the
   snapshot's permutations. A lookup with one input graph and a bound subject uses GSPO.
@@ -930,10 +933,11 @@ returns, and the kept closure is the heap it holds after the run.
 
 **Memory tradeoffs of the kept closure.** The kept closure takes 40% of its previous
 memory for RDFS and 46% for OWL 2 RL on this data, and a run that reads it back from the
-dataset peaks at 39% to 47% of its previous heap and finishes in 49% to 73% of the time.
-Small changes with a kept closure became slower, 2 to 5 times at 16 threads and up to 5
-times at 1 thread for the later changes, though the first change at 1 thread became
-faster. The backward search and the insertion now read the input graphs from the store's
+dataset peaks at 39% to 50% of its previous heap and finishes in 40% to 73% of the time.
+Small changes with a kept closure became slower, 1.3 to 4.9 times at 16 threads and 1.9
+to 6.5 times at 1 thread for the later changes, though the first change at 1 thread
+became faster. [ROADMAP](../ROADMAP.md) item 87 is to win this time back, as designed under
+"Roadmap follow-ups (2026-10-18)" below. The backward search and the insertion now read the input graphs from the store's
 compressed blocks, where the previous closure answered them from its own hash tables. The
 first change after the closure is kept decodes most of the blocks it reads, and later
 changes find more of them in the block cache. On LUBM-style data with 20 universities on a
@@ -947,18 +951,27 @@ of datasets a server can keep warm, and a change of 1,000 triples still finishes
 
 **`dt-not-type` coverage.** The follow-up built §8's coverage. `literal-not-in-datatype`
 finds the literals that are ill-typed for their own datatype by a scan of the vocabulary.
-The scan reads the literal keys of a generation's base vocabulary once and remembers the
-ill-typed ones for the last eight generations read, and it reads the delta vocabulary each
-time. Literals inlined in their ids take only canonical, valid forms and are not read. The
-check then looks up the subjects and properties that have each ill-typed literal as a value
-in the checked graphs, 256 literals to a query, so a literal that no checked graph holds is
-not reported. `datatype-range.rq` keeps only its range branch. With the inferences, the
+The scan reads the literal keys of a generation's base vocabulary once, and the generation
+keeps the ids of the ill-typed ones until it is dropped. The scan stops at 262,145 ids, one
+more than the check's cap, so the list takes at most 2 MiB. It runs while the generation's
+lock is held, so a second check that starts meanwhile waits for it instead of reading the
+vocabulary again. The delta vocabulary is read each time, up to the end of the checked
+snapshot, 4,096 positions to a hold of its lock. Literals inlined in their ids take only
+canonical, valid forms and are not read. The check then decodes the ill-typed literals 256
+at a time, in the order of their ids with those of the base vocabulary first, and looks up
+the subjects and properties that have each one as a value in the checked graphs, so a
+literal that no checked graph holds is not reported. `datatype-range.rq` keeps only its range branch. With the inferences, the
 check also reads the literal typings, the facts `lt rdf:type DT` with a literal subject,
 among the generalized facts of the materialization. It reads them from the closure the
 dataset keeps for the recorded commit, or else from the generalized facts that a persistent
 dataset saved. These typings come from rules such as a range through a subclass of a
 datatype, and RDF cannot state them, so they never reach the inferred graph. Their
-findings have the literal as their focus and the basis `uses-inferences`. The typings are
+findings have the literal as their focus and the basis `uses-inferences`, and only the
+typings of literals that the checked graphs hold are reported. Reading them from a kept
+closure holds the cache's lock only for a pass that compares ids, and the literals are
+decoded after it is released, because a run takes that lock while it holds the store's
+writer lock. While a run has an in-memory dataset's closure out of the cache, its
+diagnostics have no typing findings. The typings are
 read only for the RDFS, RDFS simple and OWL 2 RL profiles, whose rules OWL 2 entails, so a
 literal typed outside its value space is one OWL 2 reports too, and the check stays sound.
 Jena rules can type a literal with any datatype, so their typings are not read. The test
@@ -970,8 +983,23 @@ The example's `diag` subcommand runs the check twice on the same snapshot. On th
 instance and data, with 100 universities and no ill-typed literals, the first check took
 10.9 to 11.6 s with a peak heap of 1,098 MiB before, when a query read every literal value,
 and 9 to 17 ms with 1.5 MiB after. A second check on the same generation took 10.7 to
-12.5 s before and under 1 ms after. The remembered result holds only the ill-typed
-literals, so its memory follows their number.
+12.5 s before and under 1 ms after. Diagnostics have no memory budget, so the memory
+they keep is bounded by construction, at 2 MiB per generation.
+
+**Review of the follow-up.** A review of the follow-up found the remembered ill-typed
+literals unbounded, kept in a process-wide list of eight generations that outlived their
+datasets, and cloned on each call. They are now the bounded list of ids described above.
+It also found that the delta vocabulary was read under one hold of its lock, that the
+typings ignored the checked graphs, and that `Graph::set_base` left the distinct-count
+estimates at the size of the first base tier. The validation found that `literal_typings`
+decoded every typing while it held the cache's lock. All five are fixed, with the tests
+`f16_ill_typed_memory_is_bounded`, `f16_concurrent_first_scans_share_one_read`,
+`f16_delta_scan_releases_the_lock` and `f16_delta_literal_in_a_named_graph` in
+`diagnostics.rs`, `f16_typings_follow_the_checked_graphs` in `tests/diagnostics.rs`,
+`f16_estimates_follow_the_new_base` in `graph.rs` and
+`literal_typings_come_only_from_sound_profiles` in the `sparkles` crate's
+`tests/handles.rs`. The two readers of the saved generalized facts are now one streaming
+reader, which also refuses a key longer than the bytes left in its file.
 
 **The flaky budget test.** `f16_shared_candidate_budget` in `tests/memory.rs` failed now and
 then under load, when the heap it measured grew by 1.4 to 3 MB past its bound. The
@@ -999,3 +1027,28 @@ own LUBM-style generator at 100 universities.
   candidates.
 * `examples/reasoner-bench.rs` and `examples/incremental.rs` did not gain flags. The new
   example takes `RAYON_NUM_THREADS`.
+
+### Roadmap follow-ups (2026-10-18)
+
+**Small incremental runs over a kept closure ([ROADMAP](../ROADMAP.md) item 87).** Since the
+kept closure holds only the derived facts, the backward search and the insertion read the
+explicit facts from the store's compressed blocks. On LUBM-style data with 13.1 million
+triples, a change of 1,000 triples took 1.3 to 4.9 times longer at 16 threads than when the
+closure held the explicit facts. Handing decoded blocks from one rule evaluation to the
+next did not change the time measurably.
+
+The design keeps a cache of input facts with the closure. Each probe of the base tier that
+the backward search or the insertion makes is answered from the cache when it holds the
+probe's key range, and otherwise from the blocks, after which the facts read join the
+cache. The cache is charged to the run's memory budget before it grows, it moves to the
+cache of kept closures with the closure, and its size counts against the kept closure's
+heap when a later run takes it. A later snapshot of the same generation invalidates the
+key ranges that the snapshot's delta touches, and a generation switch drops the cache. When
+the budget leaves no room, the run reads the blocks as it does now, so the cache changes
+speed and never results.
+
+The work is done when a change of 1,000 triples with a kept closure on the same data and
+instance takes at most 1.2 times its time before the follow-up, at 16 threads, and the kept
+closure's memory with its cache stays under 60% of the closure that held the explicit
+facts. The differential tests of `incremental.rs` and the multi-commit runs of the
+follow-up's review must pass unchanged.

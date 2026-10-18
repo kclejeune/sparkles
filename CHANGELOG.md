@@ -76,19 +76,23 @@ the database's owner or as root.
 The closure a dataset keeps for incremental reasoning runs holds only the derived triples
 and reads the input graphs from the store's indexes. On LUBM-style data with 13.1 million
 triples it took 918 MiB instead of 2,267 MiB for RDFS and 1,226 MiB instead of 2,654 MiB
-for OWL 2 RL, and a run that reads the closure back from a persistent dataset took 49% to
-73% of its previous time. A change of 1,000 triples with a kept closure took 2 to 5 times
-longer at 16 threads, up to 142 ms on that data, because it reads the input graphs from
-compressed blocks. `serve --reason-cache-triples` now counts derived triples only, so the
+for OWL 2 RL, and a run that reads the closure back from a persistent dataset took 40% to
+73% of its previous time. This trades speed for memory. A change of 1,000 triples with a
+kept closure took 1.3 to 4.9 times longer at 16 threads, up to 142 ms on that data,
+because it reads the input graphs from compressed blocks. Roadmap item 87 is to win that
+time back with a cache of the input facts that the backward search reads, sized by the
+memory budget. `serve --reason-cache-triples` now counts derived triples only, so the
 same limit keeps the closure of a larger input, and `baseScans` of an incremental run
 counts every read of the input graphs.
 
 `literal-not-in-datatype` finds ill-typed literals by a scan of the vocabulary that it
 remembers per generation, instead of a query over every literal value, which took 11 to 12 s
-on 13.1 million triples and now takes under 20 ms. With the inferences included, it also
-reports the literal typings among the generalized triples of an RDFS or OWL 2 RL
+on 13.1 million triples and now takes under 20 ms. The generation keeps the ids of at most
+262,145 ill-typed literals, 2 MiB, and frees them with itself. With the inferences included,
+it also reports the literal typings among the generalized triples of an RDFS or OWL 2 RL
 materialization, read from the closure the dataset keeps or from the generalized triples a
-persistent dataset saved, with the basis `uses-inferences`. For Rust callers,
+persistent dataset saved, with the basis `uses-inferences`. They are reported for the
+literals that the checked graphs hold. For Rust callers,
 `sparkles_reasoner::diagnostics::diagnose_with` takes these typings, and
 `sparkles_reasoner::literal_typings` reads them.
 
