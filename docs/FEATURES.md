@@ -43,13 +43,18 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
   the Node and Python bindings take a `groupCommit` and a `group_commit` option. The JVM
   library follows the default and has no option. A persistent dataset holds up to 64
   commits or 4 MiB of log records in its queue, plus the speculative snapshots of the
-  commits in flight, which is the memory this speed costs. The size of those snapshots was
-  not measured. It takes SPARQL updates, Graph Store writes, uploads, RDF Patch, commit
+  commits in flight, which is the memory this speed costs. On an indexed 10.5M-triple
+  dataset with sixteen writers, that state raised the peak resident memory by 15 to 21 MiB.
+  It takes SPARQL updates, Graph Store writes, uploads, RDF Patch, commit
   messages and change digests, preconditions, graph-restricted writes, SHACL-guarded
   writes and writes during a compaction. ShEx-guarded datasets commit
-  through the group path one commit at a time. A commit that does not qualify takes the
-  ordinary path. Commits on a dataset with a full-text, spatial or embedding index are such
-  commits. A commit by the only writer, with no fence running, is synchronized as the
+  through the group path one commit at a time. Datasets with a full-text, spatial or
+  embedding index group their commits as well. A commit's spatial view rides in its
+  speculative snapshot, its full-text changes reach the live index only after its fence,
+  and its embedding work is scheduled when it publishes, so no index on disk names a
+  commit the log could lose. A commit that does not qualify takes the ordinary path, as do
+  commits while a full-text index recovers or rebuilds and while a spatial index builds. A
+  commit by the only writer, with no fence running, is synchronized as the
   default writer synchronizes it. `/$/metrics` reports the synchronization time, the
   commits per fence, the wait, and why commits fell back or failed, and `/$/stats/{ds}`
   whether the dataset groups commits.
@@ -312,10 +317,6 @@ that work by priority and links each item to its design spec.
   rules for the bytes it already holds. A torn record that an older build left there can
   still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3 and
   [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
-* Group commit does not group commits on a dataset with a full-text, spatial or embedding
-  index. Such a commit takes the ordinary path, so it is as fast as before but gains
-  nothing. [Roadmap](ROADMAP.md) item 86 and
-  [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets).
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
