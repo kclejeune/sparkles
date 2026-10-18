@@ -15,7 +15,63 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: Mimalloc = Mimalloc;
+
+/// mimalloc, called through its plain entry points for word alignment.
+///
+/// `mimalloc::MiMalloc` sends every request to `mi_malloc_aligned`. In mimalloc 3 an
+/// aligned request of 64 KiB or more reserves extra room to align it, so a buffer whose
+/// size is a power of two lands in the next size class: a full decoded block column of
+/// 256 KiB takes 320 KiB. `mi_malloc` returns blocks aligned to the 8-byte word for every
+/// size, so requests aligned to 8 or less use it and the rest keep the aligned calls.
+#[cfg(feature = "mimalloc")]
+struct Mimalloc;
+
+/// The alignment of every block `mi_malloc` returns.
+#[cfg(feature = "mimalloc")]
+const WORD: usize = 8;
+
+#[cfg(feature = "mimalloc")]
+// SAFETY: every block comes from mimalloc and goes back to it through `mi_free` or a
+// reallocation. Blocks from the plain calls are aligned to `WORD`, which these calls only
+// serve when the layout asks for no more.
+unsafe impl std::alloc::GlobalAlloc for Mimalloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        use libmimalloc_sys::{mi_malloc, mi_malloc_aligned};
+        if layout.align() <= WORD {
+            unsafe { mi_malloc(layout.size()) as *mut u8 }
+        } else {
+            unsafe { mi_malloc_aligned(layout.size(), layout.align()) as *mut u8 }
+        }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        use libmimalloc_sys::{mi_zalloc, mi_zalloc_aligned};
+        if layout.align() <= WORD {
+            unsafe { mi_zalloc(layout.size()) as *mut u8 }
+        } else {
+            unsafe { mi_zalloc_aligned(layout.size(), layout.align()) as *mut u8 }
+        }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: std::alloc::Layout) {
+        unsafe { libmimalloc_sys::mi_free(ptr as *mut std::ffi::c_void) }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        use libmimalloc_sys::{mi_realloc, mi_realloc_aligned};
+        let ptr = ptr as *mut std::ffi::c_void;
+        if layout.align() <= WORD {
+            unsafe { mi_realloc(ptr, new_size) as *mut u8 }
+        } else {
+            unsafe { mi_realloc_aligned(ptr, new_size, layout.align()) as *mut u8 }
+        }
+    }
+}
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static DIRTY: AtomicBool = AtomicBool::new(false);
@@ -115,5 +171,62 @@ fn release() {
     // SAFETY: malloc_trim only returns free memory to the OS.
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+#[cfg(all(test, feature = "mimalloc"))]
+mod tests {
+    use super::Mimalloc;
+    use std::alloc::{GlobalAlloc, Layout};
+
+    fn usable(p: *mut u8) -> usize {
+        // SAFETY: `p` is a live block from mimalloc.
+        unsafe { libmimalloc_sys::mi_usable_size(p as *const std::ffi::c_void) }
+    }
+
+    /// A word-aligned buffer of a power-of-two size keeps its size class. Through the
+    /// aligned calls, a full block column of 256 KiB took 320 KiB.
+    #[test]
+    fn word_aligned_powers_of_two_keep_their_size_class() {
+        for size in [64 << 10, 128 << 10, 256 << 10, 1 << 20] {
+            let layout = Layout::from_size_align(size, 8).unwrap();
+            // SAFETY: the layout has a non-zero size, and each block is freed with the
+            // layout it has then.
+            unsafe {
+                let p = Mimalloc.alloc(layout);
+                assert_eq!(usable(p), size, "alloc of {size}");
+                Mimalloc.dealloc(p, layout);
+                let z = Mimalloc.alloc_zeroed(layout);
+                assert_eq!(usable(z), size, "alloc_zeroed of {size}");
+                assert!(std::slice::from_raw_parts(z, size).iter().all(|&b| b == 0));
+                let r = Mimalloc.realloc(z, layout, size * 2);
+                assert_eq!(usable(r), size * 2, "realloc to {}", size * 2);
+                Mimalloc.dealloc(r, Layout::from_size_align(size * 2, 8).unwrap());
+            }
+        }
+    }
+
+    /// Larger alignments still go through the aligned calls, and every block is aligned
+    /// as its layout asks.
+    #[test]
+    fn every_block_has_its_alignment() {
+        for align in [1, 2, 4, 8, 16, 64, 4096] {
+            for size in [1, 3, 8, 24, 100, 4096, 70_000, 300_000] {
+                let layout = Layout::from_size_align(size, align).unwrap();
+                let grown = Layout::from_size_align(size + 1000, align).unwrap();
+                // SAFETY: the layout has a non-zero size, and each block is freed with the
+                // layout it has then.
+                unsafe {
+                    let p = Mimalloc.alloc(layout);
+                    assert_eq!(p as usize % align, 0, "alloc {size} aligned to {align}");
+                    let p = Mimalloc.realloc(p, layout, grown.size());
+                    assert_eq!(p as usize % align, 0, "realloc {size} aligned to {align}");
+                    Mimalloc.dealloc(p, grown);
+                    let z = Mimalloc.alloc_zeroed(layout);
+                    assert_eq!(z as usize % align, 0, "zeroed {size} aligned to {align}");
+                    Mimalloc.dealloc(z, layout);
+                }
+            }
+        }
     }
 }

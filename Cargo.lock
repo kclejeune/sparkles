@@ -5811,7 +5811,6 @@ dependencies = [
  "libmimalloc-sys",
  "lsp-server",
  "lsp-types",
- "mimalloc",
  "mime_guess",
  "opentelemetry",
  "opentelemetry-appender-tracing",
