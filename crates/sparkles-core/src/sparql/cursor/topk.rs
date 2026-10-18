@@ -231,3 +231,64 @@ impl TopK {
         Ok(batch)
     }
 }
+
+/// An ordered top-k over a scan (`IndexTopK`). It reads the pieces of the scan whose ids
+/// are in value order from their best end, and the other pieces a morsel at a time into a
+/// heap of its best k rows ([`exec::ordered_topk`]), so it holds one morsel and k rows.
+/// When a value of those pieces is not totally ordered, the generic plan, a streaming
+/// top-k over the scan that the operator holds as its child, answers instead, as it does
+/// eagerly.
+pub(super) struct IndexTopK {
+    node: Node,
+    loaded: Option<Buffer>,
+    at: usize,
+    generic: bool,
+}
+
+impl IndexTopK {
+    pub(super) fn new(node: Node) -> Self {
+        Self {
+            node,
+            loaded: None,
+            at: 0,
+            generic: false,
+        }
+    }
+
+    pub(super) fn done(&self, children: &[Operator]) -> bool {
+        if self.generic {
+            return children[0].done;
+        }
+        self.loaded.as_ref().is_some_and(|b| self.at == b.table.len)
+    }
+
+    pub(super) fn next(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        children: &mut [Operator],
+        options: &CursorOptions,
+        info: &mut crate::sparql::PlanInfo,
+        cap: usize,
+    ) -> Result<Option<Buffer>> {
+        if self.loaded.is_none() && !self.generic {
+            let Kind::OrderedTopK(spec) = &self.node.kind else {
+                unreachable!("an ordered top-k node")
+            };
+            match exec::ordered_topk(ctx, spec, &self.node.vars)? {
+                Some((table, read)) => {
+                    info.description = format!("{} [read {read} rows]", info.description);
+                    let charge = OwnedCharge::new(ctx, super::capacity_bytes(&table))?;
+                    self.loaded = Some(Buffer { table, charge });
+                }
+                None => self.generic = true,
+            }
+        }
+        if self.generic {
+            return children[0].next(ctx, options, cap);
+        }
+        let table = &self.loaded.as_ref().expect("loaded ordered top-k").table;
+        let batch = copy_rows(ctx, table, self.at, cap)?;
+        self.at += batch.as_ref().map_or(0, |b| b.table.len);
+        Ok(batch)
+    }
+}

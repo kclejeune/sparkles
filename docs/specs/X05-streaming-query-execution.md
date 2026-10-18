@@ -1283,6 +1283,34 @@ instance, the median of seven rounds, reading every row. The base is 5c73ced6.
 | STRSTARTS on names, 49,837 rows | 7.99 | **0.94** | 2.98 | **0.90** |
 | LANGMATCHES on titles, 500,000 rows | 1.48 | **0.95** | **0.84** | **0.88** |
 
+### Streaming range top-k (2026-10-18)
+
+A cursor no longer runs a range top-k (`IndexTopK`) as an eager operator. The operator
+still reads the parts of its range whose ids follow value order from the best end and
+stops once it has its k rows. A part whose ids say nothing of value order, such as
+values kept in the dictionary, used to be read whole into memory before its rows were
+ranked. The cursor now reads such a part in morsels of one index block, a wave of as
+many morsels as Rayon has threads at a time. Each morsel keeps its own best k rows, and
+the morsels then offer their rows in index order to one bounded heap, so ties fall as
+they do eagerly. A value that is not totally ordered still sends the query to the
+generic plan, which the cursor builds as the operator's child and which streams as well.
+Eager execution keeps its own path.
+
+The cursor's memory for the operator is about one morsel's working set per worker
+thread plus the k rows it keeps, whatever the size of the range. The test
+`ordered_top_k_memory_does_not_grow_with_its_unordered_pieces` reads 300,000 and 900,000
+dictionary values on two threads and requires the second peak to stay within a quarter
+of the first. The peak grows with the number of threads instead, since each holds a
+morsel at once, so the test fixes its pool. Running the morsels in waves of one per
+thread keeps a waiting worker from starting further morsels by work stealing.
+
+Reading the morsels one after another was 1.72 times slower than eager execution at eight
+threads on the Namespace instance, so the morsels run in parallel. At 10.5M the range
+top-k over salaries measured 1.06 times eager execution at eight threads, the median of
+21 rounds, where it measured 1.33, and 0.88 at one thread, where it measured 0.93. The
+cursor's ledger peaked at 6.1 MB with eight threads against 5.6 MB before, and at 3.3 MB
+with one thread.
+
 ### Large basic graph patterns
 
 [ROADMAP](../ROADMAP.md) item 84. The planner joins the triple patterns of a basic graph

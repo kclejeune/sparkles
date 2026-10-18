@@ -1724,6 +1724,14 @@ The cursor's ledger peaked at 13.5 MB for the CONTAINS filter with eight threads
 11.8 MB before and 15.6 MB eagerly, and at 5.2 MB with one thread, since each worker holds
 its own morsel scratch.
 
+The cursor's range top-k reads the parts of its range without value order in parallel
+morsels and keeps only its best rows
+([X05](specs/X05-streaming-query-execution.md#streaming-range-top-k-2026-10-18)). Over the
+salaries above 150,000 at 10.5M on the same instance it took 1.06 times its eager time at
+eight threads, the median of 21 rounds, against 1.33 at 5c73ced6, and 0.88 at one
+thread against 0.93. Its ledger peaked at 6.1 MB at eight threads and 3.3 MB at one,
+against 5.6 MB before at both.
+
 The JVM library also runs in automatic mode by default since 2026-10-17. In the binding
 comparison of `scripts/bench-bindings` at 1.05M on forge, with every case run twice in
 each mode in alternating processes, the JNI export of 500,000 rows took 130 ms against

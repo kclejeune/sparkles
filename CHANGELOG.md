@@ -82,6 +82,11 @@ CONTAINS, STRSTARTS and LANGMATCHES filters over names and titles now take 0.91 
 times their eager time, where they took 1.48 to 7.99 times. More threads hold more morsel
 scratch at once, 13.5 MB in the ledger at eight threads against 11.8 MB before.
 
+A streamed range top-k no longer reads the parts of its range whose ids do not follow
+value order into memory. It ranks them in parallel morsels of one index block and keeps
+only its best rows, so its memory no longer grows with the range. At 10.5M with eight
+threads it takes 1.06 times its eager time, where it took 1.33 times.
+
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server
 refuses until `sparkles migrate` runs without `--check`, and its JSON report adds `opens`.
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as

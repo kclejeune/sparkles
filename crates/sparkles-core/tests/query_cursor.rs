@@ -3949,3 +3949,104 @@ fn morsel_filters_over_scans_match_eager_in_order() {
     while c.next_batch().unwrap().is_some() {}
     assert!(leaf_rows(c.plan()) < 1000, "{}", leaf_rows(c.plan()));
 }
+
+fn plan_has(p: &sparkles_core::sparql::PlanInfo, op: &str) -> bool {
+    p.operator == op || p.children.iter().any(|c| plan_has(c, op))
+}
+
+/// A store whose `<urn:v>` values are inline decimals, in value order in the index,
+/// except every `every`-th one, written with a trailing zero, which keeps it in the
+/// dictionary, where ids say nothing of value order. Values repeat, so ties break by the
+/// subject.
+fn decimal_store(n: usize, every: usize, extra: &str) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = (0..n)
+        .map(|i| {
+            let (whole, cents) = ((i * 7919) % 5000, i % 100);
+            let value = if i % every == 0 {
+                format!("{whole}.{}0", cents % 10)
+            } else {
+                format!("{whole}.{cents:02}")
+            };
+            format!(
+                "<urn:s:{i}> <urn:v> \"{value}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+            )
+        })
+        .collect::<String>();
+    data.push_str(extra);
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+/// A cursor's ordered top-k reads the pieces of its range without value order a morsel
+/// at a time into a heap of its best rows, and answers what eager execution answers, in
+/// the same order, ties included, without an eager fallback. A value that is not totally
+/// ordered in a later morsel still sends the query to the generic plan, as it does
+/// eagerly, which streams too.
+#[test]
+fn ordered_top_k_streams_unordered_pieces_with_the_answers_of_eager() {
+    let queries = [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 25",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 7",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v FILTER(?v > 4000) } ORDER BY DESC(?v) LIMIT 30",
+        "SELECT ?v WHERE { ?s <urn:v> ?v FILTER(?v < 100) } ORDER BY DESC(?v) LIMIT 3",
+    ];
+    let date = "<urn:t> <urn:v> \"2020-01-01\"^^<http://www.w3.org/2001/XMLSchema#date> .\n";
+    for extra in ["", date] {
+        let s = decimal_store(400_000, 5, extra);
+        for q in queries {
+            let eager = query(s.snapshot(), q, &Default::default()).unwrap();
+            assert!(
+                q.contains("FILTER") || plan_has(&eager.plan, "IndexTopK"),
+                "{q}: {:#?}",
+                eager.plan
+            );
+            let expected = eager.rows();
+            // no eager fallback, even when the generic plan answers
+            let strict = options(4096);
+            let mut c = select_cursor(s.snapshot(), q, &Default::default(), &strict).unwrap();
+            let mut rows = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap()));
+            }
+            assert_eq!(rows, expected, "{q} with {extra:?}");
+        }
+    }
+}
+
+/// The cursor's ordered top-k holds a morsel per worker thread and the rows they keep,
+/// however many rows its pieces without value order hold: two workers read 4 and 12
+/// morsels of a single block with the same peak.
+#[test]
+fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let q = "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 10";
+    let mut peaks = Vec::new();
+    for n in [300_000, 900_000] {
+        let s = decimal_store(n, 3, "");
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap();
+        assert!(plan_has(&eager.plan, "IndexTopK"), "{:#?}", eager.plan);
+        let peak = |opts: &QueryOptions| {
+            let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+            let rows = pool.install(|| {
+                let mut rows = Vec::new();
+                while let Some(b) = c.next_batch().unwrap() {
+                    rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                }
+                rows
+            });
+            assert_eq!(rows, eager.rows());
+            c.stats().mem_peak_bytes
+        };
+        peaks.push(peak(&QueryOptions::default()));
+    }
+    assert!(peaks[1] < peaks[0] * 5 / 4, "{peaks:?}");
+}
