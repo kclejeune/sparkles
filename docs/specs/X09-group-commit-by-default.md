@@ -1047,8 +1047,9 @@ images in 1,000 with grouping and 26 in 1,000 without, and the harness now accep
 leftover warning after open, while any other warning or error still fails. One image held a
 log record torn at a 4 KiB block boundary after the last commit, with zeros where its ids
 were. Open truncated it with the incomplete transaction, but check called the ids errors.
-Check now reports them as warnings. Removing a leftover generation at open is
-[roadmap](../ROADMAP.md) item 14.
+Check now reports them as warnings. Since 2026-10-18 open removes a leftover generation,
+as the C13 follow-up describes, and after open the harness accepts only the leftover of an
+old generation.
 
 **Tests.** `store/group_model.rs` is the model-based stress test of section 10.1. Four to
 eight threads issue random inserts, deletes, multi-quad transactions, no-ops, dry runs and

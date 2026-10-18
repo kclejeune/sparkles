@@ -89,6 +89,10 @@ hidden `--experimental-group-commit` flag is removed, and passing it is a usage 
 
 ### Behavior
 
+Open removes generation directories newer than the one `CURRENT` names. A power loss
+during a compaction or a bulk load can leave such a directory with an empty build marker,
+which earlier releases kept until the next rebuild reused its number.
+
 A commit whose own log synchronization fails keeps its message, change digest and merge
 record. Such a commit can still come back after a restart, and it used to come back
 without them, which left a hole in the digest chain of a dataset with `--commit-digests`.

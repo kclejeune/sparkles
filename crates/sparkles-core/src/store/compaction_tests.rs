@@ -1494,3 +1494,134 @@ fn compaction_lock_with_a_spatial_index() {
         println!("{label:<28} median lock {:.1} ms", locks[1]);
     }
 }
+
+/// The `leftover:` warnings of `sparkles check` on `root`.
+fn leftovers(root: &Path) -> Vec<String> {
+    let r = crate::check::check(root, &Default::default()).unwrap();
+    assert_eq!(r.errors, 0, "{}", r.to_text());
+    r.checks
+        .iter()
+        .flat_map(|c| &c.issues)
+        .filter(|i| i.message.starts_with("leftover:"))
+        .map(|i| format!("{} {}", i.file.as_deref().unwrap_or(""), i.message))
+        .collect()
+}
+
+#[test]
+fn open_removes_a_compaction_that_a_power_loss_left_without_its_marker() {
+    // A power loss can keep the new generation's directory while its build marker and
+    // its commit.json are empty or missing, and CURRENT on the old generation. Open
+    // removes the directory all the same.
+    for point in [
+        "compact-started",
+        "compact-caught-up",
+        "compact-before-current",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let crash = dir.path().join("crash");
+        let s = Store::open(&root, StoreOptions::default()).unwrap();
+        s.load(&[nt(300, 0)]).unwrap();
+        churn(&s, 0);
+        s.set_failpoint(
+            point,
+            Some(Arc::new({
+                let crash = crash.clone();
+                move |st: &Store| copy_dir(st.root.as_ref().unwrap(), &crash)
+            })),
+        );
+        s.compact().unwrap();
+        drop(s);
+        let old = current(&crash);
+        let newer: Vec<String> = gens(&crash).into_iter().filter(|g| *g > old).collect();
+        assert_eq!(newer.len(), 1, "{point}: {:?}", gens(&crash));
+        let g = crash.join(&newer[0]);
+        for f in ["compacting", "commit.json"] {
+            if g.join(f).exists() {
+                std::fs::write(g.join(f), b"").unwrap();
+            }
+        }
+        assert!(
+            leftovers(&crash)
+                .iter()
+                .any(|l| l.contains("newer than CURRENT")),
+            "{point}: {:?}",
+            leftovers(&crash)
+        );
+        let s = Store::open(&crash, StoreOptions::default()).unwrap();
+        assert_eq!(gens(&crash), vec![old.clone()], "{point}");
+        let d = dump(&s);
+        drop(s);
+        assert_eq!(leftovers(&crash), Vec::<String>::new(), "{point}");
+        // a compaction afterwards reuses the number
+        let s = Store::open(&crash, StoreOptions::default()).unwrap();
+        s.compact().unwrap();
+        assert_eq!(current(&crash), newer[0], "{point}");
+        assert_eq!(dump(&s), d, "{point}");
+    }
+}
+
+#[test]
+fn open_removes_only_generations_newer_than_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    // every load a bulk commit, which builds a new generation
+    let bulk = StoreOptions {
+        bulk_threshold: 0,
+        ..Default::default()
+    };
+    let s = Store::open(&root, bulk.clone()).unwrap();
+    s.load(&[nt(50, 0)]).unwrap();
+    s.load(&[nt(50, 50)]).unwrap();
+    let d = dump(&s);
+    drop(s);
+    let cur = current(&root);
+    let no = commit::generation_number(&cur);
+    assert!(no >= 3, "{cur}");
+    // an interrupted bulk build: a copy of the current generation without its
+    // commit.json, which is written last
+    let g1 = commit::generation_name(no + 1);
+    copy_dir(&root.join(&cur), &root.join(&g1));
+    std::fs::remove_file(root.join(&g1).join("commit.json")).unwrap();
+    // an empty directory, as a power loss right after its creation leaves it
+    let g2 = commit::generation_name(no + 7);
+    std::fs::create_dir(root.join(&g2)).unwrap();
+    // another dataset's generation above CURRENT is a leftover too
+    let other = dir.path().join("other");
+    let o = Store::open(&other, bulk.clone()).unwrap();
+    o.load(&[nt(5, 0)]).unwrap();
+    let ocur = current(&other);
+    drop(o);
+    let g3 = commit::generation_name(no + 9);
+    copy_dir(&other.join(&ocur), &root.join(&g3));
+    // an interrupted removal
+    let deleting = format!("{}.deleting", commit::generation_name(no + 2));
+    copy_dir(&root.join(&cur), &root.join(&deleting));
+    // left alone: an older unattributable directory, names that are not generations,
+    // a file with a generation's name and a damaged catalog set aside
+    let older = commit::generation_name(no - 1);
+    std::fs::create_dir_all(root.join(&older).join("x")).unwrap();
+    let keep = [
+        older.clone(),
+        format!("{}x", commit::generation_name(no + 3)),
+        "gen-".to_string(),
+        "commits.bin.corrupt-1".to_string(),
+        commit::generation_name(no + 4),
+    ];
+    std::fs::create_dir(root.join(&keep[1])).unwrap();
+    std::fs::create_dir(root.join(&keep[2])).unwrap();
+    std::fs::write(root.join(&keep[3]), b"x").unwrap();
+    std::fs::write(root.join(&keep[4]), b"x").unwrap();
+    let s = Store::open(&root, bulk).unwrap();
+    assert_eq!(dump(&s), d);
+    for g in [&g1, &g2, &g3, &deleting] {
+        assert!(!root.join(g).exists(), "{g} is left");
+    }
+    for k in &keep {
+        assert!(root.join(k).exists(), "{k} was removed");
+    }
+    assert_eq!(current(&root), cur);
+    // the next bulk commit takes the next number
+    s.load(&[nt(10, 100)]).unwrap();
+    assert_eq!(current(&root), commit::generation_name(no + 1));
+}

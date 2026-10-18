@@ -1015,6 +1015,54 @@ pub(crate) fn remove_deleting(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove the generation directories newer than `current`, the generation `CURRENT`
+/// names, and return their names. Only the open that holds the dataset's exclusive lock
+/// calls this, so no rebuild can be writing one. Each such directory is a rebuild that a
+/// crash or a power loss interrupted before `CURRENT` switched to it, whether or not its
+/// build marker and `commit.json` reached the disk. Only directories named `gen-` and
+/// digits whose number is above `current` are touched, and nothing is removed when
+/// `current` is not a generation number. Each is renamed to `*.deleting` and the parent
+/// synced before its contents go, so a crash part way leaves what the next open finishes.
+pub(crate) fn remove_newer_generations(root: &Path, current: u32) -> Vec<String> {
+    let mut removed = Vec::new();
+    if current == 0 {
+        return removed;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return removed;
+    };
+    let mut newer: Vec<(u32, String)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let num = name.strip_prefix("gen-")?;
+            if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let no: u32 = num.parse().ok()?;
+            (no > current).then_some((no, name))
+        })
+        .collect();
+    newer.sort();
+    for (_, name) in newer {
+        match delete_generation(root, &root.join(&name)) {
+            Ok(()) => {
+                tracing::warn!(
+                    target: "sparkles::store",
+                    "removed {name}, a rebuild newer than the current generation that a crash interrupted"
+                );
+                removed.push(name);
+            }
+            Err(e) => tracing::warn!(
+                target: "sparkles::store",
+                "could not remove {name}, a rebuild newer than the current generation: {e}"
+            ),
+        }
+    }
+    removed
+}
+
 /// Remove a generation directory crash-safely: rename, sync the parent, delete.
 pub(crate) fn delete_generation(root: &Path, dir: &Path) -> Result<()> {
     if let Some(doomed) = retire_generation(root, dir)? {

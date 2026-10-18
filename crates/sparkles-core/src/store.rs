@@ -6399,7 +6399,7 @@ fn open_history(
 ) -> Result<crate::history::HistoryState> {
     use crate::history;
     history::remove_deleting(root)?;
-    compaction::remove_interrupted(root, dataset_id, current);
+    history::remove_newer_generations(root, current);
     let cfg = history::read_file(root, dataset_id)?;
     let mut h = history::HistoryState::new(cfg.pins, cfg.retention);
     h.schedules = cfg.schedules;

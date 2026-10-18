@@ -678,7 +678,7 @@ impl Checker<'_> {
                 Some(if cur_no.is_some_and(|c| no < c) {
                     "an old generation whose removal after a compaction was interrupted; safe to remove".to_string()
                 } else {
-                    "newer than CURRENT: an interrupted rebuild, replaced by the next one"
+                    "newer than CURRENT, an interrupted rebuild that the next open removes"
                         .to_string()
                 })
             } else {

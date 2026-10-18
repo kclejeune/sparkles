@@ -1152,8 +1152,9 @@ impl Store {
         if self.root.is_some() {
             run.dir = Some(dir.clone());
             self.quota.exclude(Some(&dir));
-            // marks the directory as this dataset's unfinished build, which the next open
-            // removes after a crash
+            // Marks the directory as this dataset's unfinished build. Earlier releases
+            // remove a marked directory at open, and this one removes every
+            // generation newer than CURRENT (see `history::remove_newer_generations`).
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join(BUILDING_FILE), self.dataset_id.to_string())?;
         }
@@ -1737,28 +1738,6 @@ fn relink_id(generation: &Generation, key: &[u8]) -> Result<Id> {
         return Ok(Id::vocab(id));
     }
     Ok(Id::delta(generation.dvocab.insert(key)?))
-}
-
-/// Remove the unfinished builds of compactions that a crash interrupted: directories
-/// `gen-N` above the current generation that hold this dataset's build marker.
-pub(crate) fn remove_interrupted(root: &Path, dataset_id: uuid::Uuid, current: u32) {
-    let Ok(dir) = std::fs::read_dir(root) else {
-        return;
-    };
-    for e in dir.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(num) = name.strip_prefix("gen-") else {
-            continue;
-        };
-        if !num.bytes().all(|b| b.is_ascii_digit()) || commit::generation_number(&name) <= current {
-            continue;
-        }
-        let ours = std::fs::read_to_string(e.path().join(BUILDING_FILE))
-            .is_ok_and(|id| id.trim() == dataset_id.to_string());
-        if ours && let Err(err) = crate::history::delete_generation(root, &e.path()) {
-            tracing::warn!(target: "sparkles::store::compaction", "could not remove the interrupted compaction {name}: {err}");
-        }
-    }
 }
 
 /// Read a dataset's `compaction.json` (`None` without one).

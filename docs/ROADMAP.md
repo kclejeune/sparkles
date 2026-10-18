@@ -47,8 +47,8 @@ The UI items (11, 21, 27–31) fill time when a track is waiting on benchmark re
 Item 2's gates run before item 1's benchmark refresh, so that the refresh measures the
 settled defaults. Item 86 and the rest of item 7 then run in parallel, since they change
 different parts of the engine. The removal at open of a leftover generation, from item 14,
-runs early with the other durability follow-ups, and the rest of item 14 waits for the
-sustained-write results of item 1.
+shipped on 2026-10-18 with the other durability follow-ups, and the rest of item 14 waits
+for the sustained-write results of item 1.
 
 Two decisions depend on what item 1 measures:
 
@@ -80,7 +80,7 @@ These items are cheap or foundational.
 | 11 | **Done (2026-10-16). Time slider** over graphs, results, entities and the schema. It builds on the existing `at=` field, history diffs and Memory's "As of" selector. A browser compare of complete results, a bounded commit timeline and a server comparison inside the memory budget and pool shipped with it. A calendar-aware track by time, a branch-qualified selector and a server comparison across branches stay unbuilt, as the spec's Outcome records. | [U01](specs/U01-time-slider.md) | M | High |
 | 12 | **GraphRAG community summaries** for Ask and agent memory | [C22](specs/C22-graph-rag-community-summaries.md) | M | High |
 | 13 | **Done (2026-10-16). Current shape standards.** SHACL 1.2 node expressions, ShEx 2.2, recursive ShEx typing that survives restarts, and richer drafted shapes. The SHACL 1.2 Core additions that are not expression syntax, ShEx `RESTRICTS` and the `EXACTLY` reference syntax stay out, and the Outcome sections of the specs list them. | [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12), [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12), [C02](specs/C02-schema-discovery.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
-| 14 | **Compaction.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds, automatic compaction in embedded use, and removal at open of a generation that a power loss left behind | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
+| 14 | **Compaction.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use. Open removes a generation that a power loss left behind since 2026-10-18 | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 15 | **Ingestion.** *Partly done (2026-10-13).* Office documents, more transcript adapters and CSV entity linking shipped. Images and audio remain, with the follow-ups recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 16 | **Predicate patterns (QLever's pattern trick),** FSST vocabulary compression, IRI encoding and index codecs | [X11](specs/X11-index-compression-and-predicate-patterns.md), [X01](specs/X01-compression-codecs.md#roadmap-follow-ups-2026-10-12) | L | High at scale |
 | 86 | **Group commit for indexed datasets.** Datasets with a full-text, spatial or embedding index take the ordinary path, so they gain nothing from group commit. The design carries speculative spatial views, stages full-text changes per group and schedules embedding work after the fence, so no index's durable state names a commit above the durable log. It starts after item 3 lands. | [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets) | M–L | Medium–high |

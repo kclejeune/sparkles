@@ -198,7 +198,10 @@ testing anything. A failed `logwrites` run keeps its log and the first three fai
 and `crash-harness replay --only` with the same seed rebuilds any other failing image. The
 `selftest` mode needs no root. It checks that the driver fails a load whose writes the
 server refuses with a 507, passes a working one, and fails one whose marks all fail. Run it
-after changing the harness. The `--fs` and `--work` directories must exist:
+after changing the harness, together with the harness's own tests, which
+`rustc --edition 2024 --test scripts/crash-harness.rs` builds. They check which `sparkles
+check` warnings a recovered store may still show after an open. The `--fs` and `--work`
+directories must exist:
 
 ```sh
 mkdir -p /tmp/plt

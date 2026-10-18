@@ -922,4 +922,30 @@ has a spec of its own yet. These are design sketches.
   commit. Open holds the dataset's exclusive lock, so no rebuild can be running then, and
   it could remove a generation newer than `CURRENT` as it removes `text.new` and
   `text.old`. The change needs a test for each path that writes generation directories,
-  such as compaction, bulk loads and restores.
+  such as compaction, bulk loads and restores. This one is built, and its outcome follows
+  the list.
+
+**Outcome of the leftover removal (2026-10-18).** Open removes every directory of the
+dataset root whose name is `gen-` followed by digits and whose number is above the
+generation `CURRENT` names, after it finishes interrupted collections and before it scans
+the generations for history. Earlier releases removed only a directory whose build marker
+or `commit.json` named the dataset, and a power loss can leave both empty, which is how the
+`log-writes` runs found the leftover. The rule needs no marker because open holds the
+dataset's exclusive lock, so no rebuild can be writing such a directory, and every path
+that publishes a generation inside an existing root switches `CURRENT` to it. Compaction
+and bulk commits build in the root. A restore, a clone and a new branch build a whole root
+elsewhere and rename or switch it into place, so they leave nothing above `CURRENT` in an
+existing root. Each directory is renamed to `gen-N.deleting` and the root synced before its
+contents are deleted, and the next open finishes a removal that a crash interrupted. Older
+generations, files with a generation's name, other names and `commits.bin.corrupt-*` stay,
+and nothing is removed when `CURRENT` does not name a numbered generation. Compaction still
+writes its build marker so that an earlier release opening the dataset removes an
+interrupted build as before. `sparkles check` still reports such a directory, since it does
+not open the dataset, and its message now says the next open removes it. Two tests in
+`store/compaction_tests.rs` cover a compaction interrupted at three points with an empty
+marker and `commit.json`, and an interrupted bulk build, an empty directory, another
+dataset's generation and an interrupted removal above `CURRENT` next to names that must
+stay. After open, `scripts/crash-harness.rs` now accepts only the leftover of an old
+generation, so a generation newer than `CURRENT`, a `commits.bin.corrupt-*` file or any
+other leftover fails a crash run, and `rustc --edition 2024 --test` on the file runs a test
+of that rule.

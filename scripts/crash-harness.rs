@@ -436,8 +436,8 @@ fn verify(a: &Args) {
             ));
         }
     }
-    // After open only leftovers may remain: a newer generation of a compaction that a
-    // crash interrupted stays until the next rebuild replaces it.
+    // After open only an old generation may remain. Open removes every generation newer
+    // than CURRENT, so a crash image can no longer show one afterwards.
     let (code, out, err) = sparkles(&bin, &["check", "--loc", &loc, "--format", "json"]);
     if code != 0 && !(code == 2 && only_leftovers(&out)) {
         problems.push(format!(
@@ -455,8 +455,15 @@ fn verify(a: &Args) {
     std::process::exit(if ok { 0 } else { 1 });
 }
 
-/// Whether every issue in a `sparkles check --format json` report is a warning about a
-/// leftover file, such as a generation newer than CURRENT. Each issue object names its
+/// The leftover warnings that `sparkles check` may still give after an open. Open removes
+/// generations newer than CURRENT, `text.new` and `text.old` and finishes interrupted
+/// removals, so only an old generation that something still holds can remain. Any other
+/// leftover, a set-aside `commits.bin.corrupt-*` catalog above all, is a finding.
+const ACCEPTED_LEFTOVERS: &[&str] =
+    &["leftover: an old generation whose removal after a compaction was interrupted"];
+
+/// Whether every issue in a `sparkles check --format json` report is one of the
+/// `ACCEPTED_LEFTOVERS` warnings, and there is at least one. Each issue object names its
 /// status before its message.
 fn only_leftovers(json: &str) -> bool {
     let mut any = false;
@@ -464,7 +471,9 @@ fn only_leftovers(json: &str) -> bool {
         let status = json[..i]
             .rfind("\"status\": \"")
             .and_then(|j| json[j + 11..].split('"').next());
-        if status != Some("warning") || !json[i + 12..].starts_with("leftover:") {
+        let message = &json[i + 12..];
+        if status != Some("warning") || !ACCEPTED_LEFTOVERS.iter().any(|m| message.starts_with(m))
+        {
             return false;
         }
         any = true;
@@ -729,5 +738,39 @@ fn main() {
         "verify" => verify(&a),
         "replay" => replay(&a, cmd),
         _ => die(format!("unknown command {sub}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::only_leftovers;
+
+    fn report(issues: &[(&str, &str)]) -> String {
+        let mut s = String::from("{\n  \"status\": \"warning\",\n  \"checks\": [\n    {\n      \"issues\": [\n");
+        for (status, message) in issues {
+            s.push_str(&format!(
+                "        {{\n          \"status\": \"{status}\",\n          \"message\": \"{message}\"\n        }},\n"
+            ));
+        }
+        s.push_str("      ]\n    }\n  ]\n}\n");
+        s
+    }
+
+    #[test]
+    fn only_the_old_generation_leftover_passes() {
+        let old = "leftover: an old generation whose removal after a compaction was interrupted; safe to remove";
+        assert!(only_leftovers(&report(&[("warning", old)])));
+        for other in [
+            "leftover: newer than CURRENT, an interrupted rebuild that the next open removes",
+            "leftover: a damaged commit catalog an earlier open set aside",
+            "leftover: a temporary file of an interrupted write; safe to remove",
+            "leftover: left by an interrupted full-text rebuild; removed on open",
+            "leftover: left by an interrupted deletion; safe to remove",
+            "a torn tail",
+        ] {
+            assert!(!only_leftovers(&report(&[("warning", old), ("warning", other)])), "{other}");
+        }
+        assert!(!only_leftovers(&report(&[("error", old)])));
+        assert!(!only_leftovers("{}"));
     }
 }
