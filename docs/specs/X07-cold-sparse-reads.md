@@ -759,8 +759,9 @@ including page faults, and the index wait are together larger than the gap to th
 Phase 3 and Phase 4, the 1.01B gates (A5 and the forge targets), a per-query set of
 hinted blocks in the context to avoid a second hint of a block, I/O priority for
 read-ahead, and a `FILTER` constant collector beyond the common comparison nodes.
-`bench-regressions.py` has no `--io` option, so the Namespace screen reports no I/O
-counters, and its primary metric excludes the plan time and serialization time in which
+`bench-regressions.py` gained `--io` on 2026-10-18 under roadmap item 1, which keeps each
+sample's server times and I/O profile for the forge run of the Phase 3 decision. The
+Namespace screen still reports no I/O counters, and its primary metric excludes the plan time and serialization time in which
 the prefetch work runs. The profile reads `getrusage(RUSAGE_SELF)` for process-wide
 faults, and a per-operator `RUSAGE_THREAD` breakdown is not built. `/$/stats` has no I/O
 counters, which are available only through `profile=io` and `/$/metrics`.

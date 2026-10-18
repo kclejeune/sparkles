@@ -1869,11 +1869,13 @@ so only its row count is checked.
   and on Namespace instances, among them the memory of the closure kept for incremental
   runs. They are not comparisons with other engines and are not repeated here. The harnesses
   for all three exist and are described in [BENCHMARKING.md](BENCHMARKING.md), but their
-  comparisons have not been run on the reference machine. OWL2Bench, LDBC, WatDiv's stress
-  testing and the Wikidata query log have no harness yet. The synthetic suite has a
-  regular shape, and its 28 queries are hand-picked.
+  comparisons have not been run on the reference machine. An OWL2Bench harness exists and
+  has not been run there either. LDBC, WatDiv's stress testing and the Wikidata query log
+  have no harness yet. The synthetic suite has a regular shape, and its 28 queries are
+  hand-picked.
 * **Long runs.** Hours of sustained writes and compaction under load were not compared
-  with other engines.
+  with other engines. `scripts/bench-longwrite.sh` runs that comparison and has run only
+  at smoke scale.
 * **Spatial and query-time reasoning.** GeoSPARQL workloads and query-time reasoning were
   not compared with other engines.
 * **Result caches.** All runs had result caches off.

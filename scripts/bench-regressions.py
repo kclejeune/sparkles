@@ -2,8 +2,12 @@
 """Compare warm/cold HTTP queries on an isolated store copy; disable result caching.
 
 Cold mode evicts only the supplied store's files and restarts the server per sample.
-Run one engine at a time. For billion-scale tests, apply the host's memory cap and
-pass --server-cpus 0,1,2,3,4,5,6,7,8,9,10,11. Timing excludes server startup and
+With --io, every request asks for `profile=io` in the native JSON format, and the output
+keeps each sample's metadata: the server's execution time and the I/O profile of what the
+query read and decoded, by file and by phase (X07's breakdown).
+
+Run one engine at a time. For billion-scale tests, apply the host's memory cap and pass
+--server-cpus 0,1,2,3,4,5,6,7,8,9,10,11. Timing excludes server startup and
 client process startup, so do not splice these numbers into hyperfine/curl tables.
 
     bench-regressions.py compare OLD.json NEW.json [LATER.json ...] [--engine sparkles] [--no-fail]
@@ -43,7 +47,15 @@ def compare_main(argv):
     a = ap.parse_args(argv)
     if len(a.records) < 2:
         ap.error('compare needs at least two records')
-    recs = [json.load(open(f)) for f in a.records]
+    recs = []
+    for f in a.records:
+        with open(f) as fh:
+            rec = json.load(fh)
+        # the record versions of scripts/bench-record.py that this comparison understands
+        if rec.get('record') not in (1, 2):
+            print(f'{f}: record version {rec.get("record")!r} is not one this tool knows (1, 2)', file=sys.stderr)
+            return 2
+        recs.append(rec)
 
     def key(rec, r):
         return (rec['suite'], rec['scale'], r['engine'], r['query'], r['mode'], r['clients'])
@@ -135,7 +147,11 @@ p.add_argument('--cold', action='store_true')
 p.add_argument('--port', type=int, default=5660)
 p.add_argument('--format', default='text/tab-separated-values')
 p.add_argument('--server-cpus')
+p.add_argument('--io', action='store_true',
+               help='ask for profile=io in the native format and keep each sample\'s io object and server times')
 a = p.parse_args()
+if a.io:
+    a.format = 'application/x-sparkles+json'
 if a.runs < 1 or a.warmup < 0:
     p.error('--runs must be positive and --warmup must be nonnegative')
 if not Path(a.db).is_dir():
@@ -143,7 +159,7 @@ if not Path(a.db).is_dir():
 server_cpus = range(os.cpu_count())
 if a.server_cpus:
     server_cpus = [int(cpu) for cpu in a.server_cpus.split(',')]
-url = f'http://127.0.0.1:{a.port}/bench/sparql'
+url = f'http://127.0.0.1:{a.port}/bench/sparql' + ('?profile=io' if a.io else '')
 work = Path(a.out).parent
 work.mkdir(parents=True, exist_ok=True)
 
@@ -200,7 +216,7 @@ try:
         req = urllib.request.Request(url, data=query,
             headers={'Content-Type': 'application/sparql-query',
                      'Accept': a.format})
-        times, digests, sizes = [], [], []
+        times, digests, sizes, metas = [], [], [], []
         for i in range(a.runs + (0 if a.cold else a.warmup)):
             if a.cold:
                 evict()
@@ -209,13 +225,20 @@ try:
             with urllib.request.urlopen(req, timeout=600) as response:
                 body = response.read()
             elapsed = (time.perf_counter() - before) * 1000
+            meta = None
             if a.format == 'application/x-sparkles+json':
-                print('timing', name, json.loads(body).get('meta'), flush=True)
+                doc = json.loads(body)
+                meta = doc.pop('meta', None)
+                print('timing', name, meta, flush=True)
+                # the answer without the timings and counters, for the digest
+                body = json.dumps(doc, sort_keys=True).encode()
             if a.cold:
                 stop(proc)
                 proc = None
             if a.cold or i >= a.warmup:
                 times.append(elapsed)
+                if a.io:
+                    metas.append(meta)
                 # Compare multisets, not ORDER BY sequences. An unordered LIMIT may
                 # legitimately select another subset, so also record its row count.
                 lines = body.splitlines()
@@ -224,6 +247,9 @@ try:
         result[name] = {'ms': times, 'median': statistics.median(times),
                         'mean': statistics.mean(times), 'stdev': statistics.stdev(times) if len(times) > 1 else 0,
                         'hashes': sorted(set(digests)), 'rows': sorted(set(sizes))}
+        if a.io:
+            # per sample: the server's own times and the I/O profile (docs/API.md, the I/O profile)
+            result[name]['meta'] = metas
         print(name, result[name], flush=True)
         Path(a.out).write_text(json.dumps(result, indent=2))
 finally:

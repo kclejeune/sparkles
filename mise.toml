@@ -761,12 +761,58 @@ flag "--answers-only" help="only check answers across engines; time nothing"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run (empty: only generate and materialize)"
 flag "--queries <list>" help="only these queries (q1 q9 …)"
 flag "--port-base <port>" default="48300" help="the first of the five server ports"
+flag "--infer-profiles <list>" default="rdfs owl-rl" help="the materializations to run and record"
+flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-micro, owl-mini, owl"
 '''
 run = '''
 PROFILE="$usage_profile" RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" \
 ENGINES="$usage_engines" QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" \
 ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" \
+INFER_PROFILES="$usage_infer_profiles" JENA_REASONERS="${usage_jena_reasoners:-}" \
 scripts/bench-lubm.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
+'''
+
+[tasks."bench:owl2bench"]
+description = "OWL2Bench (OWL 2 RL): Sparkles materializes the data (and Jena's rule reasoners on request), then the RL queries run on the five engines of bench over the same materialized data"
+depends = ["build"]
+usage = '''
+arg "[universities]" default="1" help="OWL2Bench scale: 1 (smoke), 2, 5, 10, 20, 50, 100 or 200"
+arg "[workdir]" default="target/bench-owl2bench" help="generator, data, materialized files, indexes and results/ (summary.md, record.json, inference.json)"
+flag "--runs <n>" default="10" help="measured runs per query"
+flag "--warmup <n>" default="2" help="warm-up runs per query"
+flag "--cold-runs <n>" default="0" help="restarts per query for the cold measurement (0: none)"
+flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
+flag "--answers-only" help="only check answers across engines; time nothing"
+flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run (empty: only generate and materialize)"
+flag "--queries <list>" help="only these queries (q2 q12 …)"
+flag "--port-base <port>" default="48300" help="the first of the five server ports"
+flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-micro, owl-mini, owl"
+'''
+run = '''
+RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" \
+ENGINES="$usage_engines" QUERIES="${usage_queries:-}" SKIP_LOAD="${usage_skip_load:+1}" \
+ANSWERS_ONLY="${usage_answers_only:+1}" PORT_BASE="$usage_port_base" JENA_REASONERS="${usage_jena_reasoners:-}" \
+scripts/bench-owl2bench.sh "$usage_universities" "$(realpath -m "$usage_workdir")"
+'''
+
+[tasks."bench:longwrite"]
+description = "Sustained writes with compaction: an hour or more of concurrent readers and writers on each engine of bench in turn, with a per-minute series, Sparkles' compactions, and state checks after the run, a SIGKILL and a restart"
+depends = ["build"]
+usage = '''
+arg "[data]" default="1000000" help="a person count for gen-data.py (1000000 is 10.5M triples), an N-Triples file, or a directory of .nt.zst files"
+arg "[workdir]" default="target/bench-longwrite" help="data, indexes, store copies and results/ (summary.md, longwrite.json, record.json)"
+flag "--seconds <n>" default="3600" help="length of each engine's run"
+flag "--readers <n>" default="16" help="reader processes"
+flag "--writers <n>" default="1" help="writer processes"
+flag "--write-rate <n>" default="0" help="write requests per second in all (0: as fast as the engine answers)"
+flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run, one after another"
+flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
+flag "--port-base <port>" default="48400" help="the first of the five server ports"
+'''
+run = '''
+SECONDS_RUN="$usage_seconds" READERS="$usage_readers" WRITERS="$usage_writers" WRITE_RATE="$usage_write_rate" \
+ENGINES="$usage_engines" SKIP_LOAD="${usage_skip_load:+1}" PORT_BASE="$usage_port_base" \
+scripts/bench-longwrite.sh "$usage_data" "$(realpath -m "$usage_workdir")"
 '''
 
 [tasks."bench:bsbm"]

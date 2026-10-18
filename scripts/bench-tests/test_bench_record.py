@@ -86,7 +86,7 @@ class RecordTests(unittest.TestCase):
 
     def test_shape_and_validation(self):
         rec, out = self.record()
-        self.assertEqual(rec["record"], 1)
+        self.assertEqual(rec["record"], 2)
         self.assertEqual({r["engine"] for r in rec["results"]}, {"sparkles", "jena", "oxigraph"})
         r = self.find(rec, "sparkles", "q1")
         self.assertEqual(len(r["samples_ms"]), 5)
@@ -331,6 +331,21 @@ class CompareTests(unittest.TestCase):
         p = self.compare(a, b, c)
         self.assertEqual(p.returncode, 1, p.stdout)
         self.assertIn("two consecutive", p.stdout)
+
+    def test_unknown_record_versions_are_refused(self):
+        a = self.qmph_record("v1", 100.0)
+        rec = jload(a)
+        rec["record"] = 3
+        b = os.path.join(self.tmp.name, "v3.json")
+        write_path(b, rec)
+        p = self.compare(a, b)
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        self.assertIn("record version 3", p.stderr)
+        v = subprocess.run([sys.executable, RECORD, "validate", b], capture_output=True, text=True)
+        self.assertEqual(v.returncode, 1)
+        self.assertIn("record version 3", v.stderr)
+        # version 1 is still read
+        self.assertEqual(self.compare(a, a).returncode, 0)
 
     def test_changed_answer_hash(self):
         a, b = self.rec("a"), self.rec("b", wrong=True)

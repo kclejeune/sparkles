@@ -1,0 +1,30 @@
+# The read queries of the long write runs on the synthetic data of scripts/gen-data.py, the
+# same texts as in scripts/bench.sh. They are the short lookups and joins of the suite,
+# so a reader goes through the set many times a minute; the scans and exports are left out.
+## star-join
+PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?p ?n ?a ?o WHERE { ?p a ex:Researcher ; foaf:name ?n ; foaf:age ?a ; ex:worksFor ?o . ?o ex:city "Kyoto" }
+## star-lookup
+PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?p ?n ?a ?s WHERE { ?p ex:worksFor <http://example.org/org/7> ; foaf:name ?n ; foaf:age ?a ; ex:salary ?s }
+## values-star
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?p ?n ?a ?k WHERE { VALUES ?p { <http://example.org/person/1> <http://example.org/person/10> <http://example.org/person/100> <http://example.org/person/1000> <http://example.org/person/10000> } ?p foaf:name ?n ; foaf:age ?a ; foaf:knows ?k }
+## employee-docs
+PREFIX ex: <http://example.org/>
+SELECT ?p ?d ?t WHERE { ?p ex:worksFor <http://example.org/org/7> . ?p ex:authorOf ?d . ?d ex:title ?t }
+## range-topk
+PREFIX ex: <http://example.org/>
+SELECT ?p ?s WHERE { ?p ex:salary ?s FILTER(?s > 150000) } ORDER BY DESC(?s) LIMIT 10
+## path-plus
+PREFIX ex: <http://example.org/>
+SELECT (COUNT(*) AS ?c) WHERE { <http://example.org/doc/1> ex:cites+ ?d }
+## exists-join
+PREFIX ex: <http://example.org/>
+SELECT (COUNT(*) AS ?c) WHERE { ?s a ex:Student ; ex:advisor ?a FILTER EXISTS { ?a ex:worksFor ?o . ?o ex:city "Kyoto" } }
+## group-avg
+PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?o (AVG(?a) AS ?avg) (COUNT(?p) AS ?n) WHERE { ?p ex:worksFor ?o ; foaf:age ?a } GROUP BY ?o ORDER BY DESC(?n) ?o LIMIT 10
+## lw-count
+PREFIX ex: <http://example.org/>
+SELECT (COUNT(*) AS ?c) WHERE { ?s ex:lwValue ?v }

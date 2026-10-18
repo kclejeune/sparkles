@@ -20,7 +20,12 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   ```
 
   The default mode loads every engine, checks the answers and times each query, a
-  single-triple update and the throughput of 16 concurrent clients. Each load runs under
+  single-triple update and the throughput of 16 concurrent clients. After the loads it
+  starts one engine's server at a time, with no other server running, checks that
+  engine's answers, times it and stops it. The fingerprints of all engines go to one
+  `answers.json`, which the summary and the record compare. The `updates` mode does the
+  same per engine, with the churn and the suite in one server process, because QLever
+  keeps updates in memory and would lose them in a restart. Each load runs under
   GNU `time`, which records its peak RSS, and the index size is the disk space the store
   takes. The harness reads each server's RSS 2 seconds after it starts, after every query
   has run once, and after the run. It also records the peak RSS during the throughput
@@ -171,9 +176,10 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   WatDiv may be used freely on the condition that publications cite G. Aluç, O. Hartig,
   M. T. Özsu and K. Daudjee, "Diversified Stress Testing of RDF Data Management
   Systems", ISWC 2014.
-* `scripts/bench-sp2b.sh`, `scripts/bench-lubm.sh` and `scripts/bench-bsbm.sh` (`mise run
-  bench:sp2b`, `bench:lubm` and `bench:bsbm`) run the standard benchmarks SP²Bench, LUBM and
-  the Berlin SPARQL Benchmark on the five engines of `scripts/bench.sh`. They share
+* `scripts/bench-sp2b.sh`, `scripts/bench-lubm.sh`, `scripts/bench-owl2bench.sh` and
+  `scripts/bench-bsbm.sh` (`mise run bench:sp2b`, `bench:lubm`, `bench:owl2bench` and
+  `bench:bsbm`) run the standard benchmarks SP²Bench, LUBM, OWL2Bench and the Berlin SPARQL
+  Benchmark on the five engines of `scripts/bench.sh`. They share
   `scripts/bench-suite-lib.sh`. Each one prepares pinned data and a fixed query set. The
   shared code then loads the data into every engine, starts the servers, checks every
   answer, times each query with hyperfine, and writes the run manifest, the result record
@@ -200,12 +206,17 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   # small runs that check the setup
   mise run bench:sp2b 50k
   mise run bench:lubm 1
+  mise run bench:owl2bench 1
   SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 2000
 
   # the runs of the published comparisons, on the reference host (see below)
   mise run bench:sp2b 10m --cold-runs 3
   mise run bench:sp2b 100m --cold-runs 3
-  mise run bench:lubm 100 --cold-runs 3
+  mise run bench:lubm 100 --cold-runs 3 --jena-reasoners "rdfs owl-mini"
+  mise run bench:owl2bench 10 --jena-reasoners "rdfs owl-micro owl-mini"
+  # F16's acceptance run A1: the rdfs materialization of LUBM(1000) alone, at the head and
+  # with SPARKLES set to a build of the commit before F16's Phase 1, in another workdir
+  mise run bench:lubm 1000 target/lubm-1000 --engines "" --infer-profiles rdfs
   SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m
   SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 10m --usecase bi
   SPARKLES_ALLOW_GPL_BENCHMARK=1 mise run bench:bsbm 100m
@@ -231,14 +242,57 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   downloads them at run time, checks them against `scripts/bench-lubm/pins.tsv` and never
   commits them. The 14 queries are in `scripts/bench-lubm/queries.txt`, written out from
   the descriptions in the LUBM paper. Several queries only return their complete answers
-  with inference. The script therefore materializes the data twice with `sparkles infer`,
-  once with the `rdfs` profile and once with the `owl-rl` profile. The time, the peak RSS
-  and the number of derived triples of each go to `results/inference.json` and the
-  record. Then it dumps the data with the inferred triples of `--profile` (default
-  `owl-rl`), and every engine loads that one file. Jena's rule reasoners are not run. Fluree's
-  documentation describes query-time reasoning with RDFS, OWL 2 QL, OWL 2 RL and Datalog
-  profiles, but the script does not turn it on, so Fluree also answers over the materialized
-  file. QLever and Oxigraph have no reasoner. Only Sparkles has an inference time.
+  with inference. The script therefore materializes the data with `sparkles infer`, once
+  with the `rdfs` profile and once with the `owl-rl` profile, each on its own copy of the
+  loaded data. `--infer-profiles` (`INFER_PROFILES`) runs only some of them, which saves
+  the disk of a second dump at 1,000 universities. For each materialization
+  `results/inference.json` and the record get the wall time, the peak RSS, the number of
+  derived triples, the reasoner's own estimate of its peak heap and its thread count from
+  `sparkles infer --status`, and the SHA-256 of the sorted derived triples. The digest lets
+  two builds' closures be compared, and `DERIVED_DIGEST=0` skips the sort it needs. The
+  derived graph streams from `sparkles dump` through `sort` into one pass that counts and
+  hashes it, and the run stops when the count differs from the derived triples that
+  `infer` reported or the dump fails, with the dump's errors in `logs/`. No copy of the
+  derived graph is written, but `sort` spills temporary files into the workdir that take
+  about the size of the derived graph in N-Triples.
+  `INFER_THREADS` sets `--threads`. A Sparkles build that does not report the peak heap gets
+  `null` there, and its peak RSS still compares. Then the script dumps the data with the
+  inferred triples of `--profile` (default `owl-rl`), and every engine loads that one file.
+  The materializations are also printed as a table in `results/summary.md`, or in
+  `results/inference.md` when no engine is selected.
+
+  `--jena-reasoners` (`JENA_REASONERS`) also times Jena's rule reasoners on the same data:
+  `rdfs`, `owl-micro`, `owl-mini` or `owl`, the reasoners that Jena's assembler names. Jena
+  has no command that writes a closure, so `sparql` counts every triple of an inference
+  model over an in-memory copy of `base.nt`, which makes the forward and backward rules
+  derive everything. The same count without a reasoner measures the start of the JVM and
+  the parse of the file, which is recorded apart. Each run is limited to
+  `JENA_REASON_TIMEOUT` seconds (default 3600) and a heap of `JENA_HEAP` (default 8G), and
+  a run that hits a limit is recorded as `timeout`, `oom` or `error`. Jena's closure
+  counts cannot be compared with Sparkles' derived triples, because its rule sets derive
+  other triples, such as `rdfs:Resource` types and `owl:sameAs` of each individual with
+  itself. Fluree's documentation describes query-time reasoning with RDFS, OWL 2 QL, OWL 2
+  RL and Datalog profiles, but the script does not turn it on, so Fluree also answers over
+  the materialized file. QLever and Oxigraph have no reasoner.
+
+  *OWL2Bench.* The scale is the number of universities. The paper's datasets have 1, 2, 5,
+  10, 20, 50, 100 and 200 universities, and 1 university gives 54,815 triples of TBox and
+  ABox. The generator and the TBoxes are Apache-2.0, and the 22 queries are a Zenodo record
+  under CC-BY-4.0. The script downloads both at run time, checks them against
+  `scripts/bench-owl2bench/pins.tsv` and never commits them. The pinned generator is the
+  jar of 2020 that made the paper's datasets, run with seed 1 on Java 8 from nixpkgs. The
+  jar of July 2026 writes its ABox in another namespace than its TBoxes, so no TBox axiom
+  applies to its data, and the script refuses data generated that way. Two generations of
+  the same scale give the same file. The script uses the OWL 2 RL TBox and runs the 18
+  queries whose profile list in the query record contains RL. `queries/profiles.tsv` in the
+  workdir lists all 22 with their profiles. Materialization, the Jena comparison and the
+  query comparison work as for LUBM, with `owl-rl` as the only default profile.
+
+  The OWL 2 RL closure grows faster than the data. At one university, 1.31 million of the
+  1.40 million derived triples are `hasSameHomeTownWith`, a symmetric and transitive
+  property whose closure is a clique per home town, and query q20 returns all of them. The
+  larger scales are therefore run one after another until a run fails on its limits, and
+  that failure is a result.
 
   *BSBM.* The scale is a product count or a size such as `10m`. The sizes `1m`, `10m` and
   `100m` use the product counts of the datasets that BSBM publishes, which are 2,785,
@@ -271,12 +325,106 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   `--usecase bi` runs the Business Intelligence use case instead of Explore. The Explore
   and Update mix is not run yet.
 
+* `scripts/bench-longwrite.sh` (`mise run bench:longwrite [data] [workdir]`) runs an hour
+  or more of concurrent reads and writes against each engine of `scripts/bench.sh` in turn, with
+  compaction under load. The data is a person count for `scripts/gen-data.py` (default
+  1,000,000, which is 10.5M triples), an N-Triples file, or a directory of `.nt.zst` files
+  such as a slice of `scripts/bench-billion.sh`, which is decompressed once. Every engine
+  loads the same file. A workdir keeps the data it was made with and refuses other data.
+  Every engine then answers the readers' queries on its loaded store. An engine whose
+  answers differ from the majority is recorded as `wrong-answer` and not run, and one that
+  fails a query is recorded as `error` and not run, unless `IGNORE_ANSWERS=1` is set. A
+  majority needs three engines, so when two engines disagree both run and the script says
+  so. Then, for one engine at a time, the script copies its store, serves the copy and
+  runs `scripts/bench-longwrite/longrun.py` against it for
+  `--seconds` (default one hour). The published runs are one hour per engine on the 10.5M
+  store, and one four-hour run of Sparkles on the same store.
+
+  ```sh
+  mise run bench:longwrite 20000 target/lw-smoke --engines sparkles --seconds 120   # smoke
+  mise run bench:longwrite                                    # 10.5M, five engines, 1 h each
+  mise run bench:longwrite 1000000 target/lw-4h --engines sparkles --seconds 14400   # 4 h
+  mise run bench:longwrite ~/.cache/sparkles-bench/billion/50m/data target/lw-dbpedia \
+      --engines "sparkles qlever oxigraph"                    # the DBpedia 50M slice
+  ```
+
+  The load generator starts 16 reader processes (`--readers`) and one writer
+  (`--writers`). The readers run a fixed set of short queries in rotation, from
+  `scripts/bench-longwrite/synthetic.txt` for the synthetic data and from
+  `scripts/bench-billion/queries` for DBpedia. Each writer inserts and deletes triples of
+  its own, `<http://example.org/lw/w/n> ex:lwValue "n"`, one at a time or 100 at a time,
+  with a fixed seed, and deletes only while it holds more than 200,000 of them, so the data
+  stays near its size while every commit leaves work for compaction. `--write-rate` paces
+  the writers. Without it each writer sends its next request when the last one is
+  answered. Every request opens a new connection, as the rest of the harness does. After
+  an error a reader or writer waits 10 ms, doubling up to one second, before it tries
+  again. A writer keeps at most 100,000 triples whose writes failed as uncertain and counts
+  the rest as overflow. On a host with 4 or more CPUs the load generator runs pinned to the
+  last quarter of them (`CLIENT_CPUS`), and on a smaller host it is not pinned. The
+  generator runs in its own session under a time limit of the run plus 15 minutes, its
+  workers exit when it dies, and the script kills the session when it exits.
+
+  A monitor samples the server every 5 seconds: its RSS, the disk space allocated to its
+  store, the write requests completed by the block device that holds the store, the
+  flushes completed by the whole disks under that device, and for
+  Sparkles the `compaction` object of `/$/stats/bench`, whose `last` entry gives each
+  compaction's start, kind, duration and writer lock time. `results/longwrite.json` gets one
+  entry per minute with the committed writes and triples, the write and read p50 and p99,
+  the errors and timeouts, the RSS, the disk use, the device counters and whether a
+  compaction ran. The disk space is read by a separate thread every 60 seconds
+  (`--disk-every`), because `du` over a large store can take longer than a sample. The
+  device counters separate the durability classes of X06 §5.1. The device and its disks
+  carry every process's I/O, so before the run the monitor counts them for 60 seconds with
+  the server idle (`BASELINE`), and the summary reports the run's counts net of that rate,
+  per committed write request. With one writer, an engine that synchronizes each commit
+  makes at least one device write per commit, made durable either by a flush or by a write
+  with forced unit access, which the kernel does not count as a flush. Sparkles writes its
+  log with `O_DIRECT` and `O_DSYNC`, so in a one-minute smoke run it made 1.6 device writes
+  but only 0.03 disk flushes per commit. With several writers, group commit lets commits
+  share one write, so the ratio is read from a single-writer run. The summary shows both
+  ratios, and the flushes alone do not decide the class. The kernel
+  counts flushes only on whole disks, not on partitions or device-mapper nodes, so the
+  monitor follows the store's device down to its disks through `/sys/block`. On the
+  development machine 500 `fdatasync` calls on an LVM volume gave 500 flushes on the NVMe
+  disk and none on the volume. The summary gives the median of the per-minute values from the second minute on,
+  since the first minute starts on a cold read set.
+
+  After the run the script compares the engine's `lwValue` triples with the state the
+  writers were told about, reading SPARQL JSON results. A write that failed leaves its
+  triples uncertain, and the check accepts them either way. A value that is not the plain
+  or `xsd:string` literal the writer sent counts as extra. Then the script kills the server
+  with SIGKILL, starts it again, which replays the engine's log, and checks again. Last, it
+  stops the server normally, starts it and checks a third time. Both restarts record the
+  time from the start to the first answered query, so the summary gives the recovery time
+  after the SIGKILL beside the time of a normal restart. A server that does not start is
+  recorded as a failed check and the run goes on to the next engine. Sparkles runs with automatic
+  compaction at its defaults. TDB2 is not compacted, because its compaction needs the
+  server stopped or an administrative request, so its disk growth is reported instead.
+  QLever keeps updates in memory, and its checks after the restarts fail by design. In a
+  one-minute smoke run on 210,000 triples with two writers, QLever's RSS reached 27 GiB
+  after about 2,300 write requests and the kernel killed it, so a long run sets
+  `SERVER_MEM_MAX` to keep an engine that outgrows its limit from taking the host down,
+  and such an engine gets the status `error`. The servers' logs are copied to `logs/`
+  before each store copy is removed.
+
+  Each engine gets a status. It is `error` when the state check failed or could not decide,
+  when no write succeeded, when more than 1% of the reads or writes failed, when the server
+  went away during the run, or when a `synced` or `written` engine lost acknowledged writes
+  after the SIGKILL or the restart. It is `wrong-answer` when the engine was not run because
+  of its answers, and `ok` otherwise. `results/summary.md` has one row per engine with the
+  status and the checks, and `results/record.json` one `longrun` result for the writes and
+  one for the reads.
+
 * `scripts/bench-record.py` writes and checks the common result record that the standard
   suites produce, and `scripts/bench-regressions.py compare` compares records.
   `results/record.json` of a suite run holds one entry per engine, query, mode and client
   count with the samples in milliseconds, the median, the p95, the answer fingerprint and
   whether it agrees with the majority, a status (`ok`, `timeout`, `error`, `oom` or
-  `wrong-answer`), and for write results the durability class. `results/manifest.json` next
+  `wrong-answer`), and for write results the durability class. A long write run has the
+  mode `longrun`, which needs record version 2, its samples are the per-minute medians
+  from the second minute on, and its write result carries the per-minute series, the
+  compactions, the state checks and the reasons for its status. `compare` refuses a record
+  whose version it does not know. `results/manifest.json` next
   to it records the commit of the checkout that holds the scripts, the Sparkles binary's
   checksum and, when the caller sets `SPARKLES_COMMIT`, the commit it was built from, each
   engine's version, binary checksum and license (with the store path for an engine from

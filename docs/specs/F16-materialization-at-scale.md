@@ -1032,7 +1032,13 @@ most 162 KB, against a bound of the 48,000-byte limit plus 256 KiB.
 **Open parts of Phase 1.** The acceptance runs of §11 and §12 moved to
 [ROADMAP](../ROADMAP.md) item 1. They are A1 at 1,000 universities, OWL2Bench, and the
 LUBM and OWL2Bench runs in X06's harness. The measurements above come from the example's
-own LUBM-style generator at 100 universities.
+own LUBM-style generator at 100 universities. On 2026-10-18 X06's harness gained what
+these runs need. `scripts/bench-lubm.sh` and `scripts/bench-owl2bench.sh` record each
+materialization's `run.peakBytes`, threads and a digest of the sorted derived triples, so
+A1 compares the head with a build of the commit before Phase 1 from two runs of
+`bench-lubm.sh 1000` with `ENGINES=""` and `INFER_PROFILES=rdfs`. Both scripts also time
+Jena's rule reasoners on the same data on request. X06's Outcome records the smoke runs.
+The measurements themselves are still open.
 
 **Deviations.**
 * §3.5 expected the same cache limit to keep the closure of an input about four times
