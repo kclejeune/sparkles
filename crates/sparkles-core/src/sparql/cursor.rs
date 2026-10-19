@@ -1944,9 +1944,71 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
         .collect()
 }
 
+/// `SELECT DISTINCT … ORDER BY` deduplicates below its sort when the query may spill
+/// (item 85), so that the DISTINCT can pass rows to later passes: the DISTINCT of a
+/// projection of an ORDER BY becomes a projection of an ORDER BY of a numbered DISTINCT
+/// of the projection. Equal projected rows have equal sort keys when every key is a pure
+/// expression of projected variables without EXISTS, and the numbered DISTINCT keeps
+/// each row's first input number, on which the sort orders ties, so the rows and their
+/// order are those that sorting first gives. Other shapes keep the DISTINCT above the
+/// sort.
+fn distinct_below_order(ctx: &Ctx, node: Node) -> Node {
+    let rewrites = matches!(node.kind, Kind::Distinct)
+        && node.children.len() == 1
+        && matches!(&node.children[0].kind, Kind::Project(vars) if *vars == node.vars && !vars.is_empty())
+        && node.children[0].children.len() == 1
+        && match &node.children[0].children[0].kind {
+            Kind::OrderBy { keys, limit: None } => keys.iter().all(|(key, _)| {
+                !key.has_exists()
+                    && crate::sparql::exprcache::impurity(key).is_none()
+                    && key.var_set().iter().all(|v| node.vars.contains(v))
+            }),
+            _ => false,
+        };
+    if !rewrites {
+        return node;
+    }
+    let mut distinct = node;
+    let mut project = distinct.children.pop().expect("a projection");
+    let mut order = project.children.pop().expect("an ORDER BY");
+    let input = order.children.pop().expect("the sorted input");
+    let Kind::OrderBy { mut keys, .. } = order.kind else {
+        unreachable!("an ORDER BY")
+    };
+    let vars = distinct.vars.clone();
+    let number = ctx.var("\u{1}distinct number");
+    let below = super::plan::project(input, vars.clone(), ctx);
+    let mut numbered = Node::leaf(
+        Kind::Distinct,
+        [vars.clone(), vec![number]].concat(),
+        below.est,
+        "below the ORDER BY, so that it may spill".into(),
+    );
+    numbered.certain = [below.certain.clone(), vec![number]].concat();
+    numbered.cost = below.cost;
+    numbered.children = vec![below];
+    keys.push((Expr::Var(number), true));
+    let mut sort = Node::leaf(
+        Kind::OrderBy { keys, limit: None },
+        numbered.vars.clone(),
+        numbered.est,
+        format!("{} then the first input row", order.desc),
+    );
+    sort.certain = numbered.certain.clone();
+    sort.cost = numbered.cost + numbered.est * numbered.est.max(2.0).log2() * 0.5;
+    sort.children = vec![numbered];
+    project.children.clear();
+    super::plan::project(sort, vars, ctx)
+}
+
 impl Operator {
-    fn build(ctx: &Arc<Ctx>, mut node: Node, fallback: FallbackPolicy) -> Result<Self> {
+    fn build(ctx: &Arc<Ctx>, node: Node, fallback: FallbackPolicy) -> Result<Self> {
         ctx.check()?;
+        let mut node = if ctx.spill.is_some() {
+            distinct_below_order(ctx, node)
+        } else {
+            node
+        };
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.
         // An operator that evaluates EXISTS streams when every EXISTS pattern does.
@@ -1981,6 +2043,12 @@ impl Operator {
         // Read before the children below become shells that keep only their order.
         let value_ordered_input =
             matches!(node.kind, Kind::Distinct) && node.children.first().is_some_and(value_ordered);
+        // A DISTINCT that numbers its input rows has one variable more than its input.
+        let numbered_distinct = matches!(node.kind, Kind::Distinct)
+            && node.children.first().is_some_and(|child| {
+                child.vars.len() + 1 == node.vars.len()
+                    && node.vars.last().is_some_and(|v| !child.vars.contains(v))
+            });
         // A hash join that spills keeps its probe input's order when that input comes in
         // an order a caller observes.
         let probe_value_ordered = joins
@@ -2175,6 +2243,7 @@ impl Operator {
                     &node.vars,
                     &children[0].order,
                     value_ordered_input,
+                    numbered_distinct,
                 )?),
                 Kind::Slice { offset, limit } => State::Slice {
                     offset: *offset,
@@ -2585,6 +2654,9 @@ impl Operator {
                 State::Distinct(distinct) => {
                     let batch = match self.children[0].next(ctx, options, cap)? {
                         Some(mut buffer) => {
+                            if let Some(&number) = self.vars.last() {
+                                distinct.number(&mut buffer, number)?;
+                            }
                             distinct.apply(ctx, &mut buffer)?;
                             Some(buffer)
                         }

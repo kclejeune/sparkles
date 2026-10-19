@@ -202,9 +202,10 @@ fn run_in_order(
     Ok(rows)
 }
 
-/// A DISTINCT above an ORDER BY never sends rows to a later pass, since rows read back
-/// from disk would come after rows that sort after them. It keeps every row in its set
-/// and fails on memory when the set does not fit, rather than answer out of order.
+/// A DISTINCT above an ORDER BY keeps the order. With spill on it is moved below the sort
+/// and may spill there. A DISTINCT that stays above the sort never sends rows to a later
+/// pass, since rows read back from disk would come after rows that sort after them, and
+/// it fails on memory when its set does not fit rather than answer out of order.
 #[test]
 fn distinct_over_order_by_keeps_the_order_or_fails() {
     let s = store(20_000);
@@ -243,6 +244,74 @@ fn distinct_over_order_by_keeps_the_order_or_fails() {
             }
         }
         assert_eq!(spill.reserved_bytes(), 0, "{q}");
+    }
+}
+
+/// `SELECT DISTINCT … ORDER BY` whose sort keys are projected deduplicates below the
+/// sort when the query may spill, so the DISTINCT spills and the rows keep the order an
+/// in-memory run gives, ties included. A key that is not projected keeps the DISTINCT
+/// above the sort, which still keeps the order or fails on memory.
+#[test]
+fn distinct_below_order_by_spills_and_keeps_the_order() {
+    let s = store(20_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let opts = |memory: u64, spill: Option<Arc<Spill>>| QueryOptions {
+        max_memory_bytes: Some(memory),
+        spill,
+        ..Default::default()
+    };
+    let ordered = |q: &str, memory: u64, spill: Option<Arc<Spill>>| {
+        let cursor = CursorOptions {
+            batch_rows: 1000,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(s.snapshot(), q, &opts(memory, spill), &cursor)?;
+        let mut rows = Vec::new();
+        while let Some(b) = c.next_batch()? {
+            for i in 0..b.len() {
+                rows.push(format!("{:?}", b.row(i).unwrap()));
+            }
+        }
+        Ok::<_, Error>((rows, c.plan_json()?))
+    };
+    for q in [
+        "SELECT DISTINCT ?s { { ?s <urn:p> ?v } UNION { ?s <urn:t> ?t } } ORDER BY ?s",
+        // Many ties on the first key, decided by the second or by input order.
+        "SELECT DISTINCT ?s ?v { { ?s <urn:p> ?v } UNION { ?s <urn:p> ?v } } \
+         ORDER BY DESC(?v)",
+        "SELECT DISTINCT ?s ?v { { ?s <urn:p> ?v } UNION { ?s <urn:p> ?v } } \
+         ORDER BY (?v * 2) STR(?s) LIMIT 50 OFFSET 30000",
+        "SELECT ?s { { SELECT DISTINCT ?s { { ?s <urn:p> ?v } UNION { ?s <urn:t> ?t } } \
+         ORDER BY ?s LIMIT 10 OFFSET 15000 } }",
+    ] {
+        let (expected, _) = ordered(q, 256 << 20, None).unwrap();
+        let eager: Vec<String> = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .rows()
+            .into_iter()
+            .map(|r: Vec<Option<Term>>| format!("{r:?}"))
+            .collect();
+        assert_eq!(expected, eager, "{q}");
+        let (rows, plan) =
+            ordered(q, 512 << 10, Some(spill.clone())).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let first = rows.iter().zip(&expected).position(|(a, b)| a != b);
+        assert_eq!((rows.len(), first), (expected.len(), None), "{q}");
+        assert!(plan.contains("below the ORDER BY"), "{q}: {plan}");
+        assert!(plan.contains("\"spillPasses\""), "{q}: {plan}");
+        assert_eq!(spill.reserved_bytes(), 0, "{q}");
+    }
+    // A key that is not projected: the DISTINCT stays above the sort.
+    let q = "SELECT DISTINCT ?s { ?s <urn:p> ?v } ORDER BY ?v ?s";
+    let (expected, _) = ordered(q, 256 << 20, None).unwrap();
+    match ordered(q, 512 << 10, Some(spill.clone())) {
+        Ok((rows, plan)) => {
+            assert_eq!(rows, expected, "{q}");
+            assert!(!plan.contains("below the ORDER BY"), "{q}: {plan}");
+        }
+        Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory),
+        Err(e) => panic!("{q}: {e}"),
     }
 }
 

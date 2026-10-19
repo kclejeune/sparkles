@@ -10,6 +10,12 @@
 //! which partitions what it passes on with another hash. Equal rows always land in the
 //! same file, so each distinct row is emitted once. Rows from the files come after the
 //! input's other rows, so this needs input with no order to keep.
+//!
+//! A numbered DISTINCT deduplicates below an ORDER BY whose keys it carries (item 85).
+//! It adds to each input row its number in the input, deduplicates on the other
+//! columns and keeps each row's first occurrence with its number. The sort above it
+//! orders on its keys and then on that number, which gives the order that sorting
+//! first and deduplicating after would give, whichever pass emitted the row.
 use super::Buffer;
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -68,6 +74,10 @@ pub(super) struct Distinct {
     depth: u64,
     /// The partition this pass reads.
     source: Option<SpillReader>,
+    /// Whether the last column numbers the input rows and is not part of the key.
+    numbered: bool,
+    /// The number of the next input row.
+    next_number: i64,
     /// What the plan reports.
     pub(super) spilled: u64,
     pub(super) passes: usize,
@@ -81,13 +91,17 @@ const MIN_PASS_BYTES: u64 = 256 << 10;
 impl Distinct {
     /// `value_ordered` tells that the input is in an order that operator orders do not
     /// record, such as an ORDER BY's, which forbids passing rows to later passes.
+    /// `numbered` tells that the last of `vars` numbers the input rows, which the
+    /// operator adds, and that the order the operator gives does not matter.
     pub(super) fn new(
         ctx: &Ctx,
         vars: &[VarId],
         input_order: &[VarId],
         value_ordered: bool,
+        numbered: bool,
     ) -> Result<Self> {
-        let adjacent = !vars.is_empty() && vars.iter().all(|v| input_order.contains(v));
+        let keys = &vars[..vars.len() - usize::from(numbered)];
+        let adjacent = !keys.is_empty() && keys.iter().all(|v| input_order.contains(v));
         let base = 256 + vars.len() as u64 * 8;
         Ok(Self {
             seen: None,
@@ -98,7 +112,10 @@ impl Distinct {
             bytes: base,
             base,
             // Rows read back from disk come last, which only unordered input allows.
-            query: if adjacent || vars.is_empty() || !input_order.is_empty() || value_ordered {
+            query: if adjacent
+                || keys.is_empty()
+                || (!numbered && (!input_order.is_empty() || value_ordered))
+            {
                 None
             } else {
                 ctx.spill.clone()
@@ -109,9 +126,27 @@ impl Distinct {
             pending: Vec::new(),
             depth: 0,
             source: None,
+            numbered,
+            next_number: 0,
             spilled: 0,
             passes: 0,
         })
+    }
+
+    /// Add each input row's number as the last column, when the operator numbers rows.
+    pub(super) fn number(&mut self, buffer: &mut Buffer, var: VarId) -> Result<()> {
+        if !self.numbered {
+            return Ok(());
+        }
+        let len = buffer.table.len;
+        let first = self.next_number;
+        self.next_number += len as i64;
+        let column: Vec<Id> = (first..first + len as i64)
+            .map(|n| Id::from_i64(n).ok_or_else(|| Error::invalid("too many DISTINCT rows")))
+            .collect::<Result<_>>()?;
+        buffer.table.vars.push(var);
+        buffer.table.cols.push(column);
+        buffer.reconcile()
     }
 
     /// Whether rows passed to later passes are still to be read.
@@ -168,10 +203,11 @@ impl Distinct {
         let _gather = ctx.charge(passed.len() as u64 * (table.cols.len() as u64 * 8 + 8) + 256)?;
         let seed = self.depth.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5bd1_e995;
         let mut parts: Vec<Vec<usize>> = vec![Vec::new(); PARTITIONS];
+        let width = table.width() - usize::from(self.numbered);
         for &row in passed {
             let mut hasher = rustc_hash::FxHasher::default();
             seed.hash(&mut hasher);
-            for column in &table.cols {
+            for column in &table.cols[..width] {
                 column[row].hash(&mut hasher);
             }
             parts[(hasher.finish() >> 60) as usize % PARTITIONS].push(row);
@@ -210,7 +246,8 @@ impl Distinct {
     }
 
     pub(super) fn apply(&mut self, ctx: &Ctx, buffer: &mut Buffer) -> Result<()> {
-        let width = buffer.table.width();
+        // The key's width: a row's number is not part of it.
+        let width = buffer.table.width() - usize::from(self.numbered);
         let len = buffer.table.len;
         if width == 0 {
             let keep = usize::from(len > 0 && !self.emitted_empty);
@@ -223,8 +260,9 @@ impl Distinct {
         }
         // Room for every row of the batch to be new, reserved before the set grows. While
         // a table grows, its old and new allocations coexist.
+        let numbered = self.numbered;
         let seen = self.seen.get_or_insert_with(|| {
-            if width == 1 {
+            if width == 1 && !numbered {
                 Seen::One(FxHashSet::default())
             } else {
                 Seen::Many {
@@ -322,7 +360,7 @@ impl Distinct {
                         ctx.check()?;
                     }
                     key.clear();
-                    key.extend(buffer.table.cols.iter().map(|column| column[row]));
+                    key.extend(buffer.table.cols[..width].iter().map(|column| column[row]));
                     let hash = FxBuildHasher.hash_one(key.as_slice());
                     let found = table
                         .find(hash, |&r| {
@@ -357,7 +395,7 @@ impl Distinct {
     /// partitions of later passes, so none is emitted now.
     fn apply_frozen(&mut self, ctx: &Ctx, buffer: &mut Buffer) -> Result<()> {
         let len = buffer.table.len;
-        let width = buffer.table.width();
+        let width = buffer.table.width() - usize::from(self.numbered);
         let _rows = ctx.charge(len as u64 * 8 + 64)?;
         let mut passed = Vec::new();
         {
@@ -371,7 +409,7 @@ impl Distinct {
                     Seen::One(ids) => ids.contains(&buffer.table.cols[0][row]),
                     Seen::Many { table, rows } => {
                         key.clear();
-                        key.extend(buffer.table.cols.iter().map(|column| column[row]));
+                        key.extend(buffer.table.cols[..width].iter().map(|column| column[row]));
                         let hash = FxBuildHasher.hash_one(key.as_slice());
                         table
                             .find(hash, |&r| {
@@ -406,15 +444,16 @@ impl Distinct {
         }
         ctx.check()?;
         let _scratch = ctx.charge(len as u64 + table.width() as u64 * 8 + 64)?;
+        let keys = &table.cols[..table.width() - usize::from(self.numbered)];
         let mut keep = vec![false; len];
         keep[0] = self
             .last
             .as_ref()
-            .is_none_or(|last| table.cols.iter().zip(last).any(|(c, &v)| c[0] != v));
+            .is_none_or(|last| keys.iter().zip(last).any(|(c, &v)| c[0] != v));
         for row in 1..len {
-            keep[row] = table.cols.iter().any(|c| c[row] != c[row - 1]);
+            keep[row] = keys.iter().any(|c| c[row] != c[row - 1]);
         }
-        let last: Vec<Id> = table.cols.iter().map(|c| c[len - 1]).collect();
+        let last: Vec<Id> = keys.iter().map(|c| c[len - 1]).collect();
         table.filter_rows(&keep);
         self.last = Some(last);
         buffer.reconcile()
