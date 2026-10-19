@@ -4050,3 +4050,81 @@ fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
     }
     assert!(peaks[1] < peaks[0] * 5 / 4, "{peaks:?}");
 }
+
+/// A store whose `<urn:p>` values in `<urn:g1>` are 400,000 inline decimals below 5,
+/// which keep the ordered top-k on the index, and whose 20,000 `<urn:d:j>` subjects hold
+/// the dictionary decimal `5.0` in each of `graphs` graphs. `shift` singletons of the
+/// same value come first, so the pairs of copies sit at either parity against the block
+/// grid.
+fn union_store(graphs: usize, shift: usize) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let dec = "<http://www.w3.org/2001/XMLSchema#decimal>";
+    let mut data = String::new();
+    for i in 0..400_000 {
+        let (a, bc) = (i % 5, (i / 5) % 100);
+        data.push_str(&format!(
+            "<urn:s:{i}> <urn:p> \"{a}.{bc:02}7\"^^{dec} <urn:g1> .\n"
+        ));
+    }
+    for j in 0..shift {
+        data.push_str(&format!("<urn:a:{j}> <urn:p> \"5.0\"^^{dec} <urn:g1> .\n"));
+    }
+    for j in 0..20_000 {
+        for g in 1..=graphs {
+            data.push_str(&format!(
+                "<urn:d:{j:05}> <urn:p> \"5.0\"^^{dec} <urn:g{g}> .\n"
+            ));
+        }
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NQuads,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+/// A default graph of several named graphs holds each triple once, however the copies of
+/// a triple fall across the morsels of a cursor's ordered top-k: the morsel after a pair
+/// split by a block boundary drops its copy, as one read of the whole range does.
+#[test]
+fn ordered_top_k_dedups_union_graph_rows_across_morsels() {
+    for (graphs, shift) in [(2, 0), (2, 1), (3, 0), (3, 1), (3, 2)] {
+        let s = union_store(graphs, shift);
+        let from = (1..=graphs)
+            .map(|g| format!("FROM <urn:g{g}> "))
+            .collect::<String>();
+        for q in [
+            format!("SELECT ?s ?v {from}WHERE {{ ?s <urn:p> ?v }} ORDER BY DESC(?v) LIMIT 45000"),
+            format!("SELECT ?s ?v {from}WHERE {{ ?s <urn:p> ?v }} ORDER BY DESC(?v) LIMIT 21000"),
+        ] {
+            let eager = query(s.snapshot(), &q, &Default::default()).unwrap();
+            assert!(plan_has(&eager.plan, "IndexTopK"), "{q}: {:#?}", eager.plan);
+            let expected = eager.rows();
+            assert_eq!(
+                expected
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                expected.len(),
+                "{q}: eager repeats a row"
+            );
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let c =
+                    select_cursor(s.snapshot(), &q, &Default::default(), &options(4096)).unwrap();
+                let rows = pool.install(|| all(c));
+                assert_eq!(
+                    rows.len(),
+                    expected.len(),
+                    "{q}: {graphs} graphs, shift {shift}, {threads} threads"
+                );
+                assert_eq!(rows, expected, "{q}: {graphs} graphs, shift {shift}");
+            }
+        }
+    }
+}

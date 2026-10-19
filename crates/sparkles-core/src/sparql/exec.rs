@@ -2777,16 +2777,32 @@ fn topk_read_keys(
     exact: bool,
     vars: &[VarId],
 ) -> Result<(Table, usize)> {
+    topk_read_keys_last(ctx, spec, lo, hi, exact, vars).map(|(t, n, _)| (t, n))
+}
+
+/// [`topk_read_keys`], with the last row the scan produced before any filter when the
+/// scan drops duplicate rows of a union default graph: the next read of the same piece
+/// must drop that row again if it starts with it.
+fn topk_read_keys_last(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    lo: crate::index::Key,
+    hi: crate::index::Key,
+    exact: bool,
+    vars: &[VarId],
+) -> Result<(Table, usize, Option<Vec<Id>>)> {
     let mut t = Table::new(vars.to_vec());
     scan_into(ctx, &spec.scan, lo, hi, None, &mut t)?;
     let scanned = t.len();
+    let last =
+        (spec.scan.dedup && scanned > 0).then(|| t.cols.iter().map(|c| c[scanned - 1]).collect());
     if !exact && !spec.range_filter.is_empty() && !t.is_empty() {
         apply_range_filter(ctx, &mut t, spec.var, &spec.range_filter)?;
     }
     if !spec.filter.is_empty() && !t.is_empty() {
         apply_filter(ctx, &mut t, &spec.filter)?;
     }
-    Ok((t, scanned))
+    Ok((t, scanned, last))
 }
 
 /// The order-column id of the base row `want` rows from the best end of the ids
@@ -3067,6 +3083,16 @@ impl HeapRows<u32> for RestOffer<'_> {
 /// piece without value order: a single block.
 const TOPK_MORSEL_ROWS: usize = crate::index::BLOCK_ROWS;
 
+/// The keys `[first, last]` of one morsel of [`cursor_topk_rest`], the piece it belongs
+/// to and the rows of its blocks.
+struct Morsel {
+    first: Key,
+    last: Key,
+    exact: bool,
+    piece: usize,
+    rows: usize,
+}
+
 /// [`topk_rest`] for a cursor. The pieces are split into morsels of whole index blocks,
 /// which are read in parallel. Each morsel keeps its rows that have fewer than k rows of
 /// the morsel ahead of them, ties broken by arrival, in arrival order, and those rows are
@@ -3094,8 +3120,8 @@ fn cursor_topk_rest(
     // The morsels of every piece, in key order. Delta keys between two morsels belong to
     // the one before the gap, so each morsel but a piece's last ends just before the next
     // one's first block, and a piece with no base block is one morsel.
-    let mut morsels: Vec<(Key, Key, bool)> = Vec::new();
-    for p in pieces {
+    let mut morsels: Vec<Morsel> = Vec::new();
+    for (piece, p) in pieces.iter().enumerate() {
         let (lo, hi) = (bound(p.lo, 0), bound(p.hi, u64::MAX));
         let (b0, b1) = perm.key_block_range(&lo, &hi);
         let mut b = b0;
@@ -3125,7 +3151,13 @@ fn cursor_topk_rest(
                 }
                 next.min(hi)
             };
-            morsels.push((first, last, p.exact));
+            morsels.push(Morsel {
+                first,
+                last,
+                exact: p.exact,
+                piece,
+                rows,
+            });
             if e >= b1 {
                 break;
             }
@@ -3133,6 +3165,7 @@ fn cursor_topk_rest(
         }
     }
     ctx.check()?;
+    let _list = ctx.charge((morsels.capacity() * std::mem::size_of::<Morsel>()) as u64)?;
     let mut heap: TopK<u32> = TopK::new(spec.k, vec![spec.asc]);
     let mut slots = RestSlots {
         width: vars.len(),
@@ -3144,17 +3177,35 @@ fn cursor_topk_rest(
         + std::mem::size_of::<SortKey>() as u64
         + vars.len() as u64 * 8;
     let mut held = ctx.retained_charge(1024)?;
+    // The last row the scan of the previous morsel of the same piece produced, when the
+    // scan drops duplicate rows of a union default graph. The copies of a triple are
+    // adjacent in key order, and the scan of one morsel drops them within the morsel,
+    // so a morsel can only repeat the previous one's last row, as its first row.
+    let mut carried: Option<(usize, Vec<Id>)> = None;
     // A wave of one morsel per worker at a time: a worker that waits inside a morsel's
     // own parallel work could otherwise steal and start every other morsel.
     for wave in morsels.chunks(rayon::current_num_threads().max(1)) {
         let parts = wave
             .par_iter()
-            .map(|&(first, last, exact)| morsel_best(ctx, spec, vars, &keys, first, last, exact))
+            .map(|m| morsel_best(ctx, spec, vars, &keys, m))
             .collect::<Result<Vec<_>>>()?;
         let Some(parts) = parts.into_iter().collect::<Option<Vec<_>>>() else {
             return Ok(None);
         };
-        for (t, n) in parts {
+        for (m, (mut t, mut n, last)) in wave.iter().zip(parts) {
+            if let Some((piece, row)) = &carried
+                && *piece == m.piece
+                && !t.is_empty()
+                && t.cols.iter().zip(row).all(|(c, &id)| c[0] == id)
+            {
+                // a read of the whole piece drops this copy, as eager execution does
+                let rows: Vec<usize> = (1..t.len()).collect();
+                t = t.take_rows(&rows);
+                n -= 1;
+            }
+            if let Some(last) = last {
+                carried = Some((m.piece, last));
+            }
             *scanned += n;
             if t.is_empty() {
                 continue;
@@ -3205,15 +3256,17 @@ fn morsel_best(
     spec: &OrderedTopK,
     vars: &[VarId],
     keys: &[(Expr, bool)],
-    first: Key,
-    last: Key,
-    exact: bool,
-) -> Result<Option<(Table, usize)>> {
-    let (mut t, n) = topk_read_keys(ctx, spec, first, last, exact, vars)?;
+    m: &Morsel,
+) -> Result<Option<(Table, usize, Option<Vec<Id>>)>> {
+    // the morsel's rows, charged from its blocks before they are read and then at their
+    // real size
+    let estimate = (m.rows as u64).saturating_mul(vars.len() as u64 * 8);
+    let rows = ctx.charge(estimate)?;
+    let (mut t, n, last) = topk_read_keys_last(ctx, spec, m.first, m.last, m.exact, vars)?;
     if t.is_empty() {
-        return Ok(Some((t, n)));
+        return Ok(Some((t, n, last)));
     }
-    let _rows = ctx.charge(t.mem_bytes())?;
+    rows.add(t.mem_bytes().saturating_sub(estimate))?;
     let decoded = super::exprcache::cursor_dictionary_values(ctx, &t, &Expr::Var(spec.var))?;
     let total = match &decoded {
         Some(values) => cursor_rest_total(ctx, &t, values)?,
@@ -3249,7 +3302,7 @@ fn morsel_best(
         t = t.take_rows(&rows);
     }
     ctx.check()?;
-    Ok(Some((t, n)))
+    Ok(Some((t, n, last)))
 }
 
 /// [`OrderedTopK`]: the first k rows of the ORDER BY, in its order; `None` when a value
