@@ -206,11 +206,11 @@ impl Distinct {
         let width = table.width() - usize::from(self.numbered);
         for &row in passed {
             let mut hasher = rustc_hash::FxHasher::default();
-            seed.hash(&mut hasher);
             for column in &table.cols[..width] {
                 column[row].hash(&mut hasher);
             }
-            parts[(hasher.finish() >> 60) as usize % PARTITIONS].push(row);
+            let hash = super::joinspill::mix(hasher.finish() ^ seed);
+            parts[(hash >> 60) as usize % PARTITIONS].push(row);
         }
         if self.writers.is_empty() {
             self.writers.resize_with(PARTITIONS, || None);

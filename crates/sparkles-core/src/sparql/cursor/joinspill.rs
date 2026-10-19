@@ -32,7 +32,6 @@ use crate::sparql::table::{Table, VarId};
 use crate::spill::{QuerySpill, SpillKind, SpillReader, SpillRun, SpillWriter};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// The least memory a spilled join plans for, whatever room the query has left.
@@ -51,12 +50,20 @@ const FAN_IN: usize = 64;
 const MIN_SPOOL_ROWS: usize = 16;
 
 /// The partition of `key` at partitioning level `level`, among `fanout` partitions.
+/// Each level mixes the key with its own seed, so that the rows of one partition spread
+/// evenly over the partitions of the next level.
 fn partition(key: Id, level: u64, fanout: usize) -> usize {
-    let mut hasher = rustc_hash::FxHasher::default();
-    (level.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x2545_f491_4f6c_dd1d).hash(&mut hasher);
-    key.hash(&mut hasher);
-    // The high bits mix best.
-    (hasher.finish() >> 58) as usize % fanout
+    (mix(key.0 ^ (level + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> 58) as usize % fanout
+}
+
+/// The SplitMix64 finalizer, whose output bits each depend on every input bit. Spilled
+/// joins, groupings and DISTINCT pick a row's partition from its high bits with a seed
+/// per level. A multiplicative hash such as FxHash alone kept most of a partition's rows
+/// together at the next level, since its high bits change little with the seed.
+pub(super) fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// The bytes a table of `rows` rows of `width` columns and a hash index over it may
@@ -617,10 +624,11 @@ impl JoinSpill {
         Ok(())
     }
 
-    /// The rows one chunk of build rows may hold: half of the join's budget, or of the
-    /// room left when that is more, with no chunk held.
+    /// The rows one chunk of build rows may hold: half of the join's budget, or a quarter
+    /// of the room left with no chunk held when that is more.
     fn chunk_rows(&self, ctx: &Ctx, width: usize) -> u64 {
-        (self.budget.max(ctx.memory_room()) / 2 / chunk_row_bytes(width)).max(MIN_FRAME_ROWS as u64)
+        let bytes = (self.budget / 2).max(ctx.memory_room() / 4);
+        (bytes / chunk_row_bytes(width)).max(MIN_FRAME_ROWS as u64)
     }
 
     /// Partition a job's build and probe files again with the next seed.
@@ -1123,6 +1131,32 @@ mod tests {
     const SHARED: VarId = 1;
     const LEFT: VarId = 2;
     const RIGHT: VarId = 3;
+
+    /// The keys of one partition spread evenly over the partitions of the next level,
+    /// both for dictionary ids that differ in their low bits and for inline integers.
+    #[test]
+    fn partitioning_again_divides_a_partition() {
+        let dictionary = (0..200_000u64).map(|i| Id(i * 3 + 17));
+        let inline = (0..200_000i64).map(|i| Id::from_i64(i).unwrap());
+        for keys in [dictionary.collect::<Vec<_>>(), inline.collect()] {
+            for level in 0..MAX_LEVEL {
+                let first: Vec<Id> = keys
+                    .iter()
+                    .copied()
+                    .filter(|&key| partition(key, level, 8) == 0)
+                    .collect();
+                let mut counts = [0usize; 8];
+                for &key in &first {
+                    counts[partition(key, level + 1, 8)] += 1;
+                }
+                let even = first.len() / 8;
+                assert!(
+                    counts.iter().all(|&c| c > even * 3 / 4 && c < even * 5 / 4),
+                    "level {level}: {counts:?}"
+                );
+            }
+        }
+    }
 
     fn context(limit: u64, spill: Option<&Arc<crate::spill::Spill>>) -> Arc<Ctx> {
         let store = Store::in_memory(StoreOptions::default());

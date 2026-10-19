@@ -328,13 +328,12 @@ impl Group {
             .filter(|&(_, &slot)| slot == PASSED)
         {
             let mut hasher = rustc_hash::FxHasher::default();
-            seed.hash(&mut hasher);
             for key in &self.keys {
                 key.map_or(Id::UNDEF, |c| table.cols[c][row])
                     .hash(&mut hasher);
             }
-            // The high bits mix best.
-            parts[(hasher.finish() >> 60) as usize % PARTITIONS].push(row);
+            let hash = super::joinspill::mix(hasher.finish() ^ seed);
+            parts[(hash >> 60) as usize % PARTITIONS].push(row);
         }
         if self.writers.is_empty() {
             self.writers.resize_with(PARTITIONS, || None);
