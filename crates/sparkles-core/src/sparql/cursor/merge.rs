@@ -1,5 +1,10 @@
 //! Resumable merge joins over certainly-bound, equally ordered keys. Equal-key
 //! runs may grow; their capacities stay on the query budget across output pulls.
+//!
+//! A query that may spill writes a run of equal keys that outgrows a quarter of the room
+//! it had when the run started, or whose charge fails, to a spill file (X08 §6.3). The
+//! pair of runs then joins from the file: the left run is read once, and the right run
+//! is read again for each left row, so the output keeps its left-major order.
 use super::{Buffer, CursorOptions, Operator, capacity_bytes};
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -8,6 +13,7 @@ use crate::sparql::exec;
 use crate::sparql::plan::{JoinAlgo, Kind, Node};
 use crate::sparql::table::{Table, VarId};
 use crate::sparql::zipper;
+use crate::spill::{SpillKind, SpillReader, SpillRun, SpillWriter};
 use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::Arc;
@@ -53,6 +59,8 @@ struct Input {
 struct Run {
     owned: Option<Buffer>,
     rows: Range<usize>,
+    /// The run's rows on disk, when they outgrew memory. `rows` then counts them.
+    spooled: Option<Arc<SpillRun>>,
 }
 struct Pair {
     left: Run,
@@ -67,6 +75,11 @@ pub(super) struct Merge {
     keys: [Vec<usize>; 2],
     columns: Vec<(Option<usize>, Option<usize>)>,
     pair: Option<Pair>,
+    /// A pair of runs of which at least one was spooled to disk.
+    spooled: Option<Box<SpooledPair>>,
+    /// What the plan reports: the bytes and runs spooled.
+    pub(super) spilled: u64,
+    pub(super) spooled_runs: u64,
     optional: bool,
     /// For MINUS and semi and anti joins, whether a left row passes when the right
     /// input has its key (a semi join) or when it lacks it.
@@ -147,6 +160,7 @@ impl Input {
             return Ok(Run {
                 owned: None,
                 rows: range,
+                spooled: None,
             });
         }
         // Only a run touching an unproven batch boundary needs a copy. Ordinary
@@ -157,7 +171,21 @@ impl Input {
             .map(|&c| self.table().cols[c][self.at])
             .collect();
         let mut held = Buffer::new(ctx, &self.table().vars, range.len())?;
-        append(ctx, &mut held, self.table(), range)?;
+        // A query that may spill writes a run that outgrows a quarter of its room.
+        let threshold = ctx
+            .spill
+            .is_some()
+            .then(|| (ctx.memory_room() / 4).max(SPOOL_MIN_BYTES));
+        let mut spool: Option<SpillWriter> = None;
+        let mut spooled_rows = 0usize;
+        self.hold(
+            ctx,
+            &mut held,
+            &mut spool,
+            &mut spooled_rows,
+            threshold,
+            range,
+        )?;
         self.at = end;
         loop {
             if !self.ensure(ctx, child, options, cap)? {
@@ -172,17 +200,289 @@ impl Input {
             }
             let end = self.end(ctx, columns)?;
             let range = self.at..end;
-            append(ctx, &mut held, self.table(), range)?;
+            self.hold(
+                ctx,
+                &mut held,
+                &mut spool,
+                &mut spooled_rows,
+                threshold,
+                range,
+            )?;
             self.at = end;
             if end < self.table().len || child.done {
                 break;
             }
         }
+        if let Some(writer) = spool {
+            let run = writer.finish()?;
+            return Ok(Run {
+                owned: None,
+                rows: 0..spooled_rows,
+                spooled: Some(Arc::new(run)),
+            });
+        }
         let n = held.table.len;
         Ok(Run {
             owned: Some(held),
             rows: 0..n,
+            spooled: None,
         })
+    }
+
+    /// Add `range` of the loaded batch to a run: to `held` while it fits, and to the
+    /// spill file `spool` once it does not.
+    fn hold(
+        &self,
+        ctx: &Arc<Ctx>,
+        held: &mut Buffer,
+        spool: &mut Option<SpillWriter>,
+        spooled_rows: &mut usize,
+        threshold: Option<u64>,
+        range: Range<usize>,
+    ) -> Result<()> {
+        let table = self.table();
+        if spool.is_none() {
+            let over = threshold.filter(|&threshold| {
+                held.charge
+                    .bytes()
+                    .saturating_add(range.len() as u64 * table.width() as u64 * 8)
+                    > threshold
+            });
+            let held_now = match over {
+                Some(threshold) => Err(ctx.memory_exceeded(threshold)),
+                None => append(ctx, held, table, range.clone()),
+            };
+            match held_now {
+                Ok(()) => return Ok(()),
+                Err(error) if super::binary::spills(ctx, &error) => {
+                    let query = ctx.spill.clone().expect("a query that may spill");
+                    let mut writer = query.create(SpillKind::JoinPartition, table.width())?;
+                    // Frames that a quarter of the run's room holds a few of.
+                    let room = threshold.unwrap_or(SPOOL_MIN_BYTES);
+                    writer.set_frame_rows(
+                        ((room / 4) / (table.width().max(1) as u64 * 16)).max(64) as usize,
+                    );
+                    let slices: Vec<&[Id]> = held.table.cols.iter().map(Vec::as_slice).collect();
+                    writer.write(&slices, held.table.len)?;
+                    *spooled_rows += held.table.len;
+                    for column in &mut held.table.cols {
+                        *column = Vec::new();
+                    }
+                    held.table.len = 0;
+                    held.reconcile()?;
+                    *spool = Some(writer);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        ctx.check()?;
+        let writer = spool.as_mut().expect("a spooled run");
+        let slices: Vec<&[Id]> = table.cols.iter().map(|c| &c[range.clone()]).collect();
+        writer.write(&slices, range.len())?;
+        *spooled_rows += range.len();
+        Ok(())
+    }
+}
+
+/// The least room a run may take before it is spooled to disk.
+const SPOOL_MIN_BYTES: u64 = 16 << 10;
+
+/// One run of a spooled pair: its rows in memory, or a spill file read frame by frame.
+enum Side {
+    Rows(Buffer),
+    File {
+        run: Arc<SpillRun>,
+        reader: Option<SpillReader>,
+        frame: Vec<Vec<Id>>,
+    },
+}
+
+impl Side {
+    fn new(ctx: &Arc<Ctx>, run: Run, input: &Input) -> Result<Self> {
+        Ok(match run {
+            Run {
+                spooled: Some(run), ..
+            } => Side::File {
+                run,
+                reader: None,
+                frame: Vec::new(),
+            },
+            Run {
+                owned: Some(held), ..
+            } => Side::Rows(held),
+            Run { rows, .. } => {
+                let mut held = Buffer::new(ctx, &input.table().vars, rows.len())?;
+                append(ctx, &mut held, input.table(), rows)?;
+                Side::Rows(held)
+            }
+        })
+    }
+
+    /// Start reading the run again from its first row.
+    fn restart(&mut self) -> Result<()> {
+        if let Side::File { run, reader, frame } = self {
+            *reader = Some(run.reader()?);
+            frame.clear();
+        }
+        Ok(())
+    }
+
+    /// The next frame's length, or `None` at the end. A run in memory is one frame.
+    fn next_frame(&mut self, ctx: &Ctx, started: bool) -> Result<Option<usize>> {
+        match self {
+            Side::Rows(held) => Ok((!started).then_some(held.table.len)),
+            Side::File { reader, frame, .. } => {
+                ctx.check()?;
+                match reader.as_mut().expect("a started run").next_frame()? {
+                    Some((columns, n)) => {
+                        *frame = columns;
+                        Ok(Some(n))
+                    }
+                    None => {
+                        frame.clear();
+                        Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    fn cols(&self) -> &[Vec<Id>] {
+        match self {
+            Side::Rows(held) => &held.table.cols,
+            Side::File { frame, .. } => frame,
+        }
+    }
+}
+
+/// Two runs of equal keys, at least one of them on disk, joined left row by left row:
+/// every left row meets the whole right run, which a file reads again for each.
+struct SpooledPair {
+    left: Side,
+    right: Side,
+    /// The current left frame's length, the left row in it, and whether a frame was
+    /// read.
+    llen: usize,
+    li: usize,
+    lstarted: bool,
+    rlen: usize,
+    ri: usize,
+    rstarted: bool,
+    matched: bool,
+    done: bool,
+    _charge: Option<RetainedCharge>,
+}
+
+impl SpooledPair {
+    fn new(ctx: &Arc<Ctx>, left: Run, right: Run, inputs: &[Input; 2]) -> Result<Self> {
+        let mut left = Side::new(ctx, left, &inputs[0])?;
+        let mut right = Side::new(ctx, right, &inputs[1])?;
+        left.restart()?;
+        right.restart()?;
+        // A frame of each file, decoded and as read.
+        let frame = |side: &Side, width: usize| match side {
+            Side::File { run, .. } => {
+                run.rows().div_ceil(run.frames().max(1)) * width as u64 * 8 * 2
+            }
+            Side::Rows(_) => 0,
+        };
+        let charge = ctx.retained_charge(
+            frame(&left, inputs[0].table().width())
+                + frame(&right, inputs[1].table().width())
+                + 1024,
+        )?;
+        Ok(Self {
+            left,
+            right,
+            llen: 0,
+            li: 0,
+            lstarted: false,
+            rlen: 0,
+            ri: 0,
+            rstarted: false,
+            matched: false,
+            done: false,
+            _charge: charge,
+        })
+    }
+
+    /// Append at most `cap` rows of output in total to `out`, ending the pair when its
+    /// left run is spent.
+    fn fill(
+        &mut self,
+        ctx: &Ctx,
+        columns: &[(Option<usize>, Option<usize>)],
+        optional: bool,
+        out: &mut Buffer,
+        cap: usize,
+    ) -> Result<()> {
+        let mut steps = 0usize;
+        while out.table.len < cap {
+            if steps.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            steps += 1;
+            if self.li >= self.llen {
+                match self.left.next_frame(ctx, self.lstarted)? {
+                    Some(n) => {
+                        self.lstarted = true;
+                        self.llen = n;
+                        self.li = 0;
+                        continue;
+                    }
+                    None => {
+                        self.done = true;
+                        break;
+                    }
+                }
+            }
+            if self.ri >= self.rlen {
+                if let Some(n) = self.right.next_frame(ctx, self.rstarted)? {
+                    self.rstarted = true;
+                    self.rlen = n;
+                    self.ri = 0;
+                    continue;
+                }
+                // The right run is spent for this left row.
+                let left = self.left.cols();
+                if optional && !self.matched {
+                    for (col, &(l, _)) in out.table.cols.iter_mut().zip(columns) {
+                        col.push(l.map_or(Id::UNDEF, |c| left[c][self.li]));
+                    }
+                    out.table.len += 1;
+                }
+                self.li += 1;
+                self.matched = false;
+                self.right.restart()?;
+                self.rstarted = false;
+                self.rlen = 0;
+                self.ri = 0;
+                continue;
+            }
+            let (left, right) = (self.left.cols(), self.right.cols());
+            let (li, ri) = (self.li, self.ri);
+            let compatible = columns.iter().all(|&(l, r)| match (l, r) {
+                (Some(l), Some(r)) => {
+                    let (l, r) = (left[l][li], right[r][ri]);
+                    l == r || l.is_undef() || r.is_undef()
+                }
+                _ => true,
+            });
+            if compatible {
+                self.matched = true;
+                for (col, &(l, r)) in out.table.cols.iter_mut().zip(columns) {
+                    let value = l.map_or(Id::UNDEF, |c| left[c][li]);
+                    col.push(if value.is_undef() {
+                        r.map_or(value, |c| right[c][ri])
+                    } else {
+                        value
+                    });
+                }
+                out.table.len += 1;
+            }
+            self.ri += 1;
+        }
+        Ok(())
     }
 }
 
@@ -280,6 +580,9 @@ impl Merge {
             keys: [key_columns(0), key_columns(1)],
             columns,
             pair: None,
+            spooled: None,
+            spilled: 0,
+            spooled_runs: 0,
             optional: matches!(node.kind, Kind::LeftJoin { .. }),
             filter: match node.kind {
                 Kind::Minus => Some(false),
@@ -711,6 +1014,13 @@ impl Merge {
                 ctx.check()?;
             }
             steps += 1;
+            if let Some(spooled) = &mut self.spooled {
+                spooled.fill(ctx, &self.columns, self.optional, &mut out, cap)?;
+                if spooled.done {
+                    self.spooled = None;
+                }
+                continue;
+            }
             if self.pair.is_none() {
                 // Preserve empty-left short circuit and callback behavior.
                 if !self.inputs[0].ensure(ctx, &mut children[0], options, cap)? {
@@ -792,6 +1102,17 @@ impl Merge {
                     self.inputs[0].run(ctx, &mut children[0], options, cap, &self.keys[0])?;
                 let right =
                     self.inputs[1].run(ctx, &mut children[1], options, cap, &self.keys[1])?;
+                if left.spooled.is_some() || right.spooled.is_some() {
+                    for run in [&left, &right] {
+                        if let Some(file) = &run.spooled {
+                            self.spilled += file.bytes();
+                            self.spooled_runs += 1;
+                        }
+                    }
+                    let spooled = SpooledPair::new(ctx, left, right, &self.inputs)?;
+                    self.spooled = Some(Box::new(spooled));
+                    continue;
+                }
                 let (li, ri) = (left.rows.start, right.rows.start);
                 self.pair = Some(Pair {
                     left,
@@ -1174,6 +1495,87 @@ mod tests {
     }
 
     /// Debug builds check that output batches keep the order their operator claims.
+    /// A run of equal keys larger than a quarter of the room spools to disk, on either
+    /// side or both, and the join still gives the eager bag, with an OPTIONAL's
+    /// unmatched rows and the order the merge claims.
+    #[test]
+    fn long_runs_spool_to_disk_and_join_as_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 34,
+            query_bytes: 1 << 34,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let run = |key: i64, n: usize, shared: usize, base: i64| -> Vec<Vec<i64>> {
+            (0..n)
+                .map(|i| {
+                    let s = if i % 11 == 0 { -1 } else { (i % shared) as i64 };
+                    vec![key, s, base + i as i64]
+                })
+                .collect()
+        };
+        let long = [run(0, 6, 3, 0), run(1, 1500, 5, 100), run(3, 3, 2, 9000)].concat();
+        let short = [
+            run(1, 150, 7, 20_000),
+            run(2, 5, 2, 30_000),
+            run(3, 2, 2, 40_000),
+        ]
+        .concat();
+        let mut spooled = 0;
+        let half = long[..1000].to_vec();
+        for (left, right) in [(&long, &short), (&short, &long), (&long, &half)] {
+            for optional in [false, true] {
+                let mut node = join(values(vec![0, 1, 2], left), values(vec![0, 1, 3], right));
+                if optional {
+                    node.kind = Kind::LeftJoin { expr: None };
+                }
+                let expected = rows(&exec::execute(&context(u64::MAX), &node).unwrap().0);
+                for cap in [7, 512] {
+                    let ctx = {
+                        let store = Store::in_memory(StoreOptions::default());
+                        let mut ctx = Ctx::new(store.snapshot());
+                        for name in ["key", "shared", "left", "right"] {
+                            ctx.var(name);
+                        }
+                        ctx.mem_limit = 128 << 10;
+                        ctx.spill = Some(Arc::new(spill.query(None)));
+                        ctx.enable_cursor_accounting().unwrap();
+                        let ctx = Arc::new(ctx);
+                        ctx.attach_cursor_owner();
+                        ctx
+                    };
+                    let mut op =
+                        Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
+                            .unwrap();
+                    assert!(matches!(op.state, super::super::State::Merge(_)));
+                    let options = CursorOptions {
+                        batch_rows: cap,
+                        ..Default::default()
+                    };
+                    let mut result = Vec::new();
+                    while let Some(batch) = op.next(&ctx, &options, cap).unwrap() {
+                        result.extend(rows(&batch.table));
+                    }
+                    if let super::super::State::Merge(merge) = &op.state {
+                        spooled += merge.spooled_runs;
+                    }
+                    result.sort();
+                    assert_eq!(
+                        result.len(),
+                        expected.len(),
+                        "optional {optional} cap {cap}"
+                    );
+                    assert_eq!(result, expected, "optional {optional} cap {cap}");
+                }
+            }
+        }
+        assert!(spooled >= 12, "{spooled} runs spooled");
+        assert_eq!(spill.reserved_bytes(), 0);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "out of order")]

@@ -26,6 +26,7 @@ mod extsort;
 mod filter;
 pub mod graph;
 mod group;
+mod joinspill;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
 mod topk;
@@ -1980,6 +1981,13 @@ impl Operator {
         // Read before the children below become shells that keep only their order.
         let value_ordered_input =
             matches!(node.kind, Kind::Distinct) && node.children.first().is_some_and(value_ordered);
+        // A hash join that spills keeps its probe input's order when that input comes in
+        // an order a caller observes.
+        let probe_value_ordered = joins
+            && node
+                .children
+                .get(binary::probe_side(&node))
+                .is_some_and(value_ordered);
         // A fallback materializes only its own operator when it reads its children as
         // input tables. Those children then stream as cursors of their own.
         let inputs = materializes
@@ -2073,7 +2081,7 @@ impl Operator {
             .then(|| group::Group::new(ctx, &node))
             .transpose()?;
         let binary = incremental_binary
-            .then(|| binary::Binary::new(ctx, &node))
+            .then(|| binary::Binary::new(ctx, &node, !order.is_empty() || probe_value_ordered))
             .transpose()?;
         if binary.is_some()
             && let Kind::Join {
@@ -2521,10 +2529,32 @@ impl Operator {
                     batch
                 }
                 State::Merge(merge) => {
-                    merge.next(ctx, &mut self.children, options, &self.vars, cap)?
+                    let batch = merge.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if merge.spooled_runs > 0 {
+                        let mut counters = self.info.counters.take().unwrap_or_default();
+                        counters.insert("spilledBytes".into(), merge.spilled.into());
+                        counters.insert("spooledRuns".into(), merge.spooled_runs.into());
+                        self.info.counters = Some(counters);
+                    }
+                    batch
                 }
                 State::Binary(binary) => {
-                    binary.next(ctx, &mut self.children, options, &self.vars, cap)?
+                    let batch = binary.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(spill) = &binary.spill {
+                        let mut counters = self.info.counters.take().unwrap_or_default();
+                        let stats = &spill.stats;
+                        counters.insert("spilledBytes".into(), stats.written.into());
+                        counters.insert("spillPartitions".into(), stats.partitions.into());
+                        counters.insert("spillLevels".into(), stats.levels.into());
+                        if stats.chunks > 0 {
+                            counters.insert("spillChunks".into(), stats.chunks.into());
+                        }
+                        if binary.ordered {
+                            counters.insert("spillMergePasses".into(), stats.merge_passes.into());
+                        }
+                        self.info.counters = Some(counters);
+                    }
+                    batch
                 }
                 State::Group(group) => {
                     let batch = group.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
