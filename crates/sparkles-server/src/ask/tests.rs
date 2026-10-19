@@ -437,26 +437,66 @@ fn mentions_and_words() {
     assert!(mentions("how many people are there?").is_empty());
     assert!(words("startDate of Teams").contains("team"));
     assert!(words("startDate").contains("date"));
-    assert!(has_service("SELECT * { SERVICE <http://x/> { ?s ?p ?o } }"));
-    assert!(!has_service(
-        "SELECT * { ?s <http://x/service> \"service\" }"
-    ));
+}
+
+/// Whether `sparkles ask` would leave a query unrun as a SERVICE call. The check reads
+/// the parsed query, so no spelling of the text can hide a SERVICE pattern.
+fn calls_service(q: &str) -> bool {
+    let prefixes = [
+        (
+            "pv".to_string(),
+            "http://ld.company.org/prod-vocab/".to_string(),
+        ),
+        (
+            "service".to_string(),
+            "http://example.org/service#".to_string(),
+        ),
+        ("e".to_string(), "http://e/".to_string()),
+    ];
+    has_service(
+        sparkles::sparql::parse_query(q, None, &prefixes)
+            .ok()
+            .as_ref(),
+    )
+}
+
+#[test]
+fn service_calls_are_found_in_the_parsed_query() {
     // A class, a variable or a prefix named like the keyword is not a SERVICE call.
     // CK25 has a class pv:Service, and its questions were left unrun before this.
     for q in [
+        "SELECT * { ?s <http://x/service> \"service\" }",
         "SELECT ?service ?name WHERE { ?service a pv:Service ; pv:name ?name }",
         "SELECT * { ?s a service:Thing } # a SERVICE in a comment",
         "SELECT * { ?s ?p \"a \\\" SERVICE\" . FILTER(?p < ?q) ?s ?p $service }",
+        "SELECT * { ?s ?p \"\"\"SERVICE <http://x/> { }\"\"\" }",
     ] {
-        assert!(!has_service(q), "{q}");
+        assert!(!calls_service(q), "{q}");
     }
     for q in [
+        "SELECT * { SERVICE <http://x/> { ?s ?p ?o } }",
         "SELECT * { service <http://x/> { ?s ?p ?o } }",
         "SELECT * { SERVICE SILENT <http://x/> { ?s ?p ?o } }",
         "SELECT * { ?s ?p ?o . SERVICE<http://x/>{ ?s ?p ?o } }",
-        "SELECT * { FILTER(?a < ?b) SERVICE ?endpoint { ?s ?p ?o } }",
+        "SELECT * { ?s ?p ?o FILTER(?s < ?o) SERVICE ?endpoint { ?s ?p ?o } }",
+        // Text scans of earlier versions missed each of these.
+        "SELECT * { ?s e:a\\#b ?o . SERVICE <http://x/> { ?s ?p ?o } }",
+        "SELECT * { ?s ?p ?o # x\r SERVICE <http://x/> { ?s ?p ?o } }",
+        "SELECT * { ?s ?p ?o FILTER(?o<5)SERVICE <http://x/> { ?s ?p ?o } }",
+        "SELECT * { ?s ?p \"\"\"a\"b\"\"\" . SERVICE <http://x/> { ?s ?p ?o } }",
+        "SELECT * { \\u0053ERVICE <http://x/> { ?s ?p ?o } }",
+        // Inside EXISTS, NOT EXISTS, a bind, an ordering, an aggregate and a subquery.
+        "SELECT * { ?s ?p ?o FILTER EXISTS { SERVICE <http://x/> { ?s ?p ?o } } }",
+        "SELECT * { ?s ?p ?o FILTER NOT EXISTS { SERVICE <http://x/> { ?s ?p ?o } } }",
+        "SELECT * { ?s ?p ?o BIND(EXISTS { SERVICE <http://x/> { ?s ?p ?o } } AS ?b) }",
+        "SELECT * { ?s ?p ?o } ORDER BY (EXISTS { SERVICE <http://x/> { ?s ?p ?o } })",
+        "SELECT (COUNT(EXISTS { SERVICE <http://x/> { ?s ?p ?o } }) AS ?n) { ?s ?p ?o }",
+        "SELECT * { { SELECT ?s { SERVICE <http://x/> { ?s ?p ?o } } } }",
+        "ASK { OPTIONAL { ?s ?p ?o FILTER EXISTS { SERVICE <http://x/> { } } } }",
+        // A query that does not parse is never run by itself.
+        "SELECT * { SERVICE",
     ] {
-        assert!(has_service(q), "{q}");
+        assert!(calls_service(q), "{q}");
     }
 }
 
