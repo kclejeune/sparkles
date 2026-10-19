@@ -4213,7 +4213,7 @@ fn mixed_store(n: usize, seed: u64, delta: bool) -> Store {
     };
     let decimal = |i: usize, r: u64| {
         let (whole, digit) = (r % 2000, 1 + r % 9);
-        let value = if i % 3 == 0 {
+        let value = if i.is_multiple_of(3) {
             format!("{whole}.{digit}0")
         } else {
             format!("{whole}.{digit}")
