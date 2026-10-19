@@ -1247,8 +1247,12 @@ where this section says otherwise. `DRAFT_FORMAT` is now 2, because property sha
 The MCP tools, `check_query` and `sparkles ask` read a cheaper report on large stores, as
 [C18](C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
 describes for DBpedia. `SchemaOptions::statistics_above` builds the observed layer from
-the statistics of the index build and the delta when the store holds more quads than it
-names, the selection holds every quad and the caller reads every graph. The report
+the statistics of the index build when the store holds more quads than it names, the
+caller reads every graph and the graphs the selection leaves out hold at most a million
+base quads. `sparql::stats::exact_counts` corrects the statistics exactly for those
+graphs and for the delta, as it does for the planner, so the distinct counts and class
+instances equal a scan's, and a correction that would cost more than a scan falls back
+to one. The report
 then has `"basis": "statistics"`, which the JSON shape adds as an optional member, and
 the exact report leaves it out. `schema::predicate_objects` measures one predicate's
 objects on demand. The report endpoint, `sparkles schema` and VoID keep the exact

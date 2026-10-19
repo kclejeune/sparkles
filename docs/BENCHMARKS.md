@@ -865,6 +865,28 @@ the data decides how much a star gains. The change keeps the star masks and prob
 with each plan, which costs 2.6 to 3.2% more planning instructions for a snowflake of
 12 patterns and up to 64 MB while the greedy order runs on a plan of 1998 inputs.
 
+### Schema reports and Ask on DBpedia
+
+Roadmap item 89 measured the MCP tools and `sparkles ask` on the DBpedia 2022.12.01
+database of [BENCHMARKING](BENCHMARKING.md), 1.01 billion quads, on atlas with a warm page
+cache, through `sparkles mcp`. These figures come from atlas, not forge, and from one
+session each, so they show the size of the change rather than a published comparison.
+
+| Measurement | Before item 89 | After item 89 |
+|---|---|---|
+| First `check_query` of a process | 52.7 s, 11.1 GiB | 0.3 s, or up to 1.5 s right after the binary changed |
+| First `describe_schema` summary of 200 predicates | a full report, as for `check_query` | 1.4 s, and 11 ms repeated |
+| Terms-list query of `check_query` with VALUES outside a UNION | failed after 1.94 s at 5.5 GiB | 0.04 s |
+| `sparkles ask` with the harness's fake provider | about 100 s, most failing on the 2 GiB budget | 1.9 s, at most 508 MiB of anonymous memory |
+
+Later `check_query` calls in the same process took 20 to 60 ms. The process held under
+500 MiB of anonymous memory after the change. The mapped index pages that the sampling of
+predicate objects touches add about 2 GiB of reclaimable file-backed memory to the
+resident size. The figures are for a database without changes since its build, measured
+before the review fixes of item 89, which leave such a database on the same path. A
+store with changes corrects the statistics with one index probe for each changed value,
+and the report scans instead when that would cost more than a scan.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
