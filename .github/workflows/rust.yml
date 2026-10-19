@@ -87,6 +87,17 @@ jobs:
           cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check
           cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check
           cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check
+      # The workspace's test binaries take about 21 GB, more than a hosted Linux runner has
+      # free, and a full disk ends the job with only "The runner has received a shutdown
+      # signal". Removing toolchains the job never uses frees about 30 GB.
+      - name: Free disk space
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
       - if: ${{ !cancelled() }}
         uses: Swatinem/rust-cache@v2
         with:
@@ -105,6 +116,9 @@ jobs:
       - name: cargo nextest
         if: ${{ !cancelled() }}
         run: cargo nextest run --locked --workspace --profile ci
+      - name: Disk use
+        if: ${{ always() && runner.os == 'Linux' }}
+        run: df -h /
       - name: Doctests
         if: ${{ !cancelled() }}
         run: cargo test --locked --workspace --doc
