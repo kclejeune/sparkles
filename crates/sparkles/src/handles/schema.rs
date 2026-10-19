@@ -480,7 +480,7 @@ impl Schema {
     ) -> Result<Option<Arc<schema::PredicateObjects>>> {
         /// the most predicates kept for one state, over every selection
         const MAX_KEPT: usize = 4096;
-        let state = schema::snapshot_identity(snap);
+        let state = (snap.commit, schema::snapshot_identity(snap));
         let key = (selection(opts) ^ max_rows.rotate_left(17), iri.to_string());
         // a caller limited to some graphs, and an uncommitted or synthetic view, measure
         // for themselves

@@ -49,9 +49,9 @@ pub(super) fn rewrite(
         .position(|o| matches!(o, GraphPattern::Union { .. }))?;
     let mut scope: Vec<Variable> = Vec::new();
     operands[union].on_in_scope_variable(|v| scope.push(v.clone()));
-    let mut moved = Vec::new();
+    // the candidates are borrowed until every limit and guard has passed, so a table that
+    // stays outside is never copied
     let mut taken = vec![false; operands.len()];
-    let mut vars: Vec<Variable> = Vec::new();
     let mut rows = 0usize;
     for (i, o) in operands.iter().enumerate() {
         if let GraphPattern::Values {
@@ -61,19 +61,27 @@ pub(super) fn rewrite(
             && variables.iter().any(|v| scope.contains(v))
         {
             rows += bindings.len();
-            moved.push((*o).clone());
-            vars.extend(variables.iter().cloned());
             taken[i] = true;
         }
     }
     // all the tables or none: a table left behind would be moved by the pass that plans
     // the result, past the bound
-    if moved.is_empty()
+    if !taken.contains(&true)
         || rows > MAX_ROWS
         || rows.saturating_mul(copies(operands[union])) > MAX_COPIED_ROWS
         || opaque(operands[union], calls)
     {
         return None;
+    }
+    let mut moved = Vec::new();
+    let mut vars: Vec<Variable> = Vec::new();
+    for (i, o) in operands.iter().enumerate() {
+        if taken[i]
+            && let GraphPattern::Values { variables, .. } = o
+        {
+            moved.push((*o).clone());
+            vars.extend(variables.iter().cloned());
+        }
     }
     let pushed = push(&moved, &vars, operands[union].clone());
     // the other operands keep their order, with the union where it was
