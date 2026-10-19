@@ -12,7 +12,8 @@
 name: Python wheels
 
 # Pushes to main and pull requests run when the Python bindings or a crate they build on
-# changes. Tests, benches and examples of those crates do not change the wheel.
+# changes. Shared patch fixtures also run the wheel tests that read them. Other crates'
+# tests, benches and examples do not change the wheel.
 on:
   push:
     branches: [main]
@@ -29,6 +30,7 @@ on:
       - "crates/sparkles-shex/**"
       - "!crates/sparkles*/tests/**"
       - "crates/sparkles-py/tests/**"
+      - "crates/sparkles-core/tests/patch/**"
       - "!crates/sparkles*/benches/**"
       - "!crates/sparkles*/examples/**"
       - "vendor/**"

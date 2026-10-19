@@ -441,7 +441,8 @@ weaker memory ordering or macOS would show is low, and pushes test Linux x86_64 
 The binding workflows, `python-wheels.yml`, `node-packages.yml` and `jvm-bindings.yml`,
 run on pushes to `main` and pull requests that touch the binding or a crate it builds on,
 leaving out those crates' tests, benches and examples. Such a run builds the binding in
-the dev profile and tests it on Linux x86_64 only, in one job, and pull requests also run
+the dev profile and tests it on Linux x86_64 only, in one job. Shared core patch fixtures
+also trigger the Python wheel tests that read them. Pull requests also run
 the JVM compatibility matrix. Release tags and manual runs build and test every platform
 in the release profile. Every job has a timeout, so a hung job stops instead of running
 for GitHub's default six hours.
