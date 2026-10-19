@@ -332,6 +332,11 @@ impl External {
     /// The next sorted rows of the input's columns, at most `cap`.
     pub(super) fn next(&mut self, ctx: &Arc<Ctx>, cap: usize) -> Result<Option<Buffer>> {
         let merger = self.merge.as_mut().expect("a started merge");
+        // The merged rows are copied once more into the batch, so a batch takes at most
+        // a quarter of the room left (item 85).
+        let row = self.columns.len() as u64 * 8 + 8;
+        let fit = usize::try_from(ctx.memory_room() / 4 / row).unwrap_or(usize::MAX);
+        let cap = cap.min(fit.max(MIN_FRAME_ROWS));
         let mut out: Vec<Vec<Id>> = vec![Vec::new(); self.columns.len()];
         let n = merger.next(ctx, &self.keys, &mut out, cap)?;
         if n == 0 {
@@ -566,6 +571,18 @@ pub(super) fn load(
                 external.threshold = (external.threshold / 2).max(MIN_RUN_BYTES);
                 external.write_run(ctx, full)?;
                 merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
+            }
+            // With nothing buffered, the batch itself, which its charge already holds,
+            // becomes a run (item 85).
+            Err(Error::BudgetExceeded(b))
+                if matches!(
+                    b.kind,
+                    crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+                ) && ctx.spill.is_some() =>
+            {
+                external.threshold = (external.threshold / 2).max(MIN_RUN_BYTES);
+                external.write_run(ctx, batch)?;
+                continue;
             }
             Err(error) => return Err(error),
         }
