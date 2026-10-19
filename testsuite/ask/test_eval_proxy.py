@@ -175,6 +175,163 @@ class Framing(Base):
         conn.request("POST", "/v1/messages", body=b"{}")
         self.assertEqual(json.loads(conn.getresponse().read()), REPLY)
 
+    def test_the_pilots_first_request_now_settles_at_its_exact_cost(self):
+        # The pilot stopped with upstream_framing on its first request, a Haiku draft
+        # of lookup-01, 7.3 s after it left. Its gate took only a single
+        # Content-Length, so a 2xx reply in chunks was refused after the model had
+        # run, and the reserve stayed at its bound. The same shape of reply, chunked
+        # with the API's usual headers and a draft's usage, settles here exactly.
+        usage = dict(REPLY["usage"], input_tokens=10240, output_tokens=380)
+        body = json.dumps(dict(REPLY, usage=usage)).encode()
+        head = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"request-id: req_pilot\r\nanthropic-organization-id: org\r\n"
+            b"Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+        )
+        third = len(body) // 3
+        parts = [body[:third], body[third : 2 * third], body[2 * third :]]
+        wire = head + b"".join(b"%x\r\n" % len(p) + p + b"\r\n" for p in parts)
+        wire += b"0\r\n\r\n"
+        upstream = px.HTTPUpstream(KEY, "127.0.0.1", wire_server([wire]), tls=False)
+        carry = {"name": "pilot", "cost": 1_002_560_000}
+        ledger = self.ledger(cap=10**10, carryover=carry)
+        proxy = px.Proxy(ledger, upstream, KEY)
+        self.assertEqual(proxy.handle(raw())[0], 200)
+        settle = self.lines()[-1]
+        self.assertEqual(settle["cost"], 10240 * 100 + 380 * 500)
+        self.assertEqual(settle["requestId"], "req_pilot")
+        self.assertEqual(
+            [h["target"] for h in ledger.report()["heldAtBound"]], ["carryover"]
+        )
+
+    def test_a_compressed_reply_is_decoded_and_settles_exactly(self):
+        import gzip
+        import zlib
+
+        packed = {
+            "gzip": gzip.compress(BODY),
+            "deflate": zlib.compress(BODY),
+        }
+        for coding, data in packed.items():
+            with self.subTest(coding=coding):
+                wire = (
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Encoding: {coding}\r\n".encode()
+                    + b"Content-Length: %d\r\n\r\n" % len(data)
+                    + data
+                )
+                upstream = px.HTTPUpstream(
+                    KEY, "127.0.0.1", wire_server([wire]), tls=False
+                )
+                ledger = self.ledger(name=coding + ".jsonl")
+                status, _, body = px.Proxy(ledger, upstream, KEY).handle(raw())
+                self.assertEqual((status, json.loads(body)), (200, REPLY))
+                self.assertEqual(ledger.report()["settledNanodollars"], HAIKU_COST)
+
+    def test_a_compression_bomb_is_a_lost_reply(self):
+        import gzip
+
+        data = gzip.compress(b" " * (px.RESPONSE_CAP + 10))
+        wire = (
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n"
+            + b"Content-Length: %d\r\n\r\n" % len(data)
+            + data
+        )
+        upstream = px.HTTPUpstream(KEY, "127.0.0.1", wire_server([wire]), tls=False)
+        ledger = self.ledger()
+        self.assertEqual(px.Proxy(ledger, upstream, KEY).handle(raw())[0], 502)
+        reserve, settle = self.lines()[-2:]
+        self.assertEqual(settle["cost"], reserve["bound"])
+        self.assertEqual(settle["status"], "failure:reply too large")
+
+
+class Reconcile(Base):
+    CARRY = {"name": "pilot", "cost": 1_002_560_000}
+
+    def test_the_carryover_is_reconciled_to_the_billed_amount(self):
+        ledger = self.ledger(cap=10**10, carryover=self.CARRY)
+        self.assertEqual(ledger.spent(), self.CARRY["cost"])
+        line = ledger.reconcile(
+            "carryover", 1_600_000, "Console cost on 2026-10-15 for the pilot key"
+        )
+        self.assertEqual(line["previous"], self.CARRY["cost"])
+        self.assertEqual(ledger.spent(), 1_600_000)
+        self.assertEqual(ledger.report()["heldAtBound"], [])
+        with self.assertRaises(Invalid):
+            ledger.reconcile("carryover", 0, "again")
+        ledger.close()
+        again = px.Ledger(self.root / "ledger.jsonl", 10**10, self.CARRY)
+        self.addCleanup(again.close)
+        self.assertEqual(again.spent(), 1_600_000)
+        self.assertEqual(again.report()["reconciled"][0]["target"], "carryover")
+
+    def test_a_reconcile_needs_evidence_and_a_held_target(self):
+        ledger = self.ledger(cap=10**10, carryover=self.CARRY)
+        ok = ledger.reserve(HAIKU, 1000, "case")
+        ledger.settle(ok, 30, "ok")
+        for target, amount, evidence in (
+            ("carryover", 5, ""),
+            ("carryover", 5, "   "),
+            ("carryover", 5, "x" * 1001),
+            ("carryover", -1, "console"),
+            ("carryover", 1.5, "console"),
+            (ok, 5, "console"),  # settled from its usage, so nothing is held
+            (999, 5, "console"),
+        ):
+            with self.subTest(target=target, amount=amount):
+                with self.assertRaises(Invalid):
+                    ledger.reconcile(target, amount, evidence)
+        self.assertEqual(ledger.spent(), self.CARRY["cost"] + 30)
+        self.assertEqual(len(self.lines()), 4)  # no reconcile line was written
+
+    def test_a_reply_without_usage_and_a_crashed_reserve_are_reconciled(self):
+        reply = dict(REPLY)
+        del reply["usage"]
+        upstream = Upstream(
+            (200, [("request-id", "req_1")], json.dumps(reply).encode())
+        )
+        ledger = self.ledger(cap=10**10, carryover=self.CARRY)
+        px.Proxy(ledger, upstream, KEY).handle(raw())
+        crashed = ledger.reserve(SONNET, 5000, "case-2")
+        ledger.close()
+        again = px.Ledger(self.root / "ledger.jsonl", 10**10, self.CARRY)
+        self.addCleanup(again.close)
+        held = {h["target"]: h for h in again.report()["heldAtBound"]}
+        self.assertEqual(set(held), {"carryover", 1, crashed})
+        self.assertEqual(held[1]["status"], "usage-unknown")
+        self.assertEqual(held[1]["requestId"], "req_1")
+        self.assertEqual(held[crashed]["status"], "unsettled")
+        before = again.spent()
+        again.reconcile(1, 2000, "usage export row req_1")
+        again.reconcile(crashed, 0, "no request reached the API, per the Console log")
+        self.assertEqual(
+            again.spent(), before - held[1]["cost"] + 2000 - held[crashed]["cost"]
+        )
+        self.assertEqual(again.case_costs()[("case-2", SONNET)], 0)
+        self.assertEqual(
+            {h["target"] for h in again.report()["heldAtBound"]}, {"carryover"}
+        )
+        again.close()
+        third = px.Ledger(self.root / "ledger.jsonl", 10**10, self.CARRY)
+        self.addCleanup(third.close)
+        self.assertEqual(third.spent(), before - held[1]["cost"] + 2000 - 5000)
+
+    def test_a_tampered_reconcile_line_is_refused_on_replay(self):
+        ledger = self.ledger(cap=10**10, carryover=self.CARRY)
+        ledger.close()
+        path = self.root / "ledger.jsonl"
+        bad = {
+            "op": "reconcile",
+            "target": "carryover",
+            "previous": 1,
+            "cost": 0,
+            "evidence": "x",
+        }
+        with path.open("a") as f:
+            f.write(json.dumps(bad) + "\n")
+        with self.assertRaises(Invalid):
+            px.Ledger(path, 10**10, self.CARRY)
+
 
 class Errors(Base):
     def test_one_upstream_error_does_not_end_the_campaign(self):
@@ -288,7 +445,7 @@ class Errors(Base):
         }
         self.assertEqual(
             px.cost(SONNET, usage),
-            100 * 2000 + 10 * 2500 + 20 * 4000 + 50 * 100 + 10 * 10000,
+            100 * 2000 + 10 * 2500 + 20 * 4000 + 50 * 200 + 10 * 10000,
         )
         usage = dict(usage, cache_creation={"ephemeral_5m_input_tokens": 1})
         self.assertIsNone(px.cost(SONNET, usage))
@@ -350,12 +507,16 @@ class Cap(Base):
             px.Ledger(self.root / "ledger.jsonl", ledger.cap)
         ledger.close()
         path = self.root / "ledger.jsonl"
-        path.write_text('{"ledger":2,"capNanodollars":1}\n')
-        with self.assertRaises(Invalid):
-            px.Ledger(path, 1)
-        path.write_text('{"ledger":1,"capNanodollars":1}\n{"op":"settle","id":9}\n')
-        with self.assertRaises(Invalid):
-            px.Ledger(path, 1)
+        for text in (
+            '{"ledger":3,"capNanodollars":1}\n',
+            '{"ledger":1,"capNanodollars":1}\n',
+            '{"ledger":2,"capNanodollars":1}\n{"op":"settle","id":9}\n',
+            '{"ledger":2,"capNanodollars":2}\n',
+        ):
+            with self.subTest(text=text):
+                path.write_text(text)
+                with self.assertRaises(Invalid):
+                    px.Ledger(path, 1)
         self.assertFalse((self.root / "ledger.jsonl.lock").exists())
 
     def test_stale_lock_of_a_dead_owner_is_recovered_and_a_live_one_is_not(self):

@@ -19,11 +19,12 @@ import socket
 import ssl
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from evaluator import Invalid, strict_json
 
-LEDGER_VERSION = 1
+LEDGER_VERSION = 2
 HARD_CAP = 25 * 10**9  # USD 25 in nanodollars, for the carryover and every run together
 MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
@@ -31,7 +32,7 @@ REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # write, cache read and output. A second row applies above 100000 prompt tokens.
 RATES = {
     MODELS[0]: ((100, 125, 200, 10, 500), (500, 625, 1000, 50, 2500)),
-    MODELS[1]: ((2000, 2500, 4000, 100, 10000),) * 2,
+    MODELS[1]: ((2000, 2500, 4000, 200, 10000),) * 2,
     MODELS[2]: ((4000, 5000, 8000, 200, 20000),) * 2,
 }
 LONG_CONTEXT = 100000
@@ -167,7 +168,9 @@ class Ledger:
 
     The first line holds the format version and the cap. Reopening an existing
     ledger resumes it, and nothing resets it. A reserve line without a settle line
-    counts at its full bound.
+    counts at its full bound. A reconcile line replaces a charge that stands at an
+    upper bound, the carryover or one request, with the amount the provider billed,
+    and names the evidence for that amount.
     """
 
     def __init__(self, path, cap, carryover=None):
@@ -176,9 +179,12 @@ class Ledger:
         self.mutex = threading.Lock()
         self.reserved, self.settled, self.next_id = {}, 0, 1
         self.carryover = 0
+        self.carryover_name = None
         self.requests = 0
         self.over_bound = 0
-        self.costs = []  # (case, model, cost) for every settled request
+        # Every settled request by id, with its case, model, bound, status and charge.
+        self.charges = {}
+        self.reconciled = {}  # target -> its reconcile line
         if not self.path.is_absolute() or ".." in self.path.parts:
             raise Invalid("absolute ledger path required")
         if not 0 < cap or cap + (carryover["cost"] if carryover else 0) > HARD_CAP:
@@ -197,7 +203,8 @@ class Ledger:
                     self.write(
                         {"carryover": carryover["name"], "cost": carryover["cost"]}
                     )
-                self.carryover = carryover["cost"] if carryover else 0
+                    self.carryover = carryover["cost"]
+                    self.carryover_name = carryover["name"]
             else:
                 self.replay(carryover)
         except BaseException:
@@ -256,29 +263,46 @@ class Ledger:
 
     def apply(self, lines, carryover):
         head = strict_json(lines[0]) if lines else None
-        if (
-            not isinstance(head, dict)
-            or head.get("ledger") != LEDGER_VERSION
-            or head.get("capNanodollars") != self.cap
-        ):
-            raise Invalid("unknown ledger version or a different cap")
+        if not isinstance(head, dict) or head.get("ledger") != LEDGER_VERSION:
+            # Version 1 had no reconcile lines and no times, and no paid run wrote
+            # one, so this reader refuses it like any other unknown version.
+            raise Invalid("unknown ledger version")
+        if head.get("capNanodollars") != self.cap:
+            raise Invalid("the ledger has a different cap")
         seen = None
         for text in lines[1:]:
             line = strict_json(text)
             if "carryover" in line:
+                if seen is not None:
+                    raise Invalid("a second carryover line")
                 seen = {"name": line["carryover"], "cost": line["cost"]}
                 self.carryover += line["cost"]
+                self.carryover_name = line["carryover"]
             elif line.get("op") == "reserve":
+                if line["id"] in self.reserved or line["id"] in self.charges:
+                    raise Invalid("a reserve id repeats")
                 self.reserved[line["id"]] = line
                 self.next_id = max(self.next_id, line["id"] + 1)
             elif line.get("op") == "settle":
-                reserve = self.reserved.pop(line["id"])
-                self.settled += line["cost"]
-                self.costs.append((reserve.get("case"), reserve["model"], line["cost"]))
+                self.book(self.reserved.pop(line["id"]), line)
+            elif line.get("op") == "reconcile":
+                self.apply_reconcile(line)
             else:
                 raise Invalid("unknown ledger line")
         if seen != carryover:
             raise Invalid("the ledger's carryover differs from the run's")
+
+    def book(self, reserve, settle):
+        self.settled += settle["cost"]
+        self.charges[reserve["id"]] = {
+            "case": reserve.get("case"),
+            "model": reserve["model"],
+            "bound": reserve["bound"],
+            "at": reserve.get("at"),
+            "status": settle["status"],
+            "requestId": settle.get("requestId"),
+            "cost": settle["cost"],
+        }
 
     def spent(self):
         return (
@@ -298,6 +322,7 @@ class Ledger:
                 "model": model,
                 "bound": request_bound,
                 "case": case,
+                "at": round(time.time(), 3),
             }
             self.write(line)  # Durable before any request leaves.
             self.next_id += 1
@@ -310,28 +335,125 @@ class Ledger:
             reserve = self.reserved[ident]
             over = amount > reserve["bound"]
             self.over_bound += int(over)
-            self.write(
+            line = {
+                "op": "settle",
+                "overBound": over,
+                "id": ident,
+                "cost": amount,
+                "status": status,
+                "usage": usage,
+                "requestId": request_id,
+                "at": round(time.time(), 3),
+            }
+            self.write(line)
+            del self.reserved[ident]
+            self.book(reserve, line)
+
+    def held_at_bound(self):
+        """The charges that stand at an upper bound rather than a billed amount.
+
+        These are the carryover, every reserve without a settle line, and every
+        request that was settled at its bound because the reply was lost or its usage
+        could not be read. A reconcile line takes one off this list.
+        """
+        out = []
+        if self.carryover_name is not None and "carryover" not in self.reconciled:
+            out.append(
                 {
-                    "op": "settle",
-                    "overBound": over,
-                    "id": ident,
-                    "cost": amount,
-                    "status": status,
-                    "usage": usage,
-                    "requestId": request_id,
+                    "target": "carryover",
+                    "name": self.carryover_name,
+                    "cost": self.carryover,
                 }
             )
-            del self.reserved[ident]
-            self.settled += amount
-            self.costs.append((reserve.get("case"), reserve["model"], amount))
+        for ident, r in sorted(self.reserved.items()):
+            out.append(
+                {
+                    "target": ident,
+                    "model": r["model"],
+                    "case": r.get("case"),
+                    "at": r.get("at"),
+                    "status": "unsettled",
+                    "requestId": None,
+                    "cost": r["bound"],
+                }
+            )
+        for ident, c in sorted(self.charges.items()):
+            bounded = c["status"] == "usage-unknown" or c["status"].startswith(
+                "failure:"
+            )
+            if bounded and c["cost"] and ident not in self.reconciled:
+                out.append(
+                    {
+                        "target": ident,
+                        "model": c["model"],
+                        "case": c["case"],
+                        "at": c["at"],
+                        "status": c["status"],
+                        "requestId": c["requestId"],
+                        "cost": c["cost"],
+                    }
+                )
+        return out
+
+    def apply_reconcile(self, line):
+        target, amount, evidence = line["target"], line["cost"], line["evidence"]
+        if type(amount) is not int or amount < 0:
+            raise Invalid("a reconciled amount is a nonnegative integer")
+        if (
+            not isinstance(evidence, str)
+            or not evidence.strip()
+            or len(evidence) > 1000
+        ):
+            raise Invalid("a reconcile line needs evidence of at most 1000 characters")
+        held = {h["target"]: h for h in self.held_at_bound()}
+        if target not in held:
+            raise Invalid("the target is not a charge held at its bound")
+        previous = held[target]["cost"]
+        if line.get("previous") != previous:
+            raise Invalid("the reconcile line names a different previous charge")
+        if target == "carryover":
+            self.carryover += amount - previous
+        elif target in self.reserved:
+            self.book(
+                self.reserved.pop(target), {"cost": amount, "status": "reconciled"}
+            )
+        else:
+            self.settled += amount - previous
+            self.charges[target].update(cost=amount, status="reconciled")
+        self.reconciled[target] = line
+
+    def reconcile(self, target, amount, evidence):
+        """Replace a charge held at its bound with the amount the provider billed.
+
+        The target is "carryover" or a request id from `held_at_bound()`. The
+        evidence says where the amount comes from, such as the Console's cost for
+        the day of an API key that only this run used. An amount above the held
+        charge is recorded as it is.
+        """
+        with self.mutex:
+            held = {h["target"]: h for h in self.held_at_bound()}
+            if target not in held:
+                raise Invalid("the target is not a charge held at its bound")
+            line = {
+                "op": "reconcile",
+                "target": target,
+                "previous": held[target]["cost"],
+                "cost": amount,
+                "evidence": evidence,
+                "at": round(time.time(), 3),
+            }
+            self.apply_reconcile(line)  # Every check runs before the line is written.
+            self.write(line)
+            return line
 
     def case_costs(self):
         """Nanodollars per (case, model) over every settled request of a case."""
         totals = {}
         with self.mutex:
-            for case, model, amount in self.costs:
-                if case:
-                    totals[(case, model)] = totals.get((case, model), 0) + amount
+            for c in self.charges.values():
+                if c["case"]:
+                    key = (c["case"], c["model"])
+                    totals[key] = totals.get(key, 0) + c["cost"]
         return totals
 
     def report(self):
@@ -339,11 +461,14 @@ class Ledger:
             unresolved = sum(r["bound"] for r in self.reserved.values())
             return {
                 "ledger": str(self.path),
+                "ledgerVersion": LEDGER_VERSION,
                 "capNanodollars": self.cap,
                 "carryoverNanodollars": self.carryover,
                 "settledNanodollars": self.settled,
                 "unresolvedNanodollars": unresolved,
                 "upperLiabilityNanodollars": self.carryover + self.settled + unresolved,
+                "heldAtBound": self.held_at_bound(),
+                "reconciled": list(self.reconciled.values()),
                 "requests": self.requests,
                 "settledAboveBound": self.over_bound,
             }
@@ -365,6 +490,27 @@ def require_single_ledger(path):
     others = [p for p in path.parent.glob("*.jsonl") if p != path]
     if others:
         raise Invalid("another ledger file is in the ledger directory")
+
+
+def decode_body(headers, data):
+    """Undo a gzip or deflate content coding, within the reply cap.
+
+    The request asks for the identity coding, but a reply that comes back compressed
+    anyway still carries the usage that settles its reserve. Another coding is left
+    as it is, and the reply then settles at its bound like any unreadable reply.
+    """
+    codings = [v.strip().lower() for k, v in headers if k.lower() == "content-encoding"]
+    if codings not in (["gzip"], ["x-gzip"], ["deflate"]):
+        return data
+    wbits = 16 + zlib.MAX_WBITS if codings[0] != "deflate" else zlib.MAX_WBITS
+    try:
+        inflater = zlib.decompressobj(wbits)
+        out = inflater.decompress(data, RESPONSE_CAP + 1)
+        if len(out) > RESPONSE_CAP or inflater.unconsumed_tail:
+            raise UpstreamFailure("reply too large", True)
+        return out
+    except zlib.error:
+        return data
 
 
 class HTTPUpstream:
@@ -419,7 +565,8 @@ class HTTPUpstream:
                 raise UpstreamFailure("timeout", True)
             if len(data) > RESPONSE_CAP:
                 raise UpstreamFailure("reply too large", True)
-            return reply.status, reply.getheaders(), data
+            headers = reply.getheaders()
+            return reply.status, headers, decode_body(headers, data)
         except UpstreamFailure:
             raise
         except (OSError, http.client.HTTPException) as error:
