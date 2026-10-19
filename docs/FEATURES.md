@@ -386,14 +386,16 @@ that work by priority and links each item to its design spec.
   data, and protections hide triples, not the IRIs that visible triples mention. Backups
   cover individual datasets. There is no whole-server backup, and encryption keys for
   backup repositories cannot be managed through the API, Vault or a cloud KMS. [Roadmap](ROADMAP.md) items 61, 65, 71, 75, 76.
-* **Ask evaluation.** The initial hosted demo pilot ran 17 of the 68 demo questions on
-  four pipelines, so it planned 68 executions. It stopped on the first request and
-  scored no cases, and its unresolved $1.002560 is carried into the next run's cost
-  ledger. The harness now scores a failed Ask as a failure, computes the cascade row
-  offline and caps spend with a local ledger. No paid run has finished, so the repository
-  has no accuracy numbers for any model. The QALD-9-plus conversion exists, but its gold
-  has not been recomputed on DBpedia. Text2SPARQL'25, LC-QuAD 2.0 and independent-role
-  evaluation remain. [Roadmap](ROADMAP.md) item 6.
+* **Ask evaluation.** No paid run has finished, so the repository has no accuracy
+  numbers for any model. The initial hosted demo pilot stopped on its first request
+  because its gate refused a chunked reply, and its $1.002560 stays in the next run's
+  cost ledger until it is reconciled with the billed amount. The harness converts
+  QALD-9-plus, Text2SPARQL'25 and LC-QuAD 2.0, with gold recomputed on DBpedia
+  2022.12.01 and on CK25. Asking on the DBpedia database fails most questions, because
+  `check_query` builds a schema report of the whole dataset in every `sparkles ask`,
+  which most likely passes the 2 GiB query memory budget. LC-QuAD 2.0 needs a Wikidata load
+  from the full dump, and independent-role evaluation remains. [Roadmap](ROADMAP.md)
+  item 6.
 * **Assistant configuration.** Dataset assistant settings, including `enabled`,
   `ingest` and `send: "documents"`, can be declared for every dataset or by name in the
   settings file of `serve --settings`, which can also lock them, and changed through

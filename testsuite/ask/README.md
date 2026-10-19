@@ -3,8 +3,37 @@
 `scripts/eval-ask` runs `sparkles ask` on a question set and scores each answer against
 gold results. The demo set `demo.json` holds 68 questions over `org.ttl`. There are 59
 answerable questions, four clarification questions and five unanswerable questions. The
-set does not stand in for QALD or Text2SPARQL'25. `scripts/qald9plus-convert` builds a
-QALD-9-plus set in the same format, and `--loc DIR` runs a set against a database.
+set does not stand in for QALD or Text2SPARQL'25. Three converters build public sets in
+the same format, and `--loc DIR` runs a set against a database.
+
+## Public sets
+
+`scripts/qald9plus-convert` converts the 150 questions of the QALD-9-plus DBpedia test
+split. `scripts/text2sparql-convert --set db25` converts the 100 DBpedia questions of
+Text2SPARQL'25, and `--set ck25` the 50 questions over CK25, the challenge's corporate
+graph. `scripts/lcquad2-convert` converts the 6,046 questions of the LC-QuAD 2.0 test
+split over Wikidata, and `--sample N` keeps a fixed sample of them. Each converter pins
+its source files by commit and SHA256 and fetches them, or reads local copies with
+`--input`. None of the data is kept in the repository.
+
+Given `--sparkles` and a database with `--loc`, a converter runs every gold query on that
+database and drops the questions whose gold returns nothing, fails or cannot be scored.
+The set counts them by reason. The set also compares each recomputed answer with the
+answer the source publishes, by lexical value, and lists the questions that differ.
+`--manifest` copies a JSON record of how the database was loaded into the set. The CK25
+set recomputes on its own graph, which the converter writes beside the set file and the
+set loads with full-text search, as the demo set does. QALD-9-plus and Text2SPARQL'25 ran
+on older DBpedia releases, and LC-QuAD 2.0 needs a Wikidata database that holds
+statements and qualifiers, which the truthy dump leaves out. The scorer compares rows as
+sets, so a question that the source marks as order-sensitive is scored without its order.
+
+The DBpedia converters also make Virtuoso-dialect gold standard SPARQL. They declare the
+prefixes that DBpedia's endpoint predeclares, such as `dbo:` and `xsd:`, and put
+parentheses and a variable around a bare projection such as `SELECT DISTINCT COUNT(?x)`.
+The set keeps the source query as `sourceGold` and lists the rewrites. The DBpedia sets
+cannot run yet. On the full DBpedia database every `sparkles ask` spends about 100
+seconds building a schema report of the whole dataset for `check_query`, and most checks
+fail on the 2 GiB query memory budget, as C18's roadmap follow-ups record.
 
 ## What is scored
 
@@ -53,7 +82,8 @@ against the fake, reads no key and reports request sizes. Neither contacts a pro
 `scripts/eval-ask-anthropic` starts a proxy on a loopback port and gives the children a
 random token in place of the key. Only the proxy reads `ANTHROPIC_API_KEY`. It sends
 each request once to `api.anthropic.com` with the standard library, so Content-Length,
-chunked and close-delimited replies all work. It sets `stream` to false and the effort
+chunked and close-delimited replies all work. A reply that comes back gzip or deflate
+encoded, although the request asks for none, is decoded. It sets `stream` to false and the effort
 from the run file, and it refuses tools, cache control and any model outside the run.
 
 A JSON-lines ledger at the run file's `ledger` path holds the cap. Before each request the
@@ -62,14 +92,32 @@ and the reply writes a settle line with the cost from its usage. A request is re
 when the spent total plus its bound would pass `localCapNanodollars`. An error reply is
 free, a lost reply costs the bound and a reply without usage costs the bound. Replaying
 the ledger counts every unsettled reserve at its bound, and the pilot's unresolved
-$1.002560 is the carryover line. Reopening a ledger resumes it. Nothing resets it.
+$1.002560 is the carryover line. Reopening a ledger resumes it. Nothing resets it. The
+ledger's first line holds its format version, 2, and a reader refuses any other version.
+
+A charge that stands at an upper bound can be reconciled with the amount the provider
+billed. Such charges are the carryover, a reserve that a crash left without a settle
+line, and a request settled at its bound because its reply was lost or its usage could
+not be read. `--held` lists them with each request's model, case, time and request ID.
+`--reconcile TARGET --billed-nanodollars N --evidence TEXT` appends a reconcile line
+that replaces one of them, where TARGET is `carryover` or a request ID. The evidence
+names the source of the amount, such as the Console's cost for one day of an API key
+that only the run used. Each charge is reconciled once, and replay checks every
+reconcile line against the charge it replaced. Neither command reads a key or sends a
+request, and both create the ledger with its carryover when it does not exist yet.
+
+```
+scripts/eval-ask-anthropic --run RUN.json --held
+scripts/eval-ask-anthropic --run RUN.json --reconcile carryover \
+  --billed-nanodollars 1600000 --evidence "Console cost of key K on 2026-10-15"
+```
 
 The local ledger is the authority. A Console workspace spend limit of $24 is a backstop
 against a defect, and it can lag billing, so the run does not rely on it.
 
-Before spending, the run counts tokens, which is free, and sends one 16-token Haiku
-request. It records the status and headers of both replies in `preflight.json`. It stops
-if either step fails. A block of a set and a model runs only when the projected cost fits
+Before spending, the run counts tokens, which is free, and sends each model of the run
+one structured-output request of at most 256 tokens. It records the status and headers of
+the replies in `preflight.json`. It stops if any step fails. A block of a set and a model runs only when the projected cost fits
 the cap. The projection is the case count times the p90 measured case cost of that model,
 or a prior from the run file, times a margin.
 
@@ -110,4 +158,10 @@ every unsettled reserve at its bound. After the first real preflight, copy
 
 The pilot of 2026-10-15 ran 17 of the 68 demo questions on three pairs and a real cascade,
 which made 68 planned executions. It stopped on its first request and scored nothing. Its
-wallet, grant claim and report stay as they were.
+wallet, grant claim and report stay as they were. Its gate accepted only a reply with a
+single Content-Length, and it stopped with `upstream_framing` 7.3 seconds after the
+first Haiku request left, so the model had run and the reply most likely came back in
+chunks. The reserve was never settled and stayed at the gate's bound of $1.002560, a
+million input tokens at a price above Haiku 5.5's. The request itself held a grounding
+of at most 8,192 tokens and at most 1,024 output tokens, which costs under a cent. The
+current proxy settles such a reply at its exact cost, and a test replays one.

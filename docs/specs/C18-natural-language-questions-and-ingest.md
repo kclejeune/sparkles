@@ -4991,11 +4991,33 @@ $1.002560, as its full unresolved liability. Actual billed spend is unknown and 
 probably under one cent for one Haiku call. The retained status does not identify which
 framing check failed, and this pilot supplies no accuracy results.
 
+The gate's reader raised `upstream_framing` only for a reply without exactly one
+Content-Length, for a `Transfer-Encoding` header, for a malformed status or header line,
+and for 204 and 205. A reply outside 2xx raised `upstream_status`. The failure came 7.3
+seconds after the request left, so the model had run, and the reply was most likely a
+2xx in chunks, which the reader refused before it read the usage. The bound of
+$1.002560 is the gate's fixed reserve for Haiku, a million input tokens at $1 per million
+and 1,024 output tokens at $2.50 per million, which are not Haiku 5.5's prices. The
+request held a grounding trimmed to 8,192 tokens and asked for at most 1,024 output
+tokens, which at Haiku 5.5's $0.10 and $0.50 per million costs under $0.002.
+
+The proxy that replaced the gate decodes every framing, and a test replays a chunked
+reply of the pilot's shape and checks that it settles at its exact cost. The ledger is
+now version 2. Reserve and settle lines carry a time, and a reconcile line replaces a
+charge held at its bound, which is the carryover, a reserve without a settle line or a
+request settled at its bound, with the billed amount and the evidence for it.
+`scripts/eval-ask-anthropic --held` lists those charges, and `--reconcile` writes the line
+without reading a key. The pilot's carryover is reconciled this way once the Console's
+cost for its key on 2026-10-15 is known. A reply that comes back compressed despite the
+identity request is decoded, and Sonnet 5.5 cache reads are charged at the published
+$0.20 per million tokens, where the table had half that.
+
 The gate that the pilot used is replaced. The new ledger opens with the pilot's
 $1.002560 as a carryover line, so the local cap of $25 leaves $23.997440. The pilot's
 wallet, grant claim and report are kept as the record and are never reopened. The next run
 uses a binary built from a named commit outside the private notes. What remains is a paid
-run of the demo set and the converted QALD-9-plus set, and the work listed below.
+run of the demo set, the converted QALD-9-plus set and the Text2SPARQL'25 sets, and the
+work listed below.
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
   questions, gold answers recomputed on the loaded release as §11.1 says) and the
@@ -5008,10 +5030,52 @@ run of the demo set and the converted QALD-9-plus set, and the work listed below
   a set in the demo set's format. The data is licensed CC BY 4.0 and is not vendored.
   With `--loc` and `--sparkles` it runs every gold query on a DBpedia database, as §11.1
   says, and drops the questions whose gold returns nothing, fails, or cannot be scored,
-  and the set counts them with the release and the binary's SHA256. The recompute on the
-  DBpedia 2022.12.01 database of [BENCHMARKING](../BENCHMARKING.md), a check of its
-  full-text index for `link_entities` and a dry run that measures the grounding size, the
-  Ask latency and the query timeouts still need the host that holds the database.
+  and the set counts them with the release and the binary's SHA256. The gold queries
+  were written for DBpedia's Virtuoso endpoint, so the converter declares the prefixes
+  that endpoint predeclares and puts parentheses around a bare aggregate or function
+  projection such as `SELECT DISTINCT COUNT(?x)`, and keeps the source query beside the
+  rewritten one. The set also compares each recomputed answer with the answer QALD
+  publishes, by value. The recompute ran on English DBpedia 2022.12.01, all 38 files of
+  [BENCHMARKING](../BENCHMARKING.md)'s billion-triple run, 1,014,683,275 distinct
+  triples loaded with `sparkles load --lenient` in 449 s on atlas at a peak RSS of 8.3
+  GiB, with a text index over `rdfs:label` and `foaf:name` of 23,372,583 documents built
+  in 126 s. The binary came from commit 23075691 with SHA256 2ed83fff…3b960, and the set
+  embeds the load manifest with each file's SHA256. Of the 150 questions, 107 remain.
+  The gold of 41 returns nothing on this release, one fails because it orders by an
+  aggregate without grouping, and one returns 1,693 rows, above the scorer's 1,000. 23
+  gold queries were rewritten. Of the 107, the recomputed answer equals the published one
+  for 53 and differs for 54, 21 of which share no value with it. A search of the text
+  index for "Salt Lake City" returns the city's resources, so `link_entities` has what it
+  needs.
+- A dry run of the DBpedia sets against the fake provider showed that Ask cannot answer
+  on this database yet. Each `sparkles ask` took about 104 s, of which the fake model
+  took under 50 ms, and nine of the first ten failed although the fake drafted the gold
+  query, which `sparkles query` answers in 0.04 s with 118 MiB under the same 2 GiB
+  budget. Their check reported `budget-memory` against the 2 GiB query memory budget of
+  `sparkles ask`. `check_query` builds a schema report of the whole dataset before it
+  checks a query, which is the likely cause. Through `sparkles mcp` with a 30 s timeout
+  the same check stops after 45,857 of 58,564 predicates of that report, while
+  `describe_schema` with the summary section takes 48.6 s, and the process reached 11.1
+  GiB. Each `sparkles ask` process builds the report again. The DBpedia sets therefore
+  wait for `check_query` to read a stored or cached schema report, or to check terms
+  without one, and for `sparkles ask` to keep the report between questions, for
+  example by asking through a running server.
+- `scripts/text2sparql-convert` converts Text2SPARQL'25 from the challenge repository
+  and the CK25 repository at pinned commits, with SHA256 checks, and vendors nothing.
+  `--set db25` takes the 100 English DBpedia questions, which the challenge ran on
+  DBpedia 2015-10, and recomputes their gold on a DBpedia database with the same
+  rewrites as QALD-9-plus. On the 2022.12.01 database above, 74 remain. The gold of 25
+  returns nothing and one returns 1,199 rows, and 11 gold queries were rewritten. The
+  recomputed answer equals the challenge's published answer for 26 of the 74 and differs
+  for 48, 23 of which share no value with it. `--set ck25` takes the 50
+  questions over CK25, the corporate graph of 2025, which the converter writes beside the
+  set so the set loads it as the demo set loads `org.ttl`. On that graph 49 remain, one
+  being dropped for 1,938 rows. The recomputed answer equals the published
+  one for 45. Two differ because their gold orders on a value with ties before a limit,
+  and the published answers of the other two are empty while the gold returns rows on
+  the graph. CK25's data and questions are licensed CC BY 4.0 and the DBpedia questions
+  CC BY-SA 4.0. The strict scorer compares rows as sets, so the two CK25 questions marked
+  `RESULT_ORDER_MATTERS` are scored without their order.
 - Publish per model and role the metrics of §11.1 and §11.4 (execution accuracy with
   QALD's precision, recall and F1, valid-query rate, repair rate, latency and cost per
   correct answer) in a section of [BENCHMARKS](../BENCHMARKS.md), and replace §3.7's
@@ -5021,7 +5085,14 @@ run of the demo set and the converted QALD-9-plus set, and the work listed below
   subset is the closure of the gold queries' answers and the entities the questions
   mention, to two hops, plus the properties' labels, so the schema grounding sees a
   realistic vocabulary. Questions whose gold query returns nothing on the subset are
-  dropped and counted, as for QALD-9-plus.
+  dropped and counted, as for QALD-9-plus. `scripts/lcquad2-convert` converts the 6,046
+  questions of the LC-QuAD 2.0 test split at a pinned commit and keeps 5,820 that have a
+  usable question or paraphrase, and `--sample N` keeps a fixed sample chosen by a hash of
+  each uid. The split publishes no answers, so the subset has to be cut from a full
+  Wikidata load rather than from the answers. 1,529 of the test queries read statements
+  and qualifiers through `p:`, `ps:` and `pq:`, which the truthy dump of X06 §3.8 leaves
+  out, so the load must come from the full dump. That needs the large host of X06, and
+  until it exists the converted set cannot run.
 - Report the memorization risk: for each public set, the accuracy on questions whose
   gold query appears verbatim in public repositories against the rest, and the
   corporate Text2SPARQL'25 set as the uncontaminated reference.

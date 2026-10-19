@@ -123,6 +123,16 @@ literals that the checked graphs hold. For Rust callers,
 `sparkles_reasoner::diagnostics::diagnose_with` takes these typings, and
 `sparkles_reasoner::literal_typings` reads them.
 
+The Ask evaluation harness converts Text2SPARQL'25 (`scripts/text2sparql-convert`, the
+DBpedia set and the CK25 corporate set) and LC-QuAD 2.0 (`scripts/lcquad2-convert`).
+Every converter that recomputes gold answers on a database now also compares them with
+the answers the source publishes and records the load manifest of that database. The
+paid wrapper `scripts/eval-ask-anthropic` lists the ledger's charges that stand at an
+upper bound with `--held` and replaces one with the billed amount and its evidence with
+`--reconcile`. That is how the $1.002560 that the 2026-10-15 pilot left unresolved can
+be settled once the billed amount is known. It decodes a reply that comes back gzip or deflate encoded, and it charges
+Sonnet 5.5 cache reads at the published $0.20 per million tokens.
+
 ### Behavior
 
 A SERVICE inside an EXISTS that the query evaluates per row is called once for each
@@ -166,6 +176,10 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+The Ask evaluation cost ledger is in version 2. Reserve and settle lines carry a time,
+and a reconcile line replaces a charge held at its bound. A reader refuses a ledger of
+version 1, which no paid run wrote, and of any later version.
 
 Spill files are registered as the derived format `spill` version 1. A file has the magic
 `SPKSPL01`, the version as a u16, the operator kind, the codec, an encryption flag and
