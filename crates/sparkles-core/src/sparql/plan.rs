@@ -821,6 +821,11 @@ impl<'a> Planner<'a> {
                 Ok(self.apply_filters(n, top))
             }
             GP::Bgp { .. } | GP::Path { .. } | GP::Join { .. } | GP::Graph { .. } => {
+                // a constant table joined with a UNION goes into each branch, where it
+                // binds the branch's lookups instead of meeting their whole result
+                if let Some(pushed) = super::valuespush::rewrite(gp) {
+                    return self.plan(&pushed, g, filters);
+                }
                 let mut items = Vec::new();
                 self.collect(gp, g, &mut items)?;
                 self.plan_group(items, filters)
