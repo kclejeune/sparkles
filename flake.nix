@@ -55,20 +55,19 @@
           # packages with their dependency layers, every package the benchmark runners
           # resolve (the comparison engines and data generators of nix/benchmarks.nix and
           # the nixpkgs tools of nix/benchmark-tools.nix), the dev shell and the checks
-          # that need neither a VM nor a browser. Fluree, whose license is not free, stays
-          # out of the public cache; it is a download of a release archive and quick to
-          # build anywhere. `nix-fast-build --flake .#cacheable.<system>` builds one
-          # system's set.
+          # that need neither a VM nor a browser. `nix-fast-build --flake
+          # .#cacheable.<system>` builds one system's set.
           cacheable = inputs.nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
             system:
             withSystem system (
               { self', pkgs, ... }:
               let
                 inherit (pkgs) lib;
-                benchmarks = removeAttrs (import ./nix/benchmarks.nix { inherit pkgs; }) [
-                  "fluree"
-                  "benchmark-engines"
-                ];
+                # Fluree's release binaries (Business Source License 1.1) are included
+                # unmodified: the owner decided on 2026-10-19 that pushing them to this
+                # cache is fine, since Sparkles neither modifies them nor offers them as a
+                # service.
+                benchmarks = import ./nix/benchmarks.nix { inherit pkgs; };
                 # as `nixpkgs#<name>` with `--inputs-from .` resolves them
                 tools = lib.genAttrs (import ./nix/benchmark-tools.nix) (
                   name: inputs.nixpkgs.legacyPackages.${system}.${name}
