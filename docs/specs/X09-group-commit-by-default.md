@@ -1292,6 +1292,33 @@ commits cost in exchange for the throughput above. The four-writer figure is the
 screens used short literals, and the staged documents are bounded in number, not in bytes,
 as section 17.7 now says.
 
+**Read latency on Intel.** The Namespace screen of the query suite measured `two-hop-count`
+5.4% to 6.8% slower and `star-lookup` 10.2% slower on the server side for the change. The
+rerun on atlas, an Intel Core i5-13500, on 2026-10-18 compared `23075691` with the tip of
+origin/main after item 86, `cb94caf6`, whose tree equals `1f377923`. It used the 27 queries
+of `scripts/bench.sh` on the 1.05M-triple dataset, with `scripts/nsc-bench-remote.sh` run
+on the host as `scripts/nsc-bench.sh` runs it on an instance. Each server process was pinned
+to one performance core with the client on another, with six rounds of A, B, B, A and 20
+timed requests per query and process. Both binaries returned the same answers to every
+query. `two-hop-count` took 2.64 ms on `23075691` and 2.56 ms after, 2.8% faster, and a
+second run of ten rounds with 100 requests per process measured 2.60 and 2.54 ms, 2.5%
+faster, in nine of ten rounds. `star-lookup` took 0.058 and 0.059 ms, 1.8% more, and
+0.057 ms for both builds in the second run, 1.5% more with a spread of 61% between the
+processes of one build. `employee-docs` took 0.033 ms for both builds and 0.032 ms for both
+in the second run. The geometric mean of the server times over the 27 queries was 1.001. The
+slowest of the others on the server side were `lang-filter` at plus 3.3% and `star-join`
+and `expr-order-key` at plus 2.5%, and a rerun of ten rounds with 50 requests reproduced
+`lang-filter` at plus 3.2% and `star-join` at plus 2.7% in every round, though `expr-order-key`
+came out at plus 0.5%. These are 0.04 to 0.05 ms on queries of 1.5 to 1.7 ms. They are under
+the 5% that settles an effect, the item changed the commit path and not the query executor, and the client's
+wall time for both queries did not change, so they look like a difference of code layout.
+The wall time of `optional-chain` was 22.05 ms and 23.01 ms, 4.3% more in every round, with
+a server time of 2.02 ms against 2.03 ms. The wall time of `star-join` was the same for both
+builds in the rerun except in three of ten rounds, where one server process of the new build
+took 1 ms more. Both wall differences are steps of 1 ms that the server time does not show,
+and they are open. So the screen's `two-hop-count` and `star-lookup` slowdowns did not
+reproduce on Intel, and no query changed by more than the 5% that the host resolves.
+
 **Open under item 86.** The gates of section 17.9 run on `forge` after item 1's runs
 there, with the text and spatial query latency under a four-writer load, a spatial dataset
 with geometries and an embedding index whose worker runs. Until they pass the item stays
