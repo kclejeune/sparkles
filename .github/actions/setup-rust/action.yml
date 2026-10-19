@@ -51,7 +51,7 @@ runs:
       with:
         shared-key: ${{ inputs.cache-key }}
         workspaces: ${{ inputs.workspaces }}
-        save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci-streamline-20261019' }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
         # a failed run saves the cache too, so one cold build does not make every later
         # run cold as well
         cache-on-failure: true

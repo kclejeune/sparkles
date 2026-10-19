@@ -465,9 +465,10 @@ linking short. A cold test build still peaks above the runner's 16 GB, so that j
 16 GB of swap.
 
 Measured on the pull request that introduced this layout, a push with warm caches waits
-about TBD minutes, against about 27 minutes warm and 40 minutes cold for the single job
-it replaced, which built and ran the tests in one job of four vCPUs. The test run alone
-took 14 to 21 minutes there, and the shards take about TBD minutes each.
+about 13 minutes for `ci.yml` and a cold one about 25. The single job it replaced took
+about 27 minutes warm and 40 cold, of which the test run alone took 14 to 21. The test
+build takes 7 minutes warm and 15 cold, and each test job about 5 to 6 minutes, of which
+downloading the 2.2 GB archive takes one to one and a half.
 
 ## Releases
 
