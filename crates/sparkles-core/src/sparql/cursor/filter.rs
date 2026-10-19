@@ -304,16 +304,18 @@ impl Morsels {
                 (a <= b).then_some((a, b))
             })
             .collect();
-        // The parts the tasks copy and the decoded blocks the tasks hold, one per block
-        // of the morsel, since a task that waits can steal another block's piece. Each
-        // task also charges its own runs and key scratch.
+        // The parts the tasks copy and the decoded blocks the tasks hold. A worker holds
+        // the block it reads, and one that waits for a piece another worker took can
+        // start a further block meanwhile, so up to two blocks per worker, and no more
+        // than the morsel has. Each task also charges its own runs and key scratch.
         let width = self.cols.len().max(1) as u64;
         let blocks = rows.div_ceil(crate::index::BLOCK_ROWS).max(1) as u64;
+        let live = blocks.min(2 * rayon::current_num_threads().max(1) as u64);
         let scratch = match OwnedCharge::new(
             ctx,
             (rows as u64)
                 .saturating_mul(width * 8)
-                .saturating_add(blocks.saturating_mul(crate::index::BLOCK_ROWS as u64 * 32))
+                .saturating_add(live.saturating_mul(crate::index::BLOCK_ROWS as u64 * 32))
                 .saturating_add(4096),
         ) {
             Ok(scratch) => scratch,

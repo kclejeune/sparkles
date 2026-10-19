@@ -1262,8 +1262,9 @@ scan back to the scan's own batches from the next unread block. The scan's count
 `morselRows` in the cursor plan gives the rows read in morsels.
 
 A morsel charges its input columns, the passing rows it holds until they are written and
-a scratch area of 32 bytes per block row for each of its blocks, since a task that waits
-can steal another block's piece. On an 8-vCPU AMD EPYC Namespace
+a scratch area of 32 bytes per block row for two blocks per worker, bounded by the
+morsel's blocks, since a worker that waits for a piece another worker took can start a
+further block meanwhile. On an 8-vCPU AMD EPYC Namespace
 instance at 10.5M the cursor's ledger peaked at 13.5 MB for the CONTAINS filter with
 eight threads, against 11.8 MB before and 15.6 MB eagerly, and at 5.2 MB with one
 thread. More threads hold more morsel scratch at once, which is the memory this speed
