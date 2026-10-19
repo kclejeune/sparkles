@@ -5010,10 +5010,22 @@ request settled at its bound, with the billed amount and the evidence for it.
 without reading a key. The pilot's carryover is reconciled this way once the Console's
 cost for its key on 2026-10-15 is known. A reply that comes back compressed despite the
 identity request is decoded, and Sonnet 5.5 cache reads are charged at the published
-$0.20 per million tokens, where the table had half that.
+$0.20 per million tokens, where the table had half that. Opus 5.5 cache reads are also
+$0.20 per million, which is a twentieth of its input price, and a test pins the whole
+rate table against the pricing documentation.
+
+A review of this work tightened the ledger. Replay refuses a negative or non-integer
+amount, a request ID that is not a positive integer, a settle without its reserve, a
+carryover anywhere but right after the header and a reconcile that would take the
+ledger past USD 25. A reconcile can only lower a held charge unless `--allow-raise` is
+given, and its evidence must be 10 to 1000 printable characters. Any fault of a request
+settles at its bound, and an error inside the request keeps only its class, so a key
+with a stray newline cannot reach a message.
 
 The gate that the pilot used is replaced. The new ledger opens with the pilot's
-$1.002560 as a carryover line, so the local cap of $25 leaves $23.997440. The pilot's
+$1.002560 as a carryover line. The run file's cap is $23.997440, so the cap and the
+carryover together stay within USD 25. The ledger's spent total includes the carryover,
+so new requests can spend $22.994880 under that cap. The pilot's
 wallet, grant claim and report are kept as the record and are never reopened. The next run
 uses a binary built from a named commit outside the private notes. What remains is a paid
 run of the demo set, the converted QALD-9-plus set and the Text2SPARQL'25 sets, and the
@@ -5052,14 +5064,16 @@ work listed below.
   took under 50 ms, and nine of the first ten failed although the fake drafted the gold
   query, which `sparkles query` answers in 0.04 s with 118 MiB under the same 2 GiB
   budget. Their check reported `budget-memory` against the 2 GiB query memory budget of
-  `sparkles ask`. `check_query` builds a schema report of the whole dataset before it
-  checks a query, which is the likely cause. Through `sparkles mcp` with a 30 s timeout
+  `sparkles ask`, which is measured. `check_query` builds a schema report of the whole
+  dataset before it checks a query, which is the likely cause but was not confirmed with
+  a profile. Through `sparkles mcp` with a 30 s timeout
   the same check stops after 45,857 of 58,564 predicates of that report, while
   `describe_schema` with the summary section takes 48.6 s, and the process reached 11.1
   GiB. Each `sparkles ask` process builds the report again. The DBpedia sets therefore
   wait for `check_query` to read a stored or cached schema report, or to check terms
   without one, and for `sparkles ask` to keep the report between questions, for
-  example by asking through a running server.
+  example by asking through a running server. [Roadmap](../ROADMAP.md) item 89 tracks
+  that work.
 - `scripts/text2sparql-convert` converts Text2SPARQL'25 from the challenge repository
   and the CK25 repository at pinned commits, with SHA256 checks, and vendors nothing.
   `--set db25` takes the 100 English DBpedia questions, which the challenge ran on
@@ -5075,7 +5089,8 @@ work listed below.
   and the published answers of the other two are empty while the gold returns rows on
   the graph. CK25's data and questions are licensed CC BY 4.0 and the DBpedia questions
   CC BY-SA 4.0. The strict scorer compares rows as sets, so the two CK25 questions marked
-  `RESULT_ORDER_MATTERS` are scored without their order.
+  `RESULT_ORDER_MATTERS` are scored without their order, and their scores carry
+  `orderNotScored`.
 - Publish per model and role the metrics of §11.1 and §11.4 (execution accuracy with
   QALD's precision, recall and F1, valid-query rate, repair rate, latency and cost per
   correct answer) in a section of [BENCHMARKS](../BENCHMARKS.md), and replace §3.7's

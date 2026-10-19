@@ -25,15 +25,18 @@ set recomputes on its own graph, which the converter writes beside the set file 
 set loads with full-text search, as the demo set does. QALD-9-plus and Text2SPARQL'25 ran
 on older DBpedia releases, and LC-QuAD 2.0 needs a Wikidata database that holds
 statements and qualifiers, which the truthy dump leaves out. The scorer compares rows as
-sets, so a question that the source marks as order-sensitive is scored without its order.
+sets, so a question that the source marks as order-sensitive is scored without its order,
+and its score carries `orderNotScored`.
 
 The DBpedia converters also make Virtuoso-dialect gold standard SPARQL. They declare the
 prefixes that DBpedia's endpoint predeclares, such as `dbo:` and `xsd:`, and put
 parentheses and a variable around a bare projection such as `SELECT DISTINCT COUNT(?x)`.
-The set keeps the source query as `sourceGold` and lists the rewrites. The DBpedia sets
-cannot run yet. On the full DBpedia database every `sparkles ask` spends about 100
-seconds building a schema report of the whole dataset for `check_query`, and most checks
-fail on the 2 GiB query memory budget, as C18's roadmap follow-ups record.
+The rewrites never look inside a literal, an IRI or a comment, and the new variable is
+one the query does not use. The set keeps the source query as `sourceGold` and lists the
+rewrites. The DBpedia sets cannot run yet. On the full DBpedia database every `sparkles
+ask` takes about 100 seconds and most checks fail on the 2 GiB query memory budget. The
+likely cause is the schema report of the whole dataset that `check_query` builds in each
+process, and roadmap item 89 addresses it.
 
 ## What is scored
 
@@ -53,10 +56,10 @@ it starts a query. This is a strict RDF-term policy and not an official QALD sco
 Answerable accuracy, clarification precision and refusal accuracy have separate
 denominators. Only the `unanswerable` outcome is a successful refusal. A provider error,
 a refusal by the model, an Ask timeout or an unusable draft is a failed answer with the
-status `provider_error`, `refusal`, `timeout`, `budget_exceeded` or `invalid_output`, and the run goes on.
-A case that the cost cap refused is `budget_refused`. It leaves the denominators, marks
-its row incomplete and ends the run. A harness fault stops a run, such as failing gold,
-a wrong binary hash or a child with an unknown exit status.
+status `provider_error`, `refusal`, `timeout`, `budget_exceeded` or `invalid_output`,
+and the run goes on. A case that the cost cap refused is `budget_refused`. It leaves the
+denominators, marks its row incomplete and ends the run. A harness fault stops a run,
+such as failing gold, a wrong binary hash or a child with an unknown exit status.
 
 Each child has capped output, its own process group and cleanup. A matrix has no
 wall-clock deadline unless `--phase-deadline` sets one. Ask gets 300 seconds, a query
@@ -83,28 +86,48 @@ against the fake, reads no key and reports request sizes. Neither contacts a pro
 random token in place of the key. Only the proxy reads `ANTHROPIC_API_KEY`. It sends
 each request once to `api.anthropic.com` with the standard library, so Content-Length,
 chunked and close-delimited replies all work. A reply that comes back gzip or deflate
-encoded, although the request asks for none, is decoded. It sets `stream` to false and the effort
-from the run file, and it refuses tools, cache control and any model outside the run.
+encoded, although the request asks for none, is decoded. It sets `stream` to false and
+the effort from the run file, and it refuses tools, cache control and any model outside
+the run. The key is stripped once when it is read, and a key with whitespace or control
+characters inside is refused. An error inside the request keeps only its class, so the
+key cannot reach a message. The key does stay in the proxy's initial process
+environment, which another process of the same user can read, so the machine should be
+one only the operator uses.
 
 A JSON-lines ledger at the run file's `ledger` path holds the cap. Before each request the
 proxy writes a reserve line with an upper bound from the request size and `max_tokens`,
 and the reply writes a settle line with the cost from its usage. A request is refused
-when the spent total plus its bound would pass `localCapNanodollars`. An error reply is
-free, a lost reply costs the bound and a reply without usage costs the bound. Replaying
-the ledger counts every unsettled reserve at its bound, and the pilot's unresolved
-$1.002560 is the carryover line. Reopening a ledger resumes it. Nothing resets it. The
-ledger's first line holds its format version, 2, and a reader refuses any other version.
+when the spent total plus its bound would pass `localCapNanodollars`. The spent total
+includes the carryover, so the cap covers the carryover as well, and new requests can
+spend the cap minus the carryover. The run file is also refused when the cap plus the
+carryover passes USD 25, which counts the carryover twice and keeps the run on the safe
+side. An error reply is free, a lost reply costs the bound, a reply without usage costs
+the bound, and any other fault of the request costs the bound. Replaying the ledger
+counts every unsettled reserve at its bound, and the pilot's unresolved $1.002560 is the
+carryover line. Reopening a ledger resumes it. Nothing resets it. The ledger's first line
+holds its format version, 2, and a reader refuses any other version.
+
+Replay is strict. It refuses a cost or bound that is not a nonnegative integer, a request
+ID that is not a positive integer, a settle without its reserve, a repeated reserve, a
+carryover anywhere but right after the header, and a reconcile that breaks any rule
+below or takes the ledger past USD 25. A refused ledger stops the run. A ledger from an
+older format, an empty file and a ledger cut off between its header and its carryover
+are refused the same way, and need a new ledger directory or an edit by hand.
 
 A charge that stands at an upper bound can be reconciled with the amount the provider
 billed. Such charges are the carryover, a reserve that a crash left without a settle
 line, and a request settled at its bound because its reply was lost or its usage could
 not be read. `--held` lists them with each request's model, case, time and request ID.
 `--reconcile TARGET --billed-nanodollars N --evidence TEXT` appends a reconcile line
-that replaces one of them, where TARGET is `carryover` or a request ID. The evidence
-names the source of the amount, such as the Console's cost for one day of an API key
-that only the run used. Each charge is reconciled once, and replay checks every
-reconcile line against the charge it replaced. Neither command reads a key or sends a
-request, and both create the ledger with its carryover when it does not exist yet.
+that replaces one of them, where TARGET is `carryover` or a request ID. The evidence is
+10 to 1000 printable characters that name the source of the amount, such as the
+Console's cost for one day of an API key that only the run used. The held charge is an
+upper bound, so an amount above it is refused unless `--allow-raise` is given, and the
+line then records the raise. The command prints the previous and the new amount. Each
+charge is reconciled once, and replay checks every reconcile line against the charge it
+replaced. Neither command reads a key or sends a request, and both create the ledger
+with its carryover when it does not exist yet. Both take the ledger's lock, so they
+cannot run while a paid run holds it.
 
 ```
 scripts/eval-ask-anthropic --run RUN.json --held
@@ -116,8 +139,10 @@ The local ledger is the authority. A Console workspace spend limit of $24 is a b
 against a defect, and it can lag billing, so the run does not rely on it.
 
 Before spending, the run counts tokens, which is free, and sends each model of the run
-one structured-output request of at most 256 tokens. It records the status and headers of
-the replies in `preflight.json`. It stops if any step fails. A block of a set and a model runs only when the projected cost fits
+one structured-output request of at most 256 tokens. It records the status and headers
+of the replies in `preflight.json`, without rate-limit, request, organization, workspace
+and cookie headers. It stops if any step fails. A block of a set and a model runs only
+when the projected cost fits
 the cap. The projection is the case count times the p90 measured case cost of that model,
 or a prior from the run file, times a margin.
 

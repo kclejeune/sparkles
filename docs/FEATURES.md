@@ -391,11 +391,11 @@ that work by priority and links each item to its design spec.
   because its gate refused a chunked reply, and its $1.002560 stays in the next run's
   cost ledger until it is reconciled with the billed amount. The harness converts
   QALD-9-plus, Text2SPARQL'25 and LC-QuAD 2.0, with gold recomputed on DBpedia
-  2022.12.01 and on CK25. Asking on the DBpedia database fails most questions, because
-  `check_query` builds a schema report of the whole dataset in every `sparkles ask`,
-  which most likely passes the 2 GiB query memory budget. LC-QuAD 2.0 needs a Wikidata load
-  from the full dump, and independent-role evaluation remains. [Roadmap](ROADMAP.md)
-  item 6.
+  2022.12.01 and on CK25. Asking on the DBpedia database fails most questions on the
+  2 GiB query memory budget of `sparkles ask`, likely because `check_query` builds a
+  schema report of the whole dataset in every process, which [Roadmap](ROADMAP.md) item
+  89 addresses. LC-QuAD 2.0 needs a Wikidata load from the full dump, and
+  independent-role evaluation remains. [Roadmap](ROADMAP.md) item 6.
 * **Assistant configuration.** Dataset assistant settings, including `enabled`,
   `ingest` and `send: "documents"`, can be declared for every dataset or by name in the
   settings file of `serve --settings`, which can also lock them, and changed through

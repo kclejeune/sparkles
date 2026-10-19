@@ -130,8 +130,13 @@ the answers the source publishes and records the load manifest of that database.
 paid wrapper `scripts/eval-ask-anthropic` lists the ledger's charges that stand at an
 upper bound with `--held` and replaces one with the billed amount and its evidence with
 `--reconcile`. That is how the $1.002560 that the 2026-10-15 pilot left unresolved can
-be settled once the billed amount is known. It decodes a reply that comes back gzip or deflate encoded, and it charges
-Sonnet 5.5 cache reads at the published $0.20 per million tokens.
+be settled once the billed amount is known. An amount above the held charge needs
+`--allow-raise`, and the evidence is 10 to 1000 printable characters. The wrapper
+decodes a reply that comes back gzip or deflate encoded, settles any fault of a request
+at its bound, and charges Sonnet 5.5 cache reads at the published $0.20 per million
+tokens. The DBpedia gold rewrites leave literals and comments alone, never reuse a
+variable of the query and also rewrite `COUNT(*)`. A sampled LC-QuAD 2.0 set records how
+many questions it sampled.
 
 ### Behavior
 
@@ -178,8 +183,12 @@ throughout.
 ### Format
 
 The Ask evaluation cost ledger is in version 2. Reserve and settle lines carry a time,
-and a reconcile line replaces a charge held at its bound. A reader refuses a ledger of
-version 1, which no paid run wrote, and of any later version.
+and a reconcile line replaces a charge held at its bound. A reconcile line that raises
+a charge carries `"raise": true`. A reader refuses a ledger of version 1, which no paid
+run wrote, and of any later version. Replay also refuses a negative or non-integer
+amount, a request ID that is not a positive integer, a settle without its reserve, a
+carryover line anywhere but right after the header, and a reconcile that takes the
+ledger past USD 25.
 
 Spill files are registered as the derived format `spill` version 1. A file has the magic
 `SPKSPL01`, the version as a u16, the operator kind, the codec, an encryption flag and
