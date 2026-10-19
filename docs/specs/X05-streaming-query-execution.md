@@ -1266,7 +1266,7 @@ a scratch area of 32 bytes per block row for two blocks per worker, bounded by t
 morsel's blocks, since a worker that waits for a piece another worker took can start a
 further block meanwhile. On an 8-vCPU AMD EPYC Namespace
 instance at 10.5M the cursor's ledger peaked at 13.5 MB for the CONTAINS filter with
-eight threads, against 11.8 MB before and 15.6 MB eagerly, and at 5.2 MB with one
+eight threads, against 11.8 MB before and 15.6 MB eagerly, and at 6.2 MB with one
 thread. More threads hold more morsel scratch at once, which is the memory this speed
 costs.
 
@@ -1324,8 +1324,16 @@ Reading the morsels one after another was 1.72 times slower than eager execution
 threads on the Namespace instance, so the morsels run in parallel. At 10.5M the range
 top-k over salaries measured 1.06 times eager execution at eight threads, the median of
 21 rounds, where it measured 1.33, and 0.88 at one thread, where it measured 0.93. The
-cursor's ledger peaked at 6.1 MB with eight threads against 5.6 MB before, and at 3.3 MB
-with one thread.
+cursor's ledger peaked at 6.6 to 7.1 MB with eight threads against 5.6 MB before, and at
+3.5 MB with one thread, since each morsel now charges its rows from its blocks before it
+reads them.
+
+The fixes that followed review were measured against the first version of this work,
+8502dd4c, on a fresh instance in two processes of 21 rounds each. The range top-k
+measured 0.89 to 0.96 times eager execution at eight threads against 0.89 for 8502dd4c,
+and 0.88 at one thread for both. The filters stayed within the instance's noise of
+8502dd4c at both thread counts, and the one-thread filter ledger rose from 5.2 MB to
+6.2 MB with the scratch of a second block.
 
 ### Native JSON of a streamed filter (2026-10-18)
 

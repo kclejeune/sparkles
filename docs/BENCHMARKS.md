@@ -1723,7 +1723,7 @@ eager time, the median of seven rounds, against 5c73ced6.
 At one thread CONTAINS moved from 0.95 to 1.00 and REGEX from 1.14 to 1.15, which is
 within the noise of the AMD instance and needs an Intel host to confirm. The cursor's
 ledger peaked at 13.5 MB for the CONTAINS filter with eight threads, against
-11.8 MB before and 15.6 MB eagerly, and at 5.2 MB with one thread, since each worker holds
+11.8 MB before and 15.6 MB eagerly, and at 6.2 MB with one thread, since each worker holds
 its own morsel scratch.
 
 The cursor's range top-k reads the parts of its range without value order in parallel
@@ -1731,8 +1731,9 @@ morsels and keeps only its best rows
 ([X05](specs/X05-streaming-query-execution.md#streaming-range-top-k-2026-10-18)). Over the
 salaries above 150,000 at 10.5M on the same instance it took 1.06 times its eager time at
 eight threads, the median of 21 rounds, against 1.33 at 5c73ced6, and 0.88 at one
-thread against 0.93. Its ledger peaked at 6.1 MB at eight threads and 3.3 MB at one,
-against 5.6 MB before at both.
+thread against 0.93. Its ledger peaked at 6.6 to 7.1 MB at eight threads and 3.5 MB at
+one, against 5.6 MB before at both. The figures for the ledger are those after the fixes
+that followed review, which left the times within noise.
 
 In native JSON at one thread, the STRSTARTS filter over names took 1.30 times its eager
 time at 5c73ced6 and takes 1.01 to 1.03 times now, the median of 15 rounds in two
