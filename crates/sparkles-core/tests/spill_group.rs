@@ -43,6 +43,7 @@ fn spill(dir: &std::path::Path) -> Arc<Spill> {
         max_bytes: 4 << 30,
         query_bytes: 4 << 30,
         min_free_bytes: 0,
+        encrypted: false,
     })
     .unwrap()
 }

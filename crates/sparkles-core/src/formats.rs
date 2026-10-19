@@ -323,8 +323,8 @@ pub const SPILL: FileKind = FileKind {
     files: "the spill files under `--spill-dir` and their SPARKLES-SPILL marker",
     marker: "the u16 after the `SPKSPL01` magic; another version is refused",
     class: Class::Derived,
-    writes: 1,
-    reads: &[1],
+    writes: 2,
+    reads: &[2],
 };
 
 /// The layout marker of a backup repository.

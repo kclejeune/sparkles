@@ -7,7 +7,8 @@
 //! of each mode's memory ledger and what automatic execution chose. `SPARKLES_PROBE_MODES`
 //! picks `rows`, `tsv` or both (the default), and `SPARKLES_PROBE_MEMORY_MB` sets the
 //! query memory budget. `SPARKLES_PROBE_STREAM_MEMORY_MB` sets another budget for the
-//! cursor runs, and `SPARKLES_PROBE_SPILL_DIR` lets them spill to that directory.
+//! cursor runs, and `SPARKLES_PROBE_SPILL_DIR` lets them spill to that directory, with every
+//! spill file encrypted when `SPARKLES_PROBE_SPILL_ENCRYPTED` is set.
 use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions, write_solutions};
 use sparkles_core::sparql::{
     CursorOptions, ExecutionMode, QueryExecution, QueryOptions, query, query_cursor,
@@ -50,6 +51,7 @@ fn main() {
             max_bytes: 64 << 30,
             query_bytes: 64 << 30,
             min_free_bytes: 1 << 30,
+            encrypted: std::env::var_os("SPARKLES_PROBE_SPILL_ENCRYPTED").is_some(),
         })
         .unwrap();
         stream_options.spill = Some(spill);

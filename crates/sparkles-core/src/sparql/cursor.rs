@@ -3706,6 +3706,7 @@ mod tests {
             max_bytes: 1 << 30,
             query_bytes: 1 << 30,
             min_free_bytes: 0,
+            encrypted: false,
         })
         .unwrap();
         let decide = |q: &str, spill: Option<Arc<crate::spill::Spill>>, memory: u64, est: f64| {

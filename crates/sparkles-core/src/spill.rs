@@ -26,12 +26,24 @@
 //!
 //! The file format is private to one process, but it is versioned like every on-disk
 //! format: a 32-byte header holds the magic `SPKSPL01`, the format version, the kind of
-//! operator that wrote it, the codec, an encryption flag and the column count. Frames of
-//! at most [`FRAME_ROWS`] rows follow, each with a 16-byte header (payload length, row
-//! count, a CRC-32 of the header and payload, and flags) and a payload of columns, each
-//! a 32-bit length and the column as the index blocks encode it (zig-zag delta varints,
-//! then LZ4). A reader refuses another magic, version, codec or encryption flag, and a
-//! frame whose CRC, length or row count does not match, with [`Error::Corrupt`].
+//! operator that wrote it, the codec, the encryption, the column count and the file's
+//! number. Frames of at most [`FRAME_ROWS`] rows follow, each with a 16-byte header
+//! (payload length, row count, a CRC-32 of the header and payload, and flags) and a
+//! payload of columns, each a 32-bit length and the column as the index blocks encode it
+//! (zig-zag delta varints, then LZ4). A reader refuses another magic, version, codec or
+//! encryption, and a frame whose CRC, length or row count does not match, with
+//! [`Error::Corrupt`].
+//!
+//! With [`SpillOptions::encrypted`] (`serve --spill encrypted`, X08 §6.7) every file has
+//! its own random 256-bit AES-GCM key, made when the file is created and held only in
+//! memory by its writer and its finished run, so a file is unreadable once the process
+//! that wrote it is gone. Each frame's payload is sealed with AES-256-GCM through
+//! `aws-lc-rs`. Its nonce is the file's number and the frame's number, and its
+//! additional data is the file header's kind, column count and number with the frame's
+//! number, length and row count, so a frame that is changed, or moved to another place
+//! in its file or to another file, fails to open. The reader knows from memory how many
+//! frames the file holds, so a truncated file fails too. The CRC of an encrypted frame
+//! covers the sealed bytes, so it reveals nothing of the plain text.
 
 use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::Id;
@@ -45,7 +57,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const FORMAT_NAME: &str = "sparkles-spill";
 /// The version of the file format, in every file's header, registered as
 /// [`crate::formats::SPILL`].
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 const MAGIC: [u8; 8] = *b"SPKSPL01";
 const HEADER_BYTES: usize = 32;
 const FRAME_HEADER_BYTES: usize = 16;
@@ -57,6 +69,12 @@ pub const EXTENT: u64 = 64 << 20;
 pub const MARKER: &str = "SPARKLES-SPILL";
 /// The codec of the columns: zig-zag delta varints, then LZ4.
 const CODEC_DELTA_LZ4: u8 = 1;
+/// The encryption byte of a plain file.
+const PLAIN: u8 = 0;
+/// The encryption byte of a file whose frames are sealed with AES-256-GCM.
+const AES_256_GCM: u8 = 1;
+/// The bytes of an AES-GCM tag after each sealed payload.
+const TAG_BYTES: usize = 16;
 
 /// What wrote a spill file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +114,9 @@ pub struct SpillOptions {
     pub query_bytes: u64,
     /// The free space to leave on the spill file system.
     pub min_free_bytes: u64,
+    /// Whether every frame is encrypted with a key that only this process holds
+    /// (`serve --spill encrypted`).
+    pub encrypted: bool,
 }
 
 /// A failure the tests inject into the spill file API.
@@ -118,6 +139,7 @@ pub struct Spill {
     max_bytes: u64,
     query_bytes: u64,
     min_free_bytes: u64,
+    encrypted: bool,
     reserved: AtomicU64,
     files: AtomicU64,
     queries: AtomicU64,
@@ -310,6 +332,7 @@ impl Spill {
             max_bytes: options.max_bytes,
             query_bytes: options.query_bytes,
             min_free_bytes: options.min_free_bytes,
+            encrypted: options.encrypted,
             reserved: AtomicU64::new(0),
             files: AtomicU64::new(0),
             queries: AtomicU64::new(0),
@@ -361,6 +384,11 @@ impl Spill {
     /// The directory of this process's spill files.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Whether spill files are encrypted.
+    pub fn encrypted(&self) -> bool {
+        self.encrypted
     }
 
     /// The disk all queries together may reserve.
@@ -462,8 +490,8 @@ impl Spill {
         Ok(())
     }
 
-    /// Open an unnamed file in the process directory.
-    fn create(&self, query: u64) -> Result<File> {
+    /// Open an unnamed file in the process directory, with its number.
+    fn create(&self, query: u64) -> Result<(File, u64)> {
         let n = self.files.fetch_add(1, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
@@ -475,7 +503,7 @@ impl Spill {
                 .custom_flags(libc::O_TMPFILE)
                 .open(&self.dir);
             match opened {
-                Ok(file) => return Ok(file),
+                Ok(file) => return Ok((file, n)),
                 // A file system without O_TMPFILE takes the named path below.
                 Err(e)
                     if matches!(
@@ -497,7 +525,7 @@ impl Spill {
             .open(&path)
             .map_err(|e| failed(e, "file", self.max_bytes, self.reserved_bytes()))?;
         std::fs::remove_file(&path).map_err(|e| io(e, "file"))?;
-        Ok(file)
+        Ok((file, n))
     }
 }
 
@@ -673,7 +701,18 @@ impl QuerySpill {
         let columns_u32 =
             u32::try_from(columns).map_err(|_| Error::invalid("too many spill columns"))?;
         self.reserve(HEADER_BYTES as u64)?;
-        let file = match self.spill.create(self.number) {
+        let key = if self.spill.encrypted {
+            match FrameKey::generate() {
+                Ok(key) => Some(Arc::new(key)),
+                Err(e) => {
+                    self.release(HEADER_BYTES as u64);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        let (file, number) = match self.spill.create(self.number) {
             Ok(file) => file,
             Err(e) => {
                 self.release(HEADER_BYTES as u64);
@@ -693,12 +732,15 @@ impl QuerySpill {
         header[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         header[10] = kind as u8;
         header[11] = CODEC_DELTA_LZ4;
-        // header[12]: no encryption
+        header[12] = if key.is_some() { AES_256_GCM } else { PLAIN };
         header[16..20].copy_from_slice(&columns_u32.to_le_bytes());
+        header[20..28].copy_from_slice(&number.to_le_bytes());
         let mut writer = SpillWriter {
             file: Some(file),
             query: self.clone(),
             kind,
+            number,
+            key,
             columns,
             rows: 0,
             frames: 0,
@@ -725,6 +767,10 @@ pub struct SpillWriter {
     file: Option<File>,
     query: Arc<QuerySpill>,
     kind: SpillKind,
+    /// The file's number in the process, part of every frame's nonce.
+    number: u64,
+    /// The file's key when frames are encrypted.
+    key: Option<Arc<FrameKey>>,
     columns: usize,
     rows: u64,
     frames: u64,
@@ -788,13 +834,18 @@ impl SpillWriter {
             payload.extend_from_slice(&len.to_le_bytes());
             payload.extend_from_slice(&encoded);
         }
-        let len = u32::try_from(payload.len())
-            .map_err(|_| Error::invalid("a spill frame is too large"))?;
         let rows = range.len() as u32;
+        let sealed = payload.len() + if self.key.is_some() { TAG_BYTES } else { 0 };
+        let len =
+            u32::try_from(sealed).map_err(|_| Error::invalid("a spill frame is too large"))?;
         let mut header = [0u8; FRAME_HEADER_BYTES];
         header[..4].copy_from_slice(&len.to_le_bytes());
         header[4..8].copy_from_slice(&rows.to_le_bytes());
         header[12..16].copy_from_slice(&0u32.to_le_bytes());
+        if let Some(key) = &self.key {
+            let aad = frame_aad(self.kind, self.columns, self.number, self.frames, &header);
+            key.seal(self.number, self.frames, &aad, &mut payload)?;
+        }
         let crc = frame_crc(&header, &payload);
         header[8..12].copy_from_slice(&crc.to_le_bytes());
         let total = (FRAME_HEADER_BYTES + payload.len()) as u64;
@@ -819,6 +870,8 @@ impl SpillWriter {
             file: Some(file),
             query: self.query.clone(),
             kind: self.kind,
+            number: self.number,
+            key: self.key.take(),
             columns: self.columns,
             rows: self.rows,
             frames: self.frames,
@@ -844,12 +897,88 @@ fn frame_crc(header: &[u8; FRAME_HEADER_BYTES], payload: &[u8]) -> u32 {
     crc.sum()
 }
 
+/// The additional data a sealed frame authenticates: the file's kind, column count and
+/// number, the frame's number, and the frame header without its CRC.
+fn frame_aad(
+    kind: SpillKind,
+    columns: usize,
+    number: u64,
+    frame: u64,
+    header: &[u8; FRAME_HEADER_BYTES],
+) -> [u8; 33] {
+    let mut aad = [0u8; 33];
+    aad[0] = kind as u8;
+    aad[1..5].copy_from_slice(&(columns as u32).to_le_bytes());
+    aad[5..13].copy_from_slice(&number.to_le_bytes());
+    aad[13..21].copy_from_slice(&frame.to_le_bytes());
+    aad[21..29].copy_from_slice(&header[..8]);
+    aad[29..33].copy_from_slice(&header[12..16]);
+    aad
+}
+
+/// One spill file's AES-256-GCM key, made from the system's random source and held
+/// only in memory. aws-lc-rs clears the key's bytes when it drops.
+struct FrameKey(aws_lc_rs::aead::LessSafeKey);
+
+impl FrameKey {
+    fn generate() -> Result<Self> {
+        use aws_lc_rs::aead::{AES_256_GCM, LessSafeKey, UnboundKey};
+        let mut bytes = [0u8; 32];
+        aws_lc_rs::rand::fill(&mut bytes)
+            .map_err(|_| Error::invalid("spill encryption: no random key"))?;
+        let key = UnboundKey::new(&AES_256_GCM, &bytes)
+            .map_err(|_| Error::invalid("spill encryption: a bad key"));
+        // The plain copy of the key is cleared before the key is used.
+        for byte in &mut bytes {
+            // SAFETY: a write through a valid reference to a byte of a local array.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        Ok(Self(LessSafeKey::new(key?)))
+    }
+
+    /// The nonce of frame `frame` of file `file`: the file's number in the first four
+    /// bytes and the frame's in the last eight. The key is the file's own, so the
+    /// frame's number alone keeps nonces apart.
+    fn nonce(file: u64, frame: u64) -> aws_lc_rs::aead::Nonce {
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&(file as u32).to_le_bytes());
+        nonce[4..].copy_from_slice(&frame.to_le_bytes());
+        aws_lc_rs::aead::Nonce::assume_unique_for_key(nonce)
+    }
+
+    /// Encrypt `payload` in place and append its tag.
+    fn seal(&self, file: u64, frame: u64, aad: &[u8], payload: &mut Vec<u8>) -> Result<()> {
+        self.0
+            .seal_in_place_append_tag(
+                Self::nonce(file, frame),
+                aws_lc_rs::aead::Aad::from(aad),
+                payload,
+            )
+            .map_err(|_| Error::invalid("spill encryption failed"))
+    }
+
+    /// Decrypt `payload` in place, which ends with its tag, and give the length of the
+    /// plain text, which stays at its start.
+    fn open(&self, file: u64, frame: u64, aad: &[u8], payload: &mut [u8]) -> Result<usize> {
+        self.0
+            .open_in_place(
+                Self::nonce(file, frame),
+                aws_lc_rs::aead::Aad::from(aad),
+                payload,
+            )
+            .map(|plain| plain.len())
+            .map_err(|_| Error::Corrupt("spill frame: it fails authentication".into()))
+    }
+}
+
 /// A finished spill file. Dropping it closes the file, which frees its space.
 pub struct SpillRun {
     /// Always open until the run drops.
     file: Option<File>,
     query: Arc<QuerySpill>,
     kind: SpillKind,
+    number: u64,
+    key: Option<Arc<FrameKey>>,
     columns: usize,
     rows: u64,
     frames: u64,
@@ -905,14 +1034,23 @@ impl SpillRun {
                 header[11]
             )));
         }
-        if header[12] != 0 {
-            return Err(Error::Corrupt(
-                "spill file: encrypted frames are not supported by this build".into(),
-            ));
+        let expected = if self.key.is_some() {
+            AES_256_GCM
+        } else {
+            PLAIN
+        };
+        if header[12] != expected {
+            return Err(Error::Corrupt(format!(
+                "spill file: encryption {}, the writer used {expected}",
+                header[12]
+            )));
         }
         let columns = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
         if columns != self.columns {
             return Err(Error::Corrupt("spill file: column count differs".into()));
+        }
+        if u64::from_le_bytes(header[20..28].try_into().unwrap()) != self.number {
+            return Err(Error::Corrupt("spill file: file number differs".into()));
         }
         Ok(SpillReader {
             run: self.clone(),
@@ -987,6 +1125,18 @@ impl SpillReader {
         if frame_crc(&header, &self.payload) != crc {
             return Err(Error::Corrupt("spill frame: CRC mismatch".into()));
         }
+        let len = if let Some(key) = &self.run.key {
+            let aad = frame_aad(
+                self.run.kind,
+                self.run.columns,
+                self.run.number,
+                self.frames,
+                &header,
+            );
+            key.open(self.run.number, self.frames, &aad, &mut self.payload)?
+        } else {
+            len
+        };
         let mut columns = Vec::with_capacity(self.run.columns);
         let mut at = 0usize;
         for _ in 0..self.run.columns {
@@ -1006,7 +1156,7 @@ impl SpillReader {
         if at != len {
             return Err(Error::Corrupt("spill frame: trailing bytes".into()));
         }
-        self.offset += (FRAME_HEADER_BYTES + len) as u64;
+        self.offset += (FRAME_HEADER_BYTES + self.payload.len()) as u64;
         self.frames += 1;
         Ok(Some((columns, rows)))
     }
@@ -1022,8 +1172,135 @@ mod tests {
             max_bytes: max,
             query_bytes: query,
             min_free_bytes: 0,
+            encrypted: false,
         })
         .unwrap()
+    }
+
+    fn encrypted_spill(dir: &Path) -> Arc<Spill> {
+        Spill::open(&SpillOptions {
+            dir: dir.to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: true,
+        })
+        .unwrap()
+    }
+
+    /// Every frame of `run`: its offset and its bytes, header included.
+    fn frames_of(run: &SpillRun) -> Vec<(u64, Vec<u8>)> {
+        use std::os::unix::fs::FileExt;
+        let mut frames = Vec::new();
+        let mut at = HEADER_BYTES as u64;
+        while at < run.bytes {
+            let mut header = [0u8; FRAME_HEADER_BYTES];
+            run.file().read_exact_at(&mut header, at).unwrap();
+            let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+            let mut bytes = vec![0u8; FRAME_HEADER_BYTES + len];
+            run.file().read_exact_at(&mut bytes, at).unwrap();
+            frames.push((at, bytes));
+            at += (FRAME_HEADER_BYTES + len) as u64;
+        }
+        frames
+    }
+
+    fn read_all(run: &Arc<SpillRun>) -> Result<Vec<Id>> {
+        let mut reader = run.reader()?;
+        let mut all = Vec::new();
+        while let Some((columns, _)) = reader.next_frame()? {
+            all.extend_from_slice(&columns[0]);
+        }
+        Ok(all)
+    }
+
+    #[test]
+    fn encrypted_frames_round_trip_and_hide_the_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = spill(dir.path(), 1 << 30, 1 << 30);
+        let sealed = encrypted_spill(dir.path());
+        assert!(sealed.encrypted() && !plain.encrypted());
+        let column: Vec<Id> = (0..9000u64)
+            .map(|i| Id(0x4142_4344_4546_0000 + i * 977))
+            .collect();
+        let write = |spill: &Arc<Spill>| {
+            let query = Arc::new(spill.query(None));
+            let mut writer = query.create(SpillKind::JoinPartition, 1).unwrap();
+            writer.write(&[&column], column.len()).unwrap();
+            Arc::new(writer.finish().unwrap())
+        };
+        let (a, b) = (write(&plain), write(&sealed));
+        assert_eq!(read_all(&a).unwrap(), column);
+        assert_eq!(read_all(&b).unwrap(), column);
+        // Each sealed frame is the plain frame and a tag.
+        assert_eq!(b.bytes, a.bytes + TAG_BYTES as u64 * a.frames);
+        // No 16 bytes of a plain payload appear in the sealed file.
+        let sealed_bytes: Vec<u8> = frames_of(&b).into_iter().flat_map(|(_, f)| f).collect();
+        for (_, frame) in frames_of(&a) {
+            for window in frame[FRAME_HEADER_BYTES..]
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .take(64)
+            {
+                assert!(
+                    !sealed_bytes.windows(16).any(|w| w == window),
+                    "plain bytes in a sealed file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tampered_reordered_moved_or_truncated_encrypted_frames_are_refused() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let spill = encrypted_spill(dir.path());
+        let query = Arc::new(spill.query(None));
+        // Frames of equal length, so that swapping two keeps the file's layout.
+        let column: Vec<Id> = vec![Id(42); 3 * FRAME_ROWS];
+        let make = || {
+            let mut writer = query.create(SpillKind::SortRun, 1).unwrap();
+            writer.write(&[&column], column.len()).unwrap();
+            Arc::new(writer.finish().unwrap())
+        };
+        let corrupt = |run: &Arc<SpillRun>| {
+            let error = read_all(run).unwrap_err();
+            assert!(matches!(error, Error::Corrupt(_)), "{error}");
+            error.to_string()
+        };
+        // A changed byte of the sealed payload, with its CRC made right again.
+        let run = make();
+        let frames = frames_of(&run);
+        let (at, mut frame) = frames[1].clone();
+        frame[FRAME_HEADER_BYTES + 3] ^= 0x01;
+        let header: [u8; FRAME_HEADER_BYTES] = frame[..FRAME_HEADER_BYTES].try_into().unwrap();
+        let crc = frame_crc(&header, &frame[FRAME_HEADER_BYTES..]);
+        frame[8..12].copy_from_slice(&crc.to_le_bytes());
+        run.file().write_all_at(&frame, at).unwrap();
+        assert!(corrupt(&run).contains("authentication"));
+        // Two frames swapped.
+        let run = make();
+        let frames = frames_of(&run);
+        assert_eq!(frames[0].1.len(), frames[2].1.len());
+        run.file().write_all_at(&frames[2].1, frames[0].0).unwrap();
+        run.file().write_all_at(&frames[0].1, frames[2].0).unwrap();
+        assert!(corrupt(&run).contains("authentication"));
+        // A frame copied from another file of the same query, at the same place.
+        let (one, two) = (make(), make());
+        let theirs = frames_of(&two);
+        one.file().write_all_at(&theirs[1].1, theirs[1].0).unwrap();
+        assert!(corrupt(&one).contains("authentication"));
+        // The last frame cut off.
+        let run = make();
+        let frames = frames_of(&run);
+        run.file().set_len(frames[2].0).unwrap();
+        assert!(corrupt(&run).contains("truncated"));
+        // A plain reader's encryption byte in an encrypted file.
+        let run = make();
+        run.file().write_all_at(&[PLAIN], 12).unwrap();
+        assert!(corrupt(&run).contains("encryption"));
+        assert_eq!(read_all(&make()).unwrap(), column);
     }
 
     fn ids(n: usize, step: u64) -> Vec<Id> {
@@ -1141,6 +1418,7 @@ mod tests {
             max_bytes: EXTENT - 1,
             query_bytes: 1 << 40,
             min_free_bytes: 0,
+            encrypted: false,
         })
         .unwrap();
         let query = Arc::new(spill2.query(None));
@@ -1263,6 +1541,7 @@ mod tests {
                 max_bytes: 1 << 30,
                 query_bytes: 1 << 30,
                 min_free_bytes: 0,
+                encrypted: false,
             })
         };
         let error = open(&shared).unwrap_err();
@@ -1346,6 +1625,7 @@ mod tests {
                 max_bytes: 1 << 30,
                 query_bytes: 1 << 30,
                 min_free_bytes: 0,
+                encrypted: false,
             },
             |marker: &Path| std::fs::create_dir(marker).unwrap(),
         )

@@ -53,6 +53,7 @@ fn spill(dir: &std::path::Path) -> Arc<Spill> {
         max_bytes: 4 << 30,
         query_bytes: 4 << 30,
         min_free_bytes: 0,
+        encrypted: false,
     })
     .unwrap()
 }
@@ -206,6 +207,7 @@ fn spill_limits_fail_the_query_with_a_spill_budget() {
         max_bytes: 4 << 30,
         query_bytes: 4 << 30,
         min_free_bytes: 0,
+        encrypted: false,
     })
     .unwrap();
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";
