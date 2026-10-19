@@ -385,15 +385,10 @@ fn verify(a: &Args) {
                 whole(&out)
             ));
         }
-        let named = text_payload_seq(&loc);
-        // a checkpoint whose payload this reader misses would pass every bound check
-        let meta = std::path::Path::new(&loc).join("text/meta.json");
-        if named.is_none()
-            && std::fs::read_to_string(&meta).is_ok_and(|m| m.contains("seq"))
-        {
-            problems.push(format!("cannot read the payload of {}", meta.display()));
-        }
-        named
+        // A file that is missing, torn or not valid JSON names no commit. Open rebuilds
+        // such an index, as `sparkles check` reports, and the search check below then
+        // compares the rebuilt index with the data.
+        text_payload_seq(&loc)
     } else {
         None
     };
@@ -532,18 +527,177 @@ fn column(out: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// The commit that the full-text checkpoint of the store at `loc` names: the `seq` of
-/// the payload in `text/meta.json`, which holds the payload as an escaped JSON string.
+/// The commit that the full-text checkpoint of the store at `loc` names: the `seq` of the
+/// payload in `text/meta.json`, a JSON object whose `payload` member is a string holding
+/// another JSON object. `None` when the file is missing, torn or not of that shape.
 fn text_payload_seq(loc: &str) -> Option<u64> {
     let meta = std::fs::read_to_string(std::path::Path::new(loc).join("text/meta.json")).ok()?;
-    let payload = &meta[meta.find("\"payload\"")?..];
-    let at = payload.find("seq")? + 3;
-    let digits: String = payload[at..]
-        .trim_start_matches(|c: char| c == '\\' || c == '"' || c == ':' || c.is_whitespace())
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
+    let Json::Str(payload) = Json::parse(&meta)?.get("payload")?.clone() else {
+        return None;
+    };
+    match Json::parse(&payload)?.get("seq")? {
+        Json::Num(n) => n.parse().ok(),
+        _ => None,
+    }
+}
+
+/// A JSON value, parsed by [`Json::parse`] from a whole document. Numbers keep their text.
+#[derive(Clone, Debug, PartialEq)]
+enum Json {
+    Null,
+    Bool(bool),
+    Num(String),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    /// The value of a whole document, or `None` if it is not valid JSON, a torn file
+    /// included.
+    fn parse(text: &str) -> Option<Json> {
+        let b = text.as_bytes();
+        let mut at = 0;
+        let v = Json::value(b, &mut at, 0)?;
+        Json::space(b, &mut at);
+        (at == b.len()).then_some(v)
+    }
+
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn space(b: &[u8], at: &mut usize) {
+        while *at < b.len() && matches!(b[*at], b' ' | b'\t' | b'\n' | b'\r') {
+            *at += 1;
+        }
+    }
+
+    fn value(b: &[u8], at: &mut usize, depth: usize) -> Option<Json> {
+        if depth > 64 {
+            return None;
+        }
+        Json::space(b, at);
+        match *b.get(*at)? {
+            b'{' => {
+                *at += 1;
+                let mut members = Vec::new();
+                Json::space(b, at);
+                if b.get(*at) == Some(&b'}') {
+                    *at += 1;
+                    return Some(Json::Obj(members));
+                }
+                loop {
+                    Json::space(b, at);
+                    let Json::Str(k) = Json::string(b, at)? else {
+                        return None;
+                    };
+                    Json::space(b, at);
+                    (b.get(*at) == Some(&b':')).then_some(())?;
+                    *at += 1;
+                    members.push((k, Json::value(b, at, depth + 1)?));
+                    Json::space(b, at);
+                    match b.get(*at)? {
+                        b',' => *at += 1,
+                        b'}' => {
+                            *at += 1;
+                            return Some(Json::Obj(members));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                *at += 1;
+                let mut items = Vec::new();
+                Json::space(b, at);
+                if b.get(*at) == Some(&b']') {
+                    *at += 1;
+                    return Some(Json::Arr(items));
+                }
+                loop {
+                    items.push(Json::value(b, at, depth + 1)?);
+                    Json::space(b, at);
+                    match b.get(*at)? {
+                        b',' => *at += 1,
+                        b']' => {
+                            *at += 1;
+                            return Some(Json::Arr(items));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'"' => Json::string(b, at),
+            b't' => Json::word(b, at, "true", Json::Bool(true)),
+            b'f' => Json::word(b, at, "false", Json::Bool(false)),
+            b'n' => Json::word(b, at, "null", Json::Null),
+            b'-' | b'0'..=b'9' => {
+                let from = *at;
+                *at += 1;
+                while *at < b.len()
+                    && matches!(b[*at], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    *at += 1;
+                }
+                let n = std::str::from_utf8(&b[from..*at]).ok()?;
+                n.parse::<f64>().ok()?;
+                Some(Json::Num(n.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    fn word(b: &[u8], at: &mut usize, w: &str, v: Json) -> Option<Json> {
+        b[*at..].starts_with(w.as_bytes()).then(|| {
+            *at += w.len();
+            v
+        })
+    }
+
+    fn string(b: &[u8], at: &mut usize) -> Option<Json> {
+        (b.get(*at) == Some(&b'"')).then_some(())?;
+        *at += 1;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            match *b.get(*at)? {
+                b'"' => {
+                    *at += 1;
+                    return String::from_utf8(out).ok().map(Json::Str);
+                }
+                b'\\' => {
+                    *at += 1;
+                    let c = match *b.get(*at)? {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => {
+                            let hex = std::str::from_utf8(b.get(*at + 1..*at + 5)?).ok()?;
+                            *at += 4;
+                            char::from_u32(u32::from_str_radix(hex, 16).ok()?).unwrap_or('\u{fffd}')
+                        }
+                        _ => return None,
+                    };
+                    *at += 1;
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                c if c < 0x20 => return None,
+                c => {
+                    out.push(c);
+                    *at += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Under `--index text`: the full-text index, recovered or rebuilt by `sparkles
@@ -553,7 +707,11 @@ fn check_text(bin: &str, loc: &str, receipts: &[&Receipt], problems: &mut Vec<St
     // waits for a rebuild that open started, or retries a failed one
     let (code, out, err) = sparkles(bin, &["text-index", "--loc", loc]);
     if code != 0 {
-        problems.push(format!("text-index exited {code}: {}{}", tail(&out), tail(&err)));
+        problems.push(format!(
+            "text-index exited {code}: {}{}",
+            tail(&out),
+            tail(&err)
+        ));
         return;
     }
     let picked = sample(receipts, 48);
@@ -591,7 +749,11 @@ fn check_text(bin: &str, loc: &str, receipts: &[&Receipt], problems: &mut Vec<St
 fn check_geo(bin: &str, loc: &str, problems: &mut Vec<String>) {
     let (code, out, err) = sparkles(bin, &["geo-index", "--loc", loc]);
     if code != 0 {
-        problems.push(format!("geo-index exited {code}: {}{}", tail(&out), tail(&err)));
+        problems.push(format!(
+            "geo-index exited {code}: {}{}",
+            tail(&out),
+            tail(&err)
+        ));
         return;
     }
     let q = format!("SELECT ?s ?w WHERE {{ ?s <{AS_WKT}> ?w }}");
@@ -643,7 +805,11 @@ fn check_geo(bin: &str, loc: &str, problems: &mut Vec<String>) {
 fn check_embed(bin: &str, loc: &str, head: u64, problems: &mut Vec<String>) {
     let (code, out, err) = sparkles(bin, &["vector", "status", "--loc", loc, "--name", "docs"]);
     if code != 0 {
-        problems.push(format!("vector status exited {code}: {}{}", tail(&out), tail(&err)));
+        problems.push(format!(
+            "vector status exited {code}: {}{}",
+            tail(&out),
+            tail(&err)
+        ));
         return;
     }
     let applied = out
@@ -656,7 +822,10 @@ fn check_embed(bin: &str, loc: &str, head: u64, problems: &mut Vec<String>) {
             "the embedding index is applied to {seq}, above the head {head}"
         )),
         Some(_) => {}
-        None => problems.push(format!("no appliedSeq in the vector status: {}", tail(&out))),
+        None => problems.push(format!(
+            "no appliedSeq in the vector status: {}",
+            tail(&out)
+        )),
     }
 }
 
@@ -681,8 +850,7 @@ fn only_leftovers(json: &str) -> bool {
             .rfind("\"status\": \"")
             .and_then(|j| json[j + 11..].split('"').next());
         let message = &json[i + 12..];
-        if status != Some("warning") || !ACCEPTED_LEFTOVERS.iter().any(|m| message.starts_with(m))
-        {
+        if status != Some("warning") || !ACCEPTED_LEFTOVERS.iter().any(|m| message.starts_with(m)) {
             return false;
         }
         any = true;
@@ -955,7 +1123,9 @@ mod tests {
     use super::only_leftovers;
 
     fn report(issues: &[(&str, &str)]) -> String {
-        let mut s = String::from("{\n  \"status\": \"warning\",\n  \"checks\": [\n    {\n      \"issues\": [\n");
+        let mut s = String::from(
+            "{\n  \"status\": \"warning\",\n  \"checks\": [\n    {\n      \"issues\": [\n",
+        );
         for (status, message) in issues {
             s.push_str(&format!(
                 "        {{\n          \"status\": \"{status}\",\n          \"message\": \"{message}\"\n        }},\n"
@@ -970,7 +1140,10 @@ mod tests {
         let old = "leftover: an old generation whose removal after a compaction was interrupted; safe to remove";
         let aside = "leftover: a generation above CURRENT that open set aside instead of removing; inspect it, then rename it back and point CURRENT at it, or delete it";
         assert!(only_leftovers(&report(&[("warning", old)])));
-        assert!(only_leftovers(&report(&[("warning", old), ("warning", aside)])));
+        assert!(only_leftovers(&report(&[
+            ("warning", old),
+            ("warning", aside)
+        ])));
         for other in [
             "leftover: newer than CURRENT, which the next open removes if it is an unfinished rebuild and sets aside otherwise",
             "leftover: a damaged commit catalog an earlier open set aside",
@@ -979,7 +1152,10 @@ mod tests {
             "leftover: left by an interrupted deletion; safe to remove",
             "a torn tail",
         ] {
-            assert!(!only_leftovers(&report(&[("warning", old), ("warning", other)])), "{other}");
+            assert!(
+                !only_leftovers(&report(&[("warning", old), ("warning", other)])),
+                "{other}"
+            );
         }
         assert!(!only_leftovers(&report(&[("error", old)])));
         assert!(!only_leftovers("{}"));
@@ -997,6 +1173,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(super::text_payload_seq(loc), Some(23));
+        // a torn file, or one whose payload is not an object with a seq, names nothing
+        let whole = std::fs::read_to_string(dir.join("text/meta.json")).unwrap();
+        for cut in [10, whole.len() / 2, whole.len() - 1] {
+            std::fs::write(dir.join("text/meta.json"), &whole[..cut]).unwrap();
+            assert_eq!(super::text_payload_seq(loc), None, "cut at {cut}");
+        }
+        std::fs::write(dir.join("text/meta.json"), "{\"payload\": \"seq 23\"}").unwrap();
+        assert_eq!(super::text_payload_seq(loc), None);
+        std::fs::write(
+            dir.join("text/meta.json"),
+            "{\"payload\": null, \"seq\": 23}",
+        )
+        .unwrap();
+        assert_eq!(super::text_payload_seq(loc), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn json_parses_what_the_checkpoint_holds() {
+        use super::Json;
+        let v = Json::parse(r#" {"a": [1, -2.5e3, true, null], "b": "x\"\u00e9\n", "c": {}} "#)
+            .unwrap();
+        assert_eq!(v.get("b"), Some(&Json::Str("x\"\u{e9}\n".into())));
+        assert_eq!(
+            v.get("a"),
+            Some(&Json::Arr(vec![
+                Json::Num("1".into()),
+                Json::Num("-2.5e3".into()),
+                Json::Bool(true),
+                Json::Null
+            ]))
+        );
+        assert_eq!(v.get("c"), Some(&Json::Obj(Vec::new())));
+        for bad in ["", "{", "{\"a\" 1}", "[1,]", "{\"a\": 1} x", "\"\u{1}\""] {
+            assert_eq!(Json::parse(bad), None, "{bad:?}");
+        }
     }
 }
