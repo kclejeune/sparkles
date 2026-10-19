@@ -19,7 +19,9 @@ turn grouping off.
 
 On a store of more than ten million quads, the schema reports of the MCP tools,
 `check_query` and `sparkles ask` take the counts of predicates and classes from the
-statistics of the index build and the changes since, and say `"basis": "statistics"`.
+statistics of the index build, corrected exactly for the changes since and for graphs
+outside the selection, and say `"basis": "statistics"`. A selection that leaves out
+graphs with more than a million quads is still scanned.
 The kinds of a predicate's objects are measured when a tool needs them, from a sample of
 8,192 stored literals above 200,000 quads. On DBpedia's billion quads a `check_query`
 took 52.7 seconds and 11.1 GiB and now takes 0.3 seconds and under 500 MiB, and an
@@ -31,7 +33,9 @@ scan. A dataset keeps up to four schema reports, one per selection, instead of o
 
 The planner moves a VALUES table that shares variables with a UNION of the same join
 into each branch, so each branch looks its rows up by index instead of reading every
-quad of its pattern. `link_entities` and the terms list of `check_query` failed on the
+quad of its pattern. It moves at most 10,000 rows, keeps the table outside a BIND or
+FILTER that calls a non-deterministic function, and leaves a UNION with a SERVICE, a
+LATERAL or a property function call as written. `link_entities` and the terms list of `check_query` failed on the
 2 GiB query budget on DBpedia for this reason. `sparkles ask` gained
 `--query-memory-mb`, 2048 by default as in `sparkles mcp`.
 

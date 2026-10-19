@@ -44,8 +44,9 @@ pub const SCHEMA_FORMAT: u32 = 1;
 pub const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 
 /// The store size, in quads, above which the server's tools measure a schema report from
-/// the index statistics ([`SchemaOptions::statistics_above`]). A full report of this many
-/// quads takes about half a second.
+/// the index statistics ([`SchemaOptions::statistics_above`]). Below it a full report is
+/// cheap enough to read at every commit, and it measures the objects and the largest
+/// number of objects per subject that the statistics do not hold.
 pub const DEFAULT_STATISTICS_ABOVE: u64 = 10_000_000;
 
 /// The most quads of one predicate whose objects [`predicate_objects`] reads in full by
@@ -221,9 +222,10 @@ pub struct SchemaOptions {
     pub subject_classes: bool,
     /// Measure the observed layer from the index statistics, without scanning the
     /// indexes, when the store holds more than this many quads (see
-    /// [`Basis::Statistics`]). It applies only when the selection holds every quad of the
-    /// store, the caller reads every graph, and neither `subject_classes` nor
-    /// `term_totals` is asked for. `None` always scans.
+    /// [`Basis::Statistics`]). It applies when the caller reads every graph, the graphs
+    /// the selection leaves out hold at most a million quads of the base index, the
+    /// correction for them and for the delta costs less than a scan, and neither
+    /// `subject_classes` nor `term_totals` is asked for. `None` always scans.
     pub statistics_above: Option<u64>,
 }
 
@@ -316,12 +318,13 @@ pub enum Basis {
     /// One ordered pass over PSO and one over POS per predicate: every count is exact.
     #[default]
     Exact,
-    /// From the statistics the index build keeps, combined with the changes since, so
-    /// that a report of a billion quads takes no scan. A predicate's triples count quads,
-    /// so a triple stored in several graphs counts once per graph. Distinct subjects and
-    /// objects are estimates after updates, the largest number of objects of a subject is
-    /// not measured, and the kinds of the objects are left empty. [`predicate_objects`]
-    /// measures them for one predicate when a caller needs them.
+    /// From the statistics the index build keeps, corrected exactly for the graphs the
+    /// selection leaves out and for the changes since the build, so that a report of a
+    /// billion quads takes no scan. A predicate's triples count quads, so a triple stored
+    /// in several selected graphs counts once per graph. Distinct subjects, distinct
+    /// objects and class instances are exact. The largest number of objects of a subject
+    /// is not measured, and the kinds of the objects are left empty.
+    /// [`predicate_objects`] measures them for one predicate when a caller needs them.
     Statistics,
 }
 
@@ -1330,15 +1333,27 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
     in_phase(budget.check(), || "starting".into())?;
     let sel = Selected::resolve(snap, opts)?;
     if statistics::applies(snap, opts, &sel) {
-        let src = Src::direct(snap);
-        let obs = in_phase(statistics::observed(snap, &budget), || {
+        let obs = in_phase(statistics::observed(snap, &sel.observed, &budget), || {
             "reading the index statistics".into()
         })?;
-        let mut report = assemble(&src, opts, &sel, &budget, obs, None)?;
-        report.basis = Basis::Statistics;
-        // the counts are not kept per predicate: a later state gets a report of its own
-        report.maintenance = None;
-        return Ok(report);
+        match obs {
+            Some(obs) => {
+                let src = Src::direct(snap);
+                let mut report = assemble(&src, opts, &sel, &budget, obs, None)?;
+                report.basis = Basis::Statistics;
+                // the counts are not kept per predicate: a later state gets a report of
+                // its own
+                report.maintenance = None;
+                return Ok(report);
+            }
+            None => tracing::debug!(
+                target: "sparkles::schema",
+                quads = snap.len(),
+                inserted = snap.delta.inserts(),
+                deleted = snap.delta.deletes(),
+                "correcting the index statistics would cost more than a scan: scanning"
+            ),
+        }
     }
     let src = in_phase(
         Src::for_filters(snap, &[&sel.observed, &sel.declared], &budget),

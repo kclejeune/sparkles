@@ -203,12 +203,14 @@ impl From<Arc<Store>> for StoreHandle {
 /// graph that `check_query` reads.
 pub const SCHEMA_CACHE_ENTRIES: usize = 4;
 
-/// The objects of the predicates measured at one state with one selection.
+/// The objects of the predicates measured at one state, for every selection.
 #[derive(Default)]
 pub struct ObjectsCache {
-    /// the commit and the selection hash the entries belong to
-    pub key: (u64, u64),
-    pub entries: std::collections::HashMap<String, Option<Arc<crate::schema::PredicateObjects>>>,
+    /// the snapshot identity the entries belong to
+    pub state: u64,
+    /// by (selection hash, predicate IRI)
+    pub entries:
+        std::collections::HashMap<(u64, String), Option<Arc<crate::schema::PredicateObjects>>>,
 }
 
 /// A computed schema report and what it was computed for.

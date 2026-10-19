@@ -468,8 +468,9 @@ impl Schema {
 
     /// The objects of predicate `iri` in the selection of `opts` at `snap`, or `None`
     /// when the predicate does not occur there (see [`schema::predicate_objects`]). The
-    /// dataset keeps what it measured for the latest state and selection, so a caller of
-    /// a report measured from the statistics pays for each predicate once.
+    /// dataset keeps what it measured for the latest state, for every selection, so a
+    /// caller of a report measured from the statistics pays for each predicate once per
+    /// state, and callers that alternate selections share it.
     pub fn predicate_objects_at(
         &self,
         snap: &Arc<Snapshot>,
@@ -477,14 +478,17 @@ impl Schema {
         opts: &SchemaOptions,
         max_rows: u64,
     ) -> Result<Option<Arc<schema::PredicateObjects>>> {
-        /// the most predicates kept for one state
+        /// the most predicates kept for one state, over every selection
         const MAX_KEPT: usize = 4096;
-        let key = (snap.commit, selection(opts) ^ max_rows.rotate_left(17));
-        let keep = opts.graphs.is_none();
+        let state = schema::snapshot_identity(snap);
+        let key = (selection(opts) ^ max_rows.rotate_left(17), iri.to_string());
+        // a caller limited to some graphs, and an uncommitted or synthetic view, measure
+        // for themselves
+        let keep = opts.graphs.is_none() && snap.cacheable;
         if keep {
             let cache = self.ds.state().objects_cache.lock();
-            if cache.key == key
-                && let Some(o) = cache.entries.get(iri)
+            if cache.state == state
+                && let Some(o) = cache.entries.get(&key)
             {
                 return Ok(o.clone());
             }
@@ -494,11 +498,11 @@ impl Schema {
             .map(Arc::new);
         if keep {
             let mut cache = self.ds.state().objects_cache.lock();
-            if cache.key != key || cache.entries.len() >= MAX_KEPT {
-                cache.key = key;
+            if cache.state != state || cache.entries.len() >= MAX_KEPT {
+                cache.state = state;
                 cache.entries.clear();
             }
-            cache.entries.insert(iri.to_string(), o.clone());
+            cache.entries.insert(key, o.clone());
         }
         Ok(o)
     }

@@ -5172,21 +5172,29 @@ rather than persisting a full report on disk. Above `--schema-statistics-above` 
 ten million by default, the tools' reports take the counts of predicates and classes
 from the statistics that the index build keeps, combined with the delta since the
 build, and read only the declarations and labels from the indexes. Such a report says
-`"basis": "statistics"`. It counts quads for triples, estimates distinct counts after
-updates and leaves the largest number of objects per subject unmeasured. The kinds of a
+`"basis": "statistics"`. It counts quads for triples and leaves the largest number of
+objects per subject unmeasured. Its distinct counts and class instances are exact, because
+the counts are corrected for the delta and for the graphs the selection leaves out with
+the planner's exact correction of the statistics. A selection whose left-out graphs hold
+more than a million base quads is scanned. The kinds of a
 predicate's objects are measured when a tool needs them, in full up to 200,000 quads and
 above that from exact counts of the id ranges of each kind plus a sample of 8,192 stored
 literals. A literal that is an object of the predicate never gets a sampled
 `language-tag` or `datatype-mismatch` warning, and a sampled warning says so. A report
 lasts until the next commit, and a dataset now keeps one per selection, up to four. No
 on-disk format changed. A persisted report would still have needed a full scan for each
-new commit, while the statistics report costs under a second at any commit. The report
+new commit, while correcting the statistics for a commit's changes costs no more than a
+scan and usually far less. The report
 endpoint and `sparkles schema` keep the exact report, because they are asked for it.
 
 The planner now moves a VALUES table that shares variables with a UNION of the same
 join into each branch, and inside a BIND or FILTER there whose expression does not read
 the table, so each branch looks its rows up by index. The join distributes over the
-union, so answers are unchanged. The query that failed after 1.94 seconds at 5.5 GiB now
+union, so answers are unchanged, which a test checks by running fifteen query shapes with
+the rewrite on and off. The rewrite moves at most 10,000 rows, and at most 20,000 rows
+over all the branches' copies. It keeps the table outside a BIND or FILTER that calls
+`RAND`, `UUID`, `STRUUID`, `BNODE` or a custom function, and it leaves a UNION that holds
+a SERVICE, a LATERAL or a property function call as written. The query that failed after 1.94 seconds at 5.5 GiB now
 takes 0.04 seconds. `sparkles ask` gained `--query-memory-mb`, 2048 by default as in
 `sparkles mcp`, and `--schema-statistics-above`.
 
@@ -5204,6 +5212,16 @@ category and a diocese, and "Berlin" to several towns. With the city chosen thro
 sets therefore need a way to answer such clarifications, or a ranking of candidates
 that prefers the main resource, before they can be scored. That work belongs to item 6.
 A paid run of the DBpedia sets no longer waits for item 89.
+
+A review of the item found that the first statistics report dropped a class whose
+instance remained in a second graph after a deletion, let distinct counts drift upward
+with updates, fell back to a full scan as soon as the store had one named graph, and
+broke the `describe_schema` output schema by omitting `maxPerSubject`. The exact
+correction and the schema change above fixed those. Two limits remain. An ingestion
+profile without a predicate list gives every predicate any object on such a report,
+which [API.md](../API.md#schema-reports-from-statistics) states, and the VALUES rewrite
+misses a table under `GRAPH` and a branch filter that reads the table, which
+[Roadmap](../ROADMAP.md) item 90 tracks.
 
 **Item 15: multimodal ingestion, more transcript adapters and CSV entity linking.**
 §7.1 converts text, Markdown, HTML and PDF (`ingest/convert.rs`, `Format`), the

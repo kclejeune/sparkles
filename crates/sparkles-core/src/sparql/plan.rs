@@ -823,7 +823,18 @@ impl<'a> Planner<'a> {
             GP::Bgp { .. } | GP::Path { .. } | GP::Join { .. } | GP::Graph { .. } => {
                 // a constant table joined with a UNION goes into each branch, where it
                 // binds the branch's lookups instead of meeting their whole result
-                if let Some(pushed) = super::valuespush::rewrite(gp) {
+                let calls = |patterns: &[spargebra::term::TriplePattern]| {
+                    super::propertyext::has_calls(self.ctx, patterns)
+                        || patterns.iter().any(|t| match &t.predicate {
+                            spargebra::term::NamedNodePattern::NamedNode(p) => {
+                                super::catalog::property_functions()
+                                    .iter()
+                                    .any(|f| f == p.as_str())
+                            }
+                            _ => false,
+                        })
+                };
+                if let Some(pushed) = super::valuespush::rewrite(gp, &calls) {
                     return self.plan(&pushed, g, filters);
                 }
                 let mut items = Vec::new();

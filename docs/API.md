@@ -8944,16 +8944,25 @@ A full schema report reads every quad twice. On DBpedia 2022.12.01, about a bill
 quads, that took about 50 seconds and 11 GiB, and `check_query`, `describe_schema`,
 `link_entities`, `assert_facts` and the ingestion tools all need a report. When a store
 holds more than `--schema-statistics-above` quads, these tools take the counts from the
-statistics that the index build keeps instead, combined with the changes since the
-build, so the report reads no index rows for them. Each predicate's triples count quads,
-so a triple stored in two graphs counts twice. After updates, the distinct subjects and
-objects are estimates. The largest number of objects of one subject is not measured, and
-`describe_schema` leaves `maxPerSubject` out. The result carries `"basis": "statistics"`.
+statistics that the index build keeps instead. Those counts cover every graph of the
+build, so they are corrected for the graphs the selection leaves out and for the changes
+since the build, with one index probe for each value those quads hold. A store with no
+changes and a selection of every graph reads no index rows for the counts. Each
+predicate's triples count quads, so a triple stored in two selected graphs counts twice.
+The distinct subjects, distinct objects and class instances are exact. The largest
+number of objects of one subject is not measured, and `describe_schema` leaves
+`maxPerSubject` out. The result carries `"basis": "statistics"`.
 
-Such a report applies when the selection holds every quad of the store and the caller
-reads every graph. A named graph, a default graph beside named graphs, a caller limited
-to some graphs and `subjectClasses` still get a full report. The report is kept for each
-selection until the next commit, as a full report is.
+Such a report applies when the caller reads every graph and the graphs the selection
+leaves out hold at most a million quads of the index build, so the default graph of a
+store with a few agent memory graphs gets one. A selection that leaves out more, such as
+one small named graph of a large store, gets a full report of what it selects. So do a
+caller limited to some graphs, `subjectClasses`, and a store whose changes since the
+build would cost more to correct for than a scan, which the server logs at debug level.
+The report is kept for each selection until the next commit, as a full report is. A
+dataset keeps up to four reports, one per selection, so the memory its reports hold can
+be up to four times that of one report. A report from the statistics of a store with
+many predicates is as large as a full one, since it lists the same entries.
 
 The kinds of a predicate's objects are measured when a tool needs them. A predicate
 with at most 200,000 quads is read in full. A larger one gets exact counts of its IRIs,
@@ -8966,7 +8975,16 @@ of the predicate never gets such a warning. On DBpedia the first `check_query` o
 process took between 0.3 and 1.5 seconds, a `describe_schema` summary of 200
 predicates about 1.4 seconds, and later calls up to 60 milliseconds, while the process
 held under 500 MiB of anonymous memory. The sampled windows are read without filling
-the block cache, so they do not displace the blocks that queries use.
+the block cache, so they do not displace the blocks that queries use. The sample counts
+the literals of every graph, while the counts by kind leave out the quads of graphs the
+selection does not hold. The dataset keeps the objects measured for up to 4,096
+predicates of the latest state, for every selection.
+
+The ingestion tools' profile measures the objects of the predicates that its spec names.
+A profile without a predicate list, over a report from the statistics, gives every
+predicate `"object": "any"` with no datatypes or languages, because measuring every
+predicate of a large store would cost the scan the report avoids. Name the predicates in
+the profile's spec to get their kinds.
 
 `/{ds}/schema`, `sparkles schema` and the VoID export always scan, because they are asked
 for the report itself.

@@ -141,10 +141,11 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
     let schema_class = json!({"type":"object","required":["iri","instances","declared"],"properties":{
         "iri":{"type":"string"},"label":{"type":"string"},"instances":{"type":"integer"},
         "declared":strings(),"superClasses":strings(),"superClassExpressions":strings()}});
-    let schema_predicate = json!({"type":"object","required":["iri","triples","distinctSubjects","distinctObjects","maxPerSubject","objects"],"properties":{
+    let schema_predicate = json!({"type":"object","required":["iri","triples","distinctSubjects","distinctObjects","objects"],"properties":{
         "iri":{"type":"string"},"label":{"type":"string"},"triples":{"type":"integer"},
         "distinctSubjects":{"type":"integer"},"distinctObjects":{"type":"integer"},
-        "maxPerSubject":{"type":"integer"},"objects":strings(),
+        "maxPerSubject":{"type":"integer","description":"Absent when basis is statistics"},"objects":strings(),
+        "objectsSampled":{"type":"integer","description":"The literal objects read to split the stored literals among datatypes and languages, when the objects were sampled"},
         "domains":strings(),"ranges":strings(),"vector":{"type":"boolean"},
         "subjectClasses":strings()}});
     let profile_property = json!({"type":"object","required":["predicate","instances","triples","valuesPerInstance","objects"],"properties":{
@@ -214,7 +215,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         read(
             "describe_schema",
             "Describe schema",
-            "Classes and predicates of a dataset with exact counts, labels and RDFS/OWL declarations. section=summary (default) gives totals and the largest classes and predicates; section=classes|predicates lists all entries in IRI order, page by page with cursor. section=constraints lists the SHACL constraints per class: those of the dataset's write-time validation, or of the shapes graphs named in `shapes`, with what enforces each. section=profiles lists, per class (the largest, or those in `classes`), the predicates its instances use with value counts, kinds and the classes of the values, and the predicates that point at its instances. Counts are observations of one snapshot, never constraints.",
+            "Classes and predicates of a dataset with counts, labels and RDFS/OWL declarations. On a large dataset the counts come from the index statistics (basis=statistics): a predicate's triples then count each graph's copy, maxPerSubject is absent, and a large predicate's objects are split by a sample (objectsSampled). section=summary (default) gives totals and the largest classes and predicates; section=classes|predicates lists all entries in IRI order, page by page with cursor. section=constraints lists the SHACL constraints per class: those of the dataset's write-time validation, or of the shapes graphs named in `shapes`, with what enforces each. section=profiles lists, per class (the largest, or those in `classes`), the predicates its instances use with value counts, kinds and the classes of the values, and the predicates that point at its instances. Counts are observations of one snapshot, never constraints.",
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds(),
                 "section": {"enum":["summary","classes","predicates","constraints","profiles"],"default":"summary"},
@@ -230,6 +231,7 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
             Some(
                 json!({"type":"object","required":["dataset","commit","graph","reasoning","section","totals","builtinClassesHidden","next","prefixes"],"properties":{
                 "dataset":{"type":"string"},"commit":{"type":"integer"},"graph":{"type":"string"},
+                "basis":{"enum":["statistics"],"description":"Present when the counts come from the index statistics instead of a scan"},
                 "reasoning":{"type":"boolean"},"section":{"enum":["summary","classes","predicates","constraints","profiles"]},
                 "totals":{"type":"object","properties":{"triples":{"type":"integer"},"classes":{"type":"integer"},"predicates":{"type":"integer"}}},
                 "builtinClassesHidden":{"type":"integer"},
