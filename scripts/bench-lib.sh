@@ -110,12 +110,65 @@ CLIENT=()
 if cpu=$(client_cpu) && [ -n "$cpu" ]; then CLIENT=(taskset -c "$cpu"); fi
 
 pid_on() { ss -ltnp 2> /dev/null | grep ":$1 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true; }
+# port_users <port>: the TCP sockets in any state whose local port is <port>
+port_users() { ss -Htan "( sport = :$1 )" 2> /dev/null || true; }
+# bindable <port>: a listening socket with SO_REUSEADDR, as the servers open theirs, can bind
+# the port on 127.0.0.1 now
+bindable() {
+  python3 -I -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)' "$1"
+}
+# wait_port <port>: fails at once when a process listens on the port. A socket in another
+# state can also make a server's bind fail with "Address already in use", even with
+# SO_REUSEADDR, when that socket did not set the option itself. The usual one is a client
+# connection that used the port as its ephemeral local port and sits in TIME-WAIT for 60 s
+# after it closed. The BSBM driver and the timing loops open thousands of such connections,
+# so a port inside the ephemeral range (ip_local_port_range) can be taken this way between
+# two engines. A server's own connections in TIME-WAIT do not block it. wait_port waits up
+# to PORT_WAIT seconds (default 75) until the port can be bound.
+wait_port() {
+  local t0
+  [ -z "$(pid_on "$1")" ] || {
+    log "port $1 is in use by a listening process (set PORT_BASE)"
+    return 1
+  }
+  t0=$SECONDS
+  until bindable "$1"; do
+    if [ $((SECONDS - t0)) -ge "${PORT_WAIT:-75}" ]; then
+      log "port $1 cannot be bound after ${PORT_WAIT:-75} s; its sockets: $(port_users "$1" | head -3 | tr -s ' ' | tr '\n' ';')"
+      return 1
+    fi
+    sleep 0.25
+  done
+}
+# The kernel hands out ephemeral client ports from ip_local_port_range (32768 to 60999 by
+# default), so the servers' ports should lie below it.
+if [ -r /proc/sys/net/ipv4/ip_local_port_range ]; then
+  read -r EPH_LO EPH_HI < /proc/sys/net/ipv4/ip_local_port_range || true
+  if [ -n "${EPH_LO:-}" ] && [ "$((PORT_BASE + 4))" -ge "$EPH_LO" ] && [ "$PORT_BASE" -le "$EPH_HI" ]; then
+    log "warning: PORT_BASE $PORT_BASE lies in the ephemeral port range $EPH_LO-$EPH_HI, so client connections can hold the servers' ports"
+  fi
+fi
+# start_failed <message>: the end of a start that failed. It exits the script, unless
+# START_SOFT is set, in which case start returns 1 and the caller goes on without the engine.
+start_failed() {
+  if [ -n "${START_SOFT:-}" ]; then log "error: $*"; else die "$*"; fi
+}
 
 # start <engine>: start its server on STORE and wait until it answers; READY_S gets the
 # seconds from launch to the first answer
 start() {
   local e=$1 p=${PORT[$1]} ready t0 t1
-  [ -z "$(pid_on "$p")" ] || die "port $p is in use (set PORT_BASE)"
+  wait_port "$p" || {
+    start_failed "$e: port $p is not free"
+    return 1
+  }
   t0=$(date +%s.%N)
   case $e in
     sparkles)
@@ -165,10 +218,14 @@ start() {
       READY_S[$e]=$(awk "BEGIN {printf \"%.3f\", $t1 - $t0}")
       return 0
     fi
-    kill -0 "${PID[$e]}" 2> /dev/null || die "$e: server exited, see its log in $STORE"
+    kill -0 "${PID[$e]}" 2> /dev/null || {
+      start_failed "$e: server exited, see its log in $STORE"
+      return 1
+    }
     sleep 0.05
   done
-  die "$e: server did not start"
+  start_failed "$e: server did not start"
+  return 1
 }
 # alive <pid>: the process exists and is not a zombie
 alive() { case $(ps -o stat= -p "$1" 2> /dev/null) in "" | Z*) return 1 ;; esac }
@@ -210,8 +267,23 @@ stop() {
 }
 stop_all() { for e in $ENGINES; do stop "$e"; done; }
 # drop an engine's files from the page cache (no root needed: posix_fadvise DONTNEED); a
-# running server's mapped pages stay, so this runs between a stop and a start
-evict() { find "$(store_of "$1")" -type f -exec dd if={} iflag=nocache count=0 status=none \;; }
+# running server's mapped pages stay, so this runs between a stop and a start. One process
+# advises every file, as scripts/bench-billion.sh does. A dd per file took about 5 minutes
+# per cold Fluree run at LUBM(100), whose index has tens of thousands of files.
+evict() {
+  find "$(store_of "$1")" -type f -print0 | python3 -I -c '
+import os, sys
+for p in sys.stdin.buffer.read().split(b"\0"):
+    if p:
+        try:
+            fd = os.open(p, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)'
+}
 
 # the curl command that sends the SPARQL Update in file $2 to engine $1
 upd() {
@@ -365,9 +437,20 @@ num() { if [[ $1 =~ ^[0-9]+$ ]]; then echo "$1"; else echo '"?"'; fi; }
 
 # start_all: every selected engine's server on STORE; mem.json gets each one's RSS
 # 2 s after all are ready, before any query
+# With START_SOFT set, an engine that does not start is stopped, named in FAILED_ENGINES and
+# left out of ENGINES, and the others go on.
+FAILED_ENGINES=""
 start_all() {
-  local e kv=()
-  for e in $ENGINES; do start "$e"; done
+  local e kv=() up=""
+  for e in $ENGINES; do
+    if start "$e"; then
+      up="$up $e"
+    else
+      [ -z "${PID[$e]:-}" ] || stop "$e"
+      FAILED_ENGINES="$FAILED_ENGINES $e"
+    fi
+  done
+  ENGINES=${up# }
   sleep 2
   for e in $ENGINES; do kv+=("${NAME[$e]}=$(rss_of "$e")"); done
   setj "$RES/mem.json" idle "${kv[@]}"
@@ -426,7 +509,12 @@ cold() {
     for i in $(seq 1 "$COLD_RUNS"); do
       stop "$e"
       evict "$e"
-      start "$e"
+      if ! start "$e"; then
+        [ -z "${PID[$e]:-}" ] || stop "$e"
+        times+=(error)
+        log "cold $e $n run $i: the server did not start"
+        continue
+      fi
       ready+=("${READY_S[$e]}")
       # curl prints the time even when the request fails. A failure that took as long as the
       # limit (the client gave up, or the server's own timeout fired) is a timeout, any other an error.

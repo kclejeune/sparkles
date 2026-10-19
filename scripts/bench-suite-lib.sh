@@ -240,6 +240,9 @@ suite_run() {
   trap stop_all EXIT
   suite_manifest
   [ -n "${SKIP_LOAD:-}" ] || load_all
+  # An engine whose server does not start, or no longer starts, is left out of the rest of
+  # the run, which goes on with the others and exits with status 1 at the end.
+  local START_SOFT=1
   start_all
   answer_check
   stop_all
@@ -247,16 +250,21 @@ suite_run() {
     # Each engine runs alone for the timings (docs/specs/X06 section 5.3). The answer check
     # above may keep every server up, since it measures no time. A fresh server answers every
     # selected query once before the timings, so it is as warm as the one that was checked.
-    local all=$ENGINES e
+    local all=$ENGINES e up=""
     for e in $all; do
       ENGINES=$e
-      start "$e"
+      if ! start "$e"; then
+        [ -z "${PID[$e]:-}" ] || stop "$e"
+        FAILED_ENGINES="$FAILED_ENGINES $e"
+        continue
+      fi
+      up="$up $e"
       warm_pass "$e"
       suite_time
       if declare -F "${SUITE_EXTRA:-}" > /dev/null; then "$SUITE_EXTRA"; fi
       stop "$e"
     done
-    ENGINES=$all
+    ENGINES=${up# }
     if declare -F "${SUITE_AFTER:-}" > /dev/null; then "$SUITE_AFTER"; fi
   fi
   if [ -z "${ANSWERS_ONLY:-}" ] && [ "$COLD_RUNS" -gt 0 ]; then
@@ -273,4 +281,8 @@ suite_run() {
   python3 "$ROOT/scripts/bench-summary.py" "$RES" "${names[@]}" > /dev/null || log "bench-summary.py failed"
   [ -f "$RES/inference.json" ] && inference_table "$RES/inference.json" >> "$RES/summary.md"
   log "record: $WORK/$RES/record.json, table: $WORK/$RES/summary.md"
+  if [ -n "${FAILED_ENGINES// /}" ]; then
+    log "error: these engines did not start and are missing from the record:$FAILED_ENGINES"
+    return 1
+  fi
 }

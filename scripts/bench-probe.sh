@@ -29,7 +29,12 @@ revive() {
   if declare -F start > /dev/null && declare -F stop > /dev/null; then
     log "$1: no answer after $2, restarting it"
     stop "$1"
-    start "$1"
+    if ! start "$1"; then
+      # only with START_SOFT; without it a failed start ends the run
+      log "$1: did not start again; it is left out of the remaining queries"
+      DEAD_ENGINES="$DEAD_ENGINES $1"
+      return 0
+    fi
     python3 - "$3/restarts.json" "${NAME[$1]}" "$2" << 'EOF'
 import json, os, sys, time
 f, engine, after = sys.argv[1:]
@@ -70,6 +75,17 @@ time_query() {
     rc=0
     eval "$(q "${URL[$e]}" "$n")" > /dev/null || rc=$?
     t1=$(date +%s.%N)
+    # curl exit 7: nothing listens. The server died before this query, for example when an
+    # earlier query of the answer check or the warm-up pass ran it out of memory, so it is
+    # restarted and the query gets its first request on the new server.
+    if [ "$rc" = 7 ] && ! answering "$e"; then
+      log "$e: not running before $n, restarting it"
+      revive "$e" "before $n" "$res"
+      t0=$(date +%s.%N)
+      rc=0
+      eval "$(q "${URL[$e]}" "$n")" > /dev/null || rc=$?
+      t1=$(date +%s.%N)
+    fi
     if [ "$rc" = 0 ]; then
       ok="$ok $e"
     else

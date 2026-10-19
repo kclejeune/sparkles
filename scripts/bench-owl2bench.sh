@@ -35,7 +35,7 @@
 # Env: INFER_PROFILES (default owl-rl), INFER_THREADS, DERIVED_DIGEST, JENA_REASONERS,
 # JENA_REASON_TIMEOUT, JENA_HEAP as in scripts/bench-lubm.sh; WARMUP (default 2), RUNS
 # (default 10), COLD_RUNS (default 0), SKIP_LOAD=1, ANSWERS_ONLY=1, QUERIES="q2 q12 …",
-# ENGINES (default the five; "" only generates and materializes), PORT_BASE (default 48300),
+# ENGINES (default the five; "" only generates and materializes), PORT_BASE (default 28300),
 # SPARKLES, SERVER_MEM_MAX, CLIENT_CPU, FLUREE and FLUREE_VERSION as in scripts/bench.sh, and
 # JAVA8 (a Java 8 binary for the generator) and GEN_HEAP (its heap, default 12G).
 set -euo pipefail
@@ -45,7 +45,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${2:-$ROOT/target/bench-owl2bench}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
-PORT_BASE=${PORT_BASE:-48300}
+PORT_BASE=${PORT_BASE:-28300}
 MAX_TIME=${MAX_TIME:-600}
 export MAX_TIME
 [[ $UNIV =~ ^[1-9][0-9]*$ ]] || {

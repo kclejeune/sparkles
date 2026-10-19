@@ -61,6 +61,15 @@ class QmphTests(unittest.TestCase):
         self.run_qmph(os.path.join(self.dir.name, "nope.xml"), self.out, "a", "1", "explore-mix", "255")
         self.assertEqual(self.result()["a"]["1"]["status"], "error")
 
+    def test_a_mix_that_was_not_run_keeps_its_reason_through_the_check(self):
+        self.run_qmph(os.path.join(self.dir.name, "nope.xml"), self.out, "qlever", "1", "explore-mix", "1",
+                      "HTTP 406 to Accept: application/rdf+xml")
+        self.add("a", 1, {"1": 5.0})
+        self.run_qmph("--check", self.out, "9")
+        run = self.result()["qlever"]["1"]
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(run["status_reasons"], ["HTTP 406 to Accept: application/rdf+xml"])
+
     def test_timeouts_are_recorded(self):
         self.add("a", 1, {"1": 5.0}, timeouts=2)
         self.assertEqual(self.result()["a"]["1"]["status"], "timeout")
@@ -153,6 +162,18 @@ class QmphTests(unittest.TestCase):
         d = self.result()
         self.assertEqual(d["a"]["1"]["status"], "ok")
         self.assertEqual(d["b"]["1"]["status"], "ok")
+
+    def test_averages_that_differ_in_the_last_digit_agree(self):
+        for e in ("a", "b", "c"):
+            self.add(e, 1, {"5": 4.99, "8": 4.32})
+            self.add(e, 4, {"5": 5.0, "8": 4.33})
+        self.add("d", 1, {"5": 5.0, "8": 0.0})
+        self.run_qmph("--check", self.out)
+        d = self.result()
+        for e in ("a", "b", "c"):
+            self.assertEqual((d[e]["1"]["status"], d[e]["4"]["status"]), ("ok", "ok"))
+        self.assertEqual(d["d"]["1"]["status"], "wrong-answer")
+        self.assertEqual(d["d"]["1"]["disagreeing_queries"], ["8"])
 
     def test_one_engine_still_checks_its_runs_against_each_other(self):
         self.add("a", 1, {"1": 5.0})
