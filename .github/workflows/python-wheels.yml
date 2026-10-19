@@ -11,12 +11,26 @@
 # dependencies cached in GitHub Actions.
 name: Python wheels
 
+# Pushes to main and pull requests run when the Python bindings or a crate they build on
+# changes. Tests, benches and examples of those crates do not change the wheel.
 on:
   push:
+    branches: [main]
     tags: ["py-v*"]
-  pull_request:
-    paths:
-      - "crates/**"
+    paths: &paths
+      - "crates/sparkles/**"
+      - "crates/sparkles-alloc/**"
+      - "crates/sparkles-backup/**"
+      - "crates/sparkles-core/**"
+      - "crates/sparkles-graphql/**"
+      - "crates/sparkles-py/**"
+      - "crates/sparkles-reasoner/**"
+      - "crates/sparkles-shacl/**"
+      - "crates/sparkles-shex/**"
+      - "!crates/sparkles*/tests/**"
+      - "crates/sparkles-py/tests/**"
+      - "!crates/sparkles*/benches/**"
+      - "!crates/sparkles*/examples/**"
       - "vendor/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -24,48 +38,56 @@ on:
       - "scripts/py-sdist.py"
       - "scripts/py-wheel-test.sh"
       - ".github/workflows/python-wheels.yml"
+      - ".github/actions/setup-rust/**"
+  pull_request:
+    paths: *paths
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push or pull request update supersedes a running build; a tag's run is never
+# cancelled.
 concurrency:
   group: python-wheels-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 env:
   MATURIN_VERSION: "1.15.0"
   MANIFEST: crates/sparkles-py/Cargo.toml
-  # Pull requests build the wheels in the dev profile, which compiles far faster than the
-  # release profile's thin LTO; tags and manual runs build what would be published.
-  PROFILE_ARG: ${{ github.event_name == 'pull_request' && '--profile dev' || '--release' }}
+  # Pushes to main and pull requests build the wheels in the dev profile, which compiles
+  # far faster than the release profile's thin LTO; tags and manual runs build what would
+  # be published.
+  PROFILE_ARG: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && '--profile dev' || '--release' }}
 
 jobs:
   linux:
     timeout-minutes: 45
     name: Linux ${{ matrix.libc }} ${{ matrix.target }}
     # arm64 builds and tests natively on arm64 runners
-    # Pull requests build and test the x86_64 manylinux wheel only. Tags and manual runs
-    # build every wheel.
+    # Pushes to main and pull requests build and test the x86_64 manylinux wheel only. Tags
+    # and manual runs build every wheel.
     strategy:
       fail-fast: false
       matrix:
         target: [x86_64, aarch64]
         libc: [manylinux, musllinux]
         exclude:
-          - target: ${{ github.event_name == 'pull_request' && 'aarch64' || 'none' }}
-          - libc: ${{ github.event_name == 'pull_request' && 'musllinux' || 'none' }}
+          - target: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'aarch64' || 'none' }}
+          - libc: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'musllinux' || 'none' }}
     env:
       COMPAT: ${{ matrix.libc == 'manylinux' && '2_28' || 'musllinux_1_2' }}
     runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
       # maturin builds in a manylinux or musllinux container with the workspace mounted,
-      # so the cached target directory carries over between runs.
-      - uses: actions/cache@v4
+      # so the cached target directory carries over between runs. Only pushes to main
+      # save it (see .github/actions/setup-rust).
+      - uses: actions/cache/restore@v4
+        id: cache
         with:
           path: target
-          key: python-${{ runner.os }}-${{ runner.arch }}-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'crates/sparkles-py/Cargo.lock', '.github/workflows/python-wheels.yml') }}
+          key: python-${{ runner.os }}-${{ runner.arch }}-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'crates/sparkles-py/Cargo.lock') }}
           restore-keys: |
             python-${{ runner.os }}-${{ runner.arch }}-${{ matrix.libc }}-${{ env.PROFILE_ARG }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Build the wheel
@@ -75,6 +97,17 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ env.COMPAT }}
           args: ${{ env.PROFILE_ARG }} --locked --manifest-path ${{ env.MANIFEST }} --target-dir target --out dist
+      # The workspace's own crates change on nearly every push, so only the dependencies
+      # are worth keeping. The container writes as root.
+      - name: Save the dependency cache
+        if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo find target -maxdepth 4 \( -name 'sparkles*' -o -name 'libsparkles*' \) -prune -exec rm -rf {} +
+      - if: github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: Set up CPython 3.10 and 3.14
         if: matrix.libc == 'manylinux'
         uses: actions/setup-python@v6
@@ -100,7 +133,7 @@ jobs:
     timeout-minutes: 45
     name: macOS arm64
     # tags and manual runs only
-    if: github.event_name != 'pull_request'
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     env:
       # the oldest macOS the wheels support (spec P01, §2.4)
@@ -108,13 +141,9 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
-      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
-      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with: { cache: false, rustflags: "" }
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
         with:
-          key: ${{ env.PROFILE_ARG }}
+          cache-key: python-${{ env.PROFILE_ARG }}
           workspaces: |
             . -> target
             crates/sparkles-py -> ../../target
@@ -141,17 +170,16 @@ jobs:
   sdist:
     timeout-minutes: 45
     name: Source distribution
+    # tags and manual runs only
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v5
-      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
-      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with: { cache: false, rustflags: "" }
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
         with:
+          cache-key: python-sdist
           workspaces: |
             . -> target
             crates/sparkles-py -> ../../target
