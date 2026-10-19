@@ -168,6 +168,9 @@ so backtraces have file and line numbers but a debugger cannot show variables. S
 Jena checkout. It looks for the checkout at `../../apache/jena`, next to this
 repository, or at `SPARKLES_W3C_DIR`. The SHACL suites come from the same checkout, or from
 `SPARKLES_SHACL_TESTS`. Without the checkout, the suites are skipped.
+`scripts/fetch-test-suites.sh DIR` fetches every suite the tests read, at the commits CI
+pins, as shallow sparse checkouts of about 35 MB, and prints the variables that point the
+tests at them (`export $(scripts/fetch-test-suites.sh target/test-suites)`).
 
 All of these suites pass: 482/482, 328/328, 157/157 and 269/269 for SPARQL, and 98/98
 and 20/20 for SHACL. The eight SHACL 1.2 list tests pass, and all 32 test pairs of the
@@ -274,12 +277,12 @@ and runs the pytest suite against the installation (`scripts/py-wheel-test.sh`).
 
 #### Release workflow
 
-`.github/workflows/python-wheels.yml` runs on pull requests that touch the crates, on
-`py-v*` tags and by hand. It builds abi3 wheels with maturin-action for manylinux 2.28
-and musllinux 1.2 on x86_64 and aarch64 and for macOS on Apple silicon, and the source
-distribution. The arm64 wheels build on arm64 runners, so their tests run natively.
-Pull requests build the wheels in the dev profile, and tags and manual runs in the
-release profile. Each job installs what it built with `py-wheel-test.sh` and
+`.github/workflows/python-wheels.yml` runs on pushes to `main` and pull requests that
+touch the bindings or a crate they build on, on `py-v*` tags and by hand. Tags and manual
+runs build abi3 wheels with maturin-action for manylinux 2.28 and musllinux 1.2 on x86_64
+and aarch64 and for macOS on Apple silicon, and the source distribution. Pushes and pull
+requests build only the x86_64 manylinux wheel, in the dev profile. The arm64 wheels build
+on arm64 runners, so their tests run natively. Each job installs what it built with `py-wheel-test.sh` and
 runs the tests on CPython 3.10 and 3.14 where the runner has both. The musllinux
 wheels are tested in an Alpine container, and the sdist job builds a wheel from the
 sdist before testing it. Every package is uploaded as an artifact.
@@ -405,41 +408,66 @@ measurement limits, including local and cloud regression comparisons.
 
 ## Continuous integration
 
-The workflows in `.github/workflows` run on standard GitHub-hosted runners:
-`ubuntu-24.04` for Linux x86_64, `ubuntu-24.04-arm` for Linux arm64 and `macos-15` for
-macOS arm64. These runners are free for public repositories. Jobs check out the
-repository with `actions/checkout` and use the GitHub Actions cache. `Swatinem/rust-cache`
-caches Cargo's registry and dependency build artifacts for host builds, `actions/setup-node`
-caches pnpm's store, and `gradle/actions/setup-gradle` caches Gradle's dependencies.
-Container builds use `actions/cache`: Python caches its target directory separately
-for manylinux and musllinux, and Node's Alpine builds cache the target directory,
-Rust toolchain, Cargo registry and pnpm store. Cache keys distinguish architectures,
-build profiles and toolchains. GitHub scopes caches to a branch or pull request, with
-the default branch's caches available to other branches. Successful runs can save
-caches, including binding jobs that run only for pull requests, tags or manual dispatch.
-`actionlint` checks the workflows without custom runner labels. Namespace remains
-available for development benchmarks through `bench:nsc` and `bench:jena-nsc`.
+The workflows in `.github/workflows` run on standard GitHub-hosted runners, which are free
+for public repositories: `ubuntu-24.04` for Linux x86_64 with 4 vCPUs and 16 GB,
+`ubuntu-24.04-arm` for Linux arm64 and `macos-15` for macOS arm64. Since runner time is
+free, the workflows split their work into parallel jobs to shorten the wait for a push,
+rather than to save runner minutes. `actionlint` checks the workflow files.
 
-Several choices keep CI time down. The Rust workflow runs for pushes to `main`
-and for pull requests, but not for the pushes to a pull request's branch. Changes to the
-UI, the bindings' JavaScript and Kotlin sources, the README, the specs or the benchmark
-and image directories do not start it, while other edits under `docs/` do. A newer push
-cancels a running check of the same branch. Each platform runs Clippy and the tests in
-one job, and the Linux x86_64 job also checks
-formatting. A formatting or Clippy failure still lets the tests report. The W3C, SHACL
-and ShEx suites skip themselves in CI, because the runners have no Jena or shexTest
-checkout. The binding workflows
-run for pull requests that touch their sources, for release tags and by hand. For pull
-requests they build in the dev profile and only for Linux x86_64. Every job has a
-timeout, so a hung job stops instead of running for GitHub's default six hours. Builds
-cover Linux on x86_64 and arm64 and macOS on Apple silicon.
+`ci.yml` runs on every push to `main` and every pull request. Its jobs start together.
 
-Pushes and pull requests test Linux x86_64 only. The engine's shared state goes through
-snapshot swaps, locks and channels, and its relaxed atomics are counters and flags, so
-the risk of a fault that only arm64's weaker memory ordering or macOS would show is low.
-Before a release, run the Rust workflow by hand with **all-platforms** checked to test
-Linux arm64 and macOS as well. Running a binding workflow by hand, or pushing its
-release tag, builds and tests every platform.
+| Job | What it runs |
+|---|---|
+| Checks | Formatting of the Rust, UI, JavaScript and shell sources, shellcheck, the cited doc paths, the benchmark scripts' tests, the license notices, the generated TypeScript client against `docs/openapi.json`, and the UI's build, type check and unit tests. It needs no Rust build and takes about three minutes. |
+| Clippy | Clippy with warnings as errors on the workspace, on the formatter's wasm32 build and on the three binding crates with and without their default features. |
+| Build tests | `cargo nextest archive` builds every test binary once and uploads the archive. The doctests run here too. |
+| Test | Five jobs run the archive. Four take a quarter of the tests each (`--partition slice:N/4`), and one runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. |
+| Jena clients | Jena's own HTTP clients against the server binary from the archive (`mise run test:jena-clients`). |
+
+The test jobs fetch the W3C SPARQL and RDF suites, the SHACL and ShEx suites that Jena
+vendors and Oxigraph's JSON-LD documents with `scripts/fetch-test-suites.sh`, so the
+conformance tests run in CI as they do on a machine with the sibling checkouts. Raising
+the pinned commits in that script may need updates to the known-failure lists.
+
+A change only to the UI, the JavaScript packages, the README or the specs runs the checks
+job alone, which a first job decides with `dorny/paths-filter`. Changes only to the
+benchmark records, the images, the Kotlin sources or the binding workflows do not start
+`ci.yml`. A newer push cancels a running check of the same branch, including `main`. A
+manual run with **all-platforms** checked also runs Clippy and the tests on Linux arm64
+and macOS. The engine's shared state goes through snapshot swaps, locks and channels, and
+its relaxed atomics are counters and flags, so the risk of a fault that only arm64's
+weaker memory ordering or macOS would show is low, and pushes test Linux x86_64 only.
+
+The binding workflows, `python-wheels.yml`, `node-packages.yml` and `jvm-bindings.yml`,
+run on pushes to `main` and pull requests that touch the binding or a crate it builds on,
+leaving out those crates' tests, benches and examples. Such a run builds the binding in
+the dev profile and tests it on Linux x86_64 only, in one job, and pull requests also run
+the JVM compatibility matrix. Release tags and manual runs build and test every platform
+in the release profile. Every job has a timeout, so a hung job stops instead of running
+for GitHub's default six hours.
+
+`nix.yml` builds the flake's `cacheable` output with nix-fast-build (see [Nix](#nix)).
+
+### Caches
+
+GitHub keeps 10 GB of Actions caches per repository and evicts the least recently used
+entries beyond that. Caches saved on a branch serve only that branch, while those of
+`main` serve every branch and pull request, so the jobs that cache Cargo artifacts save
+only from pushes to `main`. `.github/actions/setup-rust` installs the toolchain that
+`rust-toolchain.toml` pins and restores `Swatinem/rust-cache` under a name per job, so the
+Clippy, test build, binding and JVM `uniffi-bindgen` jobs do not replace each other's
+entries. rust-cache keeps the dependencies' build artifacts and drops the workspace's
+own, which change on nearly every push. The Python container build caches its target
+directory the same way, `gradle/actions/setup-gradle` saves Gradle's caches from `main`
+only by default, and `actions/setup-node` caches pnpm's store. CI builds carry no debug
+information (`CARGO_PROFILE_DEV_DEBUG=0`, which `setup-rust-toolchain` sets), which keeps
+linking short. A cold test build still peaks above the runner's 16 GB, so that job adds
+16 GB of swap.
+
+Measured on the pull request that introduced this layout, a push with warm caches waits
+about TBD minutes, against about 27 minutes warm and 40 minutes cold for the single job
+it replaced, which built and ran the tests in one job of four vCPUs. The test run alone
+took 14 to 21 minutes there, and the shards take about TBD minutes each.
 
 ## Releases
 
@@ -566,6 +594,24 @@ nix build .#sparkles-cli
 nix flake check          # packages + NixOS VM test (Linux, needs KVM) + UI end-to-end tests
 nix build .#checks.x86_64-linux.ui-e2e -L   # only the UI end-to-end tests
 ```
+
+### Binary cache
+
+`.github/workflows/nix.yml` builds the flake's `cacheable.<system>` output with
+nix-fast-build and pushes what it built to the binary cache at `https://cache.kclj.io`
+with nimbus. The output holds the packages, the dependency layers of `sparkles` and the
+formatter's WebAssembly module, every package the benchmark runners resolve (see
+[BENCHMARKING.md](BENCHMARKING.md#pinned-comparison-engines)), the dev shell and the
+checks other than the NixOS VM test and the UI end-to-end tests. `--skip-cached` skips
+whatever a substituter already holds, so a run builds only what changed since the last
+push. The workflow pushes only from pushes to `main` and manual runs, and only when the
+repository has the `NIMBUS_ENDPOINT` variable and the `NIMBUS_AUTH_TOKEN` secret. Pull
+requests build without pushing. Pushes build x86_64 Linux, and a manual run with
+**all-systems** checked also builds Linux arm64 and macOS arm64.
+
+The flake's `nixConfig` names the cache and its key, which Nix uses after asking or with
+`accept-flake-config = true`. Machines that build unattended should list the cache in
+their own `nix.conf`.
 
 ### How the Rust build is layered
 
