@@ -725,6 +725,13 @@ The comparisons need source, binary, input and driver hashes, exact flags, valid
 balanced samples, cold preparation and raw distributions. Historical comparisons against
 `899fb251` remain separate from these corrected-source measurements.
 
+The refresh of 2026-10-18 to 2026-10-19 ran the suite's cold mode on forge with the release
+binary of commit 81478fbe, three restarts per query. Sparkles was fastest on 21 of 28 cold
+queries at 1.05M and on 24 of 28 at 10.5M. Its cold medians were 6.5 and 4.3 ms for
+`path-plus` and 14.9 and 20.2 ms for `star-lookup`. Oxigraph's cold `path-plus` took 2.2
+and 1.6 ms, and its `star-lookup` 15.4 ms at 10.5M. BENCHMARKS.md lists the cold losses. These are refresh figures of one
+build, not comparisons of base and final builds.
+
 The quiet forge runs remain pending for the same-host cold targets at 1.05M and 10.5M,
 the warm per-query gates, the 1.01B dense-policy gate A5, concurrent policies A6 and the
 1, 4 and 16 MiB window sweep. The 5% phase performance threshold and the 2% A2 counter-cost

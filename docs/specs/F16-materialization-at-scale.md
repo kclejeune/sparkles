@@ -1038,7 +1038,13 @@ materialization's `run.peakBytes`, threads and a digest of the sorted derived tr
 A1 compares the head with a build of the commit before Phase 1 from two runs of
 `bench-lubm.sh 1000` with `ENGINES=""` and `INFER_PROFILES=rdfs`. Both scripts also time
 Jena's rule reasoners on the same data on request. X06's Outcome records the smoke runs.
-The measurements themselves are still open.
+On 2026-10-19 the LUBM(100) run of X06's harness on forge, with the release binary of
+commit 81478fbe and 20 threads, materialized the 13,876,262 triples of the UBA data. The
+`rdfs` profile took 11.4 s, peaked at 3,204 MiB of RSS with a peak heap estimate of
+1,224 MiB, and derived 5,527,675 triples. The `owl-rl` profile took 17.3 s, peaked at
+3,837 MiB with an estimate of 1,785 MiB, and derived 10,907,029 triples. BENCHMARKS.md
+compares the five engines' queries over that closure. Jena's reasoners were not run in this
+batch. A1 at 1,000 universities and OWL2Bench remain open.
 
 **Deviations.**
 * §3.5 expected the same cache limit to keep the closure of an input about four times
