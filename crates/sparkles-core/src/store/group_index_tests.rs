@@ -243,6 +243,42 @@ fn a_failed_text_update_at_publication_leaves_the_commit_and_marks_the_index_sta
     }
 }
 
+/// A panic while a grouped commit's full-text changes are staged comes after the commit's
+/// record is in the log, so it poisons the writer rather than leave a record no fence
+/// covers, and a reopened store continues the sequence after whatever the log holds.
+#[cfg(feature = "text")]
+#[test]
+fn a_panic_while_staging_text_poisons_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), options()).unwrap();
+    s.enable_text(Default::default()).unwrap();
+    label(&s, "a", "alpha").unwrap();
+    s.set_failpoint(
+        "group-staging-text",
+        Some(Arc::new(|_| panic!("injected panic while staging"))),
+    );
+    assert!(matches!(label(&s, "b", "bravo"), Err(Error::Poisoned)));
+    s.set_failpoint("group-staging-text", None);
+    assert!(matches!(label(&s, "c", "charlie"), Err(Error::Poisoned)));
+    assert_eq!(s.snapshot().commit, 1);
+    drop(s);
+    let s = Store::open(dir.path(), options()).unwrap();
+    if let Some(job) = s.text_recovery.load_full() {
+        job.wait().unwrap();
+    }
+    let head = s.snapshot().commit;
+    assert!((1..=2).contains(&head), "head {head}");
+    label(&s, "d", "delta").unwrap();
+    assert_eq!(s.snapshot().commit, head + 1);
+    for (word, present) in [("alpha", true), ("bravo", head == 2), ("delta", true)] {
+        assert_eq!(
+            !text_hits(s.snapshot(), word).unwrap().is_empty(),
+            present,
+            "{word}"
+        );
+    }
+}
+
 /// Commits on a stale index keep their base's view without a link to the base's
 /// outcome, so the views of a long run of commits do not form a chain whose drop
 /// recurses once per commit (review P2-1 of item 86).

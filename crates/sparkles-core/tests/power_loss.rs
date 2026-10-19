@@ -1083,8 +1083,15 @@ fn crash_images_keep_every_acknowledged_commit() {
 /// recovered log and that full-text search finds exactly the recovered data. The writer
 /// checkpoints the index at every fence before its synchronization and from a side
 /// thread, so the images hold checkpoints of the run's own commits. Applying text changes
-/// before their fence makes this test fail.
+/// before their fence makes this test fail. The checkpoint at each fence needs the
+/// `failpoints` feature, which a workspace build turns on through `sparkles-shacl`.
+/// Without it the images would hold no checkpoint taken between a fence's apply and its
+/// synchronization, and the test would pass that mutation, so it is ignored instead.
 #[cfg(feature = "text")]
+#[cfg_attr(
+    not(feature = "failpoints"),
+    ignore = "needs the failpoints feature to checkpoint the index at each fence"
+)]
 #[test]
 fn crash_images_of_a_dataset_with_full_text_search() {
     for (name, cfg) in [

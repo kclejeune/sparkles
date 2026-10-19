@@ -53,9 +53,9 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
   speculative snapshot, its full-text changes reach the live index only after its fence,
   and its embedding work is scheduled when it publishes, so no index on disk names a
   commit the log could lose. A commit that does not qualify takes the ordinary path, as do
-  commits while a full-text index recovers or rebuilds and while a spatial index builds. A
-  commit by the only writer, with no fence running, is synchronized as the
-  default writer synchronizes it. `/$/metrics` reports the synchronization time, the
+  commits while a full-text index recovers or rebuilds and while a spatial index builds or
+  after its build failed. A commit by the only writer, with no fence running, is
+  synchronized as the default writer synchronizes it. `/$/metrics` reports the synchronization time, the
   commits per fence, the wait, and why commits fell back or failed, and `/$/stats/{ds}`
   whether the dataset groups commits.
   [X09](specs/X09-group-commit-by-default.md) has the design.
