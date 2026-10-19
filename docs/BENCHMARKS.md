@@ -882,8 +882,10 @@ session each, so they show the size of the change rather than a published compar
 Later `check_query` calls in the same process took 20 to 60 ms. The process held under
 500 MiB of anonymous memory after the change. The mapped index pages that the sampling of
 predicate objects touches add about 2 GiB of reclaimable file-backed memory to the
-resident size. The figures are for a database without changes since its build, measured
-before the review fixes of item 89, which leave such a database on the same path. A
+resident size. The figures are for a database without changes since its build. A rerun after the
+review fixes of item 89, interleaved with the earlier build in two rounds each, gave the
+same times: a warm first `check_query` in 0.27 to 0.30 s, later ones in 16 to 20 ms, and
+the summary in 1.32 to 1.35 s, with 296 to 392 MiB of anonymous memory for both builds. A
 store with changes corrects the statistics with one index probe for each changed value,
 and the report scans instead when that would cost more than a scan.
 
