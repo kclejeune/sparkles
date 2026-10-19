@@ -3090,7 +3090,7 @@ Each run fixes the model, the provider and the prompts and reports these numbers
 
 | Metric | Definition |
 |---|---|
-| Execution accuracy | The share of questions whose answer set equals the gold answer set. Precision, recall and F1 over answers are reported as QALD does. |
+| Execution accuracy | The share of questions whose answer set equals the gold answer set, under the policy `rdf-term-set-projected-columns-v2`. An answer with extra columns is projected onto the gold's columns first, and the report also gives the accuracy without projection. Precision, recall and F1 over answers are reported as QALD does. |
 | Valid-query rate | The share of final queries that parse and pass `check_query` without errors. |
 | Repair rate | The share of questions whose first draft failed and whose final query was correct. |
 | Clarification precision | Of the questions where the pipeline asked, the share where the gold set marks the question as ambiguous. |
@@ -3948,10 +3948,12 @@ built.
   and checks its stored complexity. The initial `scripts/eval-ask` report now uses
   one whole-pipeline row per pair and a cascade row computed from those runs.
   A failed Ask counts as a scored failure, so one provider error no longer ends a
-  matrix. Schema 3 reports strict RDF-term row-set precision and recall under one
-  global column mapping,
+  matrix. Schema 3 reports strict RDF-term row-set precision and recall,
   separate answerable, clarification and refusal denominators, and bounded child
-  execution statuses. A bounded first-draft query probe distinguishes an actually
+  execution statuses. Its policy is `rdf-term-set-projected-columns-v2`, which projects
+  an answer with extra columns onto the gold's columns under one mapping and counts the
+  answers that needed it. `--scoring-policy` still selects the whole-row policy of the
+  first paid run. A bounded first-draft query probe distinguishes an actually
   failed first draft from repair invocation. Incomplete probes stay unknown and
   outside the conditional repair denominator. Gold preflight must succeed before any model call. Reports
   require a new output directory and an exact pinned binary. The paid wrapper
@@ -5031,17 +5033,25 @@ uses a binary built from a named commit outside the private notes.
 
 The first paid run, on 2026-10-19, asked the demo set and CK25 with Haiku 5.5, Sonnet
 5.5 and Opus 5.5 at effort `medium`, through the binary of commit 23075691. It settled
-$4.30 over 612 requests with no cap refusal. The policy of that run compared whole rows,
+$4.30 over 612 requests with no cap refusal, and its ledger replays under the stricter
+reader with nothing held but the carryover. The policy of that run compared whole rows,
 and it scored as wrong every answer that named each result beside its IRI, which Sonnet
-and Opus do for most questions. `scripts/eval-ask-rescore` scored the saved answers
-again under the projected-column policy without calling a model.
+and Opus do for most questions. The projected-column policy was chosen after those
+results were seen. `scripts/eval-ask-rescore` scored the saved answers again under it
+without calling a model, and under the whole-row policy it reproduces the run's numbers
+exactly. The projected policy favors an answer with more columns, because each extra
+column is another chance to match the gold, so the table gives both and counts the
+correct answers that needed a projection. With 59 and 49 questions, a difference of a few
+questions between models is within noise.
 
 | Set | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
 |---|---|---|---|
 | demo, whole rows | 47/59 | 14/59 | 13/59 |
 | demo, projected columns | 52/59 | 48/59 | 56/59 |
+| demo, correct only by projection | 5 | 34 | 43 |
 | CK25, whole rows | 10/49 | 4/49 | 5/49 |
 | CK25, projected columns | 20/49 | 26/49 | 27/49 |
+| CK25, correct only by projection | 10 | 22 | 22 |
 
 The prompts, the effort, the output limit and the parsing were the same for every model,
 and every draft came back at the json-schema level. On the demo set the remaining

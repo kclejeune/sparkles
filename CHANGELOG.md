@@ -141,15 +141,18 @@ many questions it sampled.
 The Ask evaluation scores under `rdf-term-set-projected-columns-v2`. An answer with more
 columns than the gold, such as a name beside each IRI, is projected onto the gold's
 columns and its rows compared as a set, where the first policy scored any extra column
-as wrong. `scripts/eval-ask-rescore` scores a run's saved answers again under the
+as wrong. Each row also reports the accuracy without projection and how many correct
+answers needed one, and `--scoring-policy rdf-term-set-global-columns-v1` scores under
+the first policy. `scripts/eval-ask-rescore` scores a run's saved answers again under the
 current policy without calling a model, and the paid wrapper records every request and
 reply, key redacted, in `replies.jsonl`.
 
 ### Behavior
 
-`sparkles ask` runs a query whose class, variable or prefix is named like the SERVICE
-keyword, such as `pv:Service` or `?service`. It used to leave such a query unrun as if
-it called a remote service.
+`sparkles ask` decides whether a draft calls SERVICE from the parsed query, including
+the patterns inside EXISTS and subqueries, instead of scanning its text. A query whose
+class, variable or prefix is named like the keyword, such as `pv:Service` or `?service`,
+now runs, and a query that hides the keyword from a text scan is still left unrun.
 
 A SERVICE inside an EXISTS that the query evaluates per row is called once for each
 distinct binding of the variables it shares with the outer rows, and once in all when it
