@@ -17,6 +17,9 @@ class BenchToolsTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="bench tools ")
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name)
+        self.store_tmp = tempfile.TemporaryDirectory(prefix="bench-tools-store-", dir="/tmp")
+        self.addCleanup(self.store_tmp.cleanup)
+        self.store = Path(self.store_tmp.name)
         self.bin = self.work / "bin"
         self.bin.mkdir()
         self.calls = self.work / "calls.jsonl"
@@ -31,16 +34,20 @@ if sys.argv[1] == 'eval':
     print('4.2.2', end='')
     sys.exit(0)
 link = pathlib.Path(sys.argv[sys.argv.index('--out-link') + 1])
-(link / 'bin').mkdir(parents=True, exist_ok=True)
+store = pathlib.Path(os.environ['STORE_ROOT']) / link.name
+(store / 'bin').mkdir(parents=True, exist_ok=True)
+if not link.exists():
+    link.symlink_to(store)
 if not os.environ.get('MISSING_BIN'):
     for binary in ['qlever-index', 'qlever-server', 'tdb2.tdbloader', 'fuseki-server', 'oxigraph', 'fluree', 'aux']:
-        p = link / 'bin' / binary
+        p = store / 'bin' / binary
         p.write_text('#!/bin/sh\\nexit 0\\n')
         p.chmod(0o755)
+print(store)
 """)
         nix.chmod(0o755)
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
-                        CALLS=str(self.calls), ROOT=str(ROOT), WORK=str(self.work))
+                        CALLS=str(self.calls), STORE_ROOT=str(self.store), ROOT=str(ROOT), WORK=str(self.work))
         for key in ("FLUREE_VERSION", "FLUREE", "QINDEX", "QSERVER", "TDBLOADER", "FUSEKI", "OXIGRAPH"):
             self.env.pop(key, None)
 
@@ -61,7 +68,8 @@ if not os.environ.get('MISSING_BIN'):
                 on_path.chmod(0o755)
                 p = self.shell(f'nixbin {package} {binary}')
                 self.assertEqual(p.returncode, 0, p.stderr)
-                self.assertEqual(p.stdout.strip(), str(self.work / "gcroots" / package / "bin" / binary))
+                self.assertEqual(p.stdout.strip(), str(self.store / package / "bin" / binary))
+                self.assertEqual((self.work / "gcroots" / package).resolve(), self.store / package)
                 call = self.nix_calls()[-1]
                 self.assertIn(f"{ROOT}#{package}", call)
                 self.assertIn("--no-update-lock-file", call)
@@ -75,6 +83,12 @@ if not os.environ.get('MISSING_BIN'):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("nixpkgs#auxiliary", self.nix_calls()[-1])
         self.assertIn("--inputs-from", self.nix_calls()[-1])
+
+    def test_engine_paths_are_safe_in_serialized_commands(self):
+        # The runners embed executables in shell command strings passed to hyperfine.
+        p = self.shell('binary=$(nixbin qlever qlever-index); bash -c "$binary --help"')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue((self.work / "gcroots/qlever").is_symlink())
 
     def test_failed_build_never_returns_a_binary(self):
         p = self.shell('binary=$(nixbin qlever qlever-server); echo "started $binary"', FAIL_NIX="1")

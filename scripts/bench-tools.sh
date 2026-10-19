@@ -12,9 +12,10 @@ nixpkg() {
     *) installable="nixpkgs#$package" ;;
   esac
   mkdir -p "$WORK/gcroots" || return
+  # Store paths are safe to embed in the runners' serialized hyperfine commands,
+  # including when the work directory and its GC roots contain spaces.
   nix build --no-update-lock-file --inputs-from "$ROOT" "$installable" \
-    --out-link "$WORK/gcroots/$package" > /dev/null || return
-  echo "$WORK/gcroots/$package"
+    --out-link "$WORK/gcroots/$package" --print-out-paths || return
 }
 
 nixbin() {
