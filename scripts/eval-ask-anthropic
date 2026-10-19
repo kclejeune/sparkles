@@ -224,6 +224,7 @@ def main():
         run["maxOutputTokens"],
         run["effort"],
         run["requestTimeoutSecs"],
+        replies=out / "replies.jsonl",
     )
     server = proxy.serve()
     thread = threading.Thread(target=server.serve_forever)

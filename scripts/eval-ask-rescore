@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Score the saved answers of an Ask run again, offline, under the current policy.
+
+It reads a set's report.json and the case files beside it, runs each answer's query
+and gold with `sparkles query` on the set's data, and writes a new report to a new
+directory. No model is called and no key is read. The answers are the ones the run
+saved, so only the scoring can change. The report records the run it came from and
+the execution accuracy of each row before and after.
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+import time
+import types
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
+from evaluator import POLICY, Invalid, bounded_file, digest, strict_json
+
+_loader = importlib.machinery.SourceFileLoader(
+    "eval_ask", str(ROOT / "scripts/eval-ask")
+)
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+eval_ask = importlib.util.module_from_spec(_spec)
+_loader.exec_module(eval_ask)
+
+
+def rescore(report_path, sparkles, out, set_path=None, model_config=None, timeout=None):
+    report_path = pathlib.Path(report_path)
+    source = strict_json(bounded_file(report_path, 64 * 1024 * 1024))
+    if source.get("dataLoc"):
+        raise Invalid("a run on a database directory is rescored with that database")
+    set_path = pathlib.Path(set_path or source["set"])
+    if digest(set_path) != source["setSha256"]:
+        raise Invalid("the question set differs from the one the run used")
+    if digest(sparkles) != source["binarySha256"]:
+        raise Invalid("the binary differs from the one the run used")
+    model_config = pathlib.Path(
+        model_config or report_path.parent.parent / "models.json"
+    )
+    qset = strict_json(bounded_file(set_path, 4 * 1024 * 1024))
+    out = pathlib.Path(out)
+    if not out.is_absolute() or ROOT == out or ROOT in out.parents:
+        raise Invalid("new absolute output outside repository required")
+    out.mkdir(mode=0o700)
+    args = types.SimpleNamespace(
+        set=str(set_path),
+        sparkles=str(sparkles),
+        model_config=str(model_config),
+        loc=None,
+        out=str(out),
+        phase_deadline=0,
+        timeout=timeout or max(30.0, float(qset.get("goldTimeoutSecs") or 0)),
+    )
+    runner = eval_ask.Runner(args, qset, out)
+    qs = {q["id"]: q for q in qset["questions"]}
+    pairs = source["pairs"]
+    per_pair = {p: ({}, {}) for p in pairs}
+    cases = []
+    for case in source["cases"]:
+        saved = strict_json(
+            bounded_file(
+                report_path.parent / (case["case"] + ".json"), 16 * 1024 * 1024
+            )
+        )
+        q, answer = qs[case["id"]], saved["answer"]
+        score = runner.score(q, answer)
+        per_pair[case["pair"]][0][q["id"]] = answer
+        per_pair[case["pair"]][1][q["id"]] = score
+        cases.append(
+            dict(
+                case,
+                correct=score[0],
+                prf=score[1],
+                detail=score[2],
+                before={"correct": case["correct"], "prf": case["prf"]},
+            )
+        )
+    order = [
+        q for q in qset["questions"] if any(q["id"] in per_pair[p][0] for p in pairs)
+    ]
+    rows = []
+    for pair in pairs:
+        answers, scores = per_pair[pair]
+        done = [q for q in order if q["id"] in answers]
+        for r in eval_ask.summarize_pair(
+            pair,
+            done,
+            [answers[q["id"]] for q in done],
+            [scores[q["id"]] for q in done],
+        ):
+            r["failureStatuses"] = eval_ask.failure_counts(answers.values())
+            rows.append(r)
+    if len(pairs) > 1 and not source.get("notRun"):
+        used, c_answers, c_scores, tally = eval_ask.cascade_cases(
+            pairs,
+            order,
+            {p: per_pair[p][0] for p in pairs},
+            {p: per_pair[p][1] for p in pairs},
+        )
+        for r in eval_ask.summarize_pair(" > ".join(pairs), used, c_answers, c_scores):
+            r["derivation"] = "computed from the per-pair runs"
+            r["answeredBy"] = tally
+            rows.append(r)
+    before = {
+        r["pair"]: r["executionAccuracy"]
+        for r in source["rows"]
+        if "executionAccuracy" in r
+    }
+    comparison = [
+        {
+            "pair": r["pair"],
+            "before": before.get(r["pair"]),
+            "after": r.get("executionAccuracy"),
+        }
+        for r in rows
+    ]
+    report = dict(
+        source,
+        scoringPolicy=POLICY,
+        rescoredFrom={
+            "report": str(report_path),
+            "reportSha256": digest(report_path),
+            "scoringPolicy": source.get("scoringPolicy"),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+        cases=cases,
+        rows=rows,
+        executionAccuracyBeforeAndAfter=comparison,
+    )
+    with (out / "report.json").open("x") as f:
+        json.dump(report, f, indent=2)
+        f.write("\n")
+    return report
+
+
+def main():
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    ap.add_argument("--report", required=True, help="a set's report.json")
+    ap.add_argument(
+        "--sparkles", required=True, help="the run's binary, by absolute path"
+    )
+    ap.add_argument("--out", required=True, help="a new directory for the new report")
+    ap.add_argument("--set", help="the question set, when it has moved since the run")
+    ap.add_argument("--model-config", help="the run's models.json")
+    ap.add_argument("--timeout", type=float, help="query seconds")
+    args = ap.parse_args()
+    report = rescore(
+        args.report, args.sparkles, args.out, args.set, args.model_config, args.timeout
+    )
+    for row in report["executionAccuracyBeforeAndAfter"]:
+        b, a = row["before"], row["after"]
+        fmt = lambda x: f"{x['numerator']}/{x['denominator']}" if x else "-"  # noqa: E731
+        print(f"{row['pair']}: {fmt(b)} -> {fmt(a)}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (Invalid, OSError) as error:
+        print(f"eval-ask-rescore: {type(error).__name__} {error}", file=sys.stderr)
+        sys.exit(2)

@@ -906,6 +906,31 @@ class Requests(Base):
         )
         self.assertIn(f"127.0.0.1:{server.server_port}", config)
 
+    def test_requests_and_replies_are_recorded_without_the_key(self):
+        echo = dict(REPLY, content=[{"type": "text", "text": "key " + KEY}])
+        upstream = Upstream(
+            (200, [], json.dumps(echo).encode()),
+            (529, [], b"overloaded " + KEY.encode()),
+        )
+        path = self.root / "replies.jsonl"
+        proxy = self.proxy(upstream, replies=path)
+        proxy.set_case("c1")
+        proxy.handle(raw(text="question " + KEY))
+        proxy.handle(raw())
+        text = path.read_text()
+        self.assertNotIn(KEY, text)
+        first, second = (json.loads(x) for x in text.splitlines())
+        self.assertEqual(
+            (first["case"], first["model"], first["status"]), ("c1", HAIKU, 200)
+        )
+        self.assertEqual(
+            first["request"]["messages"][0]["content"], "question [REDACTED]"
+        )
+        self.assertEqual(first["reply"]["content"][0]["text"], "key [REDACTED]")
+        self.assertEqual(first["reply"]["usage"], REPLY["usage"])
+        self.assertEqual(second["status"], 529)
+        self.assertEqual(second["reply"], "overloaded [REDACTED]")
+
     def test_served_route_needs_the_token(self):
         proxy = self.proxy(Upstream())
         server = proxy.serve()

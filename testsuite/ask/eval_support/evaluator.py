@@ -13,7 +13,7 @@ import signal
 import subprocess
 import time
 
-POLICY = "rdf-term-set-global-columns-v1"
+POLICY = "rdf-term-set-projected-columns-v2"
 XSD_STRING = "http://www.w3.org/2001/XMLSchema#string"
 UNBOUND = ("unbound",)
 STDOUT_CAP = 4 * 1024 * 1024
@@ -287,6 +287,49 @@ def align(gold, got, check=lambda: None):
     return max(best, 0), mapping
 
 
+def project(gold, got, check=lambda: None):
+    """The best injective choice of one answer column for each gold column.
+
+    An answer may project more columns than the gold, such as a name beside each
+    person. Its rows are then projected onto the chosen columns as a set, and that
+    set is compared with the gold rows. A column is a candidate for a gold column only
+    when they share a term, unless either side has no rows. Returns the intersection,
+    the chosen columns and the projected rows.
+    """
+    gw, aw = len(gold.variables), len(got.variables)
+    if gw > aw:
+        return 0, None, frozenset()
+    gold_values = [{row[i] for row in gold.rows} for i in range(gw)]
+    got_values = [{row[j] for row in got.rows} for j in range(aw)]
+    candidates = [
+        [
+            j
+            for j in range(aw)
+            if not gold.rows
+            or not got.rows
+            or not gold_values[i].isdisjoint(got_values[j])
+        ]
+        for i in range(gw)
+    ]
+    best = (-1, None, frozenset())
+    visited = 0
+    for cols in itertools.product(*candidates):
+        check()
+        if len(set(cols)) < gw:
+            continue
+        visited += (len(got.rows) or 1) * (gw or 1)
+        if visited > 1000000:
+            raise Unsupported("projected column comparison cell cap")
+        projected = frozenset(tuple(row[j] for j in cols) for row in got.rows)
+        common = len(gold.rows & projected)
+        # Prefer more shared rows, then fewer stray rows.
+        if (common, -len(projected)) > (best[0], -len(best[2])):
+            best = (common, cols, projected)
+        if common == len(gold.rows) == len(projected):
+            break
+    return max(best[0], 0), best[1], best[2]
+
+
 def score_sets(gold, got, check=lambda: None):
     if type(gold) is bool:
         ok = type(gold) is bool and type(got) is bool and gold == got
@@ -303,7 +346,7 @@ def score_sets(gold, got, check=lambda: None):
                 "status": "wrong_result_kind",
             },
         )
-    if len(gold.variables) != len(got.variables):
+    if len(gold.variables) > len(got.variables):
         return (
             False,
             (0.0, 0.0, 0.0),
@@ -313,6 +356,28 @@ def score_sets(gold, got, check=lambda: None):
                 "goldRows": len(gold.rows),
                 "gotRows": len(got.rows),
                 "mapping": None,
+                "goldDuplicates": gold.duplicates,
+                "gotDuplicates": got.duplicates,
+                "status": "missing_columns",
+            },
+        )
+    if len(gold.variables) < len(got.variables):
+        n, mapping, projected = project(gold, got, check)
+        g, a = len(gold.rows), len(projected)
+        p = n / a if a else float(g == 0)
+        r = n / g if g else float(a == 0)
+        f = 2 * p * r / (p + r) if p + r else 0.0
+        return (
+            (g == a == n),
+            (p, r, f),
+            {
+                "kind": "select",
+                "intersection": n,
+                "goldRows": g,
+                "gotRows": len(got.rows),
+                "projectedRows": a,
+                "mapping": list(mapping) if mapping is not None else None,
+                "extraColumns": len(got.variables) - len(gold.variables),
                 "goldDuplicates": gold.duplicates,
                 "gotDuplicates": got.duplicates,
             },

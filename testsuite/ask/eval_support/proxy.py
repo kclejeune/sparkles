@@ -673,8 +673,12 @@ class Proxy:
         max_output_tokens=4096,
         effort="medium",
         timeout=120,
+        replies=None,
     ):
         self.ledger, self.upstream, self.key = ledger, upstream, key
+        # A JSON-lines file of every forwarded request and its reply, with the key
+        # redacted, so a run's answers can be diagnosed without calling a model again.
+        self.replies = pathlib.Path(replies) if replies else None
         self.models, self.max_output_tokens = tuple(models), max_output_tokens
         self.effort, self.timeout = effort, timeout
         self.token = secrets.token_urlsafe(32)
@@ -797,6 +801,7 @@ class Proxy:
             # error after generation could be billed. The cap's margin absorbs it.
             # The child's own retries see the reply.
             self.ledger.settle(ident, 0, f"http-{status}", request_id=request_id)
+            self.record(ident, model, payload, status, self.clean_bytes(data))
             return status, passed, self.clean_bytes(data)
         try:
             reply = strict_json(data)
@@ -811,10 +816,35 @@ class Proxy:
             usage=usage if isinstance(usage, dict) else None,
             request_id=request_id,
         )
+        self.record(ident, model, payload, status, self.clean_bytes(data))
         if reply is None:
             return 502, [], error_body("api_error", "the upstream reply is not JSON")
         clean, _ = redact(reply, self.key)
         return status, passed, json.dumps(clean, ensure_ascii=False).encode()
+
+    def record(self, ident, model, payload, status, data):
+        """Append the request and its reply to the replies file, key redacted."""
+        if self.replies is None:
+            return
+        try:
+            reply = strict_json(data)
+        except Invalid:
+            reply = data.decode("utf-8", "replace")[:65536]
+        request, _ = redact(strict_json(payload), self.key)
+        reply, _ = redact(reply, self.key)
+        line = {
+            "id": ident,
+            "case": self.case,
+            "model": model,
+            "status": status,
+            "request": request,
+            "reply": reply,
+        }
+        text = json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n"
+        # The record is for diagnosis. Failing to write it never fails the request.
+        with self.mutex, contextlib.suppress(OSError):
+            with self.replies.open("a", encoding="utf-8") as f:
+                f.write(text)
 
     def clean_bytes(self, data):
         if self.key and self.key.encode() in data:

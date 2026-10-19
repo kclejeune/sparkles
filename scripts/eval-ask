@@ -23,6 +23,7 @@ from evaluator import (
     GoldFault,
     HarnessFault,
     Invalid,
+    POLICY,
     OfflinePolicy,
     answer_set,
     bounded_file,
@@ -637,9 +638,7 @@ def finish_run(report, out_dir, runner, error=None):
         json.dump(report, f, indent=2)
         f.write("\n")
     with (out_dir / "report.md").open("x") as f:
-        f.write(
-            "# Ask pipelines\n\nStrict RDF-term accuracy uses rdf-term-set-global-columns-v1.\n\n"
-        )
+        f.write(f"# Ask pipelines\n\nStrict RDF-term accuracy uses {POLICY}.\n\n")
         f.write(
             "The run is "
             + ("complete" if report["complete"] else "incomplete")
@@ -662,7 +661,7 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
     report = {
         "schema": 3,
         "mode": "pipeline",
-        "scoringPolicy": "rdf-term-set-global-columns-v1",
+        "scoringPolicy": POLICY,
         "set": str(args.set),
         "setSha256": digest(args.set),
         "dataSha256": digest(runner.data) if runner.data else None,
