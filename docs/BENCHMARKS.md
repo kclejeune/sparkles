@@ -1929,9 +1929,15 @@ than 10%. Fluree's warm advantages on small lookups at 1.05M are within 10%.
     result cache.
   * QLever runs with `-m 8G -j 16 --cache-max-size-single-entry 0B`, which stops it from
     caching results, and its cache is cleared before every timed run.
-  * Fluree 4.2.2 is the release binary, which `scripts/bench.sh` downloads and verifies
-    against a checksum. It loads with `fluree create bench --from data.nt
-    --chunk-size-mb 16` and serves with `fluree server run`, `FLUREE_CACHE_MAX_MB=4096` and
+  * Fluree 4.2.2 is the release binary. The published Fluree figures come from runs in
+    which `scripts/bench.sh` downloaded the release archive and verified it against a
+    checksum. Later runs take the binary from this flake's package of the same release
+    archive, which `nix/fluree.nix` pins by SHA-256. On Linux that package rewrites the
+    executable to load the glibc of the locked nixpkgs instead of the host's, so the
+    executable's SHA-256 in result manifests differs from the downloaded binary's. The
+    published figures were not measured with the packaged executable. Fluree loads with
+    `fluree create bench --from data.nt --chunk-size-mb 16` and serves with
+    `fluree server run`, `FLUREE_CACHE_MAX_MB=4096` and
     `FLUREE_PATH_MAX_VISITED=20000000`, because the default traversal cap of 1M nodes
     rejects `knows-reach` at 10.5M. Fluree has no result cache.
   * Oxigraph loads with `oxigraph load` and then `oxigraph optimize`, the compaction its

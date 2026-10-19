@@ -3,6 +3,9 @@
 
 # Keep every resolved package alive for the whole run, including during store GC.
 # Engine packages always come from this flake, even when another version is on PATH.
+# The build prints one store path per installed output, so a package such as zstd prints
+# its bin and man outputs on two lines. Nix roots the out output as gcroots/<package> and
+# every other output as gcroots/<package>-<output>. Use nixexe to find an executable.
 nixpkg() {
   local package=$1 installable
   case $package in
@@ -18,8 +21,24 @@ nixpkg() {
     --out-link "$WORK/gcroots/$package" --print-out-paths || return
 }
 
+# Print bin/<binary> from whichever installed output of the package holds it. The
+# executable output need not be the first one that the build prints.
+nixexe() {
+  local package=$1 binary=$2 paths path
+  paths=$(nixpkg "$package") || return
+  while IFS= read -r path; do
+    if [ -f "$path/bin/$binary" ] && [ -x "$path/bin/$binary" ]; then
+      echo "$path/bin/$binary"
+      return
+    fi
+  done <<< "$paths"
+  echo "$package does not provide bin/$binary" >&2
+  return 1
+}
+
+# Auxiliary tools come from PATH when it has them, and engines always come from this flake.
 nixbin() {
-  local package=$1 binary=$2 prefix
+  local package=$1 binary=$2
   case $package in
     apache-jena | apache-jena-fuseki | qlever | oxigraph | fluree) ;;
     *)
@@ -29,12 +48,7 @@ nixbin() {
       fi
       ;;
   esac
-  prefix=$(nixpkg "$package") || return
-  [ -x "$prefix/bin/$binary" ] || {
-    echo "$package does not provide bin/$binary" >&2
-    return 1
-  }
-  echo "$prefix/bin/$binary"
+  nixexe "$package" "$binary"
 }
 
 fluree_bin() {
@@ -62,11 +76,12 @@ resolve_tools() {
   if has fluree; then FLUREE=${FLUREE:-$(fluree_bin)} || return; fi
 }
 
-# GNU time, rather than the shell keyword.
+# GNU time, rather than the shell keyword. It cannot go through nixbin, because command -v
+# finds the keyword. The optional argument replaces the system location /usr/bin/time, which
+# lets the tests reach the nixpkgs fallback.
 gnu_time() {
+  local system=${1:-/usr/bin/time}
   type -P gtime && return
-  [ -x /usr/bin/time ] && echo /usr/bin/time && return
-  local prefix
-  prefix=$(nixpkg time) || return
-  echo "$prefix/bin/time"
+  [ -x "$system" ] && echo "$system" && return
+  nixexe time time
 }
