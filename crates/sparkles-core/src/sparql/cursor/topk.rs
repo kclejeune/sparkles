@@ -5,7 +5,7 @@
 //! both modes end with the same rows in the same order at any batch size. It keeps at
 //! most `k + 1` rows of IDs and their sort keys, charged to the query budget, instead of
 //! the whole input. Output starts once the input is exhausted.
-use super::{Buffer, CursorOptions, Operator, copy_rows};
+use super::{Buffer, CursorOptions, CursorPlan, FallbackPolicy, Operator, copy_rows};
 use crate::error::Result;
 use crate::id::Id;
 use crate::sparql::ctx::{Ctx, OwnedCharge};
@@ -226,6 +226,78 @@ impl TopK {
             self.load(ctx, child, options)?;
         }
         let table = &self.loaded.as_ref().expect("loaded top-k").table;
+        let batch = copy_rows(ctx, table, self.at, cap)?;
+        self.at += batch.as_ref().map_or(0, |b| b.table.len);
+        Ok(batch)
+    }
+}
+
+/// An ordered top-k over a scan (`IndexTopK`). It reads the pieces of the scan whose ids
+/// are in value order from their best end, and the other pieces a morsel at a time into a
+/// heap of its best k rows ([`exec::ordered_topk`]), so it holds one morsel and k rows.
+/// When a value of those pieces is not totally ordered, the generic plan, a streaming
+/// top-k over the scan, answers instead, as it does eagerly. The operator builds that
+/// plan as its child only then.
+pub(super) struct IndexTopK {
+    node: Node,
+    fallback: FallbackPolicy,
+    loaded: Option<Buffer>,
+    at: usize,
+    /// the described generic plan, once it has been built
+    generic: Option<Box<CursorPlan>>,
+}
+
+impl IndexTopK {
+    pub(super) fn new(node: Node, fallback: FallbackPolicy) -> Self {
+        Self {
+            node,
+            fallback,
+            loaded: None,
+            at: 0,
+            generic: None,
+        }
+    }
+
+    pub(super) fn generic_plan(&self) -> Option<&CursorPlan> {
+        self.generic.as_deref()
+    }
+
+    pub(super) fn done(&self, children: &[Operator]) -> bool {
+        if self.generic.is_some() {
+            return children[0].done;
+        }
+        self.loaded.as_ref().is_some_and(|b| self.at == b.table.len)
+    }
+
+    pub(super) fn next(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        children: &mut Vec<Operator>,
+        options: &CursorOptions,
+        info: &mut crate::sparql::PlanInfo,
+        cap: usize,
+    ) -> Result<Option<Buffer>> {
+        if self.loaded.is_none() && self.generic.is_none() {
+            let Kind::OrderedTopK(spec) = &self.node.kind else {
+                unreachable!("an ordered top-k node")
+            };
+            match exec::ordered_topk(ctx, spec, &self.node.vars)? {
+                Some((table, read)) => {
+                    info.description = format!("{} [read {read} rows]", info.description);
+                    let charge = OwnedCharge::new(ctx, super::capacity_bytes(&table))?;
+                    self.loaded = Some(Buffer { table, charge });
+                }
+                None => {
+                    let child = Operator::build(ctx, (*spec.fallback).clone(), self.fallback)?;
+                    self.generic = Some(Box::new(child.describe(ctx)));
+                    children.push(child);
+                }
+            }
+        }
+        if self.generic.is_some() {
+            return children[0].next(ctx, options, cap);
+        }
+        let table = &self.loaded.as_ref().expect("loaded ordered top-k").table;
         let batch = copy_rows(ctx, table, self.at, cap)?;
         self.at += batch.as_ref().map_or(0, |b| b.table.len);
         Ok(batch)

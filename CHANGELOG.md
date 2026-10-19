@@ -88,6 +88,26 @@ order than an eager one, which SPARQL allows, and an ordered subquery fixes the 
 both. Rust callers set
 `QueryOptions::spill` and `max_spill_bytes`, and `BudgetKind::Spill` is a new variant.
 
+A streamed FILTER over an index scan reads the scan in morsels of whole index blocks and
+filters each morsel in parallel when every conjunct is a key test on the scan's key
+column, and a STRSTARTS filter reads only the blocks its prefix can match. At 10.5M with
+eight threads on an 8-vCPU AMD Namespace instance,
+CONTAINS, STRSTARTS and LANGMATCHES filters over names and titles now take 0.91 to 0.95
+times their eager time, where they took 1.48 to 7.99 times. More threads hold more morsel
+scratch at once, 13.5 MB in the ledger at eight threads against 11.8 MB before.
+
+A streamed range top-k no longer reads the parts of its range whose ids do not follow
+value order into memory. It ranks them in parallel morsels of one index block and keeps
+only its best rows, so its memory no longer grows with the range. A default graph made of
+several graphs still holds each triple once across the morsels. At 10.5M with eight
+threads on 8-vCPU AMD Namespace instances it takes 0.89 to 1.06 times its eager time over
+several runs, where it took 1.33 times.
+
+A streamed answer's term cache sorts its vocabulary ids with a stable sort that merges
+the columns already in index order. With the parallel filter, a STRSTARTS filter over
+names in native JSON at one thread takes 1.01 to 1.03 times its eager time, where it
+took 1.30 times.
+
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server
 refuses until `sparkles migrate` runs without `--check`, and its JSON report adds `opens`.
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as

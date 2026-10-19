@@ -1530,7 +1530,7 @@ fn whole_range(spec: &ScanSpec) -> (Key, Key) {
 /// the base-vocabulary ids of the keys with that start, and every id outside the base
 /// vocabulary (inline values, terms added by updates), which are tested as usual.
 /// Otherwise the whole scan.
-fn key_ranges(
+pub(super) fn key_ranges(
     ctx: &Ctx,
     spec: &ScanSpec,
     kf: Option<&super::keyfilter::KeyFilter>,
@@ -1897,6 +1897,161 @@ fn filter_scan_runs(
         rest,
         read,
         note,
+    }))
+}
+
+/// The variable of a scan's first free key column when every FILTER conjunct reads only
+/// it, so that [`filter_scan_morsel`] can test each of its values once. `None` when the
+/// first free column does not follow the bound prefix, when union-graph dedup compares
+/// neighbouring rows or when a conjunct reads another variable.
+pub(super) fn run_filter_split(spec: &ScanSpec, exprs: &[Expr]) -> Option<VarId> {
+    let &(kc, key) = spec.cols.first()?;
+    if spec.dedup || exprs.is_empty() || kc != spec.prefix.len() {
+        return None;
+    }
+    exprs
+        .iter()
+        .all(|e| super::exprcache::input(&[e]) == Ok(Some(key)))
+        .then_some(key)
+}
+
+/// The columns a task of [`filter_scan_morsel`] copied out, one per output variable.
+pub(super) type MorselPart = Vec<Vec<Id>>;
+
+/// One morsel of a cursor's FILTER over a scan: the rows of the scan in the key `ranges`
+/// (sorted, disjoint and within the scan) whose first free key column, bound to `key`,
+/// passes the key filter `kf` of the conjuncts `on_key`, whose copies `filters` keeps
+/// between tasks and morsels. Each parallel task takes a piece
+/// of an index block, finds the runs of the column's values, tests each run's value once
+/// on its vocabulary key and copies the rows of the runs that pass, so the morsel is read,
+/// tested and copied in one pass. Values outside the base vocabulary are tested as
+/// [`super::exprcache::filter_values`] tests them. Output column `i` is read from key
+/// column `cols[i]`. Returns the parts in key order and the rows read, or `None` when
+/// the delta has keys in a range.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn filter_scan_morsel(
+    ctx: &Ctx,
+    spec: &ScanSpec,
+    cols: &[usize],
+    key: VarId,
+    on_key: &[Expr],
+    kf: &super::keyfilter::KeyFilter,
+    filters: &parking_lot::Mutex<Vec<super::keyfilter::KeyFilter>>,
+    ranges: &[(Key, Key)],
+) -> Result<Option<(Vec<MorselPart>, u64)>> {
+    use crate::id::Tag;
+    let kc = spec.cols[0].0;
+    let vocab = &ctx.snap.generation.vocab;
+    let width = cols.len();
+    let parts = ctx.snap.par_blocks_in_ranges(
+        spec.perm,
+        ranges,
+        scan_mask(ctx, spec),
+        PIECE,
+        |b, s, e| {
+            let mut out: MorselPart = vec![Vec::new(); width];
+            if s >= e {
+                return Ok((out, 0));
+            }
+            // The rows of the piece that pass the scan's graph filter and repeated
+            // variable checks, when not all of them do.
+            let sel: Option<Vec<u32>> = (!block_passes(spec, b, s, e)).then(|| {
+                (s..e)
+                    .filter(|&i| {
+                        let k = b.key(i);
+                        spec.graph.accepts(k[spec.graph_col])
+                            && spec.eqs.iter().all(|&(x, y)| k[x] == k[y])
+                    })
+                    .map(|i| i as u32)
+                    .collect()
+            });
+            let col = &b.cols[kc];
+            let n = sel.as_ref().map_or(e - s, Vec::len);
+            let row = |j: usize| sel.as_ref().map_or(s + j, |v| v[j] as usize);
+            let _scratch = ctx.charge((n as u64).saturating_mul(24).saturating_add(1024))?;
+            // The distinct values of the sorted column, in order. Raw ids sort by tag, so
+            // the base-vocabulary values are one stretch of them.
+            let mut values: Vec<u64> = Vec::new();
+            for j in 0..n {
+                let v = col[row(j)];
+                if values.last() != Some(&v) {
+                    values.push(v);
+                }
+            }
+            let lo = values.partition_point(|&v| Id(v).tag() < Tag::Vocab);
+            let hi = lo + values[lo..].partition_point(|&v| Id(v).tag() == Tag::Vocab);
+            let payloads: Vec<u64> = values[lo..hi].iter().map(|&v| Id(v).payload()).collect();
+            let mut pass = vec![false; values.len()];
+            // A copy of the filter per task: tasks sharing a regular expression contend
+            // for its match caches. The copies are kept for later tasks, whose regular
+            // expressions then start with warm caches.
+            let kf = filters.lock().pop().unwrap_or_else(|| kf.clone());
+            let scratch = ctx.charge(0)?;
+            let mut reserved = 0;
+            let mut at = 0;
+            vocab.get_sorted_checked(
+                &payloads,
+                |need| {
+                    ctx.check()?;
+                    let bytes = (need as u64).saturating_mul(2);
+                    scratch.add(bytes.saturating_sub(reserved))?;
+                    reserved = bytes;
+                    Ok::<(), Error>(())
+                },
+                |p, k| {
+                    while payloads[at] != p {
+                        at += 1;
+                    }
+                    pass[lo + at] = kf.test(k);
+                    Ok::<(), Error>(())
+                },
+            )?;
+            drop(payloads);
+            filters.lock().push(kf);
+            if lo > 0 || hi < values.len() {
+                let other: Vec<Id> = values[..lo]
+                    .iter()
+                    .chain(&values[hi..])
+                    .map(|&v| Id(v))
+                    .collect();
+                let (hit, _) = super::exprcache::filter_values(ctx, &other, key, on_key)?;
+                for (i, h) in (0..lo).chain(hi..values.len()).zip(hit) {
+                    pass[i] = h;
+                }
+            }
+            // The passing rows, gathered without a branch per row, then each column.
+            let mut at: Vec<u32> = vec![0; n];
+            let mut w = 0;
+            let mut k = 0;
+            for j in 0..n {
+                let i = row(j);
+                if col[i] != values[k] {
+                    k += 1;
+                }
+                at[w] = i as u32;
+                w += usize::from(pass[k]);
+            }
+            at.truncate(w);
+            if w > 0 {
+                for (to, &from) in out.iter_mut().zip(cols) {
+                    let column = &b.cols[from];
+                    to.extend(at.iter().map(|&i| Id(column[i as usize])));
+                }
+            }
+            ctx.check()?;
+            Ok((out, n as u64))
+        },
+    )?;
+    Ok(parts.map(|parts| {
+        let read = parts.iter().map(|p| p.1).sum();
+        (
+            parts
+                .into_iter()
+                .filter(|p| p.0.first().is_some_and(|c| !c.is_empty()))
+                .map(|p| p.0)
+                .collect(),
+            read,
+        )
     }))
 }
 
@@ -2605,16 +2760,44 @@ fn topk_read(
         k[scan.prefix.len()] = v;
         k
     };
+    topk_read_keys(ctx, spec, bound(lo, 0), bound(hi, u64::MAX), exact, vars)
+}
+
+/// [`topk_read`] of the keys `[lo, hi]` of the scan.
+fn topk_read_keys(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    lo: crate::index::Key,
+    hi: crate::index::Key,
+    exact: bool,
+    vars: &[VarId],
+) -> Result<(Table, usize)> {
+    topk_read_keys_last(ctx, spec, lo, hi, exact, vars).map(|(t, n, _)| (t, n))
+}
+
+/// [`topk_read_keys`], with the last row the scan produced before any filter when the
+/// scan drops duplicate rows of a union default graph: the next read of the same piece
+/// must drop that row again if it starts with it.
+fn topk_read_keys_last(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    lo: crate::index::Key,
+    hi: crate::index::Key,
+    exact: bool,
+    vars: &[VarId],
+) -> Result<(Table, usize, Option<Vec<Id>>)> {
     let mut t = Table::new(vars.to_vec());
-    scan_into(ctx, scan, bound(lo, 0), bound(hi, u64::MAX), None, &mut t)?;
+    scan_into(ctx, &spec.scan, lo, hi, None, &mut t)?;
     let scanned = t.len();
+    let last =
+        (spec.scan.dedup && scanned > 0).then(|| t.cols.iter().map(|c| c[scanned - 1]).collect());
     if !exact && !spec.range_filter.is_empty() && !t.is_empty() {
         apply_range_filter(ctx, &mut t, spec.var, &spec.range_filter)?;
     }
     if !spec.filter.is_empty() && !t.is_empty() {
         apply_filter(ctx, &mut t, &spec.filter)?;
     }
-    Ok((t, scanned))
+    Ok((t, scanned, last))
 }
 
 /// The order-column id of the base row `want` rows from the best end of the ids
@@ -2753,34 +2936,22 @@ fn cursor_totally_ordered(value: Option<&Value>) -> bool {
     }
 }
 
-/// [`OrderedTopK`]: the first k rows of the ORDER BY, in its order; `None` when a value
-/// outside the monotone pieces is not totally ordered (the generic plan must decide).
-/// Also returns how many rows were scanned.
-fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(Table, usize)>> {
-    let vars: Vec<VarId> = spec.scan.cols.iter().map(|c| c.1).collect();
-    debug_assert_eq!(vars.first(), Some(&spec.var));
-    let mut scanned = 0;
-    // the pieces without value order are read whole
-    let mut rest = Table::new(vars.clone());
-    let mut runs = Vec::new();
-    for p in &spec.pieces {
-        match p.mono {
-            None => {
-                let (t, n) = topk_read(ctx, spec, p.lo, p.hi, p.exact, &vars)?;
-                scanned += n;
-                rest.append(t);
-                ctx.check_output(rest.len(), rest.width())?;
-            }
-            Some(up) => runs.push(TopKRun {
-                lo: p.lo,
-                hi: p.hi,
-                exact: p.exact,
-                best_high: up != spec.asc,
-                kept: Table::new(vars.clone()),
-                want: spec.k.max(16).saturating_mul(2),
-                done: false,
-            }),
-        }
+/// The best k rows of the pieces of an [`OrderedTopK`] scan without value order, which
+/// are read whole, in no particular order; `None` when one of their values is not
+/// totally ordered. Adds the rows read to `scanned`.
+fn topk_rest(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    vars: &[VarId],
+    pieces: &[&super::plan::TopKPiece],
+    scanned: &mut usize,
+) -> Result<Option<Table>> {
+    let mut rest = Table::new(vars.to_vec());
+    for p in pieces {
+        let (t, n) = topk_read(ctx, spec, p.lo, p.hi, p.exact, vars)?;
+        *scanned += n;
+        rest.append(t);
+        ctx.check_output(rest.len(), rest.width())?;
     }
     // Cursor contexts deliberately have no eager decoded-value cache. Decode
     // dictionary ORDER values in one charged, operation-local pass instead of
@@ -2790,38 +2961,15 @@ fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(
     } else {
         None
     };
-    let total = if let Some(values) = &decoded {
-        let mut total = true;
-        for (i, value) in values.vals.iter().enumerate() {
-            if i.is_multiple_of(1024) {
-                ctx.check()?;
+    let total = match &decoded {
+        Some(values) => cursor_rest_total(ctx, &rest, values)?,
+        None => {
+            let total = |id: &Id| totally_ordered(ctx, *id);
+            if rest.len() > PAR_THRESHOLD / 4 {
+                rest.cols[0].par_iter().all(total)
+            } else {
+                rest.cols[0].iter().all(total)
             }
-            if !cursor_totally_ordered(value.as_ref()) {
-                total = false;
-                break;
-            }
-        }
-        for (i, &id) in rest.cols[0].iter().enumerate() {
-            if !total {
-                break;
-            }
-            if i.is_multiple_of(1024) {
-                ctx.check()?;
-            }
-            if !matches!(
-                id.tag(),
-                crate::id::Tag::Vocab | crate::id::Tag::Delta | crate::id::Tag::Local
-            ) {
-                total &= totally_ordered(ctx, id);
-            }
-        }
-        total
-    } else {
-        let total = |id: &Id| totally_ordered(ctx, *id);
-        if rest.len() > PAR_THRESHOLD / 4 {
-            rest.cols[0].par_iter().all(total)
-        } else {
-            rest.cols[0].iter().all(total)
         }
     };
     if !total {
@@ -2847,6 +2995,352 @@ fn ordered_topk(ctx: &Ctx, spec: &OrderedTopK, out: &[VarId]) -> Result<Option<(
     if rest.len() > spec.k {
         rest = order_by(ctx, rest, &keys, Some(spec.k), &mut ExprReport::default())?.0;
     }
+    Ok(Some(rest))
+}
+
+/// Whether every value of the first column of `rest` is totally ordered, with its
+/// dictionary values decoded in `values`.
+fn cursor_rest_total(
+    ctx: &Ctx,
+    rest: &Table,
+    values: &super::exprcache::PerValue<Option<Value>>,
+) -> Result<bool> {
+    for (i, value) in values.vals.iter().enumerate() {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        if !cursor_totally_ordered(value.as_ref()) {
+            return Ok(false);
+        }
+    }
+    for (i, &id) in rest.cols[0].iter().enumerate() {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        if !matches!(
+            id.tag(),
+            crate::id::Tag::Vocab | crate::id::Tag::Delta | crate::id::Tag::Local
+        ) && !totally_ordered(ctx, id)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The rows that the heap of [`cursor_topk_rest`] holds, a slot of the scan's ids for
+/// each row.
+struct RestSlots {
+    width: usize,
+    ids: Vec<Id>,
+    free: Vec<u32>,
+    key_bytes: u64,
+}
+
+/// The rows of one morsel offered to the heap of [`cursor_topk_rest`].
+struct RestOffer<'a> {
+    slots: &'a mut RestSlots,
+    table: &'a Table,
+}
+
+impl HeapRows<u32> for RestOffer<'_> {
+    fn keep(&mut self, i: usize, keys: &[SortKey]) -> Result<u32> {
+        let s = &mut *self.slots;
+        let slot = match s.free.pop() {
+            Some(slot) => slot,
+            None => {
+                let slot = (s.ids.len() / s.width.max(1)) as u32;
+                s.ids.resize(s.ids.len() + s.width, Id::UNDEF);
+                slot
+            }
+        };
+        let at = slot as usize * s.width;
+        for (j, col) in self.table.cols.iter().enumerate() {
+            s.ids[at + j] = col[i];
+        }
+        s.key_bytes = s
+            .key_bytes
+            .saturating_add(keys.iter().map(SortKey::payload_bytes).sum::<u64>());
+        Ok(slot)
+    }
+
+    fn release(&mut self, entry: Entry<u32>) -> Result<()> {
+        let s = &mut *self.slots;
+        s.key_bytes = s
+            .key_bytes
+            .saturating_sub(entry.keys.iter().map(SortKey::payload_bytes).sum::<u64>());
+        s.free.push(entry.payload);
+        Ok(())
+    }
+}
+
+/// Rows of the index blocks of one morsel that a cursor's [`OrderedTopK`] reads from a
+/// piece without value order: a single block.
+const TOPK_MORSEL_ROWS: usize = crate::index::BLOCK_ROWS;
+
+/// The rows a morsel of [`cursor_topk_rest`] keeps, the rows its scan produced and, when
+/// the scan drops union-graph duplicates, the last of those rows.
+type MorselBest = (Table, usize, Option<Vec<Id>>);
+
+/// The keys `[first, last]` of one morsel of [`cursor_topk_rest`], the piece it belongs
+/// to and the rows of its blocks.
+struct Morsel {
+    first: Key,
+    last: Key,
+    exact: bool,
+    piece: usize,
+    rows: usize,
+}
+
+/// [`topk_rest`] for a cursor. The pieces are split into morsels of whole index blocks,
+/// which are read in parallel. Each morsel keeps its rows that have fewer than k rows of
+/// the morsel ahead of them, ties broken by arrival, in arrival order, and those rows are
+/// then offered in order to one heap of the best k. A row that a morsel drops has k rows
+/// of the same morsel at least as good that arrived before it, so the heap keeps the
+/// rows that [`order_by`] keeps over the concatenated pieces. The cursor holds a morsel
+/// per worker thread and the rows they keep, instead of every row of the pieces. A morsel
+/// is checked for values that are not totally ordered before it ranks its rows, and one
+/// such value sends the whole query to the generic plan, as it does eagerly.
+fn cursor_topk_rest(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    vars: &[VarId],
+    pieces: &[&super::plan::TopKPiece],
+    scanned: &mut usize,
+) -> Result<Option<Table>> {
+    let keys = [(Expr::Var(spec.var), spec.asc)];
+    let scan = &spec.scan;
+    let perm = ctx.snap.perm(scan.perm);
+    let bound = |v: u64, fill: u64| {
+        let mut k = pad(&scan.prefix, fill);
+        k[scan.prefix.len()] = v;
+        k
+    };
+    // The morsels of every piece, in key order. Delta keys between two morsels belong to
+    // the one before the gap, so each morsel but a piece's last ends just before the next
+    // one's first block, and a piece with no base block is one morsel.
+    let mut morsels: Vec<Morsel> = Vec::new();
+    for (piece, p) in pieces.iter().enumerate() {
+        let (lo, hi) = (bound(p.lo, 0), bound(p.hi, u64::MAX));
+        let (b0, b1) = perm.key_block_range(&lo, &hi);
+        let mut b = b0;
+        loop {
+            let mut e = b;
+            let mut rows = 0;
+            while e < b1 && (e == b || rows < TOPK_MORSEL_ROWS) {
+                rows += perm.blocks[e].rows as usize;
+                e += 1;
+            }
+            let first = if b == b0 {
+                lo
+            } else {
+                perm.blocks[b].first.max(lo)
+            };
+            let last = if e >= b1 {
+                hi
+            } else {
+                let mut next = perm.blocks[e].first;
+                // the key just before the next morsel's first key
+                for c in (0..4).rev() {
+                    if next[c] > 0 {
+                        next[c] -= 1;
+                        next[c + 1..].fill(u64::MAX);
+                        break;
+                    }
+                }
+                next.min(hi)
+            };
+            morsels.push(Morsel {
+                first,
+                last,
+                exact: p.exact,
+                piece,
+                rows,
+            });
+            if e >= b1 {
+                break;
+            }
+            b = e;
+        }
+    }
+    ctx.check()?;
+    let _list = ctx.charge((morsels.capacity() * std::mem::size_of::<Morsel>()) as u64)?;
+    let mut heap: TopK<u32> = TopK::new(spec.k, vec![spec.asc]);
+    let mut slots = RestSlots {
+        width: vars.len(),
+        ids: Vec::new(),
+        free: Vec::new(),
+        key_bytes: 0,
+    };
+    let entry_bytes = std::mem::size_of::<Entry<u32>>() as u64
+        + std::mem::size_of::<SortKey>() as u64
+        + vars.len() as u64 * 8;
+    let mut held = ctx.retained_charge(1024)?;
+    // The last row the scan of the previous morsel of the same piece produced, when the
+    // scan drops duplicate rows of a union default graph. The copies of a triple are
+    // adjacent in key order, and the scan of one morsel drops them within the morsel,
+    // so a morsel can only repeat the previous one's last row, as its first row.
+    let mut carried: Option<(usize, Vec<Id>)> = None;
+    // A wave of one morsel per worker at a time: a worker that waits inside a morsel's
+    // own parallel work could otherwise steal and start every other morsel.
+    for wave in morsels.chunks(rayon::current_num_threads().max(1)) {
+        let parts = wave
+            .par_iter()
+            .map(|m| morsel_best(ctx, spec, vars, &keys, m))
+            .collect::<Result<Vec<_>>>()?;
+        let Some(parts) = parts.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+        for (m, (mut t, mut n, last)) in wave.iter().zip(parts) {
+            if let Some((piece, row)) = &carried
+                && *piece == m.piece
+                && !t.is_empty()
+                && t.cols.iter().zip(row).all(|(c, &id)| c[0] == id)
+            {
+                // a read of the whole piece drops this copy, as eager execution does
+                let rows: Vec<usize> = (1..t.len()).collect();
+                t = t.take_rows(&rows);
+                n -= 1;
+            }
+            if let Some(last) = last {
+                carried = Some((m.piece, last));
+            }
+            *scanned += n;
+            if t.is_empty() {
+                continue;
+            }
+            let room = heap.k().saturating_add(1).min(t.len()) as u64;
+            if let Some(held) = &mut held {
+                held.resize(
+                    1024 + (heap.kept() as u64 + room) * entry_bytes
+                        + slots.key_bytes
+                        + slots.ids.capacity() as u64 * 8,
+                )?;
+            }
+            let mut offer = RestOffer {
+                slots: &mut slots,
+                table: &t,
+            };
+            offer_rows(
+                ctx,
+                &mut heap,
+                &t,
+                &keys,
+                &mut ExprReport::default(),
+                &mut offer,
+            )?;
+        }
+    }
+    ctx.check()?;
+    let width = slots.width;
+    let entries = heap.into_sorted();
+    ctx.check_output(entries.len(), width)?;
+    let mut rest = Table::new(vars.to_vec());
+    for (j, col) in rest.cols.iter_mut().enumerate() {
+        col.extend(
+            entries
+                .iter()
+                .map(|e| slots.ids[e.payload as usize * width + j]),
+        );
+    }
+    rest.len = entries.len();
+    Ok(Some(rest))
+}
+
+/// The rows of one morsel of [`cursor_topk_rest`] that have fewer than k rows of the
+/// morsel ahead of them, in arrival order, and the rows the morsel read; `None` when one
+/// of its values is not totally ordered.
+fn morsel_best(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    vars: &[VarId],
+    keys: &[(Expr, bool)],
+    m: &Morsel,
+) -> Result<Option<MorselBest>> {
+    // the morsel's rows, charged from its blocks before they are read and then at their
+    // real size
+    let estimate = (m.rows as u64).saturating_mul(vars.len() as u64 * 8);
+    let rows = ctx.charge(estimate)?;
+    let (mut t, n, last) = topk_read_keys_last(ctx, spec, m.first, m.last, m.exact, vars)?;
+    if t.is_empty() {
+        return Ok(Some((t, n, last)));
+    }
+    rows.add(t.mem_bytes().saturating_sub(estimate))?;
+    let decoded = super::exprcache::cursor_dictionary_values(ctx, &t, &Expr::Var(spec.var))?;
+    let total = match &decoded {
+        Some(values) => cursor_rest_total(ctx, &t, values)?,
+        // without a decoded column, values are read one at a time, as eager execution
+        // reads them
+        None => t.cols[0].iter().all(|&id| totally_ordered(ctx, id)),
+    };
+    if !total {
+        return Ok(None);
+    }
+    if ctx.opt.topk_prefilter
+        && t.len() > spec.k
+        && let Some((rows, charge)) =
+            cursor_topk_candidates(ctx, &t, keys, spec.k, decoded.as_ref())?
+        && rows.len() < t.len()
+    {
+        t = t.take_rows(&rows);
+        drop(charge);
+    }
+    drop(decoded);
+    if t.len() > spec.k {
+        let mut heap: TopK<usize> = TopK::new(spec.k, vec![spec.asc]);
+        offer_rows(
+            ctx,
+            &mut heap,
+            &t,
+            keys,
+            &mut ExprReport::default(),
+            &mut RowIndex,
+        )?;
+        let mut rows: Vec<usize> = heap.into_sorted().into_iter().map(|e| e.payload).collect();
+        rows.sort_unstable();
+        t = t.take_rows(&rows);
+    }
+    ctx.check()?;
+    Ok(Some((t, n, last)))
+}
+
+/// [`OrderedTopK`]: the first k rows of the ORDER BY, in its order; `None` when a value
+/// outside the monotone pieces is not totally ordered (the generic plan must decide).
+/// Also returns how many rows were scanned.
+pub(super) fn ordered_topk(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    out: &[VarId],
+) -> Result<Option<(Table, usize)>> {
+    let vars: Vec<VarId> = spec.scan.cols.iter().map(|c| c.1).collect();
+    debug_assert_eq!(vars.first(), Some(&spec.var));
+    let mut scanned = 0;
+    let mut whole = Vec::new();
+    let mut runs = Vec::new();
+    for p in &spec.pieces {
+        match p.mono {
+            // the pieces without value order are read whole
+            None => whole.push(p),
+            Some(up) => runs.push(TopKRun {
+                lo: p.lo,
+                hi: p.hi,
+                exact: p.exact,
+                best_high: up != spec.asc,
+                kept: Table::new(vars.clone()),
+                want: spec.k.max(16).saturating_mul(2),
+                done: false,
+            }),
+        }
+    }
+    let rest = if ctx.is_cursor() && heap_eligible(ctx) {
+        cursor_topk_rest(ctx, spec, &vars, &whole, &mut scanned)?
+    } else {
+        topk_rest(ctx, spec, &vars, &whole, &mut scanned)?
+    };
+    let Some(rest) = rest else {
+        return Ok(None);
+    };
+    let keys = [(Expr::Var(spec.var), spec.asc)];
     let held = ctx.charge(rest.mem_bytes())?;
     let better = if spec.asc {
         Ordering::Less
