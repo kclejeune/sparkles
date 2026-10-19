@@ -4,6 +4,24 @@
 
 ### Changed
 
+On a store of more than ten million quads, the schema reports of the MCP tools,
+`check_query` and `sparkles ask` take the counts of predicates and classes from the
+statistics of the index build and the changes since, and say `"basis": "statistics"`.
+The kinds of a predicate's objects are measured when a tool needs them, from a sample of
+8,192 stored literals above 200,000 quads. On DBpedia's billion quads a `check_query`
+took 52.7 seconds and 11.1 GiB and now takes 0.3 seconds and under 500 MiB, and an
+Ask takes about two seconds instead of 100. `--schema-statistics-above QUADS|off` on
+`serve`, `mcp` and `ask` sets the threshold. `/{ds}/schema` and `sparkles schema` still
+scan. A dataset keeps up to four schema reports, one per selection, instead of one.
+`describe_schema` leaves `maxPerSubject` out of a report from the statistics and adds
+`objectsSampled` to a predicate whose objects were sampled.
+
+The planner moves a VALUES table that shares variables with a UNION of the same join
+into each branch, so each branch looks its rows up by index instead of reading every
+quad of its pattern. `link_entities` and the terms list of `check_query` failed on the
+2 GiB query budget on DBpedia for this reason. `sparkles ask` gained
+`--query-memory-mb`, 2048 by default as in `sparkles mcp`.
+
 The server's query memory pool is on by default. It holds half of the memory the process
 may use, less the configured caches, and at least 256 MiB. Each query and update request
 reserves 16 MiB when it is admitted, so a host whose pool sits at the 256 MiB floor serves

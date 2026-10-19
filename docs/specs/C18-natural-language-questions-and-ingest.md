@@ -5056,7 +5056,7 @@ evaluation scores as a failure. CK25 has a class `pv:Service`, and `sparkles ask
 that name for the SERVICE keyword and left two questions unrun for every model, a fault
 now fixed. Two gold queries order on values with ties before a limit. The runs of the
 two unrun questions, and of the empty drafts with replies recorded, need new requests.
-What remains is a paid run of the DBpedia sets once roadmap item 89 lands, and the work
+What remains is a paid run of the DBpedia sets, now that roadmap item 89 has landed, and the work
 listed below.
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
@@ -5100,8 +5100,9 @@ listed below.
   GiB. Each `sparkles ask` process builds the report again. The DBpedia sets therefore
   wait for `check_query` to read a stored or cached schema report, or to check terms
   without one, and for `sparkles ask` to keep the report between questions, for
-  example by asking through a running server. [Roadmap](../ROADMAP.md) item 89 tracks
-  that work.
+  example by asking through a running server. [Roadmap](../ROADMAP.md) item 89 tracked
+  that work, and the section on asking over a billion quads below records how it was
+  done.
 - `scripts/text2sparql-convert` converts Text2SPARQL'25 from the challenge repository
   and the CK25 repository at pinned commits, with SHA256 checks, and vendors nothing.
   `--set db25` takes the 100 English DBpedia questions, which the challenge ran on
@@ -5141,6 +5142,58 @@ listed below.
   corporate Text2SPARQL'25 set as the uncontaminated reference.
 - Run the subset on the demo set in CI on every change to the prompts, as §11.4 says,
   with the mock provider when no key is configured.
+
+**Ask on a billion quads (2026-10-19), roadmap item 89.** On the DBpedia 2022.12.01 database of
+[BENCHMARKING](../BENCHMARKING.md), 1.01 billion quads on atlas, each `sparkles ask`
+used to take about 100 seconds and most failed on the 2 GiB query budget. Three causes
+were found and fixed. First, `check_query` and the `describe_schema` summary that grounds
+the question each built a full schema report, which read every quad twice. A
+`check_query` alone took 52.7 seconds and reached 11.1 GiB. The default graph of the
+summary and the union graph of the check are different selections, and the dataset kept
+one report, so each Ask built two. Second, the terms list of `check_query` looked up the
+labels and types of the query's entities with a VALUES block outside the reader's UNION
+of the default graph and the named graphs. The engine joined the table after each branch
+had read every quad of its pattern, which passed the budget. Third, `link_entities`
+writes its lookups the same way and failed for the same reason, which the pipeline hid by
+grounding without entities.
+
+The design keeps a full report for small stores and builds a cheaper one for large ones,
+rather than persisting a full report on disk. Above `--schema-statistics-above` quads,
+ten million by default, the tools' reports take the counts of predicates and classes
+from the statistics that the index build keeps, combined with the delta since the
+build, and read only the declarations and labels from the indexes. Such a report says
+`"basis": "statistics"`. It counts quads for triples, estimates distinct counts after
+updates and leaves the largest number of objects per subject unmeasured. The kinds of a
+predicate's objects are measured when a tool needs them, in full up to 200,000 quads and
+above that from exact counts of the id ranges of each kind plus a sample of 8,192 stored
+literals. A literal that is an object of the predicate never gets a sampled
+`language-tag` or `datatype-mismatch` warning, and a sampled warning says so. A report
+lasts until the next commit, and a dataset now keeps one per selection, up to four. No
+on-disk format changed. A persisted report would still have needed a full scan for each
+new commit, while the statistics report costs under a second at any commit. The report
+endpoint and `sparkles schema` keep the exact report, because they are asked for it.
+
+The planner now moves a VALUES table that shares variables with a UNION of the same
+join into each branch, and inside a BIND or FILTER there whose expression does not read
+the table, so each branch looks its rows up by index. The join distributes over the
+union, so answers are unchanged. The query that failed after 1.94 seconds at 5.5 GiB now
+takes 0.04 seconds. `sparkles ask` gained `--query-memory-mb`, 2048 by default as in
+`sparkles mcp`, and `--schema-statistics-above`.
+
+Measured on atlas with a warm page cache, through `sparkles mcp`, the first
+`check_query` of a process takes 0.3 seconds, or up to 1.5 seconds right after the
+binary changed, and later ones take 20 to 60 milliseconds. The first `describe_schema`
+summary of 200 predicates takes 1.4 seconds and a repeat 11 milliseconds. Anonymous
+memory stays under 500 MiB, and the mapped index pages the sampling touches add about 2
+GiB of reclaimable file-backed memory to the resident size. Six `sparkles ask` runs
+against the harness's fake provider, which drafts the gold query, each took 1.9 seconds
+with at most 508 MiB of anonymous memory. Now that `link_entities` works, five of the six
+stop at a clarification, because DBpedia gives "Salt Lake City" to the city, its
+category and a diocese, and "Berlin" to several towns. With the city chosen through
+`--clarification`, the first question answers with 292 rows in 1.96 seconds. The DBpedia
+sets therefore need a way to answer such clarifications, or a ranking of candidates
+that prefers the main resource, before they can be scored. That work belongs to item 6.
+A paid run of the DBpedia sets no longer waits for item 89.
 
 **Item 15: multimodal ingestion, more transcript adapters and CSV entity linking.**
 §7.1 converts text, Markdown, HTML and PDF (`ingest/convert.rs`, `Format`), the
