@@ -112,6 +112,35 @@ class Convert(unittest.TestCase):
         self.assertEqual(out["dropped"]["empty"]["ids"], ["lcquad2-6"])
         self.assertTrue(out["goldRecomputed"])
 
+    def test_a_sample_accounts_for_every_question_it_took(self):
+        out = lcq.convert(self.args(sample=4), self.source)
+        self.assertEqual((out["sourceQuestions"], out["sampledQuestions"]), (6, 4))
+        dropped = sum(v["count"] for v in out["dropped"].values())
+        self.assertEqual(len(out["questions"]) + dropped, 4)
+
+    def test_a_missing_or_repeated_uid_is_refused(self):
+        no_uid = {k: v for k, v in FIXTURE[0].items() if k != "uid"}
+        for broken in (
+            [*FIXTURE, dict(FIXTURE[0])],
+            [*FIXTURE, no_uid],
+            [*FIXTURE, dict(FIXTURE[0], uid=None)],
+        ):
+            with self.subTest(last=broken[-1].get("uid", "missing")):
+                self.source.write_text(json.dumps(broken))
+                with self.assertRaises(Invalid):
+                    lcq.convert(self.args(), self.source)
+
+    def test_whitespace_is_collapsed_only_outside_literals(self):
+        self.assertEqual(
+            lcq.compact(" select ?o\n where { ?o rdfs:label 'two  spaces'@en } "),
+            "select ?o where { ?o rdfs:label 'two  spaces'@en }",
+        )
+        self.assertEqual(
+            lcq.compact('ASK  { ?s ?p "a\\"  b" }'), 'ASK { ?s ?p "a\\"  b" }'
+        )
+        with_comment = "select ?o # the object\nwhere { ?s ?p ?o }"
+        self.assertEqual(lcq.compact(with_comment + "\n"), with_comment)
+
     def test_a_split_with_another_hash_is_refused(self):
         sys.argv = [
             "lcquad2-convert",

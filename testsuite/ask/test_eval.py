@@ -858,6 +858,12 @@ class FirstDraft(unittest.TestCase):
         self.assertEqual(
             runner.score(q, a)[2]["firstDraft"]["reason"], "complete_strict_comparison"
         )
+        # A question whose source scores row order is marked, since rows are sets here.
+        self.assertNotIn("orderNotScored", runner.score(q, answer("EMPTY"))[2])
+        ordered = dict(q, orderMatters=True)
+        self.assertIs(runner.score(ordered, answer("EMPTY"))[2]["orderNotScored"], True)
+        failed = dict(answer("EMPTY"), evalFailure="timeout")
+        self.assertIs(runner.score(ordered, failed)[2]["orderNotScored"], True)
         # A real malformed child result is unknown, never silently failed-first.
         b.write_text("#!" + PYTHON + '\nprint("{}")\n')
         probe = runner.first_draft(q, answer("WRONG"))

@@ -21,7 +21,7 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
-from convert import category, database_record, fetch_pinned, gold_result
+from convert import OPAQUE, category, database_record, fetch_pinned, gold_result
 from evaluator import Invalid, bounded_file, digest, strict_json
 
 REPO = "AskNowQA/LC-QuAD2.0"
@@ -60,6 +60,33 @@ def text_of(entry):
     return None, None
 
 
+def compact(query):
+    """The query on one line, with runs of whitespace collapsed outside literals
+    and IRIs. A query with a comment keeps its lines, since joining them would
+    comment out the rest."""
+    parts, end, comment = [], 0, False
+    for m in OPAQUE.finditer(query):
+        parts.append(re.sub(r"\s+", " ", query[end : m.start()]))
+        parts.append(m.group())
+        comment = comment or m.group().startswith("#")
+        end = m.end()
+    parts.append(re.sub(r"\s+", " ", query[end:]))
+    return query.strip() if comment else "".join(parts).strip()
+
+
+def checked_uids(entries):
+    """Every entry needs a uid, and no uid repeats, so every question id is unique."""
+    seen = set()
+    for entry in entries:
+        uid = entry.get("uid") if isinstance(entry, dict) else None
+        if type(uid) not in (int, str) or uid == "":
+            raise Invalid("an LC-QuAD 2.0 entry has no uid")
+        if uid in seen:
+            raise Invalid(f"the LC-QuAD 2.0 uid {uid} repeats")
+        seen.add(uid)
+    return entries
+
+
 def sample(entries, n, seed):
     """A fixed sample of `n` entries, ordered by a hash of the seed and the uid."""
     if n is None:
@@ -72,6 +99,7 @@ def convert(args, source):
     data = strict_json(bounded_file(source, SIZE_CAP))
     if not isinstance(data, list):
         raise Invalid("the LC-QuAD 2.0 split is a list")
+    checked_uids(data)
     header = "".join(f"PREFIX {k}: <{v}>\n" for k, v in PREFIXES.items())
     chosen = sample(data, args.sample, args.seed)
     questions = []
@@ -86,7 +114,7 @@ def convert(args, source):
         if not text or not isinstance(query, str) or not query.strip():
             dropped["noText"].append(ident)
             continue
-        query = re.sub(r"\s+", " ", query).strip()
+        query = compact(query)
         if recompute:
             _, reason = gold_result(
                 args.sparkles,
@@ -141,6 +169,8 @@ def convert(args, source):
         "goldBinarySha256": digest(args.sparkles) if recompute else None,
         "goldDatabase": database_record(args.manifest) if recompute else None,
         "sourceQuestions": len(data),
+        # Kept plus dropped adds up to this, the sample size or the whole split.
+        "sampledQuestions": len(chosen),
         "textFields": fields,
         "dropped": {k: {"count": len(v), "ids": v} for k, v in dropped.items()},
         "prefixes": PREFIXES,
@@ -180,7 +210,7 @@ def main():
         f.write("\n")
     dropped = {k: v["count"] for k, v in result["dropped"].items()}
     print(
-        f"kept {len(result['questions'])} of {result['sourceQuestions']}"
+        f"kept {len(result['questions'])} of {result['sampledQuestions']}"
         f" ({result['textFields']}), dropped {dropped}"
     )
     return 0

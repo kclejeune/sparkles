@@ -80,31 +80,60 @@ DBPEDIA_PREFIXES = {
 }
 # A projection of one aggregate or function call with no parentheses around it, which
 # Virtuoso accepts: `SELECT DISTINCT COUNT(?x)`, `SELECT Count(?x) as ?c`,
-# `SELECT COUNT(DISTINCT ?y AS ?y)`, `SELECT SUM(?n)` and `SELECT DISTINCT xsd:date(?d)`.
+# `SELECT COUNT(DISTINCT ?y AS ?y)`, `SELECT SUM(?n)`, `SELECT COUNT(*)` and
+# `SELECT DISTINCT xsd:date(?d)`.
 BARE_PROJECTION = re.compile(
     r"\bSELECT(\s+DISTINCT)?\s+"
-    r"(COUNT|SUM|AVG|MIN|MAX|SAMPLE|[A-Za-z][\w-]*:[A-Za-z][\w-]*)\s*\(\s*(DISTINCT\s+)?(\?\w+)"
-    r"(?:\s+AS\s+\?\w+)?\s*\)(?:\s+AS\s+(\?\w+))?(?=\s+(?:WHERE\b|\{))",
+    r"(COUNT|SUM|AVG|MIN|MAX|SAMPLE|[A-Za-z][\w-]*:[A-Za-z][\w-]*)\s*\(\s*(DISTINCT\s+)?"
+    r"(\?\w+|\*)(?:\s+AS\s+\?\w+)?\s*\)(?:\s+AS\s+(\?\w+))?(?=\s+(?:WHERE\b|\{))",
     re.IGNORECASE,
 )
+# Long and short string literals, IRIs and comments, in the order a scanner meets them.
+OPAQUE = re.compile(
+    r'"""(?:[^"\\]|\\.|"(?!""))*"""'
+    r"|'''(?:[^'\\]|\\.|'(?!''))*'''"
+    r'|"(?:[^"\\\n]|\\.)*"'
+    r"|'(?:[^'\\\n]|\\.)*'"
+    r"|<[^<>\"{}|^`\\\s]*>"
+    r"|#[^\n]*",
+    re.DOTALL,
+)
+
+
+def mask(query):
+    """The query with every literal, IRI and comment blanked to spaces of equal
+    length, so a pattern matched on it never looks inside them and its positions
+    still point into the query."""
+    return OPAQUE.sub(lambda m: " " * len(m.group()), query)
+
+
+def fresh_variable(base, masked):
+    names = {v.lower() for v in re.findall(r"[?$](\w+)", masked)}
+    name, n = base, 1
+    while name.lower() in names:
+        name, n = f"{base}{n}", n + 1
+    return "?" + name
 
 
 def normalize_dbpedia(query):
     """Make a gold query written for DBpedia's Virtuoso endpoint standard SPARQL.
 
     Two dialect habits are rewritten: prefixes the endpoint predeclares are declared,
-    and a bare aggregate or function projection gets its parentheses and a variable.
-    Returns the query and the list of the rewrites, empty when it was standard.
+    and a bare aggregate or function projection gets its parentheses and a variable
+    that the query does not already use. Nothing inside a literal, an IRI or a
+    comment is read or changed. Returns the query and the list of the rewrites,
+    empty when it was standard.
     """
     changes = []
-    match = BARE_PROJECTION.search(query)
+    match = BARE_PROJECTION.search(mask(query))
     if match:
         distinct, func, inner, var, alias = match.groups()
-        name = alias or ("?count" if func.upper() == "COUNT" else "?value")
+        base = "count" if func.upper() == "COUNT" else "value"
+        name = alias or fresh_variable(base, mask(query))
         replacement = f"SELECT{distinct or ''} ({func}({inner or ''}{var}) AS {name})"
         query = query[: match.start()] + replacement + query[match.end() :]
         changes.append("projection")
-    body = re.sub(r'<[^>\s]*>|"(?:[^"\\]|\\.)*"|' + r"'(?:[^'\\]|\\.)*'", " ", query)
+    body = mask(query)
     declared = {m.lower() for m in re.findall(r"PREFIX\s+([\w-]*):", body, re.I)}
     used = set(re.findall(r"(?<![\w?$:/#-])([A-Za-z][\w-]*):(?=[\w(%])", body))
     missing = sorted(p for p in used - declared if p in DBPEDIA_PREFIXES)

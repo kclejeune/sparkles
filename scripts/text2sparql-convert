@@ -275,7 +275,8 @@ def convert(args, files, scratch):
         if changes:
             entry.update(sourceGold=source_query, goldNormalized=changes)
         if "RESULT_ORDER_MATTERS" in item.get("features", []):
-            # The strict scorer compares sets of rows, so the order is not scored.
+            # The strict scorer compares sets of rows, so eval-ask marks the score
+            # of this question with orderNotScored.
             entry["orderMatters"] = True
         questions.append(entry)
     return {

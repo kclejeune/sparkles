@@ -243,6 +243,35 @@ class Normalize(unittest.TestCase):
             with self.subTest(query=query):
                 self.assertEqual(cv.normalize_dbpedia(query), (query, []))
 
+    def test_literals_and_comments_are_never_rewritten(self):
+        for query in (
+            "SELECT ?y WHERE { ?x ?p ?y FILTER(regex(?y, 'SELECT COUNT(?z) WHERE')) }",
+            'SELECT ?y WHERE { ?x ?p """SELECT SUM(?n) {""" }',
+            "# SELECT COUNT(?z) WHERE dbo:x\nSELECT ?y WHERE { ?x ?p ?y }",
+            "SELECT ?y WHERE { ?x ?p 'dbo:thing' }",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(cv.normalize_dbpedia(query), (query, []))
+
+    def test_the_alias_never_collides_and_count_star_is_rewritten(self):
+        cases = {
+            "SELECT COUNT(?count) WHERE { ?x ?p ?count }": (
+                "SELECT (COUNT(?count) AS ?count1) WHERE { ?x ?p ?count }"
+            ),
+            "SELECT SUM(?n) WHERE { ?n ?p ?value . ?value ?q ?value1 }": (
+                "SELECT (SUM(?n) AS ?value2) WHERE { ?n ?p ?value . ?value ?q ?value1 }"
+            ),
+            "SELECT COUNT(*) WHERE { ?x ?p ?o }": (
+                "SELECT (COUNT(*) AS ?count) WHERE { ?x ?p ?o }"
+            ),
+            "SELECT DISTINCT COUNT(DISTINCT *) { ?x ?p ?o }": (
+                "SELECT DISTINCT (COUNT(DISTINCT *) AS ?count) { ?x ?p ?o }"
+            ),
+        }
+        for query, want in cases.items():
+            with self.subTest(query=query):
+                self.assertEqual(cv.normalize_dbpedia(query), (want, ["projection"]))
+
 
 class Compare(unittest.TestCase):
     def rel(self, *values):

@@ -399,6 +399,14 @@ class Runner:
             }
 
     def score(self, q, out):
+        ok, scores, detail = self.score_one(q, out)
+        if q.get("orderMatters") is True:
+            # The source scores this question's row order, and this scorer compares
+            # sets of rows, so the report marks it.
+            detail["orderNotScored"] = True
+        return ok, scores, detail
+
+    def score_one(self, q, out):
         kind, outcome = q["kind"], out.get("outcome")
         failed = out.get("evalFailure")
         if kind in ("clarify", "unanswerable"):
