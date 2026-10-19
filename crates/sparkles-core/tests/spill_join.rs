@@ -161,6 +161,11 @@ const MEMORY: u64 = 1 << 20;
 /// that order; the UNION of the second has no order to keep.
 const INNER: &str = "SELECT ?a ?v ?b ?w ?k { ?a <urn:v> ?v . ?a <urn:p> ?k . \
                      ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l }";
+/// The join of INNER under a grouping, which may use its input's order, so that a
+/// spilled join keeps the probe input's order.
+const INNER_ORDERED: &str = "SELECT ?a (COUNT(*) AS ?n) (SUM(?w) AS ?ws) { ?a <urn:v> ?v . \
+                             ?a <urn:p> ?k . ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l } \
+                             GROUP BY ?a";
 const INNER_UNORDERED: &str = "SELECT ?a ?v ?b ?k ?l { { ?a <urn:v> ?v . ?a <urn:p> ?k } \
                                UNION { ?a <urn:v> ?v . ?a <urn:p> ?k FILTER(?v = 3) } \
                                ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l }";
@@ -170,7 +175,7 @@ fn spilled_hash_joins_match_eager_at_every_batch_size() {
     let s = store(30_000, false);
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
-    for q in [INNER, INNER_UNORDERED] {
+    for q in [INNER_ORDERED, INNER, INNER_UNORDERED] {
         let expected = eager(&s, q);
         let memory = run(&s, q, 256 << 20, None, 4096).unwrap();
         assert_eq!(sorted(memory.rows.clone()), expected, "{q}");
@@ -202,13 +207,16 @@ fn spilled_hash_joins_match_eager_at_every_batch_size() {
                 counter(&spilled.plan, "spilledBytes").is_some_and(|b| b > 0),
                 "{q}"
             );
-            if q == INNER {
-                // The probe input's order holds, so the rows come as they do in memory.
-                assert_eq!(spilled.firsts, memory.firsts, "{q} at batch size {batch}");
+            if q == INNER_ORDERED {
+                // The grouping may rely on the probe input's order, so the spilled join
+                // merges its output back into that order. The unit tests of the join
+                // check the order itself.
                 assert!(spilled.plan.contains("spillMergePasses"), "{q}");
             } else {
-                assert_eq!(sorted(spilled.rows), expected, "{q} at batch size {batch}");
+                // Nothing relies on the order, so the join emits partition by partition.
+                assert!(!spilled.plan.contains("spillMergePasses"), "{q}");
             }
+            assert_eq!(sorted(spilled.rows), expected, "{q} at batch size {batch}");
             assert_eq!(spill.reserved_bytes(), 0, "{q}");
         }
     }

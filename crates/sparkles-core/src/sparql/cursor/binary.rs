@@ -317,10 +317,24 @@ impl Binary {
             .spill
             .is_some()
             .then(|| (ctx.memory_room() / 2).max(super::joinspill::MIN_BUDGET));
-        while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
+        // The most the input's operators took above what the query held before, while
+        // making one batch, as the ledger's peak shows when it rises.
+        let mut demand = 0u64;
+        loop {
+            let (live, peak) = (ctx.live_bytes(), ctx.mem_peak());
+            let Some(batch) = child.next(ctx, options, options.batch_rows)? else {
+                break;
+            };
+            let raised = ctx.mem_peak();
+            if raised > peak {
+                demand = demand.max(raised - live);
+            }
             let n = batch.table.len;
+            let held = batch.charge.bytes();
             // The next batch, and what the input's operators hold to make it.
-            let next_batch = super::capacity_bytes(&batch.table).saturating_mul(4);
+            let next_batch = super::capacity_bytes(&batch.table)
+                .saturating_mul(4)
+                .max(demand.saturating_sub(held));
             let grown = threshold.filter(|&threshold| {
                 build
                     .charge

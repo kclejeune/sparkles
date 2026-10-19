@@ -8,7 +8,10 @@
 //! picks `rows`, `tsv` or both (the default), and `SPARKLES_PROBE_MEMORY_MB` sets the
 //! query memory budget. `SPARKLES_PROBE_STREAM_MEMORY_MB` sets another budget for the
 //! cursor runs, and `SPARKLES_PROBE_SPILL_DIR` lets them spill to that directory, with every
-//! spill file encrypted when `SPARKLES_PROBE_SPILL_ENCRYPTED` is set.
+//! spill file encrypted when `SPARKLES_PROBE_SPILL_ENCRYPTED` is set. With
+//! `SPARKLES_PROBE_CHECK` set, the last round of `rows` compares an order-independent
+//! digest of the eager and the streamed rows and fails when they differ.
+//! `SPARKLES_PROBE_BATCH_ROWS` sets the cursor's batch size.
 use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions, write_solutions};
 use sparkles_core::sparql::{
     CursorOptions, ExecutionMode, QueryExecution, QueryOptions, query, query_cursor,
@@ -26,6 +29,16 @@ fn median(v: &mut [f64]) -> f64 {
         return f64::NAN;
     }
     v[v.len() / 2]
+}
+
+/// An order-independent digest of a bag of rows.
+fn digest<'a>(rows: impl Iterator<Item = &'a [Option<oxrdf::Term>]>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    rows.fold(0u64, |sum, row| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        row.hash(&mut h);
+        sum.wrapping_add(h.finish())
+    })
 }
 
 fn main() {
@@ -56,9 +69,13 @@ fn main() {
         .unwrap();
         stream_options.spill = Some(spill);
     }
-    let cursor = CursorOptions::default();
+    let mut cursor = CursorOptions::default();
+    if let Ok(rows) = std::env::var("SPARKLES_PROBE_BATCH_ROWS") {
+        cursor.batch_rows = rows.parse().unwrap();
+    }
     // `eager` or `stream` runs only that mode, for a profiler
     let only = std::env::var("SPARKLES_PROBE_ONLY").ok();
+    let check = std::env::var_os("SPARKLES_PROBE_CHECK").is_some();
     println!(
         "{:<22} {:>5} {:>10} {:>10} {:>6} {:>10} {:>10} {:>9} {:>6}",
         "query", "mode", "eager ms", "stream ms", "ratio", "eager MB", "stream MB", "rows", "auto"
@@ -85,6 +102,7 @@ fn main() {
         for mode in modes.split(',') {
             let (mut eager, mut stream) = (Vec::new(), Vec::new());
             let (mut eager_mem, mut stream_mem, mut rows) = (0u64, 0u64, 0usize);
+            let (mut eager_digest, mut stream_digest, mut stream_rows) = (0u64, 0u64, 0usize);
             for round in 0..rounds + 1 {
                 for first in [round % 2 == 0, round % 2 == 1] {
                     match only.as_deref() {
@@ -100,6 +118,14 @@ fn main() {
                                 .unwrap();
                         }
                         rows = result.len();
+                        if check && round == rounds && mode == "rows" {
+                            let table = &result.table;
+                            eager_digest = (0..table.len()).fold(0u64, |sum, i| {
+                                let row: Vec<_> =
+                                    table.cols.iter().map(|c| result.term(c[i])).collect();
+                                sum.wrapping_add(digest(std::iter::once(row.as_slice())))
+                            });
+                        }
                         if round == rounds && std::env::var_os("SPARKLES_PROBE_PLAN").is_some() {
                             eprintln!(
                                 "{name} eager plan: {}",
@@ -126,7 +152,16 @@ fn main() {
                             )
                             .unwrap()
                         } else {
+                            let last = check && round == rounds;
+                            stream_rows = 0;
                             while let Some(batch) = c.next_batch().unwrap() {
+                                stream_rows += batch.len();
+                                if last {
+                                    let rows: Vec<_> =
+                                        (0..batch.len()).map(|i| batch.row(i).unwrap()).collect();
+                                    stream_digest = stream_digest
+                                        .wrapping_add(digest(rows.iter().map(Vec::as_slice)));
+                                }
                                 std::hint::black_box(batch.len());
                             }
                             c.stats()
@@ -143,6 +178,14 @@ fn main() {
                 }
             }
             let (e, s) = (median(&mut eager), median(&mut stream));
+            if check && mode == "rows" {
+                assert_eq!(
+                    (stream_rows, stream_digest),
+                    (rows, eager_digest),
+                    "{name}: the streamed rows differ from the eager rows"
+                );
+                eprintln!("{name}: {rows} rows match, digest {eager_digest:016x}");
+            }
             println!(
                 "{:<22} {:>5} {:>10.3} {:>10.3} {:>6.2} {:>10.1} {:>10.1} {:>9} {:>6}",
                 name,

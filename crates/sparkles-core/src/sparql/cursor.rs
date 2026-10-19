@@ -674,7 +674,7 @@ fn from_prepared(
     let bytes = plan_bytes(&prepared.node).saturating_add(query.len() as u64 * 16);
     let charge = OwnedCharge::new(&ctx, bytes)?;
     let spec = graph::Spec::from_parsed(parsed, options, cursor.fallback)?;
-    let root = Operator::build(&ctx, prepared.node, cursor.fallback)?;
+    let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
     let plan = root.describe(&ctx);
     ctx.check()?;
     let shared = kind == QueryKind::Select && prepared.bound.is_empty();
@@ -2003,6 +2003,19 @@ fn distinct_below_order(ctx: &Ctx, node: Node) -> Node {
 
 impl Operator {
     fn build(ctx: &Arc<Ctx>, node: Node, fallback: FallbackPolicy) -> Result<Self> {
+        Self::build_for(ctx, node, fallback, true)
+    }
+
+    /// Build the operator of `node`. `needed` tells whether anything above relies on
+    /// the order of its output. A hash join whose order nothing relies on, with spill
+    /// on, claims no order, so that it may emit a spilled join partition by partition
+    /// (item 85).
+    fn build_for(
+        ctx: &Arc<Ctx>,
+        node: Node,
+        fallback: FallbackPolicy,
+        needed: bool,
+    ) -> Result<Self> {
         ctx.check()?;
         let mut node = if ctx.spill.is_some() {
             distinct_below_order(ctx, node)
@@ -2051,11 +2064,24 @@ impl Operator {
             });
         // A hash join that spills keeps its probe input's order when that input comes in
         // an order a caller observes.
-        let probe_value_ordered = joins
+        let probe_value_ordered = needed
+            && joins
             && node
                 .children
                 .get(binary::probe_side(&node))
                 .is_some_and(value_ordered);
+        // Which children's order this operator relies on. A projection or BIND passes
+        // on what its parent needs. A join that cannot merge on what the plan claims
+        // reads its build input into a hash table and keeps only the probe input's
+        // order. Other operators may use their inputs' order.
+        let hashes = joins && ctx.spill.is_some() && !merge::eligible(&node);
+        let needs: Vec<bool> = (0..node.children.len())
+            .map(|i| match node.kind {
+                Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } => needed,
+                _ if hashes => needed && i == binary::probe_side(&node),
+                _ => true,
+            })
+            .collect();
         // A fallback materializes only its own operator when it reads its children as
         // input tables. Those children then stream as cursors of their own.
         let inputs = materializes
@@ -2081,14 +2107,15 @@ impl Operator {
         } else {
             let built = std::mem::take(&mut node.children)
                 .into_iter()
-                .map(|child| {
+                .zip(needs)
+                .map(|(child, needed)| {
                     let shell = (
                         child.vars.clone(),
                         child.certain.clone(),
                         child.est,
                         child.cost,
                     );
-                    Self::build(ctx, child, fallback).map(|op| (shell, op))
+                    Self::build_for(ctx, child, fallback, needed).map(|op| (shell, op))
                 })
                 .collect::<Result<Vec<_>>>()?;
             // Join operators read their children's shape from the node. Leave each
@@ -2125,7 +2152,7 @@ impl Operator {
             || expanding
             || walking
             || exists;
-        let order = output_order(
+        let mut order = output_order(
             &node,
             &children,
             if incremental_merge {
@@ -2148,6 +2175,9 @@ impl Operator {
         let group = incremental_group
             .then(|| group::Group::new(ctx, &node))
             .transpose()?;
+        if incremental_binary && !needed && ctx.spill.is_some() {
+            order.clear();
+        }
         let binary = incremental_binary
             .then(|| binary::Binary::new(ctx, &node, !order.is_empty() || probe_value_ordered))
             .transpose()?;
