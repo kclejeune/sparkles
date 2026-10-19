@@ -596,6 +596,9 @@ preflight() {
       done
     ) > "$out" 2> /dev/null &
     PSI_PID=$!
+    # The steps wait until `jobs -rp` is empty, and the sampler never ends, so it must not
+    # count as one of this shell's jobs. The EXIT trap still stops it by PID.
+    disown "$PSI_PID"
     log "PSI pressure sampled once per second to $out"
   fi
   return 0
