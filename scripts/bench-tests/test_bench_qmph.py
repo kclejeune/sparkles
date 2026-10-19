@@ -175,6 +175,14 @@ class QmphTests(unittest.TestCase):
         self.assertEqual(d["d"]["1"]["status"], "wrong-answer")
         self.assertEqual(d["d"]["1"]["disagreeing_queries"], ["8"])
 
+    def test_overlapping_equally_supported_values_leave_the_query_undecided(self):
+        for e, x in (("a", 100.0), ("b", 101.0), ("c", 102.0), ("d", 103.0)):
+            self.add(e, 1, {"1": x})
+        self.run_qmph("--check", self.out)
+        d = self.result()
+        for e in "abcd":
+            self.assertEqual(d[e]["1"]["status"], "ok", e)
+
     def test_one_engine_still_checks_its_runs_against_each_other(self):
         self.add("a", 1, {"1": 5.0})
         self.add("a", 4, {"1": 5.0})

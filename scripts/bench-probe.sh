@@ -33,6 +33,7 @@ revive() {
       # only with START_SOFT; without it a failed start ends the run
       log "$1: did not start again; it is left out of the remaining queries"
       DEAD_ENGINES="$DEAD_ENGINES $1"
+      FAILED_ENGINES="${FAILED_ENGINES:-} $1"
       return 0
     fi
     python3 - "$3/restarts.json" "${NAME[$1]}" "$2" << 'EOF'

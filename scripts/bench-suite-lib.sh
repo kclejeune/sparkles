@@ -282,7 +282,7 @@ suite_run() {
   [ -f "$RES/inference.json" ] && inference_table "$RES/inference.json" >> "$RES/summary.md"
   log "record: $WORK/$RES/record.json, table: $WORK/$RES/summary.md"
   if [ -n "${FAILED_ENGINES// /}" ]; then
-    log "error: these engines did not start and are missing from the record:$FAILED_ENGINES"
+    log "error: these engines did not start, or stopped and did not start again, so results are missing from the record:$FAILED_ENGINES"
     return 1
   fi
 }

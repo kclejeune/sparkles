@@ -476,6 +476,27 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(p.stdout.split("\n")[:-1], [
             "start jena", "start sparkles", "warm u a", "time sparkles", "stop sparkles", "after sparkles"])
 
+    def test_an_engine_that_cannot_be_restarted_fails_the_run(self):
+        stubs = """
+        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
+        answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
+        start() { if [ -f started-$1 ]; then return 1; fi; touch started-$1; URL[$1]=u; }
+        stop() { :; }
+        answering() { return 1; }
+        suite_time() { revive "$ENGINES" q1 r; }
+        q() { echo true; }
+        log() { :; }
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="jena")
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            suite = os.path.join(SCRIPTS, "bench-suite-lib.sh")
+            script = (f'source "{lib}"; source "{suite}"; {stubs}\n'
+                      "NAMES=(a); ENGINES='jena'; SUITE=s SCALE=1 SKIP_LOAD=1; set -e; suite_run; echo unreachable")
+            p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn("unreachable", p.stdout)
+
     def test_a_server_that_died_before_a_query_is_restarted_and_the_query_timed(self):
         stubs = """
         log() { :; }

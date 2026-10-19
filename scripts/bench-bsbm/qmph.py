@@ -87,16 +87,19 @@ def agree(x, y):
 
 
 def reference(votes):
-    """The value most votes agree on, or None. Needs at least two votes and a strict plurality."""
+    """The value most votes agree on, or None. Needs at least two votes and a strict plurality.
+    Agreement within the tolerance is not transitive, so values can overlap: with 100, 101,
+    102 and 103, both 101 and 102 have three supporters, but they leave out different votes.
+    When the best supported values do not all have the same supporters, the query is left
+    undecided rather than one of them picked."""
     if len(votes) < 2:
         return None
-    support = sorted(((sum(agree(v, w) for w in votes), v) for v in votes), reverse=True)
-    n, best = support[0]
-    rest = [w for w in votes if not agree(best, w)]
-    second = max((sum(agree(v, w) for w in rest) for v in rest), default=0)
-    if n >= 2 and n > second:
-        return best
-    return None
+    supporters = [frozenset(i for i, w in enumerate(votes) if agree(v, w)) for v in votes]
+    n = max(len(s) for s in supporters)
+    tops = {s for s in supporters if len(s) == n}
+    if n < 2 or len(tops) > 1:
+        return None
+    return votes[supporters.index(next(iter(tops)))]
 
 
 def consistent(xs):

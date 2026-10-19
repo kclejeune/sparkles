@@ -283,8 +283,9 @@ This change keeps the existing lock and engine versions.
   until 2026-10-19. Those lie in the ephemeral range, and in the first BSBM run on forge a
   client connection of the test driver held Oxigraph's port when its server started.
 
-  A server that does not start is left out of the rest of the run, which goes on with the
-  other engines, writes the record and exits with status 1. A server that is not running
+  A server that does not start, or that stops answering and does not start again, is left
+  out of the rest of the run, which goes on with the other engines, writes the record and
+  exits with status 1. A server that is not running
   when a query is about to be timed, for example because an earlier query of the answer
   check or the warm-up pass ran it out of memory, is restarted first, and
   `results/restarts.json` names it.
@@ -409,7 +410,8 @@ This change keeps the existing lock and engine versions.
   driver succeeded without a timeout. Each engine counts once, and runs with different mix
   counts are not compared with each other. Averages that differ by at most 0.05 or 1% count
   as equal, because the driver's averages of the same queries differ in the last digit
-  between client counts. A run that differs from the majority is recorded
+  between client counts. Equality within that margin is not transitive, so when two values
+  have the most support but different supporters, the query is not judged. A run that differs from the majority is recorded
   as `wrong-answer` with the numbers of the queries that differ, and a failed run keeps its
   `error` or `timeout`. For DESCRIBE and CONSTRUCT queries the driver counts the bytes of
   the RDF/XML it receives, which differ between engines that return the same triples, so
