@@ -2007,13 +2007,9 @@ impl Operator {
         };
         // A count over the key runs of two scans reads those scans itself.
         let reads_scans = matches!(node.kind, Kind::CountJoinRuns { .. });
-        let children = if index_topk {
-            // the generic plan, which answers when a value is not totally ordered
-            let Kind::OrderedTopK(spec) = &node.kind else {
-                unreachable!("an ordered top-k node")
-            };
-            vec![Self::build(ctx, (*spec.fallback).clone(), fallback)?]
-        } else if (materializes && !native_blocking && !inputs) || reads_scans {
+        // An ordered top-k builds its generic plan only when it needs it.
+        let children = if (materializes && !native_blocking && !inputs) || reads_scans || index_topk
+        {
             Vec::new()
         } else {
             let built = std::mem::take(&mut node.children)
@@ -2142,7 +2138,7 @@ impl Operator {
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
         } else if index_topk {
-            State::IndexTopK(Box::new(topk::IndexTopK::new(node)))
+            State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
             State::TopK(Box::new(topk::TopK::new(ctx, &node, &children[0].vars)?))
         } else if expanding {
@@ -2351,6 +2347,13 @@ impl Operator {
                 }
             }
             _ => {}
+        }
+        // The generic plan of an ordered top-k joins the cursor plan once it is built.
+        if let State::IndexTopK(topk) = &self.state
+            && plan.children.is_empty()
+            && let Some(generic) = topk.generic_plan()
+        {
+            plan.children.push(generic.clone());
         }
         for (child, plan) in self.children.iter().zip(&mut plan.children) {
             child.update_plan(plan);

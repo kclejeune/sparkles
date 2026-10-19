@@ -1900,24 +1900,19 @@ fn filter_scan_runs(
     }))
 }
 
-/// The variable of a scan's first free key column and the FILTER conjuncts that read only
-/// it, which [`filter_scan_morsel`] tests once per run of its values, with the other
-/// conjuncts. `None` when the first free column does not follow the bound prefix, when
-/// union-graph dedup compares neighbouring rows or when no conjunct reads only that
-/// variable.
-pub(super) fn run_filter_split(
-    spec: &ScanSpec,
-    exprs: &[Expr],
-) -> Option<(VarId, Vec<Expr>, Vec<Expr>)> {
+/// The variable of a scan's first free key column when every FILTER conjunct reads only
+/// it, so that [`filter_scan_morsel`] can test each of its values once. `None` when the
+/// first free column does not follow the bound prefix, when union-graph dedup compares
+/// neighbouring rows or when a conjunct reads another variable.
+pub(super) fn run_filter_split(spec: &ScanSpec, exprs: &[Expr]) -> Option<VarId> {
     let &(kc, key) = spec.cols.first()?;
     if spec.dedup || exprs.is_empty() || kc != spec.prefix.len() {
         return None;
     }
-    let (on_key, rest): (Vec<Expr>, Vec<Expr>) = exprs
+    exprs
         .iter()
-        .cloned()
-        .partition(|e| super::exprcache::input(&[e]) == Ok(Some(key)));
-    (!on_key.is_empty()).then_some((key, on_key, rest))
+        .all(|e| super::exprcache::input(&[e]) == Ok(Some(key)))
+        .then_some(key)
 }
 
 /// The columns a task of [`filter_scan_morsel`] copied out, one per output variable.
@@ -3083,6 +3078,10 @@ impl HeapRows<u32> for RestOffer<'_> {
 /// piece without value order: a single block.
 const TOPK_MORSEL_ROWS: usize = crate::index::BLOCK_ROWS;
 
+/// The rows a morsel of [`cursor_topk_rest`] keeps, the rows its scan produced and, when
+/// the scan drops union-graph duplicates, the last of those rows.
+type MorselBest = (Table, usize, Option<Vec<Id>>);
+
 /// The keys `[first, last]` of one morsel of [`cursor_topk_rest`], the piece it belongs
 /// to and the rows of its blocks.
 struct Morsel {
@@ -3257,7 +3256,7 @@ fn morsel_best(
     vars: &[VarId],
     keys: &[(Expr, bool)],
     m: &Morsel,
-) -> Result<Option<(Table, usize, Option<Vec<Id>>)>> {
+) -> Result<Option<MorselBest>> {
     // the morsel's rows, charged from its blocks before they are read and then at their
     // real size
     let estimate = (m.rows as u64).saturating_mul(vars.len() as u64 * 8);

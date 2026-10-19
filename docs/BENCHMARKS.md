@@ -1720,7 +1720,9 @@ eager time, the median of seven rounds, against 5c73ced6.
 | STRSTARTS on names, 49,837 rows | 7.99 | **0.94** | 2.98 | **0.90** |
 | LANGMATCHES on titles, 500,000 rows | 1.48 | **0.95** | **0.84** | **0.88** |
 
-The cursor's ledger peaked at 13.5 MB for the CONTAINS filter with eight threads, against
+At one thread CONTAINS moved from 0.95 to 1.00 and REGEX from 1.14 to 1.15, which is
+within the noise of the AMD instance and needs an Intel host to confirm. The cursor's
+ledger peaked at 13.5 MB for the CONTAINS filter with eight threads, against
 11.8 MB before and 15.6 MB eagerly, and at 5.2 MB with one thread, since each worker holds
 its own morsel scratch.
 

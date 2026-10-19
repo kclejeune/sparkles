@@ -6,7 +6,7 @@
 //! of a block, test each run of the column's values once and copy out the rows that pass,
 //! in parallel, as eager execution filters a whole scan.
 use super::{Buffer, CursorOptions, Operator, State, copy_rows, exec};
-use crate::error::{Error, Result};
+use crate::error::{BudgetKind, Error, Result};
 use crate::index::Key;
 use crate::sparql::ctx::{Ctx, OwnedCharge};
 use crate::sparql::expr::Expr;
@@ -92,9 +92,15 @@ impl Filter {
             if let Some(morsels) = &mut self.morsels
                 && morsels.rows > 0
             {
-                return morsels.emit(ctx, child, cap).map(Some);
+                let batch = morsels.emit(ctx, child, cap)?;
+                // The pool of filter copies and their regex caches go with the last rows.
+                if morsels.rows == 0 && child.done {
+                    self.morsels = None;
+                }
+                return Ok(Some(batch));
             }
             if child.done {
+                self.morsels = None;
                 return Ok(None);
             }
             let row_bytes = (child.vars.len() as u64 * 16).saturating_add(192);
@@ -130,12 +136,10 @@ impl Filter {
             if let Some(morsels) = &mut self.morsels {
                 // A morsel holds at least one whole block. Without room for one, the
                 // scan's own batches continue from the next unread block.
-                if !fits(INPUT_ROWS) {
+                if !fits(INPUT_ROWS) || !morsels.read(ctx, child, input)? {
                     morsels.resume(ctx, child);
                     self.morsels = None;
-                    continue;
                 }
-                morsels.read(ctx, child, input)?;
                 continue;
             }
             let mut input_options = options.clone();
@@ -166,7 +170,6 @@ struct Morsels {
     spec: ScanSpec,
     key: VarId,
     on_key: Vec<Expr>,
-    rest: Vec<Expr>,
     filter: KeyFilter,
     /// copies of the filter that the parallel tasks reuse, with warm regex caches
     filters: parking_lot::Mutex<Vec<KeyFilter>>,
@@ -206,7 +209,9 @@ impl Morsels {
         {
             return None;
         }
-        let (key, on_key, rest) = exec::run_filter_split(spec, exprs)?;
+        // Every conjunct is a key test on the key variable, which `eligible` requires.
+        let key = exec::run_filter_split(spec, exprs)?;
+        let on_key = exprs.clone();
         let filter = KeyFilter::new_for(ctx, &on_key, key)?;
         let cols = child
             .vars
@@ -218,7 +223,6 @@ impl Morsels {
             spec: spec.clone(),
             key,
             on_key,
-            rest,
             filter,
             filters: parking_lot::Mutex::new(Vec::new()),
             cols,
@@ -275,13 +279,22 @@ impl Morsels {
         None
     }
 
-    /// Read and filter the next morsel of about `want` rows into the parts.
-    fn read(&mut self, ctx: &Arc<Ctx>, child: &mut Operator, want: usize) -> Result<()> {
+    /// Read and filter the next morsel of about `want` rows into the parts. `false` when
+    /// the memory budget cannot hold the morsel, which leaves the morsel unread for the
+    /// scan's own batches.
+    fn read(&mut self, ctx: &Arc<Ctx>, child: &mut Operator, want: usize) -> Result<bool> {
         debug_assert_eq!(self.rows, 0);
         let began = Instant::now();
+        let (at, block) = (self.at, self.block);
         let Some((lo, hi, rows)) = self.take(ctx, want) else {
             child.done = true;
-            return Ok(());
+            return Ok(true);
+        };
+        // A charge the budget refuses gives the morsel back. It is not a sticky failure,
+        // so the scan's own smaller batches may still fit.
+        let refused = |e: &Error| {
+            matches!(e, Error::BudgetExceeded(b)
+                if matches!(b.kind, BudgetKind::Memory | BudgetKind::ServerMemory))
         };
         let ranges: Vec<(Key, Key)> = self
             .passing
@@ -291,18 +304,25 @@ impl Morsels {
                 (a <= b).then_some((a, b))
             })
             .collect();
-        // The parts the tasks copy and the decoded blocks the tasks hold. Each task also
-        // charges its own runs and key scratch.
+        // The parts the tasks copy and the decoded blocks the tasks hold, one per block
+        // of the morsel, since a task that waits can steal another block's piece. Each
+        // task also charges its own runs and key scratch.
         let width = self.cols.len().max(1) as u64;
-        let blocks = rows.div_ceil(crate::index::BLOCK_ROWS) as u64;
-        let workers = (rayon::current_num_threads() as u64).min(blocks).max(1);
-        let scratch = OwnedCharge::new(
+        let blocks = rows.div_ceil(crate::index::BLOCK_ROWS).max(1) as u64;
+        let scratch = match OwnedCharge::new(
             ctx,
             (rows as u64)
                 .saturating_mul(width * 8)
-                .saturating_add(workers.saturating_mul(crate::index::BLOCK_ROWS as u64 * 32))
+                .saturating_add(blocks.saturating_mul(crate::index::BLOCK_ROWS as u64 * 32))
                 .saturating_add(4096),
-        )?;
+        ) {
+            Ok(scratch) => scratch,
+            Err(e) if refused(&e) => {
+                (self.at, self.block) = (at, block);
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
         let (parts, read) = if ranges.is_empty() {
             (Vec::new(), 0)
         } else {
@@ -318,6 +338,20 @@ impl Morsels {
             )?
             .ok_or_else(|| Error::invalid("a cursor morsel overlaps the delta"))?
         };
+        let held = parts
+            .iter()
+            .flat_map(|p| p.iter().map(|c| c.capacity() as u64 * 8))
+            .sum::<u64>()
+            .saturating_add(parts.len() as u64 * width * 24 + 128);
+        let mut charge = match OwnedCharge::new(ctx, held) {
+            Ok(charge) => charge,
+            Err(e) if refused(&e) => {
+                (self.at, self.block) = (at, block);
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
+        drop(scratch);
         if self.at == self.ranges.len() {
             child.done = true;
         }
@@ -327,15 +361,14 @@ impl Morsels {
             .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
         child.info.actual_rows = child.rows.min(i64::MAX as usize) as i64;
         child.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
+        // the rows the filter read in morsels, which the scan's own batches may continue
+        child
+            .info
+            .counters
+            .get_or_insert_with(Default::default)
+            .insert("morselRows".into(), (child.rows as u64).into());
         ctx.check_rows(child.rows)?;
         ctx.produced(read as usize)?;
-        let held = parts
-            .iter()
-            .flat_map(|p| p.iter().map(|c| c.capacity() as u64 * 8))
-            .sum::<u64>()
-            .saturating_add(parts.len() as u64 * width * 24 + 128);
-        let mut charge = OwnedCharge::new(ctx, held)?;
-        drop(scratch);
         self.rows = parts.iter().map(|p| p.first().map_or(0, Vec::len)).sum();
         self.parts = parts.into();
         self.offset = 0;
@@ -343,11 +376,10 @@ impl Morsels {
             charge.resize(0)?;
         }
         self.held = Some(charge);
-        Ok(())
+        Ok(true)
     }
 
-    /// The next batch of at most `cap` rows of the parts, with the conjuncts that read
-    /// other variables applied.
+    /// The next batch of at most `cap` rows of the parts.
     fn emit(&mut self, ctx: &Arc<Ctx>, child: &Operator, cap: usize) -> Result<Buffer> {
         let n = cap.min(self.rows);
         let mut buffer = Buffer::new(ctx, &child.vars, n)?;
@@ -374,10 +406,6 @@ impl Morsels {
             held.resize(0)?;
         }
         buffer.table.sorted.clone_from(&child.order);
-        if !self.rest.is_empty() {
-            exec::apply_filter(ctx, &mut buffer.table, &self.rest)?;
-            buffer.reconcile()?;
-        }
         Ok(buffer)
     }
 

@@ -1245,24 +1245,25 @@ A cursor FILTER over an index scan now reads the scan itself in morsels of whole
 blocks and filters each morsel in parallel, as eager execution filters a whole scan. The
 filter chooses morsels on its first read when eager execution would filter the same scan
 by key runs, the scan reads only immutable blocks over exact key ranges, the first demand
-is at least 4,096 rows, and some conjunct of the filter reads only the scan's first free
-key column. The Rayon tasks of a morsel each take a piece of a block. A task gathers the
+is at least 4,096 rows, and every conjunct of the filter is a key test on the scan's first
+free key column. Any other filter reads the scan's own batches. The Rayon tasks of a morsel each take a piece of a block. A task gathers the
 piece's distinct values of that column, tests each once, either against the vocabulary
 through a key filter or through the expression cache for inline values, and gathers the
-rows that pass without branches. The other conjuncts run on each output batch. Morsels
-follow the filter's input size, from 32,768 rows up to 262,144, and only those parts of
+rows that pass without branches. Morsels follow the filter's input size, from 32,768 rows up to 262,144, and only those parts of
 a morsel that a STRSTARTS prefix range can match are read. Output keeps the scan's
 order, so a LIMIT stops after the morsel that fills it.
 
-Each worker keeps its own copy of the key filter in a pool that lives as long as the
-cursor. A copy of a regular expression filter starts with a cold matching cache, and
+Each worker keeps its own copy of the key filter in a pool, which the filter drops with
+its last rows. A copy of a regular expression filter starts with a cold matching cache, and
 copying the filter for each morsel kept the regular expression query slower streamed
 than eager at eight threads. When the row budget or the memory ledger no longer has room
-for a block, the filter hands the rest of the scan back to the scan's own batches from the
-next unread block.
+for a block, or the ledger refuses a morsel's charge, the filter hands the rest of the
+scan back to the scan's own batches from the next unread block. The scan's counter
+`morselRows` in the cursor plan gives the rows read in morsels.
 
 A morsel charges its input columns, the passing rows it holds until they are written and
-a scratch area of 32 bytes per block row for each worker. On an 8-vCPU AMD EPYC Namespace
+a scratch area of 32 bytes per block row for each of its blocks, since a task that waits
+can steal another block's piece. On an 8-vCPU AMD EPYC Namespace
 instance at 10.5M the cursor's ledger peaked at 13.5 MB for the CONTAINS filter with
 eight threads, against 11.8 MB before and 15.6 MB eagerly, and at 5.2 MB with one
 thread. More threads hold more morsel scratch at once, which is the memory this speed
@@ -1283,9 +1284,13 @@ instance, the median of seven rounds, reading every row. The base is 5c73ced6.
 | STRSTARTS on names, 49,837 rows | 7.99 | **0.94** | 2.98 | **0.90** |
 | LANGMATCHES on titles, 500,000 rows | 1.48 | **0.95** | **0.84** | **0.88** |
 
+At one thread CONTAINS moved from 0.95 to 1.00 and REGEX from 1.14 to 1.15. Changes under
+5% on this AMD instance are within its noise, and an Intel host is needed to tell whether
+they are real.
+
 ### Streaming range top-k (2026-10-18)
 
-A cursor no longer runs a range top-k (`IndexTopK`) as an eager operator. The operator
+A cursor no longer runs the range top-k operator `IndexTopK` eagerly. The operator
 still reads the parts of its range whose ids follow value order from the best end and
 stops once it has its k rows. A part whose ids say nothing of value order, such as
 values kept in the dictionary, used to be read whole into memory before its rows were
@@ -1293,8 +1298,18 @@ ranked. The cursor now reads such a part in morsels of one index block, a wave o
 many morsels as Rayon has threads at a time. Each morsel keeps its own best k rows, and
 the morsels then offer their rows in index order to one bounded heap, so ties fall as
 they do eagerly. A value that is not totally ordered still sends the query to the
-generic plan, which the cursor builds as the operator's child and which streams as well.
-Eager execution keeps its own path.
+generic plan, which the cursor builds as the operator's child only then and which streams
+as well. A value like that in a late morsel costs the morsels read before it, as it does
+eagerly. Eager execution keeps its own path.
+
+A default graph made of several graphs, as with two FROM clauses, holds a triple once even
+when two graphs store it. The scan drops the second copy, which follows the first in key
+order, but only within one read, so a pair of copies split by a block boundary would
+reach the heap twice. Each morsel reports the last row its scan produced, and the next
+morsel of the same piece drops its first row when it repeats that row, which is what one
+read of the whole piece keeps. The first version of this work missed that case, and
+`ordered_top_k_dedups_union_graph_rows_across_morsels` covers it with both parities of
+the pairs against the block grid.
 
 The cursor's memory for the operator is about one morsel's working set per worker
 thread plus the k rows it keeps, whatever the size of the range. The test
@@ -1314,7 +1329,8 @@ with one thread.
 ### Native JSON of a streamed filter (2026-10-18)
 
 A filter over a scan written as native JSON at one thread had taken 1.35 to 1.39 times as
-long streamed as eagerly. Two changes brought it to parity. The parallel cursor filter
+long streamed as eagerly on forge, and the STRSTARTS filter took 1.30 times on the
+Namespace instance of this work. Two changes brought it to parity. The parallel cursor filter
 above reads only the blocks a STRSTARTS prefix can match, which removed most of the gap.
 Profiles of what remained showed the cursor writer's term cache spending about a tenth of
 its time sorting the pairs of vocabulary id and cell of each batch. A column read in
