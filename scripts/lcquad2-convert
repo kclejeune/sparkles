@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Convert the LC-QuAD 2.0 test split into an Ask question set over Wikidata.
+
+The split comes from the AskNowQA/LC-QuAD2.0 repository at a pinned commit, and its
+SHA256 is checked before use. It is not vendored. The split has 6,046 questions and
+publishes no answers, so --sample N keeps a fixed sample chosen by a hash of each
+question's uid. With --loc and --sparkles, every gold query runs on a Wikidata
+database and the questions whose gold returns nothing, fails or cannot be scored are
+dropped and counted. A quarter of the gold queries read statements and qualifiers
+(p:, ps:, pq:), which the truthy dump does not hold, so that database must be loaded
+from the full dump or a subset of it.
+"""
+
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
+from convert import category, database_record, fetch_pinned, gold_result
+from evaluator import Invalid, bounded_file, digest, strict_json
+
+REPO = "AskNowQA/LC-QuAD2.0"
+COMMIT = "0a5f8f85b6f863c3b80f0fa02839e25d438af3ae"
+FILE = "dataset/test.json"
+SHA256 = "ba1500efe6308ba86af7f91033e184778204dca7ba358c77222626ae6bd3454d"
+URL = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{FILE}"
+SIZE_CAP = 16 * 1024 * 1024
+PREFIXES = {
+    "wd": "http://www.wikidata.org/entity/",
+    "wdt": "http://www.wikidata.org/prop/direct/",
+    "p": "http://www.wikidata.org/prop/",
+    "ps": "http://www.wikidata.org/prop/statement/",
+    "pq": "http://www.wikidata.org/prop/qualifier/",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+}
+STATEMENTS = re.compile(r"\b(p|ps|pq):")
+
+
+def usable(text):
+    """A verbalized question: a string of at least three words, with no template
+    braces left in it. The split also holds `n/a`, nulls and keyboard noise."""
+    return (
+        isinstance(text, str)
+        and "{" not in text
+        and len(text.split()) >= 3
+        and text.strip().lower() != "n/a"
+    )
+
+
+def text_of(entry):
+    """The annotators' question, or their paraphrase when the question is unusable."""
+    for field in ("question", "paraphrased_question"):
+        if usable(entry.get(field)):
+            return re.sub(r"\s+", " ", entry[field]).strip(), field
+    return None, None
+
+
+def sample(entries, n, seed):
+    """A fixed sample of `n` entries, ordered by a hash of the seed and the uid."""
+    if n is None:
+        return entries
+    key = lambda e: hashlib.sha256(f"{seed}:{e['uid']}".encode()).hexdigest()  # noqa: E731
+    return sorted(entries, key=key)[:n]
+
+
+def convert(args, source):
+    data = strict_json(bounded_file(source, SIZE_CAP))
+    if not isinstance(data, list):
+        raise Invalid("the LC-QuAD 2.0 split is a list")
+    header = "".join(f"PREFIX {k}: <{v}>\n" for k, v in PREFIXES.items())
+    chosen = sample(data, args.sample, args.seed)
+    questions = []
+    dropped = {"empty": [], "failed": [], "unsupported": [], "noText": []}
+    fields = {"question": 0, "paraphrased_question": 0}
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="lcquad2-"))
+    recompute = bool(args.loc)
+    for n, entry in enumerate(chosen):
+        ident = f"lcquad2-{entry['uid']}"
+        text, field = text_of(entry)
+        query = entry.get("sparql_wikidata")
+        if not text or not isinstance(query, str) or not query.strip():
+            dropped["noText"].append(ident)
+            continue
+        query = re.sub(r"\s+", " ", query).strip()
+        if recompute:
+            _, reason = gold_result(
+                args.sparkles,
+                ["--loc", args.loc],
+                header + query,
+                scratch / f"{n:05d}",
+                args.timeout,
+            )
+            if reason:
+                dropped[reason].append(ident)
+                continue
+        fields[field] += 1
+        questions.append(
+            {
+                "id": ident,
+                "kind": "answerable",
+                "category": category(query),
+                "question": text,
+                "gold": query,
+                "template": entry.get("template_id"),
+                "statements": bool(STATEMENTS.search(query)),
+            }
+        )
+    return {
+        "description": (
+            "The LC-QuAD 2.0 test split over Wikidata, converted for scripts/eval-ask. "
+            "The text is the annotators' question, or their paraphrase when the "
+            "question is unusable. Gold answers "
+            + (
+                "were recomputed on the Wikidata database named below. "
+                if recompute
+                else "are not recomputed, and the set cannot run until they are. "
+            )
+            + "Questions whose gold returns nothing or that the evaluator cannot "
+            "score are dropped and counted."
+        ),
+        "dataset": "wikidata",
+        "source": {
+            "repository": REPO,
+            "commit": COMMIT,
+            "file": FILE,
+            "sha256": SHA256,
+            "license": "The repository has no license file. It is not vendored.",
+        },
+        "sample": (
+            {"size": args.sample, "seed": args.seed}
+            if args.sample is not None
+            else None
+        ),
+        "goldRecomputed": recompute,
+        "goldTimeoutSecs": args.timeout if recompute else None,
+        "goldBinarySha256": digest(args.sparkles) if recompute else None,
+        "goldDatabase": database_record(args.manifest) if recompute else None,
+        "sourceQuestions": len(data),
+        "textFields": fields,
+        "dropped": {k: {"count": len(v), "ids": v} for k, v in dropped.items()},
+        "prefixes": PREFIXES,
+        "questions": questions,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    ap.add_argument("--out", required=True, help="a new set file")
+    ap.add_argument("--input", help="a local copy of the split, checked by SHA256")
+    ap.add_argument("--sample", type=int, help="keep a fixed sample of this size")
+    ap.add_argument("--seed", default="sparkles-ask-1")
+    ap.add_argument("--loc", help="Wikidata database directory for the gold recompute")
+    ap.add_argument("--sparkles", help="absolute path of the binary, with --loc")
+    ap.add_argument("--manifest", help="a JSON file that records the database load")
+    ap.add_argument("--timeout", type=float, default=60)
+    args = ap.parse_args()
+    if bool(args.loc) != bool(args.sparkles):
+        raise Invalid("--loc and --sparkles go together")
+    if args.sparkles and not pathlib.Path(args.sparkles).is_absolute():
+        raise Invalid("absolute --sparkles required")
+    if args.sample is not None and args.sample <= 0:
+        raise Invalid("--sample must be positive")
+    out = pathlib.Path(args.out)
+    if out.exists():
+        raise Invalid("--out must be a new file")
+    source = args.input
+    if not source:
+        source = pathlib.Path(tempfile.mkdtemp(prefix="lcquad2-src-")) / "test.json"
+        fetch_pinned(URL, SHA256, SIZE_CAP, source)
+    if digest(source) != SHA256:
+        raise Invalid("the LC-QuAD 2.0 split does not match the pinned SHA256")
+    result = convert(args, source)
+    with out.open("x") as f:
+        json.dump(result, f, indent=1)
+        f.write("\n")
+    dropped = {k: v["count"] for k, v in result["dropped"].items()}
+    print(
+        f"kept {len(result['questions'])} of {result['sourceQuestions']}"
+        f" ({result['textFields']}), dropped {dropped}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (Invalid, OSError) as error:
+        print(f"lcquad2-convert: {error}", file=sys.stderr)
+        sys.exit(2)
