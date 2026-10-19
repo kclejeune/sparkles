@@ -10,65 +10,9 @@ die() {
   log "error: $*"
   exit 1
 }
-# nixbin <pkg> <bin>: the binary on PATH, or from the nixpkgs that flake.lock pins (so the
-# engines' versions follow the repository, not the user's registry). The build's out-link in
-# WORK/gcroots is a garbage-collector root, so a `nix store gc` during a long run cannot
-# remove the binary.
-nixbin() {
-  if command -v "$2" > /dev/null; then
-    command -v "$2"
-  else
-    mkdir -p "$WORK/gcroots"
-    nix build --inputs-from "$ROOT" "nixpkgs#$1" --out-link "$WORK/gcroots/$1" > /dev/null
-    echo "$WORK/gcroots/$1/bin/$2"
-  fi
-}
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
-
-# ------------------------------------------------------------------------------ tools
-resolve_tools() {
-  if has jena; then
-    TDBLOADER=$(nixbin apache-jena tdb2.tdbloader)
-    FUSEKI=$(nixbin apache-jena-fuseki fuseki-server)
-  fi
-  if has qlever; then
-    QINDEX=$(nixbin qlever qlever-index)
-    QSERVER=$(nixbin qlever qlever-server)
-  fi
-  if has oxigraph; then OXIGRAPH=$(nixbin oxigraph oxigraph); fi
-  FLUREE_VERSION=${FLUREE_VERSION:-4.2.2}
-  if has fluree && [ -z "${FLUREE:-}" ]; then
-    local ft fdir furl want got
-    case "$(uname -sm)" in
-      "Linux x86_64") ft=x86_64-unknown-linux-gnu ;;
-      "Linux aarch64") ft=aarch64-unknown-linux-gnu ;;
-      "Darwin arm64") ft=aarch64-apple-darwin ;;
-      "Darwin x86_64") ft=x86_64-apple-darwin ;;
-      *) die "no Fluree release binary for $(uname -sm); set FLUREE" ;;
-    esac
-    fdir="$WORK/fluree-$FLUREE_VERSION"
-    FLUREE="$fdir/fluree-db-cli-$ft/fluree"
-    if [ ! -x "$FLUREE" ]; then
-      mkdir -p "$fdir"
-      furl="https://github.com/fluree/db/releases/download/v$FLUREE_VERSION/fluree-db-cli-$ft.tar.xz"
-      curl -sfL "$furl" -o "$fdir/fluree.tar.xz"
-      want=$(curl -sfL "$furl.sha256" | cut -d' ' -f1)
-      got=$(sha256sum "$fdir/fluree.tar.xz" 2> /dev/null || shasum -a 256 "$fdir/fluree.tar.xz")
-      got=${got%% *}
-      [ "$want" = "$got" ] || die "Fluree checksum mismatch ($got != $want)"
-      tar xJf "$fdir/fluree.tar.xz" -C "$fdir"
-    fi
-  fi
-}
-# GNU time (not the shell keyword), for the peak RSS of loads
-gnu_time() {
-  type -P gtime && return
-  [ -x /usr/bin/time ] && echo /usr/bin/time && return
-  # not nixbin: `command -v time` finds the shell keyword
-  mkdir -p "$WORK/gcroots"
-  nix build --inputs-from "$ROOT" nixpkgs#time --out-link "$WORK/gcroots/time" > /dev/null
-  echo "$WORK/gcroots/time/bin/time"
-}
 
 # ------------------------------------------------------------------------- engines
 # The ports are PORT_BASE (default 3931) and the four after it, so concurrent runs with

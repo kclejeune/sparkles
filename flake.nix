@@ -96,6 +96,7 @@
           _module.args.pkgs = import inputs.nixpkgs {
             inherit system;
             overlays = [ inputs.rust-overlay.overlays.default ];
+            config.allowUnfreePredicate = pkg: lib.getName pkg == "fluree";
           };
 
           packages = {
@@ -135,6 +136,7 @@
             sparkles-node = node.packages;
             default = self'.packages.sparkles;
           }
+          // import ./nix/benchmarks.nix { inherit pkgs; }
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             # OCI images of the server (nix/image.nix): `nix build .#image && ./result | docker load`
             image = pkgs.callPackage ./nix/image.nix { sparkles = self'.packages.sparkles; };

@@ -4,6 +4,55 @@ This guide describes the benchmark harnesses, their modes, outputs and measureme
 limits. [BENCHMARKS.md](BENCHMARKS.md) owns the published results, measurement context
 and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and testing.
 
+## Pinned comparison engines
+
+The flake exposes `apache-jena`, `apache-jena-fuseki`, `qlever`, `oxigraph` and
+`fluree`, plus `benchmark-engines` with all their executables. Build them before a
+benchmark so a cache miss or a compiler failure cannot interrupt a timed run.
+
+```sh
+nix build .#benchmark-engines
+nix build .#qlever .#fluree
+```
+
+Jena, Fuseki, QLever and Oxigraph reuse the definitions from the nixpkgs revision in
+`flake.lock`. The current versions are Jena 6.2.0, Fuseki 5.1.0, QLever 0.5.48 and
+Oxigraph 0.5.11. Fluree 4.2.2 uses the published release archives with SHA-256 hashes
+recorded in `nix/fluree.nix`. Its Linux executable is patched to use the locked runtime
+libraries. No Fluree source is read or built. The flake permits its Business Source
+License package explicitly. Fluree is available on Linux x86-64, Linux ARM64 and macOS
+ARM64. That release has no macOS x86-64 archive. The combined package includes Fluree only
+on its three supported systems.
+
+The HTTP comparison scripts resolve engines through these flake outputs, even when
+another version is on `PATH`. Each package gets a GC root in the run's `gcroots/`
+directory. `TDBLOADER`, `FUSEKI`, `QINDEX`, `QSERVER`, `OXIGRAPH` and `FLUREE` can
+explicitly select other executables. The billion-triple loader also accepts `XLOADER`.
+`FLUREE_VERSION`, when supplied without `FLUREE`, must match the packaged version.
+Jena loaders and servers clear `JAVA_HOME` so their wrappers use the packaged JDK.
+The RDFS oracle also defaults to the locked JDK, with `JAVA` as an explicit override.
+Other auxiliary tools prefer `PATH` and otherwise use the repository's locked nixpkgs.
+
+The binding comparisons keep their language-specific versions. Python's pyoxigraph
+and rdflib dependencies are pinned with hashes in
+`scripts/bench-bindings/python/requirements.txt`. Oxigraph JS, N3.js and Comunica use
+`scripts/bench-bindings/node/package-lock.json` with integrity hashes and `npm ci`.
+The JVM comparisons use the Jena version in `jvm/gradle/libs.versions.toml` and Gradle's
+dependency locks and verification metadata. These are separate from the HTTP engine
+packages because they measure libraries through each language's API.
+
+The QLever build failure of 2026-10-19 came from runners resolving the host's nixpkgs
+registry instead of the repository's lock. Forge's registry selected GCC 16.2.0, which
+rejected range-v3's late `enable_borrowed_range` specialization for `std::string_view`.
+The repository pin selects GCC 15.3.0 and its QLever package builds successfully.
+[Upstream nixpkgs](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/ql/qlever/package.nix)
+now packages QLever 0.6.0 and applies a
+[range-v3 patch](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/ql/qlever/fix-range-v3-borrowed-range-instantiation.patch)
+that moves the specialization before its first possible instantiation. It also disables
+`-Wmaybe-uninitialized` to avoid a separate GCC 16 internal compiler error. A future
+lock update should retain those fixes and rebuild QLever before refreshing results.
+This change keeps the existing lock and engine versions.
+
 ## Benchmark scripts
 
 * `scripts/bench.sh` (`mise run bench [people] [workdir]`) runs the engine comparison.
@@ -137,7 +186,7 @@ and comparison methodology. [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
   page cache, which `--no-cold` skips), and two of them under 16 concurrent clients. Loads
   record their time, peak RSS (GNU `time`) and index size. `--engines` also takes `jena`
   (TDB2 `xloader` and Fuseki), `oxigraph` and `fluree`. Fluree is the release binary that
-  `scripts/bench.sh` downloads. Its bulk import reads a directory of `.nt.zst` files, but
+  the flake packages. Its bulk import reads a directory of `.nt.zst` files, but
   version 4.2.2 fails on a file larger than its chunk size, so the load step first splits
   the files into pieces of whole lines of at most 512 MB uncompressed (`FLUREE_PIECE`),
   outside the timed load.
