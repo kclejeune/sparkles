@@ -308,6 +308,17 @@ fn base_stats(stats: &Stats, key: &CountKey, rdf_type: Option<u64>) -> Option<Ve
         (Perm::Pso | Perm::Pos, [], true, Rows) => {
             stats.predicates.iter().map(|s| (s.p, s.count)).collect()
         }
+        // the distinct subjects and objects of every predicate (schema reports)
+        (Perm::Pso, [], true, Distinct(2)) => stats
+            .predicates
+            .iter()
+            .map(|s| (s.p, s.distinct_subjects))
+            .collect(),
+        (Perm::Pos, [], true, Distinct(2)) => stats
+            .predicates
+            .iter()
+            .map(|s| (s.p, s.distinct_objects))
+            .collect(),
         _ => return None,
     };
     v.retain(|c| c.1 > 0);

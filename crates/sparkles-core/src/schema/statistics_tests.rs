@@ -140,18 +140,128 @@ fn statistics_report_follows_inserts_and_deletes() {
     );
 }
 
+/// The statistics report equals the exact one in every count it measures, distinct
+/// counts included.
+fn assert_same_distincts(stats: &SchemaReport, exact: &SchemaReport) {
+    assert_same_counts(stats, exact);
+    for (a, b) in stats.predicates.iter().zip(&exact.predicates) {
+        assert_eq!(
+            (a.observed.distinct_subjects, a.observed.distinct_objects),
+            (b.observed.distinct_subjects, b.observed.distinct_objects),
+            "{}",
+            a.iri
+        );
+    }
+}
+
 #[test]
-fn statistics_apply_only_to_the_whole_store() {
+fn statistics_distinct_counts_stay_exact_after_updates() {
+    // a new object of a subject the base already has, a new subject, and the deletion
+    // of one of two objects of a subject
+    let s = synthetic(500);
+    let text = "PREFIX ex: <http://ex.org/>
+        INSERT DATA { ex:s0 ex:val 3 . ex:s1 ex:val 1 . ex:n1 ex:val 1 . } ;
+        DELETE DATA { ex:s2 ex:val 2 . }";
+    crate::sparql::update::update(&s, text, &QueryOptions::default()).unwrap();
+    let snap = s.snapshot();
+    assert!(!snap.delta.is_empty());
+    let stats = discover(&snap, &stats_opts(GraphSelection::Default)).unwrap();
+    let exact = discover(&snap, &SchemaOptions::default()).unwrap();
+    assert_same_distincts(&stats, &exact);
+}
+
+#[test]
+fn statistics_keep_a_class_deleted_from_one_of_two_graphs() {
     let s = synthetic(200);
     load(
         &s,
-        format!("<{EX}g> {{ <{EX}x> <{EX}inGraph> 1 . }}"),
+        format!(
+            "<{EX}g1> {{ <{EX}S> a <{EX}One> , <{EX}Two> . <{EX}T> a <{EX}Two> . }}
+             <{EX}g2> {{ <{EX}S> a <{EX}One> , <{EX}Two> . <{EX}S> <{EX}inGraph> 1 . }}"
+        ),
         RdfFormat::TriG,
     );
+    s.compact().unwrap();
+    let union = stats_opts(GraphSelection::Union);
+    let exact_union = SchemaOptions {
+        graph: GraphSelection::Union,
+        ..Default::default()
+    };
+    let r = discover(&s.snapshot(), &union).unwrap();
+    assert_eq!(find_class(&r, &ex("One")).unwrap().observed.instances, 1);
+    assert_eq!(find_class(&r, &ex("Two")).unwrap().observed.instances, 2);
+    // the instances stay in g2, and a copy in a third graph adds no instance
+    let text = format!(
+        "DELETE DATA {{ GRAPH <{EX}g1> {{ <{EX}S> a <{EX}One> , <{EX}Two> }} }} ;
+         INSERT DATA {{ GRAPH <{EX}g3> {{ <{EX}T> a <{EX}Two> . <{EX}S> <{EX}inGraph> 1 }} }}"
+    );
+    crate::sparql::update::update(&s, &text, &QueryOptions::default()).unwrap();
     let snap = s.snapshot();
-    // the default graph leaves out the named graph's quad
-    let r = discover(&snap, &stats_opts(GraphSelection::Default)).unwrap();
-    assert_eq!(r.basis, Basis::Exact);
+    let stats = discover(&snap, &union).unwrap();
+    let exact = discover(&snap, &exact_union).unwrap();
+    assert_eq!(
+        find_class(&stats, &ex("One")).map(|c| c.observed.instances),
+        Some(1)
+    );
+    assert_eq!(
+        find_class(&stats, &ex("Two")).unwrap().observed.instances,
+        2
+    );
+    let classes = |r: &SchemaReport| -> Vec<(String, u64)> {
+        r.classes
+            .iter()
+            .map(|c| (c.iri.clone(), c.observed.instances))
+            .collect()
+    };
+    assert_eq!(classes(&stats), classes(&exact));
+    let p = find_pred(&stats, &ex("inGraph")).unwrap();
+    // two quads of one triple: the distinct counts are of the triple
+    assert_eq!(p.observed.triples, 2);
+    assert_eq!(
+        (p.observed.distinct_subjects, p.observed.distinct_objects),
+        (1, 1)
+    );
+}
+
+#[test]
+fn statistics_apply_to_a_graph_selection() {
+    let s = synthetic(200);
+    load(
+        &s,
+        format!(
+            "<{EX}g> {{ <{EX}x> <{EX}inGraph> 1 . <{EX}x> a <{EX}C1> . <{EX}s0> <{EX}val> 5 . }}"
+        ),
+        RdfFormat::TriG,
+    );
+    let check = |snap: &Arc<Snapshot>| {
+        // the default graph leaves out the named graph's quads
+        let stats = discover(snap, &stats_opts(GraphSelection::Default)).unwrap();
+        let exact = discover(snap, &SchemaOptions::default()).unwrap();
+        assert_same_distincts(&stats, &exact);
+        assert!(find_pred(&stats, &ex("inGraph")).is_none());
+        // the named graph alone: taking out the rest costs more than reading it, so it
+        // is read, unless the work limit is lifted
+        let named = GraphSelection::Named(oxrdf::NamedNode::new(ex("g")).unwrap());
+        let exact = discover(
+            snap,
+            &SchemaOptions {
+                graph: named.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let r = discover(snap, &stats_opts(named.clone())).unwrap();
+        assert_eq!(r.basis, Basis::Exact);
+        crate::sparql::stats::UNLIMITED.set(true);
+        let stats = discover(snap, &stats_opts(named));
+        crate::sparql::stats::UNLIMITED.set(false);
+        assert_same_distincts(&stats.unwrap(), &exact);
+    };
+    // the named graph in the delta, then in the base
+    check(&s.snapshot());
+    s.compact().unwrap();
+    check(&s.snapshot());
+    let snap = s.snapshot();
     let r = discover(&snap, &stats_opts(GraphSelection::Union)).unwrap();
     assert_eq!(r.basis, Basis::Statistics);
     assert_eq!(find_pred(&r, &ex("inGraph")).unwrap().observed.triples, 1);
@@ -301,4 +411,60 @@ fn objects_of_a_large_predicate_are_sampled() {
             .triples,
         8_000
     );
+}
+
+#[test]
+fn sampled_objects_leave_out_the_graphs_not_selected() {
+    // 20,000 integers and 3,000 IRIs in the default graph, and 700 integers, 400 IRIs
+    // and 300 strings in a named graph, in the base and then in the delta
+    let s = Store::in_memory(StoreOptions::default());
+    let p = format!("<{EX}mixed>");
+    let mut nt = String::new();
+    for i in 0..20_000 {
+        nt.push_str(&format!("<{EX}a{i}> {p} \"{i}\"^^<{XSD_INTEGER}> .\n"));
+    }
+    for i in 0..3_000 {
+        nt.push_str(&format!("<{EX}f{i}> {p} <{EX}o{i}> .\n"));
+    }
+    load(&s, nt, RdfFormat::NTriples);
+    let mut trig = format!("<{EX}g> {{\n");
+    for i in 0..700 {
+        trig.push_str(&format!("<{EX}x{i}> {p} {} .\n", 100_000 + i));
+    }
+    for i in 0..400 {
+        trig.push_str(&format!("<{EX}y{i}> {p} <{EX}z{i}> .\n"));
+    }
+    for i in 0..300 {
+        trig.push_str(&format!("<{EX}w{i}> {p} \"named {i}\" .\n"));
+    }
+    trig.push_str("}\n");
+    load(&s, trig, RdfFormat::TriG);
+    for compacted in [false, true] {
+        if compacted {
+            s.compact().unwrap();
+        }
+        let snap = s.snapshot();
+        let o = predicate_objects(&snap, &ex("mixed"), &SchemaOptions::default(), 2_000)
+            .unwrap()
+            .unwrap();
+        assert!(o.sampled.is_some(), "compacted {compacted}");
+        let k = &o.objects;
+        assert_eq!(
+            k.iri.map(|c| c.triples),
+            Some(3_000),
+            "compacted {compacted}"
+        );
+        let ints: Vec<u64> = k
+            .literals
+            .iter()
+            .filter(|g| g.datatype == XSD_INTEGER)
+            .map(|g| g.triples)
+            .collect();
+        assert_eq!(ints, [20_000], "compacted {compacted}");
+        assert!(
+            !k.literals.iter().any(|g| g.datatype == XSD_STRING),
+            "compacted {compacted}: {:?}",
+            k.literals
+        );
+    }
 }
