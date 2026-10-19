@@ -138,7 +138,18 @@ tokens. The DBpedia gold rewrites leave literals and comments alone, never reuse
 variable of the query and also rewrite `COUNT(*)`. A sampled LC-QuAD 2.0 set records how
 many questions it sampled.
 
+The Ask evaluation scores under `rdf-term-set-projected-columns-v2`. An answer with more
+columns than the gold, such as a name beside each IRI, is projected onto the gold's
+columns and its rows compared as a set, where the first policy scored any extra column
+as wrong. `scripts/eval-ask-rescore` scores a run's saved answers again under the
+current policy without calling a model, and the paid wrapper records every request and
+reply, key redacted, in `replies.jsonl`.
+
 ### Behavior
+
+`sparkles ask` runs a query whose class, variable or prefix is named like the SERVICE
+keyword, such as `pv:Service` or `?service`. It used to leave such a query unrun as if
+it called a remote service.
 
 A SERVICE inside an EXISTS that the query evaluates per row is called once for each
 distinct binding of the variables it shares with the outer rows, and once in all when it

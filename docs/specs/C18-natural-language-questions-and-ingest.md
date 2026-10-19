@@ -5027,9 +5027,37 @@ $1.002560 as a carryover line. The run file's cap is $23.997440, so the cap and 
 carryover together stay within USD 25. The ledger's spent total includes the carryover,
 so new requests can spend $22.994880 under that cap. The pilot's
 wallet, grant claim and report are kept as the record and are never reopened. The next run
-uses a binary built from a named commit outside the private notes. What remains is a paid
-run of the demo set, the converted QALD-9-plus set and the Text2SPARQL'25 sets, and the
-work listed below.
+uses a binary built from a named commit outside the private notes.
+
+The first paid run, on 2026-10-19, asked the demo set and CK25 with Haiku 5.5, Sonnet
+5.5 and Opus 5.5 at effort `medium`, through the binary of commit 23075691. It settled
+$4.30 over 612 requests with no cap refusal. The policy of that run compared whole rows,
+and it scored as wrong every answer that named each result beside its IRI, which Sonnet
+and Opus do for most questions. `scripts/eval-ask-rescore` scored the saved answers
+again under the projected-column policy without calling a model.
+
+| Set | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
+|---|---|---|---|
+| demo, whole rows | 47/59 | 14/59 | 13/59 |
+| demo, projected columns | 52/59 | 48/59 | 56/59 |
+| CK25, whole rows | 10/49 | 4/49 | 5/49 |
+| CK25, projected columns | 20/49 | 26/49 | 27/49 |
+
+The prompts, the effort, the output limit and the parsing were the same for every model,
+and every draft came back at the json-schema level. On the demo set the remaining
+failures are wrong rows, an answer with fewer columns than the gold, a clarification
+question, and drafts that came back with an empty query and an empty explanation, five
+from Sonnet and two from Opus. The run kept no reply bodies, so those empty drafts
+cannot be traced to a reply, and the proxy now records every reply for that reason.
+CK25 stays lower for every model for three reasons besides wrong queries. Seven of its
+questions name a person or product by a part that several entities share, such as "Ms.
+Brant", and the pipeline asks which one is meant before any model call, which the
+evaluation scores as a failure. CK25 has a class `pv:Service`, and `sparkles ask` took
+that name for the SERVICE keyword and left two questions unrun for every model, a fault
+now fixed. Two gold queries order on values with ties before a limit. The runs of the
+two unrun questions, and of the empty drafts with replies recorded, need new requests.
+What remains is a paid run of the DBpedia sets once roadmap item 89 lands, and the work
+listed below.
 
 - Run the matrix of §11.4 with real providers on the demo set, QALD-9-plus (DBpedia
   questions, gold answers recomputed on the loaded release as §11.1 says) and the

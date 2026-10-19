@@ -47,11 +47,23 @@ pair when the server itself sees a failed Ask, never by comparing with gold, and
 charges the cost of every pair it tried. These rows do not measure repair or summary
 accuracy on their own.
 
-A SELECT answer is a set of whole rows compared under one column mapping, with exact
-terms. Datatypes, language tags and lexical forms are kept, and numbers are never
-rounded. Blank nodes, more than eight columns and more than 1000 rows are unsupported.
+A SELECT answer is a set of rows compared under one column mapping, with exact terms.
+Datatypes, language tags and lexical forms are kept, and numbers are never rounded. An
+answer with the gold's width is compared whole. An answer with more columns, such as a
+name beside each person, is projected onto one distinct answer column for each gold
+column, and the projected set of rows is compared with the gold, so a stray or missing
+row still costs precision or recall. An answer with fewer columns than the gold is
+wrong. Blank nodes, more than eight columns and more than 1000 rows are unsupported.
 Gold that needs them fails before any model is called. The scorer refuses SERVICE before
-it starts a query. This is a strict RDF-term policy and not an official QALD score.
+it starts a query. This is the policy `rdf-term-set-projected-columns-v2`, a strict
+RDF-term policy and not an official QALD score. The first policy compared whole rows
+only, and it scored most answers of Sonnet 5.5 and Opus 5.5 in the first paid run as
+wrong because they named each answer beside its IRI.
+
+`scripts/eval-ask-rescore --report OUT/SET/report.json --sparkles BIN --out DIR` scores
+the saved answers of a run again under the current policy. It runs only `sparkles query`
+on the set's data, refuses a set or binary that differs from the run's, and writes a
+report with each row's execution accuracy before and after.
 
 Answerable accuracy, clarification precision and refusal accuracy have separate
 denominators. Only the `unanswerable` outcome is a successful refusal. A provider error,
@@ -142,9 +154,13 @@ Before spending, the run counts tokens, which is free, and sends each model of t
 one structured-output request of at most 256 tokens. It records the status and headers
 of the replies in `preflight.json`, without rate-limit, request, organization, workspace
 and cookie headers. It stops if any step fails. A block of a set and a model runs only
-when the projected cost fits
-the cap. The projection is the case count times the p90 measured case cost of that model,
-or a prior from the run file, times a margin.
+when the projected cost fits the cap. The projection is the case count times the p90
+measured case cost of that model, or a prior from the run file, times a margin.
+
+The proxy appends every forwarded request and its reply, with the key redacted, to
+`replies.jsonl` in the output directory, so an answer can be diagnosed later without
+calling a model again. The first paid run predates this file, so its empty drafts
+cannot be traced to the reply that produced them.
 
 ## A paid run
 
