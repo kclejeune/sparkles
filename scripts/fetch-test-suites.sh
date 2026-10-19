@@ -12,14 +12,15 @@
 #                           formatter and JSON-LD corpus tests read
 #   SPARKLES_RDF_TESTS_DIR  the W3C RDF suites (rdf-tests-cg/rdf: Turtle, TriG, N-Triples,
 #                           N-Quads, RDF/XML)
-#   SPARKLES_SHACL_TESTS    the W3C SHACL suite as Jena vendors it
+#   SPARKLES_SHACL_TESTS    the W3C SHACL suite as Jena vendors it, whose sibling
+#                           directories hold the SHACL compact syntax tests
 #   SPARKLES_SHEX_TESTS     the shexTest suite as Jena vendors it
 #   SPARKLES_OXIGRAPH_DIR   Oxigraph's own JSON-LD documents
 #
 # The JSON-LD API suite (SPARKLES_JSONLD_TESTS) is opt-in and not fetched.
 #
 # Usage: scripts/fetch-test-suites.sh [DIR]   (default: target/test-suites)
-# A checkout already at its pinned commit is kept, so a second run fetches nothing.
+# A checkout already at its pinned commit is kept, so a second run fetches nothing new.
 set -euo pipefail
 
 # The pins. Raise them together with any known-failure lists the new commits change.
@@ -37,6 +38,8 @@ sparse_checkout() {
   local url="$1" commit="$2" dest="$3"
   shift 3
   if [ "$(git -C "$dest" rev-parse HEAD 2> /dev/null)" = "$commit" ]; then
+    # the directories may differ from the last run's, and new ones are fetched lazily
+    git -C "$dest" sparse-checkout set "$@"
     return 0
   fi
   rm -rf "$dest"
@@ -57,7 +60,7 @@ sparse_checkout https://github.com/apache/jena.git "$jena_commit" "$jena" \
   jena-arq/testing/RIOT/jsonld11 \
   jena-arq/testing/RIOT/StreamManager \
   jena-arq/testing/RIOT/Reader \
-  jena-shacl/src/test/files/std \
+  jena-shacl/src/test/files \
   jena-shex/src/test/files/spec >&2
 sparse_checkout https://github.com/oxigraph/oxigraph.git "$oxigraph_commit" "$oxigraph" \
   testsuite/oxigraph-tests/jsonld >&2

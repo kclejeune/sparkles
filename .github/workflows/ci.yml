@@ -212,12 +212,17 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      # The server's build script writes a placeholder ui/build, which debug builds read
+      # from disk at run time, so the shards get it next to the archive.
       - name: Build the test archive
-        run: cargo nextest archive --locked --workspace --archive-file "$RUNNER_TEMP/tests.tar.zst"
+        run: |
+          mkdir -p "$RUNNER_TEMP/archive"
+          cargo nextest archive --locked --workspace --archive-file "$RUNNER_TEMP/archive/tests.tar.zst"
+          tar -cf "$RUNNER_TEMP/archive/ui-build.tar" ui/build
       - uses: actions/upload-artifact@v4
         with:
           name: nextest-archive
-          path: ${{ runner.temp }}/tests.tar.zst
+          path: ${{ runner.temp }}/archive
           retention-days: 1
           # the archive is zstd already
           compression-level: 0
@@ -228,14 +233,18 @@ jobs:
   # .config/nextest.toml: every failure reported at the end, and a test that runs past
   # ten minutes stopped. The suite includes openapi::tests::checked_in_copy_is_current,
   # which fails when docs/openapi.json is out of date.
+  #
+  # The tests of the `timing` group in .config/nextest.toml need the machine to
+  # themselves, and one of them runs for about four minutes on a runner, which would
+  # stall the shard it fell into. They run in a job of their own instead.
   test:
-    name: Test (${{ matrix.shard }}/4)
+    name: Test (${{ matrix.shard }})
     needs: build
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1/4, 2/4, 3/4, 4/4, timing]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -251,15 +260,26 @@ jobs:
       - name: Fetch the conformance suites
         run: scripts/fetch-test-suites.sh "$RUNNER_TEMP/test-suites" >> "$GITHUB_ENV"
       # cargo-nextest is called directly: the archive needs no Cargo, and calling cargo
-      # would make rustup install the pinned toolchain first
+      # would make rustup install the pinned toolchain first. The archive is extracted
+      # into the checkout, where the build job's target directory was, because tests find
+      # the server binary and the UI by paths fixed at compile time.
       - name: cargo nextest
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
+          tar -xf "$RUNNER_TEMP/ui-build.tar"
+          timing='test(planning_at_the_limit_stops_at_the_timeout)'
+          if [ "$SHARD" = timing ]; then
+            select=(-E "$timing")
+          else
+            select=(-E "not $timing" --partition "slice:$SHARD")
+          fi
           cargo-nextest nextest run --archive-file "$RUNNER_TEMP/tests.tar.zst" \
-            --workspace-remap . --profile ci --partition "slice:${{ matrix.shard }}/4"
+            --workspace-remap . --extract-to . --profile ci "${select[@]}"
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ matrix.shard }}
+          name: junit-${{ matrix.shard == 'timing' && 'timing' || strategy.job-index }}
           path: target/nextest/ci/junit.xml
           retention-days: 7
           if-no-files-found: ignore
