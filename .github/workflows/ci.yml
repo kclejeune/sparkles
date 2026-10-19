@@ -212,12 +212,18 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # The server's build script writes a placeholder ui/build, which debug builds read
-      # from disk at run time, so the shards get it next to the archive.
+      # The 188 test binaries share most of their code, which zstd finds with a long
+      # window: the archive shrinks from 2.2 GB to about 1.4 GB, which the five test jobs
+      # download. nextest reads windows up to 128 MB (--long=27). The server's build script
+      # writes a placeholder ui/build, which debug builds read from disk at run time, so the
+      # shards get it next to the archive.
       - name: Build the test archive
         run: |
           mkdir -p "$RUNNER_TEMP/archive"
-          cargo nextest archive --locked --workspace --archive-file "$RUNNER_TEMP/archive/tests.tar.zst"
+          cargo nextest archive --locked --workspace --zstd-level -7 --archive-file "$RUNNER_TEMP/raw.tar.zst"
+          zstd -q -d -c "$RUNNER_TEMP/raw.tar.zst" | zstd -q -6 -T0 --long=27 -o "$RUNNER_TEMP/archive/tests.tar.zst"
+          rm "$RUNNER_TEMP/raw.tar.zst"
+          ls -l "$RUNNER_TEMP/archive/tests.tar.zst"
           tar -cf "$RUNNER_TEMP/archive/ui-build.tar" ui/build
       - uses: actions/upload-artifact@v4
         with:

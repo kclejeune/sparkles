@@ -468,7 +468,8 @@ Measured on the pull request that introduced this layout, a push with warm cache
 about 13 minutes for `ci.yml` and a cold one about 25. The single job it replaced took
 about 27 minutes warm and 40 cold, of which the test run alone took 14 to 21. The test
 build takes 7 minutes warm and 15 cold, and each test job about 5 to 6 minutes, of which
-downloading the 2.2 GB archive takes one to one and a half.
+downloading the test archive takes one to two. Compressing with a long zstd window shrinks the
+archive from 2.2 GB to about 1.4 GB, because the test binaries share most of their code.
 
 ## Releases
 
