@@ -393,14 +393,24 @@ that work by priority and links each item to its design spec.
   data, and protections hide triples, not the IRIs that visible triples mention. Backups
   cover individual datasets. There is no whole-server backup, and encryption keys for
   backup repositories cannot be managed through the API, Vault or a cloud KMS. [Roadmap](ROADMAP.md) items 61, 65, 71, 75, 76.
-* **Ask evaluation.** The initial hosted demo pilot ran 17 of the 68 demo questions on
-  four pipelines, so it planned 68 executions. It stopped on the first request and
-  scored no cases, and its unresolved $1.002560 is carried into the next run's cost
-  ledger. The harness now scores a failed Ask as a failure, computes the cascade row
-  offline and caps spend with a local ledger. No paid run has finished, so the repository
-  has no accuracy numbers for any model. The QALD-9-plus conversion exists, but its gold
-  has not been recomputed on DBpedia. Text2SPARQL'25, LC-QuAD 2.0 and independent-role
-  evaluation remain. [Roadmap](ROADMAP.md) item 6.
+* **Ask evaluation.** The first paid run covers only the demo set and CK25. Its
+  whole-row policy scored Haiku 5.5, Sonnet 5.5 and Opus 5.5 at 47, 14 and 13 of 59
+  demo questions and 10, 4 and 5 of 49 CK25 questions. The projected-column policy,
+  which was chosen after those results were seen, scores the same saved answers at 52,
+  48 and 56 of 59 and 20, 26 and 27 of 49. Of those correct answers 5, 34 and 43 on the
+  demo set and 10, 22 and 22 on CK25 match only once their extra columns are set aside,
+  so the projected policy favors answers that name each result beside its IRI. With 59
+  and 49 questions, a difference of a few questions between models is within noise.
+  [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
+  records both. The evaluation cannot answer the pipeline's clarification questions,
+  which cost CK25 seven questions for every model. The initial hosted demo pilot's $1.002560
+  stays in the cost ledger until it is reconciled with the billed amount. The harness converts
+  QALD-9-plus, Text2SPARQL'25 and LC-QuAD 2.0, with gold recomputed on DBpedia
+  2022.12.01 and on CK25. Asking on the DBpedia database fails most questions on the
+  2 GiB query memory budget of `sparkles ask`, likely because `check_query` builds a
+  schema report of the whole dataset in every process, which [Roadmap](ROADMAP.md) item
+  89 addresses. LC-QuAD 2.0 needs a Wikidata load from the full dump, and
+  independent-role evaluation remains. [Roadmap](ROADMAP.md) item 6.
 * **Assistant configuration.** Dataset assistant settings, including `enabled`,
   `ingest` and `send: "documents"`, can be declared for every dataset or by name in the
   settings file of `serve --settings`, which can also lock them, and changed through

@@ -11,25 +11,26 @@ in the set. C18 section 11.1 describes why the gold answers are recomputed.
 import argparse
 import json
 import pathlib
-import re
 import sys
 import tempfile
-import time
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
+from convert import (
+    category,
+    compare,
+    database_record,
+    normalize_dbpedia,
+    summarize,
+)
+from convert import gold_result as run_gold
 from evaluator import (
-    QUERY_GRACE_SECONDS,
+    QUERY_GRACE_SECONDS,  # noqa: F401 -- the tests read it here
     Invalid,
-    OfflinePolicy,
-    Unsupported,
     answer_set,
     bounded_file,
-    capture_child,
     digest,
-    offline_query,
-    parse_child,
     strict_json,
 )
 
@@ -49,25 +50,6 @@ def fetch(target):
     pathlib.Path(target).write_bytes(data)
 
 
-def category(query):
-    """A coarse label from the shape of the gold query."""
-    text = re.sub(r"\s+", " ", query).upper()
-    body = re.sub(r"PREFIX [^ ]+ <[^>]*> ?", "", text)
-    if body.lstrip().startswith("ASK"):
-        return "ask"
-    if re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(|GROUP BY|HAVING", body):
-        return "aggregate"
-    if re.search(r"NOT EXISTS|MINUS|FILTER\s*\(\s*!", body):
-        return "negation"
-    if "ORDER BY" in body:
-        return "ordering"
-    if "UNION" in body:
-        return "union"
-    if "FILTER" in body:
-        return "filter"
-    return "join" if body.count(" . ") + body.count(" ; ") >= 1 else "lookup"
-
-
 def english(entry):
     for q in entry.get("question", []):
         if q.get("language") == "en" and isinstance(q.get("string"), str):
@@ -76,38 +58,20 @@ def english(entry):
 
 
 def gold_result(args, query, directory):
-    """Run one gold query. Return an answer set or a reason for dropping it."""
+    """Run one gold query on the database. Return an answer set or a drop reason."""
+    return run_gold(args.sparkles, ["--loc", args.loc], query, directory, args.timeout)
+
+
+def published_answer(entry):
+    """The answer QALD-9-plus publishes for a question, or None when it has none
+    that the evaluator can read."""
+    answers = entry.get("answers")
+    if not isinstance(answers, list) or len(answers) != 1:
+        return None
     try:
-        offline_query(query)
-    except OfflinePolicy:
-        return None, "unsupported"
-    record = capture_child(
-        [
-            args.sparkles,
-            "query",
-            "--loc",
-            args.loc,
-            "--results",
-            "json",
-            "--timeout",
-            str(args.timeout),
-            "--outbound-block-private",
-            "--outbound-allow",
-            "no-remote-eval.invalid",
-            query,
-        ],
-        directory,
-        time.monotonic() + args.timeout + QUERY_GRACE_SECONDS,
-    )
-    try:
-        result = answer_set(parse_child(record, directory))
-    except Unsupported:
-        return None, "unsupported"
+        return answer_set(answers[0])
     except Invalid:
-        return None, "failed"
-    if type(result) is not bool and not result.rows:
-        return None, "empty"
-    return result, None
+        return None
 
 
 def convert(args, source):
@@ -116,6 +80,7 @@ def convert(args, source):
         [],
         {"empty": [], "failed": [], "unsupported": [], "noEnglish": []},
     )
+    comparisons, normalized = {}, {}
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="qald9plus-"))
     recompute = bool(args.loc)
     for n, entry in enumerate(data["questions"]):
@@ -124,11 +89,16 @@ def convert(args, source):
         if not text or not isinstance(query, str) or not query.strip():
             dropped["noEnglish"].append(ident)
             continue
+        source_query = query
+        query, changes = normalize_dbpedia(query)
+        if changes:
+            normalized[ident] = changes
         if recompute:
-            _, reason = gold_result(args, query, scratch / f"{n:04d}")
+            result, reason = gold_result(args, query, scratch / f"{n:04d}")
             if reason:
                 dropped[reason].append(ident)
                 continue
+            comparisons[ident] = compare(published_answer(entry), result)
         questions.append(
             {
                 "id": ident,
@@ -136,6 +106,11 @@ def convert(args, source):
                 "category": category(query),
                 "question": text,
                 "gold": query,
+                **(
+                    {"sourceGold": source_query, "goldNormalized": changes}
+                    if changes
+                    else {}
+                ),
             }
         )
     out = {
@@ -162,8 +137,17 @@ def convert(args, source):
         "goldTimeoutSecs": args.timeout if recompute else None,
         "dbpediaRelease": args.release if recompute else None,
         "goldBinarySha256": digest(args.sparkles) if recompute else None,
+        "goldDatabase": (
+            database_record(getattr(args, "manifest", None)) if recompute else None
+        ),
         "sourceQuestions": len(data["questions"]),
         "dropped": {k: {"count": len(v), "ids": v} for k, v in dropped.items()},
+        # Gold queries written for Virtuoso that were made standard SPARQL.
+        "goldNormalized": {"count": len(normalized), "byId": normalized},
+        # The recomputed answers against the ones QALD-9-plus publishes, by value.
+        "publishedComparison": (
+            dict(summarize(comparisons), byId=comparisons) if recompute else None
+        ),
         "prefixes": {},
         "questions": questions,
     }
@@ -178,6 +162,9 @@ def main():
     ap.add_argument("--sparkles", help="absolute path of the binary, with --loc")
     ap.add_argument("--release", default="2022.12.01")
     ap.add_argument("--timeout", type=float, default=60)
+    ap.add_argument(
+        "--manifest", help="a JSON file that records how the database was loaded"
+    )
     args = ap.parse_args()
     if bool(args.loc) != bool(args.sparkles):
         raise Invalid("--loc and --sparkles go together")
@@ -197,8 +184,11 @@ def main():
         json.dump(result, f, indent=1)
         f.write("\n")
     dropped = {k: v["count"] for k, v in result["dropped"].items()}
+    compared = (result["publishedComparison"] or {}).get("counts")
     print(
-        f"kept {len(result['questions'])} of {result['sourceQuestions']}, dropped {dropped}"
+        f"kept {len(result['questions'])} of {result['sourceQuestions']}, "
+        f"dropped {dropped}, normalized {result['goldNormalized']['count']}, "
+        f"against the published answers {compared}"
     )
     return 0
 
