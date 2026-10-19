@@ -171,6 +171,25 @@ fn statistics_distinct_counts_stay_exact_after_updates() {
 }
 
 #[test]
+fn a_correction_beyond_the_work_limit_scans() {
+    let s = synthetic(300);
+    crate::sparql::update::update(
+        &s,
+        "PREFIX ex: <http://ex.org/> INSERT DATA { ex:n1 a ex:New ; ex:fresh 1 }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let snap = s.snapshot();
+    super::statistics::NO_CORRECTION.set(true);
+    let r = discover(&snap, &stats_opts(GraphSelection::Default));
+    super::statistics::NO_CORRECTION.set(false);
+    let r = r.unwrap();
+    assert_eq!(r.basis, Basis::Exact);
+    assert_eq!(find_pred(&r, &ex("fresh")).unwrap().observed.triples, 1);
+    assert!(r.predicates.iter().all(|p| p.observed.max_per_subject > 0));
+}
+
+#[test]
 fn statistics_keep_a_class_deleted_from_one_of_two_graphs() {
     let s = synthetic(200);
     load(
@@ -239,8 +258,7 @@ fn statistics_apply_to_a_graph_selection() {
         let exact = discover(snap, &SchemaOptions::default()).unwrap();
         assert_same_distincts(&stats, &exact);
         assert!(find_pred(&stats, &ex("inGraph")).is_none());
-        // the named graph alone: taking out the rest costs more than reading it, so it
-        // is read, unless the work limit is lifted
+        // the named graph alone
         let named = GraphSelection::Named(oxrdf::NamedNode::new(ex("g")).unwrap());
         let exact = discover(
             snap,
@@ -250,12 +268,8 @@ fn statistics_apply_to_a_graph_selection() {
             },
         )
         .unwrap();
-        let r = discover(snap, &stats_opts(named.clone())).unwrap();
-        assert_eq!(r.basis, Basis::Exact);
-        crate::sparql::stats::UNLIMITED.set(true);
-        let stats = discover(snap, &stats_opts(named));
-        crate::sparql::stats::UNLIMITED.set(false);
-        assert_same_distincts(&stats.unwrap(), &exact);
+        let stats = discover(snap, &stats_opts(named)).unwrap();
+        assert_same_distincts(&stats, &exact);
     };
     // the named graph in the delta, then in the base
     check(&s.snapshot());

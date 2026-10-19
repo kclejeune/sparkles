@@ -37,6 +37,17 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 /// store is one.
 pub(super) const UNREAD_MAX: u64 = 1_000_000;
 
+/// Rows of a scan that a correction of the statistics may always cost, whatever the
+/// store's size: about 130,000 index probes.
+const CORRECTION_FLOOR: u64 = 1 << 22;
+
+#[cfg(test)]
+thread_local! {
+    /// Leaves no room for correcting the statistics in tests, so that a report with
+    /// anything to correct falls back to a scan.
+    pub(super) static NO_CORRECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Whether a report of `opts` over `snap` is measured from the statistics.
 pub(super) fn applies(snap: &Snapshot, opts: &SchemaOptions, sel: &Selected) -> bool {
     let Some(above) = opts.statistics_above else {
@@ -130,8 +141,11 @@ pub(super) fn observed(
     let graphs = graphs_of(snap, f);
     let rdf_type = snap.lookup_iri(RDF_TYPE).map(|i| i.0);
     let check = || budget.check();
-    // the work a full report does: two passes over the quads
-    let work = snap.len().saturating_mul(2);
+    // the work a full report does, two passes over the quads, and at least what takes a
+    // few milliseconds
+    let work = snap.len().saturating_mul(2).max(CORRECTION_FLOOR);
+    #[cfg(test)]
+    let work = if NO_CORRECTION.get() { 0 } else { work };
     let count = |perm: Perm, prefix: Vec<u64>, measure: Measure| {
         let key = CountKey {
             perm,
