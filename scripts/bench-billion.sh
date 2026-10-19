@@ -44,11 +44,10 @@
 # default 4096), LOAD_TIMEOUT (a time limit for each load, in the form `timeout` takes),
 # SPARKLES (the binary, default target/release/sparkles).
 #
-# Tools come from nixpkgs when not on PATH (qlever, apache-jena, apache-jena-fuseki,
-# oxigraph, lbzip2, zstd, GNU time). Fluree (BUSL-1.1, not in nixpkgs) is the
-# checksum-verified release binary that scripts/bench.sh uses, downloaded to WORKDIR
-# unless FLUREE points at one (FLUREE_VERSION, default 4.2.2). The data is DBpedia's, under CC BY-SA 3.0 and GFDL
-# (https://www.dbpedia.org/about/); see docs/BENCHMARKS.md for the attribution.
+# Comparison engines come from this flake's pinned packages. QINDEX, QSERVER, XLOADER,
+# FUSEKI, OXIGRAPH and FLUREE override the executables. Auxiliary tools prefer PATH,
+# then the locked nixpkgs. See docs/BENCHMARKING.md. The data is DBpedia's, under
+# CC BY-SA 3.0 and GFDL (https://www.dbpedia.org/about/); see docs/BENCHMARKS.md.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -80,40 +79,13 @@ die() {
   log "error: $*"
   exit 1
 }
-nixbin() { # nixbin <pkg> <bin>
-  if command -v "$2" > /dev/null; then command -v "$2"; else echo "$(nix build "nixpkgs#$1" --no-link --print-out-paths | tail -1)/bin/$2"; fi
-}
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 selected() { [ -z "${QUERIES:-}" ] || [[ " $QUERIES " == *" $1 "* ]]; }
 ZSTD=$(nixbin zstd zstd)
-# Fluree's release binary, downloaded and checked as scripts/bench-lib.sh does
-fluree_bin() {
-  local ft fdir furl want got f
-  case "$(uname -sm)" in
-    "Linux x86_64") ft=x86_64-unknown-linux-gnu ;;
-    "Linux aarch64") ft=aarch64-unknown-linux-gnu ;;
-    "Darwin arm64") ft=aarch64-apple-darwin ;;
-    "Darwin x86_64") ft=x86_64-apple-darwin ;;
-    *) die "no Fluree release binary for $(uname -sm); set FLUREE" ;;
-  esac
-  fdir=$WORK/fluree-${FLUREE_VERSION:-4.2.2}
-  f=$fdir/fluree-db-cli-$ft/fluree
-  if [ ! -x "$f" ]; then
-    mkdir -p "$fdir"
-    furl="https://github.com/fluree/db/releases/download/v${FLUREE_VERSION:-4.2.2}/fluree-db-cli-$ft.tar.xz"
-    curl -sfL "$furl" -o "$fdir/fluree.tar.xz"
-    want=$(curl -sfL "$furl.sha256" | cut -d' ' -f1)
-    got=$(sha256sum "$fdir/fluree.tar.xz" 2> /dev/null || shasum -a 256 "$fdir/fluree.tar.xz")
-    got=${got%% *}
-    [ "$want" = "$got" ] || die "Fluree checksum mismatch ($got != $want)"
-    tar xJf "$fdir/fluree.tar.xz" -C "$fdir"
-  fi
-  echo "$f"
-}
-if has fluree && [ -z "${FLUREE:-}" ]; then FLUREE=$(fluree_bin); fi
-# GNU time (not the shell keyword) for the peak RSS of loads
-GTIME=/usr/bin/time
-[ -x "$GTIME" ] || GTIME=$(nix build nixpkgs#time --no-link --print-out-paths | tail -1)/bin/time
+if has fluree; then FLUREE=${FLUREE:-$(fluree_bin)}; fi
+GTIME=$(gnu_time)
 
 # the manifest: local path, URL, size in bytes, sha256 (largest first)
 mapfile -t ENTRIES < <(grep -v '^#' "$MANIFEST" | sort -t$'\t' -k3,3nr)
@@ -299,7 +271,7 @@ step_load() {
   fi
   if has qlever; then
     local qindex
-    qindex=$(nixbin qlever qlever-index)
+    qindex=${QINDEX:-$(nixbin qlever qlever-index)}
     # QLever reads the concatenated files from stdin, parsed in parallel
     # shellcheck disable=SC2016 # expanded by the inner shell
     timed qlever "$S/qlever-index" bash -c '
@@ -311,7 +283,7 @@ step_load() {
   if has jena; then
     # xloader reads its input twice and takes gzip, not zstd: a gzip copy of the data
     local xloader g gz=()
-    xloader=$(nixbin apache-jena tdb2.xloader)
+    xloader=${XLOADER:-$(nixbin apache-jena tdb2.xloader)}
     mkdir -p "$S/jena-input"
     for f in "${FILES[@]}"; do
       g=$S/jena-input/$(basename "${f%.zst}").gz
@@ -323,7 +295,7 @@ step_load() {
   fi
   if has oxigraph; then
     local oxigraph
-    oxigraph=$(nixbin oxigraph oxigraph)
+    oxigraph=${OXIGRAPH:-$(nixbin oxigraph oxigraph)}
     # the bulk loader from stdin, then the compaction Oxigraph recommends before reads
     # shellcheck disable=SC2016 # expanded by the inner shell
     timed oxigraph "$S/oxigraph.db" bash -c '
@@ -374,19 +346,19 @@ start() { # start <engine>
       READY[$e]="localhost:$p/\$/ping"
       ;;
     qlever)
-      (cd "$S/qlever-index" && exec "$(nixbin qlever qlever-server)" -i dbpedia -p "$p" -m "${QUERY_MEM_GB}G" \
+      (cd "$S/qlever-index" && exec "$QSERVER" -i dbpedia -p "$p" -m "${QUERY_MEM_GB}G" \
         -c 2G -e 0B -s "${TIMEOUT}s" -a bench -j 16 > "$S/logs/server-qlever.log" 2>&1) &
       URL[$e]=localhost:$p/
       READY[$e]="localhost:$p/?cmd=stats"
       ;;
     jena)
-      JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "$(nixbin apache-jena-fuseki fuseki-server)" --port "$p" \
+      JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "$FUSEKI" --port "$p" \
         --loc "$S/jena.db" /dbpedia > "$S/logs/server-jena.log" 2>&1 &
       URL[$e]=localhost:$p/dbpedia/sparql
       READY[$e]="localhost:$p/\$/ping"
       ;;
     oxigraph)
-      "$(nixbin oxigraph oxigraph)" serve-read-only --location "$S/oxigraph.db" --bind "127.0.0.1:$p" \
+      "$OXIGRAPH" serve-read-only --location "$S/oxigraph.db" --bind "127.0.0.1:$p" \
         --timeout-s "$TIMEOUT" > "$S/logs/server-oxigraph.log" 2>&1 &
       URL[$e]=localhost:$p/query
       READY[$e]="localhost:$p/query?query=ASK%7B%7D"
@@ -471,6 +443,7 @@ json.dump(d, open(f, "w"), indent=1)
 EOF
 }
 step_queries() {
+  resolve_tools
   local e n r
   for e in $ENGINES; do
     [ -f "$S/${NAME[$e]/jena-fuseki/jena-tdb2}.loaded" ] || die "$e: no index at scale $SCALE (run the load step)"
