@@ -47,7 +47,7 @@
 # LIVE_MAX, WRITE_RATE, SEED, READ_QUERIES (names; default every query of the set),
 # QUERY_SET (synthetic or dbpedia; default synthetic for a person count, dbpedia otherwise),
 # SAMPLE (seconds between samples, default 5), SKIP_LOAD=1, IGNORE_ANSWERS=1, PORT_BASE
-# (default 48400), SPARKLES, SPARKLES_ARGS, SERVER_MEM_MAX, FLUREE and FLUREE_VERSION as in
+# (default 28400), SPARKLES, SPARKLES_ARGS, SERVER_MEM_MAX, FLUREE and FLUREE_VERSION as in
 # scripts/bench.sh. CLIENT_CPUS pins the load generator (default the last quarter of the
 # CPUs on a host with 4 or more, none otherwise; "none" turns it off). The servers are not
 # pinned, so the pinning only keeps the generator's own processes together.
@@ -58,7 +58,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${2:-$ROOT/target/bench-longwrite}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
-PORT_BASE=${PORT_BASE:-48400}
+PORT_BASE=${PORT_BASE:-28400}
 SECONDS_RUN=${SECONDS_RUN:-3600}
 MAX_TIME=${MAX_TIME:-120}
 export MAX_TIME

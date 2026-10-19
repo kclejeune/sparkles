@@ -163,12 +163,7 @@ EOF
     [ -n "${SKIP_QUERIES:-}" ] && timed_all "$RES/$n.json" && continue
     echo
     echo "== $n"
-    # shellcheck disable=SC2329 # called by engine_args
-    qcmd() { q "${URL[$1]}" "$n"; }
-    mapfile -d '' ARGS < <(engine_args qcmd)
-    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
-      "${ARGS[@]}" --export-json "$RES/$n.new.json"
-    merge "$RES/$n.new.json" "$RES/$n.json"
+    time_query "$n" "$RES" "$clear"
   done
 
   # ------------------------------------------------------------------------ update latency

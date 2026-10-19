@@ -2,7 +2,7 @@
 """Write the query instances that the BSBM test driver would send, one file each.
 
     instantiate.py --tools DIR --usecase explore|bi --data td_data --out queries --instances 3 \
-                   --java java [--runs 20] [--port 48390]
+                   --java java [--runs 20] [--port 0]
 
 The BSBM driver draws the parameters of its query templates from the files the data
 generator leaves in its data directory, with a fixed seed. This script runs the driver once
@@ -34,7 +34,9 @@ p.add_argument("--out", required=True)
 p.add_argument("--instances", type=int, default=3)
 p.add_argument("--runs", type=int, default=20)
 p.add_argument("--java", default="java")
-p.add_argument("--port", type=int, default=48390)
+# 0 lets the kernel pick a free port, so the stub cannot meet a port that a server, or a
+# client connection in TIME-WAIT, still holds
+p.add_argument("--port", type=int, default=0)
 a = p.parse_args()
 
 USECASE_FILE = {"explore": "usecases/explore/sparql.txt", "bi": "usecases/businessIntelligence/sparql.txt"}[a.usecase]
@@ -91,10 +93,11 @@ class Stub(http.server.BaseHTTPRequestHandler):
 
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", a.port), Stub)
+port = server.server_address[1]
 threading.Thread(target=server.serve_forever, daemon=True).start()
 cp = ".:" + os.path.join(a.tools, "lib", "*")
 r = subprocess.run([a.java, "-Xmx512m", "-cp", cp, "benchmark.testdriver.TestDriver", "-runs", str(a.runs), "-w", "0",
-                    "-idir", a.data, "-ucf", USECASE_FILE, "-o", os.devnull, f"http://127.0.0.1:{a.port}/sparql"],
+                    "-idir", a.data, "-ucf", USECASE_FILE, "-o", os.devnull, f"http://127.0.0.1:{port}/sparql"],
                    cwd=a.tools, capture_output=True, text=True)
 server.shutdown()
 if r.returncode != 0 or not captured:
