@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -34,16 +35,27 @@ if sys.argv[1] == 'eval':
     print('4.2.2', end='')
     sys.exit(0)
 link = pathlib.Path(sys.argv[sys.argv.index('--out-link') + 1])
-store = pathlib.Path(os.environ['STORE_ROOT']) / link.name
-(store / 'bin').mkdir(parents=True, exist_ok=True)
-if not link.exists():
-    link.symlink_to(store)
-if not os.environ.get('MISSING_BIN'):
-    for binary in ['qlever-index', 'qlever-server', 'tdb2.tdbloader', 'fuseki-server', 'oxigraph', 'fluree', 'aux']:
-        p = store / 'bin' / binary
-        p.write_text('#!/bin/sh\\nexit 0\\n')
-        p.chmod(0o755)
-print(store)
+# Like zstd, a multi-output package installs its bin and man outputs. Nix roots each one as
+# <link>-<output> and prints one path per output, here with the man output first.
+outputs = ['man', 'bin'] if os.environ.get('MULTI_OUTPUT') else ['']
+for output in outputs:
+    suffix = '-' + output if output else ''
+    store = pathlib.Path(os.environ['STORE_ROOT']) / (link.name + suffix)
+    store.mkdir(parents=True, exist_ok=True)
+    out_link = link.with_name(link.name + suffix)
+    if not out_link.is_symlink():
+        out_link.symlink_to(store)
+    if output == 'man':
+        (store / 'share' / 'man').mkdir(parents=True, exist_ok=True)
+    else:
+        (store / 'bin').mkdir(exist_ok=True)
+        if not os.environ.get('MISSING_BIN'):
+            for binary in ['qlever-index', 'qlever-server', 'tdb2.tdbloader', 'fuseki-server', 'oxigraph',
+                           'fluree', 'aux', 'time']:
+                p = store / 'bin' / binary
+                p.write_text('#!/bin/sh\\nexit 0\\n')
+                p.chmod(0o755)
+    print(store)
 """)
         nix.chmod(0o755)
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
@@ -83,6 +95,34 @@ print(store)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("nixpkgs#auxiliary", self.nix_calls()[-1])
         self.assertIn("--inputs-from", self.nix_calls()[-1])
+
+    def test_multi_output_package_selects_the_output_with_the_binary(self):
+        # The executable output is not assumed to come first, and every output keeps its root.
+        for package, binary in [("auxiliary", "aux"), ("qlever", "qlever-server")]:
+            with self.subTest(package=package):
+                p = self.shell(f"nixbin {package} {binary}", MULTI_OUTPUT="1")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(p.stdout, f"{self.store / (package + '-bin') / 'bin' / binary}\n")
+                for output in ("bin", "man"):
+                    self.assertEqual((self.work / "gcroots" / f"{package}-{output}").resolve(),
+                                     self.store / f"{package}-{output}")
+
+    def test_multi_output_package_without_the_binary_is_an_error(self):
+        p = self.shell("nixbin auxiliary aux", MULTI_OUTPUT="1", MISSING_BIN="1")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("auxiliary does not provide bin/aux", p.stderr)
+
+    def test_gnu_time_falls_back_to_a_multi_output_package(self):
+        if shutil.which("gtime", path=self.env["PATH"]):
+            self.skipTest("gtime on PATH takes precedence over the fallback")
+        p = self.shell("gnu_time /nonexistent/time", MULTI_OUTPUT="1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, f"{self.store / 'time-bin' / 'bin' / 'time'}\n")
+        self.assertIn("nixpkgs#time", self.nix_calls()[-1])
+        p = self.shell('t=$(gnu_time /nonexistent/time); echo "timed with $t"', FAIL_NIX="1")
+        self.assertEqual(p.returncode, 42)
+        self.assertEqual(p.stdout, "")
 
     def test_engine_paths_are_safe_in_serialized_commands(self):
         # The runners embed executables in shell command strings passed to hyperfine.

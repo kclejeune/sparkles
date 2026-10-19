@@ -16,7 +16,7 @@ WORK=$ROOT/target/rdfs-jena
 # shellcheck source=scripts/bench-tools.sh
 source "$ROOT/scripts/bench-tools.sh"
 jena=${JENA_HOME:-$(nixpkg apache-jena)}
-java=${JAVA:-$(nixpkg jdk)/bin/java}
+java=${JAVA:-$(nixexe jdk java)}
 cd "$ROOT/crates/sparkles-core/tests/rdfs"
 
 suites=()

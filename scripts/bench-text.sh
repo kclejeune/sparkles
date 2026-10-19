@@ -19,8 +19,10 @@
 # Scores and their order are not compared, because the engines rank differently.
 # Results go to WORKDIR/results/text-*.json and WORKDIR/results/text-summary.md.
 #
-# Fuseki 5.1.0 (whose fuseki-server.jar bundles jena-text and Lucene), Jena's
-# tdb2.tdbloader and QLever come from nixpkgs when not on PATH.
+# Fuseki 5.1.0, whose fuseki-server.jar bundles jena-text and Lucene, Jena's tdb2.tdbloader
+# and QLever come from this flake's pinned packages, even when other versions are on PATH.
+# Explicit executables in TDBLOADER, FUSEKI, QINDEX and QSERVER override them. The text
+# indexer runs with the Java that the Fuseki wrapper uses, and JAVA overrides that Java.
 # Env: WARMUP (default 2), RUNS (default 10), ENGINES="sparkles jena qlever" (default),
 # QUERIES="name …" to limit the queries, SKIP_LOAD=1 to reuse the stores and text indexes
 # of an earlier run, ANSWERS_ONLY=1 to check answers and rebuild the summary without
