@@ -177,6 +177,11 @@ pub struct PredicateObjects {
 /// Windows of the sample, spread evenly over the rows of the vocabulary literals.
 const WINDOWS: u64 = 16;
 
+/// The most vocabulary literals a sample reads. Each is a lookup in the vocabulary, so
+/// the sample stays small: 8,192 rows put a group of 1% of the literals within about a
+/// fifth of its share.
+const SAMPLE_ROWS: u64 = 8192;
+
 /// The objects of predicate `iri` in the selection of `opts`, or `None` when the
 /// predicate does not occur. A predicate with at most `max_rows` quads, or a selection
 /// that does not hold every quad of the store, is read in full.
@@ -235,6 +240,9 @@ fn sampled(
     budget: &Budget,
     max_rows: u64,
 ) -> crate::Result<PredicateObjects> {
+    // the windows are read once: they do not replace the blocks that queries use
+    let reading = snap.without_cache_fill();
+    let snap = &reading;
     let vocab = &snap.generation.vocab;
     let tag_range = |t: Tag| (Id::new(t, 0), Id::new(t, PAYLOAD_MASK));
     let count = |(lo, hi): (Id, Id)| -> crate::Result<u64> {
@@ -320,7 +328,8 @@ fn sampled(
     // the vocabulary's literals: a sample of windows spread over their rows
     let mut sample = 0u64;
     if literals > 0 {
-        let by = literal_sample(snap, p, literal_range, budget, max_rows, &mut sample)?;
+        let rows = max_rows.min(SAMPLE_ROWS);
+        let by = literal_sample(snap, p, literal_range, budget, rows, &mut sample)?;
         let mut left = literals;
         let n_groups = by.len();
         for (i, (suffix, n)) in by.into_iter().enumerate() {
