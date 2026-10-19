@@ -1575,44 +1575,53 @@ impl Tools<'_> {
                 .as_ref()
                 .and_then(|rep| super::check::predicate(rep, p))
         };
-        let pred_of = |p: &str| -> ProfilePredicate {
-            match report_pred(p) {
-                Some(e) => {
-                    let o = &e.observed.objects;
-                    let iris = o.iri.as_ref().is_some_and(|k| k.triples > 0);
-                    let lits = !o.literals.is_empty();
-                    let object = match (iris, lits) {
-                        (true, false) => "iri",
-                        (false, true) => "literal",
-                        _ => "any",
-                    };
-                    let mut languages = Vec::new();
-                    for g in &o.literals {
-                        for l in g.languages.iter().flatten() {
-                            if !languages.contains(&l.lang) {
-                                languages.push(l.lang.clone());
+        // a report from the index statistics has no objects: they are measured for the
+        // predicates the spec names, and the others take any object
+        let exact = report.as_ref().is_none_or(|rep| rep.basis.is_exact());
+        let empty = sparkles::schema::ObjectKinds::default();
+        let pred_of =
+            |p: &str, measured: Option<&sparkles::schema::ObjectKinds>| -> ProfilePredicate {
+                match report_pred(p) {
+                    Some(e) => {
+                        let o = match measured {
+                            Some(m) => m,
+                            None if exact => &e.observed.objects,
+                            None => &empty,
+                        };
+                        let iris = o.iri.as_ref().is_some_and(|k| k.triples > 0);
+                        let lits = !o.literals.is_empty();
+                        let object = match (iris, lits) {
+                            (true, false) => "iri",
+                            (false, true) => "literal",
+                            _ => "any",
+                        };
+                        let mut languages = Vec::new();
+                        for g in &o.literals {
+                            for l in g.languages.iter().flatten() {
+                                if !languages.contains(&l.lang) {
+                                    languages.push(l.lang.clone());
+                                }
                             }
                         }
+                        ProfilePredicate {
+                            iri: p.to_string(),
+                            label: label(&e.declared.labels),
+                            object,
+                            datatypes: o.literals.iter().map(|g| g.datatype.clone()).collect(),
+                            languages,
+                            ranges: e.declared.ranges.clone(),
+                        }
                     }
-                    ProfilePredicate {
+                    None => ProfilePredicate {
                         iri: p.to_string(),
-                        label: label(&e.declared.labels),
-                        object,
-                        datatypes: o.literals.iter().map(|g| g.datatype.clone()).collect(),
-                        languages,
-                        ranges: e.declared.ranges.clone(),
-                    }
+                        label: None,
+                        object: "any",
+                        datatypes: Vec::new(),
+                        languages: Vec::new(),
+                        ranges: Vec::new(),
+                    },
                 }
-                None => ProfilePredicate {
-                    iri: p.to_string(),
-                    label: None,
-                    object: "any",
-                    datatypes: Vec::new(),
-                    languages: Vec::new(),
-                    ranges: Vec::new(),
-                },
-            }
-        };
+            };
         match spec.and_then(|s| s.classes.as_ref()) {
             Some(list) => {
                 for c in list {
@@ -1641,7 +1650,19 @@ impl Tools<'_> {
             }
         }
         match spec.and_then(|s| s.predicates.as_ref()) {
-            Some(list) => predicates.extend(list.iter().map(|p| pred_of(p))),
+            Some(list) => {
+                for p in list {
+                    let measured = match (report.as_deref(), report_pred(p)) {
+                        (Some(rep), Some(e)) if !exact => Some(
+                            self.entry_objects(ds, &r.snap, rep, e, r.deadline, ctx)?
+                                .0
+                                .into_owned(),
+                        ),
+                        _ => None,
+                    };
+                    predicates.push(pred_of(p, measured.as_ref()));
+                }
+            }
             None => {
                 for e in report.iter().flat_map(|rep| rep.predicates.iter()) {
                     if bookkeeping(&e.iri)
@@ -1650,7 +1671,7 @@ impl Tools<'_> {
                     {
                         continue;
                     }
-                    predicates.push(pred_of(&e.iri));
+                    predicates.push(pred_of(&e.iri, None));
                 }
             }
         }
@@ -1675,7 +1696,7 @@ impl Tools<'_> {
                             });
                         }
                     } else if !predicates.iter().any(|p| p.iri == x.as_str()) {
-                        predicates.push(pred_of(x.as_str()));
+                        predicates.push(pred_of(x.as_str(), None));
                     }
                 }
             }

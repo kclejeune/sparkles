@@ -923,7 +923,7 @@ impl Asking<'_, '_> {
                     "result": { "query": d.query, "explanation": d.explanation, "issues": check["issues"], "attempt": attempt },
                 });
             }
-            if has_service(&d.query) {
+            if has_service(parsed.as_ref()) {
                 self.notes
                     .push("the query calls SERVICE, so it was not run automatically".into());
                 self.attempts.push(record);
@@ -1059,10 +1059,11 @@ impl Asking<'_, '_> {
                 "result": { "query": query, "issues": check["issues"], "attempt": 0 },
             });
         }
-        if let Some(p) = self.parse(query) {
-            self.complexity = Some(complexity::of(&p));
+        let parsed = self.parse(query);
+        if let Some(p) = &parsed {
+            self.complexity = Some(complexity::of(p));
         }
-        if has_service(query) {
+        if has_service(parsed.as_ref()) {
             self.notes
                 .push("the query calls SERVICE, so it was not run automatically".into());
             return json!({
@@ -1472,43 +1473,126 @@ fn label(v: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the query text calls `SERVICE`, outside strings and IRIs.
-fn has_service(q: &str) -> bool {
-    let mut in_str: Option<char> = None;
-    let mut in_iri = false;
-    let mut word = String::new();
-    for c in q.chars() {
-        match (in_str, in_iri) {
-            (Some(d), _) => {
-                if c == d {
-                    in_str = None;
-                }
-                continue;
-            }
-            (None, true) => {
-                if c == '>' {
-                    in_iri = false;
-                }
-                continue;
-            }
-            _ => {}
+/// Whether a query calls a remote `SERVICE`, read from its parsed algebra.
+///
+/// Every pattern is visited, including the patterns of `EXISTS` and `NOT EXISTS` in
+/// filters, binds, orderings and aggregates, and every subquery. A path search runs
+/// locally and does not count. A query that does not parse counts as calling one,
+/// because nothing about it can be known. This only decides whether `sparkles ask`
+/// runs a draft by itself. The query engine refuses SERVICE on its own unless the
+/// server allows it.
+fn has_service(q: Option<&spargebra::Query>) -> bool {
+    use spargebra::Query;
+    match q {
+        None => true,
+        Some(
+            Query::Select { pattern, .. }
+            | Query::Ask { pattern, .. }
+            | Query::Construct { pattern, .. }
+            | Query::Describe { pattern, .. },
+        ) => pattern_calls_service(pattern),
+    }
+}
+
+fn pattern_calls_service(p: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::GraphPattern as G;
+    match p {
+        G::Service { name, inner, .. } => {
+            !sparkles::sparql::pathsearch::is_search(name) || pattern_calls_service(inner)
         }
-        if c.is_ascii_alphabetic() {
-            word.push(c);
-            continue;
+        G::Bgp { .. } | G::Path { .. } | G::Values { .. } => false,
+        G::Join { left, right }
+        | G::Lateral { left, right }
+        | G::Union { left, right }
+        | G::Minus { left, right }
+        | G::SemiJoin { left, right }
+        | G::AntiJoin { left, right } => {
+            pattern_calls_service(left) || pattern_calls_service(right)
         }
-        if word.eq_ignore_ascii_case("service") {
-            return true;
+        G::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            pattern_calls_service(left)
+                || pattern_calls_service(right)
+                || expression.as_ref().is_some_and(expression_calls_service)
         }
-        word.clear();
-        match c {
-            '"' | '\'' => in_str = Some(c),
-            '<' => in_iri = true,
-            '#' => {}
-            _ => {}
+        G::Filter { expr, inner } => expression_calls_service(expr) || pattern_calls_service(inner),
+        G::Extend {
+            inner, expression, ..
+        }
+        | G::Assign {
+            inner, expression, ..
+        }
+        | G::Unfold {
+            inner, expression, ..
+        } => expression_calls_service(expression) || pattern_calls_service(inner),
+        G::OrderBy { inner, expression } => {
+            pattern_calls_service(inner) || expression.iter().any(order_calls_service)
+        }
+        G::Group {
+            inner, aggregates, ..
+        } => {
+            pattern_calls_service(inner)
+                || aggregates.iter().any(|(_, a)| aggregate_calls_service(a))
+        }
+        G::Graph { inner, .. }
+        | G::Project { inner, .. }
+        | G::Distinct { inner }
+        | G::Reduced { inner }
+        | G::Slice { inner, .. } => pattern_calls_service(inner),
+    }
+}
+
+fn order_calls_service(o: &spargebra::algebra::OrderExpression) -> bool {
+    use spargebra::algebra::OrderExpression as O;
+    match o {
+        O::Asc(e) | O::Desc(e) => expression_calls_service(e),
+    }
+}
+
+fn aggregate_calls_service(a: &spargebra::algebra::AggregateExpression) -> bool {
+    use spargebra::algebra::AggregateExpression as A;
+    match a {
+        A::CountSolutions { .. } => false,
+        A::FunctionCall { expr, .. } => expression_calls_service(expr),
+        A::Fold {
+            expr, value, order, ..
+        } => {
+            expression_calls_service(expr)
+                || value.as_ref().is_some_and(expression_calls_service)
+                || order.iter().any(order_calls_service)
         }
     }
-    word.eq_ignore_ascii_case("service")
+}
+
+fn expression_calls_service(e: &spargebra::algebra::Expression) -> bool {
+    use spargebra::algebra::Expression as E;
+    match e {
+        E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
+        E::Exists(p) => pattern_calls_service(p),
+        E::Or(a, b)
+        | E::And(a, b)
+        | E::Equal(a, b)
+        | E::SameTerm(a, b)
+        | E::Greater(a, b)
+        | E::GreaterOrEqual(a, b)
+        | E::Less(a, b)
+        | E::LessOrEqual(a, b)
+        | E::Add(a, b)
+        | E::Subtract(a, b)
+        | E::Multiply(a, b)
+        | E::Divide(a, b) => expression_calls_service(a) || expression_calls_service(b),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expression_calls_service(a),
+        E::In(a, list) => expression_calls_service(a) || list.iter().any(expression_calls_service),
+        E::If(a, b, c) => {
+            expression_calls_service(a)
+                || expression_calls_service(b)
+                || expression_calls_service(c)
+        }
+        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expression_calls_service),
+    }
 }
 
 /// The lowercase words of `s` of three letters or more, split at camel case, with a

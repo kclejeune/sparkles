@@ -392,6 +392,16 @@ impl Vocab {
     pub fn is_iri(&self, id: u64) -> bool {
         id >= self.first_iri
     }
+    /// The first base id of an RDF 1.2 triple term: the literals come before it.
+    #[inline]
+    pub fn first_triple(&self) -> u64 {
+        self.first_triple
+    }
+    /// The first base id of an IRI: the triple terms come before it.
+    #[inline]
+    pub fn first_iri(&self) -> u64 {
+        self.first_iri
+    }
     /// Is base id `id` an RDF 1.2 triple term?
     #[inline]
     pub fn is_triple(&self, id: u64) -> bool {

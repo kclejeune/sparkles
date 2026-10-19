@@ -1665,14 +1665,19 @@ impl Tools<'_> {
             else {
                 continue;
             };
-            if let Some(issue) = literal_issue(
-                &f.p,
-                l,
-                Meet::Pattern,
-                &entry.observed.objects.literals,
-                terms,
-            ) {
-                let mut pr = Problem::new(issue.code, issue.message);
+            // a report from the index statistics samples the objects: a literal that is
+            // already an object of the predicate meets it
+            if !rep.basis.is_exact() && super::check::is_object(&r.snap, &f.p, l) {
+                continue;
+            }
+            let (objects, sampled) =
+                self.entry_objects(ds, &r.snap, &rep, entry, r.deadline, ctx)?;
+            if let Some(issue) = literal_issue(&f.p, l, Meet::Pattern, &objects.literals, terms) {
+                let mut message = issue.message;
+                if let Some(n) = sampled {
+                    message.push_str(&super::check::sample_note(n));
+                }
+                let mut pr = Problem::new(issue.code, message);
                 pr.term = issue.term;
                 pr.suggestions = issue.suggestions;
                 warnings.push(pr);

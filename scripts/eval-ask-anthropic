@@ -107,13 +107,87 @@ def admission(ledger, run):
     return admit
 
 
+def ledger_command(run, args):
+    """List or reconcile the run's ledger. It reads no key and sends no request.
+
+    A ledger that does not exist yet is created with the run's cap and carryover,
+    so the pilot's carryover can be reconciled before the first paid request.
+    """
+    if args.held == bool(args.reconcile):
+        raise Invalid("give --held or --reconcile")
+    px.require_single_ledger(run["ledger"])
+    carry = run["carryover"]
+    ledger = px.Ledger(
+        run["ledger"],
+        run["localCapNanodollars"],
+        {"name": carry["name"], "cost": carry["nanodollars"]},
+    )
+    try:
+        if args.reconcile:
+            if args.billed_nanodollars is None or args.evidence is None:
+                raise Invalid("--reconcile needs --billed-nanodollars and --evidence")
+            target = args.reconcile
+            if target != "carryover":
+                if not target.isdecimal():
+                    raise Invalid("the target is 'carryover' or a request id")
+                target = int(target)
+            line = ledger.reconcile(
+                target, args.billed_nanodollars, args.evidence, args.allow_raise
+            )
+            print(
+                f"reconciled {target}: {line['previous']} -> {line['cost']} nanodollars",
+                file=sys.stderr,
+            )
+        elif args.allow_raise:
+            raise Invalid("--allow-raise goes with --reconcile")
+        report = ledger.report()
+        print(
+            json.dumps(
+                {
+                    k: report[k]
+                    for k in (
+                        "carryoverNanodollars",
+                        "settledNanodollars",
+                        "unresolvedNanodollars",
+                        "upperLiabilityNanodollars",
+                        "heldAtBound",
+                        "reconciled",
+                    )
+                },
+                indent=2,
+            )
+        )
+    finally:
+        ledger.close()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     ap.add_argument("--run", required=True)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--preflight-only", action="store_true")
+    ap.add_argument(
+        "--held",
+        action="store_true",
+        help="list the ledger's charges that stand at an upper bound, and stop",
+    )
+    ap.add_argument(
+        "--reconcile",
+        metavar="TARGET",
+        help="replace a held charge, 'carryover' or a request id, with the billed amount",
+    )
+    ap.add_argument("--billed-nanodollars", type=int)
+    ap.add_argument("--evidence", help="where the billed amount comes from")
+    ap.add_argument(
+        "--allow-raise",
+        action="store_true",
+        help="allow a billed amount above the held charge, which is otherwise refused",
+    )
     args = ap.parse_args()
     run = load_run(args.run)
+    if args.held or args.reconcile:
+        return ledger_command(run, args)
     mod = evaluator_module()
     started = time.monotonic()
     fake = None
@@ -128,9 +202,7 @@ def main():
         fake = FakeAnthropic(qsets)
         upstream, key = fake.upstream(), FAKE_KEY
     else:
-        key = os.environ.pop("ANTHROPIC_API_KEY", "")
-        if not key:
-            raise Invalid("ANTHROPIC_API_KEY is not set")
+        key = px.clean_key(os.environ.pop("ANTHROPIC_API_KEY", ""))
         upstream = px.HTTPUpstream(key)
     out = pathlib.Path(run["out"])
     if not args.dry_run:
@@ -152,6 +224,7 @@ def main():
         run["maxOutputTokens"],
         run["effort"],
         run["requestTimeoutSecs"],
+        replies=out / "replies.jsonl",
     )
     server = proxy.serve()
     thread = threading.Thread(target=server.serve_forever)

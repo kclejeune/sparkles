@@ -4,8 +4,9 @@
 #
 #   scripts/power-loss.sh logwrites --fs ext4|xfs --sparkles BIN --harness BIN --work DIR
 #       [--points 1000] [--seconds 20] [--clients 16] [--jobs 8] [--flags "..."]
+#       [--index none|text|geo|embed]
 #   scripts/power-loss.sh kill9 --fs ext4|xfs|DIR --sparkles BIN --harness BIN --work DIR
-#       [--kills 200] [--clients 16] [--flags "..."]
+#       [--kills 200] [--clients 16] [--flags "..."] [--index none|text|geo|embed]
 #
 # logwrites needs root and the device-mapper log-writes target. It puts a file system on a
 # loop device behind log-writes, loads a small store, serves it and runs the harness's
@@ -29,6 +30,12 @@
 # or stops with an error, and a store that took no receipt over its 20 kills. logwrites
 # refuses to replay a load without receipts or with failed writes.
 #
+# --index configures an index on each new store before the load (X09 section 17.8):
+# full-text search, the spatial index, or an embedding index of the writers' literals.
+# With geo the writers also insert a point per request. With embed the server runs with
+# --no-embedding, so no text leaves the machine and the work only queues. Every check then
+# also asks `crash-harness verify --index` to compare the index with the recovered data.
+#
 # --flags are global flags given to `sparkles` before `serve`, to run the crashes with
 # and without group commit. --serve-flags are options of `serve`, for example a lower
 # --auto-compact-min-quads so that a short load crosses a compaction. Results go to
@@ -38,7 +45,7 @@ set -euo pipefail
 
 MODE=${1:-}
 [ -n "$MODE" ] && shift
-FS='' BIN='' HARNESS='' WORK='' POINTS=1000 KILLS=200 SECONDS_RUN=20 CLIENTS=16 JOBS=8 FLAGS='' SERVE_FLAGS=''
+FS='' BIN='' HARNESS='' WORK='' POINTS=1000 KILLS=200 SECONDS_RUN=20 CLIENTS=16 JOBS=8 FLAGS='' SERVE_FLAGS='' INDEX=none
 PORT=${PORT:-3931}
 POS=()
 while [ $# -gt 0 ]; do
@@ -54,6 +61,7 @@ while [ $# -gt 0 ]; do
     --jobs) JOBS=$2 ;;
     --flags) FLAGS=$2 ;;
     --serve-flags) SERVE_FLAGS=$2 ;;
+    --index) INDEX=$2 ;;
     -*)
       echo "power-loss: unknown option $1" >&2
       exit 2
@@ -71,6 +79,14 @@ die() {
   exit 1
 }
 [ -x "$BIN" ] && [ -x "$HARNESS" ] && [ -n "$WORK" ] && [ -n "$FS" ] || die "--fs, --sparkles, --harness and --work are required"
+case $INDEX in
+  none | text | geo) ;;
+  embed) SERVE_FLAGS="$SERVE_FLAGS --no-embedding" ;;
+  *) die "unknown index $INDEX" ;;
+esac
+# the driver adds a point to each request for the spatial index
+DRIVE_INDEX=()
+[ "$INDEX" = geo ] && DRIVE_INDEX=(--index geo)
 mkdir -p "$WORK"
 WORK=$(readlink -f "$WORK")
 log() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$WORK/progress.log"; }
@@ -88,6 +104,20 @@ mount_opts() { # xfs refuses two mounted copies with one UUID
 
 seed() { # <file>: 2,000 triples to start from
   for i in $(seq 1 2000); do echo "<urn:x09:seed:$i> <urn:x09:p> \"seed $i\" ."; done > "$1"
+}
+
+load_store() { # <store>: the seed, then the index of --index
+  "$BIN" load --loc "$1" "$WORK/seed.nt" > "$WORK/load.log" 2>&1
+  case $INDEX in
+    text) "$BIN" text-index --loc "$1" >> "$WORK/load.log" 2>&1 ;;
+    geo) "$BIN" geo-index --loc "$1" >> "$WORK/load.log" 2>&1 ;;
+    embed)
+      # the endpoint is never called: the server runs with --no-embedding
+      "$BIN" vector create --loc "$1" --name docs --predicate urn:x09:emb --dim 8 \
+        --embed-url http://127.0.0.1:9/v1/embeddings --embed-model none \
+        --embed-from urn:x09:p >> "$WORK/load.log" 2>&1
+      ;;
+  esac
 }
 
 SPID=
@@ -123,7 +153,7 @@ if [ "$MODE" = check-image ]; then
   fi
   rc=0
   if [ -d "$mnt/db" ]; then
-    "$HARNESS" verify --sparkles "$BIN" --loc "$mnt/db" --receipts "$WORK/receipts.txt" --mark "$mark" --write || rc=$?
+    "$HARNESS" verify --sparkles "$BIN" --loc "$mnt/db" --receipts "$WORK/receipts.txt" --mark "$mark" --write --index "$INDEX" || rc=$?
   elif [ "$mark" = start ] || [ "$mark" = - ]; then
     echo '{"ok": true, "note": "before the store existed"}'
   else
@@ -160,7 +190,7 @@ case $MODE in
     mkdir -p "$MNT" "$WORK/srv"
     mount "/dev/mapper/$DM" "$MNT"
     seed "$WORK/seed.nt"
-    "$BIN" load --loc "$MNT/db" "$WORK/seed.nt" > "$WORK/load.log" 2>&1
+    load_store "$MNT/db"
     sync
     # images at the start mark need no receipt yet
     echo "M start 0" > "$WORK/receipts.txt"
@@ -168,7 +198,7 @@ case $MODE in
     start_server "$MNT/db"
     drc=0
     "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$WORK/receipts.txt" \
-      --clients "$CLIENTS" --seconds "$SECONDS_RUN" --mark-cmd "dmsetup message $DM 0 mark" \
+      --clients "$CLIENTS" --seconds "$SECONDS_RUN" --mark-cmd "dmsetup message $DM 0 mark" ${DRIVE_INDEX[@]+"${DRIVE_INDEX[@]}"} \
       > "$WORK/drive.json" || drc=$?
     cat "$WORK/drive.json"
     # a load without receipts, or with failed writes, would make every image pass vacuously
@@ -186,7 +216,7 @@ case $MODE in
     rc=0
     "$HARNESS" replay --log "$WORK/log.img" --size "$(stat -c %s "$WORK/data.img")" --out "$WORK/replay" \
       --points "$POINTS" --from-mark start --jobs "$JOBS" --seed "${SEED:-$$}" --keep-failed 3 \
-      -- "$0" check-image --fs "$FS" --sparkles "$BIN" --harness "$HARNESS" --work "$WORK" > "$WORK/summary.json" || rc=$?
+      -- "$0" check-image --fs "$FS" --sparkles "$BIN" --harness "$HARNESS" --work "$WORK" --index "$INDEX" > "$WORK/summary.json" || rc=$?
     cp "$WORK/replay/results.tsv" "$WORK/results.tsv"
     # A failed run keeps the log, so that `crash-harness replay --only` with the same seed
     # rebuilds any failing image. The first three failing images stay as they were checked.
@@ -220,12 +250,12 @@ case $MODE in
       n=$(((i - 1) / 20))
       db=$MNT/db-$n receipts=$WORK/receipts-$n.txt
       if [ ! -d "$db" ]; then
-        "$BIN" load --loc "$db" "$WORK/seed.nt" > "$WORK/load.log" 2>&1
+        load_store "$db"
         : > "$receipts"
       fi
       start_server "$db"
       "$HARNESS" drive --addr "127.0.0.1:$PORT" --ds ds --receipts "$receipts" \
-        --clients "$CLIENTS" --seconds 30 --run "k$i" > "$WORK/drive.json" 2> "$WORK/drive.err" &
+        --clients "$CLIENTS" --seconds 30 --run "k$i" ${DRIVE_INDEX[@]+"${DRIVE_INDEX[@]}"} > "$WORK/drive.json" 2> "$WORK/drive.err" &
       DPID=$!
       # a random moment between 0.2 and 2.2 seconds into the load
       sleep "$(awk -v r="$RANDOM" 'BEGIN { printf "%.3f", 0.2 + (r % 2000) / 1000 }')"
@@ -244,7 +274,7 @@ case $MODE in
         fails=$((fails + 1))
       fi
       # every receipt logged in this store so far, after each restart
-      out=$("$HARNESS" verify --sparkles "$BIN" --loc "$db" --receipts "$receipts") || fails=$((fails + 1))
+      out=$("$HARNESS" verify --sparkles "$BIN" --loc "$db" --receipts "$receipts" --index "$INDEX") || fails=$((fails + 1))
       printf '%s\t%s\n' "$i" "$out" >> "$WORK/results.tsv"
       [ $((i % 20)) = 0 ] && log "kill $i: $out"
       # a store whose server stopped taking writes after its first kills must not pass

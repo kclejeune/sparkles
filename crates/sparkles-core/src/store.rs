@@ -31,6 +31,8 @@ mod embed;
 mod geo;
 mod group;
 #[cfg(test)]
+mod group_index_tests;
+#[cfg(test)]
 mod group_model;
 mod history_query;
 pub mod keyset;
@@ -382,6 +384,11 @@ impl Delta {
     /// The statistics of the inserted quads with predicate `p`.
     pub fn predicate(&self, p: u64) -> Option<&DeltaPredicate> {
         self.predicates.get(&p)
+    }
+
+    /// The statistics of the inserted quads of every predicate, in id order.
+    pub fn predicate_stats(&self) -> impl Iterator<Item = (u64, &DeltaPredicate)> + '_ {
+        self.predicates.iter().map(|(p, s)| (*p, s))
     }
 
     /// The statistics by predicate worked out from the inserted keys (what
@@ -1137,9 +1144,10 @@ pub struct StoreOptions {
     pub wal_direct_writes: bool,
     /// Group commit: concurrent commits of a persistent store share one synchronization,
     /// and each is acknowledged once the prefix that holds it is durable. On by default,
-    /// and ignored for in-memory stores. Writes the group does not admit (on datasets with
-    /// a full-text, spatial or embedding index, merges, forced and bulk commits) drain it
-    /// and take the ordinary path.
+    /// and ignored for in-memory stores. Writes the group does not admit (merges, forced
+    /// and bulk commits, and commits while a full-text index recovers or rebuilds or a
+    /// spatial index builds or has failed) drain it and take the ordinary path. Datasets
+    /// with a full-text, spatial or embedding index otherwise group their commits.
     pub group_commit: bool,
     /// With group commit on, a commit that is the only writer (nothing queued, no fence
     /// running, no transaction waiting for the writer lock) takes the ordinary path with
@@ -1309,7 +1317,7 @@ type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 pub struct Store {
     root: Option<PathBuf>,
     opts: StoreOptions,
-    group: Option<Box<group::Coordinator>>,
+    group: Option<Arc<group::Coordinator>>,
     /// synchronization, group size and fallback counters of the commit path
     commit_stats: commit_stats::CommitStats,
     // `current`, `writer`, `catalog`, `clock` and `history` are shared (weakly) with
@@ -2010,7 +2018,7 @@ impl Store {
             root: Some(root.to_path_buf()),
             group: opts
                 .group_commit
-                .then(|| Box::new(group::Coordinator::default())),
+                .then(|| Arc::new(group::Coordinator::default())),
             commit_stats: Default::default(),
             current: Arc::new(ArcSwap::from_pointee(Snapshot {
                 cacheable: true,
@@ -3306,6 +3314,31 @@ impl Store {
         let _ = (snap, log);
     }
 
+    /// For a grouped commit, under the writer lock: compute the commit's full-text
+    /// changes against `snap`, its speculative snapshot, and give `snap` a view that waits
+    /// for the commit's publication. Nothing reaches the live index until the leader of
+    /// the commit's fence applies the returned changes (X09 section 17.2).
+    #[cfg(feature = "text")]
+    fn stage_text(
+        &self,
+        snap: &mut Snapshot,
+        log: &[(u8, [Id; 4])],
+    ) -> Option<crate::text::Staged> {
+        debug_assert!(
+            self.text_recovery
+                .load()
+                .as_ref()
+                .is_none_or(|job| !job.pending()),
+            "a grouped commit while full-text recovery is pending"
+        );
+        let ti = self.text.load_full()?;
+        self.failpoint("group-staging-text");
+        let prev = snap.text.take();
+        let (staged, view) = ti.stage(snap, log, prev.as_ref());
+        snap.text = Some(view);
+        Some(staged)
+    }
+
     /// After a bulk commit from `old`: bring the full-text index to the new snapshot,
     /// by the documents that differ when they are few, else by a rebuild (on failure the
     /// previous view stays, and text queries report the index as stale).
@@ -3496,6 +3529,17 @@ impl Store {
     pub fn fail_next_text_commit(&self) {
         if let Some(ti) = self.text.load_full() {
             ti.fail_next_commit();
+        }
+    }
+
+    /// Test hook: checkpoint the full-text index now, as its background tick does about
+    /// once a second, so that a short run writes checkpoints that name its commits.
+    #[cfg(feature = "text")]
+    #[doc(hidden)]
+    pub fn checkpoint_text(&self) -> Result<()> {
+        match self.text.load_full() {
+            Some(ti) => ti.checkpoint(),
+            None => Ok(()),
         }
     }
 
@@ -4001,19 +4045,45 @@ impl Store {
             Some(Poisoned)
         } else if !(kind == CommitKind::Transaction || Self::speculative_kind(kind)) {
             Some(Kind)
-        } else if self.text_enabled() {
-            // the index follows each commit as it is published, which a group's
-            // coordinator does not do, and a build or recovery that installs a view under
-            // the writer lock must not meet a commit publishing an older one
-            Some(Text)
-        } else if self.geo.load().is_some() {
-            Some(Geo)
-        } else if !self.embed.works.lock().is_empty() {
-            Some(Embed)
         } else {
-            None
+            self.index_fallback()
         };
         first.map_or(Ok(()), |f| Err(Some(f)))
+    }
+
+    /// Why an index keeps commits out of a group right now (X09 section 17.3). A full-text
+    /// index stages each grouped commit's changes and applies them at publication, a
+    /// spatial view is carried in each speculative snapshot, and embedding work is
+    /// scheduled at publication, so an index in its steady state admits grouping. Its
+    /// recovery at open, an online rebuild and a spatial build install a view of their
+    /// own, and commits made meanwhile take the ordinary path until they finish.
+    fn index_fallback(&self) -> Option<Fallback> {
+        #[cfg(feature = "text")]
+        {
+            if self
+                .text_recovery
+                .load()
+                .as_ref()
+                .is_some_and(|job| job.pending())
+            {
+                return Some(Fallback::TextRecovering);
+            }
+            if self.text.load().as_ref().is_some_and(|t| t.rebuilding()) {
+                return Some(Fallback::TextRebuilding);
+            }
+        }
+        if self.geo.load().is_some() {
+            let unavailable = self.current.load().geo.as_ref().is_none_or(|v| {
+                matches!(
+                    v.state(),
+                    crate::geo::IndexState::Building(_) | crate::geo::IndexState::Failed
+                )
+            });
+            if unavailable {
+                return Some(Fallback::GeoUnavailable);
+            }
+        }
+        None
     }
 
     /// What stops a rebuild into `dir` early: the write's cancellation and deadline, and
@@ -4525,6 +4595,14 @@ impl Store {
             // and so must the full-text index, which could otherwise only catch up from it
             #[cfg(feature = "text")]
             if let Some(ti) = self.text.load_full() {
+                // the writer lock is held with the group drained (X09 section 17.3), so
+                // the index holds no commit above the published head. A leader that failed
+                // between the apply and the publication can leave one durable commit
+                // applied but unpublished, which is why a failed group is exempt.
+                debug_assert!(
+                    self.group.as_ref().is_some_and(|g| g.failed())
+                        || ti.applied() <= self.current.load().commit
+                );
                 ti.checkpoint()?;
             }
         }
@@ -6111,7 +6189,7 @@ impl WriteTxn<'_> {
             change_log: self.base.change_log.clone(),
         };
         self.store.maintain_text(&mut snap, &self.log);
-        self.store.maintain_geo(&mut snap, &self.log);
+        self.store.maintain_geo(&mut snap, &self.base, &self.log);
         self.store.remember_past(c.seq);
         let snap = Arc::new(snap);
         self.store.current.store(snap.clone());

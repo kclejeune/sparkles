@@ -48,9 +48,23 @@ FIXTURE = {
         entry(
             "6", "How many?", "SELECT (COUNT(?u) AS ?n) WHERE { <urn:a> <urn:p> ?u }"
         ),
+        entry("8", "Still there?", "SELECT ?u WHERE { <urn:b> <urn:p> ?u }"),
         entry("7", "Keine englische Frage", "ASK {}", language="de"),
     ]
 }
+
+
+def published(value):
+    return [
+        {
+            "head": {"vars": ["u"]},
+            "results": {"bindings": [{"u": {"type": "uri", "value": value}}]},
+        }
+    ]
+
+
+FIXTURE["questions"][0]["answers"] = published("urn:x")  # the same on the data
+FIXTURE["questions"][6]["answers"] = published("urn:old")  # changed since release
 
 FAKE = """
 import json, sys
@@ -81,10 +95,12 @@ class Convert(unittest.TestCase):
 
     def test_conversion_without_a_database_keeps_every_english_question(self):
         out = qald.convert(self.args(), self.source)
-        self.assertEqual(out["sourceQuestions"], 7)
+        self.assertEqual(out["sourceQuestions"], 8)
         self.assertEqual(
-            [q["id"] for q in out["questions"]], [f"qald9p-{i}" for i in range(1, 7)]
+            [q["id"] for q in out["questions"]],
+            [f"qald9p-{i}" for i in (1, 2, 3, 4, 5, 6, 8)],
         )
+        self.assertIsNone(out["publishedComparison"])
         self.assertFalse(out["goldRecomputed"])
         self.assertEqual(out["dropped"]["noEnglish"]["ids"], ["qald9p-7"])
         first = out["questions"][0]
@@ -99,7 +115,19 @@ class Convert(unittest.TestCase):
         out = qald.convert(args, self.source)
         self.assertTrue(out["goldRecomputed"])
         self.assertEqual(out["dbpediaRelease"], "2022.12.01")
-        self.assertEqual([q["id"] for q in out["questions"]], ["qald9p-1", "qald9p-6"])
+        self.assertEqual(
+            [q["id"] for q in out["questions"]], ["qald9p-1", "qald9p-6", "qald9p-8"]
+        )
+        compared = out["publishedComparison"]
+        self.assertEqual(
+            compared["counts"], {"equal": 1, "unpublished": 1, "differs": 1}
+        )
+        self.assertEqual(compared["differs"], ["qald9p-8"])
+        self.assertEqual(
+            compared["byId"]["qald9p-8"],
+            {"status": "differs", "published": 1, "recomputed": 1, "common": 0},
+        )
+        self.assertIsNone(out["goldDatabase"])
         dropped = {k: v["ids"] for k, v in out["dropped"].items()}
         self.assertEqual(dropped["empty"], ["qald9p-2"])
         self.assertEqual(dropped["failed"], ["qald9p-3"])
@@ -119,7 +147,7 @@ class Convert(unittest.TestCase):
         out = qald.convert(args, self.source)
         self.assertEqual(out["goldTimeoutSecs"], 0.2)
         self.assertEqual(out["dropped"]["failed"]["count"], 1)
-        self.assertEqual(len(out["questions"]), 2)
+        self.assertEqual(len(out["questions"]), 3)
 
     def test_categories(self):
         cases = {

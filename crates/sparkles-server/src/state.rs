@@ -345,6 +345,9 @@ pub struct AppState {
     pub file_loads: sparkles::sparql::FileLoads,
     /// cap on the classes, and separately the predicates, of one schema report
     pub schema_max_entries: usize,
+    /// the store size above which the schema reports of the tools come from the index
+    /// statistics (`--schema-statistics-above`; `None`: always scan)
+    pub schema_statistics_above: Option<u64>,
     /// what the imports of one ShEx schema may read (`--shex-max-imports` and the like)
     #[cfg(feature = "shex")]
     pub shex_import_limits: sparkles_shex::resolve::ImportLimits,
@@ -621,6 +624,7 @@ impl AppState {
             spill: None,
             file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
+            schema_statistics_above: Some(sparkles::schema::DEFAULT_STATISTICS_ABOVE),
             #[cfg(feature = "shex")]
             shex_import_limits: Default::default(),
             #[cfg(feature = "graphql")]
@@ -683,6 +687,7 @@ impl AppState {
             spill: None,
             file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
+            schema_statistics_above: Some(sparkles::schema::DEFAULT_STATISTICS_ABOVE),
             #[cfg(feature = "shex")]
             shex_import_limits: Default::default(),
             #[cfg(feature = "graphql")]
@@ -1565,5 +1570,38 @@ pub(crate) mod tests {
             (n.mode("a"), n.mode("b"), n.mode("c")),
             (Some(Read), Some(ReadWrite), None)
         );
+    }
+}
+
+/// `--schema-statistics-above`: a number of quads, or `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatisticsAbove(pub Option<u64>);
+
+impl Default for StatisticsAbove {
+    fn default() -> Self {
+        StatisticsAbove(Some(sparkles::schema::DEFAULT_STATISTICS_ABOVE))
+    }
+}
+
+impl std::str::FromStr for StatisticsAbove {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim() {
+            "off" => Ok(StatisticsAbove(None)),
+            n => n
+                .replace('_', "")
+                .parse()
+                .map(|n| StatisticsAbove(Some(n)))
+                .map_err(|_| format!("expected a number of quads or off, not {s:?}")),
+        }
+    }
+}
+
+impl std::fmt::Display for StatisticsAbove {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(n) => write!(f, "{n}"),
+            None => f.write_str("off"),
+        }
     }
 }

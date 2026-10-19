@@ -331,8 +331,10 @@ The bulk path builds and validates a replacement generation, then atomically
 switches `CURRENT`. It does not append one WAL operation for every bulk quad.
 Group commit, on by default for persistent stores, shares a durability fence across
 admitted writes and publishes only the durable prefix. It preserves durability rather
-than acknowledging unsynchronized writes, and ineligible writes, such as those on a
-dataset with a full-text, spatial or embedding index, use the ordinary path.
+than acknowledging unsynchronized writes, and ineligible writes, such as bulk and
+forced commits or writes while a full-text index rebuilds, use the ordinary path. A
+dataset's full-text changes reach its index only after their fence, and its spatial view
+travels in the speculative snapshot, so no index on disk names an unsynchronized commit.
 `--no-group-commit` turns it off. In-memory stores share the commit and snapshot model without
 disk durability.
 

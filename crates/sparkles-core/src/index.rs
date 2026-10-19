@@ -1246,6 +1246,14 @@ fn empty_col() -> Col {
 }
 
 impl BlockCache {
+    /// The block columns this view has looked up, decoded or found (for tests of how
+    /// much a pass reads).
+    #[cfg(test)]
+    pub(crate) fn lookups(&self) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.hits.load(Relaxed) + self.misses.load(Relaxed)
+    }
+
     /// A cache of its own, of at most `bytes`.
     pub fn new(bytes: u64) -> BlockCache {
         BlockCache {

@@ -87,10 +87,25 @@ jobs:
           cargo fmt --manifest-path crates/sparkles-py/Cargo.toml --check
           cargo fmt --manifest-path crates/sparkles-ffi/Cargo.toml --check
           cargo fmt --manifest-path crates/sparkles-node/Cargo.toml --check
+      # A test build without a warm cache compiles the sparkles crate's library and its test
+      # harness at once, two rustc processes of about 8 GB each, which is more than the
+      # runner's 16 GB. Running out of memory ends the job with only "The runner has received
+      # a shutdown signal", so the job adds swap to get through that peak.
+      - name: Add swap
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: |
+          sudo fallocate -l 16G /swapfile-ci
+          sudo chmod 600 /swapfile-ci
+          sudo mkswap /swapfile-ci > /dev/null
+          sudo swapon /swapfile-ci
+          free -h
+      # A failed run saves the cache too, so one cold build does not make every later run
+      # cold as well.
       - if: ${{ !cancelled() }}
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.platform }}
+          cache-on-failure: true
       - name: cargo clippy
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

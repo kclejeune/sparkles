@@ -276,6 +276,9 @@ fn selection(opts: &SchemaOptions) -> u64 {
     if opts.subject_classes {
         s.push_str("\nsubjectClasses");
     }
+    if let Some(n) = opts.statistics_above {
+        s.push_str(&format!("\nstatisticsAbove={n}"));
+    }
     fnv(&s)
 }
 
@@ -463,6 +466,47 @@ impl Schema {
         }
     }
 
+    /// The objects of predicate `iri` in the selection of `opts` at `snap`, or `None`
+    /// when the predicate does not occur there (see [`schema::predicate_objects`]). The
+    /// dataset keeps what it measured for the latest state, for every selection, so a
+    /// caller of a report measured from the statistics pays for each predicate once per
+    /// state, and callers that alternate selections share it.
+    pub fn predicate_objects_at(
+        &self,
+        snap: &Arc<Snapshot>,
+        iri: &str,
+        opts: &SchemaOptions,
+        max_rows: u64,
+    ) -> Result<Option<Arc<schema::PredicateObjects>>> {
+        /// the most predicates kept for one state, over every selection
+        const MAX_KEPT: usize = 4096;
+        let state = (snap.commit, schema::snapshot_identity(snap));
+        let key = (selection(opts) ^ max_rows.rotate_left(17), iri.to_string());
+        // a caller limited to some graphs, and an uncommitted or synthetic view, measure
+        // for themselves
+        let keep = opts.graphs.is_none() && snap.cacheable;
+        if keep {
+            let cache = self.ds.state().objects_cache.lock();
+            if cache.state == state
+                && let Some(o) = cache.entries.get(&key)
+            {
+                return Ok(o.clone());
+            }
+        }
+        let o = schema::predicate_objects(snap, iri, opts, max_rows)
+            .map_err(schema_error)?
+            .map(Arc::new);
+        if keep {
+            let mut cache = self.ds.state().objects_cache.lock();
+            if cache.state != state || cache.entries.len() >= MAX_KEPT {
+                cache.state = state;
+                cache.entries.clear();
+            }
+            cache.entries.insert(key, o.clone());
+        }
+        Ok(o)
+    }
+
     /// The state `at` names, or the head.
     fn state(&self, at: Option<&At>, deadline: Option<Instant>) -> Result<Arc<Snapshot>> {
         Ok(match at {
@@ -480,15 +524,17 @@ impl Schema {
     /// The kept report of state `identity` and `selection`, if it has what the request
     /// needs.
     fn kept(&self, identity: u64, selection: u64, term_totals: bool) -> Option<Arc<SchemaReport>> {
-        let cache = self.ds.state().schema_cache.lock();
-        cache
-            .as_ref()
-            .filter(|e| {
-                e.identity == identity
-                    && e.selection == selection
-                    && (e.report.term_totals.is_some() || !term_totals)
-            })
-            .map(|e| e.report.clone())
+        let mut cache = self.ds.state().schema_cache.lock();
+        let i = cache.iter().position(|e| {
+            e.identity == identity
+                && e.selection == selection
+                && (e.report.term_totals.is_some() || !term_totals)
+        })?;
+        // the most recently used last
+        let e = cache.remove(i);
+        let report = e.report.clone();
+        cache.push(e);
+        Some(report)
     }
 
     /// A new report of `snap`, brought up to date from the kept one when `maintain`
@@ -524,7 +570,13 @@ impl Schema {
         );
         // the dataset keeps the report everyone with access to every graph shares
         if opts.graphs.is_none() {
-            *self.ds.state().schema_cache.lock() = Some(SchemaCacheEntry {
+            let mut cache = self.ds.state().schema_cache.lock();
+            // one entry per selection: the newer state replaces the older
+            cache.retain(|e| e.selection != selection);
+            if cache.len() >= crate::dataset::SCHEMA_CACHE_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push(SchemaCacheEntry {
                 identity,
                 selection,
                 report: report.clone(),
@@ -544,9 +596,16 @@ impl Schema {
         opts: &SchemaOptions,
     ) -> std::result::Result<Option<(SchemaReport, usize)>, SchemaError> {
         let store = self.ds.store();
-        let (old, mark) = match self.ds.state().schema_cache.lock().as_ref() {
-            Some(e) if e.selection == selection => (e.report.clone(), e.mark.clone()),
-            _ => return Ok(None),
+        let kept = self
+            .ds
+            .state()
+            .schema_cache
+            .lock()
+            .iter()
+            .find(|e| e.selection == selection)
+            .map(|e| (e.report.clone(), e.mark.clone()));
+        let Some((old, mark)) = kept else {
+            return Ok(None);
         };
         if old.maintenance.is_none() || old.snapshot.commit > snap.commit {
             return Ok(None);

@@ -4,6 +4,41 @@
 
 ### Changed
 
+Group commit now covers datasets with a full-text, spatial or embedding index, which used
+to take the ordinary path. On a Namespace instance whose synchronizations were slowed to
+4 ms each, four writers on such a dataset committed about twice as fast and sixteen
+writers about eight times as fast. On the instance's own synchronization of about 0.1 ms,
+four writers gained nothing and sixteen writers about 1.6 times. These are approximate
+screens, and the gates on `forge` have not run. A commit falls back only while a
+full-text index recovers or rebuilds or while a spatial index builds or after its build
+failed, and `sparkles_group_commit_fallbacks_total` reports these as `text-recovering`,
+`text-rebuilding` and `geo-unavailable` in place of the old `text`, `geo` and `embed`
+reasons. A full-text search on a transaction that started from a commit still in flight
+waits for that commit's fence. `--no-group-commit` and `SPARKLES_GROUP_COMMIT=off` still
+turn grouping off.
+
+On a store of more than ten million quads, the schema reports of the MCP tools,
+`check_query` and `sparkles ask` take the counts of predicates and classes from the
+statistics of the index build, corrected exactly for the changes since and for graphs
+outside the selection, and say `"basis": "statistics"`. A selection that leaves out
+graphs with more than a million quads is still scanned.
+The kinds of a predicate's objects are measured when a tool needs them, from a sample of
+8,192 stored literals above 200,000 quads. On DBpedia's billion quads a `check_query`
+took 52.7 seconds and 11.1 GiB and now takes 0.3 seconds and under 500 MiB, and an
+Ask takes about two seconds instead of 100. `--schema-statistics-above QUADS|off` on
+`serve`, `mcp` and `ask` sets the threshold. `/{ds}/schema` and `sparkles schema` still
+scan. A dataset keeps up to four schema reports, one per selection, instead of one.
+`describe_schema` leaves `maxPerSubject` out of a report from the statistics and adds
+`objectsSampled` to a predicate whose objects were sampled.
+
+The planner moves a VALUES table that shares variables with a UNION of the same join
+into each branch, so each branch looks its rows up by index instead of reading every
+quad of its pattern. It moves at most 10,000 rows, keeps the table outside a BIND or
+FILTER that calls a non-deterministic function, and leaves a UNION with a SERVICE, a
+LATERAL or a property function call as written. `link_entities` and the terms list of `check_query` failed on the
+2 GiB query budget on DBpedia for this reason. `sparkles ask` gained
+`--query-memory-mb`, 2048 by default as in `sparkles mcp`.
+
 The server's query memory pool is on by default. It holds half of the memory the process
 may use, less the configured caches, and at least 256 MiB. Each query and update request
 reserves 16 MiB when it is admitted, so a host whose pool sits at the 256 MiB floor serves
@@ -75,6 +110,26 @@ order than an eager one, which SPARQL allows, and an ordered subquery fixes the 
 both. Rust callers set
 `QueryOptions::spill` and `max_spill_bytes`, and `BudgetKind::Spill` is a new variant.
 
+A streamed FILTER over an index scan reads the scan in morsels of whole index blocks and
+filters each morsel in parallel when every conjunct is a key test on the scan's key
+column, and a STRSTARTS filter reads only the blocks its prefix can match. At 10.5M with
+eight threads on an 8-vCPU AMD Namespace instance,
+CONTAINS, STRSTARTS and LANGMATCHES filters over names and titles now take 0.91 to 0.95
+times their eager time, where they took 1.48 to 7.99 times. More threads hold more morsel
+scratch at once, 13.5 MB in the ledger at eight threads against 11.8 MB before.
+
+A streamed range top-k no longer reads the parts of its range whose ids do not follow
+value order into memory. It ranks them in parallel morsels of one index block and keeps
+only its best rows, so its memory no longer grows with the range. A default graph made of
+several graphs still holds each triple once across the morsels. At 10.5M with eight
+threads on 8-vCPU AMD Namespace instances it takes 0.89 to 1.06 times its eager time over
+several runs, where it took 1.33 times.
+
+A streamed answer's term cache sorts its vocabulary ids with a stable sort that merges
+the columns already in index order. With the parallel filter, a STRSTARTS filter over
+names in native JSON at one thread takes 1.01 to 1.03 times its eager time, where it
+took 1.30 times.
+
 `sparkles migrate --check` exits 1 for a database with an interrupted run, which a server
 refuses until `sparkles migrate` runs without `--check`, and its JSON report adds `opens`.
 `sparkles migrate` keeps the mode and owner of every file it copies, and it must run as
@@ -123,7 +178,36 @@ literals that the checked graphs hold. For Rust callers,
 `sparkles_reasoner::diagnostics::diagnose_with` takes these typings, and
 `sparkles_reasoner::literal_typings` reads them.
 
+The Ask evaluation harness converts Text2SPARQL'25 (`scripts/text2sparql-convert`, the
+DBpedia set and the CK25 corporate set) and LC-QuAD 2.0 (`scripts/lcquad2-convert`).
+Every converter that recomputes gold answers on a database now also compares them with
+the answers the source publishes and records the load manifest of that database. The
+paid wrapper `scripts/eval-ask-anthropic` lists the ledger's charges that stand at an
+upper bound with `--held` and replaces one with the billed amount and its evidence with
+`--reconcile`. That is how the $1.002560 that the 2026-10-15 pilot left unresolved can
+be settled once the billed amount is known. An amount above the held charge needs
+`--allow-raise`, and the evidence is 10 to 1000 printable characters. The wrapper
+decodes a reply that comes back gzip or deflate encoded, settles any fault of a request
+at its bound, and charges Sonnet 5.5 cache reads at the published $0.20 per million
+tokens. The DBpedia gold rewrites leave literals and comments alone, never reuse a
+variable of the query and also rewrite `COUNT(*)`. A sampled LC-QuAD 2.0 set records how
+many questions it sampled.
+
+The Ask evaluation scores under `rdf-term-set-projected-columns-v2`. An answer with more
+columns than the gold, such as a name beside each IRI, is projected onto the gold's
+columns and its rows compared as a set, where the first policy scored any extra column
+as wrong. Each row also reports the accuracy without projection and how many correct
+answers needed one, and `--scoring-policy rdf-term-set-global-columns-v1` scores under
+the first policy. `scripts/eval-ask-rescore` scores a run's saved answers again under the
+current policy without calling a model, and the paid wrapper records every request and
+reply, key redacted, in `replies.jsonl`.
+
 ### Behavior
+
+`sparkles ask` decides whether a draft calls SERVICE from the parsed query, including
+the patterns inside EXISTS and subqueries, instead of scanning its text. A query whose
+class, variable or prefix is named like the keyword, such as `pv:Service` or `?service`,
+now runs, and a query that hides the keyword from a text scan is still left unrun.
 
 A SERVICE inside an EXISTS that the query evaluates per row is called once for each
 distinct binding of the variables it shares with the outer rows, and once in all when it
@@ -166,6 +250,14 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+The Ask evaluation cost ledger is in version 2. Reserve and settle lines carry a time,
+and a reconcile line replaces a charge held at its bound. A reconcile line that raises
+a charge carries `"raise": true`. A reader refuses a ledger of version 1, which no paid
+run wrote, and of any later version. Replay also refuses a negative or non-integer
+amount, a request ID that is not a positive integer, a settle without its reserve, a
+carryover line anywhere but right after the header, and a reconcile that takes the
+ledger past USD 25.
 
 Spill files are registered as the derived format `spill` version 1. A file has the magic
 `SPKSPL01`, the version as a u16, the operator kind, the codec, an encryption flag and

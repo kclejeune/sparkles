@@ -865,6 +865,30 @@ the data decides how much a star gains. The change keeps the star masks and prob
 with each plan, which costs 2.6 to 3.2% more planning instructions for a snowflake of
 12 patterns and up to 64 MB while the greedy order runs on a plan of 1998 inputs.
 
+### Schema reports and Ask on DBpedia
+
+Roadmap item 89 measured the MCP tools and `sparkles ask` on the DBpedia 2022.12.01
+database of [BENCHMARKING](BENCHMARKING.md), 1.01 billion quads, on atlas with a warm page
+cache, through `sparkles mcp`. These figures come from atlas, not forge, and from one
+session each, so they show the size of the change rather than a published comparison.
+
+| Measurement | Before item 89 | After item 89 |
+|---|---|---|
+| First `check_query` of a process | 52.7 s, 11.1 GiB | 0.3 s, or up to 1.5 s right after the binary changed |
+| First `describe_schema` summary of 200 predicates | a full report, as for `check_query` | 1.4 s, and 11 ms repeated |
+| Terms-list query of `check_query` with VALUES outside a UNION | failed after 1.94 s at 5.5 GiB | 0.04 s |
+| `sparkles ask` with the harness's fake provider | about 100 s, most failing on the 2 GiB budget | 1.9 s, at most 508 MiB of anonymous memory |
+
+Later `check_query` calls in the same process took 20 to 60 ms. The process held under
+500 MiB of anonymous memory after the change. The mapped index pages that the sampling of
+predicate objects touches add about 2 GiB of reclaimable file-backed memory to the
+resident size. The figures are for a database without changes since its build. A rerun after the
+review fixes of item 89, interleaved with the earlier build in two rounds each, gave the
+same times: a warm first `check_query` in 0.27 to 0.30 s, later ones in 16 to 20 ms, and
+the summary in 1.32 to 1.35 s, with 296 to 392 MiB of anonymous memory for both builds. A
+store with changes corrects the statistics with one index probe for each changed value,
+and the report scans instead when that would cost more than a scan.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
@@ -1132,6 +1156,53 @@ synchronization it was 0.85, 0.89 and 0.73 ms for the default writer, group comm
 the idle path and group commit with it, and in a later run 0.91 and 1.09 ms for the default
 writer and group commit, with ranges of 0.66 to 2.56 and 0.73 to 1.87 ms. These overlap, so
 the tail needed `forge` to settle.
+
+### Group commit on indexed datasets
+
+These screens compare origin/main 23075691, where a dataset with a full-text, spatial or
+embedding index takes the ordinary path, with the [X09 Phase 4](specs/X09-group-commit-by-default.md#phase-4)
+branch at 80f19430 with grouping on and with `--no-group-commit`. They ran on 2026-10-18
+with `scripts/nsc-writes.sh --index` on 8-vCPU Namespace instances, as in the previous
+section, so they are approximate. The dataset is the 10.5M-triple one with the index built
+after the load, and 4 ms are added to every synchronization (`delay-us=4000`). The
+full-text index covers every literal, so each write adds a document. The embedding index
+embeds the writers' literals, and the server runs with `--no-embedding`, so its work only
+queues. The generated data has no geometries and the writers add none, so the spatial rows
+measure admission alone. Each row is the median of four rounds of transactions per second.
+Before the change every commit of these runs fell back with reason `text`, `geo` or
+`embed`, and after it none fell back.
+
+| 10.5M, 4 ms synchronization | Index | origin/main | Grouping off | Grouping on | On / origin/main |
+|---|---|---:|---:|---:|---:|
+| Serial literal inserts | Full-text | 194.5 | 210.6 | 209.0 | 1.07 |
+| Four writers | Full-text | 203.2 | 215.2 | 441.4 | 2.17 |
+| Sixteen writers | Full-text | 202.0 | 215.6 | 1,718.0 | 8.51 |
+| Four writers with two readers | Full-text | 203.8 | 218.5 | 439.1 | 2.15 |
+| Serial literal inserts | Spatial | 213.5 | 214.4 | 207.5 | 0.97 |
+| Four writers | Spatial | 230.6 | 230.7 | 466.6 | 2.02 |
+| Sixteen writers | Spatial | 229.8 | 230.9 | 1,805.6 | 7.86 |
+| Serial literal inserts | Embedding | 217.8 | 218.8 | 220.3 | 1.01 |
+| Four writers | Embedding | 232.9 | 232.5 | 469.6 | 2.02 |
+| Sixteen writers | Embedding | 233.9 | 232.1 | 1,802.3 | 7.71 |
+
+The serial p50 and p90 with grouping on were within 3.2% of grouping off for every index.
+The four-writer p50 fell from about 17 ms to 8.5 ms, and the sixteen-writer p50 from about
+64 ms to 8.8 ms. With the full-text index, the reader p99 of the mixed run was 1.9 ms with
+grouping on and 1.1 ms with it off, with ranges of 0.9 to 2.9 ms and 1.0 to 1.3 ms. The
+Phase 3 reader tail did not settle on these instances either, so this needs `forge`.
+
+On the instances' own synchronization of about 0.1 ms, five rounds with the full-text index
+gave 14,488 transactions per second for sixteen writers with grouping on against 9,146 with
+it off, and 9,611 against 9,560 for four writers. Serial inserts commit in about 0.12 ms
+there, and ten interleaved rounds of 5,000 at 1.05M gave a median per-round ratio of p50 on
+to p50 off of 1.035, with single rounds from 0.86 to 1.58. That is within the noise of
+these instances, and the serial gate of X09 section 17.9 needs `forge`.
+
+The servers' peak resident memory, read from `VmHWM` after each run, measures what the
+speculative index state costs. With four writers grouping on peaked within 5 MiB of
+grouping off for every index. With sixteen writers it peaked 15 MiB higher with the
+full-text index, 18 MiB higher with the embedding index and 21 MiB higher with the spatial
+index, at 210, 188 and 174 MiB.
 
 ### Reader tail of group commit on forge
 
@@ -1703,6 +1774,46 @@ grouping held 38 MB against 130 MB eagerly and took 1.5 to 1.7 times as long, an
 16 MiB it held 11 MB and took 2.8 times as long. DISTINCT held 14.5 MB against 152 MB, and
 at 16 MiB 4.4 MB at 1.7 times the eager time. A budget near a tenth of the state's size
 thus costs 1.7 to 2.8 times the time, and one near half of it costs little.
+
+<a id="parallel-cursor-filters"></a>
+
+**Parallel cursor filters.** On 2026-10-18 a cursor filter over an index scan began to
+read the scan in morsels of whole blocks and filter each morsel in parallel
+([X05](specs/X05-streaming-query-execution.md#parallel-cursor-filters-2026-10-18)). The
+probe binary interleaved eager and cursor runs over 10.5M triples on an 8-vCPU AMD EPYC
+Namespace instance, reading every row. The table gives the cursor's time divided by the
+eager time, the median of seven rounds, against 5c73ced6.
+
+| Ratio of streaming to eager | 5c73ced6, 8 threads | 2026-10-18, 8 threads | 5c73ced6, 1 thread | 2026-10-18, 1 thread |
+|---|---:|---:|---:|---:|
+| CONTAINS on names, 49,837 rows | 1.95 | **0.91** | **0.95** | 1.00 |
+| REGEX on subject IRIs, 1,000 rows | 2.11 | 1.08 | 1.14 | 1.15 |
+| STRSTARTS on names, 49,837 rows | 7.99 | **0.94** | 2.98 | **0.90** |
+| LANGMATCHES on titles, 500,000 rows | 1.48 | **0.95** | **0.84** | **0.88** |
+
+At one thread CONTAINS moved from 0.95 to 1.00 and REGEX from 1.14 to 1.15, which is
+within the noise of the AMD instance and needs an Intel host to confirm. The cursor's
+ledger peaked at 13.5 MB for the CONTAINS filter with eight threads, against
+11.8 MB before and 15.6 MB eagerly, and at 6.2 MB with one thread, since each worker holds
+its own morsel scratch.
+
+The cursor's range top-k reads the parts of its range without value order in parallel
+morsels and keeps only its best rows
+([X05](specs/X05-streaming-query-execution.md#streaming-range-top-k-2026-10-18)). Over the
+salaries above 150,000 at 10.5M it took 0.89 to 1.06 times its eager time at eight threads,
+against 1.33 at 5c73ced6, and 0.88 at one thread against 0.93. The eight-thread figure
+is a range over runs of 15 to 21 rounds on two 8-vCPU AMD EPYC Namespace instances,
+because the runs spread by more than the 5% one instance can resolve. Its ledger peaked
+at 6.6 to 7.1 MB at eight threads and 3.5 MB at one, against 5.6 MB before at both. The
+figures for the ledger are those after the fixes that followed review.
+
+In native JSON at one thread, the STRSTARTS filter over names took 1.30 times its eager
+time at 5c73ced6 and takes 1.01 to 1.03 times now, the median of 15 rounds in two
+processes. The parallel filter reads fewer blocks, and the cursor writer's term cache
+sorts its ids with a stable sort that merges the already ascending columns
+([X05](specs/X05-streaming-query-execution.md#native-json-of-a-streamed-filter-2026-10-18)).
+That sort also took the streamed name scan of 1.02M rows from 0.94 to 0.88 to 0.90 times
+eager execution.
 
 The JVM library also runs in automatic mode by default since 2026-10-17. In the binding
 comparison of `scripts/bench-bindings` at 1.05M on forge, with every case run twice in

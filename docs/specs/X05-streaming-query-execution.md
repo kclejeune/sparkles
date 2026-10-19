@@ -1239,6 +1239,134 @@ inside the cursor. EXISTS and DESCRIBE still read their whole input first. The e
 join that read larger input batches, so that it seeks its index less often, was tried
 and set aside unmeasured, since automatic execution runs those joins eagerly.
 
+### Parallel cursor filters (2026-10-18)
+
+A cursor FILTER over an index scan now reads the scan itself in morsels of whole index
+blocks and filters each morsel in parallel, as eager execution filters a whole scan. The
+filter chooses morsels on its first read when eager execution would filter the same scan
+by key runs, the scan reads only immutable blocks over exact key ranges, the first demand
+is at least 4,096 rows, and every conjunct of the filter is a key test on the scan's first
+free key column. Any other filter reads the scan's own batches. The Rayon tasks of a morsel each take a piece of a block. A task gathers the
+piece's distinct values of that column, tests each once, either against the vocabulary
+through a key filter or through the expression cache for inline values, and gathers the
+rows that pass without branches. Morsels follow the filter's input size, from 32,768 rows up to 262,144, and only those parts of
+a morsel that a STRSTARTS prefix range can match are read. Output keeps the scan's
+order, so a LIMIT stops after the morsel that fills it.
+
+Each worker keeps its own copy of the key filter in a pool, which the filter drops with
+its last rows. A copy of a regular expression filter starts with a cold matching cache, and
+copying the filter for each morsel kept the regular expression query slower streamed
+than eager at eight threads. When the row budget or the memory ledger no longer has room
+for a block, or the ledger refuses one of the two charges a morsel makes for itself,
+its scratch before the read and the rows it holds after, the filter hands the rest of the
+scan back to the scan's own batches from the next unread block. A charge that a task
+inside the morsel makes and the ledger refuses still fails the query. The scan's counter
+`morselRows` in the cursor plan gives the rows read in morsels.
+
+A morsel charges its input columns, the passing rows it holds until they are written and
+a scratch area of 32 bytes per block row for two blocks per worker, bounded by the
+morsel's blocks, since a worker that waits for a piece another worker took can start a
+further block meanwhile. On an 8-vCPU AMD EPYC Namespace
+instance at 10.5M the cursor's ledger peaked at 13.5 MB for the CONTAINS filter with
+eight threads, against 11.8 MB before and 15.6 MB eagerly, and at 6.2 MB with one
+thread. More threads hold more morsel scratch at once, which is the memory this speed
+costs.
+
+Two designs were measured before this one. Reading each morsel in three parallel passes
+with a barrier after each was slower than eager execution at eight threads. Copying the
+rows of each run of equal values was slow for a column whose runs are mostly one row
+long, such as language-tagged names. The single pass over distinct values replaced both.
+
+The table gives the streaming time divided by the eager time at 10.5M on the same
+instance, the median of seven rounds, reading every row. The base is 5c73ced6.
+
+| Ratio of streaming to eager | Base, 8 threads | Now, 8 threads | Base, 1 thread | Now, 1 thread |
+|---|---:|---:|---:|---:|
+| CONTAINS on names, 49,837 rows | 1.95 | **0.91** | **0.95** | 1.00 |
+| REGEX on subject IRIs, 1,000 rows | 2.11 | 1.08 | 1.14 | 1.15 |
+| STRSTARTS on names, 49,837 rows | 7.99 | **0.94** | 2.98 | **0.90** |
+| LANGMATCHES on titles, 500,000 rows | 1.48 | **0.95** | **0.84** | **0.88** |
+
+At one thread CONTAINS moved from 0.95 to 1.00 and REGEX from 1.14 to 1.15. Changes under
+5% on this AMD instance are within its noise, and an Intel host is needed to tell whether
+they are real.
+
+### Streaming range top-k (2026-10-18)
+
+A cursor no longer runs the range top-k operator `IndexTopK` eagerly. The operator
+still reads the parts of its range whose ids follow value order from the best end and
+stops once it has its k rows. A part whose ids say nothing of value order, such as
+values kept in the dictionary, used to be read whole into memory before its rows were
+ranked. The cursor now reads such a part in morsels of one index block, a wave of as
+many morsels as Rayon has threads at a time. Each morsel keeps its own best k rows, and
+the morsels then offer their rows in index order to one bounded heap, so ties fall as
+they do eagerly. A value that is not totally ordered still sends the query to the
+generic plan, which the cursor builds as the operator's child only then and which streams
+as well. A value like that in a late morsel costs the morsels read before it, as it does
+eagerly. Because the generic plan is built at the first pull, a generic plan that could not
+stream would fail under `RejectMaterialization` at that pull rather than when the cursor
+opens. The generic plan of a range top-k is a streaming top-k over the scan, so no plan
+today reaches that failure. Eager execution keeps its own path.
+
+A default graph made of several graphs, as with two FROM clauses, holds a triple once even
+when two graphs store it. The scan drops the second copy, which follows the first in key
+order, but only within one read, so a pair of copies split by a block boundary would
+reach the heap twice. Each morsel reports the last row its scan produced, and the next
+morsel of the same piece drops its first row when it repeats that row, which is what one
+read of the whole piece keeps. The first version of this work missed that case, and
+`ordered_top_k_dedups_union_graph_rows_across_morsels` covers it with both parities of
+the pairs against the block grid.
+
+The cursor's memory for the operator is about one morsel's working set per worker
+thread plus the k rows it keeps, whatever the size of the range. The test
+`ordered_top_k_memory_does_not_grow_with_its_unordered_pieces` reads 300,000 and 900,000
+dictionary values on two threads and requires the second peak to stay within a quarter
+of the first. The peak grows with the number of threads instead, since each holds a
+morsel at once, so the test fixes its pool. Running the morsels in waves of one per
+thread keeps a waiting worker from starting further morsels by work stealing.
+
+Reading the morsels one after another was 1.72 times slower than eager execution at eight
+threads on the Namespace instance, so the morsels run in parallel. At 10.5M the range
+top-k over salaries measured 0.89 to 1.06 times eager execution at eight threads, where
+5c73ced6 measured 1.33, and 0.88 at one thread, where 5c73ced6 measured 0.93. The
+eight-thread figure is a range over runs of 15 to 21 rounds on two 8-vCPU AMD EPYC Namespace instances.
+Its spread is wider than the 5% that a single instance can resolve, so no one value
+stands for it. The
+cursor's ledger peaked at 6.6 to 7.1 MB with eight threads against 5.6 MB before, and at
+3.5 MB with one thread, since each morsel now charges its rows from its blocks before it
+reads them.
+
+The fixes that followed review were measured against the first version of this work,
+8502dd4c, on a fresh instance in two processes of 21 rounds each. The range top-k
+measured 0.89 to 0.96 times eager execution at eight threads against 0.82 to 0.99 for
+8502dd4c, and 0.88 at one thread for both, so the fixes show no change this instance can
+resolve. The filters' ratios overlapped those of 8502dd4c at both thread counts, and the one-thread filter ledger rose from 5.2 MB to
+6.2 MB with the scratch of a second block.
+
+### Native JSON of a streamed filter (2026-10-18)
+
+A filter over a scan written as native JSON at one thread had taken 1.35 to 1.39 times as
+long streamed as eagerly on forge, and the STRSTARTS filter took 1.30 times on the
+Namespace instance of this work. Two changes brought it to parity. The parallel cursor filter
+above reads only the blocks a STRSTARTS prefix can match, which removed most of the gap.
+Profiles of what remained showed the cursor writer's term cache spending about a tenth of
+its time sorting the pairs of vocabulary id and cell of each batch. A column read in
+index order is already ascending, so the cache now sorts those pairs with Rust's stable
+sort, which finds such runs and merges them in close to linear time. The pairs are
+distinct, so the order is the same as before.
+
+The table gives the streaming time divided by the eager time in native JSON at 10.5M with
+one thread on the Namespace instance, the median of 15 rounds in two processes each.
+
+| Native JSON, ratio of streaming to eager | 5c73ced6 | Parallel filter | With the stable sort |
+|---|---:|---:|---:|
+| STRSTARTS on names, 49,837 rows | 1.30 | 1.07 | 1.01 to 1.03 |
+| CONTAINS on names, 49,837 rows | **0.91** | **0.93** | **0.93** |
+| LANGMATCHES on titles, 500,000 rows | **0.90** | **0.91** | **0.85** |
+
+The stable sort also took the streamed scan of 1.02M names from 0.94 to 0.88 to 0.90
+times eager execution.
+
 ### Large basic graph patterns
 
 [ROADMAP](../ROADMAP.md) item 84. The planner joins the triple patterns of a basic graph
