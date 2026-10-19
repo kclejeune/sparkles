@@ -909,7 +909,7 @@ class Requests(Base):
     def test_requests_and_replies_are_recorded_without_the_key(self):
         echo = dict(REPLY, content=[{"type": "text", "text": "key " + KEY}])
         upstream = Upstream(
-            (200, [], json.dumps(echo).encode()),
+            (200, [("request-id", "req_9")], json.dumps(echo).encode()),
             (529, [], b"overloaded " + KEY.encode()),
         )
         path = self.root / "replies.jsonl"
@@ -917,12 +917,21 @@ class Requests(Base):
         proxy.set_case("c1")
         proxy.handle(raw(text="question " + KEY))
         proxy.handle(raw())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         text = path.read_text()
         self.assertNotIn(KEY, text)
         first, second = (json.loads(x) for x in text.splitlines())
         self.assertEqual(
             (first["case"], first["model"], first["status"]), ("c1", HAIKU, 200)
         )
+        self.assertEqual((first["requestId"], second["requestId"]), ("req_9", None))
+        # A fault while recording never costs the request its reply.
+        broken = self.proxy(
+            Upstream(),
+            ledger=self.ledger(name="broken.jsonl"),
+            replies=self.root / "no-dir" / "r.jsonl",
+        )
+        self.assertEqual(broken.handle(raw())[0], 200)
         self.assertEqual(
             first["request"]["messages"][0]["content"], "question [REDACTED]"
         )

@@ -13,6 +13,7 @@ from unittest import mock
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "eval_support"))
 from evaluator import (
+    POLICY_V1,
     Invalid,
     Unsupported,
     answer_set,
@@ -93,6 +94,10 @@ class Scoring(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(scores, (1, 1, 1))
         self.assertEqual((detail["mapping"], detail["extraColumns"]), ([1], 2))
+        # The first policy, kept to reproduce old reports, refuses any other width.
+        self.assertFalse(score_sets(gold, wide, policy=POLICY_V1)[0])
+        with self.assertRaises(Invalid):
+            score_sets(gold, wide, policy="no-such-policy")
         # Two rows for one person still project to the one gold row.
         twice = answer_set(
             result(

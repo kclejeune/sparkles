@@ -13,13 +13,16 @@ import importlib.machinery
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 import time
 import types
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
-from evaluator import POLICY, Invalid, bounded_file, digest, strict_json
+from evaluator import POLICIES, POLICY, Invalid, bounded_file, digest, strict_json
+
+CASE_ID = re.compile(r"[0-9a-f]{64}")
 
 _loader = importlib.machinery.SourceFileLoader(
     "eval_ask", str(ROOT / "scripts/eval-ask")
@@ -29,7 +32,15 @@ eval_ask = importlib.util.module_from_spec(_spec)
 _loader.exec_module(eval_ask)
 
 
-def rescore(report_path, sparkles, out, set_path=None, model_config=None, timeout=None):
+def rescore(
+    report_path,
+    sparkles,
+    out,
+    set_path=None,
+    model_config=None,
+    timeout=None,
+    policy=POLICY,
+):
     report_path = pathlib.Path(report_path)
     source = strict_json(bounded_file(report_path, 64 * 1024 * 1024))
     if source.get("dataLoc"):
@@ -43,9 +54,18 @@ def rescore(report_path, sparkles, out, set_path=None, model_config=None, timeou
         model_config or report_path.parent.parent / "models.json"
     )
     qset = strict_json(bounded_file(set_path, 4 * 1024 * 1024))
+    # The set's hash does not cover the data file beside it, so that is checked too.
+    data = (set_path.parent / qset["data"]).resolve() if qset.get("data") else None
+    if data is None or not source.get("dataSha256"):
+        raise Invalid("the run's data file and its SHA256 are both required")
+    if digest(data) != source["dataSha256"]:
+        raise Invalid("the data file differs from the one the run used")
+    if policy not in POLICIES:
+        raise Invalid("unknown scoring policy")
     out = pathlib.Path(out)
     if not out.is_absolute() or ROOT == out or ROOT in out.parents:
         raise Invalid("new absolute output outside repository required")
+    timeout = timeout or max(30.0, float(qset.get("goldTimeoutSecs") or 0))
     out.mkdir(mode=0o700)
     args = types.SimpleNamespace(
         set=str(set_path),
@@ -54,7 +74,8 @@ def rescore(report_path, sparkles, out, set_path=None, model_config=None, timeou
         loc=None,
         out=str(out),
         phase_deadline=0,
-        timeout=timeout or max(30.0, float(qset.get("goldTimeoutSecs") or 0)),
+        timeout=timeout,
+        scoring_policy=policy,
     )
     runner = eval_ask.Runner(args, qset, out)
     qs = {q["id"]: q for q in qset["questions"]}
@@ -62,11 +83,13 @@ def rescore(report_path, sparkles, out, set_path=None, model_config=None, timeou
     per_pair = {p: ({}, {}) for p in pairs}
     cases = []
     for case in source["cases"]:
-        saved = strict_json(
-            bounded_file(
-                report_path.parent / (case["case"] + ".json"), 16 * 1024 * 1024
-            )
-        )
+        name = case["case"]
+        if not CASE_ID.fullmatch(name):
+            raise Invalid("a case name is not a hex digest")
+        path = report_path.parent / (name + ".json")
+        saved = strict_json(bounded_file(path, 16 * 1024 * 1024))
+        if saved.get("id") != case["id"] or case["id"] not in qs:
+            raise Invalid("a case file does not belong to its report row")
         q, answer = qs[case["id"]], saved["answer"]
         score = runner.score(q, answer)
         per_pair[case["pair"]][0][q["id"]] = answer
@@ -78,6 +101,7 @@ def rescore(report_path, sparkles, out, set_path=None, model_config=None, timeou
                 prf=score[1],
                 detail=score[2],
                 before={"correct": case["correct"], "prf": case["prf"]},
+                caseFileSha256=digest(path),
             )
         )
     order = [
@@ -121,11 +145,12 @@ def rescore(report_path, sparkles, out, set_path=None, model_config=None, timeou
     ]
     report = dict(
         source,
-        scoringPolicy=POLICY,
+        scoringPolicy=policy,
         rescoredFrom={
             "report": str(report_path),
             "reportSha256": digest(report_path),
             "scoringPolicy": source.get("scoringPolicy"),
+            "queryTimeoutSecs": timeout,
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
         cases=cases,
@@ -148,14 +173,29 @@ def main():
     ap.add_argument("--set", help="the question set, when it has moved since the run")
     ap.add_argument("--model-config", help="the run's models.json")
     ap.add_argument("--timeout", type=float, help="query seconds")
+    ap.add_argument("--scoring-policy", choices=POLICIES, default=POLICY)
     args = ap.parse_args()
     report = rescore(
-        args.report, args.sparkles, args.out, args.set, args.model_config, args.timeout
+        args.report,
+        args.sparkles,
+        args.out,
+        args.set,
+        args.model_config,
+        args.timeout,
+        args.scoring_policy,
     )
+
+    def fmt(x):
+        return f"{x['numerator']}/{x['denominator']}" if x else "-"
+
+    rows = {r["pair"]: r for r in report["rows"]}
     for row in report["executionAccuracyBeforeAndAfter"]:
-        b, a = row["before"], row["after"]
-        fmt = lambda x: f"{x['numerator']}/{x['denominator']}" if x else "-"  # noqa: E731
-        print(f"{row['pair']}: {fmt(b)} -> {fmt(a)}")
+        r = rows.get(row["pair"], {})
+        print(
+            f"{row['pair']}: {fmt(row['before'])} -> {fmt(row['after'])},"
+            f" equal width {fmt(r.get('executionAccuracyEqualWidth'))},"
+            f" {r.get('correctByProjection', 0)} by projection"
+        )
     return 0
 
 

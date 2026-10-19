@@ -30,7 +30,9 @@ MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # Integer USD nanodollars per token as input, 5 minute cache write, 1 hour cache
 # write, cache read and output. A second row applies above 100000 prompt tokens.
-# Source: Anthropic's model and pricing documentation of October 2026. Haiku 5.5 is
+# Source: Anthropic's model and pricing documentation of October 2026, read from the
+# copy bundled with Claude Code 2.1.296 in its claude-api skill, `shared/models.md` and
+# `shared/prompt-caching.md`, on 2026-10-18, not from the live pricing page. Haiku 5.5 is
 # $0.10 and $0.50 per million up to 100K prompt tokens and $0.50 and $2.50 above.
 # Sonnet 5.5 is $2 and $10 and Opus 5.5 is $4 and $20, both with cache reads at $0.20
 # and no long-context premium. Cache writes are 1.25 times input for five minutes and
@@ -776,9 +778,9 @@ class Proxy:
             return 402, [], error_body("evaluation_budget", "the cost cap is reached")
         with self.mutex:
             self.request_bytes.append(len(payload))
-        return self.forward(ident, model, limit, payload)
+        return self.forward(ident, model, limit, payload, self.case)
 
-    def forward(self, ident, model, limit, payload):
+    def forward(self, ident, model, limit, payload, case=None):
         try:
             status, headers, data = self.upstream.send(
                 "/v1/messages", payload, self.timeout
@@ -801,7 +803,9 @@ class Proxy:
             # error after generation could be billed. The cap's margin absorbs it.
             # The child's own retries see the reply.
             self.ledger.settle(ident, 0, f"http-{status}", request_id=request_id)
-            self.record(ident, model, payload, status, self.clean_bytes(data))
+            self.record(
+                ident, case, model, payload, status, self.clean_bytes(data), request_id
+            )
             return status, passed, self.clean_bytes(data)
         try:
             reply = strict_json(data)
@@ -816,35 +820,52 @@ class Proxy:
             usage=usage if isinstance(usage, dict) else None,
             request_id=request_id,
         )
-        self.record(ident, model, payload, status, self.clean_bytes(data))
+        self.record(
+            ident, case, model, payload, status, self.clean_bytes(data), request_id
+        )
         if reply is None:
             return 502, [], error_body("api_error", "the upstream reply is not JSON")
         clean, _ = redact(reply, self.key)
         return status, passed, json.dumps(clean, ensure_ascii=False).encode()
 
-    def record(self, ident, model, payload, status, data):
-        """Append the request and its reply to the replies file, key redacted."""
+    def record(self, ident, case, model, payload, status, data, request_id):
+        """Append the request and its reply to the replies file, key redacted.
+
+        The file holds whole prompts, with the dataset's grounding, and whole replies.
+        It is created readable by its owner only. Any fault while recording is
+        swallowed, because the request is already settled and answered.
+        """
         if self.replies is None:
             return
         try:
-            reply = strict_json(data)
-        except Invalid:
-            reply = data.decode("utf-8", "replace")[:65536]
-        request, _ = redact(strict_json(payload), self.key)
-        reply, _ = redact(reply, self.key)
-        line = {
-            "id": ident,
-            "case": self.case,
-            "model": model,
-            "status": status,
-            "request": request,
-            "reply": reply,
-        }
-        text = json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n"
-        # The record is for diagnosis. Failing to write it never fails the request.
-        with self.mutex, contextlib.suppress(OSError):
-            with self.replies.open("a", encoding="utf-8") as f:
-                f.write(text)
+            try:
+                reply = strict_json(data)
+            except Invalid:
+                reply = data.decode("utf-8", "replace")[:65536]
+            request, _ = redact(strict_json(payload), self.key)
+            reply, _ = redact(reply, self.key)
+            line = {
+                "id": ident,
+                "requestId": request_id,
+                "case": case,
+                "model": model,
+                "status": status,
+                "request": request,
+                "reply": reply,
+            }
+            text = json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with self.mutex:
+                fd = os.open(
+                    self.replies,
+                    os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+                    0o600,
+                )
+                try:
+                    os.write(fd, text.encode())
+                finally:
+                    os.close(fd)
+        except Exception:  # noqa: BLE001, S110 -- a diagnosis record never fails a request
+            pass
 
     def clean_bytes(self, data):
         if self.key and self.key.encode() in data:

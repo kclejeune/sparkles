@@ -14,6 +14,9 @@ import subprocess
 import time
 
 POLICY = "rdf-term-set-projected-columns-v2"
+# The policy of the first paid run, kept so its reports can be reproduced.
+POLICY_V1 = "rdf-term-set-global-columns-v1"
+POLICIES = (POLICY, POLICY_V1)
 XSD_STRING = "http://www.w3.org/2001/XMLSchema#string"
 UNBOUND = ("unbound",)
 STDOUT_CAP = 4 * 1024 * 1024
@@ -330,7 +333,11 @@ def project(gold, got, check=lambda: None):
     return max(best[0], 0), best[1], best[2]
 
 
-def score_sets(gold, got, check=lambda: None):
+def score_sets(gold, got, check=lambda: None, policy=POLICY):
+    """Score one answer. Under `POLICY_V1` an answer of another width is always wrong,
+    which reproduces the reports made before the projected-column policy."""
+    if policy not in POLICIES:
+        raise Invalid("unknown scoring policy")
     if type(gold) is bool:
         ok = type(gold) is bool and type(got) is bool and gold == got
         return ok, (float(ok),) * 3, {"kind": "ask", "match": ok}
@@ -344,6 +351,20 @@ def score_sets(gold, got, check=lambda: None):
                 "goldRows": len(gold.rows),
                 "gotRows": 0,
                 "status": "wrong_result_kind",
+            },
+        )
+    if policy == POLICY_V1 and len(gold.variables) != len(got.variables):
+        return (
+            False,
+            (0.0, 0.0, 0.0),
+            {
+                "kind": "select",
+                "intersection": 0,
+                "goldRows": len(gold.rows),
+                "gotRows": len(got.rows),
+                "mapping": None,
+                "goldDuplicates": gold.duplicates,
+                "gotDuplicates": got.duplicates,
             },
         )
     if len(gold.variables) > len(got.variables):

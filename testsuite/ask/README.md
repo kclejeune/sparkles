@@ -56,14 +56,21 @@ row still costs precision or recall. An answer with fewer columns than the gold 
 wrong. Blank nodes, more than eight columns and more than 1000 rows are unsupported.
 Gold that needs them fails before any model is called. The scorer refuses SERVICE before
 it starts a query. This is the policy `rdf-term-set-projected-columns-v2`, a strict
-RDF-term policy and not an official QALD score. The first policy compared whole rows
-only, and it scored most answers of Sonnet 5.5 and Opus 5.5 in the first paid run as
-wrong because they named each answer beside its IRI.
+RDF-term policy and not an official QALD score. The first policy,
+`rdf-term-set-global-columns-v1`, compared whole rows only, and it scored most answers of
+Sonnet 5.5 and Opus 5.5 in the first paid run as wrong because they named each answer
+beside its IRI. The projected policy was chosen after those results were seen, and it
+favors an answer with more columns, since each extra column is another chance to match.
+Each report row therefore also gives `executionAccuracyEqualWidth` and
+`correctByProjection`, and `--scoring-policy rdf-term-set-global-columns-v1` scores under
+the first policy.
 
 `scripts/eval-ask-rescore --report OUT/SET/report.json --sparkles BIN --out DIR` scores
-the saved answers of a run again under the current policy. It runs only `sparkles query`
-on the set's data, refuses a set or binary that differs from the run's, and writes a
-report with each row's execution accuracy before and after.
+the saved answers of a run again under the current policy, or the first one with
+`--scoring-policy`. It runs only `sparkles query` on the set's data. It refuses a set, a
+data file or a binary whose SHA256 differs from the run's, and a case file whose
+question differs from its report row. The new report records the query timeout, each
+case file's SHA256 and each row's execution accuracy before and after.
 
 Answerable accuracy, clarification precision and refusal accuracy have separate
 denominators. Only the `unanswerable` outcome is a successful refusal. A provider error,
@@ -157,9 +164,12 @@ and cookie headers. It stops if any step fails. A block of a set and a model run
 when the projected cost fits the cap. The projection is the case count times the p90
 measured case cost of that model, or a prior from the run file, times a margin.
 
-The proxy appends every forwarded request and its reply, with the key redacted, to
-`replies.jsonl` in the output directory, so an answer can be diagnosed later without
-calling a model again. The first paid run predates this file, so its empty drafts
+The proxy appends every forwarded request and its reply, with the key redacted and the
+request ID, to `replies.jsonl` in the output directory, so an answer can be diagnosed
+later without calling a model again. The file is created readable by its owner only. It
+holds every prompt in full, with the grounding drawn from the dataset, and every reply,
+so it must not be kept for a private graph beyond the diagnosis and must never be
+copied into the repository as a fixture. The first paid run predates this file, so its empty drafts
 cannot be traced to the reply that produced them.
 
 ## A paid run

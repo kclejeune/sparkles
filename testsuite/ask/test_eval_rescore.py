@@ -11,7 +11,7 @@ import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "eval_support"))
-from evaluator import POLICY, Invalid
+from evaluator import POLICY, POLICY_V1, Invalid
 
 loader = importlib.machinery.SourceFileLoader(
     "rescore_under_test", str(HERE.parents[1] / "scripts/eval-ask-rescore")
@@ -20,6 +20,7 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 rescore = importlib.util.module_from_spec(spec)
 loader.exec_module(rescore)
 PYTHON = str(pathlib.Path(sys.base_prefix) / "bin/python3")
+CASE = "c" * 64
 
 # The gold returns two people. The saved answer returns them with a name beside each,
 # which the first policy scored as wrong because the widths differ.
@@ -82,7 +83,7 @@ class Rescore(unittest.TestCase):
             "usage": {"inputTokens": 10, "outputTokens": 5},
         }
         old = [False, [0.0, 0.0, 0.0], {"kind": "select", "mapping": None}]
-        (run / "set1" / "c1.json").write_text(
+        (run / "set1" / (CASE + ".json")).write_text(
             json.dumps({"id": "q1", "answer": answer, "score": old})
         )
         self.report = run / "set1" / "report.json"
@@ -94,12 +95,13 @@ class Rescore(unittest.TestCase):
                     "set": str(self.set),
                     "setSha256": sha(self.set),
                     "binarySha256": sha(self.binary),
+                    "dataSha256": sha(root / "d.ttl"),
                     "dataLoc": None,
                     "pairs": ["p/m"],
                     "notRun": [],
                     "cases": [
                         {
-                            "case": "c1",
+                            "case": CASE,
                             "pair": "p/m",
                             "id": "q1",
                             "correct": False,
@@ -132,12 +134,50 @@ class Rescore(unittest.TestCase):
         self.assertEqual(row["before"]["numerator"], 0)
         self.assertEqual(row["after"]["numerator"], 1)
         self.assertEqual(report["rescoredFrom"]["reportSha256"], sha(self.report))
+        self.assertEqual(report["rescoredFrom"]["queryTimeoutSecs"], 30.0)
+        case_file = self.report.parent / (CASE + ".json")
+        self.assertEqual(report["cases"][0]["caseFileSha256"], sha(case_file))
+        [pair] = report["rows"]
+        self.assertEqual(pair["correctByProjection"], 1)
+        self.assertEqual(pair["executionAccuracyEqualWidth"]["numerator"], 0)
         self.assertTrue((out / "report.json").is_file())
 
-    def test_a_changed_set_or_binary_is_refused(self):
-        self.set.write_text(self.set.read_text() + " ")
+    def test_the_first_policy_reproduces_the_run(self):
+        report = rescore.rescore(
+            self.report, self.binary, self.root / "v1", policy=POLICY_V1, timeout=7
+        )
+        self.assertEqual(report["scoringPolicy"], POLICY_V1)
+        self.assertFalse(report["cases"][0]["correct"])
+        self.assertEqual(report["rescoredFrom"]["queryTimeoutSecs"], 7)
+
+    def test_a_changed_set_binary_or_data_file_is_refused(self):
+        original = self.set.read_text()
+        self.set.write_text(original + " ")
         with self.assertRaises(Invalid):
             rescore.rescore(self.report, self.binary, self.root / "a")
+        self.set.write_text(original)
+        (self.root / "d.ttl").write_text("<urn:a> <urn:b> <urn:c> .\n")
+        with self.assertRaises(Invalid):
+            rescore.rescore(self.report, self.binary, self.root / "b")
+        (self.root / "d.ttl").write_text("")
+        report = json.loads(self.report.read_text())
+        report["binarySha256"] = "0" * 64
+        self.report.write_text(json.dumps(report))
+        with self.assertRaises(Invalid):
+            rescore.rescore(self.report, self.binary, self.root / "c")
+
+    def test_a_case_file_must_belong_to_its_row(self):
+        case_file = self.report.parent / (CASE + ".json")
+        saved = json.loads(case_file.read_text())
+        case_file.write_text(json.dumps(dict(saved, id="q2")))
+        with self.assertRaises(Invalid):
+            rescore.rescore(self.report, self.binary, self.root / "a")
+        case_file.write_text(json.dumps(saved))
+        report = json.loads(self.report.read_text())
+        report["cases"][0]["case"] = "../" + CASE
+        self.report.write_text(json.dumps(report))
+        with self.assertRaises(Invalid):
+            rescore.rescore(self.report, self.binary, self.root / "b")
 
 
 if __name__ == "__main__":

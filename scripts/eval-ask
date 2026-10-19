@@ -23,6 +23,7 @@ from evaluator import (
     GoldFault,
     HarnessFault,
     Invalid,
+    POLICIES,
     POLICY,
     OfflinePolicy,
     answer_set,
@@ -181,6 +182,9 @@ class Runner:
             f"PREFIX {k}: <{v}>\n" for k, v in qset.get("prefixes", {}).items()
         )
         self.gold_cache, self.serial, self.last_record = {}, 0, None
+        self.policy = getattr(args, "scoring_policy", None) or POLICY
+        if self.policy not in POLICIES:
+            raise Invalid("unknown scoring policy")
         self.env = leaf_environment(
             {"SPARKLES_EVAL_GATE_TOKEN": proxy.token} if proxy else None
         )
@@ -376,7 +380,9 @@ class Runner:
         query_sha = hashlib.sha256((self.header + query).encode()).hexdigest()
         try:
             first_result, record = self.query(query, "first-query")
-            correct, _, _ = score_sets(self.gold(q), first_result, self.check)
+            correct, _, _ = score_sets(
+                self.gold(q), first_result, self.check, self.policy
+            )
             return {
                 "status": "correct" if correct else "incorrect",
                 "reason": "complete_strict_comparison",
@@ -446,7 +452,7 @@ class Runner:
             raise
         except Invalid:
             return failure("candidate_query_failure")
-        ok, scores, detail = score_sets(gold, got, self.check)
+        ok, scores, detail = score_sets(gold, got, self.check, self.policy)
         detail["firstDraft"] = first
         return ok, scores, detail
 
@@ -495,13 +501,21 @@ def summarize_pair(pair, qs, answers, scores):
     refusal = [i for i, q in enumerate(qs) if q["kind"] == "unanswerable"]
     selects = [scores[i][2] for i in answerable if scores[i][2]["kind"] == "select"]
     common = sum(s["intersection"] for s in selects)
-    pden, rden = sum(s["gotRows"] for s in selects), sum(s["goldRows"] for s in selects)
+    # A projected answer is compared by its projected rows.
+    pden = sum(s.get("projectedRows", s["gotRows"]) for s in selects)
+    rden = sum(s["goldRows"] for s in selects)
+    # Correct answers that matched only after their extra columns were set aside.
+    projected = sum(
+        bool(scores[i][0] and scores[i][2].get("extraColumns")) for i in answerable
+    )
     return [
         {
             "pair": pair,
             "role": "demo-pipeline",
             "questions": n,
             "executionAccuracy": ratio(correct, len(answerable)),
+            "executionAccuracyEqualWidth": ratio(correct - projected, len(answerable)),
+            "correctByProjection": projected,
             "endToEndSuccess": ratio(sum(s[0] for s in scores), n),
             "repairRate": ratio(len(repaired), len(answerable)),
             "repairConditional": ratio(len(repaired), len(failed_first)),
@@ -638,7 +652,9 @@ def finish_run(report, out_dir, runner, error=None):
         json.dump(report, f, indent=2)
         f.write("\n")
     with (out_dir / "report.md").open("x") as f:
-        f.write(f"# Ask pipelines\n\nStrict RDF-term accuracy uses {POLICY}.\n\n")
+        f.write(
+            f"# Ask pipelines\n\nStrict RDF-term accuracy uses {runner.policy}.\n\n"
+        )
         f.write(
             "The run is "
             + ("complete" if report["complete"] else "incomplete")
@@ -661,7 +677,7 @@ def run_matrix(args, proxy=None, prepared=None, admit=None):
     report = {
         "schema": 3,
         "mode": "pipeline",
-        "scoringPolicy": POLICY,
+        "scoringPolicy": runner.policy,
         "set": str(args.set),
         "setSha256": digest(args.set),
         "dataSha256": digest(runner.data) if runner.data else None,
@@ -866,6 +882,12 @@ def parse_args(argv=None):
         "--phase-deadline", type=float, default=0, help="matrix seconds, 0 for none"
     )
     ap.add_argument("--only")
+    ap.add_argument(
+        "--scoring-policy",
+        choices=POLICIES,
+        default=POLICY,
+        help="the projected-column policy, or the whole-row one of the first paid run",
+    )
     ap.add_argument("--allow-loopback", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     return ap.parse_args(argv)
