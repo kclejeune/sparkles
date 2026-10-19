@@ -3327,6 +3327,7 @@ impl Store {
             "a grouped commit while full-text recovery is pending"
         );
         let ti = self.text.load_full()?;
+        self.failpoint("group-staging-text");
         let prev = snap.text.take();
         let (staged, view) = ti.stage(snap, log, prev.as_ref());
         snap.text = Some(view);
