@@ -52,13 +52,28 @@
           homeModules.sparkles = self.homeModules.default;
 
           # What the Nix workflow builds and pushes to the binary cache, per system: the
-          # packages with their dependency layers, the comparison engines, the dev shell and
-          # the checks that need neither a VM nor a browser. `nix-fast-build --flake
-          # .#cacheable.<system>` builds one system's set.
+          # packages with their dependency layers, every package the benchmark runners
+          # resolve (the comparison engines and data generators of nix/benchmarks.nix and
+          # the nixpkgs tools of nix/benchmark-tools.nix), the dev shell and the checks
+          # that need neither a VM nor a browser. Fluree, whose license is not free, stays
+          # out of the public cache; it is a download of a release archive and quick to
+          # build anywhere. `nix-fast-build --flake .#cacheable.<system>` builds one
+          # system's set.
           cacheable = inputs.nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
             system:
             withSystem system (
               { self', pkgs, ... }:
+              let
+                inherit (pkgs) lib;
+                benchmarks = removeAttrs (import ./nix/benchmarks.nix { inherit pkgs; }) [
+                  "fluree"
+                  "benchmark-engines"
+                ];
+                # as `nixpkgs#<name>` with `--inputs-from .` resolves them
+                tools = lib.genAttrs (import ./nix/benchmark-tools.nix) (
+                  name: inputs.nixpkgs.legacyPackages.${system}.${name}
+                );
+              in
               {
                 inherit (self'.packages)
                   sparkles
@@ -70,13 +85,14 @@
                   sparkles-jena
                   sparkles-node-native
                   sparkles-node
-                  benchmark-engines
                   ;
                 sparkles-deps = self'.packages.sparkles-cli.cargoArtifacts;
                 sparkles-fmt-wasm-deps = self'.packages.sparkles-fmt-wasm.cargoArtifacts;
                 devShell = self'.devShells.default;
               }
-              // pkgs.lib.mapAttrs' (name: pkgs.lib.nameValuePair "check-${name}") (
+              // lib.mapAttrs' (name: lib.nameValuePair "bench-${name}") benchmarks
+              // lib.mapAttrs' (name: lib.nameValuePair "tool-${name}") tools
+              // lib.mapAttrs' (name: lib.nameValuePair "check-${name}") (
                 removeAttrs self'.checks [
                   "nixos-module"
                   "ui-e2e"

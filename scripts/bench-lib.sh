@@ -450,18 +450,11 @@ EOF
   done
 }
 
-# pinned_build <nix file> <out-link>: build a generator's derivation (the file takes
-# { pkgs }) against the nixpkgs revision locked in flake.lock, so the compiler and the
-# libraries are pinned too (as scripts/bench-watdiv.sh does).
-pinned_build() {
-  nix build --impure --out-link "$2" --expr "
-    let
-      n = (builtins.fromJSON (builtins.readFile $ROOT/flake.lock)).nodes.nixpkgs.locked;
-      pkgs = import (builtins.fetchTarball {
-        url = \"https://github.com/\${n.owner}/\${n.repo}/archive/\${n.rev}.tar.gz\";
-        sha256 = n.narHash;
-      }) { };
-    in import $1 { inherit pkgs; }"
+# flake_build <attribute> <out-link>: build one of the flake's packages, such as a data
+# generator from nix/benchmarks.nix, against the nixpkgs revision locked in flake.lock, so
+# the compiler and the libraries are pinned too and the binary cache can serve it.
+flake_build() {
+  nix build --no-update-lock-file --out-link "$2" "$ROOT#$1"
 }
 
 # fetch_pinned <pins.tsv> <name> <dest>: download a file listed in a pins file (name, URL,

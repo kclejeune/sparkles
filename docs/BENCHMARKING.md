@@ -15,6 +15,18 @@ nix build .#benchmark-engines
 nix build .#qlever .#fluree
 ```
 
+The Nix workflow builds these packages, the WatDiv and SP2Bench generators
+(`watdiv-gen` and `sp2b-gen`) and the nixpkgs tools that the runners use, which
+`nix/benchmark-tools.nix` lists, and pushes them to the binary cache at
+`https://cache.kclj.io`. A host that trusts the cache downloads them instead of building
+them. The flake's `nixConfig` names the cache, which Nix uses after asking or with
+`accept-flake-config = true`. Hosts that run benchmarks unattended should list it in their
+own `nix.conf` as an extra substituter with the key
+`cache.kclj.io-1:StGAmbogIZLS5IAQD2IQCbbmIjv3Sq8rl/AVEw4Sy7s=`. Fluree's license is not
+free, so it stays out of the public cache and is built from its release archive on each
+host. A test in `scripts/bench-tests` fails when a runner resolves a package that is not
+in the cached set.
+
 Jena, Fuseki, QLever and Oxigraph reuse the definitions from the nixpkgs revision in
 `flake.lock`. The current versions are Jena 6.2.0, Fuseki 5.1.0, QLever 0.5.48 and
 Oxigraph 0.5.11. Fluree 4.2.2 uses the published release archives with SHA-256 hashes
