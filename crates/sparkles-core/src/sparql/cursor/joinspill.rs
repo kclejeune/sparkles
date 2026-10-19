@@ -448,7 +448,9 @@ impl JoinSpill {
         error: Error,
     ) -> Result<Self> {
         let query = ctx.spill.clone().ok_or(error)?;
-        let budget = (build.charge.bytes().max(ctx.memory_room() / 2)).max(MIN_BUDGET);
+        // Half of the room the join has once the build rows it holds are on disk.
+        let held = build.charge.bytes() + pending.as_ref().map_or(0, |p| p.charge.bytes());
+        let budget = ((held + ctx.memory_room()) / 2).max(MIN_BUDGET);
         let width = binary.build_vars.len();
         // The estimated build bytes over the memory for one partition's table, as a
         // power of two between the bounds, fewer when their buffers would not fit.
@@ -615,9 +617,10 @@ impl JoinSpill {
         Ok(())
     }
 
-    /// The rows one chunk of build rows may hold.
-    fn chunk_rows(&self, width: usize) -> u64 {
-        ((self.budget / 2) / chunk_row_bytes(width)).max(MIN_FRAME_ROWS as u64)
+    /// The rows one chunk of build rows may hold: half of the join's budget, or of the
+    /// room left when that is more, with no chunk held.
+    fn chunk_rows(&self, ctx: &Ctx, width: usize) -> u64 {
+        (self.budget.max(ctx.memory_room()) / 2 / chunk_row_bytes(width)).max(MIN_FRAME_ROWS as u64)
     }
 
     /// Partition a job's build and probe files again with the next seed.
@@ -680,14 +683,13 @@ impl JoinSpill {
     /// Read the next chunk of a job's build rows into the kernel, with the unbound build
     /// rows in the first. False when the job's build rows are spent.
     fn load_chunk(&mut self, ctx: &Arc<Ctx>, binary: &mut Binary) -> Result<bool> {
-        let pass = self.pass.as_mut().expect("a running pass");
-        let width = binary.build_vars.len();
-        let limit =
-            ((self.budget / 2) / chunk_row_bytes(width)).max(MIN_FRAME_ROWS as u64) as usize;
-        let first = !pass.chunks.started;
-        pass.chunks.started = true;
         binary.index = None;
         binary.build = None;
+        let width = binary.build_vars.len();
+        let limit = self.chunk_rows(ctx, width) as usize;
+        let pass = self.pass.as_mut().expect("a running pass");
+        let first = !pass.chunks.started;
+        pass.chunks.started = true;
         let unbound = if first { self.unbound.table.len } else { 0 };
         let left: u64 = pass.chunks.runs[pass.chunks.at.min(pass.chunks.runs.len())..]
             .iter()
@@ -757,7 +759,10 @@ impl JoinSpill {
                 return Ok(false);
             };
             let width = binary.build_vars.len();
-            let fits = job.build_rows() + self.unbound.table.len as u64 <= self.chunk_rows(width);
+            binary.index = None;
+            binary.build = None;
+            let fits =
+                job.build_rows() + self.unbound.table.len as u64 <= self.chunk_rows(ctx, width);
             if !fits && job.keyed && job.level < MAX_LEVEL {
                 self.repartition(ctx, binary, job)?;
                 continue;
