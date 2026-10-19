@@ -1472,43 +1472,61 @@ fn label(v: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the query text calls `SERVICE`, outside strings and IRIs.
+/// Whether the query text calls `SERVICE`, outside strings, IRIs and comments.
+///
+/// Only a bare keyword counts. A variable such as `?service` and a prefixed name such
+/// as `pv:Service` or `service:x` are names, not the keyword.
 fn has_service(q: &str) -> bool {
     let mut in_str: Option<char> = None;
+    let mut escaped = false;
     let mut in_iri = false;
+    let mut in_comment = false;
+    // The current token: letters, digits, `_`, `-` and `:`, which covers
+    // keywords, variable names and prefixed names, and whether `?` or `$` led it.
     let mut word = String::new();
+    let mut variable = false;
+    let keyword = |w: &str, variable: bool| !variable && w.eq_ignore_ascii_case("service");
     for c in q.chars() {
-        match (in_str, in_iri) {
-            (Some(d), _) => {
-                if c == d {
-                    in_str = None;
-                }
-                continue;
+        if let Some(d) = in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == d {
+                in_str = None;
             }
-            (None, true) => {
-                if c == '>' {
-                    in_iri = false;
-                }
-                continue;
-            }
-            _ => {}
+            continue;
         }
-        if c.is_ascii_alphabetic() {
+        if in_iri {
+            // An IRI holds no whitespace, so `<` followed by a space was a comparison.
+            if c == '>' || c.is_whitespace() {
+                in_iri = false;
+            }
+            continue;
+        }
+        if in_comment {
+            if c == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':') {
             word.push(c);
             continue;
         }
-        if word.eq_ignore_ascii_case("service") {
+        if keyword(&word, variable) {
             return true;
         }
         word.clear();
+        variable = matches!(c, '?' | '$');
         match c {
             '"' | '\'' => in_str = Some(c),
             '<' => in_iri = true,
-            '#' => {}
+            '#' => in_comment = true,
             _ => {}
         }
     }
-    word.eq_ignore_ascii_case("service")
+    keyword(&word, variable)
 }
 
 /// The lowercase words of `s` of three letters or more, split at camel case, with a

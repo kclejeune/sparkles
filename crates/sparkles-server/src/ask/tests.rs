@@ -441,6 +441,23 @@ fn mentions_and_words() {
     assert!(!has_service(
         "SELECT * { ?s <http://x/service> \"service\" }"
     ));
+    // A class, a variable or a prefix named like the keyword is not a SERVICE call.
+    // CK25 has a class pv:Service, and its questions were left unrun before this.
+    for q in [
+        "SELECT ?service ?name WHERE { ?service a pv:Service ; pv:name ?name }",
+        "SELECT * { ?s a service:Thing } # a SERVICE in a comment",
+        "SELECT * { ?s ?p \"a \\\" SERVICE\" . FILTER(?p < ?q) ?s ?p $service }",
+    ] {
+        assert!(!has_service(q), "{q}");
+    }
+    for q in [
+        "SELECT * { service <http://x/> { ?s ?p ?o } }",
+        "SELECT * { SERVICE SILENT <http://x/> { ?s ?p ?o } }",
+        "SELECT * { ?s ?p ?o . SERVICE<http://x/>{ ?s ?p ?o } }",
+        "SELECT * { FILTER(?a < ?b) SERVICE ?endpoint { ?s ?p ?o } }",
+    ] {
+        assert!(has_service(q), "{q}");
+    }
 }
 
 /// The demo question set: every gold query parses, runs over the organisation graph,
