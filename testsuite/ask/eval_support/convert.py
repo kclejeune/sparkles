@@ -80,10 +80,10 @@ DBPEDIA_PREFIXES = {
 }
 # A projection of one aggregate or function call with no parentheses around it, which
 # Virtuoso accepts: `SELECT DISTINCT COUNT(?x)`, `SELECT Count(?x) as ?c`,
-# `SELECT COUNT(DISTINCT ?y AS ?y)` and `SELECT DISTINCT xsd:date(?d)`.
+# `SELECT COUNT(DISTINCT ?y AS ?y)`, `SELECT SUM(?n)` and `SELECT DISTINCT xsd:date(?d)`.
 BARE_PROJECTION = re.compile(
     r"\bSELECT(\s+DISTINCT)?\s+"
-    r"(COUNT|[A-Za-z][\w-]*:[A-Za-z][\w-]*)\s*\(\s*(DISTINCT\s+)?(\?\w+)"
+    r"(COUNT|SUM|AVG|MIN|MAX|SAMPLE|[A-Za-z][\w-]*:[A-Za-z][\w-]*)\s*\(\s*(DISTINCT\s+)?(\?\w+)"
     r"(?:\s+AS\s+\?\w+)?\s*\)(?:\s+AS\s+(\?\w+))?(?=\s+(?:WHERE\b|\{))",
     re.IGNORECASE,
 )

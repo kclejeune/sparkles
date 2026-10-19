@@ -215,6 +215,9 @@ class Normalize(unittest.TestCase):
             "SELECT DISTINCT COUNT(?a) { ?a ?b ?c }": (
                 "SELECT DISTINCT (COUNT(?a) AS ?count) { ?a ?b ?c }"
             ),
+            "SELECT SUM(?n) WHERE { ?u <urn:students> ?n }": (
+                "SELECT (SUM(?n) AS ?value) WHERE { ?u <urn:students> ?n }"
+            ),
         }
         for query, want in cases.items():
             with self.subTest(query=query):
