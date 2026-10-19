@@ -1572,3 +1572,36 @@ pub(crate) mod tests {
         );
     }
 }
+
+/// `--schema-statistics-above`: a number of quads, or `off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatisticsAbove(pub Option<u64>);
+
+impl Default for StatisticsAbove {
+    fn default() -> Self {
+        StatisticsAbove(Some(sparkles::schema::DEFAULT_STATISTICS_ABOVE))
+    }
+}
+
+impl std::str::FromStr for StatisticsAbove {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim() {
+            "off" => Ok(StatisticsAbove(None)),
+            n => n
+                .replace('_', "")
+                .parse()
+                .map(|n| StatisticsAbove(Some(n)))
+                .map_err(|_| format!("expected a number of quads or off, not {s:?}")),
+        }
+    }
+}
+
+impl std::fmt::Display for StatisticsAbove {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(n) => write!(f, "{n}"),
+            None => f.write_str("off"),
+        }
+    }
+}

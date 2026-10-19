@@ -151,8 +151,8 @@ pub struct McpArgs {
     /// Above this many quads, the schema reports of the tools count classes and
     /// predicates from the index statistics instead of scanning the indexes, and measure
     /// a predicate's objects when a tool needs them; `off` always scans
-    #[arg(long, value_name = "QUADS", default_value_t = StatisticsAbove::default())]
-    pub schema_statistics_above: StatisticsAbove,
+    #[arg(long, value_name = "QUADS", default_value_t = crate::state::StatisticsAbove::default())]
+    pub schema_statistics_above: crate::state::StatisticsAbove,
     /// How long a tool call of a client that supports tasks runs before it becomes a
     /// task that the client polls, in milliseconds
     #[arg(long, value_name = "MS", default_value_t = 2000)]
@@ -595,37 +595,4 @@ pub fn run(args: McpArgs, store_opts: StoreOptions) -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(adapter::serve_stdio(server))
-}
-
-/// `--schema-statistics-above`: a number of quads, or `off`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StatisticsAbove(pub Option<u64>);
-
-impl Default for StatisticsAbove {
-    fn default() -> Self {
-        StatisticsAbove(Some(sparkles::schema::DEFAULT_STATISTICS_ABOVE))
-    }
-}
-
-impl std::str::FromStr for StatisticsAbove {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s.trim() {
-            "off" => Ok(StatisticsAbove(None)),
-            n => n
-                .replace('_', "")
-                .parse()
-                .map(|n| StatisticsAbove(Some(n)))
-                .map_err(|_| format!("expected a number of quads or off, not {s:?}")),
-        }
-    }
-}
-
-impl std::fmt::Display for StatisticsAbove {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Some(n) => write!(f, "{n}"),
-            None => f.write_str("off"),
-        }
-    }
 }

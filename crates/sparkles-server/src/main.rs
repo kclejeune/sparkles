@@ -1081,8 +1081,8 @@ enum Cmd {
         /// the asking pipeline count classes and predicates from the index statistics
         /// instead of scanning the indexes; `off` always scans. `/{ds}/schema` always
         /// scans
-        #[arg(long, value_name = "QUADS", default_value_t = mcp::StatisticsAbove::default())]
-        schema_statistics_above: mcp::StatisticsAbove,
+        #[arg(long, value_name = "QUADS", default_value_t = state::StatisticsAbove::default())]
+        schema_statistics_above: state::StatisticsAbove,
         // the ceilings of GraphQL requests
         #[cfg(feature = "graphql")]
         #[command(flatten)]

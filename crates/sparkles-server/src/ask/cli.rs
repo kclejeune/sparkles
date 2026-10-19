@@ -77,8 +77,8 @@ pub struct AskArgs {
     pub query_memory_mb: u64,
     /// Above this many quads, the schema reports count classes and predicates from the
     /// index statistics instead of scanning the indexes; `off` always scans
-    #[arg(long, value_name = "QUADS", default_value_t = crate::mcp::StatisticsAbove::default())]
-    pub schema_statistics_above: crate::mcp::StatisticsAbove,
+    #[arg(long, value_name = "QUADS", default_value_t = crate::state::StatisticsAbove::default())]
+    pub schema_statistics_above: crate::state::StatisticsAbove,
     /// Print the result as one JSON object
     #[arg(long, conflicts_with = "events")]
     pub json: bool,
