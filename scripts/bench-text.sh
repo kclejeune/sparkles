@@ -175,7 +175,7 @@ if [ -z "${SKIP_LOAD:-}" ]; then
   fi
   if has jena; then
     rm -rf jena.db
-    "$TDBLOADER" --loc jena.db data.nt > jena-load.log 2>&1
+    env -u JAVA_HOME "$TDBLOADER" --loc jena.db data.nt > jena-load.log 2>&1
   fi
   if has qlever; then
     rm -rf qlever-index
@@ -243,7 +243,7 @@ if has sparkles; then
 fi
 if has jena; then
   PORT[jena]=$JPORT
-  JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --config="$WORK/fuseki-text.ttl" --port "$JPORT" > fuseki.log 2>&1 &
+  env -u JAVA_HOME JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --config="$WORK/fuseki-text.ttl" --port "$JPORT" > fuseki.log 2>&1 &
   PIDS+=($!)
   wait_for "localhost:$JPORT/\$/ping"
   NAME[jena]=jena-fuseki

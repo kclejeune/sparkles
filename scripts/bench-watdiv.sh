@@ -190,7 +190,7 @@ EOF
 if [ -z "${SKIP_LOAD:-}" ]; then
   LOAD=()
   if has sparkles; then LOAD+=(--prepare 'rm -rf sparkles.db' --command-name sparkles "$SPARKLES load --loc sparkles.db data.nt"); fi
-  if has jena; then LOAD+=(--prepare 'rm -rf jena.db' --command-name jena-tdb2 "$TDBLOADER --loc jena.db data.nt"); fi
+  if has jena; then LOAD+=(--prepare 'rm -rf jena.db' --command-name jena-tdb2 "env -u JAVA_HOME $TDBLOADER --loc jena.db data.nt"); fi
   if has qlever; then
     mkdir -p qlever-index
     echo '{"num-triples-per-batch": 1000000}' > qlever-index/settings.json
@@ -240,7 +240,7 @@ if has sparkles; then
   URL[sparkles]=localhost:$SPORT/bench/sparql
 fi
 if has jena; then
-  JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --update --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
+  env -u JAVA_HOME JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --update --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
   PIDS+=($!)
   PORT[jena]=$JPORT
   wait_for "localhost:$JPORT/\$/ping"

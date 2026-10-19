@@ -291,7 +291,7 @@ step_load() {
       gz+=("$g")
     done
     mkdir -p "$S/jena-tmp"
-    timed jena-tdb2 "$S/jena.db" "$xloader" --loc "$S/jena.db" --tmpdir "$S/jena-tmp" "${gz[@]}"
+    timed jena-tdb2 "$S/jena.db" env -u JAVA_HOME "$xloader" --loc "$S/jena.db" --tmpdir "$S/jena-tmp" "${gz[@]}"
   fi
   if has oxigraph; then
     local oxigraph
@@ -352,7 +352,7 @@ start() { # start <engine>
       READY[$e]="localhost:$p/?cmd=stats"
       ;;
     jena)
-      JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "$FUSEKI" --port "$p" \
+      env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "$FUSEKI" --port "$p" \
         --loc "$S/jena.db" /dbpedia > "$S/logs/server-jena.log" 2>&1 &
       URL[$e]=localhost:$p/dbpedia/sparql
       READY[$e]="localhost:$p/\$/ping"

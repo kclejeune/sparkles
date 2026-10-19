@@ -29,7 +29,9 @@ another version is on `PATH`. Each package gets a GC root in the run's `gcroots/
 directory. `TDBLOADER`, `FUSEKI`, `QINDEX`, `QSERVER`, `OXIGRAPH` and `FLUREE` can
 explicitly select other executables. The billion-triple loader also accepts `XLOADER`.
 `FLUREE_VERSION`, when supplied without `FLUREE`, must match the packaged version.
-Auxiliary tools prefer `PATH` and otherwise use the repository's locked nixpkgs.
+Jena loaders and servers clear `JAVA_HOME` so their wrappers use the packaged JDK.
+The RDFS oracle also defaults to the locked JDK, with `JAVA` as an explicit override.
+Other auxiliary tools prefer `PATH` and otherwise use the repository's locked nixpkgs.
 
 The binding comparisons keep their language-specific versions. Python's pyoxigraph
 and rdflib dependencies are pinned with hashes in

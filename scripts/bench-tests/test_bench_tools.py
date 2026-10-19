@@ -133,6 +133,17 @@ print(store)
         self.assertIn(f"{ROOT}#qlever", self.nix_calls()[-1])
         self.assertFalse((self.work / "data.nt").exists())
 
+    def test_text_loader_uses_the_packaged_jdk(self):
+        (self.work / "data.nt").write_text("<urn:s> <urn:p> <urn:o> .\n")
+        loader = self.store / "loader"
+        loader.write_text('#!/bin/sh\n[ -z "${JAVA_HOME+x}" ] || exit 74\nexit 43\n')
+        loader.chmod(0o755)
+        p = subprocess.run(["bash", str(ROOT / "scripts/bench-text.sh"), "1", str(self.work)],
+                           env=self.env | {"ENGINES": "jena", "CLIENT_CPU": "none", "JAVA_HOME": "/old-jdk",
+                                           "TDBLOADER": str(loader), "FUSEKI": str(loader)},
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 43, p.stderr)
+
     def test_watdiv_runner_uses_pinned_qlever(self):
         # Reuse prepared generator output so only the runner's engine setup executes.
         (self.work / "gen").mkdir()
