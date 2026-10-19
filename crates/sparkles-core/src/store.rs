@@ -384,6 +384,11 @@ impl Delta {
         self.predicates.get(&p)
     }
 
+    /// The statistics of the inserted quads of every predicate, in id order.
+    pub fn predicate_stats(&self) -> impl Iterator<Item = (u64, &DeltaPredicate)> + '_ {
+        self.predicates.iter().map(|(p, s)| (*p, s))
+    }
+
     /// The statistics by predicate worked out from the inserted keys (what
     /// [`predicate`](Self::predicate) keeps up to date), for checks.
     pub fn predicates_from_keys(&self) -> BTreeMap<u64, DeltaPredicate> {

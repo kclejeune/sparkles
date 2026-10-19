@@ -71,6 +71,14 @@ pub struct AskArgs {
     /// Largest timeout of one query, in seconds
     #[arg(long, value_name = "SECS", default_value_t = 60.0)]
     pub timeout: f64,
+    /// Budget for the estimated memory of each query's intermediate results, in MiB (0:
+    /// unlimited), as `sparkles mcp --query-memory-mb` sets it
+    #[arg(long, value_name = "N", default_value_t = 2048)]
+    pub query_memory_mb: u64,
+    /// Above this many quads, the schema reports count classes and predicates from the
+    /// index statistics instead of scanning the indexes; `off` always scans
+    #[arg(long, value_name = "QUADS", default_value_t = crate::mcp::StatisticsAbove::default())]
+    pub schema_statistics_above: crate::mcp::StatisticsAbove,
     /// Print the result as one JSON object
     #[arg(long, conflicts_with = "events")]
     pub json: bool,
@@ -147,6 +155,9 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
     st.read_only = true;
     st.allow_service = false;
     st.outbound = args.outbound.policy()?;
+    st.schema_statistics_above = args.schema_statistics_above.0;
+    let memory = (args.query_memory_mb > 0).then_some(args.query_memory_mb << 20);
+    st.limits.query_memory_bytes = memory;
     let st = Arc::new(st);
     match &args.loc {
         Some(path) => {
@@ -174,6 +185,7 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
         max_rows: args.max_rows.max(1000),
         max_bytes: 4 << 20,
         max_timeout: timeout,
+        query_memory_bytes: memory,
         ..McpConfig::default()
     };
     let server = McpServer::new(st, cfg);

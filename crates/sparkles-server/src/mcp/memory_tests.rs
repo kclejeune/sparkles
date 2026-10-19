@@ -245,6 +245,93 @@ async fn check_query() {
     assert_eq!(e["code"], "bad-argument");
 }
 
+/// The `mem` dataset of [`mem`] on a server whose tools read schema reports from the
+/// index statistics at any size (`--schema-statistics-above 0`), or never.
+fn mem_with_statistics(on: bool) -> McpServer {
+    let cfg = McpConfig::default();
+    let mut st = AppState::standalone(StoreOptions::default(), cfg.max_timeout);
+    st.read_only = true;
+    st.limits.query_memory_bytes = cfg.query_memory_bytes;
+    st.limits.max_result_bytes = None;
+    st.schema_statistics_above = on.then_some(0);
+    let st = Arc::new(st);
+    let ds = st.attach("mem", DbType::Mem, None).unwrap();
+    load_trig(&ds, MEM);
+    sparkles::sparql::update::update(&ds.store, A7, &sparkles::sparql::QueryOptions::default())
+        .unwrap();
+    McpServer::new(st, cfg)
+}
+
+/// A report measured from the index statistics gives `check_query` the answers a full
+/// report gives, and a commit replaces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn check_query_from_index_statistics() {
+    let queries = [
+        "SELECT ?n WHERE { ?p a schema:Person ; foaf:name ?n }",
+        "SELECT ?p WHERE { ?p rdfs:label \"Ana Lima\" }",
+        "SELECT ?p WHERE { ?p rdfs:label \"Ana Lima\"@en }",
+        "SELECT ?u WHERE { ?u a org:Organisation } LIMIT 10",
+        "SELECT ?n WHERE { ?p a schema:Person ; rdfs:label ?n } LIMIT 5",
+        "SELECT ?p ?nope WHERE { ?p org:memberOf ex:nowhere ; schema:email 42 }",
+        "SELECT ?e WHERE { ?o a org:Organization ; schema:email ?e }",
+        "SELECT ?x WHERE { ?x spk:confidence ?c FILTER(?c > \"high\") }",
+    ];
+    let mut exact = Client::start(mem_with_statistics(false));
+    let server = mem_with_statistics(true);
+    let state = server.state.clone();
+    let mut stats = Client::start(server);
+    for q in queries {
+        let args = json!({"query": q, "terms": true});
+        let a = exact.structured("check_query", args.clone()).await;
+        let b = stats.structured("check_query", args).await;
+        assert_eq!(a["ok"], b["ok"], "{q}");
+        assert_eq!(a["issues"], b["issues"], "{q}");
+        // the counts of the terms list are quads, which equal triples here
+        assert_eq!(a["terms"], b["terms"], "{q}");
+    }
+    let d = stats
+        .structured(
+            "describe_schema",
+            json!({"section": "summary", "graph": "union"}),
+        )
+        .await;
+    assert_eq!(d["basis"], "statistics", "{d}");
+    let label = d["predicates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["iri"] == "rdfs:label")
+        .unwrap()
+        .clone();
+    assert_eq!(label["objects"], json!(["rdf:langString@en 4"]), "{label}");
+    assert!(label.get("maxPerSubject").is_none(), "{label}");
+    let d = exact
+        .structured(
+            "describe_schema",
+            json!({"section": "summary", "graph": "union"}),
+        )
+        .await;
+    assert!(d.get("basis").is_none(), "{d}");
+    // a commit adds a predicate: the next check reads a report of the new state
+    let q = json!({"query": "SELECT ?x WHERE { ?x ex:newPredicate ?y }"});
+    let s = stats.structured("check_query", q.clone()).await;
+    assert_eq!(
+        issues(&s),
+        [("unknown-predicate".into(), "error".into())],
+        "{s}"
+    );
+    let ds = state.get("mem").unwrap();
+    sparkles::sparql::update::update(
+        &ds.store,
+        "INSERT DATA { <http://example.org/z> <http://example.org/newPredicate> 1 }",
+        &sparkles::sparql::QueryOptions::default(),
+    )
+    .unwrap();
+    let s = stats.structured("check_query", q).await;
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(s["issues"], json!([]), "{s}");
+}
+
 fn put_query(server: &McpServer, ds: &str, name: &str, def: Value) {
     let ds = server.state.datasets()[ds].clone();
     let d: sparkles::stored::Definition = serde_json::from_value(def).unwrap();

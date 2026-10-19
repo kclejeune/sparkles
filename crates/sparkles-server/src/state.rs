@@ -345,6 +345,9 @@ pub struct AppState {
     pub file_loads: sparkles::sparql::FileLoads,
     /// cap on the classes, and separately the predicates, of one schema report
     pub schema_max_entries: usize,
+    /// the store size above which the schema reports of the tools come from the index
+    /// statistics (`--schema-statistics-above`; `None`: always scan)
+    pub schema_statistics_above: Option<u64>,
     /// what the imports of one ShEx schema may read (`--shex-max-imports` and the like)
     #[cfg(feature = "shex")]
     pub shex_import_limits: sparkles_shex::resolve::ImportLimits,
@@ -621,6 +624,7 @@ impl AppState {
             spill: None,
             file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
+            schema_statistics_above: Some(sparkles::schema::DEFAULT_STATISTICS_ABOVE),
             #[cfg(feature = "shex")]
             shex_import_limits: Default::default(),
             #[cfg(feature = "graphql")]
@@ -683,6 +687,7 @@ impl AppState {
             spill: None,
             file_loads: sparkles::sparql::FileLoads::Disabled,
             schema_max_entries: sparkles::schema::DEFAULT_MAX_ENTRIES,
+            schema_statistics_above: Some(sparkles::schema::DEFAULT_STATISTICS_ABOVE),
             #[cfg(feature = "shex")]
             shex_import_limits: Default::default(),
             #[cfg(feature = "graphql")]

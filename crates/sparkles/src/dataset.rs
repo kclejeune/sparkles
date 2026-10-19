@@ -144,9 +144,12 @@ pub struct DatasetState {
     pub validation: RwLock<Option<WriteGuard>>,
     /// why the write guard that `validation.json` asks for is not installed
     pub guard_error: RwLock<Option<String>>,
-    /// the last schema report computed, kept for its pagination cursors and to be
-    /// maintained from later changes
-    pub schema_cache: Mutex<Option<SchemaCacheEntry>>,
+    /// the last schema reports computed, most recently used last, kept for their
+    /// pagination cursors and to be maintained from later changes (at most
+    /// [`SCHEMA_CACHE_ENTRIES`])
+    pub schema_cache: Mutex<Vec<SchemaCacheEntry>>,
+    /// the objects of predicates measured for reports of [`crate::schema::Basis::Statistics`]
+    pub objects_cache: Mutex<ObjectsCache>,
     /// where a clone was made from (`origin.json`, or kept in memory for an in-memory
     /// clone)
     pub origin: Option<serde_json::Value>,
@@ -193,6 +196,19 @@ impl From<Arc<Store>> for StoreHandle {
     fn from(s: Arc<Store>) -> StoreHandle {
         StoreHandle::Branch(s)
     }
+}
+
+/// The most schema reports a dataset keeps: one for each selection that callers alternate
+/// between, such as the default graph that the asking pipeline describes and the union
+/// graph that `check_query` reads.
+pub const SCHEMA_CACHE_ENTRIES: usize = 4;
+
+/// The objects of the predicates measured at one state with one selection.
+#[derive(Default)]
+pub struct ObjectsCache {
+    /// the commit and the selection hash the entries belong to
+    pub key: (u64, u64),
+    pub entries: std::collections::HashMap<String, Option<Arc<crate::schema::PredicateObjects>>>,
 }
 
 /// A computed schema report and what it was computed for.
@@ -301,7 +317,8 @@ impl Dataset {
                 rdfs: RwLock::new(rdfs),
                 validation: RwLock::new(validation),
                 guard_error: RwLock::new(guard_error),
-                schema_cache: Mutex::new(None),
+                schema_cache: Mutex::new(Vec::new()),
+                objects_cache: Mutex::new(ObjectsCache::default()),
                 origin,
                 store,
             }),
