@@ -26,6 +26,15 @@ runs:
   steps:
     - uses: actions-rust-lang/setup-rust-toolchain@v1
       with: { cache: false, rustflags: "" }
+    # rust-cache keys its entries on every installed toolchain, and the runner images in
+    # rotation preinstall different stable releases, which made the same job miss its own
+    # cache from one run to the next. Only the pinned toolchain stays.
+    - name: Remove the runner's other Rust toolchains
+      shell: bash
+      run: |
+        active=$(rustup show active-toolchain | cut -d' ' -f1)
+        rustup toolchain list | cut -d' ' -f1 | grep -vx "$active" | xargs -r -n1 rustup toolchain uninstall
+        rustup toolchain list
     # A test build without a warm cache compiles the sparkles crate's library and its test
     # harness at once, two rustc processes of about 8 GB each, which is more than the
     # runner's 16 GB. Running out of memory ends the job with only "The runner has

@@ -209,6 +209,9 @@ jobs:
         with:
           cache-key: tests
           swap: "true"
+      # Without the standard library's debug information the archive is smaller, so the
+      # upload and the five downloads take less time. Panics still name their functions.
+      - run: echo CARGO_PROFILE_DEV_STRIP=debuginfo >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
