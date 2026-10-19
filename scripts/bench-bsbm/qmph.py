@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Collect the BSBM test driver's runs in results/qmph.json and check them against each other.
 
-    qmph.py <driver-output.xml> <qmph.json> <engine> <clients> <query-name> [<driver exit status>]
+    qmph.py <driver-output.xml> <qmph.json> <engine> <clients> <query-name> [<driver exit status> [<reason>]]
     qmph.py --check <qmph.json> [<comma-separated query numbers to leave out>]
 
 The first form adds one run. The driver (benchmark.testdriver.TestDriver) writes an XML file
@@ -10,13 +10,15 @@ it returned on average and how often it timed out. The file qmph.json maps an en
 client count to {qmph, runs, seconds, timeouts, avgresults, query, status}, the form
 scripts/bench-record.py reads. A missing or unreadable XML file, or a driver that exited with a
 nonzero status, records status `error`, and a run in which any query timed out records `timeout`.
-That outcome is also kept in `driver_status`.
+That outcome is also kept in `driver_status`. A reason, given when the mix was not run on the
+engine at all, goes into `status_reasons` with status `error`.
 
 The driver does not look at what a query returns, so a query that fails quickly, or that
 answers wrongly and quickly, makes the query mixes per hour look better. The second form compares
 the average result count of every query. The driver draws the same queries for a given number of
 mixes and seed, whatever the number of clients, so a correct engine returns the same averages in
-every run. Only runs in which the driver succeeded without a timeout take part, and they are
+every run, up to a difference in the last digit, so averages that differ by at most 0.05 or 1%
+count as equal. Only runs in which the driver succeeded without a timeout take part, and they are
 compared only with runs that have the same mix count. Each engine casts one vote per query, and
 only when its own runs agree, so an engine with more client counts does not outvote the others. When
 only one engine has runs, its runs vote against each other. A run that differs from the majority on
@@ -29,7 +31,6 @@ import json
 import os
 import sys
 import xml.etree.ElementTree as ET
-from collections import Counter
 
 
 def load(path):
@@ -44,8 +45,10 @@ def save(path, d):
         json.dump(d, f, indent=1)
 
 
-def add(xml, out, engine, clients, name, exit_status):
+def add(xml, out, engine, clients, name, exit_status, reason=None):
     entry = {"query": name, "status": "error", "driver_status": "error", "qmph": None}
+    if reason:
+        entry["status_reasons"] = [reason]
     try:
         root = ET.parse(xml).getroot()
         mix = root.find("querymix")
@@ -76,14 +79,31 @@ def base_status(v):
     return base if base in ("ok", "timeout", "error") else "ok"
 
 
+def agree(x, y):
+    """Two average result counts agree within 0.05 or 1%, whichever is larger. The driver's
+    averages of the same queries differ in the last digit between client counts (4.99 and 5.0
+    for Explore's query 5 at 10M), so exact equality would flag correct runs."""
+    return abs(x - y) <= max(0.05, 0.01 * max(abs(x), abs(y)))
+
+
 def reference(votes):
-    """The value most votes agree on, or None. Needs at least two votes and a strict plurality."""
+    """The value most votes agree on, or None. Needs at least two votes and a strict plurality.
+    Agreement within the tolerance is not transitive, so values can overlap: with 100, 101,
+    102 and 103, both 101 and 102 have three supporters, but they leave out different votes.
+    When the best supported values do not all have the same supporters, the query is left
+    undecided rather than one of them picked."""
     if len(votes) < 2:
         return None
-    top = Counter(votes).most_common()
-    if top[0][1] >= 2 and (len(top) == 1 or top[0][1] > top[1][1]):
-        return top[0][0]
-    return None
+    supporters = [frozenset(i for i, w in enumerate(votes) if agree(v, w)) for v in votes]
+    n = max(len(s) for s in supporters)
+    tops = {s for s in supporters if len(s) == n}
+    if n < 2 or len(tops) > 1:
+        return None
+    return votes[supporters.index(next(iter(tops)))]
+
+
+def consistent(xs):
+    return all(agree(xs[0], x) for x in xs)
 
 
 def check(path, skip=()):
@@ -109,13 +129,13 @@ def check(path, skip=()):
                     per_engine.setdefault(e, []).append(round(v["avgresults"][nr], 2))
             if len(engines) > 1:
                 # an engine counts once, and only when its own runs agree
-                ref = reference([xs[0] for xs in per_engine.values() if len(set(xs)) == 1])
+                ref = reference([xs[0] for xs in per_engine.values() if consistent(xs)])
             else:
                 ref = reference(next(iter(per_engine.values())))
             if ref is not None:
                 majority[nr] = ref
         for e, c, v in runs:
-            diff = sorted((nr for nr, x in v["avgresults"].items() if nr in majority and round(x, 2) != majority[nr]),
+            diff = sorted((nr for nr, x in v["avgresults"].items() if nr in majority and not agree(x, majority[nr])),
                           key=int)
             if diff:
                 v["status"] = "wrong-answer"
@@ -131,4 +151,5 @@ if __name__ == "__main__":
         check(sys.argv[2], set(sys.argv[3].split(",")) if len(sys.argv) > 3 else set())
     else:
         xml, out, engine, clients, name = sys.argv[1:6]
-        add(xml, out, engine, clients, name, int(sys.argv[6]) if len(sys.argv) > 6 else 0)
+        add(xml, out, engine, clients, name, int(sys.argv[6]) if len(sys.argv) > 6 else 0,
+            sys.argv[7] if len(sys.argv) > 7 else None)

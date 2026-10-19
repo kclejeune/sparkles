@@ -268,6 +268,10 @@ if has oxigraph; then
 fi
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
+# time_query (scripts/bench-probe.sh). The engines run together here, so an engine that
+# stops answering is left out of the remaining queries rather than restarted.
+# shellcheck source=scripts/bench-probe.sh
+source "$ROOT/scripts/bench-probe.sh"
 q() { # curl command for endpoint + query name (fails on HTTP errors)
   echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$2.rq $1"
 }
@@ -296,11 +300,7 @@ if [ -z "${ANSWERS_ONLY:-}" ]; then
     selected "$n" || continue
     echo
     echo "== $n"
-    qcmd() { q "${URL[$1]}" "$n"; }
-    mapfile -d '' ARGS < <(engine_args qcmd)
-    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
-      "${ARGS[@]}" --export-json "results/$n.new.json"
-    merge "results/$n.new.json" "results/$n.json"
+    time_query "$n" results "$CLEAR"
   done
 fi
 

@@ -117,11 +117,24 @@ This change keeps the existing lock and engine versions.
 
   The `cold` mode stops each engine before every query and evicts its files from the
   page cache. Then it starts the engine, records the time until it answers, and times one
-  query. It repeats this 3 times (`--cold-runs`) and keeps the median.
+  query. It repeats this 3 times (`--cold-runs`) and keeps the median. The eviction asks
+  the kernel to drop every file of the store from the page cache (`posix_fadvise` with
+  `POSIX_FADV_DONTNEED`) from one process. Earlier runs started one `dd` per file, which
+  took about 5 minutes per cold Fluree run at LUBM(100) on forge. On a local Fluree store of
+  10,074 files, on a busy laptop, the old way took 31 to 74 s and the new one 0.11 to
+  0.14 s. Neither drops pages that are not yet written back. Once the store's 66 MiB were
+  on disk, both left none of them in the page cache.
 
   The copies of the `updates` and `mixed` modes are removed at the end of the run unless
   `KEEP_SCRATCH=1` is set. The servers listen on five ports from `--port-base` (default
-  3931), so runs with different bases can share a machine. Results merge per engine, so
+  3931), so runs with different bases can share a machine. Server ports belong below the
+  kernel's range of ephemeral client ports, which is 32768 to 60999 by default
+  (`/proc/sys/net/ipv4/ip_local_port_range`), and the scripts warn about a base inside it. A
+  client connection that happened to use a server's port as its own local port stays in
+  TIME-WAIT for 60 s after it closes, and until then the server cannot bind that port, even
+  with `SO_REUSEADDR`. Before a server starts, the harness waits up to 75 s
+  (`PORT_WAIT`) until its port can be bound, and refuses a port that another process
+  listens on. Results merge per engine, so
   `--engines qlever` measures QLever again and keeps the other engines' numbers.
 
   On a machine with less memory than the engines can use, set `SERVER_MEM_MAX` (for
@@ -255,12 +268,38 @@ This change keeps the existing lock and engine versions.
   after `MAX_TIME`, and every server's query timeout is `MAX_TIME` plus a margin of 15
   seconds (`TIMEOUT_MARGIN`), so a server stops a query that the client has abandoned. A
   run that fails after taking as long as `MAX_TIME` is recorded as a `timeout`, whichever
-  side stopped it. The options are the
+  side stopped it.
+
+  Every timing loop, in these suites and in `scripts/bench.sh`, `scripts/bench-watdiv.sh`
+  and `scripts/bench-billion.sh`, sends each query once more untimed just before
+  hyperfine runs it (`scripts/bench-probe.sh`). An engine whose request fails or reaches
+  `MAX_TIME` there is recorded with that one sample, as an `error` or a `timeout`, and
+  hyperfine leaves it out, so a query that cannot finish costs `MAX_TIME` once rather than
+  12 times. After a failure and after each query's timed runs, every engine must answer a
+  one-row query within 30 seconds. An engine that does not is restarted, and
+  `results/restarts.json` names it and the query after which it stopped answering. WatDiv
+  runs its engines together and cannot restart one alone, so there such an engine is left
+  out of the remaining queries and recorded as an error for them. This check exists
+  because Fuseki 5.1 can answer its ping while every query waits forever. At 10.5M
+  triples, a `StackOverflowError` in its property path engine during `knows-reach` left
+  TDB2's node table cache locked, and `jstack` reported a deadlock between the cache's
+  monitor and Caffeine's eviction lock. Every later Jena query then ran into `MAX_TIME`.
+
+  The options are the
   ones of `scripts/bench.sh`, which are
   `ENGINES`, `QUERIES`, `RUNS`, `WARMUP`, `SKIP_LOAD`, `ANSWERS_ONLY`, `PORT_BASE`,
   `SERVER_MEM_MAX` and `CLIENT_CPU`. `COLD_RUNS=3` adds the cold measurement, a restart
   with an evicted page cache before each sample. The suites default to the ports from
-  48300.
+  28300, and the long write harness to the ports from 28400. They used 48300 and 48400
+  until 2026-10-19. Those lie in the ephemeral range, and in the first BSBM run on forge a
+  client connection of the test driver held Oxigraph's port when its server started.
+
+  A server that does not start, or that stops answering and does not start again, is left
+  out of the rest of the run, which goes on with the other engines, writes the record and
+  exits with status 1. A server that is not running
+  when a query is about to be timed, for example because an earlier query of the answer
+  check or the warm-up pass ran it out of memory, is restarted first, and
+  `results/restarts.json` names it.
 
   ```sh
   # small runs that check the setup
@@ -367,7 +406,8 @@ This change keeps the existing lock and engine versions.
   script runs the driver once against a stub endpoint to record the queries of its own query
   mixes, and it keeps three distinct instances of each template. The answers to these
   instances are compared across engines before timing, except for the DESCRIBE query, whose
-  result the SPARQL specification leaves to the engine. When a query with an ORDER BY on
+  result the SPARQL specification leaves to the engine. The stub endpoint takes a free port
+  from the kernel. When a query with an ORDER BY on
   plain variables also has a LIMIT or an OFFSET, the check sends a second, untimed request
   one row wider on each side of the cut. The rows that tie with the row past the cut may
   legitimately differ between engines, so the comparison leaves them out and compares only
@@ -379,9 +419,36 @@ This change keeps the existing lock and engine versions.
   failing or wrongly answering engine would look fast. A run in which the driver exits with an error is recorded as `error`.
   Afterwards the average result count of each query is compared across the runs in which the
   driver succeeded without a timeout. Each engine counts once, and runs with different mix
-  counts are not compared with each other. A run that differs from the majority is recorded
+  counts are not compared with each other. Averages that differ by at most 0.05 or 1% count
+  as equal, because the driver's averages of the same queries differ in the last digit
+  between client counts. Equality within that margin is not transitive, so when two values
+  have the most support but different supporters, the query is not judged. A run that differs from the majority is recorded
   as `wrong-answer` with the numbers of the queries that differ, and a failed run keeps its
-  `error` or `timeout`.
+  `error` or `timeout`. For DESCRIBE and CONSTRUCT queries the driver counts the bytes of
+  the RDF/XML it receives, which differ between engines that return the same triples, so
+  those queries are left out of this comparison. A server that stops answering during a
+  driver run is restarted before the next one. The driver runs with
+  `-Dhttp.keepAlive=false`, so every request opens a new connection, as the curl and `oha`
+  requests of the other measurements do. With Java's default keep-alive, QLever's answers
+  on a reused connection waited for a delayed TCP acknowledgement. In a smoke run with 500
+  products and one client, QLever's mix without DESCRIBE and CONSTRUCT went from 1,666 to
+  2,702 query mixes per hour with the option, and its per-query times fell by 31 to 52 ms.
+
+  The driver asks for DESCRIBE and CONSTRUCT results as RDF/XML only
+  (`Accept: application/rdf+xml`) and stops at the first request that fails. QLever 0.5.48
+  writes no RDF/XML. It answers such a request with 406 Not Acceptable and lists the
+  formats it supports, which for these queries are Turtle, N-Triples, CSV, TSV and its own
+  formats. The Explore mix has a DESCRIBE (query 9) and a CONSTRUCT (query 12), so QLever
+  cannot run it. Before the standard mix, the script sends each engine the first DESCRIBE
+  and CONSTRUCT instance as the driver would. An engine that refuses one is recorded as
+  `error` for the standard mix, with the status code in `status_reasons`, and the mix is
+  not run on it. A second mix, `explore-mix-select` in `results/qmph-select.json`, leaves
+  those queries out through the driver's own `ignoreQueries.txt` and runs on every engine.
+  The driver still draws the parameters of the skipped queries, so the other queries are
+  the same instances in both mixes. This mix compares all five engines, and the standard
+  mix compares the engines that answer in RDF/XML. Neither the queries nor the driver are
+  changed, and no engine's answers pass through a proxy. The Business Intelligence use case
+  has no DESCRIBE or CONSTRUCT query and runs only its standard mix.
   `--usecase bi` runs the Business Intelligence use case instead of Explore. The Explore
   and Update mix is not run yet.
 

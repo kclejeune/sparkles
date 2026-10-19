@@ -601,8 +601,9 @@ one ranking.
 
 ## Outcome
 
-Phase 1's tooling is built. The measurements it exists for have not been run on a
-publication host, so BENCHMARKS.md has no figures from it.
+Phase 1's tooling is built. The first batch of the standard refresh ran on the reference
+host on 2026-10-18 and 2026-10-19, and BENCHMARKS.md has its synthetic, SP²Bench and LUBM
+figures. The rest of the refresh is listed under "Left for Phase 1".
 
 **Record and manifest.** `scripts/bench-record.py` has four subcommands. `manifest` writes
 the run manifest of §6 with the commit of the scripts' checkout, the Sparkles binary's
@@ -780,18 +781,62 @@ yet.
   prefer it to the JDK of the nixpkgs wrapper, and a developer's `JAVA_HOME` may name a JDK
   older than the jars need.
 
+**First refresh batch (2026-10-18 to 2026-10-19).** The batch ran on forge with the release
+binary of commit 81478fbe, every engine alone under a 12 GiB memory limit. The harness was
+that of commit 81478fbe for the synthetic runs at 1.05M and of commit 77032452 for the
+rest. Its records are built with `bench-record.py build` from the result directories.
+
+* The synthetic suite at 1.05M and 10.5M in the default, cold, `updates` and mixed modes,
+  SP²Bench at 10M triples and LUBM(100) with the `owl-rl` closure and cold runs completed,
+  and BENCHMARKS.md has their figures. Sparkles is fastest on 27 of 28 warm queries at
+  1.05M and on all 28 at 10.5M, on 11 of 14 LUBM queries, and on 11 of the 13 SP²Bench
+  queries it answers. Its default query memory budget refuses SP²Bench `q4` with 503 and
+  `q5a`, `q6` and `q12a` with 507, and it loses `q8` and `q12b` by more than two orders of
+  magnitude.
+* The 10.5M records failed to build on forge, because `build` took the list in
+  `restarts.json` for a query's results. `restarts.json` is now an auxiliary file, and
+  the records were built afterwards from the copied results.
+* WatDiv and full-text search failed on a QLever build from an unpinned nixpkgs. The
+  runners now take the engines from this flake's outputs. The DBpedia slice of 50M
+  triples stalled after its load, because `bench-billion.sh` waited for its pressure
+  sampler, which is now disowned. These three runs were restarted on 2026-10-19 with the
+  harness of commit 0cc691f6 and the same binary and engine packages.
+* BSBM Explore at 10M and BI at 10M failed. The test driver asks for DESCRIBE and
+  CONSTRUCT results as RDF/XML only, and QLever 0.5.48 answered 406, so its mixes failed.
+  The suites' ports from 48300 lie in the kernel's range of ephemeral client ports, and a
+  client connection of the driver in TIME-WAIT held Oxigraph's port when its server
+  started, so Oxigraph and the following BI run could not bind. On 2026-10-19 the default
+  ports moved to 28300 and 28400, a server starts only once its port can be bound, the
+  driver's stub takes a free port, an engine that does not start is left out instead of
+  ending the run, a server that died before a query or during a driver run is restarted,
+  and Explore gains a second mix without its DESCRIBE and CONSTRUCT queries that runs on
+  every engine. The byte counts of those two queries are left out of the mix check. The
+driver now opens a new connection per request, because on Java's reused connections
+QLever's answers waited about 40 ms each for a delayed TCP acknowledgement. A run
+  of both use cases with 500 products on a development machine completed on all five
+  engines. BENCHMARKING.md describes the mixes. The cold eviction now advises every file
+  from one process, which took 0.11 to 0.14 s instead of 31 to 74 s for a Fluree store of
+  10,074 files.
+* Engine failures seen in the batch are measured results, listed in BENCHMARKS.md. Fuseki
+  5.1 fails `knows-reach` with a `StackOverflowError` at both sizes, and in a first attempt
+  at 10.5M the failure left TDB2's node table cache locked. Fluree's `optional-chain` at
+  10.5M was killed at the memory limit. QLever's and Fluree's servers were killed during
+  SP²Bench `q4` in the answer check, which runs all five servers at once.
+
 **Left for Phase 1.**
 
-* The standard refresh of every existing suite at one head (A5), and the regeneration of the
-  BENCHMARKS.md tables from records without a numeric change (A3). `bench.sh` starts,
+* The rest of the standard refresh at one head (A5). WatDiv, full-text search and DBpedia
+  are running again, and BSBM and the later batches of roadmap item 1 follow. The
+  regeneration of the BENCHMARKS.md tables from records without a numeric change (A3)
+  remains open. `bench.sh` starts,
   checks and times one engine at a time in its default and `updates` modes since
   2026-10-18, as `suite_run` does. The published runs invoked `bench.sh` once per engine,
   so each engine ran alone there too. `bench-record.py` reads
   the results of `bench.sh` and of a small `bench-watdiv.sh` run, and both produce valid
   records. It does not read the DBpedia or full-text results yet, and `bench-summary.py`
   still reads the raw files.
-* The published comparisons of BSBM, SP²Bench and LUBM(100) on the reference host, with a
-  noise-floor control for each (§14). Their commands are in BENCHMARKING.md.
+* The published comparison of BSBM on the reference host, and a noise-floor control for
+  each standard suite (§14). Their commands are in BENCHMARKING.md.
 * BSBM at 100M triples has not been tried, and the generator's heap defaults may need
   raising. SP²Bench at 100M triples will meet the 600 second timeout in its slower queries.
 * Open question 1 is settled for LUBM and BSBM only in practice. The BSBM tools and the LUBM

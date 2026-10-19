@@ -175,20 +175,23 @@ off and every engine's answers checked before timing.
 
 | 10.5M triples | Sparkles | Best of the others |
 |---|---|---|
-| Bulk load | **3.9 s** | QLever 9.7 s |
-| 28 benchmark queries | **Fastest on 27 of 28**, a median 3.9× faster than QLever | Fluree's `star-lookup` lead is within 10% |
+| Bulk load | **3.9 s** | QLever 9.3 s |
+| 28 benchmark queries | **Fastest on 28 of 28**, a median 3.9× faster than QLever | Fluree on `distinct-obj` and `star-lookup` and Oxigraph on `path-plus` are within 10% |
 | WatDiv, 20 templates | **4.84 ms** geometric mean | Fluree 7.41 ms |
-| Throughput, 16 clients | **241 q/s** | QLever 92 q/s |
+| Throughput, 16 clients | **239 q/s** | QLever 90 q/s |
 | Durable commit of one new literal | 1.28 ms | **Oxigraph 0.93 ms**, without synchronizing |
-| Server memory after the run | 840 MiB, 379 MiB of it block cache | **QLever 653 MiB** |
+| Server memory after the run | **765 MiB**, 379 MiB of it block cache | QLever 795 MiB |
+| Peak memory under 16 clients | 1,261 MiB | **QLever 939 MiB** |
 
 On English DBpedia, 1.24 billion triples, Sparkles loads in 480 s against QLever's
 1,674 s and Fluree's 2,919 s. It is faster than QLever on all 29 warm queries both
 answer and on 29 of 31 cold ones, and faster than Fluree on every cold query. The bindings are faster than TDB2, pyoxigraph and Oxigraph's JavaScript
 package on most of the same queries, and slower on some small lookups.
 
-Sparkles uses more memory than QLever in exchange for this speed, mostly for a 1 GiB
-decoded-block cache per dataset that can be made smaller.
+Sparkles uses more memory than QLever at its peaks in exchange for this speed, mostly for
+a 1 GiB decoded-block cache per dataset that can be made smaller. On SP²Bench and LUBM it
+is fastest on most queries but loses some by large factors, and its default memory budget
+refuses four SP²Bench queries.
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every measurement, the cost of each memory
 tradeoff and every case where Sparkles loses.
 

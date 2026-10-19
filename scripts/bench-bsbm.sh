@@ -28,7 +28,11 @@
 # 2. Query mixes per hour. For each engine and each client count in CLIENTS (default
 #    "1 4 16") the BSBM test driver runs its query mix over HTTP, BSBM_WARMUP warm-up mixes
 #    (default 50) followed by BSBM_RUNS measured mixes (default 500), and reports QMpH. The
-#    results go to results/qmph.json and the record.
+#    results go to results/qmph.json and the record. When the use case has DESCRIBE or
+#    CONSTRUCT queries (Explore's queries 9 and 12), a second mix without them runs on every
+#    engine, into results/qmph-select.json, because the driver asks for their results as
+#    RDF/XML and QLever does not write RDF/XML. An engine that refuses such a request is
+#    recorded with status error and the reason for the standard mix, which is not run on it.
 #
 # Results go to WORKDIR/results (manifest.json, record.json, summary.md, hyperfine's JSON, the
 # driver's XML files).
@@ -37,7 +41,7 @@
 # 10), COLD_RUNS (default 0), SKIP_LOAD=1, ANSWERS_ONLY=1 (checks answers, skips every
 # timing), SKIP_QMPH=1, QUERIES="explore-q2 …", ENGINES="sparkles jena qlever fluree
 # oxigraph" (default; ENGINES="" only generates the data and the queries), PORT_BASE (default
-# 48300; the driver stub uses PORT_BASE + 90), SPARKLES, JAVA, BSBM_GEN_HEAP (default 4g),
+# 28300; the driver stub takes a free port from the kernel), SPARKLES, JAVA, BSBM_GEN_HEAP (default 4g),
 # SERVER_MEM_MAX, CLIENT_CPU, FLUREE and FLUREE_VERSION as in scripts/bench.sh.
 set -euo pipefail
 
@@ -56,7 +60,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${2:-$ROOT/target/bench-bsbm}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
-PORT_BASE=${PORT_BASE:-48300}
+PORT_BASE=${PORT_BASE:-28300}
 USECASE=${USECASE:-explore}
 INSTANCES=${INSTANCES:-3}
 CLIENTS=${CLIENTS:-1 4 16}
@@ -129,7 +133,7 @@ log "dataset: $TRIPLES triples"
 if [ ! -f "queries/names-$USECASE-$INSTANCES" ]; then
   rm -f queries/"$USECASE"-q*.rq
   python3 -I "$ROOT/scripts/bench-bsbm/instantiate.py" --tools "$WORK/bsbm" --usecase "$USECASE" --out queries \
-    --instances "$INSTANCES" --runs $((4 * INSTANCES + 8)) --java "$JAVA" --port $((PORT_BASE + 90)) \
+    --instances "$INSTANCES" --runs $((4 * INSTANCES + 8)) --java "$JAVA" \
     > "queries/names-$USECASE-$INSTANCES.tmp"
   mv "queries/names-$USECASE-$INSTANCES.tmp" "queries/names-$USECASE-$INSTANCES"
 fi
@@ -144,34 +148,98 @@ POOL=1
 # ------------------------------------------------------------------------ query mixes
 # the driver's request timeout in whole milliseconds, rounded up from a possibly fractional MAX_TIME
 DRIVER_TIMEOUT_MS=$(awk -v m="$MAX_TIME" 'BEGIN { t = m * 1000; s = int(t); if (s < t) s++; print s }')
+# The driver asks for DESCRIBE and CONSTRUCT results as RDF/XML (Accept: application/rdf+xml)
+# and stops at the first request that fails. QLever 0.5.48 does not write RDF/XML and answers
+# 406 Not Acceptable, so it cannot run the Explore mix, whose query 9 is a DESCRIBE and query
+# 12 a CONSTRUCT. The driver only counts the bytes of those results, so the standard mix
+# runs unchanged for every engine that answers in RDF/XML. A second mix, `select`, leaves
+# those queries out through the driver's own ignoreQueries.txt and runs on every engine. The
+# driver still draws the parameters of the queries it skips, so the other queries are the
+# same instances in both mixes, and this mix is the one that compares all five engines.
+MIXDIR=$(sed -n 's/^querymix=//p' "bsbm/$UCF" | head -1)
+RDFXML_NRS=$(grep -ilE '^ *(describe|construct)' "bsbm/$MIXDIR"/query[0-9]*.txt 2> /dev/null | sed 's/.*query\([0-9]*\)\.txt$/\1/' | sort -n | tr '\n' ' ' || true)
+RDFXML_NRS=${RDFXML_NRS% }
+MIXES="std"
+if [ -n "$RDFXML_NRS" ]; then
+  MIXES="std select"
+  rm -rf "bsbm/$MIXDIR-select" "bsbm/usecases/$USECASE-select"
+  cp -a "bsbm/$MIXDIR" "bsbm/$MIXDIR-select"
+  {
+    cat "bsbm/$MIXDIR/ignoreQueries.txt" 2> /dev/null || true
+    echo
+    echo "$RDFXML_NRS"
+  } | tr ' ' '\n' | sed '/^$/d' > "bsbm/$MIXDIR-select/ignoreQueries.txt"
+  mkdir -p "bsbm/usecases/$USECASE-select"
+  echo "querymix=$MIXDIR-select" > "bsbm/usecases/$USECASE-select/sparql.txt"
+fi
+# rdfxml_refused <engine>: prints the HTTP status and the query when the engine refuses the
+# first DESCRIBE or CONSTRUCT instance in the form the driver sends it (GET, Accept:
+# application/rdf+xml), and nothing when it answers them all
+rdfxml_refused() {
+  local n code
+  for n in "${NAMES[@]}"; do
+    case "$(qform "queries/$n.rq")" in describe | construct) ;; *) continue ;; esac
+    code=$(curl -s -G -o /dev/null -w '%{http_code}' --max-time "$MAX_TIME" -H 'Accept: application/rdf+xml' \
+      --data-urlencode "query@queries/$n.rq" "http://${URL[$1]}") || true
+    case $code in
+      2??) ;;
+      *)
+        echo "HTTP $code to $n"
+        return 0
+        ;;
+    esac
+  done
+}
 bsbm_qmph() {
-  local e c rc
+  local e c rc mix ucf sfx out label code
   [ -z "${SKIP_QMPH:-}" ] || return 0
   echo
   echo "== query mixes per hour ($BSBM_WARMUP warm-up and $BSBM_RUNS measured mixes)"
   for e in $ENGINES; do
-    for c in $CLIENTS; do
-      rm -f "results/driver-${NAME[$e]}-$c.xml"
-      (cd bsbm && "$JAVA" -Xmx2g -cp ".:lib/*" benchmark.testdriver.TestDriver -runs "$BSBM_RUNS" -w "$BSBM_WARMUP" \
-        -mt "$c" -idir td_data -ucf "$UCF" -t "$DRIVER_TIMEOUT_MS" -o "$WORK/results/driver-${NAME[$e]}-$c.xml" \
-        "http://${URL[$e]}") > "logs/driver-${NAME[$e]}-$c.log" 2>&1 && rc=0 || rc=$?
-      python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c.xml" results/qmph.json \
-        "${NAME[$e]}" "$c" "$USECASE-mix" "$rc"
+    for mix in $MIXES; do
+      if [ "$mix" = std ]; then
+        ucf=$UCF sfx="" out=results/qmph.json label=$USECASE-mix
+      else
+        ucf=usecases/$USECASE-$mix/sparql.txt sfx=-$mix out=results/qmph-$mix.json label=$USECASE-mix-$mix
+      fi
+      code=""
+      if [ "$mix" = std ] && [ -n "$RDFXML_NRS" ]; then code=$(rdfxml_refused "$e"); fi
+      for c in $CLIENTS; do
+        rm -f "results/driver-${NAME[$e]}-$c$sfx.xml"
+        if [[ " $DEAD_ENGINES " == *" $e "* ]]; then
+          python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c$sfx.xml" "$out" "${NAME[$e]}" "$c" "$label" 1 \
+            "the server did not start again after an earlier failure"
+          continue
+        fi
+        if [ -n "$code" ]; then
+          python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c$sfx.xml" "$out" "${NAME[$e]}" "$c" "$label" 1 \
+            "the engine answers with $code for Accept: application/rdf+xml, the only format the BSBM driver asks for in DESCRIBE and CONSTRUCT queries ($RDFXML_NRS)"
+          continue
+        fi
+        # a new connection per request, as the harness's curl and oha requests make: on a
+        # reused connection QLever's answers wait about 40 ms for a delayed TCP acknowledgement
+        (cd bsbm && "$JAVA" -Dhttp.keepAlive=false -Xmx2g -cp ".:lib/*" benchmark.testdriver.TestDriver -runs "$BSBM_RUNS" -w "$BSBM_WARMUP" \
+          -mt "$c" -idir td_data -ucf "$ucf" -t "$DRIVER_TIMEOUT_MS" -o "$WORK/results/driver-${NAME[$e]}-$c$sfx.xml" \
+          "http://${URL[$e]}") > "logs/driver-${NAME[$e]}-$c$sfx.log" 2>&1 && rc=0 || rc=$?
+        python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c$sfx.xml" "$out" \
+          "${NAME[$e]}" "$c" "$label" "$rc"
+        # a server that crashed or hung during the mixes is restarted before the next run, so
+        # one failure does not fail every later client count and mix (results/restarts.json)
+        revive "$e" "$label x$c" results
+      done
     done
   done
 }
 SUITE_EXTRA=bsbm_qmph
-# the driver does not look at results, so the runs are compared by their average result counts
-# DESCRIBE results are left to the engine by the SPARQL specification, so those queries are skipped
+# The driver does not look at results, so the runs are compared by their average result
+# counts. For DESCRIBE and CONSTRUCT it counts the bytes of the RDF/XML, which differ between
+# engines that return the same triples, so those queries are left out of the comparison.
 bsbm_check() {
-  local skip f
-  [ -f results/qmph.json ] || return 0
-  skip=""
-  while read -r f; do
-    f=${f##*/query}
-    skip="$skip,${f%.txt}"
-  done < <(grep -il '^ *describe' bsbm/queries/"$USECASE"/query[0-9]*.txt 2> /dev/null || true)
-  python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" --check results/qmph.json "${skip#,}"
+  local f
+  for f in results/qmph.json results/qmph-*.json; do
+    [ -f "$f" ] || continue
+    python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" --check "$f" "$(echo "$RDFXML_NRS" | tr ' ' ',')"
+  done
 }
 SUITE_AFTER=bsbm_check
 

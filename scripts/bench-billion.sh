@@ -416,6 +416,9 @@ for f in "$HERE"/queries/*.rq; do
   n=$(basename "$f" .rq)
   selected "$n" && NAMES+=("$n")
 done
+# time_query (scripts/bench-probe.sh), which restarts an engine that stops answering
+# shellcheck source=scripts/bench-probe.sh
+source "$ROOT/scripts/bench-probe.sh"
 q() { # q <url> <query name>: the timed request (fails on HTTP errors)
   echo "curl -sf --max-time $TIMEOUT -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@$HERE/queries/$2.rq $1"
 }
@@ -482,16 +485,12 @@ step_queries() {
     echo
   done
   [ -n "${ANSWERS_ONLY:-}" ] && return
-  local clear=true args
+  local clear=true
   has qlever && clear="curl -sf -o /dev/null 'localhost:${PORT[qlever]}/?cmd=clear-cache&access-token=bench'"
   for n in "${NAMES[@]}"; do
     echo
     echo "== $n"
-    args=()
-    for e in $ENGINES; do args+=(--command-name "${NAME[$e]}" "$(q "${URL[$e]}" "$n")"); done
-    hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
-      "${args[@]}" --export-json "results/$n.new.json"
-    merge "results/$n.new.json" "results/$n.json"
+    time_query "$n" results "$clear"
   done
   for n in $THROUGHPUT; do
     selected "$n" || continue
@@ -596,6 +595,9 @@ preflight() {
       done
     ) > "$out" 2> /dev/null &
     PSI_PID=$!
+    # The steps wait until `jobs -rp` is empty, and the sampler never ends, so it must not
+    # count as one of this shell's jobs. The EXIT trap still stops it by PID.
+    disown "$PSI_PID"
     log "PSI pressure sampled once per second to $out"
   fi
   return 0

@@ -18,7 +18,7 @@ pinning, the data hashes and the start time. `finish` adds the end time.
   `throughput`, with the query name taken from the file,
 * `cold.json` and `cold-runs.json`: the restarts of bench.sh's cold mode,
 * `answers.json`: the answer fingerprints of bench-answers.py,
-* `qmph.json`: query mixes per hour, `{engine: {clients: {"qmph": …, …}}}` (bench-bsbm.sh),
+* `qmph.json` and `qmph-<variant>.json`: query mixes per hour, `{engine: {clients: {"qmph": …, …}}}` (bench-bsbm.sh),
 * `load.json`, `load-details.json`, `rss.json` and `mem.json`: loads and memory,
 * `inference.json`: the materialization of the LUBM and OWL2Bench suites,
 * `longwrite.json`: the long write runs of bench-longwrite.sh (mode `longrun`),
@@ -88,7 +88,7 @@ DURABILITY = {"sparkles": "synced", "jena": "synced", "oxigraph": "written", "ql
 STATUSES = {"ok", "timeout", "error", "oom", "wrong-answer"}
 MODES = {"warm", "cold", "update", "throughput", "qmph", "load", "answer", "longrun"}
 AUX = {"load", "load-details", "answers", "mem", "rss", "rss-probe", "churn", "mixed", "cold", "cold-runs",
-       "qmph", "extra", "manifest", "record", "update-latency", "inference", "longwrite"}
+       "qmph", "extra", "manifest", "record", "update-latency", "inference", "longwrite", "restarts"}
 CURL_TIMEOUT = 28
 MAX_TIME_S = None  # the harness's request limit in seconds, set by `build --max-time`
 
@@ -400,7 +400,7 @@ def cmd_build(a):
     fps = fingerprints(answers)
     names = a.queries if a.queries is not None else sorted({f[:-5] for f in os.listdir(d)
                                  if f.endswith(".json") and f[:-5] not in AUX and not f.startswith("throughput")
-                                 and not f.startswith("run-")
+                                 and not f.startswith("run-") and not f.startswith("qmph-")
                                  and not f.endswith(".new.json")} | set(answers or {}))
     results = []
     for n in names:
@@ -444,15 +444,18 @@ def cmd_build(a):
             if runs.get("ready"):
                 rec["ready_s"] = runs["ready"]
             results.append(rec)
-    for e, per in (load_json(d, "qmph.json") or {}).items():
-        en = engine_name(e)
-        for clients, v in per.items():
-            results.append({
-                "engine": en, "query": v.get("query", "mix"), "mode": "qmph", "clients": int(clients),
-                "durability": None, "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": None,
-                "status": v.get("status", "ok"), "qmph": v.get("qmph"),
-                **{k: v[k] for k in ("qps", "runs", "timeouts", "seconds", "disagreeing_queries", "driver_status") if k in v},
-            })
+    # qmph.json holds the standard mix, qmph-<variant>.json a variant of it (BSBM's mix without DESCRIBE and CONSTRUCT)
+    for qf in sorted(f for f in os.listdir(d) if f == "qmph.json" or (f.startswith("qmph-") and f.endswith(".json"))):
+        for e, per in (load_json(d, qf) or {}).items():
+            en = engine_name(e)
+            for clients, v in per.items():
+                results.append({
+                    "engine": en, "query": v.get("query", "mix"), "mode": "qmph", "clients": int(clients),
+                    "durability": None, "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": None,
+                    "status": v.get("status", "ok"), "qmph": v.get("qmph"),
+                    **{k: v[k] for k in ("qps", "runs", "timeouts", "seconds", "disagreeing_queries", "driver_status",
+                                         "status_reasons") if k in v},
+                })
     results += longrun_results(load_json(d, "longwrite.json"))
     if a.pool_instances:
         results = pool(results)
