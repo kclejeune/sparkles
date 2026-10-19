@@ -446,6 +446,10 @@ the JVM compatibility matrix. Release tags and manual runs build and test every 
 in the release profile. Every job has a timeout, so a hung job stops instead of running
 for GitHub's default six hours.
 
+Jena 6 removed the query builder's initial-binding API. Its compatibility run skips
+that API's test, while Jena 5 still runs it. The remaining small-query tests run on both
+versions. Substitution tests remain separate because their semantics differ.
+
 `nix.yml` builds the flake's `cacheable` output with nix-fast-build (see [Nix](#nix)).
 
 ### Caches

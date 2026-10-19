@@ -52,6 +52,11 @@ The JVM comparisons use the Jena version in `jvm/gradle/libs.versions.toml` and 
 dependency locks and verification metadata. These are separate from the HTTP engine
 packages because they measure libraries through each language's API.
 
+The JVM driver's `sparql-initial-binding` case requires Jena 5. It calls the legacy
+builder method through cached reflection so the driver also compiles with Jena 6,
+which removed that API. Timings include the reflective invocation. Asking for this
+case with Jena 6 fails before loading the dataset.
+
 The QLever build failure of 2026-10-19 came from runners resolving the host's nixpkgs
 registry instead of the repository's lock. Forge's registry selected GCC 16.2.0, which
 rejected range-v3's late `enable_borrowed_range` specialization for `std::string_view`.
