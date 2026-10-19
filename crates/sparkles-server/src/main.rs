@@ -900,10 +900,11 @@ fn default_spill_capacity(dir: &std::path::Path) -> u64 {
 }
 
 /// Open the spill directory for `serve --spill on`, removing what dead processes left in
-/// it. Spill is asked for explicitly, so a directory that cannot be used fails the start,
-/// as does one on a file system that keeps its files in memory, where spilled state
-/// would take the memory that spill is meant to save. A directory on a network file
-/// system is used with a warning, since its locks may not reach other machines.
+/// it. A directory that cannot be used is an error, as is one on a file system that keeps
+/// its files in memory, where spilled state would take the memory that spill is meant to
+/// save. The caller fails the start when spill was asked for explicitly and runs without
+/// spill otherwise. A directory on a network file system is used with a warning, since
+/// its locks may not reach other machines.
 fn open_spill(
     dir: &std::path::Path,
     max_mb: Option<u64>,
@@ -1136,11 +1137,13 @@ enum Cmd {
         /// with `Retry-After`
         #[arg(long, default_value_t = 2.0)]
         query_admission_wait: f64,
-        /// Whether streamed sorts, groupings and DISTINCT that outgrow their memory
-        /// budget write their excess to disk (`on`) or fail with their memory budget
-        /// (`off`, the default until hash joins spill too)
-        #[arg(long, value_enum, default_value_t = SpillMode::Off)]
-        spill: SpillMode,
+        /// Whether streamed sorts, groupings, DISTINCT and joins that outgrow their memory
+        /// budget write their excess to disk (`on`, the default), do so with every spill
+        /// file encrypted under a key held only in memory (`encrypted`), or fail with
+        /// their memory budget (`off`). When spill is on by default and its directory
+        /// cannot be used, the server warns and runs without spill.
+        #[arg(long, value_enum)]
+        spill: Option<SpillMode>,
         /// Directory of the spill files, on a local disk, owned by the server's user and
         /// writable by no other user; a tmpfs or ramfs is refused (default:
         /// `<data>/.spill`)
@@ -2735,15 +2738,27 @@ fn run() -> Result<()> {
             )?;
             st.admission.profile = cli_memory_profile;
             st.admission.wait = Duration::from_secs_f64(query_admission_wait);
-            if spill != SpillMode::Off {
+            let mode = spill.unwrap_or(SpillMode::On);
+            if mode != SpillMode::Off {
                 let dir = spill_dir.unwrap_or_else(|| data.join(".spill"));
-                st.spill = Some(open_spill(
+                match open_spill(
                     &dir,
                     spill_max_mb,
                     query_spill_mb,
                     min_free_disk_mb,
-                    spill == SpillMode::Encrypted,
-                )?);
+                    mode == SpillMode::Encrypted,
+                ) {
+                    Ok(opened) => st.spill = Some(opened),
+                    // Only a directory that cannot be used, not a bad flag, is passed over.
+                    Err(e) if spill.is_none() && e.to_string().starts_with("--spill:") => {
+                        tracing::warn!(
+                            "{e:#}; running without spill, so queries that outgrow their \
+                             memory budget fail (give --spill-dir a usable directory, or \
+                             --spill off)"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             st.auth = auth;
             st.cors_origins = cors_origin;

@@ -1605,11 +1605,10 @@ Query parameters beyond the standard protocol:
   keeps its group state. All of that memory counts against the query budget. Sorting
   reads its whole input into budgeted memory before the first row. DESCRIBE and
   unsupported operators also read their whole input first, which the plan shows, and
-  that memory is budgeted too. On a server started with `--spill on`, a sort without
-  LIMIT, a grouping and a DISTINCT over unordered input write what does not fit to disk
-  and finish within the budget (see [Disk spill](#disk-spill)). A hash join still keeps
-  its whole build side in memory. A query that exceeds the budget otherwise fails, so
-  streaming does not keep every query in constant memory. SELECT in SPARQL
+  that memory is budgeted too. With spill on, the server's default, a sort without
+  LIMIT, a grouping, a DISTINCT and a join write what does not fit to disk and finish
+  within the budget (see [Disk spill](#disk-spill)). A query that exceeds the budget
+  otherwise fails, so streaming does not keep every query in constant memory. SELECT in SPARQL
   Results Thrift is not supported in streaming mode and returns `501`. An invalid mode
   returns `400`.
 
@@ -7922,9 +7921,9 @@ short.
 #### Disk spill
 
 The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
-`sparkles serve --spill on` lets a streamed query finish within its memory budget by
-writing to disk what does not fit. It is off by default until hash joins spill too.
-Three operators spill.
+Spill lets a streamed query finish within its memory budget by writing to disk what does
+not fit. It is on by default, `sparkles serve --spill encrypted` encrypts every spill file,
+and `--spill off` turns it off. These operators spill.
 
 * A sort without LIMIT writes sorted runs once its input would take half the memory the
   query had when the sort started, and merges up to 64 runs at a time, with one frame of
@@ -7936,11 +7935,22 @@ Three operators spill.
   would see in memory.
 * A DISTINCT over unordered input does the same with a hash of the whole row, and the
   rows from the files come after the others. Over input ordered on all its columns it
-  needs no memory. Over any other ordered input it keeps its whole set in memory so that
-  the order holds, and fails with the `memory` budget when the set does not fit. That
-  includes `SELECT DISTINCT … ORDER BY`, where the DISTINCT comes after the sort, and a
-  DISTINCT over a join, OPTIONAL, MINUS or EXISTS whose input is an ordered subquery or
-  a ranking.
+  needs no memory. In `SELECT DISTINCT … ORDER BY` whose sort keys use only projected
+  variables, the DISTINCT runs below the sort and numbers its input rows, and the sort
+  orders ties by that number, so the DISTINCT may spill and the answer keeps its order.
+  Over any other ordered input, such as a join whose input is an ordered subquery or a
+  ranking, a DISTINCT keeps its whole set in memory so that the order holds, and fails
+  with the `memory` budget when the set does not fit.
+* A hash join whose build input outgrows half the memory left partitions both inputs into
+  files by a hash of the join key and joins them a partition at a time, partitioning a
+  partition again up to three times. A partition that one heavy key keeps too large is
+  joined as a block nested loop, reading its build rows in chunks that fit. Build rows
+  whose key is unbound stay in memory, and probe rows whose key is unbound are joined
+  against every build row last, so OPTIONAL and MINUS see every candidate. When nothing
+  above the join relies on its order, the rows come a partition at a time. Otherwise the
+  join numbers its probe rows and merges its output files back into their order.
+* A merge join spools a run of equal keys to a file once the run outgrows a quarter of
+  the memory left, and reads the file again for each row of the other side's run.
 
 `GROUP_CONCAT` joins a group's values in the order its input gives them, in memory and
 after a spill alike. SPARQL leaves that order open, and a streamed join can give a group's
@@ -7949,16 +7959,18 @@ order when it runs as a cursor. A query that needs an order concatenates over an
 subquery, as in Jena, and both kinds of execution keep that order.
 
 Spill files live in a directory per server process under `--spill-dir`, which defaults to
-`<data>/.spill` and must be on a local disk. The directory is created with mode 0700, and
-the server refuses to start with spill on when its user does not own the directory,
-another user can write it, it cannot be created, or it sits on tmpfs or ramfs, whose files
-would take the memory that spill saves. A network file system gets a warning. On a shared
+`<data>/.spill` and must be on a local disk. The directory is created with mode 0700. The
+directory cannot be used when the server's user does not own it, another user can write
+it, it cannot be created, or it sits on tmpfs or ramfs, whose files would take the memory
+that spill saves. With spill on by default, the server then logs a warning and runs
+without spill. With `--spill on` or `--spill encrypted` given, it refuses to start. A
+network file system gets a warning. On a shared
 mount, such as a Kubernetes `emptyDir` or a volume owned by root, `--spill-dir` names a
 subdirectory that does not exist yet, which the server creates with mode 0700. A file has
 no name while it is written, so it disappears when it is closed or when the process dies,
 and the next start removes the directories of processes that are gone. The format is
-versioned, every frame carries a CRC-32, and a reader refuses a version, kind or codec it
-does not know. All queries together reserve at most `--spill-max-mb`, which defaults to a
+versioned, every frame carries a CRC-32, and a reader refuses a version, kind, codec or
+encryption it does not know. All queries together reserve at most `--spill-max-mb`, which defaults to a
 quarter of the free space of the directory at start, at most 64 GiB, and the server keeps
 `--min-free-disk-mb` free. `--spill-max-mb` must be at least 1. Queries reserve the disk
 in 64 MiB extents, first come first served, and a query gives an extent back as soon as
@@ -7966,15 +7978,22 @@ its open files no longer need it, so a query that cannot get an extent fails wit
 `spill` budget rather than wait. A write that fails with `ENOSPC`, `EDQUOT` or `EFBIG`
 fails with that budget too. One query reserves at most `--query-spill-mb`, and a request
 may lower that with `spill-mb`. The plan of an operator that spilled counts `spilledBytes`
-and either `spillRuns` and `mergePasses` for a sort or `spillPasses` for a grouping or
-DISTINCT. `/$/server/memory` reports the directory's use, and `/$/metrics` adds
+and either `spillRuns` and `mergePasses` for a sort, `spillPasses` for a grouping or
+DISTINCT, `spillPartitions`, `spillLevels`, `spillChunks` and `spillMergePasses` for a
+hash join, or `spooledRuns` for a merge join. `/$/server/memory` reports the directory's use, and `/$/metrics` adds
 `sparkles_spill_capacity_bytes`, `sparkles_spill_reserved_bytes`,
 `sparkles_spill_written_bytes_total`, `sparkles_spill_queries_total` and
 `sparkles_spill_eager_retries_total`, the eager queries that ran again as cursors.
 
-Spill files hold ids, and inline ids carry literal values such as numbers and dates. The
-files are not encrypted, so a deployment that must not write query data to disk keeps
-spill off. A sort on an expression that calls `RAND`, `BNODE`, `UUID` or `STRUUID` keeps
+Spill files hold ids, and inline ids carry literal values such as numbers and dates. With
+`--spill encrypted` every frame is sealed with AES-256-GCM under a random key for each
+file that is held only in memory and never written. The nonce is the file's number and
+the frame's number, and the frame's kind, place and header are authenticated, so a frame
+that was changed, moved, reordered or cut short fails the query. After a crash the files
+cannot be read, and the next start removes them. Swap is outside this, so a deployment
+that must not write query data to disk in the clear also encrypts its swap or runs
+without it. A deployment that must not write query data to disk at all keeps spill
+off. A sort on an expression that calls `RAND`, `BNODE`, `UUID` or `STRUUID` keeps
 its computed keys in memory for the whole query, since the merge must compare the values
 the runs were sorted by.
 

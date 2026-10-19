@@ -413,8 +413,8 @@ happens to materialized inferences, and the limits.
 | `--query-memory-mb N` | `8192` (`small`: `1024`) | Budget for the estimated memory of a query's intermediate results; `0` means unlimited. |
 | `--total-query-memory-mb N` | half the available memory, less the caches (`small`: `2048`) | The query memory pool, the estimated memory of all queries and updates together. A request waits for a share of it before it runs. `0` turns the pool off. See [Memory and caches](#memory-and-caches). |
 | `--query-admission-wait S` | `2` | Seconds a request waits for its share of the pool before it answers `503` with `Retry-After: 1`. |
-| `--spill MODE` | `off` | `on` lets a streamed sort, grouping or DISTINCT that outgrows its memory budget write the excess to disk. See [Memory and caches](#memory-and-caches). |
-| `--spill-dir DIR` | `<data>/.spill` | Directory of the spill files, on a local disk. The server's user must own it and no other user may write it. A directory on tmpfs or ramfs, or one that cannot be used, fails the start. |
+| `--spill MODE` | `on` | `on` lets a streamed sort, grouping, DISTINCT or join that outgrows its memory budget write the excess to disk. `encrypted` does the same with every spill file encrypted under a key held only in memory, and `off` makes such a query fail with its memory budget. See [Memory and caches](#memory-and-caches). |
+| `--spill-dir DIR` | `<data>/.spill` | Directory of the spill files, on a local disk. The server's user must own it and no other user may write it. With spill on by default, a directory on tmpfs or ramfs, or one that cannot be used, gets a warning and the server runs without spill. With `--spill on` or `encrypted` given, it fails the start. |
 | `--spill-max-mb N` | a quarter of the free space, at most 65536 | Disk that all queries' spill files may reserve together, at least 1. Queries take it in 64 MiB extents, first come first served, and give each back once their open files no longer need it. |
 | `--query-spill-mb N` | `16384` | Disk that one query's spill files may reserve. A request may lower it with `spill-mb`. |
 | `--max-result-mb N` | `1024` | Budget for the body of a SPARQL query response; `0` means unlimited. |
@@ -547,15 +547,16 @@ behaviour. A SERVICE call from a query to its own server counts as a request of 
 so it can wait while its caller holds memory and then answer `503`. The mechanism is
 described in [API.md](API.md#query-memory-pool).
 
-`--spill on` lets a streamed query that outgrows its memory budget finish by writing to
-disk. A sort without LIMIT writes sorted runs and merges them, and a grouping or a
-DISTINCT over unordered input keeps what fits and handles the rest in later passes over
-files partitioned by a hash. A hash join still keeps its build side in memory. With
+Spill, on by default, lets a streamed query that outgrows its memory budget finish by
+writing to disk. A sort without LIMIT writes sorted runs and merges them, and a grouping
+or a DISTINCT keeps what fits and handles the rest in later passes over files
+partitioned by a hash. A hash join partitions both inputs by a hash of the key and joins
+a partition at a time, and a merge join writes a long run of equal keys to a file. With
 spill on, automatic execution also streams a query that eager execution would hold in
 more than half its memory budget, and runs an eager query that exceeds its budget once
 more as a cursor. The files go to `--spill-dir`, have no name while they are written,
-and disappear when the query ends or the process dies. They are not encrypted, so leave
-spill off where query data must not reach the disk. A sort that spills to a local SSD at
+and disappear when the query ends or the process dies. `--spill encrypted` encrypts them
+under keys held only in memory, and `--spill off` keeps query data off the disk. A sort that spills to a local SSD at
 10.5M triples took 0.72 to 0.85 times the eager time on one thread and 1.9 to 2.2 times
 on eight, holding about 50 MB where an in-memory sort holds 580 MB. The details are in
 [API.md](API.md#disk-spill).
