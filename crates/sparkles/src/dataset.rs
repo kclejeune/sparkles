@@ -206,8 +206,9 @@ pub const SCHEMA_CACHE_ENTRIES: usize = 4;
 /// The objects of the predicates measured at one state, for every selection.
 #[derive(Default)]
 pub struct ObjectsCache {
-    /// the snapshot identity the entries belong to
-    pub state: u64,
+    /// the commit and the snapshot identity the entries belong to: past snapshots share
+    /// one version, so the commit tells them apart
+    pub state: (u64, u64),
     /// by (selection hash, predicate IRI)
     pub entries:
         std::collections::HashMap<(u64, String), Option<Arc<crate::schema::PredicateObjects>>>,
