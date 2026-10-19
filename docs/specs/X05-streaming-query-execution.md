@@ -1257,8 +1257,10 @@ Each worker keeps its own copy of the key filter in a pool, which the filter dro
 its last rows. A copy of a regular expression filter starts with a cold matching cache, and
 copying the filter for each morsel kept the regular expression query slower streamed
 than eager at eight threads. When the row budget or the memory ledger no longer has room
-for a block, or the ledger refuses a morsel's charge, the filter hands the rest of the
-scan back to the scan's own batches from the next unread block. The scan's counter
+for a block, or the ledger refuses one of the two charges a morsel makes for itself,
+its scratch before the read and the rows it holds after, the filter hands the rest of the
+scan back to the scan's own batches from the next unread block. A charge that a task
+inside the morsel makes and the ledger refuses still fails the query. The scan's counter
 `morselRows` in the cursor plan gives the rows read in morsels.
 
 A morsel charges its input columns, the passing rows it holds until they are written and
@@ -1301,7 +1303,10 @@ the morsels then offer their rows in index order to one bounded heap, so ties fa
 they do eagerly. A value that is not totally ordered still sends the query to the
 generic plan, which the cursor builds as the operator's child only then and which streams
 as well. A value like that in a late morsel costs the morsels read before it, as it does
-eagerly. Eager execution keeps its own path.
+eagerly. Because the generic plan is built at the first pull, a generic plan that could not
+stream would fail under `RejectMaterialization` at that pull rather than when the cursor
+opens. The generic plan of a range top-k is a streaming top-k over the scan, so no plan
+today reaches that failure. Eager execution keeps its own path.
 
 A default graph made of several graphs, as with two FROM clauses, holds a triple once even
 when two graphs store it. The scan drops the second copy, which follows the first in key
@@ -1322,17 +1327,20 @@ thread keeps a waiting worker from starting further morsels by work stealing.
 
 Reading the morsels one after another was 1.72 times slower than eager execution at eight
 threads on the Namespace instance, so the morsels run in parallel. At 10.5M the range
-top-k over salaries measured 1.06 times eager execution at eight threads, the median of
-21 rounds, where it measured 1.33, and 0.88 at one thread, where it measured 0.93. The
+top-k over salaries measured 0.89 to 1.06 times eager execution at eight threads, where
+5c73ced6 measured 1.33, and 0.88 at one thread, where 5c73ced6 measured 0.93. The
+eight-thread figure is a range over runs of 15 to 21 rounds on two 8-vCPU AMD EPYC Namespace instances.
+Its spread is wider than the 5% that a single instance can resolve, so no one value
+stands for it. The
 cursor's ledger peaked at 6.6 to 7.1 MB with eight threads against 5.6 MB before, and at
 3.5 MB with one thread, since each morsel now charges its rows from its blocks before it
 reads them.
 
 The fixes that followed review were measured against the first version of this work,
 8502dd4c, on a fresh instance in two processes of 21 rounds each. The range top-k
-measured 0.89 to 0.96 times eager execution at eight threads against 0.89 for 8502dd4c,
-and 0.88 at one thread for both. The filters stayed within the instance's noise of
-8502dd4c at both thread counts, and the one-thread filter ledger rose from 5.2 MB to
+measured 0.89 to 0.96 times eager execution at eight threads against 0.82 to 0.99 for
+8502dd4c, and 0.88 at one thread for both, so the fixes show no change this instance can
+resolve. The filters' ratios overlapped those of 8502dd4c at both thread counts, and the one-thread filter ledger rose from 5.2 MB to
 6.2 MB with the scratch of a second block.
 
 ### Native JSON of a streamed filter (2026-10-18)

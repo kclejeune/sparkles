@@ -87,7 +87,8 @@ A streamed range top-k no longer reads the parts of its range whose ids do not f
 value order into memory. It ranks them in parallel morsels of one index block and keeps
 only its best rows, so its memory no longer grows with the range. A default graph made of
 several graphs still holds each triple once across the morsels. At 10.5M with eight
-threads it takes 1.06 times its eager time, where it took 1.33 times.
+threads on 8-vCPU AMD Namespace instances it takes 0.89 to 1.06 times its eager time over
+several runs, where it took 1.33 times.
 
 A streamed answer's term cache sorts its vocabulary ids with a stable sort that merges
 the columns already in index order. With the parallel filter, a STRSTARTS filter over
