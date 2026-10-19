@@ -26,6 +26,7 @@ from convert import (
     database_record,
     fetch_pinned,
     gold_result,
+    normalize_dbpedia,
     summarize,
 )
 from evaluator import Invalid, bounded_file, digest, strict_json
@@ -241,7 +242,7 @@ def convert(args, files, scratch):
         if args.set == "db25"
         else ["--data", str(files.get("dataSource", ""))]
     )
-    questions, comparisons = [], {}
+    questions, comparisons, normalized = [], {}, {}
     dropped = {"empty": [], "failed": [], "unsupported": [], "noText": []}
     for n, item in enumerate(items):
         ident = f"{args.set}-{item['id']}"
@@ -250,6 +251,11 @@ def convert(args, files, scratch):
         if not text or not query or not query.strip():
             dropped["noText"].append(ident)
             continue
+        source_query, changes = query, []
+        if args.set == "db25":
+            query, changes = normalize_dbpedia(query)
+        if changes:
+            normalized[ident] = changes
         if recompute:
             result, reason = gold_result(
                 args.sparkles, gold_source, query, scratch / f"{n:04d}", args.timeout
@@ -266,6 +272,8 @@ def convert(args, files, scratch):
             "question": text,
             "gold": query,
         }
+        if changes:
+            entry.update(sourceGold=source_query, goldNormalized=changes)
         if "RESULT_ORDER_MATTERS" in item.get("features", []):
             # The strict scorer compares sets of rows, so the order is not scored.
             entry["orderMatters"] = True
@@ -303,6 +311,7 @@ def convert(args, files, scratch):
         "dbpediaRelease": args.release if recompute and args.set == "db25" else None,
         "sourceQuestions": len(items),
         "dropped": {k: {"count": len(v), "ids": v} for k, v in dropped.items()},
+        "goldNormalized": {"count": len(normalized), "byId": normalized},
         "publishedComparison": (
             dict(summarize(comparisons), byId=comparisons) if recompute else None
         ),
@@ -354,7 +363,8 @@ def main():
     compared = (result["publishedComparison"] or {}).get("counts")
     print(
         f"kept {len(result['questions'])} of {result['sourceQuestions']}, "
-        f"dropped {dropped}, against the published answers {compared}"
+        f"dropped {dropped}, normalized {result['goldNormalized']['count']}, "
+        f"against the published answers {compared}"
     )
     return 0
 

@@ -56,6 +56,66 @@ def category(query):
     return "join" if body.count(" . ") + body.count(" ; ") >= 1 else "lookup"
 
 
+# The prefixes that DBpedia's Virtuoso endpoint declares itself, which QALD and
+# Text2SPARQL gold queries use without declaring them, and `res:`, which older QALD
+# releases use for resources.
+DBPEDIA_PREFIXES = {
+    "dbo": "http://dbpedia.org/ontology/",
+    "dbr": "http://dbpedia.org/resource/",
+    "res": "http://dbpedia.org/resource/",
+    "dbp": "http://dbpedia.org/property/",
+    "dbc": "http://dbpedia.org/resource/Category:",
+    "yago": "http://dbpedia.org/class/yago/",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "skos": "http://www.w3.org/2004/02/skos/core#",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "dct": "http://purl.org/dc/terms/",
+    "geo": "http://www.w3.org/2003/01/geo/wgs84_pos#",
+    "georss": "http://www.georss.org/georss/",
+    "prov": "http://www.w3.org/ns/prov#",
+}
+# A projection of one aggregate or function call with no parentheses around it, which
+# Virtuoso accepts: `SELECT DISTINCT COUNT(?x)`, `SELECT Count(?x) as ?c`,
+# `SELECT COUNT(DISTINCT ?y AS ?y)` and `SELECT DISTINCT xsd:date(?d)`.
+BARE_PROJECTION = re.compile(
+    r"\bSELECT(\s+DISTINCT)?\s+"
+    r"(COUNT|[A-Za-z][\w-]*:[A-Za-z][\w-]*)\s*\(\s*(DISTINCT\s+)?(\?\w+)"
+    r"(?:\s+AS\s+\?\w+)?\s*\)(?:\s+AS\s+(\?\w+))?(?=\s+(?:WHERE\b|\{))",
+    re.IGNORECASE,
+)
+
+
+def normalize_dbpedia(query):
+    """Make a gold query written for DBpedia's Virtuoso endpoint standard SPARQL.
+
+    Two dialect habits are rewritten: prefixes the endpoint predeclares are declared,
+    and a bare aggregate or function projection gets its parentheses and a variable.
+    Returns the query and the list of the rewrites, empty when it was standard.
+    """
+    changes = []
+    match = BARE_PROJECTION.search(query)
+    if match:
+        distinct, func, inner, var, alias = match.groups()
+        name = alias or ("?count" if func.upper() == "COUNT" else "?value")
+        replacement = f"SELECT{distinct or ''} ({func}({inner or ''}{var}) AS {name})"
+        query = query[: match.start()] + replacement + query[match.end() :]
+        changes.append("projection")
+    body = re.sub(r'<[^>\s]*>|"(?:[^"\\]|\\.)*"|' + r"'(?:[^'\\]|\\.)*'", " ", query)
+    declared = {m.lower() for m in re.findall(r"PREFIX\s+([\w-]*):", body, re.I)}
+    used = set(re.findall(r"(?<![\w?$:/#-])([A-Za-z][\w-]*):(?=[\w(%])", body))
+    missing = sorted(p for p in used - declared if p in DBPEDIA_PREFIXES)
+    if missing:
+        query = (
+            "".join(f"PREFIX {p}: <{DBPEDIA_PREFIXES[p]}>\n" for p in missing) + query
+        )
+        changes.append("prefixes:" + ",".join(missing))
+    return query, changes
+
+
 def gold_result(sparkles, source, query, directory, timeout):
     """Run one gold query on `source`, the `--loc` or `--data` arguments.
 

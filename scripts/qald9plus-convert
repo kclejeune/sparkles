@@ -17,7 +17,13 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
-from convert import category, compare, database_record, summarize
+from convert import (
+    category,
+    compare,
+    database_record,
+    normalize_dbpedia,
+    summarize,
+)
 from convert import gold_result as run_gold
 from evaluator import (
     QUERY_GRACE_SECONDS,  # noqa: F401 -- the tests read it here
@@ -74,7 +80,7 @@ def convert(args, source):
         [],
         {"empty": [], "failed": [], "unsupported": [], "noEnglish": []},
     )
-    comparisons = {}
+    comparisons, normalized = {}, {}
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="qald9plus-"))
     recompute = bool(args.loc)
     for n, entry in enumerate(data["questions"]):
@@ -83,6 +89,10 @@ def convert(args, source):
         if not text or not isinstance(query, str) or not query.strip():
             dropped["noEnglish"].append(ident)
             continue
+        source_query = query
+        query, changes = normalize_dbpedia(query)
+        if changes:
+            normalized[ident] = changes
         if recompute:
             result, reason = gold_result(args, query, scratch / f"{n:04d}")
             if reason:
@@ -96,6 +106,11 @@ def convert(args, source):
                 "category": category(query),
                 "question": text,
                 "gold": query,
+                **(
+                    {"sourceGold": source_query, "goldNormalized": changes}
+                    if changes
+                    else {}
+                ),
             }
         )
     out = {
@@ -127,6 +142,8 @@ def convert(args, source):
         ),
         "sourceQuestions": len(data["questions"]),
         "dropped": {k: {"count": len(v), "ids": v} for k, v in dropped.items()},
+        # Gold queries written for Virtuoso that were made standard SPARQL.
+        "goldNormalized": {"count": len(normalized), "byId": normalized},
         # The recomputed answers against the ones QALD-9-plus publishes, by value.
         "publishedComparison": (
             dict(summarize(comparisons), byId=comparisons) if recompute else None
@@ -167,8 +184,11 @@ def main():
         json.dump(result, f, indent=1)
         f.write("\n")
     dropped = {k: v["count"] for k, v in result["dropped"].items()}
+    compared = (result["publishedComparison"] or {}).get("counts")
     print(
-        f"kept {len(result['questions'])} of {result['sourceQuestions']}, dropped {dropped}"
+        f"kept {len(result['questions'])} of {result['sourceQuestions']}, "
+        f"dropped {dropped}, normalized {result['goldNormalized']['count']}, "
+        f"against the published answers {compared}"
     )
     return 0
 

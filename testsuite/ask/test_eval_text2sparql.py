@@ -198,6 +198,49 @@ class Convert(unittest.TestCase):
         self.assertFalse((self.root / "set.json").exists())
 
 
+class Normalize(unittest.TestCase):
+    """The Virtuoso habits of the QALD-9-plus and db25 gold queries that failed."""
+
+    def test_projections(self):
+        cases = {
+            "SELECT DISTINCT COUNT(?uri) WHERE { ?uri a ?c }": (
+                "SELECT DISTINCT (COUNT(?uri) AS ?count) WHERE { ?uri a ?c }"
+            ),
+            "SELECT Count(?sub) as ?c WHERE { ?sub ?p ?o }": (
+                "SELECT (Count(?sub) AS ?c) WHERE { ?sub ?p ?o }"
+            ),
+            "SELECT COUNT(DISTINCT ?y AS ?y) WHERE { ?x ?p ?y . }": (
+                "SELECT (COUNT(DISTINCT ?y) AS ?count) WHERE { ?x ?p ?y . }"
+            ),
+            "SELECT DISTINCT COUNT(?a) { ?a ?b ?c }": (
+                "SELECT DISTINCT (COUNT(?a) AS ?count) { ?a ?b ?c }"
+            ),
+        }
+        for query, want in cases.items():
+            with self.subTest(query=query):
+                self.assertEqual(cv.normalize_dbpedia(query), (want, ["projection"]))
+
+    def test_function_projection_and_prefixes(self):
+        query = (
+            "PREFIX res: <http://dbpedia.org/resource/> "
+            "SELECT DISTINCT xsd:date(?date) WHERE { res:X dbo:deathDate ?date }"
+        )
+        got, changes = cv.normalize_dbpedia(query)
+        self.assertEqual(changes, ["projection", "prefixes:dbo,xsd"])
+        self.assertTrue(got.startswith("PREFIX dbo: <http://dbpedia.org/ontology/>\n"))
+        self.assertIn("SELECT DISTINCT (xsd:date(?date) AS ?value) WHERE", got)
+
+    def test_standard_queries_are_left_alone(self):
+        for query in (
+            "PREFIX dbo: <http://dbpedia.org/ontology/> SELECT ?x WHERE { ?x dbo:p ?y }",
+            "SELECT (COUNT(?x) AS ?n) WHERE { ?x <http://a.b/c:d> 'e:f' }",
+            "SELECT ?x WHERE { ?x <urn:p> ?y FILTER(bif:contains(?y, 'a')) }",
+            "ASK { <http://dbpedia.org/resource/A> ?p ?o }",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(cv.normalize_dbpedia(query), (query, []))
+
+
 class Compare(unittest.TestCase):
     def rel(self, *values):
         return answer_set(
