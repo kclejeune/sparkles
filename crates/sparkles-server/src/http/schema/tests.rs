@@ -921,7 +921,7 @@ async fn reports_are_updated_from_changes() {
             let (updated, how) = summary_with_header(&app, path).await;
             assert_eq!(how, "updated; changes=5", "{kind:?} {path}");
             // the same report computed from scratch
-            *ds.schema_cache.lock() = None;
+            ds.schema_cache.lock().clear();
             let (full, how) = summary_with_header(&app, path).await;
             assert_eq!(how, "full");
             assert_eq!(updated, full, "{kind:?} {path}");

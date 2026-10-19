@@ -43,6 +43,15 @@ pub const SCHEMA_FORMAT: u32 = 1;
 /// Default cap on the number of classes, and separately of predicates, in one report.
 pub const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 
+/// The store size, in quads, above which the server's tools measure a schema report from
+/// the index statistics ([`SchemaOptions::statistics_above`]). A full report of this many
+/// quads takes about half a second.
+pub const DEFAULT_STATISTICS_ABOVE: u64 = 10_000_000;
+
+/// The most quads of one predicate whose objects [`predicate_objects`] reads in full by
+/// default; above it they are sampled.
+pub const DEFAULT_OBJECT_ROWS: u64 = 200_000;
+
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
@@ -210,6 +219,12 @@ pub struct SchemaOptions {
     /// ([`PredicateObserved::subject_classes`]). This costs one pass over the `rdf:type`
     /// triples of the selection and memory for them.
     pub subject_classes: bool,
+    /// Measure the observed layer from the index statistics, without scanning the
+    /// indexes, when the store holds more than this many quads (see
+    /// [`Basis::Statistics`]). It applies only when the selection holds every quad of the
+    /// store, the caller reads every graph, and neither `subject_classes` nor
+    /// `term_totals` is asked for. `None` always scans.
+    pub statistics_above: Option<u64>,
 }
 
 impl Default for SchemaOptions {
@@ -226,6 +241,7 @@ impl Default for SchemaOptions {
             term_totals: false,
             graphs: None,
             subject_classes: false,
+            statistics_above: None,
         }
     }
 }
@@ -291,6 +307,28 @@ pub struct Selection {
     pub reasoning: bool,
     /// `asserted` or `all`
     pub declared: &'static str,
+}
+
+/// How the observed layer of a report was measured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Basis {
+    /// One ordered pass over PSO and one over POS per predicate: every count is exact.
+    #[default]
+    Exact,
+    /// From the statistics the index build keeps, combined with the changes since, so
+    /// that a report of a billion quads takes no scan. A predicate's triples count quads,
+    /// so a triple stored in several graphs counts once per graph. Distinct subjects and
+    /// objects are estimates after updates, the largest number of objects of a subject is
+    /// not measured, and the kinds of the objects are left empty. [`predicate_objects`]
+    /// measures them for one predicate when a caller needs them.
+    Statistics,
+}
+
+impl Basis {
+    pub fn is_exact(&self) -> bool {
+        *self == Basis::Exact
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -478,6 +516,10 @@ pub struct PredicateEntry {
 #[serde(rename_all = "camelCase")]
 pub struct SchemaReport {
     pub schema_format: u32,
+    /// How the observed layer was measured. The JSON document names it only when it is
+    /// not [`Basis::Exact`].
+    #[serde(skip_serializing_if = "Basis::is_exact")]
+    pub basis: Basis,
     pub snapshot: SnapshotInfo,
     pub selection: Selection,
     pub totals: Totals,
@@ -1287,6 +1329,17 @@ pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaRepo
     };
     in_phase(budget.check(), || "starting".into())?;
     let sel = Selected::resolve(snap, opts)?;
+    if statistics::applies(snap, opts, &sel) {
+        let src = Src::direct(snap);
+        let obs = in_phase(statistics::observed(snap, &budget), || {
+            "reading the index statistics".into()
+        })?;
+        let mut report = assemble(&src, opts, &sel, &budget, obs, None)?;
+        report.basis = Basis::Statistics;
+        // the counts are not kept per predicate: a later state gets a report of its own
+        report.maintenance = None;
+        return Ok(report);
+    }
     let src = in_phase(
         Src::for_filters(snap, &[&sel.observed, &sel.declared], &budget),
         || "reading the selected graphs".into(),
@@ -1640,6 +1693,7 @@ fn assemble(
     let hierarchy = hierarchy(&class_list);
     Ok(SchemaReport {
         schema_format: SCHEMA_FORMAT,
+        basis: Basis::Exact,
         snapshot: SnapshotInfo {
             version: snapshot_identity(snap),
             commit: snap.commit,
@@ -1824,6 +1878,9 @@ use source::Src;
 
 mod expressions;
 
+mod statistics;
+pub use statistics::{PredicateObjects, basis_for, predicate_objects};
+
 mod maintain;
 pub use maintain::{max_changes, update};
 
@@ -1850,6 +1907,9 @@ mod maintain_tests;
 
 #[cfg(test)]
 mod profile_tests;
+
+#[cfg(test)]
+mod statistics_tests;
 
 #[cfg(test)]
 mod compare_tests;

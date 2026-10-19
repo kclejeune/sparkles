@@ -1241,3 +1241,15 @@ where this section says otherwise. `DRAFT_FORMAT` is now 2, because property sha
   teams, the `sh:node` reference and the pattern and range, and the data conforms to it
   in SHACL and in ShEx. A second test below full support checks that each new component
   excludes exactly the focus nodes validation reports.
+
+### Reports from the index statistics (2026-10-19)
+
+The MCP tools, `check_query` and `sparkles ask` read a cheaper report on large stores, as
+[C18](C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12)
+describes for DBpedia. `SchemaOptions::statistics_above` builds the observed layer from
+the statistics of the index build and the delta when the store holds more quads than it
+names, the selection holds every quad and the caller reads every graph. The report
+then has `"basis": "statistics"`, which the JSON shape adds as an optional member, and
+the exact report leaves it out. `schema::predicate_objects` measures one predicate's
+objects on demand. The report endpoint, `sparkles schema` and VoID keep the exact
+report. A dataset keeps up to four reports, one per selection, where it kept one.

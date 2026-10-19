@@ -860,6 +860,12 @@ impl Tools<'_> {
         )?;
         let include_builtin = a.include_builtin.unwrap_or(false);
         let mut terms = Terms::new(&prefixes, 500);
+        let deadline = self.call.arrived + timeout;
+        let exact = report.basis.is_exact();
+        let listed = |p: &PredicateEntry, terms: &mut Terms| -> Result<Value, ToolError> {
+            let (objects, sampled) = self.entry_objects(&ds, &snap, &report, p, deadline, &ctx)?;
+            Ok(predicate_json(p, &objects, sampled, exact, terms))
+        };
         let classes: Vec<&ClassEntry> = report
             .classes
             .iter()
@@ -879,6 +885,9 @@ impl Tools<'_> {
             },
             "builtinClassesHidden": hidden,
         });
+        if !exact {
+            out["basis"] = "statistics".into();
+        }
         let mut next = Value::Null;
         match section {
             Section::Summary => {
@@ -930,11 +939,11 @@ impl Tools<'_> {
                     .take(limit)
                     .map(|c| class_json(c, &mut terms))
                     .collect();
-                out["predicates"] = top_preds
-                    .iter()
-                    .take(limit)
-                    .map(|p| predicate_json(p, &mut terms))
-                    .collect();
+                let mut list = Vec::new();
+                for p in top_preds.iter().take(limit) {
+                    list.push(listed(p, &mut terms)?);
+                }
+                out["predicates"] = list.into();
             }
             Section::Profiles => {
                 let schema = SchemaOptions {
@@ -998,10 +1007,11 @@ impl Tools<'_> {
                         .map(|c| class_json(c, &mut terms))
                         .collect();
                 } else {
-                    out["predicates"] = report.predicates[start..end]
-                        .iter()
-                        .map(|p| predicate_json(p, &mut terms))
-                        .collect();
+                    let mut list = Vec::new();
+                    for p in &report.predicates[start..end] {
+                        list.push(listed(p, &mut terms)?);
+                    }
+                    out["predicates"] = list.into();
                 }
             }
         }
@@ -1042,6 +1052,7 @@ impl Tools<'_> {
             term_totals: false,
             graphs,
             subject_classes,
+            statistics_above: self.server.state.schema_statistics_above,
         };
         // the dataset's kept report, brought up to date, or a new one
         let (report, _) = ds
@@ -1050,6 +1061,53 @@ impl Tools<'_> {
             .report_at(snap, &opts)
             .map_err(|e| ctx.schema_call(e))?;
         Ok(report)
+    }
+
+    /// The objects of a predicate of `report` at `snap`: the entry's own when the report
+    /// measured them, and otherwise measured for this predicate alone, from a sample when
+    /// it has more than [`sparkles::schema::DEFAULT_OBJECT_ROWS`] quads. The second value
+    /// is the number of literal objects the sample read, when it is one.
+    pub(crate) fn entry_objects<'r>(
+        &self,
+        ds: &Dataset,
+        snap: &Arc<Snapshot>,
+        report: &SchemaReport,
+        entry: &'r PredicateEntry,
+        deadline: Instant,
+        ctx: &ErrorContext,
+    ) -> Result<
+        (
+            std::borrow::Cow<'r, sparkles::schema::ObjectKinds>,
+            Option<u64>,
+        ),
+        ToolError,
+    > {
+        if report.basis.is_exact() {
+            return Ok((std::borrow::Cow::Borrowed(&entry.observed.objects), None));
+        }
+        let opts = SchemaOptions {
+            graph: GraphSelection::parse(&report.selection.graph)
+                .map_err(ToolError::bad_argument)?,
+            inferred_graph: Some(INFERRED_GRAPH.to_string()),
+            include_inferred: report.selection.reasoning,
+            deadline: Some(deadline),
+            cancel: Some(self.call.cancel.clone()),
+            ..Default::default()
+        };
+        let measured = ds
+            .dataset
+            .schema()
+            .predicate_objects_at(
+                snap,
+                &entry.iri,
+                &opts,
+                sparkles::schema::DEFAULT_OBJECT_ROWS,
+            )
+            .map_err(|e| ctx.schema_call(e))?;
+        Ok(match measured {
+            Some(m) => (std::borrow::Cow::Owned(m.objects.clone()), m.sampled),
+            None => (std::borrow::Cow::Owned(Default::default()), None),
+        })
     }
 
     // -------------------------------------------------------------- sparql_query ------
@@ -1735,20 +1793,29 @@ fn constraints_json(
     e
 }
 
-fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
+/// A predicate of a report as `describe_schema` lists it, with its objects (the entry's
+/// own, or measured for it when the report came from the index statistics, see
+/// [`Tools::entry_objects`]) and the size of their sample when they come from one.
+fn predicate_json(
+    p: &PredicateEntry,
+    objects: &sparkles::schema::ObjectKinds,
+    sampled: Option<u64>,
+    exact: bool,
+    terms: &mut Terms,
+) -> Value {
     let o = &p.observed;
     let mut kinds: Vec<(String, u64)> = Vec::new();
-    if let Some(k) = &o.objects.iri {
+    if let Some(k) = &objects.iri {
         kinds.push(("iri".into(), k.triples));
     }
-    if let Some(k) = &o.objects.blank {
+    if let Some(k) = &objects.blank {
         kinds.push(("blank".into(), k.triples));
     }
-    if let Some(k) = &o.objects.triple_term {
+    if let Some(k) = &objects.triple_term {
         kinds.push(("triple".into(), k.triples));
     }
     let mut vector = false;
-    for g in &o.objects.literals {
+    for g in &objects.literals {
         vector |= sparkles::vector::is_datatype(&g.datatype);
         let mut name = terms.iri(&g.datatype);
         if let Some(langs) = g.languages.as_ref().filter(|l| !l.is_empty()) {
@@ -1769,9 +1836,15 @@ fn predicate_json(p: &PredicateEntry, terms: &mut Terms) -> Value {
         "triples": o.triples,
         "distinctSubjects": o.distinct_subjects,
         "distinctObjects": o.distinct_objects,
-        "maxPerSubject": o.max_per_subject,
         "objects": kinds.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>(),
     });
+    // a report from the index statistics does not measure it
+    if exact {
+        e["maxPerSubject"] = o.max_per_subject.into();
+    }
+    if let Some(n) = sampled {
+        e["objectsSampled"] = n.into();
+    }
     if let Some(l) = render::choose(
         p.declared
             .labels

@@ -3358,6 +3358,13 @@ summary and the usage of each model call, and `--events` prints each step as a J
 as it happens. `--no-run` stops after the check, and `--no-summary` leaves the summary
 out.
 
+Each query of an Ask runs under a memory budget of 2048 MiB, as in `sparkles mcp`, and
+`--query-memory-mb N` changes it, with `0` for no budget. On a database of more than ten
+million quads, the schema that grounds the question and checks the query comes from the
+index statistics, so an Ask on a billion quads starts in seconds and stays within that
+budget ([API.md](API.md#schema-reports-from-statistics)). `--schema-statistics-above`
+moves that threshold, and `off` scans the whole dataset as smaller ones are.
+
 When a name in the question matches several entities, or the model finds two readings
 of the question, the command prints the choices and stops. Ask again with
 `--clarification` and the chosen value. A model with a context window under 16,384

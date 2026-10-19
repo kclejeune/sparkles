@@ -8910,7 +8910,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
              [--allow-update] [--allow-service] [--timeout SECS] [--query-memory-mb N]
              [--max-rows N] [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
              [--disable-tool NAME]... [--no-stored-queries] [--schema-max-entries N] [--text]
-             [--task-after-ms MS]
+             [--schema-statistics-above QUADS|off] [--task-after-ms MS]
 sparkles mcp --url URL [--token TOKEN] [--insecure-http]
 ```
 
@@ -8930,12 +8930,46 @@ sparkles mcp --url URL [--token TOKEN] [--insecure-http]
 | `--outbound-allow-private`, `--outbound-block-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | private blocked, none, `60`, `256` | Where an allowed `SERVICE` may connect, as for `sparkles serve`. |
 | `--disable-tool NAME` | | Does not offer the tool. |
 | `--no-stored-queries` | off | Does not offer the datasets' stored queries as tools. |
+| `--schema-statistics-above QUADS` | `10000000` | Above this many quads, the tools' schema reports come from the index statistics instead of a scan (see [Schema reports from statistics](#schema-reports-from-statistics)). `off` always scans. `serve` and `ask` take the same flag. |
 | `--task-after-ms MS` | `2000` | How long a call of a client that supports the tasks extension runs before it becomes a task (see [Tasks](#tasks)). |
 | `--url URL` | | Bridges stdio to the `/$/mcp` endpoint of a running server instead of opening databases (see [Bridge to a server](#bridge-to-a-server)). |
 | `--token TOKEN` | | With `--url`: the API token to send, instead of `SPARKLES_TOKEN` or the saved login. |
 | `--insecure-http` | off | With `--url`: allows plain `http` to a host other than localhost. |
 
 The process exits 0 when stdin closes and 1 on a startup error. Logs go to stderr.
+
+#### Schema reports from statistics
+
+A full schema report reads every quad twice. On DBpedia 2022.12.01, about a billion
+quads, that took about 50 seconds and 11 GiB, and `check_query`, `describe_schema`,
+`link_entities`, `assert_facts` and the ingestion tools all need a report. When a store
+holds more than `--schema-statistics-above` quads, these tools take the counts from the
+statistics that the index build keeps instead, combined with the changes since the
+build, so the report reads no index rows for them. Each predicate's triples count quads,
+so a triple stored in two graphs counts twice. After updates, the distinct subjects and
+objects are estimates. The largest number of objects of one subject is not measured, and
+`describe_schema` leaves `maxPerSubject` out. The result carries `"basis": "statistics"`.
+
+Such a report applies when the selection holds every quad of the store and the caller
+reads every graph. A named graph, a default graph beside named graphs, a caller limited
+to some graphs and `subjectClasses` still get a full report. The report is kept for each
+selection until the next commit, as a full report is.
+
+The kinds of a predicate's objects are measured when a tool needs them. A predicate
+with at most 200,000 quads is read in full. A larger one gets exact counts of its IRIs,
+blank nodes, triple terms and inline literals from the index, and its other literals are
+split among datatypes and languages in the proportions of a sample of 8,192 of them,
+read in 16 windows spread over the predicate's rows. `describe_schema` then adds
+`objectsSampled` with the sample's size, and a `language-tag` or `datatype-mismatch`
+warning of `check_query` says that it comes from a sample. A literal that is an object
+of the predicate never gets such a warning. On DBpedia the first `check_query` of a
+process took between 0.3 and 1.5 seconds, a `describe_schema` summary of 200
+predicates about 1.4 seconds, and later calls up to 60 milliseconds, while the process
+held under 500 MiB of anonymous memory. The sampled windows are read without filling
+the block cache, so they do not displace the blocks that queries use.
+
+`/{ds}/schema`, `sparkles schema` and the VoID export always scan, because they are asked
+for the report itself.
 
 **Protocol.** The server supports revision `2026-07-28` and the legacy `initialize`
 handshake of `2025-11-25` and `2025-06-18`. Revision `2026-07-28` is stateless. It uses
