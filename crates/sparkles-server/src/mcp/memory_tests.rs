@@ -305,6 +305,25 @@ async fn check_query_from_index_statistics() {
         .clone();
     assert_eq!(label["objects"], json!(["rdf:langString@en 4"]), "{label}");
     assert!(label.get("maxPerSubject").is_none(), "{label}");
+    // the output schema of describe_schema admits the statistics report: no member it
+    // requires of a predicate is missing, and it names the ones this report adds
+    let r = stats.request(90, "tools/list", json!({"_meta": m()})).await;
+    let tool = r["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "describe_schema")
+        .unwrap()
+        .clone();
+    let out = &tool["outputSchema"];
+    let item = &out["properties"]["predicates"]["items"];
+    for p in d["predicates"].as_array().unwrap() {
+        for k in item["required"].as_array().unwrap() {
+            assert!(p.get(k.as_str().unwrap()).is_some(), "{k} missing in {p}");
+        }
+    }
+    assert!(out["properties"].get("basis").is_some(), "{out}");
+    assert!(item["properties"].get("objectsSampled").is_some(), "{item}");
     let d = exact
         .structured(
             "describe_schema",
