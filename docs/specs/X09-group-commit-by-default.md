@@ -1124,9 +1124,8 @@ Phase 4 was built on 2026-10-18 as [roadmap](../ROADMAP.md) item 86. Datasets wi
 full-text, spatial or embedding index now group their commits. The placement of section
 17.2 holds for each index, and the differences from sections 17.3 to 17.6 are listed below.
 Nothing on disk changed, so no format version moved. Every index stays derived from the
-log, and no index file joins the fence. A review of the branch found no way for an index
-to name a commit above the durable log, and its other findings were fixed before the
-branch landed, as the paragraphs below note, or are listed as open at the end.
+log, and no index file joins the fence. The work this phase leaves open is listed at the
+end.
 
 **Admission.** `group_check` no longer refuses a dataset for having an index. A commit falls
 back with `text-recovering` while a full-text recovery job is pending, with
@@ -1144,13 +1143,15 @@ commits lead their own fences. It installs its view only under the writer lock w
 queue empty, so no grouped commit can publish an older view over it. The wait gives up
 only when 2 s pass with no commit leaving the group, which a commit whose thread panicked
 after queueing it causes, and then the thread releases the lock so that a writer can
-lead that commit, and tries again. The first build gave up after 50 ms in all cases, and
-a review found that with fences longer than that, as an indexed dataset's publication
-can make them, the install never happened while writers kept committing. A test now
-installs a build under sixteen writers whose fences take 80 ms each. Commits made during a
-build, or after a build failed, fall back with `geo-unavailable`, which answers question 3
-of section 17.10 for this phase. Section 17.3 named this reason `geo-building`, which
-misnamed the failed case.
+lead that commit, and tries again. A wait with a fixed limit would let new commits in
+each time it gave up, and with fences longer than the limit the view would never install
+while writers kept committing. A test installs a build under sixteen writers whose fences
+take 80 ms each. While the installer holds the writer lock, new transactions wait for it.
+That stall lasts about two fences, the one running and the one that publishes the queued
+commits, and 2 s when a commit was left queued by a thread that panicked. Commits made
+during a build, or after a build failed, fall back with `geo-unavailable`, which answers
+question 3 of section 17.10 for this phase. Section 17.3 named this reason
+`geo-building`, which misnamed the failed case.
 
 **Full-text changes.** Section 17.3 described an overlay that queries on a speculative
 snapshot would search after the published view. The built design keeps the staging and
@@ -1168,9 +1169,10 @@ waits for the next writer, and that writer may be the searching transaction. If 
 commit's documents fail to apply, the index is marked stale, the commit stays
 acknowledged, and the search reports the index as unavailable, as on the ordinary path.
 Such a commit keeps its base's view resolved to the published view behind it, never the
-base's pending view. A review found that the first build kept the pending view, so on a
-stale index each commit's view held the previous one, and dropping the chain after tens of
-thousands of commits overflowed the stack. A staged change computed before a change of the
+base's pending view, which holds the base's outcome. Otherwise on a stale index each
+commit's view would hold the previous one, and dropping the chain after tens of thousands
+of commits would overflow the stack. A test drops 20,000 such views on a small stack. A
+staged change computed before a change of the
 index's configuration is computed again at publication. A panic while a commit's changes
 are staged poisons the writer, because the commit's record is already in the log and no
 fence would cover it.
@@ -1224,22 +1226,25 @@ checkpoint against the recovered head and text search results against a scan, wi
 grouping on and off. Its writer checkpoints the index at every fence before the
 synchronization and from a side thread, and the test requires an image whose checkpoint
 names a commit of the run and a recorded rename of `meta.json`. Applying text changes
-before their fence makes it fail. The first version took no checkpoint during its short
-run, so every image held the setup's checkpoint, which a review found. The module comment
+before their fence makes it fail. The checkpoint at each fence needs the `failpoints`
+feature, which a workspace build turns on, and without it the test is ignored. The module
+comment
 lists the limits of the shim's model of directory operations. `scripts/power-loss.sh` and
 `scripts/crash-harness.rs` take `--index text|geo|embed`, and after each crash
 `crash-harness verify` checks a sample of receipts through a text or spatial query, or the
 embedding index's applied commit. Before anything opens the store, which would rebuild an
 index found ahead of the log, `verify --index text` reads the commit that the checkpoint
 names and fails when it is above the head or when `sparkles check` reports the index ahead
-of the data.
+of the data. A `meta.json` that is missing, torn or not valid JSON names no commit. Open
+rebuilds such an index, as `sparkles check` reports, and the search check then compares the
+rebuilt index with the data.
 
 **Crash runs.** On 2026-10-18 the `kill9` mode of `scripts/power-loss.sh` ran 200 kills
 with each index on a new ext4 and a new XFS file system of an 8-vCPU Namespace instance,
-with a build of cf833158, which has the review's fixes, and the stricter text check. Every
-check compared the index with the recovered data as well as every receipt, and the text
-check first bounded the checkpoint by the head. No kill failed. A run before the fixes,
-with the old check, had no failure either.
+with a build of cf833158 and the text check that bounds the checkpoint by the head before
+the first open. Every check compared the index with the recovered data as well as every
+receipt. No kill failed. An earlier run, with a build of 80f19430 and a text check that ran
+after open, had no failure either.
 
 | Index | ext4 receipts | XFS receipts | Failed |
 |---|---:|---:|---:|
@@ -1251,9 +1256,9 @@ The `logwrites` mode ran on `forge` on 2026-10-18 with a build of 80f19430, unde
 host's lock for heavy work. Each run replayed 1,000 crash images of a 20 s load of sixteen
 writers with a mark every 50 ms, and each image's check also compared the index with the
 recovered data. With the spatial index each request also inserted a point. Every image
-passed. These runs predate the review's fixes and the text check that reads the
-checkpoint before the first open, so they would not have noticed an index ahead of the
-log that open rebuilt. A rerun with the fixes is queued on `forge` with the gates.
+passed. These runs predate cf833158 and the text check that reads the checkpoint before
+the first open, so they would not have noticed an index ahead of the log that open
+rebuilt. A rerun with cf833158 or later is queued on `forge` with the gates.
 
 | Run | Receipts | Marks | Log entries | Images | Failed |
 |---|---:|---:|---:|---:|---:|
@@ -1290,8 +1295,8 @@ as section 17.7 now says.
 **Open under item 86.** The gates of section 17.9 run on `forge` after item 1's runs
 there, with the text and spatial query latency under a four-writer load, a spatial dataset
 with geometries and an embedding index whose worker runs. Until they pass the item stays
-partly done, or the user amends a gate as for Phase 3. Three findings of the review are
-deferred to that work. Staged documents could count their bytes in the queue's limit,
+partly done, or the user amends a gate as for Phase 3. Three smaller items wait for that
+work. Staged documents could count their bytes in the queue's limit,
 since a queue of long literals now holds more than 4 MiB of them. The leader applies a
 prefix's text changes, a Tantivy commit included when the batch is full, while its fence
 is still active, which delays the next fence and is question 4 of section 17.10, and the
