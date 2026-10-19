@@ -605,7 +605,8 @@ fn next_key(mut k: Key) -> Option<Key> {
 }
 
 /// The basis a report of these options over this snapshot would have, without
-/// computing it.
+/// computing it. A report this calls [`Basis::Statistics`] is still exact when correcting
+/// the statistics for the delta and the graphs left out would cost more than a scan.
 pub fn basis_for(snap: &Snapshot, opts: &SchemaOptions) -> Result<Basis, SchemaError> {
     let sel = Selected::resolve(snap, opts)?;
     Ok(if applies(snap, opts, &sel) {
