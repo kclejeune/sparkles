@@ -273,10 +273,14 @@ class Reconcile(Base):
             ("carryover", 5, ""),
             ("carryover", 5, "   "),
             ("carryover", 5, "x" * 1001),
-            ("carryover", -1, "console"),
-            ("carryover", 1.5, "console"),
-            (ok, 5, "console"),  # settled from its usage, so nothing is held
-            (999, 5, "console"),
+            ("carryover", -1, "Console cost"),
+            ("carryover", 1.5, "Console cost"),
+            (ok, 5, "Console cost"),  # settled from its usage, so nothing is held
+            (999, 5, "Console cost"),
+            ("carryover", 5, "short"),
+            ("carryover", 5, "Console\ncost of the day"),
+            ("carryover", 5, " Console cost "),
+            ("carryover", 10**12, "Console cost of the day"),
         ):
             with self.subTest(target=target, amount=amount):
                 with self.assertRaises(Invalid):
@@ -325,12 +329,152 @@ class Reconcile(Base):
             "target": "carryover",
             "previous": 1,
             "cost": 0,
-            "evidence": "x",
+            "evidence": "Console cost of the day",
         }
         with path.open("a") as f:
             f.write(json.dumps(bad) + "\n")
         with self.assertRaises(Invalid):
             px.Ledger(path, 10**10, self.CARRY)
+
+    def test_a_lower_bill_is_recorded_and_a_higher_one_needs_allow_raise(self):
+        ledger = self.ledger(cap=10**10, carryover=self.CARRY)
+        evidence = "Console cost of 2026-10-15"
+        with self.assertRaises(Invalid):
+            ledger.reconcile("carryover", self.CARRY["cost"] + 1, evidence)
+        self.assertEqual(len(self.lines()), 2)
+        line = ledger.reconcile("carryover", self.CARRY["cost"] + 1, evidence, True)
+        self.assertIs(line["raise"], True)
+        self.assertEqual(ledger.spent(), self.CARRY["cost"] + 1)
+        ledger.close()
+        again = px.Ledger(self.root / "ledger.jsonl", 10**10, self.CARRY)
+        self.addCleanup(again.close)
+        self.assertEqual(again.spent(), self.CARRY["cost"] + 1)
+        lower = self.ledger(cap=10**10, carryover=self.CARRY, name="lower.jsonl")
+        self.assertNotIn("raise", lower.reconcile("carryover", 1_600_000, evidence))
+        self.assertEqual(lower.spent(), 1_600_000)
+
+    def test_every_reconcile_check_runs_on_replay(self):
+        good = {
+            "op": "reconcile",
+            "target": "carryover",
+            "previous": self.CARRY["cost"],
+            "cost": 1_600_000,
+            "evidence": "Console cost of the day",
+        }
+        raised = self.CARRY["cost"] + 1
+        cases = {
+            "evidence": [dict(good, evidence="")],
+            "type": [dict(good, cost="1600000")],
+            "unknown target": [dict(good, target=7)],
+            "twice": [good, dict(good, previous=1_600_000)],
+            "raise without flag": [dict(good, cost=raised)],
+            "flag not a bool": [dict(good, cost=raised, **{"raise": 1})],
+            "past the hard cap": [dict(good, cost=px.HARD_CAP + 1, **{"raise": True})],
+        }
+        for name, lines in cases.items():
+            with self.subTest(name):
+                path = self.root / (name.replace(" ", "-") + ".jsonl")
+                px.Ledger(path, 10**10, self.CARRY).close()
+                with path.open("a") as f:
+                    f.writelines(json.dumps(x) + "\n" for x in lines)
+                with self.assertRaises(Invalid):
+                    px.Ledger(path, 10**10, self.CARRY)
+
+
+class Replay(Base):
+    """A ledger is replayed strictly. Each case appends lines to a fresh ledger."""
+
+    CARRY = {"name": "pilot", "cost": 500}
+
+    def refused(self, *lines, carryover=CARRY):
+        path = self.root / "tampered.jsonl"
+        if path.exists():
+            path.unlink()
+        px.Ledger(path, 10**9, carryover).close()
+        with path.open("a") as f:
+            f.writelines(json.dumps(x) + "\n" for x in lines)
+        with self.assertRaises(Invalid):
+            px.Ledger(path, 10**9, carryover)
+
+    def reserve(self, ident=1, bound=100):
+        return {"op": "reserve", "id": ident, "model": HAIKU, "bound": bound}
+
+    def settle(self, ident=1, cost=5):
+        return {"op": "settle", "id": ident, "cost": cost, "status": "ok"}
+
+    def test_a_valid_ledger_replays(self):
+        path = self.root / "ok.jsonl"
+        px.Ledger(path, 10**9, self.CARRY).close()
+        with path.open("a") as f:
+            for x in (self.reserve(), self.settle(), self.reserve(2)):
+                f.write(json.dumps(x) + "\n")
+        ledger = px.Ledger(path, 10**9, self.CARRY)
+        self.addCleanup(ledger.close)
+        self.assertEqual(ledger.spent(), 500 + 5 + 100)
+
+    def test_negative_or_non_integer_amounts_are_refused(self):
+        for lines in (
+            [self.reserve(), self.settle(cost=-95)],
+            [self.reserve(bound="100")],
+            [self.reserve(bound=-1)],
+            [self.reserve(bound=True)],
+            [self.reserve(bound=1.5)],
+            [self.reserve(), self.settle(cost=2.5)],
+        ):
+            with self.subTest(lines=lines):
+                self.refused(*lines)
+
+    def test_bad_ids_and_orphans_are_refused(self):
+        for lines in (
+            [self.reserve(ident=0)],
+            [self.reserve(ident="1")],
+            [self.reserve(), self.reserve()],
+            [self.reserve(), self.settle(), self.reserve()],
+            [self.settle(ident=9)],
+            [self.reserve(), self.settle(), self.settle()],
+            [dict(self.reserve(), model="claude-unknown")],
+            [["not", "a", "line"]],
+        ):
+            with self.subTest(lines=lines):
+                self.refused(*lines)
+
+    def test_a_carryover_must_follow_the_header_once(self):
+        self.refused({"carryover": "again", "cost": 1})
+        self.refused({"carryover": "pilot", "cost": -500}, carryover=None)
+        path = self.root / "late.jsonl"
+        head = {"ledger": px.LEDGER_VERSION, "capNanodollars": 10**9}
+        late = (head, self.reserve(), {"carryover": "pilot", "cost": 500})
+        path.write_text("".join(json.dumps(x) + "\n" for x in late))
+        with self.assertRaises(Invalid):
+            px.Ledger(path, 10**9, self.CARRY)
+
+
+class Rates(unittest.TestCase):
+    def test_the_rate_table_is_pinned(self):
+        # Anthropic's model and pricing documentation of October 2026, in nanodollars
+        # per token: input, 5 minute write, 1 hour write, cache read, output.
+        self.assertEqual(px.MODELS, (HAIKU, SONNET, OPUS))
+        self.assertEqual(
+            px.MODELS, ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
+        )
+        self.assertEqual(px.LONG_CONTEXT, 100000)
+        self.assertEqual(
+            px.RATES,
+            {
+                HAIKU: ((100, 125, 200, 10, 500), (500, 625, 1000, 50, 2500)),
+                SONNET: ((2000, 2500, 4000, 200, 10000),) * 2,
+                OPUS: ((4000, 5000, 8000, 200, 20000),) * 2,
+            },
+        )
+
+    def test_cache_reads_on_every_model(self):
+        usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 1000}
+        self.assertEqual(px.cost(HAIKU, usage), 1000 * 10)  # $0.01 per million
+        self.assertEqual(px.cost(SONNET, usage), 1000 * 200)  # $0.20 per million
+        self.assertEqual(px.cost(OPUS, usage), 1000 * 200)  # $0.20 per million
+        big = dict(usage, cache_read_input_tokens=100001)
+        self.assertEqual(px.cost(HAIKU, big), 100001 * 50)
+        self.assertEqual(px.cost(OPUS, big), 100001 * 200)
 
 
 class Errors(Base):
@@ -452,6 +596,60 @@ class Errors(Base):
         big = {"input_tokens": 100001, "output_tokens": 1}
         self.assertEqual(px.cost(HAIKU, big), 100001 * 500 + 2500)
 
+    def test_any_other_upstream_fault_settles_at_the_bound(self):
+        proxy = self.proxy(Upstream(RuntimeError("boom " + KEY)))
+        status, _, body = proxy.handle(raw())
+        self.assertEqual(status, 502)
+        self.assertNotIn(KEY.encode(), body)
+        reserve, settle = self.lines()[-2:]
+        self.assertEqual(settle["cost"], reserve["bound"])
+        self.assertEqual(settle["status"], "failure:internal-RuntimeError")
+        self.assertEqual(proxy.ledger.report()["unresolvedNanodollars"], 0)
+
+    def test_a_header_error_never_carries_the_key(self):
+        bad = KEY + "\n"
+        port = wire_server(framings(BODY)["content-length"])
+        upstream = px.HTTPUpstream(bad, "127.0.0.1", port, tls=False)
+        with self.assertRaises(px.UpstreamFailure) as caught:
+            upstream.send("/v1/messages", b"{}", 5)
+        self.assertNotIn(KEY, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(caught.exception.reason, "ValueError")
+
+    def test_the_key_is_stripped_and_checked_once(self):
+        self.assertEqual(px.clean_key(KEY + "\n"), KEY)
+        for bad in ("", "  ", "sk-ant a", "sk-ant\x00a", "sk-ant-é"):
+            with self.subTest(bad=bad), self.assertRaises(Invalid) as caught:
+                px.clean_key(bad)
+            self.assertNotIn("sk-ant", str(caught.exception))
+
+    def test_x_gzip_decodes_and_a_corrupt_gzip_settles_at_the_bound(self):
+        import gzip
+
+        for coding, data, exact in (
+            ("x-gzip", gzip.compress(BODY), True),
+            ("gzip", gzip.compress(BODY)[:-12] + b"garbage-tail", False),
+        ):
+            with self.subTest(coding=coding, exact=exact):
+                wire = (
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Encoding: {coding}\r\n".encode()
+                    + b"Content-Length: %d\r\n\r\n" % len(data)
+                    + data
+                )
+                upstream = px.HTTPUpstream(
+                    KEY, "127.0.0.1", wire_server([wire]), tls=False
+                )
+                name = f"{coding}-{exact}.jsonl"
+                ledger = self.ledger(name=name)
+                px.Proxy(ledger, upstream, KEY).handle(raw())
+                reserve, settle = self.lines(name)[-2:]
+                if exact:
+                    self.assertEqual(settle["cost"], HAIKU_COST)
+                else:
+                    self.assertEqual(settle["cost"], reserve["bound"])
+                    self.assertEqual(settle["status"], "usage-unknown")
+
 
 class Cap(Base):
     def test_boundary(self):
@@ -571,6 +769,29 @@ class Cap(Base):
         thread.join(5)
         self.assertEqual(proxy.case_cost("c"), HAIKU_COST)
 
+    def test_concurrent_reserves_never_pass_the_cap(self):
+        ledger = self.ledger(cap=1000)
+        barrier = threading.Barrier(16)
+        admitted, refused = [], []
+
+        def take():
+            barrier.wait(5)
+            for _ in range(10):
+                try:
+                    admitted.append(ledger.reserve(HAIKU, 7, "race"))
+                except px.CapExceeded:
+                    refused.append(1)
+
+        threads = [threading.Thread(target=take) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(len(admitted), 1000 // 7)
+        self.assertEqual(len(set(admitted)), len(admitted))
+        self.assertLessEqual(ledger.spent(), 1000)
+        self.assertEqual(len(refused), 160 - 1000 // 7)
+
     def test_costs_by_case_and_model(self):
         proxy = self.proxy(Upstream())
         proxy.set_case("c1")
@@ -606,6 +827,22 @@ class Preflight(Base):
                 )
                 with self.assertRaises(Invalid):
                     px.preflight(proxy, upstream)
+
+    def test_identifying_headers_are_not_recorded(self):
+        headers = [
+            ("content-type", "application/json"),
+            ("anthropic-organization-id", "org-secret"),
+            ("anthropic-workspace-id", "ws-secret"),
+            ("anthropic-ratelimit-requests-limit", "50"),
+            ("request-id", "req_1"),
+            ("set-cookie", "c"),
+        ]
+        upstream = Upstream((200, headers, BODY), (200, headers, BODY))
+        result = px.preflight(self.proxy(upstream), upstream)
+        for recorded in (result["countTokens"], result["message"]):
+            self.assertEqual(
+                recorded["headers"], [["content-type", "application/json"]]
+            )
 
     def test_a_reply_that_is_not_the_requested_json_stops_the_preflight(self):
         text = dict(REPLY, content=[{"type": "text", "text": "not json"}])

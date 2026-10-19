@@ -30,6 +30,12 @@ MODELS = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 REQUEST_CAP, RESPONSE_CAP = 128 * 1024, 1024 * 1024
 # Integer USD nanodollars per token as input, 5 minute cache write, 1 hour cache
 # write, cache read and output. A second row applies above 100000 prompt tokens.
+# Source: Anthropic's model and pricing documentation of October 2026. Haiku 5.5 is
+# $0.10 and $0.50 per million up to 100K prompt tokens and $0.50 and $2.50 above.
+# Sonnet 5.5 is $2 and $10 and Opus 5.5 is $4 and $20, both with cache reads at $0.20
+# and no long-context premium. Cache writes are 1.25 times input for five minutes and
+# 2 times for one hour, and a Haiku cache read is 0.1 times input. The Haiku long-context
+# cache columns apply those multipliers to the higher base. A test pins this table.
 RATES = {
     MODELS[0]: ((100, 125, 200, 10, 500), (500, 625, 1000, 50, 2500)),
     MODELS[1]: ((2000, 2500, 4000, 200, 10000),) * 2,
@@ -85,6 +91,37 @@ def count(value):
     if type(value) is not int or value < 0 or value > 10**9:
         raise ValueError("token count")
     return value
+
+
+def amount(value):
+    """A ledger amount: a nonnegative integer of nanodollars, never a bool."""
+    if type(value) is not int or value < 0:
+        raise Invalid("a ledger amount is a nonnegative integer")
+    return value
+
+
+def request_id(value):
+    if type(value) is not int or value <= 0:
+        raise Invalid("a request id is a positive integer")
+    return value
+
+
+EVIDENCE_LENGTH = (10, 1000)
+
+
+def check_evidence(evidence):
+    """Evidence names where a billed amount comes from, in printable text."""
+    low, high = EVIDENCE_LENGTH
+    if (
+        not isinstance(evidence, str)
+        or evidence != evidence.strip()
+        or not low <= len(evidence) <= high
+        or not evidence.isprintable()
+    ):
+        raise Invalid(
+            f"a reconcile line needs evidence of {low} to {high} printable characters"
+        )
+    return evidence
 
 
 GEO_PREMIUM = (
@@ -213,7 +250,11 @@ class Ledger:
 
     def acquire_lock(self):
         """Take the run lock. A lock whose owner process is gone is stale and is
-        replaced. A live, unreadable or foreign owner keeps it."""
+        replaced. A live, unreadable or foreign owner keeps it.
+
+        Two starters that both find the same stale lock at once can each remove it and
+        take a fresh one. That needs a crash and two simultaneous restarts, and is a
+        known limitation."""
         for _ in range(2):
             try:
                 fd = os.open(
@@ -270,21 +311,37 @@ class Ledger:
         if head.get("capNanodollars") != self.cap:
             raise Invalid("the ledger has a different cap")
         seen = None
-        for text in lines[1:]:
+        for n, text in enumerate(lines[1:], start=1):
             line = strict_json(text)
+            if not isinstance(line, dict):
+                raise Invalid("unknown ledger line")
             if "carryover" in line:
                 if seen is not None:
                     raise Invalid("a second carryover line")
-                seen = {"name": line["carryover"], "cost": line["cost"]}
-                self.carryover += line["cost"]
+                if n != 1:
+                    raise Invalid("the carryover line must follow the header")
+                if not isinstance(line["carryover"], str):
+                    raise Invalid("a carryover needs a name")
+                seen = {"name": line["carryover"], "cost": amount(line["cost"])}
+                self.carryover += seen["cost"]
                 self.carryover_name = line["carryover"]
             elif line.get("op") == "reserve":
-                if line["id"] in self.reserved or line["id"] in self.charges:
+                ident = request_id(line["id"])
+                amount(line["bound"])
+                if line["model"] not in RATES:
+                    raise Invalid("a reserve names an unknown model")
+                if ident in self.reserved or ident in self.charges:
                     raise Invalid("a reserve id repeats")
-                self.reserved[line["id"]] = line
-                self.next_id = max(self.next_id, line["id"] + 1)
+                self.reserved[ident] = line
+                self.next_id = max(self.next_id, ident + 1)
             elif line.get("op") == "settle":
-                self.book(self.reserved.pop(line["id"]), line)
+                ident = request_id(line["id"])
+                amount(line["cost"])
+                if ident not in self.reserved:
+                    raise Invalid("a settle line has no reserve")
+                if not isinstance(line["status"], str):
+                    raise Invalid("a settle line needs a status")
+                self.book(self.reserved.pop(ident), line)
             elif line.get("op") == "reconcile":
                 self.apply_reconcile(line)
             else:
@@ -396,39 +453,43 @@ class Ledger:
         return out
 
     def apply_reconcile(self, line):
-        target, amount, evidence = line["target"], line["cost"], line["evidence"]
-        if type(amount) is not int or amount < 0:
-            raise Invalid("a reconciled amount is a nonnegative integer")
-        if (
-            not isinstance(evidence, str)
-            or not evidence.strip()
-            or len(evidence) > 1000
-        ):
-            raise Invalid("a reconcile line needs evidence of at most 1000 characters")
+        target, billed = line["target"], amount(line["cost"])
+        check_evidence(line["evidence"])
+        raised = line.get("raise", False)
+        if type(raised) is not bool:
+            raise Invalid("a reconcile line's raise flag is a boolean")
         held = {h["target"]: h for h in self.held_at_bound()}
         if target not in held:
             raise Invalid("the target is not a charge held at its bound")
         previous = held[target]["cost"]
         if line.get("previous") != previous:
             raise Invalid("the reconcile line names a different previous charge")
+        if billed > previous and not raised:
+            # The held charge is an upper bound, so a higher bill means the bound was
+            # wrong. Recording it is allowed, but only when asked for explicitly.
+            raise Invalid(
+                "the billed amount is above the held charge, see --allow-raise"
+            )
+        if self.spent() + billed - previous > HARD_CAP:
+            raise Invalid("the reconciled ledger would pass the hard cap")
         if target == "carryover":
-            self.carryover += amount - previous
+            self.carryover += billed - previous
         elif target in self.reserved:
             self.book(
-                self.reserved.pop(target), {"cost": amount, "status": "reconciled"}
+                self.reserved.pop(target), {"cost": billed, "status": "reconciled"}
             )
         else:
-            self.settled += amount - previous
-            self.charges[target].update(cost=amount, status="reconciled")
+            self.settled += billed - previous
+            self.charges[target].update(cost=billed, status="reconciled")
         self.reconciled[target] = line
 
-    def reconcile(self, target, amount, evidence):
+    def reconcile(self, target, billed, evidence, allow_raise=False):
         """Replace a charge held at its bound with the amount the provider billed.
 
         The target is "carryover" or a request id from `held_at_bound()`. The
         evidence says where the amount comes from, such as the Console's cost for
         the day of an API key that only this run used. An amount above the held
-        charge is recorded as it is.
+        charge is refused unless `allow_raise` is set, and the line then records it.
         """
         with self.mutex:
             held = {h["target"]: h for h in self.held_at_bound()}
@@ -438,10 +499,12 @@ class Ledger:
                 "op": "reconcile",
                 "target": target,
                 "previous": held[target]["cost"],
-                "cost": amount,
+                "cost": billed,
                 "evidence": evidence,
                 "at": round(time.time(), 3),
             }
+            if allow_raise:
+                line["raise"] = True
             self.apply_reconcile(line)  # Every check runs before the line is written.
             self.write(line)
             return line
@@ -513,6 +576,21 @@ def decode_body(headers, data):
         return data
 
 
+def clean_key(raw):
+    """Strip the key once at read time and refuse one that cannot be a header value.
+
+    A secret manager can leave a trailing newline. A control character inside the key
+    would make http.client raise an error that quotes the header, key included, so
+    such a key is refused here with a message that does not hold it.
+    """
+    key = (raw or "").strip()
+    if not key:
+        raise Invalid("ANTHROPIC_API_KEY is not set")
+    if not key.isascii() or not key.isprintable() or any(c.isspace() for c in key):
+        raise Invalid("ANTHROPIC_API_KEY holds whitespace or control characters")
+    return key
+
+
 class HTTPUpstream:
     """One standard-library request. It never retries, and http.client decodes the
     Content-Length, chunked and close-delimited framings alike."""
@@ -569,7 +647,9 @@ class HTTPUpstream:
             return reply.status, headers, decode_body(headers, data)
         except UpstreamFailure:
             raise
-        except (OSError, http.client.HTTPException) as error:
+        except (OSError, http.client.HTTPException, ValueError, UnicodeError) as error:
+            # Only the class is kept. A ValueError from a header check can quote the
+            # key, so its message never leaves this function.
             reason = "timeout" if expired.is_set() else type(error).__name__
             raise UpstreamFailure(reason, sent) from None
         finally:
@@ -705,6 +785,10 @@ class Proxy:
                 ident, limit if failure.sent else 0, "failure:" + failure.reason
             )
             return 502, [], error_body("api_error", "the upstream did not answer")
+        except Exception as error:  # noqa: BLE001 -- the reserve must never stay open
+            # Any other fault may come after the body left, so it costs the bound.
+            self.ledger.settle(ident, limit, "failure:internal-" + type(error).__name__)
+            return 502, [], error_body("api_error", "the proxy failed")
         self.last_headers = headers
         passed = [(k, v) for k, v in headers if k.lower() in REPLY_HEADERS]
         request_id = next((v for k, v in headers if k.lower() == "request-id"), None)
@@ -845,7 +929,14 @@ def preflight(proxy, upstream, timeout=30):
         raise Invalid("preflight token count failed")
 
     def keep(headers):
-        dropped = ("anthropic-ratelimit", "request-id", "x-api-key", "set-cookie")
+        dropped = (
+            "anthropic-ratelimit",
+            "anthropic-organization",
+            "anthropic-workspace",
+            "request-id",
+            "x-api-key",
+            "set-cookie",
+        )
         return [[k, v] for k, v in headers if not k.lower().startswith(dropped)]
 
     models = {}

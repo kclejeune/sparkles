@@ -131,7 +131,15 @@ def ledger_command(run, args):
                 if not target.isdecimal():
                     raise Invalid("the target is 'carryover' or a request id")
                 target = int(target)
-            ledger.reconcile(target, args.billed_nanodollars, args.evidence)
+            line = ledger.reconcile(
+                target, args.billed_nanodollars, args.evidence, args.allow_raise
+            )
+            print(
+                f"reconciled {target}: {line['previous']} -> {line['cost']} nanodollars",
+                file=sys.stderr,
+            )
+        elif args.allow_raise:
+            raise Invalid("--allow-raise goes with --reconcile")
         report = ledger.report()
         print(
             json.dumps(
@@ -171,6 +179,11 @@ def main():
     )
     ap.add_argument("--billed-nanodollars", type=int)
     ap.add_argument("--evidence", help="where the billed amount comes from")
+    ap.add_argument(
+        "--allow-raise",
+        action="store_true",
+        help="allow a billed amount above the held charge, which is otherwise refused",
+    )
     args = ap.parse_args()
     run = load_run(args.run)
     if args.held or args.reconcile:
@@ -189,9 +202,7 @@ def main():
         fake = FakeAnthropic(qsets)
         upstream, key = fake.upstream(), FAKE_KEY
     else:
-        key = os.environ.pop("ANTHROPIC_API_KEY", "")
-        if not key:
-            raise Invalid("ANTHROPIC_API_KEY is not set")
+        key = px.clean_key(os.environ.pop("ANTHROPIC_API_KEY", ""))
         upstream = px.HTTPUpstream(key)
     out = pathlib.Path(run["out"])
     if not args.dry_run:

@@ -77,7 +77,11 @@ class LedgerCommand(unittest.TestCase):
         import io
 
         args = argparse.Namespace(
-            held=False, reconcile=None, billed_nanodollars=None, evidence=None
+            held=False,
+            reconcile=None,
+            billed_nanodollars=None,
+            evidence=None,
+            allow_raise=False,
         )
         vars(args).update(kw)
         out = io.StringIO()
@@ -107,8 +111,27 @@ class LedgerCommand(unittest.TestCase):
             for target in ("carryover", "7", "x"):
                 with self.subTest(target=target), self.assertRaises(Invalid):
                     self.run_command(
-                        run, reconcile=target, billed_nanodollars=0, evidence="e"
+                        run,
+                        reconcile=target,
+                        billed_nanodollars=0,
+                        evidence="Console cost of 2026-10-15",
                     )
+
+    def test_a_raise_needs_allow_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = dict(copy.deepcopy(RUN), ledger=str(pathlib.Path(d) / "l.jsonl"))
+            raised = {
+                "reconcile": "carryover",
+                "billed_nanodollars": 1_100_000_000,
+                "evidence": "Console cost of 2026-10-15",
+            }
+            with self.assertRaises(Invalid):
+                self.run_command(run, **raised)
+            with self.assertRaises(Invalid):
+                self.run_command(run, held=True, allow_raise=True)
+            done = self.run_command(run, allow_raise=True, **raised)
+            self.assertEqual(done["carryoverNanodollars"], 1_100_000_000)
+            self.assertIs(done["reconciled"][0]["raise"], True)
 
 
 if __name__ == "__main__":
