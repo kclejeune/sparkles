@@ -424,6 +424,10 @@ rather than to save runner minutes. `actionlint` checks the workflow files.
 | Test | Five jobs run the archive. Four take a quarter of the tests each (`--partition slice:N/4`), and one runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. |
 | Jena clients | Jena's own HTTP clients against the server binary from the archive (`mise run test:jena-clients`). |
 
+The transcript import integration test reserves all test slots while it runs in its
+shard. It sends a 5 MiB transcript through the real server, whose query deadline stays
+at 30 seconds. Other tests resume after it finishes.
+
 The test jobs fetch the W3C SPARQL and RDF suites, the SHACL and ShEx suites that Jena
 vendors and Oxigraph's JSON-LD documents with `scripts/fetch-test-suites.sh`, so the
 conformance tests run in CI as they do on a machine with the sibling checkouts. Raising

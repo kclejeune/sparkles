@@ -36,3 +36,10 @@ filter = "test(planning_at_the_limit_stops_at_the_timeout)"
 test-group = "timing"
 threads-required = "num-cpus"
 slow-timeout = { period = "300s", terminate-after = 4 }
+
+# This functional test imports a 5 MiB transcript through real HTTP requests. Give
+# it the runner's test slots so concurrent heavy tests do not consume its server's
+# query deadline. Keep the production timeout and all assertions unchanged.
+[[profile.default.overrides]]
+filter = "binary(cli_memory) & test(memory_transcripts_review_and_export)"
+threads-required = "num-test-threads"
