@@ -853,11 +853,18 @@ repeated request timeouts. Each engine, mix and client count now has a configura
 1800 second wall budget, with bounded process-group cleanup and an explicit timeout
 record without partial throughput. Successful runs retain their requested mix
 counts. These repairs have regression coverage. WatDiv completed with the corrected
-harness, while DBpedia and BI are being rerun. The runner leaves JAVA unset for Jena 6’s loader
+harness. The DBpedia 50M query rerun also completed on 2026-10-20, reusing the
+2026-10-19 stores and load measurements. Its record contains all 155 warm cells,
+155 cold cells and ten throughput cells. All timed requests succeeded. Jena and
+Oxigraph disagree with the other three engines on two aggregate queries, and
+Oxigraph’s separate answer check for `top-linked` exceeded its 300 second limit.
+The timing limit was 600 seconds. These limitations are explicit in BENCHMARKS.md,
+and the aggregate disagreements remain unresolved. BI is still running.
+The runner leaves JAVA unset for Jena 6’s loader
 so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
 
-* The rest of the standard refresh at one head (A5). The DBpedia and BI reruns
-  and the later batches remain. The
+* The rest of the standard refresh at one head (A5). The BI rerun and the later
+  batches remain. The
   regeneration of the BENCHMARKS.md tables from records without a numeric change (A3)
   remains open. `bench.sh` starts,
   checks and times one engine at a time in its default and `updates` modes since
@@ -865,7 +872,10 @@ so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
   so each engine ran alone there too. `bench-record.py` reads
   the results of `bench.sh` and of a small `bench-watdiv.sh` run, and both produce valid
   records. The runner also normalizes the full-text files into a common record. The
-  DBpedia record awaits a complete run, and `bench-summary.py` still reads raw files.
+  DBpedia 50M record and figures are published, and `bench-summary.py` still reads raw
+  files. Equals signs in sampled-input filenames were parsed as argument separators,
+  collapsing 38 files into 28 manifest entries without hashes or byte sizes.
+  Complete input provenance and the two aggregate answer disagreements remain open.
 * BSBM BI on the reference host and a noise-floor control for each standard suite
   (§14) remain. Their commands are in BENCHMARKING.md.
 * BSBM at 100M triples has not been tried, and the generator's heap defaults may need
