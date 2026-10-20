@@ -1234,7 +1234,8 @@ mod tests {
         let input: Vec<_> = (0..10_000).map(|i| vec![7, 11, i]).collect();
         for nested_on_left in [true, false] {
             let nested = join(values(vec![0, 1, 2], &input), values(vec![0], &[vec![7]]));
-            let other = values(vec![0, 1, 3], &[vec![7, 11, 13]]);
+            let other = values(vec![0, 1], &[vec![7, 11]]);
+            let widths = if nested_on_left { [3, 2] } else { [2, 3] };
             let node = if nested_on_left {
                 join(nested, other)
             } else {
@@ -1252,12 +1253,30 @@ mod tests {
                     ..Default::default()
                 };
                 let mut actual = Vec::new();
+                let mut checked_reservation = false;
                 while let Some(batch) = op.next(&ctx, &options, cap).unwrap() {
                     actual.extend(rows(&batch.table));
+                    if let super::super::State::Merge(merge) = &op.state
+                        && let Some(pair) = &merge.spooled
+                    {
+                        let frame_bytes = |side: &Side, width| match side {
+                            Side::File { run, .. } => run.max_frame_rows() as u64 * width * 16,
+                            Side::Rows(_) => 0,
+                        };
+                        let required = frame_bytes(&pair.left, widths[0])
+                            + frame_bytes(&pair.right, widths[1])
+                            + 1024;
+                        assert!(
+                            pair._charge.as_ref().unwrap().bytes() >= required,
+                            "nested_left={nested_on_left}, cap={cap}, widths={widths:?}"
+                        );
+                        checked_reservation = true;
+                    }
                 }
                 actual.sort();
                 assert_eq!(actual, expected);
                 assert!(spill.written_bytes() > 0);
+                assert!(checked_reservation);
                 drop(op);
                 drop(ctx);
                 assert_eq!(spill.reserved_bytes(), 0);
