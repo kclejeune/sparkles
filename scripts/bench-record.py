@@ -401,7 +401,7 @@ def cmd_build(a):
     names = a.queries if a.queries is not None else sorted({f[:-5] for f in os.listdir(d)
                                  if f.endswith(".json") and f[:-5] not in AUX and not f.startswith("throughput")
                                  and not f.startswith("run-") and not f.startswith("qmph-")
-                                 and not f.endswith(".new.json")} | set(answers or {}))
+                                 and not f.endswith((".new.json", ".hf.json"))} | set(answers or {}))
     results = []
     for n in names:
         results += hyperfine_results(d, n, "warm", fps)
@@ -418,7 +418,7 @@ def cmd_build(a):
                             "samples_ms": [], "median_ms": None, "p95_ms": None, "answer": fp, "status": st})
     results += hyperfine_results(d, "update-latency", "update", fps)
     for f in sorted(os.listdir(d)):
-        if f.startswith("throughput") and f.endswith(".json"):
+        if f.startswith("throughput") and f.endswith(".json") and not f.endswith((".new.json", ".hf.json")):
             j = load_json(d, f)
             q = f[:-5] if f != "throughput.json" else "star-join"
             for r in j["results"]:

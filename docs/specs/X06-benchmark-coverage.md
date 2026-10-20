@@ -825,10 +825,19 @@ QLever's answers waited about 40 ms each for a delayed TCP acknowledgement. A ru
 
 **Left for Phase 1.**
 
-The reruns completed WatDiv, full-text search and BSBM Explore on 2026-10-19.
+The reruns completed full-text search and BSBM Explore on 2026-10-19. WatDiv's
+last query was interrupted when QLever crashed, and its record included unfinished
+hyperfine output as an extra query. The collector now excludes those temporary
+files, and the shared timing helper prepares each engine separately so QLever's
+cache operation cannot prevent a later engine's measurement. A server that dies
+during timing records an engine failure without publishing its partial samples.
+A broken preparation command against a responsive server still fails the harness.
 DBpedia's warm phase failed after QLever timed out and restarted on another port,
 because cache preparation still used its old endpoint. Preparation now resolves
 the endpoint after the query probes and restarts, including for later throughput.
+DBpedia also kept every answer-check server alive during warm measurements. It now
+stops them, then warms, times and samples RSS for each engine alone, applying the
+configured systemd memory limit without swap. CLIENT_CPU can pin its timed clients.
 BSBM BI exhausted its eight-hour batch limit while Jena's driver continued after
 repeated request timeouts. Each engine, mix and client count now has a configurable
 1800 second wall budget, with bounded process-group cleanup and an explicit timeout
@@ -836,8 +845,8 @@ record without partial throughput. Successful runs retain their requested mix
 counts. These repairs have regression coverage. Their measured reruns and the
 publication of the completed results remain open.
 
-* The rest of the standard refresh at one head (A5). Publication of WatDiv, full-text
-  search and BSBM Explore, the DBpedia and BI reruns, and the later batches remain. The
+* The rest of the standard refresh at one head (A5). Publication of full-text search
+  and BSBM Explore, the WatDiv, DBpedia and BI reruns, and the later batches remain. The
   regeneration of the BENCHMARKS.md tables from records without a numeric change (A3)
   remains open. `bench.sh` starts,
   checks and times one engine at a time in its default and `updates` modes since

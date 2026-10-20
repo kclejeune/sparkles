@@ -398,6 +398,13 @@ This change keeps the existing lock and engine versions.
   larger scales are therefore run one after another until a run fails on its limits, and
   that failure is a result.
 
+  The DBpedia query phase checks answers with all selected engines, stops them,
+  then runs each engine alone through a full untimed warm pass, timings, throughput
+  and RSS sampling. `SERVER_MEM_MAX` applies the same per-server memory limit with
+  swap disabled, and `CLIENT_CPU` pins timed clients when set. Cache preparation
+  resolves the current QLever endpoint after restarts. Unfinished hyperfine files
+  are retained as diagnostic artifacts and excluded from generated records.
+
   *BSBM.* The scale is a product count or a size such as `10m`. The sizes `1m`, `10m` and
   `100m` use the product counts of the datasets that BSBM publishes, which are 2,785,
   28,480 and 284,826 products (the V2.0 specification for 1m and 100m, and the 2013 V3.1

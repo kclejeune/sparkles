@@ -107,6 +107,16 @@ class RecordTests(unittest.TestCase):
         q = self.find(rec, "sparkles", "explore-mix", "qmph")
         self.assertEqual(q["qmph"], 1234.5)
 
+    def test_unfinished_hyperfine_outputs_are_not_published(self):
+        fixture(self.res)
+        for name in ("q1.hf", "q1.qlever.hf", "q1.new", "throughput-q1.new"):
+            write(self.res, name + ".json", {"results": [hyperfine("sparkles", [0.001])]})
+        out = os.path.join(self.tmp.name, "record.json")
+        result = build(self.res, out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queries = {r["query"] for r in jload(out)["results"]}
+        self.assertFalse(any(q.endswith((".hf", ".new")) for q in queries), queries)
+
     def test_qmph_variants_and_their_reasons_are_read(self):
         fixture(self.res)
         write(self.res, "qmph.json", {"qlever": {"4": {"qmph": None, "query": "explore-mix", "status": "error",

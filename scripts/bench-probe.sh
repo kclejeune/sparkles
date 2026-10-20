@@ -59,22 +59,25 @@ EOF
   fi
 }
 
-# failed_result <json> <command> <seconds> <curl exit>: a one-sample hyperfine result for a
-# query whose first request failed, which the record reads as a timeout or an error
+# failed_result <json> <command> <seconds> <exit> [stage]: a failed sample, read as a
+# timeout or error. The default stage is the first request, before timing.
 failed_result() {
   python3 - "$@" << 'EOF'
 import json, os, sys
 f, cmd, secs, code = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4])
+timed = len(sys.argv) > 5 and sys.argv[5] == "timed"
 d = json.load(open(f)) if os.path.exists(f) else {"results": []}
 d["results"] = [r for r in d["results"] if r.get("command") != cmd]
 d["results"].append({"command": cmd, "mean": secs, "stddev": None, "median": secs, "user": 0.0, "system": 0.0,
-                     "min": secs, "max": secs, "times": [secs], "exit_codes": [code], "first_request_failed": True})
+                     "min": secs, "max": secs, "times": [secs], "exit_codes": [code],
+                     "first_request_failed": not timed, "timed_run_failed": timed})
 json.dump(d, open(f, "w"), indent=1)
 EOF
 }
 
 time_query() {
-  local n=$1 res=$2 clear=${3:-} all=$ENGINES ok="" e rc t0 t1 args=()
+  local n=$1 res=$2 prepare=${3:-} all=$ENGINES ok="" e rc t0 t1 clear hf
+  local ENGINES=$ENGINES
   local new=$res/$n.new.json
   rm -f "$new"
   for e in $all; do
@@ -105,22 +108,34 @@ time_query() {
       revive "$e" "$n" "$res"
     fi
   done
-  for e in $ok; do args+=(--command-name "${NAME[$e]}" "$(q "${URL[$e]}" "$n")"); done
-  if [ ${#args[@]} -gt 0 ]; then
+  # Prepare and time each engine separately. Clearing QLever's cache must not
+  # prevent another engine's timing after QLever crashes.
+  for e in $ok; do
+    ENGINES=$e
+    clear=$prepare
     [ -n "$clear" ] || clear=$(cache_prepare)
-    ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
-      "${args[@]}" --export-json "$res/$n.hf.json"
-    python3 - "$res/$n.hf.json" "$new" << 'EOF'
+    hf=$res/$n.$e.hf.json
+    rm -f "$hf"
+    if ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
+      --command-name "${NAME[$e]}" "$(q "${URL[$e]}" "$n")" --export-json "$hf"; then
+      python3 - "$hf" "$new" << 'EOF'
 import json, os, sys
 hf, new = sys.argv[1:]
 d = json.load(open(new)) if os.path.exists(new) else {"results": []}
 d["results"] += json.load(open(hf))["results"]
 json.dump(d, open(new, "w"), indent=1)
 EOF
-    rm -f "$res/$n.hf.json"
-    # a server that stopped answering during the runs is restarted before the next query
-    for e in $ok; do revive "$e" "$n" "$res"; done
-  fi
+      rm -f "$hf"
+    else
+      rc=$?
+      # A live server with a broken preparation command is a harness failure.
+      # A dead server is an engine failure; discard its incomplete timed sample.
+      answering "$e" && return "$rc"
+      log "$e: stopped answering while timing $n, recorded as an engine failure"
+      failed_result "$new" "${NAME[$e]}" 0 "$rc" timed
+    fi
+    revive "$e" "$n" "$res"
+  done
   ENGINES=$all
   merge "$new" "$res/$n.json"
 }

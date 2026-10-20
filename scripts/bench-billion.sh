@@ -42,7 +42,9 @@
 # of Fluree's bulk import, default 8192), FLUREE_PIECE (the largest piece of Fluree's
 # input, uncompressed, as `split -C` takes it, default 512M), FLUREE_CACHE_MB (the cache of Fluree's server,
 # default 4096), LOAD_TIMEOUT (a time limit for each load, in the form `timeout` takes),
-# SPARKLES (the binary, default target/release/sparkles).
+# SPARKLES (the binary, default target/release/sparkles), SERVER_MEM_MAX (optional
+# per-server systemd memory limit with no swap), CLIENT_CPU (optional client affinity,
+# or none to leave clients unpinned).
 #
 # Comparison engines come from this flake's pinned packages. QINDEX, QSERVER, XLOADER,
 # FUSEKI, OXIGRAPH and FLUREE override the executables. Auxiliary tools prefer PATH,
@@ -329,6 +331,16 @@ step_load() {
 }
 
 # --------------------------------------------------------------------------- servers
+CAP=()
+if [ -n "${SERVER_MEM_MAX:-}" ]; then
+  command -v systemd-run > /dev/null || die "SERVER_MEM_MAX needs systemd-run"
+  CAP=(systemd-run --user --scope --quiet -p "MemoryMax=$SERVER_MEM_MAX" -p MemorySwapMax=0 --)
+fi
+CLIENT=()
+if [ -n "${CLIENT_CPU:-}" ] && [ "$CLIENT_CPU" != none ]; then
+  command -v taskset > /dev/null || die "CLIENT_CPU needs taskset"
+  CLIENT=(taskset -c "$CLIENT_CPU")
+fi
 freeport() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 declare -A NAME URL READY PORT PID FILESOF
 NAME=([sparkles]=sparkles [qlever]=qlever [jena]=jena-fuseki [oxigraph]=oxigraph [fluree]=fluree)
@@ -340,25 +352,25 @@ start() { # start <engine>
   PORT[$e]=$p
   case $e in
     sparkles)
-      "$SPARKLES" --result-cache-mb 0 serve --data "$S/sparkles-server" --loc dbpedia="$S/sparkles.db" \
+      "${CAP[@]}" "$SPARKLES" --result-cache-mb 0 serve --data "$S/sparkles-server" --loc dbpedia="$S/sparkles.db" \
         --port "$p" --timeout "$TIMEOUT" --query-memory-mb $((QUERY_MEM_GB * 1024)) --no-access-log > "$S/logs/server-sparkles.log" 2>&1 &
       URL[$e]=localhost:$p/dbpedia/sparql
       READY[$e]="localhost:$p/\$/ping"
       ;;
     qlever)
-      (cd "$S/qlever-index" && exec "$QSERVER" -i dbpedia -p "$p" -m "${QUERY_MEM_GB}G" \
+      (cd "$S/qlever-index" && exec "${CAP[@]}" "$QSERVER" -i dbpedia -p "$p" -m "${QUERY_MEM_GB}G" \
         -c 2G -e 0B -s "${TIMEOUT}s" -a bench -j 16 > "$S/logs/server-qlever.log" 2>&1) &
       URL[$e]=localhost:$p/
       READY[$e]="localhost:$p/?cmd=stats"
       ;;
     jena)
-      env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "$FUSEKI" --port "$p" \
+      env -u JAVA_HOME JVM_ARGS="-Xmx${JENA_HEAP:-8G}" "${CAP[@]}" "$FUSEKI" --port "$p" \
         --loc "$S/jena.db" /dbpedia > "$S/logs/server-jena.log" 2>&1 &
       URL[$e]=localhost:$p/dbpedia/sparql
       READY[$e]="localhost:$p/\$/ping"
       ;;
     oxigraph)
-      "$OXIGRAPH" serve-read-only --location "$S/oxigraph.db" --bind "127.0.0.1:$p" \
+      "${CAP[@]}" "$OXIGRAPH" serve-read-only --location "$S/oxigraph.db" --bind "127.0.0.1:$p" \
         --timeout-s "$TIMEOUT" > "$S/logs/server-oxigraph.log" 2>&1 &
       URL[$e]=localhost:$p/query
       READY[$e]="localhost:$p/query?query=ASK%7B%7D"
@@ -366,7 +378,7 @@ start() { # start <engine>
     fluree)
       # the settings of scripts/bench-lib.sh, with this script's TIMEOUT
       (cd "$S/fluree" && FLUREE_CACHE_MAX_MB=${FLUREE_CACHE_MB:-4096} FLUREE_PATH_MAX_VISITED=20000000 \
-        FLUREE_QUERY_TIMEOUT_MS=$((TIMEOUT * 1000)) exec "$FLUREE" server run --listen-addr "127.0.0.1:$p" \
+        FLUREE_QUERY_TIMEOUT_MS=$((TIMEOUT * 1000)) exec "${CAP[@]}" "$FLUREE" server run --listen-addr "127.0.0.1:$p" \
         --storage-path "$S/fluree/.fluree/storage" --log-level warn > "$S/logs/server-fluree.log" 2>&1) &
       URL[$e]=localhost:$p/v1/fluree/query/dbpedia:main
       READY[$e]="localhost:$p/health"
@@ -393,7 +405,11 @@ stop() { # stop <engine>: by port, since wrapper scripts (fuseki-server) outlive
   wait "${PID[$e]}" 2> /dev/null || true
   unset "PORT[$e]"
 }
-stop_all() { for e in $ENGINES; do stop "$e"; done; }
+# ENGINES is narrowed while timing. Every launched server remains in PORT until stopped.
+stop_all() {
+  local e
+  for e in "${!PORT[@]}"; do stop "$e"; done
+}
 PSI_PID= # the pressure sampler of the preflight, stopped on exit
 trap 'stop_all; [ -z "$PSI_PID" ] || kill "$PSI_PID" 2> /dev/null || true' EXIT
 # drop an engine's files from the page cache (no root needed: posix_fadvise DONTNEED);
@@ -447,7 +463,8 @@ EOF
 }
 step_queries() {
   resolve_tools
-  local e n r
+  local e n r all=$ENGINES
+  local ENGINES=$all
   for e in $ENGINES; do
     [ -f "$S/${NAME[$e]/jena-fuseki/jena-tdb2}.loaded" ] || die "$e: no index at scale $SCALE (run the load step)"
   done
@@ -459,7 +476,7 @@ step_queries() {
         evict "$e"
         start "$e"
         # curl prints the time even when the request fails, so a failure replaces it
-        if ! r=$(curl -sf --max-time "$TIMEOUT" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
+        if ! r=$(${CLIENT[@]+"${CLIENT[@]}"} curl -sf --max-time "$TIMEOUT" -o /dev/null -w '%{time_total}' -H 'Accept: text/tab-separated-values' \
           --data-urlencode "query@$HERE/queries/$n.rq" "${URL[$e]}"); then
           r=error
         fi
@@ -484,36 +501,42 @@ step_queries() {
     done
     echo
   done
+  stop_all
   [ -n "${ANSWERS_ONLY:-}" ] && return
-  for n in "${NAMES[@]}"; do
-    echo
-    echo "== $n"
-    time_query "$n" results
-  done
-  for n in $THROUGHPUT; do
-    selected "$n" || continue
-    echo
-    echo "== throughput $n ($NREQ requests, $CONC clients)"
-    args=()
-    for e in $ENGINES; do
-      args+=(--command-name "${NAME[$e]}" "seq $NREQ | xargs -P $CONC -I{} $(q "${URL[$e]}" "$n")")
+  # Only one engine runs during its full warm pass, timings, throughput and RSS sample.
+  # Local ENGINES restores the selected list on return; cleanup uses PORT even on failure.
+  for e in $all; do
+    ENGINES=$e
+    start "$e"
+    log "$e: warming selected queries"
+    for n in "${NAMES[@]}"; do
+      eval "$(q "${URL[$e]}" "$n")" > /dev/null || true
     done
-    hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
-      "${args[@]}" --export-json "results/throughput-$n.new.json"
-    merge "results/throughput-$n.new.json" "results/throughput-$n.json"
-  done
-  sleep 2 # idle servers may hand free memory back
-  local kv=()
-  for e in $ENGINES; do
-    kv+=("${NAME[$e]}=$(awk '/VmRSS/ {printf "%.0f", $2/1024}' "/proc/$(pid_on "${PORT[$e]}")/status" 2> /dev/null || echo "?")")
-  done
-  python3 - "$S/results/rss.json" "${kv[@]}" << 'EOF'
+    for n in "${NAMES[@]}"; do
+      echo
+      echo "== $e $n"
+      time_query "$n" results
+    done
+    for n in $THROUGHPUT; do
+      selected "$n" || continue
+      echo
+      echo "== $e throughput $n ($NREQ requests, $CONC clients)"
+      ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
+        --command-name "${NAME[$e]}" "seq $NREQ | xargs -P $CONC -I{} $(q "${URL[$e]}" "$n")" \
+        --export-json "results/throughput-$n.new.json"
+      merge "results/throughput-$n.new.json" "results/throughput-$n.json"
+    done
+    sleep 2 # idle servers may hand free memory back
+    r=$(awk '/VmRSS/ {printf "%.0f", $2/1024}' "/proc/$(pid_on "${PORT[$e]}")/status" 2> /dev/null || echo "?")
+    python3 - "$S/results/rss.json" "${NAME[$e]}=$r" << 'EOF'
 import json, os, sys
 f = sys.argv[1]
 d = json.load(open(f)) if os.path.exists(f) else {}
 d.update(kv.split("=", 1) for kv in sys.argv[2:])
 json.dump(d, open(f, "w"), indent=1)
 EOF
+    stop "$e"
+  done
   log "server RSS (MiB): $(cat "$S/results/rss.json")"
 }
 
