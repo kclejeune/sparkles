@@ -458,7 +458,9 @@ Jena 6 removed the query builder's initial-binding API. Its compatibility run sk
 that API's test, while Jena 5 still runs it. The remaining small-query tests run on both
 versions. Substitution tests remain separate because their semantics differ.
 
-`nix.yml` builds the flake's `cacheable` output with nix-fast-build (see [Nix](#nix)).
+`nix.yml` builds the flake's `cacheable` output with nix-fast-build on x86_64 Linux,
+arm64 Linux and arm64 macOS for pushes, pull requests and manual runs
+when their changed paths select the workflow. The [Nix](#nix) section describes its build set.
 
 ### Caches
 
@@ -620,8 +622,9 @@ checks other than the NixOS VM test and the UI end-to-end tests. `--skip-cached`
 whatever a substituter already holds, so a run builds only what changed since the last
 push. The workflow pushes only from pushes to `main` and manual runs, and only when the
 repository has the `NIMBUS_ENDPOINT` variable and the `NIMBUS_AUTH_TOKEN` secret. Pull
-requests build without pushing. Pushes build x86_64 Linux, and a manual run with
-**all-systems** checked also builds Linux arm64 and macOS arm64.
+requests build without pushing. Pushes, pull requests and manual runs build all three
+cacheable systems, `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`, on native
+GitHub runners.
 
 The flake's `nixConfig` names the cache and its key, which Nix uses after asking or with
 `accept-flake-config = true`. Machines that build unattended should list the cache in
