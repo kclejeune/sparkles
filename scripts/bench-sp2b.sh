@@ -61,7 +61,7 @@ if [ -z "${SP2B:-}" ]; then
   SP2B=$WORK/sp2b-gen
   if [ ! -x "$SP2B/bin/sp2b_gen" ]; then
     log "building the SP2Bench generator (scripts/bench-sp2b/sp2b.nix)"
-    pinned_build "$ROOT/scripts/bench-sp2b/sp2b.nix" "$SP2B"
+    flake_build sp2b-gen "$SP2B"
   fi
 fi
 

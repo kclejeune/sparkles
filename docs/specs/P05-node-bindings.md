@@ -1295,7 +1295,9 @@ and a `queryToStream` producer gives its permit back while it waits for the read
 open cursor keeps its snapshot until it is drained, closed or collected, so callers that
 stop reading early should call `close()` or use `await using`. The result iterator asks
 for the next batch once half of the current batch has been consumed. Dumps and
-`queryToStream` serialize on Tokio's blocking pool. `catalog.reserve()` returns a promise,
+`queryToStream` serialize on Tokio's blocking pool. Closing a result reports `stopped`
+even when its cancellation interrupts a prefetched SELECT or graph batch. A query error
+that preceded close stays `failed`, with its error intact. `catalog.reserve()` returns a promise,
 because a claim can touch the catalog's files. A panic inside the addon reaches
 JavaScript as an `InternalError` rather than as invalid input.
 
