@@ -825,8 +825,19 @@ QLever's answers waited about 40 ms each for a delayed TCP acknowledgement. A ru
 
 **Left for Phase 1.**
 
-* The rest of the standard refresh at one head (A5). WatDiv, full-text search and DBpedia
-  are running again, and BSBM and the later batches of roadmap item 1 follow. The
+The reruns completed WatDiv, full-text search and BSBM Explore on 2026-10-19.
+DBpedia's warm phase failed after QLever timed out and restarted on another port,
+because cache preparation still used its old endpoint. Preparation now resolves
+the endpoint after the query probes and restarts, including for later throughput.
+BSBM BI exhausted its eight-hour batch limit while Jena's driver continued after
+repeated request timeouts. Each engine, mix and client count now has a configurable
+1800 second wall budget, with bounded process-group cleanup and an explicit timeout
+record without partial throughput. Successful runs retain their requested mix
+counts. These repairs have regression coverage. Their measured reruns and the
+publication of the completed results remain open.
+
+* The rest of the standard refresh at one head (A5). Publication of WatDiv, full-text
+  search and BSBM Explore, the DBpedia and BI reruns, and the later batches remain. The
   regeneration of the BENCHMARKS.md tables from records without a numeric change (A3)
   remains open. `bench.sh` starts,
   checks and times one engine at a time in its default and `updates` modes since

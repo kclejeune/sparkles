@@ -422,6 +422,15 @@ This change keeps the existing lock and engine versions.
   and 16 clients (`--clients`) after 50 warm-up mixes and 500 measured ones, and the record
   gets its query mixes per hour. The driver does not look at what a query returns, so a
   failing or wrongly answering engine would look fast. A run in which the driver exits with an error is recorded as `error`.
+  Each engine, mix and client count has a wall budget of `BSBM_MAX_TIME` seconds,
+  defaulting to 1800, separate from the request timeout. The driver can continue
+  after a request timeout, so its request limit alone does not bound a run. At the
+  wall deadline the harness terminates the driver's process group, allows up to
+  `BSBM_KILL_AFTER` seconds to exit, defaulting to 5, and kills surviving processes.
+  The interrupted run records `timeout` and its reason without a throughput value,
+  then the harness checks the server and continues with the next client count.
+  Successful runs keep the requested warm-up and measured mix counts. The result
+  record keeps both limits, the mix counts and the client counts in its settings.
   Afterwards the average result count of each query is compared across the runs in which the
   driver succeeded without a timeout. Each engine counts once, and runs with different mix
   counts are not compared with each other. Averages that differ by at most 0.05 or 1% count

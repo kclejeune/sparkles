@@ -3,6 +3,7 @@
     python3 -m unittest discover -s scripts/bench-tests
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -12,6 +13,9 @@ import unittest
 
 SCRIPTS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QMPH = os.path.join(SCRIPTS, "bench-bsbm", "qmph.py")
+SPEC = importlib.util.spec_from_file_location("bsbm_qmph", QMPH)
+qm = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(qm)
 
 
 def driver_xml(avg, qmph=100.0, timeouts=0, runs=10):
@@ -73,6 +77,35 @@ class QmphTests(unittest.TestCase):
     def test_timeouts_are_recorded(self):
         self.add("a", 1, {"1": 5.0}, timeouts=2)
         self.assertEqual(self.result()["a"]["1"]["status"], "timeout")
+
+    def test_a_reason_survives_valid_xml_and_check(self):
+        xml = os.path.join(self.dir.name, "driver.xml")
+        with open(xml, "w") as f:
+            f.write(driver_xml({"1": 5.0}))
+        self.run_qmph(xml, self.out, "a", "1", "bi-mix", "137", "driver was killed")
+        self.run_qmph("--check", self.out)
+        run = self.result()["a"]["1"]
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(run["status_reasons"], ["driver was killed"])
+        self.assertIsNone(run["qmph"])
+
+    def test_a_wall_timeout_survives_every_xml_state_and_check(self):
+        xml = os.path.join(self.dir.name, "driver.xml")
+        for body in (None, "<unfinished", driver_xml({"1": 5.0})):
+            with self.subTest(body=body):
+                if os.path.exists(xml):
+                    os.unlink(xml)
+                if body is not None:
+                    with open(xml, "w") as f:
+                        f.write(body)
+                qm.add(xml, self.out, "a", "1", "bi-mix", -9,
+                       "whole driver budget exceeded", timed_out=True)
+                self.run_qmph("--check", self.out)
+                run = self.result()["a"]["1"]
+                self.assertEqual(run["status"], "timeout")
+                self.assertEqual(run["driver_status"], "timeout")
+                self.assertEqual(run["status_reasons"], ["whole driver budget exceeded"])
+                self.assertIsNone(run["qmph"])
 
     def test_check_flags_the_run_that_differs(self):
         self.add("a", 1, {"1": 5.0, "2": 7.0})

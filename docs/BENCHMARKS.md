@@ -21,11 +21,14 @@ release binary of commit 81478fbe. The harness was that of commit 81478fbe for t
 runs and of commit 77032452 for the others. The summary, the synthetic tables, the cold,
 churn, mixed-load, updates, load and memory figures of the synthetic suite, and the
 [SP²Bench](#sp2bench-at-10m-triples) and [LUBM](#lubm100) sections come from these runs.
-Other sections keep their earlier measurements. WatDiv, full-text search and the
-50M-triple slice of DBpedia are being measured again, because their first runs in this
-batch failed on a QLever build and on a harness that waited for its pressure sampler. BSBM
-is waiting for a run with the harness fixes of 2026-10-19, and the later batches of the
-refresh have not started.
+Other sections keep their earlier measurements. WatDiv, full-text search and BSBM
+Explore completed reruns on 2026-10-19, and publication of their refreshed figures
+remains open. The DBpedia slice of 50M triples remains incomplete after a QLever
+restart left cache preparation pointing at its old port. BSBM BI reached its
+query-mix phase but exhausted the eight-hour batch limit while the Jena driver
+continued after repeated request timeouts. The harness now resolves cache preparation
+after restarts and bounds each BSBM driver run. These two workloads need another run,
+and the later batches of the refresh have not started.
 
 * [Summary](#summary)
 * [Query performance](#query-performance)

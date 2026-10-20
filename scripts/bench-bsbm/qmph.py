@@ -10,8 +10,9 @@ it returned on average and how often it timed out. The file qmph.json maps an en
 client count to {qmph, runs, seconds, timeouts, avgresults, query, status}, the form
 scripts/bench-record.py reads. A missing or unreadable XML file, or a driver that exited with a
 nonzero status, records status `error`, and a run in which any query timed out records `timeout`.
-That outcome is also kept in `driver_status`. A reason, given when the mix was not run on the
-engine at all, goes into `status_reasons` with status `error`.
+That outcome is also kept in `driver_status`. The bounded driver wrapper can record a whole-run
+timeout even when the driver did not finish its XML. Reasons are kept in `status_reasons`.
+Interrupted or failed driver processes do not report throughput.
 
 The driver does not look at what a query returns, so a query that fails quickly, or that
 answers wrongly and quickly, makes the query mixes per hour look better. The second form compares
@@ -45,10 +46,8 @@ def save(path, d):
         json.dump(d, f, indent=1)
 
 
-def add(xml, out, engine, clients, name, exit_status, reason=None):
+def add(xml, out, engine, clients, name, exit_status, reason=None, *, timed_out=False):
     entry = {"query": name, "status": "error", "driver_status": "error", "qmph": None}
-    if reason:
-        entry["status_reasons"] = [reason]
     try:
         root = ET.parse(xml).getroot()
         mix = root.find("querymix")
@@ -65,6 +64,12 @@ def add(xml, out, engine, clients, name, exit_status, reason=None):
                  "timeouts": timeouts, "avgresults": avg}
     except (OSError, ET.ParseError, AttributeError, ValueError, TypeError):
         pass
+    if timed_out:
+        entry["status"] = entry["driver_status"] = "timeout"
+    if timed_out or exit_status:
+        entry["qmph"] = None
+    if reason:
+        entry["status_reasons"] = [reason]
     d = load(out)
     d.setdefault(engine, {})[clients] = entry
     save(out, d)

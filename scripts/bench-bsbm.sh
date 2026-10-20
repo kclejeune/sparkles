@@ -37,7 +37,9 @@
 # Results go to WORKDIR/results (manifest.json, record.json, summary.md, hyperfine's JSON, the
 # driver's XML files).
 #
-# Env: USECASE, INSTANCES, CLIENTS, BSBM_RUNS, BSBM_WARMUP, WARMUP (default 2), RUNS (default
+# Env: USECASE, INSTANCES, CLIENTS, BSBM_RUNS, BSBM_WARMUP, BSBM_MAX_TIME (default 1800
+# seconds per engine/mix/client driver run), BSBM_KILL_AFTER (default 5 seconds),
+# WARMUP (default 2), RUNS (default
 # 10), COLD_RUNS (default 0), SKIP_LOAD=1, ANSWERS_ONLY=1 (checks answers, skips every
 # timing), SKIP_QMPH=1, QUERIES="explore-q2 …", ENGINES="sparkles jena qlever fluree
 # oxigraph" (default; ENGINES="" only generates the data and the queries), PORT_BASE (default
@@ -66,6 +68,16 @@ INSTANCES=${INSTANCES:-3}
 CLIENTS=${CLIENTS:-1 4 16}
 BSBM_RUNS=${BSBM_RUNS:-500}
 BSBM_WARMUP=${BSBM_WARMUP:-50}
+BSBM_MAX_TIME=${BSBM_MAX_TIME:-1800}
+BSBM_KILL_AFTER=${BSBM_KILL_AFTER:-5}
+# This wall budget bounds a whole driver cell, independently of each request's MAX_TIME.
+# It is a configurable guard, not a sampling interval. A cut-off run has no throughput.
+for limit in BSBM_MAX_TIME BSBM_KILL_AFTER; do
+  if ! { [[ ${!limit} =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] && awk -v s="${!limit}" 'BEGIN { exit !(s > 0) }'; }; then
+    echo "$limit must be a positive number of seconds, not '${!limit}'" >&2
+    exit 2
+  fi
+done
 MAX_TIME=${MAX_TIME:-300}
 export MAX_TIME
 case $USECASE in
@@ -191,7 +203,20 @@ rdfxml_refused() {
   done
 }
 bsbm_qmph() {
-  local e c rc mix ucf sfx out label code
+  local e c mix ucf sfx out label code
+  python3 -I - results/extra.json "$BSBM_MAX_TIME" "$BSBM_KILL_AFTER" "$BSBM_WARMUP" "$BSBM_RUNS" "$CLIENTS" << 'EOF'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text()) if path.exists() else {}
+data.setdefault("settings", {}).update({
+    "bsbmMaxTimeSeconds": float(sys.argv[2]),
+    "bsbmKillAfterSeconds": float(sys.argv[3]),
+    "bsbmWarmup": int(sys.argv[4]),
+    "bsbmRuns": int(sys.argv[5]),
+    "bsbmClients": [int(c) for c in sys.argv[6].split()],
+})
+path.write_text(json.dumps(data, indent=1))
+EOF
   [ -z "${SKIP_QMPH:-}" ] || return 0
   echo
   echo "== query mixes per hour ($BSBM_WARMUP warm-up and $BSBM_RUNS measured mixes)"
@@ -218,11 +243,13 @@ bsbm_qmph() {
         fi
         # a new connection per request, as the harness's curl and oha requests make: on a
         # reused connection QLever's answers wait about 40 ms for a delayed TCP acknowledgement
-        (cd bsbm && "$JAVA" -Dhttp.keepAlive=false -Xmx2g -cp ".:lib/*" benchmark.testdriver.TestDriver -runs "$BSBM_RUNS" -w "$BSBM_WARMUP" \
+        echo "$e: $label x$c (whole driver wall budget ${BSBM_MAX_TIME}s)"
+        python3 -I "$ROOT/scripts/bench-bsbm/driver.py" --timeout "$BSBM_MAX_TIME" --grace "$BSBM_KILL_AFTER" \
+          --cwd "$WORK/bsbm" --xml "$WORK/results/driver-${NAME[$e]}-$c$sfx.xml" --out "$out" \
+          --engine "${NAME[$e]}" --clients "$c" --name "$label" \
+          -- "$JAVA" -Dhttp.keepAlive=false -Xmx2g -cp ".:lib/*" benchmark.testdriver.TestDriver -runs "$BSBM_RUNS" -w "$BSBM_WARMUP" \
           -mt "$c" -idir td_data -ucf "$ucf" -t "$DRIVER_TIMEOUT_MS" -o "$WORK/results/driver-${NAME[$e]}-$c$sfx.xml" \
-          "http://${URL[$e]}") > "logs/driver-${NAME[$e]}-$c$sfx.log" 2>&1 && rc=0 || rc=$?
-        python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c$sfx.xml" "$out" \
-          "${NAME[$e]}" "$c" "$label" "$rc"
+          "http://${URL[$e]}" > "logs/driver-${NAME[$e]}-$c$sfx.log" 2>&1
         # a server that crashed or hung during the mixes is restarted before the next run, so
         # one failure does not fail every later client count and mix (results/restarts.json)
         revive "$e" "$label x$c" results
