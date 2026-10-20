@@ -626,6 +626,10 @@ their own `nix.conf`.
 
 ### How the Rust build is layered
 
+Per-crate Nix builds remain an investigation under [roadmap item 92](ROADMAP.md)
+and [X13](specs/X13-per-crate-nix-builds.md). A working crate2nix prototype has not
+completed a matched comparison or packaging validation, so these builds keep Crane.
+
 crane builds `sparkles`, `sparkles-cli` and `sparkles-fmt-wasm` in two derivations each.
 The first one compiles only the dependencies. It sees the manifests and `Cargo.lock`,
 and every workspace source file is replaced by an empty stub, so it is rebuilt only when
