@@ -107,6 +107,23 @@ class RecordTests(unittest.TestCase):
         q = self.find(rec, "sparkles", "explore-mix", "qmph")
         self.assertEqual(q["qmph"], 1234.5)
 
+    def test_qmph_variants_and_their_reasons_are_read(self):
+        fixture(self.res)
+        write(self.res, "qmph.json", {"qlever": {"4": {"qmph": None, "query": "explore-mix", "status": "error",
+                                                       "status_reasons": ["HTTP 406"]}}})
+        write(self.res, "qmph-select.json", {"qlever": {"4": {"qmph": 99.0, "query": "explore-mix-select",
+                                                                   "status": "ok"}}})
+        out = os.path.join(self.tmp.name, "record.json")
+        p = build(self.res, out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rec = jload(out)
+        std = self.find(rec, "qlever", "explore-mix", "qmph")
+        self.assertEqual((std["status"], std["status_reasons"]), ("error", ["HTTP 406"]))
+        self.assertEqual(self.find(rec, "qlever", "explore-mix-select", "qmph")["qmph"], 99.0)
+        # the variant file is not taken for a query of its own
+        self.assertFalse(any(r["query"] == "qmph-select" for r in rec["results"]))
+        self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out]).returncode, 0)
+
     def test_answers_only_runs_carry_their_fingerprints(self):
         write(self.res, "answers.json", {
             "q1": {"sparkles": {"rows": 3, "exact": "a", "value": "a"}, "oxigraph": {"rows": 3, "exact": "a", "value": "a"},
@@ -435,6 +452,151 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(p.stdout.split("\n")[:-1], [
             "start sparkles", "warm u a", "warm u b", "time sparkles", "stop sparkles",
             "start jena", "warm u a", "warm u b", "time jena", "stop jena"])
+
+    def test_an_engine_that_does_not_start_is_left_out_and_the_run_fails(self):
+        stubs = """
+        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
+        answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
+        start() { echo "start $1"; if [ "$1" = jena ]; then start_failed "jena: no"; return 1; fi; URL[$1]=u; }
+        stop() { echo "stop $1"; }
+        suite_time() { echo "time $ENGINES"; }
+        after() { echo "after $ENGINES"; }
+        q() { echo "echo warm $1 $2"; }
+        log() { :; }
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="jena sparkles")
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            suite = os.path.join(SCRIPTS, "bench-suite-lib.sh")
+            script = (f'source "{lib}"; source "{suite}"; {stubs}\n'
+                      "NAMES=(a); ENGINES='jena sparkles'; SUITE=s SCALE=1 SKIP_LOAD=1 SUITE_AFTER=after; "
+                      "set -e; suite_run; echo unreachable")
+            p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.stdout.split("\n")[:-1], [
+            "start jena", "start sparkles", "warm u a", "time sparkles", "stop sparkles", "after sparkles"])
+
+    def test_an_engine_that_cannot_be_restarted_fails_the_run(self):
+        stubs = """
+        resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
+        answer_check() { :; }; stop_all() { :; }; cold() { :; }; python3() { :; }
+        start() { if [ -f started-$1 ]; then return 1; fi; touch started-$1; URL[$1]=u; }
+        stop() { :; }
+        answering() { return 1; }
+        suite_time() { revive "$ENGINES" q1 r; }
+        q() { echo true; }
+        log() { :; }
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="jena")
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            suite = os.path.join(SCRIPTS, "bench-suite-lib.sh")
+            script = (f'source "{lib}"; source "{suite}"; {stubs}\n'
+                      "NAMES=(a); ENGINES='jena'; SUITE=s SCALE=1 SKIP_LOAD=1; set -e; suite_run; echo unreachable")
+            p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertNotIn("unreachable", p.stdout)
+
+    def test_a_server_that_died_before_a_query_is_restarted_and_the_query_timed(self):
+        stubs = """
+        log() { :; }
+        answering() { [ -f up ]; }
+        revive() { echo "revive $1 $2"; touch up; }
+        q() { echo "[ -f up ] || (exit 7)"; }
+        hyperfine() { echo "hyperfine"; echo '{"results": []}' > "${@: -1}"; }
+        """
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="fluree", CLIENT_CPU="none")
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            script = f'source "{lib}"; {stubs}\nNAME[fluree]=fluree; URL[fluree]=u; WARMUP=1 RUNS=1; mkdir -p r; time_query count-all r true'
+            p = subprocess.run(["bash", "-c", script], cwd=d, env=env, capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout.split("\n")[:2], ["revive fluree before count-all", "hyperfine"])
+            self.assertFalse(os.path.exists(os.path.join(d, "r", "count-all.new.json")) and
+                             "first_request_failed" in open(os.path.join(d, "r", "count-all.new.json")).read())
+
+
+@unittest.skipUnless(os.path.exists("/proc/sys/net/ipv4/ip_local_port_range"), "Linux only")
+class PortTests(unittest.TestCase):
+    """A client connection in TIME-WAIT on a server's port makes the server's bind fail even with
+    SO_REUSEADDR, and a listening-socket check does not see it (BSBM batch 1 on forge)."""
+
+    def lib(self, script, **extra):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles", **extra)
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            return subprocess.run(["bash", "-c", f'source "{lib}"; {script}'], cwd=d, env=env,
+                                  capture_output=True, text=True)
+
+    def test_a_time_wait_socket_holds_the_port_until_it_goes(self):
+        import socket
+        import time
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        c = socket.socket()
+        c.bind(("127.0.0.1", 0))
+        port = c.getsockname()[1]
+        c.connect(srv.getsockname())
+        a, _ = srv.accept()
+        c.close()  # the side that closes first keeps TIME-WAIT
+        time.sleep(0.1)
+        a.close()
+        srv.close()
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        with self.assertRaises(OSError):
+            s.bind(("127.0.0.1", port))
+        s.close()
+        p = self.lib(f'[ -z "$(pid_on {port})" ] && echo no-listener; wait_port {port} || echo held', PORT_WAIT="1")
+        self.assertEqual(p.stdout.split(), ["no-listener", "held"], p.stderr)
+        self.assertIn("TIME-WAIT", p.stderr)
+
+    def test_a_servers_own_time_wait_sockets_do_not_hold_its_port(self):
+        import socket
+        import time
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        port = srv.getsockname()[1]
+        c = socket.socket()
+        c.connect(("127.0.0.1", port))
+        a, _ = srv.accept()
+        a.close()  # the server closes first, so its side keeps TIME-WAIT on the port
+        time.sleep(0.1)
+        c.close()
+        srv.close()
+        p = self.lib(f"wait_port {port} && echo free", PORT_WAIT="0")
+        self.assertEqual(p.stdout.strip(), "free", p.stderr)
+
+    def test_a_free_port_needs_no_wait(self):
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        p = self.lib(f"wait_port {port} && echo free", PORT_WAIT="0")
+        self.assertEqual(p.stdout.strip(), "free", p.stderr)
+
+    def test_server_ports_in_the_ephemeral_range_are_warned_about(self):
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            lo, hi = map(int, f.read().split())
+        self.assertIn("ephemeral port range", self.lib("true", PORT_BASE=str(lo + 10)).stderr)
+        if lo > 28404:
+            self.assertNotIn("ephemeral", self.lib("true", PORT_BASE="28300").stderr)
+
+    def test_evict_reads_names_with_spaces_and_newlines(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "sparkles.db")
+            os.mkdir(store)
+            for n in ("a b", "c\nd"):
+                write_text(os.path.join(store, n), "x" * 4096)
+            env = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, ENGINES="sparkles")
+            lib = os.path.join(SCRIPTS, "bench-lib.sh")
+            p = subprocess.run(["bash", "-c", f'source "{lib}"; evict sparkles && echo done'], cwd=d, env=env,
+                               capture_output=True, text=True)
+        self.assertEqual((p.stdout.strip(), p.stderr), ("done", ""))
 
 
 if __name__ == "__main__":

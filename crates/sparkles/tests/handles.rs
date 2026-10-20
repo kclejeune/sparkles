@@ -1065,3 +1065,41 @@ fn algorithms_catalog_duplicate_fields_stay_readable_and_read_only() {
         unchanged();
     }
 }
+
+/// The objects measured at one past commit are not served for another: past snapshots
+/// share a version, so the cache keys them by commit too.
+#[test]
+fn predicate_objects_of_past_commits_are_their_own() {
+    use sparkles::history::HistoryOptions;
+    use sparkles::schema::{GraphSelection, SchemaOptions};
+    let (_dir, ds) = persistent();
+    let ints = ds.head_commit().seq;
+    ds.update(
+        "DELETE WHERE { ?s <http://ex.org/p> ?o } ; INSERT DATA { <http://ex.org/a> <http://ex.org/p> <http://ex.org/x> }",
+    )
+    .unwrap();
+    let iris = ds.head_commit().seq;
+    ds.update("INSERT DATA { <http://ex.org/z> <http://ex.org/q> 1 }")
+        .unwrap();
+    let o = HistoryOptions {
+        cancel: None,
+        deadline: None,
+    };
+    let opts = SchemaOptions {
+        graph: GraphSelection::Union,
+        ..Default::default()
+    };
+    let objects = |seq: u64| {
+        let (snap, _) = ds.store().snapshot_at(&At::Commit(seq), &o).unwrap();
+        ds.schema()
+            .predicate_objects_at(&snap, "http://ex.org/p", &opts, 1000)
+            .unwrap()
+            .unwrap()
+            .objects
+            .clone()
+    };
+    let a = objects(ints);
+    assert!(a.iri.is_none() && !a.literals.is_empty(), "{a:?}");
+    let b = objects(iris);
+    assert!(b.iri.is_some() && b.literals.is_empty(), "{b:?}");
+}

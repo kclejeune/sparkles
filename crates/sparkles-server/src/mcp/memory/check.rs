@@ -636,11 +636,19 @@ impl Tools<'_> {
                 else {
                     continue;
                 };
-                if let Some(issue) =
-                    literal_issue(p, l, *meet, &entry.observed.objects.literals, &mut terms)
-                {
+                // a report from the index statistics samples the objects: a literal that
+                // is an object of the predicate meets it whatever the sample holds
+                if !rep.basis.is_exact() && *meet == Meet::Pattern && is_object(&r.snap, p, l) {
+                    continue;
+                }
+                let (objects, sampled) =
+                    self.entry_objects(&ds, &r.snap, rep, entry, deadline, &ctx)?;
+                if let Some(issue) = literal_issue(p, l, *meet, &objects.literals, &mut terms) {
                     let mut issue = issue;
                     issue.at = locate(&a.query, p.as_str(), &prefix_map);
+                    if let Some(n) = sampled {
+                        issue.message.push_str(&sample_note(n));
+                    }
                     issues.push(issue);
                 }
             }
@@ -761,42 +769,37 @@ impl Tools<'_> {
             .collect();
         let mut labels: HashMap<String, Vec<(usize, Literal)>> = HashMap::new();
         let mut types: HashMap<String, Vec<String>> = HashMap::new();
-        if !looked.is_empty() {
-            let preds = crate::mcp::render::LABEL_PREDICATES;
-            let mut values = String::from("VALUES ?lp { ");
-            for p in preds {
-                values.push_str(&format!("<{p}> "));
-            }
-            values.push('}');
-            let q = format!(
-                "SELECT ?t ?lp ?l WHERE {{ {} {values} {} FILTER(isLiteral(?l)) }} LIMIT {}",
-                super::values_iris("t", looked.iter().copied()),
-                r.quads("?t ?lp ?l", &[]),
-                looked.len() * 8
-            );
-            for row in r.rows(&q, Vec::new())? {
-                if let (
-                    Some(Term::NamedNode(t)),
-                    Some(Term::NamedNode(lp)),
-                    Some(Term::Literal(l)),
-                ) = (&row[0], &row[1], &row[2])
-                {
+        // one query per entity with the entity bound: a VALUES block outside the
+        // reader's UNION of graphs is joined after each branch reads every graph, which
+        // on a billion quads passes the query memory budget
+        let preds = crate::mcp::render::LABEL_PREDICATES;
+        let mut values = String::from("VALUES ?lp { ");
+        for p in preds {
+            values.push_str(&format!("<{p}> "));
+        }
+        values.push('}');
+        let label_q = format!(
+            "SELECT ?lp ?l WHERE {{ {values} {} FILTER(isLiteral(?l)) }} LIMIT 8",
+            r.quads("?t ?lp ?l", &[]),
+        );
+        let type_q = format!(
+            "SELECT DISTINCT ?c WHERE {{ {} }} LIMIT 4",
+            r.quads(&format!("?t <{RDF_TYPE}> ?c"), &[]),
+        );
+        for o in &looked {
+            let bind = || vec![("t".to_string(), Term::NamedNode((*o).clone()))];
+            for row in r.rows(&label_q, bind())? {
+                if let (Some(Term::NamedNode(lp)), Some(Term::Literal(l))) = (&row[0], &row[1]) {
                     let rank = preds.iter().position(|p| *p == lp.as_str()).unwrap_or(0);
                     labels
-                        .entry(t.as_str().to_string())
+                        .entry(o.as_str().to_string())
                         .or_default()
                         .push((rank, l.clone()));
                 }
             }
-            let q = format!(
-                "SELECT DISTINCT ?t ?c WHERE {{ {} {} }} LIMIT {}",
-                super::values_iris("t", looked.iter().copied()),
-                r.quads(&format!("?t <{RDF_TYPE}> ?c"), &[]),
-                looked.len() * 4
-            );
-            for row in r.rows(&q, Vec::new())? {
-                if let (Some(Term::NamedNode(t)), Some(Term::NamedNode(c))) = (&row[0], &row[1]) {
-                    let v = types.entry(t.as_str().to_string()).or_default();
+            for row in r.rows(&type_q, bind())? {
+                if let Some(Term::NamedNode(c)) = &row[0] {
+                    let v = types.entry(o.as_str().to_string()).or_default();
                     if v.len() < 3 {
                         v.push(c.as_str().to_string());
                     }
@@ -968,6 +971,25 @@ pub(super) fn class<'r>(
         .binary_search_by(|e| e.iri.as_str().cmp(iri))
         .ok()
         .map(|i| &rep.classes[i])
+}
+
+/// Whether literal `l` is an object of predicate `p` in any graph.
+pub(super) fn is_object(snap: &sparkles::store::Snapshot, p: &NamedNode, l: &Literal) -> bool {
+    let (Some(p), Some(o)) = (
+        snap.lookup_iri(p.as_str()),
+        snap.lookup_term(&Term::Literal(l.clone())),
+    ) else {
+        return false;
+    };
+    snap.count(sparkles::index::Perm::Pos, &[p.0, o.0])
+        .is_ok_and(|n| n > 0)
+}
+
+/// What a warning from sampled objects adds to its message.
+pub(super) fn sample_note(n: u64) -> String {
+    format!(
+        " (in a sample of {n} of its literal objects, which may miss a rare datatype or language)"
+    )
 }
 
 /// Whether `?pp` has a triple in the view, or is declared a property there.

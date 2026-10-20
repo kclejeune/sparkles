@@ -3883,3 +3883,534 @@ fn decoding_ahead_with_growing_batches_under_tight_budgets() {
         "decoding ahead failed at {mismatches:?} KiB"
     );
 }
+
+/// The rows the leaf scan of a cursor plan read.
+fn leaf_rows(plan: &sparkles_core::sparql::CursorPlan) -> i64 {
+    match plan.children.first() {
+        Some(child) => leaf_rows(child),
+        None => plan.operator.actual_rows,
+    }
+}
+
+/// A filter over a scan on the variable it tests reads the scan in morsels of whole
+/// blocks, in parallel, and answers what eager execution answers in the same order:
+/// across block and morsel boundaries, under a small LIMIT and OFFSET, with a fixed start
+/// that skips whole key ranges, and when the row budget hands the rest of the scan back
+/// to the scan's own batches partway.
+#[test]
+fn morsel_filters_over_scans_match_eager_in_order() {
+    let s = named(150_000);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let queries = [
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) }",
+        "SELECT ?n ?s WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"9\")) }",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(STRSTARTS(?n, \"Ada 1\")) }",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(REGEX(STR(?s), \"s:1[0-9]{3}$\")) }",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) } LIMIT 3",
+        "SELECT ?s ?n WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"Ada\")) } OFFSET 40000 LIMIT 5000",
+        "SELECT ?s WHERE { ?s <urn:name> ?n FILTER(CONTAINS(?n, \"nobody\")) }",
+    ];
+    for q in queries {
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        for (opts, batch) in [
+            (QueryOptions::default(), 4096),
+            (QueryOptions::default(), 100_000),
+            (without("filter_scan_runs"), 4096),
+            (without("grow_input"), 5000),
+            (
+                QueryOptions {
+                    max_rows: Some(160_000),
+                    ..Default::default()
+                },
+                4096,
+            ),
+        ] {
+            let c = select_cursor(s.snapshot(), q, &opts, &options(batch)).unwrap();
+            let rows = pool.install(|| all(c));
+            assert_eq!(rows, eager, "{q} at {batch} rows");
+        }
+    }
+    // A fixed start reads only the key ranges that can pass, which the scan's own
+    // batches do not skip.
+    let q = queries[2];
+    let read = |opts: &QueryOptions| {
+        let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+        while c.next_batch().unwrap().is_some() {}
+        leaf_rows(c.plan())
+    };
+    assert!(read(&QueryOptions::default()) < 150_000 / 7);
+    assert_eq!(read(&without("filter_scan_runs")), 150_000);
+    // A small first demand keeps the scan's own batches.
+    let limited = format!("{} LIMIT 2", queries[0]);
+    let mut c = select_cursor(s.snapshot(), &limited, &Default::default(), &options(4096)).unwrap();
+    while c.next_batch().unwrap().is_some() {}
+    assert!(leaf_rows(c.plan()) < 1000, "{}", leaf_rows(c.plan()));
+    // Without a row budget every row is read in morsels. A row budget without room for
+    // another morsel hands the rest of the scan back to its own batches.
+    let morsels = |opts: &QueryOptions| {
+        let mut c = select_cursor(s.snapshot(), queries[0], opts, &options(4096)).unwrap();
+        while c.next_batch().unwrap().is_some() {}
+        (leaf_counter(c.plan(), "morselRows"), leaf_rows(c.plan()))
+    };
+    assert_eq!(morsels(&QueryOptions::default()), (150_000, 150_000));
+    let (read, leaf) = morsels(&QueryOptions {
+        max_rows: Some(160_000),
+        ..Default::default()
+    });
+    assert!(
+        read > 0 && read < leaf && leaf == 150_000,
+        "{read} of {leaf}"
+    );
+}
+
+/// A counter of the leaf scan of a cursor plan, 0 when it is absent.
+fn leaf_counter(plan: &sparkles_core::sparql::CursorPlan, name: &str) -> i64 {
+    match plan.children.first() {
+        Some(child) => leaf_counter(child, name),
+        None => plan
+            .operator
+            .counters
+            .as_ref()
+            .and_then(|c| c.get(name))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+    }
+}
+
+fn plan_has(p: &sparkles_core::sparql::PlanInfo, op: &str) -> bool {
+    p.operator == op || p.children.iter().any(|c| plan_has(c, op))
+}
+
+/// A store whose `<urn:v>` values are inline decimals, in value order in the index,
+/// except every `every`-th one, written with a trailing zero, which keeps it in the
+/// dictionary, where ids say nothing of value order. Values repeat, so ties break by the
+/// subject.
+fn decimal_store(n: usize, every: usize, extra: &str) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = (0..n)
+        .map(|i| {
+            let (whole, cents) = ((i * 7919) % 5000, i % 100);
+            let value = if i % every == 0 {
+                format!("{whole}.{}0", cents % 10)
+            } else {
+                format!("{whole}.{cents:02}")
+            };
+            format!(
+                "<urn:s:{i}> <urn:v> \"{value}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n"
+            )
+        })
+        .collect::<String>();
+    data.push_str(extra);
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+/// A cursor's ordered top-k reads the pieces of its range without value order a morsel
+/// at a time into a heap of its best rows, and answers what eager execution answers, in
+/// the same order, ties included, without an eager fallback. A value that is not totally
+/// ordered in a later morsel still sends the query to the generic plan, as it does
+/// eagerly, which streams too.
+#[test]
+fn ordered_top_k_streams_unordered_pieces_with_the_answers_of_eager() {
+    let queries = [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 25",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 7",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v FILTER(?v > 4000) } ORDER BY DESC(?v) LIMIT 30",
+        "SELECT ?v WHERE { ?s <urn:v> ?v FILTER(?v < 100) } ORDER BY DESC(?v) LIMIT 3",
+    ];
+    let date = "<urn:t> <urn:v> \"2020-01-01\"^^<http://www.w3.org/2001/XMLSchema#date> .\n";
+    for extra in ["", date] {
+        let s = decimal_store(400_000, 5, extra);
+        for q in queries {
+            let eager = query(s.snapshot(), q, &Default::default()).unwrap();
+            assert!(
+                q.contains("FILTER") || plan_has(&eager.plan, "IndexTopK"),
+                "{q}: {:#?}",
+                eager.plan
+            );
+            let expected = eager.rows();
+            // no eager fallback, even when the generic plan answers
+            let strict = options(4096);
+            let mut c = select_cursor(s.snapshot(), q, &Default::default(), &strict).unwrap();
+            let mut rows = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                rows.extend((0..batch.len()).map(|i| batch.row(i).unwrap()));
+            }
+            assert_eq!(rows, expected, "{q} with {extra:?}");
+            // The generic plan is built, and shown, only when it answers.
+            if let Some(node) = cursor_node(c.plan(), "IndexTopK") {
+                if extra.is_empty() {
+                    assert!(node.children.is_empty(), "{q}");
+                } else if !q.contains("FILTER") {
+                    assert!(!node.children.is_empty(), "{q}");
+                }
+            } else {
+                assert!(q.contains("FILTER"), "{q}: {:#?}", c.plan());
+            }
+        }
+    }
+}
+
+/// The first node of a cursor plan with the operator `op`.
+fn cursor_node<'a>(
+    plan: &'a sparkles_core::sparql::CursorPlan,
+    op: &str,
+) -> Option<&'a sparkles_core::sparql::CursorPlan> {
+    if plan.operator.operator == op {
+        return Some(plan);
+    }
+    plan.children.iter().find_map(|c| cursor_node(c, op))
+}
+
+/// The cursor's ordered top-k holds a morsel per worker thread and the rows they keep,
+/// however many rows its pieces without value order hold: two workers read 4 and 12
+/// morsels of a single block with the same peak.
+#[test]
+fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let q = "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 10";
+    let mut peaks = Vec::new();
+    for n in [300_000, 900_000] {
+        let s = decimal_store(n, 3, "");
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap();
+        assert!(plan_has(&eager.plan, "IndexTopK"), "{:#?}", eager.plan);
+        let peak = |opts: &QueryOptions| {
+            let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+            let rows = pool.install(|| {
+                let mut rows = Vec::new();
+                while let Some(b) = c.next_batch().unwrap() {
+                    rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                }
+                rows
+            });
+            assert_eq!(rows, eager.rows());
+            c.stats().mem_peak_bytes
+        };
+        peaks.push(peak(&QueryOptions::default()));
+    }
+    assert!(peaks[1] < peaks[0] * 5 / 4, "{peaks:?}");
+}
+
+/// A store whose `<urn:p>` values in `<urn:g1>` are 400,000 inline decimals below 5,
+/// which keep the ordered top-k on the index, and whose 20,000 `<urn:d:j>` subjects hold
+/// the dictionary decimal `5.0` in each of `graphs` graphs. `shift` singletons of the
+/// same value come first, so the pairs of copies sit at either parity against the block
+/// grid.
+fn union_store(graphs: usize, shift: usize) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let dec = "<http://www.w3.org/2001/XMLSchema#decimal>";
+    let mut data = String::new();
+    for i in 0..400_000 {
+        let (a, bc) = (i % 5, (i / 5) % 100);
+        data.push_str(&format!(
+            "<urn:s:{i}> <urn:p> \"{a}.{bc:02}7\"^^{dec} <urn:g1> .\n"
+        ));
+    }
+    for j in 0..shift {
+        data.push_str(&format!("<urn:a:{j}> <urn:p> \"5.0\"^^{dec} <urn:g1> .\n"));
+    }
+    for j in 0..20_000 {
+        for g in 1..=graphs {
+            data.push_str(&format!(
+                "<urn:d:{j:05}> <urn:p> \"5.0\"^^{dec} <urn:g{g}> .\n"
+            ));
+        }
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::NQuads,
+        None,
+    )])
+    .unwrap();
+    s
+}
+
+/// A default graph of several named graphs holds each triple once, however the copies of
+/// a triple fall across the morsels of a cursor's ordered top-k: the morsel after a pair
+/// split by a block boundary drops its copy, as one read of the whole range does.
+#[test]
+fn ordered_top_k_dedups_union_graph_rows_across_morsels() {
+    for (graphs, shift) in [(2, 0), (2, 1), (3, 0), (3, 1), (3, 2)] {
+        let s = union_store(graphs, shift);
+        let from = (1..=graphs)
+            .map(|g| format!("FROM <urn:g{g}> "))
+            .collect::<String>();
+        for q in [
+            format!("SELECT ?s ?v {from}WHERE {{ ?s <urn:p> ?v }} ORDER BY DESC(?v) LIMIT 45000"),
+            format!("SELECT ?s ?v {from}WHERE {{ ?s <urn:p> ?v }} ORDER BY DESC(?v) LIMIT 21000"),
+        ] {
+            let eager = query(s.snapshot(), &q, &Default::default()).unwrap();
+            assert!(plan_has(&eager.plan, "IndexTopK"), "{q}: {:#?}", eager.plan);
+            let expected = eager.rows();
+            assert_eq!(
+                expected
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                expected.len(),
+                "{q}: eager repeats a row"
+            );
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let c =
+                    select_cursor(s.snapshot(), &q, &Default::default(), &options(4096)).unwrap();
+                let rows = pool.install(|| all(c));
+                assert_eq!(
+                    rows.len(),
+                    expected.len(),
+                    "{q}: {graphs} graphs, shift {shift}, {threads} threads"
+                );
+                assert_eq!(rows, expected, "{q}: {graphs} graphs, shift {shift}");
+            }
+        }
+    }
+}
+
+/// A store of `n` subjects whose `<urn:o>` values mix every kind of term a key filter
+/// decides: IRIs, plain, language-tagged and typed strings with shared prefixes, accented
+/// and astral characters, inline integers and decimals, and `<urn:v>` decimals that are
+/// mostly inline with every third kept in the dictionary. The values come from a fixed
+/// seed, and with `delta` a pending update inserts and deletes some of them.
+fn mixed_store(n: usize, seed: u64, delta: bool) -> Store {
+    let mut state = seed;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 33
+    };
+    let term = |r: u64| match r % 9 {
+        0 => format!("<urn:x:{}>", r % 5000),
+        1 => format!("\"ab{}\"@en", r % 3000),
+        2 => format!("\"abc{}\"@fr", r % 3000),
+        3 => format!("\"ab{}\"", r % 4000),
+        4 => format!("\"\u{e9}{}\"^^<urn:dt>", r % 2000),
+        5 => format!("\"\u{10FFFF}ab{}\"", r % 1000),
+        6 => format!(
+            "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            r % 10_000
+        ),
+        7 => format!(
+            "\"{}.{}\"^^<http://www.w3.org/2001/XMLSchema#decimal>",
+            r % 1000,
+            1 + r % 9
+        ),
+        _ => format!("\"abd{}\"@en-GB", r % 3000),
+    };
+    let decimal = |i: usize, r: u64| {
+        let (whole, digit) = (r % 2000, 1 + r % 9);
+        let value = if i.is_multiple_of(3) {
+            format!("{whole}.{digit}0")
+        } else {
+            format!("{whole}.{digit}")
+        };
+        format!("\"{value}\"^^<http://www.w3.org/2001/XMLSchema#decimal>")
+    };
+    let mut triples = Vec::new();
+    for i in 0..n {
+        triples.push(format!("<urn:s:{i}> <urn:o> {}", term(next())));
+        triples.push(format!("<urn:s:{i}> <urn:v> {}", decimal(i, next())));
+    }
+    let s = Store::in_memory(StoreOptions::default());
+    let (base, added) = if delta {
+        triples.split_at(triples.len() * 9 / 10)
+    } else {
+        (&triples[..], &[][..])
+    };
+    load_triples(&s, base);
+    s.compact().unwrap();
+    if delta {
+        let inserts: String = added.iter().map(|t| format!("{t} . ")).collect();
+        let deletes: String = base.iter().step_by(17).map(|t| format!("{t} . ")).collect();
+        sparkles_core::sparql::update::update(
+            &s,
+            &format!("INSERT DATA {{ {inserts} }} ; DELETE DATA {{ {deletes} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!s.snapshot().delta.is_empty());
+    }
+    s
+}
+
+/// Cursor filters over scans and cursor ordered top-k answer what eager execution
+/// answers, in its order, over values of every kind, at 1, 4 and 8 threads, with and
+/// without a pending delta. Without a delta the filters read their scans in morsels.
+#[test]
+fn morsel_filters_and_ordered_top_k_agree_with_eager_on_mixed_terms() {
+    let filters = [
+        "FILTER(STRSTARTS(?o, \"ab\"))",
+        "FILTER(STRSTARTS(?o, \"ab\"@en))",
+        "FILTER(STRSTARTS(STR(?o), \"ab\"))",
+        "FILTER(STRSTARTS(?o, \"\u{e9}1\"))",
+        "FILTER(STRSTARTS(?o, \"\u{10FFFF}\"))",
+        "FILTER(STRSTARTS(?o, \"\"))",
+        "FILTER(CONTAINS(?o, \"c1\"))",
+        "FILTER(REGEX(?o, \"^abc?1[0-4]\"))",
+        "FILTER(REGEX(STR(?o), \"7$\"))",
+        "FILTER(LANGMATCHES(LANG(?o), \"en\"))",
+        "FILTER(STRSTARTS(?o, \"ab\") && !CONTAINS(?o, \"9\"))",
+    ];
+    let mut queries: Vec<String> = filters
+        .iter()
+        .map(|f| format!("SELECT ?s ?o WHERE {{ ?s <urn:o> ?o {f} }}"))
+        .collect();
+    queries.push(format!(
+        "SELECT ?o ?s WHERE {{ ?s <urn:o> ?o {} }} OFFSET 1000 LIMIT 6000",
+        filters[0]
+    ));
+    queries.push(format!(
+        "SELECT ?s ?o WHERE {{ ?s <urn:o> ?o {} }} LIMIT 5",
+        filters[6]
+    ));
+    for top in [
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 40",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY ?v LIMIT 9",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v FILTER(?v < 500) } ORDER BY DESC(?v) LIMIT 15",
+    ] {
+        queries.push(top.into());
+    }
+    let pools: Vec<_> = [1, 4, 8]
+        .into_iter()
+        .map(|n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .unwrap()
+        })
+        .collect();
+    for (seed, delta) in [(0x5eed_0001, false), (0x5eed_0002, true)] {
+        let s = mixed_store(120_000, seed, delta);
+        for q in &queries {
+            let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+            for pool in &pools {
+                for batch in [4096, 50_000] {
+                    let mut c =
+                        select_cursor(s.snapshot(), q, &Default::default(), &options(batch))
+                            .unwrap();
+                    let rows = pool.install(|| {
+                        let mut rows = Vec::new();
+                        while let Some(b) = c.next_batch().unwrap() {
+                            rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                        }
+                        rows
+                    });
+                    let threads = pool.current_num_threads();
+                    assert_eq!(
+                        rows, eager,
+                        "{q}: delta {delta}, {threads} threads, {batch}"
+                    );
+                    // the plain key tests read morsels, as a conjunction under
+                    // negation does not
+                    if !delta && (q == &queries[0] || q == &queries[6]) {
+                        assert!(
+                            leaf_counter(c.plan(), "morselRows") > 0,
+                            "{q} does not read morsels"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A cancelled or timed-out cursor over the parallel filter and the ordered top-k stops
+/// with an error or a complete answer, and dropping it returns every byte it charged.
+#[test]
+fn parallel_cursor_operators_release_their_memory_when_stopped() {
+    use sparkles_core::sparql::pool::QueryPool;
+    let s = mixed_store(120_000, 0x5eed_0003, false);
+    let queries = [
+        "SELECT ?s ?o WHERE { ?s <urn:o> ?o FILTER(CONTAINS(?o, \"b1\")) }",
+        "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 40",
+    ];
+    let pool = QueryPool::new(1 << 30);
+    for q in queries {
+        let eager = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        // cancelled after its first batch
+        let grant = Arc::new(pool.try_grant(0).unwrap());
+        let opts = QueryOptions {
+            grant: Some(grant.clone()),
+            no_cache: true,
+            ..Default::default()
+        };
+        let mut c = select_cursor(s.snapshot(), q, &opts, &options(4096)).unwrap();
+        let first = c.next_batch().unwrap();
+        assert!(first.is_some(), "{q}");
+        drop(first);
+        c.cancellation_token().store(true, Ordering::Relaxed);
+        match c.next_batch() {
+            Err(Error::Cancelled) | Ok(None) => {}
+            Err(e) => panic!("{q}: {e}"),
+            Ok(Some(_)) => panic!("{q}: a batch after cancellation"),
+        }
+        drop((c, opts));
+        assert_eq!(grant.used(), 0, "{q}: cancelled");
+        // under a deadline of a millisecond
+        for (timeout, base) in [(1, true), (5, true), (1, false), (5, false)] {
+            let opts = QueryOptions {
+                grant: Some(grant.clone()),
+                timeout: Some(Duration::from_millis(timeout)),
+                no_cache: true,
+                ..if base {
+                    Default::default()
+                } else {
+                    without("filter_scan_runs")
+                }
+            };
+            let answer = select_cursor(s.snapshot(), q, &opts, &options(4096)).and_then(|mut c| {
+                let mut rows = Vec::new();
+                while let Some(b) = c.next_batch()? {
+                    rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                }
+                Ok(rows)
+            });
+            if let Ok(rows) = answer {
+                assert_eq!(rows, eager, "{q}");
+            }
+            assert_eq!(grant.used(), 0, "{q}: {timeout} ms, {base}");
+        }
+        // under small memory budgets, where a morsel the budget refuses goes back to the
+        // scan's own batches
+        for kib in [192, 512, 2048, 8192] {
+            let opts = QueryOptions {
+                grant: Some(grant.clone()),
+                no_cache: true,
+                max_memory_bytes: Some(kib << 10),
+                ..Default::default()
+            };
+            let answer = select_cursor(s.snapshot(), q, &opts, &options(4096)).and_then(|mut c| {
+                let mut rows = Vec::new();
+                while let Some(b) = c.next_batch()? {
+                    rows.extend((0..b.len()).map(|i| b.row(i).unwrap()));
+                }
+                Ok((rows, c.stats().mem_peak_bytes))
+            });
+            match answer {
+                Ok((rows, peak)) => {
+                    assert_eq!(rows, eager, "{q} in {kib} KiB");
+                    assert!(peak <= kib << 10, "{q}: {peak} in {kib} KiB");
+                }
+                Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory),
+                Err(e) => panic!("{q} in {kib} KiB: {e}"),
+            }
+            assert_eq!(grant.used(), 0, "{q}: {kib} KiB");
+        }
+        drop(grant);
+        assert_eq!(pool.granted(), 0, "{q}");
+    }
+}

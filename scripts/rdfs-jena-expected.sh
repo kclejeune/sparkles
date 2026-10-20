@@ -7,14 +7,17 @@
 #
 #   scripts/rdfs-jena-expected.sh
 #
-# $JENA_HOME is a Jena distribution (default: nixpkgs#apache-jena) and $JAVA a Java 17 or
-# later (default: `java` on PATH, else nixpkgs#jdk).
+# $JENA_HOME is a Jena distribution (default: this flake's apache-jena) and $JAVA a Java 17 or
+# later (default: the locked nixpkgs jdk).
 set -euo pipefail
 
-cd "$(dirname "$0")/../crates/sparkles-core/tests/rdfs"
-
-jena=${JENA_HOME:-$(nix build --no-link --print-out-paths nixpkgs#apache-jena)}
-java=${JAVA:-$(command -v java || echo "$(nix build --no-link --print-out-paths nixpkgs#jdk)/bin/java")}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+WORK=$ROOT/target/rdfs-jena
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
+jena=${JENA_HOME:-$(nixpkg apache-jena)}
+java=${JAVA:-$(nixexe jdk java)}
+cd "$ROOT/crates/sparkles-core/tests/rdfs"
 
 suites=()
 for d in */; do suites+=("${d%/}"); done

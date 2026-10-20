@@ -70,5 +70,69 @@ class LoadRun(unittest.TestCase):
                 self.load(dict(copy.deepcopy(RUN), **change))
 
 
+class LedgerCommand(unittest.TestCase):
+    def run_command(self, run, **kw):
+        import argparse
+        import contextlib
+        import io
+
+        args = argparse.Namespace(
+            held=False,
+            reconcile=None,
+            billed_nanodollars=None,
+            evidence=None,
+            allow_raise=False,
+        )
+        vars(args).update(kw)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(runner.ledger_command(run, args), 0)
+        return json.loads(out.getvalue())
+
+    def test_the_carryover_is_reconciled_before_any_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = dict(copy.deepcopy(RUN), ledger=str(pathlib.Path(d) / "l.jsonl"))
+            held = self.run_command(run, held=True)["heldAtBound"]
+            self.assertEqual(
+                held, [{"target": "carryover", "name": "pilot", "cost": 1_002_560_000}]
+            )
+            with self.assertRaises(Invalid):
+                self.run_command(run, reconcile="carryover", billed_nanodollars=1)
+            done = self.run_command(
+                run,
+                reconcile="carryover",
+                billed_nanodollars=1_600_000,
+                evidence="Console cost of 2026-10-15",
+            )
+            self.assertEqual(done["upperLiabilityNanodollars"], 1_600_000)
+            self.assertEqual(done["heldAtBound"], [])
+            again = self.run_command(run, held=True)
+            self.assertEqual(again["carryoverNanodollars"], 1_600_000)
+            for target in ("carryover", "7", "x"):
+                with self.subTest(target=target), self.assertRaises(Invalid):
+                    self.run_command(
+                        run,
+                        reconcile=target,
+                        billed_nanodollars=0,
+                        evidence="Console cost of 2026-10-15",
+                    )
+
+    def test_a_raise_needs_allow_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = dict(copy.deepcopy(RUN), ledger=str(pathlib.Path(d) / "l.jsonl"))
+            raised = {
+                "reconcile": "carryover",
+                "billed_nanodollars": 1_100_000_000,
+                "evidence": "Console cost of 2026-10-15",
+            }
+            with self.assertRaises(Invalid):
+                self.run_command(run, **raised)
+            with self.assertRaises(Invalid):
+                self.run_command(run, held=True, allow_raise=True)
+            done = self.run_command(run, allow_raise=True, **raised)
+            self.assertEqual(done["carryoverNanodollars"], 1_100_000_000)
+            self.assertIs(done["reconciled"][0]["raise"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

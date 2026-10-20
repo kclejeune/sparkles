@@ -19,8 +19,10 @@
 # Scores and their order are not compared, because the engines rank differently.
 # Results go to WORKDIR/results/text-*.json and WORKDIR/results/text-summary.md.
 #
-# Fuseki 5.1.0 (whose fuseki-server.jar bundles jena-text and Lucene), Jena's
-# tdb2.tdbloader and QLever come from nixpkgs when not on PATH.
+# Fuseki 5.1.0, whose fuseki-server.jar bundles jena-text and Lucene, Jena's tdb2.tdbloader
+# and QLever come from this flake's pinned packages, even when other versions are on PATH.
+# Explicit executables in TDBLOADER, FUSEKI, QINDEX and QSERVER override them. The text
+# indexer runs with the Java that the Fuseki wrapper uses, and JAVA overrides that Java.
 # Env: WARMUP (default 2), RUNS (default 10), ENGINES="sparkles jena qlever" (default),
 # QUERIES="name …" to limit the queries, SKIP_LOAD=1 to reuse the stores and text indexes
 # of an earlier run, ANSWERS_ONLY=1 to check answers and rebuild the summary without
@@ -70,25 +72,18 @@ mkdir -p "$WORK/results" "$WORK/queries"
 WORK=$(cd "$WORK" && pwd)
 cd "$WORK"
 
-nixbin() { # nixbin <pkg> <bin>
-  if command -v "$2" > /dev/null; then command -v "$2"; else echo "$(nix build "nixpkgs#$1" --no-link --print-out-paths | tail -1)/bin/$2"; fi
-}
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
 ENGINES=${ENGINES:-sparkles jena qlever}
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
+resolve_tools
 if has jena; then
-  TDBLOADER=$(nixbin apache-jena tdb2.tdbloader)
-  FUSEKI=$(nixbin apache-jena-fuseki fuseki-server)
   # jena.textindexer runs from the Fuseki jar, with the Java the Fuseki wrapper uses
   FHOME=$(dirname "$(readlink -f "$FUSEKI")")
   [ -f "$FHOME/fuseki-server.jar" ] || FHOME=$(dirname "$FHOME")
   FJAR=$FHOME/fuseki-server.jar
   JDK=$(grep -o "/nix/store/[^'\":]*openjdk[^/'\":]*" "$FUSEKI" 2> /dev/null | head -1 || true)
-  JAVA=java
-  [ -n "$JDK" ] && JAVA=$JDK/bin/java
-fi
-if has qlever; then
-  QINDEX=$(nixbin qlever qlever-index)
-  QSERVER=$(nixbin qlever qlever-server)
+  JAVA=${JAVA:-${JDK:+$JDK/bin/}java}
 fi
 
 # merge <new.json> <dest.json>: replace/add hyperfine results by command name
@@ -182,7 +177,7 @@ if [ -z "${SKIP_LOAD:-}" ]; then
   fi
   if has jena; then
     rm -rf jena.db
-    "$TDBLOADER" --loc jena.db data.nt > jena-load.log 2>&1
+    env -u JAVA_HOME "$TDBLOADER" --loc jena.db data.nt > jena-load.log 2>&1
   fi
   if has qlever; then
     rm -rf qlever-index
@@ -250,7 +245,7 @@ if has sparkles; then
 fi
 if has jena; then
   PORT[jena]=$JPORT
-  JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --config="$WORK/fuseki-text.ttl" --port "$JPORT" > fuseki.log 2>&1 &
+  env -u JAVA_HOME JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --config="$WORK/fuseki-text.ttl" --port "$JPORT" > fuseki.log 2>&1 &
   PIDS+=($!)
   wait_for "localhost:$JPORT/\$/ping"
   NAME[jena]=jena-fuseki

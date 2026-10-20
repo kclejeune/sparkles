@@ -247,8 +247,16 @@ impl Store {
     }
 
     /// In the commit path, before `snap` is published: index the geometries of the
-    /// commit's logged quads and give `snap` its view.
-    pub(super) fn maintain_geo(&self, snap: &mut Snapshot, log: &[(u8, [Id; 4])]) {
+    /// commit's logged quads and give `snap` its view. `before` is the state the commit
+    /// started from, its transaction's base. With group commit that is the speculative
+    /// head, so the view `snap` gets is speculative too, and it is dropped with the
+    /// snapshot when the commit's fence fails (X09 section 17.2).
+    pub(super) fn maintain_geo(
+        &self,
+        snap: &mut Snapshot,
+        before: &Snapshot,
+        log: &[(u8, [Id; 4])],
+    ) {
         #[cfg(feature = "geo")]
         {
             let Some(idx) = self.geo.load_full() else {
@@ -261,10 +269,8 @@ impl Store {
             let mut v = (*prev).clone();
             v.commit = snap.commit;
             if v.usable().is_some() {
-                // the snapshot this commit started from: still the published one
-                let before = self.current.load_full();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    index_commit(&idx, &mut v, snap, &before, log)
+                    index_commit(&idx, &mut v, snap, before, log)
                 }));
                 let failure = match r {
                     Ok(Ok(())) => None,
@@ -286,7 +292,7 @@ impl Store {
             snap.geo = Some(Arc::new(v));
         }
         #[cfg(not(feature = "geo"))]
-        let _ = (snap, log);
+        let _ = (snap, before, log);
     }
 
     /// After a bulk commit or a compaction, under the writer lock and before `new` is
@@ -562,6 +568,7 @@ impl Store {
             && snap.generation._base.is_none();
         let current = Arc::downgrade(&self.current);
         let writer = Arc::downgrade(&self.writer);
+        let group = self.group.as_ref().map(Arc::downgrade);
         let uid = snap.generation.uid;
         let failed = idx.clone();
         let spawned = std::thread::Builder::new()
@@ -601,11 +608,34 @@ impl Store {
                     idx.finish(epoch, None, None);
                     return;
                 };
-                let w = writer.lock();
-                if w.closed || superseded() {
-                    drop(w);
-                    idx.finish(epoch, None, None);
-                    return;
+                // With group commit, the view is installed only when no grouped commit
+                // is in flight, since the coordinator publishes without the writer lock
+                // and a commit queued before now carries a view derived from the old one
+                // (X09 section 17.3). The writer lock keeps new commits out meanwhile.
+                let mut w = loop {
+                    let w = writer.lock();
+                    if w.closed || superseded() {
+                        drop(w);
+                        idx.finish(epoch, None, None);
+                        return;
+                    }
+                    match group.as_ref().and_then(std::sync::Weak::upgrade) {
+                        Some(g) if !g.settle(std::time::Duration::from_secs(2)) => {
+                            drop(w);
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        _ => break w,
+                    }
+                };
+                // The speculative head is now published, so later transactions start
+                // from the snapshot this installs. After a failed fence the writer's next
+                // drain resets its head to the durable one.
+                if group
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_some_and(|g| !g.failed())
+                {
+                    w.staged = None;
                 }
                 let cur = current.load_full();
                 let (view, message, last) = finish_view(&idx, epoch, &cur, lookup, built);

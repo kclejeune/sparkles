@@ -288,7 +288,9 @@ impl Tools<'_> {
                     else {
                         continue;
                     };
-                    for g in &rep.predicates[i].observed.objects.literals {
+                    let (objects, _) =
+                        self.entry_objects(ds, &r.snap, &rep, &rep.predicates[i], r.deadline, ctx)?;
+                    for g in &objects.literals {
                         for l in g.languages.iter().flatten() {
                             tags.insert(l.lang.clone());
                         }

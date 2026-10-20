@@ -32,6 +32,7 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 
@@ -147,6 +148,10 @@ p.add_argument('--cold', action='store_true')
 p.add_argument('--port', type=int, default=5660)
 p.add_argument('--format', default='text/tab-separated-values')
 p.add_argument('--server-cpus')
+p.add_argument('--keep-going', action='store_true',
+               help='record a query whose request fails as {"error": ...} and go on to the next query')
+p.add_argument('--serve-arg', action='append', default=[],
+               help='a flag for `sparkles serve`, repeated for each word, for example --serve-arg=--memory-profile --serve-arg=small')
 p.add_argument('--io', action='store_true',
                help='ask for profile=io in the native format and keep each sample\'s io object and server times')
 a = p.parse_args()
@@ -174,7 +179,7 @@ def start():
     log = open(work / 'server.log', 'ab')
     proc = subprocess.Popen([a.binary, '--result-cache-mb', '0', 'serve',
         '--data', str(work / 'server'), '--loc', f'bench={a.db}',
-        '--port', str(a.port), '--timeout', '600', '--read-only'],
+        '--port', str(a.port), '--timeout', '600', '--read-only', *a.serve_arg],
         stdout=log, stderr=log,
         preexec_fn=lambda: os.sched_setaffinity(0, server_cpus))
     log.close()
@@ -217,13 +222,23 @@ try:
             headers={'Content-Type': 'application/sparql-query',
                      'Accept': a.format})
         times, digests, sizes, metas = [], [], [], []
+        failed = None
         for i in range(a.runs + (0 if a.cold else a.warmup)):
             if a.cold:
                 evict()
                 proc = start()
             before = time.perf_counter()
-            with urllib.request.urlopen(req, timeout=600) as response:
-                body = response.read()
+            try:
+                with urllib.request.urlopen(req, timeout=600) as response:
+                    body = response.read()
+            except (urllib.error.URLError, TimeoutError) as e:
+                if not a.keep_going:
+                    raise
+                if a.cold:
+                    stop(proc)
+                    proc = None
+                failed = str(getattr(e, 'code', '') or e)
+                break
             elapsed = (time.perf_counter() - before) * 1000
             meta = None
             if a.format == 'application/x-sparkles+json':
@@ -244,6 +259,15 @@ try:
                 lines = body.splitlines()
                 digests.append(hashlib.sha256(b'\n'.join(sorted(lines))).hexdigest())
                 sizes.append(len(lines) - 1)
+        if failed is not None:
+            result[name] = {'error': failed, 'ms': times}
+            print(name, result[name], flush=True)
+            Path(a.out).write_text(json.dumps(result, indent=2))
+            if not a.cold:
+                # a failed request may have left the server in any state
+                stop(proc)
+                proc = start()
+            continue
         result[name] = {'ms': times, 'median': statistics.median(times),
                         'mean': statistics.mean(times), 'stdev': statistics.stdev(times) if len(times) > 1 else 0,
                         'hashes': sorted(set(digests)), 'rows': sorted(set(sizes))}

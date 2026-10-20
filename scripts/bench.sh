@@ -30,9 +30,10 @@
 # * cold: per engine, query and run (COLD_RUNS, default 3): stops the server, evicts its
 #   files from the page cache, starts it (time to ready) and times one query.
 #
-# Jena, Fuseki, QLever, Oxigraph and oha come from nixpkgs when not on PATH. Fluree
-# (BUSL-1.1, not in nixpkgs) is the checksum-verified release binary, downloaded to WORKDIR
-# (Linux x86_64 / aarch64, macOS) unless FLUREE points at one.
+# Comparison engines come from this flake's pinned packages, including Fluree's release
+# binary. Explicit TDBLOADER, FUSEKI, QINDEX, QSERVER, OXIGRAPH and FLUREE paths override
+# them. FLUREE_VERSION, if set without FLUREE, must match the packaged version.
+# Auxiliary tools prefer PATH, then the locked nixpkgs. See docs/BENCHMARKING.md.
 # Env: WARMUP (default 2), RUNS (default 10), SKIP_LOAD=1 to reuse existing indexes,
 # SKIP_QUERIES=1 to reuse a query's existing results when they hold every engine of the run
 # (re-runs updates/throughput/RSS),
@@ -162,12 +163,7 @@ EOF
     [ -n "${SKIP_QUERIES:-}" ] && timed_all "$RES/$n.json" && continue
     echo
     echo "== $n"
-    # shellcheck disable=SC2329 # called by engine_args
-    qcmd() { q "${URL[$1]}" "$n"; }
-    mapfile -d '' ARGS < <(engine_args qcmd)
-    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
-      "${ARGS[@]}" --export-json "$RES/$n.new.json"
-    merge "$RES/$n.new.json" "$RES/$n.json"
+    time_query "$n" "$RES" "$clear"
   done
 
   # ------------------------------------------------------------------------ update latency

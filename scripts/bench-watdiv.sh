@@ -93,9 +93,8 @@ die() {
   log "error: $*"
   exit 1
 }
-nixbin() { # nixbin <pkg> <bin>
-  if command -v "$2" > /dev/null; then command -v "$2"; else echo "$(nix build "nixpkgs#$1" --no-link --print-out-paths | tail -1)/bin/$2"; fi
-}
+# shellcheck source=scripts/bench-tools.sh
+source "$ROOT/scripts/bench-tools.sh"
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
 has() { [[ " $ENGINES " == *" $1 "* ]]; }
 
@@ -104,15 +103,9 @@ if [ -z "${WATDIV:-}" ]; then
   WATDIV=$WORK/watdiv-gen
   if [ ! -x "$WATDIV/bin/watdiv" ]; then
     log "building the WatDiv generator (scripts/bench-watdiv/watdiv.nix)"
-    # nixpkgs at the revision locked in flake.lock, so the compiler and Boost are pinned too
-    nix build --impure --out-link "$WATDIV" --expr "
-      let
-        n = (builtins.fromJSON (builtins.readFile $ROOT/flake.lock)).nodes.nixpkgs.locked;
-        pkgs = import (builtins.fetchTarball {
-          url = \"https://github.com/\${n.owner}/\${n.repo}/archive/\${n.rev}.tar.gz\";
-          sha256 = n.narHash;
-        }) { };
-      in import $ROOT/scripts/bench-watdiv/watdiv.nix { inherit pkgs; }"
+    # the flake's watdiv-gen (nix/benchmarks.nix), on the nixpkgs revision locked in
+    # flake.lock, so the compiler and Boost are pinned too
+    nix build --no-update-lock-file --out-link "$WATDIV" "$ROOT#watdiv-gen"
   fi
 fi
 MODEL=$WATDIV/share/watdiv/model/wsdbm-data-model.txt
@@ -170,38 +163,7 @@ selected() { # selected <instance>: QUERIES lists templates or instances
 }
 
 # ---------------------------------------------------------------------------- engines
-if has jena; then
-  TDBLOADER=$(nixbin apache-jena tdb2.tdbloader)
-  FUSEKI=$(nixbin apache-jena-fuseki fuseki-server)
-fi
-if has qlever; then
-  QINDEX=$(nixbin qlever qlever-index)
-  QSERVER=$(nixbin qlever qlever-server)
-fi
-if has oxigraph; then OXIGRAPH=$(nixbin oxigraph oxigraph); fi
-
-FLUREE_VERSION=${FLUREE_VERSION:-4.2.2}
-if has fluree && [ -z "${FLUREE:-}" ]; then
-  case "$(uname -sm)" in
-    "Linux x86_64") FT=x86_64-unknown-linux-gnu ;;
-    "Linux aarch64") FT=aarch64-unknown-linux-gnu ;;
-    "Darwin arm64") FT=aarch64-apple-darwin ;;
-    "Darwin x86_64") FT=x86_64-apple-darwin ;;
-    *) die "no Fluree release binary for $(uname -sm); set FLUREE" ;;
-  esac
-  FDIR="fluree-$FLUREE_VERSION"
-  FLUREE="$WORK/$FDIR/fluree-db-cli-$FT/fluree"
-  if [ ! -x "$FLUREE" ]; then
-    mkdir -p "$FDIR"
-    FURL="https://github.com/fluree/db/releases/download/v$FLUREE_VERSION/fluree-db-cli-$FT.tar.xz"
-    curl -sfL "$FURL" -o "$FDIR/fluree.tar.xz"
-    want=$(curl -sfL "$FURL.sha256" | cut -d' ' -f1)
-    got=$(sha256sum "$FDIR/fluree.tar.xz" 2> /dev/null || shasum -a 256 "$FDIR/fluree.tar.xz")
-    got=${got%% *}
-    [ "$want" = "$got" ] || die "Fluree checksum mismatch ($got != $want)"
-    tar xJf "$FDIR/fluree.tar.xz" -C "$FDIR"
-  fi
-fi
+resolve_tools
 
 # merge <new.json> <dest.json>: replace/add hyperfine results by command name
 merge() {
@@ -222,7 +184,7 @@ EOF
 if [ -z "${SKIP_LOAD:-}" ]; then
   LOAD=()
   if has sparkles; then LOAD+=(--prepare 'rm -rf sparkles.db' --command-name sparkles "$SPARKLES load --loc sparkles.db data.nt"); fi
-  if has jena; then LOAD+=(--prepare 'rm -rf jena.db' --command-name jena-tdb2 "$TDBLOADER --loc jena.db data.nt"); fi
+  if has jena; then LOAD+=(--prepare 'rm -rf jena.db' --command-name jena-tdb2 "env -u JAVA_HOME $TDBLOADER --loc jena.db data.nt"); fi
   if has qlever; then
     mkdir -p qlever-index
     echo '{"num-triples-per-batch": 1000000}' > qlever-index/settings.json
@@ -272,7 +234,7 @@ if has sparkles; then
   URL[sparkles]=localhost:$SPORT/bench/sparql
 fi
 if has jena; then
-  JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --update --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
+  env -u JAVA_HOME JVM_ARGS="-Xmx8G" "${CAP[@]}" "$FUSEKI" --update --port $JPORT --loc "$WORK/jena.db" /bench > fuseki.log 2>&1 &
   PIDS+=($!)
   PORT[jena]=$JPORT
   wait_for "localhost:$JPORT/\$/ping"
@@ -306,6 +268,10 @@ if has oxigraph; then
 fi
 # hyperfine arguments for every selected engine: engine_args <command-fn>
 engine_args() { for e in $ENGINES; do printf '%s\0' --command-name "${NAME[$e]}" "$($1 "$e")"; done; }
+# time_query (scripts/bench-probe.sh). The engines run together here, so an engine that
+# stops answering is left out of the remaining queries rather than restarted.
+# shellcheck source=scripts/bench-probe.sh
+source "$ROOT/scripts/bench-probe.sh"
 q() { # curl command for endpoint + query name (fails on HTTP errors)
   echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$2.rq $1"
 }
@@ -334,11 +300,7 @@ if [ -z "${ANSWERS_ONLY:-}" ]; then
     selected "$n" || continue
     echo
     echo "== $n"
-    qcmd() { q "${URL[$1]}" "$n"; }
-    mapfile -d '' ARGS < <(engine_args qcmd)
-    "${CLIENT[@]}" hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
-      "${ARGS[@]}" --export-json "results/$n.new.json"
-    merge "results/$n.new.json" "results/$n.json"
+    time_query "$n" results "$CLEAR"
   done
 fi
 

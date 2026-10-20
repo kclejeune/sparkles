@@ -738,7 +738,7 @@ flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--answers-only" help="only check answers across engines; time nothing"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run"
 flag "--queries <list>" help="only these queries (q1 q5a …)"
-flag "--port-base <port>" default="48300" help="the first of the five server ports"
+flag "--port-base <port>" default="28300" help="the first of the five server ports"
 '''
 run = '''
 RUNS="$usage_runs" WARMUP="$usage_warmup" COLD_RUNS="$usage_cold_runs" ENGINES="$usage_engines" \
@@ -760,7 +760,7 @@ flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--answers-only" help="only check answers across engines; time nothing"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run (empty: only generate and materialize)"
 flag "--queries <list>" help="only these queries (q1 q9 …)"
-flag "--port-base <port>" default="48300" help="the first of the five server ports"
+flag "--port-base <port>" default="28300" help="the first of the five server ports"
 flag "--infer-profiles <list>" default="rdfs owl-rl" help="the materializations to run and record"
 flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-micro, owl-mini, owl"
 '''
@@ -785,7 +785,7 @@ flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--answers-only" help="only check answers across engines; time nothing"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run (empty: only generate and materialize)"
 flag "--queries <list>" help="only these queries (q2 q12 …)"
-flag "--port-base <port>" default="48300" help="the first of the five server ports"
+flag "--port-base <port>" default="28300" help="the first of the five server ports"
 flag "--jena-reasoners <list>" help="also time Jena's rule reasoners: rdfs, owl-micro, owl-mini, owl"
 '''
 run = '''
@@ -807,7 +807,7 @@ flag "--writers <n>" default="1" help="writer processes"
 flag "--write-rate <n>" default="0" help="write requests per second in all (0: as fast as the engine answers)"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run, one after another"
 flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
-flag "--port-base <port>" default="48400" help="the first of the five server ports"
+flag "--port-base <port>" default="28400" help="the first of the five server ports"
 '''
 run = '''
 SECONDS_RUN="$usage_seconds" READERS="$usage_readers" WRITERS="$usage_writers" WRITE_RATE="$usage_write_rate" \
@@ -834,7 +834,7 @@ flag "--queries <list>" help="only these templates or instances (explore-q2 bi-q
 flag "--skip-load" help="reuse indexes from a previous run in the same workdir"
 flag "--answers-only" help="only check answers across engines; time nothing"
 flag "--engines <list>" default="sparkles jena qlever fluree oxigraph" help="engines to run"
-flag "--port-base <port>" default="48300" help="the first of the five server ports"
+flag "--port-base <port>" default="28300" help="the first of the five server ports"
 '''
 run = '''
 USECASE="$usage_usecase" INSTANCES="$usage_instances" CLIENTS="$usage_clients" BSBM_RUNS="$usage_bsbm_runs" \
@@ -1018,6 +1018,7 @@ flag "--changes <n>" default="3000" help="requests of the serial scenarios"
 flag "--writer-changes <n>" default="20000" help="requests of the writers scenarios"
 flag "--mixed-changes <n>" default="5000" help="requests of the mixed scenario"
 flag "--write-rate <n>" default="0" help="pace the writers of writers and mixed to this many requests per second in total (0: unpaced)"
+flag "--index <kind>" default="none" help="an index configured on every store after loading: none, text, geo or embed"
 flag "--cargo-args <flags>" help="extra cargo build flags for revisions"
 flag "--duration <d>" default="2h" help="the instance's lifetime cap"
 flag "--out <dir>" help="results directory (default target/nsc-writes/<UTC time>)"
@@ -1026,7 +1027,7 @@ run = '''
 # shellcheck disable=SC2154,SC2086 # usage_variants is a list of variants
 scripts/nsc-writes.sh --people "$usage_people" --scenarios "$usage_scenarios" --rounds "$usage_rounds" \
   --changes "$usage_changes" --writer-changes "$usage_writer_changes" --mixed-changes "$usage_mixed_changes" \
-  --write-rate "$usage_write_rate" --duration "$usage_duration" ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
+  --write-rate "$usage_write_rate" --index "$usage_index" --duration "$usage_duration" ${usage_cargo_args:+--cargo-args "$usage_cargo_args"} \
   ${usage_out:+--out "$usage_out"} $usage_variants
 '''
 

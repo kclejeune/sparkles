@@ -513,6 +513,10 @@ pub struct TextView {
 enum ViewSource {
     Ready(ReadyView),
     Unavailable(UnavailableState),
+    /// The view of a grouped commit whose fence has not published it yet. Its changes
+    /// wait in a [`Staged`] and reach the live index only at publication, so a search
+    /// waits for that and then uses the view the publication made (X09 section 17.2).
+    Pending(std::sync::Arc<imp::Outcome>),
 }
 
 #[cfg(feature = "text")]
@@ -544,9 +548,34 @@ impl UnavailableState {
 }
 
 impl TextView {
+    /// How many grouped commits' outcomes a search on this view may go through before
+    /// it reaches a ready or unavailable view.
+    #[cfg(all(test, feature = "text"))]
+    pub(crate) fn pending_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut view = self;
+        while let ViewSource::Pending(p) = &view.source {
+            depth += 1;
+            match p.get() {
+                Some(Some(next)) => view = next,
+                _ => break,
+            }
+        }
+        depth
+    }
+
     #[cfg(feature = "text")]
     pub(crate) fn is_available(&self) -> bool {
-        matches!(self.source, ViewSource::Ready(_))
+        match &self.source {
+            ViewSource::Ready(_) => true,
+            ViewSource::Unavailable(_) => false,
+            // not published yet: it will be ready unless its fence fails
+            ViewSource::Pending(p) => match p.get() {
+                None => true,
+                Some(Some(v)) => v.seq == self.seq && v.is_available(),
+                Some(None) => false,
+            },
+        }
     }
 
     #[cfg(feature = "text")]
@@ -582,6 +611,7 @@ impl TextView {
             ViewSource::Unavailable(state) => {
                 Err(unavailable("dataset", state.name(), self.seq, data_seq))
             }
+            ViewSource::Pending(p) => p.published(self.seq, data_seq)?.ready(data_seq),
         }
     }
 
@@ -692,9 +722,9 @@ pub(crate) fn probe(root: &std::path::Path, _checksums: bool) -> TextProbe {
 }
 
 #[cfg(feature = "text")]
-pub use imp::TextIndex;
-#[cfg(feature = "text")]
 pub(crate) use imp::read_config as imp_read_config;
+#[cfg(feature = "text")]
+pub use imp::{Staged, TextIndex};
 #[cfg(feature = "text")]
 pub(crate) use imp::{cleanup_staging, next_owner, seed_branch};
 #[cfg(feature = "text")]
@@ -958,9 +988,148 @@ mod imp {
         }
     }
 
+    /// How long a search on a speculative view waits for its commit's publication.
+    const PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Where a grouped commit's view learns how its publication ended: the view the
+    /// live index gave the commit, or `None` when its fence failed and the commit was
+    /// never published.
+    #[derive(Default)]
+    pub(crate) struct Outcome {
+        view: OnceLock<Option<Arc<super::TextView>>>,
+        lock: Mutex<()>,
+        set: parking_lot::Condvar,
+    }
+
+    impl Outcome {
+        pub(super) fn get(&self) -> Option<&Option<Arc<super::TextView>>> {
+            self.view.get()
+        }
+
+        fn finish(&self, view: Option<Arc<super::TextView>>) {
+            let _g = self.lock.lock();
+            let _ = self.view.set(view);
+            self.set.notify_all();
+        }
+
+        /// The view of commit `seq` once it is published. Only a transaction that starts
+        /// from the speculative head of a group searches before that, and every commit in
+        /// flight is published or failed by the thread that queued it, so the wait ends
+        /// with the commit's fence. A view that the live index could not bring to `seq`
+        /// is stale, as on the ordinary path. The wait is bounded by [`PUBLISH_WAIT`]: a
+        /// commit whose thread panicked after queueing it waits for the next writer to
+        /// lead its fence, and the searching transaction may be that writer, holding the
+        /// writer lock. The search then fails with a timeout instead of hanging.
+        pub(super) fn published(&self, seq: u64, data_seq: u64) -> Result<&super::TextView> {
+            if self.view.get().is_none() {
+                let deadline = std::time::Instant::now() + PUBLISH_WAIT;
+                let mut g = self.lock.lock();
+                while self.view.get().is_none() {
+                    if self.set.wait_until(&mut g, deadline).timed_out()
+                        && self.view.get().is_none()
+                    {
+                        return Err(Error::Timeout);
+                    }
+                }
+            }
+            match self.view.get() {
+                Some(Some(v)) if v.seq == seq => Ok(v),
+                Some(Some(v)) => Err(unavailable("dataset", "stale", v.seq, data_seq)),
+                _ => Err(Error::Poisoned),
+            }
+        }
+    }
+
+    /// `view` without a link through another commit's [`Outcome`]. A commit that keeps
+    /// its base's view, because the index is stale or its apply failed, must not keep
+    /// the base's pending view: that view holds the base's outcome, which holds the view
+    /// before it, and a stale index would grow the chain by one link per commit until
+    /// dropping it overflows the stack. Every view an outcome holds is settled, so one
+    /// step suffices. The base of a commit being published was published before it, so
+    /// its outcome is set.
+    pub(super) fn settled(view: Option<Arc<super::TextView>>) -> Option<Arc<super::TextView>> {
+        let v = view?;
+        if let super::ViewSource::Pending(p) = &v.source
+            && let Some(Some(published)) = p.get()
+        {
+            return Some(published.clone());
+        }
+        Some(v)
+    }
+
+    /// One document change of a staged commit: the document of a quad the commit
+    /// leaves present, or `None` for one it removed.
+    struct StagedDoc {
+        key: [u8; 16],
+        hash: u64,
+        doc: Option<TantivyDocument>,
+        /// whether a document of the quad may exist from before the commit
+        indexed: bool,
+    }
+
+    /// A grouped commit's full-text changes (X09 section 17.2). They are computed from
+    /// the commit's speculative snapshot under the writer lock, when the commit is
+    /// queued, and reach the live index writer only when the commit's fence has made it
+    /// durable and the leader publishes it, through [`Staged::apply`]. The live writer, and
+    /// so every checkpoint of the index, therefore holds only commits at or below the
+    /// durable head of the log. Dropping a `Staged` that was never applied, as a failed
+    /// fence does, tells the commit's speculative view that it will not be published.
+    pub struct Staged {
+        inner: Arc<Inner>,
+        seq: u64,
+        shared: Arc<Shared>,
+        touched: Vec<([Id; 4], bool)>,
+        docs: Option<Result<Vec<StagedDoc>>>,
+        /// the view of the commit's base, which the commit keeps if the index fails
+        prev: Option<Arc<super::TextView>>,
+        outcome: Arc<Outcome>,
+    }
+
+    impl Staged {
+        /// Apply the commit's changes to the live index, as the ordinary path does for a
+        /// commit it has synchronized, and return its view. `snap` is the commit's
+        /// snapshot, from which the documents are made again if the index was replaced
+        /// since they were staged.
+        pub fn apply(mut self, snap: &Snapshot) -> Option<Arc<super::TextView>> {
+            let inner = self.inner.clone();
+            if let Some(j) = inner.journal.lock().as_mut() {
+                j.extend(self.touched.iter().map(|(q, _)| *q));
+            }
+            let view = if !inner.healthy() {
+                settled(self.prev.take())
+            } else {
+                let current = inner.live.lock().shared.clone();
+                let docs = match self.docs.take() {
+                    Some(d) if Arc::ptr_eq(&current, &self.shared) => d,
+                    _ => inner.documents(snap, &current, &self.touched),
+                };
+                match docs.and_then(|d| inner.apply_docs(self.seq, d)) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        inner.fail_locked(&mut inner.live.lock(), &e);
+                        settled(self.prev.take())
+                    }
+                }
+            };
+            self.outcome.finish(view.clone());
+            view
+        }
+    }
+
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            if self.outcome.get().is_none() {
+                self.outcome.finish(None);
+            }
+        }
+    }
+
     impl super::TextView {
         /// The searcher of this view, sealing its batch first if needed.
         pub(crate) fn resolved(&self) -> Result<&Resolved> {
+            if let ViewSource::Pending(p) = &self.source {
+                return p.published(self.seq, self.seq)?.resolved();
+            }
             let ready = self.ready(self.seq)?;
             if ready.slot.0.get().is_none() {
                 match ready.owner.upgrade() {
@@ -1944,23 +2113,66 @@ mod imp {
                 j.extend(log.iter().map(|(_, q)| *q));
             }
             if !inner.healthy() {
-                return prev.cloned();
+                return settled(prev.cloned());
             }
-            // a quad the transaction inserted first was absent before it: no document
-            // of it can exist yet
-            let mut first = FxHashSet::default();
-            let touched: Vec<([Id; 4], bool)> = log
-                .iter()
-                .filter(|(_, q)| first.insert(*q))
-                .map(|(op, q)| (*q, *op != crate::store::WAL_INSERT))
-                .collect();
+            let touched = touched_of(log);
             match inner.apply(snap, &touched) {
                 Ok(v) => Some(v),
                 Err(e) => {
                     inner.fail_locked(&mut inner.live.lock(), &e);
-                    prev.cloned()
+                    settled(prev.cloned())
                 }
             }
+        }
+
+        /// Stage a grouped commit: compute the documents its changes (`log`) make in
+        /// `snap`, the commit's speculative snapshot, without touching the live index.
+        /// Returns the staged changes, which [`Staged::apply`] applies when the commit is
+        /// published, and the commit's view, which a search waits on until then. `prev`
+        /// is the view of the commit's base.
+        pub fn stage(
+            &self,
+            snap: &Snapshot,
+            log: &[(u8, [Id; 4])],
+            prev: Option<&Arc<super::TextView>>,
+        ) -> (Staged, Arc<super::TextView>) {
+            let inner = &self.inner;
+            let touched = touched_of(log);
+            let shared = inner.live.lock().shared.clone();
+            // an index that is stale keeps the base's view at publication
+            let docs = inner
+                .healthy()
+                .then(|| inner.documents(snap, &shared, &touched));
+            let outcome = Arc::new(Outcome::default());
+            let view = Arc::new(super::TextView {
+                seq: snap.commit,
+                epoch: inner.epoch.load(Ordering::SeqCst),
+                owner: inner.owner,
+                source: ViewSource::Pending(outcome.clone()),
+                uncommitted: false,
+            });
+            let staged = Staged {
+                inner: inner.clone(),
+                seq: snap.commit,
+                shared,
+                touched,
+                docs: Some(docs.unwrap_or(Ok(Vec::new()))),
+                prev: prev.cloned(),
+                outcome,
+            };
+            (staged, view)
+        }
+
+        /// Whether an online rebuild runs, between [`start_journal`](Self::start_journal)
+        /// and the end of its [`install`](Self::install).
+        pub fn rebuilding(&self) -> bool {
+            self.inner.journal.lock().is_some()
+        }
+
+        /// The commit the live index has applied (staged or committed). It is never above
+        /// the store's published head.
+        pub fn applied(&self) -> u64 {
+            self.inner.live.lock().applied
         }
 
         /// Make the on-disk index durable, with a payload naming the last applied commit:
@@ -2062,6 +2274,17 @@ mod imp {
         pub fn set_ticks(&self, on: bool) {
             self.inner.ticks.store(on, Ordering::SeqCst);
         }
+    }
+
+    /// The quads a commit's `log` changed, each with whether a document of it may exist
+    /// from before the commit. A quad the transaction inserted first was absent before
+    /// it, so no document of it can exist yet.
+    fn touched_of(log: &[(u8, [Id; 4])]) -> Vec<([Id; 4], bool)> {
+        let mut first = FxHashSet::default();
+        log.iter()
+            .filter(|(_, q)| first.insert(*q))
+            .map(|(op, q)| (*q, *op != crate::store::WAL_INSERT))
+            .collect()
     }
 
     fn payload(config: &TextConfig, seq: u64, epoch: u64) -> String {
@@ -2383,13 +2606,24 @@ mod imp {
             snap: &Snapshot,
             touched: &[([Id; 4], bool)],
         ) -> Result<Arc<TextView>> {
-            let mut live = self.live.lock();
-            let live = &mut *live;
-            let shared = live.shared.clone();
+            let shared = self.live.lock().shared.clone();
+            let docs = self.documents(snap, &shared, touched)?;
+            self.apply_docs(snap.commit, docs)
+        }
+
+        /// The document changes of the quads `touched` in `snap`: the first half of
+        /// [`apply`](Self::apply), which reads only the snapshot, so a grouped commit
+        /// computes it when it is queued.
+        fn documents(
+            &self,
+            snap: &Snapshot,
+            shared: &Shared,
+            touched: &[([Id; 4], bool)],
+        ) -> Result<Vec<StagedDoc>> {
             let fields = &shared.fields;
             let mut terms = Terms::default();
-            let mut changed = false;
             let mut seen = FxHashSet::default();
+            let mut out = Vec::new();
             for (q, indexed) in touched {
                 if !seen.insert(*q) {
                     continue;
@@ -2408,15 +2642,38 @@ mod imp {
                     // inserted and removed again by the same transaction
                     continue;
                 }
-                changed = true;
+                out.push(StagedDoc {
+                    key,
+                    hash,
+                    doc: present.then_some(doc),
+                    indexed: *indexed,
+                });
+            }
+            Ok(out)
+        }
+
+        /// Apply the document changes of commit `seq` to the live index and return the
+        /// commit's view: the second half of [`apply`](Self::apply).
+        fn apply_docs(self: &Arc<Self>, seq: u64, docs: Vec<StagedDoc>) -> Result<Arc<TextView>> {
+            let mut live = self.live.lock();
+            let live = &mut *live;
+            let key_field = live.shared.fields.key;
+            let changed = !docs.is_empty();
+            for StagedDoc {
+                key,
+                hash,
+                doc,
+                indexed,
+            } in docs
+            {
                 live.uncertain.insert(hash);
-                if present {
+                if let Some(doc) = doc {
                     // deleting is not free even when nothing matches (every commit with
                     // deletes opens each segment to apply them): a fresh quad has no
                     // document unless one was kept for its removal earlier in the batch
-                    if live.removed.remove(&key).is_some() || *indexed {
+                    if live.removed.remove(&key).is_some() || indexed {
                         live.writer()?
-                            .delete_term(Term::from_field_bytes(fields.key, &key));
+                            .delete_term(Term::from_field_bytes(key_field, &key));
                         live.staged += 1;
                     }
                     live.writer()?.add_document(doc).map_err(text_err)?;
@@ -2432,7 +2689,11 @@ mod imp {
             if changed && self.fail_next_commit.swap(false, Ordering::SeqCst) {
                 return Err(text_err("injected failure"));
             }
-            live.applied = snap.commit;
+            debug_assert!(
+                seq >= live.applied,
+                "full-text commits are applied in commit order"
+            );
+            live.applied = seq;
             let slot = if changed || live.open.is_some() {
                 live.open.get_or_insert_with(Default::default).clone()
             } else {
@@ -2443,7 +2704,7 @@ mod imp {
             if live.staged + live.removed.len() >= STAGED_MAX {
                 self.seal_locked(live)?;
             }
-            Ok(self.view_in(live, snap.commit, slot))
+            Ok(self.view_in(live, seq, slot))
         }
 
         /// See [`TextIndex::apply_bulk`]. The documents of `old` are known by their keys,

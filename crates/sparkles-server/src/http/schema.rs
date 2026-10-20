@@ -104,6 +104,8 @@ fn parse(st: &AppState, ds: &Dataset, uri: &Uri, p: &Principal) -> ApiResult<Req
                 // a caller limited to some graphs gets a report of those only
                 graphs: p.view(&ds.name, crate::auth::Endpoint::Info),
                 subject_classes,
+                // the report endpoint measures: only the tools read the statistics
+                statistics_above: None,
             },
             at,
             timeout: Some(timeout),

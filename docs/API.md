@@ -213,7 +213,7 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_commit_sync_seconds` | histogram (0.1 ms … 5 s). The time of each commit synchronization. `direct` is a write-through write of the WAL records, `buffered` an `fdatasync` for one commit, and `group` the one `fdatasync` for the commits of a group commit fence. A path has series once it has a commit. | `dataset`, `path` = `direct` \| `buffered` \| `group` |
 | `sparkles_group_commit_size` | histogram (1 … 64 commits, ×2). The commits in each group commit fence that synchronized successfully. | `dataset` |
 | `sparkles_group_commit_wait_seconds` | histogram (0.1 ms … 5 s). The time from a grouped commit joining the queue to its acknowledgement. | `dataset` |
-| `sparkles_group_commit_fallbacks_total` | counter. Commits of a dataset with group commit on that took the ordinary path, by the first condition that kept them out of a group. A reason has series once it has a commit. | `dataset`, `reason` = `poisoned` \| `kind` \| `text` \| `geo` \| `embed` \| `bulk` \| `size` \| `noop` |
+| `sparkles_group_commit_fallbacks_total` | counter. Commits of a dataset with group commit on that took the ordinary path, by the first condition that kept them out of a group. A reason has series once it has a commit. `text-recovering` and `text-rebuilding` mean the full-text index is recovering or rebuilding, and `geo-unavailable` that the spatial view is building or failed. | `dataset`, `reason` = `poisoned` \| `kind` \| `text-recovering` \| `text-rebuilding` \| `geo-unavailable` \| `bulk` \| `size` \| `noop` |
 | `sparkles_group_commit_failures_total` | counter. Group commit fences whose synchronization failed. Each one poisons the dataset's writer. | `dataset` |
 | `sparkles_compactions_total` | counter. Compactions since the server started. | `dataset`, `mode` = `auto` \| `manual`, `outcome` = `done` \| `abandoned` \| `cancelled` \| `failed` |
 | `sparkles_compaction_seconds`, `sparkles_compaction_lock_seconds` | summary (`_sum`, `_count`). The duration of the compactions that published a generation, and how long their switch held the writer lock. | `dataset` |
@@ -8929,7 +8929,7 @@ sparkles mcp (--loc [NAME=]PATH)... | (--data FILE... [--name NAME])
              [--allow-update] [--allow-service] [--timeout SECS] [--query-memory-mb N]
              [--max-rows N] [--mcp-max-rows N] [--mcp-max-bytes N] [--max-concurrent N]
              [--disable-tool NAME]... [--no-stored-queries] [--schema-max-entries N] [--text]
-             [--task-after-ms MS]
+             [--schema-statistics-above QUADS|off] [--task-after-ms MS]
 sparkles mcp --url URL [--token TOKEN] [--insecure-http]
 ```
 
@@ -8949,12 +8949,64 @@ sparkles mcp --url URL [--token TOKEN] [--insecure-http]
 | `--outbound-allow-private`, `--outbound-block-private`, `--outbound-allow HOST_OR_CIDR`, `--outbound-timeout S`, `--outbound-max-mb N` | private blocked, none, `60`, `256` | Where an allowed `SERVICE` may connect, as for `sparkles serve`. |
 | `--disable-tool NAME` | | Does not offer the tool. |
 | `--no-stored-queries` | off | Does not offer the datasets' stored queries as tools. |
+| `--schema-statistics-above QUADS` | `10000000` | Above this many quads, the tools' schema reports come from the index statistics instead of a scan (see [Schema reports from statistics](#schema-reports-from-statistics)). `off` always scans. `serve` and `ask` take the same flag. |
 | `--task-after-ms MS` | `2000` | How long a call of a client that supports the tasks extension runs before it becomes a task (see [Tasks](#tasks)). |
 | `--url URL` | | Bridges stdio to the `/$/mcp` endpoint of a running server instead of opening databases (see [Bridge to a server](#bridge-to-a-server)). |
 | `--token TOKEN` | | With `--url`: the API token to send, instead of `SPARKLES_TOKEN` or the saved login. |
 | `--insecure-http` | off | With `--url`: allows plain `http` to a host other than localhost. |
 
 The process exits 0 when stdin closes and 1 on a startup error. Logs go to stderr.
+
+#### Schema reports from statistics
+
+A full schema report reads every quad twice. On DBpedia 2022.12.01, about a billion
+quads, that took about 50 seconds and 11 GiB, and `check_query`, `describe_schema`,
+`link_entities`, `assert_facts` and the ingestion tools all need a report. When a store
+holds more than `--schema-statistics-above` quads, these tools take the counts from the
+statistics that the index build keeps instead. Those counts cover every graph of the
+build, so they are corrected for the graphs the selection leaves out and for the changes
+since the build, with one index probe for each value those quads hold. A store with no
+changes and a selection of every graph reads no index rows for the counts. Each
+predicate's triples count quads, so a triple stored in two selected graphs counts twice.
+The distinct subjects, distinct objects and class instances are exact. The largest
+number of objects of one subject is not measured, and `describe_schema` leaves
+`maxPerSubject` out. The result carries `"basis": "statistics"`.
+
+Such a report applies when the caller reads every graph and the graphs the selection
+leaves out hold at most a million quads of the index build, so the default graph of a
+store with a few agent memory graphs gets one. A selection that leaves out more, such as
+one small named graph of a large store, gets a full report of what it selects. So do a
+caller limited to some graphs, `subjectClasses`, and a store whose changes since the
+build would cost more to correct for than a scan, which the server logs at debug level.
+The report is kept for each selection until the next commit, as a full report is. A
+dataset keeps up to four reports, one per selection, so the memory its reports hold can
+be up to four times that of one report. A report from the statistics of a store with
+many predicates is as large as a full one, since it lists the same entries.
+
+The kinds of a predicate's objects are measured when a tool needs them. A predicate
+with at most 200,000 quads is read in full. A larger one gets exact counts of its IRIs,
+blank nodes, triple terms and inline literals from the index, and its other literals are
+split among datatypes and languages in the proportions of a sample of 8,192 of them,
+read in 16 windows spread over the predicate's rows. `describe_schema` then adds
+`objectsSampled` with the sample's size, and a `language-tag` or `datatype-mismatch`
+warning of `check_query` says that it comes from a sample. A literal that is an object
+of the predicate never gets such a warning. On DBpedia the first `check_query` of a
+process took between 0.3 and 1.5 seconds, a `describe_schema` summary of 200
+predicates about 1.4 seconds, and later calls up to 60 milliseconds, while the process
+held under 500 MiB of anonymous memory. The sampled windows are read without filling
+the block cache, so they do not displace the blocks that queries use. The sample counts
+the literals of every graph, while the counts by kind leave out the quads of graphs the
+selection does not hold. The dataset keeps the objects measured for up to 4,096
+predicates of the latest state, for every selection.
+
+The ingestion tools' profile measures the objects of the predicates that its spec names.
+A profile without a predicate list, over a report from the statistics, gives every
+predicate `"object": "any"` with no datatypes or languages, because measuring every
+predicate of a large store would cost the scan the report avoids. Name the predicates in
+the profile's spec to get their kinds.
+
+`/{ds}/schema`, `sparkles schema` and the VoID export always scan, because they are asked
+for the report itself.
 
 **Protocol.** The server supports revision `2026-07-28` and the legacy `initialize`
 handshake of `2025-11-25` and `2025-06-18`. Revision `2026-07-28` is stateless. It uses

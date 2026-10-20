@@ -1036,7 +1036,12 @@ latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
   Admission takes the queue's lock on every request.
 * The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold, which the Phase
   1a gate requires. Only the 1.05M screen ran, and roadmap item 1 runs them on forge with
-  its benchmark refresh.
+  its benchmark refresh. The first batch of that refresh, on 2026-10-18 and 2026-10-19
+  with commit 81478fbe, ran the 10.5M suite with the default profile only, so it does not
+  decide the gate. In the same batch, SP²Bench at 10M triples met the default profile's
+  query budget of 8,192 MiB and pool of 5,344 MiB. Sparkles answered `q4` with 503 and
+  `q5a`, `q6` and `q12a` with 507 within 0.3 s, and its access log gives the outcome
+  `budget` for all four.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
@@ -1339,4 +1344,4 @@ dominates it in both kinds of run.
 **What remains.** A spilled join whose order is relied on writes its output twice,
 which made the `foaf:knows` join 8.9 times slower than in memory under 4 MiB, where the
 OPTIONAL and MINUS joins took 3.3 and 4.6 times. A DISTINCT over ordered input other than
-an ORDER BY keeps its whole set. These are roadmap item 89.
+an ORDER BY keeps its whole set. These are roadmap item 93.

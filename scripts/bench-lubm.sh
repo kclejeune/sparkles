@@ -31,7 +31,7 @@
 #
 # Env: PROFILE (owl-rl or rdfs), WARMUP (default 2), RUNS (default 10), COLD_RUNS (default 0),
 # SKIP_LOAD=1, ANSWERS_ONLY=1, QUERIES="q1 q9 …", ENGINES="sparkles jena qlever fluree oxigraph"
-# (default; ENGINES="" only generates and materializes the data), PORT_BASE (default 48300),
+# (default; ENGINES="" only generates and materializes the data), PORT_BASE (default 28300),
 # SPARKLES, SERVER_MEM_MAX, CLIENT_CPU, JAVA, FLUREE and FLUREE_VERSION as in scripts/bench.sh.
 set -euo pipefail
 
@@ -40,7 +40,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${2:-$ROOT/target/bench-lubm}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
-PORT_BASE=${PORT_BASE:-48300}
+PORT_BASE=${PORT_BASE:-28300}
 PROFILE=${PROFILE:-owl-rl}
 MAX_TIME=${MAX_TIME:-600}
 export MAX_TIME

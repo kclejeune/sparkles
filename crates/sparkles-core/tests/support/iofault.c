@@ -4,24 +4,30 @@
 //
 //  * Recording. With $SPARKLES_IO_LOG set it appends every write, truncation and
 //    synchronization to that file, in the order the process issued them, with the bytes
-//    written. tests/power_loss.rs replays the log to rebuild the files as a power loss at
-//    any point would leave them.
+//    written, and every directory operation that succeeded: the creation of a file, a
+//    rename and an unlink. A synchronization of a directory is recorded like one of a
+//    file. tests/power_loss.rs replays the log to rebuild the files as a power loss at any
+//    point would leave them.
 //  * Faults. $SPARKLES_IO_FAULT is a comma-separated list of OP:SUFFIX:N or OP:SUFFIX:N+
 //    entries. OP is fdatasync, fsync or pwrite (also for write). The call number N (counted
 //    from 1 over the calls on files whose path ends in SUFFIX) fails with EIO instead of
 //    reaching the kernel, and with N+ so does every later call too.
 //
 // Log record, little endian:
-//   u8 kind (1 write begin, 2 write end, 3 truncate, 4 sync begin, 5 sync end),
+//   u8 kind (1 write begin, 2 write end, 3 truncate, 4 sync begin, 5 sync end, 6 rename,
+//   7 unlink, 8 create),
 //   u8 flag (write: 1 when the descriptor is O_DSYNC; end records: 1 when the call failed),
-//   u16 path length, path bytes, u64 offset, u64 length, then for a write the bytes.
+//   u16 path length, path bytes, u64 offset, u64 length, then for a write the bytes and for
+//   a rename the new path (the path is the old one).
 // Only the shim's own bookkeeping is serialized: the real calls run concurrently.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +36,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-enum { K_WRITE = 1, K_WRITE_END = 2, K_TRUNC = 3, K_SYNC = 4, K_SYNC_END = 5 };
+enum {
+  K_WRITE = 1,
+  K_WRITE_END = 2,
+  K_TRUNC = 3,
+  K_SYNC = 4,
+  K_SYNC_END = 5,
+  K_RENAME = 6,
+  K_UNLINK = 7,
+  K_CREATE = 8
+};
 
 static int (*real_fdatasync)(int);
 static int (*real_fsync)(int);
@@ -218,3 +233,138 @@ int ftruncate64(int fd, off_t len) {
   return real_ftruncate(fd, len);
 }
 int ftruncate(int fd, off_t len) { return ftruncate64(fd, len); }
+
+// ------------------------------------------------------------- directory operations
+
+static int (*real_rename)(const char *, const char *);
+static int (*real_renameat)(int, const char *, int, const char *);
+static int (*real_unlink)(const char *);
+static int (*real_unlinkat)(int, const char *, int);
+static int (*real_open64)(const char *, int, ...);
+static int (*real_openat)(int, const char *, int, ...);
+static int (*real_openat64)(int, const char *, int, ...);
+static pthread_once_t dir_once = PTHREAD_ONCE_INIT;
+
+static void dir_init(void) {
+  real_rename = dlsym(RTLD_NEXT, "rename");
+  real_renameat = dlsym(RTLD_NEXT, "renameat");
+  real_unlink = dlsym(RTLD_NEXT, "unlink");
+  real_unlinkat = dlsym(RTLD_NEXT, "unlinkat");
+  real_open64 = dlsym(RTLD_NEXT, "open64");
+  real_openat = dlsym(RTLD_NEXT, "openat");
+  real_openat64 = dlsym(RTLD_NEXT, "openat64");
+}
+
+// The absolute path of `path`, taken relative to `dirfd`, with its directory resolved,
+// when it is under the root. The entry itself need not exist.
+static int resolve(int dirfd, const char *path, char *out, size_t cap) {
+  if (root_len == 0 || !path) return 0;
+  char full[PATH_MAX];
+  if (path[0] == '/') {
+    snprintf(full, sizeof full, "%s", path);
+  } else if (dirfd == AT_FDCWD) {
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof cwd)) return 0;
+    snprintf(full, sizeof full, "%s/%s", cwd, path);
+  } else {
+    char link[64], dir[PATH_MAX];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", dirfd);
+    ssize_t n = readlink(link, dir, sizeof dir - 1);
+    if (n <= 0) return 0;
+    dir[n] = 0;
+    snprintf(full, sizeof full, "%s/%s", dir, path);
+  }
+  char a[PATH_MAX], b[PATH_MAX], real[PATH_MAX];
+  strcpy(a, full);
+  strcpy(b, full);
+  if (!realpath(dirname(a), real)) return 0;
+  snprintf(out, cap, "%s/%s", real, basename(b));
+  size_t n = strlen(out);
+  return n > root_len && strncmp(out, root, root_len) == 0 && out[root_len] == '/';
+}
+
+static int rename_call(int olddirfd, const char *from, int newdirfd, const char *to, int at) {
+  init();
+  pthread_once(&dir_once, dir_init);
+  char a[PATH_MAX], b[PATH_MAX];
+  int ia = resolve(olddirfd, from, a, sizeof a);
+  int ib = resolve(newdirfd, to, b, sizeof b);
+  int r = at ? real_renameat(olddirfd, from, newdirfd, to) : real_rename(from, to);
+  int saved = errno;
+  if (r == 0 && ia && ib) record(K_RENAME, 0, a, 0, strlen(b), b);
+  errno = saved;
+  return r;
+}
+
+int rename(const char *from, const char *to) { return rename_call(AT_FDCWD, from, AT_FDCWD, to, 0); }
+int renameat(int olddirfd, const char *from, int newdirfd, const char *to) {
+  return rename_call(olddirfd, from, newdirfd, to, 1);
+}
+
+static int unlink_call(int dirfd, const char *path, int flags, int at) {
+  init();
+  pthread_once(&dir_once, dir_init);
+  char p[PATH_MAX];
+  int in = resolve(dirfd, path, p, sizeof p);
+  int r = at ? real_unlinkat(dirfd, path, flags) : real_unlink(path);
+  int saved = errno;
+  if (r == 0 && in) record(K_UNLINK, 0, p, 0, 0, NULL);
+  errno = saved;
+  return r;
+}
+
+int unlink(const char *path) { return unlink_call(AT_FDCWD, path, 0, 0); }
+int unlinkat(int dirfd, const char *path, int flags) { return unlink_call(dirfd, path, flags, 1); }
+
+// An open that creates the file (O_CREAT) or empties it (O_TRUNC) records that.
+static int open_call(int dirfd, const char *path, int flags, mode_t mode, int which) {
+  init();
+  pthread_once(&dir_once, dir_init);
+  char p[PATH_MAX];
+  int in = (flags & (O_CREAT | O_TRUNC)) && (flags & O_TMPFILE) != O_TMPFILE &&
+           resolve(dirfd, path, p, sizeof p);
+  int existed = in && access(p, F_OK) == 0;
+  int fd;
+  switch (which) {
+    case 0: fd = real_open(path, flags, mode); break;
+    case 1: fd = real_open64(path, flags, mode); break;
+    case 2: fd = real_openat(dirfd, path, flags, mode); break;
+    default: fd = real_openat64(dirfd, path, flags, mode); break;
+  }
+  int saved = errno;
+  if (fd >= 0 && in) {
+    if (!existed && (flags & O_CREAT)) {
+      record(K_CREATE, 0, p, 0, 0, NULL);
+    } else if (existed && (flags & O_TRUNC) && (flags & O_ACCMODE) != O_RDONLY) {
+      record(K_TRUNC, 0, p, 0, 0, NULL);
+    }
+  }
+  errno = saved;
+  return fd;
+}
+
+#define MODE_OF(flags)                                                                   \
+  mode_t mode = 0;                                                                       \
+  if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {                           \
+    va_list ap;                                                                          \
+    va_start(ap, flags);                                                                 \
+    mode = (mode_t)va_arg(ap, int);                                                      \
+    va_end(ap);                                                                          \
+  }
+
+int open(const char *path, int flags, ...) {
+  MODE_OF(flags);
+  return open_call(AT_FDCWD, path, flags, mode, 0);
+}
+int open64(const char *path, int flags, ...) {
+  MODE_OF(flags);
+  return open_call(AT_FDCWD, path, flags, mode, 1);
+}
+int openat(int dirfd, const char *path, int flags, ...) {
+  MODE_OF(flags);
+  return open_call(dirfd, path, flags, mode, 2);
+}
+int openat64(int dirfd, const char *path, int flags, ...) {
+  MODE_OF(flags);
+  return open_call(dirfd, path, flags, mode, 3);
+}

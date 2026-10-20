@@ -7410,7 +7410,7 @@ export interface components {
             spill?: {
                 /** @description The disk all queries' spill files may reserve together (`--spill-max-mb`). */
                 capacityBytes?: number;
-                /** @description Whether streamed sorts, groupings and unordered DISTINCT may write what outgrows their memory budget to disk (`--spill`). */
+                /** @description Whether streamed sorts, groupings, DISTINCT and joins may write what outgrows their memory budget to disk (`--spill`, on by default). */
                 enabled: boolean;
                 /** @description The disk one query may reserve (`--query-spill-mb`), `null` when only the total limits it. */
                 queryBytes?: number | null;

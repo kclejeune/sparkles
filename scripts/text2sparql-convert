@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Convert a Text2SPARQL'25 question set into an Ask question set.
+
+`--set db25` takes the 100 DBpedia questions of the ESWC 2025 challenge, and
+`--set ck25` the 50 questions over the corporate knowledge graph CK25. The files
+come from the challenge repository and the CK25 repository at pinned commits, and
+their SHA256 is checked before use. Neither is vendored. With --sparkles, every gold
+query runs on the data the run will use, which for db25 is a DBpedia database given
+with --loc, and for ck25 is the CK25 graph itself. Questions whose gold returns
+nothing, fails or cannot be scored are dropped and counted, and the recomputed
+answers are compared with the answers the challenge publishes.
+"""
+
+import argparse
+import json
+import pathlib
+import shutil
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "testsuite/ask/eval_support"))
+from convert import (
+    category,
+    compare,
+    database_record,
+    fetch_pinned,
+    gold_result,
+    normalize_dbpedia,
+    summarize,
+)
+from evaluator import Invalid, bounded_file, digest, strict_json
+
+CHALLENGE = "AKSW/text2sparql.aksw.org"
+CHALLENGE_COMMIT = "9254e7868bc8a90eca445e7486afd27c653af6c9"  # the 2025 branch
+CK25 = "eccenca/ck25-dataset"
+CK25_COMMIT = "cb928b2f201e4bdbbde9a1cd0653152779736395"  # release 1.2.0
+SIZE_CAP = 8 * 1024 * 1024
+
+# name -> (repository, commit, path, SHA256)
+FILES = {
+    "db25-questions": (
+        CHALLENGE,
+        CHALLENGE_COMMIT,
+        "docs/benchmark/questions_db25.yaml",
+        "41c447c361f5315b066c157f1dd9801e60ce6029cb02f56af9937fae9cfcebb6",
+    ),
+    "db25-answers": (
+        CHALLENGE,
+        CHALLENGE_COMMIT,
+        "docs/benchmark/db25_true_result_set.json",
+        "e5001e581283b43dbe16c0710bb718fb98e08845c67e2ddef2e8610533175302",
+    ),
+    "ck25-questions": (
+        CK25,
+        CK25_COMMIT,
+        "questions.yml",
+        "305263d864bca6c7452d5d10bfd57fc9598a815d7c4fd930d0e36e699ba0e6a6",
+    ),
+    "ck25-data": (
+        CK25,
+        CK25_COMMIT,
+        "graphs/prod-inst.ttl",
+        "73ade6d02fd0805ad05961024f0e2d4fc3aa3105704e05337af8aacc8b4033b6",
+    ),
+    "ck25-answers": (
+        CHALLENGE,
+        CHALLENGE_COMMIT,
+        "docs/benchmark/ck25_true_result_set.json",
+        "8563a66faa72bc803833d22773bb5c41d33656645d0906c84cce135a84f68771",
+    ),
+}
+SETS = {
+    "db25": {
+        "questions": 100,
+        "dataset": "dbpedia",
+        "license": "CC BY-SA 4.0",
+        "description": (
+            "The DBpedia questions of the Text2SPARQL'25 challenge (ESWC 2025), in "
+            "English. The challenge ran them on DBpedia 2015-10."
+        ),
+    },
+    "ck25": {
+        "questions": 50,
+        "dataset": "ck25",
+        "license": "CC BY 4.0",
+        "description": (
+            "The corporate knowledge graph questions of the Text2SPARQL'25 challenge "
+            "(ESWC 2025), over CK25, a graph built for the challenge whose queries no "
+            "model saw before its release."
+        ),
+    },
+}
+
+
+def url(name):
+    repo, commit, path, _ = FILES[name]
+    return f"https://raw.githubusercontent.com/{repo}/{commit}/{path}"
+
+
+def source(args, name, scratch):
+    """A checked local copy of one pinned file."""
+    base = pathlib.PurePosixPath(FILES[name][2]).name
+    if args.input:
+        path = pathlib.Path(args.input) / base
+        if digest(path) != FILES[name][3]:
+            raise Invalid(f"{path} does not match its pinned SHA256")
+        return path
+    path = scratch / base
+    fetch_pinned(url(name), FILES[name][3], SIZE_CAP, path)
+    return path
+
+
+def scalar(text):
+    """A YAML scalar of the forms these files use: plain, double or single quoted."""
+    text = text.strip()
+    if text.startswith('"'):
+        try:
+            value = json.loads(text)
+        except ValueError:
+            raise Invalid("unsupported double-quoted YAML scalar") from None
+        if not isinstance(value, str):
+            raise Invalid("unsupported double-quoted YAML scalar")
+        return value
+    if text.startswith("'"):
+        if not text.endswith("'") or len(text) < 2:
+            raise Invalid("unsupported single-quoted YAML scalar")
+        return text[1:-1].replace("''", "'")
+    if text[:1] in ("|", ">", "&", "*", "!", "[", "{"):
+        raise Invalid("unsupported YAML scalar")
+    return text
+
+
+def parse_questions(text):
+    """Read the Text2SPARQL questions file, a small fixed subset of YAML.
+
+    The file is a `dataset` mapping and a `questions` list whose items hold an `id`,
+    a `question` mapping from language to text, a `query` mapping with `sparql` as a
+    literal block or a scalar, and lists of strings. Anything else is refused, so a
+    changed file cannot be read wrongly in silence.
+    """
+    lines = text.splitlines()
+    questions, current, i = [], None, 0
+    section = key = child = None
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped == "---":
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            section = stripped.rstrip(":")
+            if section not in ("dataset", "questions") or not stripped.endswith(":"):
+                raise Invalid(f"unexpected top-level YAML key {stripped!r}")
+            continue
+        if section == "dataset":
+            continue
+        if indent == 2 and stripped.startswith("- id:"):
+            current = {"id": scalar(stripped[len("- id:") :]), "question": {}}
+            questions.append(current)
+            key = None
+            continue
+        if current is None:
+            raise Invalid("a question field before the first question")
+        if indent == 4:
+            name, sep, rest = stripped.partition(":")
+            if not sep:
+                raise Invalid("unexpected YAML line")
+            key, child = name, None
+            if rest.strip():
+                current[key] = scalar(rest)
+            elif key in ("features", "classes", "properties"):
+                current[key] = []
+            elif key not in ("question", "query"):
+                raise Invalid(f"unexpected question field {key!r}")
+            continue
+        if indent == 6 and key in ("features", "classes", "properties"):
+            if not stripped.startswith("- "):
+                raise Invalid("a list item expected")
+            current[key].append(scalar(stripped[2:]))
+            continue
+        if indent > 4 and key == "question":
+            # The texts sit at 6 spaces in most entries and at 8 in a few.
+            if child is None:
+                child = indent
+            if indent != child:
+                raise Invalid("inconsistent indentation of the question texts")
+            lang, sep, rest = stripped.partition(":")
+            if not sep or not rest.strip():
+                raise Invalid("a question text expected")
+            words = [rest.strip()]
+            # A plain scalar may go on over more indented lines, folded by a space.
+            while i < len(lines) and len(lines[i]) - len(lines[i].lstrip(" ")) > child:
+                if words[0][:1] in ('"', "'") or not lines[i].strip():
+                    raise Invalid("unsupported multi-line YAML scalar")
+                words.append(lines[i].strip())
+                i += 1
+            current["question"][lang] = scalar(" ".join(words))
+            continue
+        if indent == 6 and key == "query":
+            name, sep, rest = stripped.partition(":")
+            if name != "sparql" or not sep:
+                raise Invalid("a sparql query expected")
+            if rest.strip() == "|":
+                block = []
+                while i < len(lines) and (
+                    not lines[i].strip()
+                    or len(lines[i]) - len(lines[i].lstrip(" ")) >= 8
+                ):
+                    block.append(lines[i][8:])
+                    i += 1
+                current["sparql"] = "\n".join(block).strip() + "\n"
+            else:
+                current["sparql"] = scalar(rest)
+            continue
+        raise Invalid(f"unexpected YAML line {line!r}")
+    return questions
+
+
+def published(answers, key):
+    """The published answer of one question: a boolean for ASK, else its values."""
+    if key not in answers:
+        return None
+    values = answers[key]
+    if not isinstance(values, dict):
+        raise Invalid("unexpected published answer")
+    if set(values) == {"true"} and values["true"] in (0, 1):
+        return bool(values["true"])
+    return set(values)
+
+
+def convert(args, files, scratch):
+    meta = SETS[args.set]
+    items = parse_questions(bounded_file(files["questions"], SIZE_CAP).decode())
+    if len(items) != meta["questions"]:
+        raise Invalid(f"expected {meta['questions']} questions, read {len(items)}")
+    answers = strict_json(bounded_file(files["answers"], SIZE_CAP))
+    recompute = bool(args.sparkles)
+    gold_source = (
+        ["--loc", args.loc]
+        if args.set == "db25"
+        else ["--data", str(files.get("dataSource", ""))]
+    )
+    questions, comparisons, normalized = [], {}, {}
+    dropped = {"empty": [], "failed": [], "unsupported": [], "noText": []}
+    for n, item in enumerate(items):
+        ident = f"{args.set}-{item['id']}"
+        text = item["question"].get(args.language)
+        query = item.get("sparql")
+        if not text or not query or not query.strip():
+            dropped["noText"].append(ident)
+            continue
+        source_query, changes = query, []
+        if args.set == "db25":
+            query, changes = normalize_dbpedia(query)
+        if changes:
+            normalized[ident] = changes
+        if recompute:
+            result, reason = gold_result(
+                args.sparkles, gold_source, query, scratch / f"{n:04d}", args.timeout
+            )
+            if reason:
+                dropped[reason].append(ident)
+                continue
+            key = f"{args.set}:{item['id']}-{args.language}"
+            comparisons[ident] = compare(published(answers, key), result)
+        entry = {
+            "id": ident,
+            "kind": "answerable",
+            "category": category(query),
+            "question": text,
+            "gold": query,
+        }
+        if changes:
+            entry.update(sourceGold=source_query, goldNormalized=changes)
+        if "RESULT_ORDER_MATTERS" in item.get("features", []):
+            # The strict scorer compares sets of rows, so eval-ask marks the score
+            # of this question with orderNotScored.
+            entry["orderMatters"] = True
+        questions.append(entry)
+    return {
+        "description": meta["description"]
+        + " Gold answers "
+        + (
+            "were recomputed on the data named below. "
+            if recompute
+            else "are not recomputed. "
+        )
+        + "Questions whose gold returns nothing or that the evaluator cannot score "
+        "are dropped and counted.",
+        "dataset": meta["dataset"],
+        **({"data": files["dataName"]} if args.set == "ck25" else {}),
+        "source": {
+            name.split("-", 1)[1]: {
+                "repository": FILES[name][0],
+                "commit": FILES[name][1],
+                "file": FILES[name][2],
+                "sha256": FILES[name][3],
+            }
+            for name in FILES
+            if name.startswith(args.set)
+        },
+        "license": meta["license"],
+        "language": args.language,
+        "goldRecomputed": recompute,
+        "goldTimeoutSecs": args.timeout if recompute else None,
+        "goldBinarySha256": digest(args.sparkles) if recompute else None,
+        "goldDatabase": (
+            database_record(args.manifest) if recompute and args.set == "db25" else None
+        ),
+        "dbpediaRelease": args.release if recompute and args.set == "db25" else None,
+        "sourceQuestions": len(items),
+        "dropped": {k: {"count": len(v), "ids": v} for k, v in dropped.items()},
+        "goldNormalized": {"count": len(normalized), "byId": normalized},
+        "publishedComparison": (
+            dict(summarize(comparisons), byId=comparisons) if recompute else None
+        ),
+        "prefixes": {},
+        "questions": questions,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    ap.add_argument("--set", required=True, choices=sorted(SETS))
+    ap.add_argument("--out", required=True, help="a new set file")
+    ap.add_argument("--input", help="a directory with local copies of the files")
+    ap.add_argument("--language", default="en", help="db25 also has es")
+    ap.add_argument("--loc", help="DBpedia database directory, for db25")
+    ap.add_argument("--sparkles", help="absolute path of the binary for the recompute")
+    ap.add_argument("--release", default="2022.12.01")
+    ap.add_argument("--manifest", help="a JSON file that records the database load")
+    ap.add_argument("--timeout", type=float, default=60)
+    args = ap.parse_args()
+    if args.set == "db25" and bool(args.loc) != bool(args.sparkles):
+        raise Invalid("--loc and --sparkles go together for db25")
+    if args.set == "ck25" and args.loc:
+        raise Invalid("ck25 recomputes on its own graph, without --loc")
+    if args.sparkles and not pathlib.Path(args.sparkles).is_absolute():
+        raise Invalid("absolute --sparkles required")
+    out = pathlib.Path(args.out)
+    if out.exists():
+        raise Invalid("--out must be a new file")
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="text2sparql-"))
+    files = {
+        "questions": source(args, args.set + "-questions", scratch),
+        "answers": source(args, args.set + "-answers", scratch),
+    }
+    if args.set == "ck25":
+        # The set loads its data from beside the set file, like the demo set.
+        files["dataSource"] = source(args, "ck25-data", scratch)
+        files["dataName"] = out.stem + "-prod-inst.ttl"
+        files["data"] = out.parent / files["dataName"]
+        if files["data"].exists():
+            raise Invalid(f"{files['data']} already exists")
+    result = convert(args, files, scratch)
+    if args.set == "ck25":
+        shutil.copyfile(files["dataSource"], files["data"])
+    with out.open("x") as f:
+        json.dump(result, f, indent=1)
+        f.write("\n")
+    dropped = {k: v["count"] for k, v in result["dropped"].items()}
+    compared = (result["publishedComparison"] or {}).get("counts")
+    print(
+        f"kept {len(result['questions'])} of {result['sourceQuestions']}, "
+        f"dropped {dropped}, normalized {result['goldNormalized']['count']}, "
+        f"against the published answers {compared}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (Invalid, OSError) as error:
+        print(f"text2sparql-convert: {error}", file=sys.stderr)
+        sys.exit(2)

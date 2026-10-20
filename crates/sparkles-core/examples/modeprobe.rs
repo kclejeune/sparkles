@@ -5,7 +5,8 @@
 //! both reading every row (`rows`) and writing TSV to a sink (`tsv`). It prints the median
 //! times, their ratio (streaming over eager, under 1 means streaming is faster), the peak
 //! of each mode's memory ledger and what automatic execution chose. `SPARKLES_PROBE_MODES`
-//! picks `rows`, `tsv` or both (the default), and `SPARKLES_PROBE_MEMORY_MB` sets the
+//! lists the modes, `rows,tsv` by default, where `json` writes SPARQL JSON and `native`
+//! the native JSON of the UI, and `SPARKLES_PROBE_MEMORY_MB` sets the
 //! query memory budget. `SPARKLES_PROBE_STREAM_MEMORY_MB` sets another budget for the
 //! cursor runs, and `SPARKLES_PROBE_SPILL_DIR` lets them spill to that directory, with every
 //! spill file encrypted when `SPARKLES_PROBE_SPILL_ENCRYPTED` is set. With
@@ -39,6 +40,17 @@ fn digest<'a>(rows: impl Iterator<Item = &'a [Option<oxrdf::Term>]>) -> u64 {
         row.hash(&mut h);
         sum.wrapping_add(h.finish())
     })
+}
+
+/// The writer of a mode other than `rows`: `tsv`, `json` for SPARQL JSON or `native` for
+/// the native JSON of `application/x-sparkles+json`.
+fn format(mode: &str) -> Option<SolutionsFormat> {
+    match mode {
+        "tsv" => Some(SolutionsFormat::Tsv),
+        "json" => Some(SolutionsFormat::Json),
+        "native" => Some(SolutionsFormat::Sparkles),
+        _ => None,
+    }
 }
 
 fn main() {
@@ -113,9 +125,8 @@ fn main() {
                     let started = Instant::now();
                     if first {
                         let result = query(store.snapshot(), &text, &options).unwrap();
-                        if mode == "tsv" {
-                            write_solutions(&result, SolutionsFormat::Tsv, std::io::sink(), None)
-                                .unwrap();
+                        if let Some(format) = format(mode) {
+                            write_solutions(&result, format, std::io::sink(), None).unwrap();
                         }
                         rows = result.len();
                         if check && round == rounds && mode == "rows" {
@@ -143,14 +154,8 @@ fn main() {
                         else {
                             panic!("{name}: not a SELECT cursor");
                         };
-                        let stats = if mode == "tsv" {
-                            write_cursor_solutions(
-                                &mut c,
-                                SolutionsFormat::Tsv,
-                                std::io::sink(),
-                                None,
-                            )
-                            .unwrap()
+                        let stats = if let Some(format) = format(mode) {
+                            write_cursor_solutions(&mut c, format, std::io::sink(), None).unwrap()
                         } else {
                             let last = check && round == rounds;
                             stream_rows = 0;

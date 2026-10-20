@@ -390,7 +390,10 @@ impl TermCache {
                 }
             }
         }
-        pairs.sort_unstable();
+        // A column read in index order is often already ascending, so the pairs are a
+        // few sorted runs, which the run-detecting stable sort merges in near-linear
+        // time. The pairs are distinct, so its order is that of an unstable sort.
+        pairs.sort();
         ctx.check()?;
         let mut slots = vec![u32::MAX; cells];
         let mut ids = Vec::with_capacity(pairs.len());
@@ -1693,6 +1696,7 @@ enum State {
         external: Option<Box<extsort::External>>,
     },
     TopK(Box<topk::TopK>),
+    IndexTopK(Box<topk::IndexTopK>),
 }
 
 struct Operator {
@@ -2033,6 +2037,8 @@ impl Operator {
         let walking = walk::eligible(&node);
         let native_blocking =
             matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. }) && node.children.len() == 1;
+        // An ordered top-k keeps a heap of its best rows, as a streaming top-k does.
+        let index_topk = matches!(node.kind, Kind::OrderedTopK(_)) && exec::heap_eligible(ctx);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -2040,6 +2046,7 @@ impl Operator {
             && !incremental_group
             && !expanding
             && !walking
+            && !index_topk
             && (!native_blocking || !exists_streams);
         if materializes && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
@@ -2102,7 +2109,9 @@ impl Operator {
         };
         // A count over the key runs of two scans reads those scans itself.
         let reads_scans = matches!(node.kind, Kind::CountJoinRuns { .. });
-        let children = if (materializes && !native_blocking && !inputs) || reads_scans {
+        // An ordered top-k builds its generic plan only when it needs it.
+        let children = if (materializes && !native_blocking && !inputs) || reads_scans || index_topk
+        {
             Vec::new()
         } else {
             let built = std::mem::take(&mut node.children)
@@ -2146,6 +2155,7 @@ impl Operator {
                 | Kind::CountJoinRuns { .. }
         ) || materializes
             || native_blocking
+            || index_topk
             || incremental_merge
             || incremental_binary
             || incremental_group
@@ -2195,8 +2205,14 @@ impl Operator {
             );
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists).then(|| {
-            if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
+        let reason = (materializes || native_blocking || exists || index_topk).then(|| {
+            if let Kind::OrderedTopK(spec) = &node.kind {
+                format!(
+                    "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
+                    node.operator(),
+                    spec.k
+                )
+            } else if let (true, Kind::OrderBy { limit: Some(k), .. }) = (heap, &node.kind) {
                 format!(
                     "{} reads all input but keeps only its best {k} rows under the memory budget before output",
                     node.operator()
@@ -2227,6 +2243,8 @@ impl Operator {
             State::Group(Box::new(group))
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
+        } else if index_topk {
+            State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
             State::TopK(Box::new(topk::TopK::new(ctx, &node, &children[0].vars)?))
         } else if expanding {
@@ -2396,6 +2414,7 @@ impl Operator {
                         | State::Counts { .. }
                         | State::Blocking { .. }
                         | State::TopK(_)
+                        | State::IndexTopK(_)
                 ),
             growing_state: self.growing,
             complete: false,
@@ -2435,6 +2454,13 @@ impl Operator {
                 }
             }
             _ => {}
+        }
+        // The generic plan of an ordered top-k joins the cursor plan once it is built.
+        if let State::IndexTopK(topk) = &self.state
+            && plan.children.is_empty()
+            && let Some(generic) = topk.generic_plan()
+        {
+            plan.children.push(generic.clone());
         }
         for (child, plan) in self.children.iter().zip(&mut plan.children) {
             child.update_plan(plan);
@@ -2724,6 +2750,11 @@ impl Operator {
                 State::TopK(topk) => {
                     let b = topk.next(ctx, &mut self.children[0], options, cap)?;
                     self.done = topk.done();
+                    b
+                }
+                State::IndexTopK(topk) => {
+                    let b = topk.next(ctx, &mut self.children, options, &mut self.info, cap)?;
+                    self.done = topk.done(&self.children);
                     b
                 }
                 State::Blocking {

@@ -9,8 +9,10 @@
 //!
 //!   drive --addr A --ds D --receipts FILE [--clients 16] [--seconds S] [--run R]
 //!         [--message-every N] [--mark-cmd CMD] [--mark-ms 50] [--allow-empty]
+//!         [--index geo]
 //!       `--clients` writers insert one new triple per request, `<urn:x09:R:W:K>
-//!       <urn:x09:p> "v-R-W-K"`, every `--message-every`th with a commit message, until
+//!       <urn:x09:p> "v-R-W-K"`, and with `--index geo` a `geo:asWKT` point of the same
+//!       subject, every `--message-every`th with a commit message, until
 //!       `--seconds` pass or the server stops answering. Each acknowledged receipt (the
 //!       `Sparkles-Commit` header of a 200 answer) is appended to FILE as
 //!       `R <commit> <subject> <object> <message or ->`. With `--mark-cmd`, every
@@ -25,11 +27,16 @@
 //!       failed or none was made.
 //!
 //!   verify --sparkles BIN --loc DIR --receipts FILE [--mark NAME] [--write]
+//!         [--index text|geo|embed]
 //!       Checks a recovered store: `sparkles check` reports no error before and after the
 //!       store is opened; the head is at or after the last receipt counted by mark NAME
 //!       (every receipt in the file without `--mark`); every receipt at or below the head
 //!       has its triple and, for a message, its message; with `--write`, a new commit
-//!       continues the sequence at head + 1. Prints one JSON line and exits 1 on failure.
+//!       continues the sequence at head + 1. With `--index` the index agrees with the
+//!       recovered data (X09 section 17.8): full-text search finds a sample of 48 receipts
+//!       by their words and nothing else, spatial windows find what a scan of the points
+//!       finds, and the embedding index names no commit above the head. Prints one JSON
+//!       line and exits 1 on failure.
 //!
 //!   replay --log FILE --size BYTES --out DIR --points N [--seed S] [--from-mark NAME]
 //!         [--jobs J] [--keep-failed K] [--only N,...] -- CMD...
@@ -108,6 +115,14 @@ impl Rng {
 
 // ------------------------------------------------------------------ drive ------
 
+const AS_WKT: &str = "http://www.opengis.net/ont/geosparql#asWKT";
+const WKT: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
+
+/// The point of writer `w`'s `k`th triple under `--index geo`, on a grid of 0.5 degrees.
+fn point(w: u64, k: u64) -> (f64, f64) {
+    (w as f64 * 0.5, (k % 300) as f64 * 0.5 - 75.0)
+}
+
 /// One request on its own connection: the status and the `Sparkles-Commit` header.
 fn post(
     addr: &str,
@@ -155,6 +170,7 @@ fn drive(a: &Args) {
     let marking = mark_cmd.is_some();
     let mark_ms = a.num("--mark-ms", 50);
     let allow_empty = a.flag("--allow-empty");
+    let geo = a.get("--index").as_deref() == Some("geo");
     let file = Arc::new(Mutex::new(
         OpenOptions::new()
             .create(true)
@@ -207,7 +223,14 @@ fn drive(a: &Args) {
                 let s = format!("urn:x09:{run}:{w}:{k}");
                 let o = format!("v-{run}-{w}-{k}");
                 let m = (every > 0 && k % every == 0).then(|| format!("m-{run}-{w}-{k}"));
-                let update = format!("INSERT DATA {{ <{s}> <urn:x09:p> \"{o}\" }}");
+                let update = if geo {
+                    let (x, y) = point(w, k);
+                    format!(
+                        "INSERT DATA {{ <{s}> <urn:x09:p> \"{o}\" . <{s}> <{AS_WKT}> \"POINT({x} {y})\"^^<{WKT}> }}"
+                    )
+                } else {
+                    format!("INSERT DATA {{ <{s}> <urn:x09:p> \"{o}\" }}")
+                };
                 match post(&addr, &ds, &update, m.as_deref()) {
                     Ok((200, Some(c))) => acked
                         .lock()
@@ -352,6 +375,23 @@ fn verify(a: &Args) {
             tail(&err)
         ));
     }
+    // A full-text index that names a commit above the log is rebuilt by the first open,
+    // which would hide it from the search check below, so it is read before anything
+    // opens the store: from the checkpoint itself, and from `sparkles check`.
+    let text_named = if a.get("--index").as_deref() == Some("text") {
+        if out.contains("ahead of the data") {
+            problems.push(format!(
+                "the full-text index is ahead of the log before open: {}",
+                whole(&out)
+            ));
+        }
+        // A file that is missing, torn or not valid JSON names no commit. Open rebuilds
+        // such an index, as `sparkles check` reports, and the search check below then
+        // compares the rebuilt index with the data.
+        text_payload_seq(&loc)
+    } else {
+        None
+    };
     let q = "SELECT ?s ?o WHERE { ?s <urn:x09:p> ?o }";
     let (code, out, err) = sparkles(&bin, &["query", "--loc", &loc, "--results", "tsv", q]);
     if code != 0 {
@@ -395,6 +435,11 @@ fn verify(a: &Args) {
         (head, messages)
     };
     let (head, messages) = history(&mut problems);
+    if let Some(named) = text_named.filter(|&n| n > head) {
+        problems.push(format!(
+            "the full-text checkpoint names commit {named}, the log ends at {head}"
+        ));
+    }
     let need = receipts[..bound]
         .iter()
         .map(|r| r.commit)
@@ -419,6 +464,17 @@ fn verify(a: &Args) {
         }
         if problems.len() > 20 {
             break;
+        }
+    }
+    // the indexes of the recovered store agree with its data
+    if problems.is_empty() {
+        let at_head: Vec<&Receipt> = receipts.iter().filter(|r| r.commit <= head).collect();
+        match a.get("--index").as_deref() {
+            Some("text") => check_text(&bin, &loc, &at_head, &mut problems),
+            Some("geo") => check_geo(&bin, &loc, &mut problems),
+            Some("embed") => check_embed(&bin, &loc, head, &mut problems),
+            Some("none") | None => {}
+            Some(i) => die(format!("unknown index {i}")),
         }
     }
     let mut next = None;
@@ -455,6 +511,324 @@ fn verify(a: &Args) {
     std::process::exit(if ok { 0 } else { 1 });
 }
 
+/// Every `step`th of `items`, at most `n` of them, spread over the whole list.
+fn sample<'a, T>(items: &'a [T], n: usize) -> Vec<&'a T> {
+    let step = items.len().div_ceil(n.max(1)).max(1);
+    items.iter().step_by(step).collect()
+}
+
+/// The first column of a TSV result, without the header.
+fn column(out: &str) -> std::collections::BTreeSet<String> {
+    out.lines()
+        .skip(1)
+        .filter_map(|l| l.split('\t').next())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches('<').trim_end_matches('>').to_string())
+        .collect()
+}
+
+/// The commit that the full-text checkpoint of the store at `loc` names: the `seq` of the
+/// payload in `text/meta.json`, a JSON object whose `payload` member is a string holding
+/// another JSON object. `None` when the file is missing, torn or not of that shape.
+fn text_payload_seq(loc: &str) -> Option<u64> {
+    let meta = std::fs::read_to_string(std::path::Path::new(loc).join("text/meta.json")).ok()?;
+    let Json::Str(payload) = Json::parse(&meta)?.get("payload")?.clone() else {
+        return None;
+    };
+    match Json::parse(&payload)?.get("seq")? {
+        Json::Num(n) => n.parse().ok(),
+        _ => None,
+    }
+}
+
+/// A JSON value, parsed by [`Json::parse`] from a whole document. Numbers keep their text.
+#[derive(Clone, Debug, PartialEq)]
+enum Json {
+    Null,
+    Bool(bool),
+    Num(String),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    /// The value of a whole document, or `None` if it is not valid JSON, a torn file
+    /// included.
+    fn parse(text: &str) -> Option<Json> {
+        let b = text.as_bytes();
+        let mut at = 0;
+        let v = Json::value(b, &mut at, 0)?;
+        Json::space(b, &mut at);
+        (at == b.len()).then_some(v)
+    }
+
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    fn space(b: &[u8], at: &mut usize) {
+        while *at < b.len() && matches!(b[*at], b' ' | b'\t' | b'\n' | b'\r') {
+            *at += 1;
+        }
+    }
+
+    fn value(b: &[u8], at: &mut usize, depth: usize) -> Option<Json> {
+        if depth > 64 {
+            return None;
+        }
+        Json::space(b, at);
+        match *b.get(*at)? {
+            b'{' => {
+                *at += 1;
+                let mut members = Vec::new();
+                Json::space(b, at);
+                if b.get(*at) == Some(&b'}') {
+                    *at += 1;
+                    return Some(Json::Obj(members));
+                }
+                loop {
+                    Json::space(b, at);
+                    let Json::Str(k) = Json::string(b, at)? else {
+                        return None;
+                    };
+                    Json::space(b, at);
+                    (b.get(*at) == Some(&b':')).then_some(())?;
+                    *at += 1;
+                    members.push((k, Json::value(b, at, depth + 1)?));
+                    Json::space(b, at);
+                    match b.get(*at)? {
+                        b',' => *at += 1,
+                        b'}' => {
+                            *at += 1;
+                            return Some(Json::Obj(members));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                *at += 1;
+                let mut items = Vec::new();
+                Json::space(b, at);
+                if b.get(*at) == Some(&b']') {
+                    *at += 1;
+                    return Some(Json::Arr(items));
+                }
+                loop {
+                    items.push(Json::value(b, at, depth + 1)?);
+                    Json::space(b, at);
+                    match b.get(*at)? {
+                        b',' => *at += 1,
+                        b']' => {
+                            *at += 1;
+                            return Some(Json::Arr(items));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'"' => Json::string(b, at),
+            b't' => Json::word(b, at, "true", Json::Bool(true)),
+            b'f' => Json::word(b, at, "false", Json::Bool(false)),
+            b'n' => Json::word(b, at, "null", Json::Null),
+            b'-' | b'0'..=b'9' => {
+                let from = *at;
+                *at += 1;
+                while *at < b.len()
+                    && matches!(b[*at], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    *at += 1;
+                }
+                let n = std::str::from_utf8(&b[from..*at]).ok()?;
+                n.parse::<f64>().ok()?;
+                Some(Json::Num(n.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    fn word(b: &[u8], at: &mut usize, w: &str, v: Json) -> Option<Json> {
+        b[*at..].starts_with(w.as_bytes()).then(|| {
+            *at += w.len();
+            v
+        })
+    }
+
+    fn string(b: &[u8], at: &mut usize) -> Option<Json> {
+        (b.get(*at) == Some(&b'"')).then_some(())?;
+        *at += 1;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            match *b.get(*at)? {
+                b'"' => {
+                    *at += 1;
+                    return String::from_utf8(out).ok().map(Json::Str);
+                }
+                b'\\' => {
+                    *at += 1;
+                    let c = match *b.get(*at)? {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => {
+                            let hex = std::str::from_utf8(b.get(*at + 1..*at + 5)?).ok()?;
+                            *at += 4;
+                            char::from_u32(u32::from_str_radix(hex, 16).ok()?).unwrap_or('\u{fffd}')
+                        }
+                        _ => return None,
+                    };
+                    *at += 1;
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                c if c < 0x20 => return None,
+                c => {
+                    out.push(c);
+                    *at += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Under `--index text`: the full-text index, recovered or rebuilt by `sparkles
+/// text-index`, finds each of a sample of the receipts by the words of its object, and
+/// nothing else.
+fn check_text(bin: &str, loc: &str, receipts: &[&Receipt], problems: &mut Vec<String>) {
+    // waits for a rebuild that open started, or retries a failed one
+    let (code, out, err) = sparkles(bin, &["text-index", "--loc", loc]);
+    if code != 0 {
+        problems.push(format!(
+            "text-index exited {code}: {}{}",
+            tail(&out),
+            tail(&err)
+        ));
+        return;
+    }
+    let picked = sample(receipts, 48);
+    if picked.is_empty() {
+        return;
+    }
+    let values: String = picked
+        .iter()
+        .map(|r| format!("\"\\\"{}\\\"\" ", r.object))
+        .collect();
+    let q = format!(
+        "PREFIX text: <http://jena.apache.org/text#> SELECT DISTINCT ?s WHERE {{ VALUES ?q {{ {values}}} ?s text:query ?q }}"
+    );
+    let (code, out, err) = sparkles(bin, &["query", "--loc", loc, "--results", "tsv", &q]);
+    if code != 0 {
+        problems.push(format!("text query exited {code}: {}", tail(&err)));
+        return;
+    }
+    let found = column(&out);
+    let wanted: std::collections::BTreeSet<String> =
+        picked.iter().map(|r| r.subject.clone()).collect();
+    if found != wanted {
+        let missing: Vec<_> = wanted.difference(&found).take(5).collect();
+        let extra: Vec<_> = found.difference(&wanted).take(5).collect();
+        problems.push(format!(
+            "full-text search found {} of {} sampled receipts, missing {missing:?}, extra {extra:?}",
+            found.intersection(&wanted).count(),
+            wanted.len()
+        ));
+    }
+}
+
+/// Under `--index geo`: the spatial index builds from the recovered store, and window
+/// queries answer what a scan of the points answers.
+fn check_geo(bin: &str, loc: &str, problems: &mut Vec<String>) {
+    let (code, out, err) = sparkles(bin, &["geo-index", "--loc", loc]);
+    if code != 0 {
+        problems.push(format!(
+            "geo-index exited {code}: {}{}",
+            tail(&out),
+            tail(&err)
+        ));
+        return;
+    }
+    let q = format!("SELECT ?s ?w WHERE {{ ?s <{AS_WKT}> ?w }}");
+    let (code, out, err) = sparkles(bin, &["query", "--loc", loc, "--results", "tsv", &q]);
+    if code != 0 {
+        problems.push(format!("point query exited {code}: {}", tail(&err)));
+        return;
+    }
+    let points: Vec<(String, f64, f64)> = out
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let (s, w) = l.split_once('\t')?;
+            let inner = w.split("POINT(").nth(1)?.split(')').next()?;
+            let mut xy = inner.split_whitespace().map(|v| v.parse::<f64>());
+            let (x, y) = (xy.next()?.ok()?, xy.next()?.ok()?);
+            Some((s.trim_matches(['<', '>']).to_string(), x, y))
+        })
+        .collect();
+    for &(x, y) in [(0.0, -75.0), (2.0, 0.0), (5.0, 40.0)].iter() {
+        let (x0, y0, x1, y1) = (x - 0.25, y - 0.25, x + 1.75, y + 10.25);
+        let poly = format!("POLYGON(({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))");
+        let q = format!(
+            "PREFIX geof: <http://www.opengis.net/def/function/geosparql/> SELECT ?s WHERE {{ ?s <{AS_WKT}> ?w FILTER(geof:sfWithin(?w, \"{poly}\"^^<{WKT}>)) }}"
+        );
+        let (code, out, err) = sparkles(bin, &["query", "--loc", loc, "--results", "tsv", &q]);
+        if code != 0 {
+            problems.push(format!("window query exited {code}: {}", tail(&err)));
+            return;
+        }
+        let found = column(&out);
+        let wanted: std::collections::BTreeSet<String> = points
+            .iter()
+            .filter(|(_, px, py)| *px > x0 && *px < x1 && *py > y0 && *py < y1)
+            .map(|(s, _, _)| s.clone())
+            .collect();
+        if found != wanted {
+            problems.push(format!(
+                "window {poly} found {} points, a scan {}",
+                found.len(),
+                wanted.len()
+            ));
+        }
+    }
+}
+
+/// Under `--index embed`: the embedding index opens on the recovered store, and the commit
+/// its vectors are applied to is at or below the recovered head.
+fn check_embed(bin: &str, loc: &str, head: u64, problems: &mut Vec<String>) {
+    let (code, out, err) = sparkles(bin, &["vector", "status", "--loc", loc, "--name", "docs"]);
+    if code != 0 {
+        problems.push(format!(
+            "vector status exited {code}: {}{}",
+            tail(&out),
+            tail(&err)
+        ));
+        return;
+    }
+    let applied = out
+        .split("\"appliedSeq\":")
+        .nth(1)
+        .and_then(|v| v.trim().split([',', '}', '\n']).next())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    match applied {
+        Some(seq) if seq > head => problems.push(format!(
+            "the embedding index is applied to {seq}, above the head {head}"
+        )),
+        Some(_) => {}
+        None => problems.push(format!(
+            "no appliedSeq in the vector status: {}",
+            tail(&out)
+        )),
+    }
+}
+
 /// The leftover warnings that `sparkles check` may still give after an open. Open removes
 /// unfinished builds above CURRENT, `text.new`, `text.old` and the store's own `.tmp`
 /// files and finishes interrupted removals. Two generation leftovers remain possible: an
@@ -476,8 +850,7 @@ fn only_leftovers(json: &str) -> bool {
             .rfind("\"status\": \"")
             .and_then(|j| json[j + 11..].split('"').next());
         let message = &json[i + 12..];
-        if status != Some("warning") || !ACCEPTED_LEFTOVERS.iter().any(|m| message.starts_with(m))
-        {
+        if status != Some("warning") || !ACCEPTED_LEFTOVERS.iter().any(|m| message.starts_with(m)) {
             return false;
         }
         any = true;
@@ -750,7 +1123,9 @@ mod tests {
     use super::only_leftovers;
 
     fn report(issues: &[(&str, &str)]) -> String {
-        let mut s = String::from("{\n  \"status\": \"warning\",\n  \"checks\": [\n    {\n      \"issues\": [\n");
+        let mut s = String::from(
+            "{\n  \"status\": \"warning\",\n  \"checks\": [\n    {\n      \"issues\": [\n",
+        );
         for (status, message) in issues {
             s.push_str(&format!(
                 "        {{\n          \"status\": \"{status}\",\n          \"message\": \"{message}\"\n        }},\n"
@@ -765,7 +1140,10 @@ mod tests {
         let old = "leftover: an old generation whose removal after a compaction was interrupted; safe to remove";
         let aside = "leftover: a generation above CURRENT that open set aside instead of removing; inspect it, then rename it back and point CURRENT at it, or delete it";
         assert!(only_leftovers(&report(&[("warning", old)])));
-        assert!(only_leftovers(&report(&[("warning", old), ("warning", aside)])));
+        assert!(only_leftovers(&report(&[
+            ("warning", old),
+            ("warning", aside)
+        ])));
         for other in [
             "leftover: newer than CURRENT, which the next open removes if it is an unfinished rebuild and sets aside otherwise",
             "leftover: a damaged commit catalog an earlier open set aside",
@@ -774,9 +1152,62 @@ mod tests {
             "leftover: left by an interrupted deletion; safe to remove",
             "a torn tail",
         ] {
-            assert!(!only_leftovers(&report(&[("warning", old), ("warning", other)])), "{other}");
+            assert!(
+                !only_leftovers(&report(&[("warning", old), ("warning", other)])),
+                "{other}"
+            );
         }
         assert!(!only_leftovers(&report(&[("error", old)])));
         assert!(!only_leftovers("{}"));
+    }
+
+    #[test]
+    fn the_full_text_checkpoint_names_the_seq_of_its_payload() {
+        let dir = std::env::temp_dir().join(format!("crash-harness-meta-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("text")).unwrap();
+        let loc = dir.to_str().unwrap();
+        assert_eq!(super::text_payload_seq(loc), None);
+        std::fs::write(
+            dir.join("text/meta.json"),
+            "{\n  \"segments\": [],\n  \"opstamp\": 41,\n  \"payload\": \"{\\\"format\\\":1,\\\"seq\\\":23,\\\"epoch\\\":2,\\\"config\\\":\\\"x\\\"}\"\n}",
+        )
+        .unwrap();
+        assert_eq!(super::text_payload_seq(loc), Some(23));
+        // a torn file, or one whose payload is not an object with a seq, names nothing
+        let whole = std::fs::read_to_string(dir.join("text/meta.json")).unwrap();
+        for cut in [10, whole.len() / 2, whole.len() - 1] {
+            std::fs::write(dir.join("text/meta.json"), &whole[..cut]).unwrap();
+            assert_eq!(super::text_payload_seq(loc), None, "cut at {cut}");
+        }
+        std::fs::write(dir.join("text/meta.json"), "{\"payload\": \"seq 23\"}").unwrap();
+        assert_eq!(super::text_payload_seq(loc), None);
+        std::fs::write(
+            dir.join("text/meta.json"),
+            "{\"payload\": null, \"seq\": 23}",
+        )
+        .unwrap();
+        assert_eq!(super::text_payload_seq(loc), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn json_parses_what_the_checkpoint_holds() {
+        use super::Json;
+        let v = Json::parse(r#" {"a": [1, -2.5e3, true, null], "b": "x\"\u00e9\n", "c": {}} "#)
+            .unwrap();
+        assert_eq!(v.get("b"), Some(&Json::Str("x\"\u{e9}\n".into())));
+        assert_eq!(
+            v.get("a"),
+            Some(&Json::Arr(vec![
+                Json::Num("1".into()),
+                Json::Num("-2.5e3".into()),
+                Json::Bool(true),
+                Json::Null
+            ]))
+        );
+        assert_eq!(v.get("c"), Some(&Json::Obj(Vec::new())));
+        for bad in ["", "{", "{\"a\" 1}", "[1,]", "{\"a\": 1} x", "\"\u{1}\""] {
+            assert_eq!(Json::parse(bad), None, "{bad:?}");
+        }
     }
 }

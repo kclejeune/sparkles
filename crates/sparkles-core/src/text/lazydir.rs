@@ -187,8 +187,12 @@ impl Directory for LazySyncDir {
         let mut tmp = tempfile::Builder::new().tempfile_in(&self.shared.root)?;
         tmp.write_all(data)?;
         tmp.flush()?;
-        tmp.into_temp_path().persist(target)?;
-        Ok(())
+        // `std::fs::rename` rather than `TempPath::persist`, which may rename by a raw
+        // system call: the power-loss tests record renames through libc
+        let tmp = tmp.into_temp_path().keep().map_err(|e| e.error)?;
+        std::fs::rename(&tmp, target).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 
     fn sync_directory(&self) -> io::Result<()> {

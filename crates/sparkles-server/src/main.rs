@@ -1083,6 +1083,12 @@ enum Cmd {
         /// Largest number of classes, and of predicates, a schema report may have
         #[arg(long, default_value_t = sparkles::schema::DEFAULT_MAX_ENTRIES)]
         schema_max_entries: usize,
+        /// Above this many quads, the schema reports of the MCP tools, `check_query` and
+        /// the asking pipeline count classes and predicates from the index statistics
+        /// instead of scanning the indexes; `off` always scans. `/{ds}/schema` always
+        /// scans
+        #[arg(long, value_name = "QUADS", default_value_t = state::StatisticsAbove::default())]
+        schema_statistics_above: state::StatisticsAbove,
         // the ceilings of GraphQL requests
         #[cfg(feature = "graphql")]
         #[command(flatten)]
@@ -2556,6 +2562,7 @@ fn run() -> Result<()> {
             no_geo_rewrite,
             map_style_url,
             schema_max_entries,
+            schema_statistics_above,
             #[cfg(feature = "graphql")]
             graphql,
             shex_imports,
@@ -2811,6 +2818,7 @@ fn run() -> Result<()> {
             }
             st.asks.history_days = ask_history_days;
             st.schema_max_entries = schema_max_entries;
+            st.schema_statistics_above = schema_statistics_above.0;
             #[cfg(feature = "shex")]
             {
                 st.shex_import_limits = shex_imports.limits()?;
@@ -4316,6 +4324,8 @@ fn run() -> Result<()> {
                 term_totals: void.is_some(),
                 graphs: None,
                 subject_classes,
+                // `sparkles schema` is asked for the report itself: it always scans
+                statistics_above: None,
             };
             if profiles {
                 return schema_profiles(&snap, sopts, class, &format);

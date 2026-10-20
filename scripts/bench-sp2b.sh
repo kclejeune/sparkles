@@ -23,7 +23,7 @@
 # Env: WARMUP (default 2), RUNS (default 10), COLD_RUNS (restarts per query for the cold
 # measurement, default 0), SKIP_LOAD=1, ANSWERS_ONLY=1, QUERIES="q1 q5a …",
 # ENGINES="sparkles jena qlever fluree oxigraph" (default; ENGINES="" only generates the
-# data and the queries), PORT_BASE (default 48300), SPARKLES (default target/release/sparkles),
+# data and the queries), PORT_BASE (default 28300), SPARKLES (default target/release/sparkles),
 # SP2B (a prefix holding bin/sp2b_gen and share/sp2b, instead of the nix build), SERVER_MEM_MAX,
 # CLIENT_CPU, FLUREE and FLUREE_VERSION as in scripts/bench.sh.
 set -euo pipefail
@@ -33,7 +33,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${2:-$ROOT/target/bench-sp2b}
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 ENGINES=${ENGINES-sparkles jena qlever fluree oxigraph}
-PORT_BASE=${PORT_BASE:-48300}
+PORT_BASE=${PORT_BASE:-28300}
 MAX_TIME=${MAX_TIME:-600}
 export MAX_TIME
 SUITE=sp2bench
@@ -61,7 +61,7 @@ if [ -z "${SP2B:-}" ]; then
   SP2B=$WORK/sp2b-gen
   if [ ! -x "$SP2B/bin/sp2b_gen" ]; then
     log "building the SP2Bench generator (scripts/bench-sp2b/sp2b.nix)"
-    pinned_build "$ROOT/scripts/bench-sp2b/sp2b.nix" "$SP2B"
+    flake_build sp2b-gen "$SP2B"
   fi
 fi
 

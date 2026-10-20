@@ -1038,7 +1038,13 @@ materialization's `run.peakBytes`, threads and a digest of the sorted derived tr
 A1 compares the head with a build of the commit before Phase 1 from two runs of
 `bench-lubm.sh 1000` with `ENGINES=""` and `INFER_PROFILES=rdfs`. Both scripts also time
 Jena's rule reasoners on the same data on request. X06's Outcome records the smoke runs.
-The measurements themselves are still open.
+On 2026-10-19 the LUBM(100) run of X06's harness on forge, with the release binary of
+commit 81478fbe and 20 threads, materialized the 13,876,262 triples of the UBA data. The
+`rdfs` profile took 11.4 s, peaked at 3,204 MiB of RSS with a peak heap estimate of
+1,224 MiB, and derived 5,527,675 triples. The `owl-rl` profile took 17.3 s, peaked at
+3,837 MiB with an estimate of 1,785 MiB, and derived 10,907,029 triples. BENCHMARKS.md
+compares the five engines' queries over that closure. Jena's reasoners were not run in this
+batch. A1 at 1,000 universities and OWL2Bench remain open.
 
 **Deviations.**
 * §3.5 expected the same cache limit to keep the closure of an input about four times
@@ -1153,6 +1159,53 @@ up to 17% on this instance, and a full run executes only a few added checks per 
 evaluation of this work, so two runs cannot tell a regression from noise. The difference is
 past the 5% that an AMD Namespace instance resolves, so it has to be measured again on an
 Intel host before item 87 closes.
+
+**Intel rerun of the 1-thread full run.** The rerun ran on atlas, an Intel Core i5-13500 with 20
+threads and 15 GiB, on 2026-10-18, with `lubm keep` on the same LUBM-style data with 100
+universities, for `5b2085bc` and for `23075691`, the tip of main with item 87. The two
+builds ran in turn on a fresh copy of the dataset, six times each, and the order of the two
+swapped from round to round. The runs at 1 thread were pinned to one performance core, and
+the runs at 16 threads were not pinned. Nothing else ran on the machine during the runs, and
+the whole process peaked at 3.74 GiB resident for OWL 2 RL and 2.88 GiB for RDFS. These are
+development A/B measurements, not published benchmarks. The table gives the range of the
+six runs and the median where the runs differ.
+
+| Run | `5b2085bc` | Item 87 |
+|---|---|---|
+| OWL 2 RL, full run, 1 thread | 42.1 to 43.7 s, median 42.2 | 42.1 to 43.5 s, median 42.4 |
+| OWL 2 RL, full run, 16 threads | 19.0 to 19.4 s, median 19.1 | 19.0 to 19.4 s, median 19.2 |
+| RDFS, full run, 1 thread | 26.3 to 26.4 s, median 26.3 | 26.3 to 26.7 s, median 26.5 |
+| RDFS, full run, 16 threads | 13.7 to 14.0 s, median 13.9 | 13.7 to 13.9 s, median 13.8 |
+| OWL 2 RL, change read back from the dataset, 1 thread | 3.09 to 3.16 s, median 3.11 | 3.02 to 3.20 s, median 3.08 |
+| OWL 2 RL, change read back from the dataset, 16 threads | 2.52 to 2.60 s, median 2.55 | 2.49 to 2.56 s, median 2.50 |
+| OWL 2 RL, first change, 1 thread | 167 to 173 ms, median 169 | 156 to 168 ms, median 158 |
+| OWL 2 RL, first change, 16 threads | 167 to 183 ms, median 173 | 101 to 150 ms, median 127 |
+| OWL 2 RL, undo, 1 thread | 133 to 147 ms, median 137 | 79 to 86 ms, median 79 |
+| OWL 2 RL, undo, 16 threads | 135 to 154 ms, median 141 | 53 to 64 ms, median 56 |
+| OWL 2 RL, change again, 1 thread | 93 to 96 ms, median 94 | 56 to 58 ms, median 56 |
+| OWL 2 RL, change again, 16 threads | 92 to 95 ms, median 94 | 44 to 76 ms, median 44 |
+| RDFS, first change, 1 thread | 101 to 103 ms, median 103 | 101 to 103 ms, median 102 |
+| RDFS, first change, 16 threads | 108 to 114 ms, median 111 | 40 to 50 ms, median 44 |
+| RDFS, undo, 1 thread | 33 ms | 19 to 20 ms, median 19 |
+| RDFS, undo, 16 threads | 32 to 33 ms | 14 to 23 ms, median 17 |
+| RDFS, change again, 1 thread | 51 to 54 ms, median 53 | 16 to 17 ms, median 17 |
+| RDFS, change again, 16 threads | 57 to 59 ms, median 58 | 12 to 17 ms, median 13 |
+| OWL 2 RL, kept closure | 1,226 MiB | 1,244 MiB |
+| RDFS, kept closure | 918 MiB | 927 MiB |
+
+The 1-thread gap does not hold on Intel. The OWL 2 RL full run at 1 thread took 0.4% more
+time by the medians, against 10% to 12% on Namespace, and the ranges of the two builds
+overlap almost completely. The other full runs differ by between minus 0.7% and plus 0.8%.
+The run on Namespace therefore most likely measured the noise of that instance, which differed by up
+to 17% between runs of one build, and not a cost of item 87. The runs that read the closure
+back from the dataset did not change either. Every small change except the first at 1 thread
+is faster than after the follow-up, by 1.4 to 4.5 times at 16 threads and by 1.7 to 3.1 times
+at 1 thread for the changes after the first. The first changes at 1 thread are as fast as
+after the follow-up for RDFS and 7% faster for OWL 2 RL. The runs
+did not include `a6179e58`, so they do not restate the goal of 1.2 times the time before
+the follow-up. The kept closure grew by 9 and 18 MiB, as it did on Namespace. Atlas is
+slower than the Namespace instance at 1 thread for these runs, and its 16-thread runs are
+slower too, since six of its 14 cores are performance cores that run two threads each.
 
 Two costs remain. The first change of a kept closure still decodes blocks that no answer
 covers, and a few of its lookups read long ranges in one thread, such as the members of a

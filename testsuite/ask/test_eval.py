@@ -13,6 +13,7 @@ from unittest import mock
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "eval_support"))
 from evaluator import (
+    POLICY_V1,
     Invalid,
     Unsupported,
     answer_set,
@@ -40,6 +41,10 @@ def literal(value, **kw):
 
 def result(rows, names=("x", "y")):
     return {"head": {"vars": list(names)}, "results": {"bindings": rows}}
+
+
+def iri(value):
+    return {"type": "uri", "value": value}
 
 
 class Scoring(unittest.TestCase):
@@ -72,6 +77,71 @@ class Scoring(unittest.TestCase):
         self.assertEqual(a, c)
         self.assertEqual(prf(a, c), (1, 1, 1))
         self.assertLess(prf(a, b)[2], 1)
+
+    def test_extra_answer_columns_are_projected(self):
+        gold = answer_set(result([{"p": iri("urn:a")}, {"p": iri("urn:b")}], ("p",)))
+        # The right people with a name and a city beside each.
+        wide = answer_set(
+            result(
+                [
+                    {"n": literal("A"), "p": iri("urn:a"), "c": iri("urn:berlin")},
+                    {"n": literal("B"), "p": iri("urn:b"), "c": iri("urn:berlin")},
+                ],
+                ("n", "p", "c"),
+            )
+        )
+        ok, scores, detail = score_sets(gold, wide)
+        self.assertTrue(ok)
+        self.assertEqual(scores, (1, 1, 1))
+        self.assertEqual((detail["mapping"], detail["extraColumns"]), ([1], 2))
+        # The first policy, kept to reproduce old reports, refuses any other width.
+        self.assertFalse(score_sets(gold, wide, policy=POLICY_V1)[0])
+        with self.assertRaises(Invalid):
+            score_sets(gold, wide, policy="no-such-policy")
+        # Two rows for one person still project to the one gold row.
+        twice = answer_set(
+            result(
+                [
+                    {"p": iri("urn:a"), "n": literal("A")},
+                    {"p": iri("urn:a"), "n": literal("Alias")},
+                    {"p": iri("urn:b"), "n": literal("B")},
+                ],
+                ("p", "n"),
+            )
+        )
+        self.assertTrue(score_sets(gold, twice)[0])
+        # A stray person in the projection costs precision, a missing one recall.
+        stray = answer_set(
+            result(
+                [
+                    {"p": iri("urn:a"), "n": literal("A")},
+                    {"p": iri("urn:b"), "n": literal("B")},
+                    {"p": iri("urn:c"), "n": literal("C")},
+                ],
+                ("p", "n"),
+            )
+        )
+        ok, scores, _ = score_sets(gold, stray)
+        self.assertFalse(ok)
+        self.assertEqual(scores[:2], (2 / 3, 1))
+        one = answer_set(result([{"p": iri("urn:a"), "n": literal("A")}], ("p", "n")))
+        self.assertEqual(score_sets(gold, one)[1][:2], (1, 0.5))
+        # Terms stay exact: a label in place of the IRI is not the answer.
+        label = answer_set(
+            result([{"n": literal("urn:a"), "m": literal("x")}], ("n", "m"))
+        )
+        self.assertFalse(score_sets(gold, label)[0])
+        # Two gold columns are matched to two distinct answer columns.
+        pair = answer_set(result([{"p": iri("urn:a"), "q": iri("urn:a")}], ("p", "q")))
+        pair_wide = answer_set(
+            result(
+                [{"x": literal("x"), "p": iri("urn:a"), "q": iri("urn:a")}],
+                ("x", "p", "q"),
+            )
+        )
+        self.assertTrue(score_sets(pair, pair_wide)[0])
+        narrow = answer_set(result([{"p": iri("urn:a")}], ("p",)))
+        self.assertEqual(score_sets(pair, narrow)[2]["status"], "missing_columns")
 
     def test_tuple_precision(self):
         a = answer_set(
@@ -784,9 +854,15 @@ class ProcessCensus(unittest.TestCase):
 
 class ExtraInvariants(unittest.TestCase):
     def test_empty_arity_is_not_a_match_and_nonfinite_exponents(self):
+        # An answer narrower than the gold never matches, even when both are empty.
+        self.assertEqual(
+            prf(answer_set(result([], ("x", "y"))), answer_set(result([], ("x",)))),
+            (0, 0, 0),
+        )
+        # A wider one is projected onto the gold's columns, so empty matches empty.
         self.assertEqual(
             prf(answer_set(result([], ("x",))), answer_set(result([], ("x", "y")))),
-            (0, 0, 0),
+            (1, 1, 1),
         )
         with self.assertRaises(Invalid):
             strict_json('{"number":1e9999}')
@@ -858,6 +934,12 @@ class FirstDraft(unittest.TestCase):
         self.assertEqual(
             runner.score(q, a)[2]["firstDraft"]["reason"], "complete_strict_comparison"
         )
+        # A question whose source scores row order is marked, since rows are sets here.
+        self.assertNotIn("orderNotScored", runner.score(q, answer("EMPTY"))[2])
+        ordered = dict(q, orderMatters=True)
+        self.assertIs(runner.score(ordered, answer("EMPTY"))[2]["orderNotScored"], True)
+        failed = dict(answer("EMPTY"), evalFailure="timeout")
+        self.assertIs(runner.score(ordered, failed)[2]["orderNotScored"], True)
         # A real malformed child result is unknown, never silently failed-first.
         b.write_text("#!" + PYTHON + '\nprint("{}")\n')
         probe = runner.first_draft(q, answer("WRONG"))
