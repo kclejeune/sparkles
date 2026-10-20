@@ -5,53 +5,78 @@
 # with Cargo and Gradle dependencies cached in GitHub Actions.
 name: JVM bindings
 
+# Pushes to main and pull requests run when the JVM bindings or a crate the native library
+# builds on changes. Tests, benches and examples of those crates do not change the library.
 on:
   push:
+    branches: [main]
     tags: ["jvm-v*"]
+    paths: &paths
+      - "crates/sparkles/**"
+      - "crates/sparkles-alloc/**"
+      - "crates/sparkles-backup/**"
+      - "crates/sparkles-core/**"
+      - "crates/sparkles-ffi/**"
+      - "crates/sparkles-fmt/**"
+      - "crates/sparkles-graphql/**"
+      - "crates/sparkles-reasoner/**"
+      - "crates/sparkles-shacl/**"
+      - "crates/sparkles-shex/**"
+      - "!crates/sparkles*/tests/**"
+      - "!crates/sparkles*/benches/**"
+      - "!crates/sparkles*/examples/**"
+      - "crates/sparkles-ffi/examples/**"
+      - "vendor/**"
+      - "jvm/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/jvm-native.sh"
+      - ".github/workflows/jvm-bindings.yml"
+      - ".github/actions/setup-rust/**"
   pull_request:
-    paths: ["crates/**", "vendor/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "jvm/**", "scripts/jvm-native.sh", ".github/workflows/jvm-bindings.yml"]
+    paths: *paths
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A newer push or pull request update supersedes a running build; a tag's run is never
+# cancelled.
 concurrency:
   group: jvm-bindings-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 env:
-  # Pull requests build the bindings in the dev profile, which compiles far faster than the
-  # release profile's thin LTO; tags and manual runs build what would be published.
-  JVM_PROFILE: ${{ github.event_name == 'pull_request' && 'dev' || 'release' }}
+  # Pushes to main and pull requests build the bindings in the dev profile, which compiles
+  # far faster than the release profile's thin LTO; tags and manual runs build what would
+  # be published.
+  JVM_PROFILE: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'dev' || 'release' }}
 
 jobs:
   natives:
     timeout-minutes: 45
-    # Pull requests build and test linux-x86_64 only. Tags and manual runs build every
-    # platform, which the release jars need.
+    # Pushes to main and pull requests build and test linux-x86_64 only. Tags and manual
+    # runs build every platform, which the release jars need.
     strategy:
       fail-fast: false
       matrix:
         platform: [linux-x86_64, linux-aarch64, macos-aarch64]
         exclude:
-          - platform: ${{ github.event_name == 'pull_request' && 'linux-aarch64' || 'none' }}
-          - platform: ${{ github.event_name == 'pull_request' && 'macos-aarch64' || 'none' }}
+          - platform: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'linux-aarch64' || 'none' }}
+          - platform: ${{ github.ref_type == 'branch' && github.event_name != 'workflow_dispatch' && 'macos-aarch64' || 'none' }}
     runs-on: ${{ matrix.platform == 'macos-aarch64' && 'macos-15' || matrix.platform == 'linux-aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v5
-      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
-      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with: { cache: false, rustflags: "" }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
+      # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
-        with: { cache-read-only: false }
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
         with:
-          key: ${{ env.JVM_PROFILE }}
+          cache-key: jvm-natives-${{ matrix.platform }}-${{ env.JVM_PROFILE }}
           workspaces: |
             . -> target
             crates/sparkles-ffi -> ../../target
@@ -83,23 +108,22 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # The all-platform jars and the Java and Jena version matrix: pull requests, tags and
+  # manual runs. A push to main stops after the natives job's tests.
   jars:
     timeout-minutes: 30
     needs: natives
+    if: github.event_name != 'push' || github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
-      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with: { cache: false, rustflags: "" }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
+      # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
-        with: { cache-read-only: false }
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
         with:
-          key: ${{ env.JVM_PROFILE }}
+          cache-key: jvm-bindgen
           workspaces: |
             . -> target
             crates/sparkles-ffi -> ../../target
@@ -129,17 +153,13 @@ jobs:
           - { java: "21", jena: "6.2.0" }
     steps:
       - uses: actions/checkout@v5
-      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
-      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with: { cache: false, rustflags: "" }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "${{ matrix.java }}" }
+      # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
-        with: { cache-read-only: false }
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
         with:
-          key: ${{ env.JVM_PROFILE }}
+          cache-key: jvm-bindgen
           workspaces: |
             . -> target
             crates/sparkles-ffi -> ../../target
@@ -159,17 +179,13 @@ jobs:
     environment: maven
     steps:
       - uses: actions/checkout@v5
-      # installs the toolchain, components and targets that rust-toolchain.toml pins; the
-      # cache action below caches Cargo, and no RUSTFLAGS are added, as in local builds
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with: { cache: false, rustflags: "" }
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: "17" }
+      # saves Gradle's caches from main only, by default
       - uses: gradle/actions/setup-gradle@v4
-        with: { cache-read-only: false }
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-rust
         with:
-          key: ${{ env.JVM_PROFILE }}
+          cache-key: jvm-bindgen
           workspaces: |
             . -> target
             crates/sparkles-ffi -> ../../target

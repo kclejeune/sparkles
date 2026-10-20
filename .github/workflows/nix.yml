@@ -1,0 +1,112 @@
+# The flake's packages, dependency layers, comparison engines, dev shell and checks
+# (`cacheable.<system>` in flake.nix), built with nix-fast-build and pushed to the binary
+# cache at https://cache.kclj.io, so that CI, development machines and benchmark hosts
+# download what another of them already built (docs/DEVELOPMENT.md, "Nix").
+#
+# Only pushes to main and manual runs push, and only when the repository has the
+# NIMBUS_ENDPOINT variable and the NIMBUS_AUTH_TOKEN secret. Pull requests, and runs
+# without them, build without pushing. `--skip-cached` skips whatever a substituter
+# already has, so a run builds only what changed since the last push.
+name: Nix
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: &ignore
+      - "docs/**"
+      - "README.md"
+      - "js/**/*.md"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/python-wheels.yml"
+      - ".github/workflows/node-packages.yml"
+      - ".github/workflows/jvm-bindings.yml"
+  pull_request:
+    paths-ignore: *ignore
+  workflow_dispatch:
+    inputs:
+      all-systems:
+        description: Also build Linux arm64 and macOS arm64
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.system }})
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJSON(inputs.all-systems && '["x86_64-linux", "aarch64-linux", "aarch64-darwin"]' || '["x86_64-linux"]') }}
+    # Sized to GitHub's runners: Linux has 4 vCPUs and 16 GB, macOS 3 vCPUs and 7 GB.
+    runs-on: ${{ matrix.system == 'aarch64-darwin' && 'macos-15' || matrix.system == 'aarch64-linux' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    env:
+      BUILD_JOBS: ${{ matrix.system == 'aarch64-darwin' && '1' || '2' }}
+      EVAL_MAX_MEMORY: ${{ matrix.system == 'aarch64-darwin' && '4096' || '8192' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # about 30 GB of preinstalled toolchains that the Nix builds do not use
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          determinate: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            accept-flake-config = true
+            max-substitution-jobs = 4
+            # Large downloads from cache.kclj.io sometimes arrive truncated on runners,
+            # and Nix does not retry a failed decompression, so it builds instead.
+            fallback = true
+            # Collect garbage during the build when space runs low, instead of failing.
+            min-free = 2147483648
+            max-free = 6442450944
+            extra-substituters = https://cache.kclj.io
+            extra-trusted-public-keys = cache.kclj.io-1:StGAmbogIZLS5IAQD2IQCbbmIjv3Sq8rl/AVEw4Sy7s=
+      - name: Decide whether to push
+        id: push
+        env:
+          NIMBUS_ENDPOINT: ${{ vars.NIMBUS_ENDPOINT }}
+          NIMBUS_AUTH_TOKEN: ${{ secrets.NIMBUS_AUTH_TOKEN }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            echo "pull request: building without pushing"
+            echo enabled=false >> "$GITHUB_OUTPUT"
+          elif [ -z "$NIMBUS_ENDPOINT" ] || [ -z "$NIMBUS_AUTH_TOKEN" ]; then
+            echo "::notice::NIMBUS_ENDPOINT or NIMBUS_AUTH_TOKEN is not set: building without pushing"
+            echo enabled=false >> "$GITHUB_OUTPUT"
+          else
+            echo enabled=true >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install nix-fast-build and nimbus
+        run: |
+          nix profile add --inputs-from . nixpkgs#nix-fast-build
+          if [ "${{ steps.push.outputs.enabled }}" = true ]; then
+            nix profile add github:kclejeune/nimbus/048eedac026c60ce7df58b9c5e2b130accbac4b7#nimbus
+          fi
+      - name: Build, and push when enabled
+        env:
+          NIMBUS_ENDPOINT: ${{ vars.NIMBUS_ENDPOINT }}
+          NIMBUS_AUTH_TOKEN: ${{ secrets.NIMBUS_AUTH_TOKEN }}
+        run: |
+          build=(nix-fast-build --flake ".#cacheable.${{ matrix.system }}" --no-nom --skip-cached
+            --eval-workers 1 --eval-max-memory-size "$EVAL_MAX_MEMORY" -j "$BUILD_JOBS")
+          if [ "${{ steps.push.outputs.enabled }}" = true ]; then
+            nimbus watch-exec kclejeune "${build[@]}"
+          else
+            "${build[@]}"
+          fi

@@ -183,6 +183,10 @@ public object QueryEngineSparkles {
  * character and grows from 16 characters, and that took about a third of the time of
  * writing a small query.
  */
+// Jena 6 deprecates the IndentedWriter(Writer, Boolean) constructor, which this class needs
+// to write to its own Writer. The library builds against Jena 5 and 6 with warnings as
+// errors, so the warning is suppressed here rather than the constructor replaced.
+@Suppress("DEPRECATION")
 private class TextBuffer private constructor(private val sink: BuilderWriter) : IndentedWriter(sink, false) {
     constructor() : this(BuilderWriter())
 

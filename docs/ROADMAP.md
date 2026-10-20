@@ -141,6 +141,7 @@ These items are smaller or narrower. Each has a design sketch in the linked spec
 
 | # | Item | Spec | Size |
 |---|---|---|---|
+| 92 | Per-crate Nix builds. Compare the working crate2nix prototype with Crane under matched build settings, measure which crates rebuild after source changes, and validate packaging and platform coverage before deciding whether to migrate. | [X13](specs/X13-per-crate-nix-builds.md) | S–M |
 | 45 | Branches: a remote branch-relink CLI, and clones and archive transfer between servers | [F09](specs/F09-branches-and-merges.md#roadmap-follow-ups-2026-10-12) | M |
 | 46 | Notifications: an email channel, an administration UI, broader backup-failure coverage, and delivery that doesn't let a slow channel delay the others | [C21](specs/C21-outbound-notifications.md#roadmap-follow-ups-2026-10-12) | M |
 | 47 | Rust client: typed bodies for the remaining administration calls, proactive rate-limit pacing, and credential integration tests | [P02](specs/P02-rust-client.md#roadmap-follow-ups-2026-10-12) | S–M |

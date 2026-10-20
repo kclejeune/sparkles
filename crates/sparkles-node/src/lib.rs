@@ -918,6 +918,7 @@ fn pull(
     cursor: &Mutex<Option<Cursor>>,
     statistics: &Mutex<Option<String>>,
     cancel: &Option<Arc<AtomicBool>>,
+    close_requested: &AtomicBool,
     max_rows: u32,
     max_bytes: u32,
 ) -> sparkles::Result<Option<WireBatch>> {
@@ -977,7 +978,12 @@ fn pull(
                 {
                     state.batch = None;
                     state.row = 0;
-                    state.batch = state.cursor.next_batch()?;
+                    state.batch = cursor_batch(
+                        state.cursor.next_batch(),
+                        &mut state.closed_by_cancel,
+                        close_requested,
+                        cancel,
+                    )?;
                 }
                 match &state.batch {
                     None => None,
@@ -996,7 +1002,12 @@ fn pull(
                 if state.batch.as_ref().is_none_or(|b| state.row == b.len()) {
                     state.batch = None;
                     state.row = 0;
-                    state.batch = state.cursor.next_batch()?;
+                    state.batch = cursor_batch(
+                        state.cursor.next_batch(),
+                        &mut state.closed_by_cancel,
+                        close_requested,
+                        cancel,
+                    )?;
                 }
                 state.batch.as_ref().map(|batch| {
                     let row = quad_cells(batch.quads()[state.row].clone());
@@ -1056,14 +1067,37 @@ fn pull(
     Ok(Some(batch))
 }
 
+// Only a typed cancellation observed during an explicit close is a clean stop. A
+// failure already recorded by an earlier pull must remain a failure after close.
+fn cursor_batch<T>(
+    result: sparkles::Result<T>,
+    closed_by_cancel: &mut bool,
+    close_requested: &AtomicBool,
+    cancel: &Option<Arc<AtomicBool>>,
+) -> sparkles::Result<T> {
+    if matches!(&result, Err(EngineError::Cancelled))
+        // Acquire the close request published before close sets the shared token.
+        && cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
+        && close_requested.load(Ordering::Acquire)
+    {
+        *closed_by_cancel = true;
+    }
+    result
+}
+
 struct SelectCursor {
     cursor: sparkles::sparql::QueryCursor,
     batch: Option<sparkles::sparql::QueryBatch>,
     row: usize,
+    closed_by_cancel: bool,
 }
 impl SelectCursor {
     fn stats_json(&self, sent: usize, closing: bool) -> sparkles::Result<String> {
         let mut stats = self.cursor.stats();
+        if self.closed_by_cancel && stats.status == sparkles::sparql::CursorStatus::Failed {
+            stats.status = sparkles::sparql::CursorStatus::Stopped;
+            stats.error = None;
+        }
         if self
             .batch
             .as_ref()
@@ -1087,10 +1121,15 @@ struct GraphStream {
     cursor: sparkles::sparql::GraphCursor,
     batch: Option<sparkles::sparql::GraphBatch>,
     row: usize,
+    closed_by_cancel: bool,
 }
 impl GraphStream {
     fn stats_json(&self, sent: usize, closing: bool) -> sparkles::Result<String> {
         let mut stats = self.cursor.stats();
+        if self.closed_by_cancel && stats.status == sparkles::sparql::CursorStatus::Failed {
+            stats.status = sparkles::sparql::CursorStatus::Stopped;
+            stats.error = None;
+        }
         if self.batch.as_ref().is_some_and(|b| self.row < b.len())
             && stats.status == sparkles::sparql::CursorStatus::Complete
         {
@@ -1130,6 +1169,7 @@ pub struct NativeResult {
     metadata: String,
     statistics: Arc<Mutex<Option<String>>>,
     cancel: Option<Arc<AtomicBool>>,
+    close_requested: Arc<AtomicBool>,
     /// the first batch, computed in the call that made the result (see `with_first`)
     first: Mutex<Option<WireBatch>>,
 }
@@ -1160,6 +1200,7 @@ impl NativeResult {
             metadata,
             statistics: Default::default(),
             cancel: None,
+            close_requested: Default::default(),
             first: Mutex::new(None),
         }
     }
@@ -1209,11 +1250,13 @@ impl NativeResult {
                 cursor: *cursor,
                 batch: None,
                 row: 0,
+                closed_by_cancel: false,
             })),
             QueryExecution::Graph(cursor) => Rows::Graph(Box::new(GraphStream {
                 cursor: *cursor,
                 batch: None,
                 row: 0,
+                closed_by_cancel: false,
             })),
             QueryExecution::Ask(result) => Rows::Ask(result),
         };
@@ -1227,6 +1270,7 @@ impl NativeResult {
             metadata,
             statistics: Default::default(),
             cancel: Some(cancel),
+            close_requested: Default::default(),
             first: Mutex::new(None),
         })
     }
@@ -1238,7 +1282,14 @@ impl NativeResult {
         if let Some((rows, bytes)) = first {
             // A drained result still sends an empty batch that says so, so that
             // JavaScript does not ask the pool for a batch that cannot come.
-            let batch = pull(&self.cursor, &self.statistics, &self.cancel, rows, bytes)?;
+            let batch = pull(
+                &self.cursor,
+                &self.statistics,
+                &self.cancel,
+                &self.close_requested,
+                rows,
+                bytes,
+            )?;
             *self.first.lock() =
                 Some(batch.unwrap_or_else(|| TermTable::new(0).finish(Vec::new(), 0, 0, true)));
         }
@@ -1254,6 +1305,7 @@ impl NativeResult {
             metadata: r#"{"type":"quads"}"#.into(),
             statistics: Default::default(),
             cancel: None,
+            close_requested: Default::default(),
             first: Mutex::new(None),
         }
     }
@@ -1273,8 +1325,9 @@ impl NativeResult {
     }
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
+        self.close_requested.store(true, Ordering::Release);
         if let Some(cancel) = &self.cancel {
-            cancel.store(true, Ordering::Relaxed);
+            cancel.store(true, Ordering::Release);
         }
         let cursor = self.cursor.clone();
         let statistics = self.statistics.clone();
@@ -1328,13 +1381,24 @@ impl NativeResult {
         let cursor = self.cursor.clone();
         let statistics = self.statistics.clone();
         let cancel = self.cancel.clone();
+        let close_requested = self.close_requested.clone();
         // A streaming cursor computes its batch under a reader permit, which it gives back
         // when the batch is done. Waiting for the permit stops when the cursor is closed.
         let _permit = match &cancel {
             Some(flag) => Some(query_permit(&Value::Null, flag).await?),
             None => None,
         };
-        blocking(move || pull(&cursor, &statistics, &cancel, max_rows, max_bytes)).await
+        blocking(move || {
+            pull(
+                &cursor,
+                &statistics,
+                &cancel,
+                &close_requested,
+                max_rows,
+                max_bytes,
+            )
+        })
+        .await
     }
 }
 

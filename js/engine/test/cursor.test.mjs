@@ -76,6 +76,53 @@ test(
   },
 );
 
+test('closing SELECT and graph prefetch reports a clean stop', { timeout: 30000 }, async () => {
+  const ds = Dataset.memory();
+  try {
+    for (const [kind, query] of [
+      ['select', 'SELECT ?x { VALUES ?x { 1 2 3 } }'],
+      ['construct', 'CONSTRUCT { <urn:s> <urn:p> ?x } WHERE { VALUES ?x { 1 2 3 } }'],
+    ]) {
+      // A one-row batch starts prefetch as soon as next() returns. Repeated closes
+      // exercise both orders of the prefetch and native close tasks.
+      for (let i = 0; i < 64; i++) {
+        const result = await ds[kind](query, { execution: 'streaming', batchSize: 1 });
+        assert.equal((await result.next()).done, false);
+        await result.return();
+        const { stats } = await result.stats();
+        assert.equal(stats.status, 'stopped', `${kind} close ${i}`);
+        assert.equal(stats.error, null);
+      }
+    }
+  } finally {
+    await ds.close();
+  }
+});
+
+test('closing a failed prefetch preserves the query error', { timeout: 30000 }, async () => {
+  const ds = Dataset.memory();
+  try {
+    for (const [kind, query] of [
+      ['select', 'SELECT ?x { VALUES ?x { 1 2 3 } }'],
+      ['construct', 'CONSTRUCT { <urn:s> <urn:p> ?x } WHERE { VALUES ?x { 1 2 3 } }'],
+    ]) {
+      const result = await ds[kind](query, {
+        execution: 'streaming',
+        batchSize: 1,
+        maxRowsProduced: kind === 'construct' ? 4 : 2,
+      });
+      assert.equal((await result.next()).done, false);
+      await assert.rejects(result.next(), (error) => error.name === 'BudgetExceededError');
+      await result.close();
+      const { stats } = await result.stats();
+      assert.equal(stats.status, 'failed');
+      assert.ok(stats.error);
+    }
+  } finally {
+    await ds.close();
+  }
+});
+
 test(
   'graph and ASK cursors preserve query forms and byte streaming',
   { timeout: 30000 },

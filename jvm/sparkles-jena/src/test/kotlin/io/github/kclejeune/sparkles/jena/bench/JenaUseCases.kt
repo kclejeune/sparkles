@@ -3,6 +3,7 @@ package io.github.kclejeune.sparkles.jena.bench
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import io.github.kclejeune.sparkles.jena.DatasetGraphSparkles
+import io.github.kclejeune.sparkles.jena.LegacyInitialBinding
 import io.github.kclejeune.sparkles.jena.Sparkles
 import io.github.kclejeune.sparkles.jena.SparklesDatasets
 import org.apache.jena.fuseki.main.FusekiServer
@@ -380,8 +381,10 @@ internal object JenaUseCases {
                 }
             }
             "sparql-initial-binding" -> read {
-                @Suppress("DEPRECATION")
-                val b = QueryExecDatasetBuilder.create().dataset(dsg).query(prepared).initialBinding(BindingFactory.binding(sVar, person(i).asNode()))
+                val b = LegacyInitialBinding.apply(
+                    QueryExecDatasetBuilder.create().dataset(dsg).query(prepared),
+                    BindingFactory.binding(sVar, person(i).asNode()),
+                )
                 if (sparkles) b.context(noCache)
                 b.build().use { qe ->
                     val rs = qe.select()
@@ -587,6 +590,7 @@ internal object JenaUseCases {
         var env: Env? = null
         var dsg: DatasetGraph? = null
         try {
+            if (cfg.mode != "load" && "sparql-initial-binding" in cfg.cases) LegacyInitialBinding.requireSupported()
             val t = System.nanoTime()
             if (cfg.mode == "load") {
                 val d = load(cfg)

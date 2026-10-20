@@ -18,6 +18,10 @@ let
 in
 engines
 // {
+  # The data generators of the WatDiv and SP2Bench runners, built from checksum-pinned
+  # releases (scripts/bench-watdiv.sh, scripts/bench-sp2b.sh).
+  watdiv-gen = import ../scripts/bench-watdiv/watdiv.nix { inherit pkgs; };
+  sp2b-gen = import ../scripts/bench-sp2b/sp2b.nix { inherit pkgs; };
   benchmark-engines = pkgs.buildEnv {
     name = "sparkles-benchmark-engines";
     paths = builtins.attrValues engines;

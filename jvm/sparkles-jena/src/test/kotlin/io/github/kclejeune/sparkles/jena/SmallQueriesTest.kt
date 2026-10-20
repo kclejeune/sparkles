@@ -16,6 +16,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import java.io.ByteArrayInputStream
 
@@ -176,13 +177,15 @@ class SmallQueriesTest {
 
     @Test
     fun an_initial_binding_bounds_the_subject() {
+        assumeTrue(LegacyInitialBinding.supported, "Jena 6 removed the initialBinding API")
         val dsg = data()
         val q = QueryFactory.create(prefixes + "SELECT ?n ?a { ?s :name ?n ; :age ?a }")
         val before = dsg.stats().smallQueries
         val rows = Txn.calculateRead(dsg) {
-            @Suppress("DEPRECATION")
-            QueryExecDatasetBuilder.create().dataset(dsg).query(q)
-                .initialBinding(BindingFactory.binding(Var.alloc("s"), NodeFactory.createURI("http://example/p4")))
+            LegacyInitialBinding.apply(
+                QueryExecDatasetBuilder.create().dataset(dsg).query(q),
+                BindingFactory.binding(Var.alloc("s"), NodeFactory.createURI("http://example/p4")),
+            )
                 .select().materialize().let { rs -> buildList { while (rs.hasNext()) add(rs.next().get("n").literalLexicalForm) } }
         }
         assertEquals(listOf("Person 4"), rows)

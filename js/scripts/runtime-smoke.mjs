@@ -33,7 +33,7 @@ assert.equal(
   '2026-01-01T01:00:00+00:00',
 );
 const cat = Catalog.memory();
-const claim = cat.reserve('runtime', 'clone', 'smoke');
+const claim = await cat.reserve('runtime', 'clone', 'smoke');
 claim.close();
 await cat.create('runtime', { kind: 'mem' });
 await cat.close();

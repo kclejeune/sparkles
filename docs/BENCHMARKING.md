@@ -15,6 +15,17 @@ nix build .#benchmark-engines
 nix build .#qlever .#fluree
 ```
 
+The Nix workflow builds these packages, the WatDiv and SP2Bench generators
+(`watdiv-gen` and `sp2b-gen`) and the nixpkgs tools that the runners use, which
+`nix/benchmark-tools.nix` lists, and pushes them to the binary cache at
+`https://cache.kclj.io`. A host that trusts the cache downloads them instead of building
+them. The flake's `nixConfig` names the cache, which Nix uses after asking or with
+`accept-flake-config = true`. Hosts that run benchmarks unattended should list it in their
+own `nix.conf` as an extra substituter with the key
+`cache.kclj.io-1:StGAmbogIZLS5IAQD2IQCbbmIjv3Sq8rl/AVEw4Sy7s=`. The cache holds
+Fluree's release binaries unmodified as well. A test in `scripts/bench-tests` fails when a
+runner resolves a package that is not in the cached set.
+
 Jena, Fuseki, QLever and Oxigraph reuse the definitions from the nixpkgs revision in
 `flake.lock`. The current versions are Jena 6.2.0, Fuseki 5.1.0, QLever 0.5.48 and
 Oxigraph 0.5.11. Fluree 4.2.2 uses the published release archives with SHA-256 hashes
@@ -40,6 +51,11 @@ and rdflib dependencies are pinned with hashes in
 The JVM comparisons use the Jena version in `jvm/gradle/libs.versions.toml` and Gradle's
 dependency locks and verification metadata. These are separate from the HTTP engine
 packages because they measure libraries through each language's API.
+
+The JVM driver's `sparql-initial-binding` case requires Jena 5. It calls the legacy
+builder method through cached reflection so the driver also compiles with Jena 6,
+which removed that API. Timings include the reflective invocation. Asking for this
+case with Jena 6 fails before loading the dataset.
 
 The QLever build failure of 2026-10-19 came from runners resolving the host's nixpkgs
 registry instead of the repository's lock. Forge's registry selected GCC 16.2.0, which

@@ -103,15 +103,9 @@ if [ -z "${WATDIV:-}" ]; then
   WATDIV=$WORK/watdiv-gen
   if [ ! -x "$WATDIV/bin/watdiv" ]; then
     log "building the WatDiv generator (scripts/bench-watdiv/watdiv.nix)"
-    # nixpkgs at the revision locked in flake.lock, so the compiler and Boost are pinned too
-    nix build --impure --out-link "$WATDIV" --expr "
-      let
-        n = (builtins.fromJSON (builtins.readFile $ROOT/flake.lock)).nodes.nixpkgs.locked;
-        pkgs = import (builtins.fetchTarball {
-          url = \"https://github.com/\${n.owner}/\${n.repo}/archive/\${n.rev}.tar.gz\";
-          sha256 = n.narHash;
-        }) { };
-      in import $ROOT/scripts/bench-watdiv/watdiv.nix { inherit pkgs; }"
+    # the flake's watdiv-gen (nix/benchmarks.nix), on the nixpkgs revision locked in
+    # flake.lock, so the compiler and Boost are pinned too
+    nix build --no-update-lock-file --out-link "$WATDIV" "$ROOT#watdiv-gen"
   fi
 fi
 MODEL=$WATDIV/share/watdiv/model/wsdbm-data-model.txt
