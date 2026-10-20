@@ -11,7 +11,7 @@ check every engine's answers before timing them, and list every case where Spark
 | OS and kernel | NixOS, Linux 6.18 |
 | Sparkles | 0.1.0, release builds with default features, rustc 1.98 and 1.99 |
 | Other engines | QLever 0.5.48, Fluree 4.2.2 (the release binary), Oxigraph 0.5.11 (server, pyoxigraph and the JavaScript package), Apache Jena TDB2 6.2.0 with Fuseki 5.1.0, Jena 5.6.0 (TDB2 and TIM in the JVM comparison), rdflib 7.6.0, N3.js 2.13.11 with Comunica 5.4.1 |
-| Measured | 2026-10-03 to 2026-10-09, and 2026-10-18 to 2026-10-19 for the refreshed sections named below. The QLever figures for the DBpedia `geo-box` and `country-population` queries come from an earlier run on the same host. |
+| Measured | 2026-10-03 to 2026-10-09, and 2026-10-18 to 2026-10-20 for the refreshed sections named below. The QLever figures for the DBpedia `geo-box` and `country-population` queries come from an earlier run on the same host. |
 
 The synthetic suite in all modes was measured again, and SP²Bench at 10M triples and
 LUBM(100) for the first time, on `forge` from 2026-10-18 to 2026-10-19, as the first batch
@@ -21,18 +21,18 @@ release binary of commit 81478fbe. The harness was that of commit 81478fbe for t
 runs and of commit 77032452 for the others. The summary, the synthetic tables, the cold,
 churn, mixed-load, updates, load and memory figures of the synthetic suite, and the
 [SP²Bench](#sp2bench-at-10m-triples) and [LUBM](#lubm100) sections come from these runs.
-Other sections keep their earlier measurements. Full-text search and BSBM Explore
-completed reruns on 2026-10-19, and publication of their refreshed figures remains
-open. WatDiv's last query was interrupted when QLever crashed, and its partial
+The full-text queries at 1.05M were measured again on 2026-10-20, each engine alone
+with the indexes built on 2026-10-19. The BSBM Explore comparison at 10M is from
+2026-10-19. Their sections link to the result records. Other sections keep their
+earlier measurements. WatDiv's last query was interrupted when QLever crashed, and its partial
 hyperfine output was included as an extra query in the generated record. That
 record is incomplete and does not replace the published figures. The DBpedia slice of 50M triples remains incomplete after a QLever
 restart left cache preparation pointing at its old port. BSBM BI reached its
 query-mix phase but exhausted the eight-hour batch limit while the Jena driver
 continued after repeated request timeouts. The harness now resolves cache preparation
 after restarts, times DBpedia engines alone under the configured memory limit,
-ignores unfinished timing files, and bounds each BSBM driver run. WatDiv and these
-two workloads need another run,
-and the later batches of the refresh have not started.
+ignores unfinished timing files, and bounds each BSBM driver run. WatDiv, DBpedia and BI are being
+rerun with the corrected harness. The later batches of the refresh have not started.
 
 * [Summary](#summary)
 * [Query performance](#query-performance)
@@ -79,6 +79,8 @@ On larger and standard workloads:
 * **SP²Bench at 10M triples.** Sparkles answers 13 of 17 queries and is fastest on 11. Its
   default query memory budget refuses `q4`, `q5a`, `q6` and `q12a`, and Jena is 181× faster
   on `q8` and Oxigraph about 5,000× on `q12b`.
+* **BSBM Explore at 10M triples.** Sparkles has the lowest pooled median on eight of
+  eleven templates. Fluree is 2.9× faster on q5, and Oxigraph is faster on q7 and q8.
 * **Durable writes.** A commit that adds a new literal takes a median of 1.13 ms at 1.05M
   and 1.28 ms at 10.5M, synchronized to disk before it is acknowledged. Oxigraph commits
   faster without synchronizing in that harness. In the suite's churn of 5,000 commits,
@@ -612,6 +614,55 @@ source. Vocabulary profiling also observes mapped offsets before loading them an
 accounts for ordinary and fallible bulk decodes independently of advice. These
 correctness tests establish no new speed result or counter-cost measurement.
 
+### BSBM Explore at 10M triples
+
+This run used 10,095,035 generated triples and 28,480 products on forge on
+2026-10-19, with the release binary of 81478fbe. Each engine ran alone under a
+12 GiB limit. The configured driver mix produced three instances of each of eleven
+query templates. Each latency below is the pooled median of thirty HTTP samples,
+after two warm-up requests per instance. DESCRIBE answers are not compared because
+SPARQL leaves their contents to the engine. A dagger marks a wrong answer, whose
+latency is not ranked. The [Explore record](benchmarks/2026-10-19-bsbm-10m-explore-forge.json)
+contains every result, fingerprint and driver status. Its original manifest did not
+capture the harness commit. The batch launcher names 5e9e0924, and all 142 script
+files in the preserved archive matched that revision when checked on 2026-10-20.
+
+| Template, median ms | Sparkles | Jena | QLever | Fluree | Oxigraph |
+|---|---:|---:|---:|---:|---:|
+| q1 | **3.76** | 8.00 | 9.63 | 4.71 | 4.60 |
+| q2 | **3.80** | 9.31 | 14.91 | 4.41 | 4.67 |
+| q3 | **3.94** | 8.22 | 12.64 | 4.53 | 4.79 |
+| q4 | **4.06** | 8.23 | 25.43 | 5.25 | 5.65 |
+| q5 | 16.25 | 629.44 | 20.93 | **5.58** | 42.65 |
+| q7 | 5.25 | 7.23 | 90.64 | 5.07 | **4.51** |
+| q8 | 5.92 | 7.26 | 50.76 | 4.29 † | **4.13** |
+| q9 | **3.52** | 6.61 | 6.24 | 3.61 | 3.67 |
+| q10 | **4.01** | 6.98 | 139.03 | 5.55 | 4.35 |
+| q11 | **3.46** | 6.63 | 6.13 | 3.56 † | 3.54 |
+| q12 | **3.56** | 7.18 | 11.96 † | 3.96 † | 3.90 |
+
+Fluree returned different answers for q8, q11 and q12. QLever differed on q12.
+Fluree was fastest on q5 among engines with correct answers, at 5.58 ms against
+Sparkles' 16.25 ms. Oxigraph was fastest on q7 and q8.
+
+The driver ran fifty warm-up mixes and five hundred measured mixes with each
+client count. The standard mix includes DESCRIBE and CONSTRUCT, which the driver
+requests as RDF/XML. QLever refuses that format. The SELECT-only mix omits those
+queries and is reported separately. An error means the driver failed or its result
+counts failed the comparison. Fluree's throughput is marked with a dagger because its per-template answers
+disagree. Its throughput is not ranked against engines whose answers agree.
+
+| Mix | Clients | Sparkles | Jena | QLever | Fluree | Oxigraph |
+|---|---:|---:|---:|---:|---:|---:|
+| Standard QMpH | 1 | 44,964 | 2,047 | error | 95,969 † | 15,622 |
+| Standard QMpH | 4 | 167,172 | 3,173 | error | 304,636 † | error |
+| Standard QMpH | 16 | 204,780 | 2,012 | error | 579,271 † | error |
+| SELECT-only QMpH | 1 | 38,212 | 2,105 | error | 103,489 † | error |
+| SELECT-only QMpH | 4 | 171,934 | 3,237 | error | 329,816 † | 74,102 |
+| SELECT-only QMpH | 16 | 206,847 | error | error | 662,847 † | error |
+
+The BI comparison and the 100M scale remain incomplete in this refresh.
+
 ### Full-text search
 
 The comparison uses Sparkles' Tantivy-backed `text:query`, Fuseki's Lucene-backed
@@ -620,17 +671,22 @@ jena-text and QLever's `ql:contains-word`. Sparkles and Jena index `foaf:name`,
 and joins on predicates, searches the indexed form for the stemmed case, and does not
 highlight. Hit sets and counts agree, while scores and the order of tied hits are not
 compared. Times are TSV HTTP means ± standard deviation in ms, over ten runs at 1.05M and
-five at 10.5M.
+five at 10.5M. The 1.05M queries were refreshed on 2026-10-20 with the release binary
+of 81478fbe and the harness of aa53c0e6, a 12 GiB server limit and clients pinned to
+CPU 11. The [full-text record](benchmarks/2026-10-20-text-1.05m-forge.json) includes
+the samples, answer fingerprints and reused index-build measurements. The 10.5M
+figures are retained from the earlier run and have not been reverified under this
+isolated setup.
 
 | query | sparkles 1.05M | jena-fuseki 1.05M | qlever 1.05M | sparkles 10.5M | jena-fuseki 10.5M | qlever 10.5M |
 |---|---:|---:|---:|---:|---:|---:|
-| rare-top10 | **4.0 ± 0.2** | 12.7 ± 1.5 | 6.7 ± 0.4 | **5.8 ± 0.4** | 15.0 ± 1.9 | 7.8 ± 0.5 |
-| common-top10 | **4.2 ± 0.2** | 11.7 ± 1.5 | 7.8 ± 0.6 | **8.1 ± 0.3** | 14.9 ± 2.8 | 17.5 ± 2.7 |
-| common-count | **4.7 ± 0.2** | 53.9 ± 3.4 | 7.2 ± 0.7 | 14.8 ± 0.6 | 406.9 ± 4.3 | **13.5 ± 1.1** |
-| text-join | **5.4 ± 0.2** | 66.0 ± 1.5 | 11.3 ± 0.8 | **21.4 ± 0.6** | 585.4 ± 5.1 | 46.6 ± 7.6 |
-| conjunction | **4.2 ± 0.1** | 15.0 ± 1.5 | 7.0 ± 0.3 | **8.2 ± 0.2** | 80.7 ± 0.8 | 14.3 ± 1.0 |
-| highlight | **11.4 ± 0.2** | 101.8 ± 8.7 | 13.7 ± 1.3 | **70.6 ± 0.5** | 841.8 ± 46.2 | 94.8 ± 6.5 |
-| stemmed | **4.0 ± 0.2** | 12.2 ± 0.6 | 5.9 ± 0.3 | **5.4 ± 0.3** | 53.5 ± 0.9 | 18.6 ± 2.6 |
+| rare-top10 | **3.9 ± 0.1** | 13.1 ± 1.0 | 6.8 ± 0.4 | **5.8 ± 0.4** | 15.0 ± 1.9 | 7.8 ± 0.5 |
+| common-top10 | **4.2 ± 0.1** | 11.1 ± 1.2 | 7.4 ± 0.6 | **8.1 ± 0.3** | 14.9 ± 2.8 | 17.5 ± 2.7 |
+| common-count | **4.7 ± 0.2** | 54.7 ± 3.2 | 7.2 ± 0.5 | 14.8 ± 0.6 | 406.9 ± 4.3 | **13.5 ± 1.1** |
+| text-join | **5.5 ± 0.2** | 70.7 ± 5.2 | 11.9 ± 1.2 | **21.4 ± 0.6** | 585.4 ± 5.1 | 46.6 ± 7.6 |
+| conjunction | **4.2 ± 0.1** | 15.0 ± 1.8 | 7.2 ± 0.3 | **8.2 ± 0.2** | 80.7 ± 0.8 | 14.3 ± 1.0 |
+| highlight | **11.4 ± 0.2** | 103.7 ± 10.1 | 15.0 ± 1.9 | **70.6 ± 0.5** | 841.8 ± 46.2 | 94.8 ± 6.5 |
+| stemmed | **3.9 ± 0.1** | 11.1 ± 1.3 | 6.2 ± 0.3 | **5.4 ± 0.3** | 53.5 ± 0.9 | 18.6 ± 2.6 |
 
 QLever's lead on `common-count` at 10.5M, which counts 49,837 hits, is within 10%. The
 highlight form returns plain literals in QLever and marked words in Sparkles and Jena.
@@ -1072,7 +1128,7 @@ Decompression runs as one stream in front of the parallel parser and adds 0.1–
 
 | Build | Time | Result |
 |---|---:|---|
-| Full-text index, 1.05M triples | **0.41 s** (Fuseki 4.37, QLever 1.86) | 13.1 MB (QLever **11.1**, Fuseki 24.9) |
+| Full-text index, 1.05M triples | **0.39 s** (Fuseki 4.53, QLever 1.88) | 13.2 MB (QLever **11.1**, Fuseki 24.9) |
 | Full-text index, 10.5M triples | **6.48 s** (Fuseki 25.98, QLever 19.35) | 122.5 MB (QLever **99.9**, Fuseki 227.8) |
 | Full-text document store, every string literal of 10.5M (1,540,012 documents) | 6.17 s with zstd, 6.07 s with LZ4 | 114.1 MB with zstd (the default), 117.3 MB with LZ4 |
 | HNSW vector index, 100,000 × 384 dimensions, `M=16`, `efConstruction=128` | 6.43 s (14.02 s before the half-precision build) | 163 MB of mapped files, 1,044.4 MB peak RSS |
@@ -2034,6 +2090,7 @@ than 10%. Fluree's warm advantage on `star-lookup` at 1.05M is within 10%.
 | Case | Reference advantage | Qualification |
 |---|---|---|
 | SP²Bench `q8` and `q12b`, 10M | Jena 181× on `q8`, Oxigraph about 5,000× and Jena about 2,900× on `q12b` | Sparkles' plan produces 555,607,405 rows for the one-row ASK of `q12b`. |
+| BSBM Explore `q5`, `q7` and `q8`, 10M | Fluree 2.9× on `q5`, Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
 | SP²Bench `q4`, `q5a`, `q6` and `q12a`, 10M | Jena answers `q6` and `q12a`, and Oxigraph `q12a` | Sparkles' default query memory budget refuses all four. No engine finished `q4` or `q5a`. |
 | LUBM(100) `q2` | QLever 3.7× | Sparkles is fastest on 11 of 14 queries. |
 | LUBM(100) `q1` and `q3` means | Fluree 1.19× and 1.22× | Sparkles' medians are lower, so the means reflect slow outliers. |
@@ -2112,8 +2169,8 @@ than 10%. Fluree's warm advantage on `star-lookup` at 1.05M is within 10%.
 before timing and fingerprints it by the row count, by the solution multiset under RDF
 term identity, and by the same multiset with numbers compared by value to 12 significant
 digits. An engine whose answer differs in value from the majority is marked † and not
-ranked, which happens only to QLever, on `types-grouped` after the update churn. A ‡ marks
-equal values returned as different RDF terms. `export-500k` uses LIMIT without ORDER BY,
+ranked. The BSBM Explore comparison marks Fluree on q8, q11 and q12 and QLever on q12.
+A ‡ marks equal values returned as different RDF terms. `export-500k` uses LIMIT without ORDER BY,
 so only its row count is checked.
 
 ### Engine failures
@@ -2148,8 +2205,8 @@ harness errors.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of
   28.7 GiB under a 14 GiB limit.
 * **Other standard benchmarks.** SP²Bench at 10M triples and LUBM(100) have been compared
-  on the reference machine. BSBM's comparison waits for a rerun, SP²Bench at 100M and
-  LUBM(1000) have not been run, and the OWL2Bench harness has not been run there either.
+  on the reference machine, as has BSBM Explore at 10M. BSBM BI and the 100M scale,
+  SP²Bench at 100M, LUBM(1000) and the OWL2Bench acceptance runs remain open.
   LDBC, WatDiv's stress testing and the Wikidata query log have no harness. The synthetic
   suite has a regular shape, and its 28 queries are hand-picked.
 * **Long runs.** Hours of sustained writes and compaction under load were not compared

@@ -150,6 +150,33 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(r["jena"]["status"], "error")
         self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out], capture_output=True).returncode, 0)
 
+    def test_unchecked_answers_never_vote_or_claim_agreement(self):
+        unchecked = {"rows": 6, "exact": "unchecked", "value": "unchecked"}
+        engines = ("sparkles", "jena-fuseki", "oxigraph")
+        for instance in (1, 2):
+            write(self.res, f"describe-{instance}.json", {
+                "results": [hyperfine(e, [0.01]) for e in engines]})
+        write(self.res, "answers.json", {
+            **{f"describe-{i}": {e: unchecked for e in engines} for i in (1, 2)},
+            "mixed": {"sparkles": unchecked, "jena-fuseki": unchecked,
+                      "oxigraph": {"rows": 1, "exact": "checked", "value": "checked"}},
+        })
+        out = os.path.join(self.tmp.name, "record.json")
+        p = build(self.res, out, **{"pool-instances": True})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rec = jload(out)
+        for e in ("sparkles", "jena", "oxigraph"):
+            row = self.find(rec, e, "describe")
+            self.assertIsNone(row["answer"])
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(len(row["samples_ms"]), 2)
+        for e in ("sparkles", "jena"):
+            self.assertIsNone(self.find(rec, e, "mixed", "answer")["answer"])
+        checked = self.find(rec, "oxigraph", "mixed", "answer")
+        self.assertIsNone(checked["answer"]["agrees"])
+        self.assertEqual(checked["status"], "ok")
+        self.assertEqual(subprocess.run([sys.executable, RECORD, "validate", out], capture_output=True).returncode, 0)
+
     def test_build_without_queries_finds_answer_only_queries(self):
         write(self.res, "answers.json", {"q1": {"sparkles": {"rows": 3, "exact": "x", "value": "x"}}})
         out = os.path.join(self.tmp.name, "r.json")

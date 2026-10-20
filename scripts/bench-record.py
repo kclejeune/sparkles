@@ -251,7 +251,10 @@ def fingerprints(answers):
     that answered, on the digest by value; None when there is no majority."""
     out = {}
     for q, per in (answers or {}).items():
-        ok = {e: v for e, v in per.items() if v.get("rows") != "error"}
+        # The DESCRIBE sentinel records an intentionally skipped comparison. It
+        # must neither become a fingerprint nor vote for a majority.
+        ok = {e: v for e, v in per.items() if v.get("rows") != "error"
+              and v.get("exact") != "unchecked" and v.get("value") != "unchecked"}
         digest = {e: (v.get("value") or v.get("exact") or str(v.get("rows"))) + ("/" + v["order"] if v.get("order") else "")
                   for e, v in ok.items()}
         vals = list(digest.values())
@@ -265,7 +268,7 @@ def fingerprints(answers):
                 ref = top
         for e, v in per.items():
             en = engine_name(e)
-            if v.get("rows") == "error":
+            if e not in ok:
                 out[q, en] = None
             else:
                 agrees = None if ref is None or len(vals) == 1 else digest[e] == ref

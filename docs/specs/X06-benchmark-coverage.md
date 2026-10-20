@@ -603,7 +603,10 @@ one ranking.
 
 Phase 1's tooling is built. The first batch of the standard refresh ran on the reference
 host on 2026-10-18 and 2026-10-19, and BENCHMARKS.md has its synthetic, SP²Bench and LUBM
-figures. The rest of the refresh is listed under "Left for Phase 1".
+figures. BENCHMARKS.md also includes the BSBM Explore comparison at 10M from
+2026-10-19 and the isolated full-text queries at 1.05M from 2026-10-20, with
+versioned records of their samples, answer fingerprints and engine failures. The
+rest of the refresh is listed under "Left for Phase 1".
 
 **Record and manifest.** `scripts/bench-record.py` has four subcommands. `manifest` writes
 the run manifest of §6 with the commit of the scripts' checkout, the Sparkles binary's
@@ -616,7 +619,9 @@ numbers and the memory readings, and the LUBM record carries the materialization
 under `inference`. `build --pool-instances` merges query instances named `<template>-<i>`
 into one result per template, with the samples pooled. The agreement of an answer is judged
 against the majority of the engines that answered, as in `bench-summary.py`, and a result
-that disagrees is recorded as `wrong-answer`. The durability class of §5.1 is filled in for
+that disagrees is recorded as `wrong-answer`. An intentionally unchecked DESCRIBE answer has
+no fingerprint in the record and does not vote for the majority. The collector no
+longer treats matching unchecked markers as proof of agreement. The durability class of §5.1 is filled in for
 update results only, and no suite has a long write run yet.
 
 **Comparison.** `scripts/bench-regressions.py compare` takes two or more records, pairs
@@ -825,7 +830,10 @@ QLever's answers waited about 40 ms each for a delayed TCP acknowledgement. A ru
 
 **Left for Phase 1.**
 
-The reruns completed full-text search and BSBM Explore on 2026-10-19. WatDiv's
+BSBM Explore at 10M completed on 2026-10-19, and its figures and record are in
+BENCHMARKS.md. Full-text queries at 1.05M were rerun one engine at a time on
+2026-10-20 using the retained indexes, and their record includes the earlier
+index-build measurements. WatDiv's
 last query was interrupted when QLever crashed, and its record included unfinished
 hyperfine output as an extra query. The collector now excludes those temporary
 files, and the shared timing helper prepares each engine separately so QLever's
@@ -842,21 +850,22 @@ BSBM BI exhausted its eight-hour batch limit while Jena's driver continued after
 repeated request timeouts. Each engine, mix and client count now has a configurable
 1800 second wall budget, with bounded process-group cleanup and an explicit timeout
 record without partial throughput. Successful runs retain their requested mix
-counts. These repairs have regression coverage. Their measured reruns and the
-publication of the completed results remain open.
+counts. These repairs have regression coverage. WatDiv, DBpedia and BI are being
+rerun with the corrected harness. The runner leaves JAVA unset for Jena 6’s loader
+so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
 
-* The rest of the standard refresh at one head (A5). Publication of full-text search
-  and BSBM Explore, the WatDiv, DBpedia and BI reruns, and the later batches remain. The
+* The rest of the standard refresh at one head (A5). The WatDiv, DBpedia and BI
+  reruns and the later batches remain. The
   regeneration of the BENCHMARKS.md tables from records without a numeric change (A3)
   remains open. `bench.sh` starts,
   checks and times one engine at a time in its default and `updates` modes since
   2026-10-18, as `suite_run` does. The published runs invoked `bench.sh` once per engine,
   so each engine ran alone there too. `bench-record.py` reads
   the results of `bench.sh` and of a small `bench-watdiv.sh` run, and both produce valid
-  records. It does not read the DBpedia or full-text results yet, and `bench-summary.py`
-  still reads the raw files.
-* The published comparison of BSBM on the reference host, and a noise-floor control for
-  each standard suite (§14). Their commands are in BENCHMARKING.md.
+  records. The runner also normalizes the full-text files into a common record. The
+  DBpedia record awaits a complete run, and `bench-summary.py` still reads raw files.
+* BSBM BI on the reference host and a noise-floor control for each standard suite
+  (§14) remain. Their commands are in BENCHMARKING.md.
 * BSBM at 100M triples has not been tried, and the generator's heap defaults may need
   raising. SP²Bench at 100M triples will meet the 600 second timeout in its slower queries.
 * Open question 1 is settled for LUBM and BSBM only in practice. The BSBM tools and the LUBM
