@@ -116,8 +116,12 @@ time_query() {
     [ -n "$clear" ] || clear=$(cache_prepare)
     hf=$res/$n.$e.hf.json
     rm -f "$hf"
-    if ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
-      --command-name "${NAME[$e]}" "$(q "${URL[$e]}" "$n")" --export-json "$hf"; then
+    rc=0
+    ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
+      --command-name "${NAME[$e]}" "$(q "${URL[$e]}" "$n")" --export-json "$hf" || rc=$?
+    if answering "$e"; then
+      # A live server with a broken preparation command is a harness failure.
+      [ "$rc" = 0 ] || return "$rc"
       python3 - "$hf" "$new" << 'EOF'
 import json, os, sys
 hf, new = sys.argv[1:]
@@ -127,10 +131,9 @@ json.dump(d, open(new, "w"), indent=1)
 EOF
       rm -f "$hf"
     else
-      rc=$?
-      # A live server with a broken preparation command is a harness failure.
-      # A dead server is an engine failure; discard its incomplete timed sample.
-      answering "$e" && return "$rc"
+      # --ignore-failure can exit zero after a server dies. Discard all of that
+      # engine's timed samples before merging, even when hyperfine succeeded.
+      [ "$rc" != 0 ] || rc=1
       log "$e: stopped answering while timing $n, recorded as an engine failure"
       failed_result "$new" "${NAME[$e]}" 0 "$rc" timed
     fi
