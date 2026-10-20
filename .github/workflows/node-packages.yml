@@ -5,7 +5,8 @@
 # dependencies cached in GitHub Actions.
 name: Node packages
 # Pushes to main and pull requests run when the Node packages or a crate the addon builds
-# on changes. Tests, benches and examples of those crates do not change the addon.
+# on changes, or when the server used by the remote client tests changes. Tests, benches
+# and examples of those crates do not change the builds.
 on:
   push:
     branches: [main]
@@ -14,18 +15,22 @@ on:
       - 'crates/sparkles/**'
       - 'crates/sparkles-alloc/**'
       - 'crates/sparkles-backup/**'
+      - 'crates/sparkles-client/**'
       - 'crates/sparkles-core/**'
       - 'crates/sparkles-fmt/**'
       - 'crates/sparkles-graphql/**'
+      - 'crates/sparkles-memory-import/**'
+      - 'crates/sparkles-modelstore/**'
       - 'crates/sparkles-node/**'
+      - 'crates/sparkles-office/**'
       - 'crates/sparkles-reasoner/**'
+      # the remote client's tests build the default-feature server
+      - 'crates/sparkles-server/**'
       - 'crates/sparkles-shacl/**'
       - 'crates/sparkles-shex/**'
       - '!crates/sparkles*/tests/**'
       - '!crates/sparkles*/benches/**'
       - '!crates/sparkles*/examples/**'
-      # the remote client's tests run against the server
-      - 'crates/sparkles-server/src/**'
       - 'vendor/**'
       - 'js/**'
       - 'Cargo.toml'
@@ -39,11 +44,11 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-# A newer push or pull request update supersedes a running build; a tag's run is never
-# cancelled.
+# Main runs have distinct groups so neither running nor pending checks are superseded.
+# Pull request updates supersede earlier checks; tag runs are never cancelled.
 concurrency:
-  group: node-packages-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  group: node-packages-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 env:
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
   # far faster than the release profile's thin LTO; tags and manual runs build what would
