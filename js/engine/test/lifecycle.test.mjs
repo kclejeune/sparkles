@@ -255,20 +255,21 @@ test(
         const worker = new Worker(new URL('./worker.mjs', import.meta.url), {
           workerData: { path },
         });
+        // Exit can drain the message before an await continuation gets to run.
         const result = await new Promise((resolve, reject) => {
-          worker.once('message', resolve);
+          let result;
+          worker.once('message', (value) => {
+            result = value;
+          });
           worker.once('error', reject);
           worker.once('exit', (code) => {
             if (code) reject(new Error(`worker exit ${code}`));
+            else resolve(result);
           });
         });
+        assert.ok(result, 'worker exited without a result');
         assert.equal(result.id, ds.id);
         assert.equal(result.count, String(i + 2));
-        await new Promise((resolve, reject) =>
-          worker.once('exit', (code) =>
-            code ? reject(new Error(`worker exit ${code}`)) : resolve(),
-          ),
-        );
       }
       assert.equal(await ds.count(), 4n);
     } finally {
