@@ -49,10 +49,11 @@ on:
 permissions:
   contents: read
 
-# A newer push supersedes a running check of the same branch, including main.
+# Main runs have distinct groups so neither running nor pending checks are superseded.
+# Pull request updates supersede earlier checks.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always

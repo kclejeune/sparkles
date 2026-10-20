@@ -32,9 +32,11 @@ on:
 permissions:
   contents: read
 
+# Main runs have distinct groups so neither running nor pending checks are superseded.
+# Pull request updates supersede earlier checks.
 concurrency:
-  group: nix-${{ github.ref }}
-  cancel-in-progress: true
+  group: nix-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   build:

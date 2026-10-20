@@ -436,8 +436,10 @@ the pinned commits in that script may need updates to the known-failure lists.
 A change only to the UI, the JavaScript packages, the README or the specs runs the checks
 job alone, which a first job decides with `dorny/paths-filter`. Changes only to the
 benchmark records, the images, the Kotlin sources or the binding workflows do not start
-`ci.yml`. A newer push cancels a running check of the same branch, including `main`. A
-manual run with **all-platforms** checked also runs Clippy and the tests on Linux arm64
+`ci.yml`. In all five workflows, main runs use distinct concurrency groups so a newer
+push preserves both running and queued checks. Pull request updates cancel earlier
+checks, while binding release tags remain protected from cancellation. A manual run
+with **all-platforms** checked also runs Clippy and the tests on Linux arm64
 and macOS. The engine's shared state goes through snapshot swaps, locks and channels, and
 its relaxed atomics are counters and flags, so the risk of a fault that only arm64's
 weaker memory ordering or macOS would show is low, and pushes test Linux x86_64 only.
@@ -445,8 +447,9 @@ weaker memory ordering or macOS would show is low, and pushes test Linux x86_64 
 The binding workflows, `python-wheels.yml`, `node-packages.yml` and `jvm-bindings.yml`,
 run on pushes to `main` and pull requests that touch the binding or a crate it builds on,
 leaving out those crates' tests, benches and examples. Such a run builds the binding in
-the dev profile and tests it on Linux x86_64 only, in one job. Shared core patch fixtures
-also trigger the Python wheel tests that read them. Pull requests also run
+the dev profile and tests it on Linux x86_64 only, in one job. The Node workflow also
+tracks the default-feature server and its dependencies for the remote client test. Shared
+core patch fixtures also trigger the Python wheel tests that read them. Pull requests also run
 the JVM compatibility matrix. Release tags and manual runs build and test every platform
 in the release profile. Every job has a timeout, so a hung job stops instead of running
 for GitHub's default six hours.

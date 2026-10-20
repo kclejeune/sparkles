@@ -41,11 +41,11 @@ on:
 permissions:
   contents: read
 
-# A newer push or pull request update supersedes a running build; a tag's run is never
-# cancelled.
+# Main runs have distinct groups so neither running nor pending checks are superseded.
+# Pull request updates supersede earlier checks; tag runs are never cancelled.
 concurrency:
-  group: jvm-bindings-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  group: jvm-bindings-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref_type != 'tag' }}
 
 env:
   # Pushes to main and pull requests build the bindings in the dev profile, which compiles
