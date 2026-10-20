@@ -1231,7 +1231,9 @@ tests are `tests/spill_join.rs`, the unit tests of `joinspill.rs`, `merge.rs` an
   or when the room left would no longer cover what the input took to make its last
   batch. The last rule measures the rise of the query's peak while the input makes a
   batch, since a deep input such as a chain of merge joins holds several batches of its
-  own and otherwise ran out of memory before the join could spill.
+  own and otherwise ran out of memory before the join could spill. These proactive
+  thresholds apply only after a build row has a bound shared key. Disconnected builds
+  and builds with every shared key unbound continue until a real memory charge fails.
 * Partition 0 is not kept in memory, so every partition takes the same path. The hybrid
   join of §6.3 would save writing one partition, but it would also have to share the
   room with the partition writers and the probe input, which made the budgets of the
@@ -1264,12 +1266,20 @@ tests are `tests/spill_join.rs`, the unit tests of `joinspill.rs`, `merge.rs` an
   spill is on and emits its partitions in turn. One whose order is relied on numbers its
   probe rows, writes each partition's output in that order and merges the output files
   by number, up to 64 at a time, which restores the probe order at the cost of writing
-  the output once more.
+  the output once more. Output files consolidate during production with the
+  memory-derived fan-in. Equal generations merge first, with smallest-file merges
+  bounding the total to 128 retained output files and one active writer. Reader
+  frames, output buffers and temporary disk overlap are admitted before a merge.
+  Consolidation reserves these buffers while the join is still live and can add
+  intermediate writes. The earlier measurements do not measure this repair.
 
 **Merge join.** A run of equal keys that outgrows a quarter of the room left, at least
 16 KiB, or whose charge fails, is spooled to a file. The pair of runs is then joined
 left-major, reading the right run again for each left row, so the output keeps the
-merge join's order. The plan counts `spooledRuns`.
+merge join's order. Child schema widths are retained through EOF, so a spooled final
+run from a nested join remains readable after its input buffer is released. The plan
+counts `spooledRuns`. Reader admission uses the largest frame actually written,
+including encrypted files, rather than an average that can omit a long first frame.
 
 **DISTINCT below ORDER BY.** §6.5 numbers rows and merges partitions by number. The
 build instead rewrites `Distinct(Project(OrderBy(X)))` into
@@ -1279,7 +1289,9 @@ EXISTS. The DISTINCT keeps the first number of each row, the sort orders ties by
 number, and the projection drops it. Equal projected rows have equal keys, so the
 answer and its order are those that sorting first gives, and the DISTINCT spills as an
 unordered one does. Other shapes keep the DISTINCT above the sort with its whole set in
-memory, as before.
+memory, as before. A numbered DISTINCT that may partition its input claims no
+intermediate order, leaving the enclosing sort to restore it. Its row arena is
+charged during relocation even when the projected row has only one column.
 
 **Encryption.** §6.7 is built as written with `aws-lc-rs` 1.18.1, which the server
 already links through rustls and which `sparkles-backup` pins. A file's random 256-bit

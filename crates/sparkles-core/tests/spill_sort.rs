@@ -114,6 +114,20 @@ fn leftovers(dir: &std::path::Path) -> Vec<String> {
 const MEMORY: u64 = 768 << 10;
 
 #[test]
+fn numbered_distinct_can_spill_partially_ordered_scan_input() {
+    let s = store(60_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT DISTINCT ?s ?v { ?s <urn:p> ?o BIND(STR(?o) AS ?v) } ORDER BY DESC(?v) ?s";
+    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let actual = run(&s, q, MEMORY, Some(spill.clone()), None).unwrap();
+    assert_eq!(actual, expected);
+    assert!(spill.written_bytes() > 0);
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
+
+#[test]
 fn spilled_order_by_matches_eager_order_with_ties_and_expressions() {
     let s = store(60_000);
     let tmp = tempfile::tempdir().unwrap();

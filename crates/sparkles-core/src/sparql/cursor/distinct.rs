@@ -133,6 +133,11 @@ impl Distinct {
         })
     }
 
+    /// A later partition may precede rows already emitted in the input's order.
+    pub(super) fn may_reorder(&self) -> bool {
+        self.query.is_some()
+    }
+
     /// Add each input row's number as the last column, when the operator numbers rows.
     pub(super) fn number(&mut self, buffer: &mut Buffer, var: VarId) -> Result<()> {
         if !self.numbered {
@@ -271,9 +276,9 @@ impl Distinct {
                 }
             }
         });
-        let (size, capacity, entry, arena) = match seen {
-            Seen::One(ids) => (ids.len(), ids.capacity(), 8, 0),
-            Seen::Many { table, rows } => (table.len(), table.capacity(), 4, rows.capacity()),
+        let (size, capacity, entry, arena, has_arena) = match seen {
+            Seen::One(ids) => (ids.len(), ids.capacity(), 8, 0, false),
+            Seen::Many { table, rows } => (table.len(), table.capacity(), 4, rows.capacity(), true),
         };
         let needed = size.saturating_add(len);
         if self.query.is_some() && self.threshold == 0 {
@@ -295,7 +300,7 @@ impl Distinct {
             let old = table_bytes(capacity, entry);
             let new = table_bytes(target, entry);
             let arena_old = arena as u64 * 8;
-            let arena_new = if width > 1 {
+            let arena_new = if has_arena {
                 (target.saturating_mul(width) as u64).saturating_mul(8)
             } else {
                 0
@@ -457,5 +462,83 @@ impl Distinct {
         table.filter_rows(&keep);
         self.last = Some(last);
         buffer.reconcile()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    fn numbered_growth(limit: u64, fits: bool) -> u64 {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.var("value");
+        ctx.var("number");
+        ctx.mem_limit = limit;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_cursor_owner();
+        let baseline = ctx.live_bytes();
+        let mut distinct = Distinct::new(&ctx, &[0, 1], &[], false, true).unwrap();
+        let batch = |first: i64, len: usize| {
+            let mut buffer = Buffer::new(&ctx, &[0, 1], len).unwrap();
+            for i in first..first + len as i64 {
+                let id = Id::from_i64(i).unwrap();
+                buffer.table.cols[0].push(id);
+                buffer.table.cols[1].push(id);
+            }
+            buffer.table.len = len;
+            buffer.reconcile().unwrap();
+            buffer
+        };
+        let mut first = batch(0, 32);
+        distinct.apply(&ctx, &mut first).unwrap();
+        drop(first);
+        let (old_table, old_arena, target) = match distinct.seen.as_ref().unwrap() {
+            Seen::Many { table, rows } => (
+                table_bytes(table.capacity(), 4),
+                rows.capacity() as u64 * 8,
+                (table.len() + 64).max(table.capacity() * 2),
+            ),
+            Seen::One(_) => panic!("numbered input must retain row numbers separately"),
+        };
+        let neighbor = ctx.retained_charge(4096).unwrap();
+        let mut next = batch(32, 64);
+        let other = ctx.live_bytes() - distinct.bytes;
+        let overlapping =
+            other + old_table + table_bytes(target, 4) + old_arena + target as u64 * 8 + 256;
+        if fits {
+            distinct.apply(&ctx, &mut next).unwrap();
+            assert!(
+                ctx.mem_peak() >= overlapping,
+                "peak {} missed overlapping arenas requiring {overlapping}",
+                ctx.mem_peak()
+            );
+        } else {
+            assert!(matches!(
+                distinct.apply(&ctx, &mut next),
+                Err(Error::BudgetExceeded(_))
+            ));
+            match distinct.seen.as_ref().unwrap() {
+                Seen::Many { table, rows } => {
+                    assert_eq!(table_bytes(table.capacity(), 4), old_table);
+                    assert_eq!(rows.capacity() as u64 * 8, old_arena);
+                    assert_eq!(table.len(), 32);
+                }
+                Seen::One(_) => unreachable!(),
+            }
+        }
+        drop(next);
+        drop(neighbor);
+        drop(distinct);
+        assert_eq!(ctx.live_bytes(), baseline);
+        overlapping
+    }
+
+    #[test]
+    fn numbered_one_column_growth_reserves_both_row_arenas() {
+        let overlap = numbered_growth(1 << 20, true);
+        numbered_growth(overlap - 1, false);
     }
 }

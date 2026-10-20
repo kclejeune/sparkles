@@ -2301,6 +2301,11 @@ impl Operator {
                 _ => State::Unary(node),
             }
         };
+        if let State::Distinct(distinct) = &state
+            && distinct.may_reorder()
+        {
+            order.clear();
+        }
         Ok(Self {
             state,
             children,

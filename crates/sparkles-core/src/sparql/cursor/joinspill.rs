@@ -46,6 +46,8 @@ pub(super) const MAX_LEVEL: u64 = 3;
 const MIN_FRAME_ROWS: usize = 64;
 /// The most files an ordered join's output merge reads at once.
 const FAN_IN: usize = 64;
+/// The total finished output files retained across all merge levels.
+const MAX_OUTPUT_RUNS: usize = 2 * FAN_IN;
 /// The fewest rows of an output file's frames.
 const MIN_SPOOL_ROWS: usize = 16;
 
@@ -235,18 +237,59 @@ struct Pass {
 
 /// Output files of an ordered join, each ascending in the probe row number of its
 /// last column.
+struct SpoolRun {
+    run: Arc<SpillRun>,
+    level: u64,
+}
+
 struct Spooler {
     query: Arc<QuerySpill>,
     out: Buffer,
     seq: Vec<Id>,
     writer: Option<SpillWriter>,
-    runs: Vec<Arc<SpillRun>>,
+    runs: Vec<SpoolRun>,
     frame_rows: usize,
+    fan_in: usize,
     width: usize,
     bytes: u64,
+    merge_passes: u64,
+    _charge: Option<RetainedCharge>,
 }
 
 impl Spooler {
+    /// Sequence IDs, the encoded payload and the writer's value, varint and
+    /// compressed-column scratch coexist. Allow allocation growth and headers.
+    fn writer_bytes(width: usize, frame_rows: usize) -> u64 {
+        frame_rows as u64 * ((width as u64 + 1) * 24 + 64) + 1024
+    }
+
+    fn new(
+        ctx: &Arc<Ctx>,
+        query: &Arc<QuerySpill>,
+        vars: &[VarId],
+        frame_rows: usize,
+        fan_in: usize,
+    ) -> Result<Self> {
+        // The output buffer charges its columns; this covers sequence numbers, the
+        // encoded writer frame and the bounded retained-run directory.
+        let charge = ctx.retained_charge(
+            Self::writer_bytes(vars.len(), frame_rows)
+                + (MAX_OUTPUT_RUNS * std::mem::size_of::<SpoolRun>()) as u64,
+        )?;
+        Ok(Self {
+            query: query.clone(),
+            out: Buffer::new(ctx, vars, frame_rows)?,
+            seq: Vec::with_capacity(frame_rows),
+            writer: None,
+            runs: Vec::with_capacity(MAX_OUTPUT_RUNS),
+            frame_rows,
+            fan_in,
+            width: vars.len(),
+            bytes: 0,
+            merge_passes: 0,
+            _charge: charge,
+        })
+    }
     fn room(&self) -> usize {
         self.frame_rows.saturating_sub(self.out.table.len).max(1)
     }
@@ -278,13 +321,98 @@ impl Spooler {
     }
 
     /// End the current file: rows that follow may have smaller numbers.
-    fn boundary(&mut self) -> Result<()> {
+    fn boundary(&mut self, ctx: &Arc<Ctx>) -> Result<()> {
         self.flush()?;
         if let Some(writer) = self.writer.take() {
             let run = writer.finish()?;
             self.bytes += run.bytes();
-            self.runs.push(Arc::new(run));
+            self.runs.push(SpoolRun {
+                run: Arc::new(run),
+                level: 0,
+            });
         }
+        loop {
+            // Merge like-sized generations, rather than rewriting a growing run for
+            // each new small run. The aggregate cap also bounds handles when many
+            // generations coexist. In that case combine the smallest files first.
+            let same_level = self.runs.iter().find_map(|run| {
+                let indices: Vec<_> = self
+                    .runs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, other)| other.level == run.level)
+                    .take(self.fan_in)
+                    .map(|(i, _)| i)
+                    .collect();
+                (indices.len() == self.fan_in).then_some(indices)
+            });
+            let indices = if let Some(indices) = same_level {
+                indices
+            } else if self.runs.len() >= MAX_OUTPUT_RUNS {
+                self.smallest(self.fan_in)
+            } else {
+                break;
+            };
+            self.combine(ctx, indices)?;
+        }
+        Ok(())
+    }
+
+    fn smallest(&self, count: usize) -> Vec<usize> {
+        let mut indices: Vec<_> = (0..self.runs.len()).collect();
+        indices.sort_unstable_by_key(|&i| self.runs[i].run.bytes());
+        indices.truncate(count);
+        indices
+    }
+
+    /// Merge a bounded set while retaining its inputs until the output is admitted
+    /// and finished. SpillWriter charges temporary disk overlap; SeqMerge charges
+    /// reader frames, and this method charges its additional output and writer.
+    fn combine(&mut self, ctx: &Arc<Ctx>, mut indices: Vec<usize>) -> Result<()> {
+        indices.sort_unstable();
+        let mut selected = Vec::with_capacity(indices.len());
+        let mut level = 0;
+        for i in indices.into_iter().rev() {
+            let run = self.runs.remove(i);
+            level = level.max(run.level + 1);
+            selected.push(run.run);
+        }
+        let mut merge = SeqMerge::new(ctx, &selected, self.width, self.frame_rows)?;
+        let _charge = ctx.retained_charge(Self::writer_bytes(self.width, self.frame_rows))?;
+        let mut out = Buffer::new(ctx, &self.out.table.vars, self.frame_rows)?;
+        let mut seq = Vec::with_capacity(self.frame_rows);
+        debug_assert!(self.writer.is_none());
+        // Selected readers share their runs' handles; only the writer adds one.
+        let output_handles = self.runs.len() + selected.len() + 1;
+        debug_assert!(output_handles <= MAX_OUTPUT_RUNS + 1);
+        let mut writer = self
+            .query
+            .create(SpillKind::JoinPartition, self.width + 1)?;
+        writer.set_frame_rows(self.frame_rows);
+        loop {
+            let more = merge.pull(ctx, &mut out.table, Some(&mut seq), self.frame_rows)?;
+            out.reconcile()?;
+            if out.table.len > 0 {
+                let mut slices: Vec<&[Id]> = out.table.cols.iter().map(Vec::as_slice).collect();
+                slices.push(&seq);
+                writer.write(&slices, out.table.len)?;
+            }
+            for col in &mut out.table.cols {
+                col.clear();
+            }
+            out.table.len = 0;
+            seq.clear();
+            if !more {
+                break;
+            }
+        }
+        let run = writer.finish()?;
+        self.bytes += run.bytes();
+        self.merge_passes += 1;
+        self.runs.push(SpoolRun {
+            run: Arc::new(run),
+            level,
+        });
         Ok(())
     }
 }
@@ -1045,16 +1173,7 @@ impl JoinSpill {
             as usize;
         let fan_in =
             ((self.budget / 4) / (frame_rows as u64 * row + 1024)).clamp(2, FAN_IN as u64) as usize;
-        self.spooler = Some(Spooler {
-            query: self.query.clone(),
-            out: Buffer::new(ctx, vars, frame_rows)?,
-            seq: Vec::with_capacity(frame_rows),
-            writer: None,
-            runs: Vec::new(),
-            frame_rows,
-            width,
-            bytes: 0,
-        });
+        self.spooler = Some(Spooler::new(ctx, &self.query, vars, frame_rows, fan_in)?);
         loop {
             let spooler = self.spooler.as_mut().expect("a spooler");
             let room = spooler.room();
@@ -1072,46 +1191,26 @@ impl JoinSpill {
             if self.restarted {
                 // The step that restarts a probe file adds no row, so the rows held are
                 // all from before it.
-                spooler.boundary()?;
+                spooler.boundary(ctx)?;
             } else if spooler.out.table.len >= spooler.frame_rows {
                 spooler.flush()?;
             }
         }
         let mut spooler = self.spooler.take().expect("a spooler");
-        spooler.boundary()?;
-        self.stats.written += spooler.bytes;
-        let mut runs = std::mem::take(&mut spooler.runs);
-        drop(spooler);
-        // Merge passes until the files fit one merge.
-        while runs.len() > fan_in {
-            self.stats.merge_passes += 1;
-            let rest = runs.split_off(fan_in);
-            let mut merge = SeqMerge::new(ctx, &runs, width, frame_rows)?;
-            let mut spooler = Spooler {
-                query: self.query.clone(),
-                out: Buffer::new(ctx, vars, frame_rows)?,
-                seq: Vec::with_capacity(frame_rows),
-                writer: None,
-                runs: Vec::new(),
-                frame_rows,
-                width,
-                bytes: 0,
-            };
-            loop {
-                let room = spooler.room();
-                let more = merge.pull(ctx, &mut spooler.out.table, Some(&mut spooler.seq), room)?;
-                spooler.out.reconcile()?;
-                spooler.flush()?;
-                if !more {
-                    break;
-                }
-            }
-            drop(merge);
-            spooler.boundary()?;
-            self.stats.written += spooler.bytes;
-            runs = rest;
-            runs.append(&mut spooler.runs);
+        spooler.boundary(ctx)?;
+        // Finish with bounded fan-in, taking the smallest files first rather than
+        // repeatedly merging a large prefix with each new file.
+        while spooler.runs.len() > fan_in {
+            let indices = spooler.smallest(fan_in);
+            spooler.combine(ctx, indices)?;
         }
+        self.stats.written += spooler.bytes;
+        self.stats.merge_passes += spooler.merge_passes;
+        let runs: Vec<_> = std::mem::take(&mut spooler.runs)
+            .into_iter()
+            .map(|run| run.run)
+            .collect();
+        drop(spooler);
         self.stats.merge_passes += 1;
         self.merge = Some(SeqMerge::new(ctx, &runs, width, frame_rows)?);
         Ok(())
@@ -1238,6 +1337,163 @@ mod tests {
         (0..table.len)
             .map(|i| table.cols.iter().map(|c| c[i]).collect())
             .collect()
+    }
+
+    #[test]
+    fn keyless_builds_above_the_proactive_threshold_still_fit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        for unbound_shared in [false, true] {
+            let mut left = values(
+                if unbound_shared {
+                    vec![KEY, LEFT]
+                } else {
+                    vec![LEFT]
+                },
+                1,
+                1,
+                false,
+                false,
+            );
+            left.est = 8000.0;
+            let mut right = values(vec![KEY, SHARED, RIGHT], 5000, 2, false, false);
+            if unbound_shared && let Kind::Values(table) = &mut right.kind {
+                table.cols[0].fill(Id::UNDEF);
+            }
+            let node = binary(
+                Kind::Join {
+                    algo: JoinAlgo::Hash,
+                    keys: if unbound_shared { vec![KEY] } else { vec![] },
+                },
+                left,
+                right,
+            );
+            let eager = context(u64::MAX, None);
+            let mut expected = rows(&exec::execute(&eager, &node).unwrap().0);
+            expected.sort();
+            for place in [None, Some(&spill)] {
+                let ctx = context(352 << 10, place);
+                let mut op =
+                    Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
+                        .unwrap();
+                let options = CursorOptions {
+                    batch_rows: 128,
+                    ..Default::default()
+                };
+                let mut actual = Vec::new();
+                while let Some(batch) = op.next(&ctx, &options, 128).unwrap_or_else(|e| {
+                    panic!("unbound={unbound_shared}, spill={}: {e:?}", place.is_some())
+                }) {
+                    actual.extend(rows(&batch.table));
+                }
+                actual.sort();
+                assert_eq!(actual, expected, "shared but unbound: {unbound_shared}");
+                assert!(ctx.mem_peak() <= 352 << 10);
+            }
+        }
+        assert_eq!(spill.reserved_bytes(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordered_output_spooling_bounds_open_handles() {
+        const CHILD: &str = "SPARKLES_ORDERED_SPOOL_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "sparql::cursor::joinspill::tests::ordered_output_spooling_bounds_open_handles",
+                "--nocapture",
+            ]);
+            command.env(CHILD, "1");
+            // SAFETY: only async-signal-safe resource-limit syscalls run before exec.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(384);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let ctx = context(16 << 20, Some(&spill));
+        // Keep the handles of a full 64-way build/probe partitioning alive.
+        let mut partitions = Vec::new();
+        for i in 0..2 * FAN_IN {
+            let mut writer = ctx
+                .spill
+                .as_ref()
+                .unwrap()
+                .create(SpillKind::JoinPartition, 1)
+                .unwrap();
+            let id = Id::from_i64(i as i64).unwrap();
+            writer.write(&[&[id]], 1).unwrap();
+            partitions.push(Arc::new(writer.finish().unwrap()));
+        }
+        for distinct_levels in [false, true] {
+            let mut spooler =
+                Spooler::new(&ctx, ctx.spill.as_ref().unwrap(), &[LEFT], 16, FAN_IN).unwrap();
+            for i in (0..512).rev() {
+                if distinct_levels {
+                    for (level, run) in spooler.runs.iter_mut().enumerate() {
+                        run.level = level as u64 + 1;
+                    }
+                }
+                let id = Id::from_i64(i).unwrap();
+                spooler.out.table.cols[0].push(id);
+                spooler.out.table.len = 1;
+                spooler.seq.push(id);
+                spooler.boundary(&ctx).unwrap();
+                assert!(spooler.runs.len() < MAX_OUTPUT_RUNS);
+            }
+            assert!(spooler.merge_passes > 0);
+            let runs: Vec<_> = spooler.runs.iter().map(|run| run.run.clone()).collect();
+            let mut merge = SeqMerge::new(&ctx, &runs, 1, 16).unwrap();
+            let mut out = Table::new(vec![LEFT]);
+            while merge.pull(&ctx, &mut out, None, 512).unwrap() {}
+            let expected: Vec<_> = (0..512).map(|i| Id::from_i64(i).unwrap()).collect();
+            assert_eq!(out.cols[0], expected);
+            drop(merge);
+            drop(runs);
+            drop(spooler);
+        }
+        drop(partitions);
+        drop(ctx);
+        assert_eq!(spill.reserved_bytes(), 0);
     }
 
     /// Every join mode, with one and two shared variables, unbound keys on both sides,

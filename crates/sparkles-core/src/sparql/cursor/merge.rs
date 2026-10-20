@@ -72,6 +72,8 @@ struct Pair {
 
 pub(super) struct Merge {
     inputs: [Input; 2],
+    /// Child schemas survive a final run whose input has already reached EOF.
+    widths: [usize; 2],
     keys: [Vec<usize>; 2],
     columns: Vec<(Option<usize>, Option<usize>)>,
     pair: Option<Pair>,
@@ -374,23 +376,24 @@ struct SpooledPair {
 }
 
 impl SpooledPair {
-    fn new(ctx: &Arc<Ctx>, left: Run, right: Run, inputs: &[Input; 2]) -> Result<Self> {
+    fn new(
+        ctx: &Arc<Ctx>,
+        left: Run,
+        right: Run,
+        inputs: &[Input; 2],
+        widths: [usize; 2],
+    ) -> Result<Self> {
         let mut left = Side::new(ctx, left, &inputs[0])?;
         let mut right = Side::new(ctx, right, &inputs[1])?;
         left.restart()?;
         right.restart()?;
         // A frame of each file, decoded and as read.
         let frame = |side: &Side, width: usize| match side {
-            Side::File { run, .. } => {
-                run.rows().div_ceil(run.frames().max(1)) * width as u64 * 8 * 2
-            }
+            Side::File { run, .. } => run.max_frame_rows() as u64 * width as u64 * 8 * 2,
             Side::Rows(_) => 0,
         };
-        let charge = ctx.retained_charge(
-            frame(&left, inputs[0].table().width())
-                + frame(&right, inputs[1].table().width())
-                + 1024,
-        )?;
+        let charge =
+            ctx.retained_charge(frame(&left, widths[0]) + frame(&right, widths[1]) + 1024)?;
         Ok(Self {
             left,
             right,
@@ -577,6 +580,7 @@ impl Merge {
         };
         Ok(Self {
             inputs: Default::default(),
+            widths: [node.children[0].vars.len(), node.children[1].vars.len()],
             keys: [key_columns(0), key_columns(1)],
             columns,
             pair: None,
@@ -1109,7 +1113,7 @@ impl Merge {
                             self.spooled_runs += 1;
                         }
                     }
-                    let spooled = SpooledPair::new(ctx, left, right, &self.inputs)?;
+                    let spooled = SpooledPair::new(ctx, left, right, &self.inputs, self.widths)?;
                     self.spooled = Some(Box::new(spooled));
                     continue;
                 }
@@ -1199,16 +1203,131 @@ mod tests {
     use crate::store::{Store, StoreOptions};
 
     fn context(limit: u64) -> Arc<Ctx> {
+        context_with_spill(limit, None)
+    }
+
+    fn context_with_spill(limit: u64, spill: Option<&Arc<crate::spill::Spill>>) -> Arc<Ctx> {
         let store = Store::in_memory(StoreOptions::default());
         let mut ctx = Ctx::new(store.snapshot());
         for name in ["key", "shared", "left", "right"] {
             ctx.var(name);
         }
         ctx.mem_limit = limit;
+        ctx.spill = spill.map(|s| Arc::new(s.query(None)));
         ctx.enable_cursor_accounting().unwrap();
         let ctx = Arc::new(ctx);
         ctx.attach_cursor_owner();
         ctx
+    }
+
+    #[test]
+    fn a_spooled_final_run_from_a_nested_merge_survives_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let input: Vec<_> = (0..10_000).map(|i| vec![7, 11, i]).collect();
+        for nested_on_left in [true, false] {
+            let nested = join(values(vec![0, 1, 2], &input), values(vec![0], &[vec![7]]));
+            let other = values(vec![0, 1, 3], &[vec![7, 11, 13]]);
+            let node = if nested_on_left {
+                join(nested, other)
+            } else {
+                join(other, nested)
+            };
+            let eager = context(u64::MAX);
+            let expected = rows(&exec::execute(&eager, &node).unwrap().0);
+            for cap in [32, 127] {
+                let ctx = context_with_spill(128 << 10, Some(&spill));
+                let mut op =
+                    Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
+                        .unwrap();
+                let options = CursorOptions {
+                    batch_rows: cap,
+                    ..Default::default()
+                };
+                let mut actual = Vec::new();
+                while let Some(batch) = op.next(&ctx, &options, cap).unwrap() {
+                    actual.extend(rows(&batch.table));
+                }
+                actual.sort();
+                assert_eq!(actual, expected);
+                assert!(spill.written_bytes() > 0);
+                drop(op);
+                drop(ctx);
+                assert_eq!(spill.reserved_bytes(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn spooled_pair_reserves_the_largest_frame() {
+        for encrypted in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+                dir: tmp.path().to_path_buf(),
+                max_bytes: 1 << 30,
+                query_bytes: 1 << 30,
+                min_free_bytes: 0,
+                encrypted,
+            })
+            .unwrap();
+            let query = Arc::new(spill.query(None));
+            let ctx = context(64 << 10);
+            let empty = query
+                .create(crate::spill::SpillKind::JoinPartition, 1)
+                .unwrap()
+                .finish()
+                .unwrap();
+            assert_eq!(empty.max_frame_rows(), 0);
+            drop(empty);
+            let mut writer = query
+                .create(crate::spill::SpillKind::JoinPartition, 1)
+                .unwrap();
+            writer.set_frame_rows(64);
+            let column: Vec<_> = (0..65).map(|i| Id::from_i64(i).unwrap()).collect();
+            writer.write(&[&column[..64]], 64).unwrap();
+            writer.set_frame_rows(1);
+            writer.write(&[&column[64..]], 1).unwrap();
+            let run = Arc::new(writer.finish().unwrap());
+            assert_eq!(run.max_frame_rows(), 64);
+            let inputs = [
+                Input {
+                    buffer: Some(Buffer::new(&ctx, &[0], 0).unwrap()),
+                    at: 0,
+                },
+                Input {
+                    buffer: Some(Buffer::new(&ctx, &[0], 0).unwrap()),
+                    at: 0,
+                },
+            ];
+            let left = Run {
+                owned: None,
+                rows: 0..65,
+                spooled: Some(run),
+            };
+            let right = Run {
+                owned: Some(Buffer::new(&ctx, &[0], 1).unwrap()),
+                rows: 0..1,
+                spooled: None,
+            };
+            let mut pair = SpooledPair::new(&ctx, left, right, &inputs, [1, 1]).unwrap();
+            assert_eq!(pair.left.next_frame(&ctx, false).unwrap(), Some(64));
+            assert!(
+                pair._charge.as_ref().unwrap().bytes() >= 64 * 8 * 2 + 1024,
+                "reservation {} does not cover the largest frame",
+                pair._charge.as_ref().unwrap().bytes()
+            );
+            drop(pair);
+            drop(inputs);
+            drop(query);
+            assert_eq!(spill.reserved_bytes(), 0);
+        }
     }
 
     fn values(vars: Vec<VarId>, rows: &[Vec<i64>]) -> Node {

@@ -1910,6 +1910,10 @@ grouping held 38 MB against 130 MB eagerly and took 1.5 to 1.7 times as long, an
 at 16 MiB 4.4 MB at 1.7 times the eager time. A budget near a tenth of the state's size
 thus costs 1.7 to 2.8 times the time, and one near half of it costs little.
 
+The review corrections of 2026-10-20 bound retained join output files and repair
+merge EOF handling, keyless build limits and numbered DISTINCT accounting and order.
+The measurements below precede those corrections and do not establish their cost.
+
 On 2026-10-18 hash joins, merge-join runs and a DISTINCT below its ORDER BY learned to
 spill too, and spill turned on by default under item 85. The same probe ran each query's
 cursor under a budget beside the unlimited cursor and eager execution, at 10.5M on an

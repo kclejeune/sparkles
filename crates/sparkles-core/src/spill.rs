@@ -744,6 +744,7 @@ impl QuerySpill {
             columns,
             rows: 0,
             frames: 0,
+            max_frame_rows: 0,
             bytes: 0,
             buffer: Vec::new(),
             scratch: Vec::new(),
@@ -774,6 +775,8 @@ pub struct SpillWriter {
     columns: usize,
     rows: u64,
     frames: u64,
+    /// The largest successfully written frame, retained for reader admission.
+    max_frame_rows: usize,
     /// The bytes reserved for the file so far.
     bytes: u64,
     buffer: Vec<u8>,
@@ -860,6 +863,7 @@ impl SpillWriter {
         self.buffer = payload;
         self.rows += u64::from(rows);
         self.frames += 1;
+        self.max_frame_rows = self.max_frame_rows.max(rows as usize);
         Ok(())
     }
 
@@ -875,6 +879,7 @@ impl SpillWriter {
             columns: self.columns,
             rows: self.rows,
             frames: self.frames,
+            max_frame_rows: self.max_frame_rows,
             bytes: std::mem::take(&mut self.bytes),
         })
     }
@@ -982,6 +987,7 @@ pub struct SpillRun {
     columns: usize,
     rows: u64,
     frames: u64,
+    max_frame_rows: usize,
     bytes: u64,
 }
 
@@ -1009,6 +1015,11 @@ impl SpillRun {
 
     pub fn frames(&self) -> u64 {
         self.frames
+    }
+
+    /// The largest frame actually written, independent of the writer's last limit.
+    pub(crate) fn max_frame_rows(&self) -> usize {
+        self.max_frame_rows
     }
 
     /// A reader from the first frame. Several readers of one file are independent.
@@ -1319,6 +1330,7 @@ mod tests {
         let run = Arc::new(writer.finish().unwrap());
         assert_eq!(run.rows(), 10_005);
         assert_eq!(run.frames(), 4);
+        assert_eq!(run.max_frame_rows(), FRAME_ROWS);
         for _ in 0..2 {
             let mut reader = run.reader().unwrap();
             let (mut x, mut y) = (Vec::new(), Vec::new());

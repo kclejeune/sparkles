@@ -320,6 +320,9 @@ impl Binary {
         // The most the input's operators took above what the query held before, while
         // making one batch, as the ledger's peak shows when it rises.
         let mut demand = 0u64;
+        // A synthetic threshold must not reject builds that have no key to
+        // partition. Inspect each appended batch only until a usable key appears.
+        let mut partitionable = false;
         loop {
             let (live, peak) = (ctx.live_bytes(), ctx.mem_peak());
             let Some(batch) = child.next(ctx, options, options.batch_rows)? else {
@@ -336,11 +339,12 @@ impl Binary {
                 .saturating_mul(4)
                 .max(demand.saturating_sub(held));
             let grown = threshold.filter(|&threshold| {
-                build
-                    .charge
-                    .bytes()
-                    .saturating_add(super::capacity_bytes(&batch.table))
-                    > threshold
+                partitionable
+                    && build
+                        .charge
+                        .bytes()
+                        .saturating_add(super::capacity_bytes(&batch.table))
+                        > threshold
                     && build.table.len > 0
             });
             let appended = match grown {
@@ -352,7 +356,13 @@ impl Binary {
                 // quarter of the room it had, or less than a few of the input's batches, so
                 // that the input can still give its next batch.
                 Ok(()) => {
-                    if let Some(threshold) = threshold
+                    if threshold.is_some() && !partitionable {
+                        partitionable = self.preferred.iter().any(|&(_, b)| {
+                            batch.table.cols[b].iter().any(|value| !value.is_undef())
+                        });
+                    }
+                    if partitionable
+                        && let Some(threshold) = threshold
                         && ctx.memory_room() < (threshold / 2).max(next_batch)
                     {
                         let error = ctx.memory_exceeded(threshold);

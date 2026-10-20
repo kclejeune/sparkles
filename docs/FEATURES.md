@@ -280,7 +280,10 @@ that work by priority and links each item to its design spec.
   eagerly. Disk spill is on by default, so sorts, groupings, DISTINCT and joins finish
   within their budget, but a DISTINCT over an ordered input other than an ORDER BY keeps
   its whole set, a grouping's single group can outgrow the budget, and eager operators
-  still fail at their budget. A spilled join that must keep its order writes its output
+  still fail at their budget. A build without a usable shared key keeps its real
+  memory budget when spill is enabled. Ordered join output consolidates as it is
+  produced, with at most 128 finished output files and one active writer. A spilled
+  join that must keep its order writes its output
   once more to merge it, which made one join under 4 MiB 8.9 times slower than in
   memory. The UI's result table, the MCP tools and the Python and JVM query calls
   run eagerly, because they report exact totals or return collected results. There is no
