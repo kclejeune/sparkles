@@ -26,12 +26,18 @@ class BsbmDriverTests(unittest.TestCase):
         self.fake.write_text("""#!/usr/bin/env python3
 import json, os, pathlib, signal, subprocess, sys, time
 mode = sys.argv[-1].rsplit('/', 1)[-1]
+if mode != 'child':
+    pathlib.Path(os.environ['DRIVER_PID']).write_text(str(os.getpid()))
 if mode == 'child':
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     pathlib.Path(os.environ['CHILD_PID']).write_text(str(os.getpid()))
     time.sleep(100)
 elif mode in ('tree', 'tree-exits'):
-    signal.signal(signal.SIGTERM, signal.SIG_IGN if mode == 'tree' else lambda *_: sys.exit(0))
+    def terminated(*_):
+        pathlib.Path(os.environ['TERM_SEEN']).write_text('term')
+        if mode == 'tree-exits':
+            sys.exit(0)
+    signal.signal(signal.SIGTERM, terminated)
     subprocess.Popen([sys.executable, __file__, 'child'])
     time.sleep(100)
 elif mode == 'hang':
@@ -51,7 +57,8 @@ else:
         f.write(json.dumps(sys.argv[1:]) + '\\n')
 """)
         self.fake.chmod(0o755)
-        self.env = dict(os.environ, CALLS=str(self.work / "calls"), CHILD_PID=str(self.work / "child-pid"))
+        self.env = dict(os.environ, CALLS=str(self.work / "calls"), CHILD_PID=str(self.work / "child-pid"),
+                        DRIVER_PID=str(self.work / "driver-pid"), TERM_SEEN=str(self.work / "term-seen"))
 
     def command(self, mode, timeout="0.5"):
         return [sys.executable, "-I", str(DRIVER), "--timeout", timeout, "--grace", "0.2",
@@ -133,6 +140,36 @@ else:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
+
+    def test_outer_termination_during_timeout_grace_still_kills_the_group(self):
+        command = self.command("tree", timeout="0.5")
+        command[command.index("--grace") + 1] = "1"
+        process = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        try:
+            marker = Path(self.env["TERM_SEEN"])
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "the timeout must enter its TERM grace wait")
+            process.terminate()
+            time.sleep(0.05)
+            if process.poll() is None:
+                process.terminate()
+            self.assertEqual(process.wait(timeout=5), 143)
+            self.assert_child_stopped()
+            self.assertFalse(self.out.exists(), "an interrupted cell must not publish throughput")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            pid_file = Path(self.env["DRIVER_PID"])
+            if pid_file.exists():
+                try:
+                    os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.communicate(timeout=5)
 
     def test_invalid_wall_budgets_are_rejected(self):
         for value in ("0", "-1", "nan", "inf", "oops"):

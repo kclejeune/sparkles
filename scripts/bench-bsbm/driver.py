@@ -33,14 +33,20 @@ def signal_group(process, sig):
 
 
 def terminate(process, grace):
-    signal_group(process, signal.SIGTERM)
+    # Defer another outer stop until the group has been killed and reaped. A signal
+    # handler raising during the grace wait must not skip the final SIGKILL.
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
     try:
-        process.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        pass
-    # The leader can exit on TERM while one of its children keeps running.
-    signal_group(process, signal.SIGKILL)
-    return process.wait(timeout=grace)
+        signal_group(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
+        # The leader can exit on TERM while one of its children keeps running.
+        signal_group(process, signal.SIGKILL)
+        return process.wait(timeout=grace)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def run(command, cwd, timeout, grace):
