@@ -1291,7 +1291,8 @@ answer and its order are those that sorting first gives, and the DISTINCT spills
 unordered one does. Other shapes keep the DISTINCT above the sort with its whole set in
 memory, as before. A numbered DISTINCT that may partition its input claims no
 intermediate order, leaving the enclosing sort to restore it. Its row arena is
-charged during relocation even when the projected row has only one column.
+charged during relocation even when the projected row has only one column or the
+hash table has room and only the arena grows.
 
 **Encryption.** §6.7 is built as written with `aws-lc-rs` 1.18.1, which the server
 already links through rustls and which `sparkles-backup` pins. A file's random 256-bit

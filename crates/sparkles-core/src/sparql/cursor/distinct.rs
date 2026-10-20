@@ -281,27 +281,52 @@ impl Distinct {
             Seen::Many { table, rows } => (table.len(), table.capacity(), 4, rows.capacity(), true),
         };
         let needed = size.saturating_add(len);
+        let hash_grows = needed > capacity;
+        let hash_target = if hash_grows {
+            needed.max(capacity.saturating_mul(2))
+        } else {
+            capacity
+        };
+        let arena_needed = needed.saturating_mul(width);
+        let arena_target = if !has_arena {
+            0
+        } else if hash_grows {
+            arena.max(hash_target.saturating_mul(width))
+        } else if arena_needed > arena {
+            arena_needed.max(arena.saturating_mul(2))
+        } else {
+            arena
+        };
+        let arena_grows = arena_target > arena;
+        let grows = hash_grows || arena_grows;
         if self.query.is_some() && self.threshold == 0 {
             self.threshold = (ctx.memory_room() / 2).max(MIN_PASS_BYTES);
         }
         if self.query.is_some()
             && !self.frozen
             && size > 0
-            && needed > capacity
-            && (table_bytes(needed.max(capacity.saturating_mul(2)), entry)
-                .saturating_add(needed.max(capacity.saturating_mul(2)) as u64 * width as u64 * 8)
-                >= self.threshold
+            && grows
+            && (table_bytes(hash_target, entry).saturating_add(if has_arena {
+                arena_target as u64 * 8
+            } else {
+                hash_target as u64 * width as u64 * 8
+            }) >= self.threshold
                 || ctx.memory_room() < self.threshold / 2)
         {
             self.frozen = true;
         }
-        if needed > capacity && !self.frozen {
-            let target = needed.max(capacity.saturating_mul(2));
+        if grows && !self.frozen {
+            // The hash table and row arena can grow independently: rounded hash
+            // capacity may still have room when the arena needs a replacement.
             let old = table_bytes(capacity, entry);
-            let new = table_bytes(target, entry);
+            let new = if hash_grows {
+                table_bytes(hash_target, entry)
+            } else {
+                0
+            };
             let arena_old = arena as u64 * 8;
-            let arena_new = if has_arena {
-                (target.saturating_mul(width) as u64).saturating_mul(8)
+            let arena_new = if arena_grows {
+                (arena_target as u64).saturating_mul(8)
             } else {
                 0
             };
@@ -324,13 +349,17 @@ impl Distinct {
             }
             let seen = self.seen.as_mut().expect("distinct state");
             match seen {
-                Seen::One(ids) => ids.reserve(target - ids.len()),
+                Seen::One(ids) => ids.reserve(hash_target - ids.len()),
                 Seen::Many { table, rows } => {
-                    table.reserve(target - table.len(), |&r| {
-                        let r = r as usize;
-                        FxBuildHasher.hash_one(&rows[r * width..(r + 1) * width])
-                    });
-                    rows.reserve_exact(target * width - rows.len());
+                    if hash_grows {
+                        table.reserve(hash_target - table.len(), |&r| {
+                            let r = r as usize;
+                            FxBuildHasher.hash_one(&rows[r * width..(r + 1) * width])
+                        });
+                    }
+                    if arena_grows {
+                        rows.reserve_exact(arena_target - rows.len());
+                    }
                 }
             }
             let (capacity, arena) = match seen {
@@ -540,5 +569,156 @@ mod tests {
     fn numbered_one_column_growth_reserves_both_row_arenas() {
         let overlap = numbered_growth(1 << 20, true);
         numbered_growth(overlap - 1, false);
+    }
+
+    // Hashbrown rounds 32 entries to capacity 56, while the row arena has only
+    // 32 rows. The overlapping batches add eight keys without growing the hash.
+    fn arena_growth(limit: u64, numbered: bool, spill_on: bool, freeze: bool, fits: bool) -> u64 {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.var("value");
+        ctx.var("second");
+        ctx.mem_limit = limit;
+        if spill_on {
+            ctx.spill = Some(Arc::new(spill.query(None)));
+        }
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_cursor_owner();
+        let baseline = ctx.live_bytes();
+        let mut distinct = Distinct::new(&ctx, &[0, 1], &[], false, numbered).unwrap();
+        let batch = |first: i64, len: usize| {
+            let mut buffer = Buffer::new(&ctx, &[0, 1], len).unwrap();
+            for i in first..first + len as i64 {
+                buffer.table.cols[0].push(Id::from_i64(i).unwrap());
+                let second = if numbered {
+                    // The second batch repeats eight keys with later input numbers.
+                    i + if first == 24 { 8 } else { 0 }
+                } else {
+                    i * 2
+                };
+                buffer.table.cols[1].push(Id::from_i64(second).unwrap());
+            }
+            buffer.table.len = len;
+            buffer.reconcile().unwrap();
+            buffer
+        };
+        let collect = |buffer: &Buffer| -> Vec<(Id, Id)> {
+            buffer.table.cols[0]
+                .iter()
+                .copied()
+                .zip(buffer.table.cols[1].iter().copied())
+                .collect()
+        };
+        let mut first = batch(0, 32);
+        distinct.apply(&ctx, &mut first).unwrap();
+        let mut output = collect(&first);
+        drop(first);
+        let width = if numbered { 1 } else { 2 };
+        let (hash, arena) = match distinct.seen.as_ref().unwrap() {
+            Seen::Many { table, rows } => (table.capacity(), rows.capacity()),
+            Seen::One(_) => panic!("both cases require a row arena"),
+        };
+        assert!(48 <= hash && 48 * width > arena);
+        let neighbor = ctx
+            .retained_charge(if freeze { 800 << 10 } else { 4096 })
+            .unwrap();
+        let mut next = batch(24, 16);
+        let other = ctx.live_bytes() - distinct.bytes;
+        let arena_target = (48 * width).max(arena * 2);
+        let overlap = other + table_bytes(hash, 4) + (arena + arena_target) as u64 * 8 + 256;
+        if fits {
+            distinct.apply(&ctx, &mut next).unwrap();
+            if freeze {
+                assert!(distinct.frozen, "arena growth must be a freeze point");
+                assert_eq!(next.table.len, 0);
+                assert!(distinct.has_more());
+            } else {
+                let required = match distinct.seen.as_ref().unwrap() {
+                    Seen::Many { table, rows } => {
+                        assert_eq!(table.capacity(), hash);
+                        assert!(rows.capacity() > arena);
+                        table_bytes(table.capacity(), 4) + rows.capacity() as u64 * 8 + 256
+                    }
+                    Seen::One(_) => unreachable!(),
+                };
+                assert_eq!(
+                    distinct.bytes, required,
+                    "retained charge must cover the live arena"
+                );
+                assert!(
+                    ctx.mem_peak() >= overlap,
+                    "both arena allocations must be admitted"
+                );
+            }
+            output.extend(collect(&next));
+        } else {
+            assert!(matches!(
+                distinct.apply(&ctx, &mut next),
+                Err(Error::BudgetExceeded(_))
+            ));
+            match distinct.seen.as_ref().unwrap() {
+                Seen::Many { table, rows } => {
+                    assert_eq!(table.capacity(), hash);
+                    assert_eq!(rows.capacity(), arena);
+                    assert_eq!(table.len(), 32);
+                    assert_eq!(rows.len(), 32 * width);
+                }
+                Seen::One(_) => unreachable!(),
+            }
+        }
+        drop(next);
+        drop(neighbor);
+        if fits {
+            while let Some(buffer) = distinct.drain(&ctx, &[0, 1]).unwrap() {
+                output.extend(collect(&buffer));
+            }
+            // Both spill modes must match the eager first-occurrence result,
+            // including the row numbers carried by numbered DISTINCT.
+            output.sort_unstable();
+            let expected: Vec<_> = (0..40)
+                .map(|i| {
+                    (
+                        Id::from_i64(i).unwrap(),
+                        Id::from_i64(if numbered {
+                            i + if i >= 32 { 8 } else { 0 }
+                        } else {
+                            i * 2
+                        })
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(output, expected);
+        }
+        drop(distinct);
+        assert_eq!(ctx.live_bytes(), baseline);
+        assert_eq!(spill.reserved_bytes(), 0);
+        overlap
+    }
+
+    #[test]
+    fn row_arena_growth_without_hash_growth_is_charged_and_denied_before_allocation() {
+        for numbered in [false, true] {
+            let overlap = arena_growth(1 << 20, numbered, false, false, true);
+            arena_growth(overlap - 1, numbered, false, false, false);
+            arena_growth(1 << 20, numbered, true, false, true);
+        }
+    }
+
+    #[test]
+    fn row_arena_growth_without_hash_growth_can_freeze_and_drain() {
+        for numbered in [false, true] {
+            arena_growth(1 << 20, numbered, true, true, true);
+        }
     }
 }
