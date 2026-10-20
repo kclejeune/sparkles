@@ -833,7 +833,9 @@ QLever's answers waited about 40 ms each for a delayed TCP acknowledgement. A ru
 BSBM Explore at 10M completed on 2026-10-19, and its figures and record are in
 BENCHMARKS.md. Full-text queries at 1.05M were rerun one engine at a time on
 2026-10-20 using the retained indexes, and their record includes the earlier
-index-build measurements. WatDiv's
+index-build measurements. WatDiv completed on 2026-10-20 with all 100 template
+and engine results passing the answer checks. Its record includes the raw instance
+timings and load measurements. In an earlier attempt, WatDiv's
 last query was interrupted when QLever crashed, and its record included unfinished
 hyperfine output as an extra query. The collector now excludes those temporary
 files, and the shared timing helper prepares each engine separately so QLever's
@@ -850,12 +852,12 @@ BSBM BI exhausted its eight-hour batch limit while Jena's driver continued after
 repeated request timeouts. Each engine, mix and client count now has a configurable
 1800 second wall budget, with bounded process-group cleanup and an explicit timeout
 record without partial throughput. Successful runs retain their requested mix
-counts. These repairs have regression coverage. WatDiv, DBpedia and BI are being
-rerun with the corrected harness. The runner leaves JAVA unset for Jena 6’s loader
+counts. These repairs have regression coverage. WatDiv completed with the corrected
+harness, while DBpedia and BI are being rerun. The runner leaves JAVA unset for Jena 6’s loader
 so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
 
-* The rest of the standard refresh at one head (A5). The WatDiv, DBpedia and BI
-  reruns and the later batches remain. The
+* The rest of the standard refresh at one head (A5). The DBpedia and BI reruns
+  and the later batches remain. The
   regeneration of the BENCHMARKS.md tables from records without a numeric change (A3)
   remains open. `bench.sh` starts,
   checks and times one engine at a time in its default and `updates` modes since

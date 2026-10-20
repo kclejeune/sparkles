@@ -23,16 +23,18 @@ churn, mixed-load, updates, load and memory figures of the synthetic suite, and 
 [SP²Bench](#sp2bench-at-10m-triples) and [LUBM](#lubm100) sections come from these runs.
 The full-text queries at 1.05M were measured again on 2026-10-20, each engine alone
 with the indexes built on 2026-10-19. The BSBM Explore comparison at 10M is from
-2026-10-19. Their sections link to the result records. Other sections keep their
-earlier measurements. WatDiv's last query was interrupted when QLever crashed, and its partial
-hyperfine output was included as an extra query in the generated record. That
-record is incomplete and does not replace the published figures. The DBpedia slice of 50M triples remains incomplete after a QLever
+2026-10-19. WatDiv at 10.97M was measured again on 2026-10-20, and all 100 template
+and engine results passed the answer checks. Their sections link to the result
+records. Other sections keep their earlier measurements. An earlier WatDiv attempt
+ended when QLever crashed, and its partial timing file was incorrectly collected as
+an extra query. That incomplete record was excluded from publication. The DBpedia
+slice of 50M triples remains incomplete after a QLever
 restart left cache preparation pointing at its old port. BSBM BI reached its
 query-mix phase but exhausted the eight-hour batch limit while the Jena driver
 continued after repeated request timeouts. The harness now resolves cache preparation
 after restarts, times DBpedia engines alone under the configured memory limit,
-ignores unfinished timing files, and bounds each BSBM driver run. WatDiv, DBpedia and BI are being
-rerun with the corrected harness. The later batches of the refresh have not started.
+ignores unfinished timing files, and bounds each BSBM driver run. WatDiv completed
+with the corrected harness, while DBpedia and BI are being rerun. The later batches of the refresh have not started.
 
 * [Summary](#summary)
 * [Query performance](#query-performance)
@@ -68,8 +70,8 @@ On larger and standard workloads:
   QLever's 1,674 s and Fluree's 2,919 s. It is faster than QLever on all 29 warm queries that both answer
   correctly and on 29 of 31 cold ones.
 * **WatDiv at 10.97M triples.** Sparkles is fastest on all 20 templates, with a
-  geometric mean of 4.84 ms against 7.41 ms for Fluree, 14.2 ms for Fuseki, 17.2 ms for
-  Oxigraph and 18.2 ms for QLever.
+  geometric mean of 4.58 ms against 6.97 ms for Fluree, 13.6 ms for Fuseki, 16.2 ms for
+  Oxigraph and 17.9 ms for QLever.
 * **Full-text search.** Sparkles is fastest on all seven queries at 1.05M and on six of
   seven at 10.5M, against Fuseki with jena-text and QLever.
 * **LUBM(100).** Over the 24.3M triples of the OWL 2 RL closure, which Sparkles
@@ -235,47 +237,56 @@ on CPU 11 and the server on CPUs 0–9, with the result cache off.
 
 ### WatDiv
 
-WatDiv v0.6 basic testing at scale 100 has 10,973,381 triples and 20 templates with five
-instances each, except C1–C3, which have one, for 88 instances. All answers agree with
-independent reference multisets. Times are geometric means over each template's five-run
-instance means after one warm-up, and category means weight templates equally. Sparkles is
-fastest on all 20 templates and on 86 of 88 instances. Fluree is faster on `S7-5` by 3.8%
-and on `F2-1` by 0.04%, both within 10%. C3 returns 419,866 rows, and its time includes
-the complete response.
+WatDiv v0.6 basic testing at scale 100 has 10,973,381 triples and 20 templates with
+five instances each, except C1 to C3, which have one, for 88 instances. The refreshed
+run on forge on 2026-10-20 used the release binary of 81478fbe and the harness of
+aa53c0e6, each engine alone under a 12 GiB limit and clients pinned to CPU 11.
+Every engine's answers agreed by RDF value multiset for every instance. Agreement
+is against the other engines, rather than an independent reference oracle.
+
+Times are geometric means over each template's ten-run instance means after two
+warm-up requests. Category means weight templates equally. Sparkles has the lowest
+mean on all twenty templates and on 84 of 88 instances. Fluree has the lower mean
+on L1-1, L3-1 and S6-1, and Oxigraph on S7-1. The L3-1 difference puts Sparkles
+21% slower in this run, while the other three differences are within 10%.
+C3 returns 419,866 rows and includes the complete response. The
+[WatDiv record](benchmarks/2026-10-20-watdiv-100-forge.json) contains the raw instance
+timings, pooled results, answer fingerprints, load measurements and run provenance.
 
 | template | instances | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
 |---|---:|---:|---:|---:|---:|---:|
-| L1 | 5 | **3.85** | 6.87 | 9.77 | 4.01 | 4.70 |
-| L2 | 5 | **4.09** | 12.2 | 9.39 | 5.48 | 15.5 |
-| L3 | 5 | **3.83** | 6.98 | 7.11 | 4.07 | 4.59 |
-| L4 | 5 | **3.81** | 8.23 | 7.06 | 4.36 | 8.28 |
-| L5 | 5 | **4.02** | 11.4 | 11.1 | 4.77 | 13.7 |
-| S1 | 5 | **4.32** | 7.63 | 95.7 | 4.84 | 7.06 |
-| S2 | 5 | **4.22** | 7.68 | 8.07 | 4.89 | 7.02 |
-| S3 | 5 | **3.97** | 10.7 | 11.0 | 5.43 | 15.6 |
-| S4 | 5 | **3.86** | 13.2 | 8.00 | 5.29 | 29.9 |
-| S5 | 5 | **3.88** | 8.03 | 10.2 | 4.73 | 13.8 |
-| S6 | 5 | **3.77** | 7.25 | 7.64 | 4.75 | 6.56 |
-| S7 | 5 | **3.78** | 6.45 | 9.67 | 3.90 | 3.93 |
-| F1 | 5 | **4.05** | 8.45 | 16.2 | 4.42 | 14.4 |
-| F2 | 5 | **4.05** | 7.88 | 32.3 | 4.52 | 8.67 |
-| F3 | 5 | **3.98** | 7.51 | 18.5 | 28.0 | 6.17 |
-| F4 | 5 | **4.59** | 7.80 | 56.3 | 26.0 | 8.94 |
-| F5 | 5 | **4.26** | 7.39 | 20.2 | 4.61 | 7.47 |
-| C1 | 1 | **6.89** | 16.8 | 33.9 | 8.16 | 36.5 |
-| C2 | 1 | **8.35** | 140 | 54.9 | 39.7 | 369 |
-| C3 | 1 | **47.92** | 10247 | 289 | 104 | 23122 |
+| L1 | 5 | **3.59** | 7.59 | 9.39 | 3.62 | 4.44 |
+| L2 | 5 | **3.74** | 12.4 | 8.94 | 5.18 | 14.5 |
+| L3 | 5 | **3.77** | 6.68 | 6.88 | 3.84 | 4.16 |
+| L4 | 5 | **3.63** | 8.04 | 6.84 | 4.09 | 7.33 |
+| L5 | 5 | **3.82** | 11.0 | 11.1 | 4.64 | 13.3 |
+| S1 | 5 | **4.11** | 6.74 | 92.6 | 4.29 | 6.72 |
+| S2 | 5 | **3.92** | 6.55 | 7.84 | 4.36 | 6.53 |
+| S3 | 5 | **3.69** | 10.4 | 11.0 | 5.14 | 14.8 |
+| S4 | 5 | **3.62** | 13.1 | 7.62 | 5.01 | 28.4 |
+| S5 | 5 | **3.59** | 6.90 | 10.2 | 4.35 | 13.4 |
+| S6 | 5 | **3.61** | 6.61 | 6.99 | 3.90 | 6.19 |
+| S7 | 5 | **3.46** | 5.39 | 9.48 | 3.56 | 3.65 |
+| F1 | 5 | **3.80** | 8.00 | 16.0 | 4.12 | 14.1 |
+| F2 | 5 | **3.79** | 7.09 | 33.0 | 4.20 | 8.42 |
+| F3 | 5 | **3.72** | 6.31 | 17.3 | 27.7 | 6.03 |
+| F4 | 5 | **4.35** | 7.35 | 59.0 | 28.2 | 8.86 |
+| F5 | 5 | **3.88** | 6.53 | 19.3 | 4.32 | 7.21 |
+| C1 | 1 | **6.54** | 17.6 | 36.2 | 7.95 | 28.6 |
+| C2 | 1 | **8.11** | 149 | 54.5 | 41.7 | 362 |
+| C3 | 1 | **50.6** | 11866 | 303 | 94.8 | 23094 |
 
 | category | templates | sparkles (ms) | jena-fuseki (ms) | qlever (ms) | fluree (ms) | oxigraph (ms) |
 |---|---:|---:|---:|---:|---:|---:|
-| **linear (L)** | 5 | **3.92** | 8.86 | 8.74 | 4.51 | 8.24 |
-| **star (S)** | 7 | **3.97** | 8.47 | 12.6 | 4.81 | 9.73 |
-| **snowflake (F)** | 5 | **4.18** | 7.80 | 25.6 | 9.23 | 8.75 |
-| **complex (C)** | 3 | **14.02** | 289 | 81.3 | 32.3 | 678 |
-| **all templates** | 20 | **4.84** | 14.2 | 18.2 | 7.41 | 17.2 |
+| **linear (L)** | 5 of 5 | **3.71** | 8.89 | 8.47 | 4.24 | 7.64 |
+| **star (S)** | 7 of 7 | **3.71** | 7.60 | 12.2 | 4.34 | 9.21 |
+| **snowflake (F)** | 5 of 5 | **3.90** | 7.03 | 25.3 | 8.99 | 8.56 |
+| **complex (C)** | 3 of 3 | **13.9** | 314 | 84.3 | 31.6 | 621 |
+| **all templates** | 20 of 20 | **4.58** | 13.6 | 17.9 | 6.97 | 16.2 |
 
 WatDiv was created by G. Aluç, O. Hartig, M. T. Özsu and K. Daudjee, “Diversified Stress
 Testing of RDF Data Management Systems,” ISWC 2014.
+
 
 <a id="sp2bench-at-10m-triples"></a>
 
@@ -1098,7 +1109,7 @@ its parallel `--file` loader did in the earlier figures.
 | 10.5M triples, peak RSS | 2,023 MiB | 4,433 MiB | **1,929 MiB** | 3,007 MiB | 2,184 MiB |
 | SP²Bench, 10M triples, time | **4.12 s** | 44.88 s | 9.70 s | 8.90 s | 20.49 s |
 | LUBM(100) closure, 24.3M triples, time | **8.04 s** | 60.38 s | 18.96 s | 20.03 s | 48.23 s |
-| WatDiv, 10.97M triples, time | **4.34 s** | 33.61 s | 9.71 s | 9.46 s | 13.16 s |
+| WatDiv, 10.97M triples, time | **3.82 s** | 33.77 s | 9.56 s | 8.92 s | 19.41 s |
 | DBpedia, 1.24B lines, time | **480 s** | — | 1,674 s | 2,919 s | — |
 | DBpedia, peak RSS | **6,059 MiB** | — | 11,401 MiB | 12,366 MiB | — |
 
@@ -2090,6 +2101,7 @@ than 10%. Fluree's warm advantage on `star-lookup` at 1.05M is within 10%.
 | Case | Reference advantage | Qualification |
 |---|---|---|
 | SP²Bench `q8` and `q12b`, 10M | Jena 181× on `q8`, Oxigraph about 5,000× and Jena about 2,900× on `q12b` | Sparkles' plan produces 555,607,405 rows for the one-row ASK of `q12b`. |
+| WatDiv `L3-1`, 10.97M | Fluree 1.21× | Sparkles has the lowest mean on all 20 template aggregates and 84 of 88 instances. This individual instance is 21% slower in the refreshed run. |
 | BSBM Explore `q5`, `q7` and `q8`, 10M | Fluree 2.9× on `q5`, Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
 | SP²Bench `q4`, `q5a`, `q6` and `q12a`, 10M | Jena answers `q6` and `q12a`, and Oxigraph `q12a` | Sparkles' default query memory budget refuses all four. No engine finished `q4` or `q5a`. |
 | LUBM(100) `q2` | QLever 3.7× | Sparkles is fastest on 11 of 14 queries. |
