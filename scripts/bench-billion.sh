@@ -485,12 +485,10 @@ step_queries() {
     echo
   done
   [ -n "${ANSWERS_ONLY:-}" ] && return
-  local clear=true
-  has qlever && clear="curl -sf -o /dev/null 'localhost:${PORT[qlever]}/?cmd=clear-cache&access-token=bench'"
   for n in "${NAMES[@]}"; do
     echo
     echo "== $n"
-    time_query "$n" results "$clear"
+    time_query "$n" results
   done
   for n in $THROUGHPUT; do
     selected "$n" || continue
@@ -500,7 +498,7 @@ step_queries() {
     for e in $ENGINES; do
       args+=(--command-name "${NAME[$e]}" "seq $NREQ | xargs -P $CONC -I{} $(q "${URL[$e]}" "$n")")
     done
-    hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$clear" \
+    hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
       "${args[@]}" --export-json "results/throughput-$n.new.json"
     merge "results/throughput-$n.new.json" "results/throughput-$n.json"
   done

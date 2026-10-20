@@ -4,7 +4,7 @@
 # caller defines q, merge, log, ENGINES, URL, NAME, WARMUP, RUNS and CLIENT, and start and
 # stop when its engines can be restarted one at a time.
 #
-# time_query <query> <results dir> <prepare command> sends one untimed request to each
+# time_query <query> <results dir> [prepare command] sends one untimed request to each
 # engine first. An engine whose first request fails or reaches MAX_TIME is recorded with
 # that one sample, as an error or a timeout (curl exit 28), and is not timed, so a query that
 # cannot finish costs MAX_TIME once instead of WARMUP + RUNS times. hyperfine then times the
@@ -16,6 +16,16 @@
 # remaining queries, each of which records it as an error.
 
 DEAD_ENGINES=${DEAD_ENGINES:-}
+
+# Resolve preparation after the probes, since a restart can change QLever's URL.
+# A server left out of the remaining queries has no cache to clear.
+cache_prepare() {
+  if [[ " $ENGINES " == *" qlever "* && " $DEAD_ENGINES " != *" qlever "* ]]; then
+    printf 'curl -sf --max-time 30 -o /dev/null %q\n' "${URL[qlever]}?cmd=clear-cache&access-token=bench"
+  else
+    echo true
+  fi
+}
 
 # answering <engine>: a one-row query answers within 30 s
 answering() {
@@ -64,7 +74,7 @@ EOF
 }
 
 time_query() {
-  local n=$1 res=$2 clear=$3 all=$ENGINES ok="" e rc t0 t1 args=()
+  local n=$1 res=$2 clear=${3:-} all=$ENGINES ok="" e rc t0 t1 args=()
   local new=$res/$n.new.json
   rm -f "$new"
   for e in $all; do
@@ -97,6 +107,7 @@ time_query() {
   done
   for e in $ok; do args+=(--command-name "${NAME[$e]}" "$(q "${URL[$e]}" "$n")"); done
   if [ ${#args[@]} -gt 0 ]; then
+    [ -n "$clear" ] || clear=$(cache_prepare)
     ${CLIENT[@]+"${CLIENT[@]}"} hyperfine --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$clear" \
       "${args[@]}" --export-json "$res/$n.hf.json"
     python3 - "$res/$n.hf.json" "$new" << 'EOF'

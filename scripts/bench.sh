@@ -142,9 +142,6 @@ suite() {
   for e in $ENGINES; do eval "$(upd "$e" queries/_delete.ru)" || true; done
   answer_check
   [ -n "${ANSWERS_ONLY:-}" ] && return
-  # clears QLever's result cache before every run (a no-op without QLever)
-  local clear=true
-  has qlever && clear="curl -sf -o /dev/null 'localhost:${PORT[qlever]}/?cmd=clear-cache&access-token=bench'"
   # timed_all <hyperfine json>: true when it has a result for every engine of ENGINES
   timed_all() {
     [ -f "$1" ] || return 1
@@ -163,7 +160,7 @@ EOF
     [ -n "${SKIP_QUERIES:-}" ] && timed_all "$RES/$n.json" && continue
     echo
     echo "== $n"
-    time_query "$n" "$RES" "$clear"
+    time_query "$n" "$RES"
   done
 
   # ------------------------------------------------------------------------ update latency
@@ -208,7 +205,7 @@ EOF
   pcmd() { par "${URL[$1]}"; }
   mapfile -d '' ARGS < <(engine_args pcmd)
   for e in $ENGINES; do reset_peak "$e"; done
-  hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$clear" \
+  hyperfine --warmup 1 --runs 3 --style basic --ignore-failure --prepare "$(cache_prepare)" \
     "${ARGS[@]}" --export-json "$RES/throughput.new.json"
   merge "$RES/throughput.new.json" "$RES/throughput.json"
   kv=()

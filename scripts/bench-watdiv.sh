@@ -293,14 +293,11 @@ done
 
 # ---------------------------------------------------------------------------- timings
 if [ -z "${ANSWERS_ONLY:-}" ]; then
-  # clears QLever's result cache before every run (a no-op without QLever)
-  CLEAR="true"
-  has qlever && CLEAR="curl -sf -o /dev/null 'localhost:$QPORT/?cmd=clear-cache&access-token=bench'"
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
     echo
     echo "== $n"
-    time_query "$n" results "$CLEAR"
+    time_query "$n" results
   done
 fi
 

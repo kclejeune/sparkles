@@ -200,14 +200,11 @@ suite_manifest() {
 
 suite_time() {
   local n
-  # clears QLever's result cache before every run (a no-op without QLever); ENGINES is one engine here
-  local clear=true
-  has qlever && clear="curl -sf -o /dev/null 'localhost:${PORT[qlever]}/?cmd=clear-cache&access-token=bench'"
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
     echo
     echo "== $n"
-    time_query "$n" "$RES" "$clear"
+    time_query "$n" "$RES"
   done
 }
 
