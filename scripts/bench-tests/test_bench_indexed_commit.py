@@ -376,6 +376,45 @@ class Oracles(unittest.TestCase):
         self.assertIsNone(BENCH.publication_index_probe("geo", "delete", "n", 0))
         self.assertIsNone(BENCH.publication_index_probe("embed", "literal", "n", 8))
 
+    def test_rss_peak_combines_kernel_bound_with_actual_interval_samples(self):
+        samples = [
+            {"start_unix": lo, "end_unix": hi, "rss_kib": rss}
+            for lo, hi, rss in (
+                (0, 0.1, 9999),
+                (1.1, 1.2, 2048),
+                (1.9, 2.1, 8888),
+                (3, 3.1, 7777),
+            )
+        ]
+        peak = BENCH.writer_peak_rss("VmHWM: 1024 kB", samples, 1, 2)
+        self.assertEqual(peak["peak_rss_kib"], 2048)
+        self.assertEqual(peak["reset_hwm_outer_window_kib"], 1024)
+        self.assertEqual(peak["sampled_writer_interval_peak_kib"], 2048)
+        self.assertEqual(peak["writer_interval_sample_count"], 1)
+        peak = BENCH.writer_peak_rss("VmHWM: 4096 kB", samples, 1, 2)
+        self.assertEqual(peak["peak_rss_kib"], 4096)
+        peak = BENCH.writer_peak_rss("VmHWM: 1024 kB", [], 1, 2)
+        self.assertEqual(peak["peak_rss_kib"], 1024)
+        self.assertIsNone(peak["sampled_writer_interval_peak_kib"])
+        for start, end in ((2, 1), (float("nan"), 2), (1, float("inf"))):
+            with self.assertRaises(AssertionError):
+                BENCH.writer_peak_rss("VmHWM: 1024 kB", samples, start, end)
+
+    def test_memory_samples_preserve_wall_read_interval(self):
+        samples = []
+        stop = mock.Mock()
+        stop.is_set.side_effect = [False, True]
+        with (
+            mock.patch.object(
+                BENCH.pathlib.Path, "read_text", return_value="VmRSS: 2048 kB"
+            ),
+            mock.patch.object(BENCH.time, "time", side_effect=[10, 10.1]),
+        ):
+            BENCH.memory_samples(123, stop, samples)
+        self.assertEqual(samples[0]["start_unix"], 10)
+        self.assertEqual(samples[0]["end_unix"], 10.1)
+        self.assertEqual(samples[0]["rss_kib"], 2048)
+
     def test_cpu_list_expands_ranges(self):
         self.assertEqual(BENCH.cpu_set("0-3,8,10-11"), {0, 1, 2, 3, 8, 10, 11})
 

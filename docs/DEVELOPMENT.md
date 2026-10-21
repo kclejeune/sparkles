@@ -442,8 +442,11 @@ The full protocol uses both dataset sizes and five ABBA blocks. A smaller pilot 
 checks the harness and estimates runtime.
 
 For memory measurements, the harness saves the server's startup peak, resets its owned
-process's Linux high-water mark immediately before the writes and records the peak when
-the writes end. It also samples resident memory during that interval. An allocation and
+process's Linux high-water mark before client startup and reads it after the client exits,
+including raw-output finalization. This gives a conservative outer-window bound. It also
+samples resident memory, preserving wall timestamps around each read. The reported peak
+is the larger of the reset kernel bound and samples read wholly within the actual writer
+interval. Both components and the sample count are saved separately. An allocation and
 release in a disposable child checks that the kernel supports resetting the peak. A
 failed reset stops the measurement. The original Namespace write harness keeps its
 existing workload defaults.

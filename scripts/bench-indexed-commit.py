@@ -596,12 +596,44 @@ def read_samples(port, text, expected, stop, samples, errors):
 
 def memory_samples(pid, stop, samples):
     while not stop.is_set():
+        start_unix = time.time()
         text = pathlib.Path(f"/proc/{pid}/status").read_text()
+        end_unix = time.time()
         rss = int(
             next(s for s in text.splitlines() if s.startswith("VmRSS:")).split()[1]
         )
-        samples.append({"time": time.monotonic(), "rss_kib": rss})
+        samples.append(
+            {
+                "time": time.monotonic(),
+                "start_unix": start_unix,
+                "end_unix": end_unix,
+                "rss_kib": rss,
+            }
+        )
         stop.wait(0.1)
+
+
+def writer_peak_rss(status, samples, start, end):
+    assert math.isfinite(start) and math.isfinite(end) and 0 < start <= end
+    hwm = int(next(s for s in status.splitlines() if s.startswith("VmHWM:")).split()[1])
+    assert hwm >= 0
+    inside = []
+    for sample in samples:
+        assert sample["rss_kib"] >= 0
+        lo, hi = sample["start_unix"], sample["end_unix"]
+        assert math.isfinite(lo) and math.isfinite(hi) and lo <= hi
+        if start <= lo <= hi <= end:
+            inside.append(sample["rss_kib"])
+    sampled = max(inside) if inside else None
+    return {
+        "peak_rss_kib": max(hwm, sampled or 0),
+        "reset_hwm_outer_window_kib": hwm,
+        "sampled_writer_interval_peak_kib": sampled,
+        "writer_interval_sample_count": len(inside),
+        "write_start_unix": start,
+        "write_end_unix": end,
+        "hwm_scope": "reset before client startup; observed after client raw-output finalization",
+    }
 
 
 def reset_hwm(pid, directory):
@@ -1216,9 +1248,12 @@ def _measure(
         )
         status = interval_status
         (directory / "proc-status.txt").write_text(status)
-        result["peak_rss_kib"] = int(
-            next(s for s in status.splitlines() if s.startswith("VmHWM:")).split()[1]
+        peak = writer_peak_rss(
+            status, memory, result["write_start_unix"], result["write_end_unix"]
         )
+        save(directory / "rss-peak.json", peak)
+        result["peak_rss_kib"] = peak["peak_rss_kib"]
+        result["rss_peak_components"] = peak
         after_embedding = caught_up(args) if index == "embed" else None
         history = read_history(args.port, before_head)
         receipts = json.loads((directory / "receipts.json").read_text())
