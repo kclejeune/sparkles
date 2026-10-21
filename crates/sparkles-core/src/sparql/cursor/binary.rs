@@ -6,6 +6,11 @@
 //! probe and build rows, up to the output's room, and the second gathers each output
 //! column from the pairs. An OPTIONAL condition is evaluated once over the gathered
 //! candidate rows of a chunk, as eager left joins do.
+//!
+//! A query that may spill partitions both inputs to disk once the build input outgrows
+//! its share of memory, and joins the partitions one pair at a time ([`super::joinspill`],
+//! X08 §6.3).
+use super::joinspill::JoinSpill;
 use super::{Buffer, CursorOptions, Operator, merge};
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -40,7 +45,7 @@ pub(super) fn probe_side(node: &Node) -> usize {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(super) enum Mode {
     Inner,
     Optional,
     Semi,
@@ -49,34 +54,48 @@ enum Mode {
 }
 
 pub(super) struct Binary {
-    mode: Mode,
-    probe_side: usize,
-    columns: Vec<(Option<usize>, Option<usize>)>,
-    shared: Vec<(usize, usize)>,
+    pub(super) mode: Mode,
+    pub(super) probe_side: usize,
+    pub(super) columns: Vec<(Option<usize>, Option<usize>)>,
+    pub(super) shared: Vec<(usize, usize)>,
     /// Probe columns in order of preference for the hash key: certain on the probe
     /// side first. The build data decides which one is used.
-    preferred: Vec<(usize, usize)>,
-    index: Option<HashIndex>,
-    build: Option<Buffer>,
-    probe: Option<Buffer>,
+    pub(super) preferred: Vec<(usize, usize)>,
+    pub(super) index: Option<HashIndex>,
+    pub(super) build: Option<Buffer>,
+    pub(super) probe: Option<Buffer>,
     /// The probe row being joined.
-    row: usize,
+    pub(super) row: usize,
     /// How many of the row's candidates have been visited.
-    offset: usize,
+    pub(super) offset: usize,
     /// Whether the row has met a matching build row so far.
-    matched: bool,
-    expression: Option<Expr>,
+    pub(super) matched: bool,
+    pub(super) expression: Option<Expr>,
+    /// Whether a semi, anti or MINUS join lists the probe rows that a build row
+    /// matches, whatever the mode keeps, because the build input is joined in several
+    /// chunks and a probe row's verdict waits for the last one.
+    pub(super) deferred: bool,
+    /// Whether the output must keep the probe input's order if the join spills,
+    /// because an operator above relies on it.
+    pub(super) ordered: bool,
+    /// The variables of the probe and build inputs.
+    pub(super) probe_vars: Vec<VarId>,
+    pub(super) build_vars: Vec<VarId>,
+    /// The planner's estimate of the build input's rows.
+    pub(super) build_est: f64,
+    /// The partitioned join, once the build input has spilled.
+    pub(super) spill: Option<Box<JoinSpill>>,
     _charge: Option<RetainedCharge>,
 }
 
 /// The build row of a pair that has none: the OPTIONAL extension of a probe row.
-const NO_ROW: u32 = u32::MAX;
+pub(super) const NO_ROW: u32 = u32::MAX;
 
 /// Build rows grouped on one shared column. A bound key's rows are one slice of `rows`,
 /// in build order. Rows that leave the key unbound are compatible with every probe
 /// value, so every bound probe also visits them, and an unbound probe visits every
 /// build row.
-struct HashIndex {
+pub(super) struct HashIndex {
     /// The probe column that carries the key.
     probe: usize,
     /// Where each key's rows start in `rows`, and how many there are.
@@ -95,7 +114,7 @@ fn map_bytes(capacity: usize, entry: u64) -> u64 {
 impl HashIndex {
     /// Index `build` on its column `column`. Row numbers are 32 bits wide, and the
     /// grouped rows, the unbound rows and the key table are charged before they grow.
-    fn new(ctx: &Ctx, build: &Table, column: usize, probe: usize) -> Result<Self> {
+    pub(super) fn new(ctx: &Ctx, build: &Table, column: usize, probe: usize) -> Result<Self> {
         let rows = u32::try_from(build.len)
             .ok()
             .filter(|&n| n < NO_ROW)
@@ -209,7 +228,9 @@ impl Candidates<'_> {
 }
 
 impl Binary {
-    pub(super) fn new(ctx: &Ctx, node: &Node) -> Result<Self> {
+    /// `ordered` tells that an operator above relies on the probe input's order, which
+    /// a spilled join then restores.
+    pub(super) fn new(ctx: &Ctx, node: &Node, ordered: bool) -> Result<Self> {
         let mode = match &node.kind {
             Kind::LeftJoin { .. } => Mode::Optional,
             Kind::HalfJoin { anti: false } => Mode::Semi,
@@ -255,6 +276,12 @@ impl Binary {
             offset: 0,
             matched: false,
             expression,
+            deferred: false,
+            ordered,
+            probe_vars: probe.vars.clone(),
+            build_vars: build.vars.clone(),
+            build_est: build.est,
+            spill: None,
             _charge: charge,
         })
     }
@@ -284,13 +311,93 @@ impl Binary {
     ) -> Result<()> {
         let child = &mut children[1 - self.probe_side];
         let mut build = Buffer::new(ctx, &child.vars, 0)?;
-        while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
+        // A query that may spill keeps the build input to half the room it had, so that
+        // the probe batches and the output still fit when the join must partition.
+        let threshold = ctx
+            .spill
+            .is_some()
+            .then(|| (ctx.memory_room() / 2).max(super::joinspill::MIN_BUDGET));
+        // The most the input's operators took above what the query held before, while
+        // making one batch, as the ledger's peak shows when it rises.
+        let mut demand = 0u64;
+        // A synthetic threshold must not reject builds that have no key to
+        // partition. Inspect each appended batch only until a usable key appears.
+        let mut partitionable = false;
+        loop {
+            let (live, peak) = (ctx.live_bytes(), ctx.mem_peak());
+            let Some(batch) = child.next(ctx, options, options.batch_rows)? else {
+                break;
+            };
+            let raised = ctx.mem_peak();
+            if raised > peak {
+                demand = demand.max(raised - live);
+            }
             let n = batch.table.len;
-            merge::append(ctx, &mut build, &batch.table, 0..n)?;
+            let held = batch.charge.bytes();
+            // The next batch, and what the input's operators hold to make it.
+            let next_batch = super::capacity_bytes(&batch.table)
+                .saturating_mul(4)
+                .max(demand.saturating_sub(held));
+            let grown = threshold.filter(|&threshold| {
+                partitionable
+                    && build
+                        .charge
+                        .bytes()
+                        .saturating_add(super::capacity_bytes(&batch.table))
+                        > threshold
+                    && build.table.len > 0
+            });
+            let appended = match grown {
+                Some(threshold) => Err(ctx.memory_exceeded(threshold)),
+                None => merge::append(ctx, &mut build, &batch.table, 0..n),
+            };
+            match appended {
+                // The build also spills when what else the query holds leaves less than a
+                // quarter of the room it had, or less than a few of the input's batches, so
+                // that the input can still give its next batch.
+                Ok(()) => {
+                    if threshold.is_some() && !partitionable {
+                        partitionable = self.preferred.iter().any(|&(_, b)| {
+                            batch.table.cols[b].iter().any(|value| !value.is_undef())
+                        });
+                    }
+                    if partitionable
+                        && let Some(threshold) = threshold
+                        && ctx.memory_room() < (threshold / 2).max(next_batch)
+                    {
+                        let error = ctx.memory_exceeded(threshold);
+                        return self.start_spill(ctx, children, options, build, None, error);
+                    }
+                }
+                Err(error) if spills(ctx, &error) => {
+                    return self.start_spill(ctx, children, options, build, Some(batch), error);
+                }
+                Err(error) => return Err(error),
+            }
         }
         // Key on the shared column that the build data leaves unbound least often.
         // A column that is unbound in every build row selects nothing.
-        let table = &build.table;
+        let Some((p, b)) = self.key_column(ctx, &build.table)? else {
+            self.build = Some(build);
+            return Ok(());
+        };
+        if build.table.len > 1 {
+            match HashIndex::new(ctx, &build.table, b, p) {
+                Ok(index) => self.index = Some(index),
+                Err(error) if spills(ctx, &error) => {
+                    return self.start_spill(ctx, children, options, build, None, error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.build = Some(build);
+        Ok(())
+    }
+
+    /// The shared column to key on: the one that `table`, a build table, leaves unbound
+    /// least often, as (probe column, build column), unless every row leaves each
+    /// shared column unbound.
+    pub(super) fn key_column(&self, ctx: &Ctx, table: &Table) -> Result<Option<(usize, usize)>> {
         let unbound = |column: usize| table.cols[column].iter().filter(|x| x.is_undef()).count();
         let mut best: Option<((usize, usize), usize)> = None;
         for &(p, b) in &self.preferred {
@@ -303,12 +410,28 @@ impl Binary {
                 break;
             }
         }
-        if let Some(((p, b), _)) = best
-            && table.len > 1
-        {
-            self.index = Some(HashIndex::new(ctx, table, b, p)?);
-        }
-        self.build = Some(build);
+        Ok(best.map(|(key, _)| key))
+    }
+
+    /// Partition the build input to disk: the rows read so far in `build`, the batch
+    /// `pending` that did not fit, and the rest of the input. A join without a key to
+    /// partition on fails with `error`, the budget error that started the spill.
+    fn start_spill(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        children: &mut [Operator],
+        options: &CursorOptions,
+        build: Buffer,
+        pending: Option<Buffer>,
+        error: Error,
+    ) -> Result<()> {
+        self.index = None;
+        let Some(key) = self.key_column(ctx, &build.table)? else {
+            return Err(error);
+        };
+        let child = &mut children[1 - self.probe_side];
+        let spill = JoinSpill::start(ctx, self, key, build, pending, child, options, error)?;
+        self.spill = Some(Box::new(spill));
         Ok(())
     }
 
@@ -361,7 +484,7 @@ impl Binary {
     /// Inner and OPTIONAL joins without a condition: the pairs of the current probe
     /// batch from the current row, at most `room` of them. An unmatched OPTIONAL row
     /// pairs with [`NO_ROW`].
-    fn pairs(
+    pub(super) fn pairs(
         &mut self,
         ctx: &Ctx,
         room: usize,
@@ -485,7 +608,7 @@ impl Binary {
     /// test the condition on their merged rows at once, then keep the pairs that pass and
     /// extend each finished row that none of its pairs passed. A row's output is at most
     /// the larger of its visited candidates and one, which bounds the chunk by `room`.
-    fn condition(
+    pub(super) fn condition(
         &mut self,
         ctx: &Ctx,
         vars: &[VarId],
@@ -574,10 +697,11 @@ impl Binary {
 
     /// Semi, anti and MINUS joins: the probe rows that pass, at most `room` of them. A
     /// row passes a semi join when a build row matches it, and the others when none does.
-    fn filter(&mut self, ctx: &Ctx, room: usize, lp: &mut Vec<u32>) -> Result<()> {
+    /// A deferred join lists the rows that a build row matches.
+    pub(super) fn filter(&mut self, ctx: &Ctx, room: usize, lp: &mut Vec<u32>) -> Result<()> {
         let probe = &self.probe.as_ref().expect("available probe").table;
         let build = &self.build.as_ref().expect("captured build").table;
-        let keep_matched = self.mode == Mode::Semi;
+        let keep_matched = self.mode == Mode::Semi || self.deferred;
         let tests = self.checks() || self.mode == Mode::Minus;
         let simple = !tests
             || (self.mode == Mode::Minus
@@ -619,11 +743,19 @@ impl Binary {
         vars: &[VarId],
         cap: usize,
     ) -> Result<Option<Buffer>> {
+        if let Some(mut spill) = self.spill.take() {
+            let batch = spill.next(self, ctx, children, options, vars, cap);
+            self.spill = Some(spill);
+            return batch;
+        }
         if !self.ensure_probe(ctx, children, options, cap)? {
             return Ok(None);
         }
-        if self.build.is_none() {
+        if self.build.is_none() && self.spill.is_none() {
             self.build(ctx, children, options)?;
+            if self.spill.is_some() {
+                return self.next(ctx, children, options, vars, cap);
+            }
         }
         let mut output = Buffer::new(ctx, vars, cap)?;
         let _pairs = ctx.charge(cap as u64 * 8 + ctx.nvars() as u64 * 16 + 256)?;
@@ -657,9 +789,19 @@ impl Binary {
     }
 }
 
+/// Whether `error` is a memory budget that a query with spill answers by spilling.
+pub(super) fn spills(ctx: &Ctx, error: &Error) -> bool {
+    ctx.spill.is_some()
+        && matches!(
+            error,
+            Error::BudgetExceeded(b)
+                if matches!(b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
+        )
+}
+
 /// Append the rows of the pairs `lp` and `rp` to `out`, one column at a time. A probe
 /// value that is unbound takes the build row's value, and [`NO_ROW`] binds none.
-fn gather(
+pub(super) fn gather(
     out: &mut Table,
     columns: &[(Option<usize>, Option<usize>)],
     probe: &Table,

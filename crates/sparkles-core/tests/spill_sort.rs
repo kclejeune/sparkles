@@ -53,6 +53,7 @@ fn spill(dir: &std::path::Path) -> Arc<Spill> {
         max_bytes: 4 << 30,
         query_bytes: 4 << 30,
         min_free_bytes: 0,
+        encrypted: false,
     })
     .unwrap()
 }
@@ -111,6 +112,20 @@ fn leftovers(dir: &std::path::Path) -> Vec<String> {
 }
 
 const MEMORY: u64 = 768 << 10;
+
+#[test]
+fn numbered_distinct_can_spill_partially_ordered_scan_input() {
+    let s = store(60_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT DISTINCT ?s ?v { ?s <urn:p> ?o BIND(STR(?o) AS ?v) } ORDER BY DESC(?v) ?s";
+    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let actual = run(&s, q, MEMORY, Some(spill.clone()), None).unwrap();
+    assert_eq!(actual, expected);
+    assert!(spill.written_bytes() > 0);
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
 
 #[test]
 fn spilled_order_by_matches_eager_order_with_ties_and_expressions() {
@@ -182,6 +197,38 @@ fn spilled_order_by_keeps_a_total_order_on_the_sort_keys() {
     assert_eq!(keys(&rows), keys(&expected));
 }
 
+/// A batch that cannot be copied into an empty sort buffer becomes a run by itself, so a
+/// sort whose input batches are large next to the room left still spills (item 85).
+#[test]
+fn a_batch_too_large_to_buffer_spills_as_its_own_run() {
+    let s = store(60_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = spill(tmp.path());
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";
+    let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+    let opts = QueryOptions {
+        max_memory_bytes: Some(MEMORY),
+        spill: Some(spill.clone()),
+        ..Default::default()
+    };
+    let cursor = CursorOptions {
+        batch_rows: 20_000,
+        ..cursor_options()
+    };
+    let mut c = select_cursor(s.snapshot(), q, &opts, &cursor).unwrap();
+    let mut rows = Vec::new();
+    while let Some(b) = c.next_batch().unwrap() {
+        for i in 0..b.len() {
+            rows.push(b.row(i).unwrap());
+        }
+    }
+    assert!(c.stats().mem_peak_bytes <= MEMORY);
+    drop(c);
+    assert_eq!(rows, expected);
+    assert_eq!(spill.reserved_bytes(), 0);
+    assert!(leftovers(tmp.path()).is_empty());
+}
+
 #[test]
 fn spilled_sorts_remove_their_files_when_dropped_early() {
     let s = store(60_000);
@@ -206,6 +253,7 @@ fn spill_limits_fail_the_query_with_a_spill_budget() {
         max_bytes: 4 << 30,
         query_bytes: 4 << 30,
         min_free_bytes: 0,
+        encrypted: false,
     })
     .unwrap();
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o } ORDER BY DESC(?o) ?s";

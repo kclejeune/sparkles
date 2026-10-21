@@ -453,6 +453,7 @@ fn spill_server(spill: bool, spill_bytes: u64) -> ([tempfile::TempDir; 2], Arc<A
                     max_bytes: spill_bytes,
                     query_bytes: spill_bytes,
                     min_free_bytes: 0,
+                    encrypted: false,
                 })
                 .unwrap(),
             );

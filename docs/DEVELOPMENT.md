@@ -177,6 +177,12 @@ and 20/20 for SHACL. The eight SHACL 1.2 list tests pass, and all 32 test pairs 
 SHACLC suite read to the expected graph and write back to it.
 `crates/sparkles-core/tests/w3c-known-failures.txt` lists known failures and is empty.
 
+For the X08 spill conformance matrix, run `SPARKLES_W3C_SPILL=plain mise run --force test:w3c`
+and repeat with `SPARKLES_W3C_SPILL=encrypted`. Cursor query passes then use a 1 MiB
+memory budget and a private spill directory per query at batch sizes 1, 2, 3 and 4,096.
+Eager passes retain their ordinary options. These runs enable spill for conformance
+fixtures; the dedicated spill tests separately force physical spill.
+
 `mise run test:jena-clients` (`scripts/test-jena-clients.sh`) builds a debug server, starts
 it on a temporary data directory on port 5230 with `--gsp-direct-naming`, and runs
 `testsuite/jena-clients/JenaClients.java` with Java's single-file launcher. The program

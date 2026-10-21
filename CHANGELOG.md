@@ -92,18 +92,24 @@ export is not cut off. Over HTTP a client that reads nothing for longer than the
 request's timeout ends the stream as a timeout. This applies to `execution=streaming` as
 well. A local `sparkles query --timeout` still counts the time its output is blocked.
 
-`sparkles serve --spill on` lets a streamed sort without LIMIT, a grouping and a DISTINCT
-over unordered input write what does not fit in their memory budget to `--spill-dir`
-(default `<data>/.spill`) and finish. The disk is limited by `--spill-max-mb` for the
+`sparkles serve --spill on` enables disk spill. It remains off by default until all
+Phase 2b acceptance gates pass. A streamed sort without LIMIT, a grouping, a
+DISTINCT, a hash join and a long run of equal keys in a merge join write what does not
+fit in their memory budget to `--spill-dir` (default `<data>/.spill`) and finish. The disk is limited by `--spill-max-mb` for the
 server and `--query-spill-mb` for one query, a request may lower the latter with
 `spill-mb`, and a query over it fails with the new `spill` budget and `507`. With spill
 on, automatic execution also streams a query that eager execution would hold in more
 than half its budget, and runs an eager SELECT that exceeds its memory budget once more
-as a cursor unless it calls SERVICE anywhere. Spill is off by default until hash joins
-spill too. A DISTINCT above an ORDER BY keeps its rows in memory so that their order
-holds. `serve --spill on` fails to start when the spill directory cannot be used, sits
-on tmpfs or ramfs, is not owned by the server's user or is writable by others, and
-`--spill-max-mb 0` is refused. `/$/server/memory` adds a `spill` object and
+as a cursor unless it calls SERVICE anywhere. In `SELECT DISTINCT … ORDER BY` the
+DISTINCT runs below the sort, numbering its input rows so that the sort keeps the order,
+and may spill. A spilled hash join keeps its probe input's order only when an operator
+above it may rely on that order, and otherwise emits its partitions in turn.
+`--spill encrypted` seals every spill frame with AES-256-GCM under a random key for each
+file held only in memory, so a changed, moved, reordered or truncated frame fails the
+query, and `--spill off` turns spill off. When the spill directory cannot be used, sits
+on tmpfs or ramfs, is not owned by the server's user or is writable by others, the
+server fails to start when spill is enabled. An ordinary start leaves the spill
+directory unopened. `--spill-max-mb 0` is refused. `/$/server/memory` adds a `spill` object and
 `/$/metrics` the `sparkles_spill_*` series, `sparkles_spill_eager_retries_total`
 among them. A streamed grouping over a join can concatenate a `GROUP_CONCAT` in another
 order than an eager one, which SPARQL allows, and an ordered subquery fixes the order in
@@ -259,11 +265,15 @@ amount, a request ID that is not a positive integer, a settle without its reserv
 carryover line anywhere but right after the header, and a reconcile that takes the
 ledger past USD 25.
 
-Spill files are registered as the derived format `spill` version 1. A file has the magic
-`SPKSPL01`, the version as a u16, the operator kind, the codec, an encryption flag and
-the column count, then frames of up to 4,096 rows with a CRC-32 over each frame's header
-and columns. Only the process that wrote a file reads it, and a reader refuses another
-version, kind, codec or encryption flag. A spill directory holds a `SPARKLES-SPILL`
+Spill files are registered as the derived format `spill` version 2. A file has the magic
+`SPKSPL01`, the version as a u16, the operator kind, the codec, the encryption, the
+column count and the file's number, then frames of up to 4,096 rows with a CRC-32 over
+each frame's header and columns. An encrypted frame holds its columns sealed with
+AES-256-GCM, with the file and frame numbers as the nonce and the frame's kind, place and
+header as associated data, and the CRC covers the sealed bytes. Only the process that
+wrote a file reads it, and a reader refuses another version, kind, codec or encryption.
+Version 1 files are refused, which costs nothing, since spill files never outlive their
+process. A spill directory holds a `SPARKLES-SPILL`
 marker that names the format and its version.
 
 The ShEx write guard's persisted typing, `validation-typing.bin`, is registered as the

@@ -2115,6 +2115,32 @@ grouping held 38 MB against 130 MB eagerly and took 1.5 to 1.7 times as long, an
 at 16 MiB 4.4 MB at 1.7 times the eager time. A budget near a tenth of the state's size
 thus costs 1.7 to 2.8 times the time, and one near half of it costs little.
 
+The review corrections of 2026-10-20 bound retained join output files and repair
+merge EOF handling, keyless build limits and numbered DISTINCT accounting and order.
+The measurements below precede those corrections and do not establish their cost.
+
+On 2026-10-18 hash joins, merge-join runs and a DISTINCT below its ORDER BY learned to
+spill too. Spill remains opt-in until the full Phase 2b acceptance gates pass. The same probe ran each query's
+cursor under a budget beside the unlimited cursor and eager execution, at 10.5M on an
+8-vCPU Namespace instance with its default threads, and checked that the spilled rows
+matched the eager ones.
+
+| 10.5M, ms | Eager | Cursor, unlimited | Cursor, 16 MiB | Cursor, 4 MiB | Written at 4 MiB |
+|---|---:|---:|---:|---:|---:|
+| Join on `foaf:knows` under a merge join, 2.5M rows | **66** | 150 | 322 | 1,333 | 157 MB |
+| OPTIONAL with a filter, 300,191 rows | **34** | 57 | 77 | 186 | 24.6 MB |
+| MINUS, 90,161 rows | **21** | 36 | 59 | 165 | 24.6 MB |
+| `SELECT DISTINCT … ORDER BY`, 917,941 rows | 615 | **569** | 1,421 | 3,028 | 60.1 MB |
+
+The unlimited cursors held 61.8 to 90.8 MB for the joins and 1,016 MB for the DISTINCT,
+and every spilled run stayed within its budget. A join of 29.2M rows where one key holds
+nine tenths of each input took 681 ms under 1 MiB as a block nested loop, against 487 ms
+for the unlimited cursor, which held 34.3 MB, and 631 ms eagerly. The `foaf:knows` join sits under a merge
+join that relies on its order, so a spilled run writes its output a second time to merge
+it back, which is why it slows more than the OPTIONAL and MINUS joins at the root. The
+spilled joins wrote 95 to 150 MB a second. `--spill encrypted` added 1 to 6% to the bytes
+written and −2 to 21% to the times under 4 MiB, most of them under 10%.
+
 <a id="parallel-cursor-filters"></a>
 
 **Parallel cursor filters.** On 2026-10-18 a cursor filter over an index scan began to
@@ -2344,8 +2370,8 @@ harness errors.
 * **Larger scale.** The largest dataset is English DBpedia at 1.24 billion triples. QLever
   is built for 10⁹–10¹¹ triples and runs Wikidata and UniProt, and its lazy evaluation,
   FSST vocabulary compression and IRI encoding matter more as data grows. Sparkles spills
-  only cursor sorts, groupings and unordered DISTINCT, and only behind
-  `serve --spill on`, so a query whose join or eager state outgrows its budget fails.
+  cursor sorts, groupings, DISTINCT and joins. A query still fails when its eager state
+  outgrows its budget.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of
   28.7 GiB under a 14 GiB limit.
 * **Other standard benchmarks.** SP²Bench at 10M triples and LUBM(100) have been compared

@@ -26,6 +26,7 @@ mod extsort;
 mod filter;
 pub mod graph;
 mod group;
+mod joinspill;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
 mod topk;
@@ -533,6 +534,20 @@ impl Buffer {
         self.charge.resize(capacity_bytes(&self.table))
     }
 
+    fn set_order(&mut self, order: &[VarId]) -> Result<()> {
+        if order.len() > self.table.sorted.capacity() {
+            // The old backing remains live while the replacement is cloned.
+            self.charge
+                .resize(capacity_bytes(&self.table).saturating_add(order.len() as u64 * 4))?;
+            self.table.sorted = order.to_vec();
+            self.reconcile()?;
+        } else {
+            self.table.sorted.clear();
+            self.table.sorted.extend_from_slice(order);
+        }
+        Ok(())
+    }
+
     fn project(&mut self, vars: &[VarId]) -> Result<()> {
         if self.table.vars == vars {
             let sorted = self
@@ -676,7 +691,7 @@ fn from_prepared(
     let bytes = plan_bytes(&prepared.node).saturating_add(query.len() as u64 * 16);
     let charge = OwnedCharge::new(&ctx, bytes)?;
     let spec = graph::Spec::from_parsed(parsed, options, cursor.fallback)?;
-    let root = Operator::build(&ctx, prepared.node, cursor.fallback)?;
+    let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
     let plan = root.describe(&ctx);
     ctx.check()?;
     let shared = kind == QueryKind::Select && prepared.bound.is_empty();
@@ -1947,9 +1962,84 @@ fn output_order(node: &Node, children: &[Operator], role: Role) -> Vec<VarId> {
         .collect()
 }
 
+/// `SELECT DISTINCT … ORDER BY` deduplicates below its sort when the query may spill
+/// (item 85), so that the DISTINCT can pass rows to later passes: the DISTINCT of a
+/// projection of an ORDER BY becomes a projection of an ORDER BY of a numbered DISTINCT
+/// of the projection. Equal projected rows have equal sort keys when every key is a pure
+/// expression of projected variables without EXISTS, and the numbered DISTINCT keeps
+/// each row's first input number, on which the sort orders ties, so the rows and their
+/// order are those that sorting first gives. Other shapes keep the DISTINCT above the
+/// sort.
+fn distinct_below_order(ctx: &Ctx, node: Node) -> Node {
+    let rewrites = matches!(node.kind, Kind::Distinct)
+        && node.children.len() == 1
+        && matches!(&node.children[0].kind, Kind::Project(vars) if *vars == node.vars && !vars.is_empty())
+        && node.children[0].children.len() == 1
+        && match &node.children[0].children[0].kind {
+            Kind::OrderBy { keys, limit: None } => keys.iter().all(|(key, _)| {
+                !key.has_exists()
+                    && crate::sparql::exprcache::impurity(key).is_none()
+                    && key.var_set().iter().all(|v| node.vars.contains(v))
+            }),
+            _ => false,
+        };
+    if !rewrites {
+        return node;
+    }
+    let mut distinct = node;
+    let mut project = distinct.children.pop().expect("a projection");
+    let mut order = project.children.pop().expect("an ORDER BY");
+    let input = order.children.pop().expect("the sorted input");
+    let Kind::OrderBy { mut keys, .. } = order.kind else {
+        unreachable!("an ORDER BY")
+    };
+    let vars = distinct.vars.clone();
+    let number = ctx.var("\u{1}distinct number");
+    let below = super::plan::project(input, vars.clone(), ctx);
+    let mut numbered = Node::leaf(
+        Kind::Distinct,
+        [vars.clone(), vec![number]].concat(),
+        below.est,
+        "below the ORDER BY, so that it may spill".into(),
+    );
+    numbered.certain = [below.certain.clone(), vec![number]].concat();
+    numbered.cost = below.cost;
+    numbered.children = vec![below];
+    keys.push((Expr::Var(number), true));
+    let mut sort = Node::leaf(
+        Kind::OrderBy { keys, limit: None },
+        numbered.vars.clone(),
+        numbered.est,
+        format!("{} then the first input row", order.desc),
+    );
+    sort.certain = numbered.certain.clone();
+    sort.cost = numbered.cost + numbered.est * numbered.est.max(2.0).log2() * 0.5;
+    sort.children = vec![numbered];
+    project.children.clear();
+    super::plan::project(sort, vars, ctx)
+}
+
 impl Operator {
-    fn build(ctx: &Arc<Ctx>, mut node: Node, fallback: FallbackPolicy) -> Result<Self> {
+    fn build(ctx: &Arc<Ctx>, node: Node, fallback: FallbackPolicy) -> Result<Self> {
+        Self::build_for(ctx, node, fallback, true)
+    }
+
+    /// Build the operator of `node`. `needed` tells whether anything above relies on
+    /// the order of its output. A hash join whose order nothing relies on, with spill
+    /// on, claims no order, so that it may emit a spilled join partition by partition
+    /// (item 85).
+    fn build_for(
+        ctx: &Arc<Ctx>,
+        node: Node,
+        fallback: FallbackPolicy,
+        needed: bool,
+    ) -> Result<Self> {
         ctx.check()?;
+        let mut node = if ctx.spill.is_some() {
+            distinct_below_order(ctx, node)
+        } else {
+            node
+        };
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.
         // An operator that evaluates EXISTS streams when every EXISTS pattern does.
@@ -1987,6 +2077,32 @@ impl Operator {
         // Read before the children below become shells that keep only their order.
         let value_ordered_input =
             matches!(node.kind, Kind::Distinct) && node.children.first().is_some_and(value_ordered);
+        // A DISTINCT that numbers its input rows has one variable more than its input.
+        let numbered_distinct = matches!(node.kind, Kind::Distinct)
+            && node.children.first().is_some_and(|child| {
+                child.vars.len() + 1 == node.vars.len()
+                    && node.vars.last().is_some_and(|v| !child.vars.contains(v))
+            });
+        // A hash join that spills keeps its probe input's order when that input comes in
+        // an order a caller observes.
+        let probe_value_ordered = needed
+            && joins
+            && node
+                .children
+                .get(binary::probe_side(&node))
+                .is_some_and(value_ordered);
+        // Which children's order this operator relies on. A projection or BIND passes
+        // on what its parent needs. A join that cannot merge on what the plan claims
+        // reads its build input into a hash table and keeps only the probe input's
+        // order. Other operators may use their inputs' order.
+        let hashes = joins && ctx.spill.is_some() && !merge::eligible(&node);
+        let needs: Vec<bool> = (0..node.children.len())
+            .map(|i| match node.kind {
+                Kind::Project(_) | Kind::Extend(..) | Kind::Slice { .. } => needed,
+                _ if hashes => needed && i == binary::probe_side(&node),
+                _ => true,
+            })
+            .collect();
         // A fallback materializes only its own operator when it reads its children as
         // input tables. Those children then stream as cursors of their own.
         let inputs = materializes
@@ -2014,14 +2130,15 @@ impl Operator {
         } else {
             let built = std::mem::take(&mut node.children)
                 .into_iter()
-                .map(|child| {
+                .zip(needs)
+                .map(|(child, needed)| {
                     let shell = (
                         child.vars.clone(),
                         child.certain.clone(),
                         child.est,
                         child.cost,
                     );
-                    Self::build(ctx, child, fallback).map(|op| (shell, op))
+                    Self::build_for(ctx, child, fallback, needed).map(|op| (shell, op))
                 })
                 .collect::<Result<Vec<_>>>()?;
             // Join operators read their children's shape from the node. Leave each
@@ -2059,7 +2176,7 @@ impl Operator {
             || expanding
             || walking
             || exists;
-        let order = output_order(
+        let mut order = output_order(
             &node,
             &children,
             if incremental_merge {
@@ -2082,8 +2199,11 @@ impl Operator {
         let group = incremental_group
             .then(|| group::Group::new(ctx, &node))
             .transpose()?;
+        if incremental_binary && !needed && ctx.spill.is_some() {
+            order.clear();
+        }
         let binary = incremental_binary
-            .then(|| binary::Binary::new(ctx, &node))
+            .then(|| binary::Binary::new(ctx, &node, !order.is_empty() || probe_value_ordered))
             .transpose()?;
         if binary.is_some()
             && let Kind::Join {
@@ -2185,6 +2305,7 @@ impl Operator {
                     &node.vars,
                     &children[0].order,
                     value_ordered_input,
+                    numbered_distinct,
                 )?),
                 Kind::Slice { offset, limit } => State::Slice {
                     offset: *offset,
@@ -2194,6 +2315,11 @@ impl Operator {
                 _ => State::Unary(node),
             }
         };
+        if let State::Distinct(distinct) = &state
+            && distinct.may_reorder()
+        {
+            order.clear();
+        }
         Ok(Self {
             state,
             children,
@@ -2487,7 +2613,7 @@ impl Operator {
         self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
         let mut batch = result?;
         if let Some(b) = &mut batch {
-            b.table.sorted.clone_from(&self.order);
+            b.set_order(&self.order)?;
             #[cfg(debug_assertions)]
             self.check_order(ctx, &b.table);
             self.rows = self
@@ -2547,10 +2673,32 @@ impl Operator {
                     batch
                 }
                 State::Merge(merge) => {
-                    merge.next(ctx, &mut self.children, options, &self.vars, cap)?
+                    let batch = merge.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if merge.spooled_runs > 0 {
+                        let mut counters = self.info.counters.take().unwrap_or_default();
+                        counters.insert("spilledBytes".into(), merge.spilled.into());
+                        counters.insert("spooledRuns".into(), merge.spooled_runs.into());
+                        self.info.counters = Some(counters);
+                    }
+                    batch
                 }
                 State::Binary(binary) => {
-                    binary.next(ctx, &mut self.children, options, &self.vars, cap)?
+                    let batch = binary.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(spill) = &binary.spill {
+                        let mut counters = self.info.counters.take().unwrap_or_default();
+                        let stats = &spill.stats;
+                        counters.insert("spilledBytes".into(), stats.written.into());
+                        counters.insert("spillPartitions".into(), stats.partitions.into());
+                        counters.insert("spillLevels".into(), stats.levels.into());
+                        if stats.chunks > 0 {
+                            counters.insert("spillChunks".into(), stats.chunks.into());
+                        }
+                        if binary.ordered {
+                            counters.insert("spillMergePasses".into(), stats.merge_passes.into());
+                        }
+                        self.info.counters = Some(counters);
+                    }
+                    batch
                 }
                 State::Group(group) => {
                     let batch = group.next(ctx, &mut self.children[0], options, &self.vars, cap)?;
@@ -2581,6 +2729,9 @@ impl Operator {
                 State::Distinct(distinct) => {
                     let batch = match self.children[0].next(ctx, options, cap)? {
                         Some(mut buffer) => {
+                            if let Some(&number) = self.vars.last() {
+                                distinct.number(&mut buffer, number)?;
+                            }
                             distinct.apply(ctx, &mut buffer)?;
                             Some(buffer)
                         }
@@ -2660,7 +2811,7 @@ impl Operator {
                                 let mut input = Buffer::new(ctx, &self.children[0].vars, 0)?;
                                 // The concatenated input keeps the child's order, which
                                 // lets a sort on a prefix of it skip reordering.
-                                input.table.sorted.clone_from(&self.children[0].order);
+                                input.set_order(&self.children[0].order)?;
                                 // Blocking input demand is independent of the requested
                                 // output prefix.
                                 while let Some(batch) =
@@ -2888,7 +3039,7 @@ fn collect_input(
     }
     let keep_lease = owns_algorithm(child);
     let mut input = Buffer::new(ctx, &child.vars, 0)?;
-    input.table.sorted.clone_from(&child.order);
+    input.set_order(&child.order)?;
     while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
         merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
     }
@@ -2898,11 +3049,7 @@ fn collect_input(
         table.sorted.clone_from(&child.order);
         return Ok((super::table::Materialized::plain(table), child.info.clone()));
     }
-    input
-        .charge
-        .resize(capacity_bytes(&input.table).saturating_add(child.order.len() as u64 * 4))?;
-    input.table.sorted.clone_from(&child.order);
-    input.reconcile()?;
+    input.set_order(&child.order)?;
     let info = child.info.clone();
     Ok((
         super::table::Materialized {
@@ -3737,6 +3884,7 @@ mod tests {
             max_bytes: 1 << 30,
             query_bytes: 1 << 30,
             min_free_bytes: 0,
+            encrypted: false,
         })
         .unwrap();
         let decide = |q: &str, spill: Option<Arc<crate::spill::Spill>>, memory: u64, est: f64| {

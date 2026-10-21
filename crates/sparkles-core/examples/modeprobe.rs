@@ -8,7 +8,13 @@
 //! lists the modes, `rows,tsv` by default, where `json` writes SPARQL JSON and `native`
 //! the native JSON of the UI, and `SPARKLES_PROBE_MEMORY_MB` sets the
 //! query memory budget. `SPARKLES_PROBE_STREAM_MEMORY_MB` sets another budget for the
-//! cursor runs, and `SPARKLES_PROBE_SPILL_DIR` lets them spill to that directory.
+//! cursor runs, and `SPARKLES_PROBE_SPILL_DIR` lets them spill to that directory, with every
+//! spill file encrypted when `SPARKLES_PROBE_SPILL_ENCRYPTED` is set. With
+//! `SPARKLES_PROBE_CHECK` set, the last round of `rows` compares an order-independent
+//! digest of the eager and the streamed rows and fails when they differ.
+//! `SPARKLES_PROBE_BATCH_ROWS` sets the cursor's batch size.
+//! `SPARKLES_PROBE_METRICS` prints a JSON record with exact ledger peaks, the
+//! configured budget, answer digests and cumulative spill writes for each mode.
 use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions, write_solutions};
 use sparkles_core::sparql::{
     CursorOptions, ExecutionMode, QueryExecution, QueryOptions, query, query_cursor,
@@ -26,6 +32,16 @@ fn median(v: &mut [f64]) -> f64 {
         return f64::NAN;
     }
     v[v.len() / 2]
+}
+
+/// An order-independent digest of a bag of rows.
+fn digest<'a>(rows: impl Iterator<Item = &'a [Option<oxrdf::Term>]>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    rows.fold(0u64, |sum, row| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        row.hash(&mut h);
+        sum.wrapping_add(h.finish())
+    })
 }
 
 /// The writer of a mode other than `rows`: `tsv`, `json` for SPARQL JSON or `native` for
@@ -62,13 +78,18 @@ fn main() {
             max_bytes: 64 << 30,
             query_bytes: 64 << 30,
             min_free_bytes: 1 << 30,
+            encrypted: std::env::var_os("SPARKLES_PROBE_SPILL_ENCRYPTED").is_some(),
         })
         .unwrap();
         stream_options.spill = Some(spill);
     }
-    let cursor = CursorOptions::default();
+    let mut cursor = CursorOptions::default();
+    if let Ok(rows) = std::env::var("SPARKLES_PROBE_BATCH_ROWS") {
+        cursor.batch_rows = rows.parse().unwrap();
+    }
     // `eager` or `stream` runs only that mode, for a profiler
     let only = std::env::var("SPARKLES_PROBE_ONLY").ok();
+    let check = std::env::var_os("SPARKLES_PROBE_CHECK").is_some();
     println!(
         "{:<22} {:>5} {:>10} {:>10} {:>6} {:>10} {:>10} {:>9} {:>6}",
         "query", "mode", "eager ms", "stream ms", "ratio", "eager MB", "stream MB", "rows", "auto"
@@ -93,8 +114,13 @@ fn main() {
             Err(_) => "error",
         };
         for mode in modes.split(',') {
+            let written_before = stream_options
+                .spill
+                .as_ref()
+                .map_or(0, |s| s.written_bytes());
             let (mut eager, mut stream) = (Vec::new(), Vec::new());
             let (mut eager_mem, mut stream_mem, mut rows) = (0u64, 0u64, 0usize);
+            let (mut eager_digest, mut stream_digest, mut stream_rows) = (0u64, 0u64, 0usize);
             for round in 0..rounds + 1 {
                 for first in [round % 2 == 0, round % 2 == 1] {
                     match only.as_deref() {
@@ -109,6 +135,14 @@ fn main() {
                             write_solutions(&result, format, std::io::sink(), None).unwrap();
                         }
                         rows = result.len();
+                        if check && round == rounds && mode == "rows" {
+                            let table = &result.table;
+                            eager_digest = (0..table.len()).fold(0u64, |sum, i| {
+                                let row: Vec<_> =
+                                    table.cols.iter().map(|c| result.term(c[i])).collect();
+                                sum.wrapping_add(digest(std::iter::once(row.as_slice())))
+                            });
+                        }
                         if round == rounds && std::env::var_os("SPARKLES_PROBE_PLAN").is_some() {
                             eprintln!(
                                 "{name} eager plan: {}",
@@ -129,7 +163,16 @@ fn main() {
                         let stats = if let Some(format) = format(mode) {
                             write_cursor_solutions(&mut c, format, std::io::sink(), None).unwrap()
                         } else {
+                            let last = check && round == rounds;
+                            stream_rows = 0;
                             while let Some(batch) = c.next_batch().unwrap() {
+                                stream_rows += batch.len();
+                                if last {
+                                    let rows: Vec<_> =
+                                        (0..batch.len()).map(|i| batch.row(i).unwrap()).collect();
+                                    stream_digest = stream_digest
+                                        .wrapping_add(digest(rows.iter().map(Vec::as_slice)));
+                                }
                                 std::hint::black_box(batch.len());
                             }
                             c.stats()
@@ -146,6 +189,14 @@ fn main() {
                 }
             }
             let (e, s) = (median(&mut eager), median(&mut stream));
+            if check && mode == "rows" {
+                assert_eq!(
+                    (stream_rows, stream_digest),
+                    (rows, eager_digest),
+                    "{name}: the streamed rows differ from the eager rows"
+                );
+                eprintln!("{name}: {rows} rows match, digest {eager_digest:016x}");
+            }
             println!(
                 "{:<22} {:>5} {:>10.3} {:>10.3} {:>6.2} {:>10.1} {:>10.1} {:>9} {:>6}",
                 name,
@@ -158,6 +209,39 @@ fn main() {
                 rows,
                 auto
             );
+            if std::env::var_os("SPARKLES_PROBE_METRICS").is_some() {
+                let reserved = stream_options
+                    .spill
+                    .as_ref()
+                    .map_or(0, |s| s.reserved_bytes());
+                assert_eq!(reserved, 0, "{name}: spill reservation remains after close");
+                if let Some(limit) = stream_options.max_memory_bytes {
+                    assert!(
+                        stream_mem <= limit,
+                        "{name}: ledger peak exceeds the budget"
+                    );
+                }
+                eprintln!(
+                    "metrics {}",
+                    serde_json::json!({
+                        "query": name,
+                        "mode": mode,
+                        "rounds": rounds,
+                        "eager_ms": e,
+                        "cursor_ms": s,
+                        "eager_peak_bytes": eager_mem,
+                        "cursor_peak_bytes": stream_mem,
+                        "cursor_budget_bytes": stream_options.max_memory_bytes,
+                        "rows": rows,
+                        "bag_checked": check && mode == "rows",
+                        "eager_digest": format!("{eager_digest:016x}"),
+                        "cursor_digest": format!("{stream_digest:016x}"),
+                        "spill_written_bytes_all_rounds": stream_options.spill.as_ref()
+                            .map_or(0, |s| s.written_bytes()).saturating_sub(written_before),
+                        "spill_reserved_bytes_after_close": reserved,
+                    })
+                );
+            }
         }
     }
 }

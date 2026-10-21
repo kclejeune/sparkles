@@ -3169,6 +3169,7 @@ name = "sparkles-core"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "aws-lc-rs",
  "brotli",
  "bzip2",
  "csv",

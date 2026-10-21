@@ -879,11 +879,13 @@ impl CompressArgs {
 }
 
 // parsed once; `serve` has most of the flags
-/// Whether streamed sorts may spill to disk (`serve --spill`).
+/// Whether streamed operators may spill to disk (`serve --spill`), and whether their
+/// files are encrypted with keys held only in memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum SpillMode {
     On,
     Off,
+    Encrypted,
 }
 
 /// The disk all queries' spill files may reserve when `--spill-max-mb` is not given: a
@@ -898,15 +900,17 @@ fn default_spill_capacity(dir: &std::path::Path) -> u64 {
 }
 
 /// Open the spill directory for `serve --spill on`, removing what dead processes left in
-/// it. Spill is asked for explicitly, so a directory that cannot be used fails the start,
-/// as does one on a file system that keeps its files in memory, where spilled state
-/// would take the memory that spill is meant to save. A directory on a network file
-/// system is used with a warning, since its locks may not reach other machines.
+/// it. A directory that cannot be used is an error, as is one on a file system that keeps
+/// its files in memory, where spilled state would take the memory that spill is meant to
+/// save. The caller fails the start if this directory cannot be used. A directory on a
+/// network file system is used with a warning, since
+/// its locks may not reach other machines.
 fn open_spill(
     dir: &std::path::Path,
     max_mb: Option<u64>,
     query_mb: u64,
     min_free_mb: u64,
+    encrypted: bool,
 ) -> anyhow::Result<Arc<sparkles::spill::Spill>> {
     let mib = |flag: &str, mb: u64| {
         mb.checked_mul(1 << 20)
@@ -926,12 +930,13 @@ fn open_spill(
             mib("query-spill-mb", query_mb)?
         },
         min_free_bytes: mib("min-free-disk-mb", min_free_mb)?,
+        encrypted,
     };
     let spill =
-        sparkles::spill::Spill::open(&options).map_err(|e| anyhow::anyhow!("--spill on: {e}"))?;
+        sparkles::spill::Spill::open(&options).map_err(|e| anyhow::anyhow!("--spill: {e}"))?;
     match sparkles::disk::special_file_system(spill.dir()) {
         Ok(Some(fs)) if sparkles::disk::in_memory_file_system(fs) => bail!(
-            "--spill on: the spill directory {} is on {fs}, which keeps its files in \
+            "--spill: the spill directory {} is on {fs}, which keeps its files in \
              memory; give --spill-dir a directory on a disk",
             dir.display()
         ),
@@ -946,9 +951,10 @@ fn open_spill(
         ),
     }
     tracing::info!(
-        "spill directory {}, {} MiB for all queries",
+        "spill directory {}, {} MiB for all queries{}",
         spill.dir().display(),
-        max_bytes >> 20
+        max_bytes >> 20,
+        if encrypted { ", encrypted" } else { "" }
     );
     Ok(spill)
 }
@@ -1137,11 +1143,13 @@ enum Cmd {
         /// with `Retry-After`
         #[arg(long, default_value_t = 2.0)]
         query_admission_wait: f64,
-        /// Whether streamed sorts, groupings and DISTINCT that outgrow their memory
-        /// budget write their excess to disk (`on`) or fail with their memory budget
-        /// (`off`, the default until hash joins spill too)
-        #[arg(long, value_enum, default_value_t = SpillMode::Off)]
-        spill: SpillMode,
+        /// Whether streamed sorts, groupings, DISTINCT and joins that outgrow their memory
+        /// budget write their excess to disk (`on`), do so with every spill
+        /// file encrypted under a key held only in memory (`encrypted`), or fail with
+        /// their memory budget (`off`, the default). Enabling spill requires a usable
+        /// spill directory or the server fails to start.
+        #[arg(long, value_enum)]
+        spill: Option<SpillMode>,
         /// Directory of the spill files, on a local disk, owned by the server's user and
         /// writable by no other user; a tmpfs or ramfs is refused (default:
         /// `<data>/.spill`)
@@ -2737,13 +2745,15 @@ fn run() -> Result<()> {
             )?;
             st.admission.profile = cli_memory_profile;
             st.admission.wait = Duration::from_secs_f64(query_admission_wait);
-            if spill == SpillMode::On {
+            let mode = spill.unwrap_or(SpillMode::Off);
+            if mode != SpillMode::Off {
                 let dir = spill_dir.unwrap_or_else(|| data.join(".spill"));
                 st.spill = Some(open_spill(
                     &dir,
                     spill_max_mb,
                     query_spill_mb,
                     min_free_disk_mb,
+                    mode == SpillMode::Encrypted,
                 )?);
             }
             st.auth = auth;
@@ -5318,22 +5328,22 @@ mod spill_options_tests {
             return;
         };
         let dir = tmp.path().join("spill");
-        let error = open_spill(&dir, Some(0), 0, 0).unwrap_err();
+        let error = open_spill(&dir, Some(0), 0, 0, false).unwrap_err();
         assert!(error.to_string().contains("--spill-max-mb"), "{error}");
-        let error = open_spill(&dir, Some(u64::MAX >> 4), 0, 0).unwrap_err();
+        let error = open_spill(&dir, Some(u64::MAX >> 4), 0, 0, false).unwrap_err();
         assert!(error.to_string().contains("too large"), "{error}");
         // A path below a file.
         let file = tmp.path().join("file");
         std::fs::write(&file, b"").unwrap();
-        assert!(open_spill(&file.join("spill"), Some(64), 0, 0).is_err());
-        let spill = open_spill(&dir, None, 0, 0).unwrap();
+        assert!(open_spill(&file.join("spill"), Some(64), 0, 0, false).is_err());
+        let spill = open_spill(&dir, None, 0, 0, false).unwrap();
         assert!(spill.capacity() > 0);
         drop(spill);
         // A file system that keeps its files in memory.
         let shm = std::path::Path::new("/dev/shm");
         if sparkles::disk::special_file_system(shm).ok().flatten() == Some("tmpfs") {
             let tmp = tempfile::tempdir_in(shm).unwrap();
-            let error = open_spill(&tmp.path().join("spill"), Some(64), 0, 0).unwrap_err();
+            let error = open_spill(&tmp.path().join("spill"), Some(64), 0, 0, false).unwrap_err();
             assert!(error.to_string().contains("tmpfs"), "{error}");
         }
     }

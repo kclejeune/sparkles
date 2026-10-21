@@ -44,6 +44,9 @@ reqwest.workspace = true
 ipnet = "2"
 tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 flate2.workspace = true
+# AES-256-GCM for `--spill encrypted`. reqwest's rustls already brings it into the tree,
+# and sparkles-backup pins the same version.
+aws-lc-rs = "=1.18.1"
 bzip2.workspace = true
 liblzma.workspace = true
 zstd = { workspace = true, optional = true }
