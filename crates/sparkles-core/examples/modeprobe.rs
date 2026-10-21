@@ -13,6 +13,8 @@
 //! `SPARKLES_PROBE_CHECK` set, the last round of `rows` compares an order-independent
 //! digest of the eager and the streamed rows and fails when they differ.
 //! `SPARKLES_PROBE_BATCH_ROWS` sets the cursor's batch size.
+//! `SPARKLES_PROBE_METRICS` prints a JSON record with exact ledger peaks, the
+//! configured budget, answer digests and cumulative spill writes for each mode.
 use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions, write_solutions};
 use sparkles_core::sparql::{
     CursorOptions, ExecutionMode, QueryExecution, QueryOptions, query, query_cursor,
@@ -112,6 +114,10 @@ fn main() {
             Err(_) => "error",
         };
         for mode in modes.split(',') {
+            let written_before = stream_options
+                .spill
+                .as_ref()
+                .map_or(0, |s| s.written_bytes());
             let (mut eager, mut stream) = (Vec::new(), Vec::new());
             let (mut eager_mem, mut stream_mem, mut rows) = (0u64, 0u64, 0usize);
             let (mut eager_digest, mut stream_digest, mut stream_rows) = (0u64, 0u64, 0usize);
@@ -203,6 +209,39 @@ fn main() {
                 rows,
                 auto
             );
+            if std::env::var_os("SPARKLES_PROBE_METRICS").is_some() {
+                let reserved = stream_options
+                    .spill
+                    .as_ref()
+                    .map_or(0, |s| s.reserved_bytes());
+                assert_eq!(reserved, 0, "{name}: spill reservation remains after close");
+                if let Some(limit) = stream_options.max_memory_bytes {
+                    assert!(
+                        stream_mem <= limit,
+                        "{name}: ledger peak exceeds the budget"
+                    );
+                }
+                eprintln!(
+                    "metrics {}",
+                    serde_json::json!({
+                        "query": name,
+                        "mode": mode,
+                        "rounds": rounds,
+                        "eager_ms": e,
+                        "cursor_ms": s,
+                        "eager_peak_bytes": eager_mem,
+                        "cursor_peak_bytes": stream_mem,
+                        "cursor_budget_bytes": stream_options.max_memory_bytes,
+                        "rows": rows,
+                        "bag_checked": check && mode == "rows",
+                        "eager_digest": format!("{eager_digest:016x}"),
+                        "cursor_digest": format!("{stream_digest:016x}"),
+                        "spill_written_bytes_all_rounds": stream_options.spill.as_ref()
+                            .map_or(0, |s| s.written_bytes()).saturating_sub(written_before),
+                        "spill_reserved_bytes_after_close": reserved,
+                    })
+                );
+            }
         }
     }
 }

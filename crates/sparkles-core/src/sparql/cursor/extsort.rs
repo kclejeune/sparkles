@@ -553,7 +553,7 @@ pub(super) fn load(
     options: &super::CursorOptions,
 ) -> Result<Option<Buffer>> {
     let mut input = Buffer::new(ctx, &child.vars, 0)?;
-    input.table.sorted.clone_from(&child.order);
+    input.set_order(&child.order)?;
     external.start(ctx);
     while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
         match merge::append(ctx, &mut input, &batch.table, 0..batch.table.len) {

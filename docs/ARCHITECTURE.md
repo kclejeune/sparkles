@@ -258,7 +258,7 @@ columns, while resumable joins avoid materializing their complete output. Hash j
 still retain a build side, DISTINCT retains seen values, and some groups retain
 aggregate state. ORDER BY with LIMIT retains a heap. A full sort and DESCRIBE remain
 barriers. Unsupported operators can materialize under the same limits, or be rejected
-when the caller selects `RejectMaterialization`. With spill on, the server's default, a
+when the caller selects `RejectMaterialization`. With `--spill on` or `encrypted`, a
 cursor sort, grouping, DISTINCT, hash join or merge join run that outgrows its memory
 budget writes its excess to disk, as [X08](specs/X08-disk-spill-and-server-memory.md)
 describes.
@@ -593,7 +593,7 @@ matter when building on it:
 | Distribution | RDF Patch application is implemented from F10. Pull replicas, promotion workflows and clustering are not. A change feed is not a running replication system. |
 | History | Readability depends on retained generations. Full-text search at historical commits and automatic pin rebasing remain deferred. Branch backups are independent. There is no whole-server backup. |
 | Encryption | F11 partially implements optional encrypted backup repositories and operator key workflows. Live dataset files remain unencrypted by Sparkles. Content-defined chunking and KMS-backed dataset encryption are not implemented. |
-| Execution | Automatic execution streams many plans, and the rest run eagerly. Sorts, groupings, DISTINCT and joins spill to disk, which the server does by default. Eager operators still hold their whole state and can exceed a budget. |
+| Execution | Automatic execution streams many plans, and the rest run eagerly. Sorts, groupings, DISTINCT and joins can spill to disk when enabled with `--spill on` or `encrypted`. Eager operators still hold their whole state and can exceed a budget. |
 | Query languages | Read-only GraphQL is implemented with limitations on nested query cost. Cypher remains [specified only](specs/F01-cypher.md). There is no implemented property-graph frontend. |
 | Reasoning and shapes | Materialization plus RDFS on read is implemented, without a general backward rule engine or ontology object API. Incremental reasoning has full-run fallbacks. ShEx 2.2 and SHACL 1.2 node expressions remain absent. |
 | Agents and settings | Implemented model clients are tested against mock endpoints. The real-model evaluation matrix is still open. C18 Phase 6 is not built. |

@@ -728,7 +728,8 @@ Roadmap item 2 finished Phase 1 on 2026-10-18, when its A1 and latency gates wer
 The Phase 1a suite runs at 10.5M and on DBpedia remain, and roadmap item 1 takes them.
 Phase 2 is built for sorts, groupings and DISTINCT under item 7, and item 85 added
 hash-join spill, the merge-join spool, DISTINCT below an ORDER BY and encryption on
-2026-10-18, when spill turned on by default. Phase 3 is not built and belongs to item 40.
+2026-10-18. Spill remains opt-in until every Phase 2b gate passes, including the
+full-scale A11 and A12 runs under item 93. Phase 3 is not built and belongs to item 40.
 
 ### Phase 1a: shared caches
 
@@ -1174,14 +1175,14 @@ extension functions or initial bindings. The cursor plan counts `eagerMemoryRetr
 not record the retry separately.
 
 **Not built here.** Hash-join spill (§6.3), the merge-join run spool and `--spill
-encrypted` (§6.7) came with item 85, described in the next section, and `--spill` stayed
-off by default until then, as §9 requires. The `NeedsSpill` signal of §4.1 is not
+encrypted` (§6.7) came with item 85, described in the next section. Spill stays off by
+default until every A8 to A14 gate passes, as section 9 requires. The `NeedsSpill` signal of §4.1 is not
 needed, since an operator switches on its own budget error or threshold. Spill for an
 update's WHERE clause (open question 3) is not offered, because updates run eagerly.
 
 **Gates.**
 
-* **A8 to A10, A14.** Item 85 met these gates, as the next section records.
+* **A8 to A10, A14.** Item 85 supplies these fixtures, as the next section records.
 * **A11.** `spilled_order_by_matches_eager_order_with_ties_and_expressions` sorts 60,000
   rows of integers, strings, language strings, IRIs, decimals and dates, with OPTIONAL
   unbound values, under 768 KiB, and a total order matches eager row for row.
@@ -1218,7 +1219,7 @@ update's WHERE clause (open question 3) is not offered, because updates run eage
 ### Phase 2b, item 85 (2026-10-18)
 
 Item 85 added hash-join spill, the merge-join spool, a DISTINCT below its ORDER BY and
-encrypted spill, and `serve` now spills by default. The code is in
+encrypted spill. These are enabled with `serve --spill on` or `encrypted`. The code is in
 `sparql/cursor/joinspill.rs`, `binary.rs`, `merge.rs`, `distinct.rs` and `spill.rs`. The
 tests are `tests/spill_join.rs`, the unit tests of `joinspill.rs`, `merge.rs` and
 `spill.rs`, and `distinct_below_order_by_spills_and_keeps_the_order` in
@@ -1277,8 +1278,12 @@ tests are `tests/spill_join.rs`, the unit tests of `joinspill.rs`, `merge.rs` an
 16 KiB, or whose charge fails, is spooled to a file. The pair of runs is then joined
 left-major, reading the right run again for each left row, so the output keeps the
 merge join's order. Child schema widths are retained through EOF, so a spooled final
-run from a nested join remains readable after its input buffer is released. The plan
-counts `spooledRuns`. Reader admission uses the largest frame actually written,
+run from a nested join remains readable after its input buffer is released. A merge
+cursor initializes its inputs before reserving an output batch, then limits its
+emission capacity to loaded rows and current room for the output and zipper scratch.
+The caller's batch size remains an upper bound, while child pulls keep their original
+cap. Intermediate buffers admit sort-order metadata before replacing its backing and
+retain its actual capacity charge. The plan counts `spooledRuns`. Reader admission uses the largest frame actually written,
 including encrypted files, rather than an average that can omit a long first frame.
 
 **DISTINCT below ORDER BY.** §6.5 numbers rows and merges partitions by number. The
@@ -1305,16 +1310,18 @@ as a CRC error first. Spill format version 2 adds the encryption and the file nu
 the header, and a reader refuses version 1 and an encryption it does not expect. Spill
 files never outlive their process, so the version bump needs no migration.
 
-**Default.** `serve` spills when `--spill` is not given. If the spill directory cannot be
-used then, the server logs a warning and runs without spill. With `--spill on` or
-`--spill encrypted` given, it fails the start as before.
+**Default.** The initial implementation enabled spill before the full A11 and A12
+runs were made. Review restored the off default required by section 9 until every
+A8 to A14 gate passes. `serve --spill on` and `--spill encrypted` enable spill and
+fail startup if the directory cannot be used. An ordinary start leaves the spill
+directory unopened. Item 93 tracks the remaining full-scale acceptance work.
 
 **Gates.** The gate runs used `examples/modeprobe` on an 8-vCPU Namespace instance at
 10.5M triples, with each spilled cursor's rows checked against eager execution by an
 order-free digest of the decoded rows.
 
 * **A8.** `spilled_hash_joins_match_eager_at_every_batch_size` joins a build input more
-  than four times its 1 MiB budget at batch sizes 7 and 4,096 and checks the plan's
+  than four times its 1 MiB budget at batch sizes 1, 7 and 4,096 and checks the plan's
   partitions, levels and bytes. The unit test of the join covers batch size 1 in each
   join mode. At 10.5M a join of `foaf:knows` over a build input of a million rows,
   whose unlimited cursor holds 90.8 MB or 23 times the 4 MiB budget, returned the 2,497,620 eager rows within the budget after
@@ -1336,8 +1343,17 @@ order-free digest of the decoded rows.
   spilled join, drops it early, lets it time out, exhausts its spill budget and injects
   reservation, write and read faults, and each leaves no file and no reservation.
 
-**Measurements.** Times are medians of three rounds with the instance's default threads
-under `mimalloc`, beside the unlimited cursor and eager execution of the same query.
+The W3C cursor harness accepts `SPARKLES_W3C_SPILL=plain` or `encrypted` to run its
+query passes with a 1 MiB budget and a private spill directory per query. It checks
+batch sizes 1, 2, 3 and 4,096 against the suite's expected answers. Eager passes keep
+their ordinary options. This configuration enables spill during conformance, while
+the integration fixtures above force physical spill.
+
+**Measurements.** The following values precede the review corrections and are retained
+as historical results. They are medians of three rounds with the instance's default
+threads under `mimalloc`, beside the unlimited cursor and eager execution of the same
+query. They do not measure bounded output consolidation or the later buffer admission
+and metadata accounting repairs.
 
 | Query at 10.5M | Eager | Cursor in memory | Spilled under 16 MiB | Spilled under 4 MiB | Written under 4 MiB |
 |---|---|---|---|---|---|
@@ -1357,4 +1373,6 @@ dominates it in both kinds of run.
 **What remains.** A spilled join whose order is relied on writes its output twice,
 which made the `foaf:knows` join 8.9 times slower than in memory under 4 MiB, where the
 OPTIONAL and MINUS joins took 3.3 and 4.6 times. A DISTINCT over ordered input other than
-an ORDER BY keeps its whole set. These are roadmap item 93.
+an ORDER BY keeps its whole set. Item 93 also takes the full-scale A11 and A12 runs,
+and default enablement requires every A8 to A14 gate. The profile runs at 10.5M and
+on DBpedia remain under item 1.

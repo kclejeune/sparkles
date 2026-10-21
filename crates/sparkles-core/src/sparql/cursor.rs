@@ -534,6 +534,20 @@ impl Buffer {
         self.charge.resize(capacity_bytes(&self.table))
     }
 
+    fn set_order(&mut self, order: &[VarId]) -> Result<()> {
+        if order.len() > self.table.sorted.capacity() {
+            // The old backing remains live while the replacement is cloned.
+            self.charge
+                .resize(capacity_bytes(&self.table).saturating_add(order.len() as u64 * 4))?;
+            self.table.sorted = order.to_vec();
+            self.reconcile()?;
+        } else {
+            self.table.sorted.clear();
+            self.table.sorted.extend_from_slice(order);
+        }
+        Ok(())
+    }
+
     fn project(&mut self, vars: &[VarId]) -> Result<()> {
         if self.table.vars == vars {
             let sorted = self
@@ -2599,7 +2613,7 @@ impl Operator {
         self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
         let mut batch = result?;
         if let Some(b) = &mut batch {
-            b.table.sorted.clone_from(&self.order);
+            b.set_order(&self.order)?;
             #[cfg(debug_assertions)]
             self.check_order(ctx, &b.table);
             self.rows = self
@@ -2797,7 +2811,7 @@ impl Operator {
                                 let mut input = Buffer::new(ctx, &self.children[0].vars, 0)?;
                                 // The concatenated input keeps the child's order, which
                                 // lets a sort on a prefix of it skip reordering.
-                                input.table.sorted.clone_from(&self.children[0].order);
+                                input.set_order(&self.children[0].order)?;
                                 // Blocking input demand is independent of the requested
                                 // output prefix.
                                 while let Some(batch) =
@@ -3025,7 +3039,7 @@ fn collect_input(
     }
     let keep_lease = owns_algorithm(child);
     let mut input = Buffer::new(ctx, &child.vars, 0)?;
-    input.table.sorted.clone_from(&child.order);
+    input.set_order(&child.order)?;
     while let Some(batch) = child.next(ctx, options, options.batch_rows)? {
         merge::append(ctx, &mut input, &batch.table, 0..batch.table.len)?;
     }
@@ -3035,11 +3049,7 @@ fn collect_input(
         table.sorted.clone_from(&child.order);
         return Ok((super::table::Materialized::plain(table), child.info.clone()));
     }
-    input
-        .charge
-        .resize(capacity_bytes(&input.table).saturating_add(child.order.len() as u64 * 4))?;
-    input.table.sorted.clone_from(&child.order);
-    input.reconcile()?;
+    input.set_order(&child.order)?;
     let info = child.info.clone();
     Ok((
         super::table::Materialized {

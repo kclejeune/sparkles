@@ -38,7 +38,7 @@ experimental = true
 # rust-toolchain.toml pins the compiler, and its version is part of every key, so a
 # raised pin reruns every check. These variables change what the checks see, so they are part of it too.
 cache = { enabled = true, command_inputs = ["rustc -V"] }
-global_env = ["RUSTFLAGS", "CARGO_FEATURES", "SPARKLES_W3C_DIR", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS"]
+global_env = ["RUSTFLAGS", "CARGO_FEATURES", "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS"]
 
 [task_config.input_groups]
 # Everything the Rust workspaces compile or read in their tests, listed by directory so the

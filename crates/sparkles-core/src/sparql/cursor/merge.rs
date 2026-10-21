@@ -990,22 +990,65 @@ impl Merge {
         vars: &[VarId],
         cap: usize,
     ) -> Result<Option<Buffer>> {
+        let pull = cap;
+        if self.filter.is_some() && !self.narrowed {
+            // The output takes only left columns, so the right input needs its key alone.
+            let child = &mut children[1];
+            let key = child.vars[self.keys[1][0]];
+            child.restrict_count_scan(ctx, key);
+            self.keys[1][0] = child.vars.iter().position(|v| *v == key).unwrap();
+            self.narrowed = true;
+        }
+        // Initialize children before reserving an empty ancestor output. A batch
+        // cap is an upper bound, and a few loaded rows need not hold that capacity.
+        let cap = if self.spooled.is_some() {
+            cap
+        } else if let Some(pair) = &self.pair {
+            cap.min(
+                (pair.left.rows.end - pair.li)
+                    .saturating_mul(pair.right.rows.len().max(1))
+                    .max(1),
+            )
+        } else {
+            if !self.inputs[0].ensure(ctx, &mut children[0], options, pull)? {
+                return Ok(None);
+            }
+            let right = self.inputs[1].ensure(ctx, &mut children[1], options, pull)?;
+            if !right && !(self.optional || self.filter == Some(false)) {
+                return Ok(None);
+            }
+            let left_rows = self.inputs[0].table().len - self.inputs[0].at;
+            let rows = if self.filter.is_some() || !right {
+                left_rows
+            } else {
+                left_rows.saturating_mul(self.inputs[1].table().len - self.inputs[1].at)
+            };
+            cap.min(rows.max(1))
+        };
+        let (scratch_row, scratch_fixed) = if self.filter.is_some() {
+            (5, 64)
+        } else if self.supports_count() {
+            (12, 128)
+        } else {
+            (0, 0)
+        };
+        let fixed = (vars.len() as u64 * 40)
+            .saturating_add(128)
+            .saturating_add(scratch_fixed);
+        let row = super::super::ctx::table_bytes(1, vars.len()).saturating_add(scratch_row);
+        let cap = cap.min(
+            usize::try_from(ctx.memory_room().saturating_sub(fixed) / row)
+                .unwrap_or(usize::MAX)
+                .max(1),
+        );
         let mut out = Buffer::new(ctx, vars, cap)?;
         if let Some(keep_matched) = self.filter {
-            if !self.narrowed {
-                // The output takes only left columns, so the right input needs its key alone.
-                let child = &mut children[1];
-                let key = child.vars[self.keys[1][0]];
-                child.restrict_count_scan(ctx, key);
-                self.keys[1][0] = child.vars.iter().position(|v| *v == key).unwrap();
-                self.narrowed = true;
-            }
             self.filter(
                 ctx,
                 children,
                 options,
                 cap,
-                cap,
+                pull,
                 keep_matched,
                 Some(&mut out),
             )?;
@@ -1027,10 +1070,10 @@ impl Merge {
             }
             if self.pair.is_none() {
                 // Preserve empty-left short circuit and callback behavior.
-                if !self.inputs[0].ensure(ctx, &mut children[0], options, cap)? {
+                if !self.inputs[0].ensure(ctx, &mut children[0], options, pull)? {
                     break;
                 }
-                if !self.inputs[1].ensure(ctx, &mut children[1], options, cap)? {
+                if !self.inputs[1].ensure(ctx, &mut children[1], options, pull)? {
                     if !self.optional {
                         break;
                     }
@@ -1103,9 +1146,9 @@ impl Merge {
                     continue;
                 }
                 let left =
-                    self.inputs[0].run(ctx, &mut children[0], options, cap, &self.keys[0])?;
+                    self.inputs[0].run(ctx, &mut children[0], options, pull, &self.keys[0])?;
                 let right =
-                    self.inputs[1].run(ctx, &mut children[1], options, cap, &self.keys[1])?;
+                    self.inputs[1].run(ctx, &mut children[1], options, pull, &self.keys[1])?;
                 if left.spooled.is_some() || right.spooled.is_some() {
                     for run in [&left, &right] {
                         if let Some(file) = &run.spooled {
@@ -1218,6 +1261,100 @@ mod tests {
         let ctx = Arc::new(ctx);
         ctx.attach_cursor_owner();
         ctx
+    }
+
+    #[test]
+    fn sorted_batch_metadata_growth_is_admitted_before_replacement() {
+        for rows in [0, 1] {
+            let ctx = context(64 << 10);
+            let mut batch = Buffer::new(&ctx, &[0, 1, 2], rows).unwrap();
+            batch.set_order(&[0]).unwrap();
+            assert_eq!(batch.charge.bytes(), capacity_bytes(&batch.table));
+            let before = batch.charge.bytes();
+            let old_capacity = batch.table.sorted.capacity();
+            let replacement = 3 * 4;
+            let held = ctx
+                .charge(ctx.memory_remaining() - replacement + 1)
+                .unwrap();
+            assert!(ctx.memory_remaining() >= replacement - old_capacity as u64 * 4);
+            assert!(ctx.memory_remaining() < replacement);
+            assert!(matches!(
+                batch.set_order(&[0, 1, 2]),
+                Err(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+            ));
+            assert_eq!(batch.table.sorted, [0]);
+            assert_eq!(batch.table.sorted.capacity(), old_capacity);
+            assert_eq!(batch.charge.bytes(), before);
+            drop(held);
+            batch.set_order(&[0, 1, 2]).unwrap();
+            assert_eq!(batch.table.sorted, [0, 1, 2]);
+            assert!(ctx.mem_peak() <= 64 << 10);
+            assert_eq!(batch.charge.bytes(), capacity_bytes(&batch.table));
+            batch.set_order(&[]).unwrap();
+            assert!(batch.table.sorted.is_empty());
+            assert_eq!(batch.charge.bytes(), capacity_bytes(&batch.table));
+        }
+    }
+
+    #[test]
+    fn nested_optional_chunks_preserve_matches_and_unbound_extensions() {
+        let optional = |left: Node, right: Node| {
+            let certain = left.certain.clone();
+            let mut node = join(left, right);
+            node.kind = Kind::LeftJoin { expr: None };
+            node.certain = certain;
+            node
+        };
+        let mut left: Vec<_> = (0..24).map(|i| vec![0, i]).collect();
+        left.extend([vec![1, 99], vec![2, 100]]);
+        let mut middle: Vec<_> = (0..24).map(|i| vec![0, i + 100]).collect();
+        middle.push(vec![2, 200]);
+        let right: Vec<_> = (0..24).map(|i| vec![0, i + 1000]).collect();
+        let node = optional(
+            values(vec![0, 1], &left),
+            optional(values(vec![0, 2], &middle), values(vec![0, 3], &right)),
+        );
+        let expected = rows(&exec::execute(&context(u64::MAX), &node).unwrap().0);
+        assert_eq!(expected.len(), 24 * 24 * 24 + 2);
+        for encrypted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+                dir: dir.path().to_owned(),
+                max_bytes: 1 << 30,
+                query_bytes: 1 << 30,
+                min_free_bytes: 0,
+                encrypted,
+            })
+            .unwrap();
+            for cap in [1, 7, 4096] {
+                let ctx = context_with_spill(1 << 20, Some(&spill));
+                let mut op =
+                    Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)
+                        .unwrap();
+                assert!(matches!(op.state, super::super::State::Merge(_)));
+                assert!(matches!(
+                    op.children[1].state,
+                    super::super::State::Merge(_)
+                ));
+                let options = CursorOptions {
+                    batch_rows: cap,
+                    ..Default::default()
+                };
+                let (mut actual, mut batches) = (Vec::new(), 0);
+                while let Some(batch) = op.next(&ctx, &options, cap).unwrap() {
+                    assert!(batch.table.len <= cap);
+                    assert!(batch.charge.bytes() >= capacity_bytes(&batch.table));
+                    actual.extend(rows(&batch.table));
+                    batches += 1;
+                }
+                actual.sort();
+                assert_eq!(actual, expected, "encrypted={encrypted}, cap={cap}");
+                assert!(batches > 1);
+                assert!(ctx.mem_peak() <= 1 << 20);
+                drop(op);
+                assert_eq!(spill.reserved_bytes(), 0);
+            }
+        }
     }
 
     #[test]

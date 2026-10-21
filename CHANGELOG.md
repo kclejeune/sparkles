@@ -92,7 +92,8 @@ export is not cut off. Over HTTP a client that reads nothing for longer than the
 request's timeout ends the stream as a timeout. This applies to `execution=streaming` as
 well. A local `sparkles query --timeout` still counts the time its output is blocked.
 
-`sparkles serve` now spills by default. A streamed sort without LIMIT, a grouping, a
+`sparkles serve --spill on` enables disk spill. It remains off by default until all
+Phase 2b acceptance gates pass. A streamed sort without LIMIT, a grouping, a
 DISTINCT, a hash join and a long run of equal keys in a merge join write what does not
 fit in their memory budget to `--spill-dir` (default `<data>/.spill`) and finish. The disk is limited by `--spill-max-mb` for the
 server and `--query-spill-mb` for one query, a request may lower the latter with
@@ -107,8 +108,8 @@ above it may rely on that order, and otherwise emits its partitions in turn.
 file held only in memory, so a changed, moved, reordered or truncated frame fails the
 query, and `--spill off` turns spill off. When the spill directory cannot be used, sits
 on tmpfs or ramfs, is not owned by the server's user or is writable by others, the
-server warns and runs without spill, unless `--spill on` or `--spill encrypted` was
-given, which fails the start. `--spill-max-mb 0` is refused. `/$/server/memory` adds a `spill` object and
+server fails to start when spill is enabled. An ordinary start leaves the spill
+directory unopened. `--spill-max-mb 0` is refused. `/$/server/memory` adds a `spill` object and
 `/$/metrics` the `sparkles_spill_*` series, `sparkles_spill_eager_retries_total`
 among them. A streamed grouping over a join can concatenate a `GROUP_CONCAT` in another
 order than an eager one, which SPARQL allows, and an ordered subquery fixes the order in

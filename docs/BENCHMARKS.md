@@ -1915,7 +1915,7 @@ merge EOF handling, keyless build limits and numbered DISTINCT accounting and or
 The measurements below precede those corrections and do not establish their cost.
 
 On 2026-10-18 hash joins, merge-join runs and a DISTINCT below its ORDER BY learned to
-spill too, and spill turned on by default under item 85. The same probe ran each query's
+spill too. Spill remains opt-in until the full Phase 2b acceptance gates pass. The same probe ran each query's
 cursor under a budget beside the unlimited cursor and eager execution, at 10.5M on an
 8-vCPU Namespace instance with its default threads, and checked that the spilled rows
 matched the eager ones.

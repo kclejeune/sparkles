@@ -1605,7 +1605,7 @@ Query parameters beyond the standard protocol:
   keeps its group state. All of that memory counts against the query budget. Sorting
   reads its whole input into budgeted memory before the first row. DESCRIBE and
   unsupported operators also read their whole input first, which the plan shows, and
-  that memory is budgeted too. With spill on, the server's default, a sort without
+  that memory is budgeted too. With `--spill on` or `encrypted`, a sort without
   LIMIT, a grouping, a DISTINCT and a join write what does not fit to disk and finish
   within the budget (see [Disk spill](#disk-spill)). A query that exceeds the budget
   otherwise fails, so streaming does not keep every query in constant memory. SELECT in SPARQL
@@ -7922,8 +7922,9 @@ short.
 
 The design is in [X08 Disk spill and server-wide memory](specs/X08-disk-spill-and-server-memory.md).
 Spill lets a streamed query finish within its memory budget by writing to disk what does
-not fit. It is on by default, `sparkles serve --spill encrypted` encrypts every spill file,
-and `--spill off` turns it off. These operators spill.
+not fit. It is off by default until all Phase 2b acceptance gates pass.
+`sparkles serve --spill on` enables it, and `--spill encrypted` also encrypts every
+spill file. These operators spill when it is enabled.
 
 * A sort without LIMIT writes sorted runs once its input would take half the memory the
   query had when the sort started, and merges up to 64 runs at a time, with one frame of
@@ -7962,8 +7963,8 @@ Spill files live in a directory per server process under `--spill-dir`, which de
 `<data>/.spill` and must be on a local disk. The directory is created with mode 0700. The
 directory cannot be used when the server's user does not own it, another user can write
 it, it cannot be created, or it sits on tmpfs or ramfs, whose files would take the memory
-that spill saves. With spill on by default, the server then logs a warning and runs
-without spill. With `--spill on` or `--spill encrypted` given, it refuses to start. A
+that spill saves. With `--spill on` or `--spill encrypted` given, the server refuses
+to start if the directory cannot be used. With spill off, it does not open the directory. A
 network file system gets a warning. On a shared
 mount, such as a Kubernetes `emptyDir` or a volume owned by root, `--spill-dir` names a
 subdirectory that does not exist yet, which the server creates with mode 0700. A file has

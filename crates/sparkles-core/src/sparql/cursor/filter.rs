@@ -407,7 +407,7 @@ impl Morsels {
         {
             held.resize(0)?;
         }
-        buffer.table.sorted.clone_from(&child.order);
+        buffer.set_order(&child.order)?;
         Ok(buffer)
     }
 

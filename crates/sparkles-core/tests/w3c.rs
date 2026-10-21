@@ -15,6 +15,9 @@
 //! empty extension registry installed. A cursor pass first opens each query with the
 //! policy that refuses eager fallback. A query that needs fallback is counted in the
 //! pass's summary and then runs with fallback allowed, so it is still checked.
+//! `SPARKLES_W3C_SPILL=plain` or `encrypted` gives cursor query passes a 1 MiB
+//! memory budget and a private spill directory per query. Eager passes keep their
+//! ordinary options as an unlimited reference.
 
 use oxrdf::dataset::CanonicalizationAlgorithm;
 use oxrdf::vocab::rdf;
@@ -651,7 +654,13 @@ fn run_query_test(t: &TestCase, m: &Manifest, mode: Mode) -> Result<(), String> 
         &format!("{QT}graphData"),
         false,
     )?;
-    let opts = QueryOptions {
+    let spill_mode = std::env::var("SPARKLES_W3C_SPILL").ok();
+    let spill_dir = if mode.cursor.is_some() && spill_mode.is_some() {
+        Some(tempfile::tempdir().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let mut opts = QueryOptions {
         base_iri: Some(qurl.clone()),
         timeout: Some(std::time::Duration::from_secs(20)),
         extensions: mode
@@ -659,6 +668,24 @@ fn run_query_test(t: &TestCase, m: &Manifest, mode: Mode) -> Result<(), String> 
             .then(|| sparkles_core::sparql::extensions::ExtensionRegistry::builder().build()),
         ..Default::default()
     };
+    if let Some(dir) = &spill_dir {
+        let encrypted = match spill_mode.as_deref() {
+            Some("plain") => false,
+            Some("encrypted") => true,
+            _ => return Err("SPARKLES_W3C_SPILL must be plain or encrypted".into()),
+        };
+        opts.max_memory_bytes = Some(1 << 20);
+        opts.spill = Some(
+            sparkles_core::spill::Spill::open(&sparkles_core::spill::SpillOptions {
+                dir: dir.path().to_owned(),
+                max_bytes: 128 << 20,
+                query_bytes: 128 << 20,
+                min_free_bytes: 0,
+                encrypted,
+            })
+            .map_err(|e| e.to_string())?,
+        );
+    }
     let r = match mode.cursor {
         Some(batch_rows) => cursor_answer(&store, &qtext, &opts, batch_rows)?,
         None => eager_answer(&store, &qtext, &opts)?,

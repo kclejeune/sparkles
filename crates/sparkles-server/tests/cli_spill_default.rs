@@ -1,7 +1,5 @@
-//! `serve` spills by default (X08, item 85). With the default, a spill directory that
-//! cannot be used is passed over with a warning and the server runs without spill. With
-//! `--spill on` or `--spill encrypted` given, the same directory fails the start, and
-//! `--spill off` turns spill off.
+//! `serve` keeps spill opt-in until every X08 Phase 2b gate passes. Enabling spill
+//! explicitly requires a usable directory; an ordinary start leaves it unopened.
 
 use serde_json::Value as J;
 use std::io::{Read, Write};
@@ -96,7 +94,7 @@ impl Drop for Server {
 }
 
 #[test]
-fn spill_is_on_by_default_and_an_unusable_directory_only_fails_an_explicit_request() {
+fn spill_is_opt_in_and_an_unusable_directory_fails_when_requested() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let log = dir.path().join("server.log");
@@ -107,13 +105,13 @@ fn spill_is_on_by_default_and_an_unusable_directory_only_fails_an_explicit_reque
 
     {
         let s = Server::start(&data, &[], &log);
-        assert_eq!(s.spill()["enabled"], true, "{}", s.spill());
+        assert_eq!(s.spill()["enabled"], false, "{}", s.spill());
+        assert!(!data.join(".spill").exists());
     }
     {
         let s = Server::start(&data, &["--spill-dir", unusable], &log);
         assert_eq!(s.spill()["enabled"], false, "{}", s.spill());
-        let text = std::fs::read_to_string(&log).unwrap();
-        assert!(text.contains("running without spill"), "{text}");
+        assert!(!data.join(".spill").exists());
     }
     {
         let s = Server::start(&data, &["--spill", "off"], &log);
@@ -135,8 +133,8 @@ fn spill_is_on_by_default_and_an_unusable_directory_only_fails_an_explicit_reque
         };
         assert!(!status.success(), "--spill {mode}");
     }
-    {
-        let s = Server::start(&data, &["--spill", "encrypted"], &log);
+    for mode in ["on", "encrypted"] {
+        let s = Server::start(&data, &["--spill", mode], &log);
         assert_eq!(s.spill()["enabled"], true, "{}", s.spill());
     }
 }

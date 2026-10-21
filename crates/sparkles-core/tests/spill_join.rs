@@ -14,13 +14,14 @@ use std::sync::Arc;
 
 /// `n` subjects `a` and `n` subjects `b`. Each `a` has a value `v` and, unless it is one
 /// of every twenty, a key `p`. Each `b` has a value `w`, a label `l` and, unless it is
-/// one of every twenty, a key `q`. With `heavy`, nine keys in ten are one key on both
-/// sides; otherwise each key has about three subjects on each side.
+/// one of every twenty, a key `q`. With `heavy`, all keys are bound and exactly nine
+/// keys in ten are one key on both sides; otherwise each key has about three subjects
+/// on each side.
 fn store(n: usize, heavy: bool) -> Store {
     let s = Store::in_memory(StoreOptions::default());
     let key = |i: usize| {
         if heavy {
-            if i.is_multiple_of(10) { i } else { 0 }
+            if i.is_multiple_of(10) { i + 1 } else { 0 }
         } else {
             (i * 7919) % (n / 3).max(1)
         }
@@ -29,7 +30,7 @@ fn store(n: usize, heavy: bool) -> Store {
     for i in 0..n {
         let a = (i * 104_729) % n;
         data.push_str(&format!("<urn:a:{a}> <urn:v> {} .\n", a % 13));
-        if !a.is_multiple_of(20) {
+        if heavy || !a.is_multiple_of(20) {
             data.push_str(&format!("<urn:a:{a}> <urn:p> <urn:k:{}> .\n", key(a)));
         }
         let b = (i * 15_485_863) % n;
@@ -38,7 +39,7 @@ fn store(n: usize, heavy: bool) -> Store {
         for x in 1..=3 {
             data.push_str(&format!("<urn:b:{b}> <urn:x{x}> {} .\n", b * x));
         }
-        if b % 20 != 3 {
+        if heavy || b % 20 != 3 {
             data.push_str(&format!("<urn:b:{b}> <urn:q> <urn:k:{}> .\n", key(b * 7)));
         }
     }
@@ -96,6 +97,7 @@ fn run(
     let mut rows = Vec::new();
     let mut firsts = Vec::new();
     while let Some(b) = c.next_batch()? {
+        assert!(b.len() <= batch_rows);
         for i in 0..b.len() {
             let row = b.row(i).unwrap();
             firsts.push(format!("{:?}", row[0]));
@@ -156,6 +158,67 @@ fn counter(plan: &str, name: &str) -> Option<u64> {
 
 const MEMORY: u64 = 1 << 20;
 
+/// The named/default-graph shape of W3C dawg-optional-complex-3 has two rows,
+/// but speculative output buffers of nested merges used to exhaust 1 MiB.
+#[test]
+fn nested_optional_with_a_named_graph_fits_a_small_budget_at_large_batch_caps() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data = r#"
+        @prefix foaf: <http://xmlns.com/foaf/0.1/> .
+        @prefix ex: <http://example.org/things#> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        _:a a foaf:Person; foaf:name "Eve"; ex:empId "9"^^xsd:integer .
+        _:b a foaf:Person; foaf:name "Alice"; ex:empId "29"^^xsd:integer;
+            ex:healthplan ex:HealthPlanD .
+        _:c a foaf:Person; foaf:name "Fred"; ex:empId "27"^^xsd:integer .
+        _:e foaf:name "Bob"; ex:empId "23"^^xsd:integer; ex:healthplan ex:HealthPlanC .
+        _:f foaf:name "Bob"; ex:empId "30"^^xsd:integer; ex:healthplan ex:HealthPlanB .
+        _:g a foaf:Person; ex:ssn "000000000"; foaf:name "Bert";
+            ex:department "DeptA"; ex:healthplan ex:HealthPlanA .
+        <urn:contacts> {
+            <tag:alice@example:foafUri> foaf:mbox <mailto:alice@example.net>;
+                foaf:name "Alice"; foaf:nick "WhoMe?";
+                foaf:depiction <http://example.com/alice.png> .
+            <tag:bert@example:foafUri> foaf:mbox <mailto:bert@example.net>;
+                foaf:nick "BigB"; foaf:name "Bert" .
+            <tag:eve@example:foafUri> foaf:mbox <mailto:eve@example.net>;
+                foaf:firstName "Eve" .
+            <tag:john@example:foafUri> foaf:mbox <mailto:john@example.net>;
+                foaf:nick "jDoe"; foaf:isPrimaryTopicOf <http://example.com/people/johnDoe> .
+        }
+    "#;
+    s.load(&[Source::from_bytes(
+        data.as_bytes().to_vec(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    let q = "PREFIX foaf: <http://xmlns.com/foaf/0.1/> \
+             PREFIX ex: <http://example.org/things#> \
+             SELECT ?name ?nick ?plan ?dept { \
+               ?person a foaf:Person; foaf:name ?name . \
+               GRAPH ?x { [] foaf:name ?name; foaf:nick ?nick } \
+               OPTIONAL { ?person ex:healthplan ?plan \
+                          OPTIONAL { ?person ex:department ?dept } } }";
+    let expected = eager(&s, q);
+    assert_eq!(expected.len(), 2);
+    for encrypted in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = spill_with(tmp.path(), encrypted);
+        for batch in [1, 7, 4096] {
+            let result = run(&s, q, MEMORY, Some(spill.clone()), batch).unwrap();
+            assert_eq!(
+                sorted(result.rows),
+                expected,
+                "encrypted={encrypted}, batch={batch}"
+            );
+            assert!(result.peak <= MEMORY);
+            assert_eq!(spill.reserved_bytes(), 0);
+            assert!(leftovers(tmp.path()).is_empty());
+        }
+    }
+}
+
 /// Joins on `?k` whose inputs come in no order of the key, so the cursor joins them by
 /// hash. The probe input of the first is ordered on `?a`, so a spilled join restores
 /// that order; the UNION of the second has no order to keep.
@@ -193,8 +256,7 @@ fn spilled_hash_joins_match_eager_at_every_batch_size() {
                 other.map(|r| r.rows.len())
             ),
         }
-        // Batches of one row are covered by the unit tests of the join, on smaller inputs.
-        for batch in [7, 4096] {
+        for batch in [1, 7, 4096] {
             let spilled = run(&s, q, MEMORY, Some(spill.clone()), batch).unwrap();
             assert!(spilled.peak <= MEMORY, "{q}: peak {}", spilled.peak);
             assert!(
@@ -272,6 +334,22 @@ const HEAVY_MEMORY: u64 = 320 << 10;
 #[test]
 fn a_heavy_key_joins_as_a_block_nested_loop() {
     let s = store(3_000, true);
+    for property in ["p", "q"] {
+        let all = format!("SELECT ?s {{ ?s <urn:{property}> ?k }}");
+        let heavy = format!("SELECT ?s {{ ?s <urn:{property}> <urn:k:0> }}");
+        assert_eq!(
+            query(s.snapshot(), &all, &Default::default())
+                .unwrap()
+                .len(),
+            3_000
+        );
+        assert_eq!(
+            query(s.snapshot(), &heavy, &Default::default())
+                .unwrap()
+                .len(),
+            2_700
+        );
+    }
     let tmp = tempfile::tempdir().unwrap();
     let spill = spill(tmp.path());
     // Wide build rows, so that a few thousand of them outgrow the budget.
