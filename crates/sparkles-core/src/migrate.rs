@@ -419,7 +419,7 @@ pub(crate) fn check_not_pending(root: &Path) -> Result<()> {
 /// * With the database missing, a checked copy takes its place, since the run stopped
 ///   between its two renames. A work directory without the mark of a passed check is
 ///   not touched and is reported, because only outside interference produces it.
-fn recover_locked(root: &Path) -> Result<Option<std::fs::File>> {
+fn recover_locked(root: &Path) -> Result<Option<crate::store::ProcessLock>> {
     let work = work_dir(root);
     if !work.is_dir() {
         // The originating marker, rather than this binary's version, names the old copy.
@@ -556,12 +556,12 @@ fn require_named(root: &Path) -> Result<()> {
 /// The lock that serializes migrations of one database: a file next to the database,
 /// `.migrate.lock-<name>`, which survives both renames of a swap. It is left in place
 /// after the run, since removing a lock file races with the processes waiting for it.
-fn lock_migration(root: &Path) -> Result<std::fs::File> {
+fn lock_migration(root: &Path) -> Result<crate::store::ProcessLock> {
     use std::io::{Read, Write};
     // a name that no work or old directory of another database can have: `.migrate-a.lock`
     // would be the work directory of a database named `a.lock`
     let path = sibling(root, ".migrate.lock-");
-    let mut f = std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -569,8 +569,9 @@ fn lock_migration(root: &Path) -> Result<std::fs::File> {
         .open(&path)?;
     match f.try_lock() {
         Ok(()) => {
+            let f = crate::store::ProcessLock::from_locked_file(f);
             f.set_len(0)?;
-            writeln!(f, "{}", std::process::id())?;
+            writeln!(&*f, "{}", std::process::id())?;
             Ok(f)
         }
         Err(std::fs::TryLockError::WouldBlock) => {

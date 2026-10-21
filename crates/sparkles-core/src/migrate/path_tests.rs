@@ -1,6 +1,20 @@
 use super::*;
 use crate::store::{Store, StoreOptions};
 
+#[test]
+fn migration_guard_unlocks_while_an_inherited_descriptor_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let guard = lock_migration(&root).unwrap();
+    let inherited = guard.try_clone().unwrap();
+    drop(guard);
+    let next = lock_migration(&root).unwrap();
+    drop(inherited);
+    assert!(matches!(lock_migration(&root), Err(Error::Locked { .. })));
+    drop(next);
+    assert!(lock_migration(&root).is_ok());
+}
+
 fn assert_data(root: &Path) {
     let store = Store::open(root, StoreOptions::default()).unwrap();
     assert_eq!(store.snapshot().len(), 1);
