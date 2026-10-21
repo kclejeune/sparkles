@@ -37,7 +37,7 @@
 //! `--literal-predicate IRI` changes the literal writer's predicate. `--op geo` writes
 //! typed WKT points. `--samples FILE` and `--receipts FILE` preserve individual latencies
 //! and acknowledgment IDs in new files. `--request-timings FILE` also records each real
-//! request, including serial warmups and failures, with wall and monotonic timing.
+//! workload attempt, including serial warmups and failures, with wall and monotonic timing.
 //! Only a caller that verifies every intervening internal commit may use
 //! `--allow-receipt-gaps`, which requires a receipt file.
 use std::io::{Read, Write};
@@ -59,28 +59,29 @@ struct Resp {
 }
 
 impl Conn {
-    fn new(addr: &str) -> Conn {
-        Conn {
+    fn new(addr: &str) -> Result<Conn, String> {
+        Ok(Conn {
             addr: addr.to_string(),
-            s: Conn::dial(addr),
+            s: Conn::dial(addr).map_err(|e| format!("connect {addr}: {e}"))?,
             buf: Vec::new(),
-        }
+        })
     }
-    fn dial(addr: &str) -> TcpStream {
-        let s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("connect {addr}: {e}"));
-        s.set_nodelay(true).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-        s
+    fn dial(addr: &str) -> std::io::Result<TcpStream> {
+        let s = TcpStream::connect(addr)?;
+        s.set_nodelay(true)?;
+        s.set_read_timeout(Some(Duration::from_secs(60)))?;
+        Ok(s)
     }
-    fn redial(&mut self) {
-        self.s = Conn::dial(&self.addr);
+    fn redial(&mut self) -> Result<(), String> {
         self.buf.clear();
+        self.s = Conn::dial(&self.addr).map_err(|e| format!("connect {}: {e}", self.addr))?;
+        Ok(())
     }
     /// Dial again if the server closed the kept-alive connection while it was idle. Call it
     /// outside the timed span; it sends nothing.
-    fn ready(&mut self) {
+    fn ready(&mut self) -> Result<(), String> {
         if !self.buf.is_empty() {
-            return;
+            return Ok(());
         }
         // With nothing sent, anything but "no data yet" means the connection is unusable:
         // the server closed it, reset it, or said something no request asked for.
@@ -89,17 +90,18 @@ impl Conn {
                 self.s.peek(&mut [0u8; 1]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
             );
-        self.s.set_nonblocking(false).unwrap();
+        self.s.set_nonblocking(false).map_err(|e| e.to_string())?;
         if closed {
-            self.redial();
+            self.redial()?;
         }
+        Ok(())
     }
     /// Send `req` and read its answer. The request is sent again on a new connection only
     /// when writing it failed. Once it was written the server may have run it, so a failed
     /// read is an error and is never retried.
     fn request(&mut self, req: &[u8]) -> Result<Resp, String> {
         if self.s.write_all(req).is_err() {
-            self.redial();
+            self.redial()?;
             self.s
                 .write_all(req)
                 .map_err(|e| format!("send to {}: {e}", self.addr))?;
@@ -108,7 +110,7 @@ impl Conn {
             Some(r) => Ok(r),
             None => {
                 // the connection's state is unknown, so the next request gets a new one
-                self.redial();
+                self.redial()?;
                 Err(format!(
                     "no answer from {} after the request was sent",
                     self.addr
@@ -448,9 +450,15 @@ fn main() {
     let mut seed_receipts = Vec::new();
     // untimed seeding: deletes need their triples, and every run warms the connection
     if op == "delete" {
-        let mut c = Conn::new(&a.addr);
+        let mut c = Conn::new(&a.addr).unwrap_or_else(|e| {
+            eprintln!("delete setup connection failed: {e}");
+            std::process::exit(2);
+        });
         for i in 0..a.changes + a.warmup {
-            c.ready();
+            c.ready().unwrap_or_else(|e| {
+                eprintln!("delete setup connection {} failed: {e}", i + 1);
+                std::process::exit(2);
+            });
             let r = c
                 .request(&update_request(&a.ds, &a.addr, &update(&a, "iri", i)))
                 .unwrap_or_else(|e| {
@@ -527,7 +535,7 @@ fn main() {
                 if a.scenario == "serial" && i == a.warmup {
                     timed_start = Some(Instant::now());
                 }
-                c.ready();
+                let readiness = c.as_mut().map_err(|e| e.clone()).and_then(|c| c.ready());
                 let timed = a.scenario != "serial" || i >= a.warmup;
                 let start_unix = if timed || a.request_timings.is_some() {
                     unix_seconds()
@@ -538,7 +546,7 @@ fn main() {
                     first_unix = first_unix.min(start_unix);
                 }
                 let t = Instant::now();
-                let r = c.request(&req);
+                let r = readiness.and_then(|_| c.as_mut().map_err(|e| e.clone())?.request(&req));
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 if let Some(due) = request_due {
                     // Only a real request contributes lag, including connection readiness.
@@ -630,9 +638,11 @@ fn main() {
                         std::thread::sleep(due - now);
                     }
                     due += period;
-                    c.ready();
+                    let readiness = c.as_mut().map_err(|e| e.clone()).and_then(|c| c.ready());
                     let t = Instant::now();
-                    let r = match c.request(&req) {
+                    let r = match readiness
+                        .and_then(|_| c.as_mut().map_err(|e| e.clone())?.request(&req))
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             eprintln!("count request: {e}");

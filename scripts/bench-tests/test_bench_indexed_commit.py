@@ -784,6 +784,7 @@ class Client(unittest.TestCase):
         self.response_delay = 0
         self.response_status = 200
         self.drop_response = False
+        self.stop_listener_on_request = None
         self.lock = threading.Lock()
         requests, lock = self.requests, self.lock
         owner = self
@@ -800,6 +801,11 @@ class Client(unittest.TestCase):
                     requests.append(body.decode())
                     receipt = len(requests) * owner.receipt_step
                 time.sleep(owner.response_delay)
+                if owner.stop_listener_on_request == len(requests):
+                    owner.server.shutdown()
+                    owner.server.socket.close()
+                    self.close_connection = True
+                    return
                 if owner.drop_response:
                     self.close_connection = True
                     return
@@ -915,6 +921,49 @@ class Client(unittest.TestCase):
             rows = list(csv.DictReader(file, delimiter="\t"))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "0")
+
+    def test_refused_reconnect_preserves_earlier_and_failed_attempt_timings(self):
+        self.stop_listener_on_request = 2
+        path = pathlib.Path(self.temp.name) / "refused-reconnect.tsv"
+        path.unlink(missing_ok=True)
+        result = self.run_client(
+            "writers",
+            "--clients",
+            "1",
+            "--changes",
+            "3",
+            "--request-timings",
+            str(path),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        with path.open() as file:
+            rows = list(csv.DictReader(file, delimiter="\t"))
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual([r["status"] for r in rows], ["200", "0", "0"])
+        self.assertEqual([int(r["index"]) for r in rows], [0, 1, 2])
+        self.assertNotIn(b"panicked", result.stderr)
+
+    def test_initial_refusal_finishes_without_stranding_writer_barrier(self):
+        self.server.shutdown()
+        self.server.socket.close()
+        path = pathlib.Path(self.temp.name) / "initial-refusal.tsv"
+        path.unlink(missing_ok=True)
+        result = self.run_client(
+            "writers",
+            "--clients",
+            "2",
+            "--changes",
+            "3",
+            "--request-timings",
+            str(path),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        with path.open() as file:
+            rows = list(csv.DictReader(file, delimiter="\t"))
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(r["status"] == "0" for r in rows))
+        self.assertEqual(sorted(int(r["index"]) for r in rows), [0, 1, 2])
+        self.assertNotIn(b"panicked", result.stderr)
 
     def test_existing_request_timing_file_is_not_overwritten_or_written_to(self):
         path = pathlib.Path(self.temp.name) / "existing-timings.tsv"
