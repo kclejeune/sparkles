@@ -345,6 +345,13 @@ access log counts 555,607,405 rows produced inside the `q12b` plan for an answer
 row. On `q11` the unchecked times of QLever and Fluree, 42.8 and 51.7 ms, are lower than
 Sparkles' 95.7 ms.
 
+A planner correction on 2026-10-21 moved the selective author pattern into eligible
+UNION branches before their join order is chosen. On a local SP²Bench v1.01 50k fixture, `q8` produced 6,439 intermediate rows instead of 875,171, with the
+same 264 names. `q12b` produced 4,856 instead of 861,737 and kept its true answer.
+These are counts of executed operator rows from baseline `a6e91187` and its corrected
+plan. The 10M latency figures above still describe the earlier Forge run. The new
+plan's latency at that scale remains to be measured.
+
 Sparkles loads the data in 4.12 s, against 8.90 s for Fluree, 9.70 s for QLever, 20.49 s
 for Oxigraph and 44.88 s for TDB2. Its index takes 307 MiB on disk, against QLever's
 294 MiB, and its load peaks at 2,264 MiB, against Fluree's 1,835 MiB and QLever's

@@ -87,6 +87,7 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
 Queries and updates follow the W3C recommendations and Jena ARQ's extensions, checked against the W3C suites and Jena's own answers.
 
 * SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY and aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET and EXISTS.
+* The planner moves an eligible small basic graph pattern into pure UNION branches so each branch can use its bindings when choosing its join order. It preserves duplicate solutions and FILTER scope, and bounds both the anchor estimate and copied patterns. This avoids enumerating unrelated coauthor walks in SP²Bench `q8` and `q12b` ([roadmap](ROADMAP.md) item 91).
 * RDF 1.2 and SPARQL 1.2 in every RDF syntax. This covers triple terms (`<<( s p o )>>`), the reification syntax `<< >>`, annotations, base-direction literals (`"x"@en--rtl`), and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`.
 * Property paths. `p*`, `p+` and `p?` run as a breadth-first search over the index, starting from the side the join input binds.
 * The value space: numeric promotion, comparisons, effective boolean values and the total order for ORDER BY.
