@@ -284,9 +284,12 @@ that work by priority and links each item to its design spec.
   memory budget when spill is enabled. Ordered join output consolidates as it is
   produced, with at most 128 finished output files and one active writer. A spilled
   join that must keep its order writes its output
-  once more to merge it, which made one join under 4 MiB 8.9 times slower than in
-  memory. Item 93 includes the full-scale A11 and A12 acceptance runs required before
-  enabling spill by default. The UI's result table, the MCP tools and the Python and JVM query calls
+  once more to merge it. In the initial implementation's historical measurements,
+  this made one join under 4 MiB 8.9 times slower than in memory. The full-scale
+  20-million-row sort and 10-million-group aggregate and DISTINCT matrix now pass
+  in plain and encrypted modes under 64 MiB. Item 93 retains the execution
+  follow-ups, performance investigation and review of enabling spill by default.
+  The UI's result table, the MCP tools and the Python and JVM query calls
   run eagerly, because they report exact totals or return collected results. There is no
   FSST vocabulary compression, IRI encoding, pattern trick, pinned results, materialized
   views or live query monitoring. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40, 93.

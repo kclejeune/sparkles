@@ -730,8 +730,9 @@ Roadmap item 2 finished Phase 1 on 2026-10-18, when its A1 and latency gates wer
 The Phase 1a suite runs at 10.5M and on DBpedia remain, and roadmap item 1 takes them.
 Phase 2 is built for sorts, groupings and DISTINCT under item 7, and item 85 added
 hash-join spill, the merge-join spool, DISTINCT below an ORDER BY and encryption on
-2026-10-18. Spill remains opt-in until every Phase 2b gate passes, including the
-full-scale A11 and A12 runs under item 93. Phase 3 is not built and belongs to item 40.
+2026-10-18. Spill remains opt-in. Item 93 records the full-scale acceptance runs,
+the review of enabling spill by default and the remaining execution work. Phase 3
+is not built and belongs to item 40.
 
 ### Phase 1a: shared caches
 
@@ -1312,11 +1313,12 @@ as a CRC error first. Spill format version 2 adds the encryption and the file nu
 the header, and a reader refuses version 1 and an encryption it does not expect. Spill
 files never outlive their process, so the version bump needs no migration.
 
-**Default.** The initial implementation enabled spill before the full A11 and A12
-runs were made. Review restored the off default required by section 9 until every
-A8 to A14 gate passes. `serve --spill on` and `--spill encrypted` enable spill and
-fail startup if the directory cannot be used. An ordinary start leaves the spill
-directory unopened. Item 93 tracks the remaining full-scale acceptance work.
+The initial implementation enabled spill before the full A11 and A12 runs were
+made. Review restored the off default required by section 9 until every A8 to A14
+gate passes. `serve --spill on` and `--spill encrypted` enable spill and fail startup
+if the directory cannot be used. An ordinary start leaves the spill directory
+unopened. Item 93 records the full-scale runs and tracks the review of enabling spill
+by default and remaining execution work.
 
 **Gates.** The fixtures below check current behavior. The 10.5M figures in this list
 are historical results from the initial implementation, before the review corrections.
@@ -1374,9 +1376,41 @@ under 4 MiB by −2% to 21%, most of them under 10%. Two runs under 16 MiB were 
 instance was noisy there. Process RSS is not a useful measure here, since the block cache of a 10.5M store
 dominates it in both kinds of run.
 
-**What remains.** A spilled join whose order is relied on writes its output twice,
-which made the `foaf:knows` join 8.9 times slower than in memory under 4 MiB, where the
-OPTIONAL and MINUS joins took 3.3 and 4.6 times. A DISTINCT over ordered input other than
-an ORDER BY keeps its whole set. Item 93 also takes the full-scale A11 and A12 runs,
-and default enablement requires every A8 to A14 gate. The profile runs at 10.5M and
-on DBpedia remain under item 1.
+A spilled join whose order is relied on writes its output twice. In the historical
+measurements above, this made the `foaf:knows` join 8.9 times slower than in memory
+under 4 MiB, where the OPTIONAL and MINUS joins took 3.3 and 4.6 times. A DISTINCT
+over ordered input other than an ORDER BY keeps its whole set. Item 93 tracks these
+execution limits, the performance investigation and the review of enabling spill
+by default. Default enablement requires every A8 to A14 gate. The profile runs at 10.5M and on
+DBpedia remain under item 1.
+
+### Full-scale spill acceptance, item 93 (2026-10-21)
+
+The manual `spill_acceptance` example now covers the full A11 and A12 cardinalities
+in both plain and encrypted modes. The A11 sort processes 20 million rows with mixed
+numbers, strings, dates with and without time zones and unbound keys under 64 MiB.
+It matches every position of the unlimited sort and checks input-order stability
+for ties on identical RDF terms.
+
+The A12 matrix processes 10 million groups from 40 million input rows under 64 MiB.
+It covers COUNT, SUM, AVG, MIN, MAX, SAMPLE, GROUP_CONCAT and COUNT(DISTINCT) both
+separately and in one query containing all eight aggregates. Independent formulas
+check exact RDF datatypes and numeric values, and a dense group-identity check
+requires every group exactly once. SAMPLE matches the eager choice and its allowed
+value set. GROUP_CONCAT matches the eager ordering and exact string spelling of
+every component. Ordered DISTINCT checks its entire independently derived sequence
+after both DISTINCT and ORDER BY physically spill.
+
+All 22 plain and encrypted configurations passed. The bounded cursors finish
+without eager fallback, their operator counts show the required full inputs and
+outputs, and their charged query peaks stay within 64 MiB. Physical spill counters
+are positive, reservations return to zero and query files are removed after close.
+The tests release each unlimited reference before running its bounded cursor.
+Process peak RSS includes that earlier reference and is separate from the query's
+memory ledger. The fixture and oracle tests also reject wrong identities, RDF
+datatypes, aggregate values, missing or extra columns, choice changes and malformed
+GROUP_CONCAT spellings.
+
+The earlier 10.5M tables remain historical measurements from before the reviewed
+corrections. Spill remains opt-in. Item 93 retains the execution follow-ups,
+performance investigation and review of enabling spill by default.
