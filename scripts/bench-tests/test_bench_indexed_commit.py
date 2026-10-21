@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -31,6 +33,144 @@ def answer(value="17", datatype=BENCH.XSD + "integer"):
 
 
 class Oracles(unittest.TestCase):
+    def test_acknowledgments_match_exact_recovered_user_history(self):
+        receipt = {"workload": [10, 12], "seeds": []}
+        history = [
+            {"seq": 10, "kind": "update"},
+            {"seq": 11, "kind": "embed", "message": "embeddings of vector index docs"},
+            {"seq": 12, "kind": "update"},
+        ]
+        self.assertEqual(BENCH.verify_receipts(receipt, history, True), 1)
+        with self.assertRaises(AssertionError):
+            BENCH.verify_receipts(receipt, history, False)
+        for bad in (
+            {"workload": [10, 13], "seeds": []},
+            {"workload": [10, 10], "seeds": []},
+            {"workload": [12], "seeds": []},
+        ):
+            with self.assertRaises(AssertionError):
+                BENCH.verify_receipts(bad, history, True)
+        history[1]["kind"] = "transaction"
+        with self.assertRaises(AssertionError):
+            BENCH.verify_receipts(receipt, history, True)
+
+    def test_slow_inflight_reader_is_not_censored_at_writer_stop(self):
+        samples = [
+            {"start": -1, "end": 1},
+            {"start": 1, "end": 100},
+            {"start": 3, "end": 4},
+        ]
+        self.assertEqual(BENCH.window_samples(samples, 0, 2), [samples[1]])
+
+    def test_reopened_spatial_index_is_ready_before_its_plan_is_used(self):
+        with (
+            tempfile.TemporaryDirectory(prefix="sparkles-ready-") as temp,
+            mock.patch.object(
+                BENCH,
+                "get_json",
+                side_effect=[{"state": "building"}, {"state": "ready"}],
+            ) as status,
+            mock.patch.object(BENCH, "query", return_value=17),
+            mock.patch.object(
+                BENCH, "raw_request", return_value=b'{"plan":"SpatialScan"}'
+            ),
+            mock.patch.object(BENCH.time, "sleep"),
+        ):
+            BENCH.indexed_ready(SimpleNamespace(port=3986), "geo", pathlib.Path(temp))
+            self.assertEqual(status.call_count, 2)
+
+    def test_cpu_list_expands_ranges(self):
+        self.assertEqual(BENCH.cpu_set("0-3,8,10-11"), {0, 1, 2, 3, 8, 10, 11})
+
+    def test_duplicate_input_lines_do_not_inflate_the_rdf_count_oracle(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-set-count-") as temp:
+            root = pathlib.Path(temp)
+            (root / "data.nt").write_text(
+                '<urn:s> <urn:p> "one" .\n' * 2 + '<urn:t> <urn:p> "two" .\n'
+            )
+            self.assertEqual(BENCH.unique_triples(root), 2)
+            self.assertFalse((root / "unique.nt").exists())
+
+    def test_failed_server_startup_removes_only_the_owned_clone(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-server-failure-") as temp:
+            root = pathlib.Path(temp)
+            (root / "seed").mkdir()
+            (root / "seed" / "preserve").write_text("seed")
+            with (
+                mock.patch.object(
+                    BENCH, "Server", side_effect=RuntimeError("startup failed")
+                ),
+                self.assertRaisesRegex(RuntimeError, "startup failed"),
+            ):
+                BENCH.measure(None, root, "text", "writers", True, 0, "run", 0)
+            self.assertFalse((root / "run" / "store").exists())
+            self.assertEqual((root / "seed" / "preserve").read_text(), "seed")
+            self.assertTrue((root / "run" / "failure.json").exists())
+
+    def test_owned_cleanup_kills_a_process_that_ignores_termination(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("owned", 10), 0]
+        BENCH.stop_owned(process)
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertEqual(
+            process.wait.call_args_list, [mock.call(timeout=10), mock.call(timeout=5)]
+        )
+
+    def test_failed_client_output_is_preserved(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-client-failure-") as temp:
+            root = pathlib.Path(temp)
+            with self.assertRaises(subprocess.CalledProcessError):
+                BENCH.run_client(
+                    ["sh", "-c", 'printf "failure receipt\\n"; exit 2'], root
+                )
+            self.assertEqual((root / "client.stdout").read_text(), "failure receipt\n")
+            self.assertEqual(
+                json.loads((root / "client-exit.json").read_text())["returncode"], 2
+            )
+
+    def test_stuck_client_is_killed_and_partial_output_is_preserved(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-client-timeout-") as temp:
+            root = pathlib.Path(temp)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                BENCH.run_client(
+                    [
+                        "python3",
+                        "-c",
+                        'import time; print("partial",flush=True); time.sleep(60)',
+                    ],
+                    root,
+                    timeout=0.2,
+                )
+            self.assertEqual((root / "client.stdout").read_text(), "partial\n")
+            self.assertTrue(
+                json.loads((root / "client-exit.json").read_text())["forced"]
+            )
+
+    def test_incomplete_scenario_set_and_warmup_are_not_full_acceptance(self):
+        args = SimpleNamespace(
+            blocks=5,
+            people=[100000, 1000000],
+            indexes=["text", "geo", "embed"],
+            scenarios=[
+                "serial-literal",
+                "serial-iri",
+                "serial-delete",
+                "writers",
+                "mixed",
+            ],
+            serial_changes=2000,
+            writer_changes=50000,
+            warmup=200,
+        )
+        self.assertTrue(BENCH.full_protocol(args))
+        args.warmup = 0
+        self.assertFalse(BENCH.full_protocol(args))
+        args.warmup = 200
+        args.scenarios = ["writers"] * 5
+        self.assertFalse(BENCH.full_protocol(args))
+
     @unittest.skipUnless(
         pathlib.Path("/proc/self/clear_refs").exists(), "Linux peak-RSS reset"
     )
@@ -118,7 +258,8 @@ class Oracles(unittest.TestCase):
             )
             self.assertTrue(stop.is_set())
             self.assertTrue(errors)
-            self.assertEqual(samples, [])
+            self.assertEqual(len(samples), 1)
+            self.assertIn("error", samples[0])
         finally:
             server.shutdown()
             server.server_close()
@@ -186,8 +327,10 @@ class Client(unittest.TestCase):
 
     def setUp(self):
         self.requests = []
+        self.receipt_step = 1
         self.lock = threading.Lock()
         requests, lock = self.requests, self.lock
+        owner = self
 
         class Writes(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -199,7 +342,7 @@ class Client(unittest.TestCase):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
                 with lock:
                     requests.append(body.decode())
-                    receipt = len(requests)
+                    receipt = len(requests) * owner.receipt_step
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.send_header("Sparkles-Commit", str(receipt))
@@ -263,6 +406,22 @@ class Client(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(samples.read_text(), "preserve\n")
         self.assertEqual(self.requests, [])
+
+    def test_gaps_require_external_verification_and_preserve_ids(self):
+        self.receipt_step = 2
+        strict = self.run_client("serial")
+        self.assertNotEqual(strict.returncode, 0)
+        self.requests.clear()
+        receipts = pathlib.Path(self.temp.name) / "gaps.json"
+        receipts.unlink(missing_ok=True)
+        verified = self.run_client(
+            "serial", "--allow-receipt-gaps", "--receipts", str(receipts)
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertFalse(json.loads(verified.stdout)["receipts_contiguous"])
+        self.assertEqual(
+            json.loads(receipts.read_text())["workload"], list(range(2, 18, 2))
+        )
 
 
 if __name__ == "__main__":

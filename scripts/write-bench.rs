@@ -29,10 +29,15 @@
 //! total. Each client sends on its own schedule of N / clients requests per second, as the
 //! readers do, so two servers can be compared at the same commit rate. Without it, every
 //! client sends its next request as soon as the last one is answered.
-//! Operations (`--op`, writers and mixed always use `literal`)
+//! Operations (`--op`, default `literal`)
 //!   literal  a new subject and a new literal, so the commit adds a term to the vocabulary
 //!   iri      a new edge between two people of the generated dataset (scripts/gen-data.py)
 //!   delete   the same edges, inserted untimed first and then deleted
+//!   geo      a new subject and a typed WKT point outside the fixed reader window
+//! `--literal-predicate IRI` changes the literal writer's predicate. `--op geo` writes
+//! typed WKT points. `--samples FILE` and `--receipts FILE` preserve individual latencies
+//! and acknowledgment IDs in new files. Only a caller that verifies every intervening
+//! internal commit may use `--allow-receipt-gaps`, which requires a receipt file.
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -243,6 +248,8 @@ struct Args {
     run: String,
     literal_predicate: String,
     samples: Option<String>,
+    receipt_file: Option<String>,
+    allow_receipt_gaps: bool,
 }
 
 fn parse() -> Args {
@@ -267,6 +274,8 @@ fn parse() -> Args {
         ),
         literal_predicate: "urn:wb:p".into(),
         samples: None,
+        receipt_file: None,
+        allow_receipt_gaps: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -285,6 +294,8 @@ fn parse() -> Args {
             "--run" => a.run = val(),
             "--literal-predicate" => a.literal_predicate = val(),
             "--samples" => a.samples = Some(val()),
+            "--receipts" => a.receipt_file = Some(val()),
+            "--allow-receipt-gaps" => a.allow_receipt_gaps = true,
             "--message" => {
                 let _ = MESSAGE.set(val());
             }
@@ -319,6 +330,10 @@ fn parse() -> Args {
     assert!(
         a.changes > 0 && a.clients > 0,
         "positive changes and clients required"
+    );
+    assert!(
+        !a.allow_receipt_gaps || a.receipt_file.is_some(),
+        "receipt gaps require --receipts and external history verification"
     );
     assert!(
         matches!(a.op.as_str(), "literal" | "iri" | "delete" | "geo"),
@@ -378,8 +393,22 @@ fn stats(mut v: Vec<f64>) -> String {
     )
 }
 
+fn unix_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
 fn main() {
     let a = parse();
+    let mut receipt_file = a.receipt_file.as_ref().map(|path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new receipt file")
+    });
     let mut sample_file = a.samples.as_ref().map(|path| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -390,6 +419,7 @@ fn main() {
         file
     });
     let op = a.op.clone();
+    let mut seed_receipts = Vec::new();
     // untimed seeding: deletes need their triples, and every run warms the connection
     if op == "delete" {
         let mut c = Conn::new(&a.addr);
@@ -411,6 +441,7 @@ fn main() {
                 );
                 std::process::exit(2);
             }
+            seed_receipts.push(r.commit.unwrap());
         }
     }
     let total = if a.scenario == "serial" {
@@ -439,6 +470,8 @@ fn main() {
             let mut errors = 0usize;
             let mut missing_receipts = 0usize;
             let (mut timed_start, mut timed_end) = (None, None);
+            let (mut first_unix, mut last_unix) = (f64::INFINITY, 0.0f64);
+            let mut max_schedule_lag_ms = 0.0f64;
             gate.wait();
             // with --write-rate, client k of n sends every n / rate seconds, offset by k / rate
             let period = (a.write_rate > 0.0)
@@ -455,6 +488,8 @@ fn main() {
                     if now < due {
                         std::thread::sleep(due - now);
                     }
+                    max_schedule_lag_ms = max_schedule_lag_ms
+                        .max(Instant::now().saturating_duration_since(due).as_secs_f64() * 1e3);
                     due += period;
                 }
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -466,9 +501,16 @@ fn main() {
                     timed_start = Some(Instant::now());
                 }
                 c.ready();
+                let timed = a.scenario != "serial" || i >= a.warmup;
+                if timed {
+                    first_unix = first_unix.min(unix_seconds());
+                }
                 let t = Instant::now();
                 let r = c.request(&req);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
+                if timed {
+                    last_unix = unix_seconds();
+                }
                 if a.scenario == "serial" && i >= a.warmup {
                     timed_end = Some(Instant::now());
                 }
@@ -498,7 +540,15 @@ fn main() {
             let timed_span = timed_start
                 .zip(timed_end)
                 .map(|(start, end)| end.duration_since(start));
-            (lat, errors, missing_receipts, timed_span)
+            (
+                lat,
+                errors,
+                missing_receipts,
+                timed_span,
+                first_unix,
+                last_unix,
+                max_schedule_lag_ms,
+            )
         }));
     }
     let mut readers = Vec::new();
@@ -560,8 +610,13 @@ fn main() {
     let mut errors = 0;
     let mut missing_receipts = 0;
     let mut serial_elapsed = None;
+    let (mut write_start_unix, mut write_end_unix) = (f64::INFINITY, 0.0f64);
+    let mut max_schedule_lag_ms = 0.0f64;
     for w in writers {
-        let (l, e, missing, span) = w.join().unwrap();
+        let (l, e, missing, span, first, last, lag) = w.join().unwrap();
+        max_schedule_lag_ms = max_schedule_lag_ms.max(lag);
+        write_start_unix = write_start_unix.min(first);
+        write_end_unix = write_end_unix.max(last);
         serial_elapsed = serial_elapsed.or(span);
         per_client.push(l.len());
         lat.extend(l);
@@ -588,6 +643,9 @@ fn main() {
         d.dedup();
         d.len() == rc.len()
     };
+    if let Some(file) = &mut receipt_file {
+        writeln!(file, "{{\"workload\":{rc:?},\"seeds\":{seed_receipts:?}}}").unwrap();
+    }
     let timed = lat.len();
     let mean_share = per_client.iter().sum::<usize>() as f64 / per_client.len().max(1) as f64;
     let spread = per_client
@@ -603,7 +661,7 @@ fn main() {
         }
     }
     println!(
-        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{}}}",
+        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{},\"write_start_unix\":{:.9},\"write_end_unix\":{:.9},\"max_schedule_lag_ms\":{:.6}}}",
         a.scenario,
         op,
         clients,
@@ -628,12 +686,15 @@ fn main() {
         } else {
             stats(rlat)
         },
-        rbad
+        rbad,
+        write_start_unix,
+        write_end_unix,
+        max_schedule_lag_ms
     );
     if errors > 0
         || missing_receipts > 0
         || rc.len() != total - errors
-        || !contiguous
+        || (!contiguous && !a.allow_receipt_gaps)
         || !distinct
         || rbad > 0
     {

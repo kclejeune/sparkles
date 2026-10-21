@@ -421,7 +421,11 @@ in a user systemd service with a 12 GiB memory limit and no swap. The CPU lists 
 match the host's topology. It creates fresh store copies, checks indexed answers and
 acknowledgements, saves individual latencies and checks a cold reopen after each run.
 The embedding worker calls a deterministic local provider, whose cost represents that
-provider alone. A failed acceptance threshold remains a failed gate in the result.
+provider alone. Its own ordinary commits can appear between client receipts. The harness
+checks every acknowledgment against the recovered user history and verifies the
+intervening embedding commits, their fallback counters and their derived triples
+separately. It keeps the ordinary client's strict receipt checks. A failed acceptance
+threshold remains a failed gate in the result.
 The full protocol uses both dataset sizes and five ABBA blocks. A smaller pilot only
 checks the harness and estimates runtime.
 
@@ -431,6 +435,10 @@ the writes end. It also samples resident memory during that interval. An allocat
 release in a disposable child checks that the kernel supports resetting the peak. A
 failed reset stops the measurement. The original Namespace write harness keeps its
 existing workload defaults.
+
+Reader requests started while the writers run keep their full latency, including those
+that finish after the writes stop. A timeout fails the observation. Both alternatives
+must sustain the same offered write rate before their reader tails can be compared.
 
 ## Continuous integration
 

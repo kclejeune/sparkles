@@ -7,6 +7,7 @@ its newly created directory. The caller holds the host's heavy lock for the whol
 """
 
 import argparse
+import collections
 import concurrent.futures
 import fcntl
 import hashlib
@@ -16,6 +17,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -25,11 +27,13 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import parse_qs, urlsplit
 
 FOAF_NAME = "http://xmlns.com/foaf/0.1/name"
 GEO = "http://www.opengis.net/ont/geosparql#"
 XSD = "http://www.w3.org/2001/XMLSchema#"
 SENTINELS = 17
+EMBED_PREDICATE = "urn:item86:embedding"
 TEXT_QUERY = (
     "PREFIX text:<http://jena.apache.org/text#> "
     'SELECT (COUNT(*) AS ?n) WHERE { ?s text:query ("fixedsentinel" 100) }'
@@ -63,9 +67,12 @@ def vector(text):
 
 def serve_provider(port):
     state = {"requests": 0, "inputs": 0}
+    batches = collections.deque(maxlen=100000)
     lock = threading.Lock()
 
     class Provider(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *_):
             pass
 
@@ -79,9 +86,16 @@ def serve_provider(port):
 
         def do_GET(self):
             with lock:
-                self.reply(200, dict(state))
+                url = urlsplit(self.path)
+                if url.path == "/batches":
+                    after = int(parse_qs(url.query)["after"][0])
+                    assert not batches or batches[0]["seq"] <= after + 1
+                    self.reply(200, [b for b in batches if b["seq"] > after])
+                else:
+                    self.reply(200, dict(state))
 
         def do_POST(self):
+            start_unix = time.time()
             try:
                 data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 inputs = data["input"]
@@ -98,6 +112,14 @@ def serve_provider(port):
                 with lock:
                     state["requests"] += 1
                     state["inputs"] += len(inputs)
+                    batches.append(
+                        {
+                            "seq": state["requests"],
+                            "start_unix": start_unix,
+                            "end_unix": time.time(),
+                            "inputs": len(inputs),
+                        }
+                    )
                 self.reply(
                     200,
                     {
@@ -176,7 +198,98 @@ def metrics(port, directory):
             if 'dataset="bench"' in key:
                 family = key.split("{", 1)[0]
                 result[family] = result.get(family, 0) + float(value)
+                if family == "sparkles_group_commit_fallbacks_total":
+                    reason = re.search(r'reason="([^"]+)"', key).group(1)
+                    result["fallback/" + reason] = result.get(
+                        "fallback/" + reason, 0
+                    ) + float(value)
     return result
+
+
+def cpu_set(text):
+    cpus = set()
+    for part in text.split(","):
+        limits = part.split("-")
+        lo, hi = int(limits[0]), int(limits[-1])
+        assert len(limits) <= 2 and 0 <= lo <= hi
+        cpus.update(range(lo, hi + 1))
+    return cpus
+
+
+def indexed_ready(args, index, directory):
+    if index == "embed":
+        return caught_up(args)
+    if index == "geo":
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            status = get_json(args.port, "/$/geo/bench")
+            if status["state"] == "ready":
+                break
+            time.sleep(0.1)
+        else:
+            raise TimeoutError("spatial index readiness")
+    text = TEXT_QUERY if index == "text" else GEO_QUERY
+    assert query(args.port, text) == SENTINELS
+    plan = json.loads(
+        raw_request(
+            args.port,
+            "/bench/sparql/explain",
+            {"query": text, "profile": "run", "describe": False},
+        )
+    )
+    save(directory / "reader-plan.json", plan)
+    assert ("Text" if index == "text" else "SpatialScan") in json.dumps(plan)
+    return None
+
+
+def source_count(port):
+    return query(
+        port,
+        f"SELECT (COUNT(*) AS ?n) WHERE {{?s ?p ?o FILTER(?p != <{EMBED_PREDICATE}>)}}",
+    )
+
+
+def embedding_count(port):
+    return query(port, f"SELECT (COUNT(*) AS ?n) WHERE {{?s <{EMBED_PREDICATE}> ?o}}")
+
+
+def read_history(port, after):
+    commits, cursor = [], after
+    while True:
+        page = get_json(port, f"/$/commits/bench?after={cursor}&limit=1000")
+        rows = page["commits"]
+        if not rows:
+            assert cursor == page["head"], "commit history is incomplete"
+            return commits
+        for row in rows:
+            assert row["seq"] == cursor + 1, "gap in retained commit history"
+            commits.append(row)
+            cursor = row["seq"]
+        if cursor == page["head"]:
+            return commits
+
+
+def verify_receipts(receipts, history, embedded):
+    workload, seeds = receipts["workload"], receipts["seeds"]
+    all_receipts = workload + seeds
+    assert len(set(all_receipts)) == len(all_receipts), (
+        "duplicate acknowledged receipts"
+    )
+    user = {c["seq"] for c in history if c["kind"] == "update"}
+    assert set(all_receipts) == user, (
+        "acknowledged receipts differ from recovered user history"
+    )
+    internal = [c for c in history if c["kind"] != "update"]
+    assert not internal or embedded, "unexpected internal commits"
+    assert all(
+        c["kind"] == "embed" and c.get("message") == "embeddings of vector index docs"
+        for c in internal
+    ), "unverified internal commit"
+    return len(internal)
+
+
+def window_samples(samples, start, end, field="start"):
+    return [s for s in samples if start <= s[field] <= end]
 
 
 def get_json(port, path):
@@ -256,6 +369,56 @@ def summarize(results):
     return {"gates": gates, "passed": bool(gates) and all(g["passed"] for g in gates)}
 
 
+def full_protocol(args):
+    return (
+        args.blocks >= 5
+        and args.people == [100000, 1000000]
+        and set(args.indexes) == {"text", "geo", "embed"}
+        and len(args.scenarios) == 5
+        and set(args.scenarios)
+        == {"serial-literal", "serial-iri", "serial-delete", "writers", "mixed"}
+        and args.serial_changes >= 2000
+        and args.warmup >= 200
+        and args.writer_changes == 50000
+    )
+
+
+def stop_owned(process):
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def run_client(command, directory, timeout=1800):
+    with (directory / "client.stderr").open("wb") as err:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=err, start_new_session=True
+        )
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, _ = process.communicate(timeout=10)
+            (directory / "client.stdout").write_bytes(stdout)
+            save(
+                directory / "client-exit.json",
+                {"returncode": process.returncode, "forced": True},
+            )
+            raise
+    (directory / "client.stdout").write_bytes(stdout)
+    save(
+        directory / "client-exit.json",
+        {"returncode": process.returncode, "forced": False},
+    )
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, command, output=stdout)
+    return stdout
+
+
 def read_samples(port, text, expected, stop, samples, errors):
     due = time.monotonic()
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
@@ -265,6 +428,7 @@ def read_samples(port, text, expected, stop, samples, errors):
                 break
             due += 1 / 25
             start = time.monotonic()
+            start_unix = time.time()
             try:
                 actual = query(port, text, conn)
                 assert actual == expected, (actual, expected)
@@ -272,6 +436,7 @@ def read_samples(port, text, expected, stop, samples, errors):
                 samples.append(
                     {
                         "start": start,
+                        "start_unix": start_unix,
                         "end": end,
                         "ms": (end - start) * 1000,
                         "count": actual,
@@ -284,6 +449,16 @@ def read_samples(port, text, expected, stop, samples, errors):
                 KeyError,
                 http.client.HTTPException,
             ) as exc:
+                end = time.monotonic()
+                samples.append(
+                    {
+                        "start": start,
+                        "start_unix": start_unix,
+                        "end": end,
+                        "ms": (end - start) * 1000,
+                        "error": str(exc),
+                    }
+                )
                 errors.append(str(exc))
                 stop.set()
     finally:
@@ -423,6 +598,7 @@ def generate(root, people, index):
 class Server:
     def __init__(self, args, store, directory, grouped):
         self.args, self.store, self.directory = args, store, directory
+        self.closed = False
         self.unit = "sparkles-item86-" + uuid.uuid4().hex
         self.log = (directory / "server.log").open("wb")
         command = [
@@ -432,11 +608,14 @@ class Server:
             "--wait",
             "--pipe",
             "--service-type=exec",
+            "--collect",
             f"--unit={self.unit}",
             "-p",
             "MemoryMax=12G",
             "-p",
             "MemorySwapMax=0",
+            "-p",
+            "TimeoutStopSec=30s",
             "taskset",
             "-c",
             args.server_cpus,
@@ -494,6 +673,7 @@ class Server:
                     "MemorySwapMax",
                 ],
                 text=True,
+                timeout=10,
             )
             (directory / "scope.txt").write_text(properties)
             props = dict(s.split("=", 1) for s in properties.splitlines())
@@ -503,23 +683,56 @@ class Server:
             )
             self.pid = int(props["MainPID"])
             assert self.pid > 0
+            assert set(os.sched_getaffinity(self.pid)) == cpu_set(args.server_cpus)
+            save(
+                directory / "server-affinity.json",
+                {"pid": self.pid, "cpus": sorted(os.sched_getaffinity(self.pid))},
+            )
         except BaseException:
             self.close()
             raise
 
     def close(self):
-        subprocess.run(
-            ["systemctl", "--user", "stop", self.unit],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        if self.closed:
+            return
+        forced = False
         try:
-            self.process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-            self.process.wait(timeout=10)
-        self.log.close()
+            try:
+                result = subprocess.run(
+                    ["systemctl", "--user", "stop", self.unit],
+                    check=False,
+                    capture_output=True,
+                    timeout=40,
+                )
+                assert result.returncode == 0, result.stderr
+            except (subprocess.TimeoutExpired, AssertionError):
+                forced = True
+                subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "kill",
+                        "--kill-whom=all",
+                        "--signal=KILL",
+                        self.unit,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+            stop_owned(self.process)
+        finally:
+            self.closed = True
+            self.log.close()
+            save(
+                self.directory / "cleanup.json",
+                {
+                    "unit": self.unit,
+                    "forced": forced,
+                    "returncode": self.process.poll(),
+                },
+            )
+        assert not forced, "server required forced cleanup; run is not accepted"
 
 
 def caught_up(args):
@@ -540,11 +753,45 @@ def run_command(command, path):
         subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, check=True)
 
 
+def unique_triples(directory):
+    # gen-data.py can repeat a knows edge. A line count is not an RDF-set oracle.
+    unique = directory / "unique.nt"
+    try:
+        canonical = re.compile(
+            r'<[^<>\s]+> <[^<>\s]+> (?:<[^<>\s]+>|"(?:[^"\\\r\n]|\\["\\])*"(?:@[a-z]+|\^\^<[^<>\s]+>)?) \.\n'
+        )
+        with (directory / "data.nt").open(encoding="utf-8") as source:
+            assert all(canonical.fullmatch(line) for line in source), (
+                "fixture must be canonical one-statement N-Triples without comments"
+            )
+        subprocess.run(
+            [
+                "sort",
+                "-u",
+                "-S",
+                "256M",
+                "-T",
+                str(directory),
+                "-o",
+                str(unique),
+                str(directory / "data.nt"),
+            ],
+            env=os.environ | {"LC_ALL": "C"},
+            check=True,
+            timeout=600,
+        )
+        with unique.open("rb") as triples:
+            return sum(1 for _ in triples)
+    finally:
+        unique.unlink(missing_ok=True)
+
+
 def prepare(args, root, index, people):
     seed = root / "seed"
     if seed.exists():
         raise FileExistsError(seed)
-    triples = generate(root, people, index)
+    lines = generate(root, people, index)
+    triples = unique_triples(root)
     run_command(
         [args.binary, "load", "--loc", str(seed), str(root / "data.nt")],
         root / "load.log",
@@ -576,9 +823,13 @@ def prepare(args, root, index, people):
     bootstrap.mkdir()
     server = Server(args, seed, bootstrap, True)
     try:
-        assert query(args.port, "SELECT (COUNT(*) AS ?n) WHERE {?s ?p ?o}") == triples
+        ready = indexed_ready(args, index, bootstrap)
+        assert source_count(args.port) == triples
         if index == "embed":
-            save(bootstrap / "embedding.json", caught_up(args))
+            save(bootstrap / "embedding.json", ready)
+            assert embedding_count(args.port) == query(
+                args.port, f"SELECT (COUNT(*) AS ?n) WHERE {{?s <{FOAF_NAME}> ?o}}"
+            )
         else:
             text = TEXT_QUERY if index == "text" else GEO_QUERY
             assert query(args.port, text) == SENTINELS
@@ -601,6 +852,7 @@ def prepare(args, root, index, people):
             "people": people,
             "index": index,
             "triples": triples,
+            "input_lines": lines,
             "sha256": digest(root / "data.nt"),
         },
     )
@@ -608,6 +860,25 @@ def prepare(args, root, index, people):
 
 
 def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
+    directory = cell / run_id
+    try:
+        return _measure(
+            args, cell, index, scenario, grouped, triples, run_id, write_rate
+        )
+    except BaseException as error:
+        if directory.exists():
+            save(
+                directory / "failure.json",
+                {"type": type(error).__name__, "error": str(error)},
+            )
+        raise
+    finally:
+        # Startup can fail before _measure reaches its service/reader cleanup block.
+        if (directory / "store").exists():
+            shutil.rmtree(directory / "store")
+
+
+def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
     directory = cell / run_id
     directory.mkdir()
     store = directory / "store"
@@ -648,7 +919,11 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         FOAF_NAME,
         "--samples",
         str(directory / "writer-samples.tsv"),
+        "--receipts",
+        str(directory / "receipts.json"),
     ]
+    if index == "embed":
+        command += ["--allow-receipt-gaps"]
     command += (
         ["serial", "--warmup", str(args.warmup)]
         if scenario.startswith("serial-")
@@ -657,7 +932,12 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
     if scenario == "mixed":
         command += ["--write-rate", str(write_rate)]
     try:
-        before_embedding = caught_up(args) if index == "embed" else None
+        before_embedding = indexed_ready(args, index, directory)
+        before_head = get_json(args.port, "/$/commits/bench/head")["commit"]["seq"]
+        before_derived = embedding_count(args.port) if index == "embed" else 0
+        baseline = directory / "before"
+        baseline.mkdir()
+        before_counters = metrics(args.port, baseline)
         assert get_json(args.port, "/$/stats/bench")["groupCommit"] == grouped
         provider_before = get_json(args.provider_port, "/")
         reset_hwm(server.pid, directory)
@@ -674,10 +954,7 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
             pathlib.Path("/proc/diskstats").read_text()
         )
         start = time.monotonic()
-        with (directory / "client.stderr").open("wb") as err:
-            client = subprocess.run(
-                command, stdout=subprocess.PIPE, stderr=err, check=True
-            )
+        client_output = run_client(command, directory)
         end = time.monotonic()
         interval_status = pathlib.Path(f"/proc/{server.pid}/status").read_text()
         provider_after = get_json(args.provider_port, "/")
@@ -686,14 +963,25 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
             future.result()
         pool.shutdown(wait=True)
         assert not errors, errors
-        result = json.loads(client.stdout)
+        result = json.loads(client_output)
         assert (
             result["changes"] == changes
             and result["errors"] == 0
             and result["missing_receipts"] == 0
         )
-        assert result["receipts_contiguous"] and result["receipts_distinct"]
-        overlap = [s for s in samples if s["start"] >= start and s["end"] <= end]
+        assert (result["receipts_contiguous"] or index == "embed") and result[
+            "receipts_distinct"
+        ]
+        if scenario == "mixed":
+            assert 0.95 <= result["tps"] / write_rate <= 1.05, (
+                "write rate did not match the fixed offered load"
+            )
+            assert result["max_schedule_lag_ms"] <= max(50, 2000 * 4 / write_rate), (
+                "paced writers fell behind their schedules"
+            )
+        overlap = window_samples(
+            samples, result["write_start_unix"], result["write_end_unix"], "start_unix"
+        )
         save(directory / "reader-samples.json", samples)
         save(directory / "memory-samples.json", memory)
         if scenario == "mixed":
@@ -713,15 +1001,34 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         result["peak_rss_kib"] = int(
             next(s for s in status.splitlines() if s.startswith("VmHWM:")).split()[1]
         )
+        after_embedding = caught_up(args) if index == "embed" else None
+        history = read_history(args.port, before_head)
+        receipts = json.loads((directory / "receipts.json").read_text())
+        internal = verify_receipts(receipts, history, index == "embed")
+        save(directory / "live-history.json", history)
         counters = metrics(args.port, directory)
-        assert counters.get("sparkles_group_commit_failures_total", 0) == 0
-        assert counters.get("sparkles_group_commit_fallbacks_total", 0) == 0
-        admitted = counters.get("sparkles_group_commit_size_sum", 0)
+        delta = {
+            key: value - before_counters.get(key, 0) for key, value in counters.items()
+        }
+        assert delta.get("sparkles_group_commit_failures_total", 0) == 0
+        for key, value in delta.items():
+            if key.startswith("fallback/"):
+                assert (
+                    key == "fallback/kind"
+                    and index == "embed"
+                    and grouped
+                    and value == internal
+                ), "unexpected fallback"
+        assert delta.get("sparkles_group_commit_fallbacks_total", 0) == (
+            internal if grouped and index == "embed" else 0
+        )
+        admitted = delta.get("sparkles_group_commit_size_sum", 0)
         if not grouped:
             assert admitted == 0, "ordinary run admitted grouped commits"
-        elif not scenario.startswith("serial-"):
+        elif scenario == "writers":
             assert admitted > 0, "four-writer run admitted no grouped commits"
         result["grouped_admissions"] = admitted
+        result["internal_embed_commits"] = internal
         # The exact generated subject namespace gives an independent data oracle.
         expected = changes + (args.warmup if scenario.startswith("serial-") else 0)
         if scenario == "serial-delete":
@@ -734,10 +1041,20 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
             check = (
                 f"SELECT (COUNT(*) AS ?n) WHERE {{ ?s <urn:wb:link:{namespace}> ?o }}"
             )
+        elif index == "embed":
+            check = (
+                f"SELECT (COUNT(*) AS ?n) WHERE {{ ?s <{FOAF_NAME}> ?o . "
+                f'FILTER(STRSTARTS(STR(?s), "urn:wb:{namespace}:")) }}'
+            )
         assert query(args.port, check) == expected
+        assert source_count(args.port) == triples + expected
+        derived = embedding_count(args.port) if index == "embed" else 0
+        assert derived == before_derived + (
+            expected if index == "embed" and operation == "literal" else 0
+        )
         assert (
             query(args.port, "SELECT (COUNT(*) AS ?n) WHERE {?s ?p ?o}")
-            == triples + expected
+            == triples + expected + derived
         )
         result["write_namespace_count"] = expected
         index_check = None
@@ -758,7 +1075,6 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
             (directory / "publication.rq").write_text(index_check + "\n")
             assert query(args.port, index_check) == expected
         if index == "embed":
-            after_embedding = caught_up(args)
             save(directory / "embedding-before.json", before_embedding)
             save(directory / "embedding-after.json", after_embedding)
             if operation == "literal":
@@ -766,9 +1082,17 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
                     after_embedding["embedding"]["embedded"]
                     > before_embedding["embedding"]["embedded"]
                 )
-                assert provider_after["inputs"] > provider_before["inputs"], (
-                    "worker made no provider progress during writes"
+                batches = get_json(
+                    args.provider_port, f"/batches?after={provider_before['requests']}"
                 )
+                save(directory / "provider-batches.json", batches)
+                assert any(
+                    result["write_start_unix"]
+                    <= b["start_unix"]
+                    <= result["write_end_unix"]
+                    and b["inputs"] > 0
+                    for b in batches
+                ), "worker made no provider progress during the actual write interval"
             save(
                 directory / "provider-window.json",
                 {"before": provider_before, "after": provider_after},
@@ -777,7 +1101,14 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         reopen = directory / "reopen"
         reopen.mkdir()
         server = Server(args, store, reopen, grouped)
+        indexed_ready(args, index, reopen)
         assert query(args.port, check) == expected
+        assert source_count(args.port) == triples + expected
+        if index == "embed":
+            assert embedding_count(args.port) == derived
+        recovered_history = read_history(args.port, before_head)
+        verify_receipts(receipts, recovered_history, index == "embed")
+        save(reopen / "history.json", recovered_history)
         if index_check:
             assert query(args.port, index_check) == expected
         if index in ("text", "geo"):
@@ -800,9 +1131,18 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         )
         save(directory / "result.json", result)
         return result
+    except BaseException as error:
+        save(
+            directory / "failure.json",
+            {"type": type(error).__name__, "error": str(error)},
+        )
+        raise
     finally:
         stop.set()
         pool.shutdown(wait=True)
+        save(directory / "reader-samples.json", samples)
+        save(directory / "reader-errors.json", errors)
+        save(directory / "memory-samples.json", memory)
         server.close()
         # Only this invocation's fresh cloned store is removed; raw receipts stay.
         shutil.rmtree(store)
@@ -855,6 +1195,16 @@ def main():
     assert args.blocks > 0 and min(args.people) > 0
     assert args.serial_changes > 0 and args.writer_changes > 0 and args.warmup >= 0
     assert math.isfinite(args.write_rate) and args.write_rate >= 0
+    server_cpus, client_cpus, provider_cpus = map(
+        cpu_set, (args.server_cpus, args.client_cpus, args.provider_cpus)
+    )
+    assert (
+        not server_cpus & client_cpus
+        and not server_cpus & provider_cpus
+        and not client_cpus & provider_cpus
+    )
+    os.sched_setaffinity(0, client_cpus)
+    assert set(os.sched_getaffinity(0)) == client_cpus
     # Do not wait silently behind another lane, and do not benchmark without ownership.
     heavy_lock = open(args.heavy_lock, "a+")  # noqa: SIM115 -- Held across the full campaign and explicitly closed below.
     fcntl.flock(heavy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -886,6 +1236,7 @@ def main():
         },
     )
     record_environment(root)
+    save(root / "coordinator-affinity.json", {"cpus": sorted(os.sched_getaffinity(0))})
     probe_hwm(root)
     provider = subprocess.Popen(
         [
@@ -959,20 +1310,16 @@ def main():
                 "finished_unix": time.time(),
                 "processes": len(results),
                 "gates_passed": summary["passed"],
-                "full_protocol": args.blocks >= 5
-                and args.people == [100000, 1000000]
-                and set(args.indexes) == {"text", "geo", "embed"}
-                and len(args.scenarios) == 5
-                and args.serial_changes >= 2000
-                and args.writer_changes == 50000,
+                "full_protocol": full_protocol(args),
             },
         )
         if not summary["passed"]:
             raise SystemExit(3)
     finally:
-        provider.terminate()
-        provider.wait(timeout=10)
-        heavy_lock.close()
+        try:
+            stop_owned(provider)
+        finally:
+            heavy_lock.close()
 
 
 if __name__ == "__main__":
