@@ -443,7 +443,8 @@ checks the harness and estimates runtime.
 
 Embedding seeds first finish their provider work, then close cleanly for a full offline
 compaction and vector rebuild. A cold validation with embedding disabled checks the exact
-source and derived counts, a complete persisted graph and an empty overlay. The same
+source and derived counts, a complete graph reopened from nonempty mapped files and an
+empty overlay. The same
 baseline checks run before each timed process. Provider-idle status alone does not prove
 that graph construction has finished. Offline maintenance uses owned services with the
 same memory and CPU limits as the server, finite deadlines and saved cleanup receipts.

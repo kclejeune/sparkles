@@ -933,6 +933,13 @@ def canonical_embedding_ready(args, directory, expected, *, embedding=True):
         ), "seed vectors were skipped"
         assert status["state"] in ("building", "ready"), status
         if status["state"] == "ready":
+            files = status.get("files")
+            assert isinstance(files, dict) and files.get("opened") is True, (
+                "seed graph must reopen its persisted files"
+            )
+            assert files["bytes"] > 0 and status["memory"]["residency"] == "mmap", (
+                "seed graph must have nonempty mapped files"
+            )
             assert status["rows"] == expected, "seed vector base count"
             assert status["hnsw"]["nodes"] == expected, "seed graph count"
             provider = status["embedding"]

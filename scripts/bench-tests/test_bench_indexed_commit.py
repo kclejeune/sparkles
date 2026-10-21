@@ -313,6 +313,8 @@ class Oracles(unittest.TestCase):
     def test_canonical_embedding_seed_requires_complete_persisted_graph(self):
         clean = {
             "state": "ready",
+            "files": {"opened": True, "bytes": 4096},
+            "memory": {"residency": "mmap"},
             "rows": 10,
             "hnsw": {"nodes": 10},
             "overlay": {
@@ -328,6 +330,10 @@ class Oracles(unittest.TestCase):
         bad = []
         for section, key, value in (
             (None, "state", "failed"),
+            (None, "files", None),
+            ("files", "opened", False),
+            ("files", "bytes", 0),
+            ("memory", "residency", "heap"),
             (None, "rows", 9),
             ("hnsw", "nodes", 9),
             ("overlay", "inserts", 1),
