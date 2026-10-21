@@ -412,6 +412,26 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 measurement limits, including local and cloud regression comparisons.
 [BENCHMARKS.md](BENCHMARKS.md) contains published results and their methodology.
 
+`scripts/bench-indexed-commit.py` runs the native indexed group-commit gates of X09
+section 17.9 on a quiet Linux host. It takes an externally built Sparkles binary and the
+standalone client built from `scripts/write-bench.rs`. Its `--help` describes the matrix
+and the pilot overrides. Both alternatives use the same binary, and the ordinary writer
+adds `--no-group-commit`. The harness holds the host's heavy lock and runs each server
+in a user systemd service with a 12 GiB memory limit and no swap. The CPU lists need to
+match the host's topology. It creates fresh store copies, checks indexed answers and
+acknowledgements, saves individual latencies and checks a cold reopen after each run.
+The embedding worker calls a deterministic local provider, whose cost represents that
+provider alone. A failed acceptance threshold remains a failed gate in the result.
+The full protocol uses both dataset sizes and five ABBA blocks. A smaller pilot only
+checks the harness and estimates runtime.
+
+For memory measurements, the harness saves the server's startup peak, resets its owned
+process's Linux high-water mark immediately before the writes and records the peak when
+the writes end. It also samples resident memory during that interval. An allocation and
+release in a disposable child checks that the kernel supports resetting the peak. A
+failed reset stops the measurement. The original Namespace write harness keeps its
+existing workload defaults.
+
 ## Continuous integration
 
 The workflows in `.github/workflows` run on standard GitHub-hosted runners, which are free

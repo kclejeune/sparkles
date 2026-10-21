@@ -241,6 +241,8 @@ struct Args {
     warmup: usize,
     people: usize,
     run: String,
+    literal_predicate: String,
+    samples: Option<String>,
 }
 
 fn parse() -> Args {
@@ -263,6 +265,8 @@ fn parse() -> Args {
                 .unwrap()
                 .as_millis()
         ),
+        literal_predicate: "urn:wb:p".into(),
+        samples: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -279,6 +283,8 @@ fn parse() -> Args {
             "--warmup" => a.warmup = val().parse().unwrap(),
             "--people" => a.people = val().parse().unwrap(),
             "--run" => a.run = val(),
+            "--literal-predicate" => a.literal_predicate = val(),
+            "--samples" => a.samples = Some(val()),
             "--message" => {
                 let _ = MESSAGE.set(val());
             }
@@ -298,6 +304,26 @@ fn parse() -> Args {
         a.write_rate == 0.0 || a.scenario != "serial",
         "--write-rate paces writers and mixed only"
     );
+    assert!(
+        !a.literal_predicate.is_empty()
+            && !a
+                .literal_predicate
+                .chars()
+                .any(|c| c.is_whitespace() || "<>\"{}|^`\\".contains(c)),
+        "--literal-predicate must be an absolute IRI without SPARQL delimiters"
+    );
+    assert!(
+        a.literal_predicate.contains(':'),
+        "--literal-predicate must be absolute"
+    );
+    assert!(
+        a.changes > 0 && a.clients > 0,
+        "positive changes and clients required"
+    );
+    assert!(
+        matches!(a.op.as_str(), "literal" | "iri" | "delete" | "geo"),
+        "operation: literal, iri, delete or geo"
+    );
     a
 }
 
@@ -305,8 +331,14 @@ fn parse() -> Args {
 fn update(a: &Args, op: &str, i: usize) -> String {
     match op {
         "literal" => format!(
-            "INSERT DATA {{ <urn:wb:{}:s{i}> <urn:wb:p> \"value {} {i}\" }}",
-            a.run, a.run
+            "INSERT DATA {{ <urn:wb:{}:s{i}> <{}> \"value {} {i}\" }}",
+            a.run, a.literal_predicate, a.run
+        ),
+        "geo" => format!(
+            "INSERT DATA {{ <urn:wb:{}:s{i}> <http://www.opengis.net/ont/geosparql#asWKT> \"POINT({} {})\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> }}",
+            a.run,
+            100 + i % 50,
+            40 + i % 30
         ),
         "iri" | "delete" => {
             let (s, o) = edge(a, i);
@@ -316,7 +348,7 @@ fn update(a: &Args, op: &str, i: usize) -> String {
                 a.run
             )
         }
-        _ => panic!("operation: literal, iri or delete"),
+        _ => panic!("operation: literal, iri, delete or geo"),
     }
 }
 
@@ -348,11 +380,16 @@ fn stats(mut v: Vec<f64>) -> String {
 
 fn main() {
     let a = parse();
-    let op = if a.scenario == "serial" {
-        a.op.clone()
-    } else {
-        "literal".to_string()
-    };
+    let mut sample_file = a.samples.as_ref().map(|path| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new latency sample file");
+        writeln!(file, "kind\tlatency_ms").unwrap();
+        file
+    });
+    let op = a.op.clone();
     // untimed seeding: deletes need their triples, and every run warms the connection
     if op == "delete" {
         let mut c = Conn::new(&a.addr);
@@ -557,6 +594,14 @@ fn main() {
         .iter()
         .map(|n| (*n as f64 - mean_share).abs() / mean_share.max(1.0))
         .fold(0.0, f64::max);
+    if let Some(file) = &mut sample_file {
+        for value in &lat {
+            writeln!(file, "writer\t{value:.9}").unwrap();
+        }
+        for value in &rlat {
+            writeln!(file, "reader\t{value:.9}").unwrap();
+        }
+    }
     println!(
         "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{}}}",
         a.scenario,
