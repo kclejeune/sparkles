@@ -277,15 +277,19 @@ fn aggregate_code(case: &str, value: &Option<Term>, offset: usize) -> u16 {
             let Some(Term::Literal(text)) = value else {
                 panic!("GROUP_CONCAT not a literal")
             };
-            let values: Vec<usize> = text
-                .value()
-                .split(',')
-                .map(|s| s.parse().expect("concat integer"))
-                .collect();
+            let values: Vec<_> = text.value().split(',').collect();
             assert_eq!(values.len(), 4);
             let mut counts = [0; 4];
             let mut code = 0;
-            for n in values {
+            for value in values {
+                let n: usize = value.parse().expect("concat integer");
+                // STR of the fixture's integer arithmetic has one canonical spelling.
+                // Preserve the exact RDF string, not just its parsed numeric values.
+                assert_eq!(
+                    value,
+                    n.to_string(),
+                    "GROUP_CONCAT changed integer spelling"
+                );
                 assert!((offset + 1..=offset + 3).contains(&n));
                 let n = n - offset;
                 counts[n] += 1;
@@ -902,6 +906,37 @@ mod tests {
         let concat_bits = code & 255;
         for sample in 1..=3 {
             assert_eq!(((sample << 8) | concat_bits) & 255, concat_bits);
+        }
+    }
+    #[test]
+    fn concat_oracle_refuses_changed_rdf_string_spelling() {
+        for text in ["03,1,3,2", "+3,1,3,2", "3, 1,3,2"] {
+            let term = Some(Literal::new_simple_literal(text).into());
+            assert!(
+                std::panic::catch_unwind(|| aggregate_code("concat", &term, 0)).is_err(),
+                "accepted changed RDF string {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn concat_oracle_accepts_exact_arithmetic_spellings_at_group_offsets() {
+        for offset in [0, 1, 96, 97, 192] {
+            let text = format!(
+                "{},{},{},{}",
+                offset + 3,
+                offset + 1,
+                offset + 3,
+                offset + 2
+            );
+            assert_eq!(
+                aggregate_code(
+                    "concat",
+                    &Some(Literal::new_simple_literal(text).into()),
+                    offset
+                ),
+                222
+            );
         }
     }
 }
