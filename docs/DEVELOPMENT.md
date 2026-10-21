@@ -435,6 +435,85 @@ flake runs the same tests as its `ui-e2e` check (see [Nix](#nix)).
 measurement limits, including local and cloud regression comparisons.
 [BENCHMARKS.md](BENCHMARKS.md) contains published results and their methodology.
 
+`scripts/bench-indexed-commit.py` runs the native indexed group-commit gates of X09
+section 17.9 on a quiet Linux host. It takes an externally built Sparkles binary and the
+standalone client built from `scripts/write-bench.rs`. Its `--help` describes the matrix
+and the pilot overrides. Both alternatives use the same binary, and the ordinary writer
+adds `--no-group-commit`. The harness holds the host's heavy lock and runs each server
+in a user systemd service with a 12 GiB memory limit and no swap. The CPU lists need to
+match the host's topology. It creates fresh store copies, checks indexed answers and
+acknowledgements, saves individual latencies and checks a cold reopen after each run.
+Generated fixtures and seeds are flushed after preparation. Every fresh store copy is
+flushed before server startup, and completed raw evidence is flushed after cleanup.
+These owned-file flushes stay outside the writer interval and prevent bulk preparation
+writeback from spilling into the next measurement. They add no delay to timed commits.
+The embedding worker calls a deterministic local provider, whose cost represents that
+provider alone. Its own ordinary commits can appear between client receipts. The harness
+checks every acknowledgment against the recovered user history and verifies the
+intervening embedding commits, their fallback counters and their derived triples
+separately. It keeps the ordinary client's strict receipt checks. A failed acceptance
+threshold remains a failed gate in the result.
+Cold embedding inspection disables the worker and compares persisted derived triples and
+commit identities before they can be regenerated.
+Text and spatial publication checks save executed plans and require the exact completed
+TextSearch or SpatialScan operator. Spatial plans must report a ready index without a
+fallback. A broad geometry count checks every write, while a selective typed-WKT window
+checks spatial-index publication to the unique write namespace. The client's coordinate
+cycle places one write in that window every 150 changes. Both counts and index plans are
+checked live and after a cold reopen.
+The full protocol uses both dataset sizes and five ABBA blocks. A smaller pilot only
+checks the harness and estimates runtime.
+
+Embedding seeds first finish their provider work, then close cleanly for a full offline
+compaction and vector rebuild. A cold validation with embedding disabled checks the exact
+source and derived counts, a complete graph reopened from nonempty mapped files and an
+empty overlay. The same
+baseline checks run before each timed process. Provider-idle status alone does not prove
+that graph construction has finished. Offline maintenance uses owned services with the
+same memory and CPU limits as the server, finite deadlines and saved cleanup receipts.
+New timed writes still run the normal embedding and graph workers, and provider work must
+occur inside the writer interval.
+
+For memory measurements, the harness saves the server's startup peak, resets its owned
+process's Linux high-water mark before client startup and reads it after the client exits,
+including raw-output finalization. This gives a conservative outer-window bound. It also
+samples resident memory, preserving wall timestamps around each read. The reported peak
+is the larger of the reset kernel bound and samples read wholly within the actual writer
+interval. Both components and the sample count are saved separately. The memory gate
+certifies the peak difference using the grouped outer-window upper bound minus the
+ordinary interval's sampled lower bound. It retains the original outer-window difference
+as a diagnostic. Missing interval samples cannot pass the gate. This prevents an
+ordinary-only post-write spike from masking a grouped interval increase. An allocation and
+release in a disposable child checks that the kernel supports resetting the peak. A
+failed reset stops the measurement. The original Namespace write harness keeps its
+existing workload defaults.
+
+Reader requests started while the writers run keep their full latency, including those
+that finish after the writes stop. A timeout fails the observation. Both alternatives
+must sustain the same offered write rate before their reader tails can be compared.
+The harness adds a load-quality requirement beyond X09's numerical thresholds. Each
+mixed process must achieve its offered rate within five percent, with maximum schedule
+lag no greater than 50 ms or two client periods, whichever is longer.
+Schedule lag is measured at each real request's start, after connection readiness.
+Exhausted writer iterations cannot contribute a lag for an unsent request. The client's
+optional `--request-timings` file records each workload attempt's client and index, its timed or
+warmup status, wall start and end, monotonic start and due offsets, latency and HTTP
+status. Transport and connection-readiness failures use status zero. The client never
+resends a request after losing its response. Rows are buffered and written when the client
+finishes, outside the writer interval. The indexed harness saves these diagnostics for
+each process while keeping the original latency samples separate.
+A violation remains a failed gate even when the reader latency ratio passes. The harness
+retains its raw samples and completes the data and cold-recovery checks before moving
+to the next process.
+When no rate is supplied, calibration runs an unpaced ABBA block with the actual indexed
+readers and chooses eighty percent of the slowest observed writer throughput. The harness
+then validates that common offered rate on both alternatives, including a supplied rate,
+before acceptance processes begin. Either alternative missing the five-percent achieved
+rate tolerance stops the matrix and retains all calibration evidence. The rate is fixed
+throughout the acceptance matrix. Calibration has its own raw samples and cold-recovery
+checks and cannot enter acceptance summaries. Its aggregate rate validation does not
+excuse a failed schedule-lag check in an acceptance process.
+
 ## Continuous integration
 
 The workflows in `.github/workflows` run on standard GitHub-hosted runners, which are free

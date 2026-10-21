@@ -29,10 +29,17 @@
 //! total. Each client sends on its own schedule of N / clients requests per second, as the
 //! readers do, so two servers can be compared at the same commit rate. Without it, every
 //! client sends its next request as soon as the last one is answered.
-//! Operations (`--op`, writers and mixed always use `literal`)
+//! Operations (`--op`, default `literal`)
 //!   literal  a new subject and a new literal, so the commit adds a term to the vocabulary
 //!   iri      a new edge between two people of the generated dataset (scripts/gen-data.py)
 //!   delete   the same edges, inserted untimed first and then deleted
+//!   geo      a new subject and a typed WKT point outside the fixed reader window
+//! `--literal-predicate IRI` changes the literal writer's predicate. `--op geo` writes
+//! typed WKT points. `--samples FILE` and `--receipts FILE` preserve individual latencies
+//! and acknowledgment IDs in new files. `--request-timings FILE` also records each real
+//! workload attempt, including serial warmups and failures, with wall and monotonic timing.
+//! Only a caller that verifies every intervening internal commit may use
+//! `--allow-receipt-gaps`, which requires a receipt file.
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,6 +50,7 @@ struct Conn {
     addr: String,
     s: TcpStream,
     buf: Vec<u8>,
+    usable: bool,
 }
 
 struct Resp {
@@ -52,28 +60,37 @@ struct Resp {
 }
 
 impl Conn {
-    fn new(addr: &str) -> Conn {
-        Conn {
+    fn new(addr: &str) -> Result<Conn, String> {
+        Ok(Conn {
             addr: addr.to_string(),
-            s: Conn::dial(addr),
+            s: Conn::dial(addr).map_err(|e| format!("connect {addr}: {e}"))?,
             buf: Vec::new(),
-        }
+            usable: true,
+        })
     }
-    fn dial(addr: &str) -> TcpStream {
-        let s = TcpStream::connect(addr).unwrap_or_else(|e| panic!("connect {addr}: {e}"));
-        s.set_nodelay(true).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-        s
+    fn dial(addr: &str) -> std::io::Result<TcpStream> {
+        let s = TcpStream::connect(addr)?;
+        s.set_nodelay(true)?;
+        s.set_read_timeout(Some(Duration::from_secs(60)))?;
+        Ok(s)
     }
-    fn redial(&mut self) {
-        self.s = Conn::dial(&self.addr);
+    fn redial(&mut self) -> Result<(), String> {
+        // A refused dial must never make the uncertain old stream reusable.
+        self.usable = false;
+        let _ = self.s.shutdown(std::net::Shutdown::Both);
         self.buf.clear();
+        self.s = Conn::dial(&self.addr).map_err(|e| format!("connect {}: {e}", self.addr))?;
+        self.usable = true;
+        Ok(())
     }
     /// Dial again if the server closed the kept-alive connection while it was idle. Call it
     /// outside the timed span; it sends nothing.
-    fn ready(&mut self) {
+    fn ready(&mut self) -> Result<(), String> {
+        if !self.usable {
+            return self.redial();
+        }
         if !self.buf.is_empty() {
-            return;
+            return Ok(());
         }
         // With nothing sent, anything but "no data yet" means the connection is unusable:
         // the server closed it, reset it, or said something no request asked for.
@@ -82,17 +99,24 @@ impl Conn {
                 self.s.peek(&mut [0u8; 1]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
             );
-        self.s.set_nonblocking(false).unwrap();
+        self.s.set_nonblocking(false).map_err(|e| e.to_string())?;
         if closed {
-            self.redial();
+            self.redial()?;
         }
+        Ok(())
     }
     /// Send `req` and read its answer. The request is sent again on a new connection only
     /// when writing it failed. Once it was written the server may have run it, so a failed
     /// read is an error and is never retried.
     fn request(&mut self, req: &[u8]) -> Result<Resp, String> {
+        if !self.usable {
+            return Err(format!(
+                "connection to {} needs successful readiness",
+                self.addr
+            ));
+        }
         if self.s.write_all(req).is_err() {
-            self.redial();
+            self.redial()?;
             self.s
                 .write_all(req)
                 .map_err(|e| format!("send to {}: {e}", self.addr))?;
@@ -101,7 +125,7 @@ impl Conn {
             Some(r) => Ok(r),
             None => {
                 // the connection's state is unknown, so the next request gets a new one
-                self.redial();
+                self.redial()?;
                 Err(format!(
                     "no answer from {} after the request was sent",
                     self.addr
@@ -241,6 +265,11 @@ struct Args {
     warmup: usize,
     people: usize,
     run: String,
+    literal_predicate: String,
+    samples: Option<String>,
+    request_timings: Option<String>,
+    receipt_file: Option<String>,
+    allow_receipt_gaps: bool,
 }
 
 fn parse() -> Args {
@@ -263,6 +292,11 @@ fn parse() -> Args {
                 .unwrap()
                 .as_millis()
         ),
+        literal_predicate: "urn:wb:p".into(),
+        samples: None,
+        request_timings: None,
+        receipt_file: None,
+        allow_receipt_gaps: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -279,6 +313,11 @@ fn parse() -> Args {
             "--warmup" => a.warmup = val().parse().unwrap(),
             "--people" => a.people = val().parse().unwrap(),
             "--run" => a.run = val(),
+            "--literal-predicate" => a.literal_predicate = val(),
+            "--samples" => a.samples = Some(val()),
+            "--request-timings" => a.request_timings = Some(val()),
+            "--receipts" => a.receipt_file = Some(val()),
+            "--allow-receipt-gaps" => a.allow_receipt_gaps = true,
             "--message" => {
                 let _ = MESSAGE.set(val());
             }
@@ -298,6 +337,30 @@ fn parse() -> Args {
         a.write_rate == 0.0 || a.scenario != "serial",
         "--write-rate paces writers and mixed only"
     );
+    assert!(
+        !a.literal_predicate.is_empty()
+            && !a
+                .literal_predicate
+                .chars()
+                .any(|c| c.is_whitespace() || "<>\"{}|^`\\".contains(c)),
+        "--literal-predicate must be an absolute IRI without SPARQL delimiters"
+    );
+    assert!(
+        a.literal_predicate.contains(':'),
+        "--literal-predicate must be absolute"
+    );
+    assert!(
+        a.changes > 0 && a.clients > 0,
+        "positive changes and clients required"
+    );
+    assert!(
+        !a.allow_receipt_gaps || a.receipt_file.is_some(),
+        "receipt gaps require --receipts and external history verification"
+    );
+    assert!(
+        matches!(a.op.as_str(), "literal" | "iri" | "delete" | "geo"),
+        "operation: literal, iri, delete or geo"
+    );
     a
 }
 
@@ -305,8 +368,14 @@ fn parse() -> Args {
 fn update(a: &Args, op: &str, i: usize) -> String {
     match op {
         "literal" => format!(
-            "INSERT DATA {{ <urn:wb:{}:s{i}> <urn:wb:p> \"value {} {i}\" }}",
-            a.run, a.run
+            "INSERT DATA {{ <urn:wb:{}:s{i}> <{}> \"value {} {i}\" }}",
+            a.run, a.literal_predicate, a.run
+        ),
+        "geo" => format!(
+            "INSERT DATA {{ <urn:wb:{}:s{i}> <http://www.opengis.net/ont/geosparql#asWKT> \"POINT({} {})\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> }}",
+            a.run,
+            100 + i % 50,
+            40 + i % 30
         ),
         "iri" | "delete" => {
             let (s, o) = edge(a, i);
@@ -316,7 +385,7 @@ fn update(a: &Args, op: &str, i: usize) -> String {
                 a.run
             )
         }
-        _ => panic!("operation: literal, iri or delete"),
+        _ => panic!("operation: literal, iri, delete or geo"),
     }
 }
 
@@ -346,18 +415,65 @@ fn stats(mut v: Vec<f64>) -> String {
     )
 }
 
+fn unix_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+struct RequestTiming {
+    client: usize,
+    index: usize,
+    timed: bool,
+    start_unix: f64,
+    end_unix: f64,
+    start_offset_ms: f64,
+    due_offset_ms: Option<f64>,
+    latency_ms: f64,
+    status: u16,
+}
+
 fn main() {
     let a = parse();
-    let op = if a.scenario == "serial" {
-        a.op.clone()
-    } else {
-        "literal".to_string()
-    };
+    let mut receipt_file = a.receipt_file.as_ref().map(|path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new receipt file")
+    });
+    let mut sample_file = a.samples.as_ref().map(|path| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new latency sample file");
+        writeln!(file, "kind\tlatency_ms").unwrap();
+        file
+    });
+    let mut timing_file = a.request_timings.as_ref().map(|path| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new request timing file");
+        writeln!(file, "client\tindex\ttimed\tstart_unix\tend_unix\tstart_offset_ms\tdue_offset_ms\tlatency_ms\tstatus").unwrap();
+        file
+    });
+    let op = a.op.clone();
+    let mut seed_receipts = Vec::new();
     // untimed seeding: deletes need their triples, and every run warms the connection
     if op == "delete" {
-        let mut c = Conn::new(&a.addr);
+        let mut c = Conn::new(&a.addr).unwrap_or_else(|e| {
+            eprintln!("delete setup connection failed: {e}");
+            std::process::exit(2);
+        });
         for i in 0..a.changes + a.warmup {
-            c.ready();
+            c.ready().unwrap_or_else(|e| {
+                eprintln!("delete setup connection {} failed: {e}", i + 1);
+                std::process::exit(2);
+            });
             let r = c
                 .request(&update_request(&a.ds, &a.addr, &update(&a, "iri", i)))
                 .unwrap_or_else(|e| {
@@ -374,6 +490,7 @@ fn main() {
                 );
                 std::process::exit(2);
             }
+            seed_receipts.push(r.commit.unwrap());
         }
     }
     let total = if a.scenario == "serial" {
@@ -398,21 +515,26 @@ fn main() {
         writers.push(std::thread::spawn(move || {
             let mut c = Conn::new(&a.addr);
             let mut lat = Vec::new();
+            let mut timings = Vec::new();
             let mut mine = Vec::new();
             let mut errors = 0usize;
             let mut missing_receipts = 0usize;
             let (mut timed_start, mut timed_end) = (None, None);
+            let (mut first_unix, mut last_unix) = (f64::INFINITY, 0.0f64);
+            let mut max_schedule_lag_ms = 0.0f64;
             gate.wait();
             // with --write-rate, client k of n sends every n / rate seconds, offset by k / rate
             let period = (a.write_rate > 0.0)
                 .then(|| Duration::from_secs_f64(clients as f64 / a.write_rate));
-            let mut due = Instant::now()
+            let origin = Instant::now();
+            let mut due = origin
                 + Duration::from_secs_f64(if a.write_rate > 0.0 {
                     k as f64 / a.write_rate
                 } else {
                     0.0
                 });
             loop {
+                let request_due = period.map(|_| due);
                 if let Some(period) = period {
                     let now = Instant::now();
                     if now < due {
@@ -428,10 +550,46 @@ fn main() {
                 if a.scenario == "serial" && i == a.warmup {
                     timed_start = Some(Instant::now());
                 }
-                c.ready();
+                let readiness = c.as_mut().map_err(|e| e.clone()).and_then(|c| c.ready());
+                let timed = a.scenario != "serial" || i >= a.warmup;
+                let start_unix = if timed || a.request_timings.is_some() {
+                    unix_seconds()
+                } else {
+                    0.0
+                };
+                if timed {
+                    first_unix = first_unix.min(start_unix);
+                }
                 let t = Instant::now();
-                let r = c.request(&req);
+                let r = readiness.and_then(|_| c.as_mut().map_err(|e| e.clone())?.request(&req));
                 let ms = t.elapsed().as_secs_f64() * 1e3;
+                if let Some(due) = request_due {
+                    // Only a real request contributes lag, including connection readiness.
+                    max_schedule_lag_ms = max_schedule_lag_ms
+                        .max(t.saturating_duration_since(due).as_secs_f64() * 1e3);
+                }
+                let end_unix = if timed || a.request_timings.is_some() {
+                    unix_seconds()
+                } else {
+                    0.0
+                };
+                if timed {
+                    last_unix = end_unix;
+                }
+                if a.request_timings.is_some() {
+                    timings.push(RequestTiming {
+                        client: k,
+                        index: i,
+                        timed,
+                        start_unix,
+                        end_unix,
+                        start_offset_ms: t.duration_since(origin).as_secs_f64() * 1e3,
+                        due_offset_ms: request_due
+                            .map(|due| due.duration_since(origin).as_secs_f64() * 1e3),
+                        latency_ms: ms,
+                        status: r.as_ref().map(|r| r.status).unwrap_or(0),
+                    });
+                }
                 if a.scenario == "serial" && i >= a.warmup {
                     timed_end = Some(Instant::now());
                 }
@@ -461,7 +619,16 @@ fn main() {
             let timed_span = timed_start
                 .zip(timed_end)
                 .map(|(start, end)| end.duration_since(start));
-            (lat, errors, missing_receipts, timed_span)
+            (
+                lat,
+                errors,
+                missing_receipts,
+                timed_span,
+                first_unix,
+                last_unix,
+                max_schedule_lag_ms,
+                timings,
+            )
         }));
     }
     let mut readers = Vec::new();
@@ -486,9 +653,11 @@ fn main() {
                         std::thread::sleep(due - now);
                     }
                     due += period;
-                    c.ready();
+                    let readiness = c.as_mut().map_err(|e| e.clone()).and_then(|c| c.ready());
                     let t = Instant::now();
-                    let r = match c.request(&req) {
+                    let r = match readiness
+                        .and_then(|_| c.as_mut().map_err(|e| e.clone())?.request(&req))
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             eprintln!("count request: {e}");
@@ -523,8 +692,15 @@ fn main() {
     let mut errors = 0;
     let mut missing_receipts = 0;
     let mut serial_elapsed = None;
+    let (mut write_start_unix, mut write_end_unix) = (f64::INFINITY, 0.0f64);
+    let mut max_schedule_lag_ms = 0.0f64;
+    let mut request_timings = Vec::new();
     for w in writers {
-        let (l, e, missing, span) = w.join().unwrap();
+        let (l, e, missing, span, first, last, lag, timings) = w.join().unwrap();
+        request_timings.extend(timings);
+        max_schedule_lag_ms = max_schedule_lag_ms.max(lag);
+        write_start_unix = write_start_unix.min(first);
+        write_end_unix = write_end_unix.max(last);
         serial_elapsed = serial_elapsed.or(span);
         per_client.push(l.len());
         lat.extend(l);
@@ -551,14 +727,47 @@ fn main() {
         d.dedup();
         d.len() == rc.len()
     };
+    if let Some(file) = &mut receipt_file {
+        writeln!(file, "{{\"workload\":{rc:?},\"seeds\":{seed_receipts:?}}}").unwrap();
+    }
     let timed = lat.len();
     let mean_share = per_client.iter().sum::<usize>() as f64 / per_client.len().max(1) as f64;
     let spread = per_client
         .iter()
         .map(|n| (*n as f64 - mean_share).abs() / mean_share.max(1.0))
         .fold(0.0, f64::max);
+    if let Some(file) = &mut timing_file {
+        for row in &request_timings {
+            let due = row
+                .due_offset_ms
+                .map(|v| format!("{v:.9}"))
+                .unwrap_or_default();
+            writeln!(
+                file,
+                "{}\t{}\t{}\t{:.9}\t{:.9}\t{:.9}\t{}\t{:.9}\t{}",
+                row.client,
+                row.index,
+                row.timed,
+                row.start_unix,
+                row.end_unix,
+                row.start_offset_ms,
+                due,
+                row.latency_ms,
+                row.status
+            )
+            .unwrap();
+        }
+    }
+    if let Some(file) = &mut sample_file {
+        for value in &lat {
+            writeln!(file, "writer\t{value:.9}").unwrap();
+        }
+        for value in &rlat {
+            writeln!(file, "reader\t{value:.9}").unwrap();
+        }
+    }
     println!(
-        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{}}}",
+        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{},\"write_start_unix\":{:.9},\"write_end_unix\":{:.9},\"max_schedule_lag_ms\":{:.6}}}",
         a.scenario,
         op,
         clients,
@@ -583,15 +792,67 @@ fn main() {
         } else {
             stats(rlat)
         },
-        rbad
+        rbad,
+        write_start_unix,
+        write_end_unix,
+        max_schedule_lag_ms
     );
     if errors > 0
         || missing_receipts > 0
         || rc.len() != total - errors
-        || !contiguous
+        || (!contiguous && !a.allow_receipt_gaps)
         || !distinct
         || rbad > 0
     {
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn refused_redial_never_reuses_an_uncertain_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut first = [0; 5];
+            socket.read_exact(&mut first).unwrap();
+            assert_eq!(&first, b"first");
+            drop(listener);
+            // Withhold the first response until the client times out and tries to redial.
+            let mut second = [0; 6];
+            let reused = socket.read_exact(&mut second).is_ok() && &second == b"second";
+            if reused {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSparkles-Commit: 77\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+            reused
+        });
+        let mut client = Conn::new(&addr).unwrap_or_else(|e| panic!("{e}"));
+        client
+            .s
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(client.request(b"first").is_err());
+        let second = client.ready().and_then(|_| client.request(b"second"));
+        let reused = server.join().unwrap();
+        assert!(
+            !reused,
+            "a later request used the socket with an unanswered request"
+        );
+        assert!(
+            second.is_err(),
+            "a delayed old response was accepted as a new receipt"
+        );
     }
 }
