@@ -456,7 +456,11 @@ process's Linux high-water mark before client startup and reads it after the cli
 including raw-output finalization. This gives a conservative outer-window bound. It also
 samples resident memory, preserving wall timestamps around each read. The reported peak
 is the larger of the reset kernel bound and samples read wholly within the actual writer
-interval. Both components and the sample count are saved separately. An allocation and
+interval. Both components and the sample count are saved separately. The memory gate
+certifies the peak difference using the grouped outer-window upper bound minus the
+ordinary interval's sampled lower bound. It retains the original outer-window difference
+as a diagnostic. Missing interval samples cannot pass the gate. This prevents an
+ordinary-only post-write spike from masking a grouped interval increase. An allocation and
 release in a disposable child checks that the kernel supports resetting the peak. A
 failed reset stops the measurement. The original Namespace write harness keeps its
 existing workload defaults.

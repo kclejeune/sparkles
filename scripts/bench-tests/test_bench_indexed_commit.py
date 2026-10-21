@@ -57,6 +57,15 @@ def index_plan(operator="SpatialScan"):
     }
 
 
+def rss_bounds(upper, lower=None):
+    return {
+        "peak_rss_kib": upper,
+        "reset_hwm_outer_window_kib": upper,
+        "sampled_writer_interval_peak_kib": upper if lower is None else lower,
+        "writer_interval_sample_count": 10,
+    }
+
+
 class Oracles(unittest.TestCase):
     def test_owned_flush_counts_files_and_rejects_external_links_and_fifo(self):
         with tempfile.TemporaryDirectory(prefix="sparkles-flush-") as temp:
@@ -858,6 +867,49 @@ class Oracles(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_ordinary_post_write_peak_cannot_mask_grouped_interval_rss(self):
+        rows = [
+            {
+                "people": 100000,
+                "index": "embed",
+                "scenario": "writers",
+                "grouped": grouped,
+                "tps": tps,
+                "peak_rss_kib": upper,
+                "rss_peak_components": rss_bounds(upper, lower),
+            }
+            for grouped, upper, lower, tps in (
+                (False, 300 * 1024, 100 * 1024, 100),
+                (True, 250 * 1024, 250 * 1024, 150),
+            )
+        ]
+        summary = BENCH.summarize(rows)
+        self.assertFalse(summary["passed"])
+        check = summary["gates"][0]["checks"]["peak_rss"]
+        self.assertEqual(check["delta_kib"], -50 * 1024)
+        self.assertEqual(check["certified_delta_upper_kib"], 150 * 1024)
+        for extra, accepted in ((65536, True), (65537, False)):
+            rows[0].update(
+                peak_rss_kib=100 * 1024, rss_peak_components=rss_bounds(100 * 1024)
+            )
+            rows[1].update(
+                peak_rss_kib=100 * 1024 + extra,
+                rss_peak_components=rss_bounds(100 * 1024 + extra),
+            )
+            self.assertEqual(BENCH.summarize(rows)["passed"], accepted)
+        for missing in (
+            None,
+            {
+                **rss_bounds(100 * 1024),
+                "sampled_writer_interval_peak_kib": None,
+                "writer_interval_sample_count": 0,
+            },
+        ):
+            rows[0]["rss_peak_components"] = missing
+            check = BENCH.summarize(rows)["gates"][0]["checks"]["peak_rss"]
+            self.assertFalse(check["passed"])
+            self.assertIsNone(check["certified_delta_upper_kib"])
+
     def test_gate_failures_are_not_masked_by_passing_memory(self):
         rows = [
             {
@@ -866,6 +918,7 @@ class Oracles(unittest.TestCase):
                 "scenario": "writers",
                 "grouped": grouped,
                 "peak_rss_kib": 1024,
+                "rss_peak_components": rss_bounds(1024),
                 "tps": tps,
             }
             for grouped, tps in ((False, 100), (True, 140))
@@ -975,6 +1028,7 @@ class Oracles(unittest.TestCase):
                 "grouped": grouped,
                 "calibration": True,
                 "peak_rss_kib": 1024,
+                "rss_peak_components": rss_bounds(1024),
                 "readers": {"p50_ms": 1, "p99_ms": 1},
                 "write_rate": 500,
                 "tps": 500,
@@ -1009,6 +1063,7 @@ class Oracles(unittest.TestCase):
                 "scenario": "mixed",
                 "grouped": grouped,
                 "peak_rss_kib": 1024,
+                "rss_peak_components": rss_bounds(1024),
                 "readers": {"p50_ms": 1, "p99_ms": 1},
                 "write_rate": 540.64,
                 "tps": 538.2,
@@ -1043,6 +1098,7 @@ class Oracles(unittest.TestCase):
             r.update(
                 scenario="mixed",
                 peak_rss_kib=123,
+                rss_peak_components=rss_bounds(123),
                 readers={"p50_ms": 1, "p99_ms": 1},
                 write_rate=100,
                 tps=100,

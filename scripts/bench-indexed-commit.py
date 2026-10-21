@@ -422,6 +422,40 @@ def mixed_load_checks(result):
     }
 
 
+def rss_difference_certificate(variants):
+    outer = [max(r["peak_rss_kib"] for r in variant) for variant in variants]
+    result = {
+        "delta_kib": outer[1] - outer[0],
+        "certified_delta_upper_kib": None,
+        "passed": False,
+    }
+    for variant in variants:
+        for row in variant:
+            components = row.get("rss_peak_components")
+            if not isinstance(components, dict):
+                result["reason"] = "missing RSS component receipts"
+                return result
+            lower = components.get("sampled_writer_interval_peak_kib")
+            if lower is None or components.get("writer_interval_sample_count", 0) <= 0:
+                result["reason"] = "no actual writer-interval RSS sample"
+                return result
+            assert 0 <= lower <= row["peak_rss_kib"]
+            assert components["peak_rss_kib"] == row["peak_rss_kib"]
+            assert 0 <= components["reset_hwm_outer_window_kib"] <= row["peak_rss_kib"]
+    ordinary_lower = max(
+        r["rss_peak_components"]["sampled_writer_interval_peak_kib"]
+        for r in variants[0]
+    )
+    certified = outer[1] - ordinary_lower
+    result.update(
+        certified_delta_upper_kib=certified,
+        ordinary_interval_sampled_lower_kib=ordinary_lower,
+        grouped_outer_upper_kib=outer[1],
+        passed=certified <= 65536,
+    )
+    return result
+
+
 def summarize(results):
     assert not any(r.get("calibration", False) for r in results), (
         "calibration processes cannot enter acceptance summaries"
@@ -448,11 +482,7 @@ def summarize(results):
                 ratio = values[1] / values[0]
                 checks[metric] = {"ratio": ratio, "passed": 0.95 <= ratio <= 1.05}
         else:
-            rss = [max(r["peak_rss_kib"] for r in variant) for variant in variants]
-            checks["peak_rss"] = {
-                "delta_kib": rss[1] - rss[0],
-                "passed": rss[1] - rss[0] <= 65536,
-            }
+            checks["peak_rss"] = rss_difference_certificate(variants)
             if scenario == "writers":
                 tps = [
                     statistics.median(r["tps"] for r in variant) for variant in variants
