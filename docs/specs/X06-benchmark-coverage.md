@@ -900,3 +900,44 @@ so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
 * Phases 2 to 4 are untouched.
 
 See [ROADMAP](../ROADMAP.md) item 1.
+
+
+### SP²Bench planner follow-up (2026-10-21)
+
+Roadmap item 91 traced the `q8` and `q12b` losses to a selective author pattern
+joined outside a UNION. Each branch planned its coauthor joins without that
+restriction and generated unrelated walks before joining the author. On baseline
+`a6e91187`, a fixture with 64 unrelated papers made the two queries produce 54,368
+and 54,367 operator rows while returning two names and a true boolean.
+
+The planner now distributes an eligible basic graph pattern into pure UNION
+branches before choosing their join order. It plans the anchor to require an
+estimate of at most 32 rows, limits it to eight triples and allows at most eight
+branches. The extra anchor plan does no query execution. It also compares the complete
+ordinary and distributed plan costs, choosing distribution only when its estimate
+is lower. A small intersection that reads large inputs can therefore stay outside
+the UNION. A branch may contain a
+basic graph pattern and deterministic FILTER wrappers. A moved variable read by a filter must already be bound by that filter's
+original basic graph pattern. This
+preserves expression errors, BOUND and bag multiplicities. Property functions,
+application callbacks, volatile expressions, EXISTS, OPTIONAL, SERVICE, LATERAL,
+subqueries and assignments keep their original boundaries. Any compiled outer
+filter retains the ordinary join. This preserves its evaluation count and placement
+without assuming that extension aliases or dynamic calls are pure.
+
+The same release queries over the checksum-pinned SP²Bench v1.01 generator's
+50k fixture return the same 264 names and true boolean after the correction.
+Their executed row counts fall from 875,171 to 6,439 for `q8` and from 861,737 to
+4,856 for `q12b`. These local counts establish the removed work. They do not
+replace the published Forge latency figures. The 10M performance acceptance and
+the budget failures on the other item 91 queries remain open.
+
+Regression tests cover irrelevant coauthor components, both join orientations,
+duplicate hidden anchor bindings, repeated UNION branches, empty anchors and
+filters whose variables would become newly bound. Explicit cursors check the
+answers at batch sizes 1, 7 and 4,096 without eager materialization. Guard tests
+keep effectful or scope-sensitive branches outside the transformation and bound
+its expansion. A broad-anchor plan stays outside the UNION, as does a one-row anchor whose
+large intersection would be repeated in every branch. Outer FILTER controls cover
+native volatile functions, EXISTS, Jena UUID aliases, dynamic calls and a deterministic
+expression in both join orientations.

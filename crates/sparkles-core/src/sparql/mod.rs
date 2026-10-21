@@ -46,6 +46,7 @@ pub mod stats;
 pub mod svccache;
 pub mod table;
 pub mod textpf;
+mod unionpush;
 pub mod update;
 pub mod value;
 mod valuespush;
