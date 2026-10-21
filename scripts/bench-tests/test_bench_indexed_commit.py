@@ -472,6 +472,7 @@ class Oracles(unittest.TestCase):
             ) as launched,
             mock.patch.object(BENCH.subprocess, "run", side_effect=control),
             mock.patch.object(BENCH.os, "sched_getaffinity", return_value={0}),
+            mock.patch.object(BENCH.os, "readlink", return_value="/owned/sparkles"),
             mock.patch.object(BENCH.time, "sleep"),
             mock.patch.object(BENCH, "stop_owned") as stop,
         ):
