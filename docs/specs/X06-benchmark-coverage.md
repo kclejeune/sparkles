@@ -919,9 +919,9 @@ basic graph pattern and deterministic FILTER wrappers. A moved variable read by 
 original basic graph pattern. This
 preserves expression errors, BOUND and bag multiplicities. Property functions,
 application callbacks, volatile expressions, EXISTS, OPTIONAL, SERVICE, LATERAL,
-subqueries and assignments keep their original boundaries. Compiled outer filters
-containing volatile calls or EXISTS retain the ordinary join so distribution cannot
-change their evaluation count or placement.
+subqueries and assignments keep their original boundaries. Any compiled outer
+filter retains the ordinary join. This preserves its evaluation count and placement
+without assuming that extension aliases or dynamic calls are pure.
 
 The same release queries over the checksum-pinned SP²Bench v1.01 generator's
 50k fixture return the same 264 names and true boolean after the correction.
@@ -936,4 +936,6 @@ filters whose variables would become newly bound. Explicit cursors check the
 answers at batch sizes 1, 7 and 4,096 without eager materialization. Guard tests
 keep effectful or scope-sensitive branches outside the transformation and bound
 its expansion. A broad-anchor plan stays outside the UNION, as does a one-row anchor whose
-large intersection would be repeated in every branch.
+large intersection would be repeated in every branch. Outer FILTER controls cover
+native volatile functions, EXISTS, Jena UUID aliases, dynamic calls and a deterministic
+expression in both join orientations.

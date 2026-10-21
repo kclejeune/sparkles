@@ -309,7 +309,7 @@ fn a_small_anchor_with_expensive_reads_is_computed_once() {
 }
 
 #[test]
-fn outer_volatile_and_exists_filters_keep_the_original_join_boundary() {
+fn outer_filters_keep_the_original_join_boundary() {
     let store = bibliographic_store(64);
     let anchor = "?anchor a <urn:Person>; <urn:name> \"Anchor\" .";
     let union = BODY.replace(anchor, "");
@@ -324,6 +324,10 @@ fn outer_volatile_and_exists_filters_keep_the_original_join_boundary() {
             "IF(isBlank(BNODE()), STRLEN(STR(?anchor)), 0) > 0",
             "YEAR(NOW()) + STRLEN(STR(?anchor)) > 0",
             "EXISTS { ?anchor <urn:name> ?n }",
+            "STRLEN(STR(<http://jena.apache.org/ARQ/function#uuid>())) + STRLEN(STR(?anchor)) > 0",
+            "STRLEN(<http://jena.apache.org/ARQ/function#struuid>()) + STRLEN(STR(?anchor)) > 0",
+            "STRLEN(STR(<http://www.w3.org/2005/xpath-functions#apply>(<http://jena.apache.org/ARQ/function#uuid>))) + STRLEN(STR(?anchor)) > 0",
+            "STRLEN(STR(?anchor)) > 0",
         ] {
             let q = format!("SELECT DISTINCT ?name WHERE {{ {body} FILTER({expression}) }}");
             let result = query(

@@ -838,9 +838,9 @@ impl<'a> Planner<'a> {
                     return self.plan(&pushed, g, filters);
                 }
                 if !self.ctx.calls_extensions
-                    // Outer filters would enter every branch, changing the number or
-                    // placement of volatile calls and correlated EXISTS evaluations.
-                    && filters.iter().all(super::cache::deterministic)
+                    // Preserve outer filters' ordinary evaluation boundary, including
+                    // extension aliases and dynamic calls that might be volatile.
+                    && filters.is_empty()
                     && let Some((anchor, pushed)) = super::unionpush::rewrite(gp, &calls)
                 {
                     // Planning a small pure anchor does not execute it. Keep broad
