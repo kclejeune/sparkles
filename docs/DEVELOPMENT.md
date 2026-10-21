@@ -186,14 +186,15 @@ fixtures; the dedicated spill tests separately force physical spill.
 The explicit X08 A11 and A12 gates use the `spill_acceptance` example. It produces
 20 million mixed-type sort rows or 10 million groups from compact streaming fixtures,
 checks an unlimited eager reference and independent result oracles, and requires
-physical spill within the configured budget. These memory-intensive gates run
+physical spill within the configured budget. The `all` case runs all eight aggregate
+functions together, and separate cases also check each function. These memory-intensive gates run
 separately from ordinary CI, on a reserved host with its own build target.
 
 ```sh
 set -eu
 for mode in plain encrypted; do
   RAYON_NUM_THREADS=2 cargo run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- sort "target/x08-acceptance-$mode/sort" 10000 2000 "$mode" 64
-  for case in count sum avg min max sample concat count-distinct distinct; do
+  for case in all count sum avg min max sample concat count-distinct distinct; do
     RAYON_NUM_THREADS=2 cargo run --release -p sparkles-core --example spill_acceptance --features text,geo-epsg,zstd,brotli -- "$case" "target/x08-acceptance-$mode/$case" 10000 1000 "$mode" 64
   done
 done

@@ -2,7 +2,7 @@
 //!
 //! cargo run --release -p sparkles-core --example spill_acceptance -- \
 //!     sort OUTPUT 10000 2000 plain 64
-//! Other cases are count, sum, avg, min, max, sample, concat, count-distinct and
+//! Other cases are all, count, sum, avg, min, max, sample, concat, count-distinct and
 //! distinct. A12 uses 10000 bases and 1000 repetitions. Each invocation checks one
 //! unlimited eager reference and one strictly bounded cursor, then writes receipts.
 //! Small invocations exercise exactly the same fixtures and independent oracles,
@@ -27,6 +27,30 @@ static GLOBAL: sparkles_alloc::Mimalloc = sparkles_alloc::Mimalloc;
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const SORT_ROWS: usize = 20_000_000;
 const GROUPS: usize = 10_000_000;
+const AGGREGATES: [&str; 8] = [
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "sample",
+    "concat",
+    "count-distinct",
+];
+
+fn aggregate_expression(case: &str) -> &'static str {
+    match case {
+        "count" => "COUNT(*)",
+        "sum" => "SUM(?value)",
+        "avg" => "AVG(?value)",
+        "min" => "MIN(?value)",
+        "max" => "MAX(?value)",
+        "sample" => "SAMPLE(?value)",
+        "concat" => "GROUP_CONCAT(STR(?value); separator=\",\")",
+        "count-distinct" => "COUNT(DISTINCT ?value)",
+        _ => panic!("unknown acceptance case"),
+    }
+}
 
 struct Config {
     case: String,
@@ -162,18 +186,17 @@ fn fixture(config: &Config, ordered: bool) -> String {
         if config.case == "distinct" {
             format!("SELECT DISTINCT ?g ?h WHERE {{ {body} }} ORDER BY DESC(?g) ?h")
         } else {
-            let aggregate = match config.case.as_str() {
-                "count" => "COUNT(*)",
-                "sum" => "SUM(?value)",
-                "avg" => "AVG(?value)",
-                "min" => "MIN(?value)",
-                "max" => "MAX(?value)",
-                "sample" => "SAMPLE(?value)",
-                "concat" => "GROUP_CONCAT(STR(?value); separator=\",\")",
-                "count-distinct" => "COUNT(DISTINCT ?value)",
-                _ => panic!("unknown acceptance case"),
+            let projection = if config.case == "all" {
+                AGGREGATES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, case)| format!("({} AS ?answer{i})", aggregate_expression(case)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                format!("({} AS ?answer)", aggregate_expression(&config.case))
             };
-            format!("SELECT ?g ?h ({aggregate} AS ?answer) WHERE {{ {body} }} GROUP BY ?g ?h")
+            format!("SELECT ?g ?h {projection} WHERE {{ {body} }} GROUP BY ?g ?h")
         }
     }
 }
@@ -274,6 +297,30 @@ fn aggregate_code(case: &str, value: &Option<Term>, offset: usize) -> u16 {
         _ => panic!("not an aggregate"),
     }
     0
+}
+
+// Both nondeterministic eager choices fit in ten bits: SAMPLE occupies bits8..9
+// and the four two-bit GROUP_CONCAT values occupy bits0..7.
+fn aggregate_row_code(case: &str, row: &[Option<Term>], offset: usize) -> u16 {
+    if case != "all" {
+        assert_eq!(row.len(), 3, "aggregate column count changed");
+        return aggregate_code(case, &row[2], offset);
+    }
+    assert_eq!(
+        row.len(),
+        2 + AGGREGATES.len(),
+        "aggregate column count changed"
+    );
+    let mut code = 0;
+    for (case, value) in AGGREGATES.iter().zip(&row[2..]) {
+        let choice = aggregate_code(case, value, offset);
+        code |= match *case {
+            "sample" => choice << 8,
+            "concat" => choice,
+            _ => 0,
+        };
+    }
+    code
 }
 
 fn group_offset(config: &Config, id: usize) -> usize {
@@ -485,7 +532,7 @@ fn run(config: Config) -> Result<()> {
     let n = config.groups();
     let mut oracle_codes = vec![
         0;
-        if matches!(config.case.as_str(), "sample" | "concat") {
+        if matches!(config.case.as_str(), "all" | "sample" | "concat") {
             n
         } else {
             0
@@ -511,7 +558,7 @@ fn run(config: Config) -> Result<()> {
                     (config.bases - 1 - i / config.repeats) * config.repeats + i % config.repeats;
                 assert_eq!(id, expected, "unlimited DISTINCT order");
             } else {
-                let code = aggregate_code(&config.case, &row[2], group_offset(&config, id));
+                let code = aggregate_row_code(&config.case, &row, group_offset(&config, id));
                 if !oracle_codes.is_empty() {
                     oracle_codes[id] = code;
                 }
@@ -571,7 +618,7 @@ fn run(config: Config) -> Result<()> {
                 + count % config.repeats;
             assert_eq!(id, expected, "spilled DISTINCT sequence");
         } else {
-            let code = aggregate_code(&config.case, &row[2], group_offset(&config, id));
+            let code = aggregate_row_code(&config.case, &row, group_offset(&config, id));
             if !oracle_codes.is_empty() {
                 assert_eq!(
                     code, oracle_codes[id],
@@ -802,5 +849,59 @@ mod tests {
             ),
             0,
         );
+    }
+    fn combined_row() -> Vec<Option<Term>> {
+        vec![
+            Some(Literal::from(0).into()),
+            Some(Literal::from(0).into()),
+            Some(Literal::from(4).into()),
+            Some(Literal::from(9).into()),
+            Some(
+                Literal::new_typed_literal(
+                    "2.25",
+                    NamedNode::new(format!("{XSD}decimal")).unwrap(),
+                )
+                .into(),
+            ),
+            Some(Literal::from(1).into()),
+            Some(Literal::from(3).into()),
+            Some(Literal::from(3).into()),
+            Some(Literal::new_simple_literal("3,1,3,2").into()),
+            Some(Literal::from(3).into()),
+        ]
+    }
+
+    #[test]
+    fn combined_oracle_checks_every_column() {
+        let row = combined_row();
+        aggregate_row_code("all", &row, 0);
+        for index in 2..row.len() {
+            let mut wrong = row.clone();
+            wrong[index] = None;
+            assert!(
+                std::panic::catch_unwind(|| aggregate_row_code("all", &wrong, 0)).is_err(),
+                "unchecked column {index}"
+            );
+        }
+        assert!(std::panic::catch_unwind(|| aggregate_row_code("all", &row[..9], 0)).is_err());
+        let mut extra = row.clone();
+        extra.push(None);
+        assert!(std::panic::catch_unwind(|| aggregate_row_code("all", &extra, 0)).is_err());
+    }
+
+    #[test]
+    fn combined_choice_code_preserves_both_eager_choices() {
+        let row = combined_row();
+        let code = aggregate_row_code("all", &row, 0);
+        let mut sample = row.clone();
+        sample[7] = Some(Literal::from(1).into());
+        let mut concat = row.clone();
+        concat[8] = Some(Literal::new_simple_literal("1,3,2,3").into());
+        assert_ne!(aggregate_row_code("all", &sample, 0), code);
+        assert_ne!(aggregate_row_code("all", &concat, 0), code);
+        let concat_bits = code & 255;
+        for sample in 1..=3 {
+            assert_eq!(((sample << 8) | concat_bits) & 255, concat_bits);
+        }
     }
 }
