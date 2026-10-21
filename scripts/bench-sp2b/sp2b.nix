@@ -17,6 +17,10 @@ pkgs.stdenv.mkDerivation {
     hash = "sha256-ZkBQbPLi0ULqNDWxuMw5mYeTSevNGjzcYB24MfXLPXM=";
   };
   sourceRoot = "sp2b/src";
+  # Darwin uses 64-bit file offsets with the standard stdio API and has no fopen64.
+  postPatch = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+    substituteInPlace generator.cpp --replace-fail 'fopen64(' 'fopen('
+  '';
   buildPhase = ''
     runHook preBuild
     make CPP="c++ -O2 -w -include cstring -include cstdlib -include cstdio -include climits"

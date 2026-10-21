@@ -1246,20 +1246,23 @@ mod tests {
         assert!(r.readahead.contains_key("vocab.dat"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn profile_counts_resident_pages() {
         if isolated_profile_test("profile_counts_resident_pages") {
             return;
         }
         use std::io::Write;
+        // SAFETY: sysconf has no pointer arguments or other preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
         let mut f = tempfile::tempfile().unwrap();
-        f.write_all(&vec![7u8; 64 * 4096]).unwrap();
+        f.write_all(&vec![7u8; 64 * page]).unwrap();
         f.sync_all().unwrap();
         // SAFETY: the file is private to this test and not modified while mapped
         let m = unsafe { memmap2::Mmap::map(&f).unwrap() };
         let p = Profile::start();
-        touch(IoFile::VocabData, m.as_ptr(), 0, 8 * 4096);
-        fault_in(&m[..8 * 4096]);
+        touch(IoFile::VocabData, m.as_ptr(), 0, 8 * page);
+        fault_in(&m[..8 * page]);
         let r = p.report();
         let pages = r.pages.expect("pages");
         let io = &pages["vocab.dat"];
