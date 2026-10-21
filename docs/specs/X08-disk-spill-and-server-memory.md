@@ -1316,9 +1316,11 @@ A8 to A14 gate passes. `serve --spill on` and `--spill encrypted` enable spill a
 fail startup if the directory cannot be used. An ordinary start leaves the spill
 directory unopened. Item 93 tracks the remaining full-scale acceptance work.
 
-**Gates.** The gate runs used `examples/modeprobe` on an 8-vCPU Namespace instance at
-10.5M triples, with each spilled cursor's rows checked against eager execution by an
-order-free digest of the decoded rows.
+**Gates.** The fixtures below check current behavior. The 10.5M figures in this list
+are historical results from the initial implementation, before the review corrections.
+Those runs used `examples/modeprobe` on an 8-vCPU Namespace instance, with each spilled
+cursor's rows checked against eager execution by an order-free digest of the decoded
+rows.
 
 * **A8.** `spilled_hash_joins_match_eager_at_every_batch_size` joins a build input more
   than four times its 1 MiB budget at batch sizes 1, 7 and 4,096 and checks the plan's
