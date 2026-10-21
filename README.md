@@ -1,4 +1,4 @@
-# Sparkles
+# Sparkles ✨
 
 Sparkles is a fast RDF, SPARQL and OWL database written in Rust. It reimplements
 [Apache Jena](https://jena.apache.org/) and Fuseki, with their protocols, semantics and
