@@ -315,6 +315,48 @@ class Oracles(unittest.TestCase):
         rows[1]["tps"] = 151
         self.assertTrue(BENCH.summarize(rows)["passed"])
 
+    def test_pacing_boundaries_remain_unchanged(self):
+        row = {"write_rate": 100, "tps": 95, "max_schedule_lag_ms": 80}
+        checks = BENCH.mixed_load_checks(row)
+        self.assertTrue(all(v["passed"] for v in checks.values()))
+        row["tps"] = 105
+        self.assertTrue(BENCH.mixed_load_checks(row)["achieved_rate"]["passed"])
+        row["max_schedule_lag_ms"] = 80.001
+        self.assertFalse(BENCH.mixed_load_checks(row)["schedule_lag"]["passed"])
+        row.update(write_rate=540.64, tps=538.2, max_schedule_lag_ms=50)
+        self.assertTrue(BENCH.mixed_load_checks(row)["schedule_lag"]["passed"])
+        row["max_schedule_lag_ms"] = 50.001
+        self.assertFalse(BENCH.mixed_load_checks(row)["schedule_lag"]["passed"])
+        row["write_rate"] = 0
+        with self.assertRaises(AssertionError):
+            BENCH.mixed_load_checks(row)
+
+    def test_one_paced_stall_cannot_be_averaged_into_acceptance(self):
+        rows = [
+            {
+                "people": 1000000,
+                "index": "text",
+                "scenario": "mixed",
+                "grouped": grouped,
+                "peak_rss_kib": 1024,
+                "readers": {"p50_ms": 1, "p99_ms": 1},
+                "write_rate": 540.64,
+                "tps": 538.2,
+                "max_schedule_lag_ms": lag,
+            }
+            for grouped, lag in ((False, 854.644), (True, 1), (True, 1), (False, 1))
+        ]
+        result = BENCH.summarize(rows)
+        self.assertFalse(result["passed"])
+        checks = result["gates"][0]["checks"]
+        self.assertTrue(checks["achieved_rate"]["passed"])
+        self.assertFalse(checks["schedule_lag"]["passed"])
+        self.assertTrue(checks["p99_ms"]["passed"])
+        rows[0]["max_schedule_lag_ms"] = 1
+        self.assertTrue(BENCH.summarize(rows)["passed"])
+        rows[3]["tps"] = 400
+        self.assertFalse(BENCH.summarize(rows)["passed"])
+
     def test_serial_and_read_tail_thresholds(self):
         rows = [
             {
@@ -329,7 +371,12 @@ class Oracles(unittest.TestCase):
         self.assertFalse(BENCH.summarize(rows)["passed"])
         for r in rows:
             r.update(
-                scenario="mixed", peak_rss_kib=123, readers={"p50_ms": 1, "p99_ms": 1}
+                scenario="mixed",
+                peak_rss_kib=123,
+                readers={"p50_ms": 1, "p99_ms": 1},
+                write_rate=100,
+                tps=100,
+                max_schedule_lag_ms=0,
             )
         rows[1]["readers"]["p99_ms"] = 1.11
         self.assertFalse(BENCH.summarize(rows)["passed"])

@@ -331,6 +331,28 @@ def percentile(values, fraction):
     return values[math.floor((len(values) - 1) * fraction + 0.5)]
 
 
+def mixed_load_checks(result):
+    target = result["write_rate"]
+    assert target > 0, "mixed process requires a positive common offered rate"
+    ratio = result["tps"] / target
+    lag_limit = max(50, 2000 * 4 / target)
+    return {
+        "achieved_rate": {
+            "requirement": "harness load quality",
+            "target_tps": target,
+            "achieved_tps": result["tps"],
+            "ratio": ratio,
+            "passed": 0.95 <= ratio <= 1.05,
+        },
+        "schedule_lag": {
+            "requirement": "harness load quality; not an X09 numeric threshold",
+            "max_ms": result["max_schedule_lag_ms"],
+            "limit_ms": lag_limit,
+            "passed": result["max_schedule_lag_ms"] <= lag_limit,
+        },
+    }
+
+
 def summarize(results):
     gates = []
     keys = sorted({(r["people"], r["index"], r["scenario"]) for r in results})
@@ -368,6 +390,21 @@ def summarize(results):
                     "passed": tps[1] / tps[0] >= 1.5,
                 }
             else:
+                pacing = [mixed_load_checks(row) for row in rows]
+                for name in ("achieved_rate", "schedule_lag"):
+                    processes = [
+                        {
+                            "namespace": row.get("namespace"),
+                            "grouped": row["grouped"],
+                            "block": row.get("block"),
+                            **check[name],
+                        }
+                        for row, check in zip(rows, pacing, strict=True)
+                    ]
+                    checks[name] = {
+                        "processes": processes,
+                        "passed": all(check["passed"] for check in processes),
+                    }
                 for metric in ("p50_ms", "p99_ms"):
                     values = [
                         statistics.median(r["readers"][metric] for r in variant)
@@ -997,12 +1034,11 @@ def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
             "receipts_distinct"
         ]
         if scenario == "mixed":
-            assert 0.95 <= result["tps"] / write_rate <= 1.05, (
-                "write rate did not match the fixed offered load"
-            )
-            assert result["max_schedule_lag_ms"] <= max(50, 2000 * 4 / write_rate), (
-                "paced writers fell behind their schedules"
-            )
+            assert result["write_rate"] == write_rate
+            # Numerical load failures remain failed gates, but must not prevent
+            # receipt, index-publication and cold-recovery evidence collection.
+            result["mixed_load_checks"] = mixed_load_checks(result)
+            save(directory / "mixed-load-checks.json", result["mixed_load_checks"])
         overlap = window_samples(
             samples, result["write_start_unix"], result["write_end_unix"], "start_unix"
         )

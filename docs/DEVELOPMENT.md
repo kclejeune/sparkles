@@ -441,6 +441,12 @@ existing workload defaults.
 Reader requests started while the writers run keep their full latency, including those
 that finish after the writes stop. A timeout fails the observation. Both alternatives
 must sustain the same offered write rate before their reader tails can be compared.
+The harness adds a load-quality requirement beyond X09's numerical thresholds. Each
+mixed process must achieve its offered rate within five percent, with maximum schedule
+lag no greater than 50 ms or two client periods, whichever is longer.
+A violation remains a failed gate even when the reader latency ratio passes. The harness
+retains its raw samples and completes the data and cold-recovery checks before moving
+to the next process.
 
 ## Continuous integration
 
