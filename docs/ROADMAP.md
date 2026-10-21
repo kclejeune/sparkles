@@ -135,6 +135,22 @@ These items are cheap or foundational.
 | 90 | VALUES pushdown in more shapes. The rewrite of item 89 fires only at a join the planner plans as a whole, so `GRAPH <g> { VALUES … { A } UNION { B } }` and joins reached while flattening a group keep the table outside. A branch FILTER that reads the table's variable, such as `FILTER(isLiteral(?l))`, also keeps the table outside it, so the branch still reads its whole pattern. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | S–M |
 | 91 | SP²Bench planner losses. At 10M triples Sparkles takes 6.4 s on `q8`, where Jena takes 35 ms, and 20.9 s on its ASK form `q12b`, where Oxigraph takes 4.2 ms, after producing 555,607,405 intermediate rows for a one-row answer. The default memory profile also refuses `q4`, `q5a`, `q6` and `q12a` on its query budget ([BENCHMARKS](BENCHMARKS.md)). | [X06](specs/X06-benchmark-coverage.md) | M |
 
+### Spill performance investigation
+
+For item 85, repeat the default-path `expr-order-key` and `distinct-join` comparisons
+on a quiet Intel host with matched builds and inputs. Capture the executed plans and
+profile shared cursor buffer accounting, join and DISTINCT work before assigning a
+cause. Bisect reproducible slowdowns below the push gate as well as threshold failures.
+The initial screen passed the gate but does not establish that performance is
+unchanged across queries.
+
+Measure ordered hash joins with a GROUP BY parent at tight and larger spill budgets,
+including consolidation writes, merge passes, charged memory, result equality and
+cleanup. Compare memory budgets within one build separately from comparisons between
+builds, and retain coverage for partially ordered DISTINCT. These investigations belong
+to [X08](specs/X08-disk-spill-and-server-memory.md), with reference measurements on forge
+when the host is free.
+
 ## Tier 5: backlog
 
 These items are smaller or narrower. Each has a design sketch in the linked spec.
