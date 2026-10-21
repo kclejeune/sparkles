@@ -1,8 +1,11 @@
 use super::*;
 use std::cell::RefCell;
 
+type AfterAcquire = Box<dyn FnOnce(&File)>;
+
 thread_local! {
     static AFTER_OPEN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    static AFTER_ACQUIRE: RefCell<Option<AfterAcquire>> = const { RefCell::new(None) };
 }
 
 /// Consumed before invocation so a nested migration lock does not call it again.
@@ -11,6 +14,193 @@ pub(super) fn after_open() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+pub(super) fn after_acquire(file: &File) {
+    let hook = AFTER_ACQUIRE.with(|h| h.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(file);
+    }
+}
+
+#[test]
+fn closing_store_unlocks_while_an_inherited_descriptor_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), Default::default()).unwrap();
+    let inherited = store._lock.as_ref().unwrap().try_clone().unwrap();
+    assert!(matches!(
+        Store::open(dir.path(), Default::default()),
+        Err(Error::Locked { .. })
+    ));
+    drop(store);
+    let reopened = Store::open(dir.path(), Default::default()).unwrap();
+    // Closing an inherited descriptor must not release the new owner's lock.
+    drop(inherited);
+    assert!(matches!(
+        Store::open(dir.path(), Default::default()),
+        Err(Error::Locked { .. })
+    ));
+    drop(reopened);
+    assert!(Store::open(dir.path(), Default::default()).is_ok());
+}
+
+#[test]
+fn offline_guard_unlocks_while_an_inherited_descriptor_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = lock_database(dir.path()).unwrap();
+    let inherited = guard.try_clone().unwrap();
+    drop(guard);
+    let next = lock_database(dir.path()).unwrap();
+    drop(inherited);
+    assert!(matches!(
+        lock_database(dir.path()),
+        Err(Error::Locked { .. })
+    ));
+    drop(next);
+    assert!(lock_database(dir.path()).is_ok());
+}
+
+#[test]
+fn database_lock_outlives_owned_field_destructors() {
+    struct CheckLock {
+        root: PathBuf,
+        observed: Arc<AtomicBool>,
+    }
+    impl Drop for CheckLock {
+        fn drop(&mut self) {
+            self.observed.store(
+                matches!(lock_database(&self.root), Err(Error::Locked { .. })),
+                Ordering::SeqCst,
+            );
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), Default::default()).unwrap();
+    let observed = Arc::new(AtomicBool::new(false));
+    let check = CheckLock {
+        root: dir.path().to_path_buf(),
+        observed: observed.clone(),
+    };
+    *store.clock.lock() = Some(Arc::new(move || {
+        let _keep_until_clock_drop = &check;
+        0
+    }));
+    drop(store);
+    assert!(observed.load(Ordering::SeqCst));
+    assert!(lock_database(dir.path()).is_ok());
+}
+
+#[test]
+fn failed_startup_unlocks_while_an_inherited_descriptor_lives() {
+    use std::rc::Rc;
+    let dir = tempfile::tempdir().unwrap();
+    drop(Store::open(dir.path(), Default::default()).unwrap());
+    let current = dir.path().join("CURRENT");
+    let original = std::fs::read(&current).unwrap();
+    let inherited = Rc::new(RefCell::new(None));
+    let capture = inherited.clone();
+    let corrupt = current.clone();
+    AFTER_ACQUIRE.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move |file| {
+            *capture.borrow_mut() = Some(file.try_clone().unwrap());
+            std::fs::write(corrupt, b"missing-generation\n").unwrap();
+        }));
+    });
+    let failed = Store::open(dir.path(), Default::default());
+    std::fs::write(current, original).unwrap();
+    assert!(failed.is_err());
+    assert!(inherited.borrow().is_some());
+    let reopened = Store::open(dir.path(), Default::default()).unwrap();
+    drop(inherited);
+    assert!(matches!(
+        Store::open(dir.path(), Default::default()),
+        Err(Error::Locked { .. })
+    ));
+    drop(reopened);
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_store_unlocks_during_an_unrelated_pre_exec_child() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::{net::UnixStream, process::CommandExt};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), Default::default()).unwrap();
+    let (mut ready_parent, ready_child) = UnixStream::pair().unwrap();
+    let (resume_parent, resume_child) = UnixStream::pair().unwrap();
+    ready_parent
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let close_ready = ready_parent.as_raw_fd();
+    let close_resume = resume_parent.as_raw_fd();
+    let worker = std::thread::spawn(move || {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--list", "--exact", "store::lock_tests"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let ready = ready_child.as_raw_fd();
+        let resume = resume_child.as_raw_fd();
+        // SAFETY: only async-signal-safe close/write/poll/read syscalls run after
+        // fork. The parent holds both pairs until the spawn has completed, and the
+        // poll timeout bounds cleanup even if the parent fails before releasing it.
+        unsafe {
+            command.pre_exec(move || {
+                libc::close(close_ready);
+                libc::close(close_resume);
+                if libc::write(ready, b"x".as_ptr().cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut poll = libc::pollfd {
+                    fd: resume,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if libc::poll(&mut poll, 1, 10_000) <= 0 {
+                    return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                }
+                let mut byte = 0u8;
+                if libc::read(resume, (&mut byte as *mut u8).cast(), 1) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let spawned = command.spawn();
+        drop(ready_child);
+        drop(resume_child);
+        let mut child = spawned.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("inherited-descriptor child failed to exit");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let ready = ready_parent.read_exact(&mut [0u8]);
+    // Keep the child strictly before exec while the logical Store owner closes.
+    drop(store);
+    let reopened = Store::open(dir.path(), Default::default());
+    // Reap before asserting, so the expected fail-before result also cleans up.
+    drop(resume_parent);
+    let status = worker.join().unwrap();
+    ready.unwrap();
+    assert!(status.success());
+    let reopened = reopened.unwrap();
+    assert!(matches!(
+        Store::open(dir.path(), Default::default()),
+        Err(Error::Locked { .. })
+    ));
+    drop(reopened);
 }
 
 #[cfg(unix)]

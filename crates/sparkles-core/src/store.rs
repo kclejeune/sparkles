@@ -37,6 +37,7 @@ mod group_model;
 mod history_query;
 pub mod keyset;
 mod link;
+mod lock;
 #[cfg(test)]
 mod lock_tests;
 mod mem_history;
@@ -1314,6 +1315,8 @@ fn sources_reach_default_graph(sources: &[Source]) -> bool {
 
 type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
+pub(crate) use lock::ProcessLock;
+
 pub struct Store {
     root: Option<PathBuf>,
     opts: StoreOptions,
@@ -1335,8 +1338,6 @@ pub struct Store {
     removed_prefixes: Mutex<BTreeSet<String>>,
     /// which prefix names loaded data may bind (spec C20 §3.4), set by the server
     prefix_filter: Mutex<Option<PrefixFilter>>,
-    /// exclusive OS lock on `<root>/sparkles.lock` (TDB2 `tdb.lock`), held while open
-    _lock: Option<File>,
     dataset_id: uuid::Uuid,
     /// `forkedFrom` of an in-memory clone (a persistent one keeps it in `dataset.json`)
     forked_mem: Option<ForkedFrom>,
@@ -1390,6 +1391,9 @@ pub struct Store {
     /// test hooks by failpoint name
     #[cfg(any(test, feature = "failpoints"))]
     failpoints: Mutex<BTreeMap<&'static str, backup::Failpoint>>,
+    /// Keep exclusion through Drop and every other owned field's destructor.
+    /// Fields drop in declaration order, so this must remain last.
+    _lock: Option<ProcessLock>,
 }
 
 pub(crate) const WAL_INSERT: u8 = 1;
@@ -1397,7 +1401,7 @@ pub(crate) const WAL_INSERT: u8 = 1;
 /// Take the exclusive process lock of a database directory, for offline work on a
 /// closed database (`sparkles migrate`). Checks the locked file's identity but allows
 /// pending migration state, which the caller may be recovering.
-pub(crate) fn lock_database(root: &Path) -> Result<File> {
+pub(crate) fn lock_database(root: &Path) -> Result<ProcessLock> {
     let lock = lock_dir(root)?;
     verify_database_lock(root, &lock)?;
     Ok(lock)
@@ -1503,9 +1507,9 @@ fn has_files(dir: &Path) -> bool {
 }
 
 /// Take the exclusive process lock of a database directory.
-fn lock_dir(root: &Path) -> Result<File> {
+fn lock_dir(root: &Path) -> Result<ProcessLock> {
     let path = root.join("sparkles.lock");
-    let mut f = OpenOptions::new()
+    let f = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -1515,8 +1519,11 @@ fn lock_dir(root: &Path) -> Result<File> {
     lock_tests::after_open();
     match f.try_lock() {
         Ok(()) => {
+            let f = ProcessLock::from_locked_file(f);
             f.set_len(0)?;
-            writeln!(f, "{}", std::process::id())?;
+            writeln!(&*f, "{}", std::process::id())?;
+            #[cfg(test)]
+            lock_tests::after_acquire(&f);
             Ok(f)
         }
         Err(std::fs::TryLockError::WouldBlock) => {

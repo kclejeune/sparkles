@@ -127,6 +127,12 @@ runs every hook over the whole tree.
 
 ## Testing
 
+Persistent stores and offline migrations hold an exclusive file lock through their
+owned cleanup. The lock guard explicitly unlocks before closing its descriptor, so an
+unrelated child between fork and exec cannot delay reopening the database. Store fields
+that own writers must be declared before the lock guard so their destructors finish
+while exclusion still holds.
+
 ```sh
 mise run ci            # formatting, clippy, all workspace tests, UI, Python, JVM and JavaScript tests, license notices
 mise run ci:fast       # formatting, cited doc paths, workspace clippy and the Rust tests
