@@ -3,18 +3,99 @@
 //! The usual join-order search cannot reorder an opaque UNION's interior. Distribute
 //! a small BGP into its branches so that search can constrain their joins. Filters
 //! cross the join only when the new bindings cannot change their original scope.
+use super::plan::{Kind, Node, ScanSpec};
 use spargebra::algebra::{Expression, Function, GraphPattern};
 use spargebra::term::{TermPattern, TriplePattern, Variable};
 
 const MAX_TRIPLES: usize = 8;
 const MAX_BRANCHES: usize = 8;
+const MAX_SCREEN_NODES: usize = MAX_TRIPLES * MAX_BRANCHES * 4;
 /// Do not duplicate broad anchor reads merely because they have a constant object.
 pub(super) const MAX_ANCHOR_ROWS: f64 = 32.0;
 
-pub(super) fn rewrite<'a>(
+#[cfg(test)]
+thread_local! {
+    static ALTERNATIVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn alternate_planned() {
+    ALTERNATIVES.with(|n| n.set(n.get() + 1));
+}
+
+pub(super) struct Candidate<'a> {
+    pub anchor: &'a GraphPattern,
+    union: &'a GraphPattern,
+    patterns: &'a [TriplePattern],
+    branches: usize,
+}
+
+impl Candidate<'_> {
+    pub fn expand(&self) -> GraphPattern {
+        expand(self.union, self.patterns)
+    }
+
+    /// Invest in another join-order search only for repeated unconstrained reads.
+    /// The work floor uses the existing anchor row limit per branch, in planner
+    /// cost units. It is independent of host timings and correlated fanout estimates.
+    pub fn worth_planning(&self, original: &Node) -> bool {
+        if !original.cost.is_finite() || original.cost <= self.branches as f64 * MAX_ANCHOR_ROWS {
+            return false;
+        }
+        let mut todo = vec![(original, false)];
+        let mut visited = 0;
+        while let Some((node, in_union)) = todo.pop() {
+            visited += 1;
+            if visited > MAX_SCREEN_NODES {
+                return false;
+            }
+            if in_union && matches!(node.kind, Kind::Join { .. }) && node.children.len() == 2 {
+                let left = &node.children[0];
+                let right = &node.children[1];
+                if let (Some(a), Some(b)) = (unrestricted_scan(left), unrestricted_scan(right))
+                    && same_relation(a, b)
+                    && (left.vars.iter().any(|v| !right.vars.contains(v))
+                        || right.vars.iter().any(|v| !left.vars.contains(v)))
+                {
+                    return true;
+                }
+            }
+            todo.extend(
+                node.children
+                    .iter()
+                    .map(|c| (c, in_union || matches!(node.kind, Kind::Union))),
+            );
+        }
+        false
+    }
+}
+
+fn unrestricted_scan(mut node: &Node) -> Option<&ScanSpec> {
+    for _ in 0..MAX_SCREEN_NODES {
+        match &node.kind {
+            Kind::Scan(scan) if scan.eqs.is_empty() => return Some(scan),
+            Kind::Sort(_) if node.children.len() == 1 => node = &node.children[0],
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn same_relation(a: &ScanSpec, b: &ScanSpec) -> bool {
+    let bindings = |scan: &ScanSpec| {
+        let mut values = [None; 4];
+        for (&position, &value) in scan.perm.order().iter().zip(&scan.prefix) {
+            values[position] = Some(value);
+        }
+        values
+    };
+    a.graph == b.graph && a.dedup == b.dedup && bindings(a) == bindings(b)
+}
+
+pub(super) fn candidate<'a>(
     gp: &'a GraphPattern,
     calls: &dyn Fn(&[TriplePattern]) -> bool,
-) -> Option<(&'a GraphPattern, GraphPattern)> {
+) -> Option<Candidate<'a>> {
     let GraphPattern::Join { left, right } = gp else {
         return None;
     };
@@ -39,7 +120,54 @@ pub(super) fn rewrite<'a>(
         return None;
     }
     let moved = variables(anchor);
-    push(union, patterns, &moved, calls, &mut 0).map(|pattern| (anchor, pattern))
+    let mut todo = vec![union];
+    let mut branches = 0;
+    let mut visited = 0;
+    while let Some(node) = todo.pop() {
+        visited += 1;
+        if visited > MAX_SCREEN_NODES {
+            return None;
+        }
+        match node {
+            GraphPattern::Union { left, right } => {
+                todo.push(right);
+                todo.push(left);
+            }
+            GraphPattern::Filter { expr, inner } => {
+                if !safe_expression(expr, &moved, &bound(inner)?) {
+                    return None;
+                }
+                todo.push(inner);
+            }
+            GraphPattern::Bgp { patterns } => {
+                branches += 1;
+                let vars = variables(node);
+                if branches > MAX_BRANCHES
+                    || calls(patterns)
+                    || moved.is_empty()
+                    // Keep anchor-only multiplicity columns on the ordinary path.
+                    || !moved.iter().all(|v| vars.contains(v))
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(Candidate {
+        anchor,
+        union,
+        patterns,
+        branches,
+    })
+}
+
+#[cfg(test)]
+fn rewrite<'a>(
+    gp: &'a GraphPattern,
+    calls: &dyn Fn(&[TriplePattern]) -> bool,
+) -> Option<(&'a GraphPattern, GraphPattern)> {
+    candidate(gp, calls).map(|c| (c.anchor, c.expand()))
 }
 
 fn variables(gp: &GraphPattern) -> Vec<Variable> {
@@ -54,54 +182,38 @@ fn variables(gp: &GraphPattern) -> Vec<Variable> {
 
 /// Only BGPs and their FILTER wrappers have certainly-bound named variables here.
 /// In particular an OPTIONAL or UNION's in-scope variables would not prove this.
-fn bound(gp: &GraphPattern) -> Option<Vec<Variable>> {
-    match gp {
-        GraphPattern::Bgp { .. } => Some(variables(gp)),
-        GraphPattern::Filter { inner, .. } => bound(inner),
-        _ => None,
+fn bound(mut gp: &GraphPattern) -> Option<Vec<Variable>> {
+    for _ in 0..MAX_SCREEN_NODES {
+        match gp {
+            GraphPattern::Bgp { .. } => return Some(variables(gp)),
+            GraphPattern::Filter { inner, .. } => gp = inner,
+            _ => return None,
+        }
     }
+    None
 }
 
-fn push(
-    gp: &GraphPattern,
-    anchor: &[TriplePattern],
-    moved: &[Variable],
-    calls: &dyn Fn(&[TriplePattern]) -> bool,
-    branches: &mut usize,
-) -> Option<GraphPattern> {
+fn expand(gp: &GraphPattern, anchor: &[TriplePattern]) -> GraphPattern {
     match gp {
-        GraphPattern::Union { left, right } => Some(GraphPattern::Union {
-            left: Box::new(push(left, anchor, moved, calls, branches)?),
-            right: Box::new(push(right, anchor, moved, calls, branches)?),
-        }),
-        GraphPattern::Filter { expr, inner } => {
-            let bound = bound(inner)?;
-            if !safe_expression(expr, moved, &bound) {
-                return None;
-            }
-            Some(GraphPattern::Filter {
-                expr: expr.clone(),
-                inner: Box::new(push(inner, anchor, moved, calls, branches)?),
-            })
-        }
+        GraphPattern::Union { left, right } => GraphPattern::Union {
+            left: Box::new(expand(left, anchor)),
+            right: Box::new(expand(right, anchor)),
+        },
+        GraphPattern::Filter { expr, inner } => GraphPattern::Filter {
+            expr: expr.clone(),
+            inner: Box::new(expand(inner, anchor)),
+        },
         GraphPattern::Bgp { patterns } => {
-            *branches += 1;
-            if *branches > MAX_BRANCHES
-                || calls(patterns)
-                || !variables(gp).iter().any(|v| moved.contains(v))
-            {
-                return None;
-            }
             // Conjunction is a bag join. Keep every pattern and every matching
             // assignment, including anchor variables hidden by an outer projection.
             let mut combined = Vec::with_capacity(anchor.len() + patterns.len());
             combined.extend_from_slice(anchor);
             combined.extend_from_slice(patterns);
-            Some(GraphPattern::Bgp { patterns: combined })
+            GraphPattern::Bgp { patterns: combined }
         }
         // No scope or effect assumptions about OPTIONAL, subqueries, BIND, SERVICE,
         // LATERAL, paths or registered property functions are needed for this rule.
-        _ => None,
+        _ => unreachable!("candidate contains only validated pure branches"),
     }
 }
 
@@ -151,6 +263,154 @@ fn safe_expression(expr: &Expression, moved: &[Variable], bound: &[Variable]) ->
 mod tests {
     use super::*;
 
+    #[test]
+    fn small_or_unshared_anchors_do_not_plan_an_alternative() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[Source::from_bytes(
+            b"<urn:s> <urn:name> \"Anchor\"; <urn:tag> \"one\", \"two\"; <urn:p> <urn:a>, <urn:b> .".to_vec(),
+            oxrdfio::RdfFormat::Turtle, None,
+        )]).unwrap();
+        for (anchor, branch, rows) in [
+            (
+                "?s <urn:name> \"Anchor\"; <urn:tag> ?hidden",
+                "?s <urn:p> ?v",
+                8,
+            ),
+            (
+                "?s <urn:name> \"Anchor\"",
+                "?s <urn:p> ?v; <urn:name> ?name",
+                4,
+            ),
+            ("?s <urn:name> \"Anchor\"", "?s <urn:p> ?x; <urn:p> ?y", 8),
+        ] {
+            for body in [
+                format!("{anchor} {{ {{ {branch} }} UNION {{ {branch} }} }}"),
+                format!("{{ {{ {branch} }} UNION {{ {branch} }} }} {anchor}"),
+            ] {
+                ALTERNATIVES.with(|n| n.set(0));
+                let result = query(
+                    store.snapshot(),
+                    &format!("SELECT * WHERE {{ {body} }}"),
+                    &QueryOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(result.len(), rows, "{body}");
+                assert_eq!(ALTERNATIVES.with(|n| n.get()), 0, "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rejected_high_read_anchor_does_not_plan_an_alternative() {
+        use crate::io::Source;
+        use crate::sparql::{QueryOptions, query};
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:shared> a <urn:C>; <urn:q> <urn:x> .\n");
+        for branch in 0..8 {
+            data.push_str(&format!("<urn:shared> <urn:r{branch}> \"v\" .\n"));
+        }
+        for i in 0..64 {
+            data.push_str(&format!(
+                "<urn:s:{}> a <urn:C> .\n<urn:s:{}> <urn:q> <urn:x> .\n",
+                2 * i,
+                2 * i + 1
+            ));
+            for branch in 0..8 {
+                data.push_str(&format!("<urn:s:{}> <urn:r{branch}> \"v\" .\n", 2 * i + 1));
+            }
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let branches = (0..8)
+            .map(|i| format!("{{ ?s <urn:r{i}> ?v }}"))
+            .collect::<Vec<_>>()
+            .join(" UNION ");
+        for object in ["?hidden", "<urn:x>"] {
+            ALTERNATIVES.with(|n| n.set(0));
+            let text = format!(
+                "SELECT ?s ?v WHERE {{ ?s a <urn:C>; <urn:q> {object} . {{ {branches} }} }}"
+            );
+            let result = query(store.snapshot(), &text, &QueryOptions::default()).unwrap();
+            assert_eq!(result.len(), 8);
+            assert_eq!(ALTERNATIVES.with(|n| n.get()), 0, "{text}");
+        }
+    }
+
+    #[test]
+    fn relation_screen_checks_bindings_work_and_bounded_traversal() {
+        use super::super::plan::{GraphFilter, JoinAlgo};
+        use crate::index::Perm;
+        fn scan(perm: Perm, predicate: u64, vars: Vec<u32>) -> Node {
+            let spec = ScanSpec {
+                perm,
+                prefix: vec![predicate],
+                cols: vec![],
+                eqs: vec![],
+                graph: GraphFilter::Default,
+                graph_col: perm.col_of(crate::index::G),
+                dedup: false,
+            };
+            Node::leaf(Kind::Scan(spec), vars, 100.0, String::new())
+        }
+        fn unary(kind: Kind, child: Node) -> Node {
+            let mut node = Node::leaf(kind, child.vars.clone(), child.est, String::new());
+            node.cost = child.cost;
+            node.children.push(child);
+            node
+        }
+        let gp = body(
+            "SELECT * WHERE { ?root <urn:anchor> <urn:target> { ?root <urn:p> ?v } UNION { ?root <urn:q> ?v } }",
+        );
+        let candidate = candidate(&gp, &|_| false).unwrap();
+        let left = scan(Perm::Pso, 42, vec![0, 1]);
+        let right = scan(Perm::Pos, 42, vec![0, 2]);
+        let mut joined = Node::leaf(
+            Kind::Join {
+                algo: JoinAlgo::Merge,
+                keys: vec![0],
+            },
+            vec![0, 1, 2],
+            50.0,
+            String::new(),
+        );
+        joined.children = vec![left, right];
+        let mut original = unary(Kind::Union, joined);
+        original.cost = 1000.0;
+        // Uniform estimates can understate a correlated self-join's fanout.
+        assert!(candidate.worth_planning(&original));
+        original.cost = 2.0 * MAX_ANCHOR_ROWS;
+        assert!(!candidate.worth_planning(&original));
+        original.cost = 1000.0;
+        let mut other = original.clone();
+        let Kind::Scan(scan) = &mut other.children[0].children[1].kind else {
+            unreachable!()
+        };
+        scan.prefix[0] = 43;
+        assert!(!candidate.worth_planning(&other));
+        let mut other = original.clone();
+        let Kind::Scan(scan) = &mut other.children[0].children[1].kind else {
+            unreachable!()
+        };
+        scan.graph = GraphFilter::One(9);
+        assert!(!candidate.worth_planning(&other));
+        let mut other = original.clone();
+        other.children[0].children[1].vars = vec![0, 1];
+        assert!(!candidate.worth_planning(&other));
+        for _ in 0..MAX_SCREEN_NODES {
+            original = unary(Kind::Sort(vec![]), original);
+        }
+        assert!(!candidate.worth_planning(&original));
+    }
+
     fn body(query: &str) -> GraphPattern {
         let spargebra::Query::Select { pattern, .. } =
             spargebra::SparqlParser::new().parse_query(query).unwrap()
@@ -198,8 +458,13 @@ mod tests {
             "SERVICE <http://example.org/sparql> { ?root <urn:p> ?v }",
             "{ SELECT ?root WHERE { ?root <urn:p> ?v } LIMIT 1 }",
         ] {
+            let anchor = if branch.contains("?outer") {
+                "?root <urn:anchor> <urn:target>; <urn:bind> ?outer"
+            } else {
+                "?root <urn:anchor> <urn:target>"
+            };
             let query = format!(
-                "SELECT * WHERE {{ ?root <urn:anchor> <urn:target>; <urn:bind> ?outer . {{ {branch} }} UNION {{ ?root <urn:q> ?v }} }}"
+                "SELECT * WHERE {{ {anchor} . {{ {branch} }} UNION {{ ?root <urn:q> ?v }} }}"
             );
             assert!(rewrite_query(&query).is_none(), "{query}");
         }

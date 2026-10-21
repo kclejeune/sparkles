@@ -94,7 +94,7 @@ fn a_selective_pattern_limits_work_inside_union_branches() {
 }
 
 #[test]
-fn distributing_an_anchor_preserves_hidden_duplicates_and_union_bags() {
+fn an_ordinary_anchor_preserves_hidden_duplicates_and_union_bags() {
     let store = bibliographic_store(0);
     store
         .load(&[Source::from_bytes(
@@ -123,6 +123,40 @@ fn distributing_an_anchor_preserves_hidden_duplicates_and_union_bags() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn a_distributed_shared_anchor_preserves_repeated_union_bags() {
+    let store = bibliographic_store(64);
+    let long = "?paper <urn:creator> ?anchor, ?author . ?otherPaper <urn:creator> ?author, ?otherAuthor . ?otherAuthor <urn:name> ?name FILTER(?author != ?anchor && ?otherPaper != ?paper && ?otherAuthor != ?anchor && ?otherAuthor != ?author)";
+    let short = "?paper <urn:creator> ?anchor, ?author . ?author <urn:name> ?name FILTER(?author != ?anchor)";
+    let branches = [long, short, long, short]
+        .map(|b| format!("{{ {b} }}"))
+        .join(" UNION ");
+    let anchor = "?anchor a <urn:Person>; <urn:name> \"Anchor\" .";
+    for body in [
+        format!("{anchor} {{ {branches} }}"),
+        format!("{{ {branches} }} {anchor}"),
+    ] {
+        let result = query(
+            store.snapshot(),
+            &format!("SELECT ?name WHERE {{ {body} }}"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let mut names = result
+            .rows()
+            .into_iter()
+            .map(|row| row[0].as_ref().unwrap().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["\"Alice\"", "\"Alice\"", "\"Bob\"", "\"Bob\""]);
+        assert!(
+            result.rows_produced < 64 * 128 + 1024,
+            "{} rows produced",
+            result.rows_produced
+        );
     }
 }
 

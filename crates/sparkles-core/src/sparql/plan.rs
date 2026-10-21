@@ -837,20 +837,28 @@ impl<'a> Planner<'a> {
                 if let Some(pushed) = super::valuespush::rewrite(gp, &calls) {
                     return self.plan(&pushed, g, filters);
                 }
-                if !self.ctx.calls_extensions
+                let candidate = if !self.ctx.calls_extensions
                     // Preserve outer filters' ordinary evaluation boundary, including
                     // extension aliases and dynamic calls that might be volatile.
                     && filters.is_empty()
-                    && let Some((anchor, pushed)) = super::unionpush::rewrite(gp, &calls)
+                {
+                    super::unionpush::candidate(gp, &calls)
+                } else {
+                    None
+                };
+                let mut items = Vec::new();
+                self.collect(gp, g, &mut items)?;
+                let original = self.plan_group(items, filters)?;
+                if let Some(candidate) = candidate
+                    && candidate.worth_planning(&original)
                 {
                     // Planning a small pure anchor does not execute it. Keep broad
                     // inputs outside the UNION instead of repeating their reads.
-                    let anchor = self.plan(anchor, g, Vec::new())?;
+                    #[cfg(test)]
+                    super::unionpush::alternate_planned();
+                    let anchor = self.plan(candidate.anchor, g, Vec::new())?;
                     if anchor.est.is_finite() && anchor.est <= super::unionpush::MAX_ANCHOR_ROWS {
-                        let distributed = self.plan(&pushed, g, filters.clone())?;
-                        let mut items = Vec::new();
-                        self.collect(gp, g, &mut items)?;
-                        let original = self.plan_group(items, filters)?;
+                        let distributed = self.plan(&candidate.expand(), g, Vec::new())?;
                         // Few output rows may still require expensive intersections.
                         // Include those repeated reads, not just the anchor's size.
                         return Ok(
@@ -862,9 +870,7 @@ impl<'a> Planner<'a> {
                         );
                     }
                 }
-                let mut items = Vec::new();
-                self.collect(gp, g, &mut items)?;
-                self.plan_group(items, filters)
+                Ok(original)
             }
             GP::Lateral { left, right } if super::lateral::join_equivalent(self, left, right) => {
                 let mut items = Vec::new();

@@ -911,7 +911,17 @@ restriction and generated unrelated walks before joining the author. On baseline
 and 54,367 operator rows while returning two names and a true boolean.
 
 The planner now distributes an eligible basic graph pattern into pure UNION
-branches before choosing their join order. It plans the anchor to require an
+branches before choosing their join order. It builds the ordinary plan once and
+reuses it whenever a bounded screen declines alternative planning. Every anchor
+variable must already occur in every branch. An ordinary branch must join scans
+of the same unrestricted index relation with different variable sets, and the
+ordinary estimated cost must exceed 32 cost units per branch. That work floor
+uses the existing anchor row limit rather than host latency. Algebra and plan
+inspection use iterative walks with explicit node limits. Hidden anchor columns,
+cheap plans and branches without repeated unbound reads keep the ordinary path
+before any alternative algebra is copied or planned.
+
+For an admitted candidate, it plans the anchor to require an
 estimate of at most 32 rows, limits it to eight triples and allows at most eight
 branches. The extra anchor plan does no query execution. It also compares the complete
 ordinary and distributed plan costs, choosing distribution only when its estimate
@@ -940,4 +950,7 @@ keep effectful or scope-sensitive branches outside the transformation and bound
 its expansion. A broad-anchor plan stays outside the UNION, as does a one-row anchor whose
 large intersection would be repeated in every branch. Outer FILTER controls cover
 native volatile functions, EXISTS, Jena UUID aliases, dynamic calls and a deterministic
-expression in both join orientations.
+expression in both join orientations. Test-only observations verify that cheap
+shared-anchor self-joins and rejected high-read anchors do not enter alternative
+planning. Native timing diagnostics distinguish planning and total server time
+from execution time, which excludes the optimizer's work.
