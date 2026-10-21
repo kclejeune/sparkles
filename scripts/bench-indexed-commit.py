@@ -21,6 +21,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import statistics
 import subprocess
 import sys
@@ -847,6 +848,49 @@ def unique_triples(directory):
         unique.unlink(missing_ok=True)
 
 
+def flush_owned_tree(root):
+    """Finish bulk preparation/evidence writeback before the next timed process."""
+    start = time.monotonic()
+    if not stat.S_ISDIR(root.lstat().st_mode):
+        raise ValueError("flush root must be an owned directory")
+    files, directories, size = 0, 0, 0
+
+    def walk_error(error):
+        raise error
+
+    for current, children, names in os.walk(
+        root, topdown=False, followlinks=False, onerror=walk_error
+    ):
+        directory = pathlib.Path(current)
+        for name in children:
+            if not stat.S_ISDIR((directory / name).lstat().st_mode):
+                raise ValueError("flush refuses a symlink or special directory")
+        for name in sorted(names):
+            fd = os.open(directory / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("flush refuses a symlink or special file")
+                os.fsync(fd)
+                size += info.st_size
+                files += 1
+            finally:
+                os.close(fd)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+            directories += 1
+        finally:
+            os.close(fd)
+    return {
+        "root": str(root),
+        "files": files,
+        "directories": directories,
+        "bytes": size,
+        "elapsed_seconds": time.monotonic() - start,
+    }
+
+
 def prepare(args, root, index, people):
     seed = root / "seed"
     if seed.exists():
@@ -917,6 +961,7 @@ def prepare(args, root, index, people):
             "sha256": digest(root / "data.nt"),
         },
     )
+    save(root / "preparation-sync.json", flush_owned_tree(root))
     return triples
 
 
@@ -938,12 +983,14 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         # Startup can fail before _measure reaches its service/reader cleanup block.
         if (directory / "store").exists():
             shutil.rmtree(directory / "store")
+        save(directory / "evidence-sync.json", flush_owned_tree(directory))
 
 
 def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
     directory = cell / run_id
     store = directory / "store"
     shutil.copytree(cell / "seed", store)
+    save(directory / "clone-sync.json", flush_owned_tree(store))
     server = Server(args, store, directory, grouped)
     stop = threading.Event()
     samples, errors, futures, memory = [], [], [], []

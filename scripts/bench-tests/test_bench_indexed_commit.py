@@ -3,6 +3,8 @@
 import http.server
 import importlib.util
 import json
+import mmap
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -33,6 +35,108 @@ def answer(value="17", datatype=BENCH.XSD + "integer"):
 
 
 class Oracles(unittest.TestCase):
+    def test_owned_flush_counts_files_and_rejects_external_links_and_fifo(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-flush-") as temp:
+            parent = pathlib.Path(temp)
+            root = parent / "owned"
+            (root / "child").mkdir(parents=True)
+            (root / "one").write_bytes(b"a")
+            (root / "child" / "two").write_bytes(b"bc")
+            result = BENCH.flush_owned_tree(root)
+            self.assertEqual(
+                (result["files"], result["directories"], result["bytes"]), (2, 2, 3)
+            )
+            external = parent / "external"
+            external.mkdir()
+            (external / "marker").write_text("preserve")
+            unsafe = parent / "unsafe"
+            unsafe.mkdir()
+            for target in [external, external / "marker"]:
+                link = unsafe / "link"
+                link.symlink_to(target)
+                with mock.patch.object(BENCH.os, "fsync") as sync:
+                    with self.assertRaises((OSError, ValueError)):
+                        BENCH.flush_owned_tree(unsafe)
+                    sync.assert_not_called()
+                link.unlink()
+            fifo = unsafe / "fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(ValueError, "special file"):
+                BENCH.flush_owned_tree(unsafe)
+            self.assertEqual((external / "marker").read_text(), "preserve")
+
+    def test_clone_flush_failure_prevents_server_start_and_preserves_failure(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-failed-flush-") as temp:
+            root = pathlib.Path(temp)
+            (root / "seed").mkdir()
+            (root / "seed" / "marker").write_text("seed")
+            with (
+                mock.patch.object(
+                    BENCH, "flush_owned_tree", side_effect=[OSError("flush failed"), {}]
+                ),
+                mock.patch.object(BENCH, "Server") as server,
+                self.assertRaisesRegex(OSError, "flush failed"),
+            ):
+                BENCH.measure(None, root, "text", "writers", True, 0, "run", 0)
+            server.assert_not_called()
+            self.assertEqual((root / "seed" / "marker").read_text(), "seed")
+            self.assertFalse((root / "run" / "store").exists())
+            self.assertIn("flush failed", (root / "run" / "failure.json").read_text())
+
+    @unittest.skipUnless(
+        pathlib.Path("/proc/self/smaps").exists(), "Linux dirty-page probe"
+    )
+    def test_fresh_ext4_clone_is_clean_before_server_start(self):
+        parent = SCRIPTS.parent / "target"
+        parent.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="sparkles-clone-fence-", dir=parent
+        ) as temp:
+            root = pathlib.Path(temp)
+            filesystem = subprocess.check_output(
+                ["findmnt", "-n", "-o", "FSTYPE", "-T", str(root)], text=True
+            ).strip()
+            if filesystem != "ext4":
+                self.skipTest("regression requires ext4 copy writeback")
+            (root / "seed").mkdir()
+            source = root / "seed" / "base"
+            with source.open("wb") as out:
+                out.write(b"x" * (1024 * 1024))
+                out.flush()
+                os.fsync(out.fileno())
+
+            def server_start(_args, store, _directory, _grouped):
+                clone = store / "base"
+                with (
+                    clone.open("rb") as inp,
+                    mmap.mmap(inp.fileno(), 0, access=mmap.ACCESS_READ) as mapped,
+                ):
+                    sum(mapped[i] for i in range(0, len(mapped), 4096))
+                    active, dirty = False, 0
+                    for line in (
+                        pathlib.Path("/proc/self/smaps").read_text().splitlines()
+                    ):
+                        if line.endswith(str(clone)):
+                            active = True
+                        elif active:
+                            if "-" in line.split()[0]:
+                                break
+                            if line.startswith(("Private_Dirty:", "Shared_Dirty:")):
+                                dirty += int(line.split()[1])
+                    self.assertEqual(
+                        dirty, 0, "clone writeback overlaps server startup"
+                    )
+                raise RuntimeError("clean clone reached server start")
+
+            with (
+                mock.patch.object(BENCH, "Server", side_effect=server_start),
+                self.assertRaisesRegex(
+                    RuntimeError, "clean clone reached server start"
+                ),
+            ):
+                BENCH.measure(None, root, "text", "writers", True, 0, "run", 0)
+            self.assertFalse((root / "run" / "store").exists())
+
     def test_missing_or_regenerated_embed_history_is_not_durable_recovery(self):
         live = [
             {"seq": 2, "kind": "update", "timestamp": "T0"},

@@ -420,6 +420,10 @@ adds `--no-group-commit`. The harness holds the host's heavy lock and runs each 
 in a user systemd service with a 12 GiB memory limit and no swap. The CPU lists need to
 match the host's topology. It creates fresh store copies, checks indexed answers and
 acknowledgements, saves individual latencies and checks a cold reopen after each run.
+Generated fixtures and seeds are flushed after preparation. Every fresh store copy is
+flushed before server startup, and completed raw evidence is flushed after cleanup.
+These owned-file flushes stay outside the writer interval and prevent bulk preparation
+writeback from spilling into the next measurement. They add no delay to timed commits.
 The embedding worker calls a deterministic local provider, whose cost represents that
 provider alone. Its own ordinary commits can appear between client receipts. The harness
 checks every acknowledgment against the recovered user history and verifies the
