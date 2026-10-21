@@ -2,11 +2,13 @@
 
 > **Status:** partly shipped
 >
-> **Phases:** Phase 1 has shipped its tooling and not its measurements. The result record,
+> **Phases:** Phase 1 has shipped its tooling and part of its measurements. The result record,
 > the run manifest, `scripts/bench-record.py`, the `compare` subcommand and the BSBM
-> (Explore and BI), SP²Bench and LUBM drivers are in the repository and run at smoke scale.
-> The standard refresh of the existing suites at one head, the published comparisons of the
-> new suites and the regeneration of the BENCHMARKS.md tables from records are not done.
+> (Explore and BI), SP²Bench and LUBM drivers are in the repository. Published forge records
+> cover the synthetic suite, SP²Bench, LUBM, Explore, full-text, WatDiv, DBpedia 50M and
+> BI, with their answer and provenance limits recorded in BENCHMARKS.md. A standard
+> refresh at one head, resolution of the open failures and answer disagreements, and
+> regeneration of the BENCHMARKS.md tables from records remain incomplete.
 > Phase 2 adds comparative spatial and vector runs, OWL2Bench and long write runs
 > with compaction. Its OWL2Bench driver, the Jena rule reasoner comparison and the long
 > write harness are built and ran at smoke scale, and its measurements are not done. Phase 3 adds LDBC SNB Interactive and BI and the Wikidata query-log

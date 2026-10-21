@@ -1,19 +1,21 @@
 # X08: Disk spill and server-wide memory
 
-> **Status:** Phase 1 shipped, Phases 2 and 3 specified
+> **Status:** Phase 1 shipped, Phase 2 implemented with acceptance open, Phase 3 specified
 >
 > **Phases:** Phase 1 is shipped. It is server-wide cache sizing, a smaller memory
-> profile and the server-wide query memory pool with admission control. Phase 2 adds
+> profile and the server-wide query memory pool with admission control. Phase 2 implements
 > batch-oriented hash join and grouping kernels in the cursor engine, then disk spill for
-> hash joins, sorts, grouping and DISTINCT. Phase 3 reduces the idle server footprint,
-> the Python process footprint and the size of the full-text index.
+> hash joins, sorts, grouping and DISTINCT. Spill remains opt-in until every Phase 2b
+> acceptance gate passes under roadmap item 93. Phase 3 is not built. It reduces the
+> idle server footprint, the Python process footprint and the size of the full-text index.
 >
 > **User docs:** [USAGE](../USAGE.md#memory-and-caches) and
-> [API](../API.md#query-memory-pool) for Phase 1. Phases 2 and 3 have none, because
-> nothing is built.
+> [API](../API.md#query-memory-pool) cover memory management.
+> [Usage](../USAGE.md#incremental-query-execution) covers execution modes, and
+> [Memory and caches](../USAGE.md#memory-and-caches) covers opt-in spill.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how Phase 1 landed and where it differs from the text above.
+> the end records how Phases 1 and 2 landed and where they differ from the text above.
 
 This design was written from the Sparkles code at `fc123d04` (the store's caches, the
 query context and its charges, the cursor operators, the server's limits and flags), the

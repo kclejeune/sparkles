@@ -1,10 +1,12 @@
 # X05: Streaming query execution
 
-> **Status:** implemented in part (Phases 1, 2 and 4, and Phase 3 without disk spill).
-> Growing state fails explicitly when it exceeds the query budget, because disk spill
-> was not built. Eager execution remains the default, and automatic selection is
-> restricted to measured eligible cases. On some workloads, explicit streaming takes
-> longer than eager execution to deliver a complete response.
+> **Status:** implemented in part. Phases 1 and 2 shipped, and Phases 3 and 4 have
+> implemented paths with follow-ups remaining. Batch kernels and opt-in disk spill
+> are implemented under [X08](X08-disk-spill-and-server-memory.md), whose Phase 2b
+> acceptance remains open. Automatic execution is the default over HTTP, in the CLI,
+> Node and the JVM adapter, and selects streaming for measured eligible cases.
+> On some workloads, explicit streaming takes longer than eager execution to deliver
+> a complete response.
 >
 > **Phases:** Phase 1 adds opt-in SELECT cursors with resumable scans and unary
 > operators. Phase 2 integrates result writers and HTTP with backpressure. Phase 3 adds
@@ -12,7 +14,7 @@
 > graph queries, binding integration and measured automatic selection.
 >
 > **User docs:** [API](../API.md#applicationx-sparklesjson-ui-result-format),
-> [Usage](../USAGE.md#incremental-query-execution). Existing query APIs remain eager.
+> [Usage](../USAGE.md#incremental-query-execution). Explicit eager execution remains available.
 
 ## 1. Purpose and scope
 
