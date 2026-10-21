@@ -239,3 +239,71 @@ fn the_replanned_union_streams_across_requested_batch_sizes() {
         assert!(result.rows_produced < 64 * 64 + 512);
     }
 }
+
+#[test]
+fn a_small_anchor_with_expensive_reads_is_computed_once() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..256 {
+        data.push_str(&format!("<urn:s:{:08}> a <urn:C> .\n", 2 * i + 2));
+        data.push_str(&format!("<urn:s:{:08}> <urn:q> <urn:x> .\n", 2 * i + 1));
+        for branch in 0..8 {
+            data.push_str(&format!(
+                "<urn:s:{:08}> <urn:r{branch}> \"v\" .\n",
+                2 * i + 1
+            ));
+        }
+    }
+    data.push_str("<urn:shared> a <urn:C>; <urn:q> <urn:x> .\n");
+    for branch in 0..8 {
+        data.push_str(&format!("<urn:shared> <urn:r{branch}> \"v\" .\n"));
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let branches = (0..8)
+        .map(|branch| format!("{{ ?s <urn:r{branch}> ?v }}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ");
+    let q = format!("SELECT ?s ?v WHERE {{ ?s a <urn:C>; <urn:q> ?x . {{ {branches} }} }}");
+    let result = query(
+        store.snapshot(),
+        &q,
+        &QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(result.len(), 8);
+    for row in result.rows() {
+        assert_eq!(
+            row,
+            vec![
+                Some(Term::NamedNode(
+                    oxrdf::NamedNode::new("urn:shared").unwrap()
+                )),
+                Some(Term::Literal(Literal::new_simple_literal("v")))
+            ]
+        );
+    }
+    fn reads_class(p: &sparkles_core::sparql::PlanInfo) -> bool {
+        p.description.contains("urn:C") || p.children.iter().any(reads_class)
+    }
+    fn check(p: &sparkles_core::sparql::PlanInfo) -> usize {
+        if p.operator == "Union" {
+            assert!(
+                !p.children.iter().any(reads_class),
+                "repeated expensive anchor: {p:#?}"
+            );
+            1
+        } else {
+            p.children.iter().map(check).sum()
+        }
+    }
+    assert_eq!(check(&result.plan), 1);
+}

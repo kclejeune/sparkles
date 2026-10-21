@@ -911,7 +911,10 @@ and 54,367 operator rows while returning two names and a true boolean.
 The planner now distributes an eligible basic graph pattern into pure UNION
 branches before choosing their join order. It plans the anchor to require an
 estimate of at most 32 rows, limits it to eight triples and allows at most eight
-branches. The extra anchor plan does no query execution. A branch may contain a
+branches. The extra anchor plan does no query execution. It also compares the complete
+ordinary and distributed plan costs, choosing distribution only when its estimate
+is lower. A small intersection that reads large inputs can therefore stay outside
+the UNION. A branch may contain a
 basic graph pattern and deterministic FILTER wrappers. A moved variable read by a filter must already be bound by that filter's
 original basic graph pattern. This
 preserves expression errors, BOUND and bag multiplicities. Property functions,
@@ -930,4 +933,5 @@ duplicate hidden anchor bindings, repeated UNION branches, empty anchors and
 filters whose variables would become newly bound. Explicit cursors check the
 answers at batch sizes 1, 7 and 4,096 without eager materialization. Guard tests
 keep effectful or scope-sensitive branches outside the transformation and bound
-its expansion. A broad-anchor plan stays outside the UNION.
+its expansion. A broad-anchor plan stays outside the UNION, as does a one-row anchor whose
+large intersection would be repeated in every branch.

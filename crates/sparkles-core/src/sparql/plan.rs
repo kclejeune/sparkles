@@ -844,7 +844,19 @@ impl<'a> Planner<'a> {
                     // inputs outside the UNION instead of repeating their reads.
                     let anchor = self.plan(anchor, g, Vec::new())?;
                     if anchor.est.is_finite() && anchor.est <= super::unionpush::MAX_ANCHOR_ROWS {
-                        return self.plan(&pushed, g, filters);
+                        let distributed = self.plan(&pushed, g, filters.clone())?;
+                        let mut items = Vec::new();
+                        self.collect(gp, g, &mut items)?;
+                        let original = self.plan_group(items, filters)?;
+                        // Few output rows may still require expensive intersections.
+                        // Include those repeated reads, not just the anchor's size.
+                        return Ok(
+                            if distributed.cost.is_finite() && distributed.cost < original.cost {
+                                distributed
+                            } else {
+                                original
+                            },
+                        );
                     }
                 }
                 let mut items = Vec::new();
