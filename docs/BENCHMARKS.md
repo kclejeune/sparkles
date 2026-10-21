@@ -352,6 +352,12 @@ These are counts of executed operator rows from baseline `a6e91187` and its corr
 plan. The 10M latency figures above still describe the earlier Forge run. The new
 plan's latency at that scale remains to be measured.
 
+Alternative planning now requires shared anchor variables, repeated unbound scan
+relations and enough estimated ordinary work. A bounded screen keeps cheap plans
+and hidden anchor columns on the ordinary path before constructing an alternative.
+Planning and total server time are checked separately from execution time, which
+excludes the optimizer's work.
+
 Sparkles loads the data in 4.12 s, against 8.90 s for Fluree, 9.70 s for QLever, 20.49 s
 for Oxigraph and 44.88 s for TDB2. Its index takes 307 MiB on disk, against QLever's
 294 MiB, and its load peaks at 2,264 MiB, against Fluree's 1,835 MiB and QLever's
