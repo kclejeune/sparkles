@@ -288,6 +288,27 @@ def verify_receipts(receipts, history, embedded):
     return len(internal)
 
 
+def verify_recovered_history(live, recovered):
+    fields = (
+        "seq",
+        "parent",
+        "timestamp",
+        "kind",
+        "message",
+        "digest",
+        "inserted",
+        "deleted",
+        "quads",
+    )
+
+    def identity(history):
+        return [tuple(c.get(field) for field in fields) for c in history]
+
+    assert identity(live) == identity(recovered), (
+        "durable commit history changed on reopen"
+    )
+
+
 def window_samples(samples, start, end, field="start"):
     return [s for s in samples if start <= s[field] <= end]
 
@@ -596,7 +617,7 @@ def generate(root, people, index):
 
 
 class Server:
-    def __init__(self, args, store, directory, grouped):
+    def __init__(self, args, store, directory, grouped, embedding=True):
         self.args, self.store, self.directory = args, store, directory
         self.closed = False
         self.unit = "sparkles-item86-" + uuid.uuid4().hex
@@ -641,6 +662,9 @@ class Server:
             "--timeout",
             "600",
         ]
+        if not embedding:
+            command.append("--no-embedding")
+        save(directory / "server-command.json", {"unit": self.unit, "command": command})
         self.process = subprocess.Popen(
             command, stdout=self.log, stderr=subprocess.STDOUT
         )
@@ -861,6 +885,7 @@ def prepare(args, root, index, people):
 
 def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
     directory = cell / run_id
+    directory.mkdir()
     try:
         return _measure(
             args, cell, index, scenario, grouped, triples, run_id, write_rate
@@ -880,7 +905,6 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
 
 def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
     directory = cell / run_id
-    directory.mkdir()
     store = directory / "store"
     shutil.copytree(cell / "seed", store)
     server = Server(args, store, directory, grouped)
@@ -1100,13 +1124,15 @@ def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         server.close()
         reopen = directory / "reopen"
         reopen.mkdir()
-        server = Server(args, store, reopen, grouped)
-        indexed_ready(args, index, reopen)
+        server = Server(args, store, reopen, grouped, embedding=index != "embed")
+        if index != "embed":
+            indexed_ready(args, index, reopen)
         assert query(args.port, check) == expected
         assert source_count(args.port) == triples + expected
         if index == "embed":
             assert embedding_count(args.port) == derived
         recovered_history = read_history(args.port, before_head)
+        verify_recovered_history(history, recovered_history)
         verify_receipts(receipts, recovered_history, index == "embed")
         save(reopen / "history.json", recovered_history)
         if index_check:
@@ -1116,8 +1142,6 @@ def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
                 query(args.port, TEXT_QUERY if index == "text" else GEO_QUERY)
                 == SENTINELS
             )
-        else:
-            caught_up(args)
         result.update(
             {
                 "grouped": grouped,

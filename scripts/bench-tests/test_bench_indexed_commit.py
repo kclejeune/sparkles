@@ -33,6 +33,38 @@ def answer(value="17", datatype=BENCH.XSD + "integer"):
 
 
 class Oracles(unittest.TestCase):
+    def test_missing_or_regenerated_embed_history_is_not_durable_recovery(self):
+        live = [
+            {"seq": 2, "kind": "update", "timestamp": "T0"},
+            {
+                "seq": 3,
+                "kind": "embed",
+                "timestamp": "T1",
+                "message": "embeddings of vector index docs",
+            },
+        ]
+        # Receipt equality alone cannot detect the lost trailing internal commit.
+        self.assertEqual(
+            BENCH.verify_receipts({"workload": [2], "seeds": []}, live[:1], True), 0
+        )
+        BENCH.verify_recovered_history(live, live)
+        with self.assertRaises(AssertionError):
+            BENCH.verify_recovered_history(live, live[:1])
+        regenerated = [dict(c) for c in live]
+        regenerated[1]["timestamp"] = "T2"
+        with self.assertRaises(AssertionError):
+            BENCH.verify_recovered_history(live, regenerated)
+
+    def test_existing_run_store_survives_refusal(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-existing-run-") as temp:
+            root = pathlib.Path(temp)
+            (root / "run" / "store").mkdir(parents=True)
+            marker = root / "run" / "store" / "preserve"
+            marker.write_text("existing store")
+            with self.assertRaises(FileExistsError):
+                BENCH.measure(None, root, "text", "writers", True, 0, "run", 0)
+            self.assertEqual(marker.read_text(), "existing store")
+
     def test_acknowledgments_match_exact_recovered_user_history(self):
         receipt = {"workload": [10, 12], "seeds": []}
         history = [

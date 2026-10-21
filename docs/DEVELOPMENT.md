@@ -426,6 +426,8 @@ checks every acknowledgment against the recovered user history and verifies the
 intervening embedding commits, their fallback counters and their derived triples
 separately. It keeps the ordinary client's strict receipt checks. A failed acceptance
 threshold remains a failed gate in the result.
+Cold embedding inspection disables the worker and compares persisted derived triples and
+commit identities before they can be regenerated.
 The full protocol uses both dataset sizes and five ABBA blocks. A smaller pilot only
 checks the harness and estimates runtime.
 
