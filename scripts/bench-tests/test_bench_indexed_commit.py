@@ -34,6 +34,27 @@ def answer(value="17", datatype=BENCH.XSD + "integer"):
     ).encode()
 
 
+def index_plan(operator="SpatialScan"):
+    return {
+        "executed": True,
+        "nodes": [
+            {
+                "id": "0",
+                "operator": operator,
+                "actualRows": 17,
+                "complete": True,
+                "partial": False,
+            }
+        ],
+        "plan": {
+            "id": "0",
+            "operator": operator,
+            "children": [],
+            "counters": {"index": "ready", "fallback": False},
+        },
+    }
+
+
 class Oracles(unittest.TestCase):
     def test_owned_flush_counts_files_and_rejects_external_links_and_fifo(self):
         with tempfile.TemporaryDirectory(prefix="sparkles-flush-") as temp:
@@ -240,6 +261,30 @@ class Oracles(unittest.TestCase):
         ]
         self.assertEqual(BENCH.window_samples(samples, 0, 2), [samples[1]])
 
+    def test_spatial_plan_note_cannot_substitute_for_executed_index(self):
+        plan = {
+            "executed": True,
+            "notes": [{"text": "SpatialScan could have been used"}],
+            "nodes": [
+                {
+                    "operator": "IndexScan",
+                    "actualRows": 17,
+                    "complete": True,
+                    "partial": False,
+                }
+            ],
+        }
+        with (
+            tempfile.TemporaryDirectory(prefix="sparkles-plan-") as temp,
+            mock.patch.object(BENCH, "get_json", return_value={"state": "ready"}),
+            mock.patch.object(BENCH, "query", return_value=17),
+            mock.patch.object(
+                BENCH, "raw_request", return_value=json.dumps(plan).encode()
+            ),
+            self.assertRaisesRegex(AssertionError, "SpatialScan"),
+        ):
+            BENCH.indexed_ready(SimpleNamespace(port=3986), "geo", pathlib.Path(temp))
+
     def test_reopened_spatial_index_is_ready_before_its_plan_is_used(self):
         with (
             tempfile.TemporaryDirectory(prefix="sparkles-ready-") as temp,
@@ -250,12 +295,84 @@ class Oracles(unittest.TestCase):
             ) as status,
             mock.patch.object(BENCH, "query", return_value=17),
             mock.patch.object(
-                BENCH, "raw_request", return_value=b'{"plan":"SpatialScan"}'
+                BENCH, "raw_request", return_value=json.dumps(index_plan()).encode()
             ),
             mock.patch.object(BENCH.time, "sleep"),
         ):
             BENCH.indexed_ready(SimpleNamespace(port=3986), "geo", pathlib.Path(temp))
             self.assertEqual(status.call_count, 2)
+
+    def test_executed_index_plan_requires_exact_complete_operator_and_no_fallback(self):
+        valid = index_plan()
+        invalid = []
+        for key, value in (("executed", False), ("executed", None)):
+            invalid.append({**valid, key: value})
+        for key, value in (
+            ("complete", False),
+            ("partial", True),
+            ("actualRows", None),
+            ("actualRows", True),
+            ("operator", "IndexScan"),
+        ):
+            invalid.append({**valid, "nodes": [{**valid["nodes"][0], key: value}]})
+        for counters in (
+            {},
+            {"index": "ready", "fallback": True},
+            {"index": "building", "fallback": False},
+        ):
+            invalid.append({**valid, "plan": {**valid["plan"], "counters": counters}})
+        invalid.append({**valid, "plan": {**valid["plan"], "id": "different"}})
+        for plan in [valid, index_plan("TextSearch"), *invalid]:
+            with (
+                self.subTest(plan=plan),
+                tempfile.TemporaryDirectory(prefix="sparkles-plan-") as temp,
+                mock.patch.object(
+                    BENCH, "raw_request", return_value=json.dumps(plan).encode()
+                ),
+            ):
+                path = pathlib.Path(temp) / "raw.json"
+                operator = plan["nodes"][0]["operator"]
+                operator = "TextSearch" if operator == "TextSearch" else "SpatialScan"
+                if plan in invalid:
+                    with self.assertRaises(AssertionError):
+                        BENCH.executed_index_plan(3986, "query", operator, path)
+                else:
+                    BENCH.executed_index_plan(3986, "query", operator, path)
+                self.assertEqual(json.loads(path.read_text()), plan)
+
+    def test_selective_publication_counts_and_cold_plan_are_checked(self):
+        for index, op, expected, count in (
+            ("geo", "geo", 50000, 334),
+            ("geo", "geo", 2200, 15),
+            ("text", "literal", 2200, 2200),
+        ):
+            probe = BENCH.publication_index_probe(index, op, "unique", expected)
+            self.assertEqual(probe["expected"], count)
+            if index == "geo":
+                self.assertIn("^^geo:wktLiteral", probe["query"])
+                self.assertIn("99.5 39.5", probe["query"])
+                self.assertIn("urn:wb:unique:", probe["query"])
+            with (
+                tempfile.TemporaryDirectory(prefix="sparkles-publication-") as temp,
+                mock.patch.object(BENCH, "query", return_value=count),
+                mock.patch.object(BENCH, "executed_index_plan") as plan,
+            ):
+                directory = pathlib.Path(temp)
+                BENCH.verify_index_publication(3986, probe, directory)
+                plan.assert_called_once_with(
+                    3986,
+                    probe["query"],
+                    probe["operator"],
+                    directory / "index-publication-plan.json",
+                )
+            with (
+                tempfile.TemporaryDirectory(prefix="sparkles-publication-") as temp,
+                mock.patch.object(BENCH, "query", return_value=count + 1),
+                self.assertRaises(AssertionError),
+            ):
+                BENCH.verify_index_publication(3986, probe, pathlib.Path(temp))
+        self.assertIsNone(BENCH.publication_index_probe("geo", "delete", "n", 0))
+        self.assertIsNone(BENCH.publication_index_probe("embed", "literal", "n", 8))
 
     def test_cpu_list_expands_ranges(self):
         self.assertEqual(BENCH.cpu_set("0-3,8,10-11"), {0, 1, 2, 3, 8, 10, 11})
@@ -720,6 +837,15 @@ class Client(unittest.TestCase):
         self.assertEqual(len(samples.read_text().splitlines()), 9)
         self.assertEqual(len(self.requests), 8)
         self.assertTrue(all("asWKT" in q and "wktLiteral" in q for q in self.requests))
+
+    def test_spatial_publication_cycle_matches_actual_client_coordinates(self):
+        result = self.run_client("writers", "--op", "geo", "--changes", "301")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        count = sum('"POINT(100 40)"' in request for request in self.requests)
+        self.assertEqual(count, 3)
+        self.assertEqual(
+            count, BENCH.publication_index_probe("geo", "geo", "n", 301)["expected"]
+        )
 
     def test_configured_literal_predicate_is_sent(self):
         result = self.run_client("serial", "--literal-predicate", BENCH.FOAF_NAME)

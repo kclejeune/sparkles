@@ -432,6 +432,12 @@ separately. It keeps the ordinary client's strict receipt checks. A failed accep
 threshold remains a failed gate in the result.
 Cold embedding inspection disables the worker and compares persisted derived triples and
 commit identities before they can be regenerated.
+Text and spatial publication checks save executed plans and require the exact completed
+TextSearch or SpatialScan operator. Spatial plans must report a ready index without a
+fallback. A broad geometry count checks every write, while a selective typed-WKT window
+checks spatial-index publication to the unique write namespace. The client's coordinate
+cycle places one write in that window every 150 changes. Both counts and index plans are
+checked live and after a cold reopen.
 The full protocol uses both dataset sizes and five ABBA blocks. A smaller pilot only
 checks the harness and estimates runtime.
 

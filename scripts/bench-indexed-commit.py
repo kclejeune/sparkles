@@ -217,6 +217,76 @@ def cpu_set(text):
     return cpus
 
 
+def executed_index_plan(port, text, operator, path):
+    plan = json.loads(
+        raw_request(
+            port,
+            "/bench/sparql/explain",
+            {"query": text, "profile": "run", "describe": False},
+        )
+    )
+    save(path, plan)
+    assert plan.get("executed") is True, "index plan was not executed"
+    nodes = [n for n in plan.get("nodes", []) if n.get("operator") == operator]
+    assert nodes, "executed index operator missing: " + operator
+    for node in nodes:
+        assert node.get("complete") is True and node.get("partial") is False
+        rows = node.get("actualRows")
+        assert type(rows) is int and rows >= 0, "index actual rows missing"
+        if operator == "SpatialScan":
+            pending, matching = [plan.get("plan", {})], []
+            while pending:
+                current = pending.pop()
+                if current.get("id") == node.get("id"):
+                    matching.append(current)
+                pending.extend(current.get("children", []))
+            assert len(matching) == 1 and matching[0].get("operator") == operator
+            counters = matching[0].get("counters", {})
+            assert counters.get("index") == "ready", "spatial index was not ready"
+            assert counters.get("fallback") is False, "spatial index used fallback"
+    return plan
+
+
+def publication_index_probe(index, operation, namespace, expected):
+    if index == "text" and operation == "literal":
+        return {
+            "query": (
+                "PREFIX text:<http://jena.apache.org/text#> "
+                f'SELECT (COUNT(*) AS ?n) WHERE {{ ?s text:query ("value" {expected + 1}) }}'
+            ),
+            "expected": expected,
+            "operator": "TextSearch",
+        }
+    if index == "geo" and operation == "geo":
+        # The client's POINT(100+i%50 40+i%30) returns here every150 writes.
+        return {
+            "query": (
+                "PREFIX geo:<http://www.opengis.net/ont/geosparql#> "
+                "PREFIX geof:<http://www.opengis.net/def/function/geosparql/> "
+                "SELECT (COUNT(*) AS ?n) WHERE { ?s geo:asWKT ?w . "
+                'FILTER(geof:sfWithin(?w, "POLYGON((99.5 39.5,100.5 39.5,100.5 40.5,99.5 40.5,99.5 39.5))"^^geo:wktLiteral)) '
+                f'FILTER(STRSTARTS(STR(?s), "urn:wb:{namespace}:")) }}'
+            ),
+            "expected": (expected + 149) // 150,
+            "operator": "SpatialScan",
+        }
+    return None
+
+
+def verify_index_publication(port, probe, directory):
+    if probe is None:
+        return
+    save(directory / "index-publication.json", probe)
+    (directory / "index-publication.rq").write_text(probe["query"] + "\n")
+    assert query(port, probe["query"]) == probe["expected"]
+    executed_index_plan(
+        port,
+        probe["query"],
+        probe["operator"],
+        directory / "index-publication-plan.json",
+    )
+
+
 def indexed_ready(args, index, directory):
     if index == "embed":
         return caught_up(args)
@@ -231,15 +301,12 @@ def indexed_ready(args, index, directory):
             raise TimeoutError("spatial index readiness")
     text = TEXT_QUERY if index == "text" else GEO_QUERY
     assert query(args.port, text) == SENTINELS
-    plan = json.loads(
-        raw_request(
-            args.port,
-            "/bench/sparql/explain",
-            {"query": text, "profile": "run", "describe": False},
-        )
+    executed_index_plan(
+        args.port,
+        text,
+        "TextSearch" if index == "text" else "SpatialScan",
+        directory / "reader-plan.json",
     )
-    save(directory / "reader-plan.json", plan)
-    assert ("Text" if index == "text" else "SpatialScan") in json.dumps(plan)
     return None
 
 
@@ -942,16 +1009,7 @@ def prepare(args, root, index, people):
             text = TEXT_QUERY if index == "text" else GEO_QUERY
             assert query(args.port, text) == SENTINELS
             (root / "reader.rq").write_text(text + "\n")
-            plan = json.loads(
-                raw_request(
-                    args.port,
-                    "/bench/sparql/explain",
-                    {"query": text, "profile": "run", "describe": False},
-                )
-            )
-            save(root / "reader-plan.json", plan)
-            label = "Text" if index == "text" else "SpatialScan"
-            assert label in json.dumps(plan), "indexed plan operator missing: " + label
+            shutil.copyfile(bootstrap / "reader-plan.json", root / "reader-plan.json")
     finally:
         server.close()
     save(
@@ -1232,6 +1290,10 @@ def _measure(
         if index_check:
             (directory / "publication.rq").write_text(index_check + "\n")
             assert query(args.port, index_check) == expected
+        publication_probe = publication_index_probe(
+            index, operation, namespace, expected
+        )
+        verify_index_publication(args.port, publication_probe, directory)
         if index == "embed":
             save(directory / "embedding-before.json", before_embedding)
             save(directory / "embedding-after.json", after_embedding)
@@ -1271,6 +1333,7 @@ def _measure(
         save(reopen / "history.json", recovered_history)
         if index_check:
             assert query(args.port, index_check) == expected
+        verify_index_publication(args.port, publication_probe, reopen)
         if index in ("text", "geo"):
             assert (
                 query(args.port, TEXT_QUERY if index == "text" else GEO_QUERY)
