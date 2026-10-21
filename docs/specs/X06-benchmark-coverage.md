@@ -919,7 +919,9 @@ basic graph pattern and deterministic FILTER wrappers. A moved variable read by 
 original basic graph pattern. This
 preserves expression errors, BOUND and bag multiplicities. Property functions,
 application callbacks, volatile expressions, EXISTS, OPTIONAL, SERVICE, LATERAL,
-subqueries and assignments keep their original boundaries.
+subqueries and assignments keep their original boundaries. Compiled outer filters
+containing volatile calls or EXISTS retain the ordinary join so distribution cannot
+change their evaluation count or placement.
 
 The same release queries over the checksum-pinned SP²Bench v1.01 generator's
 50k fixture return the same 264 names and true boolean after the correction.

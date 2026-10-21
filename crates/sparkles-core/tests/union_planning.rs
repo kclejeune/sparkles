@@ -307,3 +307,63 @@ fn a_small_anchor_with_expensive_reads_is_computed_once() {
     }
     assert_eq!(check(&result.plan), 1);
 }
+
+#[test]
+fn outer_volatile_and_exists_filters_keep_the_original_join_boundary() {
+    let store = bibliographic_store(64);
+    let anchor = "?anchor a <urn:Person>; <urn:name> \"Anchor\" .";
+    let union = BODY.replace(anchor, "");
+    for body in [
+        format!("{anchor} {{ {union} }}"),
+        format!("{{ {union} }} {anchor}"),
+    ] {
+        for expression in [
+            "RAND() + IF(STR(?anchor) = \"x\", 1, 2) > 0",
+            "STRLEN(STR(UUID())) + STRLEN(STR(?anchor)) > 0",
+            "STRLEN(STRUUID()) + STRLEN(STR(?anchor)) > 0",
+            "IF(isBlank(BNODE()), STRLEN(STR(?anchor)), 0) > 0",
+            "YEAR(NOW()) + STRLEN(STR(?anchor)) > 0",
+            "EXISTS { ?anchor <urn:name> ?n }",
+        ] {
+            let q = format!("SELECT DISTINCT ?name WHERE {{ {body} FILTER({expression}) }}");
+            let result = query(
+                store.snapshot(),
+                &q,
+                &QueryOptions {
+                    no_cache: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut names = result.rows();
+            names.sort_by_key(|row| row[0].as_ref().unwrap().to_string());
+            assert_eq!(
+                names,
+                vec![
+                    vec![Some(Term::Literal(Literal::new_simple_literal("Alice")))],
+                    vec![Some(Term::Literal(Literal::new_simple_literal("Bob")))],
+                ],
+                "{q}"
+            );
+            fn has_anchor(p: &sparkles_core::sparql::PlanInfo) -> bool {
+                p.description.contains("\"Anchor\"") || p.children.iter().any(has_anchor)
+            }
+            fn check_union(p: &sparkles_core::sparql::PlanInfo) -> usize {
+                if p.operator == "Union" {
+                    assert!(!p.children.iter().any(has_anchor), "{p:#?}");
+                    1
+                } else {
+                    p.children.iter().map(check_union).sum()
+                }
+            }
+            assert_eq!(check_union(&result.plan), 1, "{q}");
+            fn rand_filters(p: &sparkles_core::sparql::PlanInfo) -> usize {
+                usize::from(p.operator == "Filter" && p.description.contains("RAND()"))
+                    + p.children.iter().map(rand_filters).sum::<usize>()
+            }
+            if expression.starts_with("RAND()") {
+                assert_eq!(rand_filters(&result.plan), 1, "{q}");
+            }
+        }
+    }
+}
