@@ -454,6 +454,13 @@ must sustain the same offered write rate before their reader tails can be compar
 The harness adds a load-quality requirement beyond X09's numerical thresholds. Each
 mixed process must achieve its offered rate within five percent, with maximum schedule
 lag no greater than 50 ms or two client periods, whichever is longer.
+Schedule lag is measured at each real request's start, after connection readiness.
+Exhausted writer iterations cannot contribute a lag for an unsent request. The client's
+optional `--request-timings` file records each request's client and index, its timed or
+warmup status, wall start and end, monotonic start and due offsets, latency and HTTP
+status. Transport failures use status zero. Rows are buffered and written when the client
+finishes, outside the writer interval. The indexed harness saves these diagnostics for
+each process while keeping the original latency samples separate.
 A violation remains a failed gate even when the reader latency ratio passes. The harness
 retains its raw samples and completes the data and cold-recovery checks before moving
 to the next process.

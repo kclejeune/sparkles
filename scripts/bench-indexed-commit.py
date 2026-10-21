@@ -1133,6 +1133,8 @@ def _measure(
         FOAF_NAME,
         "--samples",
         str(directory / "writer-samples.tsv"),
+        "--request-timings",
+        str(directory / "request-timings.tsv"),
         "--receipts",
         str(directory / "receipts.json"),
     ]

@@ -36,8 +36,10 @@
 //!   geo      a new subject and a typed WKT point outside the fixed reader window
 //! `--literal-predicate IRI` changes the literal writer's predicate. `--op geo` writes
 //! typed WKT points. `--samples FILE` and `--receipts FILE` preserve individual latencies
-//! and acknowledgment IDs in new files. Only a caller that verifies every intervening
-//! internal commit may use `--allow-receipt-gaps`, which requires a receipt file.
+//! and acknowledgment IDs in new files. `--request-timings FILE` also records each real
+//! request, including serial warmups and failures, with wall and monotonic timing.
+//! Only a caller that verifies every intervening internal commit may use
+//! `--allow-receipt-gaps`, which requires a receipt file.
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -248,6 +250,7 @@ struct Args {
     run: String,
     literal_predicate: String,
     samples: Option<String>,
+    request_timings: Option<String>,
     receipt_file: Option<String>,
     allow_receipt_gaps: bool,
 }
@@ -274,6 +277,7 @@ fn parse() -> Args {
         ),
         literal_predicate: "urn:wb:p".into(),
         samples: None,
+        request_timings: None,
         receipt_file: None,
         allow_receipt_gaps: false,
     };
@@ -294,6 +298,7 @@ fn parse() -> Args {
             "--run" => a.run = val(),
             "--literal-predicate" => a.literal_predicate = val(),
             "--samples" => a.samples = Some(val()),
+            "--request-timings" => a.request_timings = Some(val()),
             "--receipts" => a.receipt_file = Some(val()),
             "--allow-receipt-gaps" => a.allow_receipt_gaps = true,
             "--message" => {
@@ -400,6 +405,18 @@ fn unix_seconds() -> f64 {
         .as_secs_f64()
 }
 
+struct RequestTiming {
+    client: usize,
+    index: usize,
+    timed: bool,
+    start_unix: f64,
+    end_unix: f64,
+    start_offset_ms: f64,
+    due_offset_ms: Option<f64>,
+    latency_ms: f64,
+    status: u16,
+}
+
 fn main() {
     let a = parse();
     let mut receipt_file = a.receipt_file.as_ref().map(|path| {
@@ -416,6 +433,15 @@ fn main() {
             .open(path)
             .expect("create new latency sample file");
         writeln!(file, "kind\tlatency_ms").unwrap();
+        file
+    });
+    let mut timing_file = a.request_timings.as_ref().map(|path| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new request timing file");
+        writeln!(file, "client\tindex\ttimed\tstart_unix\tend_unix\tstart_offset_ms\tdue_offset_ms\tlatency_ms\tstatus").unwrap();
         file
     });
     let op = a.op.clone();
@@ -466,6 +492,7 @@ fn main() {
         writers.push(std::thread::spawn(move || {
             let mut c = Conn::new(&a.addr);
             let mut lat = Vec::new();
+            let mut timings = Vec::new();
             let mut mine = Vec::new();
             let mut errors = 0usize;
             let mut missing_receipts = 0usize;
@@ -476,20 +503,20 @@ fn main() {
             // with --write-rate, client k of n sends every n / rate seconds, offset by k / rate
             let period = (a.write_rate > 0.0)
                 .then(|| Duration::from_secs_f64(clients as f64 / a.write_rate));
-            let mut due = Instant::now()
+            let origin = Instant::now();
+            let mut due = origin
                 + Duration::from_secs_f64(if a.write_rate > 0.0 {
                     k as f64 / a.write_rate
                 } else {
                     0.0
                 });
             loop {
+                let request_due = period.map(|_| due);
                 if let Some(period) = period {
                     let now = Instant::now();
                     if now < due {
                         std::thread::sleep(due - now);
                     }
-                    max_schedule_lag_ms = max_schedule_lag_ms
-                        .max(Instant::now().saturating_duration_since(due).as_secs_f64() * 1e3);
                     due += period;
                 }
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -502,14 +529,43 @@ fn main() {
                 }
                 c.ready();
                 let timed = a.scenario != "serial" || i >= a.warmup;
+                let start_unix = if timed || a.request_timings.is_some() {
+                    unix_seconds()
+                } else {
+                    0.0
+                };
                 if timed {
-                    first_unix = first_unix.min(unix_seconds());
+                    first_unix = first_unix.min(start_unix);
                 }
                 let t = Instant::now();
                 let r = c.request(&req);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
+                if let Some(due) = request_due {
+                    // Only a real request contributes lag, including connection readiness.
+                    max_schedule_lag_ms = max_schedule_lag_ms
+                        .max(t.saturating_duration_since(due).as_secs_f64() * 1e3);
+                }
+                let end_unix = if timed || a.request_timings.is_some() {
+                    unix_seconds()
+                } else {
+                    0.0
+                };
                 if timed {
-                    last_unix = unix_seconds();
+                    last_unix = end_unix;
+                }
+                if a.request_timings.is_some() {
+                    timings.push(RequestTiming {
+                        client: k,
+                        index: i,
+                        timed,
+                        start_unix,
+                        end_unix,
+                        start_offset_ms: t.duration_since(origin).as_secs_f64() * 1e3,
+                        due_offset_ms: request_due
+                            .map(|due| due.duration_since(origin).as_secs_f64() * 1e3),
+                        latency_ms: ms,
+                        status: r.as_ref().map(|r| r.status).unwrap_or(0),
+                    });
                 }
                 if a.scenario == "serial" && i >= a.warmup {
                     timed_end = Some(Instant::now());
@@ -548,6 +604,7 @@ fn main() {
                 first_unix,
                 last_unix,
                 max_schedule_lag_ms,
+                timings,
             )
         }));
     }
@@ -612,8 +669,10 @@ fn main() {
     let mut serial_elapsed = None;
     let (mut write_start_unix, mut write_end_unix) = (f64::INFINITY, 0.0f64);
     let mut max_schedule_lag_ms = 0.0f64;
+    let mut request_timings = Vec::new();
     for w in writers {
-        let (l, e, missing, span, first, last, lag) = w.join().unwrap();
+        let (l, e, missing, span, first, last, lag, timings) = w.join().unwrap();
+        request_timings.extend(timings);
         max_schedule_lag_ms = max_schedule_lag_ms.max(lag);
         write_start_unix = write_start_unix.min(first);
         write_end_unix = write_end_unix.max(last);
@@ -652,6 +711,28 @@ fn main() {
         .iter()
         .map(|n| (*n as f64 - mean_share).abs() / mean_share.max(1.0))
         .fold(0.0, f64::max);
+    if let Some(file) = &mut timing_file {
+        for row in &request_timings {
+            let due = row
+                .due_offset_ms
+                .map(|v| format!("{v:.9}"))
+                .unwrap_or_default();
+            writeln!(
+                file,
+                "{}\t{}\t{}\t{:.9}\t{:.9}\t{:.9}\t{}\t{:.9}\t{}",
+                row.client,
+                row.index,
+                row.timed,
+                row.start_unix,
+                row.end_unix,
+                row.start_offset_ms,
+                due,
+                row.latency_ms,
+                row.status
+            )
+            .unwrap();
+        }
+    }
     if let Some(file) = &mut sample_file {
         for value in &lat {
             writeln!(file, "writer\t{value:.9}").unwrap();

@@ -1,5 +1,6 @@
 """Oracles and client wire behavior required by X09's native indexed gates."""
 
+import csv
 import http.server
 import importlib.util
 import json
@@ -9,6 +10,7 @@ import pathlib
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -779,6 +781,9 @@ class Client(unittest.TestCase):
     def setUp(self):
         self.requests = []
         self.receipt_step = 1
+        self.response_delay = 0
+        self.response_status = 200
+        self.drop_response = False
         self.lock = threading.Lock()
         requests, lock = self.requests, self.lock
         owner = self
@@ -794,7 +799,11 @@ class Client(unittest.TestCase):
                 with lock:
                     requests.append(body.decode())
                     receipt = len(requests) * owner.receipt_step
-                self.send_response(200)
+                time.sleep(owner.response_delay)
+                if owner.drop_response:
+                    self.close_connection = True
+                    return
+                self.send_response(owner.response_status)
                 self.send_header("Content-Length", "0")
                 self.send_header("Sparkles-Commit", str(receipt))
                 self.end_headers()
@@ -824,6 +833,96 @@ class Client(unittest.TestCase):
             check=False,
             timeout=15,
         )
+
+    def test_final_response_cannot_create_lag_for_an_unsent_request(self):
+        self.response_delay = 0.15
+        result = self.run_client(
+            "writers", "--clients", "1", "--changes", "1", "--write-rate", "100"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)
+        self.assertEqual(len(self.requests), 1)
+        self.assertGreater(row["writers"]["max_ms"], 100)
+        self.assertLess(row["max_schedule_lag_ms"], 50)
+
+    def test_request_timings_match_real_backlog_and_preserve_warmup_and_errors(self):
+        path = pathlib.Path(self.temp.name) / "request-timings.tsv"
+        path.unlink(missing_ok=True)
+        self.response_delay = 0.15
+        result = self.run_client(
+            "writers",
+            "--clients",
+            "1",
+            "--changes",
+            "2",
+            "--write-rate",
+            "100",
+            "--request-timings",
+            str(path),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with path.open() as file:
+            rows = list(csv.DictReader(file, delimiter="\t"))
+        self.assertEqual(len(rows), 2)
+        lag = max(
+            max(0, float(r["start_offset_ms"]) - float(r["due_offset_ms"]))
+            for r in rows
+        )
+        self.assertGreater(lag, 100)
+        self.assertAlmostEqual(
+            lag, json.loads(result.stdout)["max_schedule_lag_ms"], places=5
+        )
+        self.assertTrue(
+            all(r["status"] == "200" and r["timed"] == "true" for r in rows)
+        )
+        self.assertEqual([int(r["index"]) for r in rows], [0, 1])
+        self.assertTrue(
+            all(float(r["end_unix"]) >= float(r["start_unix"]) > 0 for r in rows)
+        )
+
+        path.unlink()
+        self.response_delay = 0
+        result = self.run_client(
+            "serial", "--changes", "3", "--warmup", "2", "--request-timings", str(path)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with path.open() as file:
+            rows = list(csv.DictReader(file, delimiter="\t"))
+        self.assertEqual(
+            [r["timed"] for r in rows], ["false", "false", "true", "true", "true"]
+        )
+        self.assertTrue(all(r["due_offset_ms"] == "" for r in rows))
+        self.assertEqual(json.loads(result.stdout)["changes"], 3)
+
+        path.unlink()
+        self.response_status = 500
+        result = self.run_client(
+            "writers", "--changes", "1", "--request-timings", str(path)
+        )
+        self.assertNotEqual(result.returncode, 0)
+        with path.open() as file:
+            rows = list(csv.DictReader(file, delimiter="\t"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "500")
+
+        path.unlink()
+        self.drop_response = True
+        result = self.run_client(
+            "writers", "--changes", "1", "--request-timings", str(path)
+        )
+        self.assertNotEqual(result.returncode, 0)
+        with path.open() as file:
+            rows = list(csv.DictReader(file, delimiter="\t"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "0")
+
+    def test_existing_request_timing_file_is_not_overwritten_or_written_to(self):
+        path = pathlib.Path(self.temp.name) / "existing-timings.tsv"
+        path.write_text("preserve\n")
+        result = self.run_client("writers", "--request-timings", str(path))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(path.read_text(), "preserve\n")
 
     def test_concurrent_geometry_writes_and_samples(self):
         samples = pathlib.Path(self.temp.name) / "geometry.tsv"
