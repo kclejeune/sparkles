@@ -16,6 +16,7 @@ pub(super) const MAX_ANCHOR_ROWS: f64 = 32.0;
 #[cfg(test)]
 thread_local! {
     static ALTERNATIVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ELIGIBILITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -96,31 +97,14 @@ pub(super) fn candidate<'a>(
     gp: &'a GraphPattern,
     calls: &dyn Fn(&[TriplePattern]) -> bool,
 ) -> Option<Candidate<'a>> {
-    let GraphPattern::Join { left, right } = gp else {
-        return None;
-    };
-    let (anchor, union) = match (&**left, &**right) {
-        (anchor @ GraphPattern::Bgp { .. }, union @ GraphPattern::Union { .. })
-        | (union @ GraphPattern::Union { .. }, anchor @ GraphPattern::Bgp { .. }) => {
-            (anchor, union)
-        }
-        _ => return None,
-    };
-    let GraphPattern::Bgp { patterns } = anchor else {
-        unreachable!()
-    };
-    if patterns.is_empty()
-        || patterns.len() > MAX_TRIPLES
-        || calls(patterns)
-        // A constant predicate alone need not constrain the shared variables.
-        || !patterns.iter().any(|t| {
-            matches!(t.object, TermPattern::NamedNode(_) | TermPattern::Literal(_))
-        })
-    {
+    #[cfg(test)]
+    ELIGIBILITY.with(|n| n.set(n.get() + 1));
+    let mut candidate = shape(gp)?;
+    if calls(candidate.patterns) {
         return None;
     }
-    let moved = variables(anchor);
-    let mut todo = vec![union];
+    let moved = variables(candidate.anchor);
+    let mut todo = vec![candidate.union];
     let mut branches = 0;
     let mut visited = 0;
     while let Some(node) = todo.pop() {
@@ -154,11 +138,45 @@ pub(super) fn candidate<'a>(
             _ => return None,
         }
     }
+    candidate.branches = branches;
+    Some(candidate)
+}
+
+/// Screen ordinary work before property catalogues and variable sets are allocated.
+/// Every direct UNION has at least two branches. The complete branch-count floor
+/// and all semantic guards still apply after this conservative lower-bound check.
+pub(super) fn screen(gp: &GraphPattern, original: &Node) -> bool {
+    shape(gp).is_some_and(|candidate| candidate.worth_planning(original))
+}
+
+fn shape(gp: &GraphPattern) -> Option<Candidate<'_>> {
+    let GraphPattern::Join { left, right } = gp else {
+        return None;
+    };
+    let (anchor, union) = match (&**left, &**right) {
+        (anchor @ GraphPattern::Bgp { .. }, union @ GraphPattern::Union { .. })
+        | (union @ GraphPattern::Union { .. }, anchor @ GraphPattern::Bgp { .. }) => {
+            (anchor, union)
+        }
+        _ => return None,
+    };
+    let GraphPattern::Bgp { patterns } = anchor else {
+        unreachable!()
+    };
+    if patterns.is_empty()
+        || patterns.len() > MAX_TRIPLES
+        // A constant predicate alone need not constrain the shared variables.
+        || !patterns.iter().any(|t| {
+            matches!(t.object, TermPattern::NamedNode(_) | TermPattern::Literal(_))
+        })
+    {
+        return None;
+    }
     Some(Candidate {
         anchor,
         union,
         patterns,
-        branches,
+        branches: 2,
     })
 }
 
@@ -291,6 +309,7 @@ mod tests {
                 format!("{{ {{ {branch} }} UNION {{ {branch} }} }} {anchor}"),
             ] {
                 ALTERNATIVES.with(|n| n.set(0));
+                ELIGIBILITY.with(|n| n.set(0));
                 let result = query(
                     store.snapshot(),
                     &format!("SELECT * WHERE {{ {body} }}"),
@@ -299,6 +318,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(result.len(), rows, "{body}");
                 assert_eq!(ALTERNATIVES.with(|n| n.get()), 0, "{body}");
+                assert_eq!(ELIGIBILITY.with(|n| n.get()), 0, "{body}");
             }
         }
     }
@@ -336,12 +356,14 @@ mod tests {
             .join(" UNION ");
         for object in ["?hidden", "<urn:x>"] {
             ALTERNATIVES.with(|n| n.set(0));
+            ELIGIBILITY.with(|n| n.set(0));
             let text = format!(
                 "SELECT ?s ?v WHERE {{ ?s a <urn:C>; <urn:q> {object} . {{ {branches} }} }}"
             );
             let result = query(store.snapshot(), &text, &QueryOptions::default()).unwrap();
             assert_eq!(result.len(), 8);
             assert_eq!(ALTERNATIVES.with(|n| n.get()), 0, "{text}");
+            assert_eq!(ELIGIBILITY.with(|n| n.get()), 0, "{text}");
         }
     }
 

@@ -354,7 +354,8 @@ plan's latency at that scale remains to be measured.
 
 Alternative planning now requires shared anchor variables, repeated unbound scan
 relations and enough estimated ordinary work. A bounded screen keeps cheap plans
-and hidden anchor columns on the ordinary path before constructing an alternative.
+and hidden anchor columns on the ordinary path before eligibility allocations or
+alternative construction.
 Planning and total server time are checked separately from execution time, which
 excludes the optimizer's work.
 
