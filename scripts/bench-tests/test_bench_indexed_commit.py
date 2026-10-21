@@ -943,6 +943,33 @@ class Client(unittest.TestCase):
         self.assertEqual([int(r["index"]) for r in rows], [0, 1, 2])
         self.assertNotIn(b"panicked", result.stderr)
 
+    def test_uncertain_socket_cannot_accept_a_delayed_old_receipt(self):
+        binary = pathlib.Path(self.temp.name) / "write-bench-unit-tests"
+        subprocess.run(
+            [
+                "rustc",
+                "--edition",
+                "2024",
+                "--test",
+                "-o",
+                str(binary),
+                str(SCRIPTS / "write-bench.rs"),
+            ],
+            check=True,
+            timeout=30,
+        )
+        result = subprocess.run(
+            [
+                str(binary),
+                "--exact",
+                "tests::refused_redial_never_reuses_an_uncertain_connection",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_initial_refusal_finishes_without_stranding_writer_barrier(self):
         self.server.shutdown()
         self.server.socket.close()

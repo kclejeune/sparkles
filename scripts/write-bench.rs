@@ -50,6 +50,7 @@ struct Conn {
     addr: String,
     s: TcpStream,
     buf: Vec<u8>,
+    usable: bool,
 }
 
 struct Resp {
@@ -64,6 +65,7 @@ impl Conn {
             addr: addr.to_string(),
             s: Conn::dial(addr).map_err(|e| format!("connect {addr}: {e}"))?,
             buf: Vec::new(),
+            usable: true,
         })
     }
     fn dial(addr: &str) -> std::io::Result<TcpStream> {
@@ -73,13 +75,20 @@ impl Conn {
         Ok(s)
     }
     fn redial(&mut self) -> Result<(), String> {
+        // A refused dial must never make the uncertain old stream reusable.
+        self.usable = false;
+        let _ = self.s.shutdown(std::net::Shutdown::Both);
         self.buf.clear();
         self.s = Conn::dial(&self.addr).map_err(|e| format!("connect {}: {e}", self.addr))?;
+        self.usable = true;
         Ok(())
     }
     /// Dial again if the server closed the kept-alive connection while it was idle. Call it
     /// outside the timed span; it sends nothing.
     fn ready(&mut self) -> Result<(), String> {
+        if !self.usable {
+            return self.redial();
+        }
         if !self.buf.is_empty() {
             return Ok(());
         }
@@ -100,6 +109,12 @@ impl Conn {
     /// when writing it failed. Once it was written the server may have run it, so a failed
     /// read is an error and is never retried.
     fn request(&mut self, req: &[u8]) -> Result<Resp, String> {
+        if !self.usable {
+            return Err(format!(
+                "connection to {} needs successful readiness",
+                self.addr
+            ));
+        }
         if self.s.write_all(req).is_err() {
             self.redial()?;
             self.s
@@ -790,5 +805,54 @@ fn main() {
         || rbad > 0
     {
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn refused_redial_never_reuses_an_uncertain_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut first = [0; 5];
+            socket.read_exact(&mut first).unwrap();
+            assert_eq!(&first, b"first");
+            drop(listener);
+            // Withhold the first response until the client times out and tries to redial.
+            let mut second = [0; 6];
+            let reused = socket.read_exact(&mut second).is_ok() && &second == b"second";
+            if reused {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSparkles-Commit: 77\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+            reused
+        });
+        let mut client = Conn::new(&addr).unwrap_or_else(|e| panic!("{e}"));
+        client
+            .s
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(client.request(b"first").is_err());
+        let second = client.ready().and_then(|_| client.request(b"second"));
+        let reused = server.join().unwrap();
+        assert!(
+            !reused,
+            "a later request used the socket with an unanswered request"
+        );
+        assert!(
+            second.is_err(),
+            "a delayed old response was accepted as a new receipt"
+        );
     }
 }
