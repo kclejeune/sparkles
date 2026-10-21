@@ -8,6 +8,7 @@
 //! Small invocations exercise exactly the same fixtures and independent oracles,
 //! but never set the receipt's fullScale field. Use a fresh OUTPUT per invocation.
 use oxrdf::{Literal, NamedNode, Term};
+use oxsdatatypes::Decimal;
 use serde_json::{Value, json};
 use sparkles_core::sparql::{
     CursorOptions, CursorStatus, FallbackPolicy, QueryOptions, query, select_cursor,
@@ -181,13 +182,12 @@ fn integer(term: &Option<Term>) -> usize {
     let Some(Term::Literal(value)) = term else {
         panic!("expected an integer, got {term:?}")
     };
+    assert_eq!(
+        value.datatype().as_str(),
+        format!("{XSD}integer"),
+        "identity or aggregate integer datatype changed"
+    );
     value.value().parse().expect("nonnegative integer result")
-}
-fn numeric(term: &Option<Term>) -> f64 {
-    let Some(Term::Literal(value)) = term else {
-        panic!("expected a number, got {term:?}")
-    };
-    value.value().parse().expect("numeric result")
 }
 
 struct Seen {
@@ -230,12 +230,18 @@ fn aggregate_code(case: &str, value: &Option<Term>, offset: usize) -> u16 {
         "aggregate datatype changed"
     );
     match case {
-        "count" => assert_eq!(numeric(value), 4.0),
-        "sum" => assert_eq!(numeric(value), (9 + 4 * offset) as f64),
-        "avg" => assert_eq!(numeric(value), 2.25 + offset as f64),
-        "min" => assert_eq!(numeric(value), (1 + offset) as f64),
-        "max" => assert_eq!(numeric(value), (3 + offset) as f64),
-        "count-distinct" => assert_eq!(numeric(value), 3.0),
+        "count" => assert_eq!(integer(value), 4),
+        "sum" => assert_eq!(integer(value), 9 + 4 * offset),
+        "avg" => {
+            let actual: Decimal = literal.value().parse().expect("exact decimal result");
+            let expected = Decimal::from(offset as u64)
+                .checked_add("2.25".parse::<Decimal>().unwrap())
+                .unwrap();
+            assert_eq!(actual, expected, "AVG changed its exact decimal value");
+        }
+        "min" => assert_eq!(integer(value), 1 + offset),
+        "max" => assert_eq!(integer(value), 3 + offset),
+        "count-distinct" => assert_eq!(integer(value), 3),
         "sample" => {
             let n = integer(value);
             assert!(
@@ -736,5 +742,65 @@ mod tests {
             "children":[{"operator":{"operator":"CartesianProduct","actualRows":400}}]});
         assert!(operator_rows(&plan, "GroupBy", 100, 400));
         assert!(!operator_rows(&plan, "GroupBy", 10_000_000, 40_000_000));
+    }
+    #[test]
+    #[should_panic(expected = "datatype")]
+    fn identity_oracle_refuses_a_string_typed_integer() {
+        integer(&Some(Literal::new_simple_literal("7").into()));
+    }
+
+    #[test]
+    #[should_panic(expected = "integer result")]
+    fn aggregate_oracle_refuses_invalid_integer_exponent_syntax() {
+        aggregate_code(
+            "count",
+            &Some(
+                Literal::new_typed_literal("4e0", NamedNode::new(format!("{XSD}integer")).unwrap())
+                    .into(),
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exact decimal value")]
+    fn average_oracle_refuses_an_inexact_decimal_hidden_by_float_rounding() {
+        aggregate_code(
+            "avg",
+            &Some(
+                Literal::new_typed_literal(
+                    "2.25000000000000001",
+                    NamedNode::new(format!("{XSD}decimal")).unwrap(),
+                )
+                .into(),
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn numeric_oracles_accept_equivalent_exact_lexical_values() {
+        aggregate_code(
+            "count",
+            &Some(
+                Literal::new_typed_literal(
+                    "+004",
+                    NamedNode::new(format!("{XSD}integer")).unwrap(),
+                )
+                .into(),
+            ),
+            0,
+        );
+        aggregate_code(
+            "avg",
+            &Some(
+                Literal::new_typed_literal(
+                    "+2.2500",
+                    NamedNode::new(format!("{XSD}decimal")).unwrap(),
+                )
+                .into(),
+            ),
+            0,
+        );
     }
 }
