@@ -355,6 +355,9 @@ def mixed_load_checks(result):
 
 
 def summarize(results):
+    assert not any(r.get("calibration", False) for r in results), (
+        "calibration processes cannot enter acceptance summaries"
+    )
     gates = []
     keys = sorted({(r["people"], r["index"], r["scenario"]) for r in results})
     for people, index, scenario in keys:
@@ -965,12 +968,35 @@ def prepare(args, root, index, people):
     return triples
 
 
-def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
+def measure(
+    args,
+    cell,
+    index,
+    scenario,
+    grouped,
+    triples,
+    run_id,
+    write_rate,
+    *,
+    calibration=False,
+):
+    assert not calibration or scenario == "mixed"
+    assert scenario != "mixed" or write_rate > 0 or calibration, (
+        "only calibration may run unpaced mixed writers"
+    )
     directory = cell / run_id
     directory.mkdir()
     try:
         return _measure(
-            args, cell, index, scenario, grouped, triples, run_id, write_rate
+            args,
+            cell,
+            index,
+            scenario,
+            grouped,
+            triples,
+            run_id,
+            write_rate,
+            calibration=calibration,
         )
     except BaseException as error:
         if directory.exists():
@@ -983,10 +1009,32 @@ def measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         # Startup can fail before _measure reaches its service/reader cleanup block.
         if (directory / "store").exists():
             shutil.rmtree(directory / "store")
-        save(directory / "evidence-sync.json", flush_owned_tree(directory))
+        try:
+            save(directory / "evidence-sync.json", flush_owned_tree(directory))
+        except BaseException as error:
+            failure = {
+                "type": type(error).__name__,
+                "error": str(error),
+                "phase": "evidence flush",
+            }
+            save(directory / "evidence-sync-failure.json", failure)
+            if not (directory / "failure.json").exists():
+                save(directory / "failure.json", failure)
+            raise
 
 
-def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
+def _measure(
+    args,
+    cell,
+    index,
+    scenario,
+    grouped,
+    triples,
+    run_id,
+    write_rate,
+    *,
+    calibration=False,
+):
     directory = cell / run_id
     store = directory / "store"
     shutil.copytree(cell / "seed", store)
@@ -1072,6 +1120,7 @@ def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         pool.shutdown(wait=True)
         assert not errors, errors
         result = json.loads(client_output)
+        result["calibration"] = calibration
         assert (
             result["changes"] == changes
             and result["errors"] == 0
@@ -1084,7 +1133,9 @@ def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
             assert result["write_rate"] == write_rate
             # Numerical load failures remain failed gates, but must not prevent
             # receipt, index-publication and cold-recovery evidence collection.
-            result["mixed_load_checks"] = mixed_load_checks(result)
+            result["mixed_load_checks"] = (
+                mixed_load_checks(result) if write_rate else None
+            )
             save(directory / "mixed-load-checks.json", result["mixed_load_checks"])
         overlap = window_samples(
             samples, result["write_start_unix"], result["write_end_unix"], "start_unix"
@@ -1132,7 +1183,7 @@ def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         admitted = delta.get("sparkles_group_commit_size_sum", 0)
         if not grouped:
             assert admitted == 0, "ordinary run admitted grouped commits"
-        elif scenario == "writers":
+        elif scenario == "writers" or (calibration and not write_rate):
             assert admitted > 0, "four-writer run admitted no grouped commits"
         result["grouped_admissions"] = admitted
         result["internal_embed_commits"] = internal
@@ -1255,6 +1306,62 @@ def _measure(args, cell, index, scenario, grouped, triples, run_id, write_rate):
         shutil.rmtree(store)
 
 
+def calibrate_mixed(args, cell, index, triples, requested_rate):
+    """Discover and validate one aggregate rate with the actual indexed readers."""
+    assert index in ("text", "geo")
+    receipt = {
+        "requested_rate": requested_rate,
+        "unpaced": [],
+        "validation": [],
+        "common_rate": requested_rate or None,
+        "achieved_rate_validated": False,
+    }
+    path = cell / "rate-calibration.json"
+    save(path, receipt)
+    rate = requested_rate
+    if not rate:
+        for position, grouped in enumerate((False, True, True, False)):
+            row = measure(
+                args,
+                cell,
+                index,
+                "mixed",
+                grouped,
+                triples,
+                f"cal-unpaced-{position}",
+                0,
+                calibration=True,
+            )
+            receipt["unpaced"].append(row)
+            save(path, receipt)
+        rate = min(row["tps"] for row in receipt["unpaced"]) * 0.8
+        receipt["common_rate"] = rate
+        save(path, receipt)
+    for grouped in (False, True):
+        row = measure(
+            args,
+            cell,
+            index,
+            "mixed",
+            grouped,
+            triples,
+            f"cal-paced-{int(grouped)}",
+            rate,
+            calibration=True,
+        )
+        receipt["validation"].append(row)
+        save(path, receipt)
+    receipt["achieved_rate_validated"] = all(
+        row["mixed_load_checks"]["achieved_rate"]["passed"]
+        for row in receipt["validation"]
+    )
+    save(path, receipt)
+    assert receipt["achieved_rate_validated"], (
+        "common mixed rate validation failed; preserving all calibration evidence"
+    )
+    return rate
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--provider", type=int, help=argparse.SUPPRESS)
@@ -1283,7 +1390,7 @@ def main():
         "--write-rate",
         type=float,
         default=0,
-        help="fixed mixed rate; derive from slow pilot when zero",
+        help="fixed mixed rate; discover with active readers when zero; always validate both alternatives",
     )
     p.add_argument("--port", type=int, default=3986)
     p.add_argument("--provider-port", type=int, default=3987)
@@ -1373,21 +1480,8 @@ def main():
                 cell.mkdir()
                 triples = prepare(args, cell, index, people)
                 write_rate = args.write_rate
-                if not write_rate and "mixed" in args.scenarios and index != "embed":
-                    pilot = [
-                        measure(
-                            args,
-                            cell,
-                            index,
-                            "writers",
-                            grouped,
-                            triples,
-                            f"pilot-{int(grouped)}",
-                            0,
-                        )
-                        for grouped in (False, True)
-                    ]
-                    write_rate = min(r["tps"] for r in pilot) * 0.8
+                if "mixed" in args.scenarios and index != "embed":
+                    write_rate = calibrate_mixed(args, cell, index, triples, write_rate)
                 for block in range(args.blocks):
                     for scenario in args.scenarios:
                         if index == "embed" and scenario == "mixed":

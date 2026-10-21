@@ -451,6 +451,14 @@ lag no greater than 50 ms or two client periods, whichever is longer.
 A violation remains a failed gate even when the reader latency ratio passes. The harness
 retains its raw samples and completes the data and cold-recovery checks before moving
 to the next process.
+When no rate is supplied, calibration runs an unpaced ABBA block with the actual indexed
+readers and chooses eighty percent of the slowest observed writer throughput. The harness
+then validates that common offered rate on both alternatives, including a supplied rate,
+before acceptance processes begin. Either alternative missing the five-percent achieved
+rate tolerance stops the matrix and retains all calibration evidence. The rate is fixed
+throughout the acceptance matrix. Calibration has its own raw samples and cold-recovery
+checks and cannot enter acceptance summaries. Its aggregate rate validation does not
+excuse a failed schedule-lag check in an acceptance process.
 
 ## Continuous integration
 

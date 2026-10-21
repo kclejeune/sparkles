@@ -65,6 +65,48 @@ class Oracles(unittest.TestCase):
                 BENCH.flush_owned_tree(unsafe)
             self.assertEqual((external / "marker").read_text(), "preserve")
 
+    def test_evidence_flush_failure_records_itself_and_preserves_original_failure(self):
+        for original in (None, RuntimeError("original measurement failure")):
+            with (
+                self.subTest(original=original),
+                tempfile.TemporaryDirectory(
+                    prefix="sparkles-evidence-failure-"
+                ) as temp,
+            ):
+                root = pathlib.Path(temp)
+
+                def measured(*args, original_error=original, **kwargs):
+                    directory = args[1] / args[6]
+                    (directory / "store").mkdir()
+                    if original_error:
+                        raise original_error
+                    BENCH.save(directory / "result.json", {"reopen": "passed"})
+                    return {"reopen": "passed"}
+
+                with (
+                    mock.patch.object(BENCH, "_measure", side_effect=measured),
+                    mock.patch.object(
+                        BENCH,
+                        "flush_owned_tree",
+                        side_effect=OSError("evidence flush failed"),
+                    ),
+                    self.assertRaisesRegex(OSError, "evidence flush failed"),
+                ):
+                    BENCH.measure(None, root, "text", "writers", False, 0, "run", 0)
+                directory = root / "run"
+                self.assertFalse((directory / "store").exists())
+                self.assertTrue((directory / "failure.json").exists())
+                failure = json.loads((directory / "failure.json").read_text())
+                self.assertEqual(
+                    failure["error"],
+                    str(original) if original else "evidence flush failed",
+                )
+                secondary = json.loads(
+                    (directory / "evidence-sync-failure.json").read_text()
+                )
+                self.assertEqual(secondary["error"], "evidence flush failed")
+                self.assertEqual(secondary["phase"], "evidence flush")
+
     def test_clone_flush_failure_prevents_server_start_and_preserves_failure(self):
         with tempfile.TemporaryDirectory(prefix="sparkles-failed-flush-") as temp:
             root = pathlib.Path(temp)
@@ -418,6 +460,115 @@ class Oracles(unittest.TestCase):
         self.assertFalse(result["gates"][0]["checks"]["throughput"]["passed"])
         rows[1]["tps"] = 151
         self.assertTrue(BENCH.summarize(rows)["passed"])
+
+    def test_active_reader_calibration_uses_slowest_abba_and_validates_common_rate(
+        self,
+    ):
+        calls = []
+        discovery = iter((1036.3, 1457.1, 1376.8, 668.4))
+
+        def process(
+            args, cell, index, scenario, grouped, triples, run_id, rate, *, calibration
+        ):
+            self.assertTrue(calibration)
+            self.assertEqual((index, scenario), ("geo", "mixed"))
+            calls.append((grouped, rate, run_id))
+            row = {
+                "calibration": True,
+                "scenario": scenario,
+                "grouped": grouped,
+                "write_rate": rate,
+                "tps": next(discovery) if not rate else rate * (1 if grouped else 0.99),
+                "max_schedule_lag_ms": 200 if rate else 0,
+                "reopen": "passed",
+            }
+            row["mixed_load_checks"] = BENCH.mixed_load_checks(row) if rate else None
+            return row
+
+        with tempfile.TemporaryDirectory(prefix="sparkles-active-rate-") as temp:
+            root = pathlib.Path(temp)
+            with mock.patch.object(BENCH, "measure", side_effect=process):
+                rate = BENCH.calibrate_mixed(None, root, "geo", 10, 0)
+            self.assertAlmostEqual(rate, 668.4 * 0.8)
+            self.assertEqual(
+                [grouped for grouped, _, _ in calls],
+                [False, True, True, False, False, True],
+            )
+            self.assertEqual([r for _, r, _ in calls[:4]], [0] * 4)
+            self.assertEqual([r for _, r, _ in calls[4:]], [rate] * 2)
+            receipt = json.loads((root / "rate-calibration.json").read_text())
+            self.assertTrue(receipt["achieved_rate_validated"])
+            self.assertEqual(
+                (len(receipt["unpaced"]), len(receipt["validation"])), (4, 2)
+            )
+            self.assertTrue(
+                all(
+                    not r["mixed_load_checks"]["schedule_lag"]["passed"]
+                    for r in receipt["validation"]
+                )
+            )
+            with self.assertRaisesRegex(AssertionError, "calibration"):
+                BENCH.summarize(receipt["validation"])
+
+    def test_failed_common_rate_preserves_both_alternatives_without_retry(self):
+        rates = []
+
+        def process(
+            args, cell, index, scenario, grouped, triples, run_id, rate, *, calibration
+        ):
+            self.assertTrue(calibration)
+            rates.append(rate)
+            row = {
+                "calibration": True,
+                "scenario": scenario,
+                "grouped": grouped,
+                "write_rate": rate,
+                "tps": rate if grouped else rate * 0.8,
+                "max_schedule_lag_ms": 0,
+                "reopen": "passed",
+            }
+            row["mixed_load_checks"] = BENCH.mixed_load_checks(row)
+            return row
+
+        with tempfile.TemporaryDirectory(prefix="sparkles-invalid-rate-") as temp:
+            root = pathlib.Path(temp)
+            with (
+                mock.patch.object(BENCH, "measure", side_effect=process),
+                self.assertRaisesRegex(AssertionError, "rate validation failed"),
+            ):
+                BENCH.calibrate_mixed(None, root, "text", 10, 500)
+            self.assertEqual(rates, [500, 500])
+            receipt = json.loads((root / "rate-calibration.json").read_text())
+            self.assertFalse(receipt["achieved_rate_validated"])
+            self.assertEqual(receipt["unpaced"], [])
+            self.assertEqual(len(receipt["validation"]), 2)
+            self.assertTrue(all(r["reopen"] == "passed" for r in receipt["validation"]))
+
+    def test_unpaced_mixed_acceptance_is_refused_before_creating_run(self):
+        with tempfile.TemporaryDirectory(prefix="sparkles-unpaced-refusal-") as temp:
+            root = pathlib.Path(temp)
+            with self.assertRaisesRegex(AssertionError, "only calibration"):
+                BENCH.measure(None, root, "geo", "mixed", False, 10, "run", 0)
+            self.assertFalse((root / "run").exists())
+
+    def test_calibration_process_cannot_enter_acceptance_summary(self):
+        rows = [
+            {
+                "people": 1000000,
+                "index": "geo",
+                "scenario": "mixed",
+                "grouped": grouped,
+                "calibration": True,
+                "peak_rss_kib": 1024,
+                "readers": {"p50_ms": 1, "p99_ms": 1},
+                "write_rate": 500,
+                "tps": 500,
+                "max_schedule_lag_ms": 1,
+            }
+            for grouped in (False, True)
+        ]
+        with self.assertRaisesRegex(AssertionError, "calibration"):
+            BENCH.summarize(rows)
 
     def test_pacing_boundaries_remain_unchanged(self):
         row = {"write_rate": 100, "tps": 95, "max_schedule_lag_ms": 80}
