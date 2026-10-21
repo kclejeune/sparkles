@@ -604,7 +604,8 @@ one ranking.
 Phase 1's tooling is built. The first batch of the standard refresh ran on the reference
 host on 2026-10-18 and 2026-10-19, and BENCHMARKS.md has its synthetic, SP²Bench and LUBM
 figures. BENCHMARKS.md also includes the BSBM Explore comparison at 10M from
-2026-10-19 and the isolated full-text queries at 1.05M from 2026-10-20, with
+2026-10-19, the isolated full-text queries at 1.05M from 2026-10-20 and BSBM BI at
+10M from 2026-10-20 to 2026-10-21, with
 versioned records of their samples, answer fingerprints and engine failures. The
 rest of the refresh is listed under "Left for Phase 1".
 
@@ -859,12 +860,20 @@ harness. The DBpedia 50M query rerun also completed on 2026-10-20, reusing the
 Oxigraph disagree with the other three engines on two aggregate queries, and
 Oxigraph’s separate answer check for `top-linked` exceeded its 300 second limit.
 The timing limit was 600 seconds. These limitations are explicit in BENCHMARKS.md,
-and the aggregate disagreements remain unresolved. BI is still running.
+and the aggregate disagreements remain unresolved. The bounded BI rerun completed
+on 2026-10-21 and its 55-cell record is published. Sparkles' generated driver
+queries encounter HTTP 503 budget refusals, while QLever fails and the Jena and
+Oxigraph drivers time out. Fluree's two completed driver cells have no successful
+competitor for the result-count check and are not ranked. Fixed q4 and q5 have
+unresolved answer disagreements, and QLever lacks complete fixed-instance answer
+checks on q4 through q8. QLever is 12.6 times faster on the agreeing q2 instances
+and 1.37 times on q3. These are observations of the 81478fbe binary, not a
+comparison with the current head.
 The runner leaves JAVA unset for Jena 6’s loader
 so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
 
-* The rest of the standard refresh at one head (A5). The BI rerun and the later
-  batches remain. The
+* The rest of the standard refresh at one head (A5). BI's driver failures and
+  answer checks and the later batches remain. The
   regeneration of the BENCHMARKS.md tables from records without a numeric change (A3)
   remains open. `bench.sh` starts,
   checks and times one engine at a time in its default and `updates` modes since
@@ -876,7 +885,8 @@ so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
   files. Equals signs in sampled-input filenames were parsed as argument separators,
   collapsing 38 files into 28 manifest entries without hashes or byte sizes.
   Complete input provenance and the two aggregate answer disagreements remain open.
-* BSBM BI on the reference host and a noise-floor control for each standard suite
+* BSBM BI's generated driver budget refusals and failures, its disputed or missing
+  fixed-instance answers and a noise-floor control for each standard suite
   (§14) remain. Their commands are in BENCHMARKING.md.
 * BSBM at 100M triples has not been tried, and the generator's heap defaults may need
   raising. SP²Bench at 100M triples will meet the 600 second timeout in its slower queries.

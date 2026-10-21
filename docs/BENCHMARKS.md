@@ -11,7 +11,7 @@ check every engine's answers before timing them, and list every case where Spark
 | OS and kernel | NixOS, Linux 6.18 |
 | Sparkles | 0.1.0, release builds with default features, rustc 1.98 and 1.99 |
 | Other engines | QLever 0.5.48, Fluree 4.2.2 (the release binary), Oxigraph 0.5.11 (server, pyoxigraph and the JavaScript package), Apache Jena TDB2 6.2.0 with Fuseki 5.1.0, Jena 5.6.0 (TDB2 and TIM in the JVM comparison), rdflib 7.6.0, N3.js 2.13.11 with Comunica 5.4.1 |
-| Measured | 2026-10-03 to 2026-10-09, and 2026-10-18 to 2026-10-20 for the refreshed sections named below. The QLever figures for the DBpedia `geo-box` and `country-population` queries come from an earlier run on the same host. |
+| Measured | 2026-10-03 to 2026-10-09, and 2026-10-18 to 2026-10-21 for the refreshed sections named below. The QLever figures for the DBpedia `geo-box` and `country-population` queries come from an earlier run on the same host. |
 
 The synthetic suite in all modes was measured again, and SP²Bench at 10M triples and
 LUBM(100) for the first time, on `forge` from 2026-10-18 to 2026-10-19, as the first batch
@@ -36,8 +36,11 @@ reached its query-mix phase but exhausted the eight-hour batch limit while the J
 continued after repeated request timeouts. The harness now resolves cache preparation
 after restarts, times DBpedia engines alone under the configured memory limit,
 ignores unfinished timing files, and bounds each BSBM driver run. WatDiv and the
-DBpedia 50M query rerun completed with the corrected harness, while BI is still
-running. The later batches of the refresh have not started.
+DBpedia 50M query rerun completed with the corrected harness. The bounded BI rerun
+completed on 2026-10-21 and recorded driver failures, timeouts and unresolved answer
+checks. Its section separates these from comparisons with agreeing answers. These
+runs used the older 81478fbe binary, rather than the current head. The later batches
+of the refresh have not started.
 
 * [Summary](#summary)
 * [Query performance](#query-performance)
@@ -89,6 +92,10 @@ On larger and standard workloads:
   on `q8` and Oxigraph about 5,000× on `q12b`.
 * **BSBM Explore at 10M triples.** Sparkles has the lowest pooled median on eight of
   eleven templates. Fluree is 2.9× faster on q5, and Oxigraph is faster on q7 and q8.
+* **BSBM BI at 10M triples.** QLever is 12.6× faster on q2 and 1.37× on q3, whose
+  fixed-instance answers agree with Sparkles. Sparkles' generated driver queries
+  encounter budget refusals, and no engine completes a throughput run with answers
+  qualified against the others.
 * **Durable writes.** A commit that adds a new literal takes a median of 1.13 ms at 1.05M
   and 1.28 ms at 10.5M, synchronized to disk before it is acknowledged. Oxigraph commits
   faster without synchronizing in that harness. In the suite's churn of 5,000 commits,
@@ -803,7 +810,65 @@ disagree. Its throughput is not ranked against engines whose answers agree.
 | SELECT-only QMpH | 4 | 171,934 | 3,237 | error | 329,816 † | 74,102 |
 | SELECT-only QMpH | 16 | 206,847 | error | error | 662,847 † | error |
 
-The BI comparison and the 100M scale remain incomplete in this refresh.
+The 100M scale remains incomplete in this refresh.
+
+### BSBM BI at 10M triples
+
+This run used 10,095,035 generated triples and 28,480 products on forge from
+2026-10-20 to 2026-10-21. Each engine ran alone under a 12 GiB limit, with the HTTP
+timing client on CPU 11 and result caches off. Sparkles was the release binary of
+81478fbe and the harness was aa53c0e6. The
+[BI record](benchmarks/2026-10-21-bsbm-10m-bi-forge.json) preserves all 55 cells,
+including failures. These measurements do not compare the current head with an
+older build.
+
+Each template has three fixed instances, timed ten times after two warm-ups per
+instance. The table pools those thirty HTTP samples. A dagger marks an answer that
+differs from the majority and is excluded from ranking. The q4 and q5 fingerprints
+have no agreeing reference, so their whole rows remain unranked. QLever lacks a
+complete answer fingerprint for q4 through q8, even where its timing requests
+succeeded. Those cells are shown as unverified. Oxigraph timed out on two q7
+instances, so its pooled cell is a timeout rather than a comparison of its ten
+successful samples with another engine's thirty.
+
+| Template, median ms | Sparkles | Jena | QLever | Fluree | Oxigraph |
+|---|---:|---:|---:|---:|---:|
+| q1 | 12.84 | 3,241.71 | 52.51 | 155.26 | 2,077.28 |
+| q2 | 2,253.69 | 3,562.21 | 179.28 | 23.10 † | 32,569.39 |
+| q3 | 38.89 | 1,733.90 | 28.45 | 287.78 † | 3,287.87 |
+| q4, unranked | 150.12 | 8,452.57 | unverified | 162.22 | 6,868.73 |
+| q5, unranked | 30.04 | 198.17 | unverified | 693.70 | 138.93 |
+| q6 | 16.22 | 23.72 | unverified | 338.27 † | 28.77 |
+| q7 | 52.35 | 74.60 | unverified | 210.01 † | timeout |
+| q8 | 34.46 | 121.75 | unverified | 202.66 † | 184.04 |
+
+Only q1 has complete agreeing answers from all five engines. Among the verified
+cells of the other ranked templates, QLever has the lowest pooled median on q2 and
+q3, and Sparkles on q6, q7 and q8. The q7 comparison covers Sparkles and Jena only.
+Agreement is a cross-engine check, not an independent semantic oracle. The aggregate
+disagreements and missing answers remain open under roadmap item 1.
+
+The driver uses generated parameters beyond the three fixed instances. It requested
+fifty warm-up mixes and five hundred measured mixes at each client count, with a
+1,800 second wall budget per cell. Sparkles' three driver cells exited after HTTP
+503 replies that its access log records as budget refusals. The failing queries
+include q4 with ProductType6 and q2 with Product16512. The retained log does not
+identify the specific budget. These failures are outside the fixed instances above.
+QLever's driver failed with a refused connection at one client and HTTP 500 at four
+and sixteen clients. Jena and Oxigraph timed out at every client count. The runner's
+successful exit means that it recorded these results, rather than that every engine
+completed the requested mixes.
+
+| BI QMpH | Clients | Sparkles | Jena | QLever | Fluree | Oxigraph |
+|---|---:|---:|---:|---:|---:|---:|
+| Standard mix | 1 | error | timeout | error | timeout | timeout |
+| Standard mix | 4 | error | timeout | error | 2,174 † | timeout |
+| Standard mix | 16 | error | timeout | error | 3,143 † | timeout |
+
+Fluree alone completed two driver cells. Their result-count check has no successful
+competing engine to compare, and its fixed q2, q3, q6, q7 and q8 answers disagree.
+Its QMpH figures are observations and are not ranked. No throughput winner is
+established by this run.
 
 ### Full-text search
 
@@ -2260,6 +2325,7 @@ than 10%. Fluree's warm advantage on `star-lookup` at 1.05M is within 10%.
 | SP²Bench `q8` and `q12b`, 10M | Jena 181× on `q8`, Oxigraph about 5,000× and Jena about 2,900× on `q12b` | Sparkles' plan produces 555,607,405 rows for the one-row ASK of `q12b`. |
 | WatDiv `L3-1`, 10.97M | Fluree 1.21× | Sparkles has the lowest mean on all 20 template aggregates and 84 of 88 instances. This individual instance is 21% slower in the refreshed run. |
 | BSBM Explore `q5`, `q7` and `q8`, 10M | Fluree 2.9× on `q5`, Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
+| BSBM BI `q2` and `q3`, 10M | QLever 12.6× on `q2` and 1.37× on `q3` | The three fixed-instance answer checks agree. The generated driver mix still fails on a Sparkles budget refusal. |
 | SP²Bench `q4`, `q5a`, `q6` and `q12a`, 10M | Jena answers `q6` and `q12a`, and Oxigraph `q12a` | Sparkles' default query memory budget refuses all four. No engine finished `q4` or `q5a`. |
 | LUBM(100) `q2` | QLever 3.7× | Sparkles is fastest on 11 of 14 queries. |
 | LUBM(100) `q1` and `q3` means | Fluree 1.19× and 1.22× | Sparkles' medians are lower, so the means reflect slow outliers. |
@@ -2375,8 +2441,9 @@ harness errors.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of
   28.7 GiB under a 14 GiB limit.
 * **Other standard benchmarks.** SP²Bench at 10M triples and LUBM(100) have been compared
-  on the reference machine, as has BSBM Explore at 10M. BSBM BI and the 100M scale,
-  SP²Bench at 100M, LUBM(1000) and the OWL2Bench acceptance runs remain open.
+  on the reference machine, as have BSBM Explore and BI at 10M. BI's driver failures
+  and incomplete answer checks remain unresolved. The 100M BSBM and SP²Bench scales,
+  LUBM(1000) and the OWL2Bench acceptance runs remain open.
   LDBC, WatDiv's stress testing and the Wikidata query log have no harness. The synthetic
   suite has a regular shape, and its 28 queries are hand-picked.
 * **Long runs.** Hours of sustained writes and compaction under load were not compared
