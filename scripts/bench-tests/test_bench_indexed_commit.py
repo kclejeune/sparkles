@@ -287,6 +287,256 @@ class Oracles(unittest.TestCase):
         ):
             BENCH.indexed_ready(SimpleNamespace(port=3986), "geo", pathlib.Path(temp))
 
+    def test_provider_idle_does_not_make_an_unfinished_embedding_seed_ready(self):
+        status = {
+            "state": "ready",
+            "rows": 10,
+            "hnsw": {"nodes": 11},
+            "overlay": {
+                "inserts": 4,
+                "deletes": 0,
+                "indexed": 1,
+                "pending": 3,
+                "overBudget": False,
+            },
+            "skipped": {"malformed": 0, "wrongDimension": 0, "zeroNorm": 0},
+            "embedding": {"state": "idle", "appliedSeq": 7, "headSeq": 7},
+        }
+        with (
+            tempfile.TemporaryDirectory(prefix="sparkles-seed-ready-") as temp,
+            mock.patch.object(BENCH, "get_json", return_value=status),
+            mock.patch.object(BENCH, "embedding_count", return_value=14),
+            self.assertRaisesRegex(AssertionError, "seed overlay"),
+        ):
+            BENCH.indexed_ready(SimpleNamespace(port=3986), "embed", pathlib.Path(temp))
+
+    def test_canonical_embedding_seed_requires_complete_persisted_graph(self):
+        clean = {
+            "state": "ready",
+            "rows": 10,
+            "hnsw": {"nodes": 10},
+            "overlay": {
+                "inserts": 0,
+                "deletes": 0,
+                "indexed": 0,
+                "pending": 0,
+                "overBudget": False,
+            },
+            "skipped": {"malformed": 0, "wrongDimension": 0, "zeroNorm": 0},
+            "embedding": {"state": "idle", "appliedSeq": 7, "headSeq": 7, "backlog": 0},
+        }
+        bad = []
+        for section, key, value in (
+            (None, "state", "failed"),
+            (None, "rows", 9),
+            ("hnsw", "nodes", 9),
+            ("overlay", "inserts", 1),
+            ("overlay", "deletes", 1),
+            ("overlay", "indexed", 1),
+            ("overlay", "pending", 1),
+            ("overlay", "overBudget", True),
+            ("skipped", "malformed", 1),
+            ("skipped", "wrongDimension", 1),
+            ("skipped", "zeroNorm", 1),
+            ("embedding", "state", "embedding"),
+            ("embedding", "appliedSeq", 6),
+            ("embedding", "backlog", 1),
+        ):
+            status = json.loads(json.dumps(clean))
+            (status if section is None else status[section])[key] = value
+            bad.append(status)
+        for status in bad:
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory(prefix="sparkles-canonical-") as temp,
+                mock.patch.object(BENCH, "get_json", return_value=status),
+                self.assertRaises(AssertionError),
+            ):
+                BENCH.canonical_embedding_ready(
+                    SimpleNamespace(port=3986), pathlib.Path(temp), 10
+                )
+        building = {**clean, "state": "building", "rows": 0}
+        with (
+            tempfile.TemporaryDirectory(prefix="sparkles-canonical-") as temp,
+            mock.patch.object(BENCH, "get_json", side_effect=[building, clean]),
+            mock.patch.object(BENCH.time, "sleep"),
+        ):
+            result = BENCH.canonical_embedding_ready(
+                SimpleNamespace(port=3986), pathlib.Path(temp), 10
+            )
+            self.assertEqual(result, clean)
+            observations = json.loads(
+                (pathlib.Path(temp) / "canonical-embedding-readiness.json").read_text()
+            )
+            self.assertEqual(len(observations), 2)
+        cold = {**clean, "embedding": {**clean["embedding"], "state": "disabled"}}
+        with (
+            tempfile.TemporaryDirectory(prefix="sparkles-canonical-") as temp,
+            mock.patch.object(BENCH, "get_json", return_value=cold),
+        ):
+            self.assertEqual(
+                BENCH.canonical_embedding_ready(
+                    SimpleNamespace(port=3986), pathlib.Path(temp), 10, embedding=False
+                ),
+                cold,
+            )
+
+    def test_embedding_seed_compacts_and_rebuilds_after_stop_then_cold_validates(self):
+        events = []
+        args = SimpleNamespace(binary="/owned/sparkles", provider_port=3987, port=3986)
+
+        def start(_args, _seed, directory, _grouped, **kwargs):
+            events.append(("start", directory.name, kwargs.get("embedding", True)))
+            return SimpleNamespace(
+                close=lambda: events.append(("stop", directory.name))
+            )
+
+        def offline(_args, command, directory):
+            events.append(("offline", command[1], directory.name))
+            if command[1] == "compact":
+                self.assertEqual(command[-2:], ["--partial", "off"])
+            else:
+                self.assertEqual(command[1:3], ["vector", "rebuild"])
+
+        with (
+            tempfile.TemporaryDirectory(prefix="sparkles-prepare-") as temp,
+            mock.patch.object(BENCH, "generate", return_value=20),
+            mock.patch.object(BENCH, "unique_triples", return_value=17),
+            mock.patch.object(BENCH, "run_command"),
+            mock.patch.object(BENCH, "digest", return_value="fixture-sha"),
+            mock.patch.object(BENCH, "Server", side_effect=start),
+            mock.patch.object(
+                BENCH,
+                "caught_up",
+                side_effect=lambda _a: events.append(("provider-only",)) or {},
+            ),
+            mock.patch.object(
+                BENCH,
+                "indexed_ready",
+                side_effect=AssertionError(
+                    "bootstrap must not require canonical graph yet"
+                ),
+            ),
+            mock.patch.object(BENCH, "source_count", return_value=17),
+            mock.patch.object(BENCH, "embedding_count", return_value=10),
+            mock.patch.object(BENCH, "query", return_value=10),
+            mock.patch.object(BENCH, "run_preparation_command", side_effect=offline),
+            mock.patch.object(
+                BENCH,
+                "canonical_embedding_ready",
+                side_effect=lambda a, d, n, **kw: events.append(
+                    ("canonical", n, kw["embedding"])
+                ),
+            ),
+            mock.patch.object(BENCH, "flush_owned_tree", return_value={}),
+        ):
+            self.assertEqual(BENCH.prepare(args, pathlib.Path(temp), "embed", 1000), 17)
+        self.assertEqual(
+            events,
+            [
+                ("start", "bootstrap", True),
+                ("provider-only",),
+                ("stop", "bootstrap"),
+                ("offline", "compact", "compact-seed"),
+                ("offline", "vector", "rebuild-seed"),
+                ("start", "canonical-seed", False),
+                ("canonical", 10, False),
+                ("stop", "canonical-seed"),
+            ],
+        )
+
+    def test_offline_seed_command_has_bounded_owned_service_and_cleanup_receipts(self):
+        args = SimpleNamespace(server_cpus="0")
+        process = mock.Mock(returncode=0)
+        process.poll.side_effect = [None, 0]
+        properties = (
+            "MemoryPeak=1234\nMemoryMax=12884901888\nMemorySwapMax=0\nMainPID=42\n"
+        )
+
+        def control(command, **kwargs):
+            self.assertIn("timeout", kwargs)
+            if "show" in command:
+                return SimpleNamespace(returncode=0, stdout=properties)
+            return SimpleNamespace(returncode=3, stdout="inactive")
+
+        with (
+            tempfile.TemporaryDirectory(prefix="sparkles-offline-") as temp,
+            mock.patch.object(
+                BENCH.subprocess, "Popen", return_value=process
+            ) as launched,
+            mock.patch.object(BENCH.subprocess, "run", side_effect=control),
+            mock.patch.object(BENCH.os, "sched_getaffinity", return_value={0}),
+            mock.patch.object(BENCH.time, "sleep"),
+            mock.patch.object(BENCH, "stop_owned") as stop,
+        ):
+            directory = pathlib.Path(temp) / "compact"
+            BENCH.run_preparation_command(
+                args,
+                ["/owned/sparkles", "compact", "--loc", str(directory / "seed")],
+                directory,
+            )
+            command = launched.call_args.args[0]
+            self.assertIn("MemoryMax=12G", command)
+            self.assertIn("MemorySwapMax=0", command)
+            self.assertIn("RuntimeMaxSec=600s", command)
+            self.assertEqual(
+                json.loads((directory / "resources.json").read_text())[
+                    "observed_peak_bytes"
+                ],
+                1234,
+            )
+            self.assertFalse(
+                json.loads((directory / "cleanup.json").read_text())["forced"]
+            )
+            stop.assert_called_once_with(process)
+
+    def test_offline_seed_failure_cleanup_is_finite_and_preserves_receipts(self):
+        for forced, stop_error in (
+            (True, None),
+            (False, OSError("client stop failed")),
+        ):
+            with self.subTest(forced=forced):
+                args = SimpleNamespace(server_cpus="0")
+                process = mock.Mock(returncode=0)
+                process.poll.side_effect = [None, 0]
+                controls = []
+
+                def control(command, controls=controls, forced=forced, **kwargs):
+                    controls.append(command)
+                    self.assertIn("timeout", kwargs)
+                    if "show" in command:
+                        return SimpleNamespace(returncode=0, stdout="")
+                    if forced and "stop" in command:
+                        raise subprocess.TimeoutExpired(command, 40)
+                    return SimpleNamespace(returncode=3, stdout="inactive")
+
+                with (
+                    tempfile.TemporaryDirectory(
+                        prefix="sparkles-offline-failed-"
+                    ) as temp,
+                    mock.patch.object(BENCH.subprocess, "Popen", return_value=process),
+                    mock.patch.object(BENCH.subprocess, "run", side_effect=control),
+                    mock.patch.object(BENCH.time, "sleep"),
+                    mock.patch.object(BENCH, "stop_owned", side_effect=stop_error),
+                    self.assertRaises(AssertionError if forced else OSError),
+                ):
+                    directory = pathlib.Path(temp) / "compact"
+                    try:
+                        BENCH.run_preparation_command(
+                            args, ["/owned/sparkles", "compact"], directory
+                        )
+                    finally:
+                        receipt = json.loads((directory / "cleanup.json").read_text())
+                        self.assertEqual(receipt["forced"], forced)
+                        self.assertTrue(receipt["inactive"])
+                        self.assertTrue((directory / "resources.json").exists())
+                        if forced:
+                            self.assertTrue(
+                                any(
+                                    "--kill-whom=all" in command for command in controls
+                                )
+                            )
+
     def test_reopened_spatial_index_is_ready_before_its_plan_is_used(self):
         with (
             tempfile.TemporaryDirectory(prefix="sparkles-ready-") as temp,

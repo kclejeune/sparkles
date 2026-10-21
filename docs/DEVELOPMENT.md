@@ -441,6 +441,15 @@ checked live and after a cold reopen.
 The full protocol uses both dataset sizes and five ABBA blocks. A smaller pilot only
 checks the harness and estimates runtime.
 
+Embedding seeds first finish their provider work, then close cleanly for a full offline
+compaction and vector rebuild. A cold validation with embedding disabled checks the exact
+source and derived counts, a complete persisted graph and an empty overlay. The same
+baseline checks run before each timed process. Provider-idle status alone does not prove
+that graph construction has finished. Offline maintenance uses owned services with the
+same memory and CPU limits as the server, finite deadlines and saved cleanup receipts.
+New timed writes still run the normal embedding and graph workers, and provider work must
+occur inside the writer interval.
+
 For memory measurements, the harness saves the server's startup peak, resets its owned
 process's Linux high-water mark before client startup and reads it after the client exits,
 including raw-output finalization. This gives a conservative outer-window bound. It also

@@ -289,7 +289,8 @@ def verify_index_publication(port, probe, directory):
 
 def indexed_ready(args, index, directory):
     if index == "embed":
-        return caught_up(args)
+        caught_up(args)
+        return canonical_embedding_ready(args, directory, embedding_count(args.port))
     if index == "geo":
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
@@ -912,6 +913,199 @@ def caught_up(args):
     raise TimeoutError("embedding worker catch-up")
 
 
+def canonical_embedding_ready(args, directory, expected, *, embedding=True):
+    """Require a persisted, complete seed graph, not merely an idle provider."""
+    assert expected > 0
+    deadline = time.monotonic() + 600
+    observations = []
+    while time.monotonic() < deadline:
+        status = get_json(args.port, "/$/vector/bench/docs")
+        observations.append({"time_unix": time.time(), "status": status})
+        save(directory / "canonical-embedding-readiness.json", observations)
+        overlay = status["overlay"]
+        assert all(
+            overlay[key] == 0 for key in ("inserts", "deletes", "indexed", "pending")
+        ), "seed overlay must be empty"
+        assert not overlay["overBudget"], "seed graph exceeded its budget"
+        assert all(
+            status["skipped"][key] == 0
+            for key in ("malformed", "wrongDimension", "zeroNorm")
+        ), "seed vectors were skipped"
+        assert status["state"] in ("building", "ready"), status
+        if status["state"] == "ready":
+            assert status["rows"] == expected, "seed vector base count"
+            assert status["hnsw"]["nodes"] == expected, "seed graph count"
+            provider = status["embedding"]
+            assert provider["state"] == ("idle" if embedding else "disabled"), status
+            if embedding:
+                assert provider["appliedSeq"] == provider["headSeq"], status
+                assert provider["backlog"] == 0, status
+            return status
+        time.sleep(0.2)
+    raise TimeoutError("canonical embedding seed graph readiness")
+
+
+def run_preparation_command(args, command, directory, timeout=600):
+    """Bound offline seed maintenance with the same owned host resource limits."""
+    directory.mkdir()
+    unit = "sparkles-item86-" + uuid.uuid4().hex
+    scoped = [
+        "systemd-run",
+        "--user",
+        "--quiet",
+        "--wait",
+        "--pipe",
+        "--service-type=exec",
+        "--collect",
+        f"--unit={unit}",
+        "-p",
+        "MemoryMax=12G",
+        "-p",
+        "MemorySwapMax=0",
+        "-p",
+        "TimeoutStopSec=30s",
+        "-p",
+        f"RuntimeMaxSec={timeout}s",
+        "taskset",
+        "-c",
+        args.server_cpus,
+        *command,
+    ]
+    save(directory / "command.json", {"unit": unit, "command": scoped})
+    started = time.monotonic()
+    samples = []
+    forced = False
+    with (directory / "command.log").open("wb") as out:
+        process = subprocess.Popen(scoped, stdout=out, stderr=subprocess.STDOUT)
+        try:
+            while process.poll() is None:
+                properties = subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "show",
+                        unit,
+                        "-p",
+                        "MemoryPeak",
+                        "-p",
+                        "MemoryMax",
+                        "-p",
+                        "MemorySwapMax",
+                        "-p",
+                        "MainPID",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                fields = dict(
+                    line.split("=", 1)
+                    for line in properties.stdout.splitlines()
+                    if "=" in line
+                )
+                if fields.get("MemoryMax", "").isdigit():
+                    assert int(fields["MemoryMax"]) == 12 * 1024**3
+                    assert fields["MemorySwapMax"] == "0"
+                    samples.append(
+                        {"elapsed_seconds": time.monotonic() - started, **fields}
+                    )
+                    if (
+                        fields.get("MainPID", "").isdigit()
+                        and int(fields["MainPID"]) > 0
+                    ):
+                        try:
+                            pid = int(fields["MainPID"])
+                            # Do not inspect taskset before it applies affinity and execs.
+                            if os.readlink(f"/proc/{pid}/exe") == os.path.realpath(
+                                command[0]
+                            ):
+                                assert set(os.sched_getaffinity(pid)) == cpu_set(
+                                    args.server_cpus
+                                )
+                        except (FileNotFoundError, ProcessLookupError):
+                            pass  # A short preparation command may exit between reads.
+                if time.monotonic() - started > timeout + 15:
+                    raise TimeoutError("offline seed preparation command")
+                time.sleep(0.1)
+            assert process.returncode == 0, "offline seed preparation command failed"
+        finally:
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "stop", unit],
+                    capture_output=True,
+                    check=False,
+                    timeout=40,
+                )
+                # A successfully collected unit may already be absent.
+                active = subprocess.run(
+                    ["systemctl", "--user", "is-active", unit],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                assert active.returncode in (3, 4), (
+                    "offline preparation service remains active"
+                )
+            except (subprocess.TimeoutExpired, AssertionError):
+                forced = True
+                subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "kill",
+                        "--kill-whom=all",
+                        "--signal=KILL",
+                        unit,
+                    ],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            finally:
+                try:
+                    stop_owned(process)
+                finally:
+                    inactive = False
+                    try:
+                        final = subprocess.run(
+                            ["systemctl", "--user", "is-active", unit],
+                            capture_output=True,
+                            check=False,
+                            timeout=10,
+                        )
+                        inactive = final.returncode in (3, 4)
+                    finally:
+                        save(
+                            directory / "cleanup.json",
+                            {
+                                "unit": unit,
+                                "forced": forced,
+                                "returncode": process.returncode,
+                                "inactive": inactive,
+                            },
+                        )
+                        save(
+                            directory / "resources.json",
+                            {
+                                "elapsed_seconds": time.monotonic() - started,
+                                "samples": samples,
+                                "observed_peak_bytes": max(
+                                    (
+                                        int(s["MemoryPeak"])
+                                        for s in samples
+                                        if s.get("MemoryPeak", "").isdigit()
+                                    ),
+                                    default=None,
+                                ),
+                                "scope": "periodic systemd accounting observations during offline preparation; not an exact final process peak",
+                            },
+                        )
+    assert not forced and inactive, (
+        "offline preparation required forced or incomplete cleanup"
+    )
+
+
 def run_command(command, path):
     with path.open("wb") as out:
         subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, check=True)
@@ -1030,11 +1224,18 @@ def prepare(args, root, index, people):
     bootstrap.mkdir()
     server = Server(args, seed, bootstrap, True)
     try:
-        ready = indexed_ready(args, index, bootstrap)
+        # This first bootstrap deliberately creates all derived seed vectors. Its
+        # live graph/overlay is canonicalized offline after the clean stop.
+        ready = (
+            caught_up(args)
+            if index == "embed"
+            else indexed_ready(args, index, bootstrap)
+        )
         assert source_count(args.port) == triples
         if index == "embed":
             save(bootstrap / "embedding.json", ready)
-            assert embedding_count(args.port) == query(
+            derived = embedding_count(args.port)
+            assert derived == query(
                 args.port, f"SELECT (COUNT(*) AS ?n) WHERE {{?s <{FOAF_NAME}> ?o}}"
             )
         else:
@@ -1044,6 +1245,26 @@ def prepare(args, root, index, people):
             shutil.copyfile(bootstrap / "reader-plan.json", root / "reader-plan.json")
     finally:
         server.close()
+    if index == "embed":
+        run_preparation_command(
+            args,
+            [args.binary, "compact", "--loc", str(seed), "--partial", "off"],
+            root / "compact-seed",
+        )
+        run_preparation_command(
+            args,
+            [args.binary, "vector", "rebuild", "--loc", str(seed), "--name", "docs"],
+            root / "rebuild-seed",
+        )
+        validation = root / "canonical-seed"
+        validation.mkdir()
+        server = Server(args, seed, validation, True, embedding=False)
+        try:
+            assert source_count(args.port) == triples
+            assert embedding_count(args.port) == derived
+            canonical_embedding_ready(args, validation, derived, embedding=False)
+        finally:
+            server.close()
     save(
         root / "data.json",
         {
