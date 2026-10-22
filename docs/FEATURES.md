@@ -273,7 +273,9 @@ that work by priority and links each item to its design spec.
   run eagerly, and each operator then materializes its result within budgets. Automatic
   execution, the default over HTTP, in the CLI, in Node and in the JVM library, streams
   plain scans of a thousand rows or more and groupings of an estimated 20,000 input rows
-  or more. Other plans stream only when the caller asks for
+  or more. A bounded pure ASK with an equality-filtered Cartesian product also streams
+  when its estimated candidate table exceeds an existing row or memory budget. It stops
+  at the first qualifying pair and keeps the actual work limits. Other plans stream only when the caller asks for
   `execution=streaming` ([X05](specs/X05-streaming-query-execution.md)). Streaming runs scans,
   joins, DISTINCT and eligible aggregates batch by batch. ORDER BY with LIMIT reads its
   input batch by batch into a heap of the rows it returns. Sorts without LIMIT and

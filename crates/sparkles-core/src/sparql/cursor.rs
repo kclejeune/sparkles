@@ -736,10 +736,39 @@ pub fn ask_streaming(
 
 fn finish_ask(mut cursor: QueryCursor) -> Result<QueryResult> {
     let boolean = cursor.next_batch()?.is_some_and(|batch| !batch.is_empty());
+    Ok(finish_ask_result(cursor, boolean))
+}
+
+fn finish_ask_with_plan(
+    mut cursor: QueryCursor,
+) -> std::result::Result<QueryResult, Box<super::Failed>> {
+    let boolean = match cursor.next_batch() {
+        Ok(batch) => batch.is_some_and(|batch| !batch.is_empty()),
+        Err(error) => {
+            fn incomplete(plan: &mut CursorPlan) {
+                if !plan.complete && plan.operator.fidelity().skipped.is_none() {
+                    plan.operator.fidelity_mut().incomplete = true;
+                }
+                plan.children.iter_mut().for_each(incomplete);
+            }
+            let plan = depth::with_stack(cursor.depth, || {
+                incomplete(&mut cursor.plan);
+                cursor.plan_info()
+            });
+            return Err(Box::new(super::Failed {
+                error,
+                plan: Some(plan),
+            }));
+        }
+    };
+    Ok(finish_ask_result(cursor, boolean))
+}
+
+fn finish_ask_result(mut cursor: QueryCursor, boolean: bool) -> QueryResult {
     cursor.close();
     let stats = cursor.stats();
     let plan = depth::with_stack(cursor.depth, || cursor.plan_info());
-    Ok(QueryResult {
+    QueryResult {
         kind: QueryKind::Ask,
         vars: Vec::new(),
         table: Table::default(),
@@ -752,7 +781,7 @@ fn finish_ask(mut cursor: QueryCursor) -> Result<QueryResult> {
         rows_produced: stats.rows_produced,
         describe_truncated: false,
         ctx: cursor.ctx.clone(),
-    })
+    }
 }
 
 /// A collected result with depth-protected metadata and destruction.
@@ -841,6 +870,9 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
+    if kind == QueryKind::Ask {
+        return filtered_ask_admitted(ctx, node);
+    }
     // A plan expected to pass the row budgets stays eager, so that it fails before the
     // first byte of output with an error status rather than partway through a stream.
     if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
@@ -875,6 +907,134 @@ pub(super) fn auto_streaming(
         && options.batch_bytes >= 4096 * 32
         && headroom < u64::MAX
         && ctx.memory_remaining() >= headroom
+}
+
+/// An ASK with a pure equality filter can stop at its first matching pair instead
+/// of materializing an over-budget Cartesian candidate table. Keep the ordinary
+/// path for cheap queries and restrict this policy to the measured native shape.
+fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
+    use super::plan::JoinAlgo;
+
+    if !ctx.snap.delta.is_empty() || ctx.calls_extensions {
+        return false;
+    }
+    let Kind::Slice {
+        offset: 0,
+        limit: Some(1),
+    } = node.kind
+    else {
+        return false;
+    };
+    let Some(mut filtered) = node.children.first() else {
+        return false;
+    };
+    // The planner may project the ASK pattern's in-scope variables. Bound this
+    // transparent wrapper walk before doing any expression or subtree inspection.
+    for _ in 0..8 {
+        if !matches!(filtered.kind, Kind::Project(_)) || filtered.children.len() != 1 {
+            break;
+        }
+        filtered = &filtered.children[0];
+    }
+    let Kind::Filter(expressions) = &filtered.kind else {
+        return false;
+    };
+    let [Expr::Eq(left, right)] = expressions.as_slice() else {
+        return false;
+    };
+    let (Expr::Var(left), Expr::Var(right)) = (&**left, &**right) else {
+        return false;
+    };
+    let [product] = filtered.children.as_slice() else {
+        return false;
+    };
+    let Kind::Join {
+        algo: JoinAlgo::Cross,
+        ..
+    } = product.kind
+    else {
+        return false;
+    };
+    let [a, b] = product.children.as_slice() else {
+        return false;
+    };
+    if !((a.certain.contains(left) && b.certain.contains(right))
+        || (a.certain.contains(right) && b.certain.contains(left)))
+    {
+        return false;
+    }
+    if !a.est.is_finite() || !b.est.is_finite() || a.est < 0.0 || b.est < 0.0 {
+        return false;
+    }
+    let rows = product.est;
+    let bytes = rows * (product.vars.len().max(1) * 8) as f64;
+    if !rows.is_finite()
+        || rows <= 0.0
+        || !bytes.is_finite()
+        || (rows <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64)
+    {
+        return false;
+    }
+    // Only exact scan counts prove that run_limited's first 64-row prefix is
+    // cheap. Repeated-variable and graph/dedup estimates can undercount its work.
+    fn exact_scan(ctx: &Ctx, node: &Node) -> bool {
+        let Kind::Scan(scan) = &node.kind else {
+            return false;
+        };
+        scan.eqs.is_empty()
+            && !scan.dedup
+            && (matches!(scan.graph, super::plan::GraphFilter::All)
+                || scan
+                    .prefix
+                    .get(scan.graph_col)
+                    .is_some_and(|g| scan.graph.accepts(*g))
+                || (ctx.snap.generation.stats.graphs.len() == 1
+                    && scan.graph.accepts(ctx.snap.generation.stats.graphs[0].0)))
+    }
+    if exact_scan(ctx, a) && exact_scan(ctx, b) {
+        let (small, large) = if a.est <= b.est { (a, b) } else { (b, a) };
+        let prefix = large.est.min(64.0);
+        let candidates = small.est * prefix;
+        let held =
+            small.est * (small.vars.len() * 8) as f64 + prefix * (large.vars.len() * 8) as f64;
+        let bytes = candidates * ((product.vars.len() + 1) * 8) as f64 + held;
+        if candidates <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64 {
+            return false;
+        }
+    }
+    // No effects, expressions or eager fallbacks are hidden below the equality.
+    // The count also bounds recursion and work on large rejected plans.
+    fn plain(node: &Node, remaining: &mut usize) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        let shape = match &node.kind {
+            Kind::Scan(_) | Kind::Values(_) | Kind::Empty => node.children.is_empty(),
+            Kind::Join { .. } => node.children.len() == 2,
+            Kind::Project(_) | Kind::Sort(_) => node.children.len() == 1,
+            _ => false,
+        };
+        shape && node.children.iter().all(|child| plain(child, remaining))
+    }
+    plain(product, &mut 64) && native(product)
+}
+
+/// Only an admitted pure ASK product is oriented: build the same smaller input
+/// that eager limited execution collects, while streaming the larger one. Other
+/// cursor and eager plans retain their original children and variable order.
+fn orient_filtered_ask(node: &mut Node) {
+    let mut filtered = &mut node.children[0];
+    for _ in 0..8 {
+        if !matches!(filtered.kind, Kind::Project(_)) {
+            break;
+        }
+        filtered = &mut filtered.children[0];
+    }
+    let product = &mut filtered.children[0];
+    if product.children[0].est < product.children[1].est {
+        product.children.swap(0, 1);
+    }
 }
 
 /// The estimated input rows from which automatic execution streams a grouping. The
@@ -1115,7 +1275,7 @@ pub fn query_execution_with_plan(
                 return Err(Error::invalid("cursor batch rows and bytes must be positive").into());
             }
             let planning = Instant::now();
-            let prepared =
+            let mut prepared =
                 super::prepare_query(snapshot, &parsed, options, Some(started), Some(cursor))?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let kind = prepared.kind;
@@ -1130,11 +1290,23 @@ pub fn query_execution_with_plan(
                 && retryable(&prepared.node)
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.is_cursor() {
+                if kind == QueryKind::Ask {
+                    orient_filtered_ask(&mut prepared.node);
+                }
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
                     kind,
                 )?;
-                Ok(QueryExecution::Select(Box::new(cursor)))
+                if kind == QueryKind::Ask {
+                    let depth = cursor.depth;
+                    let result = finish_ask_with_plan(cursor)?;
+                    Ok(QueryExecution::Ask(Box::new(AskResult {
+                        result: Some(result),
+                        depth,
+                    })))
+                } else {
+                    Ok(QueryExecution::Select(Box::new(cursor)))
+                }
             } else {
                 let ran = depth::with_stack(levels, || {
                     super::execute_prepared(&parsed, options, parse_ms, plan_ms, prepared)
@@ -2609,32 +2781,43 @@ impl Operator {
             .min((options.batch_bytes / row_bytes).max(1));
         // Leave headroom for layouts and unary scratch; allocation itself still checks.
         let cap = cap.min(ctx.rows_within_budget(self.vars.len()).max(1));
-        let result = self.next_inner(ctx, options, cap);
-        self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
-        let mut batch = result?;
-        if let Some(b) = &mut batch {
-            b.set_order(&self.order)?;
-            #[cfg(debug_assertions)]
-            self.check_order(ctx, &b.table);
-            self.rows = self
-                .rows
-                .checked_add(b.table.len)
-                .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-            ctx.check_rows(self.rows)?;
-            // Eager kernels already counted all their operator work during execution.
-            if !matches!(
-                self.state,
-                State::Fallback { .. } | State::Scalar(_) | State::Counts { .. } | State::Expand(_)
-            ) {
-                ctx.produced(b.table.len)?;
+        let result = (|| {
+            let result = self.next_inner(ctx, options, cap);
+            self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
+            let mut batch = result?;
+            if let Some(b) = &mut batch {
+                b.set_order(&self.order)?;
+                #[cfg(debug_assertions)]
+                self.check_order(ctx, &b.table);
+                self.rows = self
+                    .rows
+                    .checked_add(b.table.len)
+                    .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
+                ctx.check_rows(self.rows)?;
+                // Eager kernels already counted all their operator work during execution.
+                if !matches!(
+                    self.state,
+                    State::Fallback { .. }
+                        | State::Scalar(_)
+                        | State::Counts { .. }
+                        | State::Expand(_)
+                ) {
+                    ctx.produced(b.table.len)?;
+                }
+                // a fallback counts the rows it emitted; `materializedRows` holds its table
+                self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
+            } else {
+                self.done = true;
             }
-            // a fallback counts the rows it emitted; `materializedRows` holds its table
-            self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
-        } else {
-            self.done = true;
+            ctx.check()?;
+            Ok(batch)
+        })();
+        // Input exhaustion alone is not successful completion. A failed output
+        // charge or final request check leaves this operator incomplete.
+        if result.is_err() {
+            self.done = false;
         }
-        ctx.check()?;
-        Ok(batch)
+        result
     }
 
     fn next_inner(
@@ -3835,6 +4018,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn filtered_ask_admission_keeps_small_effectful_and_mutable_plans_ordinary() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..64 {
+            data.push_str(&format!("<urn:left:{i}> <urn:left> {i} .\n"));
+            data.push_str(&format!("<urn:right:{i}> <urn:right> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let text = "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y)}";
+        let prepare = |text: &str, max_rows| {
+            let query = super::super::parse_query(text, None, &[]).unwrap();
+            let options = QueryOptions {
+                max_rows: Some(max_rows),
+                no_cache: true,
+                ..Default::default()
+            };
+            super::super::prepare_query(store.snapshot(), &query, &options, None, None).unwrap()
+        };
+        let p = prepare(text, 1024);
+        assert!(filtered_ask_admitted(&p.ctx, &p.node));
+        let small = prepare(text, 8192);
+        assert!(!filtered_ask_admitted(&small.ctx, &small.node));
+        for text in [
+            "ASK {?a <urn:left> ?x}",
+            "SELECT * {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y)}",
+            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y && RAND() < 1)}",
+            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = UUID())}",
+            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?a)}",
+            "ASK {?a <urn:left> ?x OPTIONAL {?b <urn:right> ?y} FILTER(?x = ?y)}",
+            "ASK {VALUES ?x {UNDEF 1} VALUES ?y {UNDEF 1} FILTER(?x = ?y)}",
+        ] {
+            let p = prepare(text, 1);
+            assert!(!filtered_ask_admitted(&p.ctx, &p.node), "{text}");
+        }
+        let mut effects = prepare(text, 1024);
+        Arc::get_mut(&mut effects.ctx).unwrap().calls_extensions = true;
+        assert!(!filtered_ask_admitted(&effects.ctx, &effects.node));
+        // A retained immutable context stays eligible; a new delta keeps the
+        // conservative ordinary policy until it has an immutable generation.
+        super::super::update::update(
+            &store,
+            "INSERT DATA {<urn:new> <urn:left> 0}",
+            &Default::default(),
+        )
+        .unwrap();
+        let changed = prepare(text, 1024);
+        assert!(!filtered_ask_admitted(&changed.ctx, &changed.node));
+        assert!(filtered_ask_admitted(&p.ctx, &p.node));
     }
 
     #[test]

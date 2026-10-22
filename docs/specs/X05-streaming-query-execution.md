@@ -1518,3 +1518,21 @@ levels, and the limit could rise to what the text allows. That changes the plann
 executors and the plan format, so it stays on the roadmap. Growing the stack at the
 recursion points of the planner and the executor, or an iterative clone and drop of plan
 nodes, would also make the stack independent of the count of the walk.
+
+### Bounded filtered ASK admission (2026-10-22)
+
+Automatic execution also admits an immutable native ASK whose single variable
+equality FILTER sits over an independent Cartesian product when the ordinary
+candidate estimate exceeds its existing row or memory budget. The bounded shape
+check preserves the original FILTER and value comparison, excludes effects and
+unsupported inputs, and keeps cheap ASK on its ordinary path. It consumes the
+already prepared cursor through the explicit ASK completion path. A qualifying
+binding stops its input, while a false ASK still consumes and charges the work it
+needs to prove that no binding qualifies. This does not change SELECT admission
+or raise a query budget. A direct-scan product whose exact scan counts prove that
+the existing eager prefix fits stays ordinary. Discounted graph and repeated-variable
+estimates cannot provide that proof. An admitted product builds the smaller estimated input, matching
+the eager prefix path's full-input choice. Runtime failures retain their partial
+plan and mark unfinished nodes incomplete, including an exhausted input whose final
+output accounting fails. Roadmap item 91 tracks the SP²Bench
+follow-up.

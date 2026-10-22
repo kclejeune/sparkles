@@ -956,3 +956,33 @@ expression in both join orientations. Test-only observations verify that cheap
 shared-anchor self-joins and rejected high-read anchors do not enter eligibility
 validation or alternative planning. Native timing diagnostics distinguish planning and total server time
 from execution time, which excludes the optimizer's work.
+
+### SP²Bench ASK candidate follow-up (2026-10-22)
+
+The default-budget failure of `q12a` comes from an equality FILTER above a
+Cartesian product. Eager ASK evaluates growing prefixes, but each prefix still
+reserves its candidate pairs before applying that filter. The cursor can stop at
+the first qualifying pair without reserving the whole candidate table.
+
+Automatic execution now selects that existing ASK cursor for a bounded native
+shape when the ordinary candidate estimate exceeds the query's row or memory
+budget. The shape is a single variable equality over an independent product,
+under ASK's limit and transparent projection. Both compared variables must be
+certainly bound by their respective inputs. A bounded inspection admits only
+plain scans, values, projections, sorts and joins over an immutable snapshot.
+Extension calls, effects, other expressions and unsupported inputs keep the
+ordinary path. Direct scans whose exact counts prove that the existing eager
+prefix fits their budgets stay ordinary. Graph and repeated-variable discounts
+cannot establish that bound.
+An admitted product builds the smaller estimated input, as eager limited
+execution does. The prepared plan is reused, and the boolean, timing,
+cancellation and ownership behavior follows the explicit ASK cursor. Runtime
+failures keep their partial execution plan and mark unfinished nodes incomplete,
+including scans whose output accounting fails after input exhaustion.
+
+Regression cases preserve numeric, date and language value equality without
+renaming variables. They distinguish a first qualifying solution from a false ASK
+that genuinely consumes more candidate rows than its budget. Memory and produced
+row limits remain enforced. Small ordinary ASK and SELECT policies are unchanged.
+The historical Forge tables remain unchanged. Reference acceptance at 10M and the
+remaining `q4`, `q5a` and `q6` failures are still open.
