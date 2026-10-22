@@ -979,6 +979,9 @@ execution does. The prepared plan is reused, and the boolean, timing,
 cancellation and ownership behavior follows the explicit ASK cursor. Runtime
 failures keep their partial execution plan and mark unfinished nodes incomplete,
 including scans whose output accounting fails after input exhaustion.
+Repeated HTTP ASK requests retain automatic admission even after their completed
+body is remembered as quick. In-place scheduling does not establish that eager
+candidate storage fits the next request's budget.
 
 Regression cases preserve numeric, date and language value equality without
 renaming variables. They distinguish a first qualifying solution from a false ASK

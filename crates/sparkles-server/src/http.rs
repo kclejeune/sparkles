@@ -1403,10 +1403,12 @@ pub(crate) async fn run_query(
     // The first run of a query decides from its parsed algebra whether it has a SERVICE
     // of the algorithm namespace, so a prefixed name counts like the full IRI, and a
     // query that does is never remembered as quick and so never runs in place.
-    let in_place = at.is_none() && inline::available() && QUICK.is_quick(quick_key);
-    // A query known to be quick ran eagerly in well under the time a stream pays off,
-    // so it skips the automatic decision and keeps running in place.
-    let auto = auto && !in_place;
+    let quick = QUICK.execution(quick_key);
+    let in_place = at.is_none() && inline::available() && quick.is_some();
+    // SELECT and graph queries retain their quick eager shortcut. ASK can be quick
+    // because its native execution avoids eager candidate storage, so it must keep
+    // automatic admission even when scheduled in place.
+    let auto = auto && (!in_place || quick == Some(inline::QuickExecution::PreserveAuto));
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
@@ -1495,6 +1497,7 @@ pub(crate) async fn run_query(
     let algorithmic = r.ctx.calls_algorithm();
     let query_ms = r.timing.total_ms;
     let cells = r.len().saturating_mul(r.vars.len().max(3));
+    let is_ask = r.kind == QueryKind::Ask;
     let is_graph = !matches!(r.kind, QueryKind::Select | QueryKind::Ask);
     let truncated = r.describe_truncated;
     let sparkles_doc =
@@ -1589,14 +1592,16 @@ pub(crate) async fn run_query(
     };
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
-            QUICK.record(
-                quick_key,
-                if algorithmic {
-                    f64::INFINITY
-                } else {
-                    query_ms + serialize_ms
-                },
-            );
+            let ms = if algorithmic {
+                f64::INFINITY
+            } else {
+                query_ms + serialize_ms
+            };
+            if is_ask {
+                QUICK.record_ask(quick_key, ms);
+            } else {
+                QUICK.record(quick_key, ms);
+            }
             let report = RequestReport {
                 response_bytes: Some(body.len() as u64),
                 serialize_ms: Some(serialize_ms),
