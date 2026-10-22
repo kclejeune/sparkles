@@ -415,6 +415,15 @@ fn stats(mut v: Vec<f64>) -> String {
     )
 }
 
+fn throughput_json(timed: usize, elapsed: f64) -> String {
+    let rate = if elapsed > 0.0 {
+        timed as f64 / elapsed
+    } else {
+        0.0
+    };
+    format!("{rate:.9}")
+}
+
 fn unix_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -767,7 +776,7 @@ fn main() {
         }
     }
     println!(
-        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{},\"write_start_unix\":{:.9},\"write_end_unix\":{:.9},\"max_schedule_lag_ms\":{:.6}}}",
+        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.9},\"tps\":{},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{},\"write_start_unix\":{:.9},\"write_end_unix\":{:.9},\"max_schedule_lag_ms\":{:.6}}}",
         a.scenario,
         op,
         clients,
@@ -776,11 +785,7 @@ fn main() {
         errors,
         missing_receipts,
         elapsed,
-        if elapsed > 0.0 {
-            timed as f64 / elapsed
-        } else {
-            0.0
-        },
+        throughput_json(timed, elapsed),
         stats(lat),
         contiguous,
         distinct,
@@ -848,6 +853,30 @@ mod tests {
                 "rounding rejected a true 4.999% difference: {ratio}"
             );
         }
+    }
+
+    #[test]
+    fn throughput_preserves_load_gate_rejections() {
+        let rate: f64 = throughput_json(50000, 50000.0 / 495.551).parse().unwrap();
+        assert!(
+            rate / 521.68 < 0.95,
+            "rounding accepted an insufficient rate: {rate}"
+        );
+    }
+
+    #[test]
+    fn throughput_preserves_load_gate_acceptance() {
+        let rate: f64 = throughput_json(50000, 50000.0 / 547.75).parse().unwrap();
+        assert!(
+            rate / 521.68 <= 1.05,
+            "rounding rejected a valid rate: {rate}"
+        );
+    }
+
+    #[test]
+    fn throughput_zero_duration_is_zero() {
+        let rate: f64 = throughput_json(50000, 0.0).parse().unwrap();
+        assert_eq!(rate, 0.0);
     }
 
     #[test]

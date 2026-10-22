@@ -1137,6 +1137,15 @@ class ClientStatistics(unittest.TestCase):
     def test_serial_gate_acceptance_survives_json_serialization(self):
         self.run_statistic_test("statistics_preserve_serial_gate_acceptance")
 
+    def test_load_gate_rejections_survive_json_serialization(self):
+        self.run_statistic_test("throughput_preserves_load_gate_rejections")
+
+    def test_load_gate_acceptance_survives_json_serialization(self):
+        self.run_statistic_test("throughput_preserves_load_gate_acceptance")
+
+    def test_zero_duration_serialization(self):
+        self.run_statistic_test("throughput_zero_duration_is_zero")
+
     def run_statistic_test(self, name):
         result = subprocess.run(
             [str(self.binary), "--exact", f"tests::{name}"],

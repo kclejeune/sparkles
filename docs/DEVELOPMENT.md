@@ -508,10 +508,10 @@ status. Transport and connection-readiness failures use status zero. The client 
 resends a request after losing its response. Rows are buffered and written when the client
 finishes, outside the writer interval. The indexed harness saves these diagnostics for
 each process while keeping the original latency samples separate.
-Latency summaries preserve the raw samples' nine decimal places in milliseconds, so
-rounding does not change decisions near a performance gate. Writer latency measures
-the client's HTTP request and response interval. It does not isolate engine execution
-or storage synchronization time.
+Latency summaries preserve the raw samples' nine decimal places in milliseconds.
+Elapsed seconds and throughput also retain nine decimal places for performance gate
+comparisons. Writer latency measures the client's HTTP request and response interval.
+It does not isolate engine execution or storage synchronization time.
 A violation remains a failed gate even when the reader latency ratio passes. The harness
 retains its raw samples and completes the data and cold-recovery checks before moving
 to the next process.
