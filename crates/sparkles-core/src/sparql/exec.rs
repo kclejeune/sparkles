@@ -538,7 +538,7 @@ fn execute_owned_inner(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Material
 }
 
 fn execute_uncached(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Materialized, PlanInfo)> {
-    execute_node(ctx, n, None, algorithm)
+    execute_node(ctx, n, None, algorithm, None)
 }
 
 /// The inputs of an operator, from a caller that produces each child's table itself.
@@ -564,7 +564,7 @@ pub(super) fn execute_with_inputs(
     inputs: Inputs<'_>,
 ) -> Result<(Materialized, PlanInfo)> {
     debug_assert!(reads_inputs(n));
-    execute_node(ctx, n, Some(inputs), contains_algorithm(n))
+    execute_node(ctx, n, Some(inputs), contains_algorithm(n), None)
 }
 
 fn execute_node(
@@ -572,6 +572,7 @@ fn execute_node(
     n: &Node,
     inputs: Option<Inputs<'_>>,
     algorithm: bool,
+    equality: Option<(VarId, VarId)>,
 ) -> Result<(Materialized, PlanInfo)> {
     let start = Instant::now();
     let mut failing = Failing {
@@ -591,6 +592,7 @@ fn execute_node(
         &mut failing.infos,
         &mut failing.armed,
         algorithm,
+        equality,
     )
 }
 
@@ -656,6 +658,7 @@ fn fail_at(ctx: &Ctx, n: &Node, start: Instant, mut known: Vec<(usize, PlanInfo)
 
 // One caller: inlined so that the success path returns its table and plan directly.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn run_node(
     ctx: &Ctx,
     n: &Node,
@@ -664,13 +667,21 @@ fn run_node(
     infos: &mut Vec<PlanInfo>,
     failing: &mut bool,
     algorithm: bool,
+    equality: Option<(VarId, VarId)>,
 ) -> Result<(Materialized, PlanInfo)> {
     // the children's tables count against the memory budget until this operator is done
     let held = ctx.charge(0)?;
     let owned_input = std::cell::Cell::new(false);
+    let filtered_cross = inputs.is_none().then(|| string_cross_hint(n)).flatten();
     let mut child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
         let (mut t, info) = match inputs.as_mut() {
             Some(inputs) => inputs(i)?,
+            // A filtered subset is not the unfiltered child's result. In particular,
+            // never look it up or store it under the ordinary Cross cache key. The
+            // logical parent Filter and both complete inputs still cache normally.
+            None if i == 0 && filtered_cross.is_some() => {
+                execute_node(ctx, &n.children[i], None, algorithm, filtered_cross)?
+            }
             None => execute_owned_inner(
                 ctx,
                 &n.children[i],
@@ -787,7 +798,18 @@ fn run_node(
                     None => child(1, infos)?,
                 };
                 match algo {
-                    JoinAlgo::Cross => cross(ctx, &l, &r)?,
+                    JoinAlgo::Cross => match equality {
+                        Some(keys) => match string_cross(ctx, n, &l, &r, keys)? {
+                            Some(t) => {
+                                note = Some(
+                                    "[string equality candidates; residual FILTER retained]".into(),
+                                );
+                                t
+                            }
+                            None => cross(ctx, &l, &r)?,
+                        },
+                        None => cross(ctx, &l, &r)?,
+                    },
                     JoinAlgo::Merge => join_noted(ctx, &l, &r, true, &mut note)?,
                     JoinAlgo::Hash => join_noted(ctx, &l, &r, false, &mut note)?,
                 }
@@ -4105,6 +4127,143 @@ fn kept_order_iter<'a>(
             !shared || !has_undef(t, c)
         })
         .copied()
+}
+
+/// A single variable value-equality over two independent, certainly-bound inputs.
+/// This is an execution hint, not an RDF-term join or an algebra rewrite. The
+/// original FILTER is evaluated after candidate generation in every case.
+fn string_cross_hint(n: &Node) -> Option<(VarId, VarId)> {
+    let Kind::Filter(es) = &n.kind else {
+        return None;
+    };
+    let [Expr::Eq(a, b)] = es.as_slice() else {
+        return None;
+    };
+    let (Expr::Var(a), Expr::Var(b)) = (&**a, &**b) else {
+        return None;
+    };
+    let [cross] = n.children.as_slice() else {
+        return None;
+    };
+    if !matches!(
+        cross.kind,
+        Kind::Join {
+            algo: JoinAlgo::Cross,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let [l, r] = cross.children.as_slice() else {
+        return None;
+    };
+    if l.certain.contains(a) && !r.vars.contains(a) && r.certain.contains(b) && !l.vars.contains(b)
+    {
+        Some((*a, *b))
+    } else if l.certain.contains(b)
+        && !r.vars.contains(b)
+        && r.certain.contains(a)
+        && !l.vars.contains(a)
+    {
+        Some((*b, *a))
+    } else {
+        None
+    }
+}
+
+/// Keep the first admission deliberately narrow: no expression-bearing inputs,
+/// OPTIONAL, SERVICE or extension operators. Walk iteratively, and only after an
+/// actually oversized product has made candidate pruning worth considering.
+fn plain_cross_input(n: &Node) -> bool {
+    let mut todo = vec![n];
+    while let Some(n) = todo.pop() {
+        if !matches!(
+            n.kind,
+            Kind::Scan(_) | Kind::Values(_) | Kind::Project(_) | Kind::Sort(_) | Kind::Join { .. }
+        ) {
+            return false;
+        }
+        todo.extend(&n.children);
+    }
+    true
+}
+
+/// Generate only string-equal pairs when the complete product would exceed an
+/// existing row or memory limit. Numeric promotion is not an equivalence relation
+/// suitable for this index, and language/error/unbound cases keep the generic
+/// evaluator. Declining never reruns the inputs or partially emits their result.
+fn string_cross(
+    ctx: &Ctx,
+    n: &Node,
+    l: &Table,
+    r: &Table,
+    (lv, rv): (VarId, VarId),
+) -> Result<Option<Table>> {
+    let product = l.len().saturating_mul(r.len());
+    if product <= ctx.max_rows
+        && (product as u64) <= ctx.max_rows_produced.saturating_sub(ctx.rows_produced())
+        && product <= ctx.rows_within_budget(n.vars.len() + 1)
+    {
+        return Ok(None);
+    }
+    if !n.children.iter().all(plain_cross_input) {
+        return Ok(None);
+    }
+    let lay = layout(l, r);
+    if !lay.shared.is_empty() {
+        return Ok(None);
+    }
+    let (Some(lc), Some(rc)) = (l.col_of(lv), r.col_of(rv)) else {
+        return Ok(None);
+    };
+    // Prove the entire domain before allocating an index or pruning any pair.
+    // Value::Str covers simple literals and xsd:string; compare lexical values,
+    // not term ids, and keep the original ids in the output.
+    for col in [&l.cols[lc], &r.cols[rc]] {
+        for (i, &id) in col.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            if !matches!(ctx.value(id), Some(Value::Str(_))) {
+                return Ok(None);
+            }
+        }
+    }
+    type Entry = (std::sync::Arc<str>, usize);
+    let _index_charge =
+        ctx.charge((r.len() as u64).saturating_mul(std::mem::size_of::<Entry>() as u64))?;
+    let mut index = Vec::<Entry>::with_capacity(r.len());
+    for (j, &id) in r.cols[rc].iter().enumerate() {
+        if j.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let Some(Value::Str(s)) = ctx.value(id) else {
+            unreachable!("proved string domain")
+        };
+        index.push((s, j));
+    }
+    // In-place sorting needs no second row array; equal keys stay in right-row
+    // order, so probing left rows preserves the product's original pair order.
+    index.sort_unstable();
+    ctx.check()?;
+    let mut pairs = Vec::new();
+    for (i, &id) in l.cols[lc].iter().enumerate() {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let Some(Value::Str(s)) = ctx.value(id) else {
+            unreachable!("proved string domain")
+        };
+        let begin = index.partition_point(|(key, _)| key < &s);
+        let end = begin + index[begin..].partition_point(|(key, _)| key == &s);
+        let rows = pairs.len().saturating_add(end - begin);
+        // Includes the pair array while the matching table is materialized. An
+        // equal-key run may itself be too large and must fail before expansion.
+        ctx.check_output(rows, lay.vars.len() + 1)?;
+        pairs.reserve_exact(end - begin);
+        pairs.extend(index[begin..end].iter().map(|(_, j)| (i as u32, *j as u32)));
+    }
+    Ok(Some(materialize(l, r, &lay, &pairs)))
 }
 
 fn cross(ctx: &Ctx, l: &Table, r: &Table) -> Result<Table> {
