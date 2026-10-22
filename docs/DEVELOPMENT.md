@@ -512,6 +512,8 @@ Latency summaries preserve the raw samples' nine decimal places in milliseconds.
 Elapsed seconds and throughput also retain nine decimal places for performance gate
 comparisons. Writer latency measures the client's HTTP request and response interval.
 It does not isolate engine execution or storage synchronization time.
+Writer thread names include their zero-based client index so scheduler observations
+can be matched to individual clients.
 A violation remains a failed gate even when the reader latency ratio passes. The harness
 retains its raw samples and completes the data and cold-recovery checks before moving
 to the next process.

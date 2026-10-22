@@ -1185,6 +1185,7 @@ class Client(unittest.TestCase):
         self.response_status = 200
         self.drop_response = False
         self.stop_listener_on_request = None
+        self.hold_responses = None
         self.lock = threading.Lock()
         requests, lock = self.requests, self.lock
         owner = self
@@ -1200,6 +1201,11 @@ class Client(unittest.TestCase):
                 with lock:
                     requests.append(body.decode())
                     receipt = len(requests) * owner.receipt_step
+                if owner.hold_responses is not None and not owner.hold_responses.wait(
+                    timeout=10
+                ):
+                    self.close_connection = True
+                    return
                 time.sleep(owner.response_delay)
                 if owner.stop_listener_on_request == len(requests):
                     owner.server.shutdown()
@@ -1239,6 +1245,60 @@ class Client(unittest.TestCase):
             check=False,
             timeout=15,
         )
+
+    @unittest.skipUnless(
+        pathlib.Path("/proc/self/task").is_dir(), "requires Linux procfs thread names"
+    )
+    def test_writer_threads_map_client_indices_to_native_tids(self):
+        self.hold_responses = threading.Event()
+        process = subprocess.Popen(
+            [
+                str(self.binary),
+                "--addr",
+                f"127.0.0.1:{self.server.server_port}",
+                "--changes",
+                "8",
+                "--warmup",
+                "0",
+                "writers",
+                "--clients",
+                "4",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            received = 0
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with self.lock:
+                    received = len(self.requests)
+                if received >= 4 or process.poll() is not None:
+                    break
+                time.sleep(0.005)
+            self.assertGreaterEqual(received, 4, "all four real writers must be active")
+            names = {}
+            for task in pathlib.Path(f"/proc/{process.pid}/task").iterdir():
+                try:
+                    name = (task / "comm").read_text().strip()
+                except FileNotFoundError:
+                    continue
+                if name.startswith("wb-writer-"):
+                    names[name] = int(task.name)
+            self.assertEqual(set(names), {f"wb-writer-{k}" for k in range(4)})
+            self.assertEqual(len(set(names.values())), 4)
+        finally:
+            self.hold_responses.set()
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+                raise
+        self.assertEqual(process.returncode, 0, stderr)
+        result = json.loads(stdout)
+        self.assertEqual(result["changes"], 8)
+        self.assertEqual(result["errors"], 0)
 
     def test_final_response_cannot_create_lag_for_an_unsent_request(self):
         self.response_delay = 0.15
