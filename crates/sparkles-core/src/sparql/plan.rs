@@ -823,8 +823,8 @@ impl<'a> Planner<'a> {
             GP::Bgp { .. } | GP::Path { .. } | GP::Join { .. } | GP::Graph { .. } => {
                 // a constant table joined with a UNION goes into each branch, where it
                 // binds the branch's lookups instead of meeting their whole result
-                let calls = |patterns: &[spargebra::term::TriplePattern]| {
-                    super::propertyext::has_calls(self.ctx, patterns)
+                let calls = |ctx: &Ctx, patterns: &[spargebra::term::TriplePattern]| {
+                    super::propertyext::has_calls(ctx, patterns)
                         || patterns.iter().any(|t| match &t.predicate {
                             spargebra::term::NamedNodePattern::NamedNode(p) => {
                                 super::catalog::property_functions()
@@ -834,22 +834,22 @@ impl<'a> Planner<'a> {
                             _ => false,
                         })
                 };
-                if let Some(pushed) = super::valuespush::rewrite(gp, &calls) {
+                if let Some(pushed) =
+                    super::valuespush::rewrite(gp, &|patterns| calls(self.ctx, patterns))
+                {
                     return self.plan(&pushed, g, filters);
                 }
-                let candidate = if !self.ctx.calls_extensions
+                let consider_union = !self.ctx.calls_extensions
                     // Preserve outer filters' ordinary evaluation boundary, including
                     // extension aliases and dynamic calls that might be volatile.
-                    && filters.is_empty()
-                {
-                    super::unionpush::candidate(gp, &calls)
-                } else {
-                    None
-                };
+                    && filters.is_empty();
                 let mut items = Vec::new();
                 self.collect(gp, g, &mut items)?;
                 let original = self.plan_group(items, filters)?;
-                if let Some(candidate) = candidate
+                if consider_union
+                    && super::unionpush::screen(gp, &original)
+                    && let Some(candidate) =
+                        super::unionpush::candidate(gp, &|patterns| calls(self.ctx, patterns))
                     && candidate.worth_planning(&original)
                 {
                     // Planning a small pure anchor does not execute it. Keep broad

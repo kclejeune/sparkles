@@ -912,7 +912,9 @@ and 54,367 operator rows while returning two names and a true boolean.
 
 The planner now distributes an eligible basic graph pattern into pure UNION
 branches before choosing their join order. It builds the ordinary plan once and
-reuses it whenever a bounded screen declines alternative planning. Every anchor
+reuses it whenever a bounded screen declines alternative planning. A borrowed shape
+check and the existing cost and relation screen precede property catalogue and
+variable-set allocation. Every anchor
 variable must already occur in every branch. An ordinary branch must join scans
 of the same unrestricted index relation with different variable sets, and the
 ordinary estimated cost must exceed 32 cost units per branch. That work floor
@@ -951,6 +953,6 @@ its expansion. A broad-anchor plan stays outside the UNION, as does a one-row an
 large intersection would be repeated in every branch. Outer FILTER controls cover
 native volatile functions, EXISTS, Jena UUID aliases, dynamic calls and a deterministic
 expression in both join orientations. Test-only observations verify that cheap
-shared-anchor self-joins and rejected high-read anchors do not enter alternative
-planning. Native timing diagnostics distinguish planning and total server time
+shared-anchor self-joins and rejected high-read anchors do not enter eligibility
+validation or alternative planning. Native timing diagnostics distinguish planning and total server time
 from execution time, which excludes the optimizer's work.

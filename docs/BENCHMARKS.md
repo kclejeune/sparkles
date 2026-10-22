@@ -353,8 +353,9 @@ plan. The 10M latency figures above still describe the earlier Forge run. The ne
 plan's latency at that scale remains to be measured.
 
 Alternative planning now requires shared anchor variables, repeated unbound scan
-relations and enough estimated ordinary work. A bounded screen keeps cheap plans
-and hidden anchor columns on the ordinary path before constructing an alternative.
+relations and enough estimated ordinary work. A bounded work screen rejects cheap
+plans before eligibility allocations. Further validation keeps hidden anchor
+columns on the ordinary path before constructing an alternative.
 Planning and total server time are checked separately from execution time, which
 excludes the optimizer's work.
 
