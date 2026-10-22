@@ -1168,6 +1168,8 @@ mod imp {
         /// of removed quads are kept, and until the next Tantivy commit)
         applied: u64,
         committed: u64,
+        /// successful Tantivy commits of this live directory, including repeated RDF heads
+        commit_generation: u64,
         /// operations (additions and deletions) no Tantivy commit has made visible yet
         staged: usize,
         /// the batch of the views handed out since the last seal, if any
@@ -1199,6 +1201,11 @@ mod imp {
         fail_next_commit: AtomicBool,
         /// the tick seals and checkpoints (off only in tests)
         ticks: AtomicBool,
+        retirement_failed: AtomicBool,
+        #[cfg(test)]
+        after_checkpoint_io: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        #[cfg(test)]
+        before_install_checkpoint: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         /// the quads of the commits since an online rebuild's snapshot, while one runs
         journal: Mutex<Option<Vec<[Id; 4]>>>,
         /// held for the whole of a rebuild, so that two never build at once
@@ -1489,6 +1496,7 @@ mod imp {
             dirty_since: None,
             applied: seq,
             committed: seq,
+            commit_generation: 0,
             staged: 0,
             open: None,
             uncertain: Default::default(),
@@ -1935,6 +1943,11 @@ mod imp {
             last_rebuild: Mutex::new(None),
             fail_next_commit: Default::default(),
             ticks: AtomicBool::new(true),
+            retirement_failed: AtomicBool::new(false),
+            #[cfg(test)]
+            after_checkpoint_io: Mutex::new(None),
+            #[cfg(test)]
+            before_install_checkpoint: Mutex::new(None),
             journal: Default::default(),
             rebuilding: Default::default(),
         })
@@ -2180,6 +2193,24 @@ mod imp {
         /// a second after writes, before compaction, and on drop.
         pub fn checkpoint(&self) -> Result<()> {
             self.inner.checkpoint()
+        }
+
+        /// Stop maintenance before the store deletes or reuses this index's path.
+        /// Old sealed views can keep their searchers, but no writer may touch that path.
+        /// The caller owns the store's lifecycle lock and drained writer admission.
+        pub(crate) fn retire(&self) -> Result<()> {
+            if self.inner.retirement_failed.load(Ordering::SeqCst) {
+                return Err(text_err(
+                    "a failed full-text retirement must be rebuilt or reopened",
+                ));
+            }
+            self.inner.ticks.store(false, Ordering::SeqCst);
+            let result = self.inner.close();
+            if let Err(error) = &result {
+                self.inner.retirement_failed.store(true, Ordering::SeqCst);
+                self.inner.fail_locked(&mut self.inner.live.lock(), error);
+            }
+            result
         }
 
         /// Rebuild the whole index from `snap` and return its view. On disk, the new
@@ -2804,6 +2835,10 @@ mod imp {
             prepared.set_payload(&payload);
             prepared.commit().map_err(text_err)?;
             live.reader.reload().map_err(text_err)?;
+            live.commit_generation = live
+                .commit_generation
+                .checked_add(1)
+                .ok_or_else(|| text_err("full-text commit generation exhausted"))?;
             live.committed = seq;
             live.staged = 0;
             if live.dir.is_some() && live.dirty_since.is_none() {
@@ -2879,18 +2914,52 @@ mod imp {
                 return;
             }
             let mut live = self.live.lock();
-            let r = self.settle_locked(&mut live).and_then(|()| {
-                if live
-                    .dirty_since
-                    .is_some_and(|t| t.elapsed() >= CHECKPOINT_AFTER)
-                {
-                    self.checkpoint_locked(&mut live)
-                } else {
-                    Ok(())
-                }
-            });
-            if let Err(e) = r {
+            if live.writer.is_none() || !self.healthy() {
+                return;
+            }
+            if let Err(e) = self.settle_locked(&mut live) {
                 self.fail_locked(&mut live, &e);
+                return;
+            }
+            if !live
+                .dirty_since
+                .is_some_and(|t| t.elapsed() >= CHECKPOINT_AFTER)
+            {
+                return;
+            }
+            if live.committed != live.applied
+                && let Err(e) = self.commit_locked(&mut live)
+            {
+                self.fail_locked(&mut live, &e);
+                return;
+            }
+            let Some(dir) = live.dir.clone() else {
+                return;
+            };
+            let generation = live.commit_generation;
+            let checkpoint = dir.prepare_checkpoint();
+            drop(live);
+            // File syncing can wait for many journal commits. Publication needs live,
+            // so keep only the pathname lease during this background I/O.
+            let result = checkpoint.run();
+            #[cfg(test)]
+            {
+                let hook = self.after_checkpoint_io.lock().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+                if let Some(root) = &self.root {
+                    crate::store::text_recovery::hook(root, "text-checkpoint-completed");
+                }
+            }
+            let mut live = self.live.lock();
+            if live.writer.is_none() || !live.dir.as_ref().is_some_and(|d| d.same_directory(&dir)) {
+                return;
+            }
+            match result {
+                Ok(true) if live.commit_generation == generation => live.dirty_since = None,
+                Ok(_) => {}
+                Err(e) => self.fail_locked(&mut live, &e.into()),
             }
         }
 
@@ -2902,8 +2971,9 @@ mod imp {
             if live.committed != live.applied {
                 self.commit_locked(live)?;
             }
-            dir.checkpoint()?;
-            live.dirty_since = None;
+            if dir.prepare_checkpoint().run()? {
+                live.dirty_since = None;
+            }
             Ok(())
         }
 
@@ -2912,6 +2982,9 @@ mod imp {
                 return Ok(());
             }
             let mut live = self.live.lock();
+            if live.writer.is_none() || !self.healthy() {
+                return Ok(());
+            }
             self.checkpoint_locked(&mut live)
         }
 
@@ -2956,7 +3029,6 @@ mod imp {
                 })?;
             }
             let snap = head;
-            self.epoch.store(epoch, Ordering::SeqCst);
             let mut live = self.live.lock();
             // the views of the old index's open batch get its searcher
             if let Err(e) = self.seal_locked(&mut live) {
@@ -2965,9 +3037,39 @@ mod imp {
                     let _ = slot.0.set(None);
                 }
             }
-            let (index, fields, dir) =
-                publish_built(self.root.as_deref(), &self.config, index, fields, new_dir)?;
-            *live = live_of(index, fields, &self.config, dir, snap.commit)?;
+            // Merge workers also write through the old pathname. Stop them before
+            // publishing another index there, while old views retain their searchers.
+            if let Some(writer) = live.writer.take()
+                && let Err(error) = writer.wait_merging_threads()
+            {
+                let error = text_err(error);
+                self.fail_locked(&mut live, &error);
+                return Err(error);
+            }
+            let old_dir = live.dir.clone();
+            #[cfg(test)]
+            {
+                let hook = self.before_install_checkpoint.lock().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            let _checkpoint = old_dir.as_ref().map(LazySyncDir::checkpoint_lease);
+            let replacement =
+                publish_built(self.root.as_deref(), &self.config, index, fields, new_dir).and_then(
+                    |(index, fields, dir)| live_of(index, fields, &self.config, dir, snap.commit),
+                );
+            *live = match replacement {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    self.fail_locked(&mut live, &error);
+                    return Err(error);
+                }
+            };
+            self.epoch.store(epoch, Ordering::SeqCst);
+            if self.retirement_failed.swap(false, Ordering::SeqCst) {
+                self.ticks.store(true, Ordering::SeqCst);
+            }
             let view = self.view_in(&live, snap.commit, live.last.clone());
             drop(live);
             *self.stale.lock() = None;
@@ -3022,16 +3124,33 @@ mod imp {
         /// Seal and commit, let running merges finish (they write metadata too), then
         /// sync.
         fn close(&self) -> Result<()> {
-            if !self.healthy() {
+            let mut live = self.live.lock();
+            if live.writer.is_none() {
                 return Ok(());
             }
-            let mut live = self.live.lock();
-            self.settle_locked(&mut live)?;
-            if live.committed != live.applied {
-                self.commit_locked(&mut live)?;
-            }
-            if let Some(w) = live.writer.take() {
-                w.wait_merging_threads().map_err(text_err)?;
+            let healthy = self.healthy();
+            let settled = if healthy {
+                self.settle_locked(&mut live).and_then(|()| {
+                    if live.committed != live.applied {
+                        self.commit_locked(&mut live)
+                    } else {
+                        Ok(())
+                    }
+                })
+            } else {
+                Ok(())
+            };
+            // Even a stale or failed index must stop its writer before path reuse.
+            let joined = live
+                .writer
+                .take()
+                .expect("the writer was checked above")
+                .wait_merging_threads()
+                .map_err(text_err);
+            settled?;
+            joined?;
+            if !healthy {
+                return Ok(());
             }
             match live.dir.clone() {
                 Some(dir) => Ok(dir.checkpoint()?),
@@ -3055,6 +3174,354 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_background_checkpoint_allows_text_publication() {
+            use std::sync::mpsc;
+            use tantivy::directory::Directory;
+
+            let root = tempfile::tempdir().unwrap();
+            let config = TextConfig::default();
+            let (index, _) = new_index(Some(&root.path().join("text")), &config).unwrap();
+            drop(index);
+            let (index, fields, dir) = open_index(root.path(), &config).unwrap();
+            let mut document = TantivyDocument::default();
+            document.add_bytes(fields.key, &[1; 16]);
+            document.add_text(fields.text, "checkpoint publication probe");
+            dir.atomic_write(Path::new("checkpoint-probe"), b"dirty")
+                .unwrap();
+            let live = live_of(index, fields, &config, Some(dir.clone()), 0).unwrap();
+            let inner = inner_of(Some(root.path()), config, live, 0);
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (released_tx, released_rx) = mpsc::channel();
+            dir.before_checkpoint_file_sync(move || {
+                let _ = entered_tx.send(());
+                let released = release_rx.recv_timeout(Duration::from_secs(20));
+                let _ = released_tx.send(released.is_ok());
+            });
+            let tick_inner = inner.clone();
+            let tick = std::thread::spawn(move || tick_inner.tick());
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+            if let Err(error) = entered {
+                let _ = release_tx.send(());
+                tick.join().unwrap();
+                panic!("the real checkpoint did not reach its file sync: {error}");
+            }
+
+            let (published_tx, published_rx) = mpsc::channel();
+            let publisher_inner = inner.clone();
+            let publisher = std::thread::spawn(move || -> Result<()> {
+                let view = publisher_inner.apply_docs(
+                    1,
+                    vec![StagedDoc {
+                        key: [1; 16],
+                        hash: 1,
+                        doc: Some(document),
+                        indexed: false,
+                    }],
+                )?;
+                let docs = view.resolved()?.searcher.num_docs();
+                let _ = published_tx.send((view.seq, docs));
+                Result::Ok(())
+            });
+            let published = published_rx.recv_timeout(Duration::from_secs(5));
+            // Release and join both owned threads before the expected pre-fix assertion.
+            let _ = release_tx.send(());
+            tick.join().unwrap();
+            publisher.join().unwrap().unwrap();
+            assert!(released_rx.recv().unwrap(), "the checkpoint latch expired");
+            assert_eq!(
+                published,
+                Ok((1, 1)),
+                "an independent background file sync blocked text publication"
+            );
+        }
+
+        fn checkpoint_fixture() -> (tempfile::TempDir, Arc<Inner>, LazySyncDir) {
+            let root = tempfile::tempdir().unwrap();
+            let config = TextConfig::default();
+            let (index, _) = new_index(Some(&root.path().join("text")), &config).unwrap();
+            drop(index);
+            let (index, fields, dir) = open_index(root.path(), &config).unwrap();
+            let live = live_of(index, fields, &config, Some(dir.clone()), 0).unwrap();
+            let inner = inner_of(Some(root.path()), config, live, 0);
+            (root, inner, dir)
+        }
+
+        fn publish_checkpoint_document(inner: &Arc<Inner>, seq: u64) -> Result<(u64, u64)> {
+            let fields = inner.live.lock().shared.fields.clone();
+            let mut document = TantivyDocument::default();
+            let mut key = [0; 16];
+            key[..8].copy_from_slice(&seq.to_le_bytes());
+            document.add_bytes(fields.key, &key);
+            document.add_text(fields.text, "checkpoint publication probe");
+            let view = inner.apply_docs(
+                seq,
+                vec![StagedDoc {
+                    key,
+                    hash: seq,
+                    doc: Some(document),
+                    indexed: false,
+                }],
+            )?;
+            let documents = view.resolved()?.searcher.num_docs();
+            Ok((view.seq, documents))
+        }
+
+        fn pause_checkpoint_completion(
+            inner: &Inner,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            use std::sync::mpsc;
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            *inner.after_checkpoint_io.lock() = Some(Box::new(move || {
+                let _ = entered_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("checkpoint completion latch expired");
+            }));
+            (entered_rx, release_tx)
+        }
+
+        #[test]
+        fn a_completed_background_checkpoint_cannot_clear_a_newer_commit() {
+            let (root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+            let (entered, release) = pause_checkpoint_completion(&inner);
+            let tick_inner = inner.clone();
+            let tick = std::thread::spawn(move || tick_inner.tick());
+            let reached = entered.recv_timeout(Duration::from_secs(5));
+            let publication = reached
+                .as_ref()
+                .ok()
+                .map(|_| publish_checkpoint_document(&inner, 2));
+            let _ = release.send(());
+            tick.join().unwrap();
+            reached.unwrap();
+            assert_eq!(publication.unwrap().unwrap(), (2, 2));
+            assert!(inner.live.lock().dirty_since.is_some());
+            assert!(dir.is_marked());
+            inner.close().unwrap();
+            assert!(!dir.is_marked());
+            let (index, _, _) = open_index(root.path(), &inner.config).unwrap();
+            assert_eq!(index.reader().unwrap().searcher().num_docs(), 2);
+        }
+
+        #[test]
+        fn a_background_checkpoint_cannot_touch_a_replacement_index() {
+            use super::super::lazydir::TestPoint;
+            use std::sync::mpsc;
+            for failed_io in [false, true] {
+                let (root, inner, dir) = checkpoint_fixture();
+                publish_checkpoint_document(&inner, 1).unwrap();
+                let store = crate::store::Store::in_memory(crate::store::StoreOptions::default());
+                let head = store.snapshot();
+                let built = inner.build(&head).unwrap();
+                inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+                let (sync_tx, sync_rx) = mpsc::channel();
+                let (sync_release_tx, sync_release_rx) = mpsc::channel();
+                dir.test_hook(TestPoint::CheckpointFileSync, move || {
+                    let _ = sync_tx.send(());
+                    sync_release_rx
+                        .recv_timeout(Duration::from_secs(20))
+                        .map_err(std::io::Error::other)?;
+                    if failed_io {
+                        Err(std::io::Error::other("old directory sync probe"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let (completed, finish) = pause_checkpoint_completion(&inner);
+                let tick_inner = inner.clone();
+                let tick = std::thread::spawn(move || tick_inner.tick());
+                let reached_sync = sync_rx.recv_timeout(Duration::from_secs(5));
+                let (install_tx, install_rx) = mpsc::channel();
+                *inner.before_install_checkpoint.lock() = Some(Box::new(move || {
+                    let _ = install_tx.send(());
+                }));
+                let installer_inner = inner.clone();
+                let installer =
+                    std::thread::spawn(move || installer_inner.install(built, &head, &[]));
+                let installing = install_rx.recv_timeout(Duration::from_secs(5));
+                // The installer has reached the lease while holding live. The original
+                // index cannot be renamed while its file-sync hook is still paused.
+                let old_payload = std::fs::read(root.path().join("text/meta.json"));
+                let _ = sync_release_tx.send(());
+                let reached_completion = completed.recv_timeout(Duration::from_secs(5));
+                let installed = installer.join().unwrap();
+                let publication = if installed.is_ok() && reached_completion.is_ok() {
+                    Some(publish_checkpoint_document(&inner, 1))
+                } else {
+                    None
+                };
+                let _ = finish.send(());
+                tick.join().unwrap();
+                reached_sync.unwrap();
+                installing.unwrap();
+                reached_completion.unwrap();
+                installed.unwrap();
+                assert_eq!(publication.unwrap().unwrap(), (1, 1));
+                let meta: serde_json::Value =
+                    serde_json::from_slice(&old_payload.unwrap()).unwrap();
+                let payload: serde_json::Value =
+                    serde_json::from_str(meta["payload"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    payload["epoch"], 0,
+                    "the old path was replaced before its lease ended"
+                );
+                assert!(
+                    inner.healthy(),
+                    "an obsolete checkpoint failed its replacement"
+                );
+                let live = inner.live.lock();
+                assert!(!live.dir.as_ref().unwrap().same_directory(&dir));
+                assert_eq!(
+                    live.commit_generation, 1,
+                    "same generation in a new directory"
+                );
+                assert!(live.dirty_since.is_some());
+                let current = live.dir.clone().unwrap();
+                drop(live);
+                assert!(current.is_marked());
+                inner.close().unwrap();
+                assert!(!current.is_marked());
+                let (index, _, _) = open_index(root.path(), &inner.config).unwrap();
+                assert_eq!(index.reader().unwrap().searcher().num_docs(), 1);
+            }
+        }
+
+        #[test]
+        fn close_can_finish_while_an_old_checkpoint_awaits_live() {
+            use super::super::lazydir::TestPoint;
+            for failed_io in [false, true] {
+                let (_root, inner, dir) = checkpoint_fixture();
+                publish_checkpoint_document(&inner, 1).unwrap();
+                inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+                if failed_io {
+                    dir.test_hook(TestPoint::CheckpointFileSync, || {
+                        Err(std::io::Error::other("old sync probe"))
+                    });
+                }
+                let (completed, release) = pause_checkpoint_completion(&inner);
+                let tick_inner = inner.clone();
+                let tick = std::thread::spawn(move || tick_inner.tick());
+                let reached = completed.recv_timeout(Duration::from_secs(5));
+                let close = reached.as_ref().ok().map(|_| inner.close());
+                let _ = release.send(());
+                tick.join().unwrap();
+                reached.unwrap();
+                close.unwrap().unwrap();
+                assert!(inner.live.lock().writer.is_none());
+                assert!(inner.healthy());
+                assert!(!dir.is_marked());
+            }
+        }
+
+        #[test]
+        fn a_background_sync_error_still_marks_its_current_index_stale() {
+            use super::super::lazydir::TestPoint;
+            let (_root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+            dir.test_hook(TestPoint::CheckpointFileSync, || {
+                Err(std::io::Error::other("sync probe"))
+            });
+            inner.tick();
+            assert!(!inner.healthy());
+            assert!(dir.is_marked());
+        }
+
+        #[test]
+        fn a_failed_retirement_cannot_retry_against_a_reused_path() {
+            use super::super::lazydir::TestPoint;
+            use tantivy::directory::Directory;
+            let (_root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            dir.test_hook(TestPoint::CheckpointParentSync, || {
+                Err(std::io::Error::other("retirement sync probe"))
+            });
+            let index = TextIndex {
+                inner: inner.clone(),
+                ticker: None,
+            };
+            assert!(index.retire().is_err());
+            assert!(inner.live.lock().writer.is_none());
+            assert!(!inner.healthy());
+            dir.atomic_write(Path::new("new-owner-probe"), b"new owner content")
+                .unwrap();
+            assert!(index.retire().is_err());
+            index.checkpoint().unwrap();
+            drop(index);
+            assert!(
+                dir.is_marked(),
+                "obsolete retirement cleared a later marker"
+            );
+            assert_eq!(
+                dir.atomic_read(Path::new("new-owner-probe")).unwrap(),
+                b"new owner content"
+            );
+        }
+
+        #[test]
+        fn retiring_a_stale_index_stops_its_writer_without_clearing_the_marker() {
+            let (_root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.fail_locked(&mut inner.live.lock(), &text_err("stale index probe"));
+            let index = TextIndex {
+                inner: inner.clone(),
+                ticker: None,
+            };
+            index.retire().unwrap();
+            index.retire().unwrap();
+            assert!(inner.live.lock().writer.is_none());
+            assert!(dir.is_marked());
+            drop(index);
+            assert!(dir.is_marked());
+        }
+
+        #[test]
+        fn rebuilding_after_failed_retirement_restores_the_store_lifecycle() {
+            use super::super::lazydir::TestPoint;
+            let root = tempfile::tempdir().unwrap();
+            let store = crate::store::Store::open(root.path(), Default::default()).unwrap();
+            store.enable_text(Default::default()).unwrap();
+            crate::sparql::update::update(&store,
+                r#"INSERT DATA { <urn:probe> <http://www.w3.org/2000/01/rdf-schema#label> "checkpoint repair probe" }"#,
+                &Default::default()).unwrap();
+            let snapshot = store.snapshot();
+            let view = snapshot.text.as_ref().unwrap();
+            view.resolved().unwrap();
+            let inner = view.ready(view.seq).unwrap().owner.upgrade().unwrap();
+            let dir = inner.live.lock().dir.clone().unwrap();
+            dir.test_hook(TestPoint::CheckpointParentSync, || {
+                Err(std::io::Error::other("retirement repair probe"))
+            });
+            assert!(
+                store
+                    .enable_text(TextConfig {
+                        max_hits: 7,
+                        ..Default::default()
+                    })
+                    .is_err()
+            );
+            assert!(inner.retirement_failed.load(Ordering::SeqCst));
+            store.rebuild_text().unwrap();
+            assert!(!inner.retirement_failed.load(Ordering::SeqCst));
+            assert!(inner.ticks.load(Ordering::SeqCst));
+            let query = crate::sparql::query(
+                store.snapshot(),
+                r#"PREFIX text:<http://jena.apache.org/text#> SELECT ?s { ?s text:query "repair" }"#,
+                &Default::default(),
+            )
+            .unwrap();
+            assert_eq!(query.rows().len(), 1);
+            store.disable_text().unwrap();
+            assert!(!root.path().join("text").exists());
+        }
 
         #[test]
         fn a_newer_text_config_is_refused() {

@@ -3390,6 +3390,9 @@ impl Store {
         let current = self.text.load_full();
         let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
         let _w = self.guarded_writer();
+        if let Some(current) = &current {
+            current.retire()?;
+        }
         self.text.store(None);
         if let Some(root) = &self.root {
             write_atomic(
@@ -3417,6 +3420,9 @@ impl Store {
         let current = self.text.load_full();
         let _rebuild = current.as_ref().map(|t| t.lock_rebuild());
         let _w = self.guarded_writer();
+        if let Some(current) = &current {
+            current.retire()?;
+        }
         self.text.store(None);
         let mut s = (*self.snapshot()).clone();
         s.text = None;
