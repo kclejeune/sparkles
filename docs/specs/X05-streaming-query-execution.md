@@ -1536,3 +1536,9 @@ the eager prefix path's full-input choice. Runtime failures retain their partial
 plan and mark unfinished nodes incomplete, including an exhausted input whose final
 output accounting fails. Roadmap item 91 tracks the SP²Bench
 follow-up.
+
+HTTP quick-query scheduling preserves automatic admission for ASK. A quick
+native boolean can require the cursor to fit its budget, and a later automatic
+request can lower the budget of a previously eager ASK. Both kinds remain
+eligible to run in place while repeating admission. SELECT keeps its existing
+quick eager shortcut, and explicit execution modes keep their requested policy.
