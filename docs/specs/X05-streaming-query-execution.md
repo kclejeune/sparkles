@@ -1529,8 +1529,10 @@ unsupported inputs, and keeps cheap ASK on its ordinary path. It consumes the
 already prepared cursor through the explicit ASK completion path. A qualifying
 binding stops its input, while a false ASK still consumes and charges the work it
 needs to prove that no binding qualifies. This does not change SELECT admission
-or raise a query budget. A direct-scan product whose existing eager prefix fits
-stays ordinary. An admitted product builds the smaller estimated input, matching
+or raise a query budget. A direct-scan product whose exact scan counts prove that
+the existing eager prefix fits stays ordinary. Discounted graph and repeated-variable
+estimates cannot provide that proof. An admitted product builds the smaller estimated input, matching
 the eager prefix path's full-input choice. Runtime failures retain their partial
-plan and mark unfinished nodes incomplete. Roadmap item 91 tracks the SP²Bench
+plan and mark unfinished nodes incomplete, including an exhausted input whose final
+output accounting fails. Roadmap item 91 tracks the SP²Bench
 follow-up.

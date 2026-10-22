@@ -305,3 +305,126 @@ fn admitted_ask_builds_the_smaller_pure_input_without_renaming_values() {
     };
     assert!(answer.result().boolean);
 }
+
+#[test]
+fn repeated_variable_scan_estimates_do_not_claim_a_cheap_eager_prefix() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from(
+        "<urn:0shared> <urn:left> <urn:0shared> .\n<urn:0shared> <urn:right> <urn:0shared> .\n",
+    );
+    for i in 1..160 {
+        data.push_str(&format!("<urn:left:{i}> <urn:left> <urn:left:{i}> .\n"));
+    }
+    for i in 1..800 {
+        data.push_str(&format!("<urn:right:{i}> <urn:right> <urn:right:{i}> .\n"));
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let ask = "ASK {?x <urn:left> ?x . ?y <urn:right> ?y FILTER(?x = ?y)}";
+    let options = QueryOptions {
+        max_rows: Some(1024),
+        no_cache: true,
+        ..Default::default()
+    };
+    assert!(
+        matches!(query(store.snapshot(), ask, &options), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows)
+    );
+    let execution = query_execution(
+        store.snapshot(),
+        ask,
+        &options,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Ask(answer) = execution else {
+        panic!("a discounted scan estimate cannot prove that the eager prefix fits")
+    };
+    assert!(answer.result().boolean);
+}
+
+#[test]
+fn graph_ratio_estimates_do_not_claim_a_cheap_eager_prefix() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from(
+        "<urn:0shared> <urn:left> <urn:0shared> .\n<urn:0shared> <urn:right> <urn:0shared> .\n",
+    );
+    for i in 1..160 {
+        data.push_str(&format!("<urn:left:{i}> <urn:left> <urn:left:{i}> .\n"));
+    }
+    for i in 1..800 {
+        data.push_str(&format!("<urn:right:{i}> <urn:right> <urn:right:{i}> .\n"));
+    }
+    data.push_str("<urn:named> {\n");
+    for i in 0..8640 {
+        data.push_str(&format!("<urn:noise:{i}> <urn:noise> <urn:noise:{i}> .\n"));
+    }
+    data.push_str("}\n");
+    store
+        .load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    // Graph-independent predicate counts are discounted by the global default
+    // graph ratio. The two predicates here exist entirely in the default graph.
+    let ask = "ASK {?x <urn:left> ?lx . ?y <urn:right> ?ry FILTER(?x = ?y)}";
+    let options = QueryOptions {
+        max_rows: Some(1024),
+        no_cache: true,
+        ..Default::default()
+    };
+    assert!(
+        matches!(query(store.snapshot(), ask, &options), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Rows)
+    );
+    let execution = query_execution(
+        store.snapshot(),
+        ask,
+        &options,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Ask(answer) = execution else {
+        panic!("a graph ratio estimate cannot prove that the eager prefix fits")
+    };
+    assert!(answer.result().boolean);
+}
+
+#[test]
+fn exhausted_scan_with_failed_row_accounting_remains_incomplete() {
+    use sparkles_core::sparql::query_execution_with_plan;
+    let store = fixture(64, "\"left\"", "\"right\"");
+    let options = QueryOptions {
+        max_rows: Some(32),
+        no_cache: true,
+        ..Default::default()
+    };
+    let failed = query_execution_with_plan(
+        store.snapshot(),
+        ASK,
+        &options,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .err()
+    .expect("build scan exceeds its row cap");
+    assert!(matches!(failed.error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Rows));
+    let plan = failed.plan.expect("partial execution is preserved");
+    let mut todo = vec![&plan];
+    let mut failing_scan = None;
+    while let Some(node) = todo.pop() {
+        if node.operator == "IndexScan" && node.actual_rows == 0 && node.time_ms > 0.0 {
+            failing_scan = Some(node);
+        }
+        todo.extend(&node.children);
+    }
+    assert!(
+        failing_scan
+            .expect("the scan attempted an output before its budget failed")
+            .fidelity()
+            .incomplete
+    );
+}

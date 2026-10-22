@@ -975,9 +975,23 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
     {
         return false;
     }
-    // Direct scans honor run_limited's first 64-row prefix. Preserve that cheap
-    // ordinary path, including the held smaller input and row-pair storage.
-    if matches!(a.kind, Kind::Scan(_)) && matches!(b.kind, Kind::Scan(_)) {
+    // Only exact scan counts prove that run_limited's first 64-row prefix is
+    // cheap. Repeated-variable and graph/dedup estimates can undercount its work.
+    fn exact_scan(ctx: &Ctx, node: &Node) -> bool {
+        let Kind::Scan(scan) = &node.kind else {
+            return false;
+        };
+        scan.eqs.is_empty()
+            && !scan.dedup
+            && (matches!(scan.graph, super::plan::GraphFilter::All)
+                || scan
+                    .prefix
+                    .get(scan.graph_col)
+                    .is_some_and(|g| scan.graph.accepts(*g))
+                || (ctx.snap.generation.stats.graphs.len() == 1
+                    && scan.graph.accepts(ctx.snap.generation.stats.graphs[0].0)))
+    }
+    if exact_scan(ctx, a) && exact_scan(ctx, b) {
         let (small, large) = if a.est <= b.est { (a, b) } else { (b, a) };
         let prefix = large.est.min(64.0);
         let candidates = small.est * prefix;
@@ -2767,32 +2781,43 @@ impl Operator {
             .min((options.batch_bytes / row_bytes).max(1));
         // Leave headroom for layouts and unary scratch; allocation itself still checks.
         let cap = cap.min(ctx.rows_within_budget(self.vars.len()).max(1));
-        let result = self.next_inner(ctx, options, cap);
-        self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
-        let mut batch = result?;
-        if let Some(b) = &mut batch {
-            b.set_order(&self.order)?;
-            #[cfg(debug_assertions)]
-            self.check_order(ctx, &b.table);
-            self.rows = self
-                .rows
-                .checked_add(b.table.len)
-                .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-            ctx.check_rows(self.rows)?;
-            // Eager kernels already counted all their operator work during execution.
-            if !matches!(
-                self.state,
-                State::Fallback { .. } | State::Scalar(_) | State::Counts { .. } | State::Expand(_)
-            ) {
-                ctx.produced(b.table.len)?;
+        let result = (|| {
+            let result = self.next_inner(ctx, options, cap);
+            self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
+            let mut batch = result?;
+            if let Some(b) = &mut batch {
+                b.set_order(&self.order)?;
+                #[cfg(debug_assertions)]
+                self.check_order(ctx, &b.table);
+                self.rows = self
+                    .rows
+                    .checked_add(b.table.len)
+                    .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
+                ctx.check_rows(self.rows)?;
+                // Eager kernels already counted all their operator work during execution.
+                if !matches!(
+                    self.state,
+                    State::Fallback { .. }
+                        | State::Scalar(_)
+                        | State::Counts { .. }
+                        | State::Expand(_)
+                ) {
+                    ctx.produced(b.table.len)?;
+                }
+                // a fallback counts the rows it emitted; `materializedRows` holds its table
+                self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
+            } else {
+                self.done = true;
             }
-            // a fallback counts the rows it emitted; `materializedRows` holds its table
-            self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
-        } else {
-            self.done = true;
+            ctx.check()?;
+            Ok(batch)
+        })();
+        // Input exhaustion alone is not successful completion. A failed output
+        // charge or final request check leaves this operator incomplete.
+        if result.is_err() {
+            self.done = false;
         }
-        ctx.check()?;
-        Ok(batch)
+        result
     }
 
     fn next_inner(
