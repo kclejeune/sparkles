@@ -841,6 +841,9 @@ pub(super) fn auto_streaming(
             _ => false,
         }
     }
+    if kind == QueryKind::Ask {
+        return filtered_ask_admitted(ctx, node);
+    }
     // A plan expected to pass the row budgets stays eager, so that it fails before the
     // first byte of output with an error status rather than partway through a stream.
     if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
@@ -875,6 +878,87 @@ pub(super) fn auto_streaming(
         && options.batch_bytes >= 4096 * 32
         && headroom < u64::MAX
         && ctx.memory_remaining() >= headroom
+}
+
+/// An ASK with a pure equality filter can stop at its first matching pair instead
+/// of materializing an over-budget Cartesian candidate table. Keep the ordinary
+/// path for cheap queries and restrict this policy to the measured native shape.
+fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
+    use super::plan::JoinAlgo;
+
+    if !ctx.snap.delta.is_empty() || ctx.calls_extensions {
+        return false;
+    }
+    let Kind::Slice {
+        offset: 0,
+        limit: Some(1),
+    } = node.kind
+    else {
+        return false;
+    };
+    let Some(mut filtered) = node.children.first() else {
+        return false;
+    };
+    // The planner may project the ASK pattern's in-scope variables. Bound this
+    // transparent wrapper walk before doing any expression or subtree inspection.
+    for _ in 0..8 {
+        if !matches!(filtered.kind, Kind::Project(_)) || filtered.children.len() != 1 {
+            break;
+        }
+        filtered = &filtered.children[0];
+    }
+    let Kind::Filter(expressions) = &filtered.kind else {
+        return false;
+    };
+    let [Expr::Eq(left, right)] = expressions.as_slice() else {
+        return false;
+    };
+    let (Expr::Var(left), Expr::Var(right)) = (&**left, &**right) else {
+        return false;
+    };
+    let [product] = filtered.children.as_slice() else {
+        return false;
+    };
+    let Kind::Join {
+        algo: JoinAlgo::Cross,
+        ..
+    } = product.kind
+    else {
+        return false;
+    };
+    let [a, b] = product.children.as_slice() else {
+        return false;
+    };
+    if !((a.certain.contains(left) && b.certain.contains(right))
+        || (a.certain.contains(right) && b.certain.contains(left)))
+    {
+        return false;
+    }
+    let rows = product.est;
+    let bytes = rows * (product.vars.len().max(1) * 8) as f64;
+    if !rows.is_finite()
+        || rows <= 0.0
+        || !bytes.is_finite()
+        || (rows <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64)
+    {
+        return false;
+    }
+    // No effects, expressions or eager fallbacks are hidden below the equality.
+    // The count also bounds recursion and work on large rejected plans.
+    fn plain(node: &Node, remaining: &mut usize) -> bool {
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        let shape = match &node.kind {
+            Kind::Scan(_) | Kind::Values(_) | Kind::Empty => node.children.is_empty(),
+            Kind::Join { .. } => node.children.len() == 2,
+            Kind::Project(_) | Kind::Sort(_) => node.children.len() == 1,
+            _ => false,
+        };
+        shape && node.children.iter().all(|child| plain(child, remaining))
+    }
+    plain(product, &mut 64) && native(product)
 }
 
 /// The estimated input rows from which automatic execution streams a grouping. The
@@ -1134,7 +1218,16 @@ pub fn query_execution_with_plan(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
                     kind,
                 )?;
-                Ok(QueryExecution::Select(Box::new(cursor)))
+                if kind == QueryKind::Ask {
+                    let depth = cursor.depth;
+                    let result = finish_ask(cursor)?;
+                    Ok(QueryExecution::Ask(Box::new(AskResult {
+                        result: Some(result),
+                        depth,
+                    })))
+                } else {
+                    Ok(QueryExecution::Select(Box::new(cursor)))
+                }
             } else {
                 let ran = depth::with_stack(levels, || {
                     super::execute_prepared(&parsed, options, parse_ms, plan_ms, prepared)
@@ -3723,6 +3816,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn filtered_ask_admission_keeps_small_effectful_and_mutable_plans_ordinary() {
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::new();
+        for i in 0..64 {
+            data.push_str(&format!("<urn:left:{i}> <urn:left> {i} .\n"));
+            data.push_str(&format!("<urn:right:{i}> <urn:right> {i} .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let text = "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y)}";
+        let prepare = |text: &str, max_rows| {
+            let query = super::super::parse_query(text, None, &[]).unwrap();
+            let options = QueryOptions {
+                max_rows: Some(max_rows),
+                no_cache: true,
+                ..Default::default()
+            };
+            super::super::prepare_query(store.snapshot(), &query, &options, None, None).unwrap()
+        };
+        let p = prepare(text, 1024);
+        assert!(filtered_ask_admitted(&p.ctx, &p.node));
+        let small = prepare(text, 8192);
+        assert!(!filtered_ask_admitted(&small.ctx, &small.node));
+        for text in [
+            "ASK {?a <urn:left> ?x}",
+            "SELECT * {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y)}",
+            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?y && RAND() < 1)}",
+            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = UUID())}",
+            "ASK {?a <urn:left> ?x . ?b <urn:right> ?y FILTER(?x = ?a)}",
+            "ASK {?a <urn:left> ?x OPTIONAL {?b <urn:right> ?y} FILTER(?x = ?y)}",
+            "ASK {VALUES ?x {UNDEF 1} VALUES ?y {UNDEF 1} FILTER(?x = ?y)}",
+        ] {
+            let p = prepare(text, 1);
+            assert!(!filtered_ask_admitted(&p.ctx, &p.node), "{text}");
+        }
+        let mut effects = prepare(text, 1024);
+        Arc::get_mut(&mut effects.ctx).unwrap().calls_extensions = true;
+        assert!(!filtered_ask_admitted(&effects.ctx, &effects.node));
+        // A retained immutable context stays eligible; a new delta keeps the
+        // conservative ordinary policy until it has an immutable generation.
+        super::super::update::update(
+            &store,
+            "INSERT DATA {<urn:new> <urn:left> 0}",
+            &Default::default(),
+        )
+        .unwrap();
+        let changed = prepare(text, 1024);
+        assert!(!filtered_ask_admitted(&changed.ctx, &changed.node));
+        assert!(filtered_ask_admitted(&p.ctx, &p.node));
     }
 
     #[test]
