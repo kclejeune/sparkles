@@ -405,7 +405,7 @@ fn stats(mut v: Vec<f64>) -> String {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean = v.iter().sum::<f64>() / v.len().max(1) as f64;
     format!(
-        "{{\"n\":{},\"p50_ms\":{:.3},\"p90_ms\":{:.3},\"p99_ms\":{:.3},\"mean_ms\":{:.3},\"max_ms\":{:.3}}}",
+        "{{\"n\":{},\"p50_ms\":{:.9},\"p90_ms\":{:.9},\"p99_ms\":{:.9},\"mean_ms\":{:.9},\"max_ms\":{:.9}}}",
         v.len(),
         pct(&v, 0.5),
         pct(&v, 0.9),
@@ -413,6 +413,15 @@ fn stats(mut v: Vec<f64>) -> String {
         mean,
         v.last().copied().unwrap_or(0.0)
     )
+}
+
+fn throughput_json(timed: usize, elapsed: f64) -> String {
+    let rate = if elapsed > 0.0 {
+        timed as f64 / elapsed
+    } else {
+        0.0
+    };
+    format!("{rate:.9}")
 }
 
 fn unix_seconds() -> f64 {
@@ -767,7 +776,7 @@ fn main() {
         }
     }
     println!(
-        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.3},\"tps\":{:.1},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{},\"write_start_unix\":{:.9},\"write_end_unix\":{:.9},\"max_schedule_lag_ms\":{:.6}}}",
+        "{{\"scenario\":\"{}\",\"op\":\"{}\",\"clients\":{},\"write_rate\":{},\"changes\":{},\"errors\":{},\"missing_receipts\":{},\"seconds\":{:.9},\"tps\":{},\"writers\":{},\"receipts_contiguous\":{},\"receipts_distinct\":{},\"first_receipt\":{},\"per_client\":{:?},\"max_share_deviation\":{:.3},\"readers\":{},\"reader_violations\":{},\"write_start_unix\":{:.9},\"write_end_unix\":{:.9},\"max_schedule_lag_ms\":{:.6}}}",
         a.scenario,
         op,
         clients,
@@ -776,11 +785,7 @@ fn main() {
         errors,
         missing_receipts,
         elapsed,
-        if elapsed > 0.0 {
-            timed as f64 / elapsed
-        } else {
-            0.0
-        },
+        throughput_json(timed, elapsed),
         stats(lat),
         contiguous,
         distinct,
@@ -812,6 +817,67 @@ fn main() {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    fn statistic(json: &str, metric: &str) -> f64 {
+        json.split(&format!("\"{metric}\":"))
+            .nth(1)
+            .unwrap()
+            .split([',', '}'])
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn statistics_preserve_serial_gate_rejections() {
+        let ordinary = stats(vec![0.44001; 3]);
+        let grouped = stats(vec![0.46249; 3]);
+        for metric in ["p50_ms", "p90_ms"] {
+            let ratio = statistic(&grouped, metric) / statistic(&ordinary, metric);
+            assert!(
+                ratio > 1.05,
+                "rounding accepted a true 5.109% regression: {ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn statistics_preserve_serial_gate_acceptance() {
+        let ordinary = stats(vec![0.44049; 3]);
+        let grouped = stats(vec![0.46251; 3]);
+        for metric in ["p50_ms", "p90_ms"] {
+            let ratio = statistic(&grouped, metric) / statistic(&ordinary, metric);
+            assert!(
+                ratio <= 1.05,
+                "rounding rejected a true 4.999% difference: {ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn throughput_preserves_load_gate_rejections() {
+        let rate: f64 = throughput_json(50000, 50000.0 / 495.551).parse().unwrap();
+        assert!(
+            rate / 521.68 < 0.95,
+            "rounding accepted an insufficient rate: {rate}"
+        );
+    }
+
+    #[test]
+    fn throughput_preserves_load_gate_acceptance() {
+        let rate: f64 = throughput_json(50000, 50000.0 / 547.75).parse().unwrap();
+        assert!(
+            rate / 521.68 <= 1.05,
+            "rounding rejected a valid rate: {rate}"
+        );
+    }
+
+    #[test]
+    fn throughput_zero_duration_is_zero() {
+        let rate: f64 = throughput_json(50000, 0.0).parse().unwrap();
+        assert_eq!(rate, 0.0);
+    }
 
     #[test]
     fn refused_redial_never_reuses_an_uncertain_connection() {
