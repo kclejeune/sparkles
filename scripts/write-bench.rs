@@ -521,7 +521,8 @@ fn main() {
             receipts.clone(),
             start_gate.clone(),
         );
-        writers.push(std::thread::spawn(move || {
+        let writer = std::thread::Builder::new().name(format!("wb-writer-{k}"));
+        let spawned = writer.spawn(move || {
             let mut c = Conn::new(&a.addr);
             let mut lat = Vec::new();
             let mut timings = Vec::new();
@@ -638,7 +639,8 @@ fn main() {
                 max_schedule_lag_ms,
                 timings,
             )
-        }));
+        });
+        writers.push(spawned.expect("spawn writer thread"));
     }
     let mut readers = Vec::new();
     if a.scenario == "mixed" {
