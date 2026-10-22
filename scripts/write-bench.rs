@@ -405,7 +405,7 @@ fn stats(mut v: Vec<f64>) -> String {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean = v.iter().sum::<f64>() / v.len().max(1) as f64;
     format!(
-        "{{\"n\":{},\"p50_ms\":{:.3},\"p90_ms\":{:.3},\"p99_ms\":{:.3},\"mean_ms\":{:.3},\"max_ms\":{:.3}}}",
+        "{{\"n\":{},\"p50_ms\":{:.9},\"p90_ms\":{:.9},\"p99_ms\":{:.9},\"mean_ms\":{:.9},\"max_ms\":{:.9}}}",
         v.len(),
         pct(&v, 0.5),
         pct(&v, 0.9),
@@ -812,6 +812,43 @@ fn main() {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    fn statistic(json: &str, metric: &str) -> f64 {
+        json.split(&format!("\"{metric}\":"))
+            .nth(1)
+            .unwrap()
+            .split([',', '}'])
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn statistics_preserve_serial_gate_rejections() {
+        let ordinary = stats(vec![0.44001; 3]);
+        let grouped = stats(vec![0.46249; 3]);
+        for metric in ["p50_ms", "p90_ms"] {
+            let ratio = statistic(&grouped, metric) / statistic(&ordinary, metric);
+            assert!(
+                ratio > 1.05,
+                "rounding accepted a true 5.109% regression: {ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn statistics_preserve_serial_gate_acceptance() {
+        let ordinary = stats(vec![0.44049; 3]);
+        let grouped = stats(vec![0.46251; 3]);
+        for metric in ["p50_ms", "p90_ms"] {
+            let ratio = statistic(&grouped, metric) / statistic(&ordinary, metric);
+            assert!(
+                ratio <= 1.05,
+                "rounding rejected a true 4.999% difference: {ratio}"
+            );
+        }
+    }
 
     #[test]
     fn refused_redial_never_reuses_an_uncertain_connection() {

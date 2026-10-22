@@ -1108,6 +1108,45 @@ class Oracles(unittest.TestCase):
         self.assertFalse(BENCH.summarize(rows)["passed"])
 
 
+class ClientStatistics(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="sparkles-client-statistics-")
+        cls.binary = pathlib.Path(cls.temp.name) / "write-bench-unit-tests"
+        subprocess.run(
+            [
+                "rustc",
+                "--edition",
+                "2024",
+                "--test",
+                "-o",
+                str(cls.binary),
+                str(SCRIPTS / "write-bench.rs"),
+            ],
+            check=True,
+            timeout=30,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def test_serial_gate_rejections_survive_json_serialization(self):
+        self.run_statistic_test("statistics_preserve_serial_gate_rejections")
+
+    def test_serial_gate_acceptance_survives_json_serialization(self):
+        self.run_statistic_test("statistics_preserve_serial_gate_acceptance")
+
+    def run_statistic_test(self, name):
+        result = subprocess.run(
+            [str(self.binary), "--exact", f"tests::{name}"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class Client(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
