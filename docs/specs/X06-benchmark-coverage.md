@@ -971,8 +971,11 @@ under ASK's limit and transparent projection. Both compared variables must be
 certainly bound by their respective inputs. A bounded inspection admits only
 plain scans, values, projections, sorts and joins over an immutable snapshot.
 Extension calls, effects, other expressions and unsupported inputs keep the
-ordinary path. The prepared plan is reused, and the boolean, timing, cancellation,
-error and ownership behavior follows the explicit ASK cursor.
+ordinary path. Direct scans whose existing eager prefix fits their budgets stay ordinary.
+An admitted product builds the smaller estimated input, as eager limited
+execution does. The prepared plan is reused, and the boolean, timing,
+cancellation and ownership behavior follows the explicit ASK cursor. Runtime
+failures keep their partial execution plan and mark unfinished nodes incomplete.
 
 Regression cases preserve numeric, date and language value equality without
 renaming variables. They distinguish a first qualifying solution from a false ASK

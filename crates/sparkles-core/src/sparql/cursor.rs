@@ -736,10 +736,39 @@ pub fn ask_streaming(
 
 fn finish_ask(mut cursor: QueryCursor) -> Result<QueryResult> {
     let boolean = cursor.next_batch()?.is_some_and(|batch| !batch.is_empty());
+    Ok(finish_ask_result(cursor, boolean))
+}
+
+fn finish_ask_with_plan(
+    mut cursor: QueryCursor,
+) -> std::result::Result<QueryResult, Box<super::Failed>> {
+    let boolean = match cursor.next_batch() {
+        Ok(batch) => batch.is_some_and(|batch| !batch.is_empty()),
+        Err(error) => {
+            fn incomplete(plan: &mut CursorPlan) {
+                if !plan.complete && plan.operator.fidelity().skipped.is_none() {
+                    plan.operator.fidelity_mut().incomplete = true;
+                }
+                plan.children.iter_mut().for_each(incomplete);
+            }
+            let plan = depth::with_stack(cursor.depth, || {
+                incomplete(&mut cursor.plan);
+                cursor.plan_info()
+            });
+            return Err(Box::new(super::Failed {
+                error,
+                plan: Some(plan),
+            }));
+        }
+    };
+    Ok(finish_ask_result(cursor, boolean))
+}
+
+fn finish_ask_result(mut cursor: QueryCursor, boolean: bool) -> QueryResult {
     cursor.close();
     let stats = cursor.stats();
     let plan = depth::with_stack(cursor.depth, || cursor.plan_info());
-    Ok(QueryResult {
+    QueryResult {
         kind: QueryKind::Ask,
         vars: Vec::new(),
         table: Table::default(),
@@ -752,7 +781,7 @@ fn finish_ask(mut cursor: QueryCursor) -> Result<QueryResult> {
         rows_produced: stats.rows_produced,
         describe_truncated: false,
         ctx: cursor.ctx.clone(),
-    })
+    }
 }
 
 /// A collected result with depth-protected metadata and destruction.
@@ -934,6 +963,9 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
     {
         return false;
     }
+    if !a.est.is_finite() || !b.est.is_finite() || a.est < 0.0 || b.est < 0.0 {
+        return false;
+    }
     let rows = product.est;
     let bytes = rows * (product.vars.len().max(1) * 8) as f64;
     if !rows.is_finite()
@@ -942,6 +974,19 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
         || (rows <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64)
     {
         return false;
+    }
+    // Direct scans honor run_limited's first 64-row prefix. Preserve that cheap
+    // ordinary path, including the held smaller input and row-pair storage.
+    if matches!(a.kind, Kind::Scan(_)) && matches!(b.kind, Kind::Scan(_)) {
+        let (small, large) = if a.est <= b.est { (a, b) } else { (b, a) };
+        let prefix = large.est.min(64.0);
+        let candidates = small.est * prefix;
+        let held =
+            small.est * (small.vars.len() * 8) as f64 + prefix * (large.vars.len() * 8) as f64;
+        let bytes = candidates * ((product.vars.len() + 1) * 8) as f64 + held;
+        if candidates <= ctx.max_rows as f64 && bytes <= ctx.memory_remaining() as f64 {
+            return false;
+        }
     }
     // No effects, expressions or eager fallbacks are hidden below the equality.
     // The count also bounds recursion and work on large rejected plans.
@@ -959,6 +1004,23 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
         shape && node.children.iter().all(|child| plain(child, remaining))
     }
     plain(product, &mut 64) && native(product)
+}
+
+/// Only an admitted pure ASK product is oriented: build the same smaller input
+/// that eager limited execution collects, while streaming the larger one. Other
+/// cursor and eager plans retain their original children and variable order.
+fn orient_filtered_ask(node: &mut Node) {
+    let mut filtered = &mut node.children[0];
+    for _ in 0..8 {
+        if !matches!(filtered.kind, Kind::Project(_)) {
+            break;
+        }
+        filtered = &mut filtered.children[0];
+    }
+    let product = &mut filtered.children[0];
+    if product.children[0].est < product.children[1].est {
+        product.children.swap(0, 1);
+    }
 }
 
 /// The estimated input rows from which automatic execution streams a grouping. The
@@ -1199,7 +1261,7 @@ pub fn query_execution_with_plan(
                 return Err(Error::invalid("cursor batch rows and bytes must be positive").into());
             }
             let planning = Instant::now();
-            let prepared =
+            let mut prepared =
                 super::prepare_query(snapshot, &parsed, options, Some(started), Some(cursor))?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let kind = prepared.kind;
@@ -1214,13 +1276,16 @@ pub fn query_execution_with_plan(
                 && retryable(&prepared.node)
                 && !matches!(&parsed, spargebra::Query::Select { pattern, .. } if calls_service(pattern));
             if prepared.ctx.is_cursor() {
+                if kind == QueryKind::Ask {
+                    orient_filtered_ask(&mut prepared.node);
+                }
                 let (cursor, _, _) = from_prepared(
                     prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels,
                     kind,
                 )?;
                 if kind == QueryKind::Ask {
                     let depth = cursor.depth;
-                    let result = finish_ask(cursor)?;
+                    let result = finish_ask_with_plan(cursor)?;
                     Ok(QueryExecution::Ask(Box::new(AskResult {
                         result: Some(result),
                         depth,

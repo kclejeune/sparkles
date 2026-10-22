@@ -6,10 +6,16 @@ use sparkles_core::store::{Store, StoreOptions};
 use sparkles_core::{BudgetKind, Error};
 
 fn fixture(n: usize, left: &str, right: &str) -> Store {
+    fixture_sizes(n, n, left, right)
+}
+
+fn fixture_sizes(left_rows: usize, right_rows: usize, left: &str, right: &str) -> Store {
     let store = Store::in_memory(StoreOptions::default());
     let mut data = String::new();
-    for i in 0..n {
+    for i in 0..left_rows {
         data.push_str(&format!("<urn:left:{i}> <urn:left> {left} .\n"));
+    }
+    for i in 0..right_rows {
         data.push_str(&format!("<urn:right:{i}> <urn:right> {right} .\n"));
     }
     store
@@ -218,4 +224,84 @@ fn automatic_ask_preserves_errors_and_small_query_policy() {
     assert!(matches!(query_execution(
         store.snapshot(), ASK, &options, &Default::default(), ExecutionMode::Auto,
     ), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory));
+}
+
+#[test]
+fn automatic_ask_keeps_successful_cheap_asymmetric_prefixes_eager() {
+    for (left, right) in [(1, 2048), (2048, 1)] {
+        let store = fixture_sizes(left, right, "\"same\"", "\"same\"");
+        let options = QueryOptions {
+            max_rows: Some(1024),
+            no_cache: true,
+            ..Default::default()
+        };
+        assert!(query(store.snapshot(), ASK, &options).unwrap().boolean);
+        let execution = query_execution(
+            store.snapshot(),
+            ASK,
+            &options,
+            &Default::default(),
+            ExecutionMode::Auto,
+        )
+        .unwrap();
+        let QueryExecution::Eager(answer) = execution else {
+            panic!("a bounded cheap eager prefix must stay ordinary")
+        };
+        assert!(answer.result().boolean);
+    }
+}
+
+#[test]
+fn automatic_ask_budget_failure_keeps_its_partial_execution_plan() {
+    use sparkles_core::sparql::query_execution_with_plan;
+    let store = fixture(64, "\"left\"", "\"right\"");
+    let options = QueryOptions {
+        max_rows: Some(1024),
+        no_cache: true,
+        ..Default::default()
+    };
+    let failed = query_execution_with_plan(
+        store.snapshot(),
+        ASK,
+        &options,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .err()
+    .expect("actual candidates exceed the row budget");
+    assert!(matches!(failed.error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Rows));
+    let plan = failed
+        .plan
+        .expect("the automatic ASK keeps the plan as far as it ran");
+    assert_eq!(plan.operator, "Limit");
+    assert!(!plan.children.is_empty());
+    assert!(plan.fidelity().incomplete);
+}
+
+#[test]
+fn admitted_ask_builds_the_smaller_pure_input_without_renaming_values() {
+    let store = fixture_sizes(1, 2048, "\"same\"", "\"same\"");
+    // The subquery hides ?left, so the pure left input keeps a projection. The
+    // ordinary direct-scan prefix screen does not apply, and native admission
+    // must avoid collecting the whole 2048-row right side.
+    let ask =
+        "ASK { {SELECT ?x WHERE {?left <urn:left> ?x}} ?right <urn:right> ?y FILTER(?x = ?y)}";
+    let options = QueryOptions {
+        max_rows: Some(1024),
+        no_cache: true,
+        ..Default::default()
+    };
+    assert!(query(store.snapshot(), ask, &options).unwrap().boolean);
+    let execution = query_execution(
+        store.snapshot(),
+        ask,
+        &options,
+        &Default::default(),
+        ExecutionMode::Auto,
+    )
+    .unwrap();
+    let QueryExecution::Ask(answer) = execution else {
+        panic!("the admitted pure projected input uses bounded ASK")
+    };
+    assert!(answer.result().boolean);
 }
