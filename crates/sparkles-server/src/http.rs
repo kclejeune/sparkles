@@ -1403,8 +1403,12 @@ pub(crate) async fn run_query(
     // The first run of a query decides from its parsed algebra whether it has a SERVICE
     // of the algorithm namespace, so a prefixed name counts like the full IRI, and a
     // query that does is never remembered as quick and so never runs in place.
-    let quick = QUICK.execution(quick_key);
-    let in_place = at.is_none() && inline::available() && quick.is_some();
+    let quick = if at.is_none() && inline::available() {
+        QUICK.execution(quick_key)
+    } else {
+        None
+    };
+    let in_place = quick.is_some();
     // SELECT and graph queries retain their quick eager shortcut. ASK can be quick
     // because its native execution avoids eager candidate storage, so it must keep
     // automatic admission even when scheduled in place.

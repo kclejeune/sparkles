@@ -108,6 +108,9 @@ pub struct QuickQueries {
     /// test hook: queries whose runs count as quick however long they took
     #[cfg(test)]
     timeless: Mutex<HashSet<u64>>,
+    /// Test-only history reads, separated by key for parallel router tests.
+    #[cfg(test)]
+    reads: Mutex<HashMap<u64, u64>>,
 }
 
 impl QuickQueries {
@@ -121,7 +124,16 @@ impl QuickQueries {
     /// Read the scheduling and execution hint in one snapshot. A failed concurrent
     /// request can remove it, but cannot turn this hint into a different policy.
     pub fn execution(&self, key: u64) -> Option<QuickExecution> {
+        #[cfg(test)]
+        {
+            *self.reads.lock().entry(key).or_default() += 1;
+        }
         self.quick.lock().get(&key).copied()
+    }
+
+    #[cfg(test)]
+    pub fn reads_by_key(&self, key: u64) -> u64 {
+        self.reads.lock().get(&key).copied().unwrap_or(0)
     }
 
     #[cfg(test)]

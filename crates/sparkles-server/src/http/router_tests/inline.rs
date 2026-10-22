@@ -382,3 +382,25 @@ async fn a_quick_ordinary_ask_stays_in_place_with_the_same_answer() {
     }
     assert_eq!(crate::http::inline::ran_by_key(key), 2);
 }
+
+/// A current-thread runtime cannot execute in place, so its requests do not need
+/// scheduling history even when the previous response was quick.
+#[tokio::test]
+async fn an_ineligible_request_does_not_read_quick_query_history() {
+    let s = server();
+    let query = "SELECT ?eligibility_probe WHERE { VALUES ?eligibility_probe { 42 } }";
+    let key = crate::http::inline::QuickQueries::key("ds", query);
+    crate::http::QUICK.ignore_time(key);
+    assert!(!crate::http::inline::available());
+    let before = crate::http::QUICK.reads_by_key(key);
+    for _ in 0..2 {
+        let response = select(&s.app, query, "application/sparql-results+json").await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+        assert_eq!(
+            response.json()["results"]["bindings"][0]["eligibility_probe"]["value"],
+            "42"
+        );
+    }
+    assert_eq!(crate::http::inline::ran_by_key(key), 0);
+    assert_eq!(crate::http::QUICK.reads_by_key(key), before);
+}
