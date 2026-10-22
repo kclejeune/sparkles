@@ -1570,7 +1570,25 @@ mod tests {
                                 result.extend(rows(&batch.table));
                             }
                             cases += 1;
-                            if matches!(&op.state, State::Binary(b) if b.spill.is_some()) {
+                            let mut plan = op.describe(&ctx);
+                            op.update_plan(&mut plan);
+                            assert!(plan.complete, "{case}");
+                            assert!(plan.full_input_before_output, "{case}");
+                            assert_eq!(plan.operator.actual_rows, result.len() as i64, "{case}");
+                            assert!(
+                                matches!(&op.state, State::Binary(b)
+                                    if b.index.is_none() && b.build.is_none()
+                                        && b.probe.is_none() && b.spill.is_none()),
+                                "{case}: exhausted join retains its working state",
+                            );
+                            if plan
+                                .operator
+                                .counters
+                                .as_ref()
+                                .and_then(|c| c.get("spilledBytes"))
+                                .and_then(serde_json::Value::as_u64)
+                                .is_some_and(|bytes| bytes > 0)
+                            {
                                 spilled += 1;
                             }
                             result.sort();

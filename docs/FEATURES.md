@@ -281,7 +281,8 @@ that work by priority and links each item to its design spec.
   eagerly. With `--spill on` or `encrypted`, sorts, groupings, DISTINCT and joins finish
   within their budget, but a DISTINCT over an ordered input other than an ORDER BY keeps
   its whole set, a grouping's single group can outgrow the budget, and eager operators
-  still fail at their budget. A build without a usable shared key keeps its real
+  still fail at their budget. Completed hash joins release their working memory
+  before a parent's later spill passes. A build without a usable shared key keeps its real
   memory budget when spill is enabled. Ordered join output consolidates as it is
   produced, with at most 128 finished output files and one active writer. A spilled
   join that must keep its order writes its output

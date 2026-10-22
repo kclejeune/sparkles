@@ -2698,6 +2698,9 @@ impl Operator {
                         }
                         self.info.counters = Some(counters);
                     }
+                    if batch.is_none() {
+                        binary.release_working_sets();
+                    }
                     batch
                 }
                 State::Group(group) => {
@@ -3527,6 +3530,115 @@ fn successor(mut key: Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouping_releases_an_exhausted_hash_join_working_set() {
+        use crate::sparql::plan::{Agg, JoinAlgo};
+        use crate::store::{Store, StoreOptions};
+        use spargebra::algebra::AggregateFunction;
+
+        const ROWS: usize = 65_536;
+        const GROUPS: usize = 64;
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = 16 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_cursor_owner();
+        let join = ctx.var("join");
+        let key = ctx.var("key");
+        let value = ctx.var("value");
+        let count = ctx.var("count");
+        let mut left = Table::new(vec![join, key]);
+        let mut right = Table::new(vec![join, value]);
+        for row in 0..ROWS {
+            let id = Id::from_i64(row as i64).unwrap();
+            left.push_row(&[id, Id::from_i64((row % GROUPS) as i64).unwrap()]);
+            right.push_row(&[id, Id::from_i64((row + 7) as i64).unwrap()]);
+        }
+        let mut hash = Node::leaf(
+            Kind::Join {
+                algo: JoinAlgo::Hash,
+                keys: vec![join],
+            },
+            vec![join, key, value],
+            ROWS as f64,
+            "linear unique-key fixture".into(),
+        );
+        hash.children = vec![
+            Node::leaf(
+                Kind::Values(left),
+                vec![join, key],
+                ROWS as f64,
+                "left".into(),
+            ),
+            Node::leaf(
+                Kind::Values(right),
+                vec![join, value],
+                ROWS as f64,
+                "right".into(),
+            ),
+        ];
+        let mut node = Node::leaf(
+            Kind::Group {
+                keys: vec![key],
+                aggs: vec![(
+                    count,
+                    Agg {
+                        func: AggregateFunction::Count,
+                        expr: None,
+                        distinct: false,
+                        fold: None,
+                        registered: None,
+                    },
+                )],
+            },
+            vec![key, count],
+            GROUPS as f64,
+            "64 exact groups".into(),
+        );
+        node.children = vec![hash];
+        // Literal input storage is still owned by the plan, just as in QueryCursor.
+        let _plan = OwnedCharge::new(&ctx, plan_bytes(&node)).unwrap();
+        let retained_plan = ctx.live_bytes();
+        let mut root = Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+        let mut plan = root.describe(&ctx);
+        let options = CursorOptions::default();
+        let batch = root
+            .next(&ctx, &options, options.batch_rows)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.table.len, GROUPS);
+        for group in 0..GROUPS {
+            assert_eq!(
+                batch.table.cols[0][group],
+                Id::from_i64(group as i64).unwrap()
+            );
+            assert_eq!(
+                batch.table.cols[1][group],
+                Id::from_i64((ROWS / GROUPS) as i64).unwrap()
+            );
+        }
+        assert!(
+            ctx.live_bytes() <= retained_plan + (256 << 10),
+            "the completed join still holds its large input/index: live={}, plan={retained_plan}",
+            ctx.live_bytes(),
+        );
+        // Keep the output batch alive while terminal calls and metadata are checked.
+        assert!(
+            root.next(&ctx, &options, options.batch_rows)
+                .unwrap()
+                .is_none()
+        );
+        assert!(root.next(&ctx, &options, 1).unwrap().is_none());
+        root.update_plan(&mut plan);
+        let join_plan = &plan.children[0];
+        assert_eq!(join_plan.operator.operator, "HashJoin");
+        assert_eq!(join_plan.operator.actual_rows, ROWS as i64);
+        assert!(join_plan.full_input_before_output);
+        assert!(join_plan.complete);
+        assert_eq!(batch.table.len, GROUPS);
+    }
 
     #[cfg(unix)]
     fn evicted_skipped_read_ahead_column(mode: &str) {
