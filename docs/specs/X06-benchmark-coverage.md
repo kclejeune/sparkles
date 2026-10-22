@@ -1009,7 +1009,9 @@ duplicates and term ids. The index owns its lexical payloads alongside the input
 and matching output. Its slots, strings and dictionary reconstruction scratch are
 charged before allocation. Sorting, pair expansion and output copying check
 cancellation in bounded chunks. Matching pairs are counted before their single
-allocation. The original SPARQL equality filter still runs. A pruned
+allocation, and their capacity stays charged while probing reconstructs keys and
+while the output columns are copied. The original SPARQL equality filter still
+runs. A pruned
 subset never uses the unfiltered product's result-cache key.
 
 Numeric promotion, language-tagged values, datatype errors, unbound variables and

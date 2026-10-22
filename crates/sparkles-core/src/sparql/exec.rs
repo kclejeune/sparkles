@@ -4277,6 +4277,10 @@ fn string_cross(
     // Includes the pair array while the matching table is materialized, with all
     // lexical index payloads and the input tables still charged and alive.
     ctx.check_output(rows, lay.vars.len() + 1)?;
+    // This buffer remains live while subsequent key reconstruction reserves its
+    // own scratch. A peak-only output estimate cannot account for that overlap.
+    let _pairs_charge =
+        ctx.charge((rows as u64).saturating_mul(std::mem::size_of::<(u32, u32)>() as u64))?;
     let mut pairs = Vec::with_capacity(rows);
     for (i, &id) in l.cols[lc].iter().enumerate() {
         if i.is_multiple_of(1024) {
@@ -4295,6 +4299,8 @@ fn string_cross(
         .expect("proved string domain");
     }
     ctx.check()?;
+    // Pair capacity is already live; admit only the output columns here.
+    ctx.check_output(rows, lay.vars.len())?;
     Ok(Some(materialize_candidates(ctx, l, r, &lay, &pairs)?))
 }
 
@@ -8072,5 +8078,84 @@ mod string_cross_tests {
             (2_000..=3_024).contains(&work),
             "{work} comparisons after cancellation at 2,000"
         );
+    }
+
+    #[test]
+    fn probe_reconstruction_must_admit_live_pair_capacity() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+        let store = Store::in_memory(StoreOptions::default());
+        let huge = "z".repeat(2 << 20);
+        store
+            .load(&[Source::from_bytes(
+                format!("<urn:s> <urn:p> \"a\" ; <urn:q> \"{huge}\" .").into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snapshot = store.snapshot();
+        let stored = |s: &str| {
+            let key = crate::id::term_key(&oxrdf::Literal::new_simple_literal(s).into());
+            Id::new(
+                crate::id::Tag::Vocab,
+                snapshot.generation.vocab.find(&key).unwrap(),
+            )
+        };
+        let same = stored("a");
+        let large = stored(&huge);
+        let mut left = Table::new(vec![0]);
+        left.push_row(&[same]);
+        left.push_row(&[large]);
+        let mut right = Table::new(vec![1]);
+        for _ in 0..65_536 {
+            right.push_row(&[same]);
+        }
+        let mut cross = Node::leaf(
+            Kind::Join {
+                algo: JoinAlgo::Cross,
+                keys: Vec::new(),
+            },
+            vec![0, 1],
+            131_072.0,
+            "cross product".into(),
+        );
+        cross.children = vec![
+            Node::leaf(
+                Kind::Values(left.clone()),
+                left.vars.clone(),
+                2.0,
+                "left".into(),
+            ),
+            Node::leaf(
+                Kind::Values(right.clone()),
+                right.vars.clone(),
+                65_536.0,
+                "right".into(),
+            ),
+        ];
+        let run = |memory| {
+            let mut ctx = Ctx::new(snapshot.clone());
+            ctx.max_rows = 100_000;
+            ctx.mem_limit = memory;
+            let _inputs = ctx.charge(left.mem_bytes() + right.mem_bytes()).unwrap();
+            let result = string_cross(&ctx, &cross, &left, &right, (0, 1));
+            (result, ctx.mem_peak())
+        };
+        // The approximately4MiB reconstruction envelope fits alongside inputs
+        // and the index. It must also include the already allocated512KiB pairs.
+        let (result, peak) = run(25 << 18);
+        let observed = result
+            .as_ref()
+            .map(|t| t.as_ref().map(Table::len))
+            .map_err(ToString::to_string);
+        assert!(
+            matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory),
+            "{observed:?}, peak {peak}"
+        );
+        let (result, peak) = run(8 << 20);
+        let table = result.unwrap().unwrap();
+        assert_eq!(table.len(), 65_536);
+        assert!(table.cols.iter().all(|c| c.iter().all(|&id| id == same)));
+        assert!(peak <= 8 << 20);
     }
 }

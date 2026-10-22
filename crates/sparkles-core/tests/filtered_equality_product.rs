@@ -55,6 +55,10 @@ fn bag(rows: Vec<Vec<Option<Term>>>) -> Vec<String> {
 }
 
 fn expected(copies: usize) -> Vec<String> {
+    expected_with_suffix(copies, "")
+}
+
+fn expected_with_suffix(copies: usize, suffix: &str) -> Vec<String> {
     let mut rows = Vec::new();
     for key in 0..32 {
         let row = vec![
@@ -62,7 +66,7 @@ fn expected(copies: usize) -> Vec<String> {
                 NamedNode::new(format!("urn:left:{key}")).unwrap(),
             )),
             Some(Term::Literal(Literal::new_simple_literal(format!(
-                "name:{key}"
+                "name:{key}{suffix}"
             )))),
         ];
         rows.extend(std::iter::repeat_n(row, copies));
@@ -439,7 +443,7 @@ fn automatic_execution_uses_the_same_result_without_changing_explicit_streaming(
 }
 
 #[test]
-fn retained_string_payloads_must_fit_the_same_query_memory_budget() {
+fn oversized_single_string_reconstruction_is_budgeted() {
     // The row tables and index slots fit 32 KiB. The independently known string
     // payloads exceed it, even when the eager value cache shares duplicate IDs.
     let store = fixture_with_suffix(&"x".repeat(32 << 10));
@@ -461,4 +465,43 @@ fn retained_string_payloads_must_fit_the_same_query_memory_budget() {
         matches!(result, Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Memory),
         "{observed:?}"
     );
+}
+
+#[test]
+fn retained_string_payloads_must_fit_the_same_query_memory_budget() {
+    // Each reconstruction fits the small budget. Their aggregate owned index
+    // payload does not; removing payload charging must make this test fail.
+    let suffix = "x".repeat(1_024);
+    let store = fixture_with_suffix(&suffix);
+    let result = query(
+        store.snapshot(),
+        Q5A,
+        &QueryOptions {
+            max_rows: Some(512),
+            max_memory_bytes: Some(32 << 10),
+            no_cache: true,
+            ..Default::default()
+        },
+    );
+    let observed = result
+        .as_ref()
+        .map(|r| (r.len(), r.mem_peak_bytes))
+        .map_err(ToString::to_string);
+    assert!(
+        matches!(result, Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Memory),
+        "{observed:?}"
+    );
+    let result = query(
+        store.snapshot(),
+        Q5A,
+        &QueryOptions {
+            max_rows: Some(512),
+            max_memory_bytes: Some(128 << 10),
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(bag(result.rows()), expected_with_suffix(1, &suffix));
+    assert!(result.mem_peak_bytes <= 128 << 10);
 }
