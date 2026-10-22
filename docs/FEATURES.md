@@ -257,6 +257,16 @@ that work by priority and links each item to its design spec.
   has no queue order, so a call that needs several threads can wait while one-thread
   calls keep taking the free slots. [Roadmap](ROADMAP.md) item 8.
 
+* **Community summaries.** Leiden can compute a community hierarchy, but Sparkles
+  does not build or store GraphRAG community reports with citations, provenance and
+  review status. Global Ask answers from those reports, community context in memory
+  tools and incremental report refresh are not built. [Roadmap](ROADMAP.md) item 12.
+
+* **Cold sparse reads.** The constant, scan and result-term prefetch paths and I/O
+  profiling are implemented. Corrected-source warm instruction and read-hint gates,
+  same-host cold targets and the dense-read policy checks remain open. A segmented
+  block layout is deferred until measurements justify it. [Roadmap](ROADMAP.md) item 4.
+
 * **Weighted betweenness.** Betweenness requires finite, strictly positive stored edge
   weights. Zero-weight shortest-path counting needs defined cycle semantics and a
   validated algorithm. SSSP still accepts zero weights, and PageRank retains its
@@ -290,6 +300,7 @@ that work by priority and links each item to its design spec.
   20-million-row sort and 10-million-group aggregate and DISTINCT matrix now pass
   in plain and encrypted modes under 64 MiB. Item 93 retains the execution
   follow-ups, performance investigation and review of enabling spill by default.
+  Low-budget grouping above an ordered spilled join remains a performance follow-up.
   The UI's result table, the MCP tools and the Python and JVM query calls
   run eagerly, because they report exact totals or return collected results. There is no
   FSST vocabulary compression, IRI encoding, pattern trick, pinned results, materialized
@@ -328,13 +339,20 @@ that work by priority and links each item to its design spec.
   still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3 and
   [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
 * Group commit on datasets with a full-text, spatial or embedding index has passed its
-  crash runs, but its performance gates have not run on `forge`. Only Namespace screens
-  exist, which show the gain on a device with 4 ms synchronizations and none for four
-  writers on the instances' own fast synchronization. The latency of full-text and spatial
-  queries during a write load has not been measured. [Roadmap](ROADMAP.md) item 86 and
+  crash runs, but complete performance acceptance on forge remains open. Partial
+  full-text pilots do not establish the full serial, concurrent and mixed-load gates.
+  A background full-text checkpoint holds the publication mutex while synchronizing
+  files, so indexed writes can wait for that I/O. Spatial and embedding acceptance
+  also remain open. [Roadmap](ROADMAP.md) item 86 and
   [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates).
+* **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.
+  The remaining budget work includes `q4` memory use, the large candidate products
+  before equality filters in `q5a` and `q6`, and eager candidate materialization in
+  `q12a` despite its ASK limit. [Roadmap](ROADMAP.md) item 91.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
-  are no other on-the-fly rules and no backward (LP) rules. Incremental maintenance does not cover rules with `noValue`,
+  are no other on-the-fly rules and no backward (LP) rules. Derived facts still use
+  the ordinary inferred graph. A separate derived-fact layer and canonical
+  `owl:sameAs` representatives are not built. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
   first run after a compaction without retained history, compute everything again.
   Inconsistency checks cover a fixed subset of OWL 2 RL. Small incremental runs over a kept closure take up to 1.6 times their earlier time for RDFS and up to 2.4 times for OWL 2 RL at 16 threads on LUBM-style data, where the goal is 1.2 times. [Roadmap](ROADMAP.md) items 9, 17, 19, 53, 87.

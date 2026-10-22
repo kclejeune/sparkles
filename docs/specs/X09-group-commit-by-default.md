@@ -1319,10 +1319,13 @@ took 1 ms more. Both wall differences are steps of 1 ms that the server time doe
 and they are open. So the screen's `two-hop-count` and `star-lookup` slowdowns did not
 reproduce on Intel, and no query changed by more than the 5% that the host resolves.
 
-**Open under item 86.** The gates of section 17.9 run on `forge` after item 1's runs
-there, with the text and spatial query latency under a four-writer load, a spatial dataset
-with geometries and an embedding index whose worker runs. Until they pass the item stays
-partly done, or the user amends a gate as for Phase 3. Three smaller items wait for that
+**Open under item 86.** Complete forge acceptance under section 17.9 remains open,
+including text and spatial query latency under a four-writer load, a spatial dataset
+with geometries and an embedding index whose worker runs. Partial full-text pilots
+have run. The current background text checkpoint holds the publication mutex while
+synchronizing files, so removing that wait must preserve checkpoint, replacement and
+close durability. Until the full gates pass the item stays partly done, or the user
+amends a gate as for Phase 3. Three smaller items wait for that
 work. Staged documents could count their bytes in the queue's limit,
 since a queue of long literals now holds more than 4 MiB of them. The leader applies a
 prefix's text changes, a Tantivy commit included when the batch is full, while its fence
