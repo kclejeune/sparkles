@@ -9,6 +9,10 @@ use sparkles_core::store::{Store, StoreOptions};
 const Q5A: &str = include_str!("fixtures/sp2b-q5a.rq");
 
 fn fixture() -> Store {
+    fixture_with_suffix("")
+}
+
+fn fixture_with_suffix(suffix: &str) -> Store {
     let store = Store::in_memory(StoreOptions {
         result_cache_min_ms: 0.0,
         ..Default::default()
@@ -18,7 +22,7 @@ fn fixture() -> Store {
     );
     for key in 0..32 {
         data.push_str(&format!(
-            "<urn:left:{key}> foaf:name \"name:{key}\" .\n<urn:right:{key}> foaf:name \"name:{key}\" .\n"
+            "<urn:left:{key}> foaf:name \"name:{key}{suffix}\" .\n<urn:right:{key}> foaf:name \"name:{key}{suffix}\" .\n"
         ));
         for duplicate in 0..2 {
             data.push_str(&format!(
@@ -432,4 +436,29 @@ fn automatic_execution_uses_the_same_result_without_changing_explicit_streaming(
         }
         assert_eq!(bag(rows), expected(1));
     }
+}
+
+#[test]
+fn retained_string_payloads_must_fit_the_same_query_memory_budget() {
+    // The row tables and index slots fit 32 KiB. The independently known string
+    // payloads exceed it, even when the eager value cache shares duplicate IDs.
+    let store = fixture_with_suffix(&"x".repeat(32 << 10));
+    let result = query(
+        store.snapshot(),
+        Q5A,
+        &QueryOptions {
+            max_rows: Some(512),
+            max_memory_bytes: Some(32 << 10),
+            no_cache: true,
+            ..Default::default()
+        },
+    );
+    let observed = result
+        .as_ref()
+        .map(|r| (r.len(), r.mem_peak_bytes))
+        .map_err(ToString::to_string);
+    assert!(
+        matches!(result, Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == sparkles_core::BudgetKind::Memory),
+        "{observed:?}"
+    );
 }
