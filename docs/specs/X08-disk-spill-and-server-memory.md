@@ -1417,5 +1417,5 @@ performance investigation and review of enabling spill by default.
 
 Completed native hash joins release their hash index, input buffers and spill readers
 when they reach EOF. Their plans keep final spill counters and completion metadata,
-and already returned batches keep their own storage. Aggregate spill passes can then
-use memory no longer needed by the join.
+and already returned batches keep their own storage. This does not resolve the known
+large spill-pass count when a grouping consumes ordered spilled join output.
