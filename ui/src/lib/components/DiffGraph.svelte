@@ -137,8 +137,12 @@
     return canvasElements(drawnCanvas, shown, label, short);
   });
 
-  const fromSeq = $derived(diff?.from.commit.seq ?? groups?.from.commit.seq ?? seqOf(fromSel));
-  const toSeq = $derived(diff?.to.commit.seq ?? groups?.to.commit.seq ?? seqOf(toSel));
+  /** The commits the range resolved to, which a time-lapse keeps while it clears the diff. */
+  let range = $state<{ from: number; to: number } | null>(null);
+  const fromSeq = $derived(
+    diff?.from.commit.seq ?? range?.from ?? groups?.from.commit.seq ?? seqOf(fromSel),
+  );
+  const toSeq = $derived(diff?.to.commit.seq ?? range?.to ?? groups?.to.commit.seq ?? seqOf(toSel));
   const total = $derived(
     diff ? diff.added + diff.removed : groups ? groups.added + groups.removed : 0,
   );
@@ -171,6 +175,7 @@
     stepIndex = -1;
     stepCount = 0;
     lapseGroups = null;
+    range = null;
     context = new Map();
     contextFor = '';
     listQuads = [];
@@ -183,6 +188,7 @@
         try {
           const g = await api.diffGroups(ds, { from: fromSel || undefined, to: toSel, signal });
           groups = g;
+          range = { from: g.from.commit.seq, to: g.to.commit.seq };
           diff = null;
           canvas = emptyCanvas();
           const omitted = groupedElements(g, short).omitted;
@@ -215,6 +221,7 @@
         signal,
       });
       diff = d;
+      range = { from: d.from.commit.seq, to: d.to.commit.seq };
       groups = null;
       listQuads = d.quads ?? [];
       const r = diffCanvas(d.quads ?? []);

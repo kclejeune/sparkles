@@ -264,6 +264,7 @@ test('the list follows the time-lapse, and moving the range starts it again', as
   await view(page).getByRole('button', { name: 'Play the time-lapse' }).click();
   await expect(view(page).getByText(/^step \d\/3$/)).toHaveText('step 3/3');
   await expect(view(page).getByRole('button', { name: 'Play the time-lapse' })).toBeVisible();
+  await expect(view(page)).toContainText('commit 0 → 3');
   // the list shows the last step's changes, not the range's
   await page.keyboard.press('l');
   const list = view(page).getByRole('region', { name: 'Changes' });
