@@ -344,7 +344,7 @@
         }
       },
       "reasoning": {
-        "description": "Include materialized inferences. The default is true when the dataset has any.",
+        "description": "Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off.",
         "in": "query",
         "name": "reasoning",
         "schema": {

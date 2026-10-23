@@ -1,6 +1,6 @@
 //! The dataset's query defaults over HTTP: RDFS on read and the materialized inferences
 //! reach `/{ds}/sparql` and a stored query's run as they reach the library's queries,
-//! and `reasoning=false` leaves the inferences out.
+//! and `reasoning=false` leaves the inferences and RDFS on read out.
 
 use super::*;
 use sparkles::reasoning::rdfs::NewSchema;
@@ -47,6 +47,10 @@ async fn configured_rdfs_reaches_http_and_stored_queries() {
         .set(NewSchema::Graph("default".into()))
         .unwrap();
     assert_eq!(answers(&s, "").await, (true, true, true));
+    // `reasoning=false` reads the asserted data alone, so RDFS on read is off for the query,
+    // which the inferred-edge lens of the UI compares against (U10 §3.1)
+    let (http, stored, _) = answers(&s, "&reasoning=false").await;
+    assert_eq!((http, stored), (false, false));
     ds.dataset.reasoning().rdfs().reset().unwrap();
     assert_eq!(answers(&s, "").await, (false, false, false));
 }

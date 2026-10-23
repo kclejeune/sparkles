@@ -1774,7 +1774,9 @@ Query parameters beyond the standard protocol:
   `stopped`, and `meta.totalRows` is `null` unless the cursor had already reached the
   end. A SPARQL LIMIT ends the query normally.
 * `reasoning=true|false` includes or excludes materialized inferences. The default is
-  `true` if the dataset has any.
+  `true` if the dataset has any. `reasoning=false` also turns [RDFS on read](#rdfs-on-read)
+  off for the request, so that it reads the asserted data alone. The UI's inferred-edge
+  lens compares a read with and without reasoning this way.
 * `nocache=true` bypasses the query result cache, so nothing is read from it or stored in
   it. It is meant for benchmarking, and `explain` accepts it too. `sparkles serve
   --result-cache-mb N` sets the server-wide cache budget (default 256, `0` disables the
