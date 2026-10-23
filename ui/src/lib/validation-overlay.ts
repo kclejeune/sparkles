@@ -412,7 +412,7 @@ export type WritePreview = {
   head: number;
   commit?: { inserted: number; deleted: number };
   changes?: { total: number; limit: number; truncated: boolean; quads: DiffQuad[] };
-  validation?: GuardReport;
+  validation?: GuardReport & { strategy?: string };
   error?: string;
 };
 
@@ -449,25 +449,52 @@ const valueOf = (t: unknown): string => {
   return typeof x.value === 'string' ? x.value : '';
 };
 
+/** The statuses of a guard summary that validated the candidate state. */
+const CHECKED = new Set(['passed', 'warned', 'rejected']);
+
 /**
- * Whether a preview's guard summary says the result would be resolved: `remains` when
- * the summary lists it, `resolved` when the summary is complete and does not, and
- * `unknown` without a summary of the result's language or when the list was truncated.
+ * Whether a preview's guard summary says the result would be resolved. It `remains` when
+ * the summary lists it: the same focus node, shape, component, path and value. Its absence
+ * means `resolved` only when the summary is conclusive: the guard validated the state
+ * (`passed`, `warned` or `rejected`), the list is not truncated, and the validation was
+ * full or the preview's complete list of changes touches the focus node, which an
+ * incremental validation then covers. Everything else is `unknown`.
  */
 export function resolution(r: VResult, p: WritePreview): 'resolved' | 'remains' | 'unknown' {
   const v = p.validation;
   if (!v || (v.language && v.language !== r.lang)) return 'unknown';
   const focus = valueOf(r.focus);
+  const value = r.value ? termKey(r.value) : null;
   const listed = (v.results ?? []).some((x) => {
     if (r.lang === 'shex') return valueOf(x.node) === focus && valueOf(x.shape) === r.shape;
     if (valueOf(x.focusNode) !== focus || valueOf(x.sourceShape) !== r.shape) return false;
     if (r.component && valueOf(x.sourceConstraintComponent) !== r.component) return false;
+    if (value != null && (!x.value || termKey(x.value as Term) !== value)) return false;
     const path = r.path ?? r.pathText;
     return path == null || valueOf(x.resultPath) === path;
   });
   if (listed) return 'remains';
-  if (v.truncated) return 'unknown';
-  return 'resolved';
+  if (v.truncated || !CHECKED.has(String(v.status ?? ''))) return 'unknown';
+  if (v.strategy === 'full') return 'resolved';
+  const c = p.changes;
+  const key = termKey(r.focus);
+  const touched = !!c && !c.truncated && c.quads.some((q) => q.subject === key || q.object === key);
+  return touched ? 'resolved' : 'unknown';
+}
+
+/**
+ * The graph a suggested fix writes, from the guard's `dataGraph` (see `FixGraph` in
+ * fixes.ts): the default graph for none, `default` or a list of only the default graph,
+ * the IRI of a list of one named graph, and `choose` for `union` or several graphs.
+ */
+export function fixGraph(dataGraph: string | string[] | undefined): string | null | 'choose' {
+  const DEFAULT = 'urn:x-arq:DefaultGraph';
+  if (dataGraph == null || dataGraph === 'default') return null;
+  if (typeof dataGraph === 'string') return dataGraph === 'union' ? 'choose' : null;
+  const named = dataGraph.filter((g) => g !== DEFAULT && g !== 'default');
+  if (named.length === 0) return null;
+  if (named.length === 1 && named.length === dataGraph.length) return named[0];
+  return 'choose';
 }
 
 /** The datatype IRI of a ShEx constraint such as `xsd:integer` or `<http://…>`, or null. */

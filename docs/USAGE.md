@@ -1588,9 +1588,12 @@ sheet at the bottom of the screen.
 `sh:maxCount`, `sh:datatype`, `sh:class`, `sh:in`, `sh:hasValue` and `sh:closed`, and the
 ShEx cardinality, datatype, value set and closed failures. The update holds the result's
 terms, and what the result does not say is a placeholder such as `?value`, which must be
-filled in before **Preview** runs. Preview is a dry run of the update
+filled in before **Preview** runs. When the guard's data graph is one named graph, the
+update writes that graph, and when it is several graphs, the update holds `GRAPH ?graph`
+for the graph that holds the triple. Preview is a dry run of the update
 ([C15](specs/C15-write-previews.md)). It lists the changes and says whether the guard
-would still report the result. **Run** commits the update only after a preview of the same
+would still report the result, or that the guard's answer does not tell, as when it
+validated other nodes than the result's. **Run** commits the update only after a preview of the same
 text, and the overlay then validates the drawn nodes again, so a fixed badge goes away.
 **Open in Query** takes the update to the query editor instead. Constraints that are not
 on one predicate, `sh:pattern`, `sh:sparql`, `sh:node` and qualified shapes get no

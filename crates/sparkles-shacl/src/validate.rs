@@ -126,7 +126,7 @@ pub fn validate_nodes(
     )?;
     let focus: Vec<Id> = nodes
         .iter()
-        .map(|n| data.resolve(n, shapes.bnodes_in_store))
+        .map(|n| resolve_focus(&mut data, n, shapes))
         .collect();
     let engine = Engine::new(shapes, &data, ids, opts)?;
     engine.run_nodes(&focus)
@@ -147,9 +147,21 @@ pub fn validate_node(
         &opts.exclude_graphs,
         shapes,
     )?;
-    let focus = data.resolve(node, shapes.bnodes_in_store);
+    let focus = resolve_focus(&mut data, node, shapes);
     let engine = Engine::new(shapes, &data, ids, opts)?;
     engine.run_nodes(&[focus])
+}
+
+/// The id of a focus node named by a caller: a blank node with the label of a stored one
+/// (`b…`) is that stored node, whatever the scope of the shapes' own blank nodes, and any
+/// other term resolves as the shapes' terms do.
+fn resolve_focus(data: &mut DataGraph, node: &Term, shapes: &Shapes) -> Id {
+    if let Term::BlankNode(b) = node
+        && let Some(id) = sparkles_core::store::parse_bnode_label(b.as_str())
+    {
+        return id;
+    }
+    data.resolve(node, shapes.bnodes_in_store)
 }
 
 /// The focus nodes a shape is validated on (see [`validate_selected`]).

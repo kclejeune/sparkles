@@ -30,8 +30,8 @@ const LEXICAL: Record<string, RegExp> = {
   float: /^([+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?|[+-]?INF|NaN)$/,
   date: /^-?\d{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(Z|[+-]\d{2}:\d{2})?$/,
   dateTime:
-    /^-?\d{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/,
-  time: /^([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/,
+    /^-?\d{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-4]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/,
+  time: /^([01]\d|2[0-4]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/,
   gYear: /^-?\d{4,}(Z|[+-]\d{2}:\d{2})?$/,
   anyURI: /^\S*$/,
 };
@@ -45,6 +45,48 @@ const RANGES: Record<string, [bigint, bigint]> = {
   unsignedInt: [0n, 2n ** 32n - 1n],
 };
 
+const daysIn = (year: number, month: number) =>
+  month === 2
+    ? (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0
+      ? 29
+      : 28
+    : [4, 6, 9, 11].includes(month)
+      ? 30
+      : 31;
+
+/** A time zone offset: `Z`, or at most `±14:00` with minutes under 60. */
+function zoneOk(z: string | undefined): boolean {
+  if (!z || z === 'Z') return true;
+  const m = /^[+-](\d{2}):(\d{2})$/.exec(z);
+  if (!m) return false;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  return min < 60 && (h < 14 || (h === 14 && min === 0));
+}
+
+/** The calendar checks that the patterns of `LEXICAL` cannot express. */
+function calendarOk(lexical: string, local: string): boolean {
+  if (local === 'date' || local === 'dateTime') {
+    const m =
+      /^(-?\d{4,})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2})(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?$/.exec(
+        lexical,
+      );
+    if (!m) return false;
+    if (Number(m[3]) > daysIn(Number(m[1]), Number(m[2]))) return false;
+    // 24:00:00 is the end of the day, with no fraction
+    if (m[4] === '24' && (m[5] !== '00' || m[6] !== '00' || (m[7] && /[1-9]/.test(m[7]))))
+      return false;
+    return zoneOk(m[8]);
+  }
+  if (local === 'time' || local === 'gYear') {
+    const z = /(Z|[+-]\d{2}:\d{2})$/.exec(lexical)?.[1];
+    if (local === 'time' && /^24:/.test(lexical) && !/^24:00:00(\.0+)?(Z|[+-]|$)/.test(lexical))
+      return false;
+    return zoneOk(z);
+  }
+  return true;
+}
+
 /**
  * Whether `lexical` is a valid lexical form of the datatype `iri`: `null` for a datatype
  * this check does not know, so that no cast is suggested.
@@ -55,6 +97,7 @@ export function validLexical(lexical: string, iri: string): boolean | null {
   const re = LEXICAL[local];
   if (!re) return null;
   if (!re.test(lexical)) return false;
+  if (!calendarOk(lexical, local)) return false;
   const range = RANGES[local];
   if (range) {
     const n = BigInt(lexical.replace(/^\+/, ''));
@@ -72,6 +115,32 @@ function messageParam(r: VResult, name: string): string | null {
   return null;
 }
 
+/** An IRI reference with nothing that could end it early (SPARQL IRIREF). */
+const IRIREF = /^<[^<>"{}|^`\\\x00-\x20]*>$/;
+/** A literal: one quoted string with valid escapes, a language tag or an IRI datatype. */
+const LITERAL =
+  /^"(?:[^"\\\n\r]|\\[tbnrf"'\\]|\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8})*"(?:@[A-Za-z]+(?:-[A-Za-z0-9]+)*|\^\^<[^<>"{}|^`\\\x00-\x20]*>)?$/;
+
+/**
+ * One RDF term in SPARQL syntax taken from message text, or null: the whole text must be
+ * one IRI reference or one literal, so message text can never add SPARQL syntax.
+ */
+export function oneTerm(text: string | null | undefined): string | null {
+  const t = (text ?? '').trim();
+  return IRIREF.test(t) || LITERAL.test(t) ? t : null;
+}
+
+/** An IRI from message or constraint text: one IRI reference, or a prefixed name. */
+function oneIri(text: string | null | undefined, prefixes: PrefixMap): string | null {
+  const t = (text ?? '').trim();
+  if (t.startsWith('<')) return IRIREF.test(t) ? t.slice(1, -1) : null;
+  const iri = expandIri(t, prefixes);
+  return iri && IRIREF.test(`<${iri}>`) ? iri : null;
+}
+
+/** Text for a comment line: line breaks become spaces, so it cannot leave the comment. */
+const oneLine = (s: string) => s.replace(/[\r\n\u2028\u2029\u0085]+/g, ' ');
+
 /** A term that may appear in a DATA block: IRIs and literals, not blank nodes. */
 const dataTerm = (t: Term | null | undefined): t is Term =>
   !!t && (t.type === 'uri' || t.type === 'literal');
@@ -84,14 +153,48 @@ function header(r: VResult, prefixes: PrefixMap): string {
   const shape =
     r.shape.startsWith('_:') || r.shape === 'START' ? r.shape : displayIri(r.shape, prefixes);
   const path = r.path ? ` · path ${displayIri(r.path, prefixes)}` : '';
-  return `# Suggested fix for ${name(r.focus)} · ${shape} · ${r.lang === 'shacl' ? 'sh:' : 'ShEx '}${r.kind}${path}`;
+  return oneLine(
+    `# Suggested fix for ${name(r.focus)} · ${shape} · ${r.lang === 'shacl' ? 'sh:' : 'ShEx '}${r.kind}${path}`,
+  );
 }
+
+/**
+ * Where the result's triples live: `null` for the default graph, a graph IRI, or `choose`
+ * when the data graph is several graphs or unknown, which puts the placeholder `?graph` in
+ * the update.
+ */
+export type FixGraph = string | null | 'choose';
 
 export type FixContext = {
   prefixes?: PrefixMap;
   /** The values of the result's path on its focus node, for `sh:maxCount`. */
   values?: Term[];
+  /** The graph the update reads and writes (the default graph when absent). */
+  graph?: FixGraph;
 };
+
+/** A triple pattern in the graph of `ctx`. */
+function inGraph(ctx: FixContext, triple: string): string {
+  if (ctx.graph == null) return triple;
+  const g = ctx.graph === 'choose' ? '?graph' : iriRef(ctx.graph);
+  return `GRAPH ${g} { ${triple} }`;
+}
+
+/** The comment that asks for the graph, when it is not known. */
+const graphNote = (ctx: FixContext): string[] =>
+  ctx.graph === 'choose'
+    ? [
+        '# The data graph is several graphs: replace ?graph with the graph that holds the triple,',
+        '# or remove GRAPH ?graph { } to use the default graph.',
+      ]
+    : [];
+
+/** A DATA block of one triple in the graph of `ctx`. */
+const dataBlock = (op: 'INSERT' | 'DELETE', ctx: FixContext, triple: string) => [
+  `${op} DATA {`,
+  ctx.graph == null ? `  ${triple} .` : `  ${inGraph(ctx, `${triple} .`)}`,
+  '}',
+];
 
 /** The triple pattern of the focus node, the result's path and `object`. */
 function arc(r: VResult, object: string): string {
@@ -102,73 +205,78 @@ function arc(r: VResult, object: string): string {
 
 function minFix(r: VResult, ctx: FixContext): string {
   const n = r.lang === 'shex' ? r.min : Number(messageParam(r, 'minCount') ?? 1);
+  const count = n != null && Number.isFinite(n) ? n : 1;
   return [
     header(r, ctx.prefixes ?? {}),
-    `# The shape needs at least ${n ?? 1} value${n === 1 ? '' : 's'} here.`,
+    `# The shape needs at least ${count} value${count === 1 ? '' : 's'} here.`,
     '# Replace ?value with the value to add, such as "text", 42 or <http://example.org/x>.',
-    'INSERT DATA {',
-    `  ${arc(r, '?value')} .`,
-    '}',
+    ...graphNote(ctx),
+    ...dataBlock('INSERT', ctx, arc(r, '?value')),
   ].join('\n');
 }
 
 function maxFix(r: VResult, ctx: FixContext): string {
-  const n = r.lang === 'shex' ? r.max : Number(messageParam(r, 'maxCount') ?? 1);
+  const raw = r.lang === 'shex' ? r.max : Number(messageParam(r, 'maxCount') ?? 1);
+  const n = raw != null && Number.isFinite(raw) ? raw : 1;
   const values = (ctx.values ?? []).filter(dataTerm);
   const listed = values.length
-    ? values.map((v, i) => `#   ${toSparql(v)}${i < (n ?? 1) ? '   (kept)' : ''}`)
+    ? values.map((v, i) => oneLine(`#   ${toSparql(v)}${i < n ? '   (kept)' : ''}`))
     : ['#   (read them with: SELECT ?v WHERE { ' + arc(r, '?v') + ' })'];
   return [
     header(r, ctx.prefixes ?? {}),
-    `# The shape allows at most ${n ?? 0} value${n === 1 ? '' : 's'} here. Keep the first and`,
+    `# The shape allows at most ${n} value${n === 1 ? '' : 's'} here. Keep the first and`,
     '# remove the rest: replace ?value with a value to remove, once per value.',
     '# The values are:',
     ...listed,
-    'DELETE DATA {',
-    `  ${arc(r, '?value')} .`,
-    '}',
+    ...graphNote(ctx),
+    ...dataBlock('DELETE', ctx, arc(r, '?value')),
   ].join('\n');
 }
 
 /** A DELETE and INSERT that replaces the value: the path when known, else any predicate. */
-function replace(r: VResult, from: Term, to: string): string {
+function replace(r: VResult, ctx: FixContext, from: Term, to: string): string {
   const f = toSparql(r.focus);
   const p = r.path ? iriRef(r.path) : '?p';
   const v = toSparql(from);
-  const pattern = r.inverse ? `${v} ${p} ${f}` : `${f} ${p} ${v}`;
-  const fresh = r.inverse ? `${to} ${p} ${f}` : `${f} ${p} ${to}`;
-  return `DELETE { ${pattern} }\nINSERT { ${fresh} }\nWHERE  { ${pattern} }`;
+  const pattern = inGraph(ctx, r.inverse ? `${v} ${p} ${f}` : `${f} ${p} ${v}`);
+  const fresh = inGraph(ctx, r.inverse ? `${to} ${p} ${f}` : `${f} ${p} ${to}`);
+  return [
+    ...graphNote(ctx),
+    `DELETE { ${pattern} }\nINSERT { ${fresh} }\nWHERE  { ${pattern} }`,
+  ].join('\n');
 }
 
 function datatypeFix(r: VResult, ctx: FixContext): string | null {
   const v = r.value;
   if (!v || v.type !== 'literal') return null;
-  const dt =
-    r.lang === 'shex'
-      ? expandIri(r.constraint ?? '', ctx.prefixes ?? {})
-      : expandIri(messageParam(r, 'DatatypeConstraint') ?? '', ctx.prefixes ?? {});
+  const text = r.lang === 'shex' ? r.constraint : messageParam(r, 'DatatypeConstraint');
+  const dt = oneIri(text, ctx.prefixes ?? {});
   if (!dt || validLexical(v.value, dt) !== true) return null;
   const cast = `${JSON.stringify(v.value)}^^<${dt}>`;
   return [
     header(r, ctx.prefixes ?? {}),
-    `# The value has the wrong datatype. Its lexical form is a valid ${displayIri(dt, ctx.prefixes ?? {})},`,
+    oneLine(
+      `# The value has the wrong datatype. Its lexical form is a valid ${displayIri(dt, ctx.prefixes ?? {})},`,
+    ),
     '# so this writes the same value with that datatype.',
-    replace(r, v, cast),
+    replace(r, ctx, v, cast),
   ].join('\n');
 }
 
 function classFix(r: VResult, ctx: FixContext): string | null {
   if (r.value?.type !== 'uri') return null;
-  const param = messageParam(r, 'ClassConstraint');
-  const cls = param ? expandIri(param, ctx.prefixes ?? {}) : null;
+  const cls = oneIri(messageParam(r, 'ClassConstraint'), ctx.prefixes ?? {});
   return [
     header(r, ctx.prefixes ?? {}),
     '# This gives the value the class the shape expects. The other choice is to change the',
     '# value to a resource that already has the class.',
     ...(cls ? [] : ['# Replace ?class with the class the shape expects.']),
-    'INSERT DATA {',
-    `  ${toSparql(r.value)} <${RDF_TYPE}> ${cls ? iriRef(cls) : '?class'} .`,
-    '}',
+    ...graphNote(ctx),
+    ...dataBlock(
+      'INSERT',
+      ctx,
+      `${toSparql(r.value)} <${RDF_TYPE}> ${cls ? iriRef(cls) : '?class'}`,
+    ),
   ].join('\n');
 }
 
@@ -177,26 +285,27 @@ function allowedFix(r: VResult, ctx: FixContext): string | null {
     r.lang === 'shex'
       ? r.constraint
       : (messageParam(r, 'InConstraint') ?? messageParam(r, 'HasValue'));
-  const lines = [
-    header(r, ctx.prefixes ?? {}),
-    allowed ? `# The allowed values are: ${allowed}` : '# The shape lists the allowed values.',
-    '# Replace ?allowed with one of them.',
-  ];
   if (r.kind === 'hasValue') {
-    // the required value is missing: add it
+    // the required value is missing: add it, when the message names exactly one term
     if (!r.path) return null;
-    const v = allowed && /^(<[^>]*>|".*")/.test(allowed) ? allowed : '?allowed';
+    const v = oneTerm(allowed) ?? '?allowed';
     return [
       header(r, ctx.prefixes ?? {}),
-      `# The shape requires the value ${allowed ?? 'it names'} here.`,
+      oneLine(`# The shape requires the value ${allowed ?? 'it names'} here.`),
       ...(v === '?allowed' ? ['# Replace ?allowed with that value.'] : []),
-      'INSERT DATA {',
-      `  ${arc(r, v)} .`,
-      '}',
+      ...graphNote(ctx),
+      ...dataBlock('INSERT', ctx, arc(r, v)),
     ].join('\n');
   }
   if (!dataTerm(r.value)) return null;
-  return [...lines, replace(r, r.value, '?allowed')].join('\n');
+  return [
+    header(r, ctx.prefixes ?? {}),
+    allowed
+      ? oneLine(`# The allowed values are: ${allowed}`)
+      : '# The shape lists the allowed values.',
+    '# Replace ?allowed with one of them.',
+    replace(r, ctx, r.value, '?allowed'),
+  ].join('\n');
 }
 
 function closedFix(r: VResult, ctx: FixContext): string | null {
@@ -204,9 +313,8 @@ function closedFix(r: VResult, ctx: FixContext): string | null {
   return [
     header(r, ctx.prefixes ?? {}),
     '# The shape is closed and does not allow this predicate. This removes the triple.',
-    'DELETE DATA {',
-    `  ${toSparql(r.focus)} ${iriRef(r.path)} ${toSparql(r.value)} .`,
-    '}',
+    ...graphNote(ctx),
+    ...dataBlock('DELETE', ctx, `${toSparql(r.focus)} ${iriRef(r.path)} ${toSparql(r.value)}`),
   ].join('\n');
 }
 
@@ -258,4 +366,4 @@ export function suggestFix(r: VResult, ctx: FixContext = {}): string | null {
 
 /** Whether a suggestion still holds a placeholder the person must fill in. */
 export const hasPlaceholder = (q: string) =>
-  /\?(value|allowed|class)\b/.test(q.replace(/^#.*$/gm, ''));
+  /\?(value|allowed|class|graph)\b/.test(q.replace(/^#.*$/gm, ''));

@@ -4,6 +4,7 @@ import {
   badges,
   componentKind,
   countsText,
+  fixGraph,
   focusable,
   fromShacl,
   fromShex,
@@ -109,7 +110,7 @@ describe('resolution', () => {
     wouldCommit: true,
     outcome: 'commit',
     head: 3,
-    validation: { language: 'shacl', results, truncated },
+    validation: { language: 'shacl', status: 'warned', strategy: 'full', results, truncated },
   });
   it('reads the guard summary of a preview', () => {
     const x = r();
@@ -118,6 +119,7 @@ describe('resolution', () => {
       sourceShape: uri(EX + 'PersonShape'),
       sourceConstraintComponent: uri(SH + 'PatternConstraintComponent'),
       resultPath: uri(EX + 'email'),
+      value: lit('a@x'),
     };
     expect(resolution(x, preview([same]))).toBe('remains');
     expect(resolution(x, preview([]))).toBe('resolved');
@@ -189,5 +191,64 @@ describe('requests', () => {
       state: 'restricted',
       message: 'Validation needs access to every graph',
     });
+  });
+});
+
+describe('review round 1: resolution needs coverage and the value', () => {
+  const same = {
+    focusNode: uri(EX + 'p17'),
+    sourceShape: uri(EX + 'PersonShape'),
+    sourceConstraintComponent: uri(SH + 'PatternConstraintComponent'),
+    resultPath: uri(EX + 'email'),
+  };
+  const p = (over: Partial<WritePreview>, v: Record<string, unknown> = {}): WritePreview => ({
+    dryRun: true,
+    wouldCommit: true,
+    outcome: 'commit',
+    head: 3,
+    changes: { total: 1, limit: 20, truncated: false, quads: [] },
+    ...over,
+    validation: { language: 'shacl', status: 'warned', results: [], truncated: false, ...v },
+  });
+  const quad = (subject: string) => ({
+    op: '+' as const,
+    subject,
+    predicate: `<${EX}other>`,
+    object: '"x"',
+    graph: null,
+  });
+  it('an incremental summary that did not validate the focus node is not conclusive', () => {
+    const x = r();
+    const other = p(
+      { changes: { total: 1, limit: 20, truncated: false, quads: [quad(`<${EX}q>`)] } },
+      { strategy: 'incremental' },
+    );
+    expect(resolution(x, other)).toBe('unknown');
+    const touched = p(
+      { changes: { total: 1, limit: 20, truncated: false, quads: [quad(`<${EX}p17>`)] } },
+      { strategy: 'incremental' },
+    );
+    expect(resolution(x, touched)).toBe('resolved');
+    expect(resolution(x, p({}, { strategy: 'full', status: 'skipped' }))).toBe('unknown');
+    expect(resolution(x, p({}, { strategy: 'full' }))).toBe('resolved');
+  });
+  it('another value of the same constraint is another result', () => {
+    const x = r({ value: lit('blue') });
+    const other = { ...same, value: lit('pink') };
+    expect(resolution(x, p({}, { strategy: 'full', results: [other] }))).toBe('resolved');
+    expect(
+      resolution(x, p({}, { strategy: 'full', results: [{ ...same, value: lit('blue') }] })),
+    ).toBe('remains');
+  });
+});
+
+describe('review round 1: the graph of the guard', () => {
+  it('maps the dataGraph of the configuration', () => {
+    expect(fixGraph(undefined)).toBeNull();
+    expect(fixGraph('default')).toBeNull();
+    expect(fixGraph(['urn:x-arq:DefaultGraph'])).toBeNull();
+    expect(fixGraph(['http://g/1'])).toBe('http://g/1');
+    expect(fixGraph('union')).toBe('choose');
+    expect(fixGraph(['http://g/1', 'http://g/2'])).toBe('choose');
   });
 });

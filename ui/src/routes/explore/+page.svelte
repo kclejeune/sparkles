@@ -353,6 +353,7 @@
 
   function closeGraphTime() {
     graphTimeOpen = false;
+    vPlaying = false;
     resetTime();
   }
 

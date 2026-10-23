@@ -195,3 +195,87 @@ describe('validLexical', () => {
     expect(validLexical('x', EX + 'custom')).toBeNull();
   });
 });
+
+/** The update text outside comment lines. */
+const code = (q: string) => q.replace(/^#.*$/gm, '');
+
+describe('review round 1', () => {
+  it('a message cannot inject SPARQL through sh:hasValue', () => {
+    const q = suggestFix(
+      shacl('HasValueConstraintComponent', {
+        messages: ['HasValue[<urn:x> . }; DROP ALL; INSERT DATA { <urn:a> <urn:b> <urn:c>]'],
+      }),
+    )!;
+    expect(code(q)).not.toMatch(/DROP/);
+    expect(hasPlaceholder(q)).toBe(true);
+  });
+
+  it('a message cannot inject SPARQL through sh:class or sh:datatype', () => {
+    const c = suggestFix(
+      shacl('ClassConstraintComponent', {
+        value: uri(EX + 'acme'),
+        messages: [
+          'ClassConstraint[<urn:a> } ; DROP ALL ; INSERT DATA { <urn:b> <urn:c> <urn:d>]: x',
+        ],
+      }),
+    )!;
+    expect(code(c)).not.toMatch(/DROP/);
+    expect(code(c)).toContain('?class');
+    const d = suggestFix(
+      shacl('DatatypeConstraintComponent', {
+        value: lit('30'),
+        messages: [`DatatypeConstraint[<${XSD}integer> } ; DROP ALL ; <${XSD}integer>]: x`],
+      }),
+    );
+    expect(d).toBeNull();
+  });
+
+  it('a line break in message text stays inside the comment', () => {
+    const q = suggestFix(
+      shacl('InConstraintComponent', {
+        value: lit('blue'),
+        messages: ['InConstraint["red"\nDROP ALL ;\n"green"] : Expected one of the list : "blue"'],
+      }),
+    )!;
+    expect(code(q)).not.toMatch(/DROP/);
+  });
+
+  it('writes the graph the triples live in', () => {
+    const min = shacl('MinCountConstraintComponent', { messages: ['minCount[1]: x'] });
+    const named = suggestFix(min, { graph: EX + 'g1' })!;
+    expect(named).toContain(
+      `INSERT DATA {\n  GRAPH <${EX}g1> { <${EX}p17> <${EX}name> ?value . }\n}`,
+    );
+    const choose = suggestFix(min, { graph: 'choose' })!;
+    expect(choose).toContain('GRAPH ?graph {');
+    expect(hasPlaceholder(choose.replace('?value .', '"x" .'))).toBe(true);
+    const dt = suggestFix(
+      shacl('DatatypeConstraintComponent', {
+        value: lit('30'),
+        messages: [`DatatypeConstraint[<${XSD}integer>]: Expected`],
+      }),
+      { graph: EX + 'g1' },
+    )!;
+    expect(dt).toContain(`DELETE { GRAPH <${EX}g1> { <${EX}p17> <${EX}name> "30" } }`);
+    expect(dt).toContain(`WHERE  { GRAPH <${EX}g1> { <${EX}p17> <${EX}name> "30" } }`);
+    const closed = suggestFix(
+      shacl('ClosedConstraintComponent', { resultPath: uri(EX + 'nick'), value: lit('Al') }),
+      { graph: EX + 'g1' },
+    )!;
+    expect(closed).toContain(`GRAPH <${EX}g1> { <${EX}p17> <${EX}nick> "Al" . }`);
+  });
+
+  it('declines impossible dates and time zones', () => {
+    expect(validLexical('2026-02-31', XSD + 'date')).toBe(false);
+    expect(validLexical('2024-02-29', XSD + 'date')).toBe(true);
+    expect(validLexical('2023-02-29', XSD + 'date')).toBe(false);
+    expect(validLexical('2026-04-31', XSD + 'date')).toBe(false);
+    expect(validLexical('2026-10-23+99:99', XSD + 'date')).toBe(false);
+    expect(validLexical('2026-10-23+14:00', XSD + 'date')).toBe(true);
+    expect(validLexical('2026-10-23-14:01', XSD + 'date')).toBe(false);
+    expect(validLexical('2026-10-23T24:00:00', XSD + 'dateTime')).toBe(true);
+    expect(validLexical('2026-10-23T24:00:01', XSD + 'dateTime')).toBe(false);
+    expect(validLexical('2026-02-30T10:00:00Z', XSD + 'dateTime')).toBe(false);
+    expect(validLexical('2026+15:00', XSD + 'gYear')).toBe(false);
+  });
+});

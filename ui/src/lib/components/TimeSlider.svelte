@@ -15,6 +15,7 @@
   // The time slider (docs/specs/U01-time-slider.md): one control over the commits of a
   // branch. It writes the `at` selector the views already read, a second handle compares
   // two commits, and Play steps through the commits while the view renders each one.
+  import { onDestroy } from 'svelte';
   import { resolve } from '$app/paths';
   import * as api from '$lib/api';
   import { changesFeedUnavailable, followCommits } from '$lib/changes-feed';
@@ -144,6 +145,8 @@
   let dragging = $state<'left' | 'right' | 'band' | null>(null);
   let playing = $state(false);
   $effect(() => onplaying?.(playing));
+  // a slider that goes away while it plays leaves nothing paused
+  onDestroy(() => onplaying?.(false));
   let speed = $state<1 | 2 | 4>(1);
   let follow = $state(false);
   let followNote = $state<string | null>(null);

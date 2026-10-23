@@ -299,6 +299,7 @@ export function overlaySummary(b, store) {
   const results = overlayResults(b, store, all) ?? [];
   return {
     language: 'shacl',
+    strategy: 'full',
     status: results.length ? (b.guard.mode === 'reject' ? 'rejected' : 'warned') : 'passed',
     mode: b.guard.mode,
     blocking: results.length,

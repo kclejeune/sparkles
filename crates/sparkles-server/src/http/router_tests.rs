@@ -1428,3 +1428,38 @@ ex:shapes { ex:NameShape a sh:NodeShape ; sh:targetClass ex:Person ;
     let r = shacl_form(&s.app, "?shapes=not%20an%20iri", "").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
+
+/// Review round 1: a stored blank node named by `target` is the stored node, also when the
+/// shapes come from the body (whose own blank nodes are local to the shapes).
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_targets_name_stored_blank_nodes() {
+    let s = server();
+    let ds = s.state.datasets().get("ds").cloned().unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            b"_:anon <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .".to_vec(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let full = validate_json(&s.app, "", NAME_SHAPES).await;
+    let blank: Vec<&J> = full["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["focusNode"]["type"] == "bnode")
+        .collect();
+    assert_eq!(blank.len(), 1, "{full}");
+    let label = blank[0]["focusNode"]["value"].as_str().unwrap().to_string();
+    let one = validate_json(&s.app, &format!("?target=_:{label}"), NAME_SHAPES).await;
+    assert_eq!(one["results"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(one["results"][0]["focusNode"]["value"], label.as_str());
+    let many = validate_json(
+        &s.app,
+        &format!("?target=_:{label}&target=ex:alice"),
+        NAME_SHAPES,
+    )
+    .await;
+    assert_eq!(many["results"].as_array().unwrap().len(), 1, "{many}");
+}

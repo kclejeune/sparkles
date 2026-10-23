@@ -15,7 +15,9 @@ ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ;
   sh:property [ sh:path ex:email ; sh:pattern "^[^@]+@[^@]+[.][^@]+$" ; sh:message "not an email address" ] .`;
 
 test.beforeAll(async ({ request }) => {
-  const r = await request.post('/$/datasets', { data: { dbName: 'quality', dbType: 'mem' } });
+  const r = await request.post('/$/datasets', {
+    data: { dbName: 'quality', dbType: 'persistent' },
+  });
   if (r.status() === 409) return;
   expect(r.ok()).toBe(true);
   const u = await request.post('/quality/update', {
@@ -88,6 +90,50 @@ test('keys: Shift+V moves to the next node with a result and V opens it', async 
   await page.keyboard.press('Shift+V');
   await page.keyboard.press('v');
   await expect(page.getByRole('dialog', { name: /Validation results of/ })).toBeVisible();
+});
+
+test('review: an edit while a preview runs keeps Run disabled', async ({ page }) => {
+  await open(page);
+  await page.getByRole('button', { name: /p3, 1 violation/ }).click();
+  const panel = page.getByRole('dialog', { name: /Validation results of/ });
+  await panel.getByRole('button', { name: 'Suggest fix' }).click();
+  const editor = panel.getByRole('textbox', { name: 'Suggested update' });
+  const text = await editor.inputValue();
+  await editor.fill(text.replace('?value .', '"Cy" .'));
+  let release = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  await page.route('**/quality/update?dryRun=true*', async (route) => {
+    await held;
+    await route.continue();
+  });
+  await panel.getByRole('button', { name: 'Preview' }).click();
+  // the editor changes while the dry run is pending
+  await editor.evaluate(
+    (el: HTMLTextAreaElement, t) => {
+      el.value = t;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    },
+    text.replace('?value .', '"Other" .'),
+  );
+  release();
+  await expect(panel).toContainText('The update would commit.');
+  await expect(panel.getByRole('button', { name: 'Run' })).toBeDisabled();
+  await expect(panel).toContainText('The text changed since the preview.');
+  await page.unroute('**/quality/update?dryRun=true*');
+});
+
+test('review: closing a playing history does not leave the overlay paused', async ({ page }) => {
+  await open(page);
+  await page.getByRole('button', { name: 'Graph history' }).click();
+  const bar = page.getByRole('region', { name: 'Graph history time slider' });
+  await bar.getByRole('slider', { name: /^(Commit|Compared to)$/ }).focus();
+  await page.keyboard.press('Home');
+  await bar.getByRole('button', { name: 'Play', exact: true }).click();
+  const overlay = page.getByRole('region', { name: 'Validation overlay' });
+  await expect(overlay).toContainText('Paused while the history plays.');
+  await page.getByRole('button', { name: 'Graph history' }).click();
+  await expect(overlay).not.toContainText('Paused while the history plays.');
+  await expect.poll(async () => Object.keys(await badgesOf(page)).length).toBe(4);
 });
 
 test('A11: a suggested fix is previewed, run, and its badge goes away', async ({ page }) => {

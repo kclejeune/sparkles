@@ -19,10 +19,11 @@
   import { load } from '$lib/storage';
   import { readShaclSyntax, shaclSyntaxKey } from '$lib/shacl';
   import { isAbort } from '$lib/supersede';
-  import { hasPlaceholder, suggestFix } from '$lib/fixes';
+  import { hasPlaceholder, suggestFix, type FixGraph } from '$lib/fixes';
   import {
     badges as toBadges,
     countsText,
+    fixGraph,
     focusable,
     groupResults,
     MARK,
@@ -98,10 +99,16 @@
       : null;
   });
 
+  /** Where the guard's results live, for suggested fixes (`choose` until known). */
+  let guardGraph = $state<FixGraph>('choose');
+  // the shapes-graph and editor sources validate the default graph
+  const graphOfFix = $derived<FixGraph>(sourceKind === 'guard' ? guardGraph : null);
+
   $effect(() => {
     const name = ds;
     probe = null;
     probeError = null;
+    guardGraph = 'choose';
     const ctl = new AbortController();
     probeGuard(name, ctl.signal)
       .then((p) => {
@@ -110,6 +117,16 @@
         // without a guard the editor's shapes are the source (§11.2)
         if (p.state === 'none') sourceKind = editorShapes ? 'editor' : 'graph';
         else sourceKind = 'guard';
+        // the guard's data graph, which a suggested fix writes (unknown: the person chooses)
+        if (p.state === 'shacl' || p.state === 'shex')
+          api
+            .writeValidation(name, ctl.signal)
+            .then((w) => {
+              if (ds === name) guardGraph = fixGraph(w?.config.dataGraph);
+            })
+            .catch(() => {
+              if (ds === name) guardGraph = 'choose';
+            });
       })
       .catch((e) => {
         if (!isAbort(e) && ds === name) probeError = api.errorMessage(e);
@@ -259,7 +276,7 @@
         values = undefined;
       }
     }
-    const text = suggestFix(r, { prefixes, values });
+    const text = suggestFix(r, { prefixes, values, graph: graphOfFix });
     if (!text) return;
     fix = { r, text, preview: null, previewed: '', busy: false, error: null, ran: false };
   }
@@ -273,11 +290,13 @@
   async function preview() {
     if (!fix || placeholder) return;
     const f = fix;
+    // the text sent is the text previewed, whatever the editor holds when the answer comes
+    const sent = f.text;
     f.busy = true;
     f.error = null;
     try {
-      f.preview = await previewUpdate(ds, f.text);
-      f.previewed = f.text;
+      f.preview = await previewUpdate(ds, sent);
+      f.previewed = sent;
     } catch (e) {
       f.preview = null;
       f.error = api.errorMessage(e);
@@ -480,6 +499,7 @@
           class="mono"
           rows={Math.min(14, fix.text.split('\n').length + 1)}
           aria-label="Suggested update"
+          readonly={fix.busy}
           bind:value={fix.text}></textarea>
         {#if placeholder}
           <p class="faint small">Fill in the placeholders, such as ?value, before the preview.</p>
