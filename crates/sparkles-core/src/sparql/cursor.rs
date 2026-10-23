@@ -2278,8 +2278,15 @@ impl Operator {
         let incremental_group = exists_streams && group::eligible(&node);
         let expanding = exists_streams && expand::eligible(&node);
         let walking = walk::eligible(&node);
-        let native_blocking =
-            matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. }) && node.children.len() == 1;
+        // A pattern count over an input reads all of it, as a sort does, and then has one
+        // row per predicate.
+        let native_blocking = matches!(
+            node.kind,
+            Kind::Sort(_) | Kind::OrderBy { .. } | Kind::PatternCount(_)
+        ) && node.children.len() == 1;
+        // A pattern count over every subject reads the pattern table, one row per
+        // predicate, as a grouped count scan does.
+        let pattern_counts = matches!(node.kind, Kind::PatternCount(_)) && node.children.is_empty();
         // An ordered top-k keeps a heap of its best rows, as a streaming top-k does.
         let index_topk = matches!(node.kind, Kind::OrderedTopK(_)) && exec::heap_eligible(ctx);
         // A native sort consumes cursor batches into charged state. It blocks before
@@ -2290,6 +2297,7 @@ impl Operator {
             && !expanding
             && !walking
             && !index_topk
+            && !pattern_counts
             && (!native_blocking || !exists_streams);
         if materializes && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
@@ -2524,7 +2532,7 @@ impl Operator {
                 | Kind::CountDistinctScan { .. }
                 | Kind::CountFilterScan { .. }
                 | Kind::CountJoinRuns { .. } => State::Scalar(node),
-                Kind::GroupCountScan { .. } => State::Counts {
+                Kind::GroupCountScan { .. } | Kind::PatternCount(_) => State::Counts {
                     node,
                     loaded: None,
                     at: 0,

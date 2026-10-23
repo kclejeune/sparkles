@@ -2106,6 +2106,12 @@ impl<'a> Planner<'a> {
         else {
             return Ok(None);
         };
+        // a substituted object restricts the triples, which the patterns cannot
+        if let Some(o) = &shape.o
+            && !matches!(self.var(o.as_str()), PT::V(_))
+        {
+            return Ok(None);
+        }
         let Some((gf, None)) = self.graph_filter(g) else {
             return Ok(None);
         };
@@ -2183,6 +2189,36 @@ impl<'a> Planner<'a> {
     /// and predicates of `?s ?p []`.
     fn has_predicate(&mut self, t: &TriplePattern, g: &ActiveGraph) -> Result<Node> {
         use super::patternplan::{PatternScanSpec, usable};
+        // A triple term is never a subject (RDF 1.2 has them only as objects) nor a
+        // predicate, so the relation is empty. Its variables stay unbound.
+        if matches!(t.subject, TermPattern::Triple(_)) || matches!(t.object, TermPattern::Triple(_))
+        {
+            fn walk(t: &TermPattern, out: &mut Vec<String>) {
+                match t {
+                    TermPattern::Variable(v) => out.push(v.as_str().to_string()),
+                    TermPattern::Triple(tp) => {
+                        walk(&tp.subject, out);
+                        if let NamedNodePattern::Variable(v) = &tp.predicate {
+                            out.push(v.as_str().to_string());
+                        }
+                        walk(&tp.object, out);
+                    }
+                    _ => {}
+                }
+            }
+            let mut names = Vec::new();
+            walk(&t.subject, &mut names);
+            walk(&t.object, &mut names);
+            let mut vars = Vec::new();
+            for n in names {
+                if let PT::V(v) = self.var(&n)
+                    && !vars.contains(&v)
+                {
+                    vars.push(v);
+                }
+            }
+            return Ok(Node::empty(vars));
+        }
         let s = self.term_pattern(&t.subject);
         let p = self.term_pattern(&t.object);
         let mut vars = Vec::new();
@@ -2201,6 +2237,8 @@ impl<'a> Planner<'a> {
         // costs less than walking every subject's pattern.
         if vars.len() == [s, p].iter().filter(|x| matches!(x, PT::V(_))).count()
             && matches!(p, PT::V(_))
+            // a cursor streams the scan, and stops at a LIMIT
+            && !self.ctx.is_cursor()
             && !matches!(g, ActiveGraph::Var(_))
             && let Some((gf, None)) = self.graph_filter(g)
             && let Some(uses) = usable(self.ctx, &gf)

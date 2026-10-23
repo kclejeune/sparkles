@@ -1301,7 +1301,7 @@ pub fn for_each_pair(
     corr: &Correction,
     only: Option<u64>,
     check: &dyn Fn() -> Result<()>,
-    mut f: impl FnMut(u64, u64) -> Result<()>,
+    mut f: impl FnMut(u64, u64) -> Result<bool>,
 ) -> Result<()> {
     // with one predicate: the patterns that hold it, found once
     let holds: Option<Vec<bool>> = match only {
@@ -1320,47 +1320,61 @@ pub fn for_each_pair(
         None => None,
     };
     let mut pats = Patterns::new(t);
-    let emit_now = |s: u64, now: &[u64], f: &mut dyn FnMut(u64, u64) -> Result<()>| {
+    // false once `f` asks to stop
+    let emit_now = |s: u64, now: &[u64], f: &mut dyn FnMut(u64, u64) -> Result<bool>| {
         for &p in now {
-            if only.is_none_or(|o| o == p) {
-                f(s, p)?;
+            if only.is_none_or(|o| o == p) && !f(s, p)? {
+                return Ok(false);
             }
         }
-        Ok::<(), Error>(())
+        Ok::<bool, Error>(true)
     };
     let mut next = 0usize;
     let touched = &corr.touched;
     let mut n = 0u64;
+    let mut stopped = false;
     t.for_each_until(|s, pid| {
         n += 1;
         if n.is_multiple_of(65536) {
             check()?;
         }
         while let Some(x) = touched.get(next).filter(|x| x.subject < s) {
-            emit_now(x.subject, &x.now, &mut f)?;
             next += 1;
+            if !emit_now(x.subject, &x.now, &mut f)? {
+                stopped = true;
+                return Ok(false);
+            }
         }
         if let Some(x) = touched.get(next).filter(|x| x.subject == s) {
-            emit_now(s, &x.now, &mut f)?;
             next += 1;
-            return Ok(true);
+            let go = emit_now(s, &x.now, &mut f)?;
+            stopped = !go;
+            return Ok(go);
         }
         match (&holds, only) {
             (Some(h), Some(p)) => {
-                if h[pid as usize] {
-                    f(s, p)?;
+                if h[pid as usize] && !f(s, p)? {
+                    stopped = true;
+                    return Ok(false);
                 }
             }
             _ => {
                 for &p in pats.get(pid)? {
-                    f(s, p)?;
+                    if !f(s, p)? {
+                        stopped = true;
+                        return Ok(false);
+                    }
                 }
             }
         }
         Ok(true)
     })?;
-    for x in &touched[next..] {
-        emit_now(x.subject, &x.now, &mut f)?;
+    if !stopped {
+        for x in &touched[next..] {
+            if !emit_now(x.subject, &x.now, &mut f)? {
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -1558,6 +1572,28 @@ pub(crate) fn rewrite(
 
 // ------------------------------------------------------------------ checking -----
 
+/// A table's (subject, pattern) entries in subject order, decoded a block at a time.
+struct Entries<'a> {
+    t: TableRef<'a>,
+    b: u64,
+    rows: Vec<(u64, u32)>,
+    i: usize,
+}
+
+impl Entries<'_> {
+    fn peek(&mut self) -> Result<Option<(u64, u32)>> {
+        while self.i >= self.rows.len() {
+            if self.b >= self.t.t.blocks {
+                return Ok(None);
+            }
+            self.t.block(self.b, &mut self.rows)?;
+            self.b += 1;
+            self.i = 0;
+        }
+        Ok(Some(self.rows[self.i]))
+    }
+}
+
 /// Check the patterns of the generation in `dir` against its SPO permutation: the
 /// checksum, every subject's pattern, the subjects of each pattern and the predicate
 /// totals. Returns the problems found (at most `max`), and a summary.
@@ -1585,30 +1621,30 @@ pub fn verify(dir: &Path, max: usize) -> Result<(Vec<String>, String)> {
         // every subject's predicates from SPO, against the table in subject order
         let mut counts = vec![0u64; t.patterns() as usize];
         let mut totals: FxHashMap<u64, u64> = FxHashMap::default();
-        let mut entries: Vec<(u64, u32)> = Vec::new();
-        t.for_each_until(|s, pid| {
-            entries.push((s, pid));
-            Ok(true)
-        })?;
-        let mut at = 0usize;
+        // the table's subjects, one block at a time
+        let mut entries = Entries {
+            t,
+            b: 0,
+            rows: Vec::with_capacity(BLOCK_SUBJECTS),
+            i: 0,
+        };
         let mut buf = Vec::new();
         let mut cur: Option<u64> = None;
         let mut set: Vec<u64> = Vec::new();
         let mut done = |s: u64, set: &mut Vec<u64>, problems: &mut Vec<String>| -> Result<()> {
-            while at < entries.len() && entries[at].0 < s {
+            while let Some((x, _)) = entries.peek()?.filter(|e| e.0 < s) {
                 note(
                     problems,
                     format!(
-                        "{} table: subject {:#x} has a pattern but no triples",
+                        "{} table: subject {x:#x} has a pattern but no triples",
                         scope.name(),
-                        entries[at].0
                     ),
                 );
-                at += 1;
+                entries.i += 1;
             }
-            let have = (at < entries.len() && entries[at].0 == s).then(|| entries[at].1);
+            let have = entries.peek()?.filter(|e| e.0 == s).map(|e| e.1);
             if have.is_some() {
-                at += 1;
+                entries.i += 1;
             }
             match (have, set.is_empty()) {
                 (None, true) => {}
@@ -1753,7 +1789,7 @@ mod tests {
         let mut pairs = Vec::new();
         for_each_pair(n, &corr, Some(30), &|| Ok(()), |s, p| {
             pairs.push((s, p));
-            Ok(())
+            Ok(true)
         })
         .unwrap();
         assert_eq!(pairs.len(), 1000);

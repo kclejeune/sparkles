@@ -963,7 +963,7 @@ fn run_node(
             t
         }
         Kind::PatternScan(spec) => {
-            let (t, nt) = super::patternplan::run_scan(ctx, spec, &n.vars)?;
+            let (t, nt, _) = super::patternplan::run_scan(ctx, spec, &n.vars, None)?;
             note = Some(nt);
             t
         }
@@ -2304,6 +2304,9 @@ pub(super) fn apply_blocking(
             Ok(table)
         }
         Kind::OrderBy { keys, limit } => Ok(order_by(ctx, table, keys, *limit, report)?.0),
+        Kind::PatternCount(spec) => {
+            Ok(super::patternplan::run_count(ctx, spec, Some(&table), &node.vars)?.0)
+        }
         _ => unreachable!("not a native blocking cursor operator"),
     }
 }
@@ -2352,6 +2355,10 @@ fn run_limited(
         Kind::Scan(spec) => {
             let (t, truncated) = scan_limited(ctx, spec, &n.vars, Some(want))?;
             finish(Materialized::plain(t), Vec::new(), !truncated)
+        }
+        Kind::PatternScan(spec) => {
+            let (t, _, stopped) = super::patternplan::run_scan(ctx, spec, &n.vars, Some(want))?;
+            finish(Materialized::plain(t), Vec::new(), !stopped)
         }
         Kind::Filter(_)
         | Kind::Extend(..)

@@ -564,3 +564,151 @@ fn the_result_cache_keeps_the_measures_apart() {
     assert_eq!(b, same(&s, subjects, Some(true)));
     assert_eq!(a, solutions(&run_on(&s.snapshot(), rows, &cached)));
 }
+
+/// Review round 1: shapes the rewrite must refuse or keep exact.
+#[test]
+fn near_misses_of_the_review() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(
+        &s,
+        "@prefix ex: <http://ex.org/> .\n\
+         ex:a ex:p 1 ; ex:q <<( ex:z ex:r ex:v )>> . ex:p ex:p 2 . ex:b ex:q 2 .\n\
+         ex:a ex:p ex:z .",
+        RdfFormat::Turtle,
+    );
+    // the subject is the grouped predicate: only ex:p ex:p 2 matches
+    let rows = same(
+        &s,
+        "SELECT ?p (COUNT(DISTINCT ?p) AS ?n) WHERE { ?p ?p ?o } GROUP BY ?p",
+        Some(false),
+    );
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    // ?o inside a triple term elsewhere joins
+    let rows = same(
+        &s,
+        "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o . ?s ex:q <<( ?o ex:r ex:v )>> } GROUP BY ?p",
+        Some(false),
+    );
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    // a triple term is never a predicate nor a subject
+    for q in [
+        "SELECT ?x WHERE { ex:a spk:hasPredicate <<( ?x ex:r ex:v )>> }",
+        "SELECT ?x WHERE { <<( ?x ex:r ex:v )>> spk:hasPredicate ?p }",
+        "SELECT ?p WHERE { ex:a spk:hasPredicate <<( ex:z ex:r ex:v )>> }",
+    ] {
+        assert!(same(&s, q, Some(false)).is_empty(), "{q}");
+    }
+    // a substituted object restricts the triples
+    let text = format!(
+        "{PREFIXES}{SPK}SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ ?s ?p ?o }} GROUP BY ?p"
+    );
+    let bound = |opt| QueryOptions {
+        initial_bindings: vec![("o".into(), oxrdf::Term::Literal(oxrdf::Literal::from(1)))],
+        ..opts(opt)
+    };
+    let fast = query(s.snapshot(), &text, &bound(Optimizations::ALL)).unwrap();
+    let slow = query(s.snapshot(), &text, &bound(Optimizations::NONE)).unwrap();
+    assert_eq!(solutions(&fast), solutions(&slow));
+    assert_eq!(solutions(&fast).len(), 1, "{:?}", solutions(&fast));
+    assert!(!has_op(&fast.plan, "PatternCount"));
+}
+
+/// A pattern scan admits its output against the memory budget, and stops at a LIMIT.
+#[test]
+fn pattern_scans_are_budgeted_and_limited() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s, &films(), RdfFormat::TriG);
+    let text = format!("{PREFIXES}{SPK}SELECT ?s ?p WHERE {{ ?s spk:hasPredicate ?p }}");
+    let tight = QueryOptions {
+        max_memory_bytes: Some(64 * 1024),
+        ..opts(Optimizations::ALL)
+    };
+    match query(s.snapshot(), &text, &tight) {
+        Err(crate::error::Error::BudgetExceeded(b)) => {
+            assert_eq!(b.kind, crate::error::BudgetKind::Memory, "{b:?}")
+        }
+        other => panic!("{:?}", other.map(|r| solutions(&r).len())),
+    }
+    let limited = format!("{text} LIMIT 3");
+    let r = query(s.snapshot(), &limited, &opts(Optimizations::ALL)).unwrap();
+    assert_eq!(solutions(&r).len(), 3);
+    assert!(has_op(&r.plan, "PatternScan"), "{:#?}", r.plan);
+    assert!(
+        super::opt_tests::has_desc(&r.plan, "stopped early"),
+        "{:#?}",
+        r.plan
+    );
+}
+
+/// Strict cursors run the counts natively and keep the streaming scan for pairs.
+#[test]
+fn cursors_run_pattern_plans_without_materializing() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s, &films(), RdfFormat::TriG);
+    update(&s, "INSERT DATA { ex:f1 ex:knows ex:f2 }");
+    let rows = |text: &str, opt: Optimizations, fallback| -> (Vec<String>, String) {
+        let text = format!("{PREFIXES}{SPK}{text}");
+        let c = CursorOptions {
+            batch_rows: 7,
+            fallback,
+            ..Default::default()
+        };
+        let mut cur = select_cursor(s.snapshot(), &text, &opts(opt), &c)
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        let mut out = Vec::new();
+        while let Some(b) = cur.next_batch().unwrap() {
+            for i in 0..b.len() {
+                out.push(format!("{:?}", b.row(i).unwrap()));
+            }
+        }
+        out.sort();
+        (out, cur.plan_json().unwrap())
+    };
+    for q in [
+        "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p",
+        "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ex:Film . ?s ?p ?o } GROUP BY ?p",
+        "SELECT DISTINCT ?p WHERE { ?s a ex:Film . ?s ?p ?o }",
+    ] {
+        let (fast, plan) = rows(q, Optimizations::ALL, FallbackPolicy::RejectMaterialization);
+        assert!(plan.contains("PatternCount"), "{q}: {plan}");
+        let (slow, _) = rows(q, Optimizations::NONE, FallbackPolicy::AllowMaterialization);
+        assert_eq!(fast, slow, "{q}");
+    }
+    let q = "SELECT ?s ?p WHERE { ?s spk:hasPredicate ?p } LIMIT 5";
+    let (fast, plan) = rows(q, Optimizations::ALL, FallbackPolicy::AllowMaterialization);
+    assert!(!plan.contains("PatternScan"), "{plan}");
+    assert_eq!(fast.len(), 5);
+}
+
+/// A partial compaction with patterns turned off writes none.
+#[test]
+fn partial_compaction_honours_patterns_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let s = Store::open(&db, StoreOptions::default()).unwrap();
+    load(&s, &films(), RdfFormat::TriG);
+    s.compact().unwrap();
+    assert!(s.snapshot().generation.patterns.file.is_some());
+    drop(s);
+    let mut o = StoreOptions::default();
+    o.build.patterns = false;
+    let s = Store::open(&db, o).unwrap();
+    update(&s, "INSERT DATA { ex:f1 ex:knows ex:f2 }");
+    let rep = s
+        .compact_with(&CompactOptions {
+            partial: Some(PartialMode::Always),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rep.mode, "partial", "{rep:?}");
+    let snap = s.snapshot();
+    assert!(snap.generation.patterns.file.is_none());
+    let gdir = snap.generation.dir.clone().unwrap();
+    assert!(!gdir.join(crate::patterns::FILE).exists());
+    let why = snap.generation.meta.patterns.as_ref().unwrap();
+    assert!(
+        why.skipped.as_deref().unwrap().contains("turned off"),
+        "{why:?}"
+    );
+    check_all_unchecked(&s);
+}

@@ -362,6 +362,7 @@ pub(crate) fn write(
     dir: &Path,
     next_bnode: u64,
     prefixes: BTreeMap<String, String>,
+    patterns: bool,
     interrupt: &crate::builder::InterruptFn,
 ) -> Result<IndexMeta> {
     let g = &snap.generation;
@@ -420,6 +421,11 @@ pub(crate) fn write(
                     r
                 },
                 || {
+                    if !patterns {
+                        return Ok(crate::patterns::PatternInfo::skipped(
+                            "turned off for this build",
+                        ));
+                    }
                     let r = crate::patterns::rewrite(snap, dir, &|| interrupt());
                     tracing::debug!(
                         target: "sparkles::store::partial",

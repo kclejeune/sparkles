@@ -1515,8 +1515,15 @@ impl Store {
                         ));
                     }
                     let interrupt = self.compaction_interrupt(o, dir);
-                    let meta =
-                        partial::write(snap, &plan, dir, next_bnode, self.prefixes(), &interrupt)?;
+                    let meta = partial::write(
+                        snap,
+                        &plan,
+                        dir,
+                        next_bnode,
+                        self.prefixes(),
+                        self.opts.build.patterns,
+                        &interrupt,
+                    )?;
                     interrupt()?;
                     return Ok((
                         meta,

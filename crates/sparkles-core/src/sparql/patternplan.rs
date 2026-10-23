@@ -122,6 +122,8 @@ pub(super) struct CountShape {
     /// the other triples of the pattern: the input
     pub rest: Vec<TriplePattern>,
     pub s: Variable,
+    /// the object variable the rewrite drops, which must not be substituted
+    pub o: Option<Variable>,
     pub counts: Vec<(Variable, Measure)>,
 }
 
@@ -142,11 +144,21 @@ pub(super) fn count_shape(
             _ => None,
         }
     };
-    let mentions = |t: &TriplePattern, name: &str| {
-        names(&t.subject).as_deref() == Some(name)
-            || names(&t.object).as_deref() == Some(name)
+    // a variable or blank node anywhere in a triple, inside triple terms too
+    fn in_term(t: &TermPattern, name: &str) -> bool {
+        match t {
+            TermPattern::Variable(v) => format!("?{}", v.as_str()) == name,
+            TermPattern::BlankNode(b) => format!("_:{}", b.as_str()) == name,
+            TermPattern::Triple(tp) => in_triple(tp, name),
+            _ => false,
+        }
+    }
+    fn in_triple(t: &TriplePattern, name: &str) -> bool {
+        in_term(&t.subject, name)
+            || in_term(&t.object, name)
             || matches!(&t.predicate, NamedNodePattern::Variable(v) if format!("?{}", v.as_str()) == name)
-    };
+    }
+    let mentions = |t: &TriplePattern, name: &str| in_triple(t, name);
     let pname = format!("?{}", p.as_str());
     let mut found: Option<(usize, Variable, bool)> = None;
     for (i, t) in patterns.iter().enumerate() {
@@ -155,13 +167,11 @@ pub(super) fn count_shape(
         };
         let sname = format!("?{}", s.as_str());
         let candidate = match &t.predicate {
-            NamedNodePattern::Variable(v) if v == p => {
-                // ?s ?p ?o with ?o fresh
-                match names(&t.object) {
-                    Some(o) if o != sname && o != pname => Some((o, false)),
-                    _ => None,
-                }
-            }
+            // ?s ?p ?o with ?o fresh, and ?s not ?p
+            NamedNodePattern::Variable(v) if v == p && *s != *p => match names(&t.object) {
+                Some(o) if o != sname && o != pname => Some((o, false)),
+                _ => None,
+            },
             pred if is_has_predicate(pred) => match &t.object {
                 TermPattern::Variable(v) if v == p && *s != *p => Some((String::new(), true)),
                 _ => None,
@@ -183,6 +193,10 @@ pub(super) fn count_shape(
         found = Some((i, s.clone(), has));
     }
     let (i, s, has) = found?;
+    let o = match &patterns[i].object {
+        TermPattern::Variable(v) if !has => Some(v.clone()),
+        _ => None,
+    };
     let mut counts = Vec::new();
     for (out, agg) in aggregates {
         let m = match agg {
@@ -213,7 +227,7 @@ pub(super) fn count_shape(
             return None;
         }
     }
-    Some(CountShape { rest, s, counts })
+    Some(CountShape { rest, s, o, counts })
 }
 
 /// (predicate, count), in predicate order.
@@ -292,12 +306,14 @@ pub(super) fn run_count(
     Ok((out, u.note()))
 }
 
-/// Run a [`PatternScanSpec`]: its variables' columns follow `vars`.
+/// Run a [`PatternScanSpec`]: its variables' columns follow `vars`. With `limit`, it
+/// stops at that many rows. Also returns the EXPLAIN note and whether it stopped early.
 pub(super) fn run_scan(
     ctx: &Ctx,
     spec: &PatternScanSpec,
     vars: &[VarId],
-) -> Result<(Table, String)> {
+    limit: Option<usize>,
+) -> Result<(Table, String, bool)> {
     let u = &spec.uses;
     let table = u
         .file
@@ -312,8 +328,22 @@ pub(super) fn run_scan(
         PathEnd::Var(v) => out.col_of(v),
         PathEnd::Const(_) => None,
     };
+    let want = limit.unwrap_or(usize::MAX);
+    let width = out.width();
     let mut row = vec![Id::UNDEF; vars.len()];
-    let mut emit = |s: u64, p: u64, out: &mut Table| -> Result<()> {
+    let mut stopped = false;
+    // false once the limit is met
+    let mut emit = |s: u64, p: u64, out: &mut Table| -> Result<bool> {
+        if out.len() >= want {
+            stopped = true;
+            return Ok(false);
+        }
+        // the columns double as they fill: admit the next size before they grow
+        let n = out.len();
+        if n >= 4096 && n.is_power_of_two() {
+            ctx.check()?;
+            ctx.check_output(n.saturating_mul(2), width)?;
+        }
         if let Some(c) = sc {
             row[c] = Id(s);
         }
@@ -321,11 +351,7 @@ pub(super) fn run_scan(
             row[c] = Id(p);
         }
         out.push_row(&row);
-        if out.len().is_multiple_of(1 << 16) {
-            ctx.check()?;
-            ctx.check_rows(out.len())?;
-        }
-        Ok(())
+        Ok(true)
     };
     match (spec.s.clone(), spec.p.clone()) {
         (PathEnd::Const(s), p) => {
@@ -337,7 +363,9 @@ pub(super) fn run_scan(
                 {
                     continue;
                 }
-                emit(s.0, q, &mut out)?;
+                if !emit(s.0, q, &mut out)? {
+                    break;
+                }
             }
         }
         (PathEnd::Var(_), p) => {
@@ -350,5 +378,5 @@ pub(super) fn run_scan(
             })?;
         }
     }
-    Ok((out, u.note()))
+    Ok((out, u.note(), stopped))
 }
