@@ -1185,6 +1185,9 @@ mod imp {
         removed: FxHashMap<[u8; 16], u64>,
         /// the first commit that removed one of them
         removed_since: Option<u64>,
+        /// background checkpoints in a row that a write raced, so that they kept the
+        /// marker (see [`RACED_BEFORE_LOCKED`])
+        raced: u32,
     }
 
     /// The index shared by its [`TextIndex`], the commit tick and the views (which seal
@@ -1492,6 +1495,15 @@ mod imp {
     /// of the tick that seals batches.
     const CHECKPOINT_AFTER: Duration = Duration::from_secs(1);
 
+    /// Background checkpoints in a row that a write may race before the tick holds the
+    /// live writer lock through its file synchronization. A checkpoint that a write
+    /// raced keeps the marker. Under commits more frequent than a checkpoint's
+    /// synchronization every unlocked attempt would race, the marker would never clear,
+    /// and every crash would pay verification at open. The locked attempt blocks text
+    /// publication for one synchronization, as an explicit checkpoint does, so it runs
+    /// at most once per this many raced ticks.
+    const RACED_BEFORE_LOCKED: u32 = 3;
+
     /// Staged operations at which a write seals its batch itself. Commit time grows with
     /// the batch (roughly 20 ms for 10k operations, 55 ms for 40k, measured on 1k-triple
     /// updates), and the first search after a burst would pay it.
@@ -1532,6 +1544,7 @@ mod imp {
             uncertain: Default::default(),
             removed: Default::default(),
             removed_since: None,
+            raced: 0,
         })
     }
 
@@ -2998,6 +3011,19 @@ mod imp {
             let Some(dir) = live.dir.clone() else {
                 return false;
             };
+            if live.raced >= RACED_BEFORE_LOCKED {
+                // Writes raced the last unlocked attempts. Holding live keeps text
+                // publication out of this one, so only a merge can still race it.
+                match dir.prepare_checkpoint().run() {
+                    Ok(true) => {
+                        live.dirty_since = None;
+                        live.raced = 0;
+                    }
+                    Ok(false) => {}
+                    Err(e) => self.fail_locked(&mut live, &e.into()),
+                }
+                return true;
+            }
             let generation = live.commit_generation;
             let checkpoint = dir.prepare_checkpoint();
             drop(live);
@@ -3019,8 +3045,13 @@ mod imp {
                 return true;
             }
             match result {
-                Ok(true) if live.commit_generation == generation => live.dirty_since = None,
-                Ok(_) => {}
+                Ok(true) => {
+                    live.raced = 0;
+                    if live.commit_generation == generation {
+                        live.dirty_since = None;
+                    }
+                }
+                Ok(false) => live.raced = live.raced.saturating_add(1),
                 Err(e) => self.fail_locked(&mut live, &e.into()),
             }
             true
@@ -3036,6 +3067,7 @@ mod imp {
             }
             if dir.prepare_checkpoint().run()? {
                 live.dirty_since = None;
+                live.raced = 0;
             }
             Ok(())
         }
@@ -3372,6 +3404,66 @@ mod imp {
             assert!(!dir.is_marked());
             let (index, _, _) = open_index(root.path(), &inner.config).unwrap();
             assert_eq!(index.reader().unwrap().searcher().num_docs(), 2);
+        }
+
+        /// A publication races every unlocked background checkpoint, inside its file
+        /// synchronization. After `RACED_BEFORE_LOCKED` such ticks the next one holds
+        /// live, the publication cannot race it, and the marker clears.
+        #[test]
+        fn steady_publication_cannot_starve_the_background_checkpoint() {
+            use super::super::lazydir::TestPoint;
+            let (root, inner, dir) = checkpoint_fixture();
+            // a merge could race the locked attempt too
+            if let Some(writer) = inner.live.lock().writer.as_ref() {
+                writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+            }
+            publish_checkpoint_document(&inner, 1).unwrap();
+            let seq = Arc::new(AtomicU64::new(1));
+            for round in 0..2 {
+                for attempt in 0..=RACED_BEFORE_LOCKED {
+                    let locked = attempt == RACED_BEFORE_LOCKED;
+                    inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+                    let (hook_inner, hook_seq) = (inner.clone(), seq.clone());
+                    let (raced_tx, raced_rx) = std::sync::mpsc::channel();
+                    dir.test_hook(TestPoint::CheckpointFileSync, move || {
+                        // The unlocked tick has released live, so the publication runs
+                        // here, between the checkpoint's snapshot and its marker check.
+                        let free = hook_inner.live.try_lock().is_some();
+                        if free {
+                            let next = hook_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                            publish_checkpoint_document(&hook_inner, next)
+                                .map_err(std::io::Error::other)?;
+                        }
+                        let _ = raced_tx.send(free);
+                        Ok(())
+                    });
+                    assert!(inner.tick(), "round {round}, attempt {attempt}");
+                    let raced = raced_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("the checkpoint synchronized no file");
+                    assert_eq!(raced, !locked, "round {round}, attempt {attempt}");
+                    assert!(inner.healthy());
+                    let live = inner.live.lock();
+                    if locked {
+                        assert!(!dir.is_marked(), "round {round}: the marker never cleared");
+                        assert!(live.dirty_since.is_none());
+                        assert_eq!(live.raced, 0);
+                    } else {
+                        assert!(dir.is_marked(), "round {round}, attempt {attempt}");
+                        assert!(live.dirty_since.is_some());
+                        assert_eq!(live.raced, attempt + 1);
+                    }
+                }
+                // the next round starts from a marked index again
+                let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
+                publish_checkpoint_document(&inner, next).unwrap();
+                assert!(dir.is_marked());
+            }
+            let published = seq.load(Ordering::SeqCst);
+            inner.close().unwrap();
+            assert!(!dir.is_marked());
+            let (index, _, _) = open_index(root.path(), &inner.config).unwrap();
+            assert_eq!(index.reader().unwrap().searcher().num_docs(), published);
         }
 
         #[test]
