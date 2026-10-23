@@ -9,7 +9,7 @@
 //! for a database no server holds, which they serve in the process through the same
 //! router (§10.2).
 
-mod conn;
+pub(crate) mod conn;
 mod maintain;
 mod ops;
 mod sync;

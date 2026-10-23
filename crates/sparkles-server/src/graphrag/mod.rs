@@ -10,6 +10,8 @@
 pub mod budget;
 #[cfg(feature = "mcp")]
 pub mod build;
+#[cfg(feature = "memory")]
+pub mod cli;
 pub mod guard;
 pub mod hierarchy;
 #[cfg(feature = "mcp")]

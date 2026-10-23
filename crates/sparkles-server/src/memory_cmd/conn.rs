@@ -211,13 +211,23 @@ impl Conn {
     }
 
     fn local(loc: &std::path::Path, dataset: String, opts: StoreOptions) -> Result<Conn, CmdError> {
+        let st = crate::state::AppState::standalone(opts, Duration::from_secs(300));
+        Conn::local_state(loc, dataset, st)
+    }
+
+    /// A local database served through the router of `st`, for a command that needs
+    /// state of its own, such as the model configuration of `sparkles graphrag --loc`.
+    pub fn local_state(
+        loc: &std::path::Path,
+        dataset: String,
+        st: crate::state::AppState,
+    ) -> Result<Conn, CmdError> {
         if !loc.is_dir() {
             return Err(CmdError::usage(format!(
                 "--loc {}: not a database directory",
                 loc.display()
             )));
         }
-        let st = crate::state::AppState::standalone(opts, Duration::from_secs(300));
         let st = Arc::new(st);
         st.attach(&dataset, crate::state::DbType::Persistent, Some(loc))?;
         let router = crate::http::router(st);
