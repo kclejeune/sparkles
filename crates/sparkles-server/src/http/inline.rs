@@ -155,8 +155,8 @@ impl QuickQueries {
         h.finish()
     }
 
-    /// Read the scheduling and execution hint in one snapshot. A failed concurrent
-    /// request can remove it, but cannot turn this hint into a different policy.
+    /// The execution hint of a quick text (for tests; requests read [`Self::history`]).
+    #[cfg(test)]
     pub fn execution(&self, key: u64) -> Option<QuickExecution> {
         match self.history(key) {
             History::Quick(execution) => Some(execution),
@@ -164,7 +164,9 @@ impl QuickQueries {
         }
     }
 
-    /// What is remembered of the text with this key, in one snapshot.
+    /// What is remembered of the text with this key, in one snapshot. A failed
+    /// concurrent request can change it, but cannot turn this hint into a different
+    /// policy.
     pub fn history(&self, key: u64) -> History {
         #[cfg(test)]
         {
