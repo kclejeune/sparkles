@@ -12,7 +12,8 @@
 //! future that notices is the one doing the work), so only requests that are short or
 //! bounded run there. Those are a query whose last run with the same text took less
 //! than [`QUICK_QUERY_MS`], the first run of a query text the server has not seen when
-//! the request has a timeout, and a small update that only inserts or deletes data and
+//! the request has a timeout and the server has been idle for [`FIRST_RUN_QUIET`], and a
+//! small update that only inserts or deletes data and
 //! finds the writer lock free. A first run gives up cancellation on disconnect, but its
 //! timeout still stops it. A text whose run was slow or failed uses the blocking pool
 //! until a later run of it is quick again, and so does a text that may call a SERVICE.
@@ -23,7 +24,9 @@
 //! through the pool and 4.3 ms in place, and a text it had not seen in 0.72 and 0.50 ms.
 //! A woken pool thread may have to leave a deep sleep state, may land on a slower core,
 //! and starts with a cold allocator heap, while the worker that read the request is
-//! already running.
+//! already running. Under steady load the opposite held: the BSBM explore driver, whose
+//! texts are all new, ran 10% to 28% slower per query with every first run in place,
+//! so a first run goes in place only on an idle server.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
