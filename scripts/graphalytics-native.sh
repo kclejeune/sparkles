@@ -14,7 +14,12 @@ out=${2:-target/graphalytics-native/$(date +%Y%m%dT%H%M%S)}
   echo "no executable at $bin" >&2
   exit 2
 }
-mkdir -p "$out"
+mkdir -p "$(dirname "$out")"
+# Refuse an existing directory before writing, so a rerun keeps the earlier results.
+mkdir "$out" 2> /dev/null || {
+  echo "output directory $out already exists" >&2
+  exit 2
+}
 echo "binary $bin sha256 $(sha256sum "$bin" | cut -d' ' -f1)" | tee "$out/summary.txt"
 echo "revision $(git rev-parse HEAD)" | tee -a "$out/summary.txt"
 

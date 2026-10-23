@@ -307,5 +307,25 @@ class GraphalyticsReferenceTests(unittest.TestCase):
         self.assertIn("vertex set", result.stderr)
 
 
+class GraphalyticsNativeRunnerTests(unittest.TestCase):
+    def test_existing_output_directory_is_refused_without_changes(self):
+        with tempfile.TemporaryDirectory(prefix="graphalytics native ") as tmp:
+            work = Path(tmp)
+            binary = work / "sparkles"
+            binary.write_text("#!/bin/sh\nexit 1\n")
+            binary.chmod(0o755)
+            out = work / "out"
+            out.mkdir()
+            summary = out / "summary.txt"
+            summary.write_text("binary earlier sha256 0\n")
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/graphalytics-native.sh"), str(binary), str(out)],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("already exists", result.stderr)
+            self.assertEqual(summary.read_text(), "binary earlier sha256 0\n")
+            self.assertEqual(sorted(p.name for p in out.iterdir()), ["summary.txt"])
+
+
 if __name__ == "__main__":
     unittest.main()
