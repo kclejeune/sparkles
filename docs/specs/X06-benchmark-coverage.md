@@ -608,8 +608,10 @@ host on 2026-10-18 and 2026-10-19, and BENCHMARKS.md has its synthetic, SP²Benc
 figures. BENCHMARKS.md also includes the BSBM Explore comparison at 10M from
 2026-10-19, the isolated full-text queries at 1.05M from 2026-10-20 and BSBM BI at
 10M from 2026-10-20 to 2026-10-21, with
-versioned records of their samples, answer fingerprints and engine failures. The
-rest of the refresh is listed under "Left for Phase 1".
+versioned records of their samples, answer fingerprints and engine failures. On
+2026-10-23 Sparkles was measured again in all of these suites at the settled head
+6699f27d, as the settled-head refresh below describes. The rest of the refresh is listed
+under "Left for Phase 1".
 
 **Record and manifest.** `scripts/bench-record.py` has four subcommands. `manifest` writes
 the run manifest of §6 with the commit of the scripts' checkout, the Sparkles binary's
@@ -831,6 +833,32 @@ QLever's answers waited about 40 ms each for a delayed TCP acknowledgement. A ru
   10.5M was killed at the memory limit. QLever's and Fluree's servers were killed during
   SP²Bench `q4` in the answer check, which runs all five servers at once.
 
+**Settled-head refresh (2026-10-23).** Roadmap item 1 measured the release binary of
+6699f27d on forge in the synthetic suite in all its modes at both scales, SP²Bench at 10M,
+LUBM(100), WatDiv at scale 100, the full-text queries at 1.05M, BSBM Explore and BI at 10M
+and the DBpedia 50M slice. Sparkles ran alone with the published settings, and the other
+engines' results were carried over under rule 1 of §8, since their versions, binaries and
+the host were unchanged. `bench-record.py build --reuse ENGINE=MANIFEST` writes such a
+record. It refuses a change of host or of an engine's version or checksum, names each
+carried-over engine under `manifest.reused` with its run's dates, host and harness, and
+marks its results `reused`. The answer checks compared Sparkles' new answers with the
+carried-over ones in every suite, and all agreed except where BENCHMARKS.md explains a
+difference. The SSD was trimmed before each batch. `sudo -n fstrim` works only from an
+operator session whose forwarded agent authorizes sudo, and fails inside a systemd user
+unit, so the operator trims before launching. The same holds for `drop_caches`, and the
+cold runs evict each engine's files with `posix_fadvise`, which needs no privilege.
+
+The refresh resolved the recorded answer questions. `scripts/bench-bsbm/bi-float-oracle.py`
+computes exact means of the float-rounded prices of BSBM BI's q4 and q5 and accepts a value
+within the error bound of float summation in any order. With each engine's raw answers,
+which `bench-answers.py` now keeps under `ANSWERS_RAW_DIR`, all five engines pass it. On the
+DBpedia slice, Jena and Oxigraph count three fewer triples because they merge `xsd:float`
+literals with different lexical forms and the same value. The DBpedia manifest now names
+all 38 inputs with their hashes, since `--data-path` names a file by its base name. The BI
+driver failures come from a Sparkles budget refusal of one generated q4 instance, which
+roadmap item 96 takes. No query regressed by 10% or more against the published figures
+in interleaved runs of the published binary and this one.
+
 **Left for Phase 1.**
 
 BSBM Explore at 10M completed on 2026-10-19, and its figures and record are in
@@ -874,8 +902,8 @@ comparison with the current head.
 The runner leaves JAVA unset for Jena 6’s loader
 so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
 
-* The rest of the standard refresh at one head (A5). BI's driver failures and
-  answer checks and the later batches remain. The
+* The later batches of the standard refresh (A5). The settled-head refresh of
+  2026-10-23 measured Sparkles at one head in every published suite. The
   regeneration of the BENCHMARKS.md tables from records without a numeric change (A3)
   remains open. `bench.sh` starts,
   checks and times one engine at a time in its default and `updates` modes since
@@ -886,10 +914,10 @@ so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
   DBpedia 50M record and figures are published, and `bench-summary.py` still reads raw
   files. Equals signs in sampled-input filenames were parsed as argument separators,
   collapsing 38 files into 28 manifest entries without hashes or byte sizes.
-  Complete input provenance and the two aggregate answer disagreements remain open.
-* BSBM BI's generated driver budget refusals and failures, its disputed or missing
-  fixed-instance answers and a noise-floor control for each standard suite
-  (§14) remain. Their commands are in BENCHMARKING.md.
+  The settled-head refresh fixed the input provenance and explained the two aggregate
+  answer disagreements.
+* A noise-floor control for each standard suite (§14) remains, and its commands are in
+  BENCHMARKING.md. BSBM BI's driver cells wait for roadmap item 96.
 * BSBM at 100M triples has not been tried, and the generator's heap defaults may need
   raising. SP²Bench at 100M triples will meet the 600 second timeout in its slower queries.
 * Open question 1 is settled for LUBM and BSBM only in practice. The BSBM tools and the LUBM
@@ -1027,6 +1055,7 @@ relabeling. The pruned product emitted 1,137,394 rows, which equals the oracle's
 count before DISTINCT, and query memory peaked at 166 MB. The previous build refused
 the query because its 924,047,440,470-row product exceeded the row limit. The guards
 `q8`, `q12b` and repeated automatic `q12a` gave the same answers and times on both
-builds. These are diagnostic timings without the forge trim protocol, so the
-reference numbers wait for item 1's refresh. The product itself runs on one thread,
+builds. These are diagnostic timings without the forge trim protocol. Item 1's
+refresh of 2026-10-23 took the reference numbers with the trim protocol, and `q5a`
+answered in a mean of 3.9 s over ten runs. The product itself runs on one thread,
 and it takes about 3.4 s of the 3.8 s execution.

@@ -293,6 +293,56 @@ class RecordTests(unittest.TestCase):
         subprocess.run([sys.executable, RECORD, "finish", path], check=True)
         self.assertIsNotNone(jload(path)["ended"])
 
+    def test_data_paths_with_equals_signs_keep_their_names_and_hashes(self):
+        path = os.path.join(self.tmp.name, "manifest.json")
+        data = os.path.join(self.tmp.name, "anchor-text_lang=en.nt.zst")
+        write_text(data, "x")
+        p = subprocess.run([sys.executable, RECORD, "manifest", "--out", path, "--suite", "t",
+                            "--data-path", f"{data}|CC BY-SA 3.0|slice 50m", "--workdir", self.tmp.name],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        d = jload(path)["data"]
+        self.assertEqual(list(d), ["anchor-text_lang=en.nt.zst"])
+        e = d["anchor-text_lang=en.nt.zst"]
+        self.assertEqual((e["license"], e["params"], e["bytes"]), ("CC BY-SA 3.0", "slice 50m", 1))
+        self.assertEqual(len(e["sha256"]), 64)
+
+    def reuse_fixture(self, prior_host="forge", prior_version="5.1.0", engine="jena-fuseki"):
+        fixture(self.res)
+        cur = {"host": {"name": "forge"}, "sparkles": {"binary_commit": "new"},
+               "engines": {"jena": {"version": "5.1.0", "sha256": "aa"}}}
+        prior = {"host": {"name": prior_host}, "started": "2026-10-18T00:00:00Z", "ended": "2026-10-19T00:00:00Z",
+                 "sparkles": {"binary_commit": "old", "scripts_commit": "s1"},
+                 "engines": {"jena": {"version": prior_version, "sha256": "aa"}, "oxigraph": {"version": "0.5.11"}}}
+        man, pri = os.path.join(self.tmp.name, "m.json"), os.path.join(self.tmp.name, "prior.json")
+        write_path(man, cur)
+        write_path(pri, prior)
+        out = os.path.join(self.tmp.name, "record.json")
+        p = build(self.res, out, manifest=man, reuse=f"{engine}={pri}")
+        return p, out, pri
+
+    def test_reused_engines_are_named_and_marked(self):
+        p, out, _ = self.reuse_fixture()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rec = jload(out)
+        self.assertEqual(rec["manifest"]["reused"]["jena"]["started"], "2026-10-18T00:00:00Z")
+        self.assertEqual(rec["manifest"]["reused"]["jena"]["engine"]["version"], "5.1.0")
+        for r in rec["results"]:
+            self.assertEqual(r.get("reused", False), r["engine"] == "jena", r)
+
+    def test_reuse_across_hosts_or_versions_is_refused(self):
+        p, _, _ = self.reuse_fixture(prior_host="atlas")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("atlas", p.stderr)
+        p, _, _ = self.reuse_fixture(prior_version="5.0.0")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("version changed", p.stderr)
+
+    def test_sparkles_results_are_never_carried_over(self):
+        p, _, _ = self.reuse_fixture(engine="sparkles")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("--reuse sparkles", p.stderr)
+
 
 class NixPackageTests(unittest.TestCase):
     def test_store_paths_give_package_and_version(self):
@@ -467,6 +517,57 @@ class LibTests(unittest.TestCase):
 
 class SuiteTests(unittest.TestCase):
     """The order of steps of suite_run in scripts/bench-suite-lib.sh, with every step stubbed."""
+
+    def infer(self, d, **env):
+        """suite_infer rdfs with a stub sparkles that derives two triples."""
+        stub = os.path.join(d, "sparkles")
+        write_text(stub, """#!/bin/sh
+case $1 in
+  load) mkdir -p "$3" ;;
+  query) printf '?n\n"1"^^<http://www.w3.org/2001/XMLSchema#integer>\n' ;;
+  infer) for a; do [ "$a" = --status ] && { echo '{"run": {"peakBytes": 5, "threads": 2}}'; exit 0; }; done
+         echo "2 inferred triples" ;;
+  dump) for a; do [ "$a" = urn:x-sparkles:inferred ] && { printf '<a> <b> <c> .\n<a> <b> <d> .\n'; exit 0; }; done
+        shift; while [ "$1" != --out ]; do shift; done; cat base.nt > "$2"; printf '<a> <b> <c> .\n<a> <b> <d> .\n' >> "$2" ;;
+esac
+""")
+        os.chmod(stub, 0o755)
+        gtime = os.path.join(d, "gtime")
+        write_text(gtime, '#!/bin/sh\nshift; out=$2; shift 2\necho "Maximum resident set size (kbytes): 1000" > "$out"\nexec "$@"\n')
+        os.chmod(gtime, 0o755)
+        write_text(os.path.join(d, "base.nt"), "<x> <y> <z> .\n" * env.pop("REPEAT", 1))
+        os.mkdir(os.path.join(d, "logs"))
+        os.mkdir(os.path.join(d, "results"))
+        lib, suite = os.path.join(SCRIPTS, "bench-lib.sh"), os.path.join(SCRIPTS, "bench-suite-lib.sh")
+        script = (f'source "{lib}"; source "{suite}"; gnu_time() {{ echo "{gtime}"; }}\n'
+                  f'SPARKLES="{stub}" RES_DIR="{d}/results"; suite_infer rdfs')
+        e = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, **env)
+        return subprocess.run(["bash", "-c", script], cwd=d, env=e, capture_output=True, text=True)
+
+    def test_closure_dump_can_be_left_out_of_an_engineless_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self.infer(d, ENGINES="", CLOSURE_DUMP="0")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(d, "rdfs.nt")))
+            inf = jload(os.path.join(d, "results", "inference.json"))["rdfs"]
+            self.assertEqual((inf["base_triples"], inf["derived_triples"], inf["total_triples"]), (1, 2, 3))
+        with tempfile.TemporaryDirectory() as d:
+            # a repeated input statement is stored once, so it counts once in the total
+            p = self.infer(d, ENGINES="", CLOSURE_DUMP="0", REPEAT=2)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            inf = jload(os.path.join(d, "results", "inference.json"))["rdfs"]
+            self.assertEqual((inf["base_triples"], inf["total_triples"]), (2, 3))
+            self.assertEqual(inf["peak_bytes"], 5)
+            self.assertEqual(len(inf["derived_sha256"]), 64)
+        with tempfile.TemporaryDirectory() as d:
+            p = self.infer(d, ENGINES="")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(jload(os.path.join(d, "results", "inference.json"))["rdfs"]["total_triples"], 3)
+            self.assertTrue(os.path.exists(os.path.join(d, "rdfs.nt")))
+        with tempfile.TemporaryDirectory() as d:
+            p = self.infer(d, ENGINES="sparkles", CLOSURE_DUMP="0")
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("CLOSURE_DUMP=0 needs", p.stderr)
 
     def test_each_timed_server_answers_every_selected_query_first(self):
         stubs = """

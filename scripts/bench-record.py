@@ -24,6 +24,12 @@ pinning, the data hashes and the start time. `finish` adds the end time.
 * `longwrite.json`: the long write runs of bench-longwrite.sh (mode `longrun`),
 * `extra.json`: optional `{"settings": {…}, "results": [ … ]}` merged into the record.
 
+`--reuse ENGINE=PRIOR_MANIFEST` marks an engine whose results were carried over from an
+earlier run instead of measured again (docs/specs/X06 section 8, rule 1). The prior run must
+name the same host and, when the current manifest lists the engine, the same engine version
+and binary hash, or the build stops. The record's `manifest.reused` keeps the prior run's
+window, binary and scripts for that engine, and each of its results gets `"reused": true`.
+
 Which queries count is decided by `--queries` (a list of names). Without it every `*.json` file
 in the directory that is not one of the files above is taken as a query, and so is every query
 name in `answers.json`, which gives a query that was only answer-checked its answer result.
@@ -212,9 +218,12 @@ def cmd_manifest(a):
     m["memory_limit"] = a.memory_limit or None
     m["client_cpu"] = a.client_cpu or None
     data = {}
-    for spec in a.data:
-        # name=path[:license[:params]] hashed here; name=sha256:… recorded as given
-        name, _, rest = spec.partition("=")
+    # name=path[|license[|params]] hashed here, name=sha256:… recorded as given, and
+    # --data-path path[|license[|params]] named by the file's base name, which may itself
+    # contain "=" (DBpedia's file names do, and name=path would split them there)
+    specs = [(spec.partition("=")[0], spec.partition("=")[2]) for spec in a.data]
+    specs += [(os.path.basename(spec.partition("|")[0]), spec) for spec in a.data_path]
+    for name, rest in specs:
         path, _, extra = rest.partition("|")
         lic, _, params = extra.partition("|")
         d = {"license": lic or "unknown", "params": params or None}
@@ -462,6 +471,10 @@ def cmd_build(a):
     results += longrun_results(load_json(d, "longwrite.json"))
     if a.pool_instances:
         results = pool(results)
+    reused = reuse_engines(man, a.reuse or [])
+    for r in results:
+        if r["engine"] in reused:
+            r["reused"] = True
     extra = load_json(d, "extra.json") or {}
     results += extra.get("results", [])
     rec = {
@@ -493,6 +506,37 @@ def cmd_build(a):
         sys.exit("the record does not conform: " + "; ".join(problems[:5]))
     json.dump(rec, open(a.out, "w"), indent=1)
     print(f"{a.out}: {len(results)} results")
+
+
+def reuse_engines(man, specs):
+    """Record in man["reused"] the engines whose results come from an earlier run, and refuse
+    a reuse across hosts or engine versions (docs/specs/X06 section 8, rule 1)."""
+    out = {}
+    for spec in specs:
+        name, _, path = spec.partition("=")
+        if not name or not path:
+            sys.exit(f"--reuse takes ENGINE=PRIOR_MANIFEST, not {spec!r}")
+        name = engine_name(name)
+        prior = json.load(open(path))
+        here, there = (man.get("host") or {}).get("name"), (prior.get("host") or {}).get("name")
+        if here and there and here != there:
+            sys.exit(f"--reuse {name}: the prior run was on {there}, not {here}")
+        if name == "sparkles":
+            # a refresh measures Sparkles itself; only the comparison engines carry over
+            sys.exit("--reuse sparkles: Sparkles' results are measured in every run and cannot be carried over")
+        pe = (prior.get("engines") or {}).get(name)
+        if pe is None:
+            sys.exit(f"--reuse {name}: the prior manifest does not list {name}")
+        ce = (man.get("engines") or {}).get(name)
+        if ce:
+            for k in ("version", "sha256"):
+                if ce.get(k) and pe.get(k) and ce[k] != pe[k]:
+                    sys.exit(f"--reuse {name}: its {k} changed from {pe[k]} to {ce[k]}")
+        out[name] = {"started": prior.get("started"), "ended": prior.get("ended"), "host": there,
+                     "scripts_commit": (prior.get("sparkles") or {}).get("scripts_commit"), "engine": pe}
+    if out:
+        man["reused"] = out
+    return out
 
 
 # --------------------------------------------------------------------------- validate
@@ -566,6 +610,8 @@ def main():
     m.add_argument("--engine", action="append", default=[], help="name=path of an engine's binary")
     m.add_argument("--data", action="append", default=[],
                    help="name=path|license|params, or name=sha256:HEX|license|params")
+    m.add_argument("--data-path", action="append", default=[],
+                   help="path|license|params, named by the file's base name, which may contain =")
     m.add_argument("--memory-limit", default="")
     m.add_argument("--client-cpu", default="")
     m.add_argument("--workdir", default=".")
@@ -589,6 +635,8 @@ def main():
     b.add_argument("--max-time", default="", help="the request limit in seconds: a failed run that took this long is a timeout")
     b.add_argument("--throughput-requests", default="")
     b.add_argument("--throughput-clients", default="16")
+    b.add_argument("--reuse", action="append", metavar="ENGINE=PRIOR_MANIFEST",
+                   help="an engine whose results were carried over from the run of PRIOR_MANIFEST")
     b.set_defaults(f=cmd_build)
     v = sub.add_parser("validate")
     v.add_argument("files", nargs="+")

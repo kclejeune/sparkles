@@ -42,7 +42,9 @@
 # of Fluree's bulk import, default 8192), FLUREE_PIECE (the largest piece of Fluree's
 # input, uncompressed, as `split -C` takes it, default 512M), FLUREE_CACHE_MB (the cache of Fluree's server,
 # default 4096), LOAD_TIMEOUT (a time limit for each load, in the form `timeout` takes),
-# SPARKLES (the binary, default target/release/sparkles), SERVER_MEM_MAX (optional
+# SPARKLES (the binary, default target/release/sparkles), SPARKLES_ARGS (more `serve` flags
+# of Sparkles, for example "--memory-profile small"), SPARKLES_QUERY_MEM=0 (leave out
+# Sparkles' --query-memory-mb, so that its memory profile sets the budget), SERVER_MEM_MAX (optional
 # per-server systemd memory limit with no swap), CLIENT_CPU (optional client affinity,
 # or none to leave clients unpinned).
 #
@@ -352,8 +354,11 @@ start() { # start <engine>
   PORT[$e]=$p
   case $e in
     sparkles)
+      local budget=(--query-memory-mb $((QUERY_MEM_GB * 1024)))
+      [ "${SPARKLES_QUERY_MEM:-1}" = 0 ] && budget=()
+      # shellcheck disable=SC2086 # SPARKLES_ARGS is a list of flags
       "${CAP[@]}" "$SPARKLES" --result-cache-mb 0 serve --data "$S/sparkles-server" --loc dbpedia="$S/sparkles.db" \
-        --port "$p" --timeout "$TIMEOUT" --query-memory-mb $((QUERY_MEM_GB * 1024)) --no-access-log > "$S/logs/server-sparkles.log" 2>&1 &
+        --port "$p" --timeout "$TIMEOUT" "${budget[@]}" --no-access-log ${SPARKLES_ARGS:-} > "$S/logs/server-sparkles.log" 2>&1 &
       URL[$e]=localhost:$p/dbpedia/sparql
       READY[$e]="localhost:$p/\$/ping"
       ;;

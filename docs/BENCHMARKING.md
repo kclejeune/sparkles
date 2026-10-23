@@ -472,6 +472,12 @@ This change keeps the existing lock and engine versions.
   has no DESCRIBE or CONSTRUCT query and runs only its standard mix.
   `--usecase bi` runs the Business Intelligence use case instead of Explore. The Explore
   and Update mix is not run yet.
+  BI's q4 and q5 average `xsd:float` prices, and engines that add them in different orders
+  return different floats. `scripts/bench-bsbm/bi-float-oracle.py DATASET.nt QUERIES RAW`
+  checks each engine's raw q4 and q5 answers against exact means computed from the data,
+  within the error bound of float summation in any order. The raw answers come from a run
+  with `ANSWERS_RAW_DIR` set, which makes `scripts/bench-answers.py` keep each engine's
+  response as `<query>.<engine>.json`.
 
 * `scripts/bench-longwrite.sh` (`mise run bench:longwrite [data] [workdir]`) runs an hour
   or more of concurrent reads and writes against each engine of `scripts/bench.sh` in turn, with
@@ -581,7 +587,11 @@ This change keeps the existing lock and engine versions.
   `bench-record.py build` also reads the results directory of `scripts/bench.sh`, and
   `--pool-instances` merges instance names such as WatDiv's `L1-3` into one result per
   template. `bench-record.py validate FILE` checks a record against the schema in its
-  header.
+  header. `build --reuse ENGINE=MANIFEST` carries an engine's results over from an earlier
+  run whose manifest is MANIFEST, after it checks that the host and the engine's version
+  and checksum are unchanged, and names the engine under `manifest.reused`. `manifest
+  --data-path PATH|LICENSE|PARAMS` names an input by its base name, for inputs whose names
+  contain `=`.
 
   ```sh
   scripts/bench-record.py build --suite synthetic --scale 10.5m --results target/bench/results \
