@@ -122,9 +122,48 @@ fn yes() -> bool {
     true
 }
 
+fn per_message() -> u64 {
+    16
+}
+fn per_request() -> u64 {
+    1_024
+}
+fn multiplier() -> u64 {
+    1
+}
+
+/// The allowances of the byte bound for one provider kind (§3.5). The defaults are
+/// unmeasured: nothing has checked them against a provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ByteBound {
+    /// framing tokens per message, the system text included
+    #[serde(default = "per_message")]
+    pub per_message: u64,
+    /// tokens per request for what a provider adds around a schema or a tool
+    #[serde(default = "per_request")]
+    pub per_request: u64,
+    /// tokens per byte of the serialized request
+    #[serde(default = "multiplier")]
+    pub multiplier: u64,
+}
+
+impl Default for ByteBound {
+    fn default() -> ByteBound {
+        ByteBound {
+            per_message: per_message(),
+            per_request: per_request(),
+            multiplier: multiplier(),
+        }
+    }
+}
+
+/// The provider kinds `budget.byteBound` may name.
+pub const BYTE_BOUND_KINDS: [&str; 3] = ["anthropic", "openai", "ollama"];
+
 /// The token budgets of §3.5. Both are hard caps that every model request reserves
 /// against before it is sent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Budget {
     #[serde(default = "tokens_per_build")]
@@ -135,6 +174,16 @@ pub struct Budget {
     /// same provider receives
     #[serde(default = "yes")]
     pub provider_counting: bool,
+    /// the byte bound's allowances by provider kind; a kind not named uses the defaults
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub byte_bound: std::collections::BTreeMap<String, ByteBound>,
+}
+
+impl Budget {
+    /// The byte bound's allowances for a provider kind.
+    pub fn byte_bound_of(&self, kind: &str) -> ByteBound {
+        self.byte_bound.get(kind).copied().unwrap_or_default()
+    }
 }
 
 impl Default for Budget {
@@ -143,6 +192,7 @@ impl Default for Budget {
             tokens_per_build: tokens_per_build(),
             tokens_per_day: tokens_per_day(),
             provider_counting: true,
+            byte_bound: Default::default(),
         }
     }
 }
@@ -269,6 +319,22 @@ impl GraphragSettings {
         if self.budget.tokens_per_build == 0 || self.budget.tokens_per_day == 0 {
             return Err("budget: token budgets must be at least 1".into());
         }
+        for (kind, b) in &self.budget.byte_bound {
+            if !BYTE_BOUND_KINDS.contains(&kind.as_str()) {
+                return Err(format!(
+                    "budget.byteBound: {kind:?} is not a provider kind that chats ({})",
+                    BYTE_BOUND_KINDS.join(", ")
+                ));
+            }
+            if !(1..=16).contains(&b.multiplier)
+                || b.per_message > 4_096
+                || b.per_request > 1_000_000
+            {
+                return Err(format!(
+                    "budget.byteBound.{kind}: multiplier must be from 1 to 16, perMessage at most 4096 and perRequest at most 1000000"
+                ));
+            }
+        }
         if self.enabled {
             if self.principal.trim().is_empty() {
                 return Err("principal is required when GraphRAG is enabled".into());
@@ -327,6 +393,22 @@ mod tests {
     }
 
     #[test]
+    fn byte_bounds_default_per_kind() {
+        let s =
+            parse(json!({ "budget": { "byteBound": { "anthropic": { "perRequest": 2048 } } } }))
+                .unwrap();
+        assert_eq!(
+            s.budget.byte_bound_of("anthropic"),
+            ByteBound {
+                per_message: 16,
+                per_request: 2048,
+                multiplier: 1
+            }
+        );
+        assert_eq!(s.budget.byte_bound_of("openai"), ByteBound::default());
+    }
+
+    #[test]
     fn unknown_versions_are_refused() {
         let e = parse(json!({ "version": 2 })).unwrap_err();
         assert!(e.contains("version 2"), "{e}");
@@ -352,6 +434,9 @@ mod tests {
             json!({ "refresh": { "minChangedFraction": 1.5 } }),
             json!({ "refresh": { "debounceSeconds": 0 } }),
             json!({ "budget": { "tokensPerBuild": 0 } }),
+            json!({ "budget": { "byteBound": { "local": {} } } }),
+            json!({ "budget": { "byteBound": { "openai": { "multiplier": 0 } } } }),
+            json!({ "budget": { "byteBound": { "openai": { "perRequest": 2_000_000 } } } }),
             json!({ "enabled": true, "projection": { "graphs": ["urn:g"] } }),
             json!({ "enabled": true, "principal": "p" }),
         ] {

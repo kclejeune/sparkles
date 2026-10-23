@@ -38,6 +38,13 @@ fn pair(provider: &str) -> Pair {
     p
 }
 
+fn budget(provider_counting: bool) -> crate::graphrag::settings::Budget {
+    crate::graphrag::settings::Budget {
+        provider_counting,
+        ..Default::default()
+    }
+}
+
 fn ledger(build: u64, day: u64) -> Arc<Ledger> {
     Arc::new(Ledger::new(
         build,
@@ -93,7 +100,7 @@ fn an_exact_local_tokenizer_comes_first() {
     let mut t = Tokenizers::default();
     t.insert("p", "m1", Arc::new(CharCounter));
     let l = ledger(1_000_000, 1_000_000);
-    let a = BuildAdmission::new(l.clone(), t, true);
+    let a = BuildAdmission::new(l.clone(), t, &budget(true));
     call(&m, "p", &a).unwrap();
     let b = a.bounds();
     assert_eq!(b.len(), 1);
@@ -119,7 +126,7 @@ fn the_provider_endpoint_counts_when_allowed() {
     });
     let m = models(json!({ "p": { "kind": "anthropic", "endpoint": mock.url() } }));
     let l = ledger(1_000_000, 1_000_000);
-    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), true);
+    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), &budget(true));
     call(&m, "p", &a).unwrap();
     let b = a.bounds();
     assert_eq!(b[0].source, Source::ProviderEndpoint);
@@ -134,7 +141,11 @@ fn the_provider_endpoint_counts_when_allowed() {
     // turned off: no counting request, the byte bound instead
     let mock2 = MockModel::start(ok(Kind::Anthropic));
     let m2 = models(json!({ "p": { "kind": "anthropic", "endpoint": mock2.url() } }));
-    let a2 = BuildAdmission::new(ledger(1_000_000, 1_000_000), Tokenizers::default(), false);
+    let a2 = BuildAdmission::new(
+        ledger(1_000_000, 1_000_000),
+        Tokenizers::default(),
+        &budget(false),
+    );
     call(&m2, "p", &a2).unwrap();
     assert_eq!(a2.bounds()[0].source, Source::ByteBound);
     assert!(
@@ -155,7 +166,11 @@ fn a_failed_count_falls_back_to_the_byte_bound() {
         }
     });
     let m = models(json!({ "p": { "kind": "anthropic", "endpoint": mock.url() } }));
-    let a = BuildAdmission::new(ledger(1_000_000, 1_000_000), Tokenizers::default(), true);
+    let a = BuildAdmission::new(
+        ledger(1_000_000, 1_000_000),
+        Tokenizers::default(),
+        &budget(true),
+    );
     call(&m, "p", &a).unwrap();
     assert_eq!(a.bounds()[0].source, Source::ByteBound);
 }
@@ -164,17 +179,35 @@ fn a_failed_count_falls_back_to_the_byte_bound() {
 fn the_byte_bound_covers_the_serialized_request() {
     let mock = MockModel::start(ok(Kind::Openai));
     let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
-    let a = BuildAdmission::new(ledger(1_000_000, 1_000_000), Tokenizers::default(), true);
+    let a = BuildAdmission::new(
+        ledger(1_000_000, 1_000_000),
+        Tokenizers::default(),
+        &budget(true),
+    );
     call(&m, "p", &a).unwrap();
     let b = &a.bounds()[0];
     assert_eq!(b.source, Source::ByteBound);
     assert!(!b.source.exact());
     let sent = serde_json::to_vec(&mock.requests()[0].body).unwrap();
     // one user message plus the system text
-    assert_eq!(
-        b.tokens,
-        sent.len() as u64 + 2 * FRAMING_PER_MESSAGE + ALLOWANCE_PER_REQUEST
+    // the unmeasured defaults: 16 per message and the system text, 1024 per request
+    assert_eq!(b.tokens, sent.len() as u64 + 2 * 16 + 1024);
+    // a kind's allowances are settings
+    let mock = MockModel::start(ok(Kind::Openai));
+    let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
+    let mut bud = budget(true);
+    bud.byte_bound.insert(
+        "openai".into(),
+        crate::graphrag::settings::ByteBound {
+            per_message: 0,
+            per_request: 0,
+            multiplier: 2,
+        },
     );
+    let a = BuildAdmission::new(ledger(1_000_000, 1_000_000), Tokenizers::default(), &bud);
+    call(&m, "p", &a).unwrap();
+    let sent = serde_json::to_vec(&mock.requests()[0].body).unwrap();
+    assert_eq!(a.bounds()[0].tokens, 2 * sent.len() as u64);
 }
 
 /// A `503` then a `200`: two reservations, the first kept whole (A12).
@@ -189,7 +222,7 @@ fn transport_retries_are_admitted_and_unknown_usage_stays_reserved() {
     });
     let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
     let l = ledger(1_000_000, 1_000_000);
-    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), true);
+    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), &budget(true));
     call(&m, "p", &a).unwrap();
     let b = a.bounds();
     assert_eq!(b.len(), 2);
@@ -210,7 +243,11 @@ fn schema_retries_and_level_fallback_are_admitted() {
         (200, mock::openai(text))
     });
     let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
-    let a = BuildAdmission::new(ledger(1_000_000, 1_000_000), Tokenizers::default(), true);
+    let a = BuildAdmission::new(
+        ledger(1_000_000, 1_000_000),
+        Tokenizers::default(),
+        &budget(true),
+    );
     call(&m, "p", &a).unwrap();
     assert_eq!(a.bounds().len(), 2);
     assert_ne!(a.bounds()[0].request_digest, a.bounds()[1].request_digest);
@@ -224,7 +261,11 @@ fn schema_retries_and_level_fallback_are_admitted() {
         }
     });
     let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
-    let a = BuildAdmission::new(ledger(1_000_000, 1_000_000), Tokenizers::default(), true);
+    let a = BuildAdmission::new(
+        ledger(1_000_000, 1_000_000),
+        Tokenizers::default(),
+        &budget(true),
+    );
     call(&m, "p", &a).unwrap();
     assert_eq!(a.bounds().len(), 2);
     assert_eq!(mock.requests().len(), 2);
@@ -235,14 +276,14 @@ fn schema_retries_and_level_fallback_are_admitted() {
 fn an_exhausted_budget_sends_no_request() {
     let mock = MockModel::start(ok(Kind::Openai));
     let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
-    let a = BuildAdmission::new(ledger(50, 1_000_000), Tokenizers::default(), true);
+    let a = BuildAdmission::new(ledger(50, 1_000_000), Tokenizers::default(), &budget(true));
     let f = call(&m, "p", &a).unwrap_err();
     assert!(matches!(f.error, StepError::Budget(_)), "{:?}", f.error);
     assert_eq!(f.record.requests, 0);
     assert!(mock.requests().is_empty());
 
     // the day's budget is checked as well
-    let a = BuildAdmission::new(ledger(1_000_000, 50), Tokenizers::default(), true);
+    let a = BuildAdmission::new(ledger(1_000_000, 50), Tokenizers::default(), &budget(true));
     let f = call(&m, "p", &a).unwrap_err();
     assert!(
         f.error.message().contains("tokensPerDay"),
@@ -265,7 +306,7 @@ fn usage_above_the_reservation_stops_the_build() {
     let mut t = Tokenizers::default();
     t.insert("p", "m1", Arc::new(CharCounter));
     let l = ledger(10_000_000, 10_000_000);
-    let a = BuildAdmission::new(l.clone(), t, true);
+    let a = BuildAdmission::new(l.clone(), t, &budget(true));
     call(&m, "p", &a).unwrap();
     let an = l.anomaly().expect("an anomaly");
     assert_eq!(an.reported, 1_000_005);
@@ -290,7 +331,7 @@ fn an_answer_without_usage_keeps_its_reservation() {
     });
     let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
     let l = ledger(1_000_000, 1_000_000);
-    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), true);
+    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), &budget(true));
     call(&m, "p", &a).unwrap();
     assert_eq!(l.build_used(), a.bounds()[0].tokens + u64::from(MAX_OUT));
 }
@@ -362,7 +403,7 @@ fn usage_of_a_refused_answer_is_settled() {
     let mut t = Tokenizers::default();
     t.insert("p", "m1", Arc::new(Fixed));
     let l = ledger(10_000_000, 10_000_000);
-    let a = BuildAdmission::new(l.clone(), t, true);
+    let a = BuildAdmission::new(l.clone(), t, &budget(true));
     let f = call(&m, "p", &a).unwrap_err();
     assert_eq!(f.error.code(), "refusal");
     assert_eq!(l.build_used(), 1_000_005);
@@ -383,7 +424,7 @@ fn counting_stays_within_the_deadline() {
     });
     let m = models(json!({ "p": { "kind": "anthropic", "endpoint": mock.url() } }));
     let l = ledger(1_000_000, 1_000_000);
-    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), true);
+    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), &budget(true));
     let started = Instant::now();
     let r = m.call_admitted(
         Some(Role::Community),
@@ -419,9 +460,33 @@ fn a_refused_retry_keeps_the_sent_attempt_in_the_record() {
     let mut t = Tokenizers::default();
     t.insert("p", "m1", Arc::new(Fixed));
     // room for exactly one reservation of 100 + MAX_OUT
-    let a = BuildAdmission::new(ledger(100 + u64::from(MAX_OUT), 1_000_000), t, true);
+    let a = BuildAdmission::new(
+        ledger(100 + u64::from(MAX_OUT), 1_000_000),
+        t,
+        &budget(true),
+    );
     let f = call(&m, "p", &a).unwrap_err();
     assert!(matches!(f.error, StepError::Budget(_)), "{:?}", f.error);
     assert_eq!(mock.requests().len(), 1);
     assert_eq!(f.record.requests, 1);
+}
+
+/// An outbound refusal keeps the reservation, since a refused redirect comes after the
+/// request was sent and the client cannot tell the two apart (round-2 review finding).
+#[test]
+fn an_outbound_refusal_keeps_the_reservation() {
+    let mock = MockModel::start(ok(Kind::Openai));
+    let cfg = ModelsConfig::parse(
+        &json!({ "providers": { "p": { "kind": "openai", "endpoint": mock.url() } } }).to_string(),
+    )
+    .unwrap();
+    // loopback is refused by the default policy
+    let m = Models::new(cfg, Default::default(), Default::default());
+    let mut t = Tokenizers::default();
+    t.insert("p", "m1", Arc::new(Fixed));
+    let l = ledger(1_000_000, 1_000_000);
+    let a = BuildAdmission::new(l.clone(), t, &budget(true));
+    let f = call(&m, "p", &a).unwrap_err();
+    assert_eq!(f.error.code(), "outbound-refused", "{:?}", f.error);
+    assert_eq!(l.build_used(), 100 + u64::from(MAX_OUT));
 }

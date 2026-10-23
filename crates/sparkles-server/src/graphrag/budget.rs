@@ -14,6 +14,7 @@
 //! reservation is an accounting anomaly: the ledger counts the reported figure and the
 //! build admits no further attempt.
 
+use super::settings::{Budget, ByteBound};
 use crate::models::CallError;
 use crate::models::Kind;
 use crate::models::admission::{Admission, Attempt, Settle, Ticket, Usage};
@@ -24,33 +25,20 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Framing tokens allowed for each message of a request, the system text included: the
-/// role markers and separators a chat template adds around a message.
-pub const FRAMING_PER_MESSAGE: u64 = 16;
-/// Tokens allowed for each request for what a provider adds around an output schema
-/// or a tool definition, such as the instructions of a forced tool call, and for the
-/// tokens that begin and end a conversation.
-pub const ALLOWANCE_PER_REQUEST: u64 = 1_024;
-
-/// Tokens per byte of the serialized request. Every kind's models tokenize with a
-/// byte-level BPE or a SentencePiece vocabulary with byte fallback, where every token of
-/// text covers at least one byte, so one token per byte bounds the text. A kind whose
-/// models break that assumption must raise its multiplier here and say why.
-pub fn bytes_multiplier(kind: Kind) -> u64 {
-    match kind {
-        Kind::Anthropic | Kind::Openai | Kind::Ollama | Kind::Local => 1,
-    }
-}
-
 /// The byte bound of a request: its serialized length in bytes times the kind's
-/// multiplier, plus the framing allowance per message and the allowance per request.
-/// The serialized body holds the text with JSON escapes and member names around it, so
-/// it is never shorter than the text the model reads.
-pub fn byte_bound(kind: Kind, bytes: &[u8], messages: usize) -> u64 {
+/// multiplier, plus the framing allowance for each message and the system text, and the
+/// allowance per request for what a provider adds around a schema or a tool. The
+/// serialized body holds the text with JSON escapes and member names around it, so it
+/// is never shorter than the text the model reads. Every kind's models are taken to
+/// tokenize with a byte-level BPE or a SentencePiece vocabulary with byte fallback,
+/// where every token of text covers at least one byte, which is why the default
+/// multiplier is 1. The allowances are settings with unmeasured defaults
+/// ([`ByteBound`]).
+pub fn byte_bound(b: &ByteBound, bytes: &[u8], messages: usize) -> u64 {
     (bytes.len() as u64)
-        .saturating_mul(bytes_multiplier(kind))
-        .saturating_add(FRAMING_PER_MESSAGE.saturating_mul(messages as u64 + 1))
-        .saturating_add(ALLOWANCE_PER_REQUEST)
+        .saturating_mul(b.multiplier)
+        .saturating_add(b.per_message.saturating_mul(messages as u64 + 1))
+        .saturating_add(b.per_request)
 }
 
 /// Where an input bound came from.
@@ -295,16 +283,18 @@ pub struct BuildAdmission {
     pub ledger: Arc<Ledger>,
     tokenizers: Tokenizers,
     provider_counting: bool,
+    budget: Budget,
     /// the bound of every admitted attempt, in order
     bounds: Mutex<Vec<InputBound>>,
 }
 
 impl BuildAdmission {
-    pub fn new(ledger: Arc<Ledger>, tokenizers: Tokenizers, provider_counting: bool) -> Self {
+    pub fn new(ledger: Arc<Ledger>, tokenizers: Tokenizers, budget: &Budget) -> Self {
         BuildAdmission {
             ledger,
             tokenizers,
-            provider_counting,
+            provider_counting: budget.provider_counting,
+            budget: budget.clone(),
             bounds: Mutex::new(Vec::new()),
         }
     }
@@ -346,7 +336,11 @@ impl BuildAdmission {
             }
         }
         make(
-            byte_bound(a.config.kind, a.bytes, a.request.messages.len()),
+            byte_bound(
+                &self.budget.byte_bound_of(a.config.kind.as_str()),
+                a.bytes,
+                a.request.messages.len(),
+            ),
             Source::ByteBound,
             None,
         )

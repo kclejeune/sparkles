@@ -102,7 +102,7 @@ A dataset's GraphRAG settings are a settings kind of C19, `graphrag`, stored in
 | `minCommunitySize` | Smaller communities get no report and are merged into their parent's report. |
 | `maxFactsPerCommunity` | The facts sent for a leaf community's report, chosen as §3.2 says. |
 | `refresh` | `manual`, or `auto` with a debounce and the share of a community's facts that must change before its report is rewritten (§5). |
-| `budget` | Tokens a full build and a day of refreshes may use, and `providerCounting`, which allows the provider's token counting endpoint (§3.5) and defaults to `true`. The provider's own budget of C19 applies as well. |
+| `budget` | Tokens a full build and a day of refreshes may use. `providerCounting` allows the provider's token counting endpoint and defaults to `true`. `byteBound` sets the byte bound's allowances per provider kind (§3.5). The provider's own budget of C19 applies as well. |
 
 ### 2.2 Building
 
@@ -258,12 +258,15 @@ sources that is available for the pair:
    principal and the same `sendByProvider` policy as the inference call, so counting
    discloses nothing that the call does not. `budget.providerCounting: false` turns it
    off.
-3. The byte bound: the UTF-8 length in bytes of the serialized request, plus a fixed
-   allowance per message for the protocol's framing tokens and a fixed allowance per
-   request for what the provider adds around a schema or a tool definition. A token of
-   a byte-level BPE tokenizer covers at least one byte, so the length in bytes bounds the
-   tokens of the text. A provider known to break that assumption gets a larger
-   multiplier, which the code documents with the provider kind.
+3. The byte bound: the UTF-8 length in bytes of the serialized request times a
+   multiplier, plus an allowance per message for the protocol's framing tokens and an
+   allowance per request for what the provider adds around a schema or a tool
+   definition. A token of a byte-level BPE tokenizer covers at least one byte, so the
+   length in bytes bounds the tokens of the text. The multiplier and the allowances are
+   settings per provider kind, `budget.byteBound`, whose defaults are a multiplier of 1,
+   16 tokens per message and 1024 tokens per request. Nothing has measured these
+   defaults against a provider. A provider known to break the one-byte assumption needs
+   a larger multiplier.
 
 A missing exact counter is never a reason to refuse a build. Each bound records its
 source, the counter and its version where there is one, the model and a digest of the
@@ -286,8 +289,11 @@ it, and its days are UTC days. The provider's own budget of C19 still applies.
 **Accounting anomalies.** A reported usage above its reservation means that a bound
 was wrong. The ledger then counts the reported usage, the build records an accounting
 anomaly with the pair, the counting source and both figures, and it sends no further
-request. Its remaining communities stay `pending`, and the anomaly shows in the status
-of §2.2. A later build reserves against the ledger as it then stands.
+request. Its remaining communities stay `pending`, the anomaly shows in the status of
+§2.2, and it raises a notice in the review inbox and counts in
+`sparkles_graphrag_accounting_anomalies_total{dataset}`, so that an administrator sees
+it. A later build reserves against the ledger as it then stands, without an
+acknowledgement.
 
 **The estimate.** The input of a higher-level report depends on the reports of its
 children, so the input of a whole build cannot be known before its first call. The
@@ -484,10 +490,10 @@ stream, ends when either changes, and the client reconnects under the new decisi
 
 The guard is applied where a request's view is resolved, in the server's principal
 view, before any path reads data. A guarded graph that is not proven for the reader is
-removed from the reader's read graphs, in the way C12 hides a graph. The reader then has
-a restricted view, and every path treats the graph as one that does not exist, through
-the machinery C12 and C12b already use for a restricted view. A caller who had no view
-before gains one, so the routes that refuse restricted callers refuse it as well. A
+removed from the reader's read graphs, in the way C12 hides a graph, and every path
+treats the graph as one that does not exist, through the machinery C12 and C12b already
+use for a restricted view. Only a reader whose view is already restricted can lose a
+graph this way, since a reader without a view is unrestricted and proven by rule 1. A
 route-local check is not enough, and the GraphRAG routes use the same decision as every
 other path.
 
@@ -599,8 +605,9 @@ effect decides whether this stays on by default (§9).
   ingestion and memory maintenance, with progress per level and cancellation between
   model calls, and show in `GET /$/memory/{ds}/maintenance`.
 - Metrics: `sparkles_graphrag_reports{dataset,status}`,
-  `sparkles_graphrag_tokens_total{dataset,phase}` and
-  `sparkles_graphrag_stale_communities{dataset}`.
+  `sparkles_graphrag_tokens_total{dataset,phase}`,
+  `sparkles_graphrag_stale_communities{dataset}` and
+  `sparkles_graphrag_accounting_anomalies_total{dataset}`.
 
 ## 9. Evaluation
 
@@ -761,7 +768,9 @@ route. The first Phase 1 parts that need no publication are in the server: the
 versioned `graphrag` settings type, the bounded and versioned build state, the hierarchy
 adapter of §3.1 with its stable identities, and the admission of §3.5, which reserves
 every model attempt from an exact local tokenizer, the provider's counting endpoint or
-the byte bound. Local mock providers test them. They are not wired into a build, a
+the byte bound. Local mock providers test them. The byte bound's default allowances are
+unmeasured. Measuring them against real providers needs paid or provider runs, which
+wait for the user's approval. They are not wired into a build, a
 settings kind or a route. Phase 1 still needs the projection reader, the
 report inputs and checks, the whole-build estimate, the disclosure guard, report
 storage with provenance, the build task and routes, the CLI, the Communities tab, the

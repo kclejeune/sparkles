@@ -540,10 +540,9 @@ pub fn send_admitted(
             match sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes.clone(), left) {
                 Ok(posted) => posted,
                 Err(sparkles::outbound::Failure::Refused(m)) => {
-                    // the policy refuses before anything is sent
-                    if let Some(tk) = ticket {
-                        tk.not_sent();
-                    }
+                    // a refusal can come from a redirect after the request was sent, so
+                    // the reservation stays counted
+                    drop(ticket);
                     return Err(CallError::Refused(scrub(
                         format!("provider {name}: the outbound policy refuses {m}"),
                         key,
