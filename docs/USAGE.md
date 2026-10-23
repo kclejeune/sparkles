@@ -2157,6 +2157,14 @@ predicates when you can, because a search without them follows every triple, inc
 the limit with `path:maxVisited`, or narrow the search with `path:maxLength` or
 predicates.
 
+When the predicates to follow are not known in advance, name the ones to skip instead.
+`path:excludePredicate rdf:type, owl:sameAs` follows every other triple. A node with
+thousands of edges, such as a country or a popular class, connects almost everything
+through itself, so a path through it says little. `path:maxDegree 1000` keeps paths from
+passing through a node with more than 1,000 edges in the search's direction, while the
+source and the target may have any number. EXPLAIN ANALYZE reports the nodes skipped this
+way as `skippedHubs`.
+
 A predicate can be followed in its own direction. A family tree stored with
 `ex:parent` from child to parent and `ex:sibling` both ways is searched from an
 ancestor down to a person with `path:predicate (ex:parent path:backward), (ex:sibling
@@ -2182,6 +2190,32 @@ Paths are computed per query and nothing is indexed ahead of time. On the 10.5M-
 benchmark data, the shortest path between two people 17 edges apart takes about 3 ms,
 where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
 runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
+
+### Finding paths in Explore
+
+Explore's **Paths** button, or `Shift+P`, opens a panel beside the graph that runs these
+searches. **From** and **To** search the dataset as Explore's search box does, and they
+also take a pasted IRI, a prefixed name or a quoted literal. A right click or a long press
+on a node offers **Paths from here** and **Paths to here**, and so do the buttons of the
+side panel, and the panel then fills **From** with the node selected before. **Mode**
+chooses the shortest path, every shortest path up to 50 or the k shortest paths, with k
+from 2 to 20.
+
+**Filters** sets the length, up to 8 edges, the direction, the hub limit and the
+predicates. By default a search goes both ways, skips nodes with more than 1,000 edges and
+follows every predicate except those of the dataset's `paths` setting, which are
+`rdf:type` and `owl:sameAs` unless an administrator changes them. **only** follows the
+listed predicates instead, and the predicate box suggests those of the schema.
+
+The paths are drawn over the graph one edge at a time, in order of length, with each
+edge labelled by the paths that use it. With reduced motion they appear at once. The list
+under the form describes each path in words, and the keys `1` to `9` show one path, `A`
+shows them all and `Escape` clears the selection. **Open in editor** opens the query in
+the query page, **Add to graph** keeps the paths' nodes in the explored graph, and **Clear**
+removes the overlay. The search reads the commit of `main` that Explore shows. When it reaches
+its limit of a million visited nodes or ten seconds, the panel says so and suggests a
+shorter length, a lower hub limit or fewer predicates. At phone width the panel is a sheet
+at the bottom of the screen that folds to its handle.
 
 ## Graph algorithms
 
@@ -2652,6 +2686,7 @@ The tools are read-only unless the operator turns on the write tool:
 * `find_paths` finds the shortest path, all shortest paths, the k shortest or all paths
   up to a length between two nodes, or from one node, as
   [`SERVICE path:search`](#finding-paths) does, and returns each path's edges.
+  `excludePredicates` skips predicates and `maxDegree` skips hubs.
 * `graph_algorithm` runs PageRank, communities, similarity, components or embeddings on
   a projection of the graph, as [`SERVICE algo:…`](#graph-algorithms) does, and returns
   the best rows with the statistics of the run. It never writes.

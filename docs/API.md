@@ -5406,6 +5406,8 @@ described under "Edges from a pattern" below.
 | `path:algorithm` | `path:shortest`, `path:allShortest`, `path:kShortest` or `path:all` | `path:shortest` | One shortest path per pair, every shortest path, the `k` shortest paths (Yen's algorithm), or every path up to `path:maxLength`. |
 | `path:predicate` | an IRI, or a list of an IRI and a direction, repeatable | every predicate | The predicates whose triples are edges. `(ex:parent path:backward)` follows that predicate in its own direction. |
 | `path:direction` | `path:forward`, `path:backward` or `path:both` | `path:forward` | Follow a triple from subject to object, from object to subject, or both ways. It applies to the predicates without a direction of their own, and to the edges of a nested pattern. |
+| `path:excludePredicate` | an IRI, repeatable | none | Triples with this predicate are not edges. It cannot be combined with `path:predicate` or a nested pattern. |
+| `path:maxDegree` | a positive integer | none | A search does not pass through a node with more edges than this in the call's direction. The source and the target are exempt. |
 | `path:start`, `path:end` | variables | | The variables of a nested pattern that give each edge's start and end. |
 | `path:minLength` | an integer | 1 | The fewest edges. 0 adds the empty path from a node to itself. The shortest modes take 0 or 1. |
 | `path:maxLength` | an integer | none | The most edges. `path:all` requires it. |
@@ -5425,7 +5427,8 @@ described under "Edges from a pattern" below.
   So a search from a node to itself finds the shortest cycle through it, as
   `?s foaf:knows+ ?s` would, and the empty path only with `path:minLength 0`. Two
   triples between the same nodes with different predicates make two different paths.
-  Literals can end a path.
+  Literals can end a path, and no edge leaves one, so a search both ways never steps
+  from a resource to a literal and on to another resource that shares it.
 * **Rows.** With any of `path:edgeIndex`, `path:edgeSubject`, `path:edgePredicate`,
   `path:edgeObject` and `path:edge`, the call returns one row per edge. Without them it returns one row
   per path. A path of length 0 has one row with the edge variables unbound. The source
@@ -5450,6 +5453,26 @@ described under "Edges from a pattern" below.
   reifier gives no weight.
 * **Without predicates** every triple is an edge, `rdf:type` included, so a search
   without `path:predicate` usually visits far more nodes than one with them.
+  `path:excludePredicate rdf:type, owl:sameAs` keeps every other predicate and skips
+  those triples as the search reads them.
+* **Hubs.** With `path:maxDegree 1000` a search does not expand a node that has more
+  than 1,000 edges it could follow, counted in the call's direction after the
+  predicates are chosen and skipped, with a self-loop followed both ways counted once.
+  The degree is a node's out-degree in path order, whichever side of a bidirectional
+  search reaches it, so a node is a hub or not for the whole call. The source and the
+  target are always expanded, and a path may end at a hub when the target is a
+  variable, but no path passes through one. The shortest path the call reports is then
+  the shortest path that avoids hubs. A skipped hub counts as visited, and `EXPLAIN`
+  ANALYZE's `PathSearch` counters gain `skippedHubs`. The degree is read from the
+  index's counts when every quad of the dataset is in the active graph, and otherwise
+  by reading the node's edges up to one past the limit. Both are taken in the caller's
+  view, so a triple the caller cannot read never makes a node a hub.
+* **Dataset defaults.** The `paths` kind of [Settings](#settings), kept in
+  `<db>/paths.json`, holds `excludedPredicates`, the predicates the web UI's path finder
+  skips by default. It defaults to `rdf:type` and `owl:sameAs` and holds at most 50
+  absolute IRIs without duplicates. `GET /$/settings/{ds}/paths` reads it and
+  `PUT /$/settings/{ds}/paths` changes it. A search names its own predicates, so the
+  setting changes no query.
 * **Directions per predicate.** `path:predicate ex:knows, (ex:parent path:backward)`
   follows `ex:knows` from subject to object and `ex:parent` from object to subject, so
   `ex:a ex:knows ex:b . ex:c ex:parent ex:b` gives the path `a b c`. The edge variables
@@ -9194,7 +9217,7 @@ open-world when SERVICE is allowed. The common arguments are:
 | `sparql_query` | `query` (required), `format` (`table`\|`json`), `maxRows` (100), `maxBytes` (65536), `maxTermChars` (500), `offset`, `exactTotal` (true), `timeoutSeconds` (30) | One text block: a table or a JSON document (below). No `structuredContent`. |
 | `explain_query` | `query` (required), `includeAlgebra`, `profile`, `notes`, `timeoutSeconds`, `useServerModel` | `{dataset, commit, queryType, estimatedRows, plan, planTruncated?, algebra?, warnings: [{code, message}]}`. `plan` has one line per operator, `<operator> <description> est=<rows> [<columns>]`, indented by depth. With `profile: "run"`, the query runs read-only under `timeoutSeconds` (30 by default), its rows are counted in `rows` without being returned, and a run that a budget stopped is explained from its partial plan with the budget in `error`. With `notes: true`, each line starts with the node id and adds `act=` and `ms=` after a run, and the result adds `nodes`, `notes` and `asks` as `POST /{ds}/sparql/explain` defines them, with `source: "template"`. The tool never calls the server's model providers unless `useServerModel` is `true`, which needs the `serverModels` permission and fails with `server-model-not-allowed` otherwise. Its prose then replaces `asks` and the notes' text with `source: "model"`, and its tokens are charged to the caller. The warnings are `unknown-term` (a constant IRI or literal of a triple pattern that the dataset does not contain), `no-limit` (no top-level LIMIT, and over 10,000 rows estimated), `large-estimate` (an intermediate result over 50M rows) and `service-disabled`. For a caller whose graph grants or triple protections hide data, `unknown-term` looks terms up in the caller's view, so a term that occurs only in hidden data is reported as an absent one is. Such a caller sees no estimates, so `estimatedRows` is `null`, the plan shows `est=?`, there is no `large-estimate`, and `no-limit` applies to every query without a LIMIT. |
 | `describe_resource` | `iri` (required), `direction` (`both`\|`outgoing`\|`incoming`), `maxTriples` (50 per direction, ≤ 500), `lang` (`en`), `mode` (`cbd`\|`scbd`\|`outgoing`) | `{dataset, commit, iri, exists, label?, types, outgoing?, incoming?, description?, prefixes}`. Each side is `{total, predicates: [{p, count}], predicatesTotal, triples: [{p, o, oLabel?}` or `{s, sLabel?, p}], truncated}`. Triples are sampled round-robin by predicate, so a hub's largest predicate does not hide the others. With `mode`, `description` is `{mode, triples: ["s p o"], truncated}`: the resource's [DESCRIBE](#describe) in that mode, at most `maxTriples` triples. |
-| `find_paths` | `source` and `target` (IRIs; at least one), `predicates` (≤ 20 IRIs; default all), `algorithm` (`shortest`\|`allShortest`\|`kShortest`\|`all`), `direction` (`forward`\|`backward`\|`both`), `minLength`, `maxLength`, `k`, `limit` (10, ≤ 100), `maxVisited`, `weight` (an IRI), `defaultWeight`, `graph` (`default` or a named graph IRI), `timeoutSeconds` (30) | `{dataset, commit, algorithm, paths: [{source, target, length, cost, edges: ["s p o"]}], limited, edgesTruncated, prefixes}`: a [path search](#path-search) as `SERVICE path:search` runs it. With one end, the paths to or from every node it connects to, at most `limit`. At most 2000 edges are returned in all. A malformed search is `syntax`, with the `path:search` message. |
+| `find_paths` | `source` and `target` (IRIs; at least one), `predicates` (≤ 20 IRIs; default all), `algorithm` (`shortest`\|`allShortest`\|`kShortest`\|`all`), `direction` (`forward`\|`backward`\|`both`), `minLength`, `maxLength`, `k`, `limit` (10, ≤ 100), `maxVisited`, `excludePredicates` (≤ 20 IRIs, not with `predicates`), `maxDegree`, `weight` (an IRI), `defaultWeight`, `graph` (`default` or a named graph IRI), `timeoutSeconds` (30) | `{dataset, commit, algorithm, paths: [{source, target, length, cost, edges: ["s p o"]}], limited, edgesTruncated, prefixes}`: a [path search](#path-search) as `SERVICE path:search` runs it. With one end, the paths to or from every node it connects to, at most `limit`. At most 2000 edges are returned in all. A malformed search is `syntax`, with the `path:search` message. |
 | `graph_algorithm` | `algorithm` (required), `projection` (a stored projection) or `predicates` (≤ 20), `direction`, `nodeClasses` and `weight`, `params` (the algorithm's parameters by name), `limit` (20, ≤ 100), `timeoutSeconds` (30) | `{dataset, commit, algorithm, columns, rows: [[…]], limited, summary, prefixes}`: a [graph algorithm](#graph-algorithms) as `SERVICE algo:<name>` runs it, with the best `limit` rows by the algorithm's main measure and the statistics of the run. Numbers are numbers and other terms are compact strings. The tool never writes results back. |
 | `list_commits` | `limit` (10, ≤ 100), `before` | `{dataset, head, firstRetained, complete, commits: [{seq, timestamp, kind, inserted, deleted, quads}], next: {before} \| null, readable: [{from, to}], snapshots: [{name, commit}]}`. `readable` lists the commits whose state `at` and `atCommit` can read, and `snapshots` the 20 newest named snapshots. |
 | `list_changes` | `subjects`, `predicates`, `objects` and `graphs` (each ≤ 20; objects may be literals in N-Triples syntax, graphs `default` or IRIs), `from` and `to` (a commit or a selector string), `op` (`add`\|`remove`), `order` (`asc`\|`desc`), `limit` (100, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, head, from, to, changes: [{commit, timestamp, kind, author?, message?, op, quad}], truncated, unrecorded: [{from, to, reason}], prefixes}`: the [history query](#history-queries) of `GET /{ds}/history`, with each quad as one line of terms. It needs the grant of the `diff` endpoint and leaves out the graphs and triples the caller may not read. |
@@ -10730,15 +10753,15 @@ figures of the runs and reviews since the server started.
 
 ### Settings
 
-A dataset's `assistant`, `memory`, `ingest` and `prefixes` settings are settings kinds. The
-effective value of a kind is computed from four layers, and a later layer overrides an
-earlier one.
+A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag` and `paths` settings
+are settings kinds. The effective value of a kind is computed from four layers, and a
+later layer overrides an earlier one.
 
 1. The built-in defaults of the kind.
 2. The `defaults` of the settings file of `serve --settings`.
 3. The settings file's entry for the dataset, by name.
 4. The runtime layer, which holds the fields changed through the API. It is kept in the
-   dataset's file (`assistant.json`, `memory.json`, or the settings members of
+   dataset's file (`assistant.json`, `memory.json`, `paths.json`, or the settings members of
    `ingest.json`), or in the process for an in-memory dataset.
 
 Layers merge as in RFC 7396. Objects merge member by member, and arrays and scalars
