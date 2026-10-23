@@ -27,6 +27,7 @@
   import {
     confirmPlan,
     deltaText,
+    edgeIdOf,
     planDiff,
     schemaAnnouncement,
     schemaChanges,
@@ -351,6 +352,7 @@
         isType: e.p === RDF_TYPE,
         paths: e.paths,
         order: e.order,
+        change: pathAdded.has(e.id) ? ('added' as const) : undefined,
       }));
     return [...marked, ...extra];
   });
@@ -370,6 +372,46 @@
   let pathNear = $state(new Map<string, string[]>());
   /** The paths are drawn without the graph, which could not take them. */
   let pathsAlone = $state(false);
+  /** The overlay's own edges that the earlier state of a comparison lacks. */
+  let pathAdded = $state(new Set<string>());
+  // comparing: a path edge that is not drawn is marked as the drawn ones are. A path is
+  // found at the later state, so its edges exist there, and an edge the earlier state
+  // lacks was added.
+  $effect(() => {
+    const o = pathOverlay;
+    const name = ds;
+    const comparing = graphTimeOpen && exCompare && !!(exFrom || exAgainst);
+    const against = exAgainst;
+    const from = exFrom;
+    if (!o || !name || !comparing) {
+      pathAdded = new Set();
+      return;
+    }
+    const drawn = untrack(() => new Set(Object.keys(edges)));
+    const own = o.edges.filter((e) => !drawn.has(e.id));
+    if (!own.length) {
+      pathAdded = new Set();
+      return;
+    }
+    const c = new AbortController();
+    const triples = own.map((e): [Term, Term, Term] => [e.s, { type: 'uri', value: e.p }, e.o]);
+    ex.presentEdges(
+      against ? `${name}@${against}` : name,
+      triples,
+      against ? undefined : from,
+      c.signal,
+    )
+      .then((before) => {
+        if (c.signal.aborted) return;
+        pathAdded = new Set(
+          own.filter((_, i) => !before.has(edgeIdOf(triples[i]))).map((e) => e.id),
+        );
+      })
+      .catch(() => {
+        // the marks are a nicety: the paths stand without them
+      });
+    return () => c.abort();
+  });
   let pathPanel: PathPanel | undefined = $state();
   /** The node selected before the current one: with both, Paths fills From and To. */
   let prevSelectedId: string | null = null;
@@ -1216,6 +1258,10 @@
       if (!first) {
         // Dataset switched in the sidebar: start over.
         resetGraph();
+        pathsOpen = false;
+        pathFrom = null;
+        pathTo = null;
+        clearPaths();
         focusId = null;
         selectedId = null;
         schema = null;
@@ -1549,20 +1595,22 @@
 
       {#if pathsOpen && ds}
         <aside class="side side-paths" aria-label="Path finder">
-          <PathPanel
-            bind:this={pathPanel}
-            {ds}
-            {prefixes}
-            at={graphTimeOpen ? exAt : ''}
-            bind:from={pathFrom}
-            bind:to={pathTo}
-            bind:highlight={pathHighlight}
-            onresult={showPaths}
-            onadd={addPathsToGraph}
-            onclear={clearPaths}
-            onclose={closePaths}
-            onfit={fitPath}
-          />
+          {#key ds}
+            <PathPanel
+              bind:this={pathPanel}
+              {ds}
+              {prefixes}
+              at={graphTimeOpen ? exAt : ''}
+              bind:from={pathFrom}
+              bind:to={pathTo}
+              bind:highlight={pathHighlight}
+              onresult={showPaths}
+              onadd={addPathsToGraph}
+              onclear={clearPaths}
+              onclose={closePaths}
+              onfit={fitPath}
+            />
+          {/key}
         </aside>
       {:else if nodeCount > 0 || graphTimeOpen}
         <aside class="side" aria-label="Resource details">

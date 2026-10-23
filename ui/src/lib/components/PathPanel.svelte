@@ -77,11 +77,19 @@
 
   let running = $state(false);
   let failure = $state<pf.SearchFailure | null>(null);
-  let result = $state<(pf.PathResult & { at: string; settings: pf.PathSettings }) | null>(null);
+  /** The paths found, with the state, the settings and the query that found them. */
+  let result = $state<
+    (pf.PathResult & { at: string; settings: pf.PathSettings; query: string }) | null
+  >(null);
   let labels = $state(new Map<string, string>());
   let announce = $state('');
   let ctl: AbortController | undefined;
-  onDestroy(() => ctl?.abort());
+  /** Stops the search in flight, so that nothing it returns is shown. */
+  function cancel() {
+    ctl?.abort();
+    ctl = undefined;
+  }
+  onDestroy(cancel);
 
   let fromPicker: EntityPicker | undefined = $state();
   let list: HTMLDivElement | undefined = $state();
@@ -126,12 +134,20 @@
     ctl?.abort();
     const c = (ctl = new AbortController());
     const s = $state.snapshot(settings) as pf.PathSettings;
+    // the state and the query of this search, which the slider may move away from
+    const runAt = at;
+    const runPhase1 = phase1;
+    const live = () => ctl === c && !c.signal.aborted;
     running = true;
     failure = null;
     announce = '';
     try {
-      const r = await pf.findPaths(ds, s, { at: at || undefined, phase1, signal: c.signal });
-      if (ctl !== c) return;
+      const r = await pf.findPaths(ds, s, {
+        at: runAt || undefined,
+        phase1: runPhase1,
+        signal: c.signal,
+      });
+      if (!live()) return;
       // the labels of the nodes, from the lookup Explore already uses
       const iris = new Set<string>();
       for (const p of r.paths) for (const t of p.nodes) if (t.type === 'uri') iris.add(t.value);
@@ -142,15 +158,15 @@
       } catch {
         // labels are a nicety: the paths stand without them
       }
-      if (ctl !== c) return;
+      if (!live()) return;
       labels = found;
-      result = { ...r, at, settings: s };
+      result = { ...r, at: runAt, settings: s, query: pf.pathQuery(s, runPhase1) };
       highlight = null;
       sheetFull = wide || r.paths.length <= 1;
       announce = pf.announcement(r.paths);
       onresult?.({ paths: r.paths, labels: found });
     } catch (e) {
-      if (ctl !== c || (e instanceof DOMException && e.name === 'AbortError')) return;
+      if (!live() || (e instanceof DOMException && e.name === 'AbortError')) return;
       failure = pf.classifyFailure(e);
       if (failure.kind === 'unsupported') {
         phase1 = false;
@@ -163,7 +179,7 @@
   }
 
   function clear() {
-    ctl?.abort();
+    cancel();
     running = false;
     result = null;
     failure = null;
@@ -180,10 +196,11 @@
     return termKey(t);
   }
 
+  /** The query page opens with the query that found the paths shown, at its state. */
   function openInEditor() {
-    if (!settings) return;
-    app.pendingQuery = { query: pf.pathQuery(settings, phase1), title: 'Paths' };
-    app.queryAt = at;
+    if (!result) return;
+    app.pendingQuery = { query: result.query, title: 'Paths' };
+    app.queryAt = result.at;
     void goto(resolve('/query'));
   }
 

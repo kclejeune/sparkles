@@ -22,6 +22,9 @@ const update = (request: APIRequestContext, sparql: string, message: string) =>
 
 test.beforeAll(async ({ request }) => {
   mkdirSync(SHOTS, { recursive: true });
+  // a second dataset to switch to
+  const other = await request.post('/$/datasets', { data: { dbName: 'paths9b', dbType: 'mem' } });
+  expect(other.ok() || other.status() === 409).toBe(true);
   const r = await request.post('/$/datasets', { data: { dbName: 'paths9', dbType: 'persistent' } });
   if (r.status() === 409) return;
   expect(r.ok()).toBe(true);
@@ -241,6 +244,103 @@ test('Open in editor takes the search to the query page', async ({ page }) => {
   await panel(page).getByRole('button', { name: 'Open in editor' }).click();
   await expect(page).toHaveURL(/\/ui\/query/);
   await expect(page.locator('.cm-content')).toContainText('path:search');
+});
+
+/** Holds the requests that `match` picks until the returned function is called. */
+async function hold(page: Page, match: (body: string) => boolean) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let seen!: () => void;
+  const arrived = new Promise<void>((r) => (seen = r));
+  await page.route('**/paths9/sparql**', async (route) => {
+    if (!match(route.request().postData() ?? '')) return route.fallback();
+    seen();
+    await gate;
+    await route.fallback();
+  });
+  return { arrived, release };
+}
+const isSearch = (b: string) => b.includes('path:search');
+const isLabels = (b: string) => b.includes('VALUES ?s') && !b.includes('path:search');
+
+test('a search keeps the state it ran at, and Open in editor runs it again', async ({ page }) => {
+  await openAlice(page, '&at=commit:1');
+  await page.keyboard.press('Shift+P');
+  await choose(page, 'To', 'Bob', /Bob/);
+  const held = await hold(page, isSearch);
+  await panel(page).getByRole('button', { name: 'Find paths' }).click();
+  await held.arrived;
+  // the slider moves to the head while the search runs at commit 1
+  const bar = page.getByRole('region', { name: 'Graph history time slider' });
+  await bar.getByRole('slider', { name: 'Commit' }).focus();
+  await page.keyboard.press('End');
+  held.release();
+  await expect(list(page).getByRole('option').first()).toHaveAccessibleName(/length 4/);
+  await expect(panel(page)).toContainText('at commit 1 · main');
+  await expect(panel(page).getByRole('button', { name: /^Search again at/ })).toBeVisible();
+  // a change to the form after the search does not change the query that is opened
+  await panel(page).getByRole('button', { name: 'Clear To' }).click();
+  await choose(page, 'To', 'Lyon', /Lyon/);
+  await panel(page).getByRole('button', { name: 'Open in editor' }).click();
+  await expect(page).toHaveURL(/\/ui\/query/);
+  await expect(page.locator('.cm-content')).toContainText('bob');
+  await expect(page.locator('.cm-content')).not.toContainText('lyon');
+});
+
+test('Clear during the label lookup leaves nothing drawn', async ({ page }) => {
+  await openAlice(page);
+  await page.keyboard.press('Shift+P');
+  await choose(page, 'To', 'Lyon', /Lyon/);
+  // the paths arrive, and the labels of their nodes are held
+  await page.waitForTimeout(300);
+  const held = await hold(page, isLabels);
+  await panel(page).getByRole('button', { name: 'Find paths' }).click();
+  await held.arrived;
+  await panel(page).getByRole('button', { name: 'Close paths' }).click();
+  held.release();
+  await page.waitForTimeout(1000);
+  expect((await edgeLabels(page)).some((l) => l.includes(' · '))).toBe(false);
+  expect((await drawn(page)).nodes.map(([l]) => l)).not.toContain('Lyon');
+});
+
+test('switching datasets clears the paths', async ({ page }) => {
+  await openAlice(page);
+  await page.keyboard.press('Shift+P');
+  await choose(page, 'To', 'Lyon', /Lyon/);
+  await panel(page).getByRole('button', { name: 'Find paths' }).click();
+  await expect.poll(() => edgeLabels(page)).toContain('worksFor · 1');
+  await page.locator('.ds-button').click();
+  await page
+    .getByRole('listbox', { name: 'Datasets' })
+    .getByRole('option', { name: /paths9b/ })
+    .click();
+  await expect(panel(page)).toHaveCount(0);
+  // the empty dataset opens on its overview, with no paths left to draw
+  await expect(page.getByText('No classes to draw')).toBeVisible();
+  await expect(page.locator('.wrap[data-graph]')).toHaveCount(0);
+});
+
+test('compare mode marks the path edges the earlier state lacks', async ({ page }) => {
+  // Carol's neighbourhood does not draw ex:alice ex:knows ex:bob, which commit 2 added
+  await page.goto(`/ui/explore?ds=paths9&iri=${encodeURIComponent(`${EX}carol`)}`);
+  await expect.poll(async () => (await drawn(page)).nodes.length).toBeGreaterThan(1);
+  await page.getByRole('button', { name: 'Graph history' }).click();
+  const bar = page.getByRole('region', { name: 'Graph history time slider' });
+  await bar.getByRole('slider', { name: /^(Commit|Compared to)$/ }).focus();
+  await page.keyboard.press('c');
+  await page.keyboard.press('Shift+P');
+  await choose(page, 'To', 'Bob', /Bob/);
+  await panel(page).getByRole('button', { name: 'Find paths' }).click();
+  await expect(list(page).getByRole('option').first()).toHaveAccessibleName(
+    'path 1, length 2, Carol knows Alice, Alice knows Bob',
+  );
+  // Carol knows Alice is drawn and unchanged, Alice knows Bob is the overlay's and added
+  const marks = async () =>
+    (await drawn(page)).edges
+      .filter(([l]) => l.endsWith('knows · 1'))
+      .map(([, c]) => c)
+      .sort();
+  await expect.poll(marks).toEqual(['', 'added']);
 });
 
 test.describe('on a phone', () => {
