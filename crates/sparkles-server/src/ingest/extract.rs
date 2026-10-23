@@ -973,8 +973,8 @@ pub fn propose(
     }
     flagged.dedup();
     let count = |f: fn(&Link) -> bool| links.iter().filter(|l| f(l)).count();
-    let pages =
-        |f: &Fact| super::convert::page_of(&converted.text, &converted.page_starts, f.start);
+    let page_map = super::convert::PageMap::new(&converted.text, &converted.page_starts);
+    let pages = |f: &Fact| page_map.page_of(f.start);
     let mut summary = json!({
         "proposed": proposed,
         "extracted": ex.facts.len(),

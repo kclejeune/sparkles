@@ -299,12 +299,43 @@ pub struct Converted {
     pub notes: Vec<String>,
 }
 
-/// The page whose marker starts the last page start at or before `offset`.
-pub fn page_of(text: &str, starts: &[usize], offset: usize) -> Option<u32> {
-    let i = starts.partition_point(|s| *s <= offset);
-    let start = *starts.get(i.checked_sub(1)?)?;
-    let marker: String = text.chars().skip(start).take(24).collect();
-    marker_page(&marker)
+/// The page of each page start of a rendition, read once. Reading a start's marker with
+/// `chars().skip(start)` scans the text from its beginning, so a lookup for every fact or
+/// page of a long PDF took time quadratic in the text.
+pub struct PageMap<'a> {
+    starts: &'a [usize],
+    pages: Vec<Option<u32>>,
+}
+
+impl<'a> PageMap<'a> {
+    /// The pages that start at `starts`, which are ascending code point offsets in `text`.
+    pub fn new(text: &str, starts: &'a [usize]) -> PageMap<'a> {
+        debug_assert!(starts.windows(2).all(|w| w[0] <= w[1]));
+        let mut chars = text.char_indices();
+        let mut at = 0;
+        let pages = starts
+            .iter()
+            .map(|&start| {
+                while at < start && chars.next().is_some() {
+                    at += 1;
+                }
+                // a start past the end has no marker
+                let (byte, _) = chars.clone().next()?;
+                let marker = text[byte..]
+                    .char_indices()
+                    .nth(24)
+                    .map_or(&text[byte..], |(end, _)| &text[byte..byte + end]);
+                marker_page(marker)
+            })
+            .collect();
+        PageMap { starts, pages }
+    }
+
+    /// The page whose marker starts the last page start at or before `offset`.
+    pub fn page_of(&self, offset: usize) -> Option<u32> {
+        let i = self.starts.partition_point(|s| *s <= offset);
+        *self.pages.get(i.checked_sub(1)?)?
+    }
 }
 
 /// The page number of a `<!-- Page N -->` marker at the start of `s`.
@@ -488,8 +519,73 @@ mod tests {
         let t = "<!-- Page 1 -->\n\nOne.\n\n<!-- Page 3 -->\n\nThree é.\n";
         let s = page_starts(t);
         assert_eq!(s, vec![0, 23]);
-        assert_eq!(page_of(t, &s, 18), Some(1));
-        assert_eq!(page_of(t, &s, 40), Some(3));
-        assert_eq!(page_of("x", &[], 0), None);
+        let map = PageMap::new(t, &s);
+        assert_eq!(map.page_of(18), Some(1));
+        assert_eq!(map.page_of(40), Some(3));
+        assert_eq!(PageMap::new("x", &[]).page_of(0), None);
+    }
+
+    /// The function that `PageMap` replaced, as the oracle of its answers.
+    fn page_of_by_scanning(text: &str, starts: &[usize], offset: usize) -> Option<u32> {
+        let i = starts.partition_point(|s| *s <= offset);
+        let start = *starts.get(i.checked_sub(1)?)?;
+        let marker: String = text.chars().skip(start).take(24).collect();
+        marker_page(&marker)
+    }
+
+    #[test]
+    fn page_map_answers_like_a_scan_for_every_offset() {
+        let mut t = String::new();
+        for n in [1, 2, 10, 123456] {
+            t.push_str(&format!(
+                "<!-- Page {n} -->\n\nCaf\u{e9} \u{4e2d}\u{6587} \u{1f600} text.\n\n"
+            ));
+        }
+        // a start whose marker is cut short by the end of the text, and one past it
+        t.push_str("<!-- Page 9 -->");
+        let mut starts = page_starts(&t);
+        starts.push(t.chars().count() + 5);
+        let map = PageMap::new(&t, &starts);
+        for offset in 0..t.chars().count() + 9 {
+            assert_eq!(
+                map.page_of(offset),
+                page_of_by_scanning(&t, &starts, offset),
+                "{offset}"
+            );
+        }
+        // starts that are not at a marker read none
+        let odd = [0, 3, 3, 40];
+        let map = PageMap::new(&t, &odd);
+        for offset in 0..60 {
+            assert_eq!(map.page_of(offset), page_of_by_scanning(&t, &odd, offset));
+        }
+    }
+
+    /// Reading the pages of a long rendition takes time in proportion to its length. With
+    /// one scan from the start of the text for each page, this text of 40,000 pages took
+    /// about ten minutes (15 s for a fortieth of its pages).
+    #[test]
+    fn page_map_scales_with_the_length_of_the_text() {
+        let mut t = String::new();
+        for n in 1..=40_000 {
+            t.push_str(&format!(
+                "<!-- Page {n} -->\n\n{}\n\n",
+                "lorem ipsum ".repeat(4)
+            ));
+        }
+        let starts = page_starts(&t);
+        assert_eq!(starts.len(), 40_000);
+        let began = std::time::Instant::now();
+        let map = PageMap::new(&t, &starts);
+        let mut sum = 0u64;
+        for &s in &starts {
+            sum += u64::from(map.page_of(s).unwrap());
+        }
+        assert_eq!(sum, 40_000 * 40_001 / 2);
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
     }
 }

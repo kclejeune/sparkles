@@ -1790,6 +1790,79 @@ fn find_quote(text: &str, quote: &str, first: bool) -> Option<(usize, usize)> {
     Some((start, start + quote.chars().count()))
 }
 
+/// Where each of a set of quotes occurs in a text, found in one pass over the text. Calling
+/// [`find_quote`] for each quote searches and counts the text from its start every time, so
+/// the re-anchoring of a source with many cited quotes took time quadratic in its length.
+struct QuoteIndex<'q> {
+    /// by quote: the span of its first occurrence in code points, and whether a second
+    /// occurrence that does not overlap the first follows, as `str::match_indices` finds
+    found: HashMap<&'q str, ((usize, usize), bool)>,
+    /// whether `found` is the whole answer, which it is unless the automaton failed to build
+    complete: bool,
+}
+
+impl<'q> QuoteIndex<'q> {
+    fn new(text: &str, quotes: impl IntoIterator<Item = &'q str>) -> QuoteIndex<'q> {
+        let distinct: Vec<&str> = quotes
+            .into_iter()
+            .filter(|q| !q.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut index = QuoteIndex {
+            found: HashMap::new(),
+            complete: true,
+        };
+        if distinct.is_empty() {
+            return index;
+        }
+        let Ok(automaton) = aho_corasick::AhoCorasick::new(&distinct) else {
+            index.complete = false;
+            return index;
+        };
+        // per quote: the byte offset of its first occurrence, and whether another follows
+        // it without overlap (the matches of one quote come in the order of their starts)
+        let mut seen: Vec<Option<(usize, bool)>> = vec![None; distinct.len()];
+        for m in automaton.find_overlapping_iter(text) {
+            let slot = &mut seen[m.pattern().as_usize()];
+            match slot {
+                None => *slot = Some((m.start(), false)),
+                Some((first, more)) if !*more && m.start() >= *first + (m.end() - m.start()) => {
+                    *more = true;
+                }
+                Some(_) => {}
+            }
+        }
+        // the code point offsets of the first occurrences, in one pass over the text
+        let mut order: Vec<(usize, usize)> = seen
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|(byte, _)| (byte, i)))
+            .collect();
+        order.sort_unstable();
+        let (mut byte, mut chars) = (0, 0);
+        for (at, i) in order {
+            chars += text[byte..at].chars().count();
+            byte = at;
+            let quote = distinct[i];
+            let more = seen[i].is_some_and(|(_, more)| more);
+            index
+                .found
+                .insert(quote, ((chars, chars + quote.chars().count()), more));
+        }
+        index
+    }
+
+    /// [`find_quote`] on the text the index was built over, for a quote it was built with.
+    fn find(&self, text: &str, quote: &str, first: bool) -> Option<(usize, usize)> {
+        if !self.complete {
+            return find_quote(text, quote, first);
+        }
+        let (span, more) = *self.found.get(quote)?;
+        (first || !more).then_some(span)
+    }
+}
+
 /// What a re-anchoring pass writes in the source's graph: statements to insert and to
 /// delete, and its counts.
 #[derive(Default)]
@@ -1964,9 +2037,10 @@ fn reanchor_pass(
     // by triple: whether some reifier stays valid
     let mut kept: HashMap<String, (Box<oxrdf::Triple>, bool)> = HashMap::new();
     let citing_set: HashSet<&str> = cites.iter().map(|(rf, ..)| rf.as_str()).collect();
+    let quotes = QuoteIndex::new(text, cites.iter().filter_map(|c| c.2.as_deref()));
     for (rf, t, q) in &cites {
         let key = t.to_string();
-        let found = q.as_deref().and_then(|q| find_quote(text, q, false));
+        let found = q.as_deref().and_then(|q| quotes.find(text, q, false));
         let e = kept.entry(key.clone()).or_insert_with(|| {
             // a reifier that cites something else keeps the fact
             let other = live
@@ -2066,24 +2140,26 @@ fn reanchor_from_pass(
         }
         let olds: BTreeSet<String> = [rend.as_str().to_string()].into();
         let imported = import_made(r, &og)?;
-        for (rf, t, q) in citing(r, &og, &olds)? {
+        let cites = citing(r, &og, &olds)?;
+        let quotes = QuoteIndex::new(text, cites.iter().filter_map(|c| c.2.as_deref()));
+        for (rf, t, q) in &cites {
             if imported.contains(&t.to_string()) {
                 continue;
             }
             let Some(q) = q else { continue };
-            let Some(span) = find_quote(text, &q, true) else {
+            let Some(span) = quotes.find(text, q, true) else {
                 continue;
             };
-            let _ = writeln!(out.ins, "{} .", triple_text(&t));
+            let _ = writeln!(out.ins, "{} .", triple_text(t));
             anchored_reifier(
                 &mut out.ins,
                 dataset_id,
-                &t,
-                &rf,
+                t,
+                rf,
                 rendition,
                 source,
                 span,
-                &q,
+                q,
                 act,
                 at,
             );
@@ -2519,6 +2595,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The index answers as `find_quote` does for every quote, whether it is absent,
+    /// unique, repeated, overlaps itself, sits at the start or the end, or is not ASCII.
+    #[test]
+    fn quote_index_answers_like_find_quote() {
+        let text =
+            "alpha beta \u{e9}t\u{e9} aaaa \u{4e2d}\u{6587} beta \u{1f600}x gamma delta aaa end";
+        let quotes = [
+            "alpha",
+            "beta",
+            "\u{e9}t\u{e9}",
+            "aa",
+            "aaa",
+            "aaaa",
+            "aaaaa",
+            "\u{4e2d}\u{6587}",
+            "\u{1f600}",
+            "gamma delta",
+            "end",
+            "a",
+            " ",
+            "absent",
+            "alpha beta",
+            "x g",
+            "t",
+            "\u{e9}",
+            "delta aaa end",
+            "",
+        ];
+        let index = QuoteIndex::new(text, quotes);
+        for q in quotes {
+            for first in [false, true] {
+                assert_eq!(
+                    index.find(text, q, first),
+                    find_quote(text, q, first),
+                    "{q:?} first={first}"
+                );
+            }
+        }
+        // the index answers for the quotes it was built with only
+        let few = QuoteIndex::new(text, ["beta"]);
+        assert_eq!(few.find(text, "gamma", true), None);
+        assert_eq!(QuoteIndex::new("", ["x"]).find("", "x", true), None);
+    }
+
+    /// Finding the quotes of a long text takes time in proportion to its length. With a
+    /// search and a count from the start of the text for each quote, these 20,000 quotes
+    /// of a text of 4 MB took about a minute (1.7 s for a fortieth of them).
+    #[test]
+    fn quote_index_scales_with_the_length_of_the_text() {
+        let n = 20_000;
+        let mut text = String::new();
+        for i in 0..n {
+            text.push_str(&format!("Entry number {i} is {}. ", "word ".repeat(40)));
+        }
+        let quotes: Vec<String> = (0..n).map(|i| format!("Entry number {i} is")).collect();
+        let began = std::time::Instant::now();
+        let index = QuoteIndex::new(&text, quotes.iter().map(String::as_str));
+        let mut at = 0;
+        for (i, q) in quotes.iter().enumerate() {
+            let (a, b) = index.find(&text, q, false).unwrap();
+            assert_eq!(b - a, q.chars().count());
+            if i > 0 {
+                assert!(a > at);
+            }
+            at = a;
+        }
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            began.elapsed()
+        );
     }
 
     #[test]
