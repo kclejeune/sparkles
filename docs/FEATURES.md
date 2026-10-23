@@ -277,9 +277,9 @@ that work by priority and links each item to its design spec.
 * **Community summaries.** A dataset has one GraphRAG configuration, so readers with
   different views cannot each have reports built from their own view. The evaluation
   of global answering against local answers and text retrieval has not run, and an
-  automatic refresh counts changes from the change feed rather than from an F13 view. The byte bound's default allowances
-  are unmeasured. [Roadmap](ROADMAP.md) item 12, and item 100 for several
-  configurations.
+  automatic refresh counts changes from the change feed rather than from an F13 view.
+  The byte bound's default allowances are unmeasured. [Roadmap](ROADMAP.md) item 12, and
+  item 100 for several configurations.
 
 * **Cold sparse reads.** The constant, scan and result-term prefetch paths and I/O
   profiling are implemented and pass the warm instruction, warm read-hint and concurrent
