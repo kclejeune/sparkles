@@ -46,6 +46,7 @@ const BRANCH_ROUTES = new Set([
   'compact',
   'stats',
   'schema',
+  'graph',
   'reason',
   'validation',
   'prefixes',

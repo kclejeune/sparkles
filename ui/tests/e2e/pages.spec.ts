@@ -34,6 +34,33 @@ test('the explorer finds a resource by label and shows its properties', async ({
   await expect(page).toHaveURL(new RegExp(`iri=${encodeURIComponent(`${EX}ada`)}`));
 });
 
+test('the explorer opens on the class overview and drills into a class', async ({ page }) => {
+  await page.goto(`/ui/explore?ds=${DATASET}`);
+  // the class level from the class profiles, announced in the live region (U06 A4, A8)
+  await expect(page.getByText('Class overview: 1 class, 0 predicates.')).toBeAttached();
+  await page.keyboard.press('l');
+  const list = page.locator('table.list');
+  const person = list.locator('tbody tr', { hasText: 'Person' });
+  await expect(person).toContainText('4');
+  // a class of four opens into its members
+  await person.getByRole('button', { name: 'Open' }).click();
+  const crumbs = page.getByRole('navigation', { name: 'Overview levels' });
+  await expect(crumbs).toContainText('Person');
+  await expect(page.getByText(/opened into 4 members/)).toBeAttached();
+  await expect(list.locator('tbody tr')).toHaveCount(4);
+  // Backspace closes the level again (A6)
+  await page.keyboard.press('Backspace');
+  await expect(list.locator('tbody tr', { hasText: 'Person' })).toBeVisible();
+  await person.getByRole('button', { name: 'Open' }).click();
+  // a member opens in the resource view
+  await list
+    .locator('tbody tr', { hasText: 'Ada Lovelace' })
+    .getByRole('button', { name: 'Explore' })
+    .click();
+  const side = page.getByRole('complementary', { name: 'Resource details' });
+  await expect(side.getByRole('heading', { name: 'Ada Lovelace' })).toBeVisible();
+});
+
 test('Similar lists the nearest entities by vector', async ({ page }) => {
   await page.goto(`/ui/explore?ds=${DATASET}&iri=${encodeURIComponent(`${EX}ada`)}`);
   const side = page.getByRole('complementary', { name: 'Resource details' });

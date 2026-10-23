@@ -35,6 +35,8 @@
   import { rejectionReport } from '$lib/write-validation';
   import GuardReportView from '$components/GuardReportView.svelte';
   import GraphView from '$components/GraphView.svelte';
+  import LargeGraphView, { type LNode } from '$components/LargeGraphView.svelte';
+  import { chooseRenderer, hasWebGL2, seed, type Renderer } from '$lib/overview';
   import Icon from '$components/Icon.svelte';
   import ExplainedPlan from '$components/ExplainedPlan.svelte';
   import ResultMap from '$components/ResultMap.svelte';
@@ -185,6 +187,13 @@
   let hideTypes = $state(false);
   let hideLiterals = $state(false);
   let maxNodes = $state(400);
+  /** The renderer the toolbar switch chose; `null` follows the node count (spec U06 §2.1). */
+  let rendererOverride = $state<Renderer | null>(null);
+  let webglOk = $state(true);
+  let webglReason = $state<string | null>(null);
+  let largeSelected = $state<string | null>(null);
+  /** Node counts the canvas renderer draws at most; larger choices offer WebGL only. */
+  const CANVAS_MAX = 2500;
   let gCols = $state<{ s: string; p: string; o: string }>({ s: '', p: '', o: '' });
 
   const active = $derived(tabs.find((t) => t.id === activeId) ?? tabs[0]);
@@ -1669,6 +1678,50 @@
         })
       : { nodes: [], edges: [], truncated: false, totalNodes: 0 },
   );
+  const choice = $derived(
+    chooseRenderer(graph.nodes.length, rendererOverride, webglOk && !webglReason),
+  );
+  /** The graph Cytoscape draws: at most CANVAS_MAX nodes. */
+  const canvasGraph = $derived(
+    choice.renderer === 'cytoscape' && graph.nodes.length > CANVAS_MAX
+      ? triplesToGraph(graphTriples, prefixes, {
+          hideTypes,
+          hideLiterals,
+          maxNodes: CANVAS_MAX,
+          marks: graphData.marks,
+        })
+      : graph,
+  );
+  const largeNodes: LNode[] = $derived.by(() => {
+    if (choice.renderer !== 'webgl') return [];
+    const colors = graphColors();
+    return graph.nodes.map((n) => {
+      const p = seed(n.id, undefined, 100 + Math.sqrt(graph.nodes.length) * 4);
+      return {
+        key: n.id,
+        label: n.label,
+        size: n.kind === 'literal' ? 2.5 : 3.5,
+        color: colors[n.kind] ?? colors.iri,
+        x: p.x,
+        y: p.y,
+      };
+    });
+  });
+  const largeEdges = $derived(
+    choice.renderer === 'webgl'
+      ? graph.edges.map((e) => ({ key: e.id, source: e.source, target: e.target, size: 0.6 }))
+      : [],
+  );
+  function graphColors(): Record<string, string> {
+    const css = typeof document === 'undefined' ? null : getComputedStyle(document.documentElement);
+    const v = (n: string, d: string) => css?.getPropertyValue(n).trim() || d;
+    return {
+      iri: v('--iri', '#2459c7'),
+      literal: v('--literal', '#0b7d69'),
+      bnode: v('--bnode', '#7d45c9'),
+      triple: v('--text-2', '#525b6d'),
+    };
+  }
   const hasTypeEdges = $derived(
     graphTriples.some(([, p]) => p.type === 'uri' && p.value === RDF_TYPE),
   );
@@ -1781,6 +1834,7 @@
   });
 
   onMount(() => {
+    webglOk = hasWebGL2();
     if (app.pendingQuery) {
       const { query, title, question, ask: text } = app.pendingQuery;
       app.pendingQuery = null;
@@ -2792,31 +2846,107 @@
                   <select class="select sm" bind:value={maxNodes}>
                     {#each [100, 250, 400, 1000, 2500] as n (n)}<option value={n}>{n}</option
                       >{/each}
+                    {#if webglOk && !webglReason}
+                      {#each [10000, 50000, 100000] as n (n)}<option value={n}
+                          >{fmtInt(n)} (WebGL)</option
+                        >{/each}
+                    {/if}
+                  </select>
+                </label>
+                <label class="row">
+                  <span class="faint">Renderer</span>
+                  <select
+                    class="select sm"
+                    value={rendererOverride ?? 'auto'}
+                    onchange={(e) => {
+                      const v = (e.currentTarget as HTMLSelectElement).value;
+                      rendererOverride = v === 'auto' ? null : (v as Renderer);
+                    }}
+                    aria-label="Renderer"
+                  >
+                    <option value="auto">Automatic</option>
+                    <option value="cytoscape">Canvas</option>
+                    <option value="webgl" disabled={!webglOk || !!webglReason}>WebGL</option>
                   </select>
                 </label>
                 <span class="spacer"></span>
-                <span class="faint">{graph.nodes.length} nodes, {graph.edges.length} edges</span>
+                <span class="faint"
+                  >{fmtInt(
+                    choice.renderer === 'webgl' ? graph.nodes.length : canvasGraph.nodes.length,
+                  )} nodes,
+                  {fmtInt(
+                    choice.renderer === 'webgl' ? graph.edges.length : canvasGraph.edges.length,
+                  )} edges</span
+                >
               </div>
-              {#if graph.truncated}
+              {#if graph.totalNodes > 100000}
                 <div class="notice warn">
                   <Icon name="alert" size={14} />
-                  Showing {graph.nodes.length} of {fmtInt(graph.totalNodes)} nodes. Large graphs are hard
-                  to read; add a LIMIT or raise Max nodes.
+                  This result has {fmtInt(graph.totalNodes)} nodes. Open the overview or narrow the query
+                  ({fmtInt(r.triples?.length ?? r.rows?.length ?? 0)} rows).
+                  <a class="btn sm" href={resolve('/explore')}>Overview</a>
+                </div>
+              {:else if canvasGraph.truncated || (choice.renderer === 'webgl' && graph.truncated)}
+                <div class="notice warn">
+                  <Icon name="alert" size={14} />
+                  Showing {fmtInt(
+                    choice.renderer === 'webgl' ? graph.nodes.length : canvasGraph.nodes.length,
+                  )}
+                  of {fmtInt(graph.totalNodes)} nodes. Large graphs are hard to read; add a LIMIT or raise
+                  Max nodes.
+                </div>
+              {/if}
+              {#if choice.reason && graph.nodes.length > CANVAS_MAX}
+                <div class="notice">
+                  <Icon name="info" size={14} />
+                  {choice.reason}.
                 </div>
               {/if}
               <div class="gcanvas">
-                <GraphView
-                  nodes={graph.nodes}
-                  edges={graph.edges}
-                  onexpand={(id) => id.startsWith('<') && openIri(id.slice(1, -1))}
-                  emptyText={r.queryType === 'SELECT'
-                    ? 'Pick subject and object columns to draw a graph'
-                    : 'No triples to draw'}
-                />
+                {#if choice.renderer === 'webgl'}
+                  <LargeGraphView
+                    nodes={largeNodes}
+                    edges={largeEdges}
+                    selected={largeSelected}
+                    label="Result graph"
+                    onselect={(k) => (largeSelected = k)}
+                    onopen={(k) => (largeSelected = k)}
+                    onfail={(reason) => (webglReason = reason)}
+                  />
+                {:else}
+                  <GraphView
+                    nodes={canvasGraph.nodes}
+                    edges={canvasGraph.edges}
+                    onexpand={(id) => id.startsWith('<') && openIri(id.slice(1, -1))}
+                    emptyText={r.queryType === 'SELECT'
+                      ? 'Pick subject and object columns to draw a graph'
+                      : 'No triples to draw'}
+                  />
+                {/if}
               </div>
-              <div class="ghint faint">
-                Double-click an IRI node to open it in Explore. Hover highlights its neighbourhood.
-              </div>
+              {#if choice.renderer === 'webgl'}
+                <div class="ghint faint">
+                  {#if largeSelected}
+                    Selected <span class="mono"
+                      >{graph.nodes.find((n) => n.id === largeSelected)?.label}</span
+                    >
+                    {#if largeSelected.startsWith('<')}
+                      <button
+                        class="btn sm"
+                        onclick={() => largeSelected && openIri(largeSelected.slice(1, -1))}
+                        >Open in Explore</button
+                      >
+                    {/if}
+                  {:else}
+                    WebGL view. Click a node to select it and highlight its neighbours.
+                  {/if}
+                </div>
+              {:else}
+                <div class="ghint faint">
+                  Double-click an IRI node to open it in Explore. Hover highlights its
+                  neighbourhood.
+                </div>
+              {/if}
             </div>
           {:else if outcome.view === 'map'}
             <ResultMap

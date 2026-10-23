@@ -25,6 +25,7 @@
     "@sveltejs/kit": "^2.70.3",
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@types/node": "^26.6.3",
+    "graphology-types": "^0.24.8",
     "oxfmt": "^0.71.0",
     "oxigraph": "^0.5.11",
     "svelte": "^5.57.1",
@@ -45,7 +46,10 @@
     "@lezer/highlight": "^1.2.5",
     "cytoscape": "^3.34.3",
     "cytoscape-fcose": "^2.2.0",
-    "maplibre-gl": "^6.11.2"
+    "graphology": "^0.26.0",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "maplibre-gl": "^6.11.2",
+    "sigma": "^3.0.3"
   },
   "pnpm": {
     "overrides": {
