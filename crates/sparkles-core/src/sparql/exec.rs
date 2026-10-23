@@ -538,7 +538,7 @@ fn execute_owned_inner(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Material
 }
 
 fn execute_uncached(ctx: &Ctx, n: &Node, algorithm: bool) -> Result<(Materialized, PlanInfo)> {
-    execute_node(ctx, n, None, algorithm)
+    execute_node(ctx, n, None, algorithm, None)
 }
 
 /// The inputs of an operator, from a caller that produces each child's table itself.
@@ -564,7 +564,7 @@ pub(super) fn execute_with_inputs(
     inputs: Inputs<'_>,
 ) -> Result<(Materialized, PlanInfo)> {
     debug_assert!(reads_inputs(n));
-    execute_node(ctx, n, Some(inputs), contains_algorithm(n))
+    execute_node(ctx, n, Some(inputs), contains_algorithm(n), None)
 }
 
 fn execute_node(
@@ -572,6 +572,7 @@ fn execute_node(
     n: &Node,
     inputs: Option<Inputs<'_>>,
     algorithm: bool,
+    equality: Option<(VarId, VarId)>,
 ) -> Result<(Materialized, PlanInfo)> {
     let start = Instant::now();
     let mut failing = Failing {
@@ -591,6 +592,7 @@ fn execute_node(
         &mut failing.infos,
         &mut failing.armed,
         algorithm,
+        equality,
     )
 }
 
@@ -656,6 +658,7 @@ fn fail_at(ctx: &Ctx, n: &Node, start: Instant, mut known: Vec<(usize, PlanInfo)
 
 // One caller: inlined so that the success path returns its table and plan directly.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn run_node(
     ctx: &Ctx,
     n: &Node,
@@ -664,13 +667,21 @@ fn run_node(
     infos: &mut Vec<PlanInfo>,
     failing: &mut bool,
     algorithm: bool,
+    equality: Option<(VarId, VarId)>,
 ) -> Result<(Materialized, PlanInfo)> {
     // the children's tables count against the memory budget until this operator is done
     let held = ctx.charge(0)?;
     let owned_input = std::cell::Cell::new(false);
+    let filtered_cross = inputs.is_none().then(|| string_cross_hint(n)).flatten();
     let mut child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
         let (mut t, info) = match inputs.as_mut() {
             Some(inputs) => inputs(i)?,
+            // A filtered subset is not the unfiltered child's result. In particular,
+            // never look it up or store it under the ordinary Cross cache key. The
+            // logical parent Filter and both complete inputs still cache normally.
+            None if i == 0 && filtered_cross.is_some() => {
+                execute_node(ctx, &n.children[i], None, algorithm, filtered_cross)?
+            }
             None => execute_owned_inner(
                 ctx,
                 &n.children[i],
@@ -787,7 +798,18 @@ fn run_node(
                     None => child(1, infos)?,
                 };
                 match algo {
-                    JoinAlgo::Cross => cross(ctx, &l, &r)?,
+                    JoinAlgo::Cross => match equality {
+                        Some(keys) => match string_cross(ctx, n, &l, &r, keys)? {
+                            Some(t) => {
+                                note = Some(
+                                    "[string equality candidates; residual FILTER retained]".into(),
+                                );
+                                t
+                            }
+                            None => cross(ctx, &l, &r)?,
+                        },
+                        None => cross(ctx, &l, &r)?,
+                    },
                     JoinAlgo::Merge => join_noted(ctx, &l, &r, true, &mut note)?,
                     JoinAlgo::Hash => join_noted(ctx, &l, &r, false, &mut note)?,
                 }
@@ -4105,6 +4127,309 @@ fn kept_order_iter<'a>(
             !shared || !has_undef(t, c)
         })
         .copied()
+}
+
+/// A single variable value-equality over two independent, certainly-bound inputs.
+/// This is an execution hint, not an RDF-term join or an algebra rewrite. The
+/// original FILTER is evaluated after candidate generation in every case.
+fn string_cross_hint(n: &Node) -> Option<(VarId, VarId)> {
+    let Kind::Filter(es) = &n.kind else {
+        return None;
+    };
+    let [Expr::Eq(a, b)] = es.as_slice() else {
+        return None;
+    };
+    let (Expr::Var(a), Expr::Var(b)) = (&**a, &**b) else {
+        return None;
+    };
+    let [cross] = n.children.as_slice() else {
+        return None;
+    };
+    if !matches!(
+        cross.kind,
+        Kind::Join {
+            algo: JoinAlgo::Cross,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let [l, r] = cross.children.as_slice() else {
+        return None;
+    };
+    if l.certain.contains(a) && !r.vars.contains(a) && r.certain.contains(b) && !l.vars.contains(b)
+    {
+        Some((*a, *b))
+    } else if l.certain.contains(b)
+        && !r.vars.contains(b)
+        && r.certain.contains(a)
+        && !l.vars.contains(a)
+    {
+        Some((*b, *a))
+    } else {
+        None
+    }
+}
+
+/// Keep the first admission deliberately narrow: no expression-bearing inputs,
+/// OPTIONAL, SERVICE or extension operators. Walk iteratively, and only after an
+/// actually oversized product has made candidate pruning worth considering.
+fn plain_cross_input(ctx: &Ctx, n: &Node) -> Result<bool> {
+    let mut todo = vec![n];
+    let mut examined = 0usize;
+    while let Some(n) = todo.pop() {
+        if examined.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        examined += 1;
+        if !matches!(
+            n.kind,
+            Kind::Scan(_) | Kind::Values(_) | Kind::Project(_) | Kind::Sort(_) | Kind::Join { .. }
+        ) {
+            return Ok(false);
+        }
+        todo.extend(&n.children);
+    }
+    Ok(true)
+}
+
+/// Generate only string-equal pairs when the complete product would exceed an
+/// existing row or memory limit. Numeric promotion is not an equivalence relation
+/// suitable for this index, and language/error/unbound cases keep the generic
+/// evaluator. Declining never reruns the inputs or partially emits their result.
+fn string_cross(
+    ctx: &Ctx,
+    n: &Node,
+    l: &Table,
+    r: &Table,
+    (lv, rv): (VarId, VarId),
+) -> Result<Option<Table>> {
+    let product = l.len().saturating_mul(r.len());
+    if product <= ctx.max_rows
+        && (product as u64) <= ctx.max_rows_produced.saturating_sub(ctx.rows_produced())
+        && product <= ctx.rows_within_budget(n.vars.len() + 1)
+    {
+        return Ok(None);
+    }
+    for child in &n.children {
+        if !plain_cross_input(ctx, child)? {
+            return Ok(None);
+        }
+    }
+    let lay = layout(l, r);
+    if !lay.shared.is_empty() {
+        return Ok(None);
+    }
+    let (Some(lc), Some(rc)) = (l.col_of(lv), r.col_of(rv)) else {
+        return Ok(None);
+    };
+    // Inspect the encoded domain without filling the uncharged eager value cache.
+    // Vocabulary reconstruction scratch is charged by with_string_lexical; no
+    // lexical allocation can escape into the index before its reservation.
+    for col in [&l.cols[lc], &r.cols[rc]] {
+        for (i, &id) in col.iter().enumerate() {
+            if i.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            if with_string_lexical(ctx, id, |_| Ok(()))?.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+    type StringEntry = (Box<str>, usize);
+    let index_charge =
+        ctx.charge((r.len() as u64).saturating_mul(std::mem::size_of::<StringEntry>() as u64))?;
+    let mut index = Vec::<StringEntry>::with_capacity(r.len());
+    for (j, &id) in r.cols[rc].iter().enumerate() {
+        if j.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let key = with_string_lexical(ctx, id, |s| {
+            index_charge.add(s.len() as u64)?;
+            Ok(Box::<str>::from(s))
+        })?
+        .expect("proved string domain");
+        index.push((key, j));
+    }
+    // One array, no extra sort scratch. Including row numbers in the key keeps
+    // equal strings in right-row order, preserving the original product order.
+    sort_candidates(ctx, &mut index)?;
+    let range = |s: &str| {
+        let begin = index.partition_point(|(key, _)| key.as_ref() < s);
+        let end = begin + index[begin..].partition_point(|(key, _)| key.as_ref() == s);
+        (begin, end)
+    };
+    // Count matching pairs before allocating them. This avoids a reallocation for
+    // each short key run and admits exactly the actual output, not the product or
+    // a geometric capacity that might itself exceed a real query limit.
+    let mut rows = 0usize;
+    for (i, &id) in l.cols[lc].iter().enumerate() {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        with_string_lexical(ctx, id, |s| {
+            let (begin, end) = range(s);
+            rows = rows.saturating_add(end - begin);
+            ctx.check_output_rows(rows)
+        })?
+        .expect("proved string domain");
+    }
+    // Includes the pair array while the matching table is materialized, with all
+    // lexical index payloads and the input tables still charged and alive.
+    ctx.check_output(rows, lay.vars.len() + 1)?;
+    // This buffer remains live while subsequent key reconstruction reserves its
+    // own scratch. A peak-only output estimate cannot account for that overlap.
+    let _pairs_charge =
+        ctx.charge((rows as u64).saturating_mul(std::mem::size_of::<(u32, u32)>() as u64))?;
+    let mut pairs = Vec::with_capacity(rows);
+    for (i, &id) in l.cols[lc].iter().enumerate() {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        with_string_lexical(ctx, id, |s| {
+            let (begin, end) = range(s);
+            for (_, j) in &index[begin..end] {
+                if pairs.len().is_multiple_of(1024) {
+                    ctx.check()?;
+                }
+                pairs.push((i as u32, *j as u32));
+            }
+            Ok(())
+        })?
+        .expect("proved string domain");
+    }
+    ctx.check()?;
+    // Pair capacity is already live; admit only the output columns here.
+    ctx.check_output(rows, lay.vars.len())?;
+    Ok(Some(materialize_candidates(ctx, l, r, &lay, &pairs)?))
+}
+
+/// Exactly the raw key encodings that Value::from_key reads as a string. Invalid
+/// UTF-8 declines this optimization instead of changing lossy-decoding equality.
+fn string_lexical_key(key: &[u8]) -> Option<&str> {
+    if key.first() != Some(&b'"') {
+        return None;
+    }
+    let sep = key
+        .iter()
+        .rposition(|&b| b == crate::id::KEY_SEP)
+        .unwrap_or(key.len());
+    let suffix = key.get(sep + 1..).unwrap_or(&[]);
+    if !suffix.is_empty() && suffix != b"^http://www.w3.org/2001/XMLSchema#string" {
+        return None;
+    }
+    std::str::from_utf8(&key[1..sep]).ok()
+}
+
+/// Read a borrowed lexical key with the existing charged vocabulary scratch.
+/// Unlike Ctx::value this does not populate the eager decoded-value cache.
+fn with_string_lexical<T>(
+    ctx: &Ctx,
+    id: Id,
+    mut f: impl FnMut(&str) -> Result<T>,
+) -> Result<Option<T>> {
+    use crate::id::Tag;
+    let mut read = |key: &[u8]| match string_lexical_key(key) {
+        Some(s) => f(s).map(Some),
+        None => Ok(None),
+    };
+    match id.tag() {
+        Tag::Vocab => ctx
+            .with_cursor_vocab_key(id.payload(), &mut read)?
+            .unwrap_or(Ok(None)),
+        Tag::Delta => ctx
+            .snap
+            .generation
+            .dvocab
+            .with(|v| v.get(id.payload()).map(&mut read).unwrap_or(Ok(None))),
+        Tag::Local => ctx.with_local_key(id.payload(), read).unwrap_or(Ok(None)),
+        _ => Ok(None),
+    }
+}
+
+/// In-place heap sort, polling per comparison rather than waiting for a complete
+/// library sort. This is used only by the admitted string candidate index.
+fn sort_candidates<T: Ord>(ctx: &Ctx, values: &mut [T]) -> Result<()> {
+    fn sift<T>(
+        values: &mut [T],
+        mut root: usize,
+        end: usize,
+        cmp: &mut impl FnMut(&T, &T) -> Result<Ordering>,
+    ) -> Result<()> {
+        while root < end / 2 {
+            let mut child = root * 2 + 1;
+            if child + 1 < end && cmp(&values[child], &values[child + 1])? == Ordering::Less {
+                child += 1;
+            }
+            if cmp(&values[root], &values[child])? != Ordering::Less {
+                break;
+            }
+            values.swap(root, child);
+            root = child;
+        }
+        Ok(())
+    }
+    ctx.check()?;
+    let mut compared = 0usize;
+    let mut cmp = |a: &T, b: &T| {
+        if compared.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        compared += 1;
+        Ok(a.cmp(b))
+    };
+    let n = values.len();
+    for root in (0..n / 2).rev() {
+        sift(values, root, n, &mut cmp)?;
+    }
+    for end in (1..n).rev() {
+        values.swap(0, end);
+        sift(values, 0, end, &mut cmp)?;
+    }
+    ctx.check()
+}
+
+/// The admitted string product keeps the ordinary join layout, but copies each
+/// column in checked chunks instead of entering an unbounded materialize loop.
+fn materialize_candidates(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    lay: &JoinLayout,
+    pairs: &[(u32, u32)],
+) -> Result<Table> {
+    ctx.check()?;
+    let mut cols = Vec::with_capacity(lay.vars.len());
+    for (lc, col) in l.cols.iter().enumerate() {
+        let fill = lay.shared.iter().find(|(x, _)| *x == lc).map(|(_, rc)| *rc);
+        let mut out = Vec::with_capacity(pairs.len());
+        for part in pairs.chunks(1024) {
+            ctx.check()?;
+            out.extend(part.iter().map(|&(i, j)| {
+                let v = col[i as usize];
+                match (v.is_undef(), fill) {
+                    (true, Some(rc)) => r.cols[rc][j as usize],
+                    _ => v,
+                }
+            }));
+        }
+        cols.push(out);
+    }
+    for &rc in &lay.right_only {
+        let mut out = Vec::with_capacity(pairs.len());
+        for part in pairs.chunks(1024) {
+            ctx.check()?;
+            out.extend(part.iter().map(|&(_, j)| r.cols[rc][j as usize]));
+        }
+        cols.push(out);
+    }
+    ctx.check()?;
+    Ok(Table {
+        vars: lay.vars.clone(),
+        cols,
+        len: pairs.len(),
+        sorted: Vec::new(),
+    })
 }
 
 fn cross(ctx: &Ctx, l: &Table, r: &Table) -> Result<Table> {
@@ -7575,4 +7900,262 @@ pub(super) fn fetch(
         sparesults::ReaderQueryResultsParserOutput::Boolean(_) => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod string_cross_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+
+    #[test]
+    fn candidate_output_copy_checks_its_work_in_bounded_chunks() {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.max_rows = 10_000;
+        ctx.mem_limit = 32 << 20;
+        let variables = (0..64)
+            .map(|i| ctx.var(&format!("v{i}")))
+            .collect::<Vec<_>>();
+        let same = ctx.intern_value(&Value::Str("same".into()));
+        let other = ctx.intern_value(&Value::Str("other".into()));
+        let mut left = Table::new(variables[..32].to_vec());
+        left.push_row(&[same; 32]);
+        left.push_row(&[other; 32]);
+        let mut right = Table::new(variables[32..].to_vec());
+        for _ in 0..8_192 {
+            right.push_row(&[same; 32]);
+        }
+        let mut cross = Node::leaf(
+            Kind::Join {
+                algo: JoinAlgo::Cross,
+                keys: Vec::new(),
+            },
+            variables,
+            16_384.0,
+            "cross product".into(),
+        );
+        cross.children = vec![
+            Node::leaf(
+                Kind::Values(left.clone()),
+                left.vars.clone(),
+                2.0,
+                "left".into(),
+            ),
+            Node::leaf(
+                Kind::Values(right.clone()),
+                right.vars.clone(),
+                8_192.0,
+                "right".into(),
+            ),
+        ];
+        let before = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        let table = string_cross(&ctx, &cross, &left, &right, (left.vars[0], right.vars[0]))
+            .unwrap()
+            .unwrap();
+        let checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before;
+        assert_eq!(table.len(), 8_192);
+        assert!(table.cols.iter().all(|c| c.iter().all(|&id| id == same)));
+        // Each output column is its own long copy loop. This lower bound only
+        // counts its materialization work, independently of proof/index/probes.
+        let minimum = table.width() * table.len().div_ceil(1_024);
+        assert!(
+            checks >= minimum,
+            "{checks} checks for {} output cells, need at least {minimum}",
+            table.width() * table.len()
+        );
+        // Isolate copying from sort/proof/probe checkpoints as well.
+        drop(table);
+        let pairs = (0..right.len()).map(|j| (0, j as u32)).collect::<Vec<_>>();
+        let before = crate::sparql::ctx::CHECKS.with(|n| n.get());
+        let copied =
+            materialize_candidates(&ctx, &left, &right, &layout(&left, &right), &pairs).unwrap();
+        let checks = crate::sparql::ctx::CHECKS.with(|n| n.get()) - before;
+        assert_eq!(copied.len(), 8_192);
+        assert!(copied.cols.iter().all(|c| c.iter().all(|&id| id == same)));
+        assert!(
+            (minimum..=2 * minimum + 4).contains(&checks),
+            "{checks} isolated copy checks"
+        );
+    }
+
+    #[test]
+    fn string_key_domain_matches_values_without_term_unification() {
+        use oxrdf::{Literal, NamedNode, Term};
+        let terms = [
+            Term::Literal(Literal::new_simple_literal("")),
+            Term::Literal(Literal::new_simple_literal("quote\"\\\n café🦀")),
+            Term::Literal(Literal::new_typed_literal(
+                "typed",
+                oxrdf::vocab::xsd::STRING,
+            )),
+            Term::Literal(Literal::new_language_tagged_literal("same", "en").unwrap()),
+            Term::Literal(Literal::new_typed_literal("01", oxrdf::vocab::xsd::INTEGER)),
+            Term::Literal(Literal::new_typed_literal(
+                "bad",
+                NamedNode::new("urn:unknown").unwrap(),
+            )),
+            Term::NamedNode(NamedNode::new("urn:iri").unwrap()),
+        ];
+        for term in terms {
+            let key = crate::id::term_key(&term);
+            let expected = match Value::from_key(&key) {
+                Value::Str(s) => Some(s),
+                _ => None,
+            };
+            assert_eq!(string_lexical_key(&key), expected.as_deref(), "{term}");
+        }
+        assert_eq!(
+            string_lexical_key(b"\"typed\xff^http://www.w3.org/2001/XMLSchema#string"),
+            Some("typed")
+        );
+        assert_eq!(string_lexical_key(b"\"\xfe\xff"), None);
+    }
+
+    #[test]
+    fn checked_candidate_sort_matches_total_key_and_row_order() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        for len in [0, 1, 2, 3, 31, 257, 8_192] {
+            let mut values = (0..len)
+                .map(|i| (format!("key:{}", i * 7_919 % 17), i))
+                .rev()
+                .collect::<Vec<_>>();
+            let mut expected = values.clone();
+            expected.sort_unstable();
+            sort_candidates(&ctx, &mut values).unwrap();
+            assert_eq!(values, expected);
+        }
+    }
+
+    #[test]
+    fn candidate_sort_cancels_after_comparisons_have_started() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering as MemOrder},
+        };
+        struct Observed {
+            value: usize,
+            compared: Arc<AtomicUsize>,
+            cancel: Arc<AtomicBool>,
+        }
+        impl PartialEq for Observed {
+            fn eq(&self, other: &Self) -> bool {
+                self.value == other.value
+            }
+        }
+        impl Eq for Observed {}
+        impl PartialOrd for Observed {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Observed {
+            fn cmp(&self, other: &Self) -> Ordering {
+                let n = self.compared.fetch_add(1, MemOrder::Relaxed) + 1;
+                if n == 2_000 {
+                    self.cancel.store(true, MemOrder::Relaxed);
+                }
+                self.value.cmp(&other.value)
+            }
+        }
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let compared = Arc::new(AtomicUsize::new(0));
+        let mut values = (0..8_192)
+            .map(|i| Observed {
+                value: i * 7_919 % 8_192,
+                compared: compared.clone(),
+                cancel: ctx.cancel.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!ctx.cancel.load(MemOrder::Relaxed));
+        assert!(matches!(
+            sort_candidates(&ctx, &mut values),
+            Err(Error::Cancelled)
+        ));
+        let work = compared.load(MemOrder::Relaxed);
+        assert!(
+            (2_000..=3_024).contains(&work),
+            "{work} comparisons after cancellation at 2,000"
+        );
+    }
+
+    #[test]
+    fn probe_reconstruction_must_admit_live_pair_capacity() {
+        use crate::io::Source;
+        use oxrdfio::RdfFormat;
+        let store = Store::in_memory(StoreOptions::default());
+        let huge = "z".repeat(2 << 20);
+        store
+            .load(&[Source::from_bytes(
+                format!("<urn:s> <urn:p> \"a\" ; <urn:q> \"{huge}\" .").into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snapshot = store.snapshot();
+        let stored = |s: &str| {
+            let key = crate::id::term_key(&oxrdf::Literal::new_simple_literal(s).into());
+            Id::new(
+                crate::id::Tag::Vocab,
+                snapshot.generation.vocab.find(&key).unwrap(),
+            )
+        };
+        let same = stored("a");
+        let large = stored(&huge);
+        let mut left = Table::new(vec![0]);
+        left.push_row(&[same]);
+        left.push_row(&[large]);
+        let mut right = Table::new(vec![1]);
+        for _ in 0..65_536 {
+            right.push_row(&[same]);
+        }
+        let mut cross = Node::leaf(
+            Kind::Join {
+                algo: JoinAlgo::Cross,
+                keys: Vec::new(),
+            },
+            vec![0, 1],
+            131_072.0,
+            "cross product".into(),
+        );
+        cross.children = vec![
+            Node::leaf(
+                Kind::Values(left.clone()),
+                left.vars.clone(),
+                2.0,
+                "left".into(),
+            ),
+            Node::leaf(
+                Kind::Values(right.clone()),
+                right.vars.clone(),
+                65_536.0,
+                "right".into(),
+            ),
+        ];
+        let run = |memory| {
+            let mut ctx = Ctx::new(snapshot.clone());
+            ctx.max_rows = 100_000;
+            ctx.mem_limit = memory;
+            let _inputs = ctx.charge(left.mem_bytes() + right.mem_bytes()).unwrap();
+            let result = string_cross(&ctx, &cross, &left, &right, (0, 1));
+            (result, ctx.mem_peak())
+        };
+        // The approximately4MiB reconstruction envelope fits alongside inputs
+        // and the index. It must also include the already allocated512KiB pairs.
+        let (result, peak) = run(25 << 18);
+        let observed = result
+            .as_ref()
+            .map(|t| t.as_ref().map(Table::len))
+            .map_err(ToString::to_string);
+        assert!(
+            matches!(result, Err(Error::BudgetExceeded(b)) if b.kind == crate::error::BudgetKind::Memory),
+            "{observed:?}, peak {peak}"
+        );
+        let (result, peak) = run(8 << 20);
+        let table = result.unwrap().unwrap();
+        assert_eq!(table.len(), 65_536);
+        assert!(table.cols.iter().all(|c| c.iter().all(|&id| id == same)));
+        assert!(peak <= 8 << 20);
+    }
 }

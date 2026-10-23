@@ -989,3 +989,35 @@ that genuinely consumes more candidate rows than its budget. Memory and produced
 row limits remain enforced. Small ordinary ASK and SELECT policies are unchanged.
 The historical Forge tables remain unchanged. Reference acceptance at 10M and the
 remaining `q4`, `q5a` and `q6` failures are still open.
+
+
+### SP²Bench string equality candidate follow-up (2026-10-22)
+
+The `q5a` failure has the same equality-filtered Cartesian product as `q12a`,
+but SELECT must retain every matching binding. A fixture using the original six
+triple patterns produces a 6,144-row product, a 192-row matching bag and 32
+DISTINCT answers. The ordinary product exceeds a 512-row limit before its filter
+runs.
+
+Eager execution can prune that product when the original intermediate row,
+produced-row or memory budget cannot hold it. The filter must be one variable
+equality over independent inputs, with both variables certainly bound. The inputs
+must contain only scans, values, projections, variable sorts and inner joins.
+Every compared runtime value must be a simple or `xsd:string` literal. A charged
+lexical string index emits matching pairs in their original order and preserves
+duplicates and term ids. The index owns its lexical payloads alongside the inputs
+and matching output. Its slots, strings and dictionary reconstruction scratch are
+charged before allocation. Sorting, pair expansion and output copying check
+cancellation in bounded chunks. Matching pairs are counted before their single
+allocation, and their capacity stays charged while probing reconstructs keys and
+while the output columns are copied. The original SPARQL equality filter still
+runs. A pruned
+subset never uses the unfiltered product's result-cache key.
+
+Numeric promotion, language-tagged values, datatype errors, unbound variables and
+mixed domains retain the ordinary kernel. No equality is replaced by RDF-term
+unification, and input expressions, OPTIONAL, SERVICE and extension operators are
+outside this admission. Products that fit their existing budgets stay ordinary.
+Explicit streaming retains its existing operators. The fixture establishes
+removed intermediate rows without a latency claim. Full-scale `q5a` acceptance
+and the separate `q4` and `q6` failures remain open.
