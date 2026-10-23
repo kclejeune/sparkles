@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import statistics
 import tempfile
 import unittest
 
@@ -52,6 +53,23 @@ def serial(
         "writers": {"p50_ms": p50, "p90_ms": p50 * 1.1, "mean_ms": mean},
         "sync": (sync_ms * syncs / 1000, syncs),
         "attempts": (count, mean, warmup),
+    }
+
+
+def writers(block, grouped, tps, sync_ms):
+    """A four-writer process that committed 50,000 changes."""
+    return {
+        "block": block,
+        "scenario": "writers",
+        "grouped": grouped,
+        "people": 1000,
+        "index": "text",
+        "calibration": False,
+        "tps": tps,
+        "peak_rss_kib": 200 * 1024,
+        "writers": {"p50_ms": 1.0, "p90_ms": 1.0, "mean_ms": 1.0},
+        "sync": (sync_ms * 50 / 1000, 50),
+        "attempts": (0, 0.0, (0, 0.0)),
     }
 
 
@@ -270,6 +288,99 @@ class IndexedReport(unittest.TestCase):
         self.assertNotIn("p50_ms=ok", before)
         self.assertIn("p50_ms=ok", after)
         self.assertNotIn("FAIL", after)
+
+    def amended(self, rows):
+        with tempfile.TemporaryDirectory() as tmp:
+            Campaign(tmp, rows)
+            return REPORT.summarize(REPORT.load(tmp))[0]["amended"]
+
+    def test_amended_serial_gate_accepts_a_faster_grouped_writer(self):
+        # The drive is slow (1.0 ms) or fast (0.25 ms) while a process runs. Six ordinary
+        # processes meet the slow state and four the fast one, and grouping meets the slow
+        # state in four processes and the fast one in six. The pooled ratio is 0.25, which
+        # the original two-sided gate rejects. Eight of the ten neighbour pairs share a
+        # state, so the median pair ratio is 1.0.
+        slow, fast = (1.0, 1.0, 0.5), (0.25, 0.25, 0.1)
+        layout = [
+            ((slow, slow), (slow, slow)),
+            ((slow, slow), (slow, slow)),
+            ((slow, fast), (slow, fast)),
+            ((fast, fast), (fast, fast)),
+            ((fast, fast), (fast, fast)),
+        ]
+        rows = []
+        for block, (first, second) in enumerate(layout):
+            rows += [
+                serial(block, False, *first[0]),
+                serial(block, True, *first[1]),
+                serial(block, True, *second[1]),
+                serial(block, False, *second[0]),
+            ]
+        with tempfile.TemporaryDirectory() as tmp:
+            Campaign(tmp, rows)
+            entry = REPORT.summarize(REPORT.load(tmp))[0]
+        self.assertAlmostEqual(entry["metrics"]["p50_ms"]["ratio"], 0.25)
+        verdict = entry["amended"]["p50_ms"]
+        self.assertTrue(verdict["passed"])
+        self.assertAlmostEqual(verdict["paired"], 1.0)
+
+    def test_amended_serial_gate_rejects_a_slower_grouped_writer(self):
+        rows = []
+        for block in range(3):
+            rows += abba(block, (1.0, 1.0, 0.5), (1.06, 1.06, 0.5))
+        amended = self.amended(rows)
+        self.assertFalse(amended["p50_ms"]["passed"])
+        self.assertFalse(amended["p90_ms"]["passed"])
+
+    def test_required_gain_follows_the_ordinary_synchronization(self):
+        self.assertAlmostEqual(REPORT.required_gain(1.2), 1.5)
+        self.assertAlmostEqual(REPORT.required_gain(3.0), 1.5)
+        self.assertAlmostEqual(REPORT.required_gain(0.6), 1.25)
+        self.assertAlmostEqual(REPORT.required_gain(0.0), 1.0)
+
+    def test_amended_throughput_gate_scales_with_the_synchronization(self):
+        # A gain of 1.4 passes where the ordinary synchronization takes 0.9 ms, which
+        # requires 1.375, and fails where it takes 1.5 ms and 1.5 is required.
+        def rows(sync_ms):
+            out = []
+            for block in range(3):
+                out += [
+                    writers(block, False, 1000, sync_ms),
+                    writers(block, True, 1400, 1.5),
+                    writers(block, True, 1400, 1.5),
+                    writers(block, False, 1000, sync_ms),
+                ]
+            return out
+
+        short = self.amended(rows(0.9))["throughput"]
+        self.assertAlmostEqual(short["required"], 1.375)
+        self.assertAlmostEqual(short["paired"], 1.4)
+        self.assertTrue(short["passed"])
+        long = self.amended(rows(1.5))["throughput"]
+        self.assertAlmostEqual(long["required"], 1.5)
+        self.assertFalse(long["passed"])
+
+    def test_amended_throughput_judges_neighbour_pairs_not_pooled_medians(self):
+        # The ordinary writer is slow after two grouped runs. The pooled ratio is 1.2
+        # and the pairs give 1.6 and 1.1, so the median pair is 1.35.
+        rows = []
+        for block in range(3):
+            rows += [
+                writers(block, False, 1000, 1.2),
+                writers(block, True, 1600, 1.5),
+                writers(block, True, 1400, 1.5),
+                writers(block, False, 1273, 1.2),
+            ]
+        amended = self.amended(rows)["throughput"]
+        self.assertAlmostEqual(amended["paired"], statistics.median([1.6, 1400 / 1273]))
+        self.assertFalse(amended["passed"])
+
+    def test_render_shows_the_amended_verdicts(self):
+        rows = abba(0, (1.0, 1.0, 0.5), (1.0, 1.0, 0.5))
+        with tempfile.TemporaryDirectory() as tmp:
+            Campaign(tmp, rows)
+            text = REPORT.render(REPORT.summarize(REPORT.load(tmp)), {})
+        self.assertIn("amended gate p50_ms: ok paired 1.000, limit 1.05", text)
 
     def test_render_carries_the_harness_verdicts(self):
         rows = [serial(0, False, 1.0, 1.0, 0.5), serial(0, True, 1.0, 1.0, 0.5)]

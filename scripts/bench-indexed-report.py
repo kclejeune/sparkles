@@ -25,6 +25,13 @@ import re
 import statistics
 import sys
 
+# The gates of X09 section 17.9 as amended on 2026-10-23. A serial process may be at most
+# 5% slower than its ordinary neighbour. Four writers must gain the ratio that
+# required_gain gives for the mean commit synchronization time of the ordinary processes.
+SERIAL_LIMIT = 1.05
+THROUGHPUT_BASE = 1.5
+SYNC_FULL_MS = 1.2
+
 SYNC = re.compile(r"^sparkles_commit_sync_seconds_(sum|count)\{[^}]*\} ([0-9.eE+-]+)$")
 
 
@@ -138,6 +145,47 @@ def paired(group, getter):
     return {"median": statistics.median(ratios), "range": spread(ratios)}
 
 
+def required_gain(sync_ms):
+    """Gain in transactions per second that four writers must reach with grouping.
+
+    Grouping saves synchronization time and nothing else, so the requirement is the
+    original 1.5 only when the ordinary path's mean commit synchronization takes
+    SYNC_FULL_MS or longer. For a shorter synchronization it falls in proportion, to 1.0
+    for a synchronization that takes no time.
+    """
+    return 1 + (THROUGHPUT_BASE - 1) * min(1.0, sync_ms / SYNC_FULL_MS)
+
+
+def amended(scenario, metrics, ordinary):
+    """Verdicts of the amended gates for one entry, or None for other scenarios."""
+    if scenario.startswith("serial-"):
+        verdicts = {}
+        for name in ("p50_ms", "p90_ms"):
+            pair = metrics.get(name, {}).get("paired")
+            verdicts[name] = {
+                "paired": pair and pair["median"],
+                "limit": SERIAL_LIMIT,
+                "passed": None if pair is None else pair["median"] <= SERIAL_LIMIT,
+            }
+        return verdicts
+    if scenario == "writers":
+        pair = metrics.get("tps", {}).get("paired")
+        syncs = [r["sync_mean_ms"] for r in ordinary]
+        if pair is None or not syncs or any(v is None for v in syncs):
+            return {"throughput": {"passed": None}}
+        sync_ms = statistics.median(syncs)
+        required = required_gain(sync_ms)
+        return {
+            "throughput": {
+                "paired": pair["median"],
+                "ordinary_sync_ms": sync_ms,
+                "required": required,
+                "passed": pair["median"] >= required,
+            }
+        }
+    return None
+
+
 def summarize(rows):
     """One entry per people, index and scenario."""
     out = []
@@ -189,6 +237,7 @@ def summarize(rows):
                 add("reader_p99_ms", lambda r: r["readers"]["p99_ms"])
                 add("max_schedule_lag_ms", lambda r: r["max_schedule_lag_ms"])
                 add("write_p99_ms", lambda r: r["writers"]["p99_ms"])
+        entry["amended"] = amended(scenario, entry["metrics"], variants["off"])
         out.append(entry)
     return out
 
@@ -216,6 +265,17 @@ def render(entries, gate_marks):
             f"{e['people']} {e['index']} {e['scenario']} "
             f"({e['processes']['off']}/{e['processes']['on']} processes) {label}".rstrip()
         )
+        for name, v in (e.get("amended") or {}).items():
+            verdict = {True: "ok", False: "FAIL", None: "n/a"}[v["passed"]]
+            detail = ""
+            if "required" in v:
+                detail = (
+                    f" paired {v['paired']:.3f}, required {v['required']:.3f}"
+                    f" at {v['ordinary_sync_ms']:.2f} ms"
+                )
+            elif v.get("paired") is not None:
+                detail = f" paired {v['paired']:.3f}, limit {v['limit']:.2f}"
+            lines.append(f"    amended gate {name}: {verdict}{detail}")
         for name, m in e["metrics"].items():
             lines.append(
                 f"    {name}: off {m['off']['median']:.3f} "
