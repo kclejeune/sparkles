@@ -1475,9 +1475,8 @@ pub fn query_execution_with_plan(
             // so the failure always comes before any output. Without spill it runs
             // again when automatic admission would have streamed it had its estimates
             // foreseen the failure: its operators all stream and their state fits.
+            // That test plans EXISTS patterns, so it waits for the failure.
             let retry = kind == QueryKind::Select
-                && (options.spill.is_some()
-                    || cursor_fits(&prepared.ctx, &prepared.node, kind, cursor))
                 && options.extensions.is_none()
                 && options.initial_bindings.is_empty()
                 && retryable(&prepared.node)
@@ -1513,7 +1512,14 @@ pub fn query_execution_with_plan(
                                     b.kind,
                                     crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
                                 )
-                            ) =>
+                            )
+                            && (options.spill.is_some()
+                                || fits_without_spill(
+                                    &retry_snapshot,
+                                    &parsed,
+                                    options,
+                                    cursor,
+                                )) =>
                     {
                         return retry_as_cursor(retry_snapshot, query, options, cursor, started);
                     }
@@ -1530,6 +1536,19 @@ pub fn query_execution_with_plan(
             }
         })
     })
+}
+
+/// Whether a cursor over `parsed` could run without spill, as automatic admission asks
+/// of it through [`cursor_fits`]. The eager run that failed has released its memory, so
+/// the query is planned again against its whole budget.
+fn fits_without_spill(
+    snapshot: &Arc<Snapshot>,
+    parsed: &spargebra::Query,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+) -> bool {
+    super::prepare_query(snapshot.clone(), parsed, options, None, None)
+        .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor))
 }
 
 /// Run `query` again as a cursor after its eager run exceeded the memory budget, within

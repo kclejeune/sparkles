@@ -1114,7 +1114,8 @@ The eager memory retry without spill (roadmap item 91) uses the same test of the
 large enough for admission, a plan that streams natively, and a cursor state that fits
 in half of the memory with its batch headroom. An eager run that fails for memory runs
 again as a cursor without spill when `cursor_fits` holds. The failure then stands in
-for the eager estimate that was too low. SP²Bench `q4` at 10M is such a plan. The planner
+for the eager estimate that was too low. The retry plans the query again to ask this only after the failure,
+because the test plans each EXISTS pattern, and a query that succeeds should not pay for it. SP²Bench `q4` at 10M is such a plan. The planner
 estimates 26.7 million rows for its largest join where 88.2 million arrive, so admission
 keeps it eager, and the retried cursor answers within 1.99 GB. A plan whose cursor
 state is not expected to fit keeps the eager failure, and no cursor starts. The state
