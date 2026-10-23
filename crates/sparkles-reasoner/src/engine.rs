@@ -683,6 +683,22 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// Read the base tier's remembered lookups through `memo`, the blocks a caller's
+    /// earlier evaluations read last (see [`take_memo`](Self::take_memo)).
+    pub fn lend_memo(&mut self, memo: Memo) {
+        self.bmemo = memo;
+    }
+
+    /// The memo lent with [`lend_memo`](Self::lend_memo), its scans counted.
+    pub fn take_memo(&mut self) -> Memo {
+        let mut memo = std::mem::take(&mut self.bmemo);
+        if let Some(b) = self.g.base() {
+            b.add_scans(memo.scans);
+        }
+        memo.scans = 0;
+        memo
+    }
+
     /// The members of the RDF list at `head` among the visible rows, or `None` when it
     /// is not a well-formed list.
     pub fn list(&mut self, head: u64) -> Option<std::rc::Rc<[u64]>> {

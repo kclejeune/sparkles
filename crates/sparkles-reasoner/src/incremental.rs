@@ -29,7 +29,7 @@
 
 use crate::budget::{Budget, Held, MemoryExceeded, table_bytes, table_capacity, table_grown};
 use crate::engine::{self, CHead, CRule, Eval, First, Limits, Mode, Slot, Step};
-use crate::facts::Base;
+use crate::facts::{Base, Memo};
 use crate::graph::{Cands, Graph, Triple};
 use crate::lookups::{self, Lookups};
 use crate::terms::Terms;
@@ -1007,6 +1007,10 @@ struct Search {
     uses: usize,
     /// the first refusal, or the first error of an evaluation
     err: Option<anyhow::Error>,
+    /// the base-tier blocks the search's evaluations read last, lent to each in turn:
+    /// the blocks of a snapshot do not change, and the evaluations of one search read
+    /// near each other
+    memo: Memo,
 }
 
 /// The bytes of the allocation a vector of capacity `cap` with `len` elements of `elem`
@@ -1042,6 +1046,7 @@ impl Search {
             held: Held::new(budget),
             uses: 0,
             err: None,
+            memo: Memo::default(),
         }
     }
 
@@ -1284,7 +1289,9 @@ impl Search {
             let Some(mut b) = bind_head(rule, hi, pre, t) else {
                 continue;
             };
-            let failed = {
+            // a nested expansion takes a memo of its own meanwhile
+            let memo = std::mem::take(&mut self.memo);
+            let (failed, memo) = {
                 let mut sink = |body: &[Triple], implicit: &[Triple]| -> bool {
                     self.instance(cx, n, root, depth, body, implicit)
                 };
@@ -1304,9 +1311,11 @@ impl Search {
                     },
                     cx.budget,
                 );
+                ev.lend_memo(memo);
                 ev.run(0, &mut b, None);
-                ev.err.take()
+                (ev.err.take(), ev.take_memo())
             };
+            self.memo = memo;
             if let Some(e) = failed {
                 self.err.get_or_insert(e);
             }
