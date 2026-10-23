@@ -83,10 +83,15 @@ Fewer instructions did not make the Namespace screen faster. On an AMD instance 
 the 100,000-person dataset, eight rounds of 50 requests per query gave a geometric mean of 0.997 for server time and
 1.019 for client time against four units. `employee-docs`, `expr-order-key` and
 `expr-bind-group` were 9% to 32% slower, and `types-grouped`, `predicate-counts` and
-`values-star` 14% to 28% faster. These are queries under 2 ms, so the setting waits for
-a pinned check on an Intel host, which decides whether it stays, is reverted or applies
-to fewer crates. A release rebuild after a change to `sparkles-core` takes about 35
-seconds longer, 2m37s instead of 2m02s on atlas with six jobs.
+`values-star` 14% to 28% faster. These are queries under 2 ms, so a pinned check on
+forge decided the setting. In 24 interleaved rounds against the same commit with four
+units, one unit made `expr-order-key` 5.3% faster, 12.72 ms against 13.43 ms, with no
+overlap between the two ranges of round medians, and 2.8% faster than the commit before
+item 7. `exists-join`, `star-join` and `employee-docs` moved by 2% or less, and
+`order-by-full` was 0.7% slower, 1059.4 ms against 1052.3 ms, so the setting stays.
+[Roadmap](ROADMAP.md) item 109 follows up the `order-by-full` cost. A release rebuild
+after a change to `sparkles-core` takes about 35 seconds longer, 2m37s instead of 2m02s
+on atlas with six jobs.
 
 ## Benchmark scripts
 
