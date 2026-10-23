@@ -717,8 +717,9 @@ impl Run<'_> {
             parent,
         };
         // whether a community holds the set is decided before the limit cuts the
-        // groups, which may leave only the largest, the instances without one
-        let (mut sizes, mut truncated) = self.sizes(class, path, &level, MAX_LIMIT)?;
+        // groups, which may leave only the largest, the instances without one. That
+        // group is at most one, so one group past the limit is enough to see a community.
+        let (mut sizes, mut truncated) = self.sizes(class, path, &level, limit + 1)?;
         if !sizes.iter().any(|(k, _)| matches!(k, Key::Community(_))) {
             return Ok(None);
         }

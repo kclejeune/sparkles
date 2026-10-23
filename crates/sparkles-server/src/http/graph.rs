@@ -34,14 +34,32 @@ use sparkles::overview::GroupsRequest;
 /// commit. A fixed schema is named by a hash of its content, a graph source by its graph,
 /// whose content the commit already names.
 fn rdfs_key(rdfs: Option<&sparkles::sparql::rdfs::RdfsOnRead>) -> String {
+    use sparkles::sparql::rdfs::RdfsSchema;
     use std::hash::{Hash, Hasher};
     match rdfs.map(|r| &r.source) {
         None => String::new(),
         Some(sparkles::sparql::rdfs::SchemaSource::Graph(g)) => format!("rdfs:graph:{g:?}"),
         Some(sparkles::sparql::rdfs::SchemaSource::Fixed(schema)) => {
+            // the hash of a schema is computed once: a schema is immutable, and the weak
+            // reference keeps its allocation, so an equal pointer is the same schema
+            static MEMO: parking_lot::Mutex<Vec<(std::sync::Weak<RdfsSchema>, String)>> =
+                parking_lot::const_mutex(Vec::new());
+            let mut memo = MEMO.lock();
+            memo.retain(|(w, _)| w.strong_count() > 0);
+            if let Some((_, k)) = memo
+                .iter()
+                .find(|(w, _)| std::ptr::eq(w.as_ptr(), Arc::as_ptr(schema)))
+            {
+                return k.clone();
+            }
             let mut h = std::collections::hash_map::DefaultHasher::new();
             format!("{schema:?}").hash(&mut h);
-            format!("rdfs:fixed:{:016x}", h.finish())
+            let key = format!("rdfs:fixed:{:016x}", h.finish());
+            if memo.len() >= 16 {
+                memo.remove(0);
+            }
+            memo.push((Arc::downgrade(schema), key.clone()));
+            key
         }
     }
 }
