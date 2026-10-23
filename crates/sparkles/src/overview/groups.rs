@@ -652,15 +652,24 @@ impl Run<'_> {
                 let label = match &key {
                     Key::Bucket(b) => {
                         let a = lo + f64::from(*b) * w;
-                        let z = if *b + 1 >= n {
+                        let last = *b + 1 >= n;
+                        let z = if last {
                             hi.max(a)
                         } else if integral {
                             a + w - 1.0
                         } else {
                             a + w
                         };
-                        if integral && (z - a).abs() < 0.5 {
-                            fmt(a)
+                        // the last range ends at the largest value, rounded down so the
+                        // label never names a number above it
+                        let step = 10f64.powi(decimals as i32);
+                        let z = if last { (z * step).floor() / step } else { z };
+                        if (z - a).abs() < 0.5 / step.max(1.0) || z < a {
+                            if last && !integral && hi > a {
+                                format!("{} or more", fmt(a))
+                            } else {
+                                fmt(a)
+                            }
                         } else {
                             format!("{} – {}", fmt(a), fmt(z))
                         }
