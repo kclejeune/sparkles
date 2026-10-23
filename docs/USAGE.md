@@ -4042,7 +4042,8 @@ anything. The hierarchy is a tree, coarsest level first. Choosing a community sh
 members, its report with findings and citations, and the review actions **Reviewed**,
 **Reject** and **Edit**. An edit is saved as a new reviewed report that supersedes the
 old one. Reviewing needs write access to the dataset without graph or triple
-restrictions. The Settings tab has a GraphRAG section with the fields above, and the
+restrictions. The tab shows the reports of main, and on another branch it asks the reader
+to switch to main. The Settings tab has a GraphRAG section with the fields above, and the
 review inbox lists the unreviewed reports. The routes are described in
 [API.md](API.md#graphrag).
 

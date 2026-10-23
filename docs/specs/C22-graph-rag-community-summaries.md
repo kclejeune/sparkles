@@ -807,9 +807,11 @@ citations of a replaced child stay resolvable.
 
 `POST /$/graphrag/{ds}/build` and `/refresh` run as tasks of kind `graphrag`. The task
 reports the estimate and waits for `POST /$/graphrag/{ds}/confirm` unless the caller
-confirmed beforehand. The run checks its settings, its providers, their send levels and
-the principal's view again after the confirmation, before each model request and before
-each commit, and it fails without committing when a review changed a report link while
+confirmed beforehand. The run checks its settings, its model configuration, its
+providers, their send levels and the principal's view again after the confirmation,
+before every HTTP attempt including retries and fallbacks, and before each commit. A
+replaced model configuration refuses the run even when its role pairs are unchanged. The
+run fails without committing when a review changed a report link while
 it ran. All branches of a dataset share its daily ledger. An accounting anomaly stops
 the run like the budget does, the remaining communities stay pending, and a later
 refresh writes them. `GET /$/graphrag/{ds}`, `/communities` and `/community` read
@@ -827,7 +829,9 @@ digests each report was written from with the facts it reads now, rather than re
 the change feed, which Phase 3 adds. The baseline of a kept report stays until the
 report is rewritten, so small changes add up. A folded member's facts go into its
 parent's input and its parent's change measure. Only an unrestricted writer can review
-a report, since §6.2 lets only such a writer write a guarded graph. The metrics hold the
+a report, since §6.2 lets only such a writer write a guarded graph, and that writer needs
+write access through the update endpoint. The HTTP routes and the Communities tab work on
+main only, and the tab tells a reader on another branch to switch to main. The metrics hold the
 figures of the runs and reviews since the server started. The byte bound's default
 allowances are unmeasured, and measuring them needs paid provider runs. Global Ask and
 memory integration remain Phase 2, and automatic refresh remains Phase 3.
