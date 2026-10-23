@@ -476,6 +476,7 @@ async fn long_polls_end_when_access_changes() {
 
 /// The GraphRAG routes decide with the same guard: a caller for whom the reports graph
 /// is not proven learns nothing derived from it (§6.4).
+#[cfg(feature = "mcp")]
 #[tokio::test]
 async fn graphrag_routes_follow_coverage() {
     let s = server();
@@ -548,6 +549,7 @@ async fn a_principal_without_a_grant_cannot_build() {
 
 /// Only an unrestricted writer reviews a report, so a restricted writer can neither
 /// write past its grants nor copy a report it sees in part (round 6, findings 3 and 8).
+#[cfg(feature = "mcp")]
 #[tokio::test]
 async fn restricted_writers_cannot_review() {
     let s = server_with(false);
