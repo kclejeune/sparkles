@@ -514,7 +514,9 @@
         { x: (left + right) / 2, y: (top + bottom) / 2 },
         { cameraState: state },
       );
-      state = { ...state, x: c.x, y: c.y, ratio: state.ratio / scale };
+      // a ratio of 1 already frames the nodes, so a smaller one only magnifies a picture
+      // whose box is a point or a line, such as a single node, past its drawn size
+      state = { ...state, x: c.x, y: c.y, ratio: Math.max(1, state.ratio / scale) };
       cam.setState(state);
     }
     if (duration) {

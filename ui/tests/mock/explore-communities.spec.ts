@@ -38,7 +38,8 @@ test('the picker draws the communities, which open into the level below', async 
   const crumbs = ov.getByRole('navigation', { name: 'Overview levels' });
   await expect(crumbs).toContainText('Communities');
   await expect(crumbs).toContainText('Engineering');
-  await expect(row(ov, 'The payments team')).toBeVisible();
+  // (the Communities tab's spec renames the payments team in the shared mock)
+  await expect(ov.locator('tbody tr')).toHaveCount(2);
   await expect(row(ov, 'The platform team')).toBeVisible();
   // the opened community's report is beside the canvas
   const side = page.getByTestId('community-side');
@@ -51,10 +52,10 @@ test('the picker draws the communities, which open into the level below', async 
   await expect(page).toHaveURL(/overview=communities&community=/);
 
   // the finest level opens into its members
-  await row(ov, 'The payments team').getByRole('button', { name: 'Open' }).click();
-  await expect(crumbs).toContainText('The payments team');
-  await expect(row(ov, 'Ana')).toBeVisible();
-  await expect(row(ov, 'Kai')).toBeVisible();
+  await row(ov, 'The platform team').getByRole('button', { name: 'Open' }).click();
+  await expect(crumbs).toContainText('The platform team');
+  await expect(row(ov, 'Lee')).toBeVisible();
+  await expect(row(ov, 'Mo')).toBeVisible();
   // Backspace closes the level
   await page.keyboard.press('Backspace');
   await expect(row(ov, 'The platform team')).toBeVisible();
@@ -68,18 +69,18 @@ test('the picker draws the communities, which open into the level below', async 
 test('a finding marks the entities it is about', async ({ page }) => {
   const ov = await communities(page);
   await row(ov, 'Engineering').getByRole('button', { name: 'Open' }).click();
-  await row(ov, 'The payments team').getByRole('button', { name: 'The payments team' }).click();
+  await row(ov, 'The platform team').getByRole('button', { name: 'The platform team' }).click();
   const side = page.getByTestId('community-side');
-  await expect(side.getByRole('heading', { name: 'The payments team' })).toBeVisible();
-  const finding = side.getByRole('button', { name: /Kai works with the rest/ });
+  await expect(side.getByRole('heading', { name: 'The platform team' })).toBeVisible();
+  const finding = side.getByRole('button', { name: /Lee works with the rest/ });
   await finding.click();
   await expect(finding).toHaveAttribute('aria-pressed', 'true');
-  // Kai is in the team, which is drawn as one group: the members are drawn on request
+  // Lee is in the team, which is drawn as one group: the members are drawn on request
   const marked = ov.getByTestId('overview-marked');
   await expect(marked).toContainText('0 of the 2 entities');
   await marked.getByRole('button', { name: 'Draw the members' }).click();
-  await expect(row(ov, 'Kai')).toHaveClass(/marked/);
-  await expect(row(ov, 'Ana')).not.toHaveClass(/marked/);
+  await expect(row(ov, 'Lee')).toHaveClass(/marked/);
+  await expect(row(ov, 'Mo')).not.toHaveClass(/marked/);
   await expect(marked).toContainText('1 of the 2 entities');
   // choosing it again clears the marks
   await finding.click();

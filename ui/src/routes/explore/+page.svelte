@@ -1297,7 +1297,11 @@
       />
     {/key}
   {:else if tab === 'graph'}
-    <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen && !community}>
+    <div
+      class="split"
+      class:overview={nodeCount === 0 && !graphTimeOpen && !community}
+      class:reporting={nodeCount === 0 && !!community}
+    >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen}
           <div class="gtools">
@@ -2762,6 +2766,11 @@
       border-left: 0;
       border-top: 1px solid var(--border);
       max-height: 50vh;
+    }
+    /* the overview's toolbars and notes sit above its canvas, so it needs more room
+       than the resource graph to keep the picture usable above a report */
+    .split.reporting {
+      grid-template-rows: minmax(min(480px, 62vh), 1fr) auto;
     }
   }
   /* a phone: the search box on a row of its own, the tabs under it */
