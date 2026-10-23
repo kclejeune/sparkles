@@ -21,6 +21,7 @@ pub mod ledger;
 pub mod projection;
 #[cfg(feature = "mcp")]
 pub mod report;
+#[cfg(feature = "mcp")]
 pub mod runtime;
 pub mod settings;
 pub mod state;

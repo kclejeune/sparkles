@@ -536,6 +536,7 @@ async fn graphrag_routes_follow_coverage() {
 
 /// A build reads as a principal that may query the dataset: a user without any grant
 /// has no view, which must not read as unrestricted (round 6, finding 2).
+#[cfg(feature = "mcp")]
 #[tokio::test]
 async fn a_principal_without_a_grant_cannot_build() {
     let s = server();
