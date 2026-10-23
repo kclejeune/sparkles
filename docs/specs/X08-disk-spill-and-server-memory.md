@@ -1085,7 +1085,7 @@ no rows. Such a call now runs in process.
 The server recognises its own endpoints without anything a client could forge. A
 SERVICE IRI names this server only when it matches the configured public base URL
 (`server.public_url` in the auth configuration), or when its scheme, host and port match
-the bound listener. The host must be the listener's literal address or, for a listener on
+the bound listener. The host must be the address the listener's socket bound or, for a listener on
 a loopback or unspecified address, `localhost`, `127.0.0.1` or `[::1]`. The path must be
 `/{ds}/sparql`, `/{ds}/query` or `/{ds}` for a dataset the server serves, with no query
 string, fragment, user information or branch. Any other IRI is an ordinary HTTP call,
@@ -1116,6 +1116,23 @@ checks that a caller restricted to two graphs sees only those through the call a
 dataset it cannot read is refused. `nested_service_calls_to_this_server_stop_at_the_depth_limit`
 and `a_service_iri_that_does_not_name_this_server_goes_over_http` cover the depth limit
 and the names that stay remote.
+
+A review found six gaps in the first version, which are fixed.
+- An update built its own context without the hook, so a SERVICE in its WHERE still went
+  over HTTP. `an_update_reads_this_server_in_process_under_its_grant` covers it.
+- The resolver looked the dataset up before it checked access. A federating caller could
+  then tell a hidden dataset, which was refused, from a missing one, which went to HTTP
+  and came back empty under `SILENT`. Access is now checked first, so both are refused.
+- The call skipped the checks of a direct request for a dataset that is offline or being
+  restored. It now applies them, fails with a SERVICE error that `SILENT` hides, and holds
+  the dataset's request handle until it ends.
+- The call kept the target dataset's server budgets even when the caller had lowered its
+  own. Its row, memory and work budgets are now never above the caller's, as
+  `a_service_call_to_this_server_keeps_the_callers_lowered_budgets` checks.
+- The listener was recorded by its `--host` value, so a host given as a DNS name was
+  accepted by name. It is now recorded by the address the socket bound.
+- An IRI with an empty or password-only user part was accepted. Any `@` in the authority
+  now keeps the call on HTTP.
 
 ### Admission after the body (2026-10-23)
 

@@ -210,8 +210,20 @@ pub trait LocalEndpoints: Send + Sync + std::fmt::Debug {
     /// For an IRI that exactly names one of this process's query endpoints, the
     /// snapshot to query and the options the caller would have there, with the caller's
     /// view of the dataset. `None` leaves the call to HTTP. An error fails the call, for
-    /// a caller that may not query the dataset it names.
-    fn resolve(&self, iri: &str) -> Option<Result<(Arc<Snapshot>, QueryOptions)>>;
+    /// a caller that may not query the dataset it names or a dataset that is out of
+    /// service.
+    fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>>;
+}
+
+/// The dataset an in-process SERVICE call queries (see [`LocalEndpoints`]).
+pub struct LocalTarget {
+    pub snap: Arc<Snapshot>,
+    /// The caller's options on that dataset. The engine lowers their budgets to the
+    /// calling query's and gives them its deadline, cancellation and grant.
+    pub options: QueryOptions,
+    /// Held until the call ends, such as the server's handle that keeps a dataset from
+    /// being swapped out by a restore while a request reads it.
+    pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl QueryOptions {

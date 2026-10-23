@@ -62,7 +62,7 @@ fn server_on(port: u16) -> Server {
         .listener
         .set(Listener {
             scheme: "http",
-            host: "0.0.0.0".into(),
+            ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
             port,
         })
         .unwrap();
@@ -212,6 +212,8 @@ async fn a_service_iri_that_does_not_name_this_server_goes_over_http() {
         format!("http://127.0.0.1:{PORT}/other/sparql"),
         format!("http://127.0.0.1:{PORT}/ds/sparql?default-graph-uri=urn:g"),
         format!("http://127.0.0.1:{PORT}/ds@b/sparql"),
+        format!("http://:pw@127.0.0.1:{PORT}/ds/sparql"),
+        format!("http://@127.0.0.1:{PORT}/ds/sparql"),
         format!("https://127.0.0.1:{PORT}/ds/sparql"),
     ] {
         let (status, body) = select(
@@ -222,4 +224,90 @@ async fn a_service_iri_that_does_not_name_this_server_goes_over_http() {
         assert_ne!(status, StatusCode::OK, "{endpoint}: {body}");
         assert!(!body.contains("urn:b"), "{endpoint}: {body}");
     }
+}
+
+async fn post_update(app: &Router, update: &str) -> (StatusCode, String) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/ds/update")
+                .header(header::CONTENT_TYPE, "application/sparql-update")
+                .body(Body::from(update.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_reads_this_server_in_process_under_its_grant() {
+    let (s, port) = served().await;
+    let pool = s.state.catalog.pool().unwrap().clone();
+    let held = pool.try_grant(48 * MB).unwrap();
+    let (status, body) = post_update(
+        &s.app,
+        &format!(
+            "INSERT {{ <urn:copy> <urn:p> ?o }} WHERE {{ \
+             SERVICE <http://127.0.0.1:{port}/ds/sparql> {{ <urn:a> <urn:p> ?o }} }}"
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(pool.stats().rejected, 0);
+    drop(held);
+    let (status, body) = select(&s.app, "SELECT ?o { <urn:copy> <urn:p> ?o }").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("urn:b"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_call_to_this_server_keeps_the_callers_lowered_budgets() {
+    let s = server();
+    // the inner query's VALUES has ten rows, above the caller's row budget of one,
+    // while the caller's own pattern has one row
+    let q = format!(
+        "SELECT ?sum {{ SERVICE <http://127.0.0.1:{PORT}/ds/sparql> {{ \
+         SELECT (SUM(?x) AS ?sum) {{ VALUES ?x {{ 1 2 3 4 5 6 7 8 9 10 }} }} }} }}"
+    );
+    let uri = format!(
+        "/ds/sparql?max-rows=1&query={}",
+        percent_encoding::utf8_percent_encode(&q, percent_encoding::NON_ALPHANUMERIC)
+    );
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::get(uri)
+                .header(header::ACCEPT, "text/csv")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("55"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_call_to_an_offline_dataset_of_this_server_fails() {
+    let s = server();
+    let off = s.state.attach("off", DbType::Mem, None).unwrap();
+    off.offline.store(true, Ordering::Relaxed);
+    let q = format!("SELECT * {{ SERVICE <http://127.0.0.1:{PORT}/off/sparql> {{ ?s ?p ?o }} }}");
+    let (status, body) = select(&s.app, &q).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("offline"), "{body}");
+    // SILENT hides it, as it hides the 503 of a direct request
+    let (status, body) = select(&s.app, &q.replace("SERVICE", "SERVICE SILENT")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

@@ -7822,7 +7822,7 @@ pub(super) fn is_local(ctx: &Ctx, url: &str) -> bool {
 /// caller nor outlive it.
 fn fetch_local(
     ctx: &Ctx,
-    target: Result<(std::sync::Arc<crate::store::Snapshot>, super::QueryOptions)>,
+    target: Result<super::LocalTarget>,
     query: &str,
     on_solution: &mut dyn FnMut(sparesults::QuerySolution) -> Result<()>,
 ) -> Result<()> {
@@ -7832,7 +7832,21 @@ fn fetch_local(
             super::MAX_SERVICE_DEPTH
         )));
     }
-    let (snap, mut opts) = target?;
+    let super::LocalTarget {
+        snap,
+        options: mut opts,
+        hold: _hold,
+    } = target?;
+    // the call can never be given more than its caller has
+    opts.max_rows = Some(opts.max_rows.map_or(ctx.max_rows, |m| m.min(ctx.max_rows)));
+    opts.max_memory_bytes = Some(
+        opts.max_memory_bytes
+            .map_or(ctx.mem_limit, |m| m.min(ctx.mem_limit)),
+    );
+    opts.max_rows_produced = Some(
+        opts.max_rows_produced
+            .map_or(ctx.max_rows_produced, |m| m.min(ctx.max_rows_produced)),
+    );
     opts.timeout = None;
     opts.deadline = ctx.current_deadline();
     opts.cancel = Some(ctx.cancel.clone());

@@ -1085,7 +1085,7 @@ datasets = {{ graphs = "read" }}
         .listener
         .set(crate::http::self_service::Listener {
             scheme: "http",
-            host: "127.0.0.1".into(),
+            ip: std::net::Ipv4Addr::LOCALHOST.into(),
             port: 9,
         })
         .unwrap();
@@ -1109,4 +1109,19 @@ datasets = {{ graphs = "read" }}
     )
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    // a hidden dataset and a missing one are refused alike
+    for name in ["secret", "no-such-dataset"] {
+        let q = format!(
+            "SELECT * {{ SERVICE SILENT <http://127.0.0.1:9/{name}/sparql> {{ ?s ?p ?o }} }}"
+        );
+        let r = call(
+            &s.app,
+            "GET",
+            &format!("/graphs/sparql?query={}", enc(&q)),
+            &[("authorization", &b("gfed")), ("accept", "text/csv")],
+            "",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{name}: {}", r.text());
+    }
 }
