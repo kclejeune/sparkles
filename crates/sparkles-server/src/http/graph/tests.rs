@@ -655,3 +655,27 @@ ex:r3 a ex:R ; ex:community <urn:x-sparkles:algo:r9:0:1> ."#
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(groups(&s.app, agents).await["within"]["size"], 40);
 }
+
+/// A fixed RDFS schema is named by its content: the same schema gives the same key on
+/// every request, from the memo after the first, and another schema another key.
+#[test]
+fn fixed_rdfs_schemas_are_keyed_by_content() {
+    use sparkles::sparql::rdfs::{RdfsOnRead, RdfsSchema};
+    let t = |sub: &str| {
+        oxrdf::Triple::new(
+            oxrdf::NamedNode::new(sub).unwrap(),
+            oxrdf::NamedNode::new("http://www.w3.org/2000/01/rdf-schema#subClassOf").unwrap(),
+            oxrdf::NamedNode::new("http://ex/Agent").unwrap(),
+        )
+    };
+    let a = RdfsOnRead::fixed(RdfsSchema::from_triples(&[t("http://ex/Person")]));
+    let b = RdfsOnRead::fixed(RdfsSchema::from_triples(&[t("http://ex/Org")]));
+    let ka = super::rdfs_key(Some(&a));
+    assert!(ka.starts_with("rdfs:fixed:"), "{ka}");
+    assert_eq!(super::rdfs_key(Some(&a)), ka);
+    assert_ne!(super::rdfs_key(Some(&b)), ka);
+    assert_eq!(super::rdfs_key(None), "");
+    // an equal schema read again from another upload has the same key
+    let a2 = RdfsOnRead::fixed(RdfsSchema::from_triples(&[t("http://ex/Person")]));
+    assert_eq!(super::rdfs_key(Some(&a2)), ka);
+}
