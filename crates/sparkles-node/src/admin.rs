@@ -252,6 +252,7 @@ fn writes(op: &str) -> bool {
             | "algo.projections.get"
             | "algo.queryText"
             | "algo.stats"
+            | "graph.groups"
             | "branches.list"
             | "branches.get"
             | "indexes.text.status"
@@ -586,6 +587,10 @@ fn run_admin(
             a["author"].as_str().map(Into::into),
             ctl,
         )?)?,
+        "graph.groups" => {
+            let req = sparkles::overview::GroupsRequest::from_json(&a["request"])?;
+            ds.graph().groups(&req, &query_options(v, flag)?)?
+        }
         "queries.list" => value(ds.queries().list())?,
         "queries.get" => value(ds.queries().get(
             text(a, "name")?,

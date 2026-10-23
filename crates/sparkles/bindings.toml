@@ -444,7 +444,7 @@ node = "Dataset.clearGraph"
 ["graph.groups"]
 python = "Dataset.graph.groups"
 jvm = "planned: a typed handle after the Python and Node.js ones"
-node = "planned: Dataset.graph.groups, returning the answer as an object"
+node = "Dataset.graph.groups"
 
 ["graphql.config.get"]
 python = "Dataset.graphql.config.get"

@@ -1,5 +1,11 @@
 import type { Dataset } from './index.js';
-import type { RDF, OperationOptions, UpdateOptions, CommitReceipt } from '@sparkles-rdf/common';
+import type {
+  RDF,
+  OperationOptions,
+  QueryOptions,
+  UpdateOptions,
+  CommitReceipt,
+} from '@sparkles-rdf/common';
 import { decodeTerm, unsigned } from '@sparkles-rdf/common';
 export type Configuration = Record<string, unknown>;
 export interface CommitInfo {
@@ -110,6 +116,41 @@ const setting = <T>(call: AdminCall, name: string): Setting<T> => ({
   set: (value, o) => call(`settings.${name}.set`, value as Configuration, o, true),
   reset: (o) => call(`settings.${name}.reset`, {}, o, true),
 });
+/** What a graph overview request groups and how (see "Graph overview" in API.md). */
+export interface GroupsRequest {
+  /** A class IRI, or a group id from an earlier answer. */
+  within: { class: string } | { group: string };
+  by?: 'auto' | 'members' | { community: string } | { property: string; buckets?: number };
+  /** Groups or members, 1 to 5,000 (the default). */
+  limit?: number;
+  /** A commit, a time or a named snapshot (`snapshot:<name>`). */
+  at?: number | bigint | Date | string;
+}
+/** The options of `graph.groups`: those of a query that bear on the view and the budgets. */
+export type GroupsOptions = Omit<
+  QueryOptions,
+  'at' | 'execution' | 'allowMaterialization' | 'bindings' | 'factory' | 'batchSize' | 'batchBytes'
+>;
+/** The answer of `graph.groups`. `commit` is the commit the answer was computed at. */
+export interface GroupsAnswer {
+  commit: bigint;
+  within: { class: string; group?: string; size: number };
+  grouping: {
+    kind: 'members' | 'values' | 'ranges' | 'communities';
+    predicate: string | null;
+  };
+  communities: boolean;
+  groups: {
+    id: string;
+    label: string;
+    size: number;
+    top: { iri: string; label?: string }[];
+  }[];
+  members?: { iri: string; label?: string; class?: string }[];
+  edges: { source: string; target: string; predicate: string | null; count: number }[];
+  truncated: boolean;
+  note?: string;
+}
 export class Administration {
   readonly snapshots;
   readonly history;
@@ -117,6 +158,7 @@ export class Administration {
   readonly prefixes;
   readonly queries;
   readonly algorithms;
+  readonly graph;
   readonly branches;
   readonly indexes;
   readonly reasoning;
@@ -323,6 +365,25 @@ export class Administration {
         call<Configuration>('algo.stats', { request }, o, false),
       runWrite: (request: Configuration, options: UpdateOptions & { author?: string } = {}) =>
         call<Configuration>('algo.runWrite', { request, author: options.author }, options, true),
+    };
+    this.graph = {
+      groups: (request: GroupsRequest, options: GroupsOptions = {}) =>
+        call<GroupsAnswer>(
+          'graph.groups',
+          {
+            request: {
+              ...request,
+              at:
+                request.at instanceof Date
+                  ? 'time:' + request.at.toISOString()
+                  : typeof request.at === 'number' || typeof request.at === 'bigint'
+                    ? 'commit:' + unsigned(request.at, 'at')
+                    : request.at,
+            },
+          },
+          options,
+          false,
+        ),
     };
     this.branches = {
       commitGraph: (
