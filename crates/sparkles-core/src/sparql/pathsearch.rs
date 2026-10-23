@@ -18,6 +18,12 @@
 //! A predicate can have a direction of its own, as in `path:predicate (ex:p
 //! path:backward)`. Edges can instead come from a nested pattern in the block, whose
 //! solutions bind `path:start` and `path:end` (the leaf's last child).
+//! `path:excludePredicate` drops the triples of some predicates from the edges of every
+//! predicate as they are read, and `path:maxDegree` keeps a search from expanding a node
+//! with more edges in the call's direction than the limit, unless it is the search's root,
+//! so no path passes through such a hub (spec U09 Phase 1, F07 §4.9). The degree comes
+//! from the index's counts of the node's ranges when every quad of the store is in the
+//! active graph, and otherwise from reading the node's edges up to one past the limit.
 //!
 //! The searches: bidirectional breadth-first search for one unweighted pair, one
 //! breadth-first search per source (or per target) for several or unbound ends,
@@ -61,6 +67,8 @@ const STEP_BYTES: u64 = 24;
 /// `u64` key and a `u32` rank padded to 16 bytes, with the table's control byte and
 /// room to grow.
 const RANK_BYTES: u64 = 32;
+/// Estimated bytes per node whose degree `path:maxDegree` checked (a map entry).
+const HUB_BYTES: u64 = 16;
 
 /// Whether a SERVICE name is the path search.
 pub fn is_search(name: &NamedNodePattern) -> bool {
@@ -109,6 +117,12 @@ pub struct PathSearchSpec {
     pub directions: Vec<Direction>,
     /// the direction of every predicate, and of the edges of a nested pattern
     pub direction: Direction,
+    /// predicate ids whose triples are not edges (`path:excludePredicate`), sorted; only
+    /// with every predicate
+    pub exclude: Vec<u64>,
+    /// a node whose degree in the call's direction is above this is not expanded, unless
+    /// it is the root of a search (`path:maxDegree`)
+    pub max_degree: Option<u64>,
     /// edges from a nested pattern (the leaf's last child): the variables of an edge's
     /// start and end
     pub edge_pattern: Option<(VarId, VarId)>,
@@ -296,6 +310,9 @@ pub(super) fn path_search_leaf(
     let mut preds: Option<Vec<u64>> = None;
     let mut dirs: Vec<Option<Direction>> = Vec::new();
     let mut pred_names = Vec::new();
+    let mut exclude: Vec<u64> = Vec::new();
+    let mut exclude_names: Vec<String> = Vec::new();
+    let mut max_degree = None;
     let mut direction = None;
     let (mut start, mut end_var) = (None, None);
     let (mut min_len, mut max_len, mut k, mut limit, mut max_visited) =
@@ -454,6 +471,20 @@ pub(super) fn path_search_leaf(
                     dirs.push(d);
                 }
             }
+            "excludePredicate" => {
+                let TermPattern::NamedNode(n) = o else {
+                    return Err(bad("path:excludePredicate takes an IRI"));
+                };
+                if exclude_names.iter().any(|x| x == n.as_str()) {
+                    return Err(bad(format!("path:excludePredicate {n} is given twice")));
+                }
+                exclude_names.push(n.as_str().to_string());
+                // a predicate the store does not have has no triples to skip
+                if let Some(id) = ctx.snap.lookup_iri(n.as_str()) {
+                    exclude.push(id.0);
+                }
+            }
+            "maxDegree" => once(&mut max_degree, integer(o, name)?, name)?,
             "start" => once(&mut start, output(o, name)?, name)?,
             "end" => once(&mut end_var, output(o, name)?, name)?,
             "minLength" => once(&mut min_len, integer(o, name)?, name)?,
@@ -500,6 +531,11 @@ pub(super) fn path_search_leaf(
                     "path:predicate and a nested pattern of edges cannot be combined; put the predicates in the pattern",
                 ));
             }
+            if !exclude_names.is_empty() {
+                return Err(bad(
+                    "path:excludePredicate and a nested pattern of edges cannot be combined; filter the pattern instead",
+                ));
+            }
             for (i, what) in [(3, "path:edgePredicate"), (7, "path:edge")] {
                 if outs[i].is_some() {
                     return Err(bad(format!(
@@ -528,6 +564,16 @@ pub(super) fn path_search_leaf(
             ));
         }
     };
+    if !pred_names.is_empty() && !exclude_names.is_empty() {
+        return Err(bad(
+            "path:excludePredicate cannot be combined with path:predicate; name the predicates to follow or the ones to skip",
+        ));
+    }
+    if max_degree == Some(0) {
+        return Err(bad("path:maxDegree must be positive"));
+    }
+    exclude.sort_unstable();
+    exclude.dedup();
     let algorithm = algorithm.unwrap_or(Algorithm::Shortest);
     let min_len =
         u32::try_from(min_len.unwrap_or(1)).map_err(|_| bad("path:minLength is too large"))?;
@@ -602,7 +648,7 @@ pub(super) fn path_search_leaf(
             .map_or_else(|| format!("{id:?}"), |t| t.to_string()),
     };
     let desc = format!(
-        "{} {} → {} via {} {}{}{}{}{}{}",
+        "{} {} → {} via {}{} {}{}{}{}{}{}{}",
         algorithm.name(),
         end(&source),
         end(&target),
@@ -622,6 +668,18 @@ pub(super) fn path_search_leaf(
                 .collect::<Vec<_>>()
                 .join(" ")
         },
+        if exclude_names.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " except {}",
+                exclude_names
+                    .iter()
+                    .map(|p| format!("<{p}>"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        },
         match direction {
             Direction::Forward => "forward",
             Direction::Backward => "backward",
@@ -639,6 +697,7 @@ pub(super) fn path_search_leaf(
             String::new()
         },
         limit.map_or(String::new(), |l| format!(" limit={l}")),
+        max_degree.map_or(String::new(), |d| format!(" maxDegree={d}")),
         weight
             .as_ref()
             .map_or(String::new(), |(w, _)| format!(" weight=<{w}>")),
@@ -675,6 +734,8 @@ pub(super) fn path_search_leaf(
         directions,
         edge_pattern,
         direction,
+        exclude,
+        max_degree,
         min_len,
         max_len,
         k,
@@ -1091,6 +1152,26 @@ impl Lane {
     }
 }
 
+/// How this call's view counts degrees: from the index alone when every quad of the
+/// store passes the graph filter, which is one count of the store's graphs per call.
+fn degree_count(ctx: &Ctx, graph: &GraphFilter) -> Result<DegreeCount> {
+    let snap = &ctx.snap;
+    let total = snap.count(Perm::Gspo, &[])?;
+    if snap.count(Perm::Gspo, &[Id::DEFAULT_GRAPH.0])? == total {
+        return Ok(if graph.accepts(Id::DEFAULT_GRAPH.0) {
+            DegreeCount::Index
+        } else {
+            DegreeCount::Zero
+        });
+    }
+    if let GraphFilter::One(g) = graph
+        && snap.count(Perm::Gspo, &[*g])? == total
+    {
+        return Ok(DegreeCount::Index);
+    }
+    Ok(DegreeCount::Scan)
+}
+
 /// What a spur search of Yen's algorithm may not use.
 struct Bans<'b> {
     nodes: &'b FxHashSet<u64>,
@@ -1129,6 +1210,28 @@ struct Engine<'a> {
     sweeps: Cell<u64>,
     /// paths the call may still return
     left: Cell<usize>,
+    /// with `path:maxDegree`: whether each node checked is a hub
+    hubs: RefCell<FxHashMap<u64, bool>>,
+    /// the roots of the current search, which are expanded even when they are hubs
+    roots: RefCell<Vec<u64>>,
+    /// expansions of a hub that were skipped
+    skipped_hubs: Cell<u64>,
+    /// how a node's degree is counted in this call's view
+    degree: DegreeCount,
+}
+
+/// How `path:maxDegree` counts a node's degree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DegreeCount {
+    /// every quad of the store passes the call's graph filter, so the index counts of a
+    /// node's ranges, less the skipped predicates and self-loops, are its degree
+    Index,
+    /// no quad of the store passes the filter, so every degree is 0
+    Zero,
+    /// rows of other graphs or repeated triples may be counted: an index count that is
+    /// not above the limit still proves a node is not a hub, and otherwise the node's
+    /// edges are read until one more than the limit is found
+    Scan,
 }
 
 impl<'a> Engine<'a> {
@@ -1196,6 +1299,10 @@ impl<'a> Engine<'a> {
             (Some(t), Some(vars)) => PatternEdges::of(t, vars),
             _ => PatternEdges::default(),
         };
+        let degree = match spec.max_degree {
+            None => DegreeCount::Scan,
+            Some(_) => degree_count(ctx, &spec.graph)?,
+        };
         Ok(Engine {
             ctx,
             spec,
@@ -1211,7 +1318,133 @@ impl<'a> Engine<'a> {
             searches: Cell::new(0),
             sweeps: Cell::new(0),
             left: Cell::new(spec.limit.unwrap_or(usize::MAX)),
+            hubs: Default::default(),
+            roots: Default::default(),
+            skipped_hubs: Cell::new(0),
+            degree,
         })
+    }
+
+    /// The roots of the search that starts: they are expanded even when they are hubs.
+    fn set_roots(&self, roots: &[u64]) {
+        if self.spec.max_degree.is_some() {
+            let mut r = self.roots.borrow_mut();
+            r.clear();
+            r.extend_from_slice(roots);
+        }
+    }
+
+    /// Whether the search may not expand `x`: `path:maxDegree` is set, `x` is not a
+    /// root of the current search, and its degree is above the limit.
+    fn blocked(&self, x: u64) -> Result<bool> {
+        if self.spec.max_degree.is_none() || self.roots.borrow().contains(&x) {
+            return Ok(false);
+        }
+        self.is_hub(x)
+    }
+
+    /// Whether the degree of `x` in the call's direction is above `path:maxDegree`,
+    /// worked out once per node of the call.
+    fn is_hub(&self, x: u64) -> Result<bool> {
+        let Some(limit) = self.spec.max_degree else {
+            return Ok(false);
+        };
+        if let Some(&h) = self.hubs.borrow().get(&x) {
+            return Ok(h);
+        }
+        let h = self.degree_above(x, limit)?;
+        self.charge.add(HUB_BYTES)?;
+        self.hubs.borrow_mut().insert(x, h);
+        Ok(h)
+    }
+
+    /// Whether `x` has more than `limit` edges that the search could follow from it in
+    /// the call's direction: its successors, whichever way the search reached it, so a
+    /// node is a hub or not whatever side of a bidirectional search meets it. The edges
+    /// are counted after the predicates are chosen and skipped and in the call's view,
+    /// with a self-loop followed both ways counted once, as the search lists them.
+    fn degree_above(&self, x: u64, limit: u64) -> Result<bool> {
+        if self.degree == DegreeCount::Zero {
+            return Ok(false);
+        }
+        let snap = &self.ctx.snap;
+        let key = |lane: &Lane, x: u64| -> Vec<u64> { lane.p.into_iter().chain([x]).collect() };
+        // an upper bound from the index: rows of every graph, skipped predicates and
+        // self-loops included
+        let mut upper = 0u64;
+        for s in &self.succ {
+            if s.lane.pattern {
+                let map = if s.lane.subject_side {
+                    &self.pattern.by_start
+                } else {
+                    &self.pattern.by_end
+                };
+                let ns = map.get(&x).map_or(&[][..], Vec::as_slice);
+                let n = ns.len() as u64;
+                upper += if s.skip_self && ns.binary_search(&x).is_ok() {
+                    n - 1
+                } else {
+                    n
+                };
+            } else {
+                upper += snap.count(s.lane.perm, &key(&s.lane, x))?;
+            }
+        }
+        if upper <= limit {
+            return Ok(false);
+        }
+        // a nested pattern's edges are counted exactly above
+        if self.succ.iter().all(|s| s.lane.pattern) {
+            return Ok(true);
+        }
+        if self.degree == DegreeCount::Index {
+            let excl = &self.spec.exclude;
+            let mut less = 0u64;
+            for s in &self.succ {
+                let lane = &s.lane;
+                if lane.p.is_none() {
+                    // the triples of a skipped predicate in this lane
+                    let by = if lane.subject_side {
+                        Perm::Pso
+                    } else {
+                        Perm::Pos
+                    };
+                    for &pe in excl {
+                        less += snap.count(by, &[pe, x])?;
+                    }
+                }
+                if s.skip_self {
+                    // a self-loop is listed by the first side only
+                    less += match lane.p {
+                        Some(p) => snap.count(Perm::Pso, &[p, x, x])?,
+                        None => {
+                            let mut loops = snap.count(Perm::Sop, &[x, x])?;
+                            for &pe in excl {
+                                loops = loops.saturating_sub(snap.count(Perm::Pso, &[pe, x, x])?);
+                            }
+                            loops
+                        }
+                    };
+                }
+            }
+            return Ok(upper.saturating_sub(less) > limit);
+        }
+        // read the edges until one more than the limit is found
+        let cap = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let mut out = Vec::new();
+        for s in &self.succ {
+            if s.lane.pattern {
+                self.pattern_lane(&s.lane, &[x], s.rev, s.skip_self, &mut out);
+            } else {
+                self.scan_lane(&s.lane, &[x], s.rev, s.skip_self, &mut out, cap)?;
+            }
+            if out.len() >= cap {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Start a new search: its visited count starts at zero.
@@ -1257,6 +1490,27 @@ impl<'a> Engine<'a> {
     /// (node, neighbour) pairs: its successors on a path when `succ`, else its
     /// predecessors.
     fn expand(&self, frontier: &[u64], succ: bool, out: &mut Vec<(u64, Step)>) -> Result<()> {
+        if self.spec.max_degree.is_none() {
+            return self.expand_all(frontier, succ, out);
+        }
+        // a hub is not expanded, unless it is a root of the search
+        let mut kept: Option<Vec<u64>> = None;
+        for (i, &x) in frontier.iter().enumerate() {
+            if self.blocked(x)? {
+                self.skipped_hubs.set(self.skipped_hubs.get() + 1);
+                kept.get_or_insert_with(|| frontier[..i].to_vec());
+            } else if let Some(k) = &mut kept {
+                k.push(x);
+            }
+        }
+        match kept {
+            None => self.expand_all(frontier, succ, out),
+            Some(k) => self.expand_all(&k, succ, out),
+        }
+    }
+
+    /// [`expand`](Self::expand) without the check of `path:maxDegree`.
+    fn expand_all(&self, frontier: &[u64], succ: bool, out: &mut Vec<(u64, Step)>) -> Result<()> {
         if frontier.is_empty() {
             return Ok(());
         }
@@ -1266,7 +1520,7 @@ impl<'a> Engine<'a> {
             if s.lane.pattern {
                 self.pattern_lane(&s.lane, frontier, s.rev, s.skip_self, out);
             } else {
-                self.scan_lane(&s.lane, frontier, s.rev, s.skip_self, out)?;
+                self.scan_lane(&s.lane, frontier, s.rev, s.skip_self, out, usize::MAX)?;
             }
         }
         self.ctx.check()
@@ -1295,6 +1549,9 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The edges of the nodes of `frontier` in one lane. `cap` stops a scan of one node
+    /// once `out` holds that many rows (the check of `path:maxDegree`).
+    #[allow(clippy::too_many_arguments)]
     fn scan_lane(
         &self,
         lane: &Lane,
@@ -1302,6 +1559,7 @@ impl<'a> Engine<'a> {
         rev: bool,
         skip_self: bool,
         out: &mut Vec<(u64, Step)>,
+        cap: usize,
     ) -> Result<()> {
         let snap = &self.ctx.snap;
         let (kc, nc, pc) = lane.cols();
@@ -1315,9 +1573,18 @@ impl<'a> Engine<'a> {
         let graph = &self.spec.graph;
         let dedup = self.dedup;
         let fixed_p = lane.p.unwrap_or(0);
+        // the skipped predicates, in the lanes of every predicate
+        let excl: &[u64] = if lane.p.is_none() {
+            &self.spec.exclude
+        } else {
+            &[]
+        };
         let mut last: Option<(u64, u64, u64)> = None;
         let mut emit = |x: u64, node: u64, p: u64, g: u64, out: &mut Vec<(u64, Step)>| {
             if !graph.accepts(g) || (skip_self && node == x) {
+                return;
+            }
+            if !excl.is_empty() && excl.binary_search(&p).is_ok() {
                 return;
             }
             if dedup && last == Some((x, node, p)) {
@@ -1347,7 +1614,7 @@ impl<'a> Engine<'a> {
                         }
                         Chunk::Row(k) => emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out),
                     }
-                    Ok(true)
+                    Ok(out.len() < cap)
                 })?;
             }
             return Ok(());
@@ -1396,11 +1663,17 @@ impl<'a> Engine<'a> {
 
     /// The neighbours of one node, cached for the call.
     fn neighbours(&self, x: u64, succ: bool) -> Result<Rc<[Step]>> {
+        // a hub has no neighbours for this search, but it may be another search's root,
+        // so the cache keeps the neighbours a root would have
+        if self.blocked(x)? {
+            self.skipped_hubs.set(self.skipped_hubs.get() + 1);
+            return Ok(Rc::from(Vec::new()));
+        }
         if let Some(n) = self.cache.borrow().get(&(x, succ)) {
             return Ok(n.clone());
         }
         let mut out = Vec::new();
-        self.expand(&[x], succ, &mut out)?;
+        self.expand_all(&[x], succ, &mut out)?;
         let steps: Rc<[Step]> = out.into_iter().map(|(_, s)| s).collect();
         self.charge
             .add(steps.len() as u64 * STEP_BYTES + NODE_BYTES)?;
@@ -1603,6 +1876,7 @@ impl<'a> Engine<'a> {
         max: Option<u32>,
     ) -> Result<Vec<Vec<Edge>>> {
         let cycle = tt == VIRT;
+        self.set_roots(&[s, if cycle { virt } else { tt }]);
         let mut f = Tree::new(s, true);
         let mut b = Tree::new(tt, false);
         let (mut ff, mut bf) = (vec![s], vec![tt]);
@@ -1623,7 +1897,17 @@ impl<'a> Engine<'a> {
                 bd += 1;
                 (&bf, &f)
             };
-            let meet: Vec<u64> = new.iter().copied().filter(|y| other.contains(*y)).collect();
+            let mut meet: Vec<u64> = new.iter().copied().filter(|y| other.contains(*y)).collect();
+            // a path may not pass through a hub, and neither side expanded one
+            if self.spec.max_degree.is_some() {
+                let mut kept = Vec::with_capacity(meet.len());
+                for m in meet {
+                    if m == s || m == tt || !self.blocked(m)? {
+                        kept.push(m);
+                    }
+                }
+                meet = kept;
+            }
             if meet.is_empty() {
                 continue;
             }
@@ -1664,6 +1948,7 @@ impl<'a> Engine<'a> {
         all: bool,
         close: bool,
     ) -> Result<Tree> {
+        self.set_roots(&[root]);
         let mut tree = Tree::new(root, forward);
         let mut frontier = vec![root];
         let mut depth = 0u32;
@@ -1705,6 +1990,7 @@ impl<'a> Engine<'a> {
         banned_edges: Option<&FxHashSet<Edge>>,
         virt: u64,
     ) -> Result<(Tree, FxHashMap<u64, f64>)> {
+        self.set_roots(&[if root == VIRT { virt } else { root }]);
         let mut tree = Tree::new(root, forward);
         let mut dist: FxHashMap<u64, f64> = FxHashMap::default();
         let mut settled: FxHashSet<u64> = FxHashSet::default();
@@ -1971,6 +2257,9 @@ impl<'a> Engine<'a> {
                 let mut d: FxHashMap<u64, u32> = ts.iter().map(|&t| (t, 0)).collect();
                 let mut frontier: Vec<u64> = ts.iter().copied().collect();
                 frontier.sort_unstable();
+                // the targets end paths and are expanded backward even when they are
+                // hubs; distances that are too small only weaken the pruning
+                self.set_roots(&frontier);
                 let mut level = 0;
                 while !frontier.is_empty() && level < max {
                     let mut found = Vec::new();
@@ -1990,6 +2279,7 @@ impl<'a> Engine<'a> {
                 Some(d)
             }
         };
+        self.set_roots(&[root]);
         let is_target = |y: u64| targets.is_none_or(|t| t.contains(&y));
         let mut on_path: FxHashSet<u64> = FxHashSet::default();
         on_path.insert(root);
@@ -2538,6 +2828,9 @@ pub fn run(
     counters.insert("paths".into(), (found.len() as u64).into());
     if eng.sweeps.get() > 0 {
         counters.insert("sweeps".into(), eng.sweeps.get().into());
+    }
+    if spec.max_degree.is_some() {
+        counters.insert("skippedHubs".into(), eng.skipped_hubs.get().into());
     }
     Ok((out, counters))
 }

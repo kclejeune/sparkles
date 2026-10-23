@@ -373,12 +373,14 @@ pub fn tools(cfg: &McpConfig) -> Vec<ToolDef> {
         read(
             "find_paths",
             "Find paths between nodes",
-            "Find the paths between nodes of a dataset's graph, as SERVICE path:search does: one shortest path (default), all shortest paths, the k shortest, or all paths up to maxLength, over the given predicates (default: every predicate) and direction. Give source and target for the paths between two nodes, or one of them for the paths to or from every node it connects to. Returns each path's ends, length, cost and edges as `s p o` lines. Runs under a timeout, a memory budget and a limit on the nodes visited.",
+            "Find the paths between nodes of a dataset's graph, as SERVICE path:search does: one shortest path (default), all shortest paths, the k shortest, or all paths up to maxLength, over the given predicates (default: every predicate but excludePredicates) and direction. maxDegree keeps paths from passing through hubs. Give source and target for the paths between two nodes, or one of them for the paths to or from every node it connects to. Returns each path's ends, length, cost and edges as `s p o` lines. Runs under a timeout, a memory budget and a limit on the nodes visited.",
             json!({"type":"object","additionalProperties":false,"properties":{
                 "dataset": ds(),
                 "source": {"type":"string","description":"The first node: an IRI or prefixed name"},
                 "target": {"type":"string","description":"The last node: an IRI or prefixed name"},
                 "predicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"The predicates whose triples are edges (default: all)"},
+                "excludePredicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"Predicates whose triples are not edges, such as rdf:type. Not with predicates"},
+                "maxDegree": {"type":"integer","minimum":1,"description":"Paths do not pass through a node with more edges than this in the search's direction. The source and target are exempt"},
                 "algorithm": {"enum":["shortest","allShortest","kShortest","all"],"default":"shortest"},
                 "direction": {"enum":["forward","backward","both"],"default":"forward","description":"Follow triples from subject to object, the other way, or both"},
                 "minLength": {"type":"integer","minimum":0,"description":"The fewest edges (default 1; the shortest modes take 0 or 1)"},

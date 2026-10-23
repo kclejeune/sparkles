@@ -20,6 +20,7 @@ mod io_profile;
 mod limits;
 mod oidc;
 mod overview;
+mod paths;
 mod proxy;
 mod refused;
 mod rename;

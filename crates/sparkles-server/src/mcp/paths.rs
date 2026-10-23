@@ -31,6 +31,8 @@ struct PathArgs {
     source: Option<String>,
     target: Option<String>,
     predicates: Option<Vec<String>>,
+    exclude_predicates: Option<Vec<String>>,
+    max_degree: Option<u64>,
     algorithm: Option<Algorithm>,
     direction: Option<Direction>,
     min_length: Option<u64>,
@@ -119,10 +121,16 @@ impl Tools<'_> {
             ));
         }
         let predicates = a.predicates.unwrap_or_default();
-        if predicates.len() > MAX_PREDICATES {
+        let excluded = a.exclude_predicates.unwrap_or_default();
+        if predicates.len() > MAX_PREDICATES || excluded.len() > MAX_PREDICATES {
             return Err(ToolError::bad_argument(format!(
                 "at most {MAX_PREDICATES} predicates"
             )));
+        }
+        if !predicates.is_empty() && !excluded.is_empty() {
+            return Err(ToolError::bad_argument(
+                "give predicates to follow or excludePredicates to skip, not both",
+            ));
         }
         let algorithm = a.algorithm.unwrap_or(Algorithm::Shortest);
         // the configuration block
@@ -136,6 +144,9 @@ impl Tools<'_> {
         for p in &predicates {
             param("predicate", &iri("predicates", p)?);
         }
+        for p in &excluded {
+            param("excludePredicate", &iri("excludePredicates", p)?);
+        }
         if let Some(d) = a.direction {
             param("direction", &format!("path:{}", d.name()));
         }
@@ -144,6 +155,7 @@ impl Tools<'_> {
             ("maxLength", a.max_length),
             ("k", a.k),
             ("maxVisited", a.max_visited),
+            ("maxDegree", a.max_degree),
         ] {
             if let Some(v) = v {
                 param(name, &v.to_string());
