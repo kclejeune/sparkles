@@ -822,6 +822,43 @@ struct Step {
     rev: bool,
 }
 
+/// Where [`Engine::scan_lane`] puts the edges it reads: a list of them, or a count for
+/// the check of `path:maxDegree`, which must not hold a hub's edges in memory.
+trait Sink {
+    /// Whether the scan checks the deadline and cancellation once per chunk, because it
+    /// does not return to a caller that checks them between nodes.
+    const CHECKS: bool;
+    fn put(&mut self, x: u64, step: Step);
+    fn len(&self) -> usize;
+}
+
+impl Sink for Vec<(u64, Step)> {
+    const CHECKS: bool = false;
+    #[inline]
+    fn put(&mut self, x: u64, step: Step) {
+        self.push((x, step));
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+}
+
+/// The number of edges a scan read.
+struct Count(usize);
+
+impl Sink for Count {
+    const CHECKS: bool = true;
+    #[inline]
+    fn put(&mut self, _: u64, _: Step) {
+        self.0 += 1;
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.0
+    }
+}
+
 /// An edge of a path, from `from` to `to` in path order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Edge {
@@ -1388,18 +1425,7 @@ impl<'a> Engine<'a> {
         let mut upper = 0u64;
         for s in &self.succ {
             if s.lane.pattern {
-                let map = if s.lane.subject_side {
-                    &self.pattern.by_start
-                } else {
-                    &self.pattern.by_end
-                };
-                let ns = map.get(&x).map_or(&[][..], Vec::as_slice);
-                let n = ns.len() as u64;
-                upper += if s.skip_self && ns.binary_search(&x).is_ok() {
-                    n - 1
-                } else {
-                    n
-                };
+                upper += self.pattern_degree(s, x);
             } else {
                 upper += snap.count(s.lane.perm, &key(&s.lane, x))?;
             }
@@ -1443,22 +1469,38 @@ impl<'a> Engine<'a> {
             }
             return Ok(upper.saturating_sub(less) > limit);
         }
-        // read the edges until one more than the limit is found
+        // count the edges until one more than the limit is found, without keeping them
         let cap = usize::try_from(limit)
             .unwrap_or(usize::MAX)
             .saturating_add(1);
-        let mut out = Vec::new();
+        let mut out = Count(0);
         for s in &self.succ {
             if s.lane.pattern {
-                self.pattern_lane(&s.lane, &[x], s.rev, s.skip_self, &mut out);
+                out.0 = out.0.saturating_add(self.pattern_degree(s, x) as usize);
             } else {
                 self.scan_lane(&s.lane, &[x], s.rev, s.skip_self, &mut out, cap)?;
             }
-            if out.len() >= cap {
+            if out.0 >= cap {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// The exact number of edges that leave `x` on a side of a nested pattern.
+    fn pattern_degree(&self, s: &Side, x: u64) -> u64 {
+        let map = if s.lane.subject_side {
+            &self.pattern.by_start
+        } else {
+            &self.pattern.by_end
+        };
+        let ns = map.get(&x).map_or(&[][..], Vec::as_slice);
+        let n = ns.len() as u64;
+        if s.skip_self && ns.binary_search(&x).is_ok() {
+            n - 1
+        } else {
+            n
+        }
     }
 
     /// Start a new search: its visited count starts at zero.
@@ -1584,13 +1626,13 @@ impl<'a> Engine<'a> {
     /// The edges of the nodes of `frontier` in one lane. `cap` stops a scan of one node
     /// once `out` holds that many rows (the check of `path:maxDegree`).
     #[allow(clippy::too_many_arguments)]
-    fn scan_lane(
+    fn scan_lane<O: Sink>(
         &self,
         lane: &Lane,
         frontier: &[u64],
         rev: bool,
         skip_self: bool,
-        out: &mut Vec<(u64, Step)>,
+        out: &mut O,
         cap: usize,
     ) -> Result<()> {
         let snap = &self.ctx.snap;
@@ -1612,7 +1654,7 @@ impl<'a> Engine<'a> {
             &[]
         };
         let mut last: Option<(u64, u64, u64)> = None;
-        let mut emit = |x: u64, node: u64, p: u64, g: u64, out: &mut Vec<(u64, Step)>| {
+        let mut emit = |x: u64, node: u64, p: u64, g: u64, out: &mut O| {
             if !graph.accepts(g) || (skip_self && node == x) {
                 return;
             }
@@ -1623,7 +1665,7 @@ impl<'a> Engine<'a> {
                 return;
             }
             last = Some((x, node, p));
-            out.push((x, Step { node, p, rev }));
+            out.put(x, Step { node, p, rev });
         };
         let rows = match lane.p {
             Some(p) => snap.estimate(lane.perm, &[p]),
@@ -1645,6 +1687,9 @@ impl<'a> Engine<'a> {
                             }
                         }
                         Chunk::Row(k) => emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out),
+                    }
+                    if O::CHECKS {
+                        self.ctx.check()?;
                     }
                     Ok(out.len() < cap)
                 })?;
