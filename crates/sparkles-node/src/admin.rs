@@ -252,6 +252,7 @@ fn writes(op: &str) -> bool {
             | "algo.projections.get"
             | "algo.queryText"
             | "algo.stats"
+            | "graph.groups"
             | "branches.list"
             | "branches.get"
             | "indexes.text.status"
@@ -395,6 +396,12 @@ impl NativeDataset {
         let flag = cancel.flag.clone();
         let _permit = if write {
             Some(permit(shared.writers.clone(), &v, &flag).await?)
+        } else {
+            None
+        };
+        // the overview runs a number of queries, so it waits for a reader's turn like one
+        let _reader = if op == "graph.groups" {
+            Some(query_permit(&v, &flag).await?)
         } else {
             None
         };
@@ -586,6 +593,10 @@ fn run_admin(
             a["author"].as_str().map(Into::into),
             ctl,
         )?)?,
+        "graph.groups" => {
+            let req = sparkles::overview::GroupsRequest::from_json(&a["request"])?;
+            ds.graph().groups(&req, &query_options(v, flag)?)?
+        }
         "queries.list" => value(ds.queries().list())?,
         "queries.get" => value(ds.queries().get(
             text(a, "name")?,

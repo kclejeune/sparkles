@@ -1059,6 +1059,18 @@ runs, before the timeout fired. The test now checks each limit on its own. The t
 check raises the budget out of reach with `max_rows`, and the budget check sets no
 timeout and expects the budget's message.
 
+### Graph overview
+
+`Dataset.graph.groups(within, *, by=None, limit=None, at=None, ...)` binds the library's
+`ds.graph().groups` from [U06](U06-large-graph-rendering.md#outcome). The arguments
+`within`, `by` and `limit` are the members of the HTTP request, and `at` takes a commit
+number or a `time:` or `snapshot:` point. The call also takes the query arguments that
+bear on the view and the budgets, which are `default_graph`, `named_graphs`,
+`include_inferred`, `timeout`, `max_rows`, `max_memory_bytes`, `max_rows_produced`,
+`cancel`, `base_iri` and `prefixes`. It returns the answer as a dict. The queries run
+without the GIL and share one deadline made from `timeout`, and a malformed request
+raises `InvalidInputError`.
+
 ### Roadmap follow-ups (2026-10-12)
 
 * **Plan cache** ([ROADMAP](../ROADMAP.md) item 32). The plan cache sketched in the

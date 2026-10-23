@@ -1485,6 +1485,18 @@ What remains behind N3.js has these causes.
   and back, which a profile of cycles does not show. Queries are already far ahead of
   both other engines, so the round left them alone.
 
+### Graph overview
+
+`ds.graph.groups(request, options?)` binds the library's `ds.graph().groups` from
+[U06](U06-large-graph-rendering.md#outcome). The request is the HTTP request as an
+object, with `at` also taking a number, a bigint or a `Date`. The options are those of a
+query that bear on the view and the budgets, such as `defaultGraph`, `namedGraphs`,
+`includeInferred`, `timeout`, `maxRows`, `maxMemoryBytes`, `maxRowsProduced` and
+`signal`. The answer is an object whose `commit` is a bigint, like the other commit
+numbers of the administration calls. The call reads, so it does not wait for the
+writer queue, but it takes a permit of `maxConcurrentQueries` like a query does and holds
+it while its queries run.
+
 ### Roadmap follow-ups (2026-10-12)
 
 * **Reusable plans** ([ROADMAP](../ROADMAP.md) item 32). [X10](X10-reusable-query-plans.md)

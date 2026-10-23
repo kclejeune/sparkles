@@ -1398,6 +1398,11 @@ impl PyDataset {
     }
 
     #[getter]
+    fn graph(slf: Py<Self>) -> crate::overview::PyGraphOverview {
+        crate::overview::PyGraphOverview { owner: slf }
+    }
+
+    #[getter]
     fn queries(slf: Py<Self>) -> crate::queries::PyStoredQueries {
         crate::queries::PyStoredQueries { owner: slf }
     }

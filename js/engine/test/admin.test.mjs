@@ -26,7 +26,15 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { QueryEngine } from '@comunica/query-sparql-rdfjs';
-import { Dataset, Catalog, Repository, factory, ConflictError } from '../dist/index.js';
+import {
+  Dataset,
+  Catalog,
+  Repository,
+  factory,
+  ConflictError,
+  InvalidInputError,
+  QueryTimeoutError,
+} from '../dist/index.js';
 const temp = () => mkdtemp(join(tmpdir(), 'sparkles-node-admin-'));
 for (const mode of ['compute-cancel', 'compute-timeout', 'slot-cancel', 'slot-timeout']) {
   test(
@@ -317,6 +325,119 @@ test('graph algorithms and named projections', async (t) => {
   assert.equal(report.triples, 5);
   assert.equal(await ds.algorithms.projections.delete('p'), true);
   assert.equal((await ds.algorithms.projections.list()).length, 0);
+});
+test('graph overview groups a class and opens a group', async (t) => {
+  const ex = 'http://ex.org/';
+  const ds = t.resource(Dataset.memory());
+  await ds.update(`PREFIX ex: <${ex}>
+    INSERT DATA {
+      ex:a a ex:Person ; ex:livesIn ex:p1 ; ex:knows ex:b .
+      ex:b a ex:Person ; ex:livesIn ex:p1 ; ex:knows ex:c .
+      ex:c a ex:Person ; ex:livesIn ex:p2 .
+      ex:d a ex:Person ; ex:livesIn ex:p2 .
+      ex:p1 a ex:Place .
+      ex:p2 a ex:Place
+    }`);
+  const edges = (answer, source) =>
+    answer.edges
+      .filter((e) => e.source === source)
+      .map((e) => [e.predicate.slice(ex.length), e.target, e.count])
+      .sort((a, b) => (a[0] + a[1] < b[0] + b[1] ? -1 : 1));
+
+  const answer = await ds.graph.groups({ within: { class: ex + 'Person' }, limit: 3 });
+  assert.equal(answer.commit, 1n);
+  assert.deepEqual(answer.within, { class: ex + 'Person', size: 4 });
+  assert.deepEqual(answer.grouping, { kind: 'values', predicate: ex + 'livesIn' });
+  assert.equal(answer.communities, false);
+  assert.equal(answer.truncated, false);
+  assert.equal(answer.members, undefined);
+  assert.deepEqual(
+    answer.groups.map((g) => [g.label, g.size, g.top.map((m) => m.iri)]),
+    [
+      [ex + 'p1', 2, [ex + 'a', ex + 'b']],
+      [ex + 'p2', 2, [ex + 'c', ex + 'd']],
+    ],
+  );
+  const [first, second] = answer.groups.map((g) => 'g:' + g.id);
+  assert.deepEqual(edges(answer, first), [
+    ['knows', first, 1],
+    ['knows', second, 1],
+    ['livesIn', 'c:' + ex + 'Place', 2],
+  ]);
+  assert.deepEqual(edges(answer, second), [['livesIn', 'c:' + ex + 'Place', 2]]);
+  assert.equal(answer.edges.length, 4);
+
+  const members = await ds.graph.groups({ within: { group: answer.groups[0].id }, limit: 3 });
+  assert.equal(members.within.group, answer.groups[0].id);
+  assert.equal(members.within.size, 2);
+  assert.deepEqual(members.grouping, { kind: 'members', predicate: null });
+  assert.deepEqual(members.groups, []);
+  assert.deepEqual(members.members, [
+    { iri: ex + 'a', class: ex + 'Person' },
+    { iri: ex + 'b', class: ex + 'Person' },
+  ]);
+  assert.deepEqual(edges(members, 'm:' + ex + 'a'), [
+    ['knows', 'm:' + ex + 'b', 1],
+    ['livesIn', 'c:' + ex + 'Place', 1],
+  ]);
+
+  const places = await ds.graph.groups({ within: { class: ex + 'Place' } });
+  assert.deepEqual(
+    places.members.map((m) => m.iri),
+    [ex + 'p1', ex + 'p2'],
+  );
+  const byProperty = await ds.graph.groups({
+    within: { class: ex + 'Person' },
+    by: { property: ex + 'livesIn', buckets: 4 },
+  });
+  assert.deepEqual(byProperty, answer);
+
+  // the point in history and the view
+  await ds.snapshots.create('before');
+  await ds.update(`INSERT DATA {<${ex}p3> a <${ex}Place>}`);
+  assert.equal((await ds.graph.groups({ within: { class: ex + 'Place' } })).within.size, 3);
+  const past = { within: { class: ex + 'Place' }, at: 'snapshot:before' };
+  assert.equal((await ds.graph.groups(past)).within.size, 2);
+  assert.deepEqual(await ds.graph.groups({ ...past, at: 1 }), await ds.graph.groups(past));
+  const empty = await ds.graph.groups(
+    { within: { class: ex + 'Place' } },
+    { defaultGraph: [ex + 'none'] },
+  );
+  assert.equal(empty.within.size, 0);
+
+  // errors and cancellation
+  await assert.rejects(ds.graph.groups({ within: { class: 'not an iri' } }), InvalidInputError);
+  await assert.rejects(ds.graph.groups({ within: { class: ex + 'Person' }, limit: 0 }));
+  await assert.rejects(ds.graph.groups({ within: { class: ex + 'Person' }, by: 'nope' }));
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    ds.graph.groups({ within: { class: ex + 'Person' } }, { signal: controller.signal }),
+  );
+});
+test('the timeout of graph overview covers all of its queries', async (t) => {
+  const ex = 'http://ex.org/';
+  const ds = t.resource(Dataset.memory());
+  // the answer takes many queries, each of which is shorter than the timeout
+  const rows = Array.from(
+    { length: 200000 },
+    (_, i) =>
+      `<${ex}s${i}> a <${ex}T> ; <${ex}region> <${ex}r${i % 12}> ; <${ex}knows> <${ex}s${(i * 7) % 200000}> .`,
+  ).join('\n');
+  await ds.load(rows, { format: 'ttl' });
+  const request = { within: { class: ex + 'T' }, by: { property: ex + 'region' } };
+  const timed = async () => {
+    const start = performance.now();
+    const answer = await ds.graph.groups(request, { noCache: true });
+    assert.equal(answer.groups.length, 12);
+    return performance.now() - start;
+  };
+  const whole = Math.min(await timed(), await timed());
+  assert.ok(whole > 40, `the answer took ${whole} ms, too fast to bound`);
+  await assert.rejects(
+    ds.graph.groups(request, { noCache: true, timeout: Math.floor(whole / 2) }),
+    QueryTimeoutError,
+  );
 });
 test('replacement is atomic and callback snapshot capture is rejected', async (t) => {
   const ds = t.resource(Dataset.memory());

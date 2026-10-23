@@ -515,6 +515,13 @@ export class Dataset extends Queryable {
         this.query(await admin.queryText(request, false), options),
     };
   }
+  /**
+   * The graph overview: `groups` groups the instances of a class, or of a group from an
+   * earlier answer, and counts the edges between the groups.
+   */
+  get graph() {
+    return this.administration.graph;
+  }
   get branches() {
     return this.administration.branches;
   }
