@@ -1,13 +1,13 @@
 # C22: Community summaries for global questions (GraphRAG)
 
-> **Status:** Phase 1 implemented, Phase 2 partly implemented; the paid acceptance runs wait for approval
+> **Status:** Phase 1 implemented, Phases 2 and 3 partly implemented; the paid acceptance runs wait for approval
 >
 > **Phases:** Phase 1 is implemented. Phase 1 is the community build from F14's Leiden, the
 > summaries written by the server's model providers with citations to facts, their
 > storage as triples with provenance and review status, the build task and the settings.
 > Phase 2 adds global questions in Ask, community context in `recall` and the brief, and
 > the MCP tool, and is partly implemented. Phase 3 refreshes communities and summaries
-> incrementally after commits.
+> incrementally after commits, and its refresh from the change feed is implemented.
 >
 > **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime)
 > cover configuring the role, and [Community reports](../USAGE.md#community-reports-graphrag)
@@ -883,6 +883,29 @@ conservative reservations before every HTTP attempt, and findings carry entity n
 that are checked exactly, with a labelled heuristic for the prose. §6 now holds the
 design of the disclosure footprint and the common read guard. Reports stay unpublished
 until that guard has passed review.
+
+Phase 3 is partly implemented. With `refresh.mode: "auto"`, a loop on the server looks
+at each dataset once a second and follows the debounce of §5. A due dataset reads the
+change feed from the commit of its last build or refresh with the principal's view and
+counts the changed facts of each stored community, the facts being those a report is
+written from. A refresh task starts when a community's count reaches
+`minChangedFraction` of its facts, when an edge joins an entity outside every stored
+community to a member, or when the feed cannot list the changes because a commit is too
+large, the history is gone or the view depends on the data. Tests with stub providers
+cover the debounce, the counting and A4 under automatic refresh.
+
+These Phase 3 choices refine §5. The refresh that the loop starts is the manual refresh
+of Phase 1, so it compares the digests of every report, re-runs Leiden every time rather
+than above 5% of the edges, and rewrites exactly the reports whose facts changed enough.
+A commit the feed lists with counts only therefore starts that refresh rather than a
+full rebuild, because the digests find the changed communities without rewriting the
+rest. The count starts at the last build or refresh, so changes that stay below the
+fraction in every window add up only when some refresh runs, because a kept report's
+baseline stays until it is rewritten. An edge between two entities that no community
+holds starts no refresh, since such entities form at most a community too small for a
+report. The task needs no confirmation and runs within `tokensPerDay`, the loop never
+starts a first build or works on a branch, and a run that left pending communities is
+retried once a day. Counting from an F13 view waits for roadmap item 17.
 
 ### Shared memory representation follow-up
 
