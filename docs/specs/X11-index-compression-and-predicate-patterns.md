@@ -502,8 +502,8 @@ triple-protection differential suite includes the shapes.
   subject's triples and needs no table.
 * §7.1's `features` list in `IndexMeta` is not added, since patterns alone keep version 2.
   Phase 2 adds it with the first feature that needs version 3.
-* Open question 1 stays open. `COUNT(*)` per predicate over `?s ?p ?o` counts triples and
-  reads the permutations.
+* Open question 1 stays open as a follow-up under [ROADMAP](../ROADMAP.md) item 16.
+  `COUNT(*)` per predicate over `?s ?p ?o` counts triples and reads the permutations.
 
 ### Measurements
 
