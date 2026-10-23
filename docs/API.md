@@ -9285,11 +9285,15 @@ reifier, at?, invalidatedAt?}], conflicts: [{s, p, values: [{o, citation}]}],
 truncated, prefixes}`.
 
 With `communities: true`, `recall` adds the [GraphRAG](#graphrag) report of each seed's
-community at `communityLevel` after the facts. The text form adds a `# communities
-level=N` line and, for each report, a `##` line with its IRI, quoted title, community,
-member count, status and seed numbers, followed by a `summary` line with the quoted
-summary. The JSON form adds `communities: {level, reports: [{iri, community, title,
-summary, status, memberCount, seeds}]}`. When GraphRAG is off or the caller may not read
+community after the facts. Without `communityLevel`, each seed takes the finest community
+that holds it, because a build folds small communities into their parents and a seed can
+lack a community at the finer levels. With `communityLevel`, only that level is read. The
+text form adds a `# communities level=N` or `# communities level=finest` line and, for
+each report, a `##` line with its IRI, quoted title, community, level, member count,
+status and seed numbers, followed by a `summary` line with the quoted summary. A recall
+whose seeds have no report says `# communities none`. The JSON form adds `communities:
+{level, reports: [{iri, community, level, title, summary, status, memberCount, seeds}]}`,
+where the outer `level` is null without `communityLevel`. When GraphRAG is off or the caller may not read
 the reports, the text says `# communities unavailable=off` or `unavailable=access` and the
 JSON says `communities: {unavailable, reports: []}`.
 
@@ -9942,7 +9946,8 @@ When the dataset has [GraphRAG](#graphrag) reports that the caller may read, the
 scope also holds the five best rated reports of the coarsest level, reviewed ones only
 unless `includeUnreviewed` is set. They follow the header as a `# communities level=N`
 line, a `##` line per report with its IRI, quoted title, member count and status, and a
-`summary` line with the quoted summary, and the answer lists them in `communities`.
+`summary` line with the quoted summary, and the answer lists them in `communities`. The
+reports count toward `maxChars`, so a brief drops the lowest rated reports that do not fit.
 
 ### Ingest profiles
 
@@ -10484,10 +10489,14 @@ answered with a query, and the draft of any other question also returns a `scope
 query. The server reads up to 100 reports at the finest level that has at most 100,
 through `community_reports` as the caller, ranked by a search for the question when the
 dataset has a full-text or embedding index and by rating otherwise. The `summarize` role
-reads the reports in batches that fill its context window, at most four at a time, and
-returns scored points that name the reports and findings they use. The points above 0,
-best first, go to the `summarize` role again, which writes the answer with `[n]` markers.
-A marker that names no point is dropped. A global answer makes at most four model
+reads the reports in batches that fill its context window after the pair's output
+limit, at most four at a time, and a report too long for one batch is split between
+batches with its finding labels kept. Each batch returns scored points that name the
+reports and findings they use, and a point that names no valid finding is dropped. A
+batch whose call fails moves the role to its next pair and runs again there. The points
+above 0, best first, go to the `summarize` role again, which writes the answer with
+`[n]` markers. A marker that names no point is dropped, and the ask stops before the
+retries and before that last call when the question's token budget is spent. A global answer makes at most four model
 answers plus one per batch. When the reports are off, missing, not readable by the
 caller, or more than half stale, or when the ask reads another branch or an earlier
 state, the ask answers with a query and says why in `notes`. A caller whose access the
@@ -10497,7 +10506,8 @@ only while the caller may read their graph.
 
 A local question's grounding also holds the titles and summaries of the communities of
 up to three entities that the question names, read with `recall` and its
-`communities` argument.
+`communities` argument. Report text is data, so this context is added only when every
+`draft` and `repair` pair may receive rows under `send` and `sendByProvider`.
 
 **Escalation.** Each role has an ordered list of pairs, cheapest first. A step moves to
 the next pair of its role on a signal the server has verified. The signals are

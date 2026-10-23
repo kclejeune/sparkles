@@ -268,7 +268,8 @@ impl Tools<'_> {
                 Err(e) => return Err(e),
             }
         }
-        if let Some(pred) = self.first_embedding(ds) {
+        // every index that may embed report text, each its own ranked list
+        for pred in report_embeddings(ds) {
             match self.vector_hits(r, &pred, q, &graphs) {
                 Ok(h) => lists.push(rank_terms(h.into_iter())),
                 Err(e) if unavailable(&e) => {}
@@ -294,4 +295,28 @@ impl Tools<'_> {
         out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(out)
     }
+}
+
+/// The predicates of the vector indexes that embed query text and may hold report text:
+/// an index over `gr:summary`, `gr:text` or `rdfs:label`, one with no predicate list, or
+/// one fed by its own query (round 1, finding 8).
+fn report_embeddings(ds: &crate::state::Dataset) -> Vec<NamedNode> {
+    let wanted = [
+        crate::graphrag::guard::gr("summary"),
+        crate::graphrag::guard::gr("text"),
+        crate::graphrag::store::RDFS_LABEL.to_string(),
+    ];
+    let mut list = ds.dataset.indexes().vector().list();
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list.into_iter()
+        .filter(|s| {
+            s.embedding.as_ref().is_some_and(|e| {
+                e.config.query_text
+                    && (e.config.query.is_some()
+                        || e.config.predicates.is_empty()
+                        || e.config.predicates.iter().any(|p| wanted.contains(p)))
+            })
+        })
+        .map(|s| super::iri(&s.predicate))
+        .collect()
 }

@@ -106,7 +106,7 @@ struct RecallArgs {
 /// The community reports a recall adds after its facts (C22 §2.5).
 #[derive(Default)]
 struct Communities {
-    /// the level read
+    /// the level asked for, or `None` for each seed's finest community
     level: Option<u32>,
     /// each report with the seed numbers its community holds
     reports: Vec<(crate::graphrag::read::ReportRef, Vec<usize>)>,
@@ -643,7 +643,7 @@ impl Tools<'_> {
         Ok(out)
     }
 
-    /// The report of each seed's community at `level` (the finest by default), read
+    /// The report of each seed's community at `level`, or of its finest community, read
     /// through the caller's view, which the disclosure guard restricts.
     fn seed_communities(
         &self,
@@ -677,23 +677,13 @@ impl Tools<'_> {
             })
             .collect();
         seeds.sort();
-        let level = match level {
-            Some(l) => Some(l),
-            None => read::level_counts(&r.snap, &opts, &graph, read::Filter::default())?
-                .keys()
-                .next_back()
-                .copied(),
-        };
-        let Some(level) = level else {
-            return Ok(Communities::default());
-        };
         let members: Vec<String> = seeds.iter().map(|(_, s)| s.clone()).collect();
         let found = read::reports_of_members(
             &r.snap,
             &opts,
             &graph,
             &members,
-            Some(level),
+            level,
             read::Filter::default(),
         )?;
         let mut reports: Vec<(read::ReportRef, Vec<usize>)> = Vec::new();
@@ -705,7 +695,7 @@ impl Tools<'_> {
             }
         }
         Ok(Communities {
-            level: Some(level),
+            level,
             reports,
             unavailable: None,
         })
@@ -1560,18 +1550,23 @@ impl Doc<'_> {
             }
         }
         if let Some(c) = self.communities {
-            match (c.unavailable, c.level) {
-                (Some(why), _) => body.push_str(&format!("# communities unavailable={why}\n")),
-                (None, Some(l)) => {
-                    body.push_str(&format!("# communities level={l}\n"));
+            match c.unavailable {
+                Some(why) => body.push_str(&format!("# communities unavailable={why}\n")),
+                None if c.reports.is_empty() => body.push_str("# communities none\n"),
+                None => {
+                    match c.level {
+                        Some(l) => body.push_str(&format!("# communities level={l}\n")),
+                        None => body.push_str("# communities level=finest\n"),
+                    }
                     for (r, seeds) in &c.reports {
                         let lit = |s: &str| Term::Literal(Literal::new_simple_literal(s));
                         let seeds: Vec<String> = seeds.iter().map(usize::to_string).collect();
                         body.push_str(&format!(
-                            "## {} {} community={} members={} status={} seeds={}\n",
+                            "## {} {} community={} level={} members={} status={} seeds={}\n",
                             terms.iri(&r.iri),
                             terms.term(&lit(&r.title)),
                             terms.iri(&r.community),
+                            r.level,
                             r.member_count,
                             r.status.as_str(),
                             seeds.join(",")
@@ -1579,7 +1574,6 @@ impl Doc<'_> {
                         body.push_str(&format!("summary {}\n", terms.term(&lit(&r.summary))));
                     }
                 }
-                (None, None) => body.push_str("# communities none\n"),
             }
         }
         let shown_facts: usize = shown.iter().map(|(_, f)| f.len()).sum();
@@ -1737,6 +1731,7 @@ impl Doc<'_> {
                     "reports": c.reports.iter().map(|(r, seeds)| json!({
                         "iri": terms.iri(&r.iri),
                         "community": terms.iri(&r.community),
+                        "level": r.level,
                         "title": r.title,
                         "summary": r.summary,
                         "status": r.status.as_str(),

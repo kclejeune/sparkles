@@ -175,6 +175,9 @@ pub struct AskOptions {
     pub mode: AskMode,
     /// use only reviewed community reports (`reviewedOnly`, C22 A7)
     pub reviewed_only: bool,
+    /// the draft and repair pairs may receive rows, so their grounding may hold the
+    /// communities of the linked entities (C22 §7.3)
+    pub report_context: bool,
 }
 
 impl Default for AskOptions {
@@ -205,6 +208,7 @@ impl Default for AskOptions {
             grant: None,
             mode: AskMode::Auto,
             reviewed_only: false,
+            report_context: false,
         }
     }
 }
@@ -869,6 +873,7 @@ impl Asking<'_, '_> {
             .take(MAX_COMMUNITIES)
             .collect();
         if !linked.is_empty()
+            && self.o.report_context
             && let Ok(v) = self.tool(
                 "recall",
                 json!({ "seeds": linked, "hops": 0, "maxTriples": 1, "communities": true, "format": "json" }),

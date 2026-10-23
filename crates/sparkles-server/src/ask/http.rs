@@ -184,6 +184,12 @@ async fn ask_route(
         }
     };
     let lists = assistant::lists(&models, &settings);
+    let report_context = assistant::rows_allowed(
+        &settings,
+        &lists,
+        &[],
+        &[crate::models::Role::Draft, crate::models::Role::Repair],
+    );
     if let Some(k) = draft_start
         && k >= lists.get(&crate::models::Role::Draft).map_or(0, Vec::len)
     {
@@ -264,6 +270,7 @@ async fn ask_route(
         grant: crate::server_memory::current_grant(),
         mode: b.mode,
         reviewed_only: b.reviewed_only,
+        report_context,
     };
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
     let finish = {

@@ -417,26 +417,52 @@ impl Tools<'_> {
             .as_ref()
             .map_or(String::new(), super::pending::brief_lines);
         // C22 §2.5: the project scope adds the coarsest level's reports
-        let communities = if scope == "project" {
+        let mut communities = if scope == "project" {
             self.brief_reports(&ds, &r, !include_unreviewed)
                 .map_err(eng)?
         } else {
             Vec::new()
         };
-        if !communities.is_empty() {
+        let mut community_lines = |list: &[crate::graphrag::read::ReportRef]| {
+            let mut out = String::new();
+            let Some(first) = list.first() else {
+                return out;
+            };
             let lit = |s: &str| Term::Literal(Literal::new_simple_literal(s));
-            review_lines.push_str(&format!("# communities level={}\n", communities[0].level));
-            for c in &communities {
-                review_lines.push_str(&format!(
+            out.push_str(&format!("# communities level={}\n", first.level));
+            for c in list {
+                out.push_str(&format!(
                     "## {} {} members={} status={}\n",
                     terms.iri(&c.iri),
                     terms.term(&lit(&c.title)),
                     c.member_count,
                     c.status.as_str()
                 ));
-                review_lines.push_str(&format!("summary {}\n", terms.term(&lit(&c.summary))));
+                out.push_str(&format!("summary {}\n", terms.term(&lit(&c.summary))));
             }
+            out
+        };
+        // the reports count toward maxChars: the lowest rated go first until the header
+        // without facts fits (round 1, finding 7)
+        let fixed = {
+            let mut sc = String::new();
+            escape_into(&mut sc, &label);
+            FIRST_LINE.chars().count()
+                + 1
+                + format!(
+                    "# dataset={} commit={commit} scope={sc} {status_word} facts={matched} shown=0\n",
+                    ds.name
+                )
+                .chars()
+                .count()
+                + review_lines.chars().count()
+        };
+        while !communities.is_empty()
+            && fixed + community_lines(&communities).chars().count() > max_chars
+        {
+            communities.pop();
         }
+        review_lines.push_str(&community_lines(&communities));
         // as many facts as fit
         let header = |shown: usize| {
             let mut h = String::from(FIRST_LINE);

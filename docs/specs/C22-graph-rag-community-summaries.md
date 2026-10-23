@@ -849,16 +849,19 @@ points to an answer with point markers, and keeps only markers that resolve thro
 point to findings. The response and the stream carry `points` and `reports`, and the
 history keeps the report identities and lists them only while their graph is proven for
 the reader. `recall` takes `communities` and `communityLevel`, the project brief adds the
-five best rated reports of the coarsest level, and a local question's grounding names
-the communities of up to three entities it links exactly. The query page shows a global
+five best rated reports of the coarsest level within `maxChars`, and a local question's
+grounding names the communities of up to three entities it links exactly when every
+draft and repair pair may receive rows. The query page shows a global
 answer with its points and reports, and **Answer from the data** and **Answer from
 summaries** switch the mode. Tests with stub providers cover A5, A6, A7 and A9 and the
 guard on every new read path.
 
 These Phase 2 choices refine the text above. `maxStale` is fixed at half of the selected
 reports, and `maxReports` at 100, rather than settings, until the evaluation sets them.
-`community_reports` ranks by the dataset's full-text and embedding indexes when they
-cover the reports graph and by rating otherwise. A global answer reads main at its head,
+`community_reports` ranks by the dataset's full-text index and by every embedding index
+that may hold report text when they cover the reports graph, and by rating otherwise.
+Without `communityLevel`, `recall` gives each seed its finest community that has a
+report. A global answer reads main at its head,
 so an ask with `at` or another branch answers locally. The context of §7.3 is on, and the
 evaluation decides whether it stays on. Several configurations per dataset and the
 evaluation of §9 remain.

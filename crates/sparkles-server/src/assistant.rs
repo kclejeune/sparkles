@@ -258,6 +258,27 @@ pub fn lists(models: &Models, s: &AssistantSettings) -> crate::ask::RoleLists {
     l
 }
 
+#[cfg(feature = "mcp")]
+/// Whether every pair of `roles` may receive rows, taking a role's forced pairs in place of
+/// its list. Report prose is data, so only such pairs see it (C22 §6, §7.3).
+pub fn rows_allowed(
+    s: &AssistantSettings,
+    lists: &crate::ask::RoleLists,
+    forced: &[(Role, crate::models::Pair)],
+    roles: &[Role],
+) -> bool {
+    let ok = |p: &crate::models::Pair| s.send_to(&p.provider) >= Send::Rows;
+    roles.iter().all(|r| {
+        let mut own = forced.iter().filter(|(f, _)| f == r).peekable();
+        if own.peek().is_some() {
+            // a forced pair is the role's whole list
+            own.all(|(_, p)| ok(p))
+        } else {
+            lists.get(r).is_none_or(|l| l.iter().all(ok))
+        }
+    })
+}
+
 /// Whether the dataset answers `POST /{ds}/ask`, and why not.
 pub fn ask_status(st: &AppState, s: &AssistantSettings) -> Result<(), &'static str> {
     if !cfg!(feature = "mcp") {

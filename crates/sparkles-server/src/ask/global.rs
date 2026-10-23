@@ -99,24 +99,42 @@ pub fn reduce_schema() -> OutputSchema {
     }
 }
 
-/// A report as the map step sees it, numbered from 1 in the selection.
-fn report_block(n: usize, r: &Value) -> String {
-    let mut t = format!(
-        "R{n} {}\nSummary: {}\n",
-        r["title"].as_str().unwrap_or(""),
-        r["summary"].as_str().unwrap_or("")
-    );
+/// A report as the map step sees it, numbered from 1 in the selection: its title,
+/// summary and numbered findings, in parts that each fit `budget` tokens. A later part
+/// repeats the title, so every finding keeps its label `F{n}.{i}`, and a line longer than
+/// the budget is cut.
+pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<String> {
+    let max_chars = (budget * CHARS_PER_TOKEN).max(64) as usize;
+    let title = r["title"].as_str().unwrap_or("");
+    let mut lines = vec![format!("Summary: {}", r["summary"].as_str().unwrap_or(""))];
     for (i, f) in r["findings"].as_array().into_iter().flatten().enumerate() {
-        t.push_str(&format!(
-            "F{n}.{} {}\n",
+        lines.push(format!(
+            "F{n}.{} {}",
             i + 1,
             f["text"].as_str().unwrap_or("")
         ));
     }
-    t
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = format!("R{n} {title}\n");
+    let mut has_line = false;
+    for l in lines {
+        let head = format!("R{n} {title} (continued)\n");
+        let l = prompts::cut(
+            &l,
+            max_chars.saturating_sub(head.chars().count() + 1).max(32),
+        );
+        if has_line && cur.chars().count() + l.chars().count() + 1 > max_chars {
+            out.push(std::mem::replace(&mut cur, head));
+        }
+        cur.push_str(&l);
+        cur.push('\n');
+        has_line = true;
+    }
+    out.push(cur);
+    out
 }
 
-/// The reports in batches whose text fits `budget` tokens, each at least one report.
+/// The blocks in batches whose text fits `budget` tokens, each at least one block.
 pub fn batches(blocks: &[String], budget: u64) -> Vec<Vec<usize>> {
     let mut out: Vec<Vec<usize>> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
@@ -148,7 +166,8 @@ pub struct Point {
 }
 
 /// The points of one map answer for the reports `batch`, keeping only labels of that
-/// batch. A point that names no label of the batch is dropped.
+/// batch. A point keeps only findings that exist, and a point without one is dropped,
+/// since its citation would not resolve to facts (§7.2 step 4).
 pub fn points_of(v: &Value, batch: &[usize], reports: &[Value]) -> Vec<Point> {
     let mut out = Vec::new();
     for p in v["points"].as_array().into_iter().flatten() {
@@ -197,7 +216,7 @@ pub fn points_of(v: &Value, batch: &[usize], reports: &[Value]) -> Vec<Point> {
                 }
             }
         }
-        if rs.is_empty() {
+        if fs.is_empty() {
             continue;
         }
         out.push(Point {
@@ -210,7 +229,8 @@ pub fn points_of(v: &Value, batch: &[usize], reports: &[Value]) -> Vec<Point> {
     out
 }
 
-/// The sentences of `t` that carry no `[n]` marker.
+/// The sentences of `t` that carry no `[n]` marker. A marker right after a sentence's
+/// stop belongs to that sentence.
 pub fn uncited_sentences(t: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -222,18 +242,27 @@ pub fn uncited_sentences(t: &str) -> Vec<String> {
         cur.clear();
     };
     let chars: Vec<char> = t.chars().collect();
-    for (i, c) in chars.iter().enumerate() {
-        cur.push(*c);
-        let end =
-            matches!(c, '.' | '!' | '?') && chars.get(i + 1).is_none_or(|n| n.is_whitespace());
-        // a marker right after the stop belongs to the sentence
-        if end
-            && !chars[i + 1..]
-                .iter()
-                .skip_while(|n| n.is_whitespace())
-                .take(1)
-                .any(|n| *n == '[')
-        {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        cur.push(c);
+        i += 1;
+        if matches!(c, '.' | '!' | '?') && chars.get(i).is_none_or(|n| n.is_whitespace()) {
+            // take the markers that follow the stop
+            loop {
+                let mut j = i;
+                while chars.get(j).is_some_and(|n| n.is_whitespace()) {
+                    j += 1;
+                }
+                if chars.get(j) != Some(&'[') {
+                    break;
+                }
+                let Some(k) = chars[j..].iter().position(|n| *n == ']') else {
+                    break;
+                };
+                cur.extend(&chars[i..j + k + 1]);
+                i = j + k + 1;
+            }
             flush(&mut cur, &mut out);
         }
     }
@@ -344,19 +373,32 @@ impl Asking<'_, '_> {
                 "no provider and model answers the summarize role",
             );
         };
-        let context = self
-            .models
-            .resolved(&pair)
-            .map_or(crate::models::DEFAULT_CONTEXT_TOKENS, |r| r.context_tokens);
-        let budget = context
-            .saturating_sub(OUTPUT_TOKENS + FRAME_TOKENS)
-            .max(512);
-        let blocks: Vec<String> = reports
-            .iter()
-            .enumerate()
-            .map(|(i, r)| report_block(i + 1, r))
-            .collect();
+        // the input a call leaves room for, after the output limit it asks for
+        let (context, output) = self.models.resolved(&pair).map_or(
+            (crate::models::DEFAULT_CONTEXT_TOKENS, OUTPUT_TOKENS),
+            |r| (r.context_tokens, u64::from(r.max_output_tokens)),
+        );
+        let output = pair.max_output_tokens.map_or(output, u64::from);
+        let budget = context.saturating_sub(output + FRAME_TOKENS).max(256);
+        // each report in parts that fit, with the report each part belongs to
+        let mut blocks: Vec<String> = Vec::new();
+        let mut owner: Vec<usize> = Vec::new();
+        for (i, r) in reports.iter().enumerate() {
+            for b in report_blocks(i + 1, r, budget) {
+                blocks.push(b);
+                owner.push(i);
+            }
+        }
         let groups = batches(&blocks, budget);
+        // the reports of each batch
+        let batch_reports: Vec<Vec<usize>> = groups
+            .iter()
+            .map(|g| {
+                let mut v: Vec<usize> = g.iter().map(|b| owner[*b]).collect();
+                v.dedup();
+                v
+            })
+            .collect();
         // §7.2: 4 + ceil(reports / batch) answers, beside the draft that classified
         let limit = 4 + groups.len();
         let question = self.o.question.clone();
@@ -388,6 +430,13 @@ impl Asking<'_, '_> {
                     format!("the ask used its {} tokens", self.o.max_tokens),
                 );
             }
+            // the pair may have moved on after a failure
+            let Some(pair) = self.pair(Role::Summarize) else {
+                return self.error(
+                    "no-model",
+                    "no provider and model answers the summarize role",
+                );
+            };
             let deadline = self.deadline;
             let models = self.models;
             let results: Vec<_> = std::thread::scope(|s| {
@@ -414,6 +463,8 @@ impl Asking<'_, '_> {
                     .collect();
                 hs.into_iter().filter_map(|h| h.join().ok()).collect()
             });
+            let mut chunk_failed = false;
+            let mut last = String::new();
             for (gi, r) in results {
                 match r {
                     Ok(a) => {
@@ -422,21 +473,36 @@ impl Asking<'_, '_> {
                     }
                     Err(f) => {
                         self.push_step(Role::Summarize, *f.record);
-                        if let crate::models::StepError::Budget(_) = f.error {
-                            return self.error("budget-exceeded", f.error.message());
+                        match f.error {
+                            crate::models::StepError::Budget(_) => {
+                                return self.error("budget-exceeded", f.error.message());
+                            }
+                            crate::models::StepError::Deadline => {
+                                return self.error("timeout", f.error.message());
+                            }
+                            _ => {}
                         }
                         self.failed_calls += 1;
+                        last = f.error.message();
+                        chunk_failed = true;
                         failed.push(gi);
                     }
                 }
             }
+            // §5.5: failures count against the ask, and move the role to its next pair
+            if chunk_failed
+                && (self.failed_calls >= super::MAX_FAILED_CALLS
+                    || !self.escalate(Role::Summarize, "provider-failure"))
+            {
+                return self.error("provider-unavailable", last);
+            }
         }
-        // a failed batch runs once more through the role's list, which may move on
+        // a failed batch runs again on the pair the role moved to
         for gi in failed {
-            if self.failed_calls > super::MAX_FAILED_CALLS {
+            if self.tokens() >= self.o.max_tokens {
                 return self.error(
-                    "provider-unavailable",
-                    "the summarize role failed too often for a global answer",
+                    "budget-exceeded",
+                    format!("the ask used its {} tokens", self.o.max_tokens),
                 );
             }
             match self.call(Role::Summarize, MAP_SYSTEM, &prompt(&groups[gi]), &schema) {
@@ -446,7 +512,7 @@ impl Asking<'_, '_> {
         }
         for (gi, a) in answers.iter().enumerate() {
             if let Some(v) = a {
-                points.extend(points_of(v, &groups[gi], &reports));
+                points.extend(points_of(v, &batch_reports[gi], &reports));
             }
         }
         // reduce: points above 0, best first, as many as fit
@@ -461,6 +527,12 @@ impl Asking<'_, '_> {
             }
             used += t;
             kept.push(p);
+        }
+        if self.tokens() >= self.o.max_tokens {
+            return self.error(
+                "budget-exceeded",
+                format!("the ask used its {} tokens", self.o.max_tokens),
+            );
         }
         let ok_answers = self.steps.iter().filter(|s| s.outcome == "ok").count();
         if ok_answers >= limit {
@@ -632,7 +704,49 @@ mod tests {
     }
 
     #[test]
+    fn a_point_needs_a_finding_that_exists() {
+        let reports = vec![json!({ "findings": [{ "iri": "r1#f1" }] })];
+        let v = json!({ "points": [
+            { "text": "A", "score": 80, "reports": ["R1"], "findings": ["F1.999"] },
+            { "text": "B", "score": 80, "reports": ["R1"], "findings": [] },
+        ] });
+        assert!(points_of(&v, &[0], &reports).is_empty());
+    }
+
+    #[test]
+    fn a_long_report_is_split_and_keeps_its_labels() {
+        let findings: Vec<Value> = (0..12)
+            .map(|i| json!({ "text": format!("finding {i} {}", "x".repeat(400)) }))
+            .collect();
+        let r = json!({ "title": "T", "summary": "S", "findings": findings });
+        let parts = report_blocks(3, &r, 300);
+        assert!(parts.len() > 1, "{}", parts.len());
+        for p in &parts {
+            assert!(
+                p.chars().count() as u64 <= 300 * CHARS_PER_TOKEN,
+                "{}",
+                p.len()
+            );
+            assert!(p.starts_with("R3 T"));
+        }
+        let all = parts.join("");
+        for i in 1..=12 {
+            assert!(all.contains(&format!("F3.{i} ")), "F3.{i}");
+        }
+        // a short report stays whole
+        let short = json!({ "title": "T", "summary": "S", "findings": [{ "text": "f" }] });
+        assert_eq!(
+            report_blocks(1, &short, 300),
+            vec!["R1 T\nSummary: S\nF1.1 f\n".to_string()]
+        );
+    }
+
+    #[test]
     fn uncited_sentences_are_found() {
+        assert_eq!(
+            uncited_sentences("Supported. [1] Unsupported."),
+            vec!["Unsupported.".to_string()]
+        );
         assert_eq!(
             uncited_sentences("Payments lead [1]. Nobody knows why. Platform runs builds. [2]"),
             vec!["Nobody knows why.".to_string()]

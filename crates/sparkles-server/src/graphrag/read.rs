@@ -265,7 +265,10 @@ pub fn with_findings(
 }
 
 /// The report of the community at `level` that holds each of `members`, for members
-/// that one holds. A member of no community at that level has no entry.
+/// that one holds. Without a level, each member takes the finest community that holds it
+/// and has a report passing `filter`, because a build folds small communities into their
+/// parents and a member can lack a community at the finer levels. A member with no
+/// such community has no entry.
 pub fn reports_of_members(
     snap: &Arc<Snapshot>,
     opts: &QueryOptions,
@@ -282,33 +285,31 @@ pub fn reports_of_members(
     if names.is_empty() {
         return Ok(Vec::new());
     }
-    // the finest level when none is given
-    let level = match level {
-        Some(l) => l,
-        None => match level_counts(snap, opts, graph, filter)?.keys().next_back() {
-            Some(l) => *l,
-            None => return Ok(Vec::new()),
-        },
+    let at = match level {
+        Some(l) => format!("FILTER(?l = {l})"),
+        None => String::new(),
     };
     let q = format!(
-        "SELECT ?m ?r WHERE {{ VALUES ?m {{ {} }} GRAPH <{graph}> {{ ?c <{member}> ?m ; <{lv}> {level} ; <{report}> ?r }} }}",
+        "SELECT ?m ?r ?l WHERE {{ VALUES ?m {{ {} }} GRAPH <{graph}> {{ ?c <{member}> ?m ; <{lv}> ?l ; <{report}> ?r }} {at} }}",
         names.join(" "),
         member = gr("member"),
         lv = gr("level"),
         report = gr("report"),
     );
-    let pairs: Vec<(String, String)> = rows(snap, opts, &q)?
+    let mut pairs: Vec<(String, String, u64)> = rows(snap, opts, &q)?
         .into_iter()
-        .filter_map(|r| Some((iri(&r[0])?, iri(&r[1])?)))
+        .filter_map(|r| Some((iri(&r[0])?, iri(&r[1])?, int(&r[2])?)))
         .collect();
-    let mut wanted: Vec<String> = pairs.iter().map(|(_, r)| r.clone()).collect();
+    // the finest first, so each member keeps the finest report that passes the filter
+    pairs.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    let mut wanted: Vec<String> = pairs.iter().map(|(_, r, _)| r.clone()).collect();
     wanted.sort();
     wanted.dedup();
     let found = reports_named(snap, opts, graph, &wanted, filter)?;
     let by: HashMap<&str, &ReportRef> = found.iter().map(|r| (r.iri.as_str(), r)).collect();
     let mut out = Vec::new();
     for m in members {
-        for (pm, r) in &pairs {
+        for (pm, r, _) in &pairs {
             if pm == m
                 && let Some(rep) = by.get(r.as_str())
             {

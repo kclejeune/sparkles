@@ -158,6 +158,12 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
         bail!("assistant.json: {e}");
     }
     let lists = crate::assistant::lists(&models, &settings);
+    let report_context = crate::assistant::rows_allowed(
+        &settings,
+        &lists,
+        &pairs,
+        &[crate::models::Role::Draft, crate::models::Role::Repair],
+    );
     let routing = settings.routing.clone().unwrap_or_default();
     let model_routing = models.config.routing.clone().unwrap_or_default();
     let timeout = Duration::from_secs_f64(args.timeout);
@@ -213,6 +219,7 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
         draft_start: args.try_harder.map(|i| i + 1),
         mode: args.mode,
         reviewed_only: args.reviewed_only,
+        report_context,
         complexity_threshold: routing
             .complexity_threshold
             .or(model_routing.complexity_threshold)
