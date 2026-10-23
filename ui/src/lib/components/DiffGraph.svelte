@@ -258,6 +258,9 @@
     }
   }
 
+  /** Members of a class read from each state at a time. */
+  const MEMBER_PAGE = 500;
+
   /** The changed members of a class of the grouped picture, 500 changes at a time. */
   async function openMembers(cls: string, offset = 0) {
     ctl?.abort();
@@ -271,14 +274,16 @@
       const ends = [groups?.from.commit.seq, groups?.to.commit.seq].map((n) =>
         n != null ? `commit:${n}` : undefined,
       );
-      const query = `SELECT DISTINCT ?s WHERE { ?s a <${cls}> } ORDER BY ?s LIMIT 1000 OFFSET ${offset}`;
+      // a page of each state, so their union fits the diff's 1,000 terms and paging both
+      // states by a page skips no member of either
+      const query = `SELECT DISTINCT ?s WHERE { ?s a <${cls}> } ORDER BY ?s LIMIT ${MEMBER_PAGE} OFFSET ${offset}`;
       const reads = await Promise.all(
         ends.map((at) => api.select(ds, query, { ...(at ? { at } : {}), signal })),
       );
-      const full = reads.some((rows) => rows.length === 1000);
+      const full = reads.some((rows) => rows.length === MEMBER_PAGE);
       const terms = [
         ...new Set(reads.flat().flatMap((r) => (r.s?.type === 'uri' ? [r.s.value] : []))),
-      ].slice(0, 1000);
+      ];
       const d = terms.length
         ? await api.diff(ds, {
             from: fromSel || undefined,
@@ -824,7 +829,7 @@
       {#if members.more}
         <button
           class="btn sm ghost"
-          onclick={() => members && openMembers(members.cls, members.offset + 1000)}
+          onclick={() => members && openMembers(members.cls, members.offset + MEMBER_PAGE)}
           >Next members</button
         >
       {/if}

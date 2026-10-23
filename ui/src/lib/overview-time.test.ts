@@ -127,6 +127,10 @@ describe('a comparison that removes a class entirely', () => {
       [`c:${EX}Person`, 0],
     ]);
     expect(g.edges.map((e) => [e.key, e.count])).toEqual([[`c:${EX}Person\u0001c:${EX}Org`, 0]]);
+    // a class that still has instances but is filtered out is not a removed one
+    const hidden = withRemoved(at, c, undefined, new Set([`${EX}Person`]));
+    expect(hidden.nodes.map((n) => n.key)).toEqual([`c:${EX}Org`]);
+    expect(hidden.edges).toEqual([]);
     // nothing removed entirely: nothing added
     expect(withRemoved(at, overviewChanges(grouped([])))).toEqual({
       nodes: at.nodes,

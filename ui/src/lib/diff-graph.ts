@@ -242,6 +242,13 @@ export function withContext(
 ): Canvas {
   const nodes = new Map(c.nodes);
   const edges = new Map(c.edges);
+  // a change keeps its graph in its id, and context is read without graphs: a changed
+  // triple is not drawn again as context
+  const changed = new Set(
+    [...c.edges.values()].map((e) =>
+      e.graph ? e.id.slice(0, e.id.length - e.graph.length - 1) : e.id,
+    ),
+  );
   for (const [, list] of context) {
     let n = 0;
     for (const { s, p, o } of list) {
@@ -254,7 +261,7 @@ export function withContext(
         graph: null,
       };
       const ids = quadIds(q);
-      if (edges.has(ids.edge)) continue;
+      if (edges.has(ids.edge) || changed.has(ids.edge)) continue;
       const fresh = [ids.sid, ids.oid].filter((id) => !nodes.has(id)).length;
       if (nodes.size + fresh > maxNodes) break;
       if (!nodes.has(ids.sid))
@@ -544,11 +551,15 @@ export function groupKeyOf(g: DiffGroup): string {
   return `${g.subjectClass}|${g.predicate}|${JSON.stringify(g.object)}`;
 }
 
-/** A group a grouped time-lapse has drawn: its net change since the start. */
+/**
+ * A group a grouped time-lapse has drawn, with the triples of it the time-lapse has seen
+ * added and not removed since. It never goes below nothing, so removing triples that were
+ * there before the start does not cancel later additions.
+ */
 export type LiveGroup = { group: DiffGroup; net: number; lastRemoved: number };
 
 /**
- * One step of a grouped time-lapse. Each group keeps its net change since the start. A
+ * One step of a grouped time-lapse. Each group keeps its live count (`LiveGroup`). A
  * group the step changed carries the step's counts, so it is marked as the canvas marks a
  * step, one with a positive net change stays unmarked, and one that fell to nothing or below
  * goes after its step unless `keepGhosts`, then stays as a ghost. At most `max` groups are
@@ -567,13 +578,14 @@ export function lapseGroupsStep(
     const prev = next.get(k);
     next.set(k, {
       group: x,
-      net: (prev?.net ?? 0) + x.added - x.removed,
+      net: Math.max(0, (prev?.net ?? 0) + x.added - x.removed),
       lastRemoved: x.removed || (prev?.lastRemoved ?? 0),
     });
     changed.set(k, x);
   }
   const groups: DiffGroup[] = [];
   for (const [k, v] of next) {
+    // a group at nothing goes after its step unless ghosts are kept
     const c = changed.get(k);
     if (c) groups.push(c);
     else if (v.net > 0) groups.push({ ...v.group, added: 0, removed: 0 });

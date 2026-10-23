@@ -102,6 +102,10 @@
   let drawnAt = '';
   let timeCtl: AbortController | undefined;
 
+  /** The classes the profiles have instances of, drawn or filtered out. */
+  const presentClasses = $derived(
+    new Set((profiles ?? []).filter((p) => p.instances > 0).map((p) => p.class)),
+  );
   const profileBase = $derived.by(() =>
     profiles ? classLevel(profiles, { builtins, label }) : { nodes: [], edges: [], hidden: 0 },
   );
@@ -109,7 +113,10 @@
     if (lapsed) return { ...lapsed, hidden: profileBase.hidden };
     // a comparison also draws the classes and edges it removed entirely, with their marks
     if (ovCompare && marks)
-      return { ...withRemoved(profileBase, marks, label), hidden: profileBase.hidden };
+      return {
+        ...withRemoved(profileBase, marks, label, presentClasses),
+        hidden: profileBase.hidden,
+      };
     return profileBase;
   });
   const picture: OvGraph = $derived(visible(base, path, label));
@@ -438,7 +445,8 @@
         timeNote = errorText(e);
       }
     } finally {
-      timeBusy = false;
+      // a read that a newer one superseded leaves the busy state to it
+      if (timeCtl?.signal === signal) timeBusy = false;
     }
   }
 
@@ -448,7 +456,8 @@
    * of the state it reached are read, so what stays on screen is exact.
    */
   $effect(() => {
-    if (playing || !lapsed || !timeOpen || timeBusy) return;
+    // not while a read runs, nor when the slider has moved on and a read will follow
+    if (playing || !lapsed || !timeOpen || timeBusy || ovAt !== drawnAt) return;
     untrack(() => {
       timeCtl?.abort();
       timeCtl = new AbortController();

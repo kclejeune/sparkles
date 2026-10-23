@@ -706,13 +706,19 @@
         if (q.op === '+' ? !nodes[sid] && !nodes[oid] : !edges[edge]) continue;
         candidates.set(edge, [s, { type: 'uri', value: p }, o]);
       }
+      // a blank node or a quoted triple cannot be checked by value: read the graph instead
+      if (
+        [...candidates.values()].some((t) =>
+          t.some((x) => x.type !== 'uri' && x.type !== 'literal'),
+        )
+      ) {
+        graphReading = false;
+        await rereadGraph();
+        return;
+      }
+      // the state the diff resolved to, which a write after it does not move
       const holds = candidates.size
-        ? await ex.presentEdges(
-            name,
-            [...candidates.values()],
-            toAt === 'head' ? undefined : toAt,
-            signal,
-          )
+        ? await ex.presentEdges(name, [...candidates.values()], `commit:${d.to.commit.seq}`, signal)
         : new Set<string>();
       if (!owns()) return;
       const addedNodes = new Set<string>();

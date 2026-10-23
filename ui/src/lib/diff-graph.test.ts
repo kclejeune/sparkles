@@ -302,6 +302,15 @@ describe('the sizes of steps', () => {
 });
 
 describe('changes between graphs', () => {
+  it('does not draw a changed triple of a named graph again as context', () => {
+    const t = { ...q('+', 'alice', 'knows', 'bob'), graph: `<${EX}g1>` };
+    const { canvas } = diffCanvas([t]);
+    const s: Term = { type: 'uri', value: `${EX}alice` };
+    const o: Term = { type: 'uri', value: `${EX}bob` };
+    const c = withContext(canvas, new Map([[`${EX}alice`, [{ s, p: `${EX}knows`, o }]]]));
+    expect(c.edges.size).toBe(1);
+  });
+
   it('draws a move between graphs as a removal and an addition', () => {
     const t = q('+', 'alice', 'knows', 'bob');
     const { canvas } = diffCanvas([
@@ -343,6 +352,11 @@ describe('a grouped time-lapse', () => {
     k = lapseGroupsStep(k.live, [], true);
     expect(k.groups).toEqual([works(0, 5)]);
     expect(groupKeyOf(works(1, 0))).toBe(groupKeyOf(works(0, 9)));
+    // removing triples from before the start does not cancel later additions
+    let r = lapseGroupsStep(new Map(), [works(0, 600)], false);
+    r = lapseGroupsStep(r.live, [works(600, 0)], false);
+    r = lapseGroupsStep(r.live, [], false);
+    expect(r.groups).toEqual([works(0, 0)]);
   });
 
   it('keeps at most `max` groups, ghosts first out', () => {

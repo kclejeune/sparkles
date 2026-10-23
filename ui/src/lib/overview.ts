@@ -355,17 +355,21 @@ export function applyOverviewChanges(
 /**
  * The class level of a comparison with what it removed entirely: a class whose last
  * instances the range removed and an edge whose last triples it removed are added with no
- * size, so that their `−` marks are drawn and listed.
+ * size, so that their `−` marks are drawn and listed. `present` holds the classes that still
+ * have instances, drawn or not, so that a class the filters or the cap leave out is not
+ * taken for a removed one.
  */
 export function withRemoved(
   g: OvGraph,
   c: OvChanges,
   label: (iri: string) => string = (i) => i,
+  present: ReadonlySet<string> = new Set(),
 ): OvGraph {
   const nodes = [...g.nodes];
   const have = new Set(nodes.map((n) => n.key));
+  const hidden = (key: string) => !have.has(key) && present.has(key.slice(2));
   const gone = (key: string) => {
-    if (have.has(key)) return;
+    if (have.has(key) || hidden(key)) return;
     have.add(key);
     const cls = key.slice(2);
     nodes.push({ key, kind: 'class', label: label(cls), size: 0, cls, iri: cls, openable: false });
@@ -376,6 +380,7 @@ export function withRemoved(
   for (const [key, d] of c.edges) {
     if (known.has(key) || d.removed === 0) continue;
     const [source, target] = key.split('\u0001');
+    if (hidden(source) || hidden(target)) continue;
     gone(source);
     gone(target);
     edges.push({
