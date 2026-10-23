@@ -1020,20 +1020,22 @@ async fn list_asks(
         };
         list.reverse();
         list.truncate(limit);
-        // C22 §6.6: the reports of a global answer only while their graph is proven
-        let snap = ds.store.snapshot();
-        let opts = {
-            let mut o = ds.dataset.query_options();
+        // C22 §6.6: the reports of a global answer only while their graph is proven.
+        // Only the mcp feature answers globally.
+        #[cfg(feature = "mcp")]
+        {
+            let snap = ds.store.snapshot();
+            #[cfg_attr(not(feature = "auth"), allow(unused_mut))]
+            let mut opts = ds.dataset.query_options();
             #[cfg(feature = "auth")]
-            crate::auth::restrict(&mut o, &p, &ds.name, crate::auth::Endpoint::Query);
-            o
-        };
-        for r in &mut list {
-            if let Some(g) = &r.reports_graph
-                && !crate::graphrag::read::readable(&snap, &opts, g)
-            {
-                r.reports.clear();
-                r.reports_graph = None;
+            crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
+            for r in &mut list {
+                if let Some(g) = &r.reports_graph
+                    && !crate::graphrag::read::readable(&snap, &opts, g)
+                {
+                    r.reports.clear();
+                    r.reports_graph = None;
+                }
             }
         }
         Ok(Json(

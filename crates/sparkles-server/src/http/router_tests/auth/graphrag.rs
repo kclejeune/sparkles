@@ -583,6 +583,7 @@ async fn restricted_writers_cannot_review() {
 
 /// A community and its report in the reports graph, linked to the build's footprint,
 /// with GraphRAG enabled for the dataset (C22 Phase 2).
+#[cfg(feature = "mcp")]
 async fn with_community(s: &AuthServer) {
     let fp = footprint_iri(s).await;
     let ds = s.state.datasets().get("rag").cloned().unwrap();
@@ -619,6 +620,7 @@ async fn with_community(s: &AuthServer) {
 }
 
 /// `user`'s principal as a request has it, with the server's disclosure guard.
+#[cfg(feature = "mcp")]
 fn guarded(s: &AuthServer, user: &str) -> crate::auth::Principal {
     s.auth()
         .user_principal(user)
@@ -627,6 +629,7 @@ fn guarded(s: &AuthServer, user: &str) -> crate::auth::Principal {
 }
 
 /// A tool call as `user`.
+#[cfg(feature = "mcp")]
 fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
     let call = crate::mcp::Call {
         arrived: std::time::Instant::now(),
@@ -652,6 +655,7 @@ fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> s
 
 /// `community_reports` and the communities of `recall` and the brief read through the
 /// guard: a caller it does not prove learns only that the reports are unavailable.
+#[cfg(feature = "mcp")]
 #[tokio::test]
 async fn report_consumers_follow_coverage() {
     let s = server();
@@ -695,6 +699,7 @@ async fn report_consumers_follow_coverage() {
 
 /// A5: a caller the guard does not prove gets a local answer and a note that the
 /// summaries are unavailable to it, even when it asks for a global answer.
+#[cfg(feature = "mcp")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a5_unproven_callers_answer_locally() {
     use crate::models::mock::{self, MockModel};
