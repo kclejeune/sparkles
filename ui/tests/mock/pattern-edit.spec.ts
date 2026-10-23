@@ -79,7 +79,8 @@ test.beforeEach(async ({ page }) => {
 
 test('A11: a query is built from an empty editor with the keyboard alone', async ({ page }) => {
   await page.goto('/ui/query');
-  await expect(editor(page)).toContainText('SELECT');
+  // the first load of the dev server can be slow
+  await expect(editor(page)).toContainText('SELECT', { timeout: 30_000 });
   await setText(page, '');
   await expect.poll(() => textOf(page)).toBe('');
   await page.keyboard.press('Alt+P');
@@ -322,7 +323,8 @@ test.describe('at 390 px', () => {
 
   test('A12: a query is built with taps alone, and nothing scrolls sideways', async ({ page }) => {
     await page.goto('/ui/query');
-    await expect(editor(page)).toContainText('SELECT');
+    // the first load of the dev server can be slow
+    await expect(editor(page)).toContainText('SELECT', { timeout: 30_000 });
     await setText(page, '');
     await expect.poll(() => textOf(page)).toBe('');
     await page.getByRole('button', { name: 'Pattern', exact: true }).tap();

@@ -656,10 +656,11 @@ edges is placed beside the drawing rather than where fcose's gravity would put i
 the view fits when a new node lands outside it. Cytoscape now measures its container
 again when the container's box changes, because a bar or form opening above the canvas
 moved it and taps landed beside their nodes. The warning mark of §4.2 rule 4 is a red
-border and a subtitle on the block, which the screen reader's description of the block
-includes. **Count matches** sends the query of §2.2 with the prologue and the `FROM` clauses
+border and a subtitle on the block or the locked filter's chip, which the screen
+reader's description and the list include. **Count matches** sends the query of §2.2 with the prologue and the `FROM` clauses
 of the text, joins a trailing `VALUES` inside the counted group so it restricts the
-solutions before they are counted, and names the count `?n`, or `?n1` and so on when the
+solutions before they are counted, with the closing brace on its own line in case the
+`VALUES` ends in a comment, and names the count `?n`, or `?n1` and so on when the
 query uses `?n`. It sends `timeout=5` and the page's **At** state, and a `408`
 shows "More than the count could finish". A count belongs to the text and the state it
 ran on, and clears when either changes. Profiles are kept per schema source, so a new

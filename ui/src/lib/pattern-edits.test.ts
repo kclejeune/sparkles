@@ -6,6 +6,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   applyChanges,
+  describe as describeEl,
   drawing,
   EditError,
   lockedOf,
@@ -327,7 +328,7 @@ SELECT * WHERE {
       'SELECT ?s ?v { ?s <http://p> ?o } VALUES ?v { 1 }\n',
     );
     expect(countQuery(q, ok(q))).toBe(
-      'SELECT (COUNT(*) AS ?n)\nWHERE { { ?s <http://p> ?o }\n  VALUES ?v { 1 } }',
+      'SELECT (COUNT(*) AS ?n)\nWHERE { { ?s <http://p> ?o }\n  VALUES ?v { 1 }\n}',
     );
   });
 
@@ -371,7 +372,7 @@ SELECT * WHERE {
   it('counts with a trailing VALUES inside the counted group, under a free alias', () => {
     const q = 'SELECT * {} VALUES ?n { 0 }\n';
     const c = countQuery(q, ok(q));
-    expect(c).toBe('SELECT (COUNT(*) AS ?n1)\nWHERE { {}\n  VALUES ?n { 0 } }');
+    expect(c).toBe('SELECT (COUNT(*) AS ?n1)\nWHERE { {}\n  VALUES ?n { 0 }\n}');
     expect(parse(c, true).ok).toBe(true);
   });
 
@@ -384,6 +385,30 @@ SELECT * WHERE {
   it('names the variables of a filter outside its EXISTS patterns', () => {
     expect(outerFilterVars('FILTER(?a + ?b > 1 && EXISTS { ?c ?p ?d })')).toEqual(['a', 'b']);
     expect(outerFilterVars('FILTER NOT EXISTS { ?x <http://q> ?z }')).toEqual([]);
+  });
+
+  // ------------------------------------------------ review round 3 of Phase 2 ------
+
+  it('counts a trailing VALUES that ends in a comment', () => {
+    const q = 'SELECT * {} VALUES ?x { 1 } # comment\n';
+    expect(parse(countQuery(q, ok(q)), true).ok).toBe(true);
+  });
+
+  it('finds EXISTS patterns past comments and literals', () => {
+    expect(outerFilterVars('FILTER(EXISTS # c\n { ?x <http://p> ?z })')).toEqual([]);
+    expect(outerFilterVars('FILTER(EXISTS { ?x <http://p> "{" } && ?unbound > 1)')).toEqual([
+      'unbound',
+    ]);
+  });
+
+  it('describes a warned locked filter with its warning', () => {
+    const q = 'SELECT * {\n  ?s <http://p> ?o .\n  FILTER(?x + ?o > 1 || ?s = ?x)\n}\n';
+    const d = drawing(ok(q));
+    const chip = d.nodes.find((n) => n.kind === 'chip')!;
+    const warned = { ...chip, warn: true, subtitle: ['uses ?x, which nothing binds now'] };
+    expect(describeEl({ node: warned }, d)).toBe(
+      'locked filter: FILTER(?x + ?o > 1 || ?s = ?x), uses ?x, which nothing binds now',
+    );
   });
 
   it('A5: seeded sequences of every kind agree with the parse (R3) and keep locked text', () => {

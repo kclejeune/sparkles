@@ -592,7 +592,7 @@ export function describe(el: { node: PNode } | { edge: PEdge }, d: Drawing): str
     case 'locked':
       return `locked ${n.locked!.kind}: ${first(n.locked!.text)}${n.warn ? `, ${n.subtitle.at(-1)}` : ''}`;
     case 'chip':
-      return `locked filter: ${first(n.title)}`;
+      return `locked filter: ${first(n.title)}${n.warn ? `, ${n.subtitle.at(-1)}` : ''}`;
     case 'var':
       return `variable ${n.label}${n.subtitle.length ? `, ${n.subtitle.join(', ')}` : ''}${tail}`;
     case 'literal':

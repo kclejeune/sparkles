@@ -127,11 +127,17 @@ const VARCHAR = /[\p{L}\p{N}_\u00B7\u0300-\u036F\u203F-\u2040]/u;
 const IRIREF = /^<[^<>"{}|^`\\\s]*>/;
 
 /**
- * The variable tokens of a text, with their ranges: `?x` and `$x` outside string
- * literals, IRIs and comments, so that `"?x"` or `# ?x` is not a variable.
+ * The variable tokens of a text, with their ranges, and the text with its comments,
+ * string literals and IRIs blanked out to spaces of the same length, so a search for
+ * keywords or braces in the mask sees SPARQL tokens only. A variable is `?x` or `$x`
+ * outside those, so `"?x"` or `# ?x` is not one.
  */
-export function varTokens(text: string): { name: string; from: number; to: number }[] {
-  const out: { name: string; from: number; to: number }[] = [];
+function scan(text: string): { vars: { name: string; from: number; to: number }[]; mask: string } {
+  const vars: { name: string; from: number; to: number }[] = [];
+  const mask = text.split('');
+  const blank = (a: number, b: number) => {
+    for (let k = a; k < Math.min(b, text.length); k++) if (mask[k] !== '\n') mask[k] = ' ';
+  };
   let i = 0;
   // one code point at a time, so a letter beyond the BMP is part of a name, with the
   // offsets in UTF-16 units as the editor's are
@@ -140,10 +146,14 @@ export function varTokens(text: string): { name: string; from: number; to: numbe
     const c = text[i];
     if (c === '\\') {
       // an escape in a prefixed name, such as `ex:a\#b`, is not a comment
+      blank(i, i + 2);
       i += 2;
     } else if (c === '#') {
+      const a = i;
       while (i < text.length && text[i] !== '\n') i++;
+      blank(a, i);
     } else if (c === '"' || c === "'") {
+      const a = i;
       const long = text.startsWith(c.repeat(3), i);
       const close = long ? c.repeat(3) : c;
       i += close.length;
@@ -153,37 +163,46 @@ export function varTokens(text: string): { name: string; from: number; to: numbe
         i++;
       }
       i += close.length;
+      blank(a, i);
     } else if (c === '<') {
       const m = IRIREF.exec(text.slice(i, i + 4096));
+      if (m) blank(i, i + m[0].length);
       i += m ? m[0].length : 1;
     } else if ((c === '?' || c === '$') && i + 1 < text.length && VARCHAR.test(at(i + 1))) {
       let j = i + 1;
       while (j < text.length && VARCHAR.test(at(j))) j += at(j).length;
-      out.push({ name: text.slice(i + 1, j), from: i, to: j });
+      vars.push({ name: text.slice(i + 1, j), from: i, to: j });
       i = j;
     } else i++;
   }
-  return out;
+  return { vars, mask: mask.join('') };
+}
+
+/** The variable tokens of a text, with their ranges (see `scan`). */
+export function varTokens(text: string): { name: string; from: number; to: number }[] {
+  return scan(text).vars;
 }
 
 /**
  * The variables of a filter's text outside its `EXISTS` and `NOT EXISTS` patterns: those it
- * reads from the solutions, where a variable inside such a pattern may be its own.
+ * reads from the solutions, where a variable inside such a pattern may be its own. The
+ * keyword and the braces are found among SPARQL tokens, past comments and literals.
  */
 export function outerFilterVars(text: string): string[] {
+  const { vars, mask } = scan(text);
   const inner: [number, number][] = [];
   const re = /\bEXISTS\s*\{/giu;
-  for (let m = re.exec(text); m; m = re.exec(text)) {
+  for (let m = re.exec(mask); m; m = re.exec(mask)) {
     let depth = 1;
     let j = m.index + m[0].length;
-    for (; j < text.length && depth > 0; j++)
-      if (text[j] === '{') depth++;
-      else if (text[j] === '}') depth--;
+    for (; j < mask.length && depth > 0; j++)
+      if (mask[j] === '{') depth++;
+      else if (mask[j] === '}') depth--;
     inner.push([m.index, j]);
     re.lastIndex = j;
   }
   const out: string[] = [];
-  for (const t of varTokens(text))
+  for (const t of vars)
     if (!inner.some(([a, b]) => t.from >= a && t.from < b) && !out.includes(t.name))
       out.push(t.name);
   return out;
@@ -901,7 +920,8 @@ export function countQuery(text: string, p: PatternOk): string {
   // a trailing VALUES restricts the solutions, so it joins inside the counted group,
   // before the aggregate
   const values = p.modifiers.filter((m) => m.kind === 'VALUES').map((m) => `\n  ${m.text}`);
-  const where = values.length ? `{ ${group}${values.join('')} }` : group;
+  // the brace on a line of its own, since a VALUES may end in a comment
+  const where = values.length ? `{ ${group}${values.join('')}\n}` : group;
   return `${prologue}${prologue && !prologue.endsWith('\n') ? '\n' : ''}SELECT (COUNT(*) AS ?${countAlias(text)})\n${from}WHERE ${where}`;
 }
 
