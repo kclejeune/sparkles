@@ -43,7 +43,10 @@
   import TermView from '$components/TermView.svelte';
   import TimeSlider from '$components/TimeSlider.svelte';
   import MemoryTab from '$components/MemoryTab.svelte';
-  import OverviewView from '$components/OverviewView.svelte';
+  import OverviewView, { type OverviewCommunity } from '$components/OverviewView.svelte';
+  import CommunityReport from '$components/CommunityReport.svelte';
+  import * as gr from '$lib/graphrag';
+  import { branchParam } from '$lib/branches';
   import TextSearchView from '$components/TextSearchView.svelte';
 
   type ENode = {
@@ -93,6 +96,44 @@
   );
   /** Full-text query of the Search tab (`&q=`). */
   let textQuery = $state(page.url.searchParams.get('q') ?? '');
+
+  // The overview grouped by the GraphRAG communities (`&overview=communities`), opened
+  // down to a community (`&community=`), with the report of the community it shows in the
+  // side panel and the entities of a chosen finding marked on the canvas (U06 with C22).
+  let overviewMode = $state<'classes' | 'communities'>(
+    page.url.searchParams.get('overview') === 'communities' ? 'communities' : 'classes',
+  );
+  const overviewFocus = page.url.searchParams.get('community');
+  /** The reports belong to main: a page on another branch draws no communities. */
+  const overviewBranch = $derived(branchParam(page.url.searchParams.get('branch')));
+  let community = $state<OverviewCommunity | null>(null);
+  let communityDetail = $state<gr.Community | null>(null);
+  let communityError = $state<unknown>(null);
+  let communityLoading = $state(false);
+  let finding = $state<number | null>(null);
+  let communitySeq = 0;
+  const marked = $derived.by(() => {
+    const f = finding != null ? communityDetail?.report?.findings[finding] : undefined;
+    return f ? gr.findingEntities(f) : null;
+  });
+
+  async function showCommunity(c: OverviewCommunity | null) {
+    const seq = ++communitySeq;
+    community = c;
+    finding = null;
+    communityError = null;
+    if (communityDetail?.iri !== c?.iri) communityDetail = null;
+    if (!c || !ds) return;
+    communityLoading = true;
+    try {
+      const d = await gr.community(ds, c.iri);
+      if (seq === communitySeq) communityDetail = d;
+    } catch (e) {
+      if (seq === communitySeq) communityError = e;
+    } finally {
+      if (seq === communitySeq) communityLoading = false;
+    }
+  }
   let nodes = $state<Record<string, ENode>>({});
   let edges = $state<Record<string, EEdge>>({});
   let focusId = $state<string | null>(null);
@@ -627,6 +668,11 @@
     if (tab !== 'graph') p.set('tab', tab);
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
+    if (!iri && tab === 'graph' && overviewMode === 'communities') {
+      p.set('overview', 'communities');
+      if (community) p.set('community', community.iri);
+    }
+    if (overviewBranch) p.set('branch', overviewBranch);
     const timed =
       tab === 'schema'
         ? schemaTimeOpen
@@ -1251,7 +1297,7 @@
       />
     {/key}
   {:else if tab === 'graph'}
-    <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen}>
+    <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen && !community}>
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen}
           <div class="gtools">
@@ -1311,6 +1357,18 @@
                 {prefixes}
                 onresource={(iri, label) => focusOn(iri, label)}
                 onschema={() => setTab('schema')}
+                branch={overviewBranch}
+                start={overviewMode}
+                focus={overviewFocus}
+                {marked}
+                oncommunity={(c) => {
+                  void showCommunity(c);
+                  syncUrl(null);
+                }}
+                onmode={(m) => {
+                  overviewMode = m;
+                  syncUrl(null);
+                }}
               />
             {/key}
           </div>
@@ -1586,6 +1644,42 @@
               <p>Select a node to see its properties.</p>
             </div>
           {/if}
+        </aside>
+      {:else if community && ds}
+        <aside class="side" aria-label="Community report" data-testid="community-side">
+          <div class="side-body scroll">
+            {#if communityDetail}
+              <CommunityReport
+                {ds}
+                detail={communityDetail}
+                {prefixes}
+                heading="h2"
+                {finding}
+                onfinding={(i) => (finding = i)}
+              >
+                {#snippet actions()}
+                  <a
+                    class="btn sm"
+                    href={gr.reportHref(resolve('/datasets/[name]', { name: ds }), community!.iri)}
+                    title="Review this report in the dataset's Communities tab"
+                    ><Icon name="sparkle" size={12} /> Open report</a
+                  >
+                  <button
+                    class="btn sm ghost"
+                    onclick={() => void showCommunity(null)}
+                    aria-label="Close the report">Close</button
+                  >
+                {/snippet}
+              </CommunityReport>
+            {:else if communityError}
+              <h2 class="side-title-plain">{community.title}</h2>
+              <div class="error-box">{api.errorMessage(communityError)}</div>
+            {:else if communityLoading}
+              <p class="faint">
+                <span class="spinner"></span> Reading the report of {community.title}…
+              </p>
+            {/if}
+          </div>
         </aside>
       {/if}
     </div>

@@ -1,3 +1,8 @@
+<script lang="ts" module>
+  /** A GraphRAG community the overview shows, for the page's report panel. */
+  export type OverviewCommunity = { iri: string; title: string; level?: number };
+</script>
+
 <script lang="ts">
   /**
    * The graph overview (spec U06 §2.3): the dataset's classes and the predicates between
@@ -6,17 +11,28 @@
    * a member opens in the resource view, and the breadcrumb (or Backspace) closes levels.
    * The list view (L) is the accessible companion of the canvas, and the view falls back
    * to Cytoscape without WebGL.
+   *
+   * The group-by picker can start the overview from the GraphRAG communities (C22)
+   * instead: the communities of one level of the hierarchy, sized by their members and
+   * coloured by their report's status, which open into the level below and, at the
+   * finest level, into their members. The selected or opened community goes to
+   * `oncommunity`, so the page can show its report beside the canvas, and `marked`
+   * entities, such as those a chosen finding is about, are ringed on the canvas.
    */
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
+  import { resolve } from '$app/paths';
   import * as api from '$lib/api';
-  import { ApiError, type ClassProfile, type GroupsBy } from '$lib/api';
+  import { ApiError, type ClassProfile, type GroupsAnswer, type GroupsBy } from '$lib/api';
   import { fmtCompact, fmtInt } from '$lib/format';
   import { shortLabel } from '$lib/graph';
+  import * as gr from '$lib/graphrag';
   import type { PrefixMap } from '$lib/rdf';
   import {
     classLevel,
+    communityLevel,
     describe,
     hasWebGL2,
+    isReports,
     MAX_CLASSES,
     nodeRadius,
     seed,
@@ -35,6 +51,12 @@
     prefixes,
     onresource,
     onschema,
+    branch = null,
+    start = 'classes',
+    focus = null,
+    marked = null,
+    oncommunity,
+    onmode,
   }: {
     ds: string;
     prefixes: PrefixMap;
@@ -42,6 +64,18 @@
     onresource: (iri: string, label?: string) => void;
     /** Show the schema tab. */
     onschema?: () => void;
+    /** The branch the page shows, null for main. The GraphRAG reports belong to main. */
+    branch?: string | null;
+    /** What the overview starts from. */
+    start?: 'classes' | 'communities';
+    /** A community to open the communities down to, and select. */
+    focus?: string | null;
+    /** IRIs of entities to ring on the canvas. */
+    marked?: string[] | null;
+    /** The community selected, or opened when none is selected; null for none. */
+    oncommunity?: (c: OverviewCommunity | null) => void;
+    /** The starting point changed. */
+    onmode?: (m: 'classes' | 'communities') => void;
   } = $props();
 
   let profiles = $state<ClassProfile[] | null>(null);
@@ -52,7 +86,7 @@
   let path = $state<OvLevel[]>([]);
   let opening = $state<string | null>(null);
   let openError = $state<string | null>(null);
-  /** The commit the class profiles were read at: every level must come from it. */
+  /** The commit the base level was read at: every level must come from it. */
   let baseCommit: number | null = null;
   let changed = $state(false);
   let selected = $state<string | null>(null);
@@ -67,13 +101,47 @@
   const positions = new Map<string, { x: number; y: number }>();
   let controller: AbortController | undefined;
 
-  const label = (iri: string) => shortLabel(iri, prefixes);
+  // the GraphRAG communities
+  let mode = $state<'classes' | 'communities'>(untrack(() => start));
+  let reports = $state<GroupsAnswer | null>(null);
+  let reportsError = $state<string | null>(null);
+  let reportsLoading = $state(false);
+  let colorBy = $state<'status' | 'community'>('status');
+  let statusColors = $state<Record<gr.CommunityStatus, string>>({
+    reviewed: '#1f8a4c',
+    unreviewed: '#2459c7',
+    stale: '#b7791f',
+    pending: '#8a8f98',
+    rejected: '#c53030',
+    failed: '#c53030',
+  });
 
-  const base = $derived.by(() =>
-    profiles ? classLevel(profiles, { builtins, label }) : { nodes: [], edges: [], hidden: 0 },
-  );
+  const label = (iri: string) => shortLabel(iri, prefixes);
+  const communities = $derived(mode === 'communities');
+  const offMain = $derived(communities && !!branch);
+  const reportsReady = $derived(communities && !offMain && reports?.available === true);
+
+  const base = $derived.by((): OvGraph & { hidden: number } => {
+    if (communities) {
+      return reportsReady && reports
+        ? { ...communityLevel(reports, label), hidden: 0 }
+        : { nodes: [], edges: [], hidden: 0 };
+    }
+    return profiles
+      ? classLevel(profiles, { builtins, label })
+      : { nodes: [], edges: [], hidden: 0 };
+  });
   const picture: OvGraph = $derived(visible(base, path, label));
-  const announce = $derived(profiles ? describe(picture, path, fmtInt) : '');
+  const startLevel = $derived(reports?.within.reports?.level ?? 0);
+  const announce = $derived(
+    communities
+      ? reportsReady
+        ? describe(picture, path, fmtInt, startLevel)
+        : ''
+      : profiles
+        ? describe(picture, path, fmtInt)
+        : '',
+  );
   const classColor = $derived.by(() => {
     const m = new Map<string, string>();
     base.nodes.forEach((n, i) => m.set(n.cls, palette[i % palette.length]));
@@ -92,6 +160,45 @@
   const sel: OvNode | undefined = $derived(selected ? byKey.get(selected) : undefined);
   const current = $derived(path.length ? path[path.length - 1] : null);
 
+  /** The colour of a node: its report's status, or its class or community. */
+  function colorOf(n: OvNode): string {
+    if (communities && colorBy === 'status') {
+      if (n.status) return statusColors[n.status];
+      return 'var(--text-3)';
+    }
+    return classColor.get(n.cls) ?? palette[0];
+  }
+  /** A drawn colour: a CSS variable is no colour to WebGL. */
+  function drawn(c: string): string {
+    return c.startsWith('var(') ? statusColors.pending : c;
+  }
+
+  /** The community the page shows: the selected one, else the one last opened. */
+  const shownCommunity = $derived.by((): OverviewCommunity | null => {
+    if (!communities) return null;
+    if (sel?.community) return { iri: sel.community, title: sel.label, level: sel.level };
+    const w = current?.answer.within;
+    if (!sel && w?.community)
+      return { iri: w.community, title: w.title ?? current!.label, level: w.level };
+    return null;
+  });
+  let lastShown: string | null = null;
+  $effect(() => {
+    const c = shownCommunity;
+    const key = c?.iri ?? null;
+    untrack(() => {
+      if (key === lastShown) return;
+      lastShown = key;
+      oncommunity?.(c);
+    });
+  });
+
+  const markedKeys = $derived.by(() => {
+    if (!marked?.length) return null;
+    const want = new Set(marked.map((i) => `m:${i}`));
+    return picture.nodes.filter((n) => want.has(n.key)).map((n) => n.key);
+  });
+
   function nodeLabel(n: OvNode) {
     return n.kind === 'member' ? n.label : `${n.label} (${fmtCompact(n.size)})`;
   }
@@ -107,7 +214,7 @@
         key: n.key,
         label: nodeLabel(n),
         size: nodeRadius(n.size, maxSize, n.kind),
-        color: classColor.get(n.cls) ?? palette[0],
+        color: drawn(colorOf(n)),
         x: p.x,
         y: p.y,
         fixed: !!known,
@@ -123,23 +230,25 @@
       size: 0.6 + (2.4 * Math.log1p(e.count)) / Math.log1p(max),
     }));
   });
+  const markedSet = $derived(new Set(markedKeys ?? []));
   const rows: ListRow[] = $derived(
     picture.nodes.map((n) => ({
       key: n.key,
       label: n.label,
       kind: n.kind,
       size: n.size,
-      cls: label(n.cls),
+      cls: communities ? (n.status ?? '') : label(n.cls),
       degree: degree.get(n.key) ?? 0,
-      color: classColor.get(n.cls) ?? palette[0],
+      color: colorOf(n),
       openable: n.openable,
+      marked: markedSet.has(n.key),
     })),
   );
   // the Cytoscape fallback
   const gnodes: GNode[] = $derived(
     picture.nodes.map((n) => ({
       id: n.key,
-      label: nodeLabel(n),
+      label: markedSet.has(n.key) ? `★ ${nodeLabel(n)}` : nodeLabel(n),
       kind: 'iri',
       title: n.key.slice(2),
     })),
@@ -159,6 +268,15 @@
     const names = ['--iri', '--literal', '--bnode', '--num', '--var', '--ok', '--spark', '--kw'];
     palette = names.map((n) => css.getPropertyValue(n).trim()).filter(Boolean);
     if (!palette.length) palette = ['#2459c7'];
+    const v = (n: string, fallback: string) => css.getPropertyValue(n).trim() || fallback;
+    statusColors = {
+      reviewed: v('--ok', statusColors.reviewed),
+      unreviewed: v('--iri', statusColors.unreviewed),
+      stale: v('--warn', statusColors.stale),
+      pending: v('--text-3', statusColors.pending),
+      rejected: v('--danger', statusColors.rejected),
+      failed: v('--danger', statusColors.failed),
+    };
   }
 
   function errorText(e: unknown): string {
@@ -180,7 +298,7 @@
     try {
       const p = await api.schemaProfiles(ds, { signal: controller.signal });
       profiles = p.classes;
-      baseCommit = p.snapshot.commit ?? null;
+      if (mode === 'classes') baseCommit = p.snapshot.commit ?? null;
       loadMs = performance.now() - t;
       // a dataset of built-in classes only keeps them, others start without them
       builtins = !p.classes.some((c) => !c.builtin && c.instances > 0);
@@ -189,6 +307,51 @@
       loadError = errorText(e);
     } finally {
       loading = false;
+    }
+  }
+
+  /** The communities of the whole dataset at `level` (the coarsest by default). */
+  async function loadCommunities(level?: number) {
+    if (branch) return;
+    controller?.abort();
+    controller = new AbortController();
+    reportsLoading = true;
+    reportsError = null;
+    const t = performance.now();
+    try {
+      const a = await api.graphGroups(
+        ds,
+        { by: { reports: level != null ? { level } : {} } },
+        controller.signal,
+      );
+      reports = a;
+      baseCommit = a.commit;
+      loadMs = performance.now() - t;
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return;
+      reportsError = errorText(e);
+    } finally {
+      reportsLoading = false;
+    }
+  }
+
+  function setMode(m: 'classes' | 'communities') {
+    if (m === mode) return;
+    controller?.abort();
+    opening = null;
+    openError = null;
+    changed = false;
+    path = [];
+    selected = null;
+    by = 'auto';
+    mode = m;
+    onmode?.(m);
+    if (m === 'communities') {
+      if (reports) baseCommit = reports.commit;
+      else void loadCommunities();
+    } else {
+      // the classes are read again, at a commit the levels below can be compared with
+      void load();
     }
   }
 
@@ -216,15 +379,24 @@
       const answer = await api.graphGroups(ds, { within, by: how }, controller.signal);
       changed = false;
       // after a write, the levels already drawn and this answer count different data:
-      // read the classes again, and keep only an opened class, whose answer is new
+      // read the base level again, and keep only an opened class, whose answer is new
       if (baseCommit != null && answer.commit !== baseCommit) {
         path = [];
         selected = null;
+        if (communities) {
+          await loadCommunities(startLevel);
+          changed = true;
+          return;
+        }
         await load();
         changed = true;
         // the classes may have moved on again: keep the answer only at their commit
         if (key.startsWith('c:') && answer.commit === baseCommit)
           path = [{ key, label: target?.label ?? key, answer }];
+        return;
+      }
+      if (answer.available === false) {
+        openError = answer.reason ?? 'The GraphRAG communities are not available.';
         return;
       }
       // a node of an earlier level closes the levels below it first
@@ -239,7 +411,7 @@
           break;
         }
       }
-      if (key.startsWith('c:')) keep = 0;
+      if (key.startsWith('c:') || base.nodes.some((n) => n.key === key)) keep = 0;
       if (current?.key === key) keep = path.length - 1;
       const lbl = target?.label ?? current?.label ?? key;
       path = [...path.slice(0, keep), { key, label: lbl, answer }];
@@ -248,7 +420,9 @@
           ? how
           : 'community' in how
             ? `community:${how.community}`
-            : `property:${how.property}`;
+            : 'property' in how
+              ? `property:${how.property}`
+              : 'auto';
       selected = null;
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
@@ -270,12 +444,16 @@
   }
 
   function regroup(value: string) {
+    if (value === 'mode:classes') return setMode('classes');
+    if (value === 'mode:communities') return setMode('communities');
     if (!current) return;
     void open(current.key, byOf(value));
   }
 
   /** The class profile of the open class, for the grouping choices. */
-  const openClass = $derived(current ? current.answer.within.class : null);
+  const openClass = $derived(
+    current && !communities ? (current.answer.within.class ?? null) : null,
+  );
   const groupChoices = $derived.by(() => {
     if (!openClass || !profiles) return [];
     const p = profiles.find((c) => c.class === openClass);
@@ -285,6 +463,50 @@
       .slice(0, 40)
       .map((x) => ({ value: `property:${x.predicate}`, label: label(x.predicate) }));
   });
+  /** The picker's value: the starting point at the base level, else the grouping. */
+  const pickerValue = $derived(current ? by : `mode:${mode}`);
+
+  /** Open the communities down to `iri` and select it. */
+  async function focusOn(iri: string) {
+    try {
+      const chain: string[] = [];
+      const lvl = startLevel;
+      for (let c: string | null = iri; c && chain.length < 16;) {
+        chain.unshift(c);
+        const d = await gr.community(ds, c);
+        if (d.level <= lvl) break;
+        c = d.parent;
+      }
+      for (const c of chain.slice(0, -1)) {
+        const n = picture.nodes.find((x) => x.community === c);
+        if (!n) return;
+        await open(n.key);
+      }
+      const last = picture.nodes.find((x) => x.community === iri);
+      if (last) selected = last.key;
+    } catch (e) {
+      openError = errorText(e);
+    }
+  }
+
+  let focused: string | null = null;
+  $effect(() => {
+    const f = focus;
+    if (!f || !reportsReady) return;
+    untrack(() => {
+      if (focused === f) return;
+      focused = f;
+      void focusOn(f);
+    });
+  });
+
+  /** Draw the members of the community the page shows, to see the marked entities. */
+  function showMembers() {
+    const c = shownCommunity;
+    if (!c) return;
+    const key = sel?.community === c.iri ? sel.key : current?.key;
+    if (key) void open(key, 'members');
+  }
 
   function onKey(e: KeyboardEvent) {
     if ((e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable]')) return;
@@ -312,7 +534,8 @@
     });
     media = matchMedia('(prefers-color-scheme: dark)');
     media.addEventListener('change', readPalette);
-    void load();
+    if (mode === 'communities') void loadCommunities();
+    else void load();
   });
 
   onDestroy(() => {
@@ -327,7 +550,10 @@
 
   const crumbs = $derived(path.map((l, i) => ({ i, label: l.label })));
   const note = $derived.by(() => {
-    if (!current) return base.hidden ? `The ${fmtInt(MAX_CLASSES)} largest classes are drawn.` : '';
+    if (!current) {
+      if (communities) return reports?.note ?? '';
+      return base.hidden ? `The ${fmtInt(MAX_CLASSES)} largest classes are drawn.` : '';
+    }
     const a = current.answer;
     const parts: string[] = [];
     if (a.note) parts.push(a.note);
@@ -344,18 +570,34 @@
       );
     return parts.join(' ');
   });
+  const markNote = $derived.by(() => {
+    if (!marked?.length || !communities) return '';
+    const n = markedKeys?.length ?? 0;
+    const of = marked.length;
+    if (n === of) return `${fmtInt(n)} ${n === 1 ? 'entity' : 'entities'} of the finding marked.`;
+    return `${fmtInt(n)} of the ${fmtInt(of)} entities of the finding are drawn and marked.`;
+  });
+  const legend = $derived.by(() => {
+    if (!communities || colorBy !== 'status') return [];
+    const seen = new Set(picture.nodes.map((n) => n.status).filter(Boolean));
+    return gr.COMMUNITY_STATUSES.filter((s) => seen.has(s));
+  });
+  const communitiesHref = $derived(`${resolve('/datasets/[name]', { name: ds })}?tab=communities`);
+  const shownLevels = $derived(reports?.levels ?? []);
 </script>
 
 <svelte:window onkeydown={onKey} />
 
-<div class="ov" bind:this={wrap}>
+<div class="ov" bind:this={wrap} data-testid="overview" data-mode={mode}>
   <div class="ov-bar">
     <nav class="crumbs" aria-label="Overview levels">
       <button
         class="crumb"
         class:cur={!path.length}
         onclick={() => closeTo(0)}
-        disabled={!path.length}><Icon name="graph" size={13} /> Overview</button
+        disabled={!path.length}
+        ><Icon name={communities ? 'sparkle' : 'graph'} size={13} />
+        {communities ? 'Communities' : 'Overview'}</button
       >
       {#each crumbs as c (c.i)}
         <span class="sep" aria-hidden="true">›</span>
@@ -370,14 +612,21 @@
       {#if opening}<span class="spinner" aria-label="Opening"></span>{/if}
     </nav>
     <span class="spacer"></span>
-    {#if current}
-      <label class="by faint small">
-        <span class="hide-xs">Group by</span>
-        <select
-          value={by}
-          onchange={(e) => regroup((e.currentTarget as HTMLSelectElement).value)}
-          aria-label="Group by"
-        >
+    <label class="by faint small">
+      <span class="hide-xs">Group by</span>
+      <select
+        value={pickerValue}
+        onchange={(e) => regroup((e.currentTarget as HTMLSelectElement).value)}
+        aria-label="Group by"
+      >
+        {#if !current}
+          <option value="mode:classes">Classes</option>
+          <option value="mode:communities">GraphRAG communities</option>
+        {:else if communities}
+          <option value="auto">Sub-communities</option>
+          <option value="members">Members</option>
+          <option value="mode:classes">Classes</option>
+        {:else}
           <option value="auto">Automatic</option>
           <option value="members">Members</option>
           {#if current?.answer.communities && current.answer.grouping.predicate}
@@ -386,10 +635,34 @@
           {#each groupChoices as g (g.value)}
             <option value={g.value}>{g.label}</option>
           {/each}
+          <option value="mode:communities">GraphRAG communities</option>
+        {/if}
+      </select>
+    </label>
+    {#if communities && reportsReady}
+      <label class="by faint small">
+        <span class="hide-xs">Colour</span>
+        <select bind:value={colorBy} aria-label="Colour by">
+          <option value="status">Report status</option>
+          <option value="community">Community</option>
         </select>
       </label>
+      {#if !path.length && shownLevels.length > 1}
+        <label class="by faint small">
+          <span class="hide-xs">Level</span>
+          <select
+            value={String(startLevel)}
+            onchange={(e) => loadCommunities(Number((e.currentTarget as HTMLSelectElement).value))}
+            aria-label="Level"
+          >
+            {#each shownLevels as l (l.level)}
+              <option value={String(l.level)}>{l.level}</option>
+            {/each}
+          </select>
+        </label>
+      {/if}
     {/if}
-    {#if !path.length && profiles?.some((c) => c.builtin && c.instances > 0)}
+    {#if !communities && !path.length && profiles?.some((c) => c.builtin && c.instances > 0)}
       <label class="row check small"
         ><input type="checkbox" bind:checked={builtins} /> Built-in</label
       >
@@ -410,13 +683,33 @@
       >
     {/if}
   </div>
-  {#if note || openError || failReason || changed}
+  {#if note || openError || failReason || changed || markNote || legend.length}
     <div class="ov-notes small">
       {#if openError}<p class="err" role="alert">{openError}</p>{/if}
       {#if changed}<p class="faint">
-          The dataset changed since the overview was read, so its classes were read again.
+          The dataset changed since the overview was read, so its {communities
+            ? 'communities'
+            : 'classes'} were read again.
         </p>{/if}
       {#if note}<p class="faint">{note}</p>{/if}
+      {#if legend.length}
+        <p class="legend faint" aria-label="Colours by report status">
+          {#each legend as s (s)}
+            <span class="key"
+              ><span class="dot" style:background={statusColors[s]} aria-hidden="true"
+              ></span>{s}</span
+            >
+          {/each}
+        </p>
+      {/if}
+      {#if markNote}
+        <p class="faint" data-testid="overview-marked">
+          {markNote}
+          {#if (markedKeys?.length ?? 0) < (marked?.length ?? 0) && shownCommunity}
+            <button class="link" onclick={showMembers}>Draw the members</button>
+          {/if}
+        </p>
+      {/if}
       {#if failReason && !listView}<p class="faint">
           {failReason}; the overview is drawn with Cytoscape.
         </p>{/if}
@@ -425,15 +718,49 @@
   <p class="sr-only" aria-live="polite">{announce}</p>
 
   <div class="ov-body">
-    {#if loading && !profiles}
+    {#if communities && offMain}
+      <div class="ov-empty" data-testid="overview-communities-off-main">
+        <Icon name="branch" size={20} />
+        <p>
+          The GraphRAG communities belong to main, and this page shows the
+          <span class="mono">{branch}</span> branch. Switch to main to draw them.
+        </p>
+      </div>
+    {:else if communities && reportsLoading && !reports}
+      <div class="ov-empty"><span class="spinner"></span> Reading the communities…</div>
+    {:else if communities && reportsError}
+      <div class="ov-empty">
+        <Icon name="alert" size={20} />
+        <p>The communities could not be read: {reportsError}</p>
+        <button class="btn sm" onclick={() => loadCommunities()}
+          ><Icon name="refresh" size={13} /> Retry</button
+        >
+      </div>
+    {:else if communities && reports && reports.available === false}
+      <div class="ov-empty" data-testid="overview-communities-unavailable">
+        <Icon name={reports.unavailable === 'access' ? 'lock' : 'sparkle'} size={22} />
+        <h2>
+          {reports.unavailable === 'access'
+            ? 'The communities are not available to you'
+            : 'No GraphRAG communities'}
+        </h2>
+        <p class="muted">{reports.reason}</p>
+        {#if reports.unavailable === 'none'}
+          <p class="muted">
+            A dataset admin builds them in the <a href={communitiesHref}>Communities tab</a>.
+          </p>
+        {/if}
+        <button class="btn sm" onclick={() => setMode('classes')}>Show the classes</button>
+      </div>
+    {:else if !communities && loading && !profiles}
       <div class="ov-empty"><span class="spinner"></span> Reading the classes…</div>
-    {:else if loadError}
+    {:else if !communities && loadError}
       <div class="ov-empty">
         <Icon name="alert" size={20} />
         <p>The overview could not be read: {loadError}</p>
         <button class="btn sm" onclick={load}><Icon name="refresh" size={13} /> Retry</button>
       </div>
-    {:else if profiles && !base.nodes.length && !path.length}
+    {:else if !communities && profiles && !base.nodes.length && !path.length}
       <div class="ov-empty">
         <Icon name="explore" size={24} />
         <h2>No classes to draw</h2>
@@ -446,16 +773,23 @@
           <button class="btn sm" onclick={() => (builtins = true)}>Show built-in classes</button>
         {/if}
       </div>
-    {:else if profiles}
+    {:else if (communities && reportsReady) || (!communities && profiles)}
       {#if listView}
-        <GraphListView {rows} {selected} onselect={(k) => (selected = k)} onopen={(k) => open(k)} />
+        <GraphListView
+          {rows}
+          {selected}
+          clsLabel={communities ? 'Status' : 'Class'}
+          onselect={(k) => (selected = k)}
+          onopen={(k) => open(k)}
+        />
       {:else if webgl && !failReason}
         <LargeGraphView
           bind:this={large}
           nodes={lnodes}
           edges={ledges}
           {selected}
-          label="Graph overview"
+          marked={markedKeys}
+          label={communities ? 'GraphRAG communities' : 'Graph overview'}
           onselect={(k) => (selected = k)}
           onopen={(k) => open(k)}
           {onlayout}
@@ -475,13 +809,16 @@
 
   {#if sel}
     <div class="ov-detail" role="region" aria-label="Selected node">
-      <span class="dot" style:background={classColor.get(sel.cls) ?? palette[0]} aria-hidden="true"
-      ></span>
+      <span class="dot" style:background={colorOf(sel)} aria-hidden="true"></span>
       <div class="d-main">
         <div class="d-title" title={sel.iri ?? sel.label}>{sel.label}</div>
         <div class="faint small">
           {#if sel.kind === 'class'}Class · {fmtInt(sel.size)} instances
+          {:else if sel.kind === 'group' && sel.status}{sel.community
+              ? `Community at level ${sel.level ?? 0}`
+              : 'Members of no community below'} · {fmtInt(sel.size)} members · {sel.status}
           {:else if sel.kind === 'group'}Group of {label(sel.cls)} · {fmtInt(sel.size)} instances
+          {:else if communities}Member
           {:else}{label(sel.cls)}{/if}
           · {fmtInt(degree.get(sel.key) ?? 0)} links{#if sel.internal}, {fmtInt(sel.internal)} inside{/if}
           {#if sel.top?.length}
@@ -500,11 +837,18 @@
       {/if}
     </div>
   {/if}
-  {#if !path.length && profiles && base.nodes.length}
+  {#if !path.length && !communities && profiles && base.nodes.length}
     <div class="ov-foot faint small">
       {fmtInt(base.nodes.length)} classes · read in {fmtInt(Math.round(loadMs))} ms · tap a class to open
       it
       {#if onschema}· <button class="link" onclick={onschema}>Browse the schema</button>{/if}
+    </div>
+  {:else if !path.length && communities && reportsReady}
+    <div class="ov-foot faint small">
+      {fmtInt(base.nodes.length)}
+      {base.nodes.length === 1 ? 'community' : 'communities'} at level {startLevel} · read in {fmtInt(
+        Math.round(loadMs),
+      )} ms · tap a community to open it
     </div>
   {/if}
 </div>
@@ -579,6 +923,20 @@
   }
   .ov-notes p {
     margin: 2px 0;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 12px;
+  }
+  .legend .key {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .legend .dot {
+    width: 9px;
+    height: 9px;
   }
   .err {
     color: var(--danger);
@@ -655,6 +1013,9 @@
   @media (max-width: 480px) {
     .hide-xs {
       display: none;
+    }
+    .by select {
+      max-width: 13ch;
     }
   }
 </style>

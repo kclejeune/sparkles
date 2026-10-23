@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 import type { Task } from './api';
 import {
   citeText,
+  exploreHref,
+  findingEntities,
+  reportHref,
+  statusClass,
   outcomeOf,
   outcomeText,
   tree,
@@ -81,5 +85,32 @@ describe('graphrag', () => {
       '<http://ex/a> <http://ex/p> "x"',
     );
     expect(citeText('urn:r#f1')).toBe('urn:r#f1');
+  });
+
+  it('marks the entities a finding is about and the resources its facts link', () => {
+    expect(
+      findingEntities({
+        text: 't',
+        about: ['http://ex/a'],
+        cites: [
+          '<<( <http://ex/a> <http://ex/knows> <http://ex/b> )>>',
+          '<<( <http://ex/c> <http://ex/name> "Cid"@en )>>',
+          '<<( _:b0 <http://ex/knows> <http://ex/d> )>>',
+          'urn:uuid:reifier',
+        ],
+        unmatchedNames: [],
+      }).sort(),
+    ).toEqual(['http://ex/a', 'http://ex/b', 'http://ex/c', 'http://ex/d']);
+  });
+
+  it('links Explore and the Communities tab to a community', () => {
+    expect(exploreHref('/ui/explore', 'org', 'urn:c:1')).toBe(
+      '/ui/explore?ds=org&overview=communities&community=urn%3Ac%3A1',
+    );
+    expect(reportHref('/ui/datasets/org', 'urn:c:1')).toBe(
+      '/ui/datasets/org?tab=communities&community=urn%3Ac%3A1',
+    );
+    expect(statusClass('stale')).toBe('warn');
+    expect(statusClass(null)).toBe('spark');
   });
 });
