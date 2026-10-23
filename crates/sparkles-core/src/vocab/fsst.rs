@@ -78,25 +78,39 @@ impl Table {
     /// key and not to a panic (`sparkles check` finds it).
     #[inline]
     pub fn decode_into(&self, codes: &[u8], out: &mut Vec<u8>) {
-        // every code adds at most 8 bytes; with the room reserved, each symbol is copied
-        // as 8 bytes and the length then cut back, which is cheaper than a copy of a
-        // variable length
+        // Every code adds at most 8 bytes. With that room reserved, each symbol is stored
+        // as one unaligned 8-byte word and the length then advanced by the symbol's own
+        // length, which is FSST's decoding loop and several times faster than a copy of
+        // a variable length.
         out.reserve(codes.len() * 8);
+        let base = out.as_mut_ptr();
+        let mut len = out.len();
         let mut i = 0;
         while i < codes.len() {
             let c = codes[i];
             if c == ESCAPE {
                 if let Some(&b) = codes.get(i + 1) {
-                    out.push(b);
+                    // SAFETY: `len` < the capacity reserved above: at most 8 bytes were
+                    // written per code before this one, and this code has 8 reserved.
+                    unsafe { base.add(len).write(b) };
+                    len += 1;
                 }
                 i += 2;
             } else {
-                let at = out.len();
-                out.extend_from_slice(&self.syms[c as usize]);
-                out.truncate(at + self.lens[c as usize] as usize);
+                // SAFETY: as above, `len + 8` is within the reserved capacity, and the
+                // write is unaligned.
+                unsafe {
+                    base.add(len)
+                        .cast::<[u8; 8]>()
+                        .write_unaligned(self.syms[c as usize])
+                };
+                len += self.lens[c as usize] as usize;
                 i += 1;
             }
         }
+        // SAFETY: the bytes up to `len` were written above (or were there before), and
+        // `len` is within the capacity.
+        unsafe { out.set_len(len) };
     }
 
     /// Append what `codes` stand for without reserving more than that, for the decodes
