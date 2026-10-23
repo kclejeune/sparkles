@@ -864,11 +864,16 @@ impl<'a> Eval<'a> {
                         let c = self.g.cands(s, p, o, lo, hi);
                         let base = self.g.reads_base(lo, hi);
                         if base && self.rows_first(c.len(), [s, p, o]) {
-                            self.rows(k, atom, b, c);
+                            let (head, rest) = c.split_at(ROWS_FIRST);
+                            self.rows(k, atom, b, head);
                             if self.stop {
                                 return;
                             }
                             self.base_facts(k, atom, b, None, [s, p, o]);
+                            if self.stop {
+                                return;
+                            }
+                            self.rows(k, atom, b, rest);
                             return;
                         }
                         if base {
@@ -885,14 +890,17 @@ impl<'a> Eval<'a> {
         }
     }
 
-    /// Whether a backward search reads an atom's in-memory candidates before its facts in
-    /// the base tier: when there are some, and the base tier's lookup is long. The facts of
-    /// the inferred graph share the input graphs' permutations, so a lookup without a
-    /// bound subject can read many blocks of the store's own inferences to find few input
-    /// facts, or none, while the derived tier often holds an instance that proves the head
-    /// at once. A search explores every instance before it calls a fact unprovable, so the
-    /// order changes how soon it stops and never its answer. Rules evaluated forward keep
-    /// the base tier first, the order of their output.
+    /// Whether a backward search reads the first [`ROWS_FIRST`] of an atom's in-memory
+    /// candidates before its facts in the base tier, and the other candidates after them:
+    /// when there are some, and the base tier's lookup is long. The facts of the inferred
+    /// graph share the input graphs' permutations, so a lookup without a bound subject can
+    /// read many blocks of the store's own inferences to find few input facts, or none,
+    /// while the derived tier often holds an instance that proves the head at once. The
+    /// bound keeps a search from exploring a large derived relation, whose instances may
+    /// all depend on the fact being proved, before an explicit fact that proves it. A
+    /// search explores every instance before it calls a fact unprovable, so the order
+    /// changes how soon it stops and never its answer. Rules evaluated forward keep the
+    /// base tier first, the order of their output.
     #[inline]
     fn rows_first(&self, rows: usize, [s, p, o]: [Option<u64>; 3]) -> bool {
         rows > 0
@@ -1201,6 +1209,10 @@ fn shares<'g>(
     }
     Ok(out)
 }
+
+/// The in-memory candidates a backward search reads before a long base-tier lookup (see
+/// [`Eval::rows_first`]).
+const ROWS_FIRST: usize = 64;
 
 /// Bindings worked out up to plan step `d` before the work is split there.
 const MAX_SPLIT_BINDINGS: usize = 1 << 16;

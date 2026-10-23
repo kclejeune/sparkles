@@ -39,12 +39,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// object before a probe of the base tier.
 const FEW_OBJECTS: u64 = 4096;
 
-/// What [`Base::may_contain`] learned: by predicate, whether the store has it and has
-/// few distinct objects for it, and by predicate and object, whether the store has them.
+/// What [`Base::classify`] learned: by predicate, whether the store has it and has few
+/// distinct objects for it.
 #[derive(Default)]
 pub(crate) struct ProbeFilter {
     p: FxHashMap<u64, (bool, bool)>,
-    po: FxHashMap<(u64, u64), bool>,
+}
+
+/// What a probe of a triple in the base tier needs (see [`Base::classify`]).
+pub(crate) enum Probe {
+    /// none, since the tier certainly lacks it
+    No,
+    /// a probe
+    Maybe,
+    /// a probe when the store has its predicate and object
+    Pair,
 }
 
 /// A contiguous key range of one permutation, a share of a scan, in the pass of one
@@ -157,9 +166,6 @@ pub(crate) struct Base {
     len: u32,
     /// per predicate: quads in the store (an upper bound of the tier's)
     counts: RwLock<FxHashMap<u64, u64>>,
-    /// per predicate and object: whether the store has quads with them, for
-    /// [`may_contain`](Self::may_contain)
-    po_any: RwLock<FxHashMap<(u64, u64), bool>>,
     scans: AtomicU64,
     /// the remembered lookups of a kept closure
     lookups: Option<Lookups>,
@@ -241,7 +247,6 @@ impl Base {
             sorted,
             len: n as u32,
             counts: RwLock::new(FxHashMap::default()),
-            po_any: RwLock::new(FxHashMap::default()),
             scans: AtomicU64::new(0),
             lookups: None,
         })
@@ -875,33 +880,27 @@ impl Base {
         Ok(())
     }
 
-    /// False when `t` is certainly not a fact of the tier: a term is not in the store,
-    /// no quad has its predicate, or, for a predicate with few distinct objects, no quad
-    /// has its predicate and object.
-    pub fn may_contain(&self, t: &Triple, f: &mut ProbeFilter) -> bool {
+    /// What a probe of `t` needs: none when `t` is certainly not a fact of the tier, since
+    /// a term is not in the store or no quad has its predicate, and a check of its
+    /// predicate and object with [`po_any`](Self::po_any) first when its predicate has few
+    /// distinct objects.
+    pub fn classify(&self, t: &Triple, f: &mut ProbeFilter) -> Probe {
         if t.iter().any(|&x| Id(x).tag() == Tag::Local) {
-            return false;
+            return Probe::No;
         }
         let (any, few_objects) =
             *f.p.entry(t[1])
                 .or_insert_with(|| (self.count_p(t[1]) > 0, self.pstats(t[1]).1 <= FEW_OBJECTS));
-        if !any || !few_objects {
-            return any;
+        match (any, few_objects) {
+            (false, _) => Probe::No,
+            (true, false) => Probe::Maybe,
+            (true, true) => Probe::Pair,
         }
-        *f.po
-            .entry((t[1], t[2]))
-            .or_insert_with(|| self.po_any(t[1], t[2]))
     }
 
-    /// Whether the store has quads with predicate `p` and object `o`, counted once per
-    /// tier: the merges of a run ask for the same pairs from every shard.
-    fn po_any(&self, p: u64, o: u64) -> bool {
-        if let Some(&any) = self.po_any.read().get(&(p, o)) {
-            return any;
-        }
-        let any = self.snap.count(Perm::Pos, &[p, o]).map_or(true, |n| n > 0);
-        self.po_any.write().insert((p, o), any);
-        any
+    /// Whether the store has quads with predicate `p` and object `o`.
+    pub fn po_any(&self, p: u64, o: u64) -> bool {
+        self.snap.count(Perm::Pos, &[p, o]).map_or(true, |n| n > 0)
     }
 
     /// Quads with predicate `p` in the store: an upper bound of the tier's facts.

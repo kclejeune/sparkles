@@ -693,3 +693,63 @@ fn closure_kept_over_a_segmented_generation() {
         }
     }
 }
+
+/// The backward search reads only a few derived rows before a long lookup of the input
+/// graphs. Every derived `ex:p` fact here depends on `ex:t ex:q ex:r`, so a search that
+/// read all 40,000 of them before the explicit `ex:e2 ex:p ex:o` would scan the input
+/// graphs once per derived fact before it found the proof of `ex:t ex:q ex:r`.
+#[test]
+fn backward_search_reaches_an_explicit_proof_past_many_derived_rows() {
+    let (_d, s) = persistent();
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [a: (?x ex:p ex:o) -> (ex:t ex:q ex:r)]
+         [b: (ex:t ex:q ex:r), (?x ex:seed ex:v) -> (?x ex:p ex:o)]"
+            .into(),
+    );
+    let mut nt = String::new();
+    for n in 0..40_000 {
+        nt.push_str(&format!("<{EX}s{n}> <{EX}seed> <{EX}v> .\n"));
+    }
+    for e in ["e1", "e2"] {
+        nt.push_str(&format!("<{EX}{e}> <{EX}p> <{EX}o> .\n"));
+    }
+    s.load(&[Source::from_bytes(
+        nt.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let cache = Cache::default();
+    let rep = run(&s, &rules, None, Some(&cache));
+    check(&s, &rules, &rep, "first run");
+    // the derived facts move into the generation's blocks, where they share the input
+    // graphs' permutations, and a run after the compaction keeps a closure over them
+    s.compact().unwrap();
+    change(&s, &[t("ex:z", "ex:seed", "ex:w")], &[]);
+    let rep = run(
+        &s,
+        &rules,
+        Some(rep.receipt.unwrap().commit.seq),
+        Some(&cache),
+    );
+    check(&s, &rules, &rep, "after the compaction");
+    change(&s, &[], &[t("ex:e1", "ex:p", "ex:o")]);
+    let rep = run(
+        &s,
+        &rules,
+        Some(rep.receipt.unwrap().commit.seq),
+        Some(&cache),
+    );
+    check(&s, &rules, &rep, "one deletion");
+    assert_eq!(rep.method, Method::Incremental, "{:?}", rep.fallback);
+    assert_eq!(
+        rep.changes.as_ref().map(|c| c.source.as_str()),
+        Some("memory")
+    );
+    assert!(
+        rep.base_scans < 1_000,
+        "{} scans of the input graphs",
+        rep.base_scans
+    );
+}
