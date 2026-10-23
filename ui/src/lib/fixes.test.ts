@@ -256,6 +256,15 @@ describe('review round 1', () => {
     );
   });
 
+  it('reads comments, IRIs and literals in source order', () => {
+    const q =
+      "DELETE { <urn:a> <urn:p> <urn:O'Brien> } INSERT { <urn:a> <urn:p> ?allowed } WHERE { <urn:a> <urn:p> <urn:O'Brien> }";
+    expect(hasPlaceholder(q)).toBe(true);
+    expect(hasPlaceholder('INSERT DATA { <urn:a#x> <urn:p> ?value }')).toBe(true);
+    expect(hasPlaceholder('INSERT DATA { <urn:a> <urn:p> "it\'s" } # ?value')).toBe(false);
+    expect(hasPlaceholder('# say "hi\nINSERT DATA { <urn:a> <urn:p> ?value }')).toBe(true);
+  });
+
   it('writes the graph the triples live in', () => {
     const min = shacl('MinCountConstraintComponent', { messages: ['minCount[1]: x'] });
     const named = suggestFix(min, { graph: EX + 'g1' })!;

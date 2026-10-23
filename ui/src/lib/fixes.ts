@@ -365,13 +365,19 @@ export function suggestFix(r: VResult, ctx: FixContext = {}): string | null {
 }
 
 /**
+ * The tokens `hasPlaceholder` reads, in source order: IRIs, literals in their short and
+ * long forms, comments to the end of the line, and variables. Matching them in one pass
+ * keeps a quote inside an IRI or a `#` inside a literal from starting another token.
+ */
+const TOKENS =
+  /<[^<>"{}|^`\\\s]*>|"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|#[^\n]*|[?$]([A-Za-z_]\w*)/g;
+
+/**
  * Whether a suggestion still holds a placeholder the person must fill in: one of the
  * variables it writes, outside comments, literals and IRIs.
  */
-export const hasPlaceholder = (q: string) =>
-  /[?$](value|allowed|class|graph)\b/.test(
-    q
-      .replace(/^#.*$/gm, '')
-      .replace(/"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g, '""')
-      .replace(/<[^<>"{}|^`\\\s]*>/g, '<>'),
-  );
+export function hasPlaceholder(q: string): boolean {
+  for (const m of q.matchAll(TOKENS))
+    if (m[1] && /^(value|allowed|class|graph)$/.test(m[1])) return true;
+  return false;
+}
