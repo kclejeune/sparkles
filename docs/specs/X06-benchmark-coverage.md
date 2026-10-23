@@ -1088,11 +1088,16 @@ same journal before `FILTER(?name1 < ?name2)` and DISTINCT, and eager execution 
 that join at a peak of 5.69 GB. Item 1's reference run capped the server at 12 GiB,
 which makes the query pool 5,344 MiB, so the pool refused the reservation with 503.
 An automatic SELECT whose eager run exceeded its memory budget already ran again as a
-cursor, but only when the query could spill. The retry now also applies without spill
-when every operator of the plan has a cursor implementation, and it covers a failure
-of the shared pool as well as of the query's own budget. The cursor holds 1.99 GB for
-`q4`. A retried cursor that still outgrows the budget, such as a sort without spill,
-fails within it.
+cursor, but only when the query could spill. Item 96's automatic admission streams a plan
+without spill when its eager output is expected to outgrow half of the memory the query
+may use and the cursor's estimated state fits in that half. The planner estimates
+26.7 million rows for the `q4` join, so admission keeps the query eager. The retry now
+asks the same question as admission about the cursor, so one rule decides both paths.
+An eager SELECT that fails its own budget or the shared pool runs again as a cursor
+without spill when every operator streams natively and the cursor's estimated state
+fits. The retry covers the plans whose estimates missed the eager failure, and it starts
+no cursor that admission would have judged too large. The cursor holds 1.99 GB for
+`q4`. A retried cursor that still outgrows the budget fails within it.
 
 The other part is the answer's size. `q4` at 10M returns 41,073,618 rows, and their
 TSV takes 1,955,839,207 bytes. That is larger than the default response budget of

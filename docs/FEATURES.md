@@ -390,6 +390,10 @@ that work by priority and links each item to its design spec.
   spill. Its answer at 10M is 1.96 GB of TSV, which is more than the default response
   budget of 1 GiB, so it answers only with a larger `--max-result-mb`. Jena stays
   faster on `q12a` and Oxigraph on `q12b`. [Roadmap](ROADMAP.md) item 91.
+* **Truncated eager responses.** An eager SELECT whose serialized response reaches
+  `--max-result-mb` stops at that size, and the client receives an incomplete body. The
+  access log still records the outcome `ok` with the full row count. [Roadmap](ROADMAP.md)
+  item 99.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Derived facts still use
   the ordinary inferred graph. A separate derived-fact layer and canonical
