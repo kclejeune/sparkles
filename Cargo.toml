@@ -105,6 +105,16 @@ lto = "thin"
 codegen-units = 4
 debug = 1
 
+# The engine crate is compiled as one codegen unit. With four, the split of its functions
+# across units moved with unrelated changes elsewhere in the crate, and so did the inlining
+# of hot query loops: an item 7 merge that touched only SERVICE code added 4.5% to the
+# instructions of `expr-order-key`. One unit removes that noise and cut the instructions of
+# `expr-order-key` by 6.4%. A release rebuild after a change to the crate takes about 35
+# seconds longer, 2m37s instead of 2m02s on atlas. docs/BENCHMARKING.md records the
+# measurements.
+[profile.release.package.sparkles-core]
+codegen-units = 1
+
 # Full debug info made each test binary about 1.3 GB, so linking and writing the 130-odd
 # test binaries dominated `cargo test`. Line tables keep file and line numbers in
 # backtraces and panics. For a debugger session that needs variables, build with
