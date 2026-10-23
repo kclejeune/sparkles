@@ -4,7 +4,7 @@
 // chosen. Only what the query returned is drawn: an arc needs both of its row's terms, and
 // an entity's position comes from a lookup under the caller's own view.
 
-import type { GeoConverted, Term } from './api';
+import type { AtInfo, GeoConverted, Term } from './api';
 import {
   abbreviate,
   isGeoLiteral,
@@ -191,5 +191,51 @@ export async function locateEnds(
     missing,
     failed: located.failed,
     firstError: 'firstError' in located ? located.firstError : undefined,
+  };
+}
+
+/**
+ * The selector that reads the state a result was read at, for looking its entities up.
+ * A read that named a state is pinned to the commit it resolved to, also when that was the
+ * head, so that a write made since does not move the entities. A read without `at` gives
+ * the empty selector, which is the head.
+ */
+export function readAt(at: AtInfo | undefined): string {
+  if (!at) return '';
+  if (at.commit != null) return `commit:${at.commit}`;
+  return at.selector === 'head' ? '' : at.selector;
+}
+
+/**
+ * Like `locateEnds`, for a comparison. The ends that only removed rows use are looked up
+ * with `base`, the state the left side was read at, because the entities of a removed row
+ * may not exist in the right one. An end that the right side uses too is located there. The
+ * places keep the order of `ends`.
+ */
+export async function locateEndsCompared(
+  ends: Ends,
+  links: readonly Link[],
+  deps: LocateDeps & { convert: (b: GeoLiteral[]) => Promise<GeoConverted[]> },
+  base?: LocateDeps & { convert: (b: GeoLiteral[]) => Promise<GeoConverted[]> },
+): Promise<EndPositions> {
+  if (!base) return locateEnds(ends, deps);
+  const kept = new Set<string>();
+  for (const l of links)
+    if (l.change !== 'removed') {
+      kept.add(l.from);
+      kept.add(l.to);
+    }
+  const now: Ends = new Map();
+  const before: Ends = new Map();
+  for (const [id, e] of ends) (kept.has(id) ? now : before).set(id, e);
+  if (!before.size) return locateEnds(ends, deps);
+  const [a, b] = await Promise.all([locateEnds(now, deps), locateEnds(before, base)]);
+  const at = new Map([...a.places, ...b.places].map((p) => [p.id, p]));
+  const missing = new Map([...a.missing, ...b.missing].map((m) => [m.id, m]));
+  return {
+    places: [...ends.keys()].flatMap((id) => (at.has(id) ? [at.get(id)!] : [])),
+    missing: [...ends.keys()].flatMap((id) => (missing.has(id) ? [missing.get(id)!] : [])),
+    failed: a.failed + b.failed,
+    firstError: a.firstError ?? b.firstError,
   };
 }

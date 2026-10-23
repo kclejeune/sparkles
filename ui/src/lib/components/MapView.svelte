@@ -56,7 +56,12 @@
     /** Fit the view to the features whenever they change. */
     fit?: boolean;
     /** The visible box after every move, [west, south, east, north] in degrees, and the zoom. */
-    onview?: (bbox: [number, number, number, number], zoom: number) => void;
+    onview?: (
+      bbox: [number, number, number, number],
+      zoom: number,
+      /** The same box with its longitudes as drawn, beyond ±180 in another copy of the world. */
+      drawn: [number, number, number, number],
+    ) => void;
     /** Arcs and markers over the features. */
     overlay?: Overlay | null;
     /** The marker with a focus ring (keyboard focus on the map of relations). */
@@ -347,6 +352,7 @@
         clamp(b.getNorth(), 90),
       ],
       m.getZoom(),
+      [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()],
     );
   }
 

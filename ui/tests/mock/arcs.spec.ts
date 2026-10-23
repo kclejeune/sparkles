@@ -164,6 +164,16 @@ test('keys: Tab walks the markers, Enter selects, Escape clears; the graph shows
   await expect(arcmap.locator('.detail')).toContainText('2 of 2');
   await page.keyboard.press('Shift+Enter');
   await expect(bar).toContainText('16 selected');
+  // adding what is selected already keeps it
+  await page.keyboard.press('Shift+Enter');
+  await expect(bar).toContainText('16 selected');
+  // Tab past the last marker moves on to the zoom buttons, whose keys are their own
+  await page.keyboard.press('Tab');
+  await expect(region.getByRole('button', { name: 'Zoom in' })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(region.getByRole('button', { name: 'Zoom out' })).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(bar).toContainText('16 selected');
   // the canvas shows the same selection: what is not selected is dimmed (the organization,
   // the person without a geometry, and the literals and classes around them)
   await page
@@ -360,6 +370,25 @@ test('A2. a result with two geometry columns draws one arc per row, split at the
   await row.click();
   await expect(row).toHaveAttribute('aria-pressed', 'true');
   expect((await sourceData(region, 'o-hot-arcs')).features).toHaveLength(1);
+  // a marker chosen from the list stays selected and does not start the lookups again
+  const lookups: string[] = [];
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && r.url().includes('/sparql')) lookups.push(r.url());
+  });
+  const bar = page.getByRole('region', { name: 'Selection' });
+  await region.evaluate((el) =>
+    (el as unknown as { __map: { jumpTo(o: object): void } }).__map.jumpTo({
+      center: [3.6, 47.3],
+      zoom: 4,
+    }),
+  );
+  await arcmap.locator('details.list summary').click();
+  await arcmap.getByRole('list', { name: 'Markers in view' }).getByRole('button').first().click();
+  await expect(bar).toContainText('selected by the map');
+  await page.waitForTimeout(700);
+  await expect(bar).toContainText('selected by the map');
+  await expect(arcmap).toHaveAttribute('data-loading', 'false');
+  expect(lookups).toHaveLength(0);
 });
 
 test('a result with two entity columns offers Arcs when the entities have geometries', async ({
@@ -472,6 +501,47 @@ test('a result read at a past state looks its entities up at that state', async 
   expect(asked.every((a) => a === 'commit:1')).toBe(true);
 });
 
+test('in a comparison the entities of removed rows are located at the earlier state', async ({
+  page,
+}) => {
+  const asked: { at: string | null; body: string }[] = [];
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && r.url().includes('/sparql'))
+      asked.push({ at: new URL(r.url()).searchParams.get('at'), body: r.postData() ?? '' });
+  });
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'flows'));
+  await page.goto('/ui/query?ds=flows&from=1');
+  const editor = page.locator('.cm-content');
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+a');
+  // the organization's geometry column gives the result its Map tab
+  await page.keyboard.insertText(
+    `${PREFIXES}PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+SELECT ?person ?org ?g WHERE { ?person ex:worksIn ?org . ?org geo:hasDefaultGeometry/geo:asWKT ?g }`,
+  );
+  await page.getByRole('button', { name: /^Run\b/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await expect(results.getByRole('grid')).toBeVisible();
+  await results.getByRole('tab', { name: 'Map' }).click();
+  await results.getByRole('button', { name: 'Arcs' }).click();
+  const arcmap = page.locator('.arcmap');
+  await expect(arcmap).toHaveAttribute('data-loading', 'false');
+  await results.getByLabel('Column the arcs start in').selectOption('person');
+  await results.getByLabel('Column the arcs end in').selectOption('org');
+  await expect(arcmap).toHaveAttribute('data-loading', 'false');
+  const region = page.getByRole('region', { name: 'Result arcs' });
+  await expect(region).toHaveAttribute('data-state', 'ready');
+  // the eleventh person of Lyon is gone at the head and only the earlier state knows where
+  // they were, so their link is drawn, as a removed one
+  const lines = (await sourceData(region, 'o-arcs')).features;
+  expect(lines.filter((f) => f.properties.change === 'removed')).toHaveLength(1);
+  const lookups = asked.filter((a) => a.body.includes('VALUES ?s'));
+  expect(lookups.some((a) => a.at === 'commit:1' && a.body.includes('lyon11'))).toBe(true);
+  expect(lookups.filter((a) => a.at !== 'commit:1').every((a) => !a.body.includes('lyon11'))).toBe(
+    true,
+  );
+});
+
 test('a result with one entity column has no Map tab', async ({ page }) => {
   const results = await runQuery(
     page,
@@ -513,11 +583,12 @@ test.describe('at 390 px', () => {
     expect(stage!.height).toBeGreaterThanOrEqual(300);
     // the controls are 44 px targets
     for (const target of [
-      arcmap.getByRole('checkbox').first(),
+      arcmap.locator('label.pred').first(),
       page.getByRole('group', { name: 'Show the graph as' }).getByRole('button', { name: 'Map' }),
+      page.getByRole('group', { name: 'Show the graph as' }).getByRole('button', { name: 'Graph' }),
     ]) {
       const b = (await target.boundingBox())!;
-      expect(Math.min(b.width, b.height)).toBeGreaterThanOrEqual(22);
+      expect(b.height).toBeGreaterThanOrEqual(43.5);
     }
     await arcmap.locator('.stage').scrollIntoViewIfNeeded();
     await page.screenshot({ path: `${SHOTS}/explore-map-390.png` });
@@ -552,6 +623,12 @@ test.describe('at 390 px', () => {
     await results.getByRole('button', { name: 'Arcs' }).tap();
     await expect(page.locator('.arcmap')).toHaveAttribute('data-arcs', '3');
     await expectNoSidewaysScroll(page, 'result arcs at 390 px');
+    for (const b of await results
+      .getByRole('group', { name: 'Draw the result as' })
+      .getByRole('button')
+      .all()) {
+      expect((await b.boundingBox())!.height).toBeGreaterThanOrEqual(43.5);
+    }
     await page.locator('.arcmap .stage').scrollIntoViewIfNeeded();
     await page.screenshot({ path: `${SHOTS}/result-arcs-390.png` });
   });

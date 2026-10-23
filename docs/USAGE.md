@@ -1523,8 +1523,9 @@ On the query page, a result with two columns of geometry literals, or with two c
 entities that have geometries, offers **Arcs** on its Map tab. Each row is an arc from the
 first column to the second, and **Label** chooses a third column to write on the arc. A
 result with two entity columns and no geometry column gets the Map tab when a lookup of its
-first 200 entities finds a geometry. The lookups run on the result's branch and at the past
-state the result was read at. Picking a row in the list beside the map highlights its arc.
+first 200 entities finds a geometry, and that lookup waits while the time slider is open.
+The lookups run on the result's branch and at the state the result was read at. When you
+compare two states, the entities that only removed rows use are looked up at the earlier one. Picking a row in the list beside the map highlights its arc.
 
 A click on a marker or an arc selects the entities it stands for, and the selection bar
 names the count and the source, with **Clear** and, in Explore, **Open as graph**, which

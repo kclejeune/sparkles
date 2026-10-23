@@ -4,6 +4,8 @@
 // others. Entities are keyed by `termKey` (`<iri>`), which the canvas and the maps both
 // use for their nodes and places.
 
+import { untrack } from 'svelte';
+
 /** The most entities a selection holds; a larger one keeps the first ones given. */
 export const SELECTION_CAP = 20_000;
 
@@ -46,6 +48,11 @@ export class SharedSelection {
 
   /** Add entities (shift-click, shift-enter). */
   add(ids: Iterable<string>, source: string) {
+    // a change reads the selection but must not make an effect that changes it depend on it
+    untrack(() => this.addNow(ids, source));
+  }
+
+  private addNow(ids: Iterable<string>, source: string) {
     const next = new Set(this.ids);
     let dropped = this.dropped;
     for (const id of ids) {
@@ -58,21 +65,26 @@ export class SharedSelection {
 
   /** Take entities out of the selection. */
   remove(ids: Iterable<string>) {
-    const next = new Set(this.ids);
-    for (const id of ids) next.delete(id);
-    this.apply(next, this.source, this.dropped);
+    untrack(() => {
+      const next = new Set(this.ids);
+      for (const id of ids) next.delete(id);
+      this.apply(next, this.source, this.dropped);
+    });
   }
 
   /** Add the entities that are not all selected, and remove them when they all are. */
   toggle(ids: Iterable<string>, source: string) {
     const list = [...ids];
-    if (list.length && list.every((id) => this.ids.has(id))) this.remove(list);
+    const all = untrack(() => list.length > 0 && list.every((id) => this.ids.has(id)));
+    if (all) this.remove(list);
     else this.add(list, source);
   }
 
   clear() {
-    if (!this.ids.size && !this.source) return;
-    this.apply(new Set(), '');
+    untrack(() => {
+      if (!this.ids.size && !this.source) return;
+      this.apply(new Set(), '');
+    });
   }
 
   /** "41 selected by the map", with the cap named when it cut the selection short. */

@@ -104,6 +104,48 @@ describe('locating entities', () => {
     expect(out.found.get('http://x/e200')).toEqual([1, 1]);
   });
 
+  it('asks again for the entities a full answer left out', async () => {
+    // A has twelve geometries and takes every row of the first answer, B has one
+    const calls: string[][] = [];
+    const run = vi.fn(async (sparql: string, limit: number) => {
+      const asked = sparql.match(/<http:\/\/x\/[ab]>/g) ?? [];
+      calls.push(asked);
+      if (asked.length === 2)
+        return Array.from({ length: limit }, (_, i) => row('http://x/a', wkt(`POINT(${i} 0)`)));
+      return [row('http://x/b', wkt('POINT(5 5)'))];
+    });
+    const out = await locateEntities(['http://x/a', 'http://x/b'], { run, convert: never });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toEqual(['<http://x/b>']);
+    expect(out.found.get('http://x/a')).toEqual([0, 0]);
+    expect(out.found.get('http://x/b')).toEqual([5, 5]);
+  });
+
+  it('does not ask again when no entity was answered or all were', async () => {
+    const run = vi.fn(async (_: string, limit: number) =>
+      Array.from({ length: limit }, (_, i) => row('http://x/a', wkt(`POINT(${i} 0)`))),
+    );
+    await locateEntities(['http://x/a'], { run, convert: never });
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts a retried batch once in its progress', async () => {
+    const seen: [number, number][] = [];
+    const run = async (sparql: string, limit: number) =>
+      sparql.includes('/a>') && sparql.includes('/b>')
+        ? Array.from({ length: limit }, (_, i) => row('http://x/a', wkt(`POINT(${i} 0)`)))
+        : [];
+    await locateEntities(['http://x/a', 'http://x/b'], {
+      run,
+      convert: never,
+      onBatch: (_, done, total) => seen.push([done, total]),
+    });
+    expect(seen).toEqual([
+      [1, 2],
+      [2, 2],
+    ]);
+  });
+
   it('reports progress after each batch', async () => {
     const seen: [number, number][] = [];
     const iris = Array.from({ length: 450 }, (_, i) => `http://x/e${i}`);

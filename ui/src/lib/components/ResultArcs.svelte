@@ -2,14 +2,14 @@
   // The Arcs mode of a result's Map tab (docs/specs/U11-linked-views.md, section 2.2): one
   // arc per row, from a first column to a second, labelled by a third when one is chosen.
   // The columns hold geometries or entities that have geometries.
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { capPlaces, MAX_ARCS, type Link, type Place } from '$lib/arcs';
   import { fmtInt } from '$lib/format';
   import {
     arcColumns,
     defaultArcColumns,
-    locateEnds,
+    locateEndsCompared,
     resultLinks,
     type EndPositions,
   } from '$lib/result-arcs';
@@ -25,6 +25,8 @@
     prefixes,
     ds,
     at = '',
+    baseDs,
+    baseAt = '',
     marks,
     onopen,
   }: {
@@ -35,6 +37,9 @@
     ds: string;
     /** The past state the result was read at (`commit:42`), empty for the head. */
     at?: string;
+    /** In compare mode, where the left side was read, for the entities of removed rows. */
+    baseDs?: string;
+    baseAt?: string;
     marks?: readonly Mark[];
     onopen?: (iri: string) => void;
   } = $props();
@@ -69,21 +74,30 @@
     located = null;
     selectedRow = null;
     listShown = 100;
-    selection.clear();
+    untrack(() => selection.clear());
     if (!ends.size) {
       progress = '';
       return;
     }
     progress = `Locating ${fmtInt(ends.size)} ${ends.size === 1 ? 'end' : 'ends'}…`;
-    locateEnds(ends, {
-      run: (sparql, limit) =>
-        api.select(ds, sparql, { at: at || undefined, send: limit, signal: ctl.signal }),
-      convert: async (batch) => (await api.geoConvert(batch, ctl.signal)).results,
+    const deps = (target: string, state: string) => ({
+      run: (sparql: string, limit: number) =>
+        api.select(target, sparql, { at: state || undefined, send: limit, signal: ctl.signal }),
+      convert: async (batch: Parameters<typeof api.geoConvert>[0]) =>
+        (await api.geoConvert(batch, ctl.signal)).results,
       signal: ctl.signal,
-      onBatch: (_, done, total) => {
-        if (!ctl.signal.aborted) progress = `Locating ${fmtInt(done)} of ${fmtInt(total)}…`;
+    });
+    locateEndsCompared(
+      ends,
+      built.links,
+      {
+        ...deps(ds, at),
+        onBatch: (_, done, total) => {
+          if (!ctl.signal.aborted) progress = `Locating ${fmtInt(done)} of ${fmtInt(total)}…`;
+        },
       },
-    })
+      baseDs ? deps(baseDs, baseAt) : undefined,
+    )
       .then((r) => {
         if (ctl.signal.aborted) return;
         located = r;

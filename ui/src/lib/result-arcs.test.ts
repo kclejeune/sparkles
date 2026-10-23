@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Term } from './api';
+import type { AtInfo, Term } from './api';
 import { MAX_ARCS } from './arcs';
 import { GEOJSON_LITERAL, WKT_LITERAL } from './geo';
 import {
@@ -8,12 +8,17 @@ import {
   endpointId,
   entityColumns,
   locateEnds,
+  locateEndsCompared,
+  readAt,
   resultLinks,
 } from './result-arcs';
 
 const iri = (value: string): Term => ({ type: 'uri', value });
 const wkt = (value: string): Term => ({ type: 'literal', value, datatype: WKT_LITERAL });
 const str = (value: string): Term => ({ type: 'literal', value });
+const never = async () => {
+  throw new Error('convert should not run');
+};
 const prefixes = {};
 const lit = (term: Term) => (term.type === 'literal' ? term.value : '');
 void lit;
@@ -177,5 +182,91 @@ describe('positions of the ends', () => {
     expect(found.places).toEqual([]);
     expect(found.failed).toBe(2);
     expect(found.firstError).toBe('403 forbidden');
+  });
+});
+
+describe('the state a result was read at', () => {
+  const info = (over: Partial<AtInfo>): AtInfo => ({
+    selector: 'commit:2',
+    commit: 2,
+    head: 2,
+    historical: false,
+    datetime: null,
+    ...over,
+  });
+
+  it('is the head for a read without a state', () => {
+    expect(readAt(undefined)).toBe('');
+  });
+
+  it('pins a read that named a state to its commit, also when that was the head then', () => {
+    expect(readAt(info({}))).toBe('commit:2');
+    expect(readAt(info({ selector: 'head', commit: 7, head: 7 }))).toBe('commit:7');
+    expect(
+      readAt(info({ selector: 'time:2026-01-01T00:00:00Z', commit: 3, historical: true })),
+    ).toBe('commit:3');
+  });
+
+  it('falls back to the selector when the server named no commit', () => {
+    expect(readAt(info({ selector: 'snapshot:s2', commit: null }))).toBe('snapshot:s2');
+    expect(readAt(info({ selector: 'head', commit: null }))).toBe('');
+  });
+});
+
+describe('positions in a comparison', () => {
+  it('locates the ends that only removed rows use at the earlier state', async () => {
+    const rows: (Term | null)[][] = [
+      [iri('http://x/kept'), iri('http://x/org')],
+      [iri('http://x/gone'), iri('http://x/org')],
+    ];
+    const r = resultLinks(['a', 'b'], rows, {
+      from: 'a',
+      to: 'b',
+      prefixes,
+      marks: ['kept', 'removed'],
+    });
+    const now: string[] = [];
+    const before: string[] = [];
+    const answer = (log: string[], where: Record<string, string>) => async (sparql: string) => {
+      const asked = Object.keys(where).filter((k) => sparql.includes(`<http://x/${k}>`));
+      log.push(...asked);
+      return asked.map((k) => ({ s: iri(`http://x/${k}`), lit: wkt(where[k]) }));
+    };
+    const found = await locateEndsCompared(
+      r.ends,
+      r.links,
+      {
+        run: answer(now, { kept: 'POINT(1 1)', org: 'POINT(2 2)' }),
+        convert: never,
+      },
+      {
+        run: answer(before, { gone: 'POINT(3 3)', org: 'POINT(9 9)' }),
+        convert: never,
+      },
+    );
+    // the organization has a kept row, so it is located now, and the removed person before
+    expect(now.sort()).toEqual(['kept', 'org']);
+    expect(before).toEqual(['gone']);
+    expect(found.places.map((p) => [p.id, p.lon])).toEqual([
+      ['<http://x/kept>', 1],
+      ['<http://x/org>', 2],
+      ['<http://x/gone>', 3],
+    ]);
+    expect(found.missing).toEqual([]);
+  });
+
+  it('is the plain lookup without an earlier state', async () => {
+    const r = resultLinks(['a', 'b'], [[iri('http://x/a'), iri('http://x/b')]], {
+      from: 'a',
+      to: 'b',
+      prefixes,
+      marks: ['removed'],
+    });
+    const found = await locateEndsCompared(r.ends, r.links, {
+      run: async () => [{ s: iri('http://x/a'), lit: wkt('POINT(1 1)') }],
+      convert: never,
+    });
+    expect(found.places.map((p) => p.id)).toEqual(['<http://x/a>']);
+    expect(found.missing.map((m) => m.iri)).toEqual(['http://x/b']);
   });
 });

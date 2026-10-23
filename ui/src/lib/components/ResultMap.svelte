@@ -21,6 +21,8 @@
     marks,
     ds = '',
     at = '',
+    baseDs,
+    baseAt = '',
   }: {
     vars: string[];
     rows: (api.Term | null)[][];
@@ -34,6 +36,9 @@
     ds?: string;
     /** The past state the result was read at (`commit:42`), empty for the head. */
     at?: string;
+    /** In compare mode, where the left side was read, for the entities of removed rows. */
+    baseDs?: string;
+    baseAt?: string;
   } = $props();
 
   // Arcs need two columns of geometries or of entities; a result with no geometry column
@@ -139,7 +144,7 @@
         </div>
       </div>
     {/if}
-    <ResultArcs {vars} {rows} {prefixes} {ds} {at} {marks} {onopen} />
+    <ResultArcs {vars} {rows} {prefixes} {ds} {at} {baseDs} {baseAt} {marks} {onopen} />
   </div>
 {:else}
   <div class="result-map">
@@ -370,6 +375,11 @@
     .body {
       grid-template-columns: 1fr;
       grid-template-rows: 320px 160px;
+    }
+    /* taps need 44 px targets: the switch between points and arcs */
+    .seg .btn {
+      min-height: 44px;
+      min-width: 44px;
     }
   }
 </style>

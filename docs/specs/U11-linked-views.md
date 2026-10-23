@@ -435,7 +435,9 @@ layout is recomputed when the map stops moving, because it depends on the zoom.
 map card, an own geometry literal, a geometry reached through `geo:hasGeometry` or
 `geo:hasDefaultGeometry`, or WGS84 latitude and longitude. One query with a `VALUES` block
 asks for 200 entities, four requests run at once, and the first literal that can be drawn
-stands for an entity with several. A line or a polygon stands at its centroid, weighted by
+stands for an entity with several. The row limit of a batch is shared by its entities, so
+when an answer comes back full, the entities it has no row for are asked again in a batch of
+their own. A line or a polygon stands at its centroid, weighted by
 length or area with holes taken out. The queries run through `api.select` on the dataset and
 branch of the page, at the `at` of the slider or of the result, and under the caller's
 view, so an entity whose geometry the caller may not read is simply not located and is
@@ -455,7 +457,8 @@ targets, the map takes the page's width and the page scrolls to the details belo
 
 **Caps.** A map draws 20,000 places and 20,000 links. A result of more rows reads the first
 20,000, and a map of more places keeps the first 20,000 and leaves out the links that end in
-the others. Both say so under the map.
+the others. Both say so under the map. Clustering wraps at the antimeridian, so places at 179 and -179
+degrees merge when they are within 20 px across the seam.
 
 **Tests.** The Vitest suites for `arcs.ts`, `selection.svelte.ts`, `locate.ts`,
 `result-arcs.ts` and the centroid and lookup query of `geo.ts` cover great circles, the
@@ -491,6 +494,10 @@ are not a published figure. The layout of 20,000 distinct arcs runs on the main 
 takes about 100 to 220 ms, which is felt as a pause after a zoom, and moving it to a worker
 is a later option. Explore's map reads the dataset and not a branch, because Explore itself
 has no branch selector. In compare mode with a branch, the nodes that only the other branch
-had are listed as not located. Colours are read from the theme when a map opens, so
+had are listed as not located. On the query page, the entities that only removed rows use are
+located at the state of the left side, and an entity that moved between the two states is
+drawn at its current position. The lookup that offers the Map tab to a result of plain
+resources does not run while the time slider is open, because it would be one more read of
+every state the slider visits, so such a result gets the tab once the bar is closed. Colours are read from the theme when a map opens, so
 a change of theme shows at the next map. Markers at one position stay merged at
 every zoom, and there is no spiral that opens them.

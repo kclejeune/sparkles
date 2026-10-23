@@ -23,6 +23,7 @@ import {
   type Link,
   type LonLat,
   type Place,
+  wrapBox,
 } from './arcs';
 
 const LYON: LonLat = [4.8357, 45.764];
@@ -196,9 +197,20 @@ describe('clustering places closer than 20 px', () => {
 
   it('averages across the antimeridian without going to the far side of the earth', () => {
     const c = clusterPlaces([place('a', 179.9999, 0), place('b', -179.9999, 0)], 1);
-    // 0.0002 degrees apart, but the pixels differ by a whole world: they stay apart
-    expect(c.clusters.length).toBeGreaterThanOrEqual(1);
-    for (const k of c.clusters) expect(Math.abs(k.lon)).toBeGreaterThan(179);
+    // 0.0002 degrees apart across the seam, so the pixels are a few apart and not a world
+    expect(c.clusters).toHaveLength(1);
+    expect(Math.abs(c.clusters[0].lon)).toBeGreaterThan(179.99);
+    expect(c.clusters[0].members).toEqual(['a', 'b']);
+  });
+
+  it('merges places on both sides of the seam at the world zoom, and not when far apart', () => {
+    const near = clusterPlaces([place('a', 179, 0), place('b', -179, 0)], 0);
+    expect(near.clusters).toHaveLength(1);
+    expect(near.of.get('a')).toBe(near.of.get('b'));
+    const far = clusterPlaces([place('a', 150, 0), place('b', -150, 0)], 0);
+    expect(far.clusters).toHaveLength(2);
+    // a place at exactly 180 and one at -180 are the same spot
+    expect(clusterPlaces([place('a', 180, 10), place('b', -180, 10)], 3).clusters).toHaveLength(1);
   });
 
   it('grows the marker with the cluster', () => {
@@ -446,10 +458,22 @@ describe('what is in view', () => {
     ]);
     // a box across the antimeridian
     const wrap = clusterPlaces(
-      [place('x', 179, 0), place('y', -179, 0), place('z', 0, 0)],
+      [place('x', 170, 0), place('y', -170, 0), place('z', 0, 0)],
       2,
     ).clusters;
-    expect(clustersInBox(wrap, [170, -5, -170, 5])).toHaveLength(2);
+    expect(clustersInBox(wrap, [160, -5, -160, 5])).toHaveLength(2);
+  });
+
+  it('puts a box as drawn into range, across the seam or around the world', () => {
+    expect(wrapBox([170, -10, 190, 10])).toEqual([170, -10, -170, 10]);
+    expect(wrapBox([-190, -10, -170, 10])).toEqual([170, -10, -170, 10]);
+    expect(wrapBox([-20, -10, 30, 10])).toEqual([-20, -10, 30, 10]);
+    expect(wrapBox([-400, -10, 400, 10])).toEqual([-180, -10, 180, 10]);
+    // another copy of the world, with the box ending on the seam
+    expect(wrapBox([100, -10, 180, 10])).toEqual([100, -10, 180, 10]);
+    // a marker at -175 is in view when the map shows 170 to 190
+    const c = clusterPlaces([place('p', -175, 0)], 4).clusters;
+    expect(clustersInBox(c, wrapBox([170, -5, 190, 5]))).toHaveLength(1);
   });
 
   it('boxes places', () => {

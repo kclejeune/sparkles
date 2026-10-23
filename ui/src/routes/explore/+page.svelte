@@ -2795,5 +2795,10 @@
       flex-basis: 100%;
       max-width: none;
     }
+    /* taps need 44 px targets: the switch between the graph and the map */
+    .gtools .seg .btn {
+      min-height: 44px;
+      min-width: 44px;
+    }
   }
 </style>

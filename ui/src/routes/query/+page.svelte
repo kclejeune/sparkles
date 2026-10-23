@@ -26,7 +26,7 @@
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { geoColumns } from '$lib/geo';
   import { locateEntities } from '$lib/locate';
-  import { entityColumns } from '$lib/result-arcs';
+  import { entityColumns, readAt } from '$lib/result-arcs';
   import { triplesToGraph, type Triple } from '$lib/graph';
   import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
@@ -117,6 +117,8 @@
     result?: api.SparklesResult;
     /** In compare mode: the same query read at the left handle's commit. */
     base?: api.SparklesResult;
+    /** Where `base` was read, `ds@branch` and the past state, for the maps of removed rows. */
+    baseFrom?: { ds: string; at: string };
     explain?: api.ExplainResult;
     updated?: { ms: number; result: api.UpdateResult | null };
     /** Whether materialized inferences were included (null: dataset has none). */
@@ -1339,7 +1341,14 @@
           branch: dsBranch,
           kind: result.queryType,
           result,
-          ...(base && base.queryType === result.queryType ? { base } : {}),
+          ...(base && base.queryType === result.queryType
+            ? {
+                base,
+                baseFrom: against
+                  ? { ds: onBranch(dsName, against), at: '' }
+                  : { ds: dsTarget, at: fromAt ?? '' },
+              }
+            : {}),
           view: keep ? prevView! : defaultView(result),
           startedAt: started,
           elapsed,
@@ -1703,7 +1712,7 @@
     if (!r || !vars || !rows || mapColumns.length || timeOpen) return;
     const cols = entityColumns(vars, rows);
     if (cols.length < 2) return;
-    const at = r.at?.historical ? r.at.selector : undefined;
+    const at = readAt(r.at) || undefined;
     const iris: string[] = [];
     const idx = cols.map((c) => vars.indexOf(c));
     for (const row of rows) {
@@ -3028,7 +3037,9 @@
               {prefixes}
               onopen={openIri}
               ds={onBranch(outcome.ds, outcome.branch)}
-              at={r.at?.historical ? r.at.selector : ''}
+              at={readAt(r.at)}
+              baseDs={mapDiff ? outcome.baseFrom?.ds : undefined}
+              baseAt={mapDiff ? outcome.baseFrom?.at : undefined}
             />
           {:else if outcome.view === 'plan'}
             {#if r.meta.plan}

@@ -222,12 +222,16 @@ export function clusterPlaces(
   px = CLUSTER_PX,
 ): { clusters: Cluster[]; of: Map<string, number> } {
   const xy = places.map((p) => mercatorPixel([p.lon, p.lat], zoom));
+  const world = TILE * 2 ** zoom;
+  // the columns of the grid wrap, so that places either side of the antimeridian meet
+  const columns = Math.max(1, Math.ceil(world / px));
+  const column = (v: number) => ((Math.floor(v / px) % columns) + columns) % columns;
   const cell = (v: number) => Math.floor(v / px);
   // a grid of cells `px` wide: a place's neighbours within reach are in the 3 by 3 around it
   const grid = new Map<string, number[]>();
   const key = (cx: number, cy: number) => `${cx},${cy}`;
   xy.forEach(([x, y], i) => {
-    const k = key(cell(x), cell(y));
+    const k = key(column(x), cell(y));
     const g = grid.get(k);
     if (g) g.push(i);
     else grid.set(k, [i]);
@@ -241,13 +245,14 @@ export function clusterPlaces(
     const members = [i];
     owner[i] = ci;
     const [x, y] = xy[i];
-    const cx = cell(x);
+    const cx = column(x);
     const cy = cell(y);
     for (let dx = -1; dx <= 1; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
-        for (const j of grid.get(key(cx + dx, cy + dy)) ?? []) {
+        for (const j of grid.get(key((((cx + dx) % columns) + columns) % columns, cy + dy)) ?? []) {
           if (owner[j] >= 0) continue;
-          if (Math.hypot(xy[j][0] - x, xy[j][1] - y) <= px) {
+          const across = Math.abs(xy[j][0] - x);
+          if (Math.hypot(Math.min(across, world - across), xy[j][1] - y) <= px) {
             owner[j] = ci;
             members.push(j);
           }
@@ -511,6 +516,22 @@ export function hotClusters(clusters: Cluster[], selected: (id: string) => boole
     if (c.members.some(selected)) out.add(i);
   });
   return out;
+}
+
+/**
+ * A box whose longitudes are as drawn, such as 170 to 190 when the antimeridian is in view,
+ * with its longitudes in range. A box that crosses the seam comes back with west greater
+ * than east, and one at least a world wide covers every longitude.
+ */
+export function wrapBox(box: [number, number, number, number]): [number, number, number, number] {
+  const [w, s, e, n] = box;
+  if (e - w >= 360) return [-180, s, 180, n];
+  const wrap = (x: number) => ((((x + 180) % 360) + 360) % 360) - 180;
+  const west = wrap(w);
+  let east = wrap(e);
+  // an edge exactly on the seam belongs to the side the box extends over
+  if (east === -180 && e > w) east = 180;
+  return [west, s, east, n];
 }
 
 /** Clusters in a box, largest first, for the list alternative and for keyboard order. */

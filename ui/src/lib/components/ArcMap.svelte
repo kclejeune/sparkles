@@ -8,6 +8,7 @@
     aggregateLinks,
     clusterPlaces,
     clustersInBox,
+    wrapBox,
     hotArcs,
     hotClusters,
     layoutArcs,
@@ -173,7 +174,7 @@
 
   function choose(ids: string[], mods: { shift: boolean; alt: boolean }) {
     if (mods.alt) selection.remove(ids);
-    else if (mods.shift) selection.toggle(ids, 'the map');
+    else if (mods.shift) selection.add(ids, 'the map');
     else selection.set(ids, 'the map');
   }
 
@@ -213,6 +214,9 @@
 
   // Tab walks the markers in view, largest first; Enter selects, Shift+Enter adds
   function onkeydown(e: KeyboardEvent) {
+    // only the map itself walks the markers; its zoom buttons and the links keep their keys
+    const t = e.target as Element | null;
+    if (!t?.closest?.('.maplibregl-canvas, .maplibregl-canvas-container')) return;
     if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
       const next = focusIdx + (e.shiftKey ? -1 : 1);
       detail = '';
@@ -315,7 +319,7 @@
       {overlay}
       focusId={focusedCluster?.id ?? null}
       {onpick}
-      onview={(box, z) => (view = { box, zoom: z })}
+      onview={(_, z, drawn) => (view = { box: wrapBox(drawn), zoom: z })}
     />
     {#if !places.length && !loading}
       <div class="empty">
