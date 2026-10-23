@@ -7,7 +7,8 @@
 
 import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { encodeHandoff } from '../../src/lib/handoff';
-import { shoot } from '../shoot';
+import { OUT, shoot } from '../shoot';
+import { join } from 'node:path';
 
 const DATASET = 'org';
 const PREFIXES = `PREFIX ex: <http://example.org/ontology#>
@@ -298,5 +299,65 @@ ORDER BY ?name`;
     .poll(async () => Number(await canvas.getAttribute('data-settled')))
     .toBeGreaterThan(0);
   await pane.getByRole('button', { name: 'Fit to view' }).click();
+  // the strip's count of the pattern's matches
+  await pane.getByRole('button', { name: 'Count matches' }).click();
+  await expect(pane.getByTestId('pattern-count')).toBeVisible();
   await shoot(page, 'pattern');
+});
+
+test('pattern-edit', async ({ page }) => {
+  // building on the canvas: + Edge from ?person, with the predicate picker ranked by the
+  // profile of ex:Person, and a waiting class node beside the drawing
+  const query = `PREFIX ex: <http://example.org/ontology#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+
+SELECT ?person ?name WHERE {
+  ?person a ex:Person ;
+          foaf:name ?name .
+}`;
+  await page.addInitScript(
+    ([q]) => {
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'People', query: q }], active: 't1' }),
+      );
+      localStorage.removeItem('sparkles.patternLayouts');
+      localStorage.setItem('sparkles.patternPane', JSON.stringify({ open: true, w: 620 }));
+    },
+    [query],
+  );
+  await page.goto(`/ui/query?ds=${DATASET}`);
+  const pane = page.getByRole('region', { name: 'Pattern', exact: true });
+  await expect(pane).toHaveAttribute('data-state', 'ok');
+  // a taller editor, so the drawing and the strip have room
+  const top = (await page.locator('.cm-editor').boundingBox())!.y;
+  const split = (await page.getByRole('separator', { name: 'Resize editor' }).boundingBox())!;
+  await page.mouse.move(split.x + split.width / 2, split.y + split.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(split.x + split.width / 2, top + 470, { steps: 5 });
+  await page.mouse.up();
+  const canvas = pane.locator('.pcanvas');
+  await expect
+    .poll(async () => Number(await canvas.getAttribute('data-settled')))
+    .toBeGreaterThan(0);
+  // a waiting class node, added with N
+  await canvas.focus();
+  await page.keyboard.press('n');
+  await page.keyboard.type('ex:Team');
+  await page.keyboard.press('Enter');
+  await expect(pane.getByTestId('pattern-live')).toContainText('waiting for an edge');
+  await pane.getByRole('button', { name: 'Fit to view' }).click();
+  // E on ?person opens the predicate picker
+  await canvas.focus();
+  await expect(pane.getByTestId('pattern-focus')).toContainText('?person');
+  await page.keyboard.press('e');
+  await pane.getByLabel('To', { exact: true }).fill('?team');
+  await pane.getByLabel('Predicate', { exact: true }).focus();
+  await expect(pane.getByRole('option').first()).toContainText('used by the class');
+  // the settling of `shoot` takes screenshots of the page, which closes the list: the
+  // page is already still once the ranked options are drawn
+  await page.mouse.move(0, 0);
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: join(OUT, 'pattern-edit.png'), animations: 'disabled' });
 });

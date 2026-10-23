@@ -91,7 +91,11 @@
       open = true;
       active = -1;
     }}
-    onblur={() => setTimeout(() => (open = false), 150)}
+    onblur={() =>
+      setTimeout(() => {
+        // a window that loses focus blurs the field too, which keeps the list open
+        if (document.activeElement !== input) open = false;
+      }, 150)}
     onkeydown={keydown}
     {...autofocus ? { autofocus: true } : {}}
   />
@@ -144,7 +148,9 @@
     position: absolute;
     z-index: 5;
     left: 0;
-    right: 0;
+    min-width: min(320px, 90vw);
+    width: max-content;
+    max-width: min(480px, 90vw);
     top: calc(100% + 2px);
     max-height: 240px;
     overflow: auto;
@@ -172,10 +178,12 @@
   }
   .count {
     margin-left: auto;
+    flex: none;
     color: var(--text-2);
     font-variant-numeric: tabular-nums;
   }
   .hint {
+    flex: none;
     color: var(--text-3);
     font-size: 11px;
   }

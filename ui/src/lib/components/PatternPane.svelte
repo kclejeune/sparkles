@@ -622,6 +622,8 @@
         ? { kind: 'add', s, p, o, ...(declare.length ? { declare } : {}) }
         : { kind: 'add-many', triples, ...(declare.length ? { declare } : {}) };
     if (apply(e, fail)) {
+      // the ends are written now, so they wait no longer, even before the redraw
+      waiting = waiting.filter((w) => w.text !== s && w.text !== o);
       edgeOpen = false;
       edgeError = null;
       edgeS = edgeP = edgeO = '';
@@ -1302,6 +1304,9 @@
     border-color: var(--spark);
   }
   .add {
+    /* above the canvas and its panel, so a picker's list opens over the drawing */
+    position: relative;
+    z-index: 4;
     display: flex;
     gap: 6px;
     padding: 6px 10px;
@@ -1423,6 +1428,8 @@
   /* the full-screen picker's list pushes the buttons down instead of covering them */
   .add.full :global(.list) {
     position: static;
+    width: 100%;
+    max-width: none;
   }
   .add.full :global(.btn),
   .add.full :global(input) {
