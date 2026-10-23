@@ -130,10 +130,14 @@ test('the focused path and the shared selection dim apart', async ({ page }) => 
   await panel(page).getByLabel('k shortest').check();
   await panel(page).getByRole('button', { name: 'Find paths' }).click();
   await expect(list(page).getByRole('option')).toHaveCount(3);
-  await page.evaluate(() =>
-    import('/ui/src/lib/selection.svelte.ts').then((m) =>
-      m.selection.set(['<http://example.org/alice>'], 'a test'),
-    ),
+  // the page's own module, which the dev server serves under the base path
+  await page.evaluate(
+    (src) =>
+      import(/* @vite-ignore */ src).then(
+        (m: { selection: { set(ids: string[], source: string): void } }) =>
+          m.selection.set(['<http://example.org/alice>'], 'a test'),
+      ),
+    '/ui/src/lib/selection.svelte.ts',
   );
   await expect.poll(async () => Number(await wrap.getAttribute('data-muted'))).toBeGreaterThan(0);
   const muted = await wrap.getAttribute('data-muted');
