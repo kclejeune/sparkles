@@ -456,9 +456,10 @@ const CHECKED = new Set(['passed', 'warned', 'rejected']);
  * Whether a preview's guard summary says the result would be resolved. It `remains` when
  * the summary lists it: the same focus node, shape, component, path and value. Its absence
  * means `resolved` only when the summary is conclusive: the guard validated the state
- * (`passed`, `warned` or `rejected`), the list is not truncated, and the validation was
- * full or the preview's complete list of changes touches the focus node, which an
- * incremental validation then covers. Everything else is `unknown`.
+ * (`passed`, `warned` or `rejected`), the list is not truncated, and it lists every result
+ * of the state. A full validation lists them all. An incremental one lists only the shapes
+ * and focus nodes it validated again, so its list is complete only when its exact `total`
+ * equals the number listed. Everything else is `unknown`.
  */
 export function resolution(r: VResult, p: WritePreview): 'resolved' | 'remains' | 'unknown' {
   const v = p.validation;
@@ -476,23 +477,27 @@ export function resolution(r: VResult, p: WritePreview): 'resolved' | 'remains' 
   if (listed) return 'remains';
   if (v.truncated || !CHECKED.has(String(v.status ?? ''))) return 'unknown';
   if (v.strategy === 'full') return 'resolved';
-  const c = p.changes;
-  const key = termKey(r.focus);
-  const touched = !!c && !c.truncated && c.quads.some((q) => q.subject === key || q.object === key);
-  return touched ? 'resolved' : 'unknown';
+  return v.total === (v.results ?? []).length ? 'resolved' : 'unknown';
 }
 
 /**
  * The graph a suggested fix writes, from the guard's `dataGraph` (see `FixGraph` in
  * fixes.ts): the default graph for none, `default` or a list of only the default graph,
- * the IRI of a list of one named graph, and `choose` for `union` or several graphs.
+ * the IRI of a list of one named graph, and `choose` for `union` or several graphs. On a
+ * server that serves the union as the default graph (`unionDefault`), the default graph
+ * is the union, so it also gives `choose`.
  */
-export function fixGraph(dataGraph: string | string[] | undefined): string | null | 'choose' {
+export function fixGraph(
+  dataGraph: string | string[] | undefined,
+  unionDefault = false,
+): string | null | 'choose' {
   const DEFAULT = 'urn:x-arq:DefaultGraph';
-  if (dataGraph == null || dataGraph === 'default') return null;
-  if (typeof dataGraph === 'string') return dataGraph === 'union' ? 'choose' : null;
+  const dflt = unionDefault ? 'choose' : null;
+  if (dataGraph == null || dataGraph === 'default') return dflt;
+  if (typeof dataGraph === 'string') return dataGraph === 'union' ? 'choose' : dflt;
   const named = dataGraph.filter((g) => g !== DEFAULT && g !== 'default');
-  if (named.length === 0) return null;
+  if (named.length === 0) return dflt;
+  if (unionDefault && named.length < dataGraph.length) return 'choose';
   if (named.length === 1 && named.length === dataGraph.length) return named[0];
   return 'choose';
 }

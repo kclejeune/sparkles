@@ -122,7 +122,7 @@
           api
             .writeValidation(name, ctl.signal)
             .then((w) => {
-              if (ds === name) guardGraph = fixGraph(w?.config.dataGraph);
+              if (ds === name) guardGraph = fixGraph(w?.config.dataGraph, w?.unionDefaultGraph);
             })
             .catch(() => {
               if (ds === name) guardGraph = 'choose';

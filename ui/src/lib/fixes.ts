@@ -364,6 +364,14 @@ export function suggestFix(r: VResult, ctx: FixContext = {}): string | null {
   }
 }
 
-/** Whether a suggestion still holds a placeholder the person must fill in. */
+/**
+ * Whether a suggestion still holds a placeholder the person must fill in: one of the
+ * variables it writes, outside comments, literals and IRIs.
+ */
 export const hasPlaceholder = (q: string) =>
-  /\?(value|allowed|class|graph)\b/.test(q.replace(/^#.*$/gm, ''));
+  /[?$](value|allowed|class|graph)\b/.test(
+    q
+      .replace(/^#.*$/gm, '')
+      .replace(/"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g, '""')
+      .replace(/<[^<>"{}|^`\\\s]*>/g, '<>'),
+  );

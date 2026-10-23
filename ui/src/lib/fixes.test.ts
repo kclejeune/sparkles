@@ -240,6 +240,22 @@ describe('review round 1', () => {
     expect(code(q)).not.toMatch(/DROP/);
   });
 
+  it('a variable name inside a literal or an IRI is not a placeholder', () => {
+    const lit1 = suggestFix(
+      shacl('HasValueConstraintComponent', { messages: ['HasValue["?graph"]'] }),
+    )!;
+    expect(lit1).toContain('"?graph"');
+    expect(hasPlaceholder(lit1)).toBe(false);
+    const iri = suggestFix(
+      shacl('HasValueConstraintComponent', { messages: [`HasValue[<${EX}x?graph=1>]`] }),
+    )!;
+    expect(iri).toContain(`<${EX}x?graph=1>`);
+    expect(hasPlaceholder(iri)).toBe(false);
+    expect(hasPlaceholder('INSERT { GRAPH ?graph { <urn:a> <urn:b> "?value" } } WHERE {}')).toBe(
+      true,
+    );
+  });
+
   it('writes the graph the triples live in', () => {
     const min = shacl('MinCountConstraintComponent', { messages: ['minCount[1]: x'] });
     const named = suggestFix(min, { graph: EX + 'g1' })!;

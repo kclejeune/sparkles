@@ -226,7 +226,7 @@ describe('review round 1: resolution needs coverage and the value', () => {
     expect(resolution(x, other)).toBe('unknown');
     const touched = p(
       { changes: { total: 1, limit: 20, truncated: false, quads: [quad(`<${EX}p17>`)] } },
-      { strategy: 'incremental' },
+      { strategy: 'incremental', total: 0 },
     );
     expect(resolution(x, touched)).toBe('resolved');
     expect(resolution(x, p({}, { strategy: 'full', status: 'skipped' }))).toBe('unknown');
@@ -250,5 +250,43 @@ describe('review round 1: the graph of the guard', () => {
     expect(fixGraph(['http://g/1'])).toBe('http://g/1');
     expect(fixGraph('union')).toBe('choose');
     expect(fixGraph(['http://g/1', 'http://g/2'])).toBe('choose');
+  });
+});
+
+describe('review round 2: coverage of the selected shape and the union default graph', () => {
+  const p = (v: Record<string, unknown>, quads: string[] = []): WritePreview => ({
+    dryRun: true,
+    wouldCommit: true,
+    outcome: 'commit',
+    head: 3,
+    changes: {
+      total: quads.length,
+      limit: 20,
+      truncated: false,
+      quads: quads.map((subject) => ({
+        op: '+' as const,
+        subject,
+        predicate: `<${EX}name>`,
+        object: '"Ana"',
+        graph: null,
+      })),
+    },
+    validation: { language: 'shacl', status: 'warned', truncated: false, results: [], ...v },
+  });
+  it('an incremental summary is conclusive only when it lists every result of the state', () => {
+    const x = r();
+    // another shape on the same node: the name shape was validated, the email result stays
+    expect(resolution(x, p({ strategy: 'incremental', total: 1 }, [`<${EX}p17>`]))).toBe('unknown');
+    expect(resolution(x, p({ strategy: 'incremental', total: 0 }, [`<${EX}p17>`]))).toBe(
+      'resolved',
+    );
+    expect(resolution(x, p({ strategy: 'incremental' }, [`<${EX}p17>`]))).toBe('unknown');
+  });
+  it('a guard over the default graph of a union-default server needs a graph', () => {
+    expect(fixGraph(undefined, true)).toBe('choose');
+    expect(fixGraph('default', true)).toBe('choose');
+    expect(fixGraph(['urn:x-arq:DefaultGraph'], true)).toBe('choose');
+    expect(fixGraph(['http://g/1'], true)).toBe('http://g/1');
+    expect(fixGraph('default', false)).toBeNull();
   });
 });

@@ -575,21 +575,25 @@ through the indexes, so its cost does not grow with the dataset.
     keeps the editor and the preview, and **Open in Query** takes the text to the query
     page at any width.
 11. **When Run is enabled.** Run needs a preview of the same text whose outcome is
-    `commit`, and a canvas at the head. A placeholder left in the text, comments aside,
-    disables Preview.
+    `commit`, and a canvas at the head. A placeholder variable left in the text disables
+    Preview. Comments, literals and IRIs that contain the same name do not count.
 12. **Resolved or not.** The preview's guard summary decides. The result is still reported
     when the summary lists the same focus node, shape, component, path and value. It is
     resolved only when the summary is conclusive: the guard validated the state, the list
-    is not truncated, and the validation was full or the preview's changes touch the focus
-    node, which an incremental validation then covers. Otherwise the panel says it cannot
-    tell, and the overlay validates again after the update runs.
+    is not truncated, and it lists every result of the state. A full validation lists them
+    all. An incremental validation lists only the shapes and focus nodes it validated
+    again, so its list is complete only when the exact total equals the number listed.
+    Otherwise the panel says it cannot tell, and the overlay validates again after the
+    update runs.
 13. **The list view.** Explore's node-link canvas has no list view, so the overlay has its
     own **Nodes with results** table with a Validation column.
 14. **Pausing.** The overlay waits while the graph's history plays, through a callback that
     TimeSlider gained, and it validates the drawn nodes 150 ms after they stop changing.
 15. **The graph a fix writes.** A result does not name its graph, so the overlay reads the
-    guard's `dataGraph` from `GET /$/validation/{ds}`, which needs read access. A data graph
-    that is the default graph gives plain updates, one named graph wraps every pattern in
+    guard's `dataGraph` from `GET /$/validation/{ds}`, which needs read access. That answer
+    also says whether the server serves the union of the graphs as the default graph, and
+    then a data graph that includes the default graph gives `GRAPH ?graph { }`. Otherwise a
+    data graph that is the default graph gives plain updates, one named graph wraps every pattern in
     `GRAPH <g> { }`, and `union`, several graphs or a failed read give `GRAPH ?graph { }`
     with the placeholder `?graph` to fill in or remove. The shapes-graph and editor sources
     validate the default graph.

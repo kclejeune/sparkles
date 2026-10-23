@@ -92,7 +92,13 @@ mod handlers {
 
     fn status_json(ds: &Dataset) -> J {
         match ds.dataset.validation().guard().get() {
-            Some(g) => g.json(),
+            Some(g) => {
+                let mut j = g.json();
+                // a guard over `default` validates the union of the graphs when the
+                // server serves the union as the default graph
+                j["unionDefaultGraph"] = J::Bool(ds.store.snapshot().union_default_graph);
+                j
+            }
             None => none_json(),
         }
     }

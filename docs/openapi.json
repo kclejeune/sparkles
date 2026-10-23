@@ -17401,6 +17401,9 @@
                   "recentRejections"
                 ],
                 "type": "object"
+              },
+              "unionDefaultGraph": {
+                "type": "boolean"
               }
             },
             "required": [

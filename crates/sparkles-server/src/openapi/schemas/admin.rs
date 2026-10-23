@@ -776,6 +776,7 @@ fn validation(put: &mut dyn FnMut(&str, J)) {
                         json!({
                             "language": string_enum(&["shacl", "shex"]),
                             "config": sref("ValidationConfig"),
+                            "unionDefaultGraph": boolean(),
                             "status": obj(
                                 &["mode", "counters", "warnings", "recentRejections"],
                                 json!({
