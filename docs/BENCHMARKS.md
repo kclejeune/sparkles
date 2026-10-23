@@ -1526,7 +1526,7 @@ spread between loads, at 2.0 to 2.1 GB at 10.5M and 3.1 to 3.3 GB on DBpedia. Wa
 queries that decode many strings, such as `export-500k`, `contains` and `lang-filter` at
 10.5M, ran 11% to 13% slower, which misses X11's warm gate of 5%, so front coding stays
 the default. Cold queries ran 2% to 3% faster on average, because fewer vocabulary pages
-are read.
+are read, but cold `export-500k` still took 1.11 times as long.
 
 ## Loading and index builds
 

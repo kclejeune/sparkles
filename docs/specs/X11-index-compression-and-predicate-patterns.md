@@ -293,34 +293,35 @@ first key plain, shrinks the DBpedia slice's `vocab.dat` to 343 MB and the 10.5M
 17.7 MB, by 29% and 32%. Coding the first keys as well would reach 36% and 45%, but the
 binary search would then decode every key it compares, so they stay plain.
 
-* **Format version.** Format 3 is the segmented layout of X07 Phase 3, so the version
-  that §7.1 calls 3 is 4 here. A generation with a feature is written as format 4, with
+* Format 3 is the segmented layout of X07 Phase 3, so the version that §7.1 calls 3 is
+  4 here. A generation with a feature is written as format 4, with
   the `features` list in `meta.json`, and one without stays format 3. A release that
   reads formats 2 and 3 checks only `format_version`, so it refuses an FSST generation as
   newer and still opens a default build.
-* **Entries.** An entry after the first of its block stores its length shifted left by
+* An entry after the first of its block stores its length shifted left by
   one, with the low bit set when its bytes are FSST codes. A suffix whose codes would not
   be shorter is stored plain, so no key grows. The 10.5M IRIs show why this matters,
   since their suffixes after front coding are digits that FSST cannot shorten.
-* **Tables.** `vocab.fsst` holds the id where the second table starts, so a reader does
+* `vocab.fsst` holds the id where the second table starts, so a reader does
   not have to find the first triple-term key before it can decode. The tables are
   trained on the suffixes of keys read from about 64 blocks of the partial vocabularies
   per kind of key. A suffix there is taken against the previous key of the same batch,
   and a table trained that way coded the merged vocabularies of both datasets within
   0.5% of one trained on their true suffixes.
-* **Writing.** The writer collects 65,536 keys, or 64 MiB of suffixes at the end of a
+* The writer collects 65,536 keys, or 64 MiB of suffixes at the end of a
   block, and codes their blocks in parallel, since coding in the merge's one appending
   thread would add about 3 s to the DBpedia slice's load.
-* **Choosing the codec.** `--vocab-codec front|fsst` sets the codec of new generations.
+* `--vocab-codec front|fsst` sets the codec of new generations.
   Without it, a new database is front-coded and a compaction keeps the codec of the
   generation it replaces. A partial compaction copies `vocab.fsst` with the vocabulary,
   and a compaction asked for another codec is a full one. §2.2's dataset setting is not
   built.
-* **Encoded IRIs.** No prefix up to the last non-digit covers 1% of the IRIs of the
+* No IRI prefix up to the last non-digit covers 1% of the IRIs of the
   DBpedia slice. The most common, `http://books.google.com/books%3Fvid=ISBN`, covers
   0.13%. `--iri-encoding auto` would therefore encode nothing there, and §4.4's gate of a
   10% smaller vocabulary on DBpedia cannot pass. At 10.5M three prefixes cover 1,520,000
-  of the 1,520,036 IRIs. Phase 2b is not built (see the [Outcome](#outcome)).
+  of the 1,520,036 IRIs. Phase 2b is not built, and the [Outcome](#phases-not-built) says
+  what it would serve.
 
 ## 5. Index column codecs (Phase 3)
 
@@ -581,13 +582,15 @@ against 1.96 GB, in one load each.
 A bulk load or a full compaction with `--vocab-codec fsst` writes each front-coded
 block's suffixes after the first key as FSST codes when the codes are shorter, with two
 symbol tables in `vocab.fsst`, one for literals and one for IRIs and triple terms. §4.5
-gives the entry format and how the tables are trained. The file is the derived kind
-`vocab-fsst` version 1 in the format registry, with the magic `SPKFSST\0` and a checksum,
-and a reader refuses another version or a damaged file. The generation is index format 4,
+gives the entry format and how the tables are trained. The file is the primary kind
+`vocab-fsst` version 1 in the format registry, with the magic `SPKFSST\0` and a checksum.
+The vocabulary cannot be decoded without it, so a reader refuses a generation whose tables
+are missing, damaged or of another version, and nothing rebuilds them. The generation is index format 4,
 whose `meta.json` lists the feature `fsst-vocab`. This build refuses a generation that
 lists a feature it does not know and names the feature, and a release that reads formats
-2 and 3 refuses format 4 as newer. A build without the flag writes format 3 as before, so
-the default index is unchanged.
+2 and 3 refuses format 4 as newer. A new database built without the flag is front-coded
+and written as format 3, so the default index is unchanged. A load into an FSST store or a
+compaction of one keeps FSST and format 4 unless the flag asks for `front`.
 
 The decoder reserves eight bytes per code, writes each symbol as one unaligned 8-byte
 store and advances by the symbol's length. `sparkles
@@ -624,9 +627,10 @@ DBpedia cells medians of two rounds of 10, and cold cells medians of two rounds 
 bytes. The load times are the means of two loads each, so the DBpedia load is about 4%
 slower, and peak RSS did not change beyond the spread between loads.
 
-Cold queries meet the gate. Their geometric means over the queries at 0.3 ms or more are
-0.966 at 10.5M and 0.977 on DBpedia, since reading fewer vocabulary pages offsets the
-decoding. `export-500k` is the slowest cold query at 1.11 times main.
+Cold queries meet the gate's limit of 15%. Their geometric means over the queries at
+0.3 ms or more are 0.966 at 10.5M and 0.977 on DBpedia, since reading fewer vocabulary
+pages offsets the decoding. The export misses its own limit of 5% both warm and cold,
+because cold `export-500k` takes 1.11 times as long as with front coding.
 
 Warm queries miss it. At 10.5M the geometric mean is 1.018 over 23 queries, but the
 queries that decode many strings are slower by more than 5%.
@@ -651,13 +655,17 @@ where the cold figures apply. Every query returned the same answers with both co
 
 ### Phases not built
 
-**Phase 2b, encoded IRIs.** §4.5 records that no IRI prefix covers even 1% of the DBpedia
+#### Phase 2b, encoded IRIs
+
+§4.5 records that no IRI prefix covers even 1% of the DBpedia
 slice's IRIs, so `auto` would encode nothing there and §4.4's gate of 10% on DBpedia
 cannot pass. The 10.5M data would encode almost every IRI. Built as an option, the phase
 would serve datasets like Wikidata and the synthetic data, at the cost of a new id tag,
 string order across encoded and plain IRIs, and prefix filters.
 
-**Phase 3, column codecs.** The probe that
+#### Phase 3, column codecs
+
+The probe that
 [X01](X01-compression-codecs.md#index-codecs-measured-2026-10-23) describes re-encoded
 every frame of the permutations. zstd at level 3 saves 21% of the permutations at 10.5M
 and 17% on DBpedia, so the whole index would shrink by about 19% and 12% with the
@@ -665,13 +673,15 @@ vocabulary, short of §5's 25% before any query cost. `pfor` without LZ4 took 2.
 times LZ4's bytes, and restarting the second column's deltas at each run of the first made
 LZ4's frames 18% to 23% larger.
 
-**Open question 1, `COUNT(*)` per predicate.** A flag per pattern, set when each of its
-subjects has exactly one triple per predicate, would let `PatternCount` answer
-`COUNT(*)` for subjects whose patterns all carry it. It would be sound, but it would
-answer almost nothing on DBpedia. None of the 75,648 `dbo:Person` subjects and none of the
-5,959 `dbo:Film` subjects has a flagged pattern, because `rdf:type` and
-`dbo:wikiPageWikiLink` take many values, and 2,495,282 of 3,222,514 subjects overall have
-some predicate with more than one triple. At 10.5M, 603,571 of 1,520,018 subjects would be
-flagged. The all-subject `predicate-counts` query already takes 5 ms on DBpedia, so the flag would mainly help counts over a class whose instances are
-single-valued.
+#### Open question 1, `COUNT(*)` per predicate
 
+A flag per pattern, set when each of its subjects has exactly one triple per predicate,
+would let `PatternCount` answer `COUNT(*)` for subjects whose patterns all carry it. It
+would be sound, but it would answer almost nothing on DBpedia. None of the 75,648
+`dbo:Person` subjects and none of the 5,959 `dbo:Film` subjects has a flagged pattern,
+because `rdf:type` and `dbo:wikiPageWikiLink` take many values, and 2,495,282 of 3,222,514
+subjects overall have some predicate with more than one triple. At 10.5M, 603,571 of
+1,520,018 subjects are single-valued, but other subjects with the same pattern are not, so
+only 15 of the 24 patterns, with 311,843 subjects, could carry the flag. The all-subject
+`predicate-counts` query already takes 5 ms on DBpedia, so the flag would mainly help
+counts over a class whose instances are single-valued.
