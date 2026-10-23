@@ -7,6 +7,25 @@
 use crate::settings::{Providers, Typed};
 use serde::{Deserialize, Serialize};
 
+/// The file in a dataset's directory that keeps the runtime layer.
+pub const GRAPHRAG_FILE: &str = "graphrag.json";
+
+/// The kind's top-level members.
+pub const MEMBERS: &[&str] = &[
+    "version",
+    "enabled",
+    "principal",
+    "projection",
+    "levels",
+    "resolution",
+    "minCommunitySize",
+    "reportsGraph",
+    "language",
+    "maxFactsPerCommunity",
+    "refresh",
+    "budget",
+];
+
 /// The settings format this server reads and writes.
 pub const SETTINGS_VERSION: u32 = 1;
 

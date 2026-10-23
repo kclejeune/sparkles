@@ -768,10 +768,13 @@ route. The first Phase 1 parts that need no publication are in the server: the
 versioned `graphrag` settings type, the bounded and versioned build state, the hierarchy
 adapter of §3.1 with its stable identities, and the admission of §3.5, which reserves
 every model attempt from an exact local tokenizer, the provider's counting endpoint or
-the byte bound. Local mock providers test them. The byte bound's default allowances are
+the byte bound. The daily ledger and the anomalies persist in a small versioned file in
+the dataset's GraphRAG directory, written before each request can be sent. The
+`graphrag` kind is registered with C19's settings, so `/$/settings` validates and keeps
+it, and no build reads it. None of these parts is wired into a build or a
+route, and local mock providers test them. The byte bound's default allowances are
 unmeasured. Measuring them against real providers needs paid or provider runs, which
-wait for the user's approval. They are not wired into a build, a
-settings kind or a route. Phase 1 still needs the projection reader, the
+wait for the user's approval. Phase 1 still needs the projection reader, the
 report inputs and checks, the whole-build estimate, the disclosure guard, report
 storage with provenance, the build task and routes, the CLI, the Communities tab, the
 inbox kind and manual refresh. Global Ask and memory integration remain Phase 2, and

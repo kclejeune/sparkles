@@ -1450,7 +1450,7 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                 ],
                 json!({
                     "dataset": string(),
-                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes"]),
+                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag"]),
                     "effective": any_object("The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file."),
                     "declared": any_object("The settings file's `defaults` and dataset entry for this kind, merged."),
                     "runtime": any_object("The runtime layer: the fields changed through the API. `null` removes a declared member."),

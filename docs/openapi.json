@@ -234,7 +234,7 @@
         }
       },
       "kind": {
-        "description": "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server.",
+        "description": "The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server.",
         "in": "path",
         "name": "kind",
         "required": true,
@@ -243,6 +243,7 @@
             "assistant",
             "memory",
             "ingest",
+            "graphrag",
             "models",
             "notifications"
           ],
@@ -14222,7 +14223,8 @@
               "assistant",
               "memory",
               "ingest",
-              "prefixes"
+              "prefixes",
+              "graphrag"
             ],
             "type": "string"
           },
