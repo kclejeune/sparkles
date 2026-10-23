@@ -41,6 +41,9 @@ pub(crate) const SEG_ENTRY: usize = 32 + 16;
 /// The most segments of a block a range read decodes one by one, as a share of the
 /// block's segments. A range that spans more reads whole columns.
 const SPARSE_SEGMENTS_DIV: usize = 4;
+/// The segments of a block that readers decode one by one before they read it whole, as a
+/// share of its segments.
+const DENSE_SEGMENTS_DIV: usize = 8;
 
 /// Read hints for the memory-mapped index and vocabulary files (on by default, `off` in
 /// `SPARKLES_IO_HINTS` turns them off for a process).
@@ -1112,11 +1115,11 @@ impl Segments {
     }
 
     /// The segments of block `b` that readers may decode one by one before they read it
-    /// whole: a quarter of them. Past that, decoding the block once costs less than
-    /// decoding more of its segments, one request each.
+    /// whole: an eighth of them. Past that, one read and decode of the block costs less
+    /// than more reads of its segments, which on a cold file wait for a page each.
     #[inline]
     fn dense_limit(&self, b: usize) -> u8 {
-        (self.count(b) / SPARSE_SEGMENTS_DIV).max(1) as u8
+        (self.count(b) / DENSE_SEGMENTS_DIV).max(1) as u8
     }
 
     /// Whether readers have decoded enough of block `b`'s segments one by one to read it
@@ -1430,6 +1433,17 @@ impl PermIndex {
         match self.read_span(cache, b, lo, hi, mask) {
             Some(span) => self.prefetch_segments(cache, b, span, mask),
             None => self.prefetch(cache, b, mask),
+        }
+    }
+
+    /// Ask the kernel for the frames of segment `s` of block `b` in the columns of `mask`.
+    pub(crate) fn hint_segment(&self, b: usize, s: usize, mask: ColMask) {
+        if let Some(data) = self.data.as_ref().filter(|_| io_hints()) {
+            for c in (0..4).filter(|c| mask & (1 << c) != 0) {
+                if let Ok((off, len)) = self.frames_span(b, c, s, s + 1) {
+                    will_need(IoFile::of_perm(self.perm), data, off, len);
+                }
+            }
         }
     }
 
@@ -1828,6 +1842,7 @@ impl BlockCache {
     ) -> Result<Block> {
         let (r0, r1) = idx.segment_rows(b, s);
         let mut decoded = false;
+        let mut hinted = !hint;
         let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
         for (c, col) in cols.iter_mut().enumerate() {
             if mask & (1 << c) == 0 {
@@ -1855,7 +1870,14 @@ impl BlockCache {
             if let Some(hook) = &self.decode_hook {
                 hook();
             }
-            let v = idx.decode_segment(b, c, s, hint)?;
+            // the segment's frames lie apart, one per column: on a cold file, the first
+            // missing one asks for it and the later columns' together, so their reads
+            // overlap
+            if !hinted {
+                hinted = true;
+                idx.hint_segment(b, s, mask & !((1 << c) - 1));
+            }
+            let v = idx.decode_segment(b, c, s, false)?;
             if self.fill {
                 self.cache.insert(key, v.clone());
             }
@@ -2685,7 +2707,7 @@ mod tests {
     }
 
     #[test]
-    fn a_block_read_by_many_segments_is_read_whole_after_a_quarter_of_them() {
+    fn a_block_read_by_many_segments_is_read_whole_after_an_eighth_of_them() {
         let keys = run_keys();
         let (_d3, i3, _d2, _i2) = both_layouts(&keys);
         let cache = BlockCache::new(1 << 26);
