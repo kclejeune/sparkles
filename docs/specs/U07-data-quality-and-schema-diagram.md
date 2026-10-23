@@ -6,7 +6,9 @@
 > write-time guard validates, and draws it as a timeline on the dataset page with links
 > to the commits that introduced each result. Phase 2 backfills the timeline for past
 > commits and finds the introducing commit of results older than the record. Phase 3
-> adds the schema diagram with observed and declared cardinalities, and its export.
+> adds the schema diagram with observed and declared cardinalities, and its export. Phase
+> 4, added on 2026-10-23 in §11, badges SHACL and ShEx results on the nodes of the Explore
+> graph, shows the failing shape and triples, and suggests a fix query.
 >
 > **User docs:** none, because nothing is built.
 >
@@ -246,6 +248,9 @@ to instances of the same class) are drawn as loops.
    the Quality card, introducing commits from the record, and the `commit=` link.
 2. **Phase 2.** Backfill and the search for introducing commits of older results.
 3. **Phase 3.** The schema diagram, its filters and its exports.
+4. **Phase 4.** Focus sets and stored shapes in the validation routes, then the validation
+   overlay on the graph, with suggested fixes (§11). It needs U10 Phase 1. It does not need
+   Phases 1 to 3 here, and uses Phase 1's record when it exists.
 
 ## 7. Acceptance examples
 
@@ -312,6 +317,187 @@ A dataset `q` has a SHACL guard in `warn` mode with
 3. Whether the diagram should show subclass edges from the declared hierarchy, which the
    class tree already shows.
 
+## 11. Phase 4: a validation overlay on the graph (2026-10-23)
+
+This section was added on 2026-10-23, when the user approved a set of graph-interaction
+features. It was written from the same sources as the rest of this spec, together with
+the SHACL and ShEx routes as built, the write previews of
+[C15](C15-write-previews.md), and the lens model of [U10](U10-canvas-lenses.md).
+
+### 11.1 Goals and non-goals
+
+The timeline of Phase 1 says when results appeared, and the Validate panel lists them as
+rows. Neither shows where in the graph the problems are. Phase 4 badges SHACL and ShEx
+results on the nodes Explore draws, shows the failing shape and the triples involved, and
+offers a query that would fix a result, for the person to review and run.
+
+**Goals**
+
+1. Every drawn node that is a focus node of a result gets a badge with its count and worst
+   severity.
+2. A badge opens the node's results with the shape, the constraint, the path, the value and
+   the message, and the triples involved are highlighted on the canvas.
+3. For the common constraint components, a suggested SPARQL Update that would resolve the
+   result, opened in the editor and previewed with C15 before anything commits.
+4. The overlay validates only the drawn nodes, so its cost follows the picture and not the
+   dataset.
+
+**Non-goals**
+
+- Applying fixes automatically. A suggestion is text in the editor, and the person runs it.
+- Fixes for every constraint. A component without a safe suggestion shows none.
+- Validation for callers whose access covers part of a dataset. The validation routes
+  refuse them today, and §11.5 keeps that rule.
+
+### 11.2 User-visible behaviour
+
+The badge channel of U10's lens menu offers **Validation**, with the source chosen
+beside it: the dataset's write-time guard, a shapes graph of the dataset, or the shapes in
+the Validate panel's editor. With a guard configured, the overlay is on by default in
+Explore for callers who may use it.
+
+```
+ (ex:p17 ⚠2) ──ex:worksFor──▶ (ex:acme)        ┌─ ex:p17 · 2 violations ───────────────┐
+      │                                          │ ex:PersonShape · sh:minCount 1        │
+   ex:email ━━━▶ ("a@x" ✕)                       │   path ex:name · no value              │
+                                                 │   [Suggest fix]                        │
+                                                 │ ex:PersonShape · sh:pattern           │
+                                                 │   path ex:email · value "a@x"          │
+                                                 │   message "not an email address"       │
+                                                 │   [Show triples]                       │
+                                                 └───────────────────────────────────────┘
+```
+
+- **Badges.** A violation is `✕`, a warning `⚠` and an info `ⓘ`, with the count. The badge
+  shows the worst severity. A literal node that is the value of a result gets the mark of
+  its result, so a bad email is marked where it is drawn.
+- **Results panel.** Clicking a badge, or pressing `V` on a focused node, opens the node's
+  results grouped by shape and constraint. Each result names its source shape, its
+  component, its path, its value and its messages, as `ShexResults` and the Validate panel
+  already show them. A ShEx result shows its shape and its failures by kind.
+- **Show triples.** The result's focus node, path and value are highlighted, and edges along
+  the path that are not drawn are added as an overlay.
+- **Suggest fix.** For the components of §11.4, the editor opens with a suggested update
+  and a comment that names the result. **Preview** runs it as a C15 dry run, which reports
+  the changes and whether the result would be resolved by the guard. The overlay never
+  commits.
+- **After a write.** When a commit changes the drawn nodes, the overlay validates them again,
+  so a fix's badge disappears.
+
+The badges are part of the node's accessible description, such as "ex:p17, 2 violations",
+and the list view gains a **Validation** column. `V` opens the results, `Shift+V` moves
+focus to the next node with a result. At 390 px the results panel is a bottom sheet, and
+**Suggest fix** opens the query page in its text tab.
+
+| Case | What the overlay shows |
+|---|---|
+| A caller whose access covers part of the dataset | **Validation** is absent from the lens menu, with "Validation needs access to every graph". |
+| No guard and no shapes graph | The source picker offers the Validate panel's shapes only. |
+| Shapes with SHACL-SPARQL constraints over the whole graph | The overlay validates the drawn nodes as focus nodes, which can differ from a full validation for constraints that are not anchored at the focus node, and the panel says so. |
+| A validation over the budget | The route's `507`, and badges stay off. |
+
+### 11.3 Server and API changes
+
+The overlay needs to validate a set of nodes against the guard's shapes without sending
+them. `POST /{ds}/shacl` validates one `target` node against a shapes graph in the body,
+and `POST /{ds}/shex` takes a shape map. Phase 4 therefore starts with one addition to
+each.
+
+**Prerequisite, focus sets and stored shapes.**
+
+1. `POST /{ds}/shacl` takes `target` up to 1,000 times, and validates each node against the
+   shapes whose targets select it, as one `target` does today. It also takes
+   `shapes=guard` or `shapes=<graph IRI>` with an empty body, which validates against the
+   write-time guard's shapes or a shapes graph of the dataset. A request that names a source
+   and also has a body is a `400`.
+2. `POST /{ds}/shex` takes `schema=guard` with an empty body, and its compact shape map may
+   hold up to 1,000 node associations, each node with its shape from the guard's shape map
+   when the map names `START` or a class target.
+
+Both answers keep their current shapes. The overlay sends the drawn nodes in batches of up
+to 500, one batch in flight. When U07 Phase 1's record exists for the head and the canvas is
+at the head, the overlay reads `GET /$/validation/{ds}/results` filtered to the drawn focus
+nodes instead, which costs no validation. Phase 1's route gains `focus=` for that, up to
+1,000 terms.
+
+These parameters are added to `docs/API.md`, the route table and the OpenAPI description.
+
+### 11.4 Suggested fixes
+
+A suggestion is generated in the browser from the result alone, in `lib/fixes.ts`. It is a
+template with the result's terms filled in and the unknowns left as clearly marked
+placeholders, so it never guesses data.
+
+| Component | Suggestion |
+|---|---|
+| `sh:minCount` | `INSERT DATA { <focus> <path> ?value }` with `?value` as a placeholder to fill in. |
+| `sh:maxCount` | A `DELETE` of the values beyond the first, listed in a comment for the person to choose. |
+| `sh:datatype` | `DELETE` and `INSERT` that casts the value when the lexical form is valid for the datatype, and none otherwise. |
+| `sh:class` | `INSERT DATA { <value> a <class> }`, with a comment that the other choice is to change the value. |
+| `sh:in`, `sh:hasValue` | A `DELETE` and `INSERT` with the allowed values listed in a comment. |
+| `sh:closed` | A `DELETE` of the triple with the unexpected predicate. |
+| ShEx `cardinality`, `datatype`, `valueSet` | The same forms as the SHACL rows above. |
+
+Paths other than a single predicate, `sh:sparql`, `sh:pattern`, `sh:node`, qualified shapes
+and other components get no suggestion, and **Show triples** remains. Every suggestion runs
+through C15's preview before the person can commit it, under their own grants and the guard.
+
+### 11.5 Access, branches and past states
+
+The SHACL and ShEx routes answer `403` to a caller whose grants cover part of a dataset,
+because a result can reveal hidden triples, and C12 §5.5 keeps validation over a view for
+later. The overlay follows that rule and is not offered to such callers. U07 §2.4 already
+shows the Quality card only to callers who can read the guard's data graphs in full, and the
+`focus=` filter of the results route keeps that check. Validation with `at=` already exists,
+so the overlay validates at the canvas's state and branch, and its header names them. Moving
+U01's slider validates the drawn nodes again at the new state, one batch at a time, and
+**Play** pauses the overlay as U10 §4.3 pauses projection lenses.
+
+### 11.6 Limits
+
+At most 1,000 focus nodes per request and 1,500 drawn nodes per canvas, with batches of 500
+and one in flight. Each request runs under the validation pool, the request timeout and the
+result budgets that the routes already apply. The results panel lists up to 100 results for
+a node and counts the rest.
+
+### 11.7 Testing
+
+- **Rust.** Repeated `target`, `shapes=guard` and `shapes=<graph>`, the `400` for a source
+  with a body, ShEx `schema=guard` with a map of many nodes, the `403` for restricted callers
+  on the new forms, and `focus=` on the results route.
+- **Router.** The new parameters under the validation pool, the request timeout and the
+  result budgets, and OpenAPI equality.
+- **Vitest.** `lib/fixes.ts` for every row of §11.4, placeholders, and the absence of a
+  suggestion for the other components. The mapping from results to badges, including values
+  drawn as literal nodes.
+- **Playwright against the mock server.** A10 to A12 below and the 390 px sheet.
+- **Playwright against a real server.** A10, A11 and A13, building the history as
+  `write-validation.spec.ts` does.
+
+### 11.8 Acceptance examples
+
+The data is §7's dataset `q`.
+
+- **A10. Badges.** With the guard's shape and three people without names drawn, each person
+  has `✕1`, and the list view's column says "1 violation" for each.
+- **A11. Fix.** **Suggest fix** on one of them opens an `INSERT DATA` with the person and
+  `ex:name` and a placeholder value. Filling it with `"Ana"` and previewing reports one
+  resolved result, and after running it the badge disappears.
+- **A12. Show triples.** For a `sh:pattern` result on `ex:email`, **Show triples** highlights
+  the person, the `ex:email` edge and the literal.
+- **A13. Restricted caller.** A caller whose grants hide one graph sees no **Validation**
+  lens and the reason, and the new request forms answer `403` for them.
+- **A14. Cost.** On a dataset of 10 million triples with 1,500 drawn nodes, badges appear
+  within two seconds of the drawing settling, through at most three requests.
+
+### 11.9 Open questions
+
+1. Whether the overlay should be offered to callers with partial access once C12's
+   validation over a view lands, and with which shapes.
+2. Whether suggested fixes should be recorded as stored updates under roadmap item 39, so a
+   team can reuse a fix across results.
+
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 31.
+Not built. See [ROADMAP](../ROADMAP.md) item 31 for Phases 1 to 3 and item 106 for
+Phase 4.
