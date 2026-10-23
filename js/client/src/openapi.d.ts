@@ -5239,7 +5239,7 @@ export interface components {
             /** @enum {string} */
             status: "violations-found" | "none-found" | "incomplete";
         };
-        /** @description The net change between two states: counts, and the quads with `quads=true`. */
+        /** @description The net change between two states: counts, the quads with `quads=true`, or the counts by class with `group=class`. */
         Diff: {
             added: number;
             /** @description Quads compared state against state. Left out for a caller limited to some graphs. */
@@ -5251,6 +5251,15 @@ export interface components {
                 /** @description The state as asked for, such as `commit:4` or `head`. */
                 selector: string;
             };
+            /**
+             * @description With `group=class`: the changes are counted in `groups` instead of listed.
+             * @enum {string}
+             */
+            group?: "class";
+            /** @description With `group=class`: the groups found, of which `groups` lists up to `limit`. */
+            groupCount?: number;
+            /** @description With `group=class`: the largest groups first. */
+            groups?: components["schemas"]["DiffGroup"][];
             /** @description Changes read from the write-ahead logs. Left out for a caller limited to some graphs. */
             logChanges?: number;
             /** @enum {string} */
@@ -5263,6 +5272,26 @@ export interface components {
                 /** @description The state as asked for, such as `commit:4` or `head`. */
                 selector: string;
             };
+            /** @description With `group=class`: more groups were found than `groups` lists. */
+            truncated?: boolean;
+        };
+        /** @description The changes of a diff with one subject class, predicate and object class or kind. */
+        DiffGroup: {
+            added: number;
+            /** @description `{class}` for a resource by its class (`null` for a blank node without one; the object of `rdf:type` is the class it names), `{literal}` for a literal by its datatype IRI, `{iri: true}` for an IRI without a class. */
+            object: {
+                class: string | null;
+            } | {
+                literal: string;
+            } | {
+                /** @enum {boolean} */
+                iri: true;
+            };
+            /** @description The predicate IRI. */
+            predicate: string;
+            removed: number;
+            /** @description The class of the subject, an IRI, read at the `to` state for an added quad and at the `from` state for a removed one. `null` for a subject without a class the caller can read. */
+            subjectClass: string | null;
         };
         /** @description The preview of a write run with `dryRun=true`: the commit it would make, its changes, validation, preconditions and storage. */
         DryRunReport: {
@@ -7839,7 +7868,7 @@ export interface components {
             /** @description The entity tag of the runtime layer, as in the `ETag` header. */
             etag: string;
             /** @enum {string} */
-            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag";
+            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths";
             /** @description The fields the settings file locks. */
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
@@ -17140,8 +17169,14 @@ export interface operations {
                 term?: string[];
                 /** @description JSON: list the quads. */
                 quads?: boolean;
-                /** @description The most quads listed. */
+                /** @description `class`: count the changes by the class of the subject, the predicate and the class or kind of the object, without the quads. Classes are read under the caller's view, at the `to` state for an added quad and at the `from` state for a removed one. JSON only, and not with `quads=true`. */
+                group?: "class";
+                /** @description The most quads listed, or with `group=class` the most groups, from 1 to 5,000 (default 5,000). */
                 limit?: number;
+                /** @description A diff across branches: the branch `from` is read on, its head by default. */
+                fromBranch?: string;
+                /** @description A diff across branches: the branch `to` is read on. */
+                toBranch?: string;
                 /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
                 format?: components["parameters"]["format"];
             };
