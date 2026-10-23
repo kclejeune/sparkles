@@ -416,10 +416,10 @@ fn newer_shapes_refuse_only_their_dataset() {
         ok(h, &["dataset", "create", "--data-dir", d, name]);
     }
     let dbs = data.join("databases");
-    // books: every meta.json at version 3 without `created`
+    // books: every meta.json at the version after this build's, without `created`
     for p in files_named(&dbs.join("books"), "meta.json") {
         let mut m: J = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
-        m["format_version"] = 3.into();
+        m["format_version"] = (sparkles::builder::FORMAT_VERSION + 1).into();
         m.as_object_mut().unwrap().remove("created");
         std::fs::write(&p, serde_json::to_vec(&m).unwrap()).unwrap();
     }
