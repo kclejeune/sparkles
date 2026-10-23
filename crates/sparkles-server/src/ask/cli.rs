@@ -95,7 +95,10 @@ fn parse_pairs(flags: &[String]) -> Result<Vec<(Role, Pair)>> {
             .split_once('=')
             .with_context(|| format!("--pair {f}: expected ROLE=PROVIDER/MODEL"))?;
         let role = Role::parse(r).with_context(|| {
-            format!("--pair {f}: unknown role {r:?} (draft, repair, summarize, extract, explain or optimize)")
+            format!(
+                "--pair {f}: unknown role {r:?} ({})",
+                Role::ALL.map(Role::as_str).join(", ")
+            )
         })?;
         let pair =
             Pair::parse(p).with_context(|| format!("--pair {f}: expected PROVIDER/MODEL"))?;

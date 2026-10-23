@@ -61,6 +61,88 @@ fn models(url: &str, model: Value) -> Models {
     )
 }
 
+#[test]
+fn community_role_resolves_after_dataset_overrides_without_calls() {
+    let pair = |model| vec![Pair::new("mock", model)];
+    let cases = [
+        (None, None, None, pair("server-summary")),
+        (
+            None,
+            Some(pair("dataset-summary")),
+            None,
+            pair("dataset-summary"),
+        ),
+        (
+            Some(pair("server-community")),
+            Some(pair("dataset-summary")),
+            None,
+            pair("server-community"),
+        ),
+        (
+            Some(pair("server-community")),
+            Some(pair("dataset-summary")),
+            Some(pair("dataset-community")),
+            pair("dataset-community"),
+        ),
+        (
+            Some(pair("server-community")),
+            Some(pair("dataset-summary")),
+            Some(Vec::new()),
+            Vec::new(),
+        ),
+        (
+            Some(Vec::new()),
+            Some(pair("dataset-summary")),
+            None,
+            Vec::new(),
+        ),
+        (None, Some(Vec::new()), None, Vec::new()),
+    ];
+    // A connection to this unused local port would fail; resolving lists needs none.
+    let mut models = models("http://127.0.0.1:1", json!({}));
+    for (community, summarize_override, community_override, expected) in cases {
+        models.config.roles.clear();
+        models
+            .config
+            .roles
+            .insert(Role::Summarize, pair("server-summary"));
+        if let Some(pairs) = community {
+            models.config.roles.insert(Role::Community, pairs);
+        }
+        let mut overrides = RoleLists::new();
+        if let Some(pairs) = summarize_override {
+            overrides.insert(Role::Summarize, pairs);
+        }
+        if let Some(pairs) = community_override {
+            overrides.insert(Role::Community, pairs);
+        }
+        let resolved = resolve_lists(&models, &overrides);
+        assert_eq!(resolved.get(&Role::Community), Some(&expected));
+    }
+    models.config.roles.clear();
+    assert!(!resolve_lists(&models, &RoleLists::new()).contains_key(&Role::Community));
+}
+
+#[test]
+fn repair_role_still_inherits_the_resolved_draft_and_can_be_disabled() {
+    let models = models("http://127.0.0.1:1", json!({}));
+    let draft = vec![Pair::new("mock", "dataset-draft")];
+    let mut overrides = RoleLists::from([(Role::Draft, draft.clone())]);
+    // The explicit server Repair list still wins over inherited Draft.
+    assert_eq!(
+        resolve_lists(&models, &overrides).get(&Role::Repair),
+        models.config.roles.get(&Role::Repair)
+    );
+    let mut models = models;
+    models.config.roles.remove(&Role::Repair);
+    assert_eq!(
+        resolve_lists(&models, &overrides).get(&Role::Repair),
+        Some(&draft)
+    );
+    overrides.insert(Role::Repair, Vec::new());
+    assert!(resolve_lists(&models, &overrides)[&Role::Repair].is_empty());
+}
+
 pub(super) fn draft(q: &str) -> String {
     json!({
         "query": q,
