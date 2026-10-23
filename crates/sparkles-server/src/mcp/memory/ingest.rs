@@ -1797,8 +1797,11 @@ struct QuoteIndex<'q> {
     /// by quote: the span of its first occurrence in code points, and whether a second
     /// occurrence that does not overlap the first follows, as `str::match_indices` finds
     found: HashMap<&'q str, ((usize, usize), bool)>,
-    /// whether `found` is the whole answer, which it is unless the automaton failed to build
+    /// whether `found` is the whole answer, which it is unless quotes were left to scans
     complete: bool,
+    /// the passes over the text that were made
+    #[cfg(test)]
+    passes: usize,
 }
 
 /// The passes over the text that [`QuoteIndex`] makes at most. Each drops the quotes that
@@ -1816,6 +1819,8 @@ impl<'q> QuoteIndex<'q> {
         let mut index = QuoteIndex {
             found: HashMap::new(),
             complete: true,
+            #[cfg(test)]
+            passes: 0,
         };
         // per quote: the byte offset of its first occurrence, and whether another follows
         // it without overlap
@@ -1828,6 +1833,10 @@ impl<'q> QuoteIndex<'q> {
                 index.complete = false;
                 break;
             };
+            #[cfg(test)]
+            {
+                index.passes += 1;
+            }
             // The matches of one quote come in the order of their starts. Every match of a
             // quote that starts a whole quote after its first settles it, and a quote has
             // at most its own length of matches before that. Matches that overlap are
@@ -2739,17 +2748,18 @@ mod tests {
         );
     }
 
-    /// Long quotes that cannot settle beside a short one that does give the same answers
-    /// as scans, which a second pass for the short one's sake would not change.
+    /// A pass that is cut short, in which the one quote that settles took little of the
+    /// work, is not made again: the quotes that cannot settle are scanned for. The text is
+    /// 1,000 repeats of `ab`, the quotes are 500 to 1,000 repeats of it, which overlap
+    /// themselves and never occur twice, and `ab`.
     #[test]
     fn quote_index_does_not_repeat_a_pass_for_little() {
-        let period: String = (0..50u8).map(|i| char::from(b'A' + i)).collect();
-        let text = period.repeat(30);
-        let mut quotes: Vec<String> = (0..50)
-            .map(|r| period.chars().cycle().skip(r).take(900).collect::<String>())
-            .collect();
-        quotes.push("A".into());
+        let text = "ab".repeat(1000);
+        let mut quotes: Vec<String> = (501..=1000).map(|n| "ab".repeat(n)).collect();
+        quotes.push("ab".into());
         let index = QuoteIndex::new(&text, quotes.iter().map(String::as_str));
+        assert_eq!(index.passes, 1);
+        assert!(!index.complete);
         for q in &quotes {
             for first in [false, true] {
                 assert_eq!(index.find(&text, q, first), find_quote(&text, q, first));
