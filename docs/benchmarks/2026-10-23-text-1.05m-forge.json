@@ -1,0 +1,683 @@
+{
+ "record": 2,
+ "suite": "full-text",
+ "scale": "1.05m",
+ "manifest": {
+  "suite": "full-text",
+  "started": "2026-10-23T04:49:09Z",
+  "ended": "2026-10-23T04:49:13Z",
+  "host": {
+   "name": "forge",
+   "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+   "cpus": 20,
+   "ram_mib": 15622,
+   "disk_model": "",
+   "kernel": "6.18.53",
+   "filesystem": "ext4",
+   "mount_options": "rw,relatime,discard,errors=remount-ro"
+  },
+  "sparkles": {
+   "binary": "/home/kclejeune/lanes/item1-refresh-20261023/bin/sparkles-6699f27d",
+   "version": "sparkles 0.1.0",
+   "sha256": "4a94efcb075ea6381b127ec6db5e85cc960d5abecf2426def5baaef264e02f20",
+   "scripts_commit": "e133a8069f69d64f75d6468dbcef46832a9d7389",
+   "binary_commit": "6699f27d",
+   "scripts_note": "The harness checkout was 6699f27d with one commit of the item 1 lane on top, e133a806. It was later rebased onto main as 2bd5ae45 and changes only scripts/bench-record.py and its tests."
+  },
+  "engines": {
+   "jena": {
+    "license": "Apache-2.0",
+    "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+    "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+    "version": "Apache Jena Fuseki version 5.1.0",
+    "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+    "package": "apache-jena-fuseki-5.1.0",
+    "reported_version": "Apache Jena Fuseki version 5.1.0"
+   },
+   "qlever": {
+    "license": "Apache-2.0",
+    "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+    "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+    "version": "0.5.48",
+    "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+    "package": "qlever-0.5.48",
+    "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+   }
+  },
+  "memory_limit": "12G",
+  "client_cpu": "11",
+  "data": {
+   "synthetic-1.05m": {
+    "license": "repository synthetic generator",
+    "params": "people=100000 seed=default",
+    "sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+    "bytes": 110445630
+   }
+  },
+  "license_check": {
+   "gpl_benchmark_allowed": false,
+   "notes": []
+  },
+  "reused": {
+   "jena": {
+    "started": "2026-10-20T21:07:57Z",
+    "ended": "2026-10-20T21:08:12Z",
+    "host": "forge",
+    "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+    "engine": {
+     "license": "Apache-2.0",
+     "binary": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0/bin/fuseki-server",
+     "sha256": "7fb10cdec48244c13ea15e4c0607b29339e5d40c67a12cae2ced41903c1d2743",
+     "version": "Apache Jena Fuseki version 5.1.0",
+     "store_path": "/nix/store/q0dscszid7jzs66xq9dip95z2hc1zmsh-apache-jena-fuseki-5.1.0",
+     "package": "apache-jena-fuseki-5.1.0",
+     "reported_version": "Apache Jena Fuseki version 5.1.0"
+    }
+   },
+   "qlever": {
+    "started": "2026-10-20T21:07:57Z",
+    "ended": "2026-10-20T21:08:12Z",
+    "host": "forge",
+    "scripts_commit": "aa53c0e661bbb2a173cd15ca569d50cc830c4bd6",
+    "engine": {
+     "license": "Apache-2.0",
+     "binary": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server",
+     "sha256": "8a3d2eb5259918b6a22607a012e50bf0087dfc9205e37613a03a09a1e68a10dc",
+     "version": "0.5.48",
+     "store_path": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48",
+     "package": "qlever-0.5.48",
+     "reported_version": "/nix/store/xn7f9c965zfza9nks2qzlrnx916xg3h2-qlever-0.5.48/bin/qlever-server 0.0.0-unknown"
+    }
+   }
+  }
+ },
+ "settings": {
+  "warmup": 2,
+  "runs": 10,
+  "timer": "hyperfine+curl",
+  "resultCache": false
+ },
+ "results": [
+  {
+   "engine": "jena",
+   "query": "rare-top10",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    13.154,
+    13.851,
+    11.151,
+    11.503,
+    13.327,
+    12.914,
+    13.37,
+    14.03,
+    13.878,
+    13.617
+   ],
+   "median_ms": 13.349,
+   "p95_ms": 14.03,
+   "answer": {
+    "rows": 2,
+    "hash": "cd1c08f87000f76e",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "qlever",
+   "query": "rare-top10",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    7.627,
+    7.106,
+    6.82,
+    6.062,
+    6.519,
+    7.06,
+    6.921,
+    6.885,
+    6.56,
+    6.455
+   ],
+   "median_ms": 6.852,
+   "p95_ms": 7.627,
+   "answer": {
+    "rows": 2,
+    "hash": "cd1c08f87000f76e",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "sparkles",
+   "query": "rare-top10",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    4.55,
+    3.972,
+    3.988,
+    4.083,
+    3.985,
+    4.111,
+    3.789,
+    3.829,
+    3.873,
+    3.857
+   ],
+   "median_ms": 3.978,
+   "p95_ms": 4.55,
+   "answer": {
+    "rows": 2,
+    "hash": "cd1c08f87000f76e",
+    "agrees": true
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "jena",
+   "query": "common-top10",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    11.304,
+    11.451,
+    11.128,
+    10.981,
+    11.016,
+    9.085,
+    10.506,
+    9.862,
+    12.564,
+    13.222
+   ],
+   "median_ms": 11.072,
+   "p95_ms": 13.222,
+   "answer": {
+    "rows": 10,
+    "hash": "10",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "qlever",
+   "query": "common-top10",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    6.876,
+    7.279,
+    8.109,
+    6.967,
+    6.736,
+    7.226,
+    7.263,
+    8.763,
+    7.274,
+    7.736
+   ],
+   "median_ms": 7.269,
+   "p95_ms": 8.763,
+   "answer": {
+    "rows": 10,
+    "hash": "10",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "sparkles",
+   "query": "common-top10",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    4.529,
+    4.594,
+    4.158,
+    3.903,
+    4.034,
+    4.096,
+    3.99,
+    3.97,
+    4.1,
+    4.078
+   ],
+   "median_ms": 4.087,
+   "p95_ms": 4.594,
+   "answer": {
+    "rows": 10,
+    "hash": "10",
+    "agrees": true
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "jena",
+   "query": "common-count",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    57.018,
+    56.268,
+    60.978,
+    53.576,
+    53.041,
+    53.572,
+    54.685,
+    57.27,
+    50.22,
+    50.787
+   ],
+   "median_ms": 54.13,
+   "p95_ms": 60.978,
+   "answer": {
+    "rows": 1,
+    "hash": "c15ab9b9da23d5cf",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "qlever",
+   "query": "common-count",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    7.238,
+    8.024,
+    7.411,
+    7.28,
+    6.666,
+    6.679,
+    7.476,
+    6.755,
+    6.776,
+    7.612
+   ],
+   "median_ms": 7.259,
+   "p95_ms": 8.024,
+   "answer": {
+    "rows": 1,
+    "hash": "c15ab9b9da23d5cf",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "sparkles",
+   "query": "common-count",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    5.297,
+    4.792,
+    5.207,
+    4.741,
+    4.844,
+    4.661,
+    4.575,
+    4.564,
+    4.803,
+    4.733
+   ],
+   "median_ms": 4.766,
+   "p95_ms": 5.297,
+   "answer": {
+    "rows": 1,
+    "hash": "c15ab9b9da23d5cf",
+    "agrees": true
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "jena",
+   "query": "text-join",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    72.579,
+    68.004,
+    71.583,
+    67.608,
+    70.896,
+    68.148,
+    68.155,
+    68.998,
+    66.821,
+    84.462
+   ],
+   "median_ms": 68.576,
+   "p95_ms": 84.462,
+   "answer": {
+    "rows": 363,
+    "hash": "dc95b4802841f6db",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "qlever",
+   "query": "text-join",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    11.028,
+    10.966,
+    11.053,
+    12.319,
+    12.666,
+    12.847,
+    10.664,
+    14.639,
+    10.955,
+    11.803
+   ],
+   "median_ms": 11.428,
+   "p95_ms": 14.639,
+   "answer": {
+    "rows": 363,
+    "hash": "dc95b4802841f6db",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "sparkles",
+   "query": "text-join",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    5.804,
+    5.876,
+    5.637,
+    5.489,
+    5.745,
+    5.673,
+    5.539,
+    5.372,
+    5.592,
+    5.457
+   ],
+   "median_ms": 5.615,
+   "p95_ms": 5.876,
+   "answer": {
+    "rows": 363,
+    "hash": "dc95b4802841f6db",
+    "agrees": true
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "jena",
+   "query": "conjunction",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    13.616,
+    13.656,
+    17.354,
+    14.51,
+    14.136,
+    19.037,
+    14.331,
+    14.357,
+    14.256,
+    14.499
+   ],
+   "median_ms": 14.344,
+   "p95_ms": 19.037,
+   "answer": {
+    "rows": 278,
+    "hash": "40938fe9a337afeb",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "qlever",
+   "query": "conjunction",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    7.61,
+    7.561,
+    7.317,
+    7.098,
+    6.761,
+    7.366,
+    6.86,
+    6.829,
+    6.862,
+    7.238
+   ],
+   "median_ms": 7.168,
+   "p95_ms": 7.61,
+   "answer": {
+    "rows": 278,
+    "hash": "40938fe9a337afeb",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "sparkles",
+   "query": "conjunction",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    4.496,
+    4.309,
+    4.21,
+    4.003,
+    4.062,
+    3.999,
+    4.076,
+    3.976,
+    4.011,
+    4.047
+   ],
+   "median_ms": 4.055,
+   "p95_ms": 4.496,
+   "answer": {
+    "rows": 278,
+    "hash": "40938fe9a337afeb",
+    "agrees": true
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "jena",
+   "query": "highlight",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    115.852,
+    96.678,
+    96.635,
+    121.23,
+    97.803,
+    97.041,
+    96.375,
+    116.598,
+    102.387,
+    96.343
+   ],
+   "median_ms": 97.422,
+   "p95_ms": 121.23,
+   "answer": {
+    "rows": 4937,
+    "hash": "4937",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "qlever",
+   "query": "highlight",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    16.483,
+    13.868,
+    19.7,
+    14.965,
+    13.201,
+    14.129,
+    13.636,
+    15.386,
+    14.225,
+    14.09
+   ],
+   "median_ms": 14.177,
+   "p95_ms": 19.7,
+   "answer": {
+    "rows": 4937,
+    "hash": "4937",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "sparkles",
+   "query": "highlight",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    11.672,
+    11.446,
+    11.743,
+    11.702,
+    11.166,
+    11.056,
+    11.643,
+    11.111,
+    11.246,
+    11.695
+   ],
+   "median_ms": 11.544,
+   "p95_ms": 11.743,
+   "answer": {
+    "rows": 4937,
+    "hash": "4937",
+    "agrees": true
+   },
+   "status": "ok"
+  },
+  {
+   "engine": "jena",
+   "query": "stemmed",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    12.022,
+    12.098,
+    13.203,
+    12.908,
+    11.228,
+    10.138,
+    10.226,
+    10.165,
+    9.595,
+    9.784
+   ],
+   "median_ms": 10.727,
+   "p95_ms": 13.203,
+   "answer": {
+    "rows": 51,
+    "hash": "b91feac8e7139c5a",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "qlever",
+   "query": "stemmed",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    6.561,
+    5.98,
+    6.481,
+    6.028,
+    6.456,
+    5.996,
+    5.903,
+    5.985,
+    5.947,
+    6.375
+   ],
+   "median_ms": 6.012,
+   "p95_ms": 6.561,
+   "answer": {
+    "rows": 51,
+    "hash": "b91feac8e7139c5a",
+    "agrees": true
+   },
+   "status": "ok",
+   "reused": true
+  },
+  {
+   "engine": "sparkles",
+   "query": "stemmed",
+   "mode": "warm",
+   "clients": 1,
+   "durability": null,
+   "samples_ms": [
+    4.26,
+    3.99,
+    3.943,
+    3.762,
+    3.848,
+    3.774,
+    3.869,
+    3.727,
+    3.86,
+    3.676
+   ],
+   "median_ms": 3.854,
+   "p95_ms": 4.26,
+   "answer": {
+    "rows": 51,
+    "hash": "b91feac8e7139c5a",
+    "agrees": true
+   },
+   "status": "ok"
+  }
+ ]
+}

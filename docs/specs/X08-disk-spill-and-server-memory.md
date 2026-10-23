@@ -727,7 +727,9 @@ kernels and decoded terms. They exclude allocator metadata, size classes and pro
 RSS, and do not establish a performance result.
 
 Roadmap item 2 finished Phase 1 on 2026-10-18, when its A1 and latency gates were met.
-The Phase 1a suite runs at 10.5M and on DBpedia remain, and roadmap item 1 takes them.
+Roadmap item 1 ran the Phase 1a suite at 10.5M and on DBpedia on 2026-10-23. The default
+profile passes and the `small` profile does not, as
+[the profile runs](#profile-runs-at-105m-and-on-dbpedia-2026-10-23) describe.
 Phase 2 is built for sorts, groupings and DISTINCT under item 7, and item 85 added
 hash-join spill, the merge-join spool, DISTINCT below an ORDER BY and encryption on
 2026-10-18. Spill remains opt-in. Item 93 records the full-scale acceptance runs,
@@ -880,8 +882,8 @@ A second independent review and validation found the slow-growth publication rac
 missing charge-based CONSTRUCT retention, uncharged eager DESCRIBE and the missing sum of
 retained contexts on one grant. Regression tests cover oversubscribed concurrent growth,
 fitting output estimates, separate context lifetimes, graph lexical payload, budget
-failure cleanup and conversion from eager preparation to cursor accounting. The profile
-runs at 10.5M and DBpedia remain, and roadmap item 1 takes them.
+failure cleanup and conversion from eager preparation to cursor accounting. Roadmap item 1
+ran the profile runs at 10.5M and on DBpedia on 2026-10-23.
 
 A plain query charges the lock-free fast account and never takes the ledger lock. Once a
 query is promoted to the ledger, the ledger serializes admission and successful
@@ -889,7 +891,7 @@ ownership publication for its charges and adapted algorithm buffers. Pool releas
 wakeups run after that lock is released. This changes the retained-estimate path from the earlier fast
 read and separate growth helper. The earlier isolated Intel comparison covered only
 `types-grouped` and does not measure this repair. The Gates section records the A1 and
-latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
+latency gates, and roadmap item 1 ran the 10.5M and DBpedia profile runs on 2026-10-23.
 
 ### Gates
 
@@ -1038,14 +1040,11 @@ latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
   object is collected.
 * A lock-free `try_grant` when no request waits, measured with the latency gate above.
   Admission takes the queue's lock on every request.
-* The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold, which the Phase
-  1a gate requires. Only the 1.05M screen ran, and roadmap item 1 runs them on forge with
-  its benchmark refresh. The first batch of that refresh, on 2026-10-18 and 2026-10-19
-  with commit 81478fbe, ran the 10.5M suite with the default profile only, so it does not
-  decide the gate. In the same batch, SP²Bench at 10M triples met the default profile's
-  query budget of 8,192 MiB and pool of 5,344 MiB. Sparkles answered `q4` with 503 and
-  `q5a`, `q6` and `q12a` with 507 within 0.3 s, and its access log gives the outcome
-  `budget` for all four.
+* The `small` profile's cold reads. The profile gate of §3.3 ran at 10.5M and on DBpedia
+  on 2026-10-23. The default profile passes it, and the `small` profile is more than 5%
+  slower on several cold queries, as
+  [the profile runs](#profile-runs-at-105m-and-on-dbpedia-2026-10-23) describe.
+  [Roadmap](../ROADMAP.md) item 97 retunes the profile.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
@@ -1382,7 +1381,36 @@ under 4 MiB, where the OPTIONAL and MINUS joins took 3.3 and 4.6 times. A DISTIN
 over ordered input other than an ORDER BY keeps its whole set. Item 93 tracks these
 execution limits, the performance investigation and the review of enabling spill
 by default. Default enablement requires every A8 to A14 gate. The profile runs at 10.5M and on
-DBpedia remain under item 1.
+DBpedia ran under item 1 on 2026-10-23.
+
+### Profile runs at 10.5M and on DBpedia (2026-10-23)
+
+Roadmap item 1 ran the profile gate of §3.3 on forge with the release binary of 6699f27d.
+Each run served Sparkles alone under a 12 GiB memory limit, with clients on CPU 11 and
+without `--query-memory-mb`, so the profile set the query budget and the pool. The runs
+alternated the default and `small` profiles in the order default, small, small, default.
+At 10.5M each run was the synthetic suite's default mode with its cold pass, ten warm
+requests and three cold restarts per query. On the DBpedia 50M slice each run was five
+warm requests after one warm-up and one cold request per query. Every query answered in
+every run with the same answers.
+
+| Run | The `small` profile against the default |
+|---|---|
+| 10.5M, warm | Geometric mean 1.006. `distinct-obj` is 11% slower, 3.56 against 3.20 ms, and `minus` 5% slower. |
+| 10.5M, cold | Geometric mean 1.032. `star-lookup` is 79% slower, 34.4 against 19.2 ms in both runs. `predicate-counts`, `types-grouped`, `values-star` and `optional-count` are 7% to 10% slower. |
+| 10.5M, 16 clients | 237 and 234 q/s against 240 and 242 q/s. |
+| 10.5M, RSS after the run | 693 and 710 MiB against 813 and 788 MiB. |
+| DBpedia 50M, warm | Geometric mean 1.012. `abstract-contains` is 20% slower because of one slow run. |
+| DBpedia 50M, cold | Geometric mean 1.006. Single samples of `outlink-classes-1`, `category-tree`, `costar-birthplace` and `category-people-2` are 21% to 59% slower. |
+| DBpedia 50M, RSS after the run | 797 MiB in both runs against 831 and 839 MiB. |
+
+The default profile is the reference of the comparison and keeps its values. The `small`
+profile saves about 100 MiB of RSS at 10.5M and 40 MiB on DBpedia, and costs little warm,
+but it fails the 5% rule on cold queries. Its 256 MiB block cache is the likely cause,
+since a cold `star-lookup` reads more blocks than that cache keeps while the same query is
+within 1% warm. [Roadmap](../ROADMAP.md) item 97 retunes the profile and repeats the
+runs. The DBpedia cold differences come from one sample per query and run, so the retune
+should take more cold samples there.
 
 ### Full-scale spill acceptance, item 93 (2026-10-21)
 

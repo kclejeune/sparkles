@@ -1044,7 +1044,36 @@ commit 81478fbe and 20 threads, materialized the 13,876,262 triples of the UBA d
 1,224 MiB, and derived 5,527,675 triples. The `owl-rl` profile took 17.3 s, peaked at
 3,837 MiB with an estimate of 1,785 MiB, and derived 10,907,029 triples. BENCHMARKS.md
 compares the five engines' queries over that closure. Jena's reasoners were not run in this
-batch. A1 at 1,000 universities and OWL2Bench remain open.
+batch.
+
+**Acceptance runs of 2026-10-23.** Roadmap item 1 compared the release binary of the
+settled head 6699f27d with a release build of c7a6811c, the parent of the first Phase 1
+commit 57a71124, on forge. Each materialization ran with no engines, with 20 threads, in a
+systemd scope of 12 GiB without swap, and the closure dump was left out, so the digest of
+the sorted derived triples is the comparison.
+
+| Run | Head 6699f27d | Baseline c7a6811c |
+|---|---|---|
+| LUBM(100), 13.9M triples, `rdfs` | 11.4 s, 3,181 MiB peak RSS, 1,213 MiB peak heap estimate | 18.7 s, 4,884 MiB |
+| LUBM(100), `owl-rl` | 16.6 s, 3,972 MiB, 1,785 MiB | 25.6 s, 5,450 MiB |
+| OWL2Bench, 200 universities, 15.6M triples, `rdfs` | 16.6 s, 3,815 MiB, 1,608 MiB | 26.8 s, 6,140 MiB |
+| OWL2Bench, 1 university, `owl-rl` | 4.8 s, 885 MiB | 24.2 s, 2,721 MiB |
+| OWL2Bench, 2 universities, `owl-rl` | 44.7 s, 1,894 MiB, 4,914,915 derived triples | Stopped at the limit of 50 million inferred triples, when `prp-trp` produced 213 million candidates |
+| LUBM(1000), 138.3M triples, `rdfs` | Stopped at the limit after 15 s and 9,377 MiB, when `rdfs2` produced 40.8 million candidates in the first iteration | Killed at the 12 GiB limit after 25 s |
+
+Both binaries derived the same closure, by digest, in every run that both finished, at
+every OWL2Bench size from 1 to 200 universities under `rdfs` and in both LUBM(100)
+profiles. On LUBM(100) with OWL 2 RL and 20 threads the head is 1.54 times faster than
+the baseline, which meets A3's 1.5 times for 16 threads. A3's 1-thread run was not
+repeated here. The head's peak RSS is 0.65 times the baseline's on LUBM(100) `rdfs` and
+0.62 times on OWL2Bench at 200 universities, short of A1's half, although A1 sets the
+half for LUBM(1000), which neither binary can finish. OWL2Bench under OWL 2 RL from five
+universities on also stops at the limit in both binaries.
+
+A1 at 1,000 universities is not decided. The reasoner's limit of 50 million inferred
+triples is fixed, and the RDFS closure of LUBM(1000) passes it in the first iteration,
+so the run needs a configurable limit and a host with more than forge's 16 GiB.
+[Roadmap](../ROADMAP.md) item 98 takes both.
 
 **Deviations.**
 * §3.5 expected the same cache limit to keep the closure of an input about four times
