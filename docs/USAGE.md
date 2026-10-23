@@ -34,6 +34,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Branches and merges](#branches-and-merges)
 * [The Explore overview](#the-explore-overview)
 * [Arcs on the map](#arcs-on-the-map)
+* [The validation overlay](#the-validation-overlay)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
@@ -1558,6 +1559,50 @@ a phone's width the controls grow to 44 px and the map takes the page's width.
 
 A map draws at most 20,000 places and 20,000 links before merging, and says when a result
 had more. [U11](specs/U11-linked-views.md#outcome) records the measurements.
+
+## The validation overlay
+
+Explore can badge the SHACL and ShEx results of the nodes it draws. When the dataset has a
+write-time guard ([Write-time validation](API.md#write-time-validation)), the overlay is on
+by default. **Validation** in the canvas toolbar turns it on or off, and the choice is
+remembered in the browser. The overlay validates only the drawn nodes, in requests of up
+to 500 nodes with one in flight, so its cost follows the picture and not the dataset. It
+validates the first 1,500 drawn nodes.
+
+The **Shapes** picker chooses where the shapes come from. The write-time guard is the
+default, and a ShEx guard validates with its own schema and shape map. A shapes graph of
+the dataset can be named by its IRI. The shapes the Validate panel of the dataset page
+last validated with can be used too, and without a guard they are the default. A node
+with results gets a badge with its count and its worst severity, `✕` for a violation,
+`⚠` for a warning and `ⓘ` for an info. A literal drawn as the value of a result gets the
+same mark. **Nodes with results** lists them with a Validation column, such as
+"1 violation".
+
+A click on a badge opens the node's results, grouped by shape and constraint, with the
+path, the value and the messages. `V` opens the results of the selected node, and
+`Shift+V` selects the next node with results. **Show triples** draws the focus node, the
+edge of the result's path and the value, and marks them. At 390 px the results open as a
+sheet at the bottom of the screen.
+
+**Suggest fix** writes a SPARQL Update for the common constraints: `sh:minCount`,
+`sh:maxCount`, `sh:datatype`, `sh:class`, `sh:in`, `sh:hasValue` and `sh:closed`, and the
+ShEx cardinality, datatype, value set and closed failures. The update holds the result's
+terms, and what the result does not say is a placeholder such as `?value`, which must be
+filled in before **Preview** runs. Preview is a dry run of the update
+([C15](specs/C15-write-previews.md)). It lists the changes and says whether the guard
+would still report the result. **Run** commits the update only after a preview of the same
+text, and the overlay then validates the drawn nodes again, so a fixed badge goes away.
+**Open in Query** takes the update to the query editor instead. Constraints that are not
+on one predicate, `sh:pattern`, `sh:sparql`, `sh:node` and qualified shapes get no
+suggestion.
+
+With the graph's **History** open, the overlay validates the state the slider shows, and it
+pauses while the history plays. It validates the drawn nodes as focus nodes, so a
+SHACL-SPARQL constraint that is not anchored at its focus node can give other results in a
+full validation, and the overlay says so when such a result appears. A caller whose
+grants cover only some graphs of the dataset cannot validate it, and the overlay shows
+"Validation needs access to every graph". A validation over the server's result budget
+shows the error and no badges.
 
 ## The time slider
 

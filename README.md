@@ -309,11 +309,11 @@ agent memory, the map view and a merge preview.
   </tr>
   <tr>
     <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing two GraphRAG communities inside Engineering, with the payments team's report beside the picture and one of its findings chosen"></td>
-    <td></td>
+    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, a bad email address and its edge marked, and a results panel previewing an update that adds a missing name"></td>
   </tr>
   <tr>
     <td>The dataset grouped by its GraphRAG communities, with a report beside it</td>
-    <td></td>
+    <td>SHACL results badged on the graph, with a suggested fix previewed</td>
   </tr>
 </table>
 
