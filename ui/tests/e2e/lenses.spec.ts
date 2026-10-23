@@ -34,7 +34,7 @@ open.beforeAll(async ({ request }) => {
   expect(t.ok(), await t.text()).toBe(true);
   const task = await t.json();
   await expect
-    .poll(async () => (await (await request.get(`/$/tasks/${task.id}`)).json()).status, {
+    .poll(async () => (await (await request.get(`/$/tasks/${task.id}`)).json()).state, {
       timeout: 30_000,
     })
     .toBe('done');
@@ -64,7 +64,8 @@ for (const [name, title] of [
       .toBe(true);
     const d = await drawn(page);
     const types = d.edges.filter(([l]) => /type/.test(l));
-    expect(types.length).toBe(2);
+    // ex:Manager, ex:Employee and, under materialized RDFS, rdfs:Resource
+    expect(types.length).toBeGreaterThanOrEqual(2);
     for (const t of types) expect(t[2]).toBe('inferred');
     expect(d.edges.find(([l]) => /manages/.test(l))?.[2]).toBe('');
     await expect(page.getByTestId('lens-legend')).toContainText(
