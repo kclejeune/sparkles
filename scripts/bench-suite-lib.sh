@@ -33,6 +33,9 @@ inferred() { python3 -I -c 'import json, sys; sys.exit(sys.argv[2] not in json.l
 # the reasoner's own peak heap estimate and thread count (`infer --status`, null for a binary
 # that does not report them), and, unless DERIVED_DIGEST=0, the SHA-256 of the sorted derived
 # triples, so two binaries' closures can be compared. INFER_THREADS sets `--threads`.
+# CLOSURE_DUMP=0 leaves out <profile>.nt, which only the query engines read, for an
+# acceptance run with no engines whose closure would not fit on the disk (LUBM(1000) is
+# about 30 GB of N-Triples). The total triples are then the base plus the derived ones.
 suite_infer() {
   local p=$1 gtime derived t0 t1 status digest=null threads=()
   gtime=$(gnu_time)
@@ -65,11 +68,19 @@ print(n, h.hexdigest())') || die "dumping the derived graph of $p failed, see lo
       die "the derived graph of $p has ${hashed% *} triples, but infer reported $derived (logs/dump-derived-$p.log)"
     digest=\"${hashed#* }\"
   fi
-  "$SPARKLES" dump --loc "infer-$p.db" --merge --format nt --out "$p.tmp.nt" > /dev/null 2> "logs/dump-$p.log" ||
-    die "dumping the closure of $p failed, see logs/dump-$p.log"
-  mv "$p.tmp.nt" "$p.nt"
+  local base total
+  base=$(wc -l < base.nt)
+  if [ "${CLOSURE_DUMP:-1}" = 0 ]; then
+    [ -z "${ENGINES// /}" ] || die "CLOSURE_DUMP=0 needs ENGINES=\"\", since the engines load $p.nt"
+    total=$((base + derived))
+  else
+    "$SPARKLES" dump --loc "infer-$p.db" --merge --format nt --out "$p.tmp.nt" > /dev/null 2> "logs/dump-$p.log" ||
+      die "dumping the closure of $p failed, see logs/dump-$p.log"
+    mv "$p.tmp.nt" "$p.nt"
+    total=$(wc -l < "$p.nt")
+  fi
   python3 -I - "$RES_DIR/inference.json" "$p" "$(awk "BEGIN {print $t1 - $t0}")" "logs/infer-$p.time" "${derived:-0}" \
-    "$(wc -l < base.nt)" "$(wc -l < "$p.nt")" "$status" "$digest" "${INFER_NOTES:-}" << 'EOF'
+    "$base" "$total" "$status" "$digest" "${INFER_NOTES:-}" << 'EOF'
 import json, os, re, sys
 f, p, secs, timef, derived, base, total, status, digest, notes = sys.argv[1:]
 rss = int(re.search(r"Maximum resident set size \(kbytes\): (\d+)", open(timef).read()).group(1))

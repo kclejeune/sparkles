@@ -499,6 +499,50 @@ class LibTests(unittest.TestCase):
 class SuiteTests(unittest.TestCase):
     """The order of steps of suite_run in scripts/bench-suite-lib.sh, with every step stubbed."""
 
+    def infer(self, d, **env):
+        """suite_infer rdfs with a stub sparkles that derives two triples."""
+        stub = os.path.join(d, "sparkles")
+        write_text(stub, """#!/bin/sh
+case $1 in
+  load) mkdir -p "$3" ;;
+  infer) for a; do [ "$a" = --status ] && { echo '{"run": {"peakBytes": 5, "threads": 2}}'; exit 0; }; done
+         echo "2 inferred triples" ;;
+  dump) for a; do [ "$a" = urn:x-sparkles:inferred ] && { printf '<a> <b> <c> .\n<a> <b> <d> .\n'; exit 0; }; done
+        shift; while [ "$1" != --out ]; do shift; done; cat base.nt > "$2"; printf '<a> <b> <c> .\n<a> <b> <d> .\n' >> "$2" ;;
+esac
+""")
+        os.chmod(stub, 0o755)
+        gtime = os.path.join(d, "gtime")
+        write_text(gtime, '#!/bin/sh\nshift; out=$2; shift 2\necho "Maximum resident set size (kbytes): 1000" > "$out"\nexec "$@"\n')
+        os.chmod(gtime, 0o755)
+        write_text(os.path.join(d, "base.nt"), "<x> <y> <z> .\n")
+        os.mkdir(os.path.join(d, "logs"))
+        os.mkdir(os.path.join(d, "results"))
+        lib, suite = os.path.join(SCRIPTS, "bench-lib.sh"), os.path.join(SCRIPTS, "bench-suite-lib.sh")
+        script = (f'source "{lib}"; source "{suite}"; gnu_time() {{ echo "{gtime}"; }}\n'
+                  f'SPARKLES="{stub}" RES_DIR="{d}/results"; suite_infer rdfs')
+        e = dict(os.environ, ROOT=os.path.dirname(SCRIPTS), WORK=d, **env)
+        return subprocess.run(["bash", "-c", script], cwd=d, env=e, capture_output=True, text=True)
+
+    def test_closure_dump_can_be_left_out_of_an_engineless_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self.infer(d, ENGINES="", CLOSURE_DUMP="0")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(d, "rdfs.nt")))
+            inf = jload(os.path.join(d, "results", "inference.json"))["rdfs"]
+            self.assertEqual((inf["base_triples"], inf["derived_triples"], inf["total_triples"]), (1, 2, 3))
+            self.assertEqual(inf["peak_bytes"], 5)
+            self.assertEqual(len(inf["derived_sha256"]), 64)
+        with tempfile.TemporaryDirectory() as d:
+            p = self.infer(d, ENGINES="")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(jload(os.path.join(d, "results", "inference.json"))["rdfs"]["total_triples"], 3)
+            self.assertTrue(os.path.exists(os.path.join(d, "rdfs.nt")))
+        with tempfile.TemporaryDirectory() as d:
+            p = self.infer(d, ENGINES="sparkles", CLOSURE_DUMP="0")
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("CLOSURE_DUMP=0 needs", p.stderr)
+
     def test_each_timed_server_answers_every_selected_query_first(self):
         stubs = """
         resolve_tools() { :; }; suite_manifest() { :; }; load_all() { :; }; start_all() { :; }
