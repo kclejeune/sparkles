@@ -1,17 +1,20 @@
 # U06: Rendering large graphs
 
-> **Status:** specified
+> **Status:** partly implemented
 >
-> **Phases:** None shipped. Phase 1 is a WebGL graph view with layout in a web worker,
-> used for graph results above the current limits, and a class-level overview drawn from
-> the existing class profiles. Phase 2 adds server-side aggregation by class and by
-> community with semantic zoom into groups. Phase 3 adds layouts computed and cached on
-> the server and a compact binary transfer format.
+> **Phases:** Phases 1 and 2 shipped on 2026-10-23. Phase 1 is a WebGL graph view with
+> layout in a web worker, used for graph results above the current limits, and a
+> class-level overview drawn from the existing class profiles. Phase 2 adds server-side
+> aggregation by community and by property with semantic zoom into groups. Phase 3, which
+> adds layouts computed and cached on the server and a compact binary transfer format, is
+> not built.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API: Graph overview](../API.md#graph-overview) ·
+> [Usage: The Explore overview](../USAGE.md#the-explore-overview) ·
+> [Features](../FEATURES.md#web-ui)
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> This is the design as written before implementation, with the amendment of §2.3 and the
+> answers of §11. The [Outcome](#outcome) section at the end records how it landed.
 
 This design was written from the public documentation of sigma.js (version 3) and
 graphology, the ForceAtlas2 paper (Jacomy et al., "ForceAtlas2, a Continuous Graph Layout
@@ -115,6 +118,14 @@ level:
   or clicking a crumb closes the groups below it.
 - **Mixed levels.** Open groups and closed groups are drawn together. Edges between an
   open member and a closed group are aggregated to the group with their count.
+
+**Amendment (user request, 2026-10-23).** The overview is what Explore shows first when no
+resource is selected, in place of the former "Start from a resource" state, rather than
+in a tab of its own. Search and paste-an-IRI stay at the top. A resource chosen there, or a
+member clicked in the overview, opens the existing resource graph. Because a phone has no
+double-click, a click or tap on a class or a group opens it, and `Enter` does the same
+from the keyboard. The open path is a single chain from one class down, which the
+breadcrumb shows, so opening a node of an earlier level closes the levels below it.
 
 ### 2.4 Keyboard and accessibility
 
@@ -304,13 +315,77 @@ opens, so the size of the query page's first load does not change.
 
 ## 11. Open questions
 
+These were open when the spec was written. The answers below were chosen on 2026-10-23,
+taking the conservative option in each case.
+
 1. Whether group answers should be cached on the server per commit, or recomputed, given
    that the schema reports' incremental updates (C02) do not cover them.
+
+   **Answer: cached per commit, bounded.** A commit's data never changes, so an answer
+   is right for as long as its commit can be asked for, and no invalidation is needed.
+   The key is the branch's id, the commit, the caller's read view
+   (`GraphAccess::read_key`), the dataset's inferred overlay and the whole request, so a
+   caller never reads an answer computed for a wider view. The cache holds at most 64
+   answers and 16 MiB of their JSON and drops the oldest first. It costs a few lines and
+   makes reopening a group, which the breadcrumb invites, immediate.
+
 2. Whether the groups route should run an F14 community detection itself when no
    written-back result exists, as a task, instead of asking the person to write one back.
+
+   **Answer: no.** A community run needs a projection, F14's thread admission and, to
+   give group ids that stay stable, a written result. Leiden over the `foaf:knows`
+   graph of the 10.5M-triple benchmark dataset, 986,333 nodes and 5.0 million edges,
+   took 22 s on an 8-vCPU Namespace instance, eleven times the two-second target of
+   goal 3. A run inside the request would miss it, and a background run would need
+   write grants that a reader of the overview may not hold. The route reads written-back
+   communities when a sample of the set's instances holds them and otherwise groups by
+   the property that splits the sample best. The UI says that the groups are property
+   buckets because no F14 communities were written, as §2.5 asks.
+
 3. Whether the overview should also offer grouping by named graph for datasets that keep
    one graph per source.
 
+   **Answer: not in Phase 2.** Grouping by graph crosses classes, so it does not fit the
+   single open path below one class that the breadcrumb shows, and the graph view of
+   C12 limits makes its counts a second source of disclosure to review. It can come later
+   as a separate level above the classes.
+
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 29.
+Phases 1 and 2 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 29, ahead of
+their tier, because the user asked for the overview to be the first thing Explore shows.
+Phase 3 is not built and stays under item 29.
+
+**Server.** `POST /$/graph/{ds}/groups` answers by communities, by property and by
+members, as §3 describes. It reads through the caller's view of C12 and C12b, is admitted
+through the query memory pool as a query, takes one deadline for all of its queries,
+stops when the client goes away and caps its groups at 5,000 and its edges at 20,000. A
+group id is `g1.` and the base64url of the class and the partitions that lead to the
+group. The server decodes an id only through checks, so an id a client makes up can only
+name a set its own SPARQL queries could name. Numeric and date properties with more
+values than buckets are grouped by ranges of a round width. The class profiles that the
+overview starts from are now computed one predicate per rayon task, and both they and the
+group answers are cached per branch, commit, view and request, at most 64 answers and
+16 MiB.
+
+**UI.** Explore opens on the class overview when no resource is chosen, with search and
+paste-an-IRI above it. The view draws with sigma and graphology in WebGL and lays out
+with ForceAtlas2 in a module worker, and falls back to Cytoscape with the reason when
+WebGL 2 is missing or its context is lost twice. A tap or Enter opens a class or group,
+the breadcrumb and Backspace close levels, and a member opens in the resource view. The
+list view, the live region, the keyboard of §2.4 and both themes work at phone and desktop
+widths. The query page uses the same view for graph results above 2,000 nodes, with a
+renderer switch and node limits up to 100,000.
+
+**Measurements.** On an 8-vCPU Namespace instance with the 10.5M-triple dataset, the
+first overview request took a median of 1.12 s with the parallel profiles and 2.30 s
+without, which meets goal 3 only with the parallel build. Repeated requests at the same
+commit return from the cache in under 1 ms. Opening the largest class, `Researcher` with
+300,002 instances, took 1.35 to 2.26 s, and deeper levels took 0.1 to 0.8 s.
+[BENCHMARKS](../BENCHMARKS.md#the-explore-overview) has the table.
+
+**Limits.** A2 and A3, the frame rate and the main-thread checks on a GPU runner, are not
+automated, because the CI browsers run without a GPU. The headless browser used for the
+checks here lost its WebGL context and fell back to Cytoscape, which exercised A9 but
+not A2. Groups by named graph and on-demand community detection are not built, for the
+reasons in §11.
