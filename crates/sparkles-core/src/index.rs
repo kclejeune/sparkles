@@ -43,7 +43,7 @@ pub(crate) const SEG_ENTRY: usize = 32 + 16;
 const SPARSE_SEGMENTS_DIV: usize = 4;
 /// The segments of a block that readers decode one by one before they read it whole, as a
 /// share of its segments.
-const DENSE_SEGMENTS_DIV: usize = 8;
+const DENSE_SEGMENTS_DIV: usize = 4;
 
 /// Read hints for the memory-mapped index and vocabulary files (on by default, `off` in
 /// `SPARKLES_IO_HINTS` turns them off for a process).
@@ -1097,6 +1097,14 @@ impl Segments {
                 SEG_HEADER + n * SEG_ENTRY
             )));
         }
+        // A directory of at most this size is asked for whole at open, as the block
+        // records of `.meta` are read whole: on a cold server a reader would otherwise wait
+        // for a page of it at its first lookup in each block. A larger one (above about
+        // 700M quads) is asked for block by block by the readers that prefetch.
+        const READ_AT_OPEN: usize = 16 << 20;
+        if map.len() <= READ_AT_OPEN {
+            will_need(IoFile::of_perm(perm), &map, 0, map.len());
+        }
         Ok(Segments {
             map,
             seg_rows,
@@ -1115,7 +1123,7 @@ impl Segments {
     }
 
     /// The segments of block `b` that readers may decode one by one before they read it
-    /// whole: an eighth of them. Past that, one read and decode of the block costs less
+    /// whole: a quarter of them. Past that, one read and decode of the block costs less
     /// than more reads of its segments, which on a cold file wait for a page each.
     #[inline]
     fn dense_limit(&self, b: usize) -> u8 {
@@ -2707,7 +2715,7 @@ mod tests {
     }
 
     #[test]
-    fn a_block_read_by_many_segments_is_read_whole_after_an_eighth_of_them() {
+    fn a_block_read_by_many_segments_is_read_whole_after_a_quarter_of_them() {
         let keys = run_keys();
         let (_d3, i3, _d2, _i2) = both_layouts(&keys);
         let cache = BlockCache::new(1 << 26);
