@@ -52,6 +52,9 @@
   let path = $state<OvLevel[]>([]);
   let opening = $state<string | null>(null);
   let openError = $state<string | null>(null);
+  /** The commit the class profiles were read at: every level must come from it. */
+  let baseCommit: number | null = null;
+  let changed = $state(false);
   let selected = $state<string | null>(null);
   let listView = $state(false);
   let webgl = $state(true);
@@ -177,6 +180,7 @@
     try {
       const p = await api.schemaProfiles(ds, { signal: controller.signal });
       profiles = p.classes;
+      baseCommit = p.snapshot.commit ?? null;
       loadMs = performance.now() - t;
       // a dataset of built-in classes only keeps them, others start without them
       builtins = !p.classes.some((c) => !c.builtin && c.instances > 0);
@@ -210,6 +214,17 @@
     try {
       const within = key.startsWith('c:') ? { class: key.slice(2) } : { group: key.slice(2) };
       const answer = await api.graphGroups(ds, { within, by: how }, controller.signal);
+      changed = false;
+      // after a write, the levels already drawn and this answer count different data:
+      // read the classes again, and keep only an opened class, whose answer is new
+      if (baseCommit != null && answer.commit !== baseCommit) {
+        path = [];
+        selected = null;
+        await load();
+        changed = true;
+        if (key.startsWith('c:')) path = [{ key, label: target?.label ?? key, answer }];
+        return;
+      }
       // a node of an earlier level closes the levels below it first
       let keep = path.length;
       for (let i = 0; i < path.length; i++) {
@@ -393,9 +408,12 @@
       >
     {/if}
   </div>
-  {#if note || openError || failReason}
+  {#if note || openError || failReason || changed}
     <div class="ov-notes small">
       {#if openError}<p class="err" role="alert">{openError}</p>{/if}
+      {#if changed}<p class="faint">
+          The dataset changed since the overview was read, so its classes were read again.
+        </p>{/if}
       {#if note}<p class="faint">{note}</p>{/if}
       {#if failReason && !listView}<p class="faint">
           {failReason}; the overview is drawn with Cytoscape.

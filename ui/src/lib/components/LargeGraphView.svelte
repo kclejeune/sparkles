@@ -24,7 +24,7 @@
    * Tab and Shift+Tab move through the largest nodes on screen, Enter opens the focused
    * one, the arrow keys pan and + and − zoom.
    */
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import type Graph from 'graphology';
   import type Sigma from 'sigma';
   import type { LayoutStart, LayoutTick } from '$lib/layout.worker';
@@ -401,11 +401,12 @@
     startLayout(true);
   }
 
-  // the props change as a whole (a new level), so one rebuild per change
+  // the props change as a whole (a new level), so one rebuild per change. The rebuild
+  // reads other state, such as the selection, which must not start another one.
   $effect(() => {
     void nodes;
     void edges;
-    if (ready) sync();
+    if (ready) untrack(sync);
   });
 
   $effect(() => {

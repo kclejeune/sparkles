@@ -1233,11 +1233,13 @@ With `by: "auto"`, a set of at most `limit` instances answers with its members. 
 set opens into the communities that F14's write-back wrote for its instances, when a
 sample of them holds `urn:x-sparkles:algo:` community resources, and otherwise into the
 values of the property that splits the sample best. A property with few values gives one
-group per value. A numeric property, or a date property by year, gives ranges. Any other
-property gives its most frequent values and one group for the rest. When no property
+group per value. A numeric property, or a date property by year, gives at most
+`buckets` ranges of a round width. Any other property gives its most frequent values and
+one group for the rest. When no property
 fits, the answer lists the first `limit` members and says so in `note`. A community opens
 into the communities below it through `skos:broader`, and the finest level opens into its
-members.
+members. A group eight partitions deep, the most a group id holds, also opens into its
+members, with a `note`.
 
 A group id names the class and the partitions that lead to the group, so a later
 request can open it without server state, and the same group has the same id in every
@@ -1248,7 +1250,7 @@ An edge's `source` and `target` are `g:` followed by a group id, `c:` followed b
 IRI, or `m:` followed by a member IRI. An answer counts the edges from its own groups or
 members to each other, to the sibling groups of every group on its path and to the other
 classes, by predicate. A group's links to its own members are an edge from the group to
-itself. An answer holds at most 5,000 groups or members and 20,000 edges, and
+itself. An answer holds at most `limit` groups or members and 20,000 edges, and
 `truncated` says when it was cut.
 
 Every count comes from SPARQL queries run under the caller's view, so a caller limited
@@ -1259,7 +1261,10 @@ query, and answers `408`, `503` and `507` as a query does. A request names its b
 with `?branch=`, as the other dataset routes under `/$/` do, and a `branch` member of the
 body is a `400`. Answers are kept per branch, commit, view and request, at most 64 of
 them and 16 MiB in all, so opening the same group again at the same commit is
-immediate.
+immediate. The view in that key holds the caller's graphs, the protections of triples
+it keeps and the graphs that `default-graph-uri` and `named-graph-uri` select. Explore
+compares each answer's `commit` with the commit of the class profiles it drew, and reads
+the classes again when a write came between them.
 
 ### Schema diffs
 
