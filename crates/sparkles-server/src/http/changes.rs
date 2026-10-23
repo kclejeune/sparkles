@@ -213,17 +213,18 @@ pub(super) async fn changes(
     let mut p = page(&ds, &ask).await?;
     if p.commits.is_empty() && !wait.is_zero() {
         wait_for_commit(&st, &ds, &mut rx, after, Instant::now() + wait).await;
-        // the view was decided before the wait (spec C22 §6.3)
-        if epoch.is_some_and(|e| e != st.access_epoch()) {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                json!({
-                    "error": "the access policy or a disclosure registry changed; ask again to read under the new rules",
-                    "code": "access-changed",
-                }),
-            ));
-        }
         p = page(&ds, &ask).await?;
+    }
+    // the view was decided when the caller was authenticated: a page read after the
+    // policy or a disclosure registry changed is not answered (spec C22 §6.3)
+    if epoch.is_some_and(|e| e != st.access_epoch()) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            json!({
+                "error": "the access policy or a disclosure registry changed; ask again to read under the new rules",
+                "code": "access-changed",
+            }),
+        ));
     }
     let id = ds.store.dataset_id();
     if fmt != DiffFormat::Json {
@@ -333,6 +334,8 @@ struct Feed {
     /// the access epoch the caller's view was decided under: a new policy or disclosure
     /// registry ends the stream before it sends another event (spec C22 §6.3)
     epoch: Option<u64>,
+    /// the stream ended because access changed
+    revoked: bool,
 }
 
 impl Feed {
@@ -355,7 +358,9 @@ impl Feed {
     async fn next(mut self) -> Option<(Result<Event, std::convert::Infallible>, Feed)> {
         loop {
             // checked before every event, so events read under the old view are dropped
-            if !self.done && self.epoch.is_some_and(|e| e != self.st.access_epoch()) {
+            // also while a terminal page drains its queue
+            if !self.revoked && self.epoch.is_some_and(|e| e != self.st.access_epoch()) {
+                self.revoked = true;
                 self.done = true;
                 self.queue.clear();
                 return Some((
@@ -433,6 +438,7 @@ fn event_stream(
         until: Instant::now() + MAX_STREAM,
         done: false,
         epoch,
+        revoked: false,
     };
     let events = futures_util::stream::unfold(feed, Feed::next);
     Sse::new(events).keep_alive(KeepAlive::default())

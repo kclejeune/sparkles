@@ -49,12 +49,10 @@ pub fn path_in(db: &Path) -> PathBuf {
 /// Serializes registry installs in the process.
 static INSTALLS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// Create `dir` inside the database directory `db`, flushing `db` when `dir` is new so
-/// that a file written in it survives a power loss.
+/// Create `dir` inside the database directory `db` and flush `db`, so that a file
+/// written in `dir` survives a power loss. `db` is flushed on every call, since an
+/// earlier call may have created `dir` and then failed to flush.
 pub(crate) fn create_dir_durably(db: &Path, dir: &Path) -> std::io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     std::fs::File::open(db)?.sync_all()?;
