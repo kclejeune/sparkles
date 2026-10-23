@@ -526,6 +526,17 @@ throughout the acceptance matrix. Calibration has its own raw samples and cold-r
 checks and cannot enter acceptance summaries. Its aggregate rate validation does not
 excuse a failed schedule-lag check in an acceptance process.
 
+`scripts/bench-indexed-report.py` summarizes finished campaigns of that harness. For
+every scenario it prints the median and range of each metric with the ordinary writer and
+with grouping, the ratio of the two medians, and the ratio between neighbouring processes
+of each ABBA block. For the serial scenarios and the writer scenarios it also prints the
+mean time of a commit synchronization, which it reads from each process's server
+counters, and for the serial scenarios the engine overhead, which is the mean request
+latency less that synchronization time. A drive whose flush latency changes between
+processes moves the synchronization column, and the overhead column shows whether the
+two writers still differ once that change is taken out. The pass and fail marks come from
+the harness's own `gate-summary.json`, and the report changes no verdict.
+
 ## Continuous integration
 
 The workflows in `.github/workflows` run on standard GitHub-hosted runners, which are free
