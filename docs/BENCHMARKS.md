@@ -775,20 +775,31 @@ The repeat with `prefetch_constants`, `prefetch_first_scan`, `prefetch_terms` an
 window changes remained active. The ablation was incomplete, and the cause remains
 unresolved.
 
-Roadmap item 4 and [X07 §9](specs/X07-cold-sparse-reads.md#9-targets), including A5,
-retain the follow-up on quiet forge. After correctness review and integration, compare
-the corrected default with the approved baseline. Repeat that comparison with the
-candidate's four flags disabled and `SPARKLES_READ_WINDOW_KB=0`. Window zero retains the
-original 1 MiB vocabulary window. The cold targets, such as `star-lookup` at 10.5M within
-17.3 ms, still require that host's measurements.
+##### Corrected source on forge
 
-These measurements predate the cancellation, decoded-cache budget and advised-coverage
-repairs. The corrected read-ahead path counts existing outstanding bytes and coalesced
-gaps, allows one next-block extension and restores advice after cache eviction. Its
-warm and cold measurements and no-profile overhead gate remain pending on integrated
-source. Vocabulary profiling also observes mapped offsets before loading them and
-accounts for ordinary and fallible bulk decodes independently of advice. These
-correctness tests establish no new speed result or counter-cost measurement.
+These figures of 2026-10-23 come from forge with the engine of main at `b7b6f760`. The
+cold preparation evicts every file of the store with `posix_fadvise(POSIX_FADV_DONTNEED)`
+before each fresh server, and the filesystem was trimmed before the loads. The first two
+columns of each size are `scripts/bench.sh --mode cold`, median of 3, with Oxigraph 0.5.11
+in the same run. Fluree was not re-measured. The "without X07" column is the same source
+with the X07 code reverted, measured with `bench-regressions.py --cold` against the
+default build in interleaved rounds of 7 samples. [X07](specs/X07-cold-sparse-reads.md#corrected-source-measurements)
+describes that pair.
+
+| Cold, forge, median ms | 1.05M Sparkles | 1.05M Oxigraph | 10.5M Sparkles | 10.5M Oxigraph | 10.5M without X07, A/B | 10.5M with X07, A/B |
+|---|---:|---:|---:|---:|---:|---:|
+| `star-lookup` | **13.2** | 14.9 | 18.8 | **15.4** | 37.4 | 22.2 |
+| `values-star` | 9.2 | **6.3** | 8.9 | **5.7** | 11.3 | 10.1 |
+| `employee-docs` | **12.0** | 15.3 | 15.1 | **14.1** | 26.3 | 18.4 |
+| `path-plus` | 6.5 | **3.8** | 5.7 | **2.2** | 6.3 | 6.6 |
+| `count-all` | **3.1** | 313.1 | **3.0** | 2,930.5 | 4.4 | 4.3 |
+| `contains` | **13.8** | 258.6 | **31.8** | 2,486.4 | 35.2 | 34.4 |
+| `lang-filter` | **11.5** | 194.2 | **26.6** | 1,784.0 | 30.3 | 30.0 |
+
+The A/B columns time requests from a Python client and are not comparable with the
+`bench.sh` columns, which use curl. Across all 28 queries, X07 makes no cold query more
+than 5% slower at either size. The 1, 4 and 16 MiB read windows gave medians within the
+noise of each other at 10.5M. The dense-read gate at 1.01B was not run.
 
 ### BSBM Explore at 10M triples
 
