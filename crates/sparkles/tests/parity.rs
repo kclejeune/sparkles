@@ -781,6 +781,14 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("explainQuery", Mcp),
         server_only!("getAssistantSettings", Process),
         server_only!("putAssistantSettings", Process),
+        // GraphRAG community reports (C22): model calls, budgets and task state
+        server_only!("getGraphrag", Process),
+        server_only!("buildGraphrag", Tasks),
+        server_only!("refreshGraphrag", Tasks),
+        server_only!("confirmGraphrag", Tasks),
+        server_only!("listCommunities", Process),
+        server_only!("getCommunity", Process),
+        server_only!("reviewCommunityReport", Process),
         // C19: the layered settings come from the server's settings file
         server_only!("getSettingsStatus", Process),
         server_only!("getDatasetSettings", Process),

@@ -63,6 +63,64 @@ pub struct GraphRule {
     /// IRI patterns with `*` that are never in the set, whatever else names them
     /// (made by [`Graphs::without_pattern`])
     pub excluded: Vec<String>,
+    /// patterns whose graphs are in the set only when a guard exempts them, on top of
+    /// every other rule (made by [`Graphs::guarded`])
+    pub guards: Vec<GraphGuard>,
+}
+
+/// Graphs a guard keeps out of a set, except those it exempts by exact IRI.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GraphGuard {
+    /// an IRI pattern with `*`
+    pub pattern: String,
+    /// exact IRIs the guard lets through (sorted), once it is decided
+    pub exempt: Vec<String>,
+    /// what decides the exempt IRIs against the snapshot a request reads. While it is
+    /// set the guard is undecided and lets nothing through, so a path that reads the
+    /// view without [`GraphAccess::bound`] sees none of the guarded graphs.
+    pub decide: Option<Decider>,
+}
+
+/// Decides which graphs of a guard's pattern a snapshot proves for one reader.
+pub trait GuardDecision: Send + Sync {
+    /// The exempt graph IRIs for `snap`.
+    fn exempt(&self, snap: &Arc<Snapshot>) -> Vec<String>;
+}
+
+/// A shared [`GuardDecision`], compared and hashed by identity.
+#[derive(Clone)]
+pub struct Decider(pub Arc<dyn GuardDecision>);
+
+impl std::fmt::Debug for Decider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Decider")
+    }
+}
+
+impl PartialEq for Decider {
+    fn eq(&self, other: &Decider) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Decider {}
+
+impl std::hash::Hash for Decider {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        (Arc::as_ptr(&self.0) as *const () as usize).hash(h)
+    }
+}
+
+impl GraphGuard {
+    /// Whether the guard lets `iri` through.
+    fn passes(&self, iri: &str) -> bool {
+        !glob(&self.pattern, iri)
+            || (self.decide.is_none()
+                && self
+                    .exempt
+                    .binary_search_by(|x| x.as_str().cmp(iri))
+                    .is_ok())
+    }
 }
 
 impl GraphRule {
@@ -97,6 +155,13 @@ impl GraphRule {
             v.sort_unstable();
             v.dedup();
         }
+        for g in &mut self.guards {
+            g.exempt.sort_unstable();
+            g.exempt.dedup();
+        }
+        self.guards
+            .sort_by(|a, b| (&a.pattern, &a.exempt).cmp(&(&b.pattern, &b.exempt)));
+        self.guards.dedup();
     }
 
     /// Add `other`'s graphs.
@@ -107,12 +172,17 @@ impl GraphRule {
         self.patterns.extend(other.patterns.iter().cloned());
         self.protected.extend(other.protected.iter().cloned());
         self.excluded.extend(other.excluded.iter().cloned());
+        // a union keeps every guard of both sides, so it never admits more
+        self.guards.extend(other.guards.iter().cloned());
         self.normalize();
     }
 
     /// Whether the named graph `iri` is in the set.
     pub fn matches_iri(&self, iri: &str) -> bool {
         if self.excluded.iter().any(|p| glob(p, iri)) {
+            return false;
+        }
+        if self.guards.iter().any(|g| !g.passes(iri)) {
             return false;
         }
         if self.iris.binary_search_by(|x| x.as_str().cmp(iri)).is_ok() {
@@ -213,6 +283,69 @@ impl Graphs {
         Graphs::Only(r)
     }
 
+    /// The set without the named graphs that `pattern` matches, except the IRIs in
+    /// `exempt`, which stay in the set when it otherwise holds them. Unlike
+    /// [`without_pattern`](Self::without_pattern), an exempt graph is not removed.
+    pub fn guarded(&self, pattern: &str, exempt: &[String]) -> Graphs {
+        let mut r = match self {
+            Graphs::All => GraphRule {
+                default_graph: true,
+                patterns: vec!["*".into()],
+                blank_nodes: true,
+                ..Default::default()
+            },
+            Graphs::Only(r) => r.clone(),
+        };
+        r.guards.push(GraphGuard {
+            pattern: pattern.to_string(),
+            exempt: exempt.to_vec(),
+            decide: None,
+        });
+        r.normalize();
+        Graphs::Only(r)
+    }
+
+    /// The set without the named graphs that `pattern` matches until the guard is bound
+    /// to a snapshot (see [`GraphAccess::bound`]), when `decide` names the exempt ones.
+    pub fn guarded_by(&self, pattern: &str, decide: Decider) -> Graphs {
+        let mut r = match self {
+            Graphs::All => GraphRule {
+                default_graph: true,
+                patterns: vec!["*".into()],
+                blank_nodes: true,
+                ..Default::default()
+            },
+            Graphs::Only(r) => r.clone(),
+        };
+        r.guards.push(GraphGuard {
+            pattern: pattern.to_string(),
+            exempt: Vec::new(),
+            decide: Some(decide),
+        });
+        r.normalize();
+        Graphs::Only(r)
+    }
+
+    /// Whether some guard of the set is undecided.
+    pub fn undecided(&self) -> bool {
+        matches!(self, Graphs::Only(r) if r.guards.iter().any(|g| g.decide.is_some()))
+    }
+
+    /// The set with every undecided guard decided against `snap`.
+    fn bound(&self, snap: &Arc<Snapshot>) -> Graphs {
+        let Graphs::Only(r) = self else {
+            return Graphs::All;
+        };
+        let mut r = r.clone();
+        for g in &mut r.guards {
+            if let Some(d) = g.decide.take() {
+                g.exempt = d.0.exempt(snap);
+            }
+        }
+        r.normalize();
+        Graphs::Only(r)
+    }
+
     /// Whether the graph named by `iri` is in the set (`urn:x-arq:DefaultGraph` is the
     /// default graph).
     pub fn allows_iri(&self, iri: &str) -> bool {
@@ -268,6 +401,20 @@ impl GraphAccess {
             write,
             triples: (!rules.rules.is_empty()).then(|| Arc::new(rules)),
         }
+    }
+
+    /// This view with its undecided guards decided against `snap`, the snapshot the
+    /// request reads (spec C22 §6.3). A view without undecided guards is returned as it
+    /// is.
+    pub fn bound(self: &Arc<Self>, snap: &Arc<Snapshot>) -> Arc<GraphAccess> {
+        if !self.read.undecided() && !self.write.undecided() {
+            return self.clone();
+        }
+        Arc::new(GraphAccess {
+            read: self.read.bound(snap),
+            write: self.write.bound(snap),
+            triples: self.triples.clone(),
+        })
     }
 
     /// Whether some protection hides triples from reads.
@@ -431,6 +578,67 @@ mod tests {
         assert!(glob("http://ex/a/*", "http://ex/a/1"));
         assert!(!glob("http://ex/a/*", "http://ex/b/1"));
         assert!(glob("http://ex/*/x", "http://ex/a/b/x"));
+    }
+
+    /// An undecided guard admits nothing until the view is bound to a snapshot.
+    #[test]
+    fn undecided_guards_wait_for_a_snapshot() {
+        struct Fixed;
+        impl GuardDecision for Fixed {
+            fn exempt(&self, snap: &Arc<Snapshot>) -> Vec<String> {
+                assert_eq!(snap.commit, 0);
+                vec!["urn:x-guarded:a".into()]
+            }
+        }
+        let d = Decider(Arc::new(Fixed));
+        let v = Arc::new(GraphAccess::graphs(
+            Graphs::All.guarded_by("urn:x-guarded:*", d.clone()),
+            Graphs::none(),
+        ));
+        assert!(!v.read.allows_iri("urn:x-guarded:a"));
+        assert!(v.read.allows_iri("urn:other"));
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions::default());
+        let b = v.bound(&store.snapshot());
+        assert!(b.read.allows_iri("urn:x-guarded:a"));
+        assert!(!b.read.allows_iri("urn:x-guarded:b"));
+        assert!(!b.read.undecided());
+        // binding a bound view keeps it
+        assert!(Arc::ptr_eq(&b, &b.bound(&store.snapshot())));
+        // a union of rules keeps the undecided guard
+        let u = Graphs::Only(GraphRule::new(["urn:x-guarded:a"], &[])).union(&v.read);
+        assert!(!u.allows_iri("urn:x-guarded:a"));
+        assert!(u.undecided());
+    }
+
+    #[test]
+    fn guards_keep_out_all_but_their_exempt_graphs() {
+        let g = Graphs::All.guarded("urn:x-guarded:*", &["urn:x-guarded:a".into()]);
+        assert!(g.allows_iri("urn:x-guarded:a"));
+        assert!(!g.allows_iri("urn:x-guarded:b"));
+        assert!(g.allows_iri("http://ex/other"));
+        assert!(g.default_graph());
+        // an exempt graph still needs the rule to hold it
+        let only = Graphs::Only(GraphRule::new(["http://ex/*"], &[]))
+            .guarded("urn:x-guarded:*", &["urn:x-guarded:a".into()]);
+        assert!(!only.allows_iri("urn:x-guarded:a"));
+        // an exact grant does not pass a guard
+        let exact =
+            Graphs::Only(GraphRule::new(["urn:x-guarded:b"], &[])).guarded("urn:x-guarded:*", &[]);
+        assert!(!exact.allows_iri("urn:x-guarded:b"));
+        // without_pattern still removes an exempt graph
+        assert!(
+            !g.without_pattern("urn:x-guarded:a")
+                .allows_iri("urn:x-guarded:a")
+        );
+        // a union keeps both sides' guards
+        let u = g.union(&Graphs::All.guarded("urn:x-guarded:*", &[]));
+        assert!(!u.allows_iri("urn:x-guarded:a"));
+        assert!(!u.allows_iri("urn:x-guarded:b"));
+        assert_eq!(
+            g,
+            Graphs::All.guarded("urn:x-guarded:*", &["urn:x-guarded:a".into()]),
+            "normalized"
+        );
     }
 
     #[test]

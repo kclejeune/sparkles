@@ -11,6 +11,7 @@ pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     explaining(put);
     ingestion(put);
     maintenance(put);
+    graphrag(put);
 }
 
 fn explaining(put: &mut dyn FnMut(&str, J)) {
@@ -840,6 +841,7 @@ fn review(put: &mut dyn FnMut(&str, J)) {
                     "open": with_desc(int(), "Unreviewed facts plus open review branches."),
                     "truncated": boolean(),
                     "prefixes": any_object("The prefixes the compact terms use."),
+                    "communities": sref("GraphragInbox"),
                 }),
             ),
             "Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches.",
@@ -1450,7 +1452,7 @@ fn settings(put: &mut dyn FnMut(&str, J)) {
                 ],
                 json!({
                     "dataset": string(),
-                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes"]),
+                    "kind": string_enum(&["assistant", "memory", "ingest", "prefixes", "graphrag"]),
                     "effective": any_object("The effective object: the built-in defaults, the declared values and the runtime layer merged, with the locked fields from the settings file."),
                     "declared": any_object("The settings file's `defaults` and dataset entry for this kind, merged."),
                     "runtime": any_object("The runtime layer: the fields changed through the API. `null` removes a declared member."),
@@ -1705,6 +1707,180 @@ fn server_settings(put: &mut dyn FnMut(&str, J)) {
             ),
             "The value of a model secret.",
             "model-secrets",
+        ),
+    );
+}
+
+fn graphrag(put: &mut dyn FnMut(&str, J)) {
+    let statuses = string_enum(&["unreviewed", "reviewed", "rejected", "stale", "failed"]);
+    put(
+        "GraphragBuildRequest",
+        doc(
+            closed(
+                &[],
+                json!({
+                    "confirm": with_desc(boolean(), "Start without waiting for a confirmation of the estimate. The default is `false`, and the task then waits for `POST /$/graphrag/{ds}/confirm`."),
+                }),
+            ),
+            "A build or a refresh of a dataset's community reports.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragConfirmRequest",
+        doc(
+            closed(
+                &["task"],
+                json!({
+                    "task": with_desc(string(), "The id of the waiting task."),
+                    "confirm": with_desc(boolean(), "`true` (the default) starts the run, and `false` ends it without sending anything."),
+                }),
+            ),
+            "The answer to a build's estimate.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragStatus",
+        doc(
+            obj(
+                &["dataset", "enabled", "reportsGraph", "available"],
+                json!({
+                    "dataset": string(),
+                    "enabled": boolean(),
+                    "reportsGraph": string(),
+                    "refresh": string_enum(&["manual", "auto"]),
+                    "available": with_desc(boolean(), "Whether the caller may read the reports graph. When it is `false`, the answer holds nothing derived from the reports."),
+                    "reason": string(),
+                    "reports": with_desc(json!({ "type": "object", "additionalProperties": int() }), "The current reports by status."),
+                    "levels": array(obj(&["level", "communities"], json!({ "level": int(), "communities": int() }))),
+                    "lastBuild": obj(&[], json!({
+                        "sourceCommit": int(),
+                        "branch": string(),
+                        "finishedAt": { "type": "string", "format": "date-time" },
+                        "tokens": int(),
+                        "pending": with_desc(int(), "The communities the last run left for a later one."),
+                    })),
+                    "budget": with_desc(obj(&[], json!({
+                        "tokensPerBuild": int(),
+                        "tokensPerDay": int(),
+                        "usedToday": int(),
+                    })), "For a dataset admin only."),
+                    "anomalies": with_desc(array(any_object("An accounting anomaly with the pair, the counting source and both figures.")), "For a dataset admin only."),
+                }),
+            ),
+            "The state of a dataset's community reports.",
+            "graphrag",
+        ),
+    );
+    let report_ref = obj(
+        &["iri"],
+        json!({ "iri": string(), "title": string(), "status": statuses.clone(), "rating": int() }),
+    );
+    put(
+        "GraphragCommunities",
+        doc(
+            obj(
+                &["available", "communities"],
+                json!({
+                    "available": boolean(),
+                    "reportsGraph": string(),
+                    "communities": array(obj(&["iri"], json!({
+                        "iri": string(),
+                        "level": int(),
+                        "parent": or_null(string()),
+                        "memberCount": int(),
+                        "report": or_null(report_ref),
+                    }))),
+                }),
+            ),
+            "The communities of the reports graph, by level and then by rating.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragCommunity",
+        doc(
+            obj(
+                &["iri"],
+                json!({
+                    "iri": string(),
+                    "level": int(),
+                    "parent": or_null(string()),
+                    "memberCount": int(),
+                    "factCount": int(),
+                    "members": with_desc(array(obj(&["iri"], json!({ "iri": string(), "label": or_null(string()) }))), "Up to 500 members."),
+                    "children": array(obj(&["iri"], json!({ "iri": string(), "title": or_null(string()) }))),
+                    "report": obj(&["iri"], json!({
+                        "iri": string(),
+                        "title": or_null(string()),
+                        "summary": or_null(string()),
+                        "status": statuses.clone(),
+                        "rating": or_null(int()),
+                        "failure": or_null(string()),
+                        "revisionOf": or_null(string()),
+                        "droppedCitations": or_null(int()),
+                        "droppedUnsupported": or_null(int()),
+                        "sourceCommit": or_null(int()),
+                        "activity": obj(&[], json!({ "model": string(), "inputTokens": int(), "outputTokens": int(), "startedAt": string() })),
+                        "findings": array(obj(&["text"], json!({
+                            "text": string(),
+                            "about": strings(),
+                            "cites": with_desc(strings(), "Cited facts as N-Triples triple terms, reifiers, and cited child findings."),
+                            "unmatchedNames": strings(),
+                        }))),
+                    })),
+                }),
+            ),
+            "A community with its members, children and report.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragReviewRequest",
+        doc(
+            closed(
+                &["report"],
+                json!({
+                    "report": with_desc(string(), "The report's IRI."),
+                    "status": string_enum(&["reviewed", "rejected"]),
+                    "title": with_desc(string(), "A new title. With `title` or `summary` the edit is a new report with status `reviewed` that supersedes this one."),
+                    "summary": string(),
+                }),
+            ),
+            "A review of a community report.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragInbox",
+        doc(
+            obj(
+                &["reportsGraph", "available"],
+                json!({
+                    "reportsGraph": string(),
+                    "available": with_desc(boolean(), "Whether the caller may read the reports graph. When it is `false`, nothing else derived from the reports is listed."),
+                    "unreviewed": int(),
+                    "reports": with_desc(array(obj(&["community", "report"], json!({
+                        "community": string(),
+                        "report": string(),
+                        "title": or_null(string()),
+                        "rating": or_null(int()),
+                        "level": or_null(int()),
+                    }))), "Up to 50 unreviewed reports, highest rating first."),
+                    "truncated": boolean(),
+                    "anomalies": with_desc(array(any_object("An accounting anomaly.")), "For a dataset admin only."),
+                }),
+            ),
+            "The community reports that wait for review, present when GraphRAG is enabled for the dataset.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragReviewResult",
+        obj(
+            &["report", "status"],
+            json!({ "report": string(), "status": statuses, "commit": or_null(int()) }),
         ),
     );
 }

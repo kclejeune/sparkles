@@ -151,7 +151,31 @@ async fn inbox(
     headers: HeaderMap,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Response> {
-    run(st, p, headers, ds, "memory_inbox", query_args(&q), false).await
+    let st2 = st.clone();
+    let p2 = p.clone();
+    let name = ds.clone();
+    let res = run(st, p, headers, ds, "memory_inbox", query_args(&q), false).await?;
+    if res.status() != StatusCode::OK {
+        return Ok(res);
+    }
+    // the community reports waiting for review (C22 §2.3)
+    let Ok(d) = crate::http::dataset(&st2, &name) else {
+        return Ok(res);
+    };
+    let Some(extra) =
+        blocking(move || Ok(crate::graphrag::http::inbox_member(&st2, &d, &p2))).await?
+    else {
+        return Ok(res);
+    };
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut v: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("communities".into(), extra);
+    }
+    Ok(Json(v).into_response())
 }
 
 async fn review(

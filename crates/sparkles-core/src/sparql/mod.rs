@@ -485,8 +485,10 @@ fn make_ctx(
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
     let snap = with_union_default(snap, opts);
+    // guarded graphs are decided against the snapshot read, before any mask
+    let graphs = opts.graphs.as_ref().map(|a| a.bound(&snap));
     // a view that hides triples reads the snapshot without them
-    let snap = match &opts.graphs {
+    let snap = match &graphs {
         Some(a) => a.masked(&snap)?,
         None => snap,
     };
@@ -586,7 +588,7 @@ fn make_ctx(
         ds.default = Some(d);
     }
     ctx.dataset = ds;
-    restrict_ctx(&mut ctx, opts.graphs.as_ref())?;
+    restrict_ctx(&mut ctx, graphs.as_ref())?;
     Ok(ctx)
 }
 
@@ -599,8 +601,10 @@ pub(crate) fn restrict_ctx(
     let Some(a) = graphs.filter(|a| !a.reads_everything()) else {
         return Ok(());
     };
-    let mut ds = std::mem::take(&mut ctx.dataset);
     let snap = ctx.snap.clone();
+    // a view not bound yet is decided against the context's snapshot
+    let a = &a.bound(&snap);
+    let mut ds = std::mem::take(&mut ctx.dataset);
     ds.restrict(&snap, a, &|id| ctx.term(id))?;
     ctx.dataset = ds;
     ctx.graphs = Some(a.clone());

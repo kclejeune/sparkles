@@ -244,6 +244,8 @@ pub fn predicate_objects(
         return Ok(None);
     };
     let phase = || format!("reading the objects of <{iri}>");
+    let rebound = super::bind_view(snap, opts);
+    let opts = rebound.as_ref().unwrap_or(opts);
     let masked = match &opts.graphs {
         Some(a) => a.masked(snap)?,
         None => snap.clone(),

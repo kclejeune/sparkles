@@ -319,6 +319,10 @@ impl Drop for Leaving<'_> {
 pub struct AppState {
     pub data_dir: PathBuf,
     pub catalog: sparkles::Catalog,
+    /// the disclosure guard of reports graphs (spec C22 §6)
+    pub graphrag_guard: Arc<crate::graphrag::guard::Guard>,
+    /// GraphRAG builds waiting for confirmation, and the figures of the metrics
+    pub graphrag: Arc<crate::graphrag::runtime::Runtime>,
     /// HTTP routing state and observers, keyed by dataset name. Only map lookups and
     /// changes happen under this lock, never catalog work or file system work.
     routing: Mutex<BTreeMap<String, Arc<Dataset>>>,
@@ -595,7 +599,17 @@ impl Limits {
     }
 }
 
+/// The disclosure guard of a catalog's datasets, which finds a dataset's directory
+/// through the catalog.
 impl AppState {
+    /// Moves whenever the access policy is reloaded (spec C22 §6.3).
+    pub fn access_epoch(&self) -> u64 {
+        #[cfg(feature = "auth")]
+        return self.auth.as_ref().map_or(0, |a| a.epoch());
+        #[cfg(not(feature = "auth"))]
+        0
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         data_dir: &Path,
@@ -616,9 +630,12 @@ impl AppState {
         std::fs::create_dir_all(data_dir.join("databases"))?;
         let mut options: sparkles::CatalogOptions = store_opts.clone().into();
         options.memory.pool_bytes = pool_bytes;
+        let catalog = sparkles::Catalog::open(data_dir, options)?;
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
-            catalog: sparkles::Catalog::open(data_dir, options)?,
+            graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            graphrag: Default::default(),
+            catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
@@ -681,9 +698,12 @@ impl AppState {
     /// the datasets themselves.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn standalone(store_opts: StoreOptions, default_timeout: std::time::Duration) -> AppState {
+        let catalog = sparkles::Catalog::memory(store_opts.clone().into());
         AppState {
             data_dir: PathBuf::new(),
-            catalog: sparkles::Catalog::memory(store_opts.clone().into()),
+            graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            graphrag: Default::default(),
+            catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),

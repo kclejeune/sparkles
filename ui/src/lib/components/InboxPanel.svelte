@@ -139,8 +139,38 @@
   {:else if error}
     <div class="error-box">{error}</div>
   {:else if data}
-    {#if data.sessions.length === 0 && data.branches.length === 0}
+    {@const rag = data.communities}
+    {#if data.sessions.length === 0 && data.branches.length === 0 && !rag?.unreviewed && !rag?.anomalies?.length}
       <p class="faint">Nothing waits for review.</p>
+    {/if}
+
+    {#if rag?.anomalies?.length}
+      <div class="error-box" role="alert">
+        <strong>GraphRAG accounting anomaly.</strong>
+        A model provider reported more usage than was reserved, and the build stopped. See the
+        <a href="{base}/datasets/{encodeURIComponent(ds)}?tab=communities">Communities tab</a>.
+      </div>
+    {/if}
+    {#if rag?.available && rag.unreviewed}
+      <section class="group" aria-label="Community reports">
+        <h3>
+          <span class="badge spark">Community reports</span>
+          <span class="small">{rag.unreviewed} unreviewed</span>
+          <a class="btn sm" href="{base}/datasets/{encodeURIComponent(ds)}?tab=communities"
+            >Open <Icon name="chevron" size={12} /></a
+          >
+        </h3>
+        <ul class="small reports">
+          {#each rag.reports ?? [] as r (r.report)}
+            <li>
+              {r.title ?? r.community}{#if r.rating != null}<span class="faint">
+                  · {r.rating}/10</span
+                >{/if}
+            </li>
+          {/each}
+        </ul>
+        {#if rag.truncated}<p class="faint small">More reports wait than the inbox lists.</p>{/if}
+      </section>
     {/if}
 
     {#each data.sessions as s (s.graph)}
@@ -354,5 +384,12 @@
   .reason {
     flex: 0 1 180px;
     min-width: 0;
+  }
+  .reports {
+    margin: 4px 0 0;
+    padding-left: 18px;
+  }
+  .reports li {
+    overflow-wrap: anywhere;
   }
 </style>

@@ -82,6 +82,25 @@ export type Inbox = {
   open: number;
   truncated: boolean;
   prefixes?: Record<string, string>;
+  /** The community reports that wait, when GraphRAG is on for the dataset (C22 §2.3). */
+  communities?: InboxCommunities;
+};
+
+/** The `communities` member of the inbox. */
+export type InboxCommunities = {
+  reportsGraph: string;
+  available: boolean;
+  unreviewed?: number;
+  reports?: {
+    community: string;
+    report: string;
+    title: string | null;
+    rating: number | null;
+    level: number | null;
+  }[];
+  truncated?: boolean;
+  /** For a dataset admin only. */
+  anomalies?: unknown[];
 };
 
 export const inbox = (ds: string, signal?: AbortSignal) =>

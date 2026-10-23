@@ -227,6 +227,10 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_embedding_backlog` | gauge. Subjects (per graph) waiting to be embedded, the status's `backlog`. | `dataset`, `index` |
 | `sparkles_embedding_lag_commits` | gauge. Commits since the newest one whose text is all embedded, which is `headSeq − appliedSeq` of the status. | `dataset`, `index` |
 | `sparkles_graphql_groups` | histogram (1 … 64). The fetch groups, which are SPARQL queries, that each GraphQL request ran. | `dataset` |
+| `sparkles_graphrag_reports` | gauge. A dataset's current [community reports](#graphrag) by status, as of the last build or review since the server started. | `dataset`, `status` = `unreviewed` \| `reviewed` \| `rejected` \| `stale` \| `failed` |
+| `sparkles_graphrag_tokens_total` | counter. Tokens counted against a dataset's GraphRAG budgets since the server started. | `dataset`, `phase` = `build` \| `refresh` |
+| `sparkles_graphrag_stale_communities` | gauge. The communities the last GraphRAG run left pending for a later one. | `dataset` |
+| `sparkles_graphrag_accounting_anomalies_total` | counter. Model responses whose reported usage passed their reservation, which stop a GraphRAG run. | `dataset` |
 | `sparkles_memory_review_pending` | gauge. The open items of a dataset's [memory review inbox](#open-review-items): unreviewed facts of kinds `session` and `import`, and open review branches of the other kinds, each branch counting once. Only datasets with memory settings report, with every kind. | `dataset`, `kind` = `session` \| `import` \| `consolidation` \| `ingest` \| `review` \| `inbox` \| `proposal` |
 | `sparkles_memory_review_oldest_seconds` | gauge. The age of the oldest open item of the kind, `0` when none is open. | `dataset`, `kind` |
 | `process_resident_memory_bytes` | gauge (Linux) | |
@@ -10578,6 +10582,69 @@ A `PUT` with an `endpoint` or an `apiKey` anywhere is a `400`, because only the 
 configuration names endpoints and keys. The `GET` answer adds `status`, which says
 whether asking works (`ask`), why not (`reason`), the draft pairs, whether a summary is
 possible, and the history days in force. A `status` member in a `PUT` is ignored.
+
+### GraphRAG
+
+A dataset's GraphRAG settings are the `graphrag` kind of [Settings](#settings), kept in
+`<db>/graphrag.json`. A build reads the dataset as the settings' `principal`, groups the
+projection's resources into the Leiden hierarchy, and has the `community` model role
+write one report per community. The reports are triples in the reports graph, which is
+`urn:x-sparkles:graphrag:reports` by default and must be named under
+`urn:x-sparkles:graphrag:`. Spec C22 describes the build, the checks and the storage.
+
+`POST /$/graphrag/{ds}/build` and `POST /$/graphrag/{ds}/refresh` need `admin` on the
+dataset and start a task of kind `graphrag` in `/$/tasks`. A build writes a report for
+every community. A refresh keeps a report whose members did not change and whose facts
+changed by less than `refresh.minChangedFraction`, and rewrites the others. A rewritten
+report supersedes the old one with `prov:wasRevisionOf`. Without `"confirm": true` the
+task stores its estimate in its `detail` and waits for
+`POST /$/graphrag/{ds}/confirm` with `{"task": "<id>"}`, or with `"confirm": false` to
+end it without sending anything. Only one GraphRAG task of a dataset runs at a time,
+and a second one is a `409`. A task can be cancelled between model calls with
+`DELETE /$/tasks/{id}`. The task's result counts the reports written, kept and failed,
+and the communities left `pending` when the budget or an accounting anomaly stopped the
+run. A later refresh writes every pending community. The run checks its settings, its
+providers and the principal's view again after the confirmation, before each model
+request and before each commit, and it fails without sending or committing when any of
+them changed. It also fails when a review changed a report link while it ran. All
+branches of a dataset share its daily token ledger.
+
+```json
+{ "mode": "build", "sourceCommit": 41, "communities": 12, "written": 12, "kept": 0,
+  "failed": 0, "pending": 0, "tokens": 48211, "requests": 12, "commits": [42, 43] }
+```
+
+`GET /$/graphrag/{ds}` needs `read` and reports the settings in force, the current
+reports by status, the communities per level and the last build. The last build shows
+only when it wrote the configured reports graph, and to a restricted caller only while
+that build's footprint is in the graph. A dataset admin also
+gets the budget used today and the accounting anomalies. A caller for whom the reports
+graph is not proven, because its access does not cover everything the build read, gets
+`"available": false` and nothing derived from the reports.
+
+`GET /$/graphrag/{ds}/communities` lists the communities with the title, status and
+rating of each one's report, and `GET /$/graphrag/{ds}/community?iri=` shows one
+community with its members, its children and its report with findings and citations.
+Both read through the caller's view, and a community the caller may not read is a
+`404`.
+
+`POST /$/graphrag/{ds}/review` needs `write` on the dataset without graph or triple
+restrictions, because only an unrestricted writer may write a reports graph. A caller
+for whom the reports graph is not proven gets a `404`, and a restricted writer gets a
+`403` with the code `restricted-writer`. The body `{"report": "<iri>", "status": "reviewed"}` sets a report's
+status to `reviewed` or `rejected`. A body with `title` or `summary` is an edit. The
+edit is a new report with status `reviewed` that copies the old report's findings and
+citations, supersedes it with `prov:wasRevisionOf`, and is committed with the caller as
+its author. Builds and reviews write commits of kind `graphrag`, whose messages hold no
+report text.
+
+When GraphRAG is enabled for a dataset, the [review inbox](#review-inbox) gains a
+`communities` member. It lists up to 50 unreviewed reports for a caller who may read the
+reports graph, and the accounting anomalies for a dataset admin. The metrics
+`sparkles_graphrag_reports`, `sparkles_graphrag_tokens_total`,
+`sparkles_graphrag_stale_communities` and `sparkles_graphrag_accounting_anomalies_total`
+count reports, tokens, pending communities and anomalies per dataset. They hold the
+figures of the runs and reviews since the server started.
 
 ### Settings
 

@@ -86,6 +86,9 @@ pub enum CallError {
     Secret(String),
     /// the provider's `tls.caCert` cannot be read or holds no certificate
     Tls(String),
+    /// the caller's admission refused an attempt before it was sent (spec C22 §3.5),
+    /// with its code, and whether an earlier attempt of the same request was sent
+    Admission(&'static str, String, bool),
 }
 
 impl CallError {
@@ -99,6 +102,7 @@ impl CallError {
             CallError::Invalid(_) => "invalid-output",
             CallError::Secret(_) => "secret-missing",
             CallError::Tls(_) => "tls-config",
+            CallError::Admission(code, ..) => code,
         }
     }
 }
@@ -112,7 +116,8 @@ impl std::fmt::Display for CallError {
             | CallError::Refusal(m)
             | CallError::Invalid(m)
             | CallError::Secret(m)
-            | CallError::Tls(m) => f.write_str(m),
+            | CallError::Tls(m)
+            | CallError::Admission(_, m, _) => f.write_str(m),
             CallError::Rejected(s, m) => write!(f, "{m} (status {s})"),
         }
     }
@@ -231,6 +236,25 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
         // `Models::call` refuses local providers before building a request
         Kind::Local => (String::new(), Value::Null),
     }
+}
+
+/// The usage a response body reports, read apart from its content so that an answer
+/// whose content is refused or malformed still settles what it used.
+pub fn usage_of(kind: Kind, body: &[u8]) -> Option<super::admission::Usage> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let (i, o) = match kind {
+        Kind::Ollama => (&v["prompt_eval_count"], &v["eval_count"]),
+        Kind::Openai => (
+            &v["usage"]["prompt_tokens"],
+            &v["usage"]["completion_tokens"],
+        ),
+        Kind::Anthropic => (&v["usage"]["input_tokens"], &v["usage"]["output_tokens"]),
+        Kind::Local => return None,
+    };
+    Some(super::admission::Usage {
+        input: i.as_u64()?,
+        output: o.as_u64()?,
+    })
 }
 
 /// The answer of a successful (`2xx`) response.
@@ -388,13 +412,74 @@ fn provider_message(body: &[u8]) -> String {
 /// Retries of a `429` or `5xx` within the call's timeout.
 const RETRIES: u32 = 2;
 
-/// Send one call, retrying a `429` or `5xx` twice within its timeout (with the
-/// provider's `Retry-After` when it is shorter than the time left).
-pub fn send(
+/// The URL and body of the provider's own token count of `req`, for the kinds that
+/// offer one: Anthropic's `POST /v1/messages/count_tokens`, which takes the request's
+/// model, system text, messages and tools without its output limit.
+pub fn count_request(p: &ProviderConfig, req: &ChatRequest) -> Option<(String, Value)> {
+    match p.kind {
+        Kind::Anthropic => {
+            let (url, mut body) = build(p, req);
+            if let Some(o) = body.as_object_mut() {
+                for k in ["max_tokens", "temperature"] {
+                    o.remove(k);
+                }
+            }
+            Some((format!("{url}/count_tokens"), body))
+        }
+        Kind::Ollama | Kind::Openai | Kind::Local => None,
+    }
+}
+
+/// The provider's own token count of `req`, through the call's transport and key.
+fn provider_count(
     t: &Transport<'_>,
     name: &str,
     p: &ProviderConfig,
     req: &ChatRequest,
+    timeout: Duration,
+) -> Result<u64, CallError> {
+    if timeout.is_zero() {
+        return Err(CallError::Unavailable(format!(
+            "provider {name}: no time is left to count tokens"
+        )));
+    }
+    let Some((url, body)) = count_request(p, req) else {
+        return Err(CallError::Invalid(format!(
+            "provider {name} has no token counting endpoint"
+        )));
+    };
+    let hs = headers(p, t.key.as_deref());
+    let hrefs: Vec<(&str, &str)> = hs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let bytes = serde_json::to_vec(&body).expect("serializable");
+    let key = t.key.as_deref();
+    let posted = sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes, timeout)
+        .map_err(|f| CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)))?;
+    if !(200..300).contains(&posted.status.as_u16()) {
+        return Err(CallError::Unavailable(scrub(
+            format!(
+                "provider {name} answered {} to a token count",
+                posted.status
+            ),
+            key,
+        )));
+    }
+    let v: Value = serde_json::from_slice(&posted.body)
+        .map_err(|_| CallError::Invalid("the token count is not JSON".into()))?;
+    v["input_tokens"]
+        .as_u64()
+        .ok_or_else(|| CallError::Invalid("the token count has no input_tokens".into()))
+}
+
+/// Send one call, retrying a `429` or `5xx` twice within its timeout (with the
+/// provider's `Retry-After` when it is shorter than the time left). With an
+/// `admission`, every HTTP attempt, retries included, is admitted before it is sent,
+/// and each admitted attempt is settled with the usage its answer reported.
+pub fn send_admitted(
+    t: &Transport<'_>,
+    name: &str,
+    p: &ProviderConfig,
+    req: &ChatRequest,
+    admission: Option<&dyn super::admission::Admission>,
 ) -> Result<ChatResponse, CallError> {
     let (url, body) = build(p, req);
     let hs = headers(p, t.key.as_deref());
@@ -402,23 +487,78 @@ pub fn send(
     let bytes = serde_json::to_vec(&body).expect("serializable");
     let started = Instant::now();
     let key = t.key.as_deref();
+    // counting spends the request's own time
+    let counter = || {
+        provider_count(
+            t,
+            name,
+            p,
+            req,
+            req.timeout.saturating_sub(started.elapsed()),
+        )
+    };
+    let has_counter = count_request(p, req).is_some();
     let mut attempt = 0;
     loop {
-        let left = req.timeout.saturating_sub(started.elapsed());
-        if left.is_zero() {
-            return Err(CallError::Unavailable(format!(
+        let timed_out = || {
+            CallError::Unavailable(format!(
                 "provider {name} did not answer within {:.0} s",
                 req.timeout.as_secs_f64()
-            )));
+            ))
+        };
+        if req.timeout.saturating_sub(started.elapsed()).is_zero() {
+            return Err(timed_out());
         }
-        let posted = sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes.clone(), left)
-            .map_err(|f| match f {
-            sparkles::outbound::Failure::Refused(m) => CallError::Refused(scrub(
-                format!("provider {name}: the outbound policy refuses {m}"),
-                key,
-            )),
-            f => CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)),
-        })?;
+        let ticket = match admission {
+            None => None,
+            Some(a) => Some(
+                a.admit(&super::admission::Attempt {
+                    provider: name,
+                    config: p,
+                    request: req,
+                    url: &url,
+                    body: &body,
+                    bytes: &bytes,
+                    provider_count: if has_counter { Some(&counter) } else { None },
+                })
+                .map_err(|e| match e {
+                    CallError::Admission(c, m, _) => CallError::Admission(c, m, attempt > 0),
+                    e => e,
+                })?,
+            ),
+        };
+        // admission may have spent time counting
+        let left = req.timeout.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            if let Some(tk) = ticket {
+                tk.not_sent();
+            }
+            return Err(timed_out());
+        }
+        // a ticket dropped on any path below leaves its usage unknown
+        let posted =
+            match sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes.clone(), left) {
+                Ok(posted) => posted,
+                Err(sparkles::outbound::Failure::Refused(m)) => {
+                    // a refusal can come from a redirect after the request was sent, so
+                    // the reservation stays counted
+                    drop(ticket);
+                    return Err(CallError::Refused(scrub(
+                        format!("provider {name}: the outbound policy refuses {m}"),
+                        key,
+                    )));
+                }
+                Err(f) => {
+                    return Err(CallError::Unavailable(scrub(
+                        format!("provider {name}: {f}"),
+                        key,
+                    )));
+                }
+            };
+        // the usage settles the reservation whatever the content holds
+        if let Some(tk) = ticket {
+            tk.settle(usage_of(p.kind, &posted.body));
+        }
         let status = posted.status.as_u16();
         if (200..300).contains(&status) {
             let mut r = parse(p.kind, &posted.body).map_err(|e| match e {

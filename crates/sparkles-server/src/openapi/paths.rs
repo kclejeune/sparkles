@@ -2740,6 +2740,67 @@ fn assist(p: &mut Paths) {
             .errors(&[400]),
     );
     p.add(
+        op(GET, "/$/graphrag/{ds}", "getGraphrag", "Datasets", "Read the state of the community reports")
+            .doc("The settings in force, the reports by status, the communities by level and the last build. A caller for whom the reports graph is not proven gets `available: false` and nothing derived from the reports. A dataset admin also gets the budget and the accounting anomalies.")
+            .see("graphrag")
+            .json("200", "The state.", "GraphragStatus")
+            .errors(&[404]),
+    );
+    for (path, id, summary, what) in [
+        (
+            "/$/graphrag/{ds}/build",
+            "buildGraphrag",
+            "Build the community reports",
+            "writes a report for every community",
+        ),
+        (
+            "/$/graphrag/{ds}/refresh",
+            "refreshGraphrag",
+            "Refresh the community reports",
+            "rewrites the reports of communities that changed",
+        ),
+    ] {
+        p.add(
+            op(POST, path, id, "Datasets", summary)
+                .doc(&format!("Starts a task of kind `graphrag` that {what}. Without `confirm` the task records its estimate in its `detail` and waits for `POST /$/graphrag/{{ds}}/confirm`. Needs `admin` on the dataset, and GraphRAG enabled in its settings."))
+                .see("graphrag")
+                .json_body(false, "GraphragBuildRequest")
+                .resp("202", "The task.", Some(json!({ "application/json": { "schema": sref("Task") } })))
+                .errors(&[400, 403, 404, 409, 503]),
+        );
+    }
+    p.add(
+        op(POST, "/$/graphrag/{ds}/confirm", "confirmGraphrag", "Datasets", "Answer a build's estimate")
+            .doc("Confirms or refuses the estimate of a task that waits for it. Needs `admin` on the dataset.")
+            .see("graphrag")
+            .json_body(true, "GraphragConfirmRequest")
+            .resp("200", "The answer was recorded.", None)
+            .errors(&[400, 403, 404, 409]),
+    );
+    p.add(
+        op(GET, "/$/graphrag/{ds}/communities", "listCommunities", "Datasets", "List the communities")
+            .doc("The communities of the reports graph with their reports' titles, statuses and ratings, read through the caller's view.")
+            .see("graphrag")
+            .json("200", "The communities.", "GraphragCommunities")
+            .errors(&[404]),
+    );
+    p.add(
+        op(GET, "/$/graphrag/{ds}/community", "getCommunity", "Datasets", "Read a community and its report")
+            .query("iri", s(), "The community's IRI.")
+            .doc("A community with its members, its children and its report with findings and citations, read through the caller's view. A community the caller may not read is a `404`.")
+            .see("graphrag")
+            .json("200", "The community.", "GraphragCommunity")
+            .errors(&[400, 404]),
+    );
+    p.add(
+        op(POST, "/$/graphrag/{ds}/review", "reviewCommunityReport", "Datasets", "Review a community report")
+            .doc("Sets a report's status to `reviewed` or `rejected`, or supersedes it with a person's edit of its title or summary. Needs `write` on the dataset and a reports graph the caller may read.")
+            .see("graphrag")
+            .json_body(true, "GraphragReviewRequest")
+            .json("200", "The review.", "GraphragReviewResult")
+            .errors(&[400, 403, 404]),
+    );
+    p.add(
         op(GET, "/$/settings", "getSettingsStatus", "Server", "Read the settings file's status")
             .doc("The path of `serve --settings`, when it and the model configuration were last read, the last reload error, and the declared dataset names that match no dataset. Needs server `admin`.")
             .see("settings")

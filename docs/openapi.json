@@ -234,7 +234,7 @@
         }
       },
       "kind": {
-        "description": "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server.",
+        "description": "The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server.",
         "in": "path",
         "name": "kind",
         "required": true,
@@ -243,6 +243,7 @@
             "assistant",
             "memory",
             "ingest",
+            "graphrag",
             "models",
             "notifications"
           ],
@@ -4080,6 +4081,7 @@
               "merge",
               "revert",
               "cherry-pick",
+              "graphrag",
               "unknown"
             ],
             "type": "string"
@@ -7497,6 +7499,614 @@
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#geosparql"
         }
       },
+      "GraphragBuildRequest": {
+        "additionalProperties": false,
+        "description": "A build or a refresh of a dataset's community reports.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "confirm": {
+            "description": "Start without waiting for a confirmation of the estimate. The default is `false`, and the task then waits for `POST /$/graphrag/{ds}/confirm`.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "GraphragCommunities": {
+        "description": "The communities of the reports graph, by level and then by rating.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "communities": {
+            "items": {
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "level": {
+                  "type": "integer"
+                },
+                "memberCount": {
+                  "type": "integer"
+                },
+                "parent": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "report": {
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "iri": {
+                          "type": "string"
+                        },
+                        "rating": {
+                          "type": "integer"
+                        },
+                        "status": {
+                          "enum": [
+                            "unreviewed",
+                            "reviewed",
+                            "rejected",
+                            "stale",
+                            "failed"
+                          ],
+                          "type": "string"
+                        },
+                        "title": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "iri"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "reportsGraph": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "available",
+          "communities"
+        ],
+        "type": "object"
+      },
+      "GraphragCommunity": {
+        "description": "A community with its members, children and report.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "children": {
+            "items": {
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "title": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "factCount": {
+            "type": "integer"
+          },
+          "iri": {
+            "type": "string"
+          },
+          "level": {
+            "type": "integer"
+          },
+          "memberCount": {
+            "type": "integer"
+          },
+          "members": {
+            "description": "Up to 500 members.",
+            "items": {
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "label": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "report": {
+            "properties": {
+              "activity": {
+                "properties": {
+                  "inputTokens": {
+                    "type": "integer"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "outputTokens": {
+                    "type": "integer"
+                  },
+                  "startedAt": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "droppedCitations": {
+                "oneOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "droppedUnsupported": {
+                "oneOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "failure": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "findings": {
+                "items": {
+                  "properties": {
+                    "about": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "cites": {
+                      "description": "Cited facts as N-Triples triple terms, reifiers, and cited child findings.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "unmatchedNames": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "text"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "iri": {
+                "type": "string"
+              },
+              "rating": {
+                "oneOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "revisionOf": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "sourceCommit": {
+                "oneOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "status": {
+                "enum": [
+                  "unreviewed",
+                  "reviewed",
+                  "rejected",
+                  "stale",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              "summary": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "title": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "iri"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "iri"
+        ],
+        "type": "object"
+      },
+      "GraphragConfirmRequest": {
+        "additionalProperties": false,
+        "description": "The answer to a build's estimate.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "confirm": {
+            "description": "`true` (the default) starts the run, and `false` ends it without sending anything.",
+            "type": "boolean"
+          },
+          "task": {
+            "description": "The id of the waiting task.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task"
+        ],
+        "type": "object"
+      },
+      "GraphragInbox": {
+        "description": "The community reports that wait for review, present when GraphRAG is enabled for the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "anomalies": {
+            "description": "For a dataset admin only.",
+            "items": {
+              "additionalProperties": true,
+              "description": "An accounting anomaly.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "available": {
+            "description": "Whether the caller may read the reports graph. When it is `false`, nothing else derived from the reports is listed.",
+            "type": "boolean"
+          },
+          "reports": {
+            "description": "Up to 50 unreviewed reports, highest rating first.",
+            "items": {
+              "properties": {
+                "community": {
+                  "type": "string"
+                },
+                "level": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "rating": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "report": {
+                  "type": "string"
+                },
+                "title": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "community",
+                "report"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "reportsGraph": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "unreviewed": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "reportsGraph",
+          "available"
+        ],
+        "type": "object"
+      },
+      "GraphragReviewRequest": {
+        "additionalProperties": false,
+        "description": "A review of a community report.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "report": {
+            "description": "The report's IRI.",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "reviewed",
+              "rejected"
+            ],
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "title": {
+            "description": "A new title. With `title` or `summary` the edit is a new report with status `reviewed` that supersedes this one.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "report"
+        ],
+        "type": "object"
+      },
+      "GraphragReviewResult": {
+        "properties": {
+          "commit": {
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "report": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "unreviewed",
+              "reviewed",
+              "rejected",
+              "stale",
+              "failed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "report",
+          "status"
+        ],
+        "type": "object"
+      },
+      "GraphragStatus": {
+        "description": "The state of a dataset's community reports.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "anomalies": {
+            "description": "For a dataset admin only.",
+            "items": {
+              "additionalProperties": true,
+              "description": "An accounting anomaly with the pair, the counting source and both figures.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "available": {
+            "description": "Whether the caller may read the reports graph. When it is `false`, the answer holds nothing derived from the reports.",
+            "type": "boolean"
+          },
+          "budget": {
+            "description": "For a dataset admin only.",
+            "properties": {
+              "tokensPerBuild": {
+                "type": "integer"
+              },
+              "tokensPerDay": {
+                "type": "integer"
+              },
+              "usedToday": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "lastBuild": {
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "finishedAt": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "pending": {
+                "description": "The communities the last run left for a later one.",
+                "type": "integer"
+              },
+              "sourceCommit": {
+                "type": "integer"
+              },
+              "tokens": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "levels": {
+            "items": {
+              "properties": {
+                "communities": {
+                  "type": "integer"
+                },
+                "level": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "level",
+                "communities"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "refresh": {
+            "enum": [
+              "manual",
+              "auto"
+            ],
+            "type": "string"
+          },
+          "reports": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "The current reports by status.",
+            "type": "object"
+          },
+          "reportsGraph": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "enabled",
+          "reportsGraph",
+          "available"
+        ],
+        "type": "object"
+      },
       "HistoryChanges": {
         "description": "The recorded changes that match a history query, in N-Triples syntax.",
         "externalDocs": {
@@ -8765,6 +9375,9 @@
           },
           "commit": {
             "type": "integer"
+          },
+          "communities": {
+            "$ref": "#/components/schemas/GraphragInbox"
           },
           "dataset": {
             "type": "string"
@@ -14222,7 +14835,8 @@
               "assistant",
               "memory",
               "ingest",
-              "prefixes"
+              "prefixes",
+              "graphrag"
             ],
             "type": "string"
           },
@@ -15814,7 +16428,8 @@
               "backup-restore",
               "backup-verify",
               "backup-gc",
-              "backup-policy"
+              "backup-policy",
+              "graphrag"
             ],
             "type": "string"
           },
@@ -23622,6 +24237,454 @@
           "GraphQL"
         ],
         "x-sparkles-permission": "read"
+      }
+    },
+    "/$/graphrag/{ds}": {
+      "get": {
+        "description": "The settings in force, the reports by status, the communities by level and the last build. A caller for whom the reports graph is not proven gets `available: false` and nothing derived from the reports. A dataset admin also gets the budget and the accounting anomalies.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "operationId": "getGraphrag",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphragStatus"
+                }
+              }
+            },
+            "description": "The state."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read the state of the community reports",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/graphrag/{ds}/build": {
+      "post": {
+        "description": "Starts a task of kind `graphrag` that writes a report for every community. Without `confirm` the task records its estimate in its `detail` and waits for `POST /$/graphrag/{ds}/confirm`. Needs `admin` on the dataset, and GraphRAG enabled in its settings.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "operationId": "buildGraphrag",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GraphragBuildRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "The task."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Build the community reports",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/graphrag/{ds}/communities": {
+      "get": {
+        "description": "The communities of the reports graph with their reports' titles, statuses and ratings, read through the caller's view.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "operationId": "listCommunities",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphragCommunities"
+                }
+              }
+            },
+            "description": "The communities."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List the communities",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/graphrag/{ds}/community": {
+      "get": {
+        "description": "A community with its members, its children and its report with findings and citations, read through the caller's view. A community the caller may not read is a `404`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "operationId": "getCommunity",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The community's IRI.",
+            "in": "query",
+            "name": "iri",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphragCommunity"
+                }
+              }
+            },
+            "description": "The community."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read a community and its report",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/graphrag/{ds}/confirm": {
+      "post": {
+        "description": "Confirms or refuses the estimate of a task that waits for it. Needs `admin` on the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "operationId": "confirmGraphrag",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GraphragConfirmRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The answer was recorded."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Answer a build's estimate",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/graphrag/{ds}/refresh": {
+      "post": {
+        "description": "Starts a task of kind `graphrag` that rewrites the reports of communities that changed. Without `confirm` the task records its estimate in its `detail` and waits for `POST /$/graphrag/{ds}/confirm`. Needs `admin` on the dataset, and GraphRAG enabled in its settings.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "operationId": "refreshGraphrag",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GraphragBuildRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": false
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "The task."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Refresh the community reports",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/graphrag/{ds}/review": {
+      "post": {
+        "description": "Sets a report's status to `reviewed` or `rejected`, or supersedes it with a person's edit of its title or summary. Needs `write` on the dataset and a reports graph the caller may read.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "operationId": "reviewCommunityReport",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GraphragReviewRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphragReviewResult"
+                }
+              }
+            },
+            "description": "The review."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Review a community report",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "write"
       }
     },
     "/$/history/{ds}": {

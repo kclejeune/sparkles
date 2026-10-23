@@ -3990,6 +3990,63 @@ in [API.md](API.md#explaining-a-query), and from the MCP tool `explain_query` wi
 The MCP tool calls the server's models only with `useServerModel: true`, which needs a
 grant with `server_models = true`.
 
+## Community reports (GraphRAG)
+
+A community report summarizes one group of closely connected resources, such as a team
+and its projects, with findings that cite the facts they come from. A build groups the
+resources of the projection's graphs into the Leiden hierarchy, has the `community`
+model role write one report per community, and stores the reports as triples in the
+reports graph `urn:x-sparkles:graphrag:reports`. Reports start `unreviewed`, and a
+person marks them `reviewed` or `rejected` or edits them.
+
+Turn the build on in the dataset's `graphrag` settings. `principal` names the user whose
+view the build reads, and the reports are readable only by callers whose access covers
+everything that view read.
+
+```sh
+sparkles settings set org graphrag.enabled=true graphrag.principal=reports \
+  'graphrag.projection.graphs=["urn:graph:org"]'
+sparkles settings set org assistant.send=rows
+```
+
+The build sends facts to the model provider, so the provider must be allowed to receive
+rows, through `assistant.send` or `assistant.sendByProvider`.
+
+```sh
+sparkles graphrag --dataset org build            # shows the estimate and asks
+sparkles graphrag --dataset org build --confirm  # sends without asking
+sparkles graphrag --dataset org status
+sparkles graphrag --dataset org reports --status unreviewed
+sparkles graphrag --dataset org refresh --confirm
+```
+
+Before it calls a model, a build reports an upper bound of the tokens it may use, and
+it waits for a confirmation unless `--confirm` is given. Without a terminal the command
+does not send anything and asks for `--confirm`. `--no-wait` prints the task and leaves
+the confirmation to the Communities tab or to `POST /$/graphrag/{ds}/confirm`. A build
+stops before any request whose reservation would pass `budget.tokensPerBuild` or
+`budget.tokensPerDay`, and leaves the remaining communities pending for a later run.
+`refresh` rewrites only the reports of communities whose members changed, or whose
+facts changed by at least `refresh.minChangedFraction`.
+
+With `--loc DB` the command opens a database directory in the process and reads the
+model configuration from `--model-config`, as `serve` does.
+
+```sh
+sparkles graphrag --loc ./org-db --dataset org --model-config models.json build --confirm
+```
+
+The dataset page's **Communities** tab shows the state of the reports, a **Build** and
+a **Refresh** button for dataset admins, and the estimate to confirm before a run sends
+anything. The hierarchy is a tree, coarsest level first. Choosing a community shows its
+members, its report with findings and citations, and the review actions **Reviewed**,
+**Reject** and **Edit**. An edit is saved as a new reviewed report that supersedes the
+old one. Reviewing needs write access to the dataset without graph or triple
+restrictions. The tab shows the reports of main, and on another branch it asks the reader
+to switch to main. The Settings tab has a GraphRAG section with the fields above, and the
+review inbox lists the unreviewed reports. The routes are described in
+[API.md](API.md#graphrag).
+
 ## Sending notifications
 
 The server can tell a person when something needs them. It sends a notification to a

@@ -700,7 +700,10 @@ impl Tools<'_> {
                 });
                 // the quads the caller can read
                 let quads = match p.view(&ds.name, crate::auth::Endpoint::Info) {
-                    Some(v) => v.masked(&snap).and_then(|m| v.visible_quads(&m)).ok(),
+                    Some(v) => {
+                        let v = v.bound(&snap);
+                        v.masked(&snap).and_then(|m| v.visible_quads(&m)).ok()
+                    }
                     None => Some(snap.len()),
                 };
                 let mut j = json!({

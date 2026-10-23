@@ -313,6 +313,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     // consolidation and retention of agent memory (C18 §8.3, §8.4)
     #[cfg(feature = "mcp")]
     let app = app.merge(crate::ingest::maintain::routes());
+    #[cfg(feature = "mcp")]
+    let app = app.merge(crate::graphrag::http::routes());
     // the MCP endpoint (`serve --mcp`)
     #[cfg(feature = "mcp")]
     let app = match crate::mcp::http::route(&state) {
@@ -2456,6 +2458,11 @@ enum Target {
     Dataset,
 }
 
+/// Whether the target is a guarded graph, which a view decides only against a snapshot.
+fn target_is_guarded(t: &Target) -> bool {
+    matches!(t, Target::Named(iri) if crate::graphrag::settings::is_guarded(iri))
+}
+
 fn gsp_target(params: &Params) -> Target {
     if params.has("default") {
         Target::Default
@@ -3101,31 +3108,26 @@ async fn gsp_on(
                 Some(_) => None,
             };
             let opts = query_options(&st, &ds, &params);
-            let hidden = |t: &Target| match (&view, t) {
+            let hidden = |v: &Option<Arc<sparkles::access::GraphAccess>>, t: &Target| match (v, t) {
                 (Some(v), Target::Default) => !v.read.default_graph(),
                 (Some(v), Target::Named(iri)) => !v.read.allows_iri(iri),
                 _ => false,
             };
             // a graph the caller cannot read answers like a missing one
-            match &target {
-                Target::Default if hidden(&target) => {
-                    return Err(err(
-                        StatusCode::NOT_FOUND,
-                        format!(
-                            "no such graph: <{}>",
-                            sparkles::sparql::ctx::DEFAULT_GRAPH_IRI
-                        ),
-                    ));
-                }
-                Target::Named(iri) if hidden(&target) => {
-                    return Err(err(
-                        StatusCode::NOT_FOUND,
-                        format!("no such graph: <{iri}>"),
-                    ));
-                }
-                _ => {}
+            let missing = |t: &Target| match t {
+                Target::Named(iri) => err(StatusCode::NOT_FOUND, format!("no such graph: <{iri}>")),
+                _ => err(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "no such graph: <{}>",
+                        sparkles::sparql::ctx::DEFAULT_GRAPH_IRI
+                    ),
+                ),
+            };
+            if hidden(&view, &target) && !target_is_guarded(&target) {
+                return Err(missing(&target));
             }
-            let (snap, what, resolved) = blocking({
+            let (snap, what, resolved, view) = blocking({
                 let ds = ds.clone();
                 let read_view = view.clone();
                 move || {
@@ -3134,6 +3136,12 @@ async fn gsp_on(
                         None => at,
                     };
                     let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
+                    // guarded graphs are decided against the snapshot read (C22 §6.3)
+                    let read_view = read_view.map(|v| v.bound(&snap));
+                    if hidden(&read_view, &target) {
+                        return Err(missing(&target));
+                    }
+                    let view = read_view.clone();
                     // protections of triples: the graph as the caller sees it, and a
                     // graph whose every quad is hidden answers like a missing one
                     let snap = match &read_view {
@@ -3152,7 +3160,7 @@ async fn gsp_on(
                         Target::Union => Export::Union,
                         Target::Dataset => Export::Dataset,
                     };
-                    Ok((snap, what, resolved))
+                    Ok((snap, what, resolved, view))
                 }
             })
             .await?;
@@ -3672,11 +3680,10 @@ fn dataset_info_for(st: &AppState, d: &Dataset, p: &Principal) -> J {
     }
     if let Some(v) = p.view(&d.name, crate::auth::Endpoint::Info) {
         redact_dataset_info(&mut info);
-        // the quads the caller can read
-        if let Ok(n) = v
-            .masked(&d.store.snapshot())
-            .and_then(|snap| v.visible_quads(&snap))
-        {
+        // the quads the caller can read, its guarded graphs decided at the snapshot
+        let snap = d.store.snapshot();
+        let v = v.bound(&snap);
+        if let Ok(n) = v.masked(&snap).and_then(|snap| v.visible_quads(&snap)) {
             info["quads"] = n.into();
         }
     }

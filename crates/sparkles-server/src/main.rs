@@ -36,6 +36,7 @@ mod geo;
 mod geo_index_cmd;
 #[cfg(feature = "graphql")]
 mod graphql;
+mod graphrag;
 mod http;
 #[cfg(feature = "mcp")]
 mod ingest;
@@ -1403,6 +1404,10 @@ enum Cmd {
     /// keep them in sync, and print the brief, recall, queries and facts
     #[cfg(feature = "memory")]
     Memory(memory_cmd::MemoryArgs),
+    /// GraphRAG community reports (C22 §2.2): build or refresh a dataset's reports, and
+    /// print their status and titles
+    #[cfg(feature = "memory")]
+    Graphrag(graphrag::cli::GraphragArgs),
     /// Format SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD: print, check (--check,
     /// -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
@@ -3232,6 +3237,8 @@ fn run() -> Result<()> {
         Cmd::Ingest(args) => ingest::cli::run_cli(args, opts),
         #[cfg(feature = "memory")]
         Cmd::Memory(args) => memory_cmd::run(args, opts),
+        #[cfg(feature = "memory")]
+        Cmd::Graphrag(args) => graphrag::cli::run(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
         #[cfg(feature = "fmt")]
