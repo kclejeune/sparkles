@@ -487,6 +487,35 @@ pub(crate) fn slice_chars(text: &str, a: usize, b: usize) -> String {
     text.chars().skip(a).take(b.saturating_sub(a)).collect()
 }
 
+/// The code points `[a, b)` of `text` for every `(a, b)` of `bounds`, as [`slice_chars`]
+/// gives them, in one pass over the text. Calling `slice_chars` for each chunk scans the
+/// text from its start every time, which takes time quadratic in the text for a text of
+/// many chunks: 7 s for 552 chunks of 2 MB in a build without optimizations.
+pub(crate) fn chunk_slices<'a>(text: &'a str, bounds: &[(usize, usize)]) -> Vec<&'a str> {
+    let mut offsets: Vec<usize> = bounds.iter().flat_map(|&(a, b)| [a, b]).collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    // the byte offset of each code point offset, which is the text's length past its end
+    let mut bytes = Vec::with_capacity(offsets.len());
+    let mut chars = text.char_indices();
+    let mut at = 0;
+    for &off in &offsets {
+        while at < off && chars.next().is_some() {
+            at += 1;
+        }
+        bytes.push(chars.clone().next().map_or(text.len(), |(i, _)| i));
+    }
+    let byte = |c: usize| {
+        bytes[offsets
+            .binary_search(&c)
+            .expect("every bound was collected")]
+    };
+    bounds
+        .iter()
+        .map(|&(a, b)| if a < b { &text[byte(a)..byte(b)] } else { "" })
+        .collect()
+}
+
 /// The IRI of a span of a rendition (RFC 5147).
 pub(crate) fn span_iri(rendition: &str, a: usize, b: usize) -> NamedNode {
     NamedNode::new_unchecked(format!("{rendition}#char={a},{b}"))
@@ -1282,6 +1311,7 @@ impl Tools<'_> {
             ins.push_str(" .\n");
             extras.write(&mut ins, &rendition);
             if settings.keep_text {
+                let slices = chunk_slices(&text, &bounds);
                 for (i, (s, e)) in bounds.iter().enumerate() {
                     let c = span_iri(rendition.as_str(), *s, *e);
                     let _ = writeln!(
@@ -1290,7 +1320,7 @@ impl Tools<'_> {
                         literal(&i.to_string(), XSD_INTEGER),
                         literal(&s.to_string(), XSD_INTEGER),
                         literal(&e.to_string(), XSD_INTEGER),
-                        Literal::new_simple_literal(slice_chars(&text, *s, *e)),
+                        Literal::new_simple_literal(slices[i]),
                     );
                 }
             }
@@ -2464,6 +2494,31 @@ mod tests {
             starts.iter().skip(1).take(3).all(|s| s == "##"),
             "{starts:?}"
         );
+    }
+
+    /// The slices of one pass are those of `slice_chars`, for text of one to four bytes
+    /// a character, for the bounds of both chunkings, past the end and out of order.
+    #[test]
+    fn chunk_slices_match_slice_chars() {
+        let mut t = String::from("# Session\n\n");
+        for i in 0..40 {
+            t.push_str(&format!(
+                "## user {i}\n\nCafe\u{301} \u{e9}t\u{e9} \u{4e2d}\u{6587} \u{1f600} \u{1f9d1}\u{200d}\u{1f4bb}. Ünïcödé.\n\n"
+            ));
+        }
+        t.push_str(&"\u{4e2d}".repeat(9000));
+        for text in [t.as_str(), "", "x", "é"] {
+            for every_heading in [false, true] {
+                let mut bounds = chunk_bounds(text, every_heading);
+                let n = text.chars().count();
+                bounds.extend([(0, 0), (3, 3), (5, 2), (n, n + 7), (n + 3, n + 9), (0, n)]);
+                let got = chunk_slices(text, &bounds);
+                assert_eq!(got.len(), bounds.len());
+                for (g, (a, e)) in got.iter().zip(&bounds) {
+                    assert_eq!(*g, slice_chars(text, *a, *e), "{a}..{e}");
+                }
+            }
+        }
     }
 
     #[test]
