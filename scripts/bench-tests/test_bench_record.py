@@ -293,6 +293,37 @@ class RecordTests(unittest.TestCase):
         subprocess.run([sys.executable, RECORD, "finish", path], check=True)
         self.assertIsNotNone(jload(path)["ended"])
 
+    def reuse_fixture(self, prior_host="forge", prior_version="5.1.0"):
+        fixture(self.res)
+        cur = {"host": {"name": "forge"}, "sparkles": {"binary_commit": "new"},
+               "engines": {"jena": {"version": "5.1.0", "sha256": "aa"}}}
+        prior = {"host": {"name": prior_host}, "started": "2026-10-18T00:00:00Z", "ended": "2026-10-19T00:00:00Z",
+                 "sparkles": {"binary_commit": "old", "scripts_commit": "s1"},
+                 "engines": {"jena": {"version": prior_version, "sha256": "aa"}, "oxigraph": {"version": "0.5.11"}}}
+        man, pri = os.path.join(self.tmp.name, "m.json"), os.path.join(self.tmp.name, "prior.json")
+        write_path(man, cur)
+        write_path(pri, prior)
+        out = os.path.join(self.tmp.name, "record.json")
+        p = build(self.res, out, manifest=man, reuse=f"jena-fuseki={pri}")
+        return p, out, pri
+
+    def test_reused_engines_are_named_and_marked(self):
+        p, out, _ = self.reuse_fixture()
+        self.assertEqual(p.returncode, 0, p.stderr)
+        rec = jload(out)
+        self.assertEqual(rec["manifest"]["reused"]["jena"]["started"], "2026-10-18T00:00:00Z")
+        self.assertEqual(rec["manifest"]["reused"]["jena"]["engine"]["version"], "5.1.0")
+        for r in rec["results"]:
+            self.assertEqual(r.get("reused", False), r["engine"] == "jena", r)
+
+    def test_reuse_across_hosts_or_versions_is_refused(self):
+        p, _, _ = self.reuse_fixture(prior_host="atlas")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("atlas", p.stderr)
+        p, _, _ = self.reuse_fixture(prior_version="5.0.0")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("version changed", p.stderr)
+
 
 class NixPackageTests(unittest.TestCase):
     def test_store_paths_give_package_and_version(self):
