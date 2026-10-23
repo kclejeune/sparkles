@@ -1753,7 +1753,14 @@ fn history(p: &mut Paths) {
                 "Only the changes whose subject or object is this term, an N-Triples term or a bare IRI. Repeat the parameter for several, up to 1,000. Not for RDF Patch.",
             )
             .query("quads", boolean(), "JSON: list the quads.")
-            .query("limit", int(), "The most quads listed.")
+            .query(
+                "group",
+                json!({ "type": "string", "enum": ["class"] }),
+                "`class`: count the changes by the class of the subject, the predicate and the class or kind of the object, without the quads. Classes are read under the caller's view, at the `to` state for an added quad and at the `from` state for a removed one. JSON only, and not with `quads=true`.",
+            )
+            .query("limit", int(), "The most quads listed, or with `group=class` the most groups, from 1 to 5,000 (default 5,000).")
+            .query("fromBranch", s(), "A diff across branches: the branch `from` is read on, its head by default.")
+            .query("toBranch", s(), "A diff across branches: the branch `to` is read on.")
             .param("format")
             .resp(
                 "200",

@@ -13,7 +13,9 @@
 
 use super::*;
 use sparkles::history::At;
-use sparkles::store::{Diff, DiffOp, DiffOptions};
+use sparkles::store::{
+    ClassGroup, ClassGroups, Diff, DiffOp, DiffOptions, MAX_GROUPS, ObjectGroup,
+};
 use std::io::Write;
 
 /// The diff line format.
@@ -219,20 +221,53 @@ pub(super) async fn diff(
         .map(|v| super::hist::term_param("term", v))
         .collect::<ApiResult<Vec<_>>>()?;
     let with_quads = fmt != DiffFormat::Json || params.get("quads").is_some_and(truthy);
-    let limit = match params.get("limit") {
-        None => usize::MAX,
-        Some(v) => v.parse().map_err(|_| {
-            err(
+    // the counts grouped by class instead of the quads
+    let group = match params.get("group") {
+        None => false,
+        Some("class") => true,
+        Some(g) => {
+            return Err(err(
                 StatusCode::BAD_REQUEST,
-                "limit must be a non-negative integer",
-            )
-        })?,
+                format!("unknown group '{g}': use class"),
+            ));
+        }
     };
-    let opts = query_options(&st, &ds, &params);
+    if group && (fmt != DiffFormat::Json || with_quads) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "group=class answers JSON counts: it does not combine with quads=true, the diff lines or RDF Patch",
+        ));
+    }
+    let limit = match params.get("limit") {
+        None if group => MAX_GROUPS,
+        None => usize::MAX,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if group && !(1..=MAX_GROUPS).contains(&n) => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!("limit: with group=class, from 1 to {MAX_GROUPS} groups"),
+                ));
+            }
+            Ok(n) => n,
+            Err(_) => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "limit must be a non-negative integer",
+                ));
+            }
+        },
+    };
+    let mut opts = query_options(&st, &ds, &params);
+    if group {
+        // a grouping holds memory of its own, under the budgets the request asks for
+        super::budgets::Overrides::parse(&params)?.apply(&mut opts);
+    }
+    // a client that goes away stops the diff and the class lookups
+    let (cancel, _cancel_on_drop) = cancel_on_drop();
     let o = DiffOptions {
         graph,
-        max_quads: st.limits.max_rows as u64,
-        cancel: opts.cancel.clone(),
+        max_quads: opts.max_rows.unwrap_or(st.limits.max_rows) as u64,
+        cancel: opts.cancel.clone().or(Some(cancel)),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
         graphs: view.clone(),
         terms: None,
@@ -266,34 +301,16 @@ pub(super) async fn diff(
     } else {
         (ds.store.dataset_id(), ds.store.dataset_id())
     };
-    let d = blocking({
+    let (d, grouped) = blocking({
         let ds = ds.clone();
         let (fb, tb) = (fb.clone(), tb.clone());
         move || {
-            if cross {
-                let from = from.unwrap_or(At::Head);
-                return Ok(main.store.branch_diff(&fb, &from, &tb, &to, &o)?);
+            let d = diff_of(&ds, &main, &here, cross, (&fb, from), (&tb, to), &o)?;
+            if !group {
+                return Ok((d, None));
             }
-            // without `from`: the commit before `to`
-            let from = match from {
-                Some(f) => f,
-                None => {
-                    let r = match ds.store.resolve(&to) {
-                        Err(e) if sparkles::branch::inherited_commit(&e).is_some() => {
-                            main.store.branch_resolve(&here, &to)?.0
-                        }
-                        r => r?,
-                    };
-                    At::Commit(r.commit.seq.saturating_sub(1))
-                }
-            };
-            match ds.dataset.history().diff(&from, &to, &o) {
-                // a commit the branch shares with its upstream
-                Err(e) if sparkles::branch::inherited_commit(&e).is_some() => {
-                    Ok(main.store.branch_diff(&here, &from, &here, &to, &o)?)
-                }
-                r => Ok(r?),
-            }
+            let g = group_by_class(&ds, &main, &here, (&fb, &tb), &d, &o, &opts, limit)?;
+            Ok((d, Some(g)))
         }
     })
     .await?;
@@ -306,6 +323,7 @@ pub(super) async fn diff(
         d.from.commit.seq,
         d.to.commit.seq,
         match (fmt, with_quads) {
+            _ if group => "json+groups",
             (DiffFormat::Lines, _) => "diff",
             (DiffFormat::Patch(_), _) => "patch",
             (DiffFormat::PatchBinary, _) => "patch-binary",
@@ -313,7 +331,7 @@ pub(super) async fn diff(
             (DiffFormat::Json, false) => "json",
         },
         match params.get("limit") {
-            Some(_) if with_quads => format!(":limit={limit}"),
+            Some(_) if with_quads || group => format!(":limit={limit}"),
             _ => String::new(),
         },
         if term_params.is_empty() {
@@ -395,8 +413,25 @@ pub(super) async fn diff(
             }
             return Ok(());
         }
-        // the summary, then the quads one by one
+        // the summary, then the quads or the groups one by one
         let mut head = serde_json::to_vec(&summary).map_err(std::io::Error::other)?;
+        if let Some(g) = &grouped {
+            head.pop(); // the closing brace
+            w.write_all(&head)?;
+            write!(
+                w,
+                ",\"group\":\"class\",\"groupCount\":{},\"truncated\":{},\"groups\":[",
+                g.total, g.truncated
+            )?;
+            for (i, x) in g.groups.iter().enumerate() {
+                if i > 0 {
+                    w.write_all(b",")?;
+                }
+                serde_json::to_writer(&mut *w, &group_json(x)).map_err(std::io::Error::other)?;
+            }
+            w.write_all(b"]}")?;
+            return Ok(());
+        }
         if !with_quads {
             w.write_all(&head)?;
             return Ok(());
@@ -442,4 +477,100 @@ pub(super) async fn diff(
         h.insert(header::ETAG, v);
     }
     Ok(resp)
+}
+
+/// The diff the request names: across branches, or on the request's branch, `from`
+/// defaulting to the commit before `to`.
+fn diff_of(
+    ds: &Dataset,
+    main: &Dataset,
+    here: &str,
+    cross: bool,
+    (fb, from): (&str, Option<At>),
+    (tb, to): (&str, At),
+    o: &DiffOptions,
+) -> ApiResult<Diff> {
+    if cross {
+        let from = from.unwrap_or(At::Head);
+        return Ok(main.store.branch_diff(fb, &from, tb, &to, o)?);
+    }
+    // without `from`: the commit before `to`
+    let from = match from {
+        Some(f) => f,
+        None => {
+            let r = match ds.store.resolve(&to) {
+                Err(e) if sparkles::branch::inherited_commit(&e).is_some() => {
+                    main.store.branch_resolve(here, &to)?.0
+                }
+                r => r?,
+            };
+            At::Commit(r.commit.seq.saturating_sub(1))
+        }
+    };
+    match ds.dataset.history().diff(&from, &to, o) {
+        // a commit the branch shares with its upstream
+        Err(e) if sparkles::branch::inherited_commit(&e).is_some() => {
+            Ok(main.store.branch_diff(here, &from, here, &to, o)?)
+        }
+        r => Ok(r?),
+    }
+}
+
+/// `group=class`: the diff's counts by the classes of its resources, which are read at
+/// each side's state under the caller's view (`o.graphs`). What the grouping holds, and
+/// the diff it groups, are charged to the request's memory budget and to its grant in the
+/// server memory pool, so a grouping past them answers `507`.
+#[allow(clippy::too_many_arguments)]
+fn group_by_class(
+    ds: &Dataset,
+    main: &Dataset,
+    here: &str,
+    (fb, tb): (&str, &str),
+    d: &Diff,
+    o: &DiffOptions,
+    opts: &sparkles::sparql::QueryOptions,
+    limit: usize,
+) -> ApiResult<ClassGroups> {
+    let mut charge = super::sparql_diff::Charge::new(opts);
+    charge.charge((d.len() as u64).saturating_mul(sparkles::store::CHANGE_BYTES))?;
+    let ho = sparkles::history::HistoryOptions {
+        cancel: o.cancel.clone(),
+        deadline: o.deadline,
+    };
+    let mut state = |op: DiffOp| -> sparkles::Result<Arc<sparkles::store::Snapshot>> {
+        let (branch, seq) = match op {
+            DiffOp::Add => (tb, d.to.commit.seq),
+            DiffOp::Remove => (fb, d.from.commit.seq),
+        };
+        let at = At::Commit(seq);
+        if branch == here {
+            let q = sparkles::sparql::QueryOptions {
+                cancel: o.cancel.clone(),
+                timeout: o
+                    .deadline
+                    .map(|t| t.saturating_duration_since(std::time::Instant::now())),
+                ..Default::default()
+            };
+            Ok(super::history::snapshot_for(ds, Some(&at), &q)?.0)
+        } else {
+            Ok(main.store.branch_snapshot_at(branch, &at, &ho)?.0)
+        }
+    };
+    Ok(d.group_by_class(&mut state, o, limit, &mut |n| charge.charge(n))?)
+}
+
+/// A group of `group=class` as JSON: IRIs without angle brackets.
+fn group_json(g: &ClassGroup) -> J {
+    let object = match &g.object {
+        ObjectGroup::Class(c) => json!({ "class": c }),
+        ObjectGroup::Literal(dt) => json!({ "literal": dt }),
+        ObjectGroup::Iri => json!({ "iri": true }),
+    };
+    json!({
+        "subjectClass": g.subject_class,
+        "predicate": g.predicate,
+        "object": object,
+        "added": g.added,
+        "removed": g.removed,
+    })
 }

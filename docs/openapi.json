@@ -6289,7 +6289,7 @@
         "type": "object"
       },
       "Diff": {
-        "description": "The net change between two states: counts, and the quads with `quads=true`.",
+        "description": "The net change between two states: counts, the quads with `quads=true`, or the counts by class with `group=class`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#diffs-between-commits"
         },
@@ -6322,6 +6322,24 @@
               "commit"
             ],
             "type": "object"
+          },
+          "group": {
+            "description": "With `group=class`: the changes are counted in `groups` instead of listed.",
+            "enum": [
+              "class"
+            ],
+            "type": "string"
+          },
+          "groupCount": {
+            "description": "With `group=class`: the groups found, of which `groups` lists up to `limit`.",
+            "type": "integer"
+          },
+          "groups": {
+            "description": "With `group=class`: the largest groups first.",
+            "items": {
+              "$ref": "#/components/schemas/DiffGroup"
+            },
+            "type": "array"
           },
           "logChanges": {
             "description": "Changes read from the write-ahead logs. Left out for a caller limited to some graphs.",
@@ -6360,6 +6378,10 @@
               "commit"
             ],
             "type": "object"
+          },
+          "truncated": {
+            "description": "With `group=class`: more groups were found than `groups` lists.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -6370,6 +6392,83 @@
           "added",
           "removed",
           "method"
+        ],
+        "type": "object"
+      },
+      "DiffGroup": {
+        "description": "The changes of a diff with one subject class, predicate and object class or kind.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#diffs-between-commits"
+        },
+        "properties": {
+          "added": {
+            "type": "integer"
+          },
+          "object": {
+            "description": "`{class}` for a resource by its class (`null` for a blank node without one; the object of `rdf:type` is the class it names), `{literal}` for a literal by its datatype IRI, `{iri: true}` for an IRI without a class.",
+            "oneOf": [
+              {
+                "properties": {
+                  "class": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "class"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "literal": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "literal"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "iri": {
+                    "enum": [
+                      true
+                    ],
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "iri"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "predicate": {
+            "description": "The predicate IRI.",
+            "type": "string"
+          },
+          "removed": {
+            "type": "integer"
+          },
+          "subjectClass": {
+            "description": "The class of the subject, an IRI, read at the `to` state for an added quad and at the `from` state for a removed one. `null` for a subject without a class the caller can read.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "subjectClass",
+          "predicate",
+          "object",
+          "added",
+          "removed"
         ],
         "type": "object"
       },
@@ -35440,11 +35539,38 @@
             }
           },
           {
-            "description": "The most quads listed.",
+            "description": "`class`: count the changes by the class of the subject, the predicate and the class or kind of the object, without the quads. Classes are read under the caller's view, at the `to` state for an added quad and at the `from` state for a removed one. JSON only, and not with `quads=true`.",
+            "in": "query",
+            "name": "group",
+            "schema": {
+              "enum": [
+                "class"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most quads listed, or with `group=class` the most groups, from 1 to 5,000 (default 5,000).",
             "in": "query",
             "name": "limit",
             "schema": {
               "type": "integer"
+            }
+          },
+          {
+            "description": "A diff across branches: the branch `from` is read on, its head by default.",
+            "in": "query",
+            "name": "fromBranch",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A diff across branches: the branch `to` is read on.",
+            "in": "query",
+            "name": "toBranch",
+            "schema": {
+              "type": "string"
             }
           },
           {
