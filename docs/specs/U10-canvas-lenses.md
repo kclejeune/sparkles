@@ -1,8 +1,8 @@
 # U10: Lenses on the graph canvas
 
-> **Status:** specified
+> **Status:** Phase 1 shipped
 >
-> **Phases:** None shipped. Phase 1 adds lenses to the Explore graph and the WebGL view, a
+> **Phases:** Phase 1 shipped on 2026-10-23. Phase 1 adds lenses to the Explore graph and the WebGL view, a
 > shared way to size, colour, badge and style drawn elements from data computed for them,
 > with a legend and a list column, and the first lenses: degree, a property's values, class,
 > graph and inferred edges drawn dashed. Phase 2 adds algorithm lenses, which size nodes by
@@ -11,10 +11,10 @@
 > this inferred?" with the reasoner's derivation tree for a dashed edge, after a server
 > prerequisite that explains inferences over a materialized closure.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [USAGE.md](../USAGE.md#lenses-on-the-graph).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how Phase 1 landed.
 
 This design was written from the Sparkles code and specs: graph algorithms
 ([F14](F14-graph-algorithms.md)), community summaries ([C22](C22-graph-rag-community-summaries.md)),
@@ -460,4 +460,74 @@ The data is a dataset with 300 people in three groups densely linked inside each
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 105.
+### Phase 1, 2026-10-23
+
+Phase 1 shipped the lens model, the menu, the legend and the list columns, with the degree,
+property, class, graph and inferred-edge lenses, on Explore's resource graph and on the query
+page's graph view with both renderers. Phases 2 and 3 remain [ROADMAP](../ROADMAP.md) item
+105.
+
+**What was built.** `ui/src/lib/lens.ts` holds the model, the quantile steps, the palette and
+the encoding table, and `ui/src/lib/lens-sources.ts` the reads. `ui/src/lib/lenses.svelte.ts`
+keeps one canvas's lens state, so that both pages share it. `LensMenu.svelte` and
+`LensLegend.svelte` are the menu and the legend, `GraphView.svelte` and
+`LargeGraphView.svelte` take a `lens` encoding and a `marked` set, and `GraphListView.svelte`
+takes a column per lens. The twelve colours and "other" are the `--lens-1` to `--lens-12` and
+`--lens-other` tokens of `app.css`, and a unit test checks that each has at least 3:1
+contrast against the surface in the light theme and both dark ones. The palette was chosen
+for the task rather than taken from ColorBrewer, some of whose qualitative colours fall below 3:1 on
+white.
+
+**Decisions the spec left open.**
+
+- *`reasoning=false` and RDFS on read.* The server's `reasoning=false` left RDFS on read on,
+  so the comparison of §3.1 could not see inferences on read. `reasoning=false` now turns
+  RDFS on read off for the request as well, which a router test checks and
+  [API.md](../API.md) documents. This is the only server change of the phase.
+- *Where the lenses are.* The Explore overview is left out. Its class level is a non-goal,
+  and its member levels belong with the algorithm lenses of Phase 2. Explore's resource
+  graph and the query page had no node list, so both gained a **List** view, which is the
+  list that §2.1 gives a column per lens.
+- *Degree.* Two size lenses count it, one in the drawn graph in the browser and one in the
+  dataset as the triples a node is subject or object of.
+- *A node with several values.* The class, graph and property colour lenses give the node
+  the value most drawn nodes share, so that the categories gather. A numeric property takes
+  the node's largest value, and a value is numeric when its lexical form is a number. The
+  property picker lists the properties of the first 200 drawn IRIs, and the size channel
+  only those whose values are mostly numbers.
+- *Class.* The class lens reads the asserted classes with `reasoning=false`, because under
+  reasoning every node is also in each superclass.
+- *Graph.* The graph lens names a node's named graph, "several graphs" for a node used in
+  more than one and "the default graph" for one used in none. The inferred graph is left
+  out, since the edge lens shows what it adds.
+- *Dashes.* While the edge lens is on, `rdf:type` edges are drawn solid, so that a dash means
+  an inferred edge only. The `i` marker is a `ⓘ` before the edge's label on the canvas
+  renderer and a circled `i` at the middle of the edge in the WebGL view.
+- *Edges a read cannot name.* An edge with a blank node or a triple term, or with a
+  predicate that is a result column's name, is not checked, and the legend counts it.
+- *Results of a query.* The edges of a `CONSTRUCT` result need not be in the data, so the
+  query page also reads them with reasoning, and an edge is inferred only when that read
+  finds it and the read without reasoning does not.
+- *The badge.* The Phase 1 badge counts a node's drawn inferred edges.
+- *WebGL.* Sigma has no dashed edges, so the WebGL view hides the inferred edges and draws
+  them dashed on its overlay canvas, up to 4,000 of them, with markers while there are at
+  most 600. Badges go on the same overlay, up to 1,500 on screen.
+- *Selection.* A legend entry rings its nodes and fades the rest, as a finding's entities
+  are marked in the overview, and leaves the single selection of the side panel alone.
+- *Keys.* `Shift+1` to `Shift+4` read the key's position, so they work on keyboards whose
+  shifted digits are other characters.
+- *Open question 3.* Lens choices are not part of the URL.
+
+**Deferred.** The compare-mode deltas of §4.3, a numeric lens's change since the left
+handle, wait for Phase 2, where projection runs need the same pairing of two states. Above
+20,000 drawn nodes the lenses are off with the reason, since the top 1,000 of §5 needs the
+kept runs of §3.2. Category colours follow category sizes on each run, and the stable
+community colours of §2.3 come with Phase 2.
+
+**Tests.** Vitest covers the quantile steps, "other", the palette's contrast, the encoding
+table, batching, incremental reads and the inferred-edge comparison
+(`lens.test.ts`, `lens-sources.test.ts`). The mock Playwright suite `tests/mock/lenses.spec.ts`
+covers A1, the size, colour and graph lenses with their legend and list columns, the
+numeric property's "no value", the absent edge lens without reasoning, the query page on both
+renderers and the 390 px layout of A12. `tests/e2e/lenses.spec.ts` runs A1 and A2 against a
+real server. A3 to A11 need Phases 2 and 3.

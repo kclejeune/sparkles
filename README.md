@@ -301,11 +301,11 @@ agent memory, the map view and a merge preview.
   </tr>
   <tr>
     <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing two GraphRAG communities inside Engineering, with the payments team's report beside the picture and one of its findings chosen"></td>
-    <td></td>
+    <td><img src="docs/images/explore-lenses.png" alt="The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend in the corner"></td>
   </tr>
   <tr>
     <td>The dataset grouped by its GraphRAG communities, with a report beside it</td>
-    <td></td>
+    <td>Lenses that size and colour the graph and dash its inferred edges</td>
   </tr>
 </table>
 

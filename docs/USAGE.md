@@ -33,6 +33,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Loading CSV and TSV](#loading-csv-and-tsv)
 * [Branches and merges](#branches-and-merges)
 * [The Explore overview](#the-explore-overview)
+* [Lenses on the graph](#lenses-on-the-graph)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
@@ -1511,6 +1512,48 @@ classes. The same grouping is `by: {"reports": {}}` in
 The query page's graph view uses the same WebGL view for results of more than 2,000
 nodes. **Max nodes** then offers 10,000, 50,000 and 100,000, and **Renderer** switches
 between the canvas and WebGL views.
+
+## Lenses on the graph
+
+A lens changes how the graph draws its nodes and edges from data about them. The resource
+graph in Explore and the query page's graph view have a **Lenses** menu in their toolbar
+(shortcut `Shift+L`) with one row per channel, and each channel has at most one lens on at
+a time.
+
+* **Size** draws a node's area in five steps of the drawn values, so that one outlier does
+  not flatten the rest. It offers the degree in the drawn graph, the degree in the dataset
+  and a numeric property of the drawn nodes. A node without a value keeps the smallest
+  size, and the legend counts it as "no value".
+* **Colour** gives twelve colours to the categories with the most nodes and "other" to the
+  rest. It offers the node's class, the named graph it is used in and a property's values.
+  The class lens reads the asserted classes, since with reasoning every node would also
+  be in each superclass. A node with several values takes the one most drawn nodes share.
+* **Badges** puts a pill with an `i` and a count in the corner of each node that has
+  inferred edges.
+* **Edges** draws the edges that the reasoner added dashed, with an `i` before their
+  label. An edge counts as inferred when the graph shows it and a read without reasoning
+  does not, which covers materialized inferences and RDFS on read alike. A triple that is
+  both asserted and inferred stays solid. While the lens is on, `rdf:type` edges are no
+  longer dashed, so that a dash means one thing.
+
+The edge lens is on by default when the dataset has materialized inferences or RDFS on
+read, and the badge and edge lenses are absent when it has neither. `Shift+1` to `Shift+4`
+turn the size, colour, badge and edge lens off and on again.
+
+The legend in the canvas's corner lists each encoding in words, such as "size is degree
+in the dataset, larger is higher" and "colour 3 is ex:Employee", with the number of nodes
+of each entry. Clicking an entry, or `Enter` on it, rings its nodes and fades the rest,
+and a second click clears them. **List** shows the drawn nodes as a table with a column
+per active lens, ordered by the size lens's value when one is on, and a screen reader
+hears each lens's result in a polite announcement. On a phone the menu is a bottom sheet
+and the legend a strip along the top of the graph that opens on a tap.
+
+The lenses read the drawn nodes with one query per 200 terms and at most four queries in
+flight, at the state the graph shows, so they follow the time slider. They read under the
+signed-in user's view, and a grown graph reads only its new nodes. Nothing they compute is
+saved. Lenses apply to at most 20,000 drawn nodes. On the query page, the edges of a
+`CONSTRUCT` result are also read with reasoning, so that a constructed triple that is not
+in the data is not taken for an inferred one.
 
 ## The time slider
 
