@@ -1185,6 +1185,9 @@ mod imp {
         removed: FxHashMap<[u8; 16], u64>,
         /// the first commit that removed one of them
         removed_since: Option<u64>,
+        /// background checkpoints in a row that a write raced, so that they kept the
+        /// marker (see [`RACED_BEFORE_LOCKED`])
+        raced: u32,
     }
 
     /// The index shared by its [`TextIndex`], the commit tick and the views (which seal
@@ -1343,9 +1346,49 @@ mod imp {
         Ok((index, fields, dir))
     }
 
-    /// Check an index that may hold unsynced writes: every file of the committed
-    /// segments must exist and match its checksum.
-    fn verify(index: &Index) -> Result<()> {
+    /// The bytes at the end of every Tantivy file after its footer's JSON: the JSON's
+    /// length and a magic number, both `u32`.
+    const FOOTER_TRAILER: u64 = 8;
+
+    /// What is wrong with the file `f` of a committed segment in the index directory
+    /// `root`, opened as `d`, or `None` when it exists (and, with `checksums`, matches its
+    /// checksum). A crash can leave a file torn to any length. Tantivy's footer parser
+    /// rejects a file shorter than 4 bytes but subtracts the 8-byte trailer from the
+    /// length of a file of 4 to 7 bytes, which panics, so such a file is reported here
+    /// before Tantivy reads it. Any other panic inside the checksum check is reported as
+    /// damage too, so that a damaged index is rebuilt rather than failing the open.
+    fn file_problem(
+        d: &tantivy::directory::ManagedDirectory,
+        root: &Path,
+        f: &Path,
+        checksums: bool,
+    ) -> Option<String> {
+        match tantivy::directory::Directory::exists(d, f) {
+            Ok(true) => {}
+            Ok(false) => return Some("missing".into()),
+            Err(e) => return Some(e.to_string()),
+        }
+        if !checksums {
+            return None;
+        }
+        match std::fs::metadata(root.join(f)) {
+            Ok(m) if m.len() < FOOTER_TRAILER => {
+                return Some(format!("truncated to {} bytes", m.len()));
+            }
+            Ok(_) => {}
+            Err(e) => return Some(e.to_string()),
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.validate_checksum(f))) {
+            Ok(Ok(true)) => None,
+            Ok(Ok(false)) => Some("checksum mismatch".into()),
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some("unreadable footer".into()),
+        }
+    }
+
+    /// Check an index in the directory `root` that may hold unsynced writes: every file
+    /// of the committed segments must exist and match its checksum.
+    fn verify(index: &Index, root: &Path) -> Result<()> {
         let d = index.directory();
         for meta in index.searchable_segment_metas().map_err(text_err)? {
             for f in meta.list_files() {
@@ -1353,10 +1396,11 @@ mod imp {
                 if meta.delete_opstamp().is_none() && f.extension().is_some_and(|e| e == "del") {
                     continue;
                 }
-                let ok = tantivy::directory::Directory::exists(d, &f).map_err(text_err)?
-                    && d.validate_checksum(&f).map_err(text_err)?;
-                if !ok {
-                    return Err(text_err(format!("{} is missing or damaged", f.display())));
+                if let Some(problem) = file_problem(d, root, &f, true) {
+                    return Err(text_err(format!(
+                        "{} is missing or damaged ({problem})",
+                        f.display()
+                    )));
                 }
             }
         }
@@ -1368,7 +1412,6 @@ mod imp {
     /// `checksums`, matches its checksum). A server may commit and merge meanwhile, so
     /// damage is re-checked against a fresh `meta.json` before it is reported.
     pub(crate) fn probe(root: &Path, checksums: bool) -> super::TextProbe {
-        use tantivy::directory::Directory;
         let mut p = super::TextProbe::default();
         let config = match read_config(root) {
             Ok(Some(c)) => c,
@@ -1431,17 +1474,7 @@ mod imp {
                         continue;
                     }
                     p.files += 1;
-                    let problem = match Directory::exists(d, &f) {
-                        Ok(false) => Some("missing".to_string()),
-                        Ok(true) if checksums => match d.validate_checksum(&f) {
-                            Ok(true) => None,
-                            Ok(false) => Some("checksum mismatch".to_string()),
-                            Err(e) => Some(e.to_string()),
-                        },
-                        Ok(true) => None,
-                        Err(e) => Some(e.to_string()),
-                    };
-                    if let Some(problem) = problem {
+                    if let Some(problem) = file_problem(d, &dir, &f, checksums) {
                         p.damaged.push((f.display().to_string(), problem));
                     }
                 }
@@ -1461,6 +1494,15 @@ mod imp {
     /// How long the index may hold unsynced commits before a checkpoint, and the period
     /// of the tick that seals batches.
     const CHECKPOINT_AFTER: Duration = Duration::from_secs(1);
+
+    /// Background checkpoints in a row that a write may race before the tick holds the
+    /// live writer lock through its file synchronization. A checkpoint that a write
+    /// raced keeps the marker. Under commits more frequent than a checkpoint's
+    /// synchronization every unlocked attempt would race, the marker would never clear,
+    /// and every crash would pay verification at open. The locked attempt blocks text
+    /// publication for one synchronization, as an explicit checkpoint does, so it runs
+    /// at most once per this many raced ticks.
+    const RACED_BEFORE_LOCKED: u32 = 3;
 
     /// Staged operations at which a write seals its batch itself. Commit time grows with
     /// the batch (roughly 20 ms for 10k operations, 55 ms for 40k, measured on 1k-triple
@@ -1502,6 +1544,7 @@ mod imp {
             uncertain: Default::default(),
             removed: Default::default(),
             removed_since: None,
+            raced: 0,
         })
     }
 
@@ -1793,7 +1836,7 @@ mod imp {
         if payload.format != FORMAT || payload.seq > seq || payload.config != config_hash(config) {
             return Ok(false);
         }
-        verify(&index)?;
+        verify(&index, &source.join("text"))?;
         let tmp = tempfile::Builder::new()
             .prefix(".text-seed-")
             .tempdir_in(root)?;
@@ -1822,7 +1865,10 @@ mod imp {
         )?;
         // Verify the exact checkpoint being published, rather than whichever
         // checkpoint the upstream has advanced to during copying.
-        verify(&Index::open_in_dir(tmp.path()).map_err(text_err)?)?;
+        verify(
+            &Index::open_in_dir(tmp.path()).map_err(text_err)?,
+            tmp.path(),
+        )?;
         crate::store::sync_dir(tmp.path())?;
         std::fs::rename(tmp.path(), root.join("text"))?;
         crate::store::sync_dir(root)?;
@@ -1901,7 +1947,7 @@ mod imp {
             .inspect_err(|e| tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding"))
             .map_err(|_| RecoveryReason::Unreadable)?;
         if dir.is_marked() {
-            verify(&index)
+            verify(&index, &root.join("text"))
                 .inspect_err(|e| tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding"))
                 .map_err(|_| RecoveryReason::Unreadable)?;
         }
@@ -2001,7 +2047,12 @@ mod imp {
             background: bool,
         ) -> Result<Option<(TextIndex, Arc<TextView>)>> {
             let hash = config_hash(&config);
-            let existing = inspect_existing(root, &config);
+            // Verification never hands Tantivy a file too short for its footer, and a
+            // panic elsewhere in reading a damaged index means the same as damage.
+            let existing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                inspect_existing(root, &config)
+            }))
+            .unwrap_or(Err(RecoveryReason::Unreadable));
             let mut classification = classify_open(
                 existing.as_ref().map(|e| &e.payload).map_err(|r| *r),
                 &hash,
@@ -2016,7 +2067,11 @@ mod imp {
                 let ExistingIndex {
                     index, fields, dir, ..
                 } = existing.expect("ready classification has existing index evidence");
-                match live_of(index, fields, &config, Some(dir), seq) {
+                let live = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    live_of(index, fields, &config, Some(dir), seq)
+                }))
+                .unwrap_or_else(|_| Err(text_err("reading the index panicked")));
+                match live {
                     Ok(live) => {
                         let t = ti(live, epoch);
                         let mut touched = Vec::new();
@@ -2956,6 +3011,19 @@ mod imp {
             let Some(dir) = live.dir.clone() else {
                 return false;
             };
+            if live.raced >= RACED_BEFORE_LOCKED {
+                // Writes raced the last unlocked attempts. Holding live keeps text
+                // publication out of this one, so only a merge can still race it. The
+                // count starts again either way, so a merge that races this attempt
+                // does not make the next ticks hold live as well.
+                live.raced = 0;
+                match dir.prepare_checkpoint().run() {
+                    Ok(true) => live.dirty_since = None,
+                    Ok(false) => {}
+                    Err(e) => self.fail_locked(&mut live, &e.into()),
+                }
+                return true;
+            }
             let generation = live.commit_generation;
             let checkpoint = dir.prepare_checkpoint();
             drop(live);
@@ -2977,8 +3045,13 @@ mod imp {
                 return true;
             }
             match result {
-                Ok(true) if live.commit_generation == generation => live.dirty_since = None,
-                Ok(_) => {}
+                Ok(true) => {
+                    live.raced = 0;
+                    if live.commit_generation == generation {
+                        live.dirty_since = None;
+                    }
+                }
+                Ok(false) => live.raced = live.raced.saturating_add(1),
                 Err(e) => self.fail_locked(&mut live, &e.into()),
             }
             true
@@ -2994,6 +3067,7 @@ mod imp {
             }
             if dir.prepare_checkpoint().run()? {
                 live.dirty_since = None;
+                live.raced = 0;
             }
             Ok(())
         }
@@ -3330,6 +3404,82 @@ mod imp {
             assert!(!dir.is_marked());
             let (index, _, _) = open_index(root.path(), &inner.config).unwrap();
             assert_eq!(index.reader().unwrap().searcher().num_docs(), 2);
+        }
+
+        /// A publication races every unlocked background checkpoint, inside its file
+        /// synchronization. After `RACED_BEFORE_LOCKED` such ticks the next one holds
+        /// live, the publication cannot race it, and the marker clears. When a merge's
+        /// write races that locked attempt instead, the count starts again, so the
+        /// following ticks release live and at most one tick in four holds it.
+        #[test]
+        fn steady_publication_cannot_starve_the_background_checkpoint() {
+            use super::super::lazydir::TestPoint;
+            let (root, inner, dir) = checkpoint_fixture();
+            // a merge could race the locked attempt too
+            if let Some(writer) = inner.live.lock().writer.as_ref() {
+                writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+            }
+            publish_checkpoint_document(&inner, 1).unwrap();
+            let seq = Arc::new(AtomicU64::new(1));
+            for round in 0..3 {
+                // the locked attempt of this round meets a merge's write
+                let merge = round == 1;
+                for attempt in 0..=RACED_BEFORE_LOCKED {
+                    let locked = attempt == RACED_BEFORE_LOCKED;
+                    inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+                    let (hook_inner, hook_seq, hook_dir) =
+                        (inner.clone(), seq.clone(), dir.clone());
+                    let (raced_tx, raced_rx) = std::sync::mpsc::channel();
+                    dir.test_hook(TestPoint::CheckpointFileSync, move || {
+                        // The unlocked tick has released live, so the publication runs
+                        // here, between the checkpoint's snapshot and its marker check.
+                        let free = hook_inner.live.try_lock().is_some();
+                        if free {
+                            let next = hook_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                            publish_checkpoint_document(&hook_inner, next)
+                                .map_err(std::io::Error::other)?;
+                        } else if merge {
+                            // a merge writes without live
+                            tantivy::directory::Directory::atomic_write(
+                                &hook_dir,
+                                Path::new("merge-probe"),
+                                b"merge",
+                            )?;
+                        }
+                        let _ = raced_tx.send(free);
+                        Ok(())
+                    });
+                    assert!(inner.tick(), "round {round}, attempt {attempt}");
+                    let raced = raced_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("the checkpoint synchronized no file");
+                    assert_eq!(raced, !locked, "round {round}, attempt {attempt}");
+                    assert!(inner.healthy());
+                    let live = inner.live.lock();
+                    if locked && merge {
+                        assert!(dir.is_marked(), "round {round}: a raced checkpoint cleared");
+                        assert!(live.dirty_since.is_some());
+                        assert_eq!(live.raced, 0, "the next tick would hold live again");
+                    } else if locked {
+                        assert!(!dir.is_marked(), "round {round}: the marker never cleared");
+                        assert!(live.dirty_since.is_none());
+                        assert_eq!(live.raced, 0);
+                    } else {
+                        assert!(dir.is_marked(), "round {round}, attempt {attempt}");
+                        assert!(live.dirty_since.is_some());
+                        assert_eq!(live.raced, attempt + 1);
+                    }
+                }
+                // the next round starts from a marked index again
+                let next = seq.fetch_add(1, Ordering::SeqCst) + 1;
+                publish_checkpoint_document(&inner, next).unwrap();
+                assert!(dir.is_marked());
+            }
+            let published = seq.load(Ordering::SeqCst);
+            inner.close().unwrap();
+            assert!(!dir.is_marked());
+            let (index, _, _) = open_index(root.path(), &inner.config).unwrap();
+            assert_eq!(index.reader().unwrap().searcher().num_docs(), published);
         }
 
         #[test]

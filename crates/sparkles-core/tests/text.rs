@@ -585,6 +585,64 @@ fn crash_images_are_verified_caught_up_or_rebuilt() {
     }
 }
 
+/// A crash can tear a segment file that `meta.json` names to any length while the marker
+/// is present. Tantivy's footer parser panics on a file of 4 to 7 bytes, which a crash
+/// image of the background checkpoint left in a `.pos` file. `sparkles check` reports such
+/// an index as damaged and open rebuilds it, without a panic. Every segment file is torn,
+/// so the check does not depend on the order in which verification visits them.
+#[test]
+fn segment_files_torn_shorter_than_their_footer_are_rebuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    {
+        let s = ready_open(&root, StoreOptions::default()).unwrap();
+        load(&s);
+        s.enable_text(TextConfig::default()).unwrap();
+        s.set_text_ticks(false);
+        insert(&s, "ex:b8 rdfs:label \"Crimson Heron\"");
+        assert_eq!(rows(&s, "SELECT ?s { ?s text:query \"heron\" }"), ["b8"]);
+        copy_dir(&root, &dir.path().join("image"));
+    }
+    for len in 0..=9u64 {
+        let img = dir.path().join(format!("torn-{len}"));
+        copy_dir(&dir.path().join("image"), &img);
+        assert!(img.join("text.dirty").exists());
+        let mut torn = 0;
+        for e in std::fs::read_dir(img.join("text")).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            if name.starts_with('.') || name.ends_with(".json") || name.ends_with(".lock") {
+                continue;
+            }
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            if f.metadata().unwrap().len() > len {
+                f.set_len(len).unwrap();
+                torn += 1;
+            }
+        }
+        assert!(torn > 0, "torn to {len} bytes");
+        let report =
+            sparkles_core::check::check(&img, &sparkles_core::check::CheckOptions::default())
+                .unwrap();
+        assert_ne!(
+            report.status,
+            sparkles_core::check::Status::Ok,
+            "torn to {len} bytes: sparkles check passed a torn index\n{}",
+            report.to_text()
+        );
+        let s = ready_open(&img, StoreOptions::default()).unwrap();
+        let st = s.text_status().unwrap();
+        assert_eq!(st.state, "ready", "torn to {len} bytes");
+        assert!(
+            st.last_rebuild.is_some(),
+            "torn to {len} bytes: not rebuilt"
+        );
+        let mut got = rows(&s, "SELECT ?s { ?s text:query \"heron\" }");
+        got.sort();
+        assert_eq!(got, ["b8"], "torn to {len} bytes");
+    }
+}
+
 /// The forms of Lucene's query syntax that jena-text accepts.
 #[test]
 fn lucene_query_syntax() {
