@@ -122,8 +122,14 @@ The user decides only scope changes and disagreements with a spec that Opus rais
 
 ### Merging and pushing
 
-Finished lanes merge into local `main` as they land. One full gate runs on the batch:
-`scripts/ci.sh`, the conformance suites and a Namespace screen
-(`mise run bench:nsc origin/main HEAD`). Push only when the tests pass and no query
-regresses by 10% or more. Rerun a flagged query with more rounds, and bisect a confirmed
-regression across the batch's merges before pushing.
+Finished lanes merge into local `main` as they land, and several lanes may share one
+batch. One full gate runs on the batch: `scripts/ci.sh`, the conformance suites and a
+Namespace screen (`mise run bench:nsc origin/main HEAD`). Push when the tests pass and the
+screen shows no query 10% or more slower after a rerun of the flagged queries with more
+rounds.
+
+Forge measurements do not hold up a feature lane or a push. A lane whose goal is
+performance measures on forge before it reports, and every other lane reports once its
+review and tests pass. Pinned forge checks of the screen's flags, including queries under
+0.3 ms, run after the push. A regression they confirm is bisected across the batch's merges
+and fixed forward in a follow-up commit.
