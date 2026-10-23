@@ -265,6 +265,12 @@ export type PNode = {
   locked?: Locked;
   /** a variable that only a locked block mentions */
   fromLocked?: boolean;
+  /** the keys of the filters drawn as chips under it (§2.2), or of the chip node itself */
+  filters?: string[];
+  /** added on the canvas and not yet used by a triple: dimmed until an edge uses it */
+  waiting?: boolean;
+  /** a locked block that uses a variable nothing binds now (§4.2 rule 4) */
+  warn?: boolean;
 };
 
 export type PEdge = {
@@ -487,12 +493,19 @@ export function drawing(p: PatternOk): Drawing {
   // filter keeps its scope: it goes on a variable only when the variable sits in the same
   // hull (or in none, for a filter of the root), else it is a node in its OPTIONAL's hull
   const chips = new Map<string, number>();
+  // the key of each filter among all filters, as the filter edits name it
+  const filterSeen = new Map<string, number>();
   for (const { filter, group } of filtersOf(p)) {
+    const fh = hash(normalized(filter.text));
+    const fn = filterSeen.get(fh) ?? 0;
+    filterSeen.set(fh, fn + 1);
+    const key = `f:${fh}:${fn}`;
     const optional = group.kind === 'optional';
     const hull = optional ? hullOf.get(group) : undefined;
     const n = filter.expr ? varNode(filter.expr.var) : undefined;
     if (filter.expr && n && !n.fromLocked && n.parent === hull && (hull || !optional)) {
       n.subtitle.push(chipText(filter.expr));
+      (n.filters ??= []).push(key);
       continue;
     }
     const h = hash(normalized(filter.text));
@@ -507,6 +520,7 @@ export function drawing(p: PatternOk): Drawing {
       subtitle: [],
       title: filter.text,
       at: filter.range.from,
+      filters: [key],
       ...(hull ? { parent: hull } : {}),
       locked: {
         kind: 'FILTER',
@@ -573,19 +587,20 @@ export function describe(el: { node: PNode } | { edge: PEdge }, d: Drawing): str
     return `edge ${e.label} from ${label(e.source)} to ${label(e.target)}${e.optional ? ', optional' : ''}`;
   }
   const n = el.node;
+  const tail = n.waiting ? ', waiting for an edge' : '';
   switch (n.kind) {
     case 'locked':
-      return `locked ${n.locked!.kind}: ${first(n.locked!.text)}`;
+      return `locked ${n.locked!.kind}: ${first(n.locked!.text)}${n.warn ? `, ${n.subtitle.at(-1)}` : ''}`;
     case 'chip':
       return `locked filter: ${first(n.title)}`;
     case 'var':
-      return `variable ${n.label}${n.subtitle.length ? `, ${n.subtitle.join(', ')}` : ''}`;
+      return `variable ${n.label}${n.subtitle.length ? `, ${n.subtitle.join(', ')}` : ''}${tail}`;
     case 'literal':
       return `literal ${n.label}`;
     case 'bnode':
       return `blank node ${n.label}`;
     default:
-      return `IRI ${n.label}${n.subtitle.length ? `, ${n.subtitle.join(', ')}` : ''}`;
+      return `IRI ${n.label}${n.subtitle.length ? `, ${n.subtitle.join(', ')}` : ''}${tail}`;
   }
 }
 

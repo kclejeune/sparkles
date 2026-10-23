@@ -26,7 +26,7 @@
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { geoColumns } from '$lib/geo';
   import { triplesToGraph, type Triple } from '$lib/graph';
-  import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
+  import { addMissingPrefixes, applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
   import { formatAny, lintAny } from '$lib/fmt-wasm';
   import { lintCounts, lintSummary } from '$lib/lint-view';
@@ -44,7 +44,8 @@
   import ResultTable from '$components/ResultTable.svelte';
   import TimeSlider, { type TimeChange } from '$components/TimeSlider.svelte';
   import SparqlEditor from '$components/SparqlEditor.svelte';
-  import PatternPane from '$components/PatternPane.svelte';
+  import PatternPane, { type CountAnswer } from '$components/PatternPane.svelte';
+  import { SchemaSource, type SchemaApi } from '$lib/pattern-schema';
   import QuestionHeader from '$components/QuestionHeader.svelte';
   import AskBar from '$components/AskBar.svelte';
   import AnswerSummary from '$components/AnswerSummary.svelte';
@@ -288,6 +289,46 @@
   const branch = $derived(branchParam(app.queryBranch));
   /** The dataset on that branch, as the API client takes it. */
   const target = $derived(ds ? onBranch(ds, branch) : null);
+  /** The schema reads of the Pattern pane's pickers, under the caller's view. */
+  const patternSchemaApi: SchemaApi = {
+    summary: (name, opts) => api.schemaSummary(name, opts),
+    page: (name, list, cursor, opts) => api.schemaPage(name, list, cursor, opts),
+    profile: async (name, cls, opts) =>
+      (await api.schemaProfiles(name, { classes: [cls], ...opts })).classes.find(
+        (c) => c.class === cls,
+      ) ?? null,
+  };
+
+  /** The state the Pattern pane's pickers and count read: the At field when it is valid. */
+  const patternAt = $derived.by(() => {
+    try {
+      return normalizeAt(app.queryAt) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  /** The schema behind the Pattern pane's pickers, at the page's branch and state (U08 §3.1). */
+  const patternSchema = $derived(
+    target ? new SchemaSource(patternSchemaApi, target, patternAt) : null,
+  );
+
+  /** Count the matches of the Pattern pane's pattern under a five-second timeout (§2.2). */
+  async function patternCount(sparql: string, signal: AbortSignal): Promise<CountAnswer> {
+    if (!target || !ds) throw new Error('No dataset is selected');
+    try {
+      const rows = await api.select(target, addMissingPrefixes(sparql, app.prefixes(ds)), {
+        timeout: 5,
+        at: patternAt,
+        signal,
+      });
+      const n = rows[0]?.n;
+      return n && n.type === 'literal' ? Number(n.value) : 0;
+    } catch (e) {
+      if (e instanceof api.ApiError && e.status === 408) return 'timeout';
+      throw e;
+    }
+  }
+
   /** The dataset's branches, offered in the Branch field (null: it has none). */
   let branchList = $state<api.Branch[] | null>(null);
   $effect(() => {
@@ -2544,6 +2585,8 @@
             tab={active.id}
             phone={isPhone}
             prefixes={app.prefixes(ds)}
+            schema={patternSchema}
+            count={patternCount}
             onedit={(changes) => editor?.applyPattern(changes)}
             onundo={() => editor?.undo()}
             onredo={() => editor?.redo()}
