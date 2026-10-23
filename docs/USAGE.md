@@ -514,8 +514,15 @@ Short requests run on the thread that received them rather than on a separate po
 they do not wait for other threads to wake up. These are queries whose previous run with
 the same text took under 10 ms, and updates of up to 64 KiB that only use `INSERT DATA`
 and `DELETE DATA`, on a dataset without write-time validation, when no other write holds
-the dataset. Such a request runs to its end even if its client disconnects, though its
-timeout still applies. Everything else runs on the pool and stops on a disconnect.
+the dataset. The first run of a query text that the server does not remember runs there
+too, because every query has a timeout, the server's 60 s default or its own `timeout`.
+That saves about 2 ms on the first request to an idle server and about 0.2 ms on every
+new text. A query whose text contains `SERVICE` is the exception and starts on the pool.
+Such a request runs to its end even if its client disconnects, though its timeout still
+applies, so a client that abandons a slow query the server has not seen before leaves it
+running until its timeout. Once a run of a text is slow or fails, its later runs use the
+pool, where they stop on a disconnect, until a run of it is quick again. Everything else
+runs on the pool and stops on a disconnect.
 
 ### Memory and caches
 

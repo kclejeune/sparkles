@@ -1416,16 +1416,29 @@ pub(crate) async fn run_query(
     // The first run of a query decides from its parsed algebra whether it has a SERVICE
     // of the algorithm namespace, so a prefixed name counts like the full IRI, and a
     // query that does is never remembered as quick and so never runs in place.
-    let quick = if at.is_none() && inline::available() {
-        QUICK.execution(quick_key)
+    let history = if at.is_none() && inline::available() {
+        QUICK.history(quick_key)
     } else {
-        None
+        inline::History::Slow
     };
-    let in_place = quick.is_some();
+    let quick = match history {
+        inline::History::Quick(execution) => Some(execution),
+        inline::History::Unseen | inline::History::Slow => None,
+    };
+    // The first run of a text the server has not seen runs in place too when a timeout
+    // bounds it, since the blocking pool costs a first request about 2 ms (see
+    // `inline`). It cannot be cancelled when its client disconnects, only by its
+    // timeout, and a slow run sends the text's later runs to the blocking pool.
+    let first_run = history == inline::History::Unseen
+        && timeout.is_some()
+        && inline::first_run_in_place(&query);
+    let in_place = quick.is_some() || first_run;
     // SELECT and graph queries retain their quick eager shortcut. ASK can be quick
     // because its native execution avoids eager candidate storage, so it must keep
-    // automatic admission even when scheduled in place.
-    let auto = auto && (!in_place || quick == Some(inline::QuickExecution::PreserveAuto));
+    // automatic admission even when scheduled in place. A first run has no history, so
+    // it keeps automatic execution as on the blocking pool.
+    let auto =
+        auto && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
