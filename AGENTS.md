@@ -35,6 +35,9 @@ work, and each item links to its design spec in [docs/specs](docs/specs/README.m
   Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
   need an Intel host, and published numbers come from forge. See
   [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+- A measured slowdown that a gate accepts still gets a follow-up item in
+  [docs/ROADMAP.md](docs/ROADMAP.md), added in the same change that accepts it. This holds
+  for a loosened gate, a result judged to be noise and a tradeoff taken on purpose.
 
 ## Commits and documentation
 
