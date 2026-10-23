@@ -327,7 +327,8 @@
         at: patternAt,
         signal,
       });
-      const n = rows[0]?.n;
+      // the count is the only column, whatever alias the query needed
+      const n = rows[0] ? Object.values(rows[0])[0] : undefined;
       return n && n.type === 'literal' ? Number(n.value) : 0;
     } catch (e) {
       if (e instanceof api.ApiError && e.status === 408) return 'timeout';

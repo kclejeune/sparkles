@@ -20,6 +20,7 @@ import {
   editAny,
   filterKeys,
   lockedBlocks,
+  outerFilterVars,
   pathForms,
   pathPrefixes,
   patternVars,
@@ -326,7 +327,7 @@ SELECT * WHERE {
       'SELECT ?s ?v { ?s <http://p> ?o } VALUES ?v { 1 }\n',
     );
     expect(countQuery(q, ok(q))).toBe(
-      'SELECT (COUNT(*) AS ?n)\nWHERE { ?s <http://p> ?o }\nVALUES ?v { 1 }',
+      'SELECT (COUNT(*) AS ?n)\nWHERE { { ?s <http://p> ?o }\n  VALUES ?v { 1 } }',
     );
   });
 
@@ -352,6 +353,37 @@ SELECT * WHERE {
     expect(run(q, { kind: 'projection', var: 'o', on: false })).toBe(
       'SELECT ?s # keep this\n  WHERE { ?s <http://p> ?o }\n',
     );
+  });
+
+  // ------------------------------------------------ review round 2 of Phase 2 ------
+
+  it('scans escaped prefixed names and code points for variables', () => {
+    const q = 'PREFIX ex: <http://x/>\nSELECT * { ?x ex:p ex:a\\#b . ?y ex:q ?z }\n';
+    expect(() =>
+      editAny(q, ok(q), { kind: 'rename', from: 'x', to: 'y', locked: false }, parse),
+    ).toThrow('?y is already in the query');
+    const wide = 'SELECT * { ?\u{10400} <http://p> ?o }\n';
+    expect(run(wide, { kind: 'rename', from: '\u{10400}', to: 'w', locked: false })).toBe(
+      'SELECT * { ?w <http://p> ?o }\n',
+    );
+  });
+
+  it('counts with a trailing VALUES inside the counted group, under a free alias', () => {
+    const q = 'SELECT * {} VALUES ?n { 0 }\n';
+    const c = countQuery(q, ok(q));
+    expect(c).toBe('SELECT (COUNT(*) AS ?n1)\nWHERE { {}\n  VALUES ?n { 0 } }');
+    expect(parse(c, true).ok).toBe(true);
+  });
+
+  it('finds the added filter among identical ones by its group', () => {
+    const q = 'SELECT * { OPTIONAL { ?s <http://q> ?x . FILTER(?x > 5) } ?s <http://p> ?x . }\n';
+    const out = run(q, { kind: 'filter-add', var: 'x', expr: '?x > 5' });
+    expect(out).toContain('} ?s <http://p> ?x .\n  FILTER(?x > 5)\n }');
+  });
+
+  it('names the variables of a filter outside its EXISTS patterns', () => {
+    expect(outerFilterVars('FILTER(?a + ?b > 1 && EXISTS { ?c ?p ?d })')).toEqual(['a', 'b']);
+    expect(outerFilterVars('FILTER NOT EXISTS { ?x <http://q> ?z }')).toEqual([]);
   });
 
   it('A5: seeded sequences of every kind agree with the parse (R3) and keep locked text', () => {

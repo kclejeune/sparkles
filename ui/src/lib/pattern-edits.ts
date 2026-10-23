@@ -133,9 +133,15 @@ const IRIREF = /^<[^<>"{}|^`\\\s]*>/;
 export function varTokens(text: string): { name: string; from: number; to: number }[] {
   const out: { name: string; from: number; to: number }[] = [];
   let i = 0;
+  // one code point at a time, so a letter beyond the BMP is part of a name, with the
+  // offsets in UTF-16 units as the editor's are
+  const at = (k: number) => String.fromCodePoint(text.codePointAt(k) ?? 0);
   while (i < text.length) {
     const c = text[i];
-    if (c === '#') {
+    if (c === '\\') {
+      // an escape in a prefixed name, such as `ex:a\#b`, is not a comment
+      i += 2;
+    } else if (c === '#') {
       while (i < text.length && text[i] !== '\n') i++;
     } else if (c === '"' || c === "'") {
       const long = text.startsWith(c.repeat(3), i);
@@ -150,13 +156,36 @@ export function varTokens(text: string): { name: string; from: number; to: numbe
     } else if (c === '<') {
       const m = IRIREF.exec(text.slice(i, i + 4096));
       i += m ? m[0].length : 1;
-    } else if ((c === '?' || c === '$') && VARCHAR.test(text[i + 1] ?? '')) {
+    } else if ((c === '?' || c === '$') && i + 1 < text.length && VARCHAR.test(at(i + 1))) {
       let j = i + 1;
-      while (j < text.length && VARCHAR.test(text[j])) j++;
+      while (j < text.length && VARCHAR.test(at(j))) j += at(j).length;
       out.push({ name: text.slice(i + 1, j), from: i, to: j });
       i = j;
     } else i++;
   }
+  return out;
+}
+
+/**
+ * The variables of a filter's text outside its `EXISTS` and `NOT EXISTS` patterns: those it
+ * reads from the solutions, where a variable inside such a pattern may be its own.
+ */
+export function outerFilterVars(text: string): string[] {
+  const inner: [number, number][] = [];
+  const re = /\bEXISTS\s*\{/giu;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    let depth = 1;
+    let j = m.index + m[0].length;
+    for (; j < text.length && depth > 0; j++)
+      if (text[j] === '{') depth++;
+      else if (text[j] === '}') depth--;
+    inner.push([m.index, j]);
+    re.lastIndex = j;
+  }
+  const out: string[] = [];
+  for (const t of varTokens(text))
+    if (!inner.some(([a, b]) => t.from >= a && t.from < b) && !out.includes(t.name))
+      out.push(t.name);
   return out;
 }
 
@@ -173,7 +202,7 @@ function swapVar(text: string, from: string, to: string): string {
 }
 
 /** The variables triples or locked blocks bind. */
-function boundVars(p: PatternOk): Set<string> {
+export function boundVars(p: PatternOk): Set<string> {
   const out = new Set<string>();
   for (const { triple: t } of triplesOf(p))
     for (const term of [t.s, t.o]) if (term.kind === 'var') out.add(term.value);
@@ -724,8 +753,12 @@ export function agreesWith(before: PatternOk, e: AnyEdit, after: PatternOk): boo
         const home = filterHome(before, e.var.replace(/^[?$]/, ''));
         const depth = (q: PatternOk, g: Group) =>
           triplesOf(q).find((t) => t.path[t.path.length - 1] === g)?.path.length ?? 0;
-        const f = filtersOf(after).find(({ filter }) => normalized(filter.text) === text);
-        if (!home || !f || depth(after, f.group) !== home.path.length) return false;
+        // the filters with their depth, so an older identical filter elsewhere is not
+        // taken for the new one
+        const scoped = (q: PatternOk) =>
+          filtersOf(q).map(({ filter, group }) => `${normalized(filter.text)}|${depth(q, group)}`);
+        const fresh = minus(scoped(after), scoped(before));
+        if (!home || !eq(fresh, [`${text}|${home.path.length}`])) return false;
       }
       return (
         (ok ||
@@ -864,11 +897,17 @@ export function countQuery(text: string, p: PatternOk): string {
     .filter((b) => b.kind === 'FROM')
     .map((b) => `${b.text}\n`)
     .join('');
-  const where = text.slice(p.root.range.from, p.root.range.to);
-  // a trailing VALUES restricts the solutions, so the count keeps it
-  const values = p.modifiers
-    .filter((m) => m.kind === 'VALUES')
-    .map((m) => `\n${m.text}`)
-    .join('');
-  return `${prologue}${prologue && !prologue.endsWith('\n') ? '\n' : ''}SELECT (COUNT(*) AS ?n)\n${from}WHERE ${where}${values}`;
+  const group = text.slice(p.root.range.from, p.root.range.to);
+  // a trailing VALUES restricts the solutions, so it joins inside the counted group,
+  // before the aggregate
+  const values = p.modifiers.filter((m) => m.kind === 'VALUES').map((m) => `\n  ${m.text}`);
+  const where = values.length ? `{ ${group}${values.join('')} }` : group;
+  return `${prologue}${prologue && !prologue.endsWith('\n') ? '\n' : ''}SELECT (COUNT(*) AS ?${countAlias(text)})\n${from}WHERE ${where}`;
+}
+
+/** The alias of the count: `n`, or the first of `n1`, `n2` … the query does not use. */
+export function countAlias(text: string): string {
+  const used = new Set(varTokens(text).map((t) => t.name));
+  if (!used.has('n')) return 'n';
+  for (let i = 1; ; i++) if (!used.has(`n${i}`)) return `n${i}`;
 }

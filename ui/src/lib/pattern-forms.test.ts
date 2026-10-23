@@ -7,6 +7,7 @@ import {
   datatypesOf,
   localName,
   narrow,
+  ProfileCache,
   rankPredicates,
   SchemaSource,
   varName,
@@ -184,6 +185,26 @@ describe('the filter forms', () => {
         foaf: 'http://xmlns.com/foaf/0.1/',
       }),
     ).toEqual([{ prefix: 'foaf', iri: 'http://xmlns.com/foaf/0.1/' }]);
+  });
+
+  // the pane reads at most 20 classes at a time, under the cache's bound of 50
+  it('asks for each profile once while answers arrive (review round 2)', async () => {
+    let asked = 0;
+    const pending: (() => void)[] = [];
+    const cache = new ProfileCache(
+      (c) =>
+        new Promise((resolve) => {
+          asked++;
+          pending.push(() => resolve(profile(c, [])));
+        }),
+    );
+    const classes = Array.from({ length: 30 }, (_, i) => `${EX}C${i}`);
+    for (let round = 0; round < 40; round++) {
+      for (const c of classes) cache.get(c, () => {});
+      pending.shift()?.();
+      await Promise.resolve();
+    }
+    expect(asked).toBe(30);
   });
 
   it('pages one request at a time per list (review round 1)', async () => {

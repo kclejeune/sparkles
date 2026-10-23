@@ -69,12 +69,14 @@
   } from '$lib/pattern';
   import {
     agreesWith,
+    boundVars,
     checkVarName,
     countQuery,
     describeEdit,
     editAny,
     filterKeys,
     lockedBlocks,
+    outerFilterVars,
     pathPrefixes,
     patternVars,
     renameReach,
@@ -88,7 +90,7 @@
   import {
     datatypesOf,
     narrow,
-    PROFILES,
+    ProfileCache,
     rankClasses,
     rankPredicates,
     varName,
@@ -196,8 +198,10 @@
   let timing = $state({ parseMs: 0, drawMs: 0 });
   /** bumped when the schema or a profile arrives, so the pickers read again */
   let schemaRev = $state(0);
-  /** Profiles of the current schema source, at most `PROFILES`; a new source starts empty. */
-  let profiles = new Map<string, ClassProfile | null | undefined>();
+  /** Profiles of the current schema source; a new source starts with an empty cache. */
+  let profiles: ProfileCache | null = null;
+  /** The classes `datatypes()` reads at most, far under the cache's bound. */
+  const DATATYPE_CLASSES = 20;
 
   const canEdit = $derived(!readonly && !!answer && !error && !!onedit);
   const over = $derived(!!answer && !!drawn && overCaps(answer, drawn));
@@ -222,9 +226,15 @@
    */
   function decorate(d: Drawing, a: PatternOk, w: Waiting[]): Drawing {
     const blocks = new Map(lockedBlocks(a).map((b) => [b.key, b.block]));
+    const bound = boundVars(a);
     const nodes: PNode[] = d.nodes.map((n) => {
       const b = n.kind === 'locked' ? blocks.get(n.id) : undefined;
-      const unbound = b ? unboundUses(a, b) : [];
+      // a locked filter warns of a variable it reads outside its EXISTS patterns
+      const unbound = b
+        ? unboundUses(a, b)
+        : n.kind === 'chip' && n.locked
+          ? outerFilterVars(n.locked.text).filter((v) => !bound.has(v))
+          : [];
       if (!unbound.length) return n;
       const names = unbound.map((v) => `?${v}`).join(', ');
       return {
@@ -324,9 +334,10 @@
     timer = setTimeout(() => void parse(t), debounce);
   });
 
-  // a count is of the text and the state it ran on
+  // a count is of the text, the drawing and the state it ran on
   $effect(() => {
     void text;
+    void drawnText;
     void countKey;
     countAbort?.abort();
     countText = null;
@@ -336,7 +347,7 @@
   // the schema loads once the pane can edit, and profiles belong to their source
   $effect(() => {
     const s = schema;
-    profiles = new Map();
+    profiles = s ? new ProfileCache((cls) => s.profile(cls)) : null;
     if (!s || readonly) return;
     void s.load().then(() => s === schema && schemaRev++);
   });
@@ -507,19 +518,10 @@
   /** The profile of a class from the cache, fetched when missing. */
   function profileOf(cls: string | undefined): ClassProfile | null {
     if (!cls || !schema) return null;
-    if (!profiles.has(cls)) {
-      const src = schema;
-      const mine = profiles;
-      mine.set(cls, undefined);
-      while (mine.size > PROFILES) mine.delete(mine.keys().next().value!);
-      void src.profile(cls).then((p) => {
-        // an answer for a source that changed since is dropped
-        if (src !== schema || mine !== profiles) return;
-        mine.set(cls, p);
-        schemaRev++;
-      });
-    }
-    return profiles.get(cls) ?? null;
+    const mine = profiles;
+    if (!mine) return null;
+    // an answer for a cache that a new source replaced since redraws nothing
+    return mine.get(cls, () => mine === profiles && schemaRev++);
   }
 
   /** How a picker writes an IRI: a prefixed name of the query or the dataset, else `<iri>`. */
@@ -540,10 +542,14 @@
     void schemaRev;
     if (!answer) return null;
     const out = new Set<string>();
+    const read = new Set<string>();
     for (const { triple } of triplesOf(answer)) {
       if (triple.o.kind !== 'var' || triple.o.value !== v || triple.p.kind !== 'iri') continue;
-      for (const cls of classesOf(triple.s.text))
+      for (const cls of classesOf(triple.s.text)) {
+        if (!read.has(cls) && read.size >= DATATYPE_CLASSES) continue;
+        read.add(cls);
         for (const dt of datatypesOf(profileOf(cls), triple.p.value) ?? []) out.add(dt);
+      }
     }
     return out.size ? [...out] : null;
   }
@@ -661,7 +667,7 @@
     const triples: Words[] = [{ s, p, o }];
     for (const end of [s, o]) {
       const w = waiting.find((x) => x.text === end && x.cls);
-      if (w && !triples.some((x) => x.s === w.text && x.p === 'a'))
+      if (w && !triples.some((x) => x.s === w.text && x.p === 'a' && x.o === w.cls))
         triples.push({ s: w.text, p: 'a', o: w.cls! });
     }
     const words = triples.flatMap((x) => [x.s, x.p, x.o]);
@@ -796,6 +802,15 @@
 
   async function runCount() {
     if (!answer || !count) return;
+    // typing since the last redraw: count the text as it is now
+    const now = source(text);
+    if (now !== drawnText) {
+      const a = patternNow(now);
+      if (!a?.ok) return void (countText = 'The text does not parse, so there is nothing to count');
+      show(now, a, 0);
+      await tick();
+    }
+    if (!answer) return;
     let sparql: string;
     try {
       sparql = countQuery(drawnText, answer);

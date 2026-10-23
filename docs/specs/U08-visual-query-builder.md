@@ -614,7 +614,10 @@ compares variable tokens only, so `"?x"` in a string or `# ?x` in a comment is t
 parsing again between them, and composes the steps with `ChangeSet.compose` into one
 change. It also deletes each understood filter whose variables the deleted triples bound
 and that nothing binds any more. A locked filter, such as `FILTER EXISTS`, stays for its
-own confirmed deletion and gets the warning mark. A literal node is the object of one
+own confirmed deletion. It gets the warning mark for a variable it reads outside its
+`EXISTS` and `NOT EXISTS` patterns that nothing binds any more. A variable inside such a
+pattern gets no mark, because it may be the pattern's own, as `?z` is in
+`EXISTS { ?x <q> ?z }`, and the canvas cannot tell the two apart. A literal node is the object of one
 triple and goes with that triple alone, since the keys of the literals after it renumber
 once it is gone. A locked block of the `WHERE` group goes after a
 confirmation that shows its text. Blocks outside it, such as `FROM` or a `CONSTRUCT`
@@ -654,11 +657,15 @@ the view fits when a new node lands outside it. Cytoscape now measures its conta
 again when the container's box changes, because a bar or form opening above the canvas
 moved it and taps landed beside their nodes. The warning mark of §4.2 rule 4 is a red
 border and a subtitle on the block, which the screen reader's description of the block
-includes. **Count matches** sends the query of §2.2 with the prologue, the `FROM` clauses
-and a trailing `VALUES` of the text, `timeout=5` and the page's **At** state, and a `408`
+includes. **Count matches** sends the query of §2.2 with the prologue and the `FROM` clauses
+of the text, joins a trailing `VALUES` inside the counted group so it restricts the
+solutions before they are counted, and names the count `?n`, or `?n1` and so on when the
+query uses `?n`. It sends `timeout=5` and the page's **At** state, and a `408`
 shows "More than the count could finish". A count belongs to the text and the state it
 ran on, and clears when either changes. Profiles are kept per schema source, so a new
-branch or **At** state reads its own, and a filter or locked-block key that typing moved
+branch or **At** state reads its own. A class is asked for once, a request on its way is
+never evicted, and the filter forms read the profiles of at most 20 classes, under the
+bound of 50, and a filter or locked-block key that typing moved
 onto another copy is refused as an edge's is. On a phone the strip folds into a **Query options** sheet, **+ Edge** is the
 two-tap mode of §2.6, and the node and edge forms fill the screen.
 

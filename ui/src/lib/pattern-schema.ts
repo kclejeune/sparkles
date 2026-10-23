@@ -120,6 +120,40 @@ export class SchemaSource {
 }
 
 /**
+ * The profiles the pane holds for one schema source. A class is asked for once; a request
+ * on its way is never evicted, and beyond `limit` answers the oldest answered one goes, so
+ * redraws while answers arrive never ask again for what is coming.
+ */
+export class ProfileCache {
+  private answered = new Map<string, ClassProfile | null>();
+  private asking = new Set<string>();
+
+  constructor(
+    private fetch: (cls: string) => Promise<ClassProfile | null>,
+    private limit = PROFILES,
+  ) {}
+
+  /** The profile when it has arrived, else null, asking for it once; `onload` runs when it
+   * arrives. */
+  get(cls: string, onload: () => void): ClassProfile | null {
+    if (this.answered.has(cls)) return this.answered.get(cls) ?? null;
+    if (!this.asking.has(cls)) {
+      this.asking.add(cls);
+      void this.fetch(cls)
+        .catch(() => null)
+        .then((p) => {
+          this.asking.delete(cls);
+          this.answered.set(cls, p);
+          while (this.answered.size > this.limit)
+            this.answered.delete(this.answered.keys().next().value!);
+          onload();
+        });
+    }
+    return null;
+  }
+}
+
+/**
  * The predicates for an edge, ranked (§2.2): those instances of the source's class use,
  * with their counts, then those whose values are instances of the target's class, then
  * the rest by their triples.

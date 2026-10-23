@@ -73,7 +73,16 @@
   }
 </script>
 
-<div class="picker" bind:this={box}>
+<div
+  class="picker"
+  bind:this={box}
+  onfocusout={() =>
+    setTimeout(() => {
+      // focus that left the picker closes the list; a window that loses focus, and the
+      // list's own button, keep it
+      if (!box?.contains(document.activeElement)) open = false;
+    }, 150)}
+>
   <input
     bind:this={input}
     {name}
@@ -92,12 +101,6 @@
       open = true;
       active = -1;
     }}
-    onblur={() =>
-      setTimeout(() => {
-        // a window that loses focus blurs the field too, and focus on the list's own
-        // button stays inside the picker: both keep the list open
-        if (!box?.contains(document.activeElement)) open = false;
-      }, 150)}
     onkeydown={keydown}
     {...autofocus ? { autofocus: true } : {}}
   />
