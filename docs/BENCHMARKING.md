@@ -69,6 +69,25 @@ that moves the specialization before its first possible instantiation. It also d
 lock update should retain those fixes and rebuild QLever before refreshing results.
 This change keeps the existing lock and engine versions.
 
+## Release build settings
+
+Release builds compile `sparkles-core` as one codegen unit and every other crate with
+four. With four units for the engine crate, the split of its functions across units
+moved with unrelated changes elsewhere in the crate, and so did the inlining of hot
+query loops. An item 7 merge that touched only SERVICE code added 4.5% to the
+instructions per request of `expr-order-key`, 197.0 million against 188.5 million, and a
+later merge took most of it away again. One unit gave `expr-order-key` 176.4 million instructions per
+request against 189.9 million with four, 6.4% fewer, measured with `perf` on atlas.
+
+Fewer instructions did not make the Namespace screen faster. On an AMD instance with
+the 100,000-person dataset, eight rounds of 50 requests per query gave a geometric mean of 0.997 for server time and
+1.019 for client time against four units. `employee-docs`, `expr-order-key` and
+`expr-bind-group` were 9% to 32% slower, and `types-grouped`, `predicate-counts` and
+`values-star` 14% to 28% faster. These are queries under 2 ms, so the setting waits for
+a pinned check on an Intel host, which decides whether it stays, is reverted or applies
+to fewer crates. A release rebuild after a change to `sparkles-core` takes about 35
+seconds longer, 2m37s instead of 2m02s on atlas with six jobs.
+
 ## Benchmark scripts
 
 * `scripts/bench.sh` (`mise run bench [people] [workdir]`) runs the engine comparison.
