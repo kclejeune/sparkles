@@ -759,14 +759,13 @@ impl Graph {
             let n: usize = pairs.iter().map(Vec::len).sum();
             if n > 0 {
                 work.try_grow(n * (size_of::<(u64, u64)>() + 1))?;
-                let mut list: Vec<(u64, u64)> = pairs
-                    .iter()
-                    .flatten()
-                    .map(|&h| {
-                        let t = get(h);
-                        (t[1], t[2])
-                    })
-                    .collect();
+                // allocated at the size charged: a collect from the flattened shards would
+                // grow by doubling
+                let mut list: Vec<(u64, u64)> = Vec::with_capacity(n);
+                list.extend(pairs.iter().flatten().map(|&h| {
+                    let t = get(h);
+                    (t[1], t[2])
+                }));
                 list.par_sort_unstable();
                 list.dedup();
                 let any: Vec<bool> = list.par_iter().map(|&(p, o)| b.po_any(p, o)).collect();
@@ -790,8 +789,8 @@ impl Graph {
             work.try_grow(
                 probes * (size_of::<(Triple, u64)>() + size_of::<Triple>() + 4 * size_of::<u64>()),
             )?;
-            let mut probe: Vec<(Triple, u64)> =
-                maybe.iter().flatten().map(|&h| (get(h), h)).collect();
+            let mut probe: Vec<(Triple, u64)> = Vec::with_capacity(probes);
+            probe.extend(maybe.iter().flatten().map(|&h| (get(h), h)));
             drop(maybe);
             probe.par_sort_unstable();
             let ts: Vec<Triple> = probe.iter().map(|x| x.0).collect();
