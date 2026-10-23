@@ -1519,6 +1519,7 @@ pub fn query_execution_with_plan(
                                     &parsed,
                                     options,
                                     cursor,
+                                    started,
                                 )) =>
                     {
                         return retry_as_cursor(retry_snapshot, query, options, cursor, started);
@@ -1546,9 +1547,23 @@ fn fits_without_spill(
     parsed: &spargebra::Query,
     options: &QueryOptions,
     cursor: &CursorOptions,
+    started: Instant,
 ) -> bool {
-    super::prepare_query(snapshot.clone(), parsed, options, None, None)
+    let options = within_first_deadline(options, started);
+    super::prepare_query(snapshot.clone(), parsed, &options, None, None)
         .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor))
+}
+
+/// `options` with a relative timeout turned into the deadline of the run that started
+/// at `started`, so that what runs after an eager failure keeps the first run's time.
+fn within_first_deadline(options: &QueryOptions, started: Instant) -> QueryOptions {
+    let mut options = options.clone();
+    if let Some(timeout) = options.timeout {
+        let deadline = started + timeout;
+        options.deadline = Some(options.deadline.map_or(deadline, |d| d.min(deadline)));
+        options.timeout = None;
+    }
+    options
 }
 
 /// Run `query` again as a cursor after its eager run exceeded the memory budget, within
@@ -1564,12 +1579,7 @@ fn retry_as_cursor(
     if let Some(spill) = &options.spill {
         spill.count_eager_retry();
     }
-    let mut options = options.clone();
-    if let Some(timeout) = options.timeout {
-        let deadline = started + timeout;
-        options.deadline = Some(options.deadline.map_or(deadline, |d| d.min(deadline)));
-        options.timeout = None;
-    }
+    let options = within_first_deadline(options, started);
     let mut execution = query_cursor(snapshot, query, &options, cursor)?;
     if let QueryExecution::Select(cursor) = &mut execution {
         let counters = cursor
