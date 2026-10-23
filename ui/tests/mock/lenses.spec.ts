@@ -256,4 +256,13 @@ test('the WebGL view draws the lenses and the list has their columns', async ({ 
   const table = page.getByRole('table', { name: 'Drawn nodes' });
   await expect(table.getByRole('columnheader', { name: 'graph', exact: true })).toBeVisible();
   await expect(table.locator('tbody tr').first()).toContainText('alice');
+  // the dashed inferred edges keep their direction: each has an arrowhead
+  await page.getByRole('button', { name: 'List', exact: true }).click();
+  const overlay = page.locator('.lg-overlay');
+  await expect
+    .poll(async () => Number(await overlay.getAttribute('data-inferred')))
+    .toBeGreaterThan(0);
+  expect(await overlay.getAttribute('data-arrows')).toBe(
+    await overlay.getAttribute('data-inferred'),
+  );
 });

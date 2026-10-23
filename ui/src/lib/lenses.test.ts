@@ -113,6 +113,47 @@ describe('Lenses', () => {
   });
 });
 
+describe('Lenses after a merge review', () => {
+  it('drops the values of an earlier state when the read of a new one fails', async () => {
+    let fail = false;
+    const { l } = lenses((s) => {
+      if (fail && s.includes('age')) throw new Error('read failed');
+      return s.includes('age') ? [{ n: iri(`${EX}a`), v: lit('41') }] : [];
+    });
+    l.setInput(input({ at: 'commit:1' }));
+    l.set('size', { lens: 'property', property: `${EX}age` });
+    await settle();
+    expect(l.results.size?.values.get(`<${EX}a>`)).toBe(41);
+    fail = true;
+    l.setInput(input({ at: 'commit:2' }));
+    await settle();
+    expect(l.status.size?.error).toBeTruthy();
+    expect(l.results.size ?? null).toBeNull();
+    l.destroy();
+  });
+
+  it('keeps the properties of the latest drawing when an earlier read ends last', async () => {
+    const waits: (() => void)[] = [];
+    const { l } = lenses(() => []);
+    l.select = (async (ds: string) => {
+      // the first dataset's read ends after the second's
+      if (ds === 'a') await new Promise<void>((r) => waits.push(r));
+      return [{ p: iri(`${EX}${ds}prop`), c: lit('1'), num: lit('1') }];
+    }) as SelectFn;
+    l.setInput(input({ ds: 'a' }));
+    const first = l.loadProperties();
+    l.setInput(input({ ds: 'b' }));
+    await l.loadProperties();
+    expect(l.properties.length).toBeGreaterThan(0);
+    const shown = JSON.stringify(l.properties);
+    expect(shown).toContain('bprop');
+    waits.forEach((r) => r());
+    await first;
+    expect(JSON.stringify(l.properties)).toBe(shown);
+    l.destroy();
+  });
+});
+
 describe('resultState', () => {
   it('reads a result at its commit, whether or not an At selector named it (re-review 1)', () => {
     expect(resultState({ meta: { commit: 7 } })).toBe('commit:7');

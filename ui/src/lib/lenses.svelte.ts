@@ -286,9 +286,11 @@ export class Lenses {
     if (key === this.#propsKey) return;
     this.#propsKey = key;
     try {
-      this.properties = await readProperties(this.#ctx(input), input.nodes);
+      const props = await readProperties(this.#ctx(input), input.nodes);
+      // a read for another drawing that finished later than this one's is dropped
+      if (this.#propsKey === key) this.properties = props;
     } catch (e) {
-      if (!isAbort(e)) this.properties = [];
+      if (!isAbort(e) && this.#propsKey === key) this.properties = [];
     }
   }
 
@@ -358,6 +360,8 @@ export class Lenses {
       if (r) this.announcement = announcement(r, this.#name(channel, choice), input.label);
     } catch (e) {
       if (!owns() || isAbort(e)) return;
+      // the values of an earlier state must not pass for this one's
+      this.results[channel] = null;
       this.status[channel] = { busy: false, error: errorMessage(e) };
     }
   }

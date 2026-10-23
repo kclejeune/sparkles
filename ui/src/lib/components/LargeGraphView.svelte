@@ -222,7 +222,14 @@
 
   /** The inferred edges, dashed, with an "i" at the middle of the longer ones. */
   function drawInferred(ctx: CanvasRenderingContext2D, w: number, h: number) {
-    if (!dashOverlay() || !graph) return;
+    if (!dashOverlay() || !graph) {
+      overlay.dataset.inferred = overlay.dataset.arrows = '0';
+      return;
+    }
+    // the arrowheads follow sigma's own: drawn while its edges are arrows
+    const showArrows = edgeType() === 'arrow';
+    let lines = 0;
+    let arrows = 0;
     ctx.save();
     ctx.setLineDash([6, 4]);
     ctx.lineWidth = 1.4;
@@ -246,10 +253,33 @@
       const faded = near && !(near.has(s) && near.has(t) && (s === focus || t === focus));
       ctx.strokeStyle = faded ? colors.edge : colors.text2;
       ctx.globalAlpha = faded ? 0.5 : 1;
+      // the direction: an arrowhead at the edge of the target, and the two directions of a
+      // reciprocal pair each set off to their own left so that they stay apart
+      const len = Math.hypot(b.x - a.x, b.y - a.y);
+      if (len < 1) continue;
+      const ux = (b.x - a.x) / len;
+      const uy = (b.y - a.y) / len;
+      const back = graph.edges(t, s).some((k) => lens.inferred.has(k));
+      const off = back ? 3 : 0;
+      const ox = uy * off;
+      const oy = -ux * off;
+      const ex = b.x - ux * (b.r + 1) + ox;
+      const ey = b.y - uy * (b.r + 1) + oy;
       ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
+      ctx.moveTo(a.x + ox, a.y + oy);
+      ctx.lineTo(ex - ux * 6, ey - uy * 6);
       ctx.stroke();
+      lines++;
+      if (showArrows) {
+        arrows++;
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.beginPath();
+        ctx.moveTo(ex, ey);
+        ctx.lineTo(ex - ux * 8 - uy * 4, ey - uy * 8 + ux * 4);
+        ctx.lineTo(ex - ux * 8 + uy * 4, ey - uy * 8 - ux * 4);
+        ctx.closePath();
+        ctx.fill();
+      }
       if (Math.hypot(b.x - a.x, b.y - a.y) > 60 && lens.inferred.size <= 600) {
         const mx = (a.x + b.x) / 2;
         const my = (a.y + b.y) / 2;
@@ -265,6 +295,9 @@
       }
     }
     ctx.restore();
+    // for the tests: the overlay has no elements to find
+    overlay.dataset.inferred = String(lines);
+    overlay.dataset.arrows = String(arrows);
   }
 
   /** The badges: a pill with "i" and the count at the upper right of each badged node. */
