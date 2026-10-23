@@ -2140,13 +2140,25 @@ impl<'a> Planner<'a> {
                 .map_or(f64::INFINITY, |i| i.est.max(1.0) * 64.0),
         );
         let desc = format!(
-            "?{} by subjects{} [{} table]",
+            "?{} by subjects{}{} [{} table]",
             self.ctx.var_name(p),
             if input.is_some() {
                 format!(" of ?{}", self.ctx.var_name(s))
             } else {
                 String::new()
             },
+            // the measures belong in the description, which keys the result cache
+            counts
+                .iter()
+                .map(|(v, m)| format!(
+                    " ?{}={}",
+                    self.ctx.var_name(*v),
+                    match m {
+                        Measure::Subjects => "subjects",
+                        Measure::Rows => "rows",
+                    }
+                ))
+                .collect::<String>(),
             uses.scope.name()
         );
         let cost = match &input {

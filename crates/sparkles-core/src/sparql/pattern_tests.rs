@@ -547,3 +547,20 @@ fn both_tables_are_built() {
     assert_eq!(f.table(Scope::Named).unwrap().subjects(), 4);
     assert!(f.table(Scope::Default).unwrap().patterns() > 10);
 }
+
+/// Two counts that differ only in what they count are cached apart.
+#[test]
+fn the_result_cache_keeps_the_measures_apart() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s, &films(), RdfFormat::TriG);
+    let cached = QueryOptions::default();
+    let rows =
+        "SELECT ?p (COUNT(?s) AS ?n) WHERE { ?s ?q ?v . ?s spk:hasPredicate ?p } GROUP BY ?p";
+    let subjects = "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?q ?v . ?s spk:hasPredicate ?p } GROUP BY ?p";
+    let a = solutions(&run_on(&s.snapshot(), rows, &cached));
+    let b = solutions(&run_on(&s.snapshot(), subjects, &cached));
+    assert_ne!(a, b);
+    assert_eq!(a, same(&s, rows, Some(true)));
+    assert_eq!(b, same(&s, subjects, Some(true)));
+    assert_eq!(a, solutions(&run_on(&s.snapshot(), rows, &cached)));
+}

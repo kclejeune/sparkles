@@ -2017,6 +2017,34 @@ while the store holds a resource typed as a container. Without one, `rdfs:member
 an ordinary triple pattern. Both readings give the same solutions in that case, so
 queries over `rdfs:member` keep their plans. JavaScript functions are not supported.
 
+### Predicate patterns and `spk:hasPredicate`
+
+`?s spk:hasPredicate ?p` (`urn:x-sparkles:hasPredicate`) holds when `?s` is the subject of
+at least one triple with predicate `?p` in the active graph. QLever's
+`<http://qlever.cs.uni-freiburg.de/builtin-functions/has-predicate>` is the same property.
+Either side can be a variable or a constant. Under `GRAPH ?g` it holds per graph.
+
+Each generation keeps predicate patterns, the set of predicates of every subject, for the
+default graph and for the union of the named graphs ([X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)).
+These shapes read them, and EXPLAIN names the operator `PatternCount` or `PatternScan`:
+
+```sparql
+# the predicates of a class's instances, with the instances that have each
+SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a dbo:Film . ?s ?p ?o } GROUP BY ?p
+SELECT ?p (COUNT(?s) AS ?n) WHERE { ?s a dbo:Film . ?s spk:hasPredicate ?p } GROUP BY ?p
+SELECT DISTINCT ?p WHERE { ?s a dbo:Film . ?s ?p ?o }
+# every subject
+SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p
+```
+
+`?p` and `?o` must appear in no other triple of the group, and the other triples must
+bind `?s`. `COUNT(*)` over `?s ?p ?o` counts triples and reads the permutations. The
+patterns hold for the base index, and every subject that pending writes or an open
+transaction touch is read again from SPO, so the answers are always those of the
+permutations. The permutations answer instead under a protection of triples, with RDFS
+on read, for a set of named graphs, for the union of the named graphs under a graph view,
+and when the delta touches more than one subject per 32 quads.
+
 ### ARQ syntax extensions
 
 Fuseki parses queries with Jena ARQ's syntax, a superset of SPARQL, and so does Sparkles.
