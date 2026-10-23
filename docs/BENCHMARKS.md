@@ -1381,6 +1381,13 @@ rather than a published comparison.
 | Open `Article`, 375,000 instances, grouped by year ranges | 0.51 to 0.82 s |
 | F14 Leiden over `foaf:knows`, 986,333 nodes and 5.0 million edges | 22.2 s |
 
+A later review made a range's key a distinct node and range pair, so that a node with
+several values in one range counts once. Five interleaved rounds on another 8-vCPU
+instance compared the two keys, each request the first after a server start. The medians
+were 1.24 s before and 1.17 s after for `Researcher`, 0.73 s and 0.67 s for one salary
+range, 0.53 s and 0.44 s by `worksFor`, and 0.54 s and 0.52 s for `Article`, with the
+same answers, so the distinct key costs nothing measurable.
+
 The parallel build computes the profile of each predicate on its own rayon task, which
 halves the first picture of the overview on this machine. Its output is the same as the
 serial build's. It uses more threads for the length of one profile request, and the
