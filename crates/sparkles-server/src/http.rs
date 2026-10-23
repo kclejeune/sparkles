@@ -49,6 +49,7 @@ mod queries;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
 pub(crate) mod sd;
+pub(crate) mod self_service;
 mod shex;
 mod sparql_diff;
 mod stream;
@@ -486,7 +487,9 @@ impl ApiError {
             resp.extensions_mut()
                 .insert(validation::RejectionTurtle(t.to_string()));
         }
-        if budget == Some(BudgetKind::ServerMemory) {
+        // only a refusal that a retry can pass says when to retry: a request larger than
+        // the whole pool answers 507 without it
+        if budget == Some(BudgetKind::ServerMemory) && self.0 == StatusCode::SERVICE_UNAVAILABLE {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
@@ -692,6 +695,12 @@ impl From<Error> for ApiError {
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
             Error::BudgetExceeded(b) if b.kind == BudgetKind::DecompressedBytes => {
                 StatusCode::PAYLOAD_TOO_LARGE
+            }
+            // more memory than the whole pool: no retry can succeed
+            Error::BudgetExceeded(b)
+                if b.kind == BudgetKind::ServerMemory && b.requested > b.limit =>
+            {
+                StatusCode::INSUFFICIENT_STORAGE
             }
             // the server's query memory is in use: a retry can succeed
             Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory => {
@@ -1345,6 +1354,8 @@ pub(crate) async fn run_query(
     asked.apply(&mut opts);
     opts.describe = describe::request_options(&ds, &params)?;
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
+    // a SERVICE call to this server runs in process, as this caller
+    self_service::install(&st, &mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -2303,6 +2314,8 @@ async fn update_endpoint(
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Update);
+    // a SERVICE call to this server in the update's WHERE runs in process, as this caller
+    self_service::install(&st, &mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
     opts.write.graphs = opts.graphs.clone();
     opts.write.author = author(&p);
@@ -5242,6 +5255,8 @@ mod pool_tests;
 mod reason_limit_tests;
 #[cfg(test)]
 mod router_tests;
+#[cfg(test)]
+mod self_service_tests;
 #[cfg(all(test, feature = "text"))]
 mod text_tests;
 #[cfg(all(test, feature = "shacl"))]

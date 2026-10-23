@@ -503,6 +503,10 @@ pub struct Ctx {
     /// the caller's scope in the cache of remote SERVICE results (see
     /// [`QueryOptions::service_scope`](super::QueryOptions::service_scope))
     pub service_scope: Arc<str>,
+    /// the process's own query endpoints (see [`super::LocalEndpoints`])
+    pub local_endpoints: Option<Arc<dyn super::LocalEndpoints>>,
+    /// how many in-process SERVICE calls this query runs inside
+    pub service_depth: u32,
     /// the dataset's named projections (see [`crate::algo::catalog`])
     pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
     /// RDFS on read (see [`super::rdfs`])
@@ -849,6 +853,8 @@ impl Ctx {
             outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
             service_scope: Arc::from(""),
+            local_endpoints: None,
+            service_depth: 0,
             algo_projections: None,
             rdfs: None,
             opt: Optimizations::default(),

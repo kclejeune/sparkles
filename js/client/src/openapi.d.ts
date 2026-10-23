@@ -4306,7 +4306,7 @@ export interface components {
             /** @description The brief as plain text. Its first line says that the lines are recalled data. */
             text: string;
         };
-        /** @description A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After`, because the server's query memory pool is in use and a retry can succeed. The `spill` budget is the disk a query's spill files may reserve. */
+        /** @description A `507` for a request over one of its budgets. The `server-memory` budget is a `503` with `Retry-After` when the server's query memory pool is in use and a retry can succeed, and a `507` without it when the request needs more than the whole pool. The `spill` budget is the disk a query's spill files may reserve. */
         BudgetError: components["schemas"]["Error"] & {
             /** @enum {string} */
             budget: "memory" | "result-bytes" | "outbound-bytes" | "validation-work" | "rows" | "rows-produced" | "dataset-bytes" | "server-memory" | "spill";

@@ -345,6 +345,8 @@ impl Request<'_> {
         if let Some(s) = &self.opts.service_scope {
             ctx.service_scope = s.clone();
         }
+        ctx.local_endpoints = self.opts.local_endpoints.clone();
+        ctx.service_depth = self.opts.service_depth;
         if let Some(o) = self.opts.optimizations {
             ctx.opt = o;
         }

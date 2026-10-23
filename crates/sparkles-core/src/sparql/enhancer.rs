@@ -1206,7 +1206,8 @@ pub(super) fn run_remote(
     let caching = rl.cache != CacheMode::None
         && rl.cache != CacheMode::Off
         && ctx.use_cache
-        && cache.enabled();
+        && cache.enabled()
+        && !super::exec::is_local(ctx, rl.endpoint.as_str());
     if caching {
         for input in &mut inputs {
             let mut kv: Vec<(&str, &Term)> =

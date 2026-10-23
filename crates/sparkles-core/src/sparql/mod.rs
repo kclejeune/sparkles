@@ -192,6 +192,39 @@ pub struct QueryOptions {
     /// dataset fills each of those fields that the caller left unset. The engine itself
     /// does not read it.
     pub defaults_applied: bool,
+    /// The query endpoints of the process that runs the query. A SERVICE whose IRI one
+    /// of them names exactly runs in this process instead of over HTTP (see
+    /// [`LocalEndpoints`]).
+    pub local_endpoints: Option<Arc<dyn LocalEndpoints>>,
+    /// How many in-process SERVICE calls this query runs inside (0 for a request's own
+    /// query). A call deeper than [`MAX_SERVICE_DEPTH`] fails.
+    pub service_depth: u32,
+}
+
+/// The most in-process SERVICE calls that nest inside one another.
+pub const MAX_SERVICE_DEPTH: u32 = 8;
+
+/// The query endpoints of the process that runs a query, so that a SERVICE call to the
+/// same server runs in process under the caller's grant, deadline and cancellation
+/// instead of queueing behind the caller for admission (X08-P1-nested-service).
+pub trait LocalEndpoints: Send + Sync + std::fmt::Debug {
+    /// For an IRI that exactly names one of this process's query endpoints, the
+    /// snapshot to query and the options the caller would have there, with the caller's
+    /// view of the dataset. `None` leaves the call to HTTP. An error fails the call, for
+    /// a caller that may not query the dataset it names or a dataset that is out of
+    /// service.
+    fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>>;
+}
+
+/// The dataset an in-process SERVICE call queries (see [`LocalEndpoints`]).
+pub struct LocalTarget {
+    pub snap: Arc<Snapshot>,
+    /// The caller's options on that dataset. The engine lowers their budgets to the
+    /// calling query's and gives them its deadline, cancellation and grant.
+    pub options: QueryOptions,
+    /// Held until the call ends, such as the server's handle that keeps a dataset from
+    /// being swapped out by a restore while a request reads it.
+    pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl QueryOptions {
@@ -503,6 +536,8 @@ fn make_ctx(
     if let Some(s) = &opts.service_scope {
         ctx.service_scope = s.clone();
     }
+    ctx.local_endpoints = opts.local_endpoints.clone();
+    ctx.service_depth = opts.service_depth;
     if let Some(o) = opts.optimizations {
         ctx.opt = o;
     }

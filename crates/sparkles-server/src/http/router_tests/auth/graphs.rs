@@ -1042,3 +1042,86 @@ async fn history_follows_the_graph_grants() {
     let r = get_as(&s.app, "/graphs/history", Some(&b("gep"))).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
 }
+
+/// A SERVICE call to this server runs in process as its caller, so it sees the
+/// caller's graphs and no more (X08-P1-nested-service).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_call_to_this_server_sees_only_the_callers_graphs() {
+    let h = |pw: &str| hash_password_with(pw, 8, 1, 1).unwrap();
+    let s = build(Fixture {
+        extra: format!(
+            r#"{}
+[[users]]
+name = "gfed"
+password = "{}"
+server = ["federate"]
+[[users.grants]]
+dataset = "graphs"
+level = "read"
+graphs = ["http://ex/a/*"]
+
+[[users]]
+name = "gfedall"
+password = "{}"
+server = ["federate"]
+datasets = {{ graphs = "read" }}
+"#,
+            users(),
+            h("gfed-pw"),
+            h("gfedall-pw"),
+        ),
+        ..Default::default()
+    });
+    let ds = s.state.attach("graphs", DbType::Mem, None).unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            DATA.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    // nothing listens on the port, so only an in-process call answers
+    s.state
+        .listener
+        .set(crate::http::self_service::Listener {
+            scheme: "http",
+            ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 9,
+        })
+        .unwrap();
+    let q = "SELECT ?g { SERVICE <http://127.0.0.1:9/graphs/sparql> { GRAPH ?g { } } }";
+    assert_eq!(
+        column(&s.app, "gfed", q).await.unwrap(),
+        ["http://ex/a/1", "http://ex/a/2"]
+    );
+    assert_eq!(
+        column(&s.app, "gfedall", q).await.unwrap(),
+        ["http://ex/a/1", "http://ex/a/2", "http://ex/b/1"]
+    );
+    // a dataset the caller cannot read is refused, and SILENT does not hide it
+    let wiki = "SELECT * { SERVICE SILENT <http://127.0.0.1:9/wiki/sparql> { ?s ?p ?o } }";
+    let r = call(
+        &s.app,
+        "GET",
+        &format!("/graphs/sparql?query={}", enc(wiki)),
+        &[("authorization", &b("gfed")), ("accept", "text/csv")],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    // a hidden dataset and a missing one are refused alike
+    for name in ["secret", "no-such-dataset"] {
+        let q = format!(
+            "SELECT * {{ SERVICE SILENT <http://127.0.0.1:9/{name}/sparql> {{ ?s ?p ?o }} }}"
+        );
+        let r = call(
+            &s.app,
+            "GET",
+            &format!("/graphs/sparql?query={}", enc(&q)),
+            &[("authorization", &b("gfed")), ("accept", "text/csv")],
+            "",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{name}: {}", r.text());
+    }
+}

@@ -345,9 +345,9 @@ that work by priority and links each item to its design spec.
   because the pairs of plans that share one variable stay quadratic. Planning observes
   the timeout and cancellation. The explanation of `/{ds}/sparql/explain` reads plans of
   at most 256 levels. [Roadmap](ROADMAP.md) item 84.
-* **Query memory pool.** A SERVICE call from a query to the same server is admitted like
-  any request, so it waits behind its caller's grant and answers `503` after the
-  admission wait, which `SILENT` turns into no rows. Routes such as SHACL, ShEx
+* **Query memory pool.** A SERVICE call to this server runs in process only from the
+  SPARQL query and update endpoints, so one from an MCP tool or GraphQL still waits
+  behind its caller's grant. Routes such as SHACL, ShEx
   validation outside its selectors, diff and the `/$/stats`, `/$/schema` and
   `/$/validate` reads hold their admitted grant idle while their own query takes a
   second one. With a pool set, an eager
@@ -366,12 +366,6 @@ that work by priority and links each item to its design spec.
   for. The `small` profile saves about 100 MiB of RSS at 10.5M, but its cold `star-lookup`
   at 10.5M is 79% slower than the default profile's and several other cold queries are 7%
   to 10% slower, past the gate's 5%. [Roadmap](ROADMAP.md) item 97.
-* **EXISTS over a Cartesian product.** A `FILTER NOT EXISTS` above a Cartesian product
-  runs eagerly and materializes the product before it filters, while the same product
-  without the filter streams. BSBM BI's q4 with ProductType6 asks for about 5.8 GiB and
-  the default query pool of 5.2 GiB refuses it. The refusal answers `503` with
-  `Retry-After`, although a request larger than the whole pool cannot succeed on retry.
-  [Roadmap](ROADMAP.md) item 96.
 * **Materialization limit.** `sparkles infer` stops a run that would derive more than 50
   million triples, and no flag or setting raises the limit. LUBM(1000) reaches it under
   RDFS in the first iteration, and OWL2Bench reaches it under OWL 2 RL from five

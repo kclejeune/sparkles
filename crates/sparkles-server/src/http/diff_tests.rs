@@ -1499,8 +1499,15 @@ async fn sparql_diff_charges_the_server_memory_pool() {
     let head = ds.store.head_commit().seq;
     let uri = format!("/h/sparql/diff?from={head}&to={head}");
     let r = sparql_diff(&s.app, &uri, q).await;
-    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", head_of(&r));
+    // more than the whole pool: 507, and no Retry-After, since a retry cannot pass
+    assert_eq!(
+        r.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        head_of(&r)
+    );
     assert_eq!(r.json()["budget"], "server-memory");
+    assert!(r.headers.get("retry-after").is_none());
     // the grant went back to the pool on the error
     assert_eq!(pool.granted(), 0);
     // a comparison that fits is answered, and gives everything back too

@@ -7815,7 +7815,12 @@ fn service(
         return Err(Error::Service("invalid SERVICE endpoint".into()));
     };
     let store = &ctx.snap.results.service;
-    if matches!(cache, CacheMode::Default | CacheMode::Clear) && ctx.use_cache && store.enabled() {
+    // an in-process call reads the current data, so its answer is never cached
+    if matches!(cache, CacheMode::Default | CacheMode::Clear)
+        && ctx.use_cache
+        && store.enabled()
+        && !is_local(ctx, url.as_str())
+    {
         // the whole result under one key: a SERVICE without `loop` has one input
         let key = super::svccache::key(&ctx.service_scope, url.as_str(), query, &[]);
         let hit = if cache == CacheMode::Default {
@@ -7870,14 +7875,85 @@ fn service(
     Ok(t)
 }
 
+/// Whether `url` names a query endpoint of this process (see [`super::LocalEndpoints`]).
+pub(super) fn is_local(ctx: &Ctx, url: &str) -> bool {
+    ctx.local_endpoints
+        .as_ref()
+        .is_some_and(|l| l.resolve(url).is_some())
+}
+
+/// Run `query` in process on the dataset `target` names, as the caller, and hand each
+/// solution to `on_solution`. The call keeps the caller's deadline, cancellation, grant,
+/// row count and outbound budget, so it can neither wait for admission behind its
+/// caller nor outlive it.
+fn fetch_local(
+    ctx: &Ctx,
+    target: Result<super::LocalTarget>,
+    query: &str,
+    on_solution: &mut dyn FnMut(sparesults::QuerySolution) -> Result<()>,
+) -> Result<()> {
+    if ctx.service_depth >= super::MAX_SERVICE_DEPTH {
+        return Err(Error::Service(format!(
+            "SERVICE calls to this server nest more than {} deep",
+            super::MAX_SERVICE_DEPTH
+        )));
+    }
+    let super::LocalTarget {
+        snap,
+        options: mut opts,
+        hold: _hold,
+    } = target?;
+    // the call can never be given more than its caller has
+    opts.max_rows = Some(opts.max_rows.map_or(ctx.max_rows, |m| m.min(ctx.max_rows)));
+    opts.max_memory_bytes = Some(
+        opts.max_memory_bytes
+            .map_or(ctx.mem_limit, |m| m.min(ctx.mem_limit)),
+    );
+    opts.max_rows_produced = Some(
+        opts.max_rows_produced
+            .map_or(ctx.max_rows_produced, |m| m.min(ctx.max_rows_produced)),
+    );
+    opts.timeout = None;
+    opts.deadline = ctx.current_deadline();
+    opts.cancel = Some(ctx.cancel.clone());
+    opts.cancellation = ctx.cancellation.clone();
+    opts.grant = ctx.grant().cloned();
+    opts.work = Some(ctx.rows_produced.clone());
+    opts.outbound_budget = Some(ctx.outbound_budget.clone());
+    opts.service_depth = ctx.service_depth + 1;
+    ctx.check()?;
+    let r = super::query(snap, query, &opts)?;
+    let vars: std::sync::Arc<[oxrdf::Variable]> = r
+        .vars
+        .iter()
+        .map(|v| oxrdf::Variable::new_unchecked(v.clone()))
+        .collect();
+    for i in 0..r.table.len() {
+        if i % 1024 == 0 {
+            ctx.check()?;
+        }
+        let row: Vec<Option<oxrdf::Term>> = r.table.row(i).iter().map(|id| r.term(*id)).collect();
+        on_solution(sparesults::QuerySolution::from((vars.clone(), row)))?;
+    }
+    Ok(())
+}
+
 /// Send `query` to the endpoint `url` through the outbound policy and hand each
-/// solution of the response to `on_solution` as it is parsed.
+/// solution of the response to `on_solution` as it is parsed. A query endpoint of this
+/// process answers in process instead (see [`fetch_local`]).
 pub(super) fn fetch(
     ctx: &Ctx,
     url: &oxrdf::NamedNode,
     query: &str,
     on_solution: &mut dyn FnMut(sparesults::QuerySolution) -> Result<()>,
 ) -> Result<()> {
+    if let Some(target) = ctx
+        .local_endpoints
+        .as_ref()
+        .and_then(|l| l.resolve(url.as_str()))
+    {
+        return fetch_local(ctx, target, query, on_solution);
+    }
     // the host of the endpoint (no user info, no port)
     let host = oxiri::Iri::parse(url.as_str())
         .ok()
