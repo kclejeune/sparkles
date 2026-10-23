@@ -25,6 +25,12 @@ arrived, so a client that sends slowly no longer holds 16 MiB of the pool while 
 Uploads, patches and Graph Store writes no longer take an initial grant or wait for the
 pool, and a release of memory wakes only the waiters that fit.
 
+A SERVICE call from the SPARQL query or update endpoint to this server now runs in
+process under the caller's principal, grant and deadline, where it used to wait for the
+memory pool behind its caller and fail with `503`. Only an IRI that names the configured
+public URL or the bound listener exactly counts as this server, and such calls nest at
+most eight deep.
+
 In the JVM library, `abort()` or a timeout that raced the end of a query could throw
 `IllegalStateException` because the query's native object had just been released. Such a
 cancel is now ignored, since the query has already finished.

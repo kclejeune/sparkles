@@ -3055,6 +3055,19 @@ fn run() -> Result<()> {
                     bail!("--unix-socket needs a Unix platform");
                 }
                 let scheme = if tls_cert.is_some() { "https" } else { "http" };
+                // the bound port, which differs from `--port 0`, for SERVICE calls to
+                // this server
+                if let Some(port) = tcp
+                    .as_ref()
+                    .and_then(|l| l.local_addr().ok())
+                    .map(|a| a.port())
+                {
+                    let _ = st.listener.set(http::self_service::Listener {
+                        scheme,
+                        host: host.clone(),
+                        port,
+                    });
+                }
                 let listening = match &unix_socket {
                     Some(p) => format!("unix:{}", p.display()),
                     None => format!("{scheme}://{addr}/"),

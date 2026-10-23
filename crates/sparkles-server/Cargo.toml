@@ -38,6 +38,8 @@ tracing-subscriber.workspace = true
 parking_lot.workspace = true
 tempfile.workspace = true
 percent-encoding.workspace = true
+# parsing SERVICE IRIs that name this server (http::self_service)
+url = "2.5"
 flate2.workspace = true
 regex.workspace = true
 mime_guess = "2"

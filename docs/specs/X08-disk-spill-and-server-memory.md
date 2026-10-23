@@ -825,9 +825,9 @@ the text:
   to Phase 2 and are not built. `meta.memory.grantedBytes` is the most the query held.
 * **Not covered.** SHACL-SPARQL, `/$/reason` and ShEx do not take grants, because they run
   through the engine's contexts without a request grant. A SERVICE call from a query to
-  its own server is admitted like any request, so it can wait for memory that its caller
-  holds, and it ends with `503` at the admission deadline. With `SILENT` the failed call
-  yields no rows for that pattern instead of an error. Routes that count as queries but
+  its own server was admitted like any request until 2026-10-23 and ended with `503` at
+  the admission deadline. It now runs in process, as the section on SERVICE calls to this
+  server describes. Routes that count as queries but
   do not run through the request's options, such as GraphQL, SHACL, ShEx, diff,
   `memory/brief` and the `/$/stats`, `/$/schema` and `/$/validate` reads, hold the
   admitted grant idle while a query of their own takes a second grant from the dataset's
@@ -1029,9 +1029,8 @@ latency gates, and roadmap item 1 ran the 10.5M and DBpedia profile runs on 2026
 * **X08-P1-grant-routing.** Done on 2026-10-23, as the grant routing section below
   describes. SHACL validation, reasoning, ShEx validation other than its selectors, and the
   schema, statistics and lint reads still run outside the admitted grant.
-* **X08-P1-nested-service.** Recognise a SERVICE call to the same server, without a header
-  that a client could forge, so that it does not wait behind its caller's grant. Today it
-  answers `503` after the admission wait, and `SILENT` turns that into empty results.
+* **X08-P1-nested-service.** Done on 2026-10-23, as the section on SERVICE calls to this
+  server describes.
 * **X08-P1-admit-after-body.** Done on 2026-10-23, as the section on admission after the
   body describes. The server still sets no body read timeout, so a slow client holds its
   rate limiter slot while it sends.
@@ -1075,6 +1074,48 @@ succeeds once the memory returns, and that no grant remains afterwards. SHACL va
 reasoning, the rest of ShEx validation and the schema, statistics, format, lint, patch and
 diff routes still run their queries outside the admitted grant, so they hold it idle and
 take a second one from the dataset's pool.
+
+### SERVICE calls to this server (2026-10-23)
+
+A query that called `SERVICE <http://this-server/ds/sparql>` sent an HTTP request to its
+own server. The request was admitted like any other, so it waited for pool memory that
+its caller held, answered `503` at the admission deadline, and `SILENT` turned that into
+no rows. Such a call now runs in process.
+
+The server recognises its own endpoints without anything a client could forge. A
+SERVICE IRI names this server only when it matches the configured public base URL
+(`server.public_url` in the auth configuration), or when its scheme, host and port match
+the bound listener. The host must be the listener's literal address or, for a listener on
+a loopback or unspecified address, `localhost`, `127.0.0.1` or `[::1]`. The path must be
+`/{ds}/sparql`, `/{ds}/query` or `/{ds}` for a dataset the server serves, with no query
+string, fragment, user information or branch. Any other IRI is an ordinary HTTP call,
+including a DNS name or an alias that happens to resolve to this server. Matching names
+rather than resolved addresses keeps the rule exact. A header that marked a call as
+nested was rejected, because a client could send it to skip admission, and a secret
+header was rejected because a proxy or an alias could carry it to another server. The
+remaining option, leaving the `503` and documenting it, would have kept federation over
+one server unusable under memory pressure.
+
+The in-process call runs as the calling request's principal on the named dataset, with
+the graphs that principal reads there through the query endpoint, so it can never see
+more than the caller could query directly. A caller without read access to that dataset
+fails with a refusal that `SILENT` does not hide, as with any refused SERVICE. SERVICE
+still needs the `federate` permission and is off under `--no-service`. The call charges the
+caller's grant and keeps its deadline, cancellation, count of rows produced and outbound
+budget. Its answer is never put in the cache of SERVICE results, since it reads the
+current data. Calls nest at most eight deep (`MAX_SERVICE_DEPTH`), and a deeper call fails
+with "SERVICE calls to this server nest more than 8 deep", which `SILENT` hides like any
+other failed SERVICE call. The engine exposes the hook as the `LocalEndpoints` trait in
+`QueryOptions`, and the server installs it on the SPARQL query and update endpoints.
+Other routes, such as MCP tools and GraphQL, still send such a call over HTTP.
+
+`a_service_call_to_this_server_runs_under_its_callers_grant` serves the router over TCP,
+holds 48 MiB of a 64 MiB pool and queries itself through four names of the listener. It
+answered `502` with the inner `503` before the change. `a_service_call_to_this_server_sees_only_the_callers_graphs`
+checks that a caller restricted to two graphs sees only those through the call and that a
+dataset it cannot read is refused. `nested_service_calls_to_this_server_stop_at_the_depth_limit`
+and `a_service_iri_that_does_not_name_this_server_goes_over_http` cover the depth limit
+and the names that stay remote.
 
 ### Admission after the body (2026-10-23)
 

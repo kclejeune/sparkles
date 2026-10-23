@@ -369,6 +369,9 @@ pub struct AppState {
     pub cors_origins: Vec<String>,
     /// the `Host` names answered without auth (`serve --public-host`)
     pub hosts: crate::exposure::Hosts,
+    /// the TCP listener `serve` bound, once it has, for recognising SERVICE calls to
+    /// this server (see [`crate::http::self_service`])
+    pub listener: std::sync::OnceLock<crate::http::self_service::Listener>,
     /// the MapLibre style of the UI's maps (`serve --map-style-url`); `None`: the
     /// bundled basemap
     pub map_style_url: Option<String>,
@@ -637,6 +640,7 @@ impl AppState {
             auth: None,
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
+            listener: Default::default(),
             map_style_url: None,
             gsp_direct_naming: GspDirectNaming::default(),
             allow_unvalidated_writes: false,
@@ -718,6 +722,7 @@ impl AppState {
             auth: None,
             cors_origins: Vec::new(),
             hosts: crate::exposure::Hosts::default(),
+            listener: Default::default(),
             map_style_url: None,
             gsp_direct_naming: GspDirectNaming::default(),
             allow_unvalidated_writes: false,

@@ -7895,8 +7895,10 @@ of its rows, its computed terms and its live charges. A CONSTRUCT or DESCRIBE re
 keeps its query's peak estimate until it is dropped or collected, even when the result is
 much smaller. This holds for a `QueryResult` and for the Python and Node result objects
 in an embedded catalog with a pool. A SERVICE call
-to the same server is admitted like any request, so it can answer `503` while its caller
-holds memory. Uploads, patches and Graph Store writes start with an empty grant and do not
+from the query or update endpoint to this server runs in process under the caller's
+principal, grant and deadline when its IRI names the public base URL or the bound
+listener exactly, as the X08 specification describes. Calls nest at most eight deep.
+Uploads, patches and Graph Store writes start with an empty grant and do not
 wait for the pool, because their bodies stream into the store and the memory of the load
 is not counted in the pool. A query that such a request runs grows the empty grant.
 

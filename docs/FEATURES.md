@@ -332,9 +332,9 @@ that work by priority and links each item to its design spec.
   because the pairs of plans that share one variable stay quadratic. Planning observes
   the timeout and cancellation. The explanation of `/{ds}/sparql/explain` reads plans of
   at most 256 levels. [Roadmap](ROADMAP.md) item 84.
-* **Query memory pool.** A SERVICE call from a query to the same server is admitted like
-  any request, so it waits behind its caller's grant and answers `503` after the
-  admission wait, which `SILENT` turns into no rows. Routes such as SHACL, ShEx
+* **Query memory pool.** A SERVICE call to this server runs in process only from the
+  SPARQL query and update endpoints, so one from an MCP tool or GraphQL still waits
+  behind its caller's grant. Routes such as SHACL, ShEx
   validation outside its selectors, diff and the `/$/stats`, `/$/schema` and
   `/$/validate` reads hold their admitted grant idle while their own query takes a
   second one. With a pool set, an eager

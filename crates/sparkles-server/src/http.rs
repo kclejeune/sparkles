@@ -48,6 +48,7 @@ mod queries;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
 pub(crate) mod sd;
+pub(crate) mod self_service;
 mod shex;
 mod sparql_diff;
 mod stream;
@@ -1343,6 +1344,8 @@ pub(crate) async fn run_query(
     asked.apply(&mut opts);
     opts.describe = describe::request_options(&ds, &params)?;
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
+    // a SERVICE call to this server runs in process, as this caller
+    self_service::install(&st, &mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -2301,6 +2304,8 @@ async fn update_endpoint(
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Update);
+    // a SERVICE call to this server in the update's WHERE runs in process, as this caller
+    self_service::install(&st, &mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
     opts.write.graphs = opts.graphs.clone();
     opts.write.author = author(&p);
@@ -5213,6 +5218,8 @@ mod patch_tests;
 mod pool_tests;
 #[cfg(test)]
 mod router_tests;
+#[cfg(test)]
+mod self_service_tests;
 #[cfg(all(test, feature = "text"))]
 mod text_tests;
 #[cfg(all(test, feature = "shacl"))]
