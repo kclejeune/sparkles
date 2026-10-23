@@ -168,7 +168,7 @@ test('the Asked list comes from the server history (A34)', async ({ page }) => {
 test('Explore offers to ask the search text', async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'org'));
   await page.goto('/ui/explore?ds=org');
-  const search = page.getByRole('combobox');
+  const search = page.getByRole('combobox', { name: /Find a resource/ });
   await search.fill('who leads payments');
   await page.getByRole('option', { name: /Ask a question/ }).click();
   await expect(page).toHaveURL(/\/ui\/query/);

@@ -170,7 +170,7 @@ test('switching datasets drops the report, even one still being read', async ({ 
   await page.getByRole('button', { name: /^org/ }).first().click();
   await page
     .getByRole('listbox', { name: 'Datasets' })
-    .getByRole('option', { name: /^foaf/ })
+    .getByRole('option', { name: /^foaf persistent/ })
     .click();
   await expect(page).toHaveURL(/ds=foaf/);
   release();
