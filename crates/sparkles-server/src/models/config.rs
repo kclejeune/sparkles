@@ -70,16 +70,18 @@ pub enum Role {
     Draft,
     Repair,
     Summarize,
+    Community,
     Extract,
     Explain,
     Optimize,
 }
 
 impl Role {
-    pub const ALL: [Role; 6] = [
+    pub const ALL: [Role; 7] = [
         Role::Draft,
         Role::Repair,
         Role::Summarize,
+        Role::Community,
         Role::Extract,
         Role::Explain,
         Role::Optimize,
@@ -90,6 +92,7 @@ impl Role {
             Role::Draft => "draft",
             Role::Repair => "repair",
             Role::Summarize => "summarize",
+            Role::Community => "community",
             Role::Extract => "extract",
             Role::Explain => "explain",
             Role::Optimize => "optimize",
@@ -98,6 +101,15 @@ impl Role {
 
     pub fn parse(s: &str) -> Option<Role> {
         Role::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+
+    /// A role's inherited list when neither layer configures it explicitly.
+    pub fn fallback(self) -> Option<Role> {
+        match self {
+            Role::Repair => Some(Role::Draft),
+            Role::Community => Some(Role::Summarize),
+            _ => None,
+        }
     }
 }
 
@@ -707,14 +719,13 @@ impl ModelsConfig {
         Ok(())
     }
 
-    /// The pairs of `role`: its own list, or for `repair` without one, the `draft`
-    /// list. Other roles without a list are off (§3.7).
+    /// The pairs of `role`: its own list, or its fallback when absent. An explicit
+    /// empty list turns the role off (C18 §3.7 and C22 §3.3).
     pub fn pairs(&self, role: Role) -> &[Pair] {
-        match self.roles.get(&role) {
-            Some(l) => l,
-            None if role == Role::Repair => self.roles.get(&Role::Draft).map_or(&[], |l| l),
-            None => &[],
-        }
+        self.roles
+            .get(&role)
+            .or_else(|| role.fallback().and_then(|r| self.roles.get(&r)))
+            .map_or(&[], |l| l)
     }
 }
 
@@ -909,6 +920,42 @@ mod tests {
         // the bare form parses too
         let v: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
         assert_eq!(ModelsConfig::parse(&v["models"].to_string()).unwrap(), c);
+    }
+
+    #[test]
+    fn community_role_inherits_summary_unless_explicitly_configured() {
+        let mut c = ModelsConfig::parse(EXAMPLE).unwrap();
+        let summarize = vec![Pair::new("local", "small"), Pair::new("local", "large")];
+        c.roles.insert(Role::Summarize, summarize.clone());
+        assert_eq!(Role::parse("community"), Some(Role::Community));
+        assert_eq!(serde_json::to_value(Role::Community).unwrap(), "community");
+        assert_eq!(c.pairs(Role::Community), summarize.as_slice());
+
+        let community = vec![Pair::new("local", "report")];
+        c.roles.insert(Role::Community, community.clone());
+        assert_eq!(c.pairs(Role::Community), community.as_slice());
+        c.roles.insert(Role::Community, Vec::new());
+        assert!(c.pairs(Role::Community).is_empty());
+        c.roles.remove(&Role::Community);
+        c.roles.insert(Role::Summarize, Vec::new());
+        assert!(c.pairs(Role::Community).is_empty());
+        c.roles.remove(&Role::Summarize);
+        assert!(c.pairs(Role::Community).is_empty());
+    }
+
+    #[test]
+    fn community_role_configuration_validates_its_provider() {
+        let mut value: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        value["models"]["roles"]["community"] =
+            serde_json::json!([{ "provider": "local", "model": "report" }]);
+        let c = ModelsConfig::parse(&value.to_string()).unwrap();
+        assert_eq!(c.pairs(Role::Community), &[Pair::new("local", "report")]);
+        value["models"]["roles"]["community"][0]["provider"] = "missing".into();
+        let error = ModelsConfig::parse(&value.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("role community"), "{error}");
+        assert!(error.contains("no provider"), "{error}");
     }
 
     #[test]

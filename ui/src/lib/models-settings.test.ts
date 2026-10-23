@@ -95,10 +95,18 @@ describe('the form of the models kind', () => {
     expect(paths).not.toContain('providers.claude.numCtx');
     expect(paths).toContain('providers.claude.version');
     expect(paths).toContain('roles.draft');
+    expect(paths).toContain('roles.community');
     expect(paths).toContain('routing.exampleScore');
     expect(groupProvider(providerGroup('gw.internal'))).toBe('gw.internal');
     expect(groupProvider('Roles')).toBeNull();
     expect(modelFields(null).filter((d) => d.group?.startsWith('Provider'))).toEqual([]);
+  });
+
+  it('explains community role inheritance and explicit opt-out', () => {
+    expect(modelFields(models()).find((d) => d.path === 'roles.community')).toMatchObject({
+      placeholder: 'the summarize list',
+      help: 'Uses the summarize list when unset. An empty list turns this role off.',
+    });
   });
 
   it('shows locks and overrides of providers as a dataset kind does', () => {

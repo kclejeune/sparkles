@@ -66,8 +66,9 @@ const SUMMARY_MIN_LEFT: Duration = Duration::from_secs(5);
 pub type RoleLists = BTreeMap<Role, Vec<Pair>>;
 
 /// The lists of each role after a dataset's overrides (§3.5): a role the overrides name
-/// replaces the server's list, an empty list turns the role off, and `repair` without a
-/// list uses `draft`'s.
+/// replaces the server's list, an empty list turns the role off, and an absent role
+/// uses its fallback after overrides (`repair` uses `draft`, `community` uses
+/// `summarize`).
 pub fn resolve_lists(models: &Models, overrides: &RoleLists) -> RoleLists {
     let mut out = RoleLists::new();
     for r in Role::ALL {
@@ -75,10 +76,13 @@ pub fn resolve_lists(models: &Models, overrides: &RoleLists) -> RoleLists {
             out.insert(r, l.clone());
         }
     }
-    if !out.contains_key(&Role::Repair)
-        && let Some(d) = out.get(&Role::Draft).cloned()
-    {
-        out.insert(Role::Repair, d);
+    for role in Role::ALL {
+        if !out.contains_key(&role)
+            && let Some(fallback) = role.fallback()
+            && let Some(pairs) = out.get(&fallback).cloned()
+        {
+            out.insert(role, pairs);
+        }
     }
     out
 }

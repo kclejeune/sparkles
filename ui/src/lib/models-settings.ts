@@ -23,7 +23,15 @@ export const MODELS_URL = '/$/server/settings/models';
 export const PROVIDER_KINDS = ['ollama', 'openai', 'anthropic'] as const;
 
 /** The steps that call a model, in the order the Models section lists them. */
-export const ROLES = ['draft', 'repair', 'summarize', 'extract', 'explain', 'optimize'] as const;
+export const ROLES = [
+  'draft',
+  'repair',
+  'summarize',
+  'community',
+  'extract',
+  'explain',
+  'optimize',
+] as const;
 
 const LEVELS = ['auto', 'json-schema', 'json-object', 'tool', 'text'] as const;
 
@@ -414,19 +422,23 @@ export function modelFields(k: SettingsKind | null): FieldDef[] {
       help: 'contextTokens, maxOutputTokens, temperature, structuredOutput, pricing, requestTimeoutSecs and numCtx by model.',
     });
   }
-  for (const role of ROLES)
+  for (const role of ROLES) {
+    const fallback = role === 'repair' ? 'draft' : role === 'community' ? 'summarize' : null;
     out.push({
       path: pathString(['roles', role]),
       group: 'Roles',
       label: role,
       type: 'json',
-      placeholder:
-        role === 'repair' ? 'the draft list' : '[{ "provider": "local", "model": "qwen3:8b" }]',
-      help:
-        role === 'draft'
-          ? 'Provider and model pairs, from the cheapest to the strongest. A role without a list is off.'
+      placeholder: fallback
+        ? `the ${fallback} list`
+        : '[{ "provider": "local", "model": "qwen3:8b" }]',
+      help: fallback
+        ? `Uses the ${fallback} list when unset. An empty list turns this role off.`
+        : role === 'draft'
+          ? 'Provider and model pairs, from the cheapest to the strongest. Roles without a fallback are off when unset.'
           : undefined,
     });
+  }
   out.push(
     {
       path: 'routing.complexityThreshold',
