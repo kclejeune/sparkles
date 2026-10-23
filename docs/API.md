@@ -3633,7 +3633,8 @@ stops the comparison within a few thousand rows. The hashes, the table of the re
 being read and the listed rows count against the memory budget (`--query-memory-mb`, or
 the request's `memory-mb`) and against the server memory pool when it is on. A comparison
 beyond the request's budget fails with `507` and `budget: "memory"`, and one the pool
-cannot cover fails with `503` and `budget: "server-memory"`. The table of hashes is
+cannot cover fails with `budget: "server-memory"`, as `503` when other queries hold the
+memory and as `507` when the comparison needs more than the whole pool. The table of hashes is
 charged by its real size, 33 bytes for each of its slots, and while it doubles the old and
 the new table are both charged. Each execution runs with the budget that the comparison
 leaves, so the engine and the comparison together stay within the request's budget. That is
@@ -7817,7 +7818,9 @@ fails the request with `507 Insufficient Storage` and a body like this:
   process's memory.
 * `server-memory` is not one of the request's own budgets. It reports that the server's
   [query memory pool](#query-memory-pool) is in use. It answers `503 Service Unavailable`
-  with `Retry-After: 1`, because a retry can succeed once other queries finish.
+  with `Retry-After: 1`, because a retry can succeed once other queries finish. A request
+  that needs more than the whole pool answers `507` without `Retry-After`, since no
+  retry can succeed.
 * `spill` (`--query-spill-mb`, default 16384, and `--spill-max-mb` for all queries) is
   the disk that a query's spill files may reserve (see [Disk spill](#disk-spill)). The
   server reserves it in 64 MiB extents, and a write that fails for lack of space fails
@@ -7886,7 +7889,8 @@ row. When memory returns, the pool wakes only the first waiter that it can serve
 that waiter wakes the next one when it takes its grant. A running query grows its grant in steps of 4 MiB as its estimate grows, and gives
 steps back as its estimate falls. A query never waits for memory once it runs. When the
 pool cannot cover its next step, the query fails with `server-memory`, and the pool
-therefore cannot deadlock. While requests wait, a query may not hold more than half of the
+therefore cannot deadlock. That failure answers `507` without `Retry-After` when the
+step would take the query past the whole pool. While requests wait, a query may not hold more than half of the
 pool. A query that exceeds its own `memory` budget still answers `507`.
 
 An eager result keeps its share of the pool until it is released, so results held by the

@@ -353,12 +353,6 @@ that work by priority and links each item to its design spec.
   for. The `small` profile saves about 100 MiB of RSS at 10.5M, but its cold `star-lookup`
   at 10.5M is 79% slower than the default profile's and several other cold queries are 7%
   to 10% slower, past the gate's 5%. [Roadmap](ROADMAP.md) item 97.
-* **EXISTS over a Cartesian product.** A `FILTER NOT EXISTS` above a Cartesian product
-  runs eagerly and materializes the product before it filters, while the same product
-  without the filter streams. BSBM BI's q4 with ProductType6 asks for about 5.8 GiB and
-  the default query pool of 5.2 GiB refuses it. The refusal answers `503` with
-  `Retry-After`, although a request larger than the whole pool cannot succeed on retry.
-  [Roadmap](ROADMAP.md) item 96.
 * **Materialization limit.** `sparkles infer` stops a run that would derive more than 50
   million triples, and no flag or setting raises the limit. LUBM(1000) reaches it under
   RDFS in the first iteration, and OWL2Bench reaches it under OWL 2 RL from five

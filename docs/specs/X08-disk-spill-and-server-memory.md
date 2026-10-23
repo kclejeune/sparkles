@@ -835,7 +835,8 @@ the text:
   writes start with an empty grant since 2026-10-23, and the memory of the load itself is
   not charged to the pool.
 * **Errors.** `BudgetKind::ServerMemory` (`server-memory`) answers `503` with
-  `Retry-After: 1`, counts as a budget in `sparkles_budget_exceeded_total`, and is
+  `Retry-After: 1`. Since roadmap item 96 a request that needs more than the whole pool
+  answers `507` without `Retry-After` and says so in its message. The kind counts as a budget in `sparkles_budget_exceeded_total`, and is
   `budget-server-memory` in the MCP tools. The optional operator caches that fall back on
   a memory failure treat it like `memory`.
 * **Embedded.** `MemoryOptions::pool_bytes` gives a catalog a pool. Its datasets' queries
@@ -1074,6 +1075,35 @@ succeeds once the memory returns, and that no grant remains afterwards. SHACL va
 reasoning, the rest of ShEx validation and the schema, statistics, format, lint, patch and
 diff routes still run their queries outside the admitted grant, so they hold it idle and
 take a second one from the dataset's pool.
+
+### Automatic streaming without spill, item 96 (2026-10-23)
+
+BSBM BI's q4 with ProductType6 joins two groupings. One of them filters a Cartesian
+product of 62,956 offers and 2,474 features with `FILTER NOT EXISTS` and averages the
+prices per feature. Automatic execution kept it eager, because the grouping sits under a
+join, which `grouped` does not look through, and spill was off, which `spill_admitted`
+requires. Eager execution holds the whole product, so the query asked the pool for about
+5.8 GiB and the default pool of 5.2 GiB refused it with `503` and `Retry-After`.
+
+`memory_admitted` now runs a plan as a cursor without spill when the plan streams
+natively, its largest eager output is expected to exceed half of the memory it may use,
+and the state the cursor keeps, with its batch headroom, is expected to fit in half. The
+memory it may use is what the query's budget leaves, never more than the capacity of its
+grant's pool, and it does not depend on how much of the pool other queries hold, so a query
+gets the same plan under load. The cursor's state is estimated per operator: the build
+side of each join, the groups of a grouping, the rows of a DISTINCT or a full sort, the
+rows a top-k keeps and the key set and pattern state of each EXISTS it answers from one.
+Other operators the cursor runs natively keep nothing, and an operator the estimate does
+not know counts its whole output. `spill_admitted` compares with the same memory.
+
+On forge at 10M quads, with the default 5.2 GiB pool, q4 with ProductType6 answers in
+15.1 s with a peak server RSS of 282 MB, where it was refused. With a 12 GB pool, eager
+execution took 17.7 s and 8.3 GB, so the cursor is also about 1.17 times faster here. The
+answers are the same. A request that needs more than the whole pool now answers `507`
+without `Retry-After` instead of `503` with it, since no retry can succeed.
+`automatic_admission_streams_a_product_whose_cursor_state_fits_without_spill` covers the
+decision, and `a_query_larger_than_the_whole_pool_answers_507_without_retry_after` the
+status.
 
 ### SERVICE calls to this server (2026-10-23)
 
