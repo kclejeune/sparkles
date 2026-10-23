@@ -4,9 +4,16 @@
 use oxrdf::{Literal, NamedNode, Term};
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
-use sparkles_core::sparql::{Optimizations, QueryOptions, query};
+use sparkles_core::sparql::extensions::{
+    ExtensionRegistry, ScalarContext, ScalarDescriptor, ScalarResult,
+};
+use sparkles_core::sparql::{
+    CursorOptions, FallbackPolicy, Optimizations, QueryOptions, query, select_cursor,
+};
 use sparkles_core::store::{Store, StoreOptions};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const Q6: &str = include_str!("fixtures/sp2b-q6.rq");
 
@@ -264,4 +271,106 @@ fn keyed_optional_keeps_value_equality_errors_and_unbound_values() {
         assert_eq!(unused, 0, "{condition}");
         assert_eq!(used, usize::from(!guarded), "{condition}");
     }
+}
+
+/// The rows of a cursor that may not materialize any operator.
+fn strict_rows(store: &Store, text: &str, options: &QueryOptions) -> Vec<String> {
+    let mut cursor = select_cursor(
+        store.snapshot(),
+        text,
+        options,
+        &CursorOptions {
+            batch_rows: 7,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut rows = Vec::new();
+    while let Some(batch) = cursor.next_batch().unwrap() {
+        for i in 0..batch.len() {
+            rows.push(batch.row(i).unwrap());
+        }
+    }
+    bag(rows)
+}
+
+#[test]
+fn keyed_optional_streams_in_a_cursor_with_the_same_answers() {
+    let store = fixture();
+    assert_eq!(strict_rows(&store, Q6, &options(4096, true)), oracle());
+    let store = mixed();
+    for condition in ["?x = ?y", "?y = ?x && ?r != <http://example.org/r9>"] {
+        let text = format!(
+            "PREFIX ex: <http://example.org/> SELECT ?l ?r WHERE {{ \
+             ?l ?p ?any OPTIONAL {{ ?l ex:v ?x }} \
+             OPTIONAL {{ ?r ex:w ?y FILTER({condition}) }} }}"
+        );
+        let eager = query(store.snapshot(), &text, &options(1_000_000, false)).unwrap();
+        assert_eq!(
+            strict_rows(&store, &text, &options(1_000_000, true)),
+            bag(eager.rows()),
+            "{condition}"
+        );
+    }
+}
+
+/// The candidate pairs of a chunk, their merged rows and the left rows' marks are
+/// charged, and a small budget gets a smaller chunk rather than an error.
+#[test]
+fn keyed_optional_charges_its_chunk_within_a_small_budget() {
+    let store = fixture();
+    let r = query(store.snapshot(), Q6, &options(1_000_000, true)).unwrap();
+    // about 190 rows on each side make a chunk of about 36,000 pairs of 8 bytes
+    assert!(r.mem_peak_bytes > 200_000, "{}", r.mem_peak_bytes);
+    let budget = 256 << 10;
+    let r = query(
+        store.snapshot(),
+        Q6,
+        &QueryOptions {
+            max_memory_bytes: Some(budget),
+            ..options(1_000_000, true)
+        },
+    )
+    .unwrap();
+    assert_eq!(bag(r.rows()), oracle());
+    assert_eq!(keyed_candidates(&r.plan).len(), 1);
+    assert!(
+        r.mem_peak_bytes <= budget,
+        "{} > {budget}",
+        r.mem_peak_bytes
+    );
+}
+
+/// An application callback in an OPTIONAL condition sees every pair the generic join
+/// tests, so its calls and their order decide the answer as before.
+#[test]
+fn application_callbacks_in_the_condition_keep_the_generic_join() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let tick = move |_: &ScalarContext<'_>, _: &[Term]| -> ScalarResult {
+        let n = count.fetch_add(1, Ordering::SeqCst);
+        Ok(Literal::from(n == 1).into())
+    };
+    let mut registry = ExtensionRegistry::builder();
+    registry
+        .register_scalar(ScalarDescriptor::new("urn:test:tick", 0..=0, tick).unwrap())
+        .unwrap();
+    let options = QueryOptions {
+        extensions: Some(registry.build()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let store = Store::in_memory(StoreOptions::default());
+    let text = "SELECT ?y WHERE { VALUES ?x { <urn:b> } \
+                OPTIONAL { VALUES ?y { <urn:a> <urn:b> } FILTER(<urn:test:tick>() && ?x = ?y) } }";
+    let r = query(store.snapshot(), text, &options).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        bag(r.rows()),
+        bag(vec![vec![Some(Term::NamedNode(
+            NamedNode::new("urn:b").unwrap()
+        ))]])
+    );
+    assert!(keyed_candidates(&r.plan).is_empty());
 }

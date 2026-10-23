@@ -4581,10 +4581,10 @@ pub(super) fn keyed_left_join(
         return left_join(ctx, l, r, Some(expr), note);
     }
     let atomic = |id: Id| matches!(ctx.kind(id), TermKind::Iri | TermKind::BNode);
-    // the right rows by value: IRIs and blank nodes sorted by id, other bound values in
-    // row order; both index vectors are charged before they grow
-    let _index = ctx.charge((r.len() as u64).saturating_mul(16))?;
-    let mut keyed: Vec<(Id, u32)> = Vec::new();
+    // The right rows by value: IRIs and blank nodes sorted by id, other bound values in
+    // row order. Both are charged before they are allocated, the second for its growth.
+    let _index = ctx.charge((r.len() as u64).saturating_mul(16 + 8))?;
+    let mut keyed: Vec<(Id, u32)> = Vec::with_capacity(r.len());
     let mut loose: Vec<u32> = Vec::new();
     for (j, &v) in r.cols[rc].iter().enumerate() {
         if j % 65536 == 0 {
@@ -4601,9 +4601,22 @@ pub(super) fn keyed_left_join(
     }
     keyed.sort_unstable();
     let w = lay.vars.len() + 1;
+    // A chunk's pairs, their merged rows and their verdicts, and a mark per left row.
+    // The chunk takes at most a quarter of the room the query has left.
+    let per_pair = 8 + w as u64 * 8 + 1;
+    let room = usize::try_from(ctx.memory_room() / 4 / per_pair).unwrap_or(usize::MAX);
+    let cap = KEYED_CHUNK
+        .min(l.len().saturating_mul(r.len()))
+        .min(room)
+        .max(1);
+    let _scratch = ctx.charge(
+        (cap as u64)
+            .saturating_mul(per_pair)
+            .saturating_add(l.len() as u64),
+    )?;
     let mut matched = vec![false; l.len()];
     let mut out = Table::new(lay.vars.clone());
-    let mut chunk: Vec<(u32, u32)> = Vec::with_capacity(KEYED_CHUNK);
+    let mut chunk: Vec<(u32, u32)> = Vec::with_capacity(cap);
     let mut candidates = 0u64;
     let flush =
         |chunk: &mut Vec<(u32, u32)>, out: &mut Table, matched: &mut [bool]| -> Result<()> {
@@ -4635,7 +4648,7 @@ pub(super) fn keyed_left_join(
                     break;
                 }
                 chunk.push((i as u32, j));
-                if chunk.len() >= KEYED_CHUNK {
+                if chunk.len() >= cap {
                     candidates += chunk.len() as u64;
                     flush(&mut chunk, &mut out, &mut matched)?;
                 }
@@ -4643,7 +4656,7 @@ pub(super) fn keyed_left_join(
         } else {
             for &j in &loose {
                 chunk.push((i as u32, j));
-                if chunk.len() >= KEYED_CHUNK {
+                if chunk.len() >= cap {
                     candidates += chunk.len() as u64;
                     flush(&mut chunk, &mut out, &mut matched)?;
                 }

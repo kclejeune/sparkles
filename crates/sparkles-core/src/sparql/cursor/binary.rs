@@ -26,7 +26,11 @@ pub(super) fn eligible(node: &Node) -> bool {
     node.children.len() == 2
         && matches!(
             node.kind,
-            Kind::Join { .. } | Kind::HalfJoin { .. } | Kind::Minus | Kind::LeftJoin { .. }
+            Kind::Join { .. }
+                | Kind::HalfJoin { .. }
+                | Kind::Minus
+                | Kind::LeftJoin { .. }
+                | Kind::KeyedLeftJoin { .. }
         )
 }
 
@@ -62,6 +66,10 @@ pub(super) struct Binary {
     /// side first. The build data decides which one is used.
     pub(super) preferred: Vec<(usize, usize)>,
     pub(super) index: Option<HashIndex>,
+    /// A keyed OPTIONAL's equality ([`Kind::KeyedLeftJoin`]): its variable's column on
+    /// the probe side and on the build side, and once the build input is read, its index.
+    pub(super) equality: Option<(usize, usize)>,
+    pub(super) equality_index: Option<EqualityIndex>,
     pub(super) build: Option<Buffer>,
     pub(super) probe: Option<Buffer>,
     /// The probe row being joined.
@@ -198,6 +206,64 @@ impl HashIndex {
     }
 }
 
+/// The build rows of a keyed OPTIONAL by the value of its equality's build variable.
+/// `=` holds between two different ids only when neither is an IRI or a blank node, as
+/// `val_eq` decides it. A probe value that is one meets the rows with the same id, another
+/// bound value meets the rows whose value is bound and is neither, and an unbound value
+/// meets none, since `=` then raises an error. The condition is tested on every candidate.
+pub(super) struct EqualityIndex {
+    /// The build rows by value, of which a probe reads only the rows of its own id.
+    by_id: HashIndex,
+    /// The build rows whose value is bound and is neither an IRI nor a blank node.
+    loose: Vec<u32>,
+    _charge: Option<RetainedCharge>,
+}
+
+impl EqualityIndex {
+    fn new(ctx: &Ctx, build: &Table, column: usize, probe: usize) -> Result<Self> {
+        let by_id = HashIndex::new(ctx, build, column, probe)?;
+        let mut charge = ctx.retained_charge(1024)?;
+        let mut loose = Vec::new();
+        for (row, &value) in build.cols[column].iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            if !value.is_undef() && !atomic(ctx, value) {
+                if loose.len() == loose.capacity()
+                    && let Some(charge) = &mut charge
+                {
+                    charge.resize((loose.capacity().max(256) as u64) * 8 + 1024)?;
+                }
+                loose.push(row as u32);
+            }
+        }
+        Ok(Self {
+            by_id,
+            loose,
+            _charge: charge,
+        })
+    }
+
+    /// The build rows that probe value `value` may equal.
+    #[inline]
+    fn candidates<'a>(&'a self, ctx: &Ctx, value: Id) -> Candidates<'a> {
+        if value.is_undef() {
+            Candidates::Keyed(&[], &[])
+        } else if atomic(ctx, value) {
+            Candidates::Keyed(self.by_id.keyed(value), &[])
+        } else {
+            Candidates::Keyed(&[], &self.loose)
+        }
+    }
+}
+
+/// Whether `value` is an IRI or a blank node, which equals only itself.
+#[inline]
+fn atomic(ctx: &Ctx, value: Id) -> bool {
+    use crate::sparql::ctx::TermKind;
+    matches!(ctx.kind(value), TermKind::Iri | TermKind::BNode)
+}
+
 /// The build rows a probe row may match: every build row, or the rows of its key and
 /// then the rows that leave the key unbound.
 #[derive(Clone, Copy)]
@@ -232,7 +298,7 @@ impl Binary {
     /// a spilled join then restores.
     pub(super) fn new(ctx: &Ctx, node: &Node, ordered: bool) -> Result<Self> {
         let mode = match &node.kind {
-            Kind::LeftJoin { .. } => Mode::Optional,
+            Kind::LeftJoin { .. } | Kind::KeyedLeftJoin { .. } => Mode::Optional,
             Kind::HalfJoin { anti: false } => Mode::Semi,
             Kind::HalfJoin { anti: true } => Mode::Anti,
             Kind::Minus => Mode::Minus,
@@ -261,6 +327,15 @@ impl Binary {
         preferred.sort_by_key(|&(p, _)| !probe.certain.contains(&probe.vars[p]));
         let expression = match &node.kind {
             Kind::LeftJoin { expr } => expr.clone(),
+            Kind::KeyedLeftJoin { expr, .. } => Some(expr.clone()),
+            _ => None,
+        };
+        let equality = match &node.kind {
+            Kind::KeyedLeftJoin { left, right, .. } => probe
+                .vars
+                .iter()
+                .position(|v| v == left)
+                .zip(build.vars.iter().position(|v| v == right)),
             _ => None,
         };
         Ok(Self {
@@ -270,6 +345,8 @@ impl Binary {
             shared,
             preferred,
             index: None,
+            equality,
+            equality_index: None,
             build: None,
             probe: None,
             row: 0,
@@ -375,6 +452,11 @@ impl Binary {
                 Err(error) => return Err(error),
             }
         }
+        if let Some((p, b)) = self.equality {
+            self.equality_index = Some(EqualityIndex::new(ctx, &build.table, b, p)?);
+            self.build = Some(build);
+            return Ok(());
+        }
         // Key on the shared column that the build data leaves unbound least often.
         // A column that is unbound in every build row selects nothing.
         let Some((p, b)) = self.key_column(ctx, &build.table)? else {
@@ -474,10 +556,15 @@ impl Binary {
 
     fn candidates<'a>(
         index: Option<&'a HashIndex>,
+        equality: Option<(usize, &'a EqualityIndex)>,
+        ctx: &Ctx,
         probe: &Table,
         row: usize,
         all: usize,
     ) -> Candidates<'a> {
+        if let Some((p, equality)) = equality {
+            return equality.candidates(ctx, probe.cols[p][row]);
+        }
         match index {
             Some(index) => {
                 let key = probe.cols[index.probe][row];
@@ -558,7 +645,16 @@ impl Binary {
             }
             steps += 1;
             let row = self.row;
-            let candidates = Self::candidates(self.index.as_ref(), probe, row, build.len);
+            let candidates = Self::candidates(
+                self.index.as_ref(),
+                self.equality
+                    .map(|(p, _)| p)
+                    .zip(self.equality_index.as_ref()),
+                ctx,
+                probe,
+                row,
+                build.len,
+            );
             let n = candidates.len();
             if !checks && self.offset == 0 && n <= room - lp.len() {
                 // Every candidate matches and the whole row fits.
@@ -646,7 +742,16 @@ impl Binary {
             steps += 1;
             let row = self.row;
             used += 1;
-            let candidates = Self::candidates(self.index.as_ref(), probe, row, build.len);
+            let candidates = Self::candidates(
+                self.index.as_ref(),
+                self.equality
+                    .map(|(p, _)| p)
+                    .zip(self.equality_index.as_ref()),
+                ctx,
+                probe,
+                row,
+                build.len,
+            );
             let n = candidates.len();
             let begin = cl.len() as u32;
             let mut visited = 0usize;
@@ -724,7 +829,16 @@ impl Binary {
             }
             steps += 1;
             let row = self.row;
-            let candidates = Self::candidates(self.index.as_ref(), probe, row, build.len);
+            let candidates = Self::candidates(
+                self.index.as_ref(),
+                self.equality
+                    .map(|(p, _)| p)
+                    .zip(self.equality_index.as_ref()),
+                ctx,
+                probe,
+                row,
+                build.len,
+            );
             let found = match candidates {
                 // Every keyed build row binds the key, so it matches a bound probe key
                 // and, for MINUS, shares that bound variable.

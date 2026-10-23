@@ -3712,8 +3712,11 @@ fn left_join(l: Node, r: Node, expr: Option<Expr>, ctx: &Ctx) -> Node {
         .filter(|v| r.vars.contains(v))
         .copied()
         .collect();
+    // The keyed join tests the condition on fewer pairs, so an application callback in
+    // it, which may count or depend on its calls, keeps the generic join.
     if keys.is_empty()
         && ctx.opt.keyed_left_join
+        && !ctx.calls_extensions
         && let Some(e) = &expr
         && let Some((a, b)) = equality_key(e, &l, &r)
     {
