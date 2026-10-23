@@ -341,6 +341,43 @@ test('compare mode marks the path edges the earlier state lacks', async ({ page 
       .map(([, c]) => c)
       .sort();
   await expect.poll(marks).toEqual(['', 'added']);
+  // from the empty dataset to commit 2 both edges are added
+  await bar.getByRole('slider', { name: 'Compared from' }).focus();
+  await page.keyboard.press('Home');
+  await expect.poll(marks).toEqual(['added', 'added']);
+  // from the empty dataset to commit 1 only Carol knows Alice is. Neither state holds Alice
+  // knows Bob, which the paths found at commit 2 still draw, so it is not marked
+  await bar.getByRole('slider', { name: 'Compared to' }).focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(bar).toContainText('from commit 0 to commit 1');
+  await expect.poll(marks).toEqual(['', 'added']);
+});
+
+test('compare mode keeps the marks of path edges when the graph changes under them', async ({
+  page,
+}) => {
+  // Alice's neighbourhood draws Alice knows Bob, and the comparison marks it
+  await openAlice(page);
+  await page.getByRole('button', { name: 'Graph history' }).click();
+  const bar = page.getByRole('region', { name: 'Graph history time slider' });
+  await bar.getByRole('slider', { name: /^(Commit|Compared to)$/ }).focus();
+  await page.keyboard.press('c');
+  await page.keyboard.press('Shift+P');
+  await choose(page, 'To', 'Bob', /Bob/);
+  await panel(page).getByRole('button', { name: 'Find paths' }).click();
+  await expect(list(page).getByRole('option').first()).toHaveAccessibleName(
+    'path 1, length 1, Alice knows Bob',
+  );
+  const knows = async () =>
+    (await drawn(page)).edges.filter(([l]) => l.endsWith('knows · 1')).map(([, c]) => c);
+  await expect.poll(knows).toEqual(['added']);
+  // the graph moves to Carol, so the overlay draws Alice knows Bob itself
+  const search = page.getByRole('combobox', { name: /Find a resource/ });
+  await search.fill('Carol');
+  await page.locator('#search-results').getByRole('option', { name: /Carol/ }).first().click();
+  await expect.poll(async () => (await drawn(page)).nodes.map(([l]) => l)).toContain('Acme');
+  await expect(panel(page)).toBeVisible();
+  await expect.poll(knows).toEqual(['added']);
 });
 
 test.describe('on a phone', () => {

@@ -352,7 +352,7 @@
         isType: e.p === RDF_TYPE,
         paths: e.paths,
         order: e.order,
-        change: pathAdded.has(e.id) ? ('added' as const) : undefined,
+        change: pathChange.get(e.id),
       }));
     return [...marked, ...extra];
   });
@@ -372,43 +372,50 @@
   let pathNear = $state(new Map<string, string[]>());
   /** The paths are drawn without the graph, which could not take them. */
   let pathsAlone = $state(false);
-  /** The overlay's own edges that the earlier state of a comparison lacks. */
-  let pathAdded = $state(new Set<string>());
-  // comparing: a path edge that is not drawn is marked as the drawn ones are. A path is
-  // found at the later state, so its edges exist there, and an edge the earlier state
-  // lacks was added.
+  /** The path edges that a comparison marks, by the overlay's edge id. */
+  let pathChange = $state(new Map<string, 'added' | 'removed'>());
+  // comparing: a path edge that is not drawn is marked as the drawn ones are. Every path
+  // edge is checked, whether or not the graph draws it now, since the graph can change
+  // under the paths. An edge is added when it holds at the later state and not at the
+  // earlier one, and removed the other way round. Both are read, because the paths may come
+  // from a third state, and an edge
+  // the check cannot read, such as one with a blank node, is found at neither and stays
+  // unmarked.
   $effect(() => {
     const o = pathOverlay;
     const name = ds;
     const comparing = graphTimeOpen && exCompare && !!(exFrom || exAgainst);
     const against = exAgainst;
     const from = exFrom;
-    if (!o || !name || !comparing) {
-      pathAdded = new Set();
-      return;
-    }
-    const drawn = untrack(() => new Set(Object.keys(edges)));
-    const own = o.edges.filter((e) => !drawn.has(e.id));
-    if (!own.length) {
-      pathAdded = new Set();
+    const later = exAt;
+    if (!o || !name || !comparing || !o.edges.length) {
+      pathChange = new Map();
       return;
     }
     const c = new AbortController();
-    const triples = own.map((e): [Term, Term, Term] => [e.s, { type: 'uri', value: e.p }, e.o]);
-    ex.presentEdges(
-      against ? `${name}@${against}` : name,
-      triples,
-      against ? undefined : from,
-      c.signal,
-    )
-      .then((before) => {
+    const triples = o.edges.map((e): [Term, Term, Term] => [e.s, { type: 'uri', value: e.p }, e.o]);
+    Promise.all([
+      ex.presentEdges(
+        against ? `${name}@${against}` : name,
+        triples,
+        against ? undefined : from,
+        c.signal,
+      ),
+      ex.presentEdges(name, triples, later || undefined, c.signal),
+    ])
+      .then(([before, after]) => {
         if (c.signal.aborted) return;
-        pathAdded = new Set(
-          own.filter((_, i) => !before.has(edgeIdOf(triples[i]))).map((e) => e.id),
-        );
+        const marks = new Map<string, 'added' | 'removed'>();
+        o.edges.forEach((e, i) => {
+          const id = edgeIdOf(triples[i]);
+          if (after.has(id) && !before.has(id)) marks.set(e.id, 'added');
+          else if (before.has(id) && !after.has(id)) marks.set(e.id, 'removed');
+        });
+        pathChange = marks;
       })
       .catch(() => {
         // the marks are a nicety: the paths stand without them
+        if (!c.signal.aborted) pathChange = new Map();
       });
     return () => c.abort();
   });
