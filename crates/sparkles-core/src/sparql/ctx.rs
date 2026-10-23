@@ -2138,6 +2138,31 @@ impl Ctx {
         }
     }
 
+    /// The order of two base-vocabulary simple literals (`xsd:string`) by their lexical
+    /// forms, compared on their vocabulary keys without decoding either term. A simple
+    /// literal's key is `"` lexical 0xFF, and UTF-8 byte order is code point order.
+    /// `None` when either id is another kind of term.
+    pub(super) fn simple_literal_cmp(&self, a: Id, b: Id) -> Option<std::cmp::Ordering> {
+        let v = &self.snap.generation.vocab;
+        let (x, y) = (a.payload(), b.payload());
+        // the literals come before the triple terms and the IRIs
+        if x >= v.first_triple() || y >= v.first_triple() {
+            return None;
+        }
+        let lexical = |k: &[u8]| -> Option<std::ops::Range<usize>> {
+            (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
+        };
+        v.get_with(x, |kx| {
+            let rx = lexical(kx)?;
+            v.get_with(y, |ky| {
+                let ry = lexical(ky)?;
+                Some(kx[rx.clone()].cmp(&ky[ry]))
+            })
+            .flatten()
+        })
+        .flatten()
+    }
+
     pub fn local_len(&self) -> u64 {
         self.local.read().len()
     }
