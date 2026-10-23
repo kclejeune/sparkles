@@ -530,6 +530,9 @@ impl Rng {
 /// A stored triple (subject, predicate, object).
 type T = (usize, usize, usize);
 
+/// The first id of the literal objects of the random graphs.
+const LIT: usize = 100;
+
 /// Every simple path (the last node may be the first) from `s` of at most `max` edges
 /// over `adj` (node → [(next node, triple)]), as (end, triples).
 fn brute(adj: &BTreeMap<usize, Vec<(usize, T)>>, s: usize, max: usize) -> Vec<(usize, Vec<T>)> {
@@ -586,13 +589,24 @@ fn random_graphs(seed: u64, cases: usize, graphs: bool) {
         let m = 2 * n + r.below(2 * n);
         let mut triples: BTreeSet<T> = BTreeSet::new();
         for _ in 0..m {
-            triples.insert((r.below(n), r.below(3), r.below(n)));
+            // a fifth of the objects are the literals 100 to 102, which end paths
+            let o = if r.below(5) == 0 {
+                LIT + r.below(3)
+            } else {
+                r.below(n)
+            };
+            triples.insert((r.below(n), r.below(3), o));
         }
         let s = Store::in_memory(StoreOptions::default());
         let text: String = triples
             .iter()
             .map(|&(a, p, b)| {
-                let t = format!("<http://ex/n{a}> <http://ex/p{p}> <http://ex/n{b}>");
+                let o = if b >= LIT {
+                    format!("\"{b}\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+                } else {
+                    format!("<http://ex/n{b}>")
+                };
+                let t = format!("<http://ex/n{a}> <http://ex/p{p}> {o}");
                 if graphs {
                     let g = r.below(3);
                     let mut q = format!("{t} <http://ex/g{g}> .\n");
@@ -626,7 +640,8 @@ fn random_graphs(seed: u64, cases: usize, graphs: bool) {
                     continue;
                 }
                 let t = (a, p, b);
-                if back || both {
+                // no edge leaves a literal
+                if (back || both) && b < LIT {
                     adj.entry(b).or_default().push((a, t));
                 }
                 if !back && !(both && a == b) {
@@ -700,6 +715,7 @@ fn random_graphs(seed: u64, cases: usize, graphs: bool) {
                 .map(|p| (*walk(src, &p).last().unwrap(), p.len()))
                 .collect();
             let want_reach: BTreeMap<usize, usize> = (0..n)
+                .chain(LIT..LIT + 3)
                 .filter_map(|t| shortest_to(t).map(|l| (t, l)))
                 .collect();
             assert_eq!(reach, want_reach, "{ctx}: shortest to every node");
@@ -786,4 +802,40 @@ fn random_graphs_against_brute_force() {
 #[test]
 fn random_graphs_over_named_graphs_against_brute_force() {
     random_graphs(0x7e57_0a11_b0b5, 12, true);
+}
+
+#[test]
+fn literals_end_paths_and_are_not_passed_through() {
+    let s = store_of("ex:a ex:age 30 . ex:b ex:age 30 . ex:a ex:p ex:b .");
+    let found = |params: &str| paths(&rows(&s, &search(params)), "a");
+    // both ways the two share a literal, but a path does not pass through it
+    assert_eq!(
+        found(
+            "path:source ex:a ; path:target ex:b ; path:direction path:both ; path:algorithm path:all ; path:maxLength 3"
+        ),
+        ["a b".to_string()].into()
+    );
+    // a literal ends a path, forward and both ways
+    for dir in ["path:forward", "path:both"] {
+        assert_eq!(
+            found(&format!(
+                "path:source ex:a ; path:target 30 ; path:direction {dir} ; path:algorithm path:allShortest"
+            )),
+            ["a 30".to_string()].into(),
+            "{dir}"
+        );
+    }
+    // and backward no edge reaches it, since none leaves it in path order
+    assert!(found("path:source ex:a ; path:target 30 ; path:direction path:backward").is_empty());
+    // the sources that reach the literal both ways are the two that state it, not each
+    // other through it
+    let from: BTreeSet<String> = rows(
+        &s,
+        "SELECT ?f WHERE { SERVICE path:search { [] path:source ?f ; path:target 30 ; \
+         path:direction path:both ; path:maxLength 1 } }",
+    )
+    .into_iter()
+    .map(|r| r["f"].clone())
+    .collect();
+    assert_eq!(from, ["a".to_string(), "b".to_string()].into());
 }

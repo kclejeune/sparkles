@@ -1218,6 +1218,9 @@ struct Engine<'a> {
     skipped_hubs: Cell<u64>,
     /// how a node's degree is counted in this call's view
     degree: DegreeCount,
+    /// some lane follows triples from their object, so a literal could be left by an
+    /// edge, which F07 §4.1 forbids: literals are then checked before they are expanded
+    sinks: bool,
 }
 
 /// How `path:maxDegree` counts a node's degree.
@@ -1299,6 +1302,7 @@ impl<'a> Engine<'a> {
             (Some(t), Some(vars)) => PatternEdges::of(t, vars),
             _ => PatternEdges::default(),
         };
+        let sinks = succ.iter().chain(&pred).any(|s: &Side| s.rev);
         let degree = match spec.max_degree {
             None => DegreeCount::Scan,
             Some(_) => degree_count(ctx, &spec.graph)?,
@@ -1322,16 +1326,26 @@ impl<'a> Engine<'a> {
             roots: Default::default(),
             skipped_hubs: Cell::new(0),
             degree,
+            sinks,
         })
     }
 
     /// The roots of the search that starts: they are expanded even when they are hubs.
     fn set_roots(&self, roots: &[u64]) {
-        if self.spec.max_degree.is_some() {
+        if self.spec.max_degree.is_some() || self.sinks {
             let mut r = self.roots.borrow_mut();
             r.clear();
             r.extend_from_slice(roots);
         }
+    }
+
+    /// Whether `x` is a literal that the search may not expand: no edge leaves a literal,
+    /// so it is never expanded to its successors, and to its predecessors only as the
+    /// root of a search, the end of the paths.
+    fn sink(&self, x: u64, succ: bool) -> bool {
+        self.sinks
+            && self.ctx.snap.term_kind(Id(x)) == crate::store::TermKind::Literal
+            && (succ || !self.roots.borrow().contains(&x))
     }
 
     /// Whether the search may not expand `x`: `path:maxDegree` is set, `x` is not a
@@ -1490,14 +1504,21 @@ impl<'a> Engine<'a> {
     /// (node, neighbour) pairs: its successors on a path when `succ`, else its
     /// predecessors.
     fn expand(&self, frontier: &[u64], succ: bool, out: &mut Vec<(u64, Step)>) -> Result<()> {
-        if self.spec.max_degree.is_none() {
+        if self.spec.max_degree.is_none() && !self.sinks {
             return self.expand_all(frontier, succ, out);
         }
-        // a hub is not expanded, unless it is a root of the search
+        // a literal is not left, and a hub is not expanded unless it is a root
         let mut kept: Option<Vec<u64>> = None;
         for (i, &x) in frontier.iter().enumerate() {
-            if self.blocked(x)? {
+            let skip = if self.sink(x, succ) {
+                true
+            } else if self.blocked(x)? {
                 self.skipped_hubs.set(self.skipped_hubs.get() + 1);
+                true
+            } else {
+                false
+            };
+            if skip {
                 kept.get_or_insert_with(|| frontier[..i].to_vec());
             } else if let Some(k) = &mut kept {
                 k.push(x);
@@ -1514,6 +1535,7 @@ impl<'a> Engine<'a> {
         if frontier.is_empty() {
             return Ok(());
         }
+        let start = out.len();
         let sides = if succ { &self.succ } else { &self.pred };
         for s in sides {
             // with both directions a self-loop is one edge, read from the first side
@@ -1522,6 +1544,16 @@ impl<'a> Engine<'a> {
             } else {
                 self.scan_lane(&s.lane, frontier, s.rev, s.skip_self, out, usize::MAX)?;
             }
+        }
+        // a predecessor's edge leaves it, so a literal is never one
+        if self.sinks && !succ {
+            let snap = &self.ctx.snap;
+            let tail = out.split_off(start);
+            out.extend(
+                tail.into_iter().filter(|(_, st)| {
+                    snap.term_kind(Id(st.node)) != crate::store::TermKind::Literal
+                }),
+            );
         }
         self.ctx.check()
     }
@@ -1665,6 +1697,9 @@ impl<'a> Engine<'a> {
     fn neighbours(&self, x: u64, succ: bool) -> Result<Rc<[Step]>> {
         // a hub has no neighbours for this search, but it may be another search's root,
         // so the cache keeps the neighbours a root would have
+        if self.sink(x, succ) {
+            return Ok(Rc::from(Vec::new()));
+        }
         if self.blocked(x)? {
             self.skipped_hubs.set(self.skipped_hubs.get() + 1);
             return Ok(Rc::from(Vec::new()));
@@ -1898,11 +1933,12 @@ impl<'a> Engine<'a> {
                 (&bf, &f)
             };
             let mut meet: Vec<u64> = new.iter().copied().filter(|y| other.contains(*y)).collect();
-            // a path may not pass through a hub, and neither side expanded one
-            if self.spec.max_degree.is_some() {
+            // a path may not pass through a hub or a literal, and neither side expanded
+            // one
+            if self.spec.max_degree.is_some() || self.sinks {
                 let mut kept = Vec::with_capacity(meet.len());
                 for m in meet {
-                    if m == s || m == tt || !self.blocked(m)? {
+                    if m == s || m == tt || !(self.sink(m, true) || self.blocked(m)?) {
                         kept.push(m);
                     }
                 }
