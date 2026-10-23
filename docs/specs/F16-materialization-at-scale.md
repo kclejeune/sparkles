@@ -1408,11 +1408,12 @@ closure that held the explicit facts. `0188dc48`, the second pass without the me
 counter, took 1.22 times for the OWL 2 RL change and 1.28 times for its undo in the same six
 rounds. Each build had single slow runs, such as 27 ms for the RDFS undo and 75 ms for the
 OWL 2 RL undo of the second pass, so the medians decide. The kept closure is unchanged. A
-run holds more transient buffers, each charged to its budget: the deduplicated candidates
-and their answers in `write_changes`, the candidates of a merge sorted by the probe they
-need with the list of their predicate-object pairs, and a memo of at most eight blocks per
-search while its chunk runs. They grow with the run's candidates, and the peak heap of a
-change of 1,000 triples still fell. Full runs of `0188dc48` measured 1.5% slower for RDFS and 2.5% for OWL 2 RL
+run holds more transient buffers, charged to its budget, that grow with its candidates: the
+deduplicated candidates and their answers in `write_changes`, and the candidates of a merge
+sorted by the probe they need with the list of their predicate-object pairs. Each search
+also keeps a memo of at most eight decoded blocks while its chunk runs. Those blocks come
+from the store's block cache, which the budget does not count, so `max_memory` does not
+bound them. The peak heap of a change of 1,000 triples still fell. Full runs of `0188dc48` measured 1.5% slower for RDFS and 2.5% for OWL 2 RL
 than the first pass in the batch that ran both, close to the spread between batches, and
 they stay faster than before the follow-up.
 
