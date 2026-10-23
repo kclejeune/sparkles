@@ -40,6 +40,7 @@
     onexpand,
     emptyText = 'Nothing to draw',
     animate = false,
+    highlight = null,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -47,6 +48,11 @@
     onselect?: (id: string | null) => void;
     onexpand?: (id: string) => void;
     emptyText?: string;
+    /**
+     * The shared selection (docs/specs/U11-linked-views.md): when it is not empty, the
+     * nodes outside it and the edges that do not join two of its nodes are dimmed.
+     */
+    highlight?: ReadonlySet<string> | null;
     /**
      * Fade added elements in and removed ones out, and keep the nodes that stay where they
      * are (the time slider). Off with `prefers-reduced-motion`, then changes appear at once.
@@ -221,6 +227,7 @@
         },
       },
       { selector: '.faded', style: { opacity: 0.25 } },
+      { selector: '.muted', style: { opacity: 0.22 } },
     ];
   }
 
@@ -475,6 +482,28 @@
       const n = cy.getElementById(id);
       if (n.nonempty()) n.select();
     }
+  });
+
+  // the shared selection dims what it does not hold
+  $effect(() => {
+    const keep = highlight;
+    void nodes;
+    void edges;
+    if (!cy) return;
+    cy.batch(() => {
+      cy!.elements().removeClass('muted');
+      if (!keep || !keep.size) return;
+      cy!
+        .nodes()
+        .filter((n) => !keep.has(n.id()))
+        .addClass('muted');
+      cy!
+        .edges()
+        .filter((e) => !(keep.has(e.source().id()) && keep.has(e.target().id())))
+        .addClass('muted');
+    });
+    // for the tests: the canvas has no elements to find
+    if (wrap) wrap.dataset.muted = String(cy.elements('.muted').length);
   });
 
   export function fit() {

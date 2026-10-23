@@ -7,7 +7,9 @@
   import { abbreviate, geoCells, isGeoLiteral, resolveGeometries, type Resolved } from '$lib/geo';
   import type { PrefixMap } from '$lib/rdf';
   import type { Mark } from '$lib/rowdiff';
+  import { defaultArcColumns } from '$lib/result-arcs';
   import MapView, { type MapFeature } from './MapView.svelte';
+  import ResultArcs from './ResultArcs.svelte';
   import TermView from './TermView.svelte';
 
   let {
@@ -17,6 +19,10 @@
     prefixes,
     onopen,
     marks,
+    ds = '',
+    at = '',
+    baseDs,
+    baseAt = '',
   }: {
     vars: string[];
     rows: (api.Term | null)[][];
@@ -26,7 +32,22 @@
     onopen?: (iri: string) => void;
     /** In compare mode, the change of each row: added rows draw bold, removed ones faded. */
     marks?: readonly Mark[];
+    /** The dataset and branch the result came from (`ds@branch`), for the entities' positions. */
+    ds?: string;
+    /** The past state the result was read at (`commit:42`), empty for the head. */
+    at?: string;
+    /** In compare mode, where the left side was read, for the entities of removed rows. */
+    baseDs?: string;
+    baseAt?: string;
   } = $props();
+
+  // Arcs need two columns of geometries or of entities; a result with no geometry column
+  // is drawn as arcs only
+  const arcsAvailable = $derived(!!ds && defaultArcColumns(vars, rows) !== null);
+  let chosen = $state<'points' | 'arcs' | null>(null);
+  const mode = $derived(
+    !arcsAvailable ? 'points' : columns.length === 0 ? 'arcs' : (chosen ?? 'points'),
+  );
 
   const changeOf = (row: number) => {
     const m = marks?.[row];
@@ -48,7 +69,7 @@
   let listShown = $state(100);
 
   $effect(() => {
-    const todo = drawnCells;
+    const todo = mode === 'points' ? drawnCells : [];
     const ctl = new AbortController();
     resolved = null;
     selected = null;
@@ -111,89 +132,132 @@
   </div>
 {/snippet}
 
-<div class="result-map">
-  <div class="opts">
-    {#if columns.length > 1}
-      <span class="faint">Columns</span>
-      {#each columns as c (c)}
-        <label class="check">
-          <input type="checkbox" bind:group={shownColumns} value={c} />
-          <span class="mono">?{c}</span>
-        </label>
-      {/each}
-    {/if}
-    <span class="spacer"></span>
-    <span class="faint">
-      {#if !resolved}
-        <span class="spinner"></span> Reading {fmtInt(drawnCells.length)} geometries…
-      {:else}
-        {fmtInt(features.length)} drawn{undrawn.length
-          ? `, ${fmtInt(undrawn.length)} not drawn`
-          : ''}
-        {#if cells.length > MAX_DRAWN}
-          (the first {fmtInt(MAX_DRAWN)} of {fmtInt(cells.length)})
-        {/if}
-      {/if}
-    </span>
-  </div>
-  <div class="body">
-    <MapView
-      {features}
-      {selected}
-      onselect={(g) => (selected = g)}
-      popup={rowPopup}
-      height="100%"
-      label="Result map"
-    />
-    <div class="rows" aria-label="Rows on the map">
-      {#each drawnRows.slice(0, listShown) as row (row)}
-        {@const label =
-          others(row).find(([, t]) => t?.type === 'literal') ?? others(row).find(([, t]) => t)}
-        <button
-          class="row-item"
-          class:sel={selected === row}
-          aria-pressed={selected === row}
-          onclick={() => (selected = selected === row ? null : row)}
-        >
-          <span class="n faint">{row + 1}</span>
-          {#if changeOf(row) === 'added'}
-            <span class="plus" title="Added" aria-label="added">+</span>
-          {:else if changeOf(row) === 'removed'}
-            <span class="minus" title="Removed" aria-label="removed">−</span>
-          {/if}
-          <span class="mono label"
-            >{#if label}<TermView term={label[1]} {prefixes} />{:else}row {row + 1}{/if}</span
+{#if mode === 'arcs'}
+  <div class="result-map arcs-mode">
+    {#if columns.length > 0}
+      <div class="opts">
+        <div class="seg" role="group" aria-label="Draw the result as">
+          <button class="btn sm" aria-pressed="false" onclick={() => (chosen = 'points')}
+            >Points</button
           >
-        </button>
-      {/each}
-      {#if drawnRows.length > listShown}
-        <button class="btn ghost sm" onclick={() => (listShown += 200)}
-          >Show more ({fmtInt(drawnRows.length - listShown)} hidden)</button
-        >
-      {/if}
-    </div>
+          <button class="btn sm" aria-pressed="true">Arcs</button>
+        </div>
+      </div>
+    {/if}
+    <ResultArcs {vars} {rows} {prefixes} {ds} {at} {baseDs} {baseAt} {marks} {onopen} />
   </div>
-  {#if undrawn.length}
-    <details class="undrawn" open={undrawn.length <= 5}>
-      <summary>
-        {fmtInt(undrawn.length)} literal{undrawn.length === 1 ? '' : 's'} could not be drawn
-      </summary>
-      <ul>
-        {#each undrawn.slice(0, 200) as u, i (i)}
-          <li>
-            <span class="faint">row {u.cell.row + 1}, ?{u.cell.column}:</span>
-            <span class="mono t-lit" title={u.cell.literal.value}
-              >{abbreviate(u.cell.literal.value)}</span
-            >
-            <span class="why">{u.error}</span>
-          </li>
+{:else}
+  <div class="result-map">
+    <div class="opts">
+      {#if arcsAvailable}
+        <div class="seg" role="group" aria-label="Draw the result as">
+          <button class="btn sm" aria-pressed="true">Points</button>
+          <button class="btn sm" aria-pressed="false" onclick={() => (chosen = 'arcs')}>Arcs</button
+          >
+        </div>
+      {/if}
+      {#if columns.length > 1}
+        <span class="faint">Columns</span>
+        {#each columns as c (c)}
+          <label class="check">
+            <input type="checkbox" bind:group={shownColumns} value={c} />
+            <span class="mono">?{c}</span>
+          </label>
         {/each}
-      </ul>
-    </details>
-  {/if}
-</div>
+      {/if}
+      <span class="spacer"></span>
+      <span class="faint">
+        {#if !resolved}
+          <span class="spinner"></span> Reading {fmtInt(drawnCells.length)} geometries…
+        {:else}
+          {fmtInt(features.length)} drawn{undrawn.length
+            ? `, ${fmtInt(undrawn.length)} not drawn`
+            : ''}
+          {#if cells.length > MAX_DRAWN}
+            (the first {fmtInt(MAX_DRAWN)} of {fmtInt(cells.length)})
+          {/if}
+        {/if}
+      </span>
+    </div>
+    <div class="body">
+      <MapView
+        {features}
+        {selected}
+        onselect={(g) => (selected = g)}
+        popup={rowPopup}
+        height="100%"
+        label="Result map"
+      />
+      <div class="rows" aria-label="Rows on the map">
+        {#each drawnRows.slice(0, listShown) as row (row)}
+          {@const label =
+            others(row).find(([, t]) => t?.type === 'literal') ?? others(row).find(([, t]) => t)}
+          <button
+            class="row-item"
+            class:sel={selected === row}
+            aria-pressed={selected === row}
+            onclick={() => (selected = selected === row ? null : row)}
+          >
+            <span class="n faint">{row + 1}</span>
+            {#if changeOf(row) === 'added'}
+              <span class="plus" title="Added" aria-label="added">+</span>
+            {:else if changeOf(row) === 'removed'}
+              <span class="minus" title="Removed" aria-label="removed">−</span>
+            {/if}
+            <span class="mono label"
+              >{#if label}<TermView term={label[1]} {prefixes} />{:else}row {row + 1}{/if}</span
+            >
+          </button>
+        {/each}
+        {#if drawnRows.length > listShown}
+          <button class="btn ghost sm" onclick={() => (listShown += 200)}
+            >Show more ({fmtInt(drawnRows.length - listShown)} hidden)</button
+          >
+        {/if}
+      </div>
+    </div>
+    {#if undrawn.length}
+      <details class="undrawn" open={undrawn.length <= 5}>
+        <summary>
+          {fmtInt(undrawn.length)} literal{undrawn.length === 1 ? '' : 's'} could not be drawn
+        </summary>
+        <ul>
+          {#each undrawn.slice(0, 200) as u, i (i)}
+            <li>
+              <span class="faint">row {u.cell.row + 1}, ?{u.cell.column}:</span>
+              <span class="mono t-lit" title={u.cell.literal.value}
+                >{abbreviate(u.cell.literal.value)}</span
+              >
+              <span class="why">{u.error}</span>
+            </li>
+          {/each}
+        </ul>
+      </details>
+    {/if}
+  </div>
+{/if}
 
 <style>
+  .arcs-mode {
+    display: flex;
+    flex-direction: column;
+  }
+  .arcs-mode > :last-child {
+    flex: 1;
+    min-height: 0;
+  }
+  .seg {
+    display: inline-flex;
+  }
+  .seg .btn:first-child {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .seg .btn:last-child {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    margin-left: -1px;
+  }
   .result-map {
     display: grid;
     grid-template-rows: auto minmax(0, 1fr) auto;
@@ -311,6 +375,11 @@
     .body {
       grid-template-columns: 1fr;
       grid-template-rows: 320px 160px;
+    }
+    /* taps need 44 px targets: the switch between points and arcs */
+    .seg .btn {
+      min-height: 44px;
+      min-width: 44px;
     }
   }
 </style>

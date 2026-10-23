@@ -449,6 +449,87 @@ export function bounds(geoms: GeoJsonGeometry[]): [number, number, number, numbe
   return w <= e ? [w, s, e, n] : null;
 }
 
+/**
+ * The point that stands for a geometry on a map of relations: a point itself, otherwise
+ * the centroid of its polygons (weighted by area), else of its lines (weighted by
+ * length), else the mean of its points. A shape with no extent falls back to the centre
+ * of its box; null when there is no position.
+ */
+export function representativePoint(g: GeoJsonGeometry): [number, number] | null {
+  type Part = { x: number; y: number; w: number };
+  const polys: Part[] = [];
+  const lines: Part[] = [];
+  const pts: Part[] = [];
+  const ring = (r: number[][]): Part => {
+    // the shoelace formula; the signed area keeps holes (opposite winding) subtracting
+    let a = 0;
+    let cx = 0;
+    let cy = 0;
+    for (let i = 0; i + 1 < r.length; i++) {
+      const k = r[i][0] * r[i + 1][1] - r[i + 1][0] * r[i][1];
+      a += k;
+      cx += (r[i][0] + r[i + 1][0]) * k;
+      cy += (r[i][1] + r[i + 1][1]) * k;
+    }
+    return a === 0 ? { x: 0, y: 0, w: 0 } : { x: cx / (3 * a), y: cy / (3 * a), w: a / 2 };
+  };
+  const polygon = (rings: number[][][]) => {
+    let w = 0;
+    let x = 0;
+    let y = 0;
+    rings.forEach((r, i) => {
+      const p = ring(r);
+      // the outer ring counts for its area, a hole against it
+      const area = i === 0 ? Math.abs(p.w) : -Math.abs(p.w);
+      w += area;
+      x += p.x * area;
+      y += p.y * area;
+    });
+    if (w > 0) polys.push({ x: x / w, y: y / w, w });
+  };
+  const line = (cs: number[][]) => {
+    let len = 0;
+    let x = 0;
+    let y = 0;
+    for (let i = 0; i + 1 < cs.length; i++) {
+      const d = Math.hypot(cs[i + 1][0] - cs[i][0], cs[i + 1][1] - cs[i][1]);
+      len += d;
+      x += ((cs[i][0] + cs[i + 1][0]) / 2) * d;
+      y += ((cs[i][1] + cs[i + 1][1]) / 2) * d;
+    }
+    if (len > 0) lines.push({ x: x / len, y: y / len, w: len });
+  };
+  const walk = (geom: GeoJsonGeometry) => {
+    const c = geom.coordinates as never;
+    switch (geom.type) {
+      case 'Point':
+        return void pts.push({ x: (c as number[])[0], y: (c as number[])[1], w: 1 });
+      case 'MultiPoint':
+        return void (c as number[][]).forEach((p) => pts.push({ x: p[0], y: p[1], w: 1 }));
+      case 'LineString':
+        return line(c as number[][]);
+      case 'MultiLineString':
+        return void (c as number[][][]).forEach(line);
+      case 'Polygon':
+        return polygon(c as number[][][]);
+      case 'MultiPolygon':
+        return void (c as number[][][][]).forEach(polygon);
+      case 'GeometryCollection':
+        return void (geom.geometries ?? []).forEach(walk);
+    }
+  };
+  walk(g);
+  const set = polys.length ? polys : lines.length ? lines : pts;
+  if (set.length) {
+    const w = set.reduce((s, p) => s + p.w, 0);
+    const x = set.reduce((s, p) => s + p.x * p.w, 0) / w;
+    const y = set.reduce((s, p) => s + p.y * p.w, 0) / w;
+    if (isFinite(x) && isFinite(y)) return [x, y];
+  }
+  const b = bounds([g]);
+  return b ? [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] : null;
+}
+
 /** A short text of a geometry literal (the start of its lexical form). */
 export function abbreviate(value: string, max = 60): string {
   const s = value.replace(/\s+/g, ' ').trim();
@@ -474,6 +555,29 @@ export function geometryQuery(iri: string, limit = 20): string {
     BIND(STRDT(CONCAT("POINT(", STR(?long), " ", STR(?lat), ")"), <${WKT_LITERAL}>) AS ?lit) }
 }
 LIMIT ${limit}`;
+}
+
+/** Most entities one batched geometry lookup names. */
+export const LOCATE_BATCH = 200;
+
+/**
+ * The geometry literals of several resources in one query, by the routes of
+ * `geometryQuery` (the resource's own literal, a feature's geometry, Basic Geo latitude
+ * and longitude). Variables: `?s` (the resource), `?lit`. The limit leaves room for a few
+ * literals per resource.
+ */
+export function geometriesQuery(iris: string[]): string {
+  const isGeo = `FILTER(isLiteral(?lit) && DATATYPE(?lit) IN (${GEO_LITERALS.map((d) => `<${d}>`).join(', ')}))`;
+  return `SELECT ?s ?lit WHERE {
+  VALUES ?s { ${iris.map(sparqlIri).join(' ')} }
+  { ?s ?p ?lit . ${isGeo} }
+  UNION
+  { ?s <${GEO}hasDefaultGeometry>|<${GEO}hasGeometry> ?geom . ?geom ?p ?lit . ${isGeo} }
+  UNION
+  { ?s <${WGS84_POS}lat> ?lat ; <${WGS84_POS}long> ?long .
+    BIND(STRDT(CONCAT("POINT(", STR(?long), " ", STR(?lat), ")"), <${WKT_LITERAL}>) AS ?lit) }
+}
+LIMIT ${Math.max(1, iris.length) * 6}`;
 }
 
 /** A geometry literal as a SPARQL constant. */
