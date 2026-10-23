@@ -1431,7 +1431,8 @@ pub(crate) async fn run_query(
     // timeout, and a slow run sends the text's later runs to the blocking pool.
     let first_run = history == inline::History::Unseen
         && timeout.is_some()
-        && inline::first_run_in_place(&query);
+        && inline::first_run_in_place(&query)
+        && crate::alloc::idle_besides_this(inline::FIRST_RUN_QUIET);
     let in_place = quick.is_some() || first_run;
     if first_run {
         // Until a run of the text ends quick and whole, it counts as slow, so a first run

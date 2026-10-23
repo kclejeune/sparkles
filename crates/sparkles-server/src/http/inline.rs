@@ -114,6 +114,15 @@ pub enum History {
     Slow,
 }
 
+/// How long the server must have been without requests for the first run of a text it
+/// has not seen to run in place. A run under steady load stays on the blocking pool,
+/// whose threads are then awake.
+#[cfg(not(test))]
+pub const FIRST_RUN_QUIET: std::time::Duration = std::time::Duration::from_millis(10);
+/// Tests send requests back to back.
+#[cfg(test)]
+pub const FIRST_RUN_QUIET: std::time::Duration = std::time::Duration::ZERO;
+
 /// Whether the first run of `query`, a text the server has not seen, may run in place
 /// under a timeout. A SERVICE call may wait on another server or run a graph algorithm,
 /// whose work does not always check the deadline, so a text that may contain one,

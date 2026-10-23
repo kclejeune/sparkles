@@ -31,6 +31,14 @@ fn now_ms() -> u64 {
     epoch().elapsed().as_millis() as u64
 }
 
+/// Whether the request calling this is the only one in flight and no other request has
+/// ended for `quiet`: the server's threads have been idle, so a wake-up of another
+/// thread would be slow.
+pub fn idle_besides_this(quiet: Duration) -> bool {
+    ACTIVE.load(Ordering::SeqCst) <= 1
+        && now_ms().saturating_sub(LAST_END_MS.load(Ordering::SeqCst)) >= quiet.as_millis() as u64
+}
+
 /// Middleware counting in-flight requests.
 pub async fn track(
     req: axum::extract::Request,
