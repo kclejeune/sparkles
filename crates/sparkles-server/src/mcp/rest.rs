@@ -315,6 +315,7 @@ async fn run(
         principal: p,
         headers: Some(headers),
         held: None,
+        grant: crate::server_memory::current_grant(),
     };
     let server = McpServer::new(st.clone(), config(&st, mode));
     let out = if mode == Mode::Internal {

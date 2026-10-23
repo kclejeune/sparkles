@@ -612,6 +612,7 @@ fn demo_set_gold_queries() {
             principal: Principal::local(),
             headers: None,
             held: None,
+            grant: None,
         };
         let mut a = Map::new();
         a.insert("query".into(), gold.into());

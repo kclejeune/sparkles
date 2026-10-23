@@ -793,9 +793,10 @@ the text:
 
 * **Admission** is an axum layer inside the rate limiter, as §4.2 says, and passes the
   grant to handlers through a task-local that `query_options` reads. A request is a query
-  or an update by the rate limiter's classes. Other requests are not admitted. A query
-  they run, MCP tool calls included, starts with an empty grant from its dataset's pool,
-  does not queue and fails with `server-memory` when the pool is short.
+  or an update by the rate limiter's classes, and an MCP tool call or resource read is
+  admitted the same way, as the grant routing section below describes. Other requests are
+  not admitted. A query they run starts with an empty grant from its dataset's pool, does
+  not queue and fails with `server-memory` when the pool is short.
 * **The initial grant** is 16 MiB, the server's `--query-memory-mb` if that is lower, and
   never more than the pool. It does not follow a request's own `memory-mb`, because the
   parameters are read after admission. The effect is that a request that lowers its budget
@@ -1022,8 +1023,9 @@ latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
   could collect on the tokio workers as well, or the caches could charge the sizes that
   mimalloc reports. The item also covers the 3% of extra instructions on queries of a few
   microseconds from 899fb251 to 4d174d02, which profiles did not trace to one cause.
-* **X08-P1-grant-routing.** Admit MCP tool calls and the other requests that never queue,
-  and route the admitted grant into every route that counts as a query.
+* **X08-P1-grant-routing.** Done on 2026-10-23, as the grant routing section below
+  describes. SHACL validation, reasoning, ShEx validation other than its selectors, and the
+  schema, statistics and lint reads still run outside the admitted grant.
 * **X08-P1-nested-service.** Recognise a SERVICE call to the same server, without a header
   that a client could forge, so that it does not wait behind its caller's grant. Today it
   answers `503` after the admission wait, and `SILENT` turns that into empty results.
@@ -1048,6 +1050,33 @@ latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
+
+### Grant routing (2026-10-23)
+
+MCP tool calls and resource reads were not admitted, so their queries took an empty grant
+from the dataset's pool and failed with `server-memory` instead of waiting when the pool
+was short. Several routes that were admitted also lost their grant before their query ran,
+because the task-local that carries it does not reach a blocking thread, and their
+queries then took a second grant from the dataset's pool or none at all.
+
+The MCP endpoint now takes an initial grant for every request that the rate limiter
+charges as a tool call or resource read, inside the limiter's caps, and waits for it in
+arrival order up to `--query-admission-wait` as the HTTP query routes do. rmcp runs the
+tool on a task of its own, so the grant travels as a request extension, and the tool's
+queries charge it through `query_options`. The memory tools that run queries for a call
+pass the call's grant on. `sparkles ask` captures the grant on the request task and hands
+it to the queries of every tool call it makes. The Graph Store DELETE, the templates of a
+tabular upload, the GraphQL draft, reasoner diagnostics, `/explain`, the MCP REST routes,
+the review routes, the ingest pipeline and the selector queries of ShEx validation also
+capture the grant before they move to a blocking thread. Without the capture, the GraphQL
+draft and reasoner diagnostics queries were not accounted at all.
+
+`mcp_calls_wait_for_the_memory_pool` holds 56 MiB of a 64 MiB pool and checks that a
+`tools/call` answers `503` with `Retry-After: 1` after the admission wait, that it
+succeeds once the memory returns, and that no grant remains afterwards. SHACL validation,
+reasoning, the rest of ShEx validation and the schema, statistics, format, lint, patch and
+diff routes still run their queries outside the admitted grant, so they hold it idle and
+take a second one from the dataset's pool.
 
 ### Retained eager results (2026-10-23)
 

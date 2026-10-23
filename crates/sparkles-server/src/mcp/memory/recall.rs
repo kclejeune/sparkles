@@ -999,6 +999,7 @@ impl Tools<'_> {
             principal: self.call.principal.clone().on_branch(None),
             headers: None,
             held: None,
+            grant: self.call.grant.clone(),
         };
         let t = Tools {
             server: self.server,

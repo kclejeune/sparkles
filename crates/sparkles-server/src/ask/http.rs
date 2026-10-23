@@ -257,6 +257,8 @@ async fn ask_route(
         full_results: true,
         cancel: Some(cancel.clone()),
         pairs: Vec::new(),
+        // read on the request's task: the pipeline runs on a blocking thread
+        grant: crate::server_memory::current_grant(),
     };
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
     let finish = {

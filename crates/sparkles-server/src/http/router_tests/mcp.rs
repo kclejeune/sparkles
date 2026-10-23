@@ -1883,3 +1883,44 @@ mod auth {
         );
     }
 }
+
+/// X08-P1-grant-routing: a tool call waits for the query memory pool in arrival order,
+/// as a query request does, answers `503` with `Retry-After` when the wait passes, and
+/// runs with the grant it was admitted with once memory frees.
+#[tokio::test]
+async fn mcp_calls_wait_for_the_memory_pool() {
+    const MIB: u64 = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(64 * MIB),
+    )
+    .unwrap();
+    st.admission.wait = Duration::from_millis(200);
+    st.mcp = Some(conf(&st, &[]));
+    let state = Arc::new(st);
+    load(&state, "t", FIXTURE);
+    let app = router(state.clone());
+    let pool = state.catalog.pool().unwrap().clone();
+    // other queries hold 56 of the 64 MiB, so the 16 MiB a call starts with is short
+    let held = pool.try_grant(56 * MIB).unwrap();
+    let args =
+        json!({"name": "sparql_query", "arguments": {"query": "SELECT * WHERE { ?s ?p ?o }"}});
+    let started = std::time::Instant::now();
+    let r = modern(&app, "tools/call", args.clone(), &[]).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.body);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert_eq!(r.header("retry-after"), "1");
+    assert_eq!(pool.stats().rejected, 1);
+    assert_eq!(pool.waiting(), 0);
+    drop(held);
+    let result = tool(&app, "sparql_query", args["arguments"].clone(), &[]).await;
+    assert!(result.get("isError").is_none_or(|e| e == false), "{result}");
+    assert_eq!(
+        pool.granted(),
+        0,
+        "the call's grant went back with the call"
+    );
+}

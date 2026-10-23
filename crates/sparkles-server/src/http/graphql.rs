@@ -615,6 +615,8 @@ pub(super) async fn draft_schema(
         timeout: super::timeout_param(&st, &params),
         view: p.view(&ds.name, Endpoint::Info),
         max_entries: st.schema_max_entries,
+        // the admitted grant, read on the request's task before the blocking thread
+        grant: crate::server_memory::current_grant(),
     };
     blocking(move || {
         let (d, commit) = ds.dataset.graphql().draft(&ds.name, req)?;

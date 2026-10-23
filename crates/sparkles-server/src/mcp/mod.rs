@@ -291,6 +291,10 @@ pub struct Call {
     /// work ends
     #[allow(dead_code)]
     pub held: Option<http::HeldShare>,
+    /// the query memory grant the HTTP request was admitted with, which the call's
+    /// queries charge; `None` on stdio and without a pool, where a query takes its own
+    /// grant from its dataset's pool
+    pub grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
 }
 
 impl McpServer {

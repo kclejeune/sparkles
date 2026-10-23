@@ -331,9 +331,8 @@ that work by priority and links each item to its design spec.
   at most 256 levels. [Roadmap](ROADMAP.md) item 84.
 * **Query memory pool.** A SERVICE call from a query to the same server is admitted like
   any request, so it waits behind its caller's grant and answers `503` after the
-  admission wait, which `SILENT` turns into no rows. MCP tool calls are not admitted, so
-  their queries fail with `server-memory` instead of waiting when the pool is short.
-  Routes such as GraphQL, SHACL, ShEx, diff and the `/$/stats`, `/$/schema` and
+  admission wait, which `SILENT` turns into no rows. Routes such as SHACL, ShEx
+  validation outside its selectors, diff and the `/$/stats`, `/$/schema` and
   `/$/validate` reads hold their admitted grant idle while their own query takes a
   second one. A query or update takes its initial grant before the server reads its
   body, so a slow client holds pool memory while it sends. With a pool set, an eager

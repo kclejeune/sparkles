@@ -141,6 +141,10 @@ pub struct AskOptions {
     pub full_results: bool,
     /// set when the client went away: the pipeline stops at its next step
     pub cancel: Option<Arc<AtomicBool>>,
+    /// the query memory grant the HTTP request was admitted with, which the ask's tool
+    /// queries charge. The pipeline runs on a blocking thread, where the request's
+    /// task-local grant does not reach, so the route captures it here.
+    pub grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
 }
 
 impl Default for AskOptions {
@@ -168,6 +172,7 @@ impl Default for AskOptions {
             reasoning: None,
             full_results: false,
             cancel: None,
+            grant: None,
         }
     }
 }
@@ -467,6 +472,7 @@ impl Asking<'_, '_> {
             principal: self.principal.clone(),
             headers: None,
             held: None,
+            grant: self.o.grant.clone(),
         };
         Ok((m, call))
     }

@@ -386,6 +386,8 @@ fn count(
         principal: Principal::local(),
         headers: None,
         held: None,
+        // a server-side count outside any request
+        grant: None,
     };
     let t = Tools {
         server: &server,

@@ -7915,9 +7915,10 @@ caches.
                   "serviceBytes": 0, "serviceEntries": 0 } ] }
 ```
 
-Requests that are not queries or updates, such as administration, are not admitted. A
-query that such a request or an MCP tool call runs starts with an empty grant and grows it
-like any other. It does not queue, and it fails with `server-memory` when the pool is
+An MCP tool call or resource read is admitted like a query, waits for its grant in the
+same order and answers `503` with `Retry-After` when the wait passes. Requests that are
+not queries or updates, such as administration, are not admitted. A query that such a
+request runs starts with an empty grant and grows it like any other. It does not queue, and it fails with `server-memory` when the pool is
 short.
 
 #### Disk spill

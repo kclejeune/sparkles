@@ -14,6 +14,12 @@ pool instead of its query's peak, so a held result or a Python or Node result ob
 longer reserves the memory of the tables it was built from. CONSTRUCT and
 DESCRIBE results keep their peak as before.
 
+MCP tool calls and resource reads now wait for the query memory pool like other queries
+and answer `503` with `Retry-After` when the admission wait passes, where they used to fail
+with `server-memory`. The queries of `sparkles ask`, the GraphQL draft, reasoner
+diagnostics, the Graph Store DELETE and tabular uploads now charge the grant their request
+was admitted with instead of taking a second one or none.
+
 In the JVM library, `abort()` or a timeout that raced the end of a query could throw
 `IllegalStateException` because the query's native object had just been released. Such a
 cancel is now ignored, since the query has already finished.

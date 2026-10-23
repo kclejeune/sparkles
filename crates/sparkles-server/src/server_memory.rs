@@ -227,8 +227,20 @@ pub fn initial_grant(st: &AppState, pool: &sparkles::sparql::pool::QueryPool) ->
 /// up to `--query-admission-wait`, as [`admit`] does for the requests it classifies.
 /// The algorithm route selects its class from its body, so it calls this itself.
 pub async fn granted(st: &AppState, req: Request, next: Next) -> Response {
+    match acquire(st).await {
+        Ok(Some(grant)) => GRANT.scope(Arc::new(grant), next.run(req)).await,
+        Ok(None) => next.run(req).await,
+        Err(rejected) => rejected,
+    }
+}
+
+/// An initial grant of the query memory pool, waiting in arrival order up to
+/// `--query-admission-wait`. `None` without a pool, and the `503` response with
+/// `Retry-After` when the wait passes. MCP calls, which name their class in their body,
+/// take their grant here and hand it to their tool through the request.
+pub async fn acquire(st: &AppState) -> Result<Option<PoolGrant>, Response> {
     let Some(pool) = st.catalog.pool() else {
-        return next.run(req).await;
+        return Ok(None);
     };
     let want = initial_grant(st, pool);
     let started = Instant::now();
@@ -251,14 +263,14 @@ pub async fn granted(st: &AppState, req: Request, next: Next) -> Response {
                             break g;
                         }
                         pool.note_rejected();
-                        return crate::http::ApiError::from(pool.exhausted(want)).into_response();
+                        return Err(crate::http::ApiError::from(pool.exhausted(want)).into_response());
                     }
                 }
             }
         }
     };
     st.admission.observe(started.elapsed());
-    GRANT.scope(Arc::new(grant), next.run(req)).await
+    Ok(Some(grant))
 }
 
 // ------------------------------------------------------------------- reports ------

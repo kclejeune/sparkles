@@ -3278,6 +3278,8 @@ async fn gsp_on(
                 .as_ref()
                 .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
             let (wopts, timeout) = wopts.start();
+            // the admitted grant, read on the request's task before the blocking thread
+            let grant = crate::server_memory::current_grant();
             blocking(move || {
                 let snap = ds.store.snapshot();
                 let clear = match &target {
@@ -3306,6 +3308,7 @@ async fn gsp_on(
                             cancel: wopts.cancel.clone(),
                             graphs: wopts.graphs.clone(),
                             write: wopts,
+                            grant,
                             ..Default::default()
                         },
                         sparkles::commit::CommitKind::GspDelete,
@@ -3476,6 +3479,8 @@ async fn upload(
         return Err(err(StatusCode::BAD_REQUEST, "no files in upload"));
     }
     let (wopts, timeout) = wopts.start();
+    // the admitted grant, read on the request's task before the blocking thread
+    let grant = crate::server_memory::current_grant();
     blocking(move || {
         let g = match graph {
             Some(g) => Some(
@@ -3507,7 +3512,7 @@ async fn upload(
             }
         }
         // CSV and TSV files are converted into N-Triples
-        let tables = tabular::convert(&mut files, &mappings, &params, &st, &wopts)?;
+        let tables = tabular::convert(&mut files, &mappings, &params, &st, &wopts, grant.as_ref())?;
         let sources = files
             .iter()
             .map(|p| {
@@ -4823,6 +4828,8 @@ async fn reason_diagnostics(
         closure,
         timeout: Some(timeout_param(&st, &params)),
         prefixes,
+        // the admitted grant, read on the request's task before the blocking thread
+        grant: crate::server_memory::current_grant(),
     };
     blocking(move || {
         let (report, j) =

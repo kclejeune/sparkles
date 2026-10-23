@@ -661,6 +661,7 @@ fn sparkles_reasoner_options() -> sparkles::reasoning::reasoner::diagnostics::Di
         closure: sparkles::reasoning::reasoner::diagnostics::Closure::Subclass,
         timeout: None,
         prefixes: Vec::new(),
+        grant: None,
     }
 }
 

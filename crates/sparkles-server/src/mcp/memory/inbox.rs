@@ -923,6 +923,7 @@ impl Tools<'_> {
             principal: p,
             headers: None,
             held: None,
+            grant: self.call.grant.clone(),
         };
         let t = Tools {
             server: self.server,

@@ -196,6 +196,12 @@ impl ServeArgs {
 #[derive(Clone)]
 pub struct HeldShare(#[allow(dead_code)] Arc<crate::ratelimit::Held>);
 
+/// The query memory grant a tool call was admitted with, carried to the tool's queries
+/// (X08-P1-grant-routing). The task-local grant of the HTTP routes does not reach the
+/// task that rmcp runs a tool on, so it travels in the request instead.
+#[derive(Clone)]
+pub struct GrantShare(pub Arc<sparkles::sparql::pool::PoolGrant>);
+
 struct Endpoint {
     state: Arc<AppState>,
     server: McpServer,
@@ -369,15 +375,33 @@ impl Endpoint {
             }
         }
         let req = Request::from_parts(parts, Body::from(bytes));
+        // a tool call or resource read runs queries, so it waits for the memory pool as
+        // a query or update request does, inside the rate limiter's caps
+        let admit = charge.class.is_some();
         match (&self.state.rate_limit, charge.class) {
             (Some(rl), Some(class)) => {
                 crate::ratelimit::limit_as(rl, class, charge.dataset, req, |req| {
-                    self.forward(req, &p)
+                    self.admitted(req, &p, admit)
                 })
                 .await
             }
-            _ => self.forward(req, &p).await,
+            _ => self.admitted(req, &p, admit).await,
         }
+    }
+
+    /// Take an initial grant of the query memory pool when `admit`, waiting in arrival
+    /// order as the HTTP query routes do, and hand the request to the tool with it.
+    async fn admitted(&self, mut req: Request, p: &Principal, admit: bool) -> Response {
+        if admit {
+            match crate::server_memory::acquire(&self.state).await {
+                Ok(Some(grant)) => {
+                    req.extensions_mut().insert(GrantShare(Arc::new(grant)));
+                }
+                Ok(None) => {}
+                Err(rejected) => return rejected,
+            }
+        }
+        self.forward(req, p).await
     }
 
     /// Hand the request to rmcp, and record the owner of a session it opens.
