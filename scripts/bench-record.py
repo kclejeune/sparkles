@@ -218,9 +218,12 @@ def cmd_manifest(a):
     m["memory_limit"] = a.memory_limit or None
     m["client_cpu"] = a.client_cpu or None
     data = {}
-    for spec in a.data:
-        # name=path[:license[:params]] hashed here; name=sha256:… recorded as given
-        name, _, rest = spec.partition("=")
+    # name=path[|license[|params]] hashed here, name=sha256:… recorded as given, and
+    # --data-path path[|license[|params]] named by the file's base name, which may itself
+    # contain "=" (DBpedia's file names do, and name=path would split them there)
+    specs = [(spec.partition("=")[0], spec.partition("=")[2]) for spec in a.data]
+    specs += [(os.path.basename(spec.partition("|")[0]), spec) for spec in a.data_path]
+    for name, rest in specs:
         path, _, extra = rest.partition("|")
         lic, _, params = extra.partition("|")
         d = {"license": lic or "unknown", "params": params or None}
@@ -607,6 +610,8 @@ def main():
     m.add_argument("--engine", action="append", default=[], help="name=path of an engine's binary")
     m.add_argument("--data", action="append", default=[],
                    help="name=path|license|params, or name=sha256:HEX|license|params")
+    m.add_argument("--data-path", action="append", default=[],
+                   help="path|license|params, named by the file's base name, which may contain =")
     m.add_argument("--memory-limit", default="")
     m.add_argument("--client-cpu", default="")
     m.add_argument("--workdir", default=".")

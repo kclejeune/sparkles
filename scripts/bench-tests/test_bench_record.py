@@ -293,6 +293,20 @@ class RecordTests(unittest.TestCase):
         subprocess.run([sys.executable, RECORD, "finish", path], check=True)
         self.assertIsNotNone(jload(path)["ended"])
 
+    def test_data_paths_with_equals_signs_keep_their_names_and_hashes(self):
+        path = os.path.join(self.tmp.name, "manifest.json")
+        data = os.path.join(self.tmp.name, "anchor-text_lang=en.nt.zst")
+        write_text(data, "x")
+        p = subprocess.run([sys.executable, RECORD, "manifest", "--out", path, "--suite", "t",
+                            "--data-path", f"{data}|CC BY-SA 3.0|slice 50m", "--workdir", self.tmp.name],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        d = jload(path)["data"]
+        self.assertEqual(list(d), ["anchor-text_lang=en.nt.zst"])
+        e = d["anchor-text_lang=en.nt.zst"]
+        self.assertEqual((e["license"], e["params"], e["bytes"]), ("CC BY-SA 3.0", "slice 50m", 1))
+        self.assertEqual(len(e["sha256"]), 64)
+
     def reuse_fixture(self, prior_host="forge", prior_version="5.1.0"):
         fixture(self.res)
         cur = {"host": {"name": "forge"}, "sparkles": {"binary_commit": "new"},
