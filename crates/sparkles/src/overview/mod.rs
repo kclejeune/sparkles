@@ -1,7 +1,9 @@
 //! The graph overview (spec U06): the instances of a class, or of a group from an
 //! earlier answer, grouped by the communities F14 wrote back, by a property's values or
 //! ranges, or listed as members, with the counted edges between the groups, to their
-//! sibling groups and to the other classes.
+//! sibling groups and to the other classes. The entities of the whole dataset can also be
+//! grouped by the community hierarchy that a GraphRAG build stored in its reports graph
+//! (spec C22 §4), one level at a time, with each group's report title and status.
 //!
 //! Every count comes from SPARQL queries run with the caller's [`QueryOptions`], so the
 //! view, the budgets, the deadline and the cancellation of `opts` apply to all of them
@@ -19,9 +21,11 @@ use std::sync::Arc;
 
 mod groups;
 mod ids;
+mod reports;
 
 pub use groups::{DEFAULT_BUCKETS, MAX_BUCKETS, MAX_EDGES, MAX_LIMIT};
 pub use ids::MAX_DEPTH;
+pub use reports::{DEFAULT_REPORTS_GRAPH, DISCLOSURE_GRAPH, GUARDED_PREFIX, MAX_REPORT_LEVEL};
 
 /// What a request groups and how.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,6 +40,8 @@ pub struct GroupsRequest {
 pub enum Within {
     Class(String),
     Group(String),
+    /// the entities of the whole dataset, which only [`By::Reports`] groups
+    Dataset,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +54,17 @@ pub enum By {
         predicate: String,
         buckets: usize,
     },
+    /// the community hierarchy of a GraphRAG reports graph (spec C22 §4)
+    Reports(ReportsBy),
+}
+
+/// The GraphRAG grouping. `graph` is the reports graph, [`DEFAULT_REPORTS_GRAPH`] when
+/// `None`, and a server fills in the one its settings name. `level` is the level the
+/// dataset opens at, 0 (the coarsest) when `None`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReportsBy {
+    pub graph: Option<String>,
+    pub level: Option<u32>,
 }
 
 fn bad(msg: impl Into<String>) -> Error {
@@ -66,6 +83,43 @@ fn iri_field(v: &J, what: &str) -> Result<String> {
     Ok(s.to_string())
 }
 
+/// The `reports` member of a `by`: `{}`, or `{"level": n, "graph": IRI}`.
+fn reports_by(v: &J) -> Result<ReportsBy> {
+    let o = match v {
+        J::Null => return Ok(ReportsBy::default()),
+        J::Object(o) => o,
+        _ => return Err(bad("by.reports must be an object such as {\"level\": 0}")),
+    };
+    for k in o.keys() {
+        if !matches!(k.as_str(), "level" | "graph") {
+            return Err(bad(format!(
+                "unknown member '{k}' of by.reports: level or graph"
+            )));
+        }
+    }
+    let level = match o.get("level") {
+        None | Some(J::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .filter(|n| *n <= u64::from(MAX_REPORT_LEVEL))
+                .ok_or_else(|| {
+                    bad(format!(
+                        "by.reports.level must be an integer from 0 to {MAX_REPORT_LEVEL}"
+                    ))
+                })? as u32,
+        ),
+    };
+    let graph = match o.get("graph") {
+        None | Some(J::Null) => None,
+        Some(v) => {
+            let g = iri_field(v, "by.reports.graph")?;
+            reports::check_graph(&g).map_err(bad)?;
+            Some(g)
+        }
+    };
+    Ok(ReportsBy { graph, level })
+}
+
 impl GroupsRequest {
     /// Parse and check a request body.
     pub fn from_json(j: &J) -> Result<GroupsRequest> {
@@ -82,6 +136,7 @@ impl GroupsRequest {
             }
         }
         let within = match o.get("within") {
+            None | Some(J::Null) => Within::Dataset,
             Some(J::Object(w)) if w.len() == 1 && w.contains_key("class") => {
                 Within::Class(iri_field(&w["class"], "within.class")?)
             }
@@ -93,7 +148,7 @@ impl GroupsRequest {
             }
             _ => {
                 return Err(bad(
-                    "within must be {\"class\": IRI} or {\"group\": id from an earlier answer}",
+                    "within must be {\"class\": IRI} or {\"group\": id from an earlier answer}, or absent with by {\"reports\": {}}",
                 ));
             }
         };
@@ -124,12 +179,16 @@ impl GroupsRequest {
                     buckets,
                 }
             }
+            Some(J::Object(b)) if b.len() == 1 && b.contains_key("reports") => {
+                By::Reports(reports_by(&b["reports"])?)
+            }
             _ => {
                 return Err(bad(
-                    "by must be \"auto\", \"members\", {\"community\": IRI} or {\"property\": IRI, \"buckets\": n}",
+                    "by must be \"auto\", \"members\", {\"community\": IRI}, {\"property\": IRI, \"buckets\": n} or {\"reports\": {\"level\": n}}",
                 ));
             }
         };
+        check_pair(&within, &by)?;
         let limit = match o.get("limit") {
             None | Some(J::Null) => MAX_LIMIT,
             Some(v) => v
@@ -152,18 +211,81 @@ impl GroupsRequest {
         })
     }
 
+    /// Whether the request reads a GraphRAG reports graph: it groups by reports, or
+    /// opens a group of an earlier reports answer.
+    pub fn reads_reports(&self) -> bool {
+        matches!(self.by, By::Reports(_))
+            || matches!(&self.within, Within::Group(g) if reports::is_reports_id(g))
+    }
+
+    /// Refuse a request that reads GraphRAG reports on a branch other than `main`. The
+    /// reports belong to main, whose builds wrote them at their build commits (spec C22
+    /// §6.5), so on another branch they would group that branch's data by main's
+    /// communities.
+    pub fn check_branch(&self, branch: &str) -> Result<()> {
+        if self.reads_reports() && branch != "main" {
+            return Err(bad(format!(
+                "GraphRAG communities are read on main, where their reports are built, and this request reads the branch '{branch}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fill in the reports graph a server's settings name, when the request groups by
+    /// reports without naming one.
+    pub fn default_reports_graph(&mut self, graph: &str) {
+        if let By::Reports(r) = &mut self.by
+            && r.graph.is_none()
+        {
+            r.graph = Some(graph.to_string());
+        }
+    }
+
     /// The request as a cache key: every member, in a fixed order.
     pub fn key(&self) -> String {
         format!("{self:?}")
     }
 }
 
+/// Refuse a `within` and a `by` that do not go together.
+fn check_pair(within: &Within, by: &By) -> Result<()> {
+    match (within, by) {
+        (Within::Dataset, By::Reports(_)) => Ok(()),
+        (Within::Dataset, _) => Err(bad(
+            "within is required, except with by {\"reports\": {}}, which groups the whole dataset",
+        )),
+        (Within::Class(_), By::Reports(_)) => Err(bad(
+            "by reports groups the whole dataset: leave out within, or name a group of an earlier reports answer",
+        )),
+        (Within::Group(g), by) if reports::is_reports_id(g) => match by {
+            By::Auto | By::Members => Ok(()),
+            By::Reports(r) if r.level.is_none() => Ok(()),
+            By::Reports(_) => Err(bad(
+                "by.reports.level chooses the level the dataset opens at, and a group opens into the level below it",
+            )),
+            _ => Err(bad(
+                "a group of the GraphRAG communities opens by \"auto\", \"members\" or {\"reports\": {}}",
+            )),
+        },
+        (Within::Group(_), By::Reports(_)) => Err(bad(
+            "by reports opens only the groups of an earlier reports answer",
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The answer to `req` at snapshot `snap`, as the JSON object that API.md describes
 /// under "Graph overview", with the snapshot's `commit`. `req.at` is not read: the
-/// caller chose the snapshot.
+/// caller chose the snapshot, and with it the branch, which
+/// [`GroupsRequest::check_branch`] checks for a request that reads reports.
 pub fn groups_at(snap: Arc<Snapshot>, req: &GroupsRequest, opts: &QueryOptions) -> Result<J> {
     let commit = snap.commit;
-    let mut answer = groups::Run { snap, opts }.answer(req)?;
+    let run = groups::Run { snap, opts };
+    let mut answer = if req.reads_reports() {
+        reports::answer(&run, req)?
+    } else {
+        run.answer(req)?
+    };
     if let Some(o) = answer.as_object_mut() {
         o.insert("commit".into(), commit.into());
     }

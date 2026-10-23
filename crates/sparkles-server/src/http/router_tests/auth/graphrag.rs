@@ -835,3 +835,170 @@ async fn history_lists_reports_only_while_proven() {
         assert!(v["asks"][0].get("reportsGraph").is_none(), "{u}: {v}");
     }
 }
+
+/// Communities in the reports graph of [`server`], in the form a build writes them.
+const COMMUNITIES: &str = r#"@prefix ex: <http://ex/> .
+@prefix gr: <urn:x-sparkles:graphrag#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+<urn:x-sparkles:graphrag:reports> {
+  <urn:c:one> a gr:Community ; gr:level 0 ; gr:memberCount 2 ; gr:member ex:x, ex:y ;
+    gr:report <urn:r:one> .
+  <urn:r:one> rdfs:label "Secret team" ; gr:status "unreviewed" .
+  <urn:c:two> a gr:Community ; gr:level 0 ; gr:memberCount 1 ; gr:member ex:z ;
+    gr:report <urn:r:two> .
+  <urn:r:two> rdfs:label "Other team" ; gr:status "reviewed" .
+}
+"#;
+
+fn with_communities() -> AuthServer {
+    let s = server();
+    let ds = s.state.datasets().get("rag").cloned().unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            COMMUNITIES.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    s
+}
+
+async fn groups(s: &AuthServer, user: &str, uri: &str, body: serde_json::Value) -> R {
+    call(
+        &s.app,
+        "POST",
+        uri,
+        &[
+            ("authorization", &b(user)),
+            ("content-type", "application/json"),
+        ],
+        &body.to_string(),
+    )
+    .await
+}
+
+/// U06 with C22 §6.4: the overview's GraphRAG grouping reads the reports graph under the
+/// guard that the GraphRAG routes use. An unrestricted reader and a proven restricted
+/// reader see the communities with their titles. An unproven reader gets an answer that
+/// says they are unavailable and holds no community, report, title, status or member,
+/// also for the group ids it took from another caller's answer, which the cache holds.
+/// The test needs only `auth`, so it also runs in a build without `mcp`, where the
+/// GraphRAG routes do not exist (C22 review round 4 found report identities leaking in
+/// such a build).
+#[tokio::test]
+async fn the_overview_reads_communities_only_where_proven() {
+    let s = with_communities();
+    let uri = "/$/graph/rag/groups";
+    let top = serde_json::json!({ "by": { "reports": {} } });
+    let mut ids = Vec::new();
+    for u in SEES {
+        let r = groups(&s, u, uri, top.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{u}: {}", r.text());
+        let v = r.json();
+        assert_eq!(v["available"], true, "{u}: {v}");
+        let labels: Vec<&str> = v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, ["Secret team", "Other team"], "{u}");
+        assert_eq!(v["groups"][0]["report"]["status"], "unreviewed");
+        assert_eq!(v["groups"][0]["size"], 2);
+        // y knows z from the first team to the second, and z knows x back
+        let between: Vec<u64> = v["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["source"] != e["target"])
+            .map(|e| e["count"].as_u64().unwrap())
+            .collect();
+        assert_eq!(between, [1, 1], "{u}: {v}");
+        for g in v["groups"].as_array().unwrap() {
+            ids.push(g["id"].as_str().unwrap().to_string());
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 2);
+    // a proven reader opens a team into its members
+    for id in &ids {
+        let r = groups(
+            &s,
+            "tua",
+            uri,
+            serde_json::json!({ "within": { "group": id } }),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json()["grouping"]["kind"], "members");
+    }
+    let mut bodies = vec![top.clone()];
+    for id in &ids {
+        bodies.push(serde_json::json!({ "within": { "group": id } }));
+        bodies.push(serde_json::json!({ "within": { "group": id }, "by": "members" }));
+    }
+    for u in BLIND {
+        for body in &bodies {
+            let r = groups(&s, u, uri, body.clone()).await;
+            assert_eq!(r.status, StatusCode::OK, "{u} {body}: {}", r.text());
+            let v = r.json();
+            assert_eq!(v["available"], false, "{u}: {v}");
+            assert_eq!(v["unavailable"], "access", "{u}: {v}");
+            let text = r.text();
+            for secret in [
+                "Secret team",
+                "Other team",
+                "urn:c:",
+                "urn:r:",
+                "unreviewed",
+                "http://ex/",
+            ] {
+                assert!(!text.contains(secret), "{u} {body} leaks {secret}: {text}");
+            }
+        }
+    }
+}
+
+/// The reports belong to main, so a branch refuses the grouping and keeps the others.
+#[tokio::test]
+async fn the_overview_reads_communities_on_main_only() {
+    let s = with_communities();
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/branches/rag",
+        &[
+            ("authorization", &b("tadmin")),
+            ("content-type", "application/json"),
+        ],
+        r#"{"name":"dev"}"#,
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let uri = "/$/graph/rag/groups?branch=dev";
+    let r = groups(
+        &s,
+        "tadmin",
+        uri,
+        serde_json::json!({ "by": { "reports": {} } }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("read on main"), "{}", r.text());
+    assert!(!r.text().contains("Secret team"));
+}
+
+/// The reports graph the overview reads by default is the one the dataset's GraphRAG
+/// settings name, and the library's constants agree with the server's.
+#[test]
+fn the_overview_uses_the_guarded_namespace_of_the_server() {
+    use crate::graphrag::settings::{GUARDED_PREFIX, GraphragSettings, MAX_LEVELS};
+    assert_eq!(sparkles::overview::GUARDED_PREFIX, GUARDED_PREFIX);
+    assert_eq!(sparkles::overview::DISCLOSURE_GRAPH, DISCLOSURE_GRAPH);
+    assert_eq!(
+        sparkles::overview::DEFAULT_REPORTS_GRAPH,
+        GraphragSettings::default().reports_graph
+    );
+    assert!(sparkles::overview::MAX_REPORT_LEVEL >= MAX_LEVELS);
+}

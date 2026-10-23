@@ -75,7 +75,14 @@ pub(super) async fn groups(
     let ds = dataset(&st, &name)?;
     let j: J = serde_json::from_slice(&body)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")))?;
-    let req = GroupsRequest::from_json(&j)?;
+    let mut req = GroupsRequest::from_json(&j)?;
+    if req.reads_reports() {
+        // the reports belong to main (spec C22 §6.5), and the settings name their graph
+        req.check_branch(&ds.store.branch_name())?;
+        let settings: crate::graphrag::settings::GraphragSettings =
+            crate::settings::effective(&st, &ds, &crate::settings::GRAPHRAG);
+        req.default_reports_graph(&settings.reports_graph);
+    }
     let params = Params::from_query(&uri);
     let mut opts = super::query_options(&st, &ds, &params);
     crate::auth::restrict(&mut opts, &p, &ds.name, Endpoint::Query);

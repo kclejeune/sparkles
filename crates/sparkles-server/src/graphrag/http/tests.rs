@@ -294,3 +294,135 @@ async fn the_last_run_shows_only_for_its_own_graph() {
     let (_, st) = call(&f.app, "GET", "/$/graphrag/org", None).await;
     assert!(st.get("lastBuild").is_none(), "{st}");
 }
+
+/// The Explore overview groups the dataset by the hierarchy a build wrote (U06 with C22
+/// §4): its groups are the stored communities of the level with their report titles,
+/// statuses and member counts, the links between groups are the data's links between
+/// their members, and each community opens into its members. The settings' reports graph
+/// is the one read.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_overview_groups_the_dataset_by_a_built_hierarchy() {
+    let f = fixture(4);
+    f.allow_rows().await;
+    enable(&f.app).await;
+    let (_, task) = call(
+        &f.app,
+        "POST",
+        "/$/graphrag/org/build",
+        Some(json!({ "confirm": true })),
+    )
+    .await;
+    let t = finished(&f.app, task["id"].as_str().unwrap()).await;
+    assert_eq!(t["state"], "done", "{t}");
+    let requests = f.mock.requests().len();
+
+    let (_, list) = call(&f.app, "GET", "/$/graphrag/org/communities", None).await;
+    let stored: Vec<&Value> = list["communities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["level"] == 0)
+        .collect();
+    assert_eq!(stored.len(), 2, "{list}");
+    let (s, top) = call(
+        &f.app,
+        "POST",
+        "/$/graph/org/groups",
+        Some(json!({ "by": { "reports": {} } })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{top}");
+    assert_eq!(top["available"], true, "{top}");
+    assert_eq!(
+        top["within"]["reports"]["graph"],
+        "urn:x-sparkles:graphrag:reports"
+    );
+    assert_eq!(top["within"]["size"], 8, "{top}");
+    let groups = top["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{top}");
+    let mut members_of: Vec<(String, Vec<String>)> = Vec::new();
+    for g in groups {
+        let c = stored
+            .iter()
+            .find(|c| c["iri"] == g["community"])
+            .unwrap_or_else(|| panic!("{g} is not a stored community: {list}"));
+        assert_eq!(g["size"], c["memberCount"], "{g}");
+        assert_eq!(g["label"], c["report"]["title"], "{g}");
+        assert_eq!(g["report"]["status"], c["report"]["status"], "{g}");
+        assert_eq!(g["report"]["status"], "unreviewed", "{g}");
+        let (s, m) = call(
+            &f.app,
+            "POST",
+            "/$/graph/org/groups",
+            Some(json!({ "within": { "group": g["id"] } })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{m}");
+        assert_eq!(m["grouping"]["kind"], "members", "{m}");
+        let iris: Vec<String> = m["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["iri"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(iris.len() as u64, g["size"].as_u64().unwrap(), "{m}");
+        members_of.push((format!("g:{}", g["id"].as_str().unwrap()), iris));
+    }
+    // each cluster is a community, and x0 knows y0 between them
+    let cluster = |iris: &[String]| iris[0].rsplit('/').next().unwrap()[..1].to_string();
+    for (_, iris) in &members_of {
+        let c = cluster(iris);
+        assert!(
+            iris.iter().all(|i| cluster(std::slice::from_ref(i)) == c),
+            "{iris:?}"
+        );
+    }
+    let between: Vec<(&str, &str, u64)> = top["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["source"] != e["target"])
+        .map(|e| {
+            (
+                e["source"].as_str().unwrap(),
+                e["target"].as_str().unwrap(),
+                e["count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let x = members_of.iter().find(|(_, m)| cluster(m) == "x").unwrap();
+    let y = members_of.iter().find(|(_, m)| cluster(m) == "y").unwrap();
+    assert_eq!(between, [(x.0.as_str(), y.0.as_str(), 1)], "{top}");
+    // six links inside each cluster of four
+    for (key, _) in &members_of {
+        let inside = top["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["source"] == key.as_str() && e["target"] == key.as_str())
+            .unwrap();
+        assert_eq!(inside["count"], 6, "{top}");
+    }
+    // the overview reads triples only: no model request
+    assert_eq!(f.mock.requests().len(), requests);
+
+    // another reports graph in the settings holds no communities yet
+    assert_eq!(
+        patch(
+            &f.app,
+            "/$/settings/org/graphrag",
+            json!({ "reportsGraph": "urn:x-sparkles:graphrag:other" })
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (_, other) = call(
+        &f.app,
+        "POST",
+        "/$/graph/org/groups",
+        Some(json!({ "by": { "reports": {} } })),
+    )
+    .await;
+    assert_eq!(other["available"], false, "{other}");
+    assert_eq!(other["unavailable"], "none", "{other}");
+}
