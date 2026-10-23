@@ -461,6 +461,14 @@ class RequestTests(unittest.TestCase):
             body = json.load(f)
         self.assertEqual([b["x"]["value"] for b in body["results"]["bindings"]], ["2", "1"])
 
+    def test_a_failed_request_leaves_no_earlier_capture(self):
+        raw = os.path.join(self.tmp.name, "raw")
+        self.answer("/ok", "SELECT ?x { ?s ?p ?x }", ANSWERS_RAW_DIR=raw)
+        self.assertTrue(os.path.exists(os.path.join(raw, "q.e.json")))
+        rec, _ = self.answer("/slow", "SELECT ?x { ?s ?p ?x }", max_time="1", ANSWERS_RAW_DIR=raw)
+        self.assertEqual(rec["rows"], "error")
+        self.assertEqual(os.listdir(raw), [])
+
 
 if __name__ == "__main__":
     unittest.main()
