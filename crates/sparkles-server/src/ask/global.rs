@@ -522,6 +522,10 @@ impl Asking<'_, '_> {
             });
             self.notes
                 .push("no community report bears on the question".into());
+            self.emit(
+                "global",
+                &json!({ "points": [], "reports": [], "global": global.clone() }),
+            );
             self.emit("summary", &s);
             return json!({
                 "outcome": "answered",
@@ -577,14 +581,21 @@ impl Asking<'_, '_> {
         } else if !uncited.is_empty() {
             s["uncitedSentences"] = json!(uncited);
         }
+        let answer = json!({
+            "points": kept.iter().enumerate().map(|(i, p)| point_json(i, p)).collect::<Vec<_>>(),
+            "reports": reports_out(if cited.is_empty() { &kept } else { &cited }),
+            "global": global,
+        });
+        // the points and reports first, so that a client can link the summary's markers
+        self.emit("global", &answer);
         self.emit("summary", &s);
         json!({
             "outcome": "answered",
             "mode": "global",
             "summary": s,
-            "points": kept.iter().enumerate().map(|(i, p)| point_json(i, p)).collect::<Vec<_>>(),
-            "reports": reports_out(if cited.is_empty() { &kept } else { &cited }),
-            "global": global,
+            "points": answer["points"],
+            "reports": answer["reports"],
+            "global": answer["global"],
         })
     }
 }

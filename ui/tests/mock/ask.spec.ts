@@ -7,6 +7,7 @@
 // assistant.
 
 import { expect, test, type Page } from '@playwright/test';
+import { phone } from '../phone';
 
 async function openQuery(page: Page, mode?: 'preview' | 'run') {
   await page.addInitScript((m) => {
@@ -183,4 +184,53 @@ test('a dataset without an assistant has no Ask bar (A19 UI)', async ({ page }) 
     timeout: 20_000,
   });
   await expect(page.getByRole('region', { name: 'Ask bar' })).toHaveCount(0);
+});
+
+test('a global question is answered from community reports, and switches to the data (C22 A6)', async ({
+  page,
+}) => {
+  const bodies: Record<string, unknown>[] = [];
+  page.on('request', (r) => {
+    if (/\/org\/ask$/.test(new URL(r.url()).pathname)) bodies.push(r.postDataJSON());
+  });
+  await openQuery(page, 'run');
+  await ask(page, 'What are the main areas of work?');
+  const answer = page.getByTestId('global-answer');
+  await expect(answer).toContainText('checkout redesign of the payments team');
+  await expect(answer).toContainText('generated from community summaries');
+  await expect(answer).toContainText('1 sentence cite no point');
+  await answer.getByRole('button', { name: '[2]' }).click();
+  await expect(answer.locator('#gpoint-2')).toHaveClass(/lit/);
+  await answer.getByText('The payments team', { exact: true }).click();
+  await expect(answer).toContainText('ontology#memberOf');
+  await answer.getByRole('button', { name: 'Answer from the data' }).click();
+  await expect(page.getByTestId('global-answer')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Answer from summaries' })).toBeVisible();
+  expect(bodies.at(-1)?.mode).toBe('local');
+  await page.getByRole('button', { name: 'Answer from summaries' }).click();
+  await expect(page.getByTestId('global-answer')).toBeVisible();
+  expect(bodies.at(-1)?.mode).toBe('global');
+});
+
+test.describe('a global answer on a phone', () => {
+  test.use({ ...phone, viewport: { width: 390, height: 844 } });
+
+  test('fits the screen', async ({ page }) => {
+    await openQuery(page, 'run');
+    await ask(page, 'What are the main areas of work?');
+    const answer = page.getByTestId('global-answer');
+    await expect(answer).toContainText('platform team');
+    await answer.getByText('The payments team', { exact: true }).click();
+    // the query page's toolbar is wider than a phone with an Ask bar, so the answer
+    // itself is measured: nothing in it reaches past its own box
+    const wide = await answer.evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      return [...el.querySelectorAll('*')]
+        .filter((c) => c.getBoundingClientRect().right > box.right + 1)
+        .map((c) => c.className || c.tagName);
+    });
+    expect(wide).toEqual([]);
+    const box = await answer.boundingBox();
+    expect(box && box.x + box.width).toBeLessThanOrEqual(391);
+  });
 });

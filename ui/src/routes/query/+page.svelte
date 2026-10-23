@@ -47,6 +47,7 @@
   import QuestionHeader from '$components/QuestionHeader.svelte';
   import AskBar from '$components/AskBar.svelte';
   import AnswerSummary from '$components/AnswerSummary.svelte';
+  import GlobalAnswer from '$components/GlobalAnswer.svelte';
   import {
     buildDefinition,
     formDefaults,
@@ -672,6 +673,8 @@
     tryHarder?: string;
     query?: string;
     run?: boolean;
+    /** answer from the data or from community reports (C22 §2.4) */
+    mode?: askApi.AskMode;
   }) {
     const name = ds;
     if (!name) return;
@@ -770,8 +773,13 @@
         case 'summary':
           a.summary = e.data;
           break;
+        case 'global':
+          a.mode = 'global';
+          a.global = e.data;
+          break;
         case 'usage':
           a.askId = e.data.askId;
+          if (!a.global && e.data.outcome !== 'error') a.mode = 'local';
           a.usage = {
             outcome: e.data.outcome,
             askId: e.data.askId,
@@ -799,6 +807,7 @@
           ...(o.clarification ? { clarification: o.clarification } : {}),
           ...(o.tryHarder ? { tryHarder: o.tryHarder } : {}),
           ...(o.query ? { query: o.query } : {}),
+          ...(o.mode ? { mode: o.mode } : {}),
           ...(at ? { at } : {}),
           ...(branch ? { branch } : {}),
           ...(reasoning != null ? { reasoning } : {}),
@@ -862,6 +871,13 @@
     const a = active.ask;
     if (!a?.question || !a.askId) return;
     void ask({ question: a.question, tabId: activeId, context: a.context, tryHarder: a.askId });
+  }
+
+  /** Ask the tab's question again, from the data or from the community reports. */
+  function answerFrom(mode: 'local' | 'global') {
+    const a = active.ask;
+    if (!a?.question) return;
+    void ask({ question: a.question, tabId: activeId, context: a.context, mode });
   }
 
   /** A new summary of the edited query's rows. */
@@ -2436,7 +2452,15 @@
         oncite={cite}
       />
     {/if}
-    {#if !outcome}
+    {#if answer?.global && !outcome && ds}
+      <GlobalAnswer
+        {ds}
+        answer={answer.global}
+        summary={answer.summary}
+        busy={!!asking}
+        onlocal={() => answerFrom('local')}
+      />
+    {:else if !outcome}
       <div class="empty">
         <Icon name="query" size={22} />
         <p>Run a query to see results here.</p>
@@ -3025,6 +3049,15 @@
           >
           <button class="btn sm" onclick={() => void sendFeedback('rejected')}
             ><Icon name="x" size={12} /> Not correct</button
+          >
+        {/if}
+        {#if answer.mode === 'local' && !answer.global}
+          <button
+            class="btn sm"
+            disabled={!!asking}
+            onclick={() => answerFrom('global')}
+            title="Ask again and answer from the dataset's community summaries"
+            ><Icon name="sparkle" size={12} /> Answer from summaries</button
           >
         {/if}
         {#if u?.tryHarder}

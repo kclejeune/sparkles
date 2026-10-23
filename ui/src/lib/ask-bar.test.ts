@@ -22,6 +22,13 @@ import {
 describe('the step indicator', () => {
   const o = { run: true, summary: true };
   const ev = (e: AskEvent) => nextStep(e, o);
+  it('names the steps of a global answer (C22 §7.2)', () => {
+    expect(ev({ event: 'scope', data: { scope: 'global' } })).toBe('Reading community reports');
+    expect(ev({ event: 'reports', data: { reports: [] } })).toBe('Reading community reports');
+    expect(ev({ event: 'global', data: { points: [], reports: [], global: {} } })).toBe(
+      'Summarizing',
+    );
+  });
   it('names the step that comes next', () => {
     expect(ev({ event: 'ground', data: {} })).toBe('Writing a query');
     expect(
