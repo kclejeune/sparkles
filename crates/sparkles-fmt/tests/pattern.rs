@@ -465,6 +465,54 @@ fn the_strict_check_adds_the_server_parser() {
 }
 
 #[test]
+fn ranges_for_the_edits_of_phase_2() {
+    let q = "PREFIX ex: <http://x/>\nSELECT DISTINCT ?a (COUNT(?b) AS ?n) WHERE {\n  ?a ex:p ?b .\n  FILTER(?b > 1 && ?a != ?b)\n  BIND(?b + 1 AS ?c)\n  VALUES ?v { 1 }\n  MINUS { ?a ex:q ?d }\n}\nORDER BY ?a";
+    let p = ok(q);
+    assert_eq!(&q[p.query_start..p.query_start + 6], "SELECT");
+    let pr = p.projection.as_ref().unwrap();
+    assert_eq!(at(q, &pr.keyword), "SELECT");
+    assert_eq!(at(q, pr.distinct_range.as_ref().unwrap()), "DISTINCT");
+    assert!(pr.star_range.is_none());
+    let list: Vec<_> = pr
+        .items
+        .iter()
+        .map(|i| (i.var.clone(), i.expression, at(q, &i.range)))
+        .collect();
+    let want = |v: &str, e: bool, t: &str| (v.to_string(), e, t.to_string());
+    assert_eq!(
+        list,
+        [want("a", false, "?a"), want("n", true, "(COUNT(?b) AS ?n)")]
+    );
+    let star = ok("SELECT * { ?s ?p ?o }");
+    assert_eq!(
+        at(
+            "SELECT * { ?s ?p ?o }",
+            star.projection.unwrap().star_range.as_ref().unwrap()
+        ),
+        "*"
+    );
+    let its = items(&p);
+    let Item::Filter(f) = &its[1] else { panic!() };
+    let refs: Vec<_> = f
+        .var_refs
+        .iter()
+        .map(|v| format!("{}={}", v.name, at(q, &v.range)))
+        .collect();
+    assert_eq!(refs, ["b=?b", "a=?a", "b=?b"]);
+    let binds = |i: usize| match &its[i] {
+        Item::Locked(l) => l.binds.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(binds(2), ["c"]);
+    assert_eq!(binds(3), ["v"]);
+    assert!(binds(4).is_empty());
+    let Item::Locked(b) = &its[2] else { panic!() };
+    assert_eq!(b.var_refs.len(), 2);
+    assert!(p.modifiers[0].binds.is_empty());
+    assert_eq!(at(q, &p.modifiers[0].var_refs[0].range), "?a");
+}
+
+#[test]
 fn unicode_ranges_are_bytes() {
     let q = "SELECT * { ?s <http://x/p> \"é😀\" . ?s <http://x/q> ?o }";
     let p = ok(q);

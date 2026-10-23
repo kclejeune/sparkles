@@ -54,11 +54,16 @@ export type Triple = {
 
 export type FilterForm = { op: string; var: string; args: string[] };
 
+/** One occurrence of a variable: its name and the range of its token, `?` included. */
+export type VarRef = { name: string; range: Range };
+
 export type Filter = {
   type: 'filter';
   /** the form the canvas understands, or null for a locked chip */
   expr: FilterForm | null;
   vars: string[];
+  /** every variable token in it, for a rename */
+  varRefs?: VarRef[];
   text: string;
   range: Range;
   /** the `.` that follows it in its group */
@@ -68,6 +73,10 @@ export type Filter = {
 export type Locked = {
   kind: string;
   vars: string[];
+  /** the variables it binds for the rest of its group (none for `MINUS` or a modifier) */
+  binds?: string[];
+  /** every variable token in it, for a rename the person confirms */
+  varRefs?: VarRef[];
   /** exactly the text at `range`, which runs over a comment that ends its line */
   text: string;
   range: Range;
@@ -107,6 +116,12 @@ export type PatternOk = {
     distinct: boolean;
     locked: boolean;
     range: Range;
+    /** the `SELECT` keyword, `DISTINCT` (or `REDUCED`) and `*` */
+    keyword?: Range;
+    distinctRange?: Range | null;
+    starRange?: Range | null;
+    /** a plain variable or an `(expression AS ?v)`, in order */
+    items?: { var: string; expression: boolean; range: Range; varRefs: VarRef[] }[];
   } | null;
   limit?: { value: number; range: Range };
   offset?: { value: number; range: Range };
@@ -114,6 +129,8 @@ export type PatternOk = {
   modifiers: Locked[];
   /** FROM clauses, a CONSTRUCT template, the terms of DESCRIBE */
   locked: Locked[];
+  /** where the query form starts, after the prologue */
+  queryStart?: number;
 };
 
 export type PatternError = {
