@@ -4,6 +4,14 @@
 
 ### Changed
 
+The first run of a query text that the server does not remember now runs on the thread
+that received it under the request's timeout when the server has been idle for 10 ms,
+instead of on the blocking pool. On forge that took about 1.8 ms off a fresh server's
+first request, and the BSBM explore mix, whose texts are all new, kept its speed. Such a run cannot be cancelled by a client disconnect, only by its timeout, and a
+text whose run is slow or fails, or that contains `SERVICE`, runs on the pool. A SERVICE
+IRI now names this server only when it is written in the URL parser's own spelling, so
+forms such as `127.1` or a path with `..` are ordinary HTTP calls.
+
 Automatic execution now streams groupings and counts over an estimated 20,000 input rows
 or more whose EXISTS and NOT EXISTS are FILTER conjuncts that a key set answers. On a
 Namespace instance at 10.5M quads these ran 0.68 to 0.99 times as long as eagerly. An

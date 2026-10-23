@@ -72,11 +72,8 @@ impl SelfEndpoints {
         // authority, whose extra slashes the parser drops, or user information of any
         // form, even an empty one, makes the IRI something other than this server's
         // endpoint.
-        let authority = iri.split_once("://")?.1;
-        let authority = authority
-            .split(['/', '?', '#', '\\'])
-            .next()
-            .unwrap_or(authority);
+        let after = iri.split_once("://")?.1;
+        let authority = after.split(['/', '?', '#', '\\']).next().unwrap_or(after);
         if authority.is_empty() || authority.contains('@') {
             return None;
         }
@@ -86,6 +83,34 @@ impl SelfEndpoints {
             || !url.username().is_empty()
             || url.password().is_some()
         {
+            return None;
+        }
+        // The parser also rewrites hosts such as `127.1`, `2130706433` or `%6cocalhost`,
+        // and paths with `.` and `..` segments or their escapes, into another spelling.
+        // Only an IRI already written in the parsed form names this server, so the raw
+        // host, port and path must equal the parsed ones.
+        let (raw_host, raw_port) = match authority.strip_prefix('[') {
+            Some(v6) => {
+                let (inner, rest) = v6.split_once(']')?;
+                (&authority[..inner.len() + 2], rest.strip_prefix(':'))
+            }
+            None => match authority.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            },
+        };
+        if !url
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case(raw_host))
+        {
+            return None;
+        }
+        if let Some(port) = raw_port
+            && port.parse::<u16>().ok().map(|p| p.to_string()).as_deref() != Some(port)
+        {
+            return None;
+        }
+        if after[authority.len()..] != *url.path() {
             return None;
         }
         let port = url.port_or_known_default()?;

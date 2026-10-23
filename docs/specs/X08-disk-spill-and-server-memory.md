@@ -1160,7 +1160,11 @@ a loopback or unspecified address, `localhost`, `127.0.0.1` or `[::1]`. The path
 `/{ds}/sparql`, `/{ds}/query` or `/{ds}` for a dataset the server serves, with no query
 string, fragment, user information or branch. Any other IRI is an ordinary HTTP call,
 including a DNS name or an alias that happens to resolve to this server. Matching names
-rather than resolved addresses keeps the rule exact. A header that marked a call as
+rather than resolved addresses keeps the rule exact. The IRI must also be written in the
+form the URL parser gives it, since the parser rewrites spellings such as `127.1`,
+`2130706433`, `%6cocalhost`, a port with a leading zero and paths with `.` or `..`
+segments into this server's endpoint. Its raw host, port and path must equal the parsed
+ones, and any other spelling stays an HTTP call. A header that marked a call as
 nested was rejected, because a client could send it to skip admission, and a secret
 header was rejected because a proxy or an alias could carry it to another server. The
 remaining option, leaving the `503` and documenting it, would have kept federation over
@@ -1204,6 +1208,67 @@ A review found six gaps in the first version, which are fixed.
 - An IRI with an empty or password-only user part was accepted, and so was one with an
   empty authority that the URL parser normalized away. The resolver now reads the
   authority as written, and an empty one or any `@` in it keeps the call on HTTP.
+
+### First runs on the receiving thread (2026-10-23)
+
+A query whose previous run with the same text took under 10 ms runs on the thread that
+received it, and every other query ran on the blocking pool. A fresh server answered its
+first `path-plus` at 10.5M triples on forge about 2 ms slower than the second request,
+outside the query's own work. Scratch builds separated the causes, with 40 fresh servers
+per variant, the canonical `path-plus` first, then 20 texts the server had not seen that
+do the same work.
+
+| Variant, median ms | First request | Unseen text |
+|---|---:|---:|
+| Blocking pool | 6.53 | 0.72 |
+| First run on the receiving thread | 4.32 | 0.50 |
+| Pool thread with a warmed allocator heap | 5.32 | 0.71 |
+| Server pinned to the performance cores | 4.48 | 0.57 |
+
+Starting four pool threads instead of one changed nothing, and serializing on the pool
+after running in place cost nothing either. About half of the first-request cost is the
+pool thread's cold allocator heap. The rest is waking an idle core: forge's i5-13500 has an
+idle state with a 1,048 µs exit latency, and a woken thread may land on a slower core.
+The worker that read the request is already running on its core.
+
+The first run of a query text that the server does not remember now runs on the receiving
+thread too, when the request has a timeout, no other request is in flight and none has
+ended in the last 10 ms. Every HTTP query has a timeout, the server's 60 s default or a
+smaller or capped `timeout` parameter, so the timeout condition always holds for queries.
+Warming the heap of the pool's first thread, the alternative for a server without a
+timeout, is not built, because no query lacks one. A text that contains `SERVICE`, or a
+`\u` escape that could spell it, starts on the pool, because a SERVICE call can wait on
+another server or run a graph algorithm. A query that reads a past state with `at` uses
+the pool as before. A request counts as in flight from the outermost layer of either
+listener, the metrics listener included, until its response body has ended, so a streamed
+answer still being produced keeps the server from counting as idle. The clock starts with
+the server, so the first request after a quiet start finds it idle also when the release
+of idle heap memory is off.
+
+The idle condition comes from the BSBM explore driver at 10M on forge, whose generated
+parameters make every text new. With every first run on the receiving thread, each query
+of the mix took 10% to 28% longer than on the pool, and 17% to 38% longer with the server
+pinned to the performance cores, so the slower cores do not explain it. Under steady load
+the pool's threads are awake, and the likely cost is the handoff of the worker's other
+tasks to another thread, which running in place needs, but the cause was not isolated.
+With the idle condition, measured against 030e62ef in rounds A, B, B, A with fresh
+servers, the mix ran 44,600 query mixes per hour on average before and 45,200 after, each query between 0.80 and 1.03
+times its previous time, and the rounds of the old build alone differed by 7%. The first
+`path-plus` of a fresh server fell from a median of 6.59 ms to 4.75 ms over 40 servers each.
+Texts the server had not seen, sent one after another by curl, stayed on the pool and took
+0.80 and 0.75 ms.
+
+The tradeoff is cancellation on disconnect. Work on the receiving thread cannot notice
+that its client went away, so a client that abandons a slow query the server has not seen
+leaves it running until its timeout. The server remembers a text as slow from the moment
+its first run starts, and only a run that ends quick with a whole answer marks it quick.
+A failed, slow or stopped first run therefore sends the text's later runs to the pool,
+where a disconnect stops them, and so does a concurrent request for the same text. The
+memory of texts holds 4,096 entries and starts over when it is full, so a slow text can
+get one more uncancellable first run after that.
+`a_first_run_in_place_still_stops_at_its_timeout`,
+`a_first_run_that_fails_to_answer_sends_the_next_run_to_the_pool` and
+`a_first_run_that_may_call_a_service_uses_the_blocking_pool` cover the rule.
 
 ### Admission after the body (2026-10-23)
 

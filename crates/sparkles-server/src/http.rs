@@ -383,7 +383,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             crate::obs::observe,
         ))
-        .layer(axum::middleware::from_fn(crate::alloc::track))
         .layer(axum::middleware::map_request(authority_host))
         .with_state(state.clone());
     // the branch a request chooses, before the routes above see it: the path form
@@ -395,6 +394,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             state,
             branches::select,
         ))
+        // outermost, so that a request counts as active from its first byte to the end
+        // of its response body (see `alloc`)
+        .layer(axum::middleware::from_fn(crate::alloc::track))
 }
 
 /// HTTP/2 requests carry their host as the `:authority` pseudo-header, not `Host`: it is
@@ -1418,16 +1420,36 @@ pub(crate) async fn run_query(
     // The first run of a query decides from its parsed algebra whether it has a SERVICE
     // of the algorithm namespace, so a prefixed name counts like the full IRI, and a
     // query that does is never remembered as quick and so never runs in place.
-    let quick = if at.is_none() && inline::available() {
-        QUICK.execution(quick_key)
+    let history = if at.is_none() && inline::available() {
+        QUICK.history(quick_key)
     } else {
-        None
+        inline::History::Slow
     };
-    let in_place = quick.is_some();
+    let quick = match history {
+        inline::History::Quick(execution) => Some(execution),
+        inline::History::Unseen | inline::History::Slow => None,
+    };
+    // The first run of a text the server has not seen runs in place too when a timeout
+    // bounds it, since the blocking pool costs a first request about 2 ms (see
+    // `inline`). It cannot be cancelled when its client disconnects, only by its
+    // timeout, and a slow run sends the text's later runs to the blocking pool.
+    let first_run = history == inline::History::Unseen
+        && timeout.is_some()
+        && inline::first_run_in_place(&query)
+        && inline::idle_for_first_run();
+    let in_place = quick.is_some() || first_run;
+    if first_run {
+        // Until a run of the text ends quick and whole, it counts as slow, so a first run
+        // that fails, stops early or fails to serialize sends the next runs to the pool,
+        // and so does a concurrent request for the same text.
+        QUICK.record(quick_key, f64::INFINITY);
+    }
     // SELECT and graph queries retain their quick eager shortcut. ASK can be quick
     // because its native execution avoids eager candidate storage, so it must keep
-    // automatic admission even when scheduled in place.
-    let auto = auto && (!in_place || quick == Some(inline::QuickExecution::PreserveAuto));
+    // automatic admission even when scheduled in place. A first run has no history, so
+    // it keeps automatic execution as on the blocking pool.
+    let auto =
+        auto && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
@@ -1605,10 +1627,12 @@ pub(crate) async fn run_query(
     // Try small answers in place; actual encoded bytes decide whether the answer
     // must switch to the blocking serializer, even with very few result cells.
     let body = if in_place && cells <= inline::QUICK_RESULT_CELLS {
-        stream::serialize_quick(limit, write, on_stream_end).await?
+        stream::serialize_quick(limit, write, on_stream_end).await
     } else {
-        stream::serialize(limit, write, on_stream_end).await?
+        stream::serialize(limit, write, on_stream_end).await
     };
+    // a run whose answer could not be written is not known to be quick any more
+    let body = body.inspect_err(|_| QUICK.record(quick_key, f64::INFINITY))?;
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
             let ms = if algorithmic {
