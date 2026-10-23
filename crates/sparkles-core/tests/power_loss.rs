@@ -20,7 +20,9 @@
 //!    `crash_images_of_a_dataset_with_full_text_search` runs the same images on a dataset
 //!    with full-text search, whose index replaces its metadata file by a rename, and checks
 //!    that the index never names a commit above the recovered log and that its results
-//!    match the recovered data (X09 section 17.8).
+//!    match the recovered data (X09 section 17.8). A separate background-checkpoint
+//!    case requires acknowledged publication during actual text-file synchronization;
+//!    a bounded fixture handshake starts a designated transaction after sync entry.
 //!  * `failed_synchronizations_*` fail one call and check that every commit that was not
 //!    acknowledged fails, that nothing past the last acknowledged commit is published, and
 //!    that the store reopens to a prefix that holds every acknowledged commit.
@@ -36,7 +38,9 @@
 //! an in-order prefix, as in the metadata journals of ext4 and XFS.
 //!
 //! `SPARKLES_POWER_LOSS_POINTS` sets the number of crash points per configuration (default
-//! 60) and `SPARKLES_POWER_LOSS_SEED` the seed of the random choices.
+//! 60) and `SPARKLES_POWER_LOSS_SEED` the seed of the random choices. Setting
+//! `SPARKLES_POWER_LOSS_KEEP` retains successful image runs and their raw I/O logs
+//! under the test target directory for inspection; failed runs are always retained.
 #![cfg(target_os = "linux")]
 
 use oxrdf::{GraphName, Literal, NamedNode, Quad};
@@ -50,6 +54,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const CHILD: &str = "SPARKLES_PL_CHILD";
+const BACKGROUND: &str = "SPARKLES_PL_BACKGROUND_TEXT";
 
 fn work_root() -> PathBuf {
     let p = Path::new(env!("CARGO_TARGET_TMPDIR")).join("power-loss");
@@ -165,6 +170,21 @@ fn child_writer() {
         .unwrap();
     let ack = Arc::new(Mutex::new(ack));
     let s = Arc::new(Store::open(&db, cfg.options()).unwrap());
+    let background = cfg!(feature = "text") && std::env::var_os(BACKGROUND).is_some();
+    // This trace event precedes write_with, so a matching receipt inside the same
+    // sync interval proves a fresh transaction could publish during checkpoint I/O.
+    let begin = background.then(|| {
+        Arc::new(Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(
+                    PathBuf::from(std::env::var("SPARKLES_PL_ACK").unwrap())
+                        .with_file_name("begin.log"),
+                )
+                .unwrap(),
+        ))
+    });
     // faults count the calls after the store has opened
     if let Ok(arm) = std::env::var("SPARKLES_IO_ARM") {
         std::fs::write(arm, b"armed").unwrap();
@@ -172,9 +192,27 @@ fn child_writer() {
     let out = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut hs = Vec::new();
     for t in 1..=cfg.threads {
-        let (s, ack, out) = (s.clone(), ack.clone(), out.clone());
+        let (s, ack, out, begin) = (s.clone(), ack.clone(), out.clone(), begin.clone());
         hs.push(std::thread::spawn(move || {
             for k in 0..cfg.commits {
+                let designated = background && t == 1 && k == 0;
+                if designated {
+                    let entered = PathBuf::from(std::env::var("SPARKLES_IO_SYNC_ENTERED").unwrap());
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !entered.is_file() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no armed text-file sync entered"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                if let Some(begin) = &begin {
+                    let mut rec = [0u8; 8];
+                    rec[..4].copy_from_slice(&t.to_le_bytes());
+                    rec[4..].copy_from_slice(&k.to_le_bytes());
+                    begin.lock().unwrap().write_all(&rec).unwrap();
+                }
                 // every commit has a message, so the annotation of each acknowledged
                 // commit is checked after the crash
                 let mut w = s.write_with(
@@ -198,6 +236,16 @@ fn child_writer() {
                         out.lock()
                             .unwrap()
                             .push(format!("ok {t} {k} {}", r.commit.seq));
+                        if designated {
+                            std::fs::write(
+                                std::env::var("SPARKLES_IO_SYNC_RELEASE").unwrap(),
+                                b"1",
+                            )
+                            .unwrap();
+                            out.lock()
+                                .unwrap()
+                                .push("background-gate-released 1 0".into());
+                        }
                     }
                     Err(e) => {
                         out.lock().unwrap().push(format!("err {t} {k} {e}"));
@@ -207,14 +255,13 @@ fn child_writer() {
             }
         }));
     }
-    // The run is far shorter than the full-text index's one-second tick, so a side
-    // thread checkpoints the index while the writers run. The checkpoints then name
-    // commits of the run, and the images check them against the recovered log.
-    // With grouping, every fence also checkpoints the index after it took its commits
-    // and before it synchronizes them, the moment at which an index that applied
-    // commits before their fence would name a commit that the crash can still lose.
+    // A side thread drives checkpointing without waiting for the one-second tick.
+    // Background mode uses the actual unlocked tick and never calls the explicit
+    // checkpoint. The other mode also checkpoints at each group fence before its
+    // synchronization, when an index applied before its fence would name commits
+    // that a crash can still lose. Both modes check against the recovered log.
     #[cfg(all(feature = "text", feature = "failpoints"))]
-    if s.text_enabled() {
+    if s.text_enabled() && !background {
         s.set_failpoint(
             "group-sealed",
             Some(Arc::new(|s: &Store| {
@@ -224,11 +271,22 @@ fn child_writer() {
     }
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     #[cfg(feature = "text")]
+    let checkpoints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[cfg(feature = "text")]
     let checkpointer = s.text_enabled().then(|| {
         let (s, done) = (s.clone(), done.clone());
+        #[cfg(feature = "failpoints")]
+        let checkpoints = checkpoints.clone();
         std::thread::spawn(move || {
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                if s.checkpoint_text().is_err() {
+                if background {
+                    #[cfg(feature = "failpoints")]
+                    if s.checkpoint_text_background_for_test() {
+                        checkpoints.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    #[cfg(not(feature = "failpoints"))]
+                    panic!("the background crash fixture needs failpoints");
+                } else if s.checkpoint_text().is_err() {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -242,6 +300,13 @@ fn child_writer() {
     #[cfg(feature = "text")]
     if let Some(c) = checkpointer {
         c.join().unwrap();
+    }
+    #[cfg(feature = "text")]
+    if background {
+        println!(
+            "LINE background-checkpoints {}",
+            checkpoints.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
     for l in out.lock().unwrap().iter() {
         println!("LINE {l}");
@@ -289,7 +354,15 @@ fn copy_dir(from: &Path, to: &Path) {
 /// Prepare a store of `base` commits, copy it to `base-db`, and run the writer on the
 /// original under the shim, recording its I/O when `record` is set and failing the calls
 /// named by `fault`.
-fn run_writer(name: &str, cfg: Config, base: u32, record: bool, fault: &str, text: bool) -> Run {
+fn run_writer(
+    name: &str,
+    cfg: Config,
+    base: u32,
+    record: bool,
+    fault: &str,
+    text: bool,
+    background: bool,
+) -> Run {
     let root = work_root().join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("ack")).unwrap();
@@ -321,9 +394,28 @@ fn run_writer(name: &str, cfg: Config, base: u32, record: bool, fault: &str, tex
         .env("SPARKLES_PL_ACK", root.join("ack/ack.log"))
         .env("SPARKLES_IO_ROOT", &root)
         .env("SPARKLES_IO_ARM", root.join("armed"))
-        .env("LD_PRELOAD", shim());
+        .env("LD_PRELOAD", shim())
+        .env_remove(BACKGROUND)
+        .env_remove("SPARKLES_IO_DELAY_US")
+        .env_remove("SPARKLES_IO_SYNC_ENTERED")
+        .env_remove("SPARKLES_IO_SYNC_RELEASE");
     if record {
         cmd.env("SPARKLES_IO_LOG", root.join("io.log"));
+    }
+    if background {
+        assert!(text && record && fault.is_empty());
+        // The first armed text-file sync waits for writer1's first receipt. That
+        // transaction starts after sync entry, so a delayed earlier receipt cannot
+        // satisfy the overlap oracle. Both sides have finite timeouts.
+        cmd.env(BACKGROUND, "1")
+            .env(
+                "SPARKLES_IO_SYNC_ENTERED",
+                root.join("ack/text-sync-entered"),
+            )
+            .env(
+                "SPARKLES_IO_SYNC_RELEASE",
+                root.join("ack/text-sync-release"),
+            );
     }
     if !fault.is_empty() {
         cmd.env("SPARKLES_IO_FAULT", fault);
@@ -929,10 +1021,149 @@ fn check_image(
     payload
 }
 
-fn crash_images(name: &str, cfg: Config, text: bool) {
+/// Require a transaction's begin and receipt in one successfully completed sync.
+/// An ack alone can be delayed after publication, and an adjacent sync is not the same
+/// interval. Repeated paths reset their admitted pairs conservatively.
+fn background_publications(log: &[Rec]) -> usize {
+    type Transactions = std::collections::BTreeSet<(u32, u32)>;
+    let mut syncing = BTreeMap::<String, (Transactions, Transactions)>::new();
+    let mut published = Transactions::new();
+    for rec in log {
+        match rec {
+            Rec::Sync { path }
+                if Path::new(path)
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with("text")) =>
+            {
+                syncing.insert(path.clone(), Default::default());
+            }
+            Rec::SyncEnd { path, failed } => {
+                if let Some((_, acknowledged)) = syncing.remove(path)
+                    && !failed
+                {
+                    published.extend(acknowledged);
+                }
+            }
+            Rec::Write { path, data, .. } if path.ends_with("begin.log") && data.len() == 8 => {
+                let key = (
+                    u32::from_le_bytes(data[..4].try_into().unwrap()),
+                    u32::from_le_bytes(data[4..].try_into().unwrap()),
+                );
+                for (begun, _) in syncing.values_mut() {
+                    begun.insert(key);
+                }
+            }
+            Rec::Write { path, data, .. } if path.ends_with("ack.log") && data.len() == 16 => {
+                let key = (
+                    u32::from_le_bytes(data[8..12].try_into().unwrap()),
+                    u32::from_le_bytes(data[12..].try_into().unwrap()),
+                );
+                for (begun, acknowledged) in syncing.values_mut() {
+                    if begun.contains(&key) {
+                        acknowledged.insert(key);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    published.len()
+}
+
+#[test]
+fn background_oracle_requires_a_fresh_transaction_in_one_successful_sync() {
+    let sync = || Rec::Sync {
+        path: "/db/text/a.seg".into(),
+    };
+    let end = |failed| Rec::SyncEnd {
+        path: "/db/text/a.seg".into(),
+        failed,
+    };
+    let begin = |t: u32, k: u32| {
+        let mut data = t.to_le_bytes().to_vec();
+        data.extend_from_slice(&k.to_le_bytes());
+        Rec::Write {
+            path: "/ack/begin.log".into(),
+            off: 0,
+            data,
+            dsync: false,
+        }
+    };
+    let ack = |t: u32, k: u32| {
+        let mut data = 4u64.to_le_bytes().to_vec();
+        data.extend_from_slice(&t.to_le_bytes());
+        data.extend_from_slice(&k.to_le_bytes());
+        Rec::Write {
+            path: "/ack/ack.log".into(),
+            off: 0,
+            data,
+            dsync: false,
+        }
+    };
+    assert_eq!(
+        background_publications(&[begin(1, 1), sync(), ack(1, 1), end(false)]),
+        0,
+        "a receipt delayed after earlier publication is not a fresh transaction"
+    );
+    assert_eq!(
+        background_publications(&[sync(), begin(1, 1), ack(1, 1), end(false)]),
+        1
+    );
+    assert_eq!(
+        background_publications(&[
+            sync(),
+            begin(1, 1),
+            end(false),
+            sync(),
+            ack(1, 1),
+            end(false)
+        ]),
+        0,
+        "the begin and receipt must be inside the same sync interval"
+    );
+    assert_eq!(
+        background_publications(&[sync(), begin(1, 1), ack(1, 2), end(false)]),
+        0,
+        "the receipt must match the transaction that began inside sync"
+    );
+    assert_eq!(
+        background_publications(&[sync(), begin(1, 1), end(false), ack(1, 1)]),
+        0
+    );
+    assert_eq!(
+        background_publications(&[sync(), begin(1, 1), ack(1, 1), end(true)]),
+        0,
+        "a failed sync cannot establish the successful-I/O interleaving"
+    );
+}
+
+fn crash_images(name: &str, cfg: Config, text: bool, background: bool) {
     let base = 3;
-    let run = run_writer(name, cfg, base, true, "", text);
+    let run = run_writer(name, cfg, base, true, "", text, background);
     let log = parse_log(&std::fs::read(run.log()).unwrap());
+    if background {
+        let count = run
+            .lines
+            .iter()
+            .find_map(|line| line.strip_prefix("background-checkpoints "))
+            .and_then(|count| count.parse::<usize>().ok())
+            .expect("the writer must report its background checkpoint attempts");
+        assert!(count > 0, "{name}: no background checkpoint ran");
+        assert!(
+            run.lines
+                .iter()
+                .any(|line| line == "background-gate-released 1 0"),
+            "{name}: designated transaction did not release the text-file sync"
+        );
+        let overlaps = background_publications(&log);
+        println!(
+            "{name}: {count} actual background checkpoints, {overlaps} fresh acknowledged transactions during successful text-file sync"
+        );
+        assert!(
+            overlaps > 0,
+            "{name}: no fresh transaction began and was acknowledged during one successful text-file synchronization"
+        );
+    }
     let root = run.root.canonicalize().unwrap();
     // the paths in the log are canonical
     let mut model = Model::new();
@@ -1001,6 +1232,11 @@ fn crash_images(name: &str, cfg: Config, text: bool) {
         }
         images += 4;
     }
+    println!(
+        "{name}: checked {images} crash images from {} I/O records, {} acknowledgements, highest text checkpoint {named}",
+        log.len(),
+        acked.len()
+    );
     assert!(images > 0);
     assert!(!acked.is_empty(), "the writer acknowledged no commit");
     // The full-text index makes segment files and replaces its metadata by a rename,
@@ -1026,7 +1262,14 @@ fn crash_images(name: &str, cfg: Config, text: bool) {
             "{name}: {renames} renames of meta.json and {creates} creations recorded"
         );
     }
-    let _ = std::fs::remove_dir_all(&run.root);
+    if std::env::var_os("SPARKLES_POWER_LOSS_KEEP").is_some() {
+        println!(
+            "{name}: retained raw I/O and crash fixture at {}",
+            run.root.display()
+        );
+    } else {
+        let _ = std::fs::remove_dir_all(&run.root);
+    }
 }
 
 #[test]
@@ -1073,7 +1316,7 @@ fn crash_images_keep_every_acknowledged_commit() {
             },
         ),
     ] {
-        crash_images(name, cfg, false);
+        crash_images(name, cfg, false, false);
     }
 }
 
@@ -1116,7 +1359,34 @@ fn crash_images_of_a_dataset_with_full_text_search() {
             },
         ),
     ] {
-        crash_images(name, cfg, true);
+        crash_images(name, cfg, true, false);
+    }
+}
+
+/// Exercise the actual unlocked background path separately from the fence/explicit
+/// checkpoint cases above. A bounded shim handshake starts a designated transaction
+/// after sync entry and holds that sync until its receipt. The test rejects a run
+/// without either a real checkpoint or fresh publication inside one successful sync.
+#[cfg(all(feature = "text", feature = "failpoints"))]
+#[test]
+fn crash_images_during_background_full_text_checkpoints() {
+    for group in [false, true] {
+        crash_images(
+            if group {
+                "background-text-group"
+            } else {
+                "background-text-ordinary"
+            },
+            Config {
+                group,
+                direct: false,
+                idle_direct: false,
+                threads: 4,
+                commits: 25,
+            },
+            true,
+            true,
+        );
     }
 }
 
@@ -1230,7 +1500,7 @@ fn a_failed_first_annotation_sync_keeps_later_messages() {
 /// section 4.3.
 fn failed_sync(name: &str, cfg: Config, fault: &str) {
     let base = 3;
-    let run = run_writer(name, cfg, base, false, fault, false);
+    let run = run_writer(name, cfg, base, false, fault, false, false);
     let mut acked = Vec::new();
     let (mut head, mut after) = (None, None);
     let mut errors = 0;

@@ -716,6 +716,211 @@ mod tests {
     }
 
     #[test]
+    fn retiring_text_maintenance_cannot_touch_a_reconfigured_directory() {
+        let _serial = serial();
+        for disable_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            populate(root);
+            let store = Arc::new(Store::open(root, Default::default()).unwrap());
+            wait(&store);
+            let old = store.text.load_full().unwrap();
+            let mut syncing = Pause::new(root, "text-checkpoint-file-sync");
+            let mut completed = Pause::new(root, "text-checkpoint-completed");
+            update(
+                &store,
+                "INSERT DATA { <http://ex/b> <http://www.w3.org/2000/01/rdf-schema#label> \"fox again\" }",
+            );
+            assert_eq!(count(&store), 2);
+            syncing.reached();
+            let mut before_lease = Pause::new(root, "text-checkpoint-before-lease");
+            let mut after_lease = Pause::new(root, "text-checkpoint-after-lease");
+            let lifecycle_store = store.clone();
+            let lifecycle = std::thread::spawn(move || {
+                if disable_first {
+                    lifecycle_store.disable_text()
+                } else {
+                    lifecycle_store
+                        .enable_text(TextConfig {
+                            max_hits: 7,
+                            ..Default::default()
+                        })
+                        .map(|_| ())
+                }
+            });
+            before_lease.reached();
+            before_lease.resume();
+            let blocked = after_lease.ready.recv_timeout(Duration::from_millis(50));
+            syncing.resume();
+            if blocked.is_err() {
+                after_lease.reached();
+            }
+            after_lease.resume();
+            completed.reached();
+            // Keeping `old` permits the lifecycle operation to return while its old
+            // ticker is still paused. The old writer must already have been retired.
+            let changed = lifecycle.join().unwrap();
+            if changed.is_ok() && disable_first {
+                assert!(!root.join("text").exists());
+                store.enable_text(Default::default()).unwrap();
+            }
+            if changed.is_ok() {
+                update(
+                    &store,
+                    "INSERT DATA { <http://ex/c> <http://www.w3.org/2000/01/rdf-schema#label> \"fox after reconfiguration\" }",
+                );
+                assert_eq!(count(&store), 3);
+            }
+            let marked_before = root.join("text.dirty").exists();
+            let old_checkpoint = old.checkpoint();
+            completed.resume();
+            drop(old); // joins the old ticker, then exercises idempotent close
+            changed.unwrap();
+            old_checkpoint.unwrap();
+            assert!(
+                blocked.is_err(),
+                "retirement passed a checkpoint still syncing its path"
+            );
+            assert!(marked_before);
+            assert!(
+                root.join("text.dirty").exists(),
+                "old maintenance cleared the new index marker"
+            );
+            assert_eq!(count(&store), 3);
+            let config = store.text_status().unwrap().config;
+            assert_eq!(
+                config.max_hits,
+                if disable_first {
+                    TextConfig::default().max_hits
+                } else {
+                    7
+                }
+            );
+            drop(store);
+            let reopened = Store::open(root, Default::default()).unwrap();
+            wait(&reopened);
+            assert_eq!(count(&reopened), 3);
+        }
+    }
+
+    #[test]
+    fn stale_retirement_waits_for_an_in_flight_background_checkpoint() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        let store = Arc::new(Store::open(root, Default::default()).unwrap());
+        wait(&store);
+        let old = store.text.load_full().unwrap();
+        let mut syncing = Pause::new(root, "text-checkpoint-file-sync");
+        let mut completed = Pause::new(root, "text-checkpoint-completed");
+        update(
+            &store,
+            "INSERT DATA { <http://ex/b> <http://www.w3.org/2000/01/rdf-schema#label> \"fox again\" }",
+        );
+        assert_eq!(count(&store), 2);
+        syncing.reached();
+        // A failed removal changes the RDF head but need not create a Tantivy file
+        // or advance the old directory's publication counter.
+        store.fail_next_text_commit();
+        update(
+            &store,
+            "DELETE DATA { <http://ex/b> <http://www.w3.org/2000/01/rdf-schema#label> \"fox again\" }",
+        );
+        assert_eq!(store.text_status().unwrap().state, "stale");
+        let (changed_tx, changed_rx) = mpsc::channel();
+        let lifecycle_store = store.clone();
+        let lifecycle = std::thread::spawn(move || {
+            let result = lifecycle_store
+                .enable_text(TextConfig {
+                    max_hits: 7,
+                    ..Default::default()
+                })
+                .map(|_| ());
+            let _ = changed_tx.send(result);
+        });
+        let early = changed_rx.recv_timeout(Duration::from_secs(2));
+        let prematurely_reused = early.is_ok();
+        if prematurely_reused {
+            assert!(early.as_ref().unwrap().is_ok());
+            store.set_text_ticks(false);
+            update(
+                &store,
+                "INSERT DATA { <http://ex/c> <http://www.w3.org/2000/01/rdf-schema#label> \"fox new owner\" }",
+            );
+            assert_eq!(count(&store), 2);
+            assert!(root.join("text.dirty").exists());
+        }
+        syncing.resume();
+        completed.reached();
+        let changed = match early {
+            Ok(result) => result,
+            Err(_) => changed_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        };
+        lifecycle.join().unwrap();
+        if !prematurely_reused && changed.is_ok() {
+            store.set_text_ticks(false);
+            update(
+                &store,
+                "INSERT DATA { <http://ex/c> <http://www.w3.org/2000/01/rdf-schema#label> \"fox new owner\" }",
+            );
+            assert_eq!(count(&store), 2);
+        }
+        let marker_retained = root.join("text.dirty").exists();
+        completed.resume();
+        drop(old);
+        changed.unwrap();
+        assert!(
+            !prematurely_reused,
+            "stale retirement reused the pathname while an old checkpoint held it; replacement marker retained={marker_retained}"
+        );
+        assert!(marker_retained, "the replacement lost its unsynced marker");
+        drop(store);
+        let reopened = Store::open(root, Default::default()).unwrap();
+        wait(&reopened);
+        assert_eq!(count(&reopened), 2);
+        assert_eq!(reopened.text_status().unwrap().config.max_hits, 7);
+    }
+
+    #[test]
+    fn reconfiguration_retires_a_stale_writer_before_rebuilding_from_durable_data() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        let store = Store::open(root, Default::default()).unwrap();
+        wait(&store);
+        let old = store.text.load_full().unwrap();
+        store.fail_next_text_commit();
+        update(
+            &store,
+            "INSERT DATA { <http://ex/b> <http://www.w3.org/2000/01/rdf-schema#label> \"fox retained after failed maintenance\" }",
+        );
+        assert_eq!(store.text_status().unwrap().state, "stale");
+        store
+            .enable_text(TextConfig {
+                max_hits: 7,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(count(&store), 2);
+        update(
+            &store,
+            "INSERT DATA { <http://ex/c> <http://www.w3.org/2000/01/rdf-schema#label> \"fox after recovery\" }",
+        );
+        assert_eq!(count(&store), 3);
+        let marked = root.join("text.dirty").exists();
+        old.checkpoint().unwrap();
+        drop(old);
+        assert!(marked);
+        assert!(root.join("text.dirty").exists());
+        drop(store);
+        let reopened = Store::open(root, Default::default()).unwrap();
+        wait(&reopened);
+        assert_eq!(count(&reopened), 3);
+    }
+
+    #[test]
     fn automatic_recovery_quota_refusal_cleans_staging_and_can_retry() {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
