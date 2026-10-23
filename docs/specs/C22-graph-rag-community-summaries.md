@@ -1,6 +1,6 @@
 # C22: Community summaries for global questions (GraphRAG)
 
-> **Status:** specified
+> **Status:** specified, with the model role foundation implemented
 >
 > **Phases:** None shipped. Phase 1 is the community build from F14's Leiden, the
 > summaries written by the server's model providers with citations to facts, their
@@ -8,7 +8,8 @@
 > Phase 2 adds global questions in Ask, community context in `recall` and the brief, and
 > the MCP tool. Phase 3 refreshes communities and summaries incrementally after commits.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime)
+> cover configuring the role. Community reports are not built.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end will record how it lands.
@@ -170,9 +171,11 @@ facts do not fit. Reports are therefore written bottom-up.
 
 ### 3.3 The model call
 
-The new role `community` of C18 §3.7 writes the report. It has its own ordered list of
-provider and model pairs, falls back to `summarize`'s list when it has none, and uses the
-structured-output levels of C18 §3.6. The output is a `CommunityReport`:
+The new role `community` extends C18 §3.7 and writes the report. It has its own ordered
+list of provider and model pairs. When neither the server nor the dataset configures
+the role, it inherits the `summarize` list after dataset overrides. An explicit empty
+`community` list turns the role off. Report calls use the structured-output levels of
+C18 §3.6. The output is a `CommunityReport`:
 
 ```json
 { "title": "Payments platform team",
@@ -440,7 +443,30 @@ evaluation.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 12.
+The `community` model role is implemented in the server configuration, dataset role
+overrides, CLI role guidance and the model settings UI. It preserves provider/model
+order and inherits the resolved `summarize` list when neither layer explicitly
+configures `community`. An explicit empty list disables the role. Configuration,
+server/dataset precedence and UI guidance have focused regression tests.
+
+No phase is complete. The foundation adds no model calls, GraphRAG settings, report
+storage, build task or route. Phase 1 still needs the hierarchy adapter, stable
+identities, report checks, budgets, provenance, access control, CLI, Communities tab,
+inbox kind and manual refresh. Global Ask and memory integration remain Phase 2, and
+automatic refresh remains Phase 3. [ROADMAP](../ROADMAP.md) item 12 tracks this work.
+
+Before report publication, the implementation needs contracts for the exact pre-build
+token count of §3.5 and the unsupported entity check of §3.4. Higher-level report inputs
+depend on generated child reports, so an exact count for an individual request does not
+establish an exact count for the whole build before its first call. Citation validation
+alone does not establish that every entity named in free text is supported.
+
+The report-read guard of §6 must retain the input disclosure boundary from the build,
+including caller-bound triple protections. Comparing a reader only with the build
+principal's current grants is insufficient after those grants change. Direct report
+reads, metadata, branches and historical snapshots need the same protection before
+reports become visible. These are implementation prerequisites, not guarantees supplied
+by the role foundation.
 
 ### Shared memory representation follow-up
 

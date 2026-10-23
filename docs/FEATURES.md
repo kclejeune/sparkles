@@ -257,10 +257,12 @@ that work by priority and links each item to its design spec.
   has no queue order, so a call that needs several threads can wait while one-thread
   calls keep taking the free slots. [Roadmap](ROADMAP.md) item 8.
 
-* **Community summaries.** Leiden can compute a community hierarchy, but Sparkles
-  does not build or store GraphRAG community reports with citations, provenance and
-  review status. Global Ask answers from those reports, community context in memory
-  tools and incremental report refresh are not built. [Roadmap](ROADMAP.md) item 12.
+* **Community summaries.** Leiden can compute a community hierarchy, and model
+  settings accept a `community` role that inherits the resolved `summarize` list when
+  unset. An explicit empty list disables it. Sparkles does not build or store GraphRAG
+  reports with citations, provenance and review status. Global Ask answers from those
+  reports, community context in memory tools and incremental report refresh are not
+  built. [Roadmap](ROADMAP.md) item 12.
 
 * **Cold sparse reads.** The constant, scan and result-term prefetch paths and I/O
   profiling are implemented. Corrected-source warm instruction and read-hint gates,
