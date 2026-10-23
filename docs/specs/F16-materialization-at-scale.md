@@ -1100,23 +1100,30 @@ inputs of the item 1 refresh. The digest is the SHA-256 of the sorted derived tr
 | Run | Head | Baseline c7a6811c, limit raised |
 |---|---|---|
 | LUBM(100), `rdfs` | 8.6 s, 3,125 MiB peak RSS, 1,213 MiB peak heap estimate | 13.5 s, 4,903 MiB |
-| LUBM(1000), 138.3M triples, `rdfs` | 90.9 s, 15,187 MiB peak RSS, 12,319 MiB peak heap estimate, 55,069,413 derived triples | Killed at the 28 GiB limit after 4 min 41 s, at 28,614 MiB RSS |
+| LUBM(1000), 138.3M triples, `rdfs` | 90.9 s, 15,187 MiB peak RSS, 12,319 MiB peak heap estimate, 55,069,413 derived triples | Killed at the 28 GiB limit after 4 min 41 s, at 28,614 MiB RSS. With swap allowed, 360.4 s and at least 34,935 MiB of RSS and swap together |
 | OWL2Bench, 1 university, `owl-rl` | 3.0 s, 809 MiB, 499 MiB | 19.8 s, 3,031 MiB |
 | OWL2Bench, 2 universities, `owl-rl` | 25.0 s, 1,892 MiB, 1,755 MiB, 4,914,915 derived triples | 162.5 s, 13,713 MiB |
 | OWL2Bench, 5 universities, `owl-rl` | Killed at the 28 GiB limit after 12 min 50 s | Killed at the 28 GiB limit after 31 s |
 
-Every run that both binaries finished derived the same closure by digest, the LUBM(100)
-RDFS closure included, so A1's last condition holds. The LUBM(1000) run also left
-11,170,179 generalized triples unwritten, as both engines do. A1 is met. The head
+A first run of the baseline on LUBM(1000) was killed at the 28 GiB limit, which leaves
+open how much it needs. A second run on a new instance kept the 28 GiB limit on memory but
+allowed swap, on a swap file of 96 GiB, and sampled the process's resident and swapped
+memory once a second. It finished in 360.4 s, slowed by the swapping, and its resident
+and swapped memory together reached at least 34,935 MiB. The sampling started about 5
+minutes into the run, so the true peak may be higher. The cgroup's own peaks were the
+28 GiB limit and 19,463 MiB of swap, which also count the page cache.
+
+Every run that both binaries finished derived the same closure by digest, LUBM(1000) and
+the LUBM(100) RDFS closure included, so A1's last condition holds. The LUBM(1000) run also
+left 11,170,179 generalized triples unwritten, as both engines do. A1 is met. The head
 completes LUBM(1000) under RDFS. Its peak heap estimate of 12,319 MiB is well within 3
 times the derived tier plus 1 GiB, which at about 135 bytes for each of its 66.2 million
-derived rows comes to about 26 GiB. It is also less than half of what the baseline needs,
-since the baseline was still growing when the 28 GiB limit stopped it, and half of that
-is 14,336 MiB. By peak RSS the head's 15,187 MiB is 0.53 of the 28 GiB, so on that measure
-the half holds only if the baseline needs more than 29.7 GiB, which an instance of 32 GiB
-cannot show. OWL2Bench under OWL 2 RL is 6.5 times faster with 0.14 times the RSS at two
-universities, where the baseline now finishes. From five universities on, neither binary
-fits 28 GiB, so the larger sizes were not run.
+derived rows comes to about 26 GiB. The baseline has no heap estimate, so the half is
+measured on resident memory, where the head's peak RSS of 15,187 MiB is at most 0.43 of
+the baseline's 34,935 MiB or more of resident and swapped memory. OWL2Bench under OWL 2 RL
+is 6.5 times faster with 0.14 times the RSS at two universities, where the baseline now
+finishes. From five universities on, neither binary fits 28 GiB, so the larger sizes were
+not run.
 
 **Deviations.**
 * §3.5 expected the same cache limit to keep the closure of an input about four times

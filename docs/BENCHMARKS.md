@@ -416,13 +416,13 @@ and the baseline is c7a6811c, the commit before F16's Phase 1, with its fixed li
 | Run | Head | Baseline |
 |---|---|---|
 | LUBM(100), `rdfs` | 8.6 s, 3,125 MiB peak RSS | 13.5 s, 4,903 MiB |
-| LUBM(1000), `rdfs` | 90.9 s, 15,187 MiB, 55,069,413 derived triples | Killed at 28 GiB after 4 min 41 s |
+| LUBM(1000), `rdfs` | 90.9 s, 15,187 MiB, 55,069,413 derived triples | Killed at 28 GiB after 4 min 41 s. With swap, 360.4 s and at least 34,935 MiB of RSS and swap |
 | OWL2Bench, 2 universities, `owl-rl` | 25.0 s, 1,892 MiB, 4,914,915 derived triples | 162.5 s, 13,713 MiB |
 | OWL2Bench, 5 universities, `owl-rl` | Killed at 28 GiB after 12 min 50 s | Killed at 28 GiB after 31 s |
 
-The closures of the runs that both binaries finished have the same SHA-256. The head's
-peak heap estimate at LUBM(1000) is 12,319 MiB, less than half of the 28 GiB the
-baseline passed, which meets A1 by that measure. These are development numbers from a
+The closures of the runs that both binaries finished have the same SHA-256, LUBM(1000)
+included. The head's peak RSS at LUBM(1000) is at most 0.43 of the resident and swapped
+memory the baseline needed, which meets A1. These are development numbers from a
 Namespace instance, not forge. [F16's Outcome](specs/F16-materialization-at-scale.md#outcome)
 has the method and the decision.
 
