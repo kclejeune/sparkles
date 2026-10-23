@@ -1343,9 +1343,49 @@ mod imp {
         Ok((index, fields, dir))
     }
 
-    /// Check an index that may hold unsynced writes: every file of the committed
-    /// segments must exist and match its checksum.
-    fn verify(index: &Index) -> Result<()> {
+    /// The bytes at the end of every Tantivy file after its footer's JSON: the JSON's
+    /// length and a magic number, both `u32`.
+    const FOOTER_TRAILER: u64 = 8;
+
+    /// What is wrong with the file `f` of a committed segment in the index directory
+    /// `root`, opened as `d`, or `None` when it exists (and, with `checksums`, matches its
+    /// checksum). A crash can leave a file torn to any length. Tantivy's footer parser
+    /// rejects a file shorter than 4 bytes but subtracts the 8-byte trailer from the
+    /// length of a file of 4 to 7 bytes, which panics, so such a file is reported here
+    /// before Tantivy reads it. Any other panic inside the checksum check is reported as
+    /// damage too, so that a damaged index is rebuilt rather than failing the open.
+    fn file_problem(
+        d: &tantivy::directory::ManagedDirectory,
+        root: &Path,
+        f: &Path,
+        checksums: bool,
+    ) -> Option<String> {
+        match tantivy::directory::Directory::exists(d, f) {
+            Ok(true) => {}
+            Ok(false) => return Some("missing".into()),
+            Err(e) => return Some(e.to_string()),
+        }
+        if !checksums {
+            return None;
+        }
+        match std::fs::metadata(root.join(f)) {
+            Ok(m) if m.len() < FOOTER_TRAILER => {
+                return Some(format!("truncated to {} bytes", m.len()));
+            }
+            Ok(_) => {}
+            Err(e) => return Some(e.to_string()),
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.validate_checksum(f))) {
+            Ok(Ok(true)) => None,
+            Ok(Ok(false)) => Some("checksum mismatch".into()),
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some("unreadable footer".into()),
+        }
+    }
+
+    /// Check an index in the directory `root` that may hold unsynced writes: every file
+    /// of the committed segments must exist and match its checksum.
+    fn verify(index: &Index, root: &Path) -> Result<()> {
         let d = index.directory();
         for meta in index.searchable_segment_metas().map_err(text_err)? {
             for f in meta.list_files() {
@@ -1353,10 +1393,11 @@ mod imp {
                 if meta.delete_opstamp().is_none() && f.extension().is_some_and(|e| e == "del") {
                     continue;
                 }
-                let ok = tantivy::directory::Directory::exists(d, &f).map_err(text_err)?
-                    && d.validate_checksum(&f).map_err(text_err)?;
-                if !ok {
-                    return Err(text_err(format!("{} is missing or damaged", f.display())));
+                if let Some(problem) = file_problem(d, root, &f, true) {
+                    return Err(text_err(format!(
+                        "{} is missing or damaged ({problem})",
+                        f.display()
+                    )));
                 }
             }
         }
@@ -1368,7 +1409,6 @@ mod imp {
     /// `checksums`, matches its checksum). A server may commit and merge meanwhile, so
     /// damage is re-checked against a fresh `meta.json` before it is reported.
     pub(crate) fn probe(root: &Path, checksums: bool) -> super::TextProbe {
-        use tantivy::directory::Directory;
         let mut p = super::TextProbe::default();
         let config = match read_config(root) {
             Ok(Some(c)) => c,
@@ -1431,17 +1471,7 @@ mod imp {
                         continue;
                     }
                     p.files += 1;
-                    let problem = match Directory::exists(d, &f) {
-                        Ok(false) => Some("missing".to_string()),
-                        Ok(true) if checksums => match d.validate_checksum(&f) {
-                            Ok(true) => None,
-                            Ok(false) => Some("checksum mismatch".to_string()),
-                            Err(e) => Some(e.to_string()),
-                        },
-                        Ok(true) => None,
-                        Err(e) => Some(e.to_string()),
-                    };
-                    if let Some(problem) = problem {
+                    if let Some(problem) = file_problem(d, &dir, &f, checksums) {
                         p.damaged.push((f.display().to_string(), problem));
                     }
                 }
@@ -1793,7 +1823,7 @@ mod imp {
         if payload.format != FORMAT || payload.seq > seq || payload.config != config_hash(config) {
             return Ok(false);
         }
-        verify(&index)?;
+        verify(&index, &source.join("text"))?;
         let tmp = tempfile::Builder::new()
             .prefix(".text-seed-")
             .tempdir_in(root)?;
@@ -1822,7 +1852,10 @@ mod imp {
         )?;
         // Verify the exact checkpoint being published, rather than whichever
         // checkpoint the upstream has advanced to during copying.
-        verify(&Index::open_in_dir(tmp.path()).map_err(text_err)?)?;
+        verify(
+            &Index::open_in_dir(tmp.path()).map_err(text_err)?,
+            tmp.path(),
+        )?;
         crate::store::sync_dir(tmp.path())?;
         std::fs::rename(tmp.path(), root.join("text"))?;
         crate::store::sync_dir(root)?;
@@ -1901,7 +1934,7 @@ mod imp {
             .inspect_err(|e| tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding"))
             .map_err(|_| RecoveryReason::Unreadable)?;
         if dir.is_marked() {
-            verify(&index)
+            verify(&index, &root.join("text"))
                 .inspect_err(|e| tracing::warn!(target: "sparkles::text::imp", "{e}; rebuilding"))
                 .map_err(|_| RecoveryReason::Unreadable)?;
         }
@@ -2001,7 +2034,12 @@ mod imp {
             background: bool,
         ) -> Result<Option<(TextIndex, Arc<TextView>)>> {
             let hash = config_hash(&config);
-            let existing = inspect_existing(root, &config);
+            // Verification never hands Tantivy a file too short for its footer, and a
+            // panic elsewhere in reading a damaged index means the same as damage.
+            let existing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                inspect_existing(root, &config)
+            }))
+            .unwrap_or(Err(RecoveryReason::Unreadable));
             let mut classification = classify_open(
                 existing.as_ref().map(|e| &e.payload).map_err(|r| *r),
                 &hash,
@@ -2016,7 +2054,11 @@ mod imp {
                 let ExistingIndex {
                     index, fields, dir, ..
                 } = existing.expect("ready classification has existing index evidence");
-                match live_of(index, fields, &config, Some(dir), seq) {
+                let live = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    live_of(index, fields, &config, Some(dir), seq)
+                }))
+                .unwrap_or_else(|_| Err(text_err("reading the index panicked")));
+                match live {
                     Ok(live) => {
                         let t = ti(live, epoch);
                         let mut touched = Vec::new();
