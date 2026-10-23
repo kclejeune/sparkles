@@ -41,6 +41,9 @@ hashbrown = { version = "=0.16.1", default-features = false }
 smallvec = "1"
 memmap2 = "0.9"
 lz4_flex = "0.14"
+# FSST symbol tables for the vocabulary's suffixes (spec X11 Phase 2a); the reader
+# decodes with its own code in sparkles-core's `vocab::fsst`
+fsst-rs = "=0.6.0"
 rayon = "1.12"
 regex = "1"
 memchr = "2"

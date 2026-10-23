@@ -69,6 +69,10 @@ pub struct BuildOptions {
     /// Memory for the map of distinct predicate patterns while the build collects them.
     /// Past it the generation is built without patterns, and the reason is recorded.
     pub pattern_bytes: usize,
+    /// How the vocabulary stores its keys' suffixes. [`VocabCodec::Fsst`] makes the
+    /// generation format 4. `None` is [`VocabCodec::default`] for a new database, and
+    /// the codec of the generation it replaces for a compaction or a bulk commit.
+    pub vocab_codec: Option<VocabCodec>,
 }
 
 impl Default for BuildOptions {
@@ -82,6 +86,7 @@ impl Default for BuildOptions {
             first_bnode: 0,
             patterns: true,
             pattern_bytes: crate::patterns::DEFAULT_BUDGET,
+            vocab_codec: None,
         }
     }
 }
@@ -169,11 +174,80 @@ pub struct IndexMeta {
     /// the member ignore it, and the file next to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patterns: Option<crate::patterns::PatternInfo>,
+    /// The features of the generation that a reader of format 3 cannot read (spec X11
+    /// §7.1), such as [`FEATURE_FSST_VOCAB`]. A generation with any is format 4, and a
+    /// reader refuses one whose features it does not all know.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
-/// The index format this build writes. Format 3 stores each column as one frame per
-/// segment with a `.seg` directory (spec X07 §6.5), and format 2 as one frame per column.
-pub const FORMAT_VERSION: u32 = 3;
+impl IndexMeta {
+    pub fn has_feature(&self, f: &str) -> bool {
+        self.features.iter().any(|x| x == f)
+    }
+}
+
+/// The newest index format this build writes. Format 3 stores each column as one frame
+/// per segment with a `.seg` directory (spec X07 §6.5), and format 2 as one frame per
+/// column. Format 4 is format 3 with the `features` of [`IndexMeta`], and a build writes
+/// it only for a generation that has a feature ([`format_for`]).
+pub const FORMAT_VERSION: u32 = 4;
+
+/// The format of a generation without features, which releases that read only format 3
+/// still open.
+pub const PLAIN_FORMAT_VERSION: u32 = 3;
+
+/// The vocabulary's suffixes are FSST-coded, with the tables in `vocab.fsst` (spec X11
+/// §4.1).
+pub const FEATURE_FSST_VOCAB: &str = "fsst-vocab";
+
+/// The features this build reads.
+pub const KNOWN_FEATURES: &[&str] = &[FEATURE_FSST_VOCAB];
+
+/// The format of a generation with `features`.
+pub fn format_for(features: &[String]) -> u32 {
+    if features.is_empty() {
+        PLAIN_FORMAT_VERSION
+    } else {
+        FORMAT_VERSION
+    }
+}
+
+/// How the base vocabulary stores the suffixes of its front-coded keys (spec X11 §4.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VocabCodec {
+    /// as they are
+    #[default]
+    Front,
+    /// FSST-coded when that is shorter, with two symbol tables trained at build time
+    Fsst,
+}
+
+impl VocabCodec {
+    pub fn name(self) -> &'static str {
+        match self {
+            VocabCodec::Front => "front",
+            VocabCodec::Fsst => "fsst",
+        }
+    }
+}
+
+impl std::str::FromStr for VocabCodec {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "front" => Ok(VocabCodec::Front),
+            "fsst" => Ok(VocabCodec::Fsst),
+            _ => Err(format!("unknown vocabulary codec `{s}`: use front or fsst")),
+        }
+    }
+}
+
+impl std::fmt::Display for VocabCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 /// The `format_version` of a generation's `meta.json` whose bytes are `bytes`, read on
 /// its own so that a newer meta in another shape is refused as newer instead of being
@@ -200,7 +274,35 @@ pub fn read_index_meta(dir: &Path, written_by: Option<&str>) -> Result<IndexMeta
         .map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
     let version = meta_version_of(&v, "meta.json")?;
     crate::formats::INDEX.check(&dir.display().to_string(), version, written_by)?;
-    serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("meta.json: {e}")))
+    let meta: IndexMeta =
+        serde_json::from_value(v).map_err(|e| Error::Corrupt(format!("meta.json: {e}")))?;
+    check_features(&dir.display().to_string(), &meta.features, written_by)?;
+    Ok(meta)
+}
+
+/// Refuse a generation (`what`) that lists a feature this build does not read, naming it.
+pub fn check_features(what: &str, features: &[String], written_by: Option<&str>) -> Result<()> {
+    let unknown: Vec<&str> = features
+        .iter()
+        .map(String::as_str)
+        .filter(|f| !KNOWN_FEATURES.contains(f))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let by = written_by
+        .map(|v| format!(", written by Sparkles {v},"))
+        .unwrap_or_default();
+    let s = if unknown.len() == 1 { "" } else { "s" };
+    Err(Error::Unsupported(format!(
+        "{what}{by} uses the index feature{s} {} that Sparkles {} does not read. It was written by a newer release: open it with that release or a later one",
+        unknown
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        crate::formats::SPARKLES_VERSION
+    )))
 }
 
 struct BatchInfo {
@@ -549,6 +651,7 @@ impl Builder {
             &self.tmp,
             &parts,
             threads,
+            self.opts.vocab_codec.unwrap_or_default(),
             &self.tmp_bytes,
             &|| self.interrupted(),
         )?;
@@ -568,7 +671,8 @@ impl Builder {
         self.report(&format!("vocabulary: {terms} terms"));
 
         // ---- 3. remap and sort; 4. permutations ------------------------------------
-        let vocab = Vocab::open(&self.dir)?;
+        let fsst = self.opts.vocab_codec.unwrap_or_default() == VocabCodec::Fsst;
+        let vocab = Vocab::open_codec(&self.dir, fsst)?;
         let rdf_type = vocab
             .find(&id::iri_key(oxrdf::vocab::rdf::TYPE.as_str()))
             .ok()
@@ -620,8 +724,13 @@ impl Builder {
             None => crate::patterns::PatternInfo::skipped("turned off for this build"),
         };
 
+        let features: Vec<String> = match self.opts.vocab_codec.unwrap_or_default() {
+            VocabCodec::Front => Vec::new(),
+            VocabCodec::Fsst => vec![FEATURE_FSST_VOCAB.into()],
+        };
         let meta = IndexMeta {
-            format_version: FORMAT_VERSION,
+            format_version: format_for(&features),
+            features,
             quads: rows,
             terms,
             next_bnode: self.next_bnode.load(Ordering::Relaxed),
@@ -1817,6 +1926,7 @@ mod tests {
             first_bnode: 0,
             patterns: true,
             pattern_bytes: crate::patterns::DEFAULT_BUDGET,
+            vocab_codec: None,
         });
         let no_hot = build(BuildOptions {
             batch_quads: 7,
