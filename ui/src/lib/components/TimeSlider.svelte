@@ -77,6 +77,7 @@
     canFollow = true,
     onchange,
     onclose,
+    onplaying,
   }: {
     /** The dataset on its branch, as the API client takes it (`ds` or `ds@branch`). */
     ds: string;
@@ -115,6 +116,8 @@
     canFollow?: boolean;
     onchange?: (c: TimeChange) => void;
     onclose?: () => void;
+    /** Told when playback starts and stops, so overlays can pause (U07 §11.5). */
+    onplaying?: (on: boolean) => void;
   } = $props();
 
   const uid = $props.id();
@@ -140,6 +143,7 @@
   let leftSeq = $state(0);
   let dragging = $state<'left' | 'right' | 'band' | null>(null);
   let playing = $state(false);
+  $effect(() => onplaying?.(playing));
   let speed = $state<1 | 2 | 4>(1);
   let follow = $state(false);
   let followNote = $state<string | null>(null);

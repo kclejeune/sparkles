@@ -174,12 +174,27 @@ const SH = 'http://www.w3.org/ns/shacl#';
 function guardRules(text) {
   const st = new ox.Store();
   st.load(text, { format: 'text/turtle' });
-  return st
+  const min = st
     .query(
       `SELECT ?shape ?cls ?path WHERE { ?shape <${SH}targetClass> ?cls ; <${SH}property> ?ps .
        ?ps <${SH}path> ?path ; <${SH}minCount> ?m FILTER(?m >= 1) }`,
     )
     .map((b) => ({ shape: b.get('shape'), cls: b.get('cls'), path: b.get('path') }));
+  // the validation overlay's sh:pattern results (U07 §11): checked by the overlay's
+  // routes and dry runs only, not by merges
+  const pattern = st
+    .query(
+      `SELECT ?shape ?cls ?path ?re ?msg WHERE { ?shape <${SH}targetClass> ?cls ; <${SH}property> ?ps .
+       ?ps <${SH}path> ?path ; <${SH}pattern> ?re OPTIONAL { ?ps <${SH}message> ?msg } }`,
+    )
+    .map((b) => ({
+      shape: b.get('shape'),
+      cls: b.get('cls'),
+      path: b.get('path'),
+      pattern: b.get('re').value,
+      message: b.get('msg')?.value,
+    }));
+  return Object.assign(min, { patterns: pattern });
 }
 
 const termJson = (t) =>
@@ -215,6 +230,82 @@ function guardReport(b, store, kind) {
     results,
     head: head(b).seq,
     kind,
+  };
+}
+
+const valueJson = (t) =>
+  t.termType === 'Literal'
+    ? {
+        type: 'literal',
+        value: t.value,
+        ...(t.language ? { 'xml:lang': t.language } : {}),
+        ...(t.datatype && !t.language && !t.datatype.value.endsWith('#string')
+          ? { datatype: t.datatype.value }
+          : {}),
+      }
+    : termJson(t);
+
+/**
+ * The overlay's results (U07 §11): the guard's minCount and pattern rules on `store`,
+ * for the focus nodes `targets` (IRIs) only.
+ */
+export function overlayResults(b, store, targets) {
+  if (!b.guard) return null;
+  const want = new Set(targets);
+  const results = [];
+  for (const r of b.guard.rules) {
+    for (const row of store.query(
+      `SELECT ?x WHERE { ?x a <${r.cls.value}> FILTER NOT EXISTS { ?x <${r.path.value}> ?v } }`,
+    )) {
+      if (!want.has(row.get('x').value)) continue;
+      results.push({
+        focusNode: termJson(row.get('x')),
+        resultPath: termJson(r.path),
+        value: null,
+        sourceShape: termJson(r.shape),
+        sourceConstraintComponent: { type: 'uri', value: `${SH}MinCountConstraintComponent` },
+        severity: { type: 'uri', value: `${SH}Violation` },
+        messages: ['minCount[1]: Invalid cardinality: expected min 1: Got count = 0'],
+      });
+    }
+  }
+  for (const r of b.guard.rules.patterns ?? []) {
+    const re = new RegExp(r.pattern);
+    for (const row of store.query(
+      `SELECT ?x ?v WHERE { ?x a <${r.cls.value}> ; <${r.path.value}> ?v }`,
+    )) {
+      const v = row.get('v');
+      if (!want.has(row.get('x').value) || re.test(v.value)) continue;
+      results.push({
+        focusNode: termJson(row.get('x')),
+        resultPath: termJson(r.path),
+        value: valueJson(v),
+        sourceShape: termJson(r.shape),
+        sourceConstraintComponent: { type: 'uri', value: `${SH}PatternConstraintComponent` },
+        severity: { type: 'uri', value: `${SH}Violation` },
+        messages: [r.message ?? `Pattern[${r.pattern}]`],
+      });
+    }
+  }
+  return results;
+}
+
+/** The guard's summary of `store` for a dry run, as a write would report it. */
+export function overlaySummary(b, store) {
+  if (!b.guard) return undefined;
+  const all = store
+    .query('SELECT DISTINCT ?x WHERE { ?x ?p ?o FILTER(isIRI(?x)) }')
+    .map((r) => r.get('x').value);
+  const results = overlayResults(b, store, all) ?? [];
+  return {
+    language: 'shacl',
+    status: results.length ? (b.guard.mode === 'reject' ? 'rejected' : 'warned') : 'passed',
+    mode: b.guard.mode,
+    blocking: results.length,
+    total: results.length,
+    limit: 100,
+    truncated: results.length > 100,
+    results: results.slice(0, 100),
   };
 }
 

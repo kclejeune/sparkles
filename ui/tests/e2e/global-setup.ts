@@ -141,6 +141,9 @@ export default async function globalSetup(_config: FullConfig) {
 
   // A static token (spk_ + 43 base64url characters), stored in the config as its sha256.
   const token = `spk_${randomBytes(32).toString('base64url')}`;
+  // a static token whose grant covers only the default graph of overlay-limited, for
+  // the validation overlay's restricted caller (U07 §11.8, A13)
+  const limited = `spk_${randomBytes(32).toString('base64url')}`;
   const hashed = spawnSync(bin, ['auth', 'hash'], { input: `${PASSWORD}\n`, encoding: 'utf8' });
   if (hashed.status !== 0) throw new Error(`sparkles auth hash failed: ${hashed.stderr}`);
   const authConfig = join(dir, 'auth.toml');
@@ -157,6 +160,15 @@ datasets = { ${DATASET} = "write" }
 name = "e2e-setup"
 hash = "sha256:${createHash('sha256').update(token).digest('hex')}"
 server = ["server-admin"]
+
+[[tokens]]
+name = "e2e-limited"
+hash = "sha256:${createHash('sha256').update(limited).digest('hex')}"
+
+[[tokens.grants]]
+dataset = "overlay-limited"
+level = "read"
+graphs = ["urn:x-arq:DefaultGraph"]
 `,
     { mode: 0o600 },
   );
@@ -211,6 +223,7 @@ server = ["server-admin"]
 
     process.env.SPARKLES_E2E_URL = url;
     process.env.SPARKLES_E2E_TOKEN = token;
+    process.env.SPARKLES_E2E_LIMITED_TOKEN = limited;
     process.env.SPARKLES_E2E_STATE = state;
 
     // backup repositories registered through its API must lie under repos/ (the config
