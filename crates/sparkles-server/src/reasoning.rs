@@ -267,6 +267,15 @@ pub fn start_reason(
                 );
             }
             Err(e) => {
+                // the limit's code and value, for clients that read the task
+                if let sparkles::Error::Component(c) = &e
+                    && c.code == sparkles::reasoning::run::INFERRED_LIMIT
+                {
+                    h.set_detail(serde_json::json!({
+                        "code": c.code,
+                        "maxInferred": req.max_inferred,
+                    }));
+                }
                 let e = match rejection_text(&e) {
                     Some(text) => anyhow::anyhow!("{prefix}{text}"),
                     None if auto => anyhow::Error::new(e).context("auto: reasoning failed"),

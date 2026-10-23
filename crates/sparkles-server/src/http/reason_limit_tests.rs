@@ -97,11 +97,14 @@ async fn the_server_limit_bounds_runs_and_requests_may_lower_it() {
     )
     .await;
     assert_eq!(t.state, "failed", "{t:?}");
-    let msg = t.message.unwrap_or_default();
+    let msg = t.message.clone().unwrap_or_default();
     assert!(
         msg.contains("exceeded the limit of 3 inferred triples") && msg.contains("maxInferred"),
         "{msg}"
     );
+    let detail = t.detail.clone().unwrap_or_default();
+    assert_eq!(detail["code"], "inferred-limit", "{detail}");
+    assert_eq!(detail["maxInferred"], 3, "{detail}");
     assert_eq!(st.get("r").unwrap().store.snapshot().commit, head);
     // a form field and a query parameter set it as well
     let t = reason(&st, &app, "/$/reason/r", "profile=owl-rl&maxInferred=2").await;
@@ -137,5 +140,14 @@ async fn the_server_limit_fails_a_run_without_a_request_limit() {
             .unwrap_or_default()
             .contains("exceeded the limit of 4 inferred triples"),
         "the server's limit applies"
+    );
+    assert_eq!(t.detail.unwrap_or_default()["maxInferred"], 4);
+}
+
+#[test]
+fn the_server_default_is_the_reasoner_default() {
+    assert_eq!(
+        crate::state::DEFAULT_REASON_MAX_INFERRED,
+        sparkles_reasoner::DEFAULT_MAX_INFERRED
     );
 }
