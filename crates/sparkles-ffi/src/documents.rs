@@ -1,6 +1,6 @@
 //! Structured administration documents are encoded once per request, rather than per
 //! nested field. The Java surface uses Jena's JSON trees and typed outer records.
-use crate::{ErrorKind, FfiDataset, FfiError, FfiOperation, FfiReadTxn, FfiResult};
+use crate::{ErrorKind, FfiDataset, FfiError, FfiOperation, FfiReadTxn, FfiResult, FfiWriteTxn};
 use std::sync::Arc;
 pub(crate) fn encode<T: serde::Serialize>(value: &T) -> FfiResult<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| FfiError::new(ErrorKind::Invalid, e.to_string()))
@@ -415,5 +415,20 @@ impl FfiReadTxn {
         operation.control.check()?;
         let (req, q) = groups_args(&self.ds.ds, &request, opts, &operation)?;
         encode(&sparkles::overview::groups_at(self.snap.clone(), &req, &q)?)
+    }
+}
+#[uniffi::export]
+impl FfiWriteTxn {
+    /// As `FfiDataset::graph_groups`, over the transaction's view, which holds its changes.
+    /// The request's `at` is not read.
+    pub fn graph_groups(
+        &self,
+        request: Vec<u8>,
+        opts: GroupsOpts,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        operation.control.check()?;
+        let (req, q) = groups_args(&self.ds.ds, &request, opts, &operation)?;
+        encode(&sparkles::overview::groups_at(self.view()?, &req, &q)?)
     }
 }

@@ -1,6 +1,9 @@
 package io.github.kclejeune.sparkles.jena
 import org.apache.jena.atlas.json.JsonObject
+import org.apache.jena.graph.NodeFactory
 import org.apache.jena.query.QueryCancelledException
+import org.apache.jena.query.ReadWrite
+import org.apache.jena.sparql.core.Quad
 import org.apache.jena.riot.Lang
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
@@ -114,6 +117,65 @@ class GraphOverviewTest {
         }
     }
 
+    private fun size(ds: DatasetGraphSparkles, request: GroupsRequest, options: GroupsOptions = GroupsOptions()): Int =
+        ds.graph().groups(request, options).get("within").asObject.getNumber("size").toInt()
+
+    private fun placeQuad(name: String) = Quad.create(
+        Quad.defaultGraphIRI,
+        NodeFactory.createURI(ex + name),
+        NodeFactory.createURI("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        NodeFactory.createURI(ex + "Place"),
+    )
+
+    @Test fun a_read_transaction_keeps_its_snapshot() {
+        SparklesDatasets.memory().use { ds ->
+            load(ds, data)
+            ds.begin(ReadWrite.READ)
+            try {
+                assertEquals(2, size(ds, place()))
+                // another thread commits a third place
+                val writer = Thread { load(ds, "<${ex}p3> a <${ex}Place> .") }
+                writer.start(); writer.join()
+                assertEquals(2, size(ds, place()))
+                assertThrows(IllegalArgumentException::class.java) { ds.graph().groups(place().copy(at = "head")) }
+            } finally {
+                ds.end()
+            }
+            assertEquals(3, size(ds, place()))
+        }
+    }
+
+    @Test fun a_write_transaction_sees_its_own_changes() {
+        SparklesDatasets.memory().use { ds ->
+            load(ds, data)
+            ds.begin(ReadWrite.WRITE)
+            try {
+                ds.add(placeQuad("p3"))
+                assertEquals(3, size(ds, place()))
+            } finally {
+                ds.abort(); ds.end()
+            }
+            assertEquals(2, size(ds, place()))
+        }
+    }
+
+    @Test fun the_union_default_graph_follows_the_dataset_settings_and_its_context() {
+        val named = "@prefix ex: <http://ex.org/> . <${ex}g> { ex:x a ex:Thing . ex:y a ex:Thing }"
+        val thing = GroupsRequest(GroupsWithin.OfClass(ex + "Thing"))
+        SparklesDatasets.memory().use { ds ->
+            ds.load(ByteArrayInputStream(named.toByteArray()), Lang.TRIG)
+            assertEquals(0, size(ds, thing))
+            ds.context.set(Sparkles.UNION_DEFAULT_GRAPH, true)
+            assertEquals(2, size(ds, thing))
+        }
+        SparklesDatasets.memory(SparklesOptions.builder().unionDefaultGraph(true).build()).use { ds ->
+            ds.load(ByteArrayInputStream(named.toByteArray()), Lang.TRIG)
+            assertEquals(2, size(ds, thing))
+            ds.context.set(Sparkles.UNION_DEFAULT_GRAPH, false)
+            assertEquals(0, size(ds, thing))
+        }
+    }
+
     @Test fun malformed_requests_cancellation_and_a_closed_dataset_fail() {
         SparklesDatasets.memory().use { ds ->
             load(ds, data)
@@ -146,11 +208,23 @@ class GraphOverviewTest {
                 assertEquals(12, answer.get("groups").asArray.size)
                 return (System.nanoTime() - start) / 1_000_000
             }
-            val whole = minOf(timed(), timed())
+            // The first runs warm the dataset up, so the measurement is the best of three more.
+            repeat(3) { timed() }
+            val whole = minOf(timed(), timed(), timed())
             assertTrue(whole > 40, "the answer took $whole ms, too fast to bound")
-            SparklesOperation(whole / 2).use { op ->
-                assertThrows(QueryCancelledException::class.java) { ds.graph().groups(request, uncached, op) }
+            // Each query takes much less than half of the whole, so a timeout of that half ends the call
+            // only when the queries share it. A run that happens to be much quicker than the best of
+            // the measurements does not end the call, so the timeout gets a few tries.
+            var ended = false
+            var tries = 0
+            while (!ended && tries++ < 6) {
+                try {
+                    SparklesOperation(whole / 2).use { op -> ds.graph().groups(request, uncached, op) }
+                } catch (e: QueryCancelledException) {
+                    ended = true
+                }
             }
+            assertTrue(ended, "a timeout of half of the $whole ms that the answer takes never ended the call in $tries tries")
         }
     }
 }

@@ -1,4 +1,5 @@
 package io.github.kclejeune.sparkles.jena
+import io.github.kclejeune.sparkles.jena.engine.unionDefaultGraph
 import io.github.kclejeune.sparkles.jena.internal.ffi.GroupsOpts
 import org.apache.jena.atlas.json.JsonObject
 import org.apache.jena.atlas.json.JsonString
@@ -45,7 +46,7 @@ public sealed class GroupsBy {
 /**
  * A request for the overview of a graph. [limit] is 1 to 5,000 and defaults to 5,000. [at] is a
  * commit, time or named snapshot as `commit:N`, `time:<RFC 3339>` or `snapshot:<name>`, and the
- * default is the head. A dataset pinned with `at` reads its own commit and rejects a request that names a point. The native library checks the
+ * default is the head. A call inside a transaction reads the transaction's view, and so does one on a dataset pinned with `at`, and these reject a request that names a point. The native library checks the
  * request and throws [SparklesInvalidException] for one that is malformed.
  */
 public data class GroupsRequest @JvmOverloads public constructor(
@@ -107,6 +108,6 @@ public class SparklesGraphOverview internal constructor(private val owner: Datas
      */
     public fun groups(request: GroupsRequest, options: GroupsOptions, operation: SparklesOperation): JsonObject {
         owner.checkOpen()
-        return document(owner.overview(request.value(), options.native(owner.options.unionDefaultGraph), operation)).asObject
+        return document(owner.overview(request.value(), options.native(unionDefaultGraph(owner, owner.context)), operation)).asObject
     }
 }
