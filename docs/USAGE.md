@@ -1491,6 +1491,25 @@ picture is drawn with the canvas renderer of the resource graph. **Built-in** sh
 hides the classes of the RDF, RDFS, OWL and SHACL vocabularies, which are shown by
 default only when the dataset has no other classes.
 
+**Group by** also offers **GraphRAG communities**, which draws the dataset as the
+communities of a [GraphRAG build](#community-reports-graphrag) instead of its classes.
+Each node is a community sized by its member count and coloured by its report's status,
+and **Colour by** switches to one colour per community. **Level** picks the level to
+start from, 0 being the coarsest. Opening a community draws the communities below it,
+and a community of the finest level opens into its members. The breadcrumb reads
+`Communities › Engineering › The payments team`. Selecting or opening a community shows
+its report beside the picture, with the same summary, findings and review actions as
+the Communities tab. Choosing a finding rings the entities it is about, and when they lie
+inside a community that is drawn closed, **Draw the members** opens it. **Open report**
+goes to the report in the Communities tab, and that tab's **Show in Explore** comes back.
+
+The communities are those of main, so on another branch the overview says so and draws
+nothing. A user whose access does not cover the reports graph is told that the
+communities are not available to them and learns nothing else about them, and a dataset
+that has no build says that none were built. Both notices offer to go back to the
+classes. The same grouping is `by: {"reports": {}}` in
+[API.md](API.md#graph-overview) and in the bindings.
+
 The query page's graph view uses the same WebGL view for results of more than 2,000
 nodes. **Max nodes** then offers 10,000, 50,000 and 100,000, and **Renderer** switches
 between the canvas and WebGL views.
@@ -4102,8 +4121,9 @@ members, its report with findings and citations, and the review actions **Review
 old one. Reviewing needs write access to the dataset without graph or triple
 restrictions. The tab shows the reports of main, and on another branch it asks the reader
 to switch to main. The Settings tab has a GraphRAG section with the fields above, and the
-review inbox lists the unreviewed reports. The routes are described in
-[API.md](API.md#graphrag).
+review inbox lists the unreviewed reports. **Show in Explore** draws the chosen
+community in the [Explore overview](#the-explore-overview), where the communities are a
+grouping of the whole dataset. The routes are described in [API.md](API.md#graphrag).
 
 Once reports exist, Ask can answer questions about the whole dataset from them, such as
 "What are the main areas of work in this organisation?". The draft decides whether a

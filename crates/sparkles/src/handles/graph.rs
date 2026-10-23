@@ -32,9 +32,14 @@ impl Graph {
     /// assert_eq!(answer["members"].as_array().unwrap().len(), 2);
     /// # Ok::<_, sparkles::Error>(())
     /// ```
+    ///
+    /// A request that groups by GraphRAG reports (`by: {"reports": {}}`) reads the
+    /// communities that the dataset's reports graph holds at that state, and is refused
+    /// on a branch other than `main`, since the reports belong to main.
     pub fn groups(&self, req: &GroupsRequest, opts: &QueryOptions) -> Result<serde_json::Value> {
-        let opts = self.ds.with_query_defaults(opts);
         let store = self.ds.store();
+        req.check_branch(&store.branch_name())?;
+        let opts = self.ds.with_query_defaults(opts);
         let snap = match &req.at {
             None => store.snapshot(),
             Some(at) => {

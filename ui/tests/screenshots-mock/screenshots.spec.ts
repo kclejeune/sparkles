@@ -1,4 +1,5 @@
-// The README's screenshots of branches and of the agent pages, in the dark theme, against
+// The README's screenshots of branches, of the agent pages and of the Explore overview
+// grouped by the GraphRAG communities, in the dark theme, against
 // the mock backend that playwright.screenshots-mock.config.ts starts. The `org` dataset
 // gets a branch whose changes clash with main, so that the dataset page shows branches and
 // the commit graph and the merge page shows conflicts. The Ask bar runs the scripted
@@ -304,4 +305,27 @@ SELECT ?label ?from ?to WHERE {
     'ready',
   );
   await shoot(page, 'result-arcs');
+});
+
+test('explore-communities', async ({ page }) => {
+  // the overview grouped by the GraphRAG communities of mock/graphrag.mjs, opened at
+  // Engineering, with the payments team's report beside it and a finding's entities marked
+  await page.goto(`/ui/explore?ds=${DATASET}&overview=communities`);
+  const ov = page.getByTestId('overview');
+  await expect(ov).toHaveAttribute('data-mode', 'communities');
+  await ov.getByRole('button', { name: 'List' }).click();
+  const row = (name: RegExp) =>
+    ov.locator('tbody tr').filter({ has: page.getByRole('button', { name }) });
+  await row(/^Engineering/)
+    .getByRole('button', { name: 'Open' })
+    .click();
+  await row(/^The payments team/)
+    .getByRole('button', { name: /^The payments team/ })
+    .click();
+  const side = page.getByTestId('community-side');
+  await expect(side.getByRole('heading', { name: 'The payments team' })).toBeVisible();
+  await side.getByRole('button', { name: /Kai works with the rest/ }).click();
+  await ov.getByRole('button', { name: 'List' }).click();
+  await expect(ov.locator('canvas').first()).toBeVisible();
+  await shoot(page, 'explore-communities');
 });

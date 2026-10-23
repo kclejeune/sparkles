@@ -128,6 +128,37 @@ def test_errors_and_cancellation(ds: Dataset) -> None:
         handle.groups({"class": EX + "Person"})
 
 
+HIERARCHY = f"""PREFIX ex: <{EX}>
+PREFIX gr: <urn:x-sparkles:graphrag#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+INSERT DATA {{ GRAPH <urn:x-sparkles:graphrag:reports> {{
+  <urn:c:A> a gr:Community ; gr:level 0 ; gr:memberCount 3 ;
+    gr:member ex:a, ex:b, ex:c ; gr:report <urn:r:A> .
+  <urn:r:A> rdfs:label "Team A" ; gr:status "reviewed" .
+  <urn:c:A1> a gr:Community ; gr:level 1 ; skos:broader <urn:c:A> ; gr:memberCount 2 ;
+    gr:member ex:a, ex:b .
+}} }}"""
+
+
+def test_grouped_by_the_graphrag_communities(ds: Dataset) -> None:
+    # without reports the grouping is unavailable and says why
+    none = ds.graph.groups(by={"reports": {}})
+    assert none["available"] is False and none["unavailable"] == "none"
+    ds.update(HIERARCHY)
+    top = ds.graph.groups(by={"reports": {}})
+    assert top["available"] is True
+    assert top["grouping"] == {"kind": "reports", "predicate": None, "level": 0}
+    [team] = top["groups"]
+    assert (team["label"], team["size"], team["children"]) == ("Team A", 3, 1)
+    assert team["report"] == {"iri": "urn:r:A", "title": "Team A", "status": "reviewed"}
+    below = ds.graph.groups({"group": team["id"]})
+    assert [g["size"] for g in below["groups"]] == [2, 1]
+    assert below["within"]["title"] == "Team A"
+    with pytest.raises(InvalidInputError):
+        ds.graph.groups(by={"reports": {"level": 99}})
+
+
 def test_the_timeout_covers_all_of_the_queries() -> None:
     # the answer takes many queries, each of which is shorter than the timeout
     rows = "\n".join(

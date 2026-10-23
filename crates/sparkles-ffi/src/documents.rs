@@ -51,6 +51,8 @@ fn groups_args(
     sparkles::sparql::QueryOptions,
 )> {
     let req = sparkles::overview::GroupsRequest::from_json(&decode(request)?)?;
+    // the transactions answer at their own snapshot, past the check of `graph().groups`
+    req.check_branch(&ds.store().branch_name())?;
     let mut q = sparkles::sparql::QueryOptions {
         union_default_graph: opts.union_default_graph,
         default_graph_uris: opts.default_graph,

@@ -307,6 +307,14 @@ agent memory, the map view and a merge preview.
     <td>The relations of a graph drawn as arcs on a map</td>
     <td>Result rows drawn as arcs between located places</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing two GraphRAG communities inside Engineering, with the payments team's report beside the picture and one of its findings chosen"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>The dataset grouped by its GraphRAG communities, with a report beside it</td>
+    <td></td>
+  </tr>
 </table>
 
 </details>

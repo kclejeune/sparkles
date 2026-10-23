@@ -27,20 +27,20 @@ pub const MAX_EDGES: usize = 20_000;
 pub const DEFAULT_BUCKETS: usize = 12;
 pub const MAX_BUCKETS: usize = 48;
 /// Rows of one aggregated edge query at most, before they are merged.
-const EDGE_ROWS: usize = 100_000;
+pub(super) const EDGE_ROWS: usize = 100_000;
 /// Instances read to choose a grouping property.
 const SAMPLE: usize = 200;
 /// Groups whose first members are listed, and how many.
-const TOP_GROUPS: usize = 12;
-const TOP_MEMBERS: usize = 3;
+pub(super) const TOP_GROUPS: usize = 12;
+pub(super) const TOP_MEMBERS: usize = 3;
 
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const SKOS_BROADER: &str = "http://www.w3.org/2004/02/skos/core#broader";
+pub(super) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+pub(super) const SKOS_BROADER: &str = "http://www.w3.org/2004/02/skos/core#broader";
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 /// The IRIs F14's write-back gives community resources.
 const COMMUNITY_PREFIX: &str = "urn:x-sparkles:algo:";
 /// Label properties, as Explore reads them.
-const LABELS: [&str; 5] = [
+pub(super) const LABELS: [&str; 5] = [
     "http://www.w3.org/2000/01/rdf-schema#label",
     "http://www.w3.org/2004/02/skos/core#prefLabel",
     "http://xmlns.com/foaf/0.1/name",
@@ -54,13 +54,13 @@ pub(super) struct Run<'a> {
 }
 
 /// The solutions of one query, with their variables.
-struct Rows {
-    vars: Vec<String>,
-    rows: Vec<Vec<Option<Term>>>,
+pub(super) struct Rows {
+    pub(super) vars: Vec<String>,
+    pub(super) rows: Vec<Vec<Option<Term>>>,
 }
 
 impl Rows {
-    fn col(&self, name: &str) -> usize {
+    pub(super) fn col(&self, name: &str) -> usize {
         self.vars
             .iter()
             .position(|v| v == name)
@@ -68,11 +68,11 @@ impl Rows {
     }
 }
 
-fn get(row: &[Option<Term>], i: usize) -> Option<&Term> {
+pub(super) fn get(row: &[Option<Term>], i: usize) -> Option<&Term> {
     row.get(i).and_then(Option::as_ref)
 }
 
-fn count(t: Option<&Term>) -> u64 {
+pub(super) fn count(t: Option<&Term>) -> u64 {
     match t {
         Some(Term::Literal(l)) => l.value().parse::<u64>().unwrap_or(0),
         _ => 0,
@@ -86,7 +86,7 @@ fn number(t: Option<&Term>) -> Option<f64> {
     }
 }
 
-fn iri_of(t: Option<&Term>) -> Option<&str> {
+pub(super) fn iri_of(t: Option<&Term>) -> Option<&str> {
     match t {
         Some(Term::NamedNode(n)) => Some(n.as_str()),
         _ => None,
@@ -98,7 +98,7 @@ fn dbl(x: f64) -> String {
     format!("\"{x:?}\"^^<{XSD}double>")
 }
 
-fn label_path() -> String {
+pub(super) fn label_path() -> String {
     format!(
         "({})",
         LABELS
@@ -312,19 +312,19 @@ struct Child {
 struct Partition {
     level: Level,
     children: Vec<Child>,
-    truncated: bool,
+    pub(super) truncated: bool,
     kind: &'static str,
 }
 
 /// Edges keyed by source, target and predicate, with their counts.
 #[derive(Default)]
-struct Edges {
-    map: HashMap<(String, String, Option<String>), u64>,
-    truncated: bool,
+pub(super) struct Edges {
+    pub(super) map: HashMap<(String, String, Option<String>), u64>,
+    pub(super) truncated: bool,
 }
 
 impl Edges {
-    fn add(&mut self, source: String, target: String, predicate: Option<&str>, n: u64) {
+    pub(super) fn add(&mut self, source: String, target: String, predicate: Option<&str>, n: u64) {
         if source == target && source.starts_with("c:") {
             return;
         }
@@ -336,7 +336,7 @@ impl Edges {
         *self.map.entry(key).or_insert(0) += n;
     }
 
-    fn json(self) -> (Vec<J>, bool) {
+    pub(super) fn json(self) -> (Vec<J>, bool) {
         let mut v: Vec<_> = self.map.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         (
@@ -349,7 +349,7 @@ impl Edges {
 }
 
 impl Run<'_> {
-    fn select(&self, q: &str) -> Result<Rows> {
+    pub(super) fn select(&self, q: &str) -> Result<Rows> {
         let r =
             crate::sparql::query_with_plan(self.snap.clone(), q, self.opts).map_err(|f| f.error)?;
         Ok(Rows {
@@ -366,6 +366,8 @@ impl Run<'_> {
                 let g = GroupId::decode(id).map_err(Error::invalid)?;
                 (g.class, g.path, Some(id.clone()))
             }
+            // the reports answer this (`groups_at`), and `from_json` pairs it with nothing else
+            Within::Dataset => return Err(Error::invalid("within is required")),
         };
         let size = self.total(&class, &path)?;
         let mut note = None;
@@ -404,6 +406,11 @@ impl Run<'_> {
                         Error::invalid(format!("these instances have no values of <{predicate}>"))
                     })?,
             ),
+            By::Reports(_) => {
+                return Err(Error::invalid(
+                    "by reports groups the whole dataset, not a class",
+                ));
+            }
         };
         let mut within = json!({ "class": class, "size": size });
         if let Some(g) = &group {

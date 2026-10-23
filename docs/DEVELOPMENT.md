@@ -98,8 +98,8 @@ mise run ci           # every check below, with a log per task and a summary (sc
 mise run ci:fast      # fmt:check + lint:doc-paths + lint + test, for iterating
 mise run doc          # API docs of the library crates
 mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
-mise run docs:screenshots # the README's screenshots (docs/images): the demo dataset in docs/demo, and the mock backend for branches, the agent pages and the arcs maps
-mise run docs:screenshots:mock # only the branch, agent and arcs screenshots, from the mock backend, without a release build
+mise run docs:screenshots # the README's screenshots (docs/images): the demo dataset in docs/demo, and the mock backend for branches, the agent pages, the arcs maps and the GraphRAG communities
+mise run docs:screenshots:mock # only the branch, agent, time slider, arcs and GraphRAG community screenshots, from the mock backend, without a release build
 mise run docker:build # the Docker image of compose.yaml (not in ci)
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki, QLever, Fluree and Oxigraph; `bench 1000000 --runs 5` for 10.5M triples

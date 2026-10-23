@@ -1207,7 +1207,8 @@ over `PSO[p]`. Errors are those of `/$/schema/{ds}`, and `400` also covers a mal
 The design is in [U06 Phase 2](specs/U06-large-graph-rendering.md#3-server-and-api-changes).
 
 `POST /$/graph/{ds}/groups` groups the instances of a class, or of a group that an
-earlier answer named, and counts the edges between the groups. The Rust library gives
+earlier answer named, or the whole dataset by its GraphRAG communities, and counts the
+edges between the groups. The Rust library gives
 the same answer through `ds.graph().groups`. Python returns it as a dict from
 `ds.graph.groups(within, by=…, limit=…, at=…)`, Node.js as an object from
 `ds.graph.groups(request)`, in which `commit` is a bigint, and the JVM as a Jena
@@ -1218,24 +1219,34 @@ overview from the class profiles and opens a class or a group with this route.
 
 ```ts
 type GroupsRequest = {
-  within: { class: string } | { group: string };   // a class IRI, or a group id from an answer
+  within?: { class: string } | { group: string };  // a class IRI, or a group id from an answer
   by?: "auto"                                       // the default
      | "members"
      | { community: string }                        // the predicate F14 wrote communities to
-     | { property: string; buckets?: number };      // 2 to 48 buckets, 12 by default
+     | { property: string; buckets?: number }       // 2 to 48 buckets, 12 by default
+     | { reports: { level?: number; graph?: string } }; // C22's communities, level 0 to 15
   limit?: number;                                   // groups or members, 1 to 5,000 (the default)
   at?: string;                                      // a commit, time or named snapshot
 };
 type GroupsAnswer = {
   commit: number;
-  within: { class: string; group?: string; size: number };
-  grouping: { kind: "members" | "values" | "ranges" | "communities"; predicate: string | null };
+  within: { class?: string; group?: string; size: number;
+            reports?: { graph: string; level: number };
+            community?: string; level?: number; title?: string; folded?: boolean };
+  grouping: { kind: "members" | "values" | "ranges" | "communities" | "reports";
+              predicate: string | null; level?: number };
   communities: boolean;
-  groups: { id: string; label: string; size: number; top: { iri: string; label?: string }[] }[];
+  groups: { id: string; label: string; size: number; top: { iri: string; label?: string }[];
+            community?: string | null; level?: number; children?: number; folded?: boolean;
+            report?: { iri: string; title: string | null; status: string | null } | null }[];
   members?: { iri: string; label?: string; class?: string }[];
   edges: { source: string; target: string; predicate: string | null; count: number }[];
   truncated: boolean;
   note?: string;
+  available?: boolean;                              // the reports grouping only
+  unavailable?: "access" | "none";
+  reason?: string;
+  levels?: { level: number; communities: number }[];
 };
 ```
 
@@ -1275,6 +1286,28 @@ immediate. The view in that key holds the caller's graphs, the protections of tr
 it keeps and the graphs that `default-graph-uri` and `named-graph-uri` select. Explore
 compares each answer's `commit` with the commit of the class profiles it drew, and reads
 the classes again when a write came between them.
+
+`by: {"reports": {}}` groups the whole dataset by the community hierarchy that a
+[GraphRAG](#graphrag) build stored, and it is the one grouping that leaves `within` out.
+`level` picks the level to start from, from 0, the coarsest and the default, to 15.
+`graph` names the reports graph, which must be in the `urn:x-sparkles:graphrag:`
+namespace, and the server takes the dataset's `reportsGraph` setting when it is left
+out. Each group is a community, with the community's IRI, its level, the number of
+communities one level below it and its report's IRI, title and status. `report` is null
+for a community that has no report, and the label is then `Community` followed by the
+end of its IRI. A group's id starts with `r1.`. Opening a group answers its children,
+together with a group whose `folded` is true for the members that no child holds, and a
+community with no children opens into its members. The edges count the links between
+members in the default graph and in the named graphs outside the GraphRAG namespace.
+`levels` lists the levels of the hierarchy with their community counts.
+
+The grouping reads the reports graph only when the caller's view proves it by the
+coverage rule of the [GraphRAG routes](#graphrag), checked against the state that the
+request reads. A caller without coverage gets `available: false`, `unavailable: "access"`
+and a `reason`, with no groups, no counts and nothing that tells whether reports exist. A
+caller with coverage gets `unavailable: "none"` when the graph holds no communities. The
+grouping reads main, where reports are built, so `?branch=` naming another branch is a
+`400`, and `at` reads the reports as they were at that point of main.
 
 ### Schema diffs
 

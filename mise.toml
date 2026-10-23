@@ -611,7 +611,7 @@ oxipng --quiet --opt 4 --strip safe ../docs/images/*.png
 '''
 
 [tasks."docs:screenshots:mock"]
-description = "Only the README's screenshots that the mock backend serves (branches, merges, the Ask bar, handoffs, agent memory and the arcs maps), without a release build"
+description = "Only the README's screenshots that the mock backend serves (branches, merges, the Ask bar, handoffs, agent memory, the time sliders, the arcs maps and the GraphRAG communities in Explore), without a release build"
 depends = ["ui:e2e:browsers"]
 dir = "ui"
 tools = { "github:shssoichiro/oxipng" = "10.2.1" }

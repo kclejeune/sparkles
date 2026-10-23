@@ -39,10 +39,13 @@
     onfail,
     iterations = 300,
     label = 'Graph',
+    marked = null,
   }: {
     nodes: LNode[];
     edges: LEdge[];
     selected?: string | null;
+    /** Nodes to mark with a ring and keep in colour, such as the entities of a finding. */
+    marked?: string[] | null;
     onselect?: (key: string | null) => void;
     onopen?: (key: string) => void;
     /** Positions after the layout ends or is paused. */
@@ -121,10 +124,18 @@
   }
 
   let near: Set<string> | null = null;
+  const markSet = $derived(new Set(marked ?? []));
 
   function setFocusSet() {
     const k = hovered ?? selected;
-    near = k && graph?.hasNode(k) ? neighbours(k) : null;
+    // marked nodes stand out on their own while nothing is hovered
+    const marks = (marked ?? []).filter((m) => graph?.hasNode(m));
+    if (!hovered && marks.length) {
+      near = new Set(marks);
+      if (selected && graph?.hasNode(selected)) near.add(selected);
+    } else {
+      near = k && graph?.hasNode(k) ? neighbours(k) : null;
+    }
     renderer?.refresh({ skipIndexation: true });
   }
 
@@ -158,6 +169,7 @@
     };
     ring(selected, false);
     if (focusKey !== selected) ring(focusKey, true);
+    for (const m of marked ?? []) if (m !== selected) ring(m, true);
   }
 
   function edgeType() {
@@ -202,7 +214,7 @@
             res.zIndex = 1;
           }
           if (allLabels && !(near && !near.has(key))) res.forceLabel = true;
-          if (key === selected || key === hovered || key === focusKey) {
+          if (key === selected || key === hovered || key === focusKey || markSet.has(key)) {
             res.forceLabel = true;
             res.zIndex = 2;
           }
@@ -437,6 +449,7 @@
 
   $effect(() => {
     void selected;
+    void marked;
     if (ready) setFocusSet();
   });
 
@@ -501,7 +514,9 @@
         { x: (left + right) / 2, y: (top + bottom) / 2 },
         { cameraState: state },
       );
-      state = { ...state, x: c.x, y: c.y, ratio: state.ratio / scale };
+      // a ratio of 1 already frames the nodes, so a smaller one only magnifies a picture
+      // whose box is a point or a line, such as a single node, past its drawn size
+      state = { ...state, x: c.x, y: c.y, ratio: Math.max(1, state.ratio / scale) };
       cam.setState(state);
     }
     if (duration) {
