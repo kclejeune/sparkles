@@ -1458,9 +1458,11 @@ pub fn query_execution_with_plan(
             let levels = levels.max(prepared.plan_depth);
             // An eager SELECT that runs out of memory runs again once as a cursor that
             // may spill (X08 §6.8). Eager execution writes nothing before it finishes,
-            // so the failure always comes before any output.
+            // so the failure always comes before any output. Without spill the cursor
+            // still holds only its operators' state rather than every intermediate
+            // result, so a plan whose operators all stream runs again too.
             let retry = kind == QueryKind::Select
-                && options.spill.is_some()
+                && (options.spill.is_some() || native(&prepared.node))
                 && options.extensions.is_none()
                 && options.initial_bindings.is_empty()
                 && retryable(&prepared.node)
@@ -1492,7 +1494,10 @@ pub fn query_execution_with_plan(
                         if retry
                             && matches!(
                                 &failed.error,
-                                Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
+                                Error::BudgetExceeded(b) if matches!(
+                                    b.kind,
+                                    crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+                                )
                             ) =>
                     {
                         return retry_as_cursor(retry_snapshot, query, options, cursor, started);
