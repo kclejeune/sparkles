@@ -339,7 +339,7 @@ const TRAIN_BLOCKS: usize = 64;
 /// and 10.5M vocabularies). Each kind takes up to [`fsst::TRAIN_BYTES`].
 fn training_sample(parts: &[Partial]) -> Result<[Vec<Vec<u8>>; 2]> {
     let mut out: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
-    for kind in 0..2 {
+    for (kind, out) in out.iter_mut().enumerate() {
         let at: Vec<(usize, u64)> = parts
             .iter()
             .enumerate()
@@ -379,7 +379,7 @@ fn training_sample(parts: &[Partial]) -> Result<[Vec<Vec<u8>>; 2]> {
                 key.extend_from_slice(rest);
                 if !first && usize::from(!fsst::is_first_kind(&key)) == kind {
                     bytes += rest.len();
-                    out[kind].push(rest.to_vec());
+                    out.push(rest.to_vec());
                 }
             }
         }

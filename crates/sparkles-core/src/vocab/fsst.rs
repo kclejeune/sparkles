@@ -208,8 +208,10 @@ impl Table {
         let syms: Vec<u64> = buf
             .get(*pos..syms_end)
             .ok_or_else(bad)?
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
         let lens = buf.get(syms_end..lens_end).ok_or_else(bad)?;
         *pos = lens_end;
