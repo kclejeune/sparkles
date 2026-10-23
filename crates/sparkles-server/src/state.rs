@@ -319,9 +319,12 @@ impl Drop for Leaving<'_> {
 pub struct AppState {
     pub data_dir: PathBuf,
     pub catalog: sparkles::Catalog,
-    /// the disclosure guard of reports graphs (spec C22 §6)
+    /// the disclosure guard of reports graphs (spec C22 §6), which only authenticated
+    /// principals carry
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub graphrag_guard: Arc<crate::graphrag::guard::Guard>,
     /// GraphRAG builds waiting for confirmation, and the figures of the metrics
+    #[cfg(feature = "mcp")]
     pub graphrag: Arc<crate::graphrag::runtime::Runtime>,
     /// HTTP routing state and observers, keyed by dataset name. Only map lookups and
     /// changes happen under this lock, never catalog work or file system work.
@@ -634,6 +637,7 @@ impl AppState {
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            #[cfg(feature = "mcp")]
             graphrag: Default::default(),
             catalog,
             admission: Default::default(),
@@ -702,6 +706,7 @@ impl AppState {
         AppState {
             data_dir: PathBuf::new(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            #[cfg(feature = "mcp")]
             graphrag: Default::default(),
             catalog,
             admission: Default::default(),
