@@ -73,8 +73,16 @@ export class SchemaSource {
     return this.loading;
   }
 
-  /** The next page of a list, when there is one and memory allows. */
-  async more(list: 'classes' | 'predicates', signal?: AbortSignal): Promise<void> {
+  private paging: Partial<Record<'classes' | 'predicates', Promise<void>>> = {};
+
+  /** The next page of a list, when there is one and memory allows. Callers while a page
+   * is on its way share it, so a cursor is read once. */
+  more(list: 'classes' | 'predicates', signal?: AbortSignal): Promise<void> {
+    this.paging[list] ??= this.page(list, signal).finally(() => delete this.paging[list]);
+    return this.paging[list]!;
+  }
+
+  private async page(list: 'classes' | 'predicates', signal?: AbortSignal): Promise<void> {
     const cursor = this.next[list];
     if (!cursor || this[list].length >= HOLD) return;
     try {

@@ -117,7 +117,9 @@ test('A11: a query is built from an empty editor with the keyboard alone', async
   expect(text).toContain('PREFIX ex: <http://example.org/ontology#>');
   expect(text).toContain('?engineer a ex:Engineer .');
   expect(text).toContain('?company a ex:Company .');
-  await expect(live(page)).toContainText('Added ?engineer a ex:Engineer and');
+  await expect(live(page)).toContainText(
+    'Added ?engineer ex:worksFor ?company and ?engineer a ex:Engineer',
+  );
   // a second edge to a new variable, then a filter on it with F
   await expect(pane(page)).not.toContainText('Add a node to start');
   await tabTo(page, 'variable ?company');
@@ -262,6 +264,16 @@ test('the strip edits the projection and modifiers, and Count matches counts', a
   // the count runs over the pattern
   await strip.getByRole('button', { name: 'Count matches' }).click();
   await expect(pane(page).getByTestId('pattern-count')).toHaveText(/^\d+ match(es)?$/);
+  // a count belongs to its state: another At clears it
+  await page.getByRole('combobox', { name: 'At' }).fill('1');
+  await expect(pane(page).getByTestId('pattern-count')).toHaveCount(0);
+  await page.getByRole('combobox', { name: 'At' }).fill('');
+  // a refused edit leaves the checkbox showing the query
+  await strip.getByRole('checkbox', { name: '?person' }).click();
+  await expect(live(page)).toHaveText('A query projects at least one variable');
+  await expect(strip.getByRole('checkbox', { name: '?person' })).toBeChecked();
+  await strip.getByRole('button', { name: 'Count matches' }).click();
+  await expect(pane(page).getByTestId('pattern-count')).toHaveText(/^\d+ match(es)?$/);
   // a count that runs out of time says so
   await page.route(/\/sparql/, async (route) => {
     if ((route.request().postData() ?? '').includes('COUNT'))
@@ -318,6 +330,11 @@ test.describe('at 390 px', () => {
     // the empty state's classes add waiting nodes with one tap each
     await pane(page).getByRole('button', { name: 'ex:Engineer' }).tap();
     await expect(live(page)).toHaveText('Added ?engineer, a ex:Engineer, waiting for an edge');
+    // a waiting node survives a visit to the Text tab
+    const views = page.getByRole('tablist', { name: 'Query views' });
+    await views.getByRole('tab', { name: 'Text' }).tap();
+    await views.getByRole('tab', { name: 'Pattern' }).tap();
+    await expect.poll(() => graphText(canvas(page))).toContain('?engineer');
     await pane(page).getByRole('button', { name: 'Node', exact: true }).tap();
     const nodeForm = pane(page).getByRole('form', { name: 'Add a node' });
     await nodeForm.getByLabel('Node', { exact: true }).fill('ex:Company');
@@ -338,7 +355,9 @@ test.describe('at 390 px', () => {
     await edgeForm.getByLabel('Predicate', { exact: true }).fill('ex:worksFor');
     await expectNoSidewaysScroll(page, 'the edge picker');
     await edgeForm.getByRole('button', { name: 'Add', exact: true }).tap();
-    await expect(live(page)).toContainText('Added ?engineer a ex:Engineer and');
+    await expect(live(page)).toContainText(
+      'Added ?engineer ex:worksFor ?company and ?engineer a ex:Engineer',
+    );
     // the strip folds into Query options
     await pane(page).getByRole('button', { name: 'Query options' }).tap();
     const sheet = pane(page).getByRole('dialog', { name: 'Query options' });

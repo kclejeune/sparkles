@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { ClassProfile, SchemaSummary } from './api';
-import { filtersOf, type PatternAnswer, type PatternOk } from './pattern';
+import { effectivePrefixes, filtersOf, type PatternAnswer, type PatternOk } from './pattern';
 import { constant, expression, formOf, formsFor, kindOf, XSD, type Op } from './pattern-filters';
 import {
   datatypesOf,
@@ -160,6 +160,39 @@ describe('the filter forms', () => {
       'langmatches',
     );
     expect(formsFor(null)).toHaveLength(14);
+  });
+
+  it('keeps regex flags, booleans of strings and prefixed names (review round 1)', () => {
+    expect(expression('regex', 'x', 'a', null, 's')).toBe('REGEX(?x, "a", "s")');
+    expect(expression('regex', 'x', 'a', null, '')).toBe('REGEX(?x, "a")');
+    expect(formOf({ op: 'regex', var: 'x', args: ['"a"', '"s"'] })).toEqual({
+      op: 'regex',
+      value: 'a',
+      flags: 's',
+    });
+    expect(formOf({ op: 'regex', var: 'x', args: ['"a"'] }).flags).toBe('');
+    expect(constant('true', `${XSD}string`)).toBe('"true"');
+    expect(constant('true')).toBe('true');
+    expect(constant('ex:alice')).toBe('ex:alice');
+    expect(constant('a b:c')).toBe('"a b:c"');
+  });
+
+  it('leaves out the dataset prefixes the query shadows (review round 1)', () => {
+    expect(
+      effectivePrefixes([{ prefix: 'ex', iri: 'http://query/' }], {
+        ex: 'http://dataset/',
+        foaf: 'http://xmlns.com/foaf/0.1/',
+      }),
+    ).toEqual([{ prefix: 'foaf', iri: 'http://xmlns.com/foaf/0.1/' }]);
+  });
+
+  it('pages one request at a time per list (review round 1)', async () => {
+    const { api, calls } = fakeApi();
+    const s = new SchemaSource(api, 'ds');
+    await s.load();
+    await Promise.all([s.more('classes'), s.more('classes')]);
+    expect(calls.filter((c) => c.startsWith('page'))).toHaveLength(1);
+    expect(s.classes.filter((c) => c.iri.endsWith('Team'))).toHaveLength(1);
   });
 
   it('writes constants', () => {

@@ -37,6 +37,7 @@
   let open = $state(false);
   let active = $state(-1);
   let input: HTMLInputElement | undefined = $state();
+  let box: HTMLDivElement | undefined = $state();
   const id = `pp-${Math.random().toString(36).slice(2, 9)}`;
   const list = $derived(open ? choices(value) : []);
 
@@ -72,7 +73,7 @@
   }
 </script>
 
-<div class="picker">
+<div class="picker" bind:this={box}>
   <input
     bind:this={input}
     {name}
@@ -93,8 +94,9 @@
     }}
     onblur={() =>
       setTimeout(() => {
-        // a window that loses focus blurs the field too, which keeps the list open
-        if (document.activeElement !== input) open = false;
+        // a window that loses focus blurs the field too, and focus on the list's own
+        // button stays inside the picker: both keep the list open
+        if (!box?.contains(document.activeElement)) open = false;
       }, 150)}
     onkeydown={keydown}
     {...autofocus ? { autofocus: true } : {}}
@@ -123,10 +125,8 @@
         <button
           class="btn sm ghost"
           type="button"
-          onmousedown={(e) => {
-            e.preventDefault();
-            onmore?.();
-          }}>More from the schema</button
+          onmousedown={(e) => e.preventDefault()}
+          onclick={() => onmore?.()}>More from the schema</button
         >
       {/if}
     </div>

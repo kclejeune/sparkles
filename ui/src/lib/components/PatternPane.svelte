@@ -6,6 +6,20 @@
 
   /** What **Count matches** answers: a count, or that the count ran out of time. */
   export type CountAnswer = number | 'timeout';
+
+  /** A node added on the canvas that no triple uses yet (§2.2). */
+  type Waiting = {
+    id: string;
+    kind: 'var' | 'iri';
+    /** the term an edge writes */
+    text: string;
+    /** for a class node, the class as an edge writes it in `?x a C` */
+    cls?: string;
+  };
+
+  /** The waiting nodes of each editor tab, in memory only, so a pane mounted again for
+   * the tab, after the phone's Text tab or another editor tab, still has them. */
+  const waitingByTab = new Map<string, Waiting[]>();
 </script>
 
 <script lang="ts">
@@ -22,7 +36,7 @@
   // **+ Edge** writes a triple, with `?x a C` first when an end is a waiting class node.
   // The panel of an element holds its edits, and the strip under the canvas holds the
   // projection, DISTINCT, LIMIT, OFFSET and **Count matches**.
-  import { onDestroy, onMount, tick } from 'svelte';
+  import { onDestroy, onMount, tick, untrack } from 'svelte';
   import type { ClassProfile } from '$lib/api';
   import { LocalUnavailable, patternLocal, patternNow } from '$lib/fmt-wasm';
   import {
@@ -31,6 +45,7 @@
     checkTerm,
     compact,
     describe,
+    effectivePrefixes,
     drawing as drawingOf,
     EditError,
     lockedOf,
@@ -58,10 +73,12 @@
     countQuery,
     describeEdit,
     editAny,
+    filterKeys,
     lockedBlocks,
     pathPrefixes,
     patternVars,
     renameReach,
+    starVars,
     unboundUses,
     type AnyEdit,
     type Phase2Edit,
@@ -71,6 +88,7 @@
   import {
     datatypesOf,
     narrow,
+    PROFILES,
     rankClasses,
     rankPredicates,
     varName,
@@ -92,6 +110,7 @@
     prefixes = {},
     schema = null,
     count,
+    countKey = '',
     onedit,
     onundo,
     onredo,
@@ -110,6 +129,8 @@
     schema?: SchemaSource | null;
     /** run a count query under the five-second timeout of §2.2 */
     count?: (sparql: string, signal: AbortSignal) => Promise<CountAnswer>;
+    /** the dataset, branch and state a count reads; a change clears the count */
+    countKey?: string;
     /** apply changes to the editor as one transaction */
     onedit?: (changes: Change[]) => void;
     onundo?: () => void;
@@ -124,16 +145,6 @@
   const BLANK = 'SELECT * WHERE {\n}\n';
   const source = (t: string) => (t.trim() === '' ? BLANK : t);
 
-  /** A node added on the canvas that no triple uses yet (§2.2). */
-  type Waiting = {
-    id: string;
-    kind: 'var' | 'iri';
-    /** the term an edge writes */
-    text: string;
-    /** for a class node, the class as an edge writes it in `?x a C` */
-    cls?: string;
-  };
-
   let answer = $state<PatternOk | null>(null);
   let error = $state<PatternError | null>(null);
   let unavailable = $state<string | null>(null);
@@ -146,7 +157,13 @@
   let selected = $state<Focusable | null>(null);
   /** what the panel opens with: the filter form, after `F` */
   let intent = $state<'filter' | null>(null);
-  let waiting = $state<Waiting[]>([]);
+  // the page keys a pane per tab, so the tab it starts with is the tab it keeps
+  let waiting = $state<Waiting[]>(untrack(() => (tab && waitingByTab.get(tab)) || []));
+  $effect(() => {
+    if (!tab) return;
+    if (waiting.length) waitingByTab.set(tab, waiting);
+    else waitingByTab.delete(tab);
+  });
   // the edge form: from, predicate, to
   let edgeOpen = $state(false);
   let edgeS = $state('');
@@ -179,14 +196,17 @@
   let timing = $state({ parseMs: 0, drawMs: 0 });
   /** bumped when the schema or a profile arrives, so the pickers read again */
   let schemaRev = $state(0);
-  const profiles = new Map<string, ClassProfile | null | undefined>();
+  /** Profiles of the current schema source, at most `PROFILES`; a new source starts empty. */
+  let profiles = new Map<string, ClassProfile | null | undefined>();
 
   const canEdit = $derived(!readonly && !!answer && !error && !!onedit);
   const over = $derived(!!answer && !!drawn && overCaps(answer, drawn));
   const shown = $derived(drawn && answer ? decorate(drawn, answer, waiting) : null);
   const rows = $derived(shown ? textOrder(shown) : []);
+  /** The dataset's prefixes, apart from those whose names the query declares for its own
+   * namespaces, which a picked IRI must not be written under. */
   const datasetPrefixes = $derived<Prefixes>(
-    Object.entries(prefixes).map(([prefix, iri]) => ({ prefix, iri })),
+    effectivePrefixes(answer?.prologue.prefixes ?? [], prefixes),
   );
   const schemaNote = $derived.by(() => {
     void schemaRev;
@@ -304,19 +324,21 @@
     timer = setTimeout(() => void parse(t), debounce);
   });
 
-  // a count is of the text it ran on
+  // a count is of the text and the state it ran on
   $effect(() => {
-    void drawnText;
+    void text;
+    void countKey;
     countAbort?.abort();
     countText = null;
     counting = false;
   });
 
-  // the schema loads once the pane can edit
+  // the schema loads once the pane can edit, and profiles belong to their source
   $effect(() => {
     const s = schema;
+    profiles = new Map();
     if (!s || readonly) return;
-    void s.load().then(() => schemaRev++);
+    void s.load().then(() => s === schema && schemaRev++);
   });
 
   onDestroy(() => {
@@ -346,6 +368,22 @@
     return {};
   }
 
+  /** What a filter's or a locked block's key names in a pattern: its text and where it
+   * sits, so a key that typing moved onto another copy is noticed. */
+  function keyed(p: PatternOk, e: AnyEdit): string | null | undefined {
+    if (e.kind === 'filter-edit' || e.kind === 'filter-delete') {
+      const f = filterKeys(p).find((x) => x.key === e.filter);
+      if (!f) return null;
+      const depth = triplesOf(p).find((t) => t.path.at(-1) === f.group)?.path.length ?? 1;
+      return `${f.filter.text}|${f.group.kind}|${depth}`;
+    }
+    if (e.kind === 'delete-locked') {
+      const b = lockedBlocks(p).find((x) => x.key === e.block);
+      return b ? `${b.block.text}|${b.block.range.from - (p.root?.range.from ?? 0)}` : null;
+    }
+    return undefined;
+  }
+
   /** The nodes and edges of a drawing, as an announcement ends. */
   const counts = (d: Drawing) =>
     `${d.nodes.filter((n) => n.kind !== 'chip').length} nodes, ${d.edges.filter((x) => x.style !== 'dotted').length} edges`;
@@ -359,7 +397,12 @@
       const a = patternNow(now);
       if (!a?.ok) return false;
       const prev = drawn;
+      const was = keyed(answer, e);
       show(now, a, 0);
+      if (was !== undefined && (was === null || was !== keyed(a, e))) {
+        refuse('The pattern changed, select it again');
+        return false;
+      }
       // the element was picked in the drawing before the typing
       const n = named(e);
       if (n.edge && (!prev || !drawn || !stillNames(prev, drawn, n.edge))) {
@@ -465,9 +508,14 @@
   function profileOf(cls: string | undefined): ClassProfile | null {
     if (!cls || !schema) return null;
     if (!profiles.has(cls)) {
-      profiles.set(cls, undefined);
-      void schema.profile(cls).then((p) => {
-        profiles.set(cls, p);
+      const src = schema;
+      const mine = profiles;
+      mine.set(cls, undefined);
+      while (mine.size > PROFILES) mine.delete(mine.keys().next().value!);
+      void src.profile(cls).then((p) => {
+        // an answer for a source that changed since is dropped
+        if (src !== schema || mine !== profiles) return;
+        mine.set(cls, p);
         schemaRev++;
       });
     }
@@ -608,13 +656,14 @@
       live = why;
     };
     if (!s || !p || !o) return fail('An edge needs a source, a predicate and a target');
-    // a waiting class node is written as `?x a C` with the edge
-    const triples: Words[] = [];
+    // a waiting class node is written as `?x a C` after the edge, so the edge's source
+    // decides the group they go in
+    const triples: Words[] = [{ s, p, o }];
     for (const end of [s, o]) {
       const w = waiting.find((x) => x.text === end && x.cls);
-      if (w && !triples.some((x) => x.s === w.text)) triples.push({ s: w.text, p: 'a', o: w.cls! });
+      if (w && !triples.some((x) => x.s === w.text && x.p === 'a'))
+        triples.push({ s: w.text, p: 'a', o: w.cls! });
     }
-    triples.push({ s, p, o });
     const words = triples.flatMap((x) => [x.s, x.p, x.o]);
     const declare = answer ? missingPrefixes(words, answer, prefixes) : [];
     const e: AnyEdit =
@@ -728,16 +777,21 @@
 
   // -------------------------------------------------------------------- the strip ----
 
-  const vars = $derived(answer ? patternVars(answer) : []);
+  const vars = $derived(answer ? starVars(answer) : []);
 
-  function setNumber(kind: 'limit' | 'offset', raw: string) {
-    const v = raw.trim();
+  /** Set LIMIT or OFFSET from its field, which shows the query's value again when the
+   * edit is refused. */
+  function setNumber(kind: 'limit' | 'offset', el: HTMLInputElement) {
+    const v = el.value.trim();
     const value = v === '' ? null : Number(v);
-    if (value !== null && (!Number.isInteger(value) || value < 0))
-      return void (live = `${kind.toUpperCase()} takes a whole number`);
     const cur = answer?.[kind]?.value ?? null;
+    const reset = () => (el.value = cur === null ? '' : String(cur));
+    if (value !== null && (!Number.isInteger(value) || value < 0)) {
+      live = `${kind.toUpperCase()} takes a whole number`;
+      return reset();
+    }
     if (value === (cur === null ? null : Number(cur))) return;
-    apply({ kind, value });
+    if (!apply({ kind, value })) reset();
   }
 
   async function runCount() {
@@ -893,7 +947,10 @@
         ><input
           type="checkbox"
           checked={a.projection.distinct}
-          onchange={(e) => apply({ kind: 'distinct', on: e.currentTarget.checked })}
+          onchange={(e) => {
+            const el = e.currentTarget;
+            if (!apply({ kind: 'distinct', on: el.checked })) el.checked = !el.checked;
+          }}
         /> DISTINCT</label
       >
       {#if a.projection.star}<span class="chip mono" title="Every variable is projected">*</span
@@ -904,7 +961,11 @@
             ><input
               type="checkbox"
               checked={a.projection.star || a.projection.vars.includes(v)}
-              onchange={(e) => apply({ kind: 'projection', var: v, on: e.currentTarget.checked })}
+              onchange={(e) => {
+                const el = e.currentTarget;
+                if (!apply({ kind: 'projection', var: v, on: el.checked }))
+                  el.checked = !el.checked;
+              }}
             />?{v}</label
           >
         {/each}
@@ -929,7 +990,7 @@
         step="1"
         inputmode="numeric"
         value={a.limit?.value ?? ''}
-        onchange={(e) => setNumber('limit', e.currentTarget.value)}
+        onchange={(e) => setNumber('limit', e.currentTarget)}
       /></label
     >
     <label class="num"
@@ -939,7 +1000,7 @@
         step="1"
         inputmode="numeric"
         value={a.offset?.value ?? ''}
-        onchange={(e) => setNumber('offset', e.currentTarget.value)}
+        onchange={(e) => setNumber('offset', e.currentTarget)}
       /></label
     >
   {:else}

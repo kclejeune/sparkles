@@ -308,9 +308,15 @@
     }
   });
   /** The schema behind the Pattern pane's pickers, at the page's branch and state (U08 §3.1). */
-  const patternSchema = $derived(
-    target ? new SchemaSource(patternSchemaApi, target, patternAt) : null,
-  );
+  let schemaMemo: { key: string; source: SchemaSource } | null = null;
+  const patternSchema = $derived.by(() => {
+    if (!target) return null;
+    // one source per dataset, branch and state, so a field that changes back reads nothing
+    const key = `${target}|${patternAt ?? ''}`;
+    if (schemaMemo?.key !== key)
+      schemaMemo = { key, source: new SchemaSource(patternSchemaApi, target, patternAt) };
+    return schemaMemo.source;
+  });
 
   /** Count the matches of the Pattern pane's pattern under a five-second timeout (§2.2). */
   async function patternCount(sparql: string, signal: AbortSignal): Promise<CountAnswer> {
@@ -2587,6 +2593,7 @@
             prefixes={app.prefixes(ds)}
             schema={patternSchema}
             count={patternCount}
+            countKey={`${target ?? ''}|${patternAt ?? ''}`}
             onedit={(changes) => editor?.applyPattern(changes)}
             onundo={() => editor?.undo()}
             onredo={() => editor?.redo()}

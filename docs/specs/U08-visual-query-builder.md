@@ -602,20 +602,28 @@ gives where the query form starts, after the prologue. `ui/src/lib/pattern-edits
 holds the edits of §2.2 beyond the splice core, each a list of changes checked against
 R3 on the strict parse of its result, as the core's are. A predicate change replaces
 the predicate token. When the triple shares its predicate with others in a `,` list, it
-moves out into a new `;` entry, so the others keep theirs. A filter is appended after the
-last triple of its group that binds the variable, as one `FILTER(…)` item. A rename
-replaces the variable's tokens in triples, understood filters and the projection, and in
-the locked blocks, modifiers and projection expressions only after the person confirms
-in a dialog that shows those blocks. A rename to a name already in the query is refused,
-since it would merge two variables. Deleting a node deletes its triples one at a time,
+moves out into a new `;` entry, so the others keep theirs. A filter is appended as one
+`FILTER(…)` item after the last binding triple of the outermost group that binds the
+variable, which is the group the drawing puts its node in, so a filter on a required
+variable never lands in an `OPTIONAL`. A rename replaces the variable's tokens in
+triples, understood filters and the projection, and in the locked blocks, modifiers and
+projection expressions only after the person confirms in a dialog that shows those
+blocks. A rename to a name used anywhere in the query, `ORDER BY` and the clauses outside
+`WHERE` included, is refused, since it would merge two variables. R3 for a rename
+compares variable tokens only, so `"?x"` in a string or `# ?x` in a comment is text. Deleting a node deletes its triples one at a time,
 parsing again between them, and composes the steps with `ChangeSet.compose` into one
 change. It also deletes each understood filter whose variables the deleted triples bound
-and that nothing binds any more. A locked block of the `WHERE` group goes after a
+and that nothing binds any more. A locked filter, such as `FILTER EXISTS`, stays for its
+own confirmed deletion and gets the warning mark. A literal node is the object of one
+triple and goes with that triple alone, since the keys of the literals after it renumber
+once it is gone. A locked block of the `WHERE` group goes after a
 confirmation that shows its text. Blocks outside it, such as `FROM` or a `CONSTRUCT`
 template, are not offered for deletion. The first projection change writes the
-variables of `SELECT *` out in the order they first appear, removing the last projected
+variables of `SELECT *` out in the order they first appear, followed by those of a
+trailing `VALUES`, removing the last projected
 variable is refused because a query projects at least one, and a new `LIMIT` or `OFFSET`
-goes after the group and the other modifiers.
+goes after the group and the other modifiers. Removing a projected variable keeps a
+comment between the items.
 
 `pattern-schema.ts` reads the pickers' terms. It reads the first page of
 `/$/schema/{ds}`, with 1,000 classes and 1,000 predicates, once per dataset, branch and
@@ -627,23 +635,31 @@ class's `incoming`, then by their triples. Variable names follow U03 §4.2, so
 are skipped. `pattern-filters.ts` holds the filter forms. The forms a variable offers
 come from the datatypes the profiles of its subjects' classes saw for the predicate, and
 every form writes an expression the reader understands, so its chip opens again in the
-same form, which a test checks for each form. `PatternPicker.svelte` is the combobox of
+same form, which a test checks for each form. A new regex is case-insensitive, and a
+regex's chip keeps its flags when it is edited. A typed `true` or `false` is a boolean
+only when the variable's datatype is unknown or `xsd:boolean`, and a typed prefixed name
+is an IRI. Picked IRIs are written under the query's prefixes or under a dataset prefix
+whose name the query does not declare, so a query that declares `ex:` for another
+namespace never gets a wrong `ex:` name. `PatternPicker.svelte` is the combobox of
 the pickers, in the WAI-ARIA pattern. A schema read that fails leaves the pickers empty
 with a note that says why, and typed names still work.
 
-A waiting node lives in the pane only, since it is not text. It is not kept across a
-reload, and a pane per editor tab means each tab has its own. An edge whose end is a
-waiting class node writes `?x a C` and the edge in one change, and an empty editor is
+A waiting node is not text, so the pane keeps it in memory per editor tab. It survives the
+phone's Text tab and a switch to another editor tab, and is gone after a reload. An edge
+whose end is a waiting class node writes the edge, then `?x a C`, in one change and in
+the group of the edge's source, which R3 checks, and an empty editor is
 edited as `SELECT * WHERE { }`, so the first edge writes the whole query. A node with no
 edges is placed beside the drawing rather than where fcose's gravity would put it, and
 the view fits when a new node lands outside it. Cytoscape now measures its container
 again when the container's box changes, because a bar or form opening above the canvas
 moved it and taps landed beside their nodes. The warning mark of §4.2 rule 4 is a red
 border and a subtitle on the block, which the screen reader's description of the block
-includes. **Count matches** sends the query of §2.2 with the prologue and `FROM` clauses
-of the text, `timeout=5` and the page's **At** state, and a `408` shows "More than the
-count could finish". A count belongs to the text it ran on and clears when the text
-changes. On a phone the strip folds into a **Query options** sheet, **+ Edge** is the
+includes. **Count matches** sends the query of §2.2 with the prologue, the `FROM` clauses
+and a trailing `VALUES` of the text, `timeout=5` and the page's **At** state, and a `408`
+shows "More than the count could finish". A count belongs to the text and the state it
+ran on, and clears when either changes. Profiles are kept per schema source, so a new
+branch or **At** state reads its own, and a filter or locked-block key that typing moved
+onto another copy is refused as an edge's is. On a phone the strip folds into a **Query options** sheet, **+ Edge** is the
 two-tap mode of §2.6, and the node and edge forms fill the screen.
 
 A11 builds A1's shape from an empty editor with `N`, `E`, `Tab` and `F`, with each edit

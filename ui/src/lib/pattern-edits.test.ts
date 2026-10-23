@@ -272,6 +272,88 @@ SELECT * WHERE {
     expect(pathPrefixes('?x = xsd:int')).toEqual(['xsd']);
   });
 
+  // ------------------------------------------------ review round 1 of Phase 2 ------
+
+  it('keeps a locked filter when its node goes, for its own confirmed deletion', () => {
+    const q = 'SELECT * {\n  ?s <http://p> ?x .\n  FILTER(EXISTS { ?x <http://q> ?z })\n}\n';
+    expect(run(q, { kind: 'delete-node', node: 'v:x' })).toBe(
+      'SELECT * {\n  FILTER(EXISTS { ?x <http://q> ?z })\n}\n',
+    );
+  });
+
+  it('puts a class-backed edge in its source’s group', () => {
+    const q = 'SELECT * {\n  ?s <http://p> ?o .\n  OPTIONAL { ?o <http://q> ?x . }\n}\n';
+    const out = run(q, {
+      kind: 'add-many',
+      triples: [
+        { s: '?x', p: '<http://r>', o: '?c' },
+        { s: '?c', p: 'a', o: '<http://C>' },
+      ],
+    });
+    expect(out).toBe(
+      'SELECT * {\n  ?s <http://p> ?o .\n  OPTIONAL { ?o <http://q> ?x .\n    ?x <http://r> ?c .\n    ?c a <http://C> .\n   }\n}\n',
+    );
+    // R3 refuses a class-backed edge that lands outside its source's OPTIONAL
+    const p0 = ok(q);
+    const wrong = ok(
+      'SELECT * {\n  ?s <http://p> ?o .\n  OPTIONAL { ?o <http://q> ?x . }\n  ?c a <http://C> .\n  ?x <http://r> ?c .\n}\n',
+    );
+    expect(
+      agreesWith(
+        p0,
+        {
+          kind: 'add-many',
+          triples: [
+            { s: '?c', p: 'a', o: '<http://C>' },
+            { s: '?x', p: '<http://r>', o: '?c' },
+          ],
+        },
+        wrong,
+      ),
+    ).toBe(false);
+  });
+
+  it('adds a filter in the group that owns its variable', () => {
+    const q = 'SELECT * {\n  ?s <http://p> ?x .\n  OPTIONAL { ?s <http://q> ?x }\n}\n';
+    expect(run(q, { kind: 'filter-add', var: 'x', expr: '?x > 5' })).toBe(
+      'SELECT * {\n  ?s <http://p> ?x .\n  FILTER(?x > 5)\n  OPTIONAL { ?s <http://q> ?x }\n}\n',
+    );
+  });
+
+  it('expands SELECT * with the variables of a trailing VALUES', () => {
+    const q = 'SELECT * { ?s <http://p> ?o } VALUES ?v { 1 }\n';
+    expect(run(q, { kind: 'projection', var: 'o', on: false })).toBe(
+      'SELECT ?s ?v { ?s <http://p> ?o } VALUES ?v { 1 }\n',
+    );
+    expect(countQuery(q, ok(q))).toBe(
+      'SELECT (COUNT(*) AS ?n)\nWHERE { ?s <http://p> ?o }\nVALUES ?v { 1 }',
+    );
+  });
+
+  it('deletes one literal of a `,` list as a node', () => {
+    const q = 'SELECT * { ?s <http://p> "a", "b" }\n';
+    const node = drawing(ok(q)).nodes.find((n) => n.label === '"a"')!.id;
+    expect(run(q, { kind: 'delete-node', node })).toBe('SELECT * { ?s <http://p> "b" }\n');
+  });
+
+  it('renames past variable-like text in strings, and refuses a name used anywhere', () => {
+    const q = 'SELECT * { ?x <http://p> "?x" }\n';
+    expect(run(q, { kind: 'rename', from: 'x', to: 'y', locked: false })).toBe(
+      'SELECT * { ?y <http://p> "?x" }\n',
+    );
+    const order = 'SELECT * { ?x <http://p> ?o } ORDER BY ?y\n';
+    expect(() =>
+      editAny(order, ok(order), { kind: 'rename', from: 'x', to: 'y', locked: false }, parse),
+    ).toThrow('?y is already in the query');
+  });
+
+  it('keeps a comment between projection items', () => {
+    const q = 'SELECT ?s # keep this\n  ?o WHERE { ?s <http://p> ?o }\n';
+    expect(run(q, { kind: 'projection', var: 'o', on: false })).toBe(
+      'SELECT ?s # keep this\n  WHERE { ?s <http://p> ?o }\n',
+    );
+  });
+
   it('A5: seeded sequences of every kind agree with the parse (R3) and keep locked text', () => {
     const start = `PREFIX ex: <http://example.org/>
 SELECT ?person ?name WHERE {

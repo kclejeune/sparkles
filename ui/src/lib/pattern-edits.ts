@@ -114,6 +114,64 @@ export function patternVars(p: PatternOk): string[] {
   return out;
 }
 
+/** The variables `SELECT *` projects: those of the pattern, then those a trailing
+ * `VALUES` binds. */
+export function starVars(p: PatternOk): string[] {
+  const out = patternVars(p);
+  for (const m of p.modifiers)
+    if (m.kind === 'VALUES') for (const v of m.binds ?? m.vars) if (!out.includes(v)) out.push(v);
+  return out;
+}
+
+const VARCHAR = /[\p{L}\p{N}_\u00B7\u0300-\u036F\u203F-\u2040]/u;
+const IRIREF = /^<[^<>"{}|^`\\\s]*>/;
+
+/**
+ * The variable tokens of a text, with their ranges: `?x` and `$x` outside string
+ * literals, IRIs and comments, so that `"?x"` or `# ?x` is not a variable.
+ */
+export function varTokens(text: string): { name: string; from: number; to: number }[] {
+  const out: { name: string; from: number; to: number }[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '#') {
+      while (i < text.length && text[i] !== '\n') i++;
+    } else if (c === '"' || c === "'") {
+      const long = text.startsWith(c.repeat(3), i);
+      const close = long ? c.repeat(3) : c;
+      i += close.length;
+      while (i < text.length && !text.startsWith(close, i)) {
+        if (text[i] === '\\') i++;
+        else if (!long && text[i] === '\n') break;
+        i++;
+      }
+      i += close.length;
+    } else if (c === '<') {
+      const m = IRIREF.exec(text.slice(i, i + 4096));
+      i += m ? m[0].length : 1;
+    } else if ((c === '?' || c === '$') && VARCHAR.test(text[i + 1] ?? '')) {
+      let j = i + 1;
+      while (j < text.length && VARCHAR.test(text[j])) j++;
+      out.push({ name: text.slice(i + 1, j), from: i, to: j });
+      i = j;
+    } else i++;
+  }
+  return out;
+}
+
+/** A text with the variable `from` renamed to `to`, as a token, nowhere else. */
+function swapVar(text: string, from: string, to: string): string {
+  let out = '';
+  let at = 0;
+  for (const t of varTokens(text))
+    if (t.name === from) {
+      out += text.slice(at, t.from + 1) + to;
+      at = t.to;
+    }
+  return out + text.slice(at);
+}
+
 /** The variables triples or locked blocks bind. */
 function boundVars(p: PatternOk): Set<string> {
   const out = new Set<string>();
@@ -243,7 +301,7 @@ export function editAny(text: string, p: PatternOk, e: AnyEdit, parse?: Parse): 
       return optionalRemoval(text, f.filter.range, f.filter.dot);
     }
     case 'rename':
-      return rename(p, e);
+      return rename(text, p, e);
     case 'delete-locked': {
       const b = lockedBlocks(p).find((x) => x.key === e.block);
       if (!b) throw new EditError('The pattern changed, select the block again');
@@ -289,8 +347,9 @@ function addMany(
     declare,
   );
   for (const w of words) for (const x of pathPrefixes(w.p)) checkDeclared(p, x, declare);
-  // the group of the first subject's patterns, as one add would choose
-  const home = homeOf(p, words[0].s, declare);
+  // the group of the first subject that has patterns, as one add would choose, so an
+  // edge from a node in an OPTIONAL takes the class triple of a new target with it
+  const home = words.map((w) => homeOf(p, w.s, declare)).find((h) => !!h);
   const g = home ? home.path[home.path.length - 1] : p.root;
   const binds = new Set<string>();
   for (const w of words)
@@ -349,17 +408,9 @@ function filterAdd(
   const v = checkVarName(e.var);
   const declare = declarations(p, e);
   for (const x of pathPrefixes(e.expr)) checkDeclared(p, x, declare);
-  // after the last triple that binds the variable, in that triple's group
-  let last: Placed | undefined;
-  for (const t of triplesOf(p)) {
-    const { s, p: pr, o } = t.triple;
-    if (
-      (s.kind === 'var' && s.value === v) ||
-      (o.kind === 'var' && o.value === v) ||
-      (pr.kind === 'var' && pr.value === v)
-    )
-      last = t;
-  }
+  // after the last triple that binds the variable in the group that owns it: the
+  // outermost group with such a triple, as the drawing places the node
+  const last = filterHome(p, v);
   if (!last) throw new EditError(`No triple binds ?${v}, so a filter on it has nothing to test`);
   const g = last.path[last.path.length - 1];
   // the last triple of that statement, whose range is the statement's
@@ -370,6 +421,17 @@ function filterAdd(
     ...insertItem(text, g, item as Item, `FILTER(${e.expr.trim()})`, false),
     ...prefixLines(declare),
   ];
+}
+
+/** The triple a new filter on `?v` follows: the last binding triple of the outermost
+ * group that binds it. */
+function filterHome(p: PatternOk, v: string): Placed | undefined {
+  const binding = triplesOf(p).filter(({ triple: { s, p: pr, o } }) =>
+    [s, pr, o].some((t) => t.kind === 'var' && t.value === v),
+  );
+  if (!binding.length) return undefined;
+  const depth = Math.min(...binding.map((t) => t.path.length));
+  return binding.filter((t) => t.path.length === depth).at(-1);
 }
 
 /** The occurrences a rename changes: those of the editable subset, and with `locked` those
@@ -411,13 +473,18 @@ export function renameReach(
   return { editable, locked };
 }
 
-function rename(p: PatternOk, e: { from: string; to: string; locked: boolean }): Change[] {
+function rename(
+  text: string,
+  p: PatternOk,
+  e: { from: string; to: string; locked: boolean },
+): Change[] {
   const from = checkVarName(e.from);
   const to = checkVarName(e.to);
   if (from === to) throw new EditError('That is the same name');
-  const all = new Set([...patternVars(p), ...lockedOf(p).flatMap((b) => b.vars)]);
-  for (const { filter } of filtersOf(p)) for (const v of filter.vars) all.add(v);
-  if (all.has(to)) throw new EditError(`?${to} is already in the query`);
+  // every variable of the whole query, projection, modifiers and clauses outside WHERE
+  // included, since a rename onto any of them would merge two variables
+  if (varTokens(text).some((t) => t.name === to))
+    throw new EditError(`?${to} is already in the query`);
   const reach = renameReach(p, from);
   const ranges = [...reach.editable, ...(e.locked ? reach.locked.flatMap((b) => b.ranges) : [])];
   if (ranges.length === 0) throw new EditError(`?${from} is not in the pattern`);
@@ -448,21 +515,26 @@ function deleteNode(text: string, p: PatternOk, node: string, parse: Parse): Cha
     if (!a.ok) throw new EditError(`Deleting the node would break the query: ${a.error}`);
     q = a;
   };
-  const touched = triplesOf(p).filter((t) => touches(t, node, p)).length;
-  if (touched === 0) throw new EditError('No triple uses that node');
-  for (let i = 0; i < 1000; i++) {
-    const t = triplesOf(q).find((x) => touches(x, node, q));
-    if (!t) break;
-    // the same removal as an edge's, for a class subtitle too
-    step([{ ...removalRange(cur, t), insert: '' }]);
-  }
-  // the filters left testing a variable that the deleted triples bound and nothing
-  // binds now
+  const touched = triplesOf(p).filter((t) => touches(t, node, p));
+  if (touched.length === 0) throw new EditError('No triple uses that node');
+  if (node.startsWith('l:')) {
+    // a literal is the object of one triple, and the keys of the literals after it
+    // renumber once it goes, so it is removed once and not looked up again
+    step([{ ...removalRange(cur, touched[0]), insert: '' }]);
+  } else
+    for (let i = 0; i < 1000; i++) {
+      const t = triplesOf(q).find((x) => touches(x, node, q));
+      if (!t) break;
+      // the same removal as an edge's, for a class subtitle too
+      step([{ ...removalRange(cur, t), insert: '' }]);
+    }
+  // the understood filters left testing a variable that the deleted triples bound and
+  // nothing binds now; a locked filter stays, for its own confirmed deletion (§4.2)
   const was = boundVars(p);
   for (let i = 0; i < 1000; i++) {
     const bound = boundVars(q);
-    const f = filterKeys(q).find(({ filter }) =>
-      filter.vars.some((x) => was.has(x) && !bound.has(x)),
+    const f = filterKeys(q).find(
+      ({ filter }) => !!filter.expr && filter.vars.some((x) => was.has(x) && !bound.has(x)),
     );
     if (!f) break;
     step(optionalRemoval(cur, f.filter.range, f.filter.dot));
@@ -480,7 +552,7 @@ function projection(text: string, p: PatternOk, v: string, on: boolean): Change[
   const name = checkVarName(v);
   if (pr.star) {
     if (on) throw new EditError(`?${name} is already projected by *`);
-    const rest = patternVars(p).filter((x) => x !== name);
+    const rest = starVars(p).filter((x) => x !== name);
     if (rest.length === 0) throw new EditError('A query projects at least one variable');
     const star = pr.starRange!;
     return [{ from: star.from, to: star.to, insert: rest.map((x) => `?${x}`).join(' ') }];
@@ -496,11 +568,21 @@ function projection(text: string, p: PatternOk, v: string, on: boolean): Change[
   const k = items.findIndex((i) => i.var === name && !i.expression);
   if (k < 0) throw new EditError(`?${name} is not projected as a plain variable`);
   if (items.length === 1) throw new EditError('A query projects at least one variable');
-  // the item with the space before it
-  const from = k > 0 ? items[k - 1].range.to : (pr.distinctRange ?? pr.keyword).to;
-  const to = items[k].range.to;
-  if (k === 0) return [{ from: items[0].range.from, to: items[1].range.from, insert: '' }];
-  return [{ from, to, insert: '' }];
+  // the item with the whitespace before it, or after it for the first; a comment
+  // between items stays, and then only the item and the spaces after it go
+  const item = items[k].range;
+  const gap =
+    k > 0
+      ? { from: items[k - 1].range.to, to: item.from }
+      : { from: item.to, to: items[1].range.from };
+  if (/^\s*$/.test(text.slice(gap.from, gap.to)))
+    return [
+      k > 0
+        ? { from: gap.from, to: item.to, insert: '' }
+        : { from: item.from, to: gap.to, insert: '' },
+    ];
+  const spaces = /^[ \t]*/.exec(text.slice(item.to))![0].length;
+  return [{ from: item.from, to: item.to + spaces, insert: '' }];
 }
 
 function distinct(text: string, p: PatternOk, on: boolean): Change[] {
@@ -594,8 +676,14 @@ export function agreesWith(before: PatternOk, e: AnyEdit, after: PatternOk): boo
       const added = minus(a, b)
         .map((x) => x.replace(/\|(true|false)$/, ''))
         .sort();
+      // every added triple sits on the side of an OPTIONAL of the group that holds its
+      // edge's source
+      const declare = declarations(before, e);
+      const home = e.triples.map((w) => homeOf(before, w.s.trim(), declare)).find((h) => !!h);
+      const side = `|${!!home && home.path.length > 1}`;
       return (
         minus(b, a).length === 0 &&
+        minus(a, b).every((x) => x.endsWith(side)) &&
         eq(added, [...want].sort()) &&
         same(filters) &&
         same(locked) &&
@@ -631,6 +719,14 @@ export function agreesWith(before: PatternOk, e: AnyEdit, after: PatternOk): boo
       const ok =
         eq(removed, old === null ? [] : [normalized(old)]) &&
         eq(added, text === null ? [] : [text]);
+      // a new filter sits in the group that owns its variable
+      if (e.kind === 'filter-add' && ok) {
+        const home = filterHome(before, e.var.replace(/^[?$]/, ''));
+        const depth = (q: PatternOk, g: Group) =>
+          triplesOf(q).find((t) => t.path[t.path.length - 1] === g)?.path.length ?? 0;
+        const f = filtersOf(after).find(({ filter }) => normalized(filter.text) === text);
+        if (!home || !f || depth(after, f.group) !== home.path.length) return false;
+      }
       return (
         (ok ||
           // an edit that writes the same text back changes nothing
@@ -642,9 +738,7 @@ export function agreesWith(before: PatternOk, e: AnyEdit, after: PatternOk): boo
     }
     case 'rename': {
       const swap = (s: string) =>
-        s.replace(/[?$]([\p{L}\p{N}_·̀-ͯ‿-⁀]+)/gu, (m, n) =>
-          n === e.from.replace(/^[?$]/, '') ? `${m[0]}${e.to.replace(/^[?$]/, '')}` : m,
-        );
+        swapVar(s, e.from.replace(/^[?$]/, ''), e.to.replace(/^[?$]/, ''));
       const lockedNow = e.locked ? locked(before).map(swap).sort() : locked(before);
       return (
         eq(triples(before).map(swap).sort(), triples(after)) &&
@@ -661,7 +755,11 @@ export function agreesWith(before: PatternOk, e: AnyEdit, after: PatternOk): boo
         eq(minus(triples(before), triples(after)).sort(), gone) &&
         minus(triples(after), triples(before)).length === 0 &&
         same(locked) &&
-        minus(filters(after), filters(before)).length === 0
+        minus(filters(after), filters(before)).length === 0 &&
+        // only understood filters go with a node
+        minus(filters(before), filters(after)).every((x) =>
+          filtersOf(before).some(({ filter }) => !!filter.expr && normalized(filter.text) === x),
+        )
       );
     }
     case 'delete-locked': {
@@ -676,9 +774,9 @@ export function agreesWith(before: PatternOk, e: AnyEdit, after: PatternOk): boo
     }
     case 'projection': {
       const name = e.var.replace(/^[?$]/, '');
-      const was = before.projection?.star ? patternVars(before) : (before.projection?.vars ?? []);
+      const was = before.projection?.star ? starVars(before) : (before.projection?.vars ?? []);
       const want = e.on ? [...was, name] : was.filter((x) => x !== name);
-      const now = after.projection?.star ? patternVars(after) : (after.projection?.vars ?? []);
+      const now = after.projection?.star ? starVars(after) : (after.projection?.vars ?? []);
       return eq(want, now) && same(triples) && same(filters) && same(locked) && sameMods();
     }
     case 'distinct':
@@ -767,5 +865,10 @@ export function countQuery(text: string, p: PatternOk): string {
     .map((b) => `${b.text}\n`)
     .join('');
   const where = text.slice(p.root.range.from, p.root.range.to);
-  return `${prologue}${prologue && !prologue.endsWith('\n') ? '\n' : ''}SELECT (COUNT(*) AS ?n)\n${from}WHERE ${where}`;
+  // a trailing VALUES restricts the solutions, so the count keeps it
+  const values = p.modifiers
+    .filter((m) => m.kind === 'VALUES')
+    .map((m) => `\n${m.text}`)
+    .join('');
+  return `${prologue}${prologue && !prologue.endsWith('\n') ? '\n' : ''}SELECT (COUNT(*) AS ?n)\n${from}WHERE ${where}${values}`;
 }

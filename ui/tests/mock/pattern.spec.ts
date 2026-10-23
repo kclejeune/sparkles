@@ -388,10 +388,12 @@ test('each editor tab keeps its own positions', async ({ page }) => {
   const first = (await positions(c))['v:person'];
   // the same query in a second tab, ?person moved the other way
   await page.getByRole('button', { name: 'New query tab' }).click();
+  // an empty tab draws an empty canvas first, so wait for the query's own layout to end
+  await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);
+  const empty = await settled(canvas(page));
   await setText(page, A3);
   await expect(pane(page)).toHaveAttribute('data-state', 'ok');
-  await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);
-  // an empty tab draws an empty canvas first, so wait for the query's nodes
+  await redrawn(canvas(page), empty);
   await expect.poll(async () => (await positions(canvas(page)))['v:person']?.[0]).toBeDefined();
   await canvas(page).focus();
   for (let i = 0; i < 10; i++) await page.keyboard.press('Shift+ArrowLeft');

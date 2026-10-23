@@ -114,6 +114,9 @@ export function quote(s: string): string {
   return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
 }
 
+/** A prefixed name, such as `ex:alice` or `:a`. */
+const PNAME = /^(?:[A-Za-z][\w-]*(?:\.[\w-]+)*)?:[\w-]+(?:\.[\w-]+)*$/u;
+
 /**
  * A value typed into a form as a constant: an IRI or prefixed name as written, a number
  * as written, a date with its datatype, a literal already written as one, else a string.
@@ -128,12 +131,21 @@ export function constant(value: string, datatype?: string | null): string {
   )
     return v;
   if (datatype && kindOf(datatype) === 'date') return `${quote(v)}^^<${datatype}>`;
-  if (v === 'true' || v === 'false') return v;
+  if ((v === 'true' || v === 'false') && (!datatype || datatype === `${XSD}boolean`)) return v;
+  // a prefixed name is an IRI, whose prefix the pane declares when the dataset does
+  if (PNAME.test(v)) return v;
   return quote(v);
 }
 
-/** The expression a form writes for `?v`. */
-export function expression(op: Op, v: string, value: string, datatype?: string | null): string {
+/** The expression a form writes for `?v`. A regex takes `flags`, `"i"` for a new filter,
+ * and none when empty. */
+export function expression(
+  op: Op,
+  v: string,
+  value: string,
+  datatype?: string | null,
+  flags = 'i',
+): string {
   const x = `?${v.replace(/^[?$]/, '')}`;
   switch (op) {
     case 'contains':
@@ -143,7 +155,9 @@ export function expression(op: Op, v: string, value: string, datatype?: string |
     case 'strends':
       return `STRENDS(${x}, ${quote(value)})`;
     case 'regex':
-      return `REGEX(${x}, ${quote(value)}, "i")`;
+      return flags
+        ? `REGEX(${x}, ${quote(value)}, ${quote(flags)})`
+        : `REGEX(${x}, ${quote(value)})`;
     case 'langmatches':
       return `LANGMATCHES(LANG(${x}), ${quote(value)})`;
     case 'bound':
@@ -163,14 +177,13 @@ function unquote(c: string): string {
   return m ? m[1].replace(/\\(.)/g, (_, x) => (x === 'n' ? '\n' : x === 'r' ? '\r' : x)) : c;
 }
 
-/** The form of a chip, to open it again: its operator and its value as typed. */
-export function formOf(f: FilterForm): { op: Op; value: string } {
+/** The form of a chip, to open it again: its operator, its value as typed, and a
+ * regex's flags. */
+export function formOf(f: FilterForm): { op: Op; value: string; flags?: string } {
   const op = f.op as Op;
   const arg = f.args[0] ?? '';
-  return {
-    op,
-    value: ['contains', 'strstarts', 'strends', 'regex', 'langmatches'].includes(op)
-      ? unquote(arg)
-      : arg,
-  };
+  const value = ['contains', 'strstarts', 'strends', 'regex', 'langmatches'].includes(op)
+    ? unquote(arg)
+    : arg;
+  return op === 'regex' ? { op, value, flags: f.args[1] ? unquote(f.args[1]) : '' } : { op, value };
 }

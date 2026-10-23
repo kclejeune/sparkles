@@ -871,6 +871,17 @@ export function checkTerm(text: string, role: 's' | 'p' | 'o'): string {
 
 export type Prefixes = { prefix: string; iri: string }[];
 
+/**
+ * The dataset's prefixes a picked IRI may be written under: those whose names the query
+ * does not declare, since the query's declaration of a name wins in its text.
+ */
+export function effectivePrefixes(query: Prefixes, dataset: Record<string, string>): Prefixes {
+  const own = new Set(query.map((x) => x.prefix));
+  return Object.entries(dataset)
+    .filter(([prefix]) => !own.has(prefix))
+    .map(([prefix, iri]) => ({ prefix, iri }));
+}
+
 /** The prefix of a prefixed name, or null for another term. */
 export const prefixOf = (t: string): string | null =>
   !/^[?$_<"'+\-.\d]/.test(t) && PNAME_RE.test(t) ? t.slice(0, t.indexOf(':')) : null;

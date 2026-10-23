@@ -79,6 +79,8 @@
   let filterKey = $state<string | null>(null);
   let filterOp = $state<Op>('=');
   let filterValue = $state('');
+  /** a regex's flags: `i` for a new filter, those of the chip for one being edited */
+  let filterFlags = $state('i');
   $effect(() => {
     // a new element starts with empty fields
     void el;
@@ -114,12 +116,14 @@
     filterOpen = true;
     filterOp = ops[0] ?? '=';
     filterValue = '';
+    filterFlags = 'i';
     if (key) {
       const f = filterOf(key);
       if (f?.expr) {
         const form = formOf(f.expr);
         filterOp = form.op;
         filterValue = form.value;
+        filterFlags = form.flags ?? 'i';
       }
     }
   }
@@ -129,7 +133,7 @@
 
   function submitFilter(ev: SubmitEvent) {
     ev.preventDefault();
-    const expr = expression(filterOp, varName, filterValue, dts?.[0] ?? null);
+    const expr = expression(filterOp, varName, filterValue, dts?.[0] ?? null, filterFlags);
     onedit(
       filterKey
         ? { kind: 'filter-edit', filter: filterKey, expr }

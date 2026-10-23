@@ -1544,7 +1544,7 @@ seen with, with ranges for numbers and dates, `CONTAINS`, `STRSTARTS`, `STRENDS`
 opens the same form again to change or delete it. The panel also renames the variable
 everywhere the pane edits. When a locked block uses the variable, the pane shows the
 block and asks whether to rename it there too. **Delete** on a node removes every triple
-that touches it, with the filters left without a bound variable. A locked block is
+that touches it, with the chips left without a bound variable. A locked block is
 deleted only after a confirmation that shows its text. A locked block that uses a
 variable nothing binds any more, for example after its triple was deleted, gets a red
 border and the note "uses ?y, which nothing binds now".
