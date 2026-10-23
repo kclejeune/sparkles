@@ -647,20 +647,20 @@ export function applyChanges(text: string, changes: Change[]): string {
 }
 
 /** The indentation of the line `offset` is on. */
-function indentAt(text: string, offset: number): string {
+export function indentAt(text: string, offset: number): string {
   const start = text.lastIndexOf('\n', offset - 1) + 1;
   return /^[ \t]*/.exec(text.slice(start))![0];
 }
 
 /** The end of the spaces and the `#` comment that end the line at `offset`, if any. */
-function lineTail(text: string, offset: number): number {
+export function lineTail(text: string, offset: number): number {
   const m = /^[ \t]*#[^\r\n]*/.exec(text.slice(offset));
   return m ? offset + m[0].length : offset;
 }
 
 /** Whether only spaces precede `offset` on its line; then the offset of the line break
  * before it (or the start of the text). */
-function blankBefore(text: string, offset: number): number | null {
+export function blankBefore(text: string, offset: number): number | null {
   const nl = text.lastIndexOf('\n', offset - 1);
   const before = text.slice(nl + 1, offset);
   if (!/^[ \t]*$/.test(before)) return null;
@@ -669,7 +669,7 @@ function blankBefore(text: string, offset: number): number | null {
 }
 
 /** The indentation for an item inside `g`. */
-function itemIndent(text: string, g: Group): string {
+export function itemIndent(text: string, g: Group): string {
   const first = g.items[0];
   if (first) {
     const r = itemRange(first);
@@ -681,7 +681,7 @@ function itemIndent(text: string, g: Group): string {
 const itemRange = (i: Item): Range => i.range;
 
 /** The variables a triple binds. */
-function bindsOf(s: Term, p: { kind: string; value: string }, o: Term): Set<string> {
+export function bindsOf(s: Term, p: { kind: string; value: string }, o: Term): Set<string> {
   const v = new Set<string>();
   if (s.kind === 'var') v.add(s.value);
   if (p.kind === 'var') v.add(p.value);
@@ -695,7 +695,7 @@ function bindsOf(s: Term, p: { kind: string; value: string }, o: Term): Set<stri
  * items of `skip` (being moved away) do not count. Returns the item it follows, or null
  * for the start of the group.
  */
-function anchor(g: Group, binds: Set<string>, skip: Set<Item> = new Set()): Item | null {
+export function anchor(g: Group, binds: Set<string>, skip: Set<Item> = new Set()): Item | null {
   const items = g.items.filter((i) => !skip.has(i));
   let last = -1;
   items.forEach((i, n) => {
@@ -714,7 +714,7 @@ function anchor(g: Group, binds: Set<string>, skip: Set<Item> = new Set()): Item
  * own line, after `after` (an item of `g`) or at the start of the group. A triple
  * statement before it without its `.` gets one, since triples need a `.` between them.
  */
-function insertItem(
+export function insertItem(
   text: string,
   g: Group,
   after: Item | null,
@@ -854,10 +854,10 @@ export function checkTerm(text: string, role: 's' | 'p' | 'o'): string {
   return t;
 }
 
-type Prefixes = { prefix: string; iri: string }[];
+export type Prefixes = { prefix: string; iri: string }[];
 
 /** The prefix of a prefixed name, or null for another term. */
-const prefixOf = (t: string): string | null =>
+export const prefixOf = (t: string): string | null =>
   !/^[?$_<"'+\-.\d]/.test(t) && PNAME_RE.test(t) ? t.slice(0, t.indexOf(':')) : null;
 
 /** The prefixes a checked term uses: its own, or its datatype's (`"1"^^xsd:int`). */
@@ -1060,7 +1060,7 @@ export function edit(text: string, p: PatternOk, e: Edit): Change[] {
 }
 
 /** The PREFIX lines an add makes: its declarations the query lacks, each prefix once. */
-function declarations(p: PatternOk, e: AddTriple): Prefixes {
+export function declarations(p: PatternOk, e: { declare?: Prefixes }): Prefixes {
   const out: Prefixes = [];
   for (const d of e.declare ?? [])
     if (
@@ -1091,7 +1091,7 @@ export function stillNames(before: Drawing, after: Drawing, edge: string): boole
  * term matches when it is written the same way, which needs no resolution and so holds
  * even for a prefix only the add declares, or when it resolves to the same term.
  */
-function homeOf(p: PatternOk, s: string, declare: Prefixes): Placed | undefined {
+export function homeOf(p: PatternOk, s: string, declare: Prefixes): Placed | undefined {
   const key = termKey(resolveTerm(s, p, declare));
   const same = (t: Term) => (t.kind !== 'literal' && t.text === s) || termKey(t) === key;
   return triplesOf(p).find((t) => same(t.triple.s) || same(t.triple.o));
@@ -1105,7 +1105,7 @@ export function resolveEdit(p: PatternOk, edge: string): Placed | undefined {
 /** The deletions that remove an OPTIONAL: its range, with its line when alone on it and no
  * `.` follows on that line, and the `.` after it in its group as a deletion of its own,
  * which keeps a comment or line break between the two. */
-function optionalRemoval(text: string, r: Range, dot: Range | null | undefined): Change[] {
+export function optionalRemoval(text: string, r: Range, dot: Range | null | undefined): Change[] {
   const out: Change[] = [];
   const to = lineTail(text, r.to);
   const start = blankBefore(text, r.from);
@@ -1129,7 +1129,7 @@ function optionalRemoval(text: string, r: Range, dot: Range | null | undefined):
  * Deletions and insertions as one list of non-overlapping changes: an insertion inside a
  * deleted range moves to its end, where the deleted text was.
  */
-function merge(dels: Change | Change[], inserts: Change[]): Change[] {
+export function merge(dels: Change | Change[], inserts: Change[]): Change[] {
   const list = Array.isArray(dels) ? dels : [dels];
   return [
     ...list,
@@ -1146,7 +1146,7 @@ function merge(dels: Change | Change[], inserts: Change[]): Change[] {
  * not declare, so the same text means the same term on both sides, while resolved values
  * would differ for exactly the names that line declares.
  */
-function signature(s: { text: string }, p: { text: string }, o: { text: string }): string {
+export function signature(s: { text: string }, p: { text: string }, o: { text: string }): string {
   return `${s.text} ${p.text} ${o.text}`;
 }
 
