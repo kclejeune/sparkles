@@ -1145,19 +1145,53 @@ fn admission_room(ctx: &Ctx) -> f64 {
     room as f64
 }
 
+/// The bytes the query-local vocabulary is assumed to keep for each term an expression
+/// generates: the term's key, its entry in the vocabulary's map and its slot.
+const GENERATED_TERM_BYTES: f64 = 128.0;
+
 /// The estimated bytes of the state a cursor over `node` keeps at once: the build
-/// side of each join, the groups of each grouping, the rows of each DISTINCT and full
-/// sort, the rows each top-k keeps and the key set of each EXISTS it answers from one.
-/// The cursor streams the rest. Operators the estimate does not know count their whole
-/// output.
+/// side of each join with its hash index, the groups of each grouping with their
+/// aggregates, the rows of each DISTINCT and full sort, the rows each top-k keeps, the
+/// key set of each EXISTS it answers from one, and the terms each BIND generates, which
+/// the query-local vocabulary keeps until the query ends. The cursor streams the rest.
+/// Operators the estimate does not know count their whole output, and state whose size
+/// does not follow from the row estimates, such as the text of a GROUP_CONCAT, makes the
+/// estimate infinite so that the plan is not admitted on it.
 fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
-    let rows = |n: &Node, est: f64| est.max(0.0) * (n.vars.len().max(1) * 8) as f64;
+    let width = |n: &Node| (n.vars.len().max(1) * 8) as f64;
+    // rows kept in a growing vector, which may hold twice their bytes while it grows
+    let rows = |n: &Node, est: f64| est.max(0.0) * width(n) * 2.0;
+    // rows found through a hash table, which coexists with its old buckets while it
+    // grows, as the cursor's own charges count it
+    let hashed = |n: &Node, est: f64| {
+        let est = est.max(0.0);
+        let entries = est.min(usize::MAX as f64) as usize;
+        rows(n, est) + binary::map_bytes(entries, 16) as f64 * 1.5 + est * 12.0 + 1024.0
+    };
     let own = match &node.kind {
         _ if binary::eligible(node) => {
             let build = &node.children[1 - binary::probe_side(node)];
-            rows(build, build.est)
+            hashed(build, build.est)
         }
-        Kind::Group { .. } | Kind::Distinct | Kind::Sort(_) => rows(node, node.est),
+        Kind::Group { aggs, .. } => {
+            let input = node.children.first().map_or(0.0, |c| c.est.max(0.0));
+            let mut bytes = hashed(node, node.est) + node.est.max(0.0) * aggs.len() as f64 * 64.0;
+            for (_, agg) in aggs {
+                if matches!(
+                    agg.func,
+                    spargebra::algebra::AggregateFunction::GroupConcat { .. }
+                ) {
+                    return f64::INFINITY;
+                }
+                // a DISTINCT aggregate keeps every distinct input row of its group
+                if agg.distinct {
+                    bytes += node.children.first().map_or(0.0, |c| hashed(c, input));
+                }
+            }
+            bytes
+        }
+        Kind::Distinct => hashed(node, node.est),
+        Kind::Sort(_) => rows(node, node.est),
         Kind::OrderBy { limit: Some(k), .. } => rows(node, (*k as f64).min(node.est)),
         Kind::OrderBy { limit: None, .. } => rows(node, node.est),
         Kind::Filter(exprs) if node.children.len() == 1 => exprs
@@ -1166,10 +1200,13 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
             .map(|e| {
                 super::exists::keyed_plan(ctx, e, &node.children[0])
                     .map_or(f64::INFINITY, |planned| {
-                        rows(&planned, planned.est) + cursor_state_bytes(ctx, &planned)
+                        hashed(&planned, planned.est) + cursor_state_bytes(ctx, &planned)
                     })
             })
             .sum(),
+        // a variable or a constant generates no term
+        Kind::Extend(_, Expr::Var(_) | Expr::Const(_) | Expr::Lit(..)) => 0.0,
+        Kind::Extend(..) => node.est.max(0.0) * GENERATED_TERM_BYTES,
         _ if supported(&node.kind) => 0.0,
         _ => rows(node, node.est),
     };
@@ -4451,6 +4488,32 @@ mod tests {
         // a full sort keeps all of its rows in the cursor too, so without spill it stays
         // eager
         assert!(!decide(sort, 32 << 20));
+        // the same product under aggregates that keep more than a row per group: a
+        // DISTINCT aggregate keeps its distinct input rows and GROUP_CONCAT its text, so
+        // neither is admitted on the memory estimate
+        let memory = |q: &str| {
+            let q = super::super::parse_query(q, None, &[]).unwrap();
+            let options = QueryOptions {
+                max_memory_bytes: Some(32 << 20),
+                ..Default::default()
+            };
+            let mut p =
+                super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
+            estimate(&mut p.node);
+            memory_admitted(&p.ctx, &p.node, p.kind, &Default::default())
+        };
+        let counted = "SELECT ?f (COUNT(?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f";
+        assert!(memory(counted));
+        assert!(!memory(
+            "SELECT ?f (COUNT(DISTINCT ?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f"
+        ));
+        assert!(!memory(
+            "SELECT ?f (GROUP_CONCAT(?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f"
+        ));
+        // a BIND that generates a term per row of the product keeps a term per row
+        assert!(!memory(
+            "SELECT ?u { ?s <urn:p> ?o . ?x <urn:q> ?f BIND(STRUUID() AS ?u) }"
+        ));
     }
 
     #[test]

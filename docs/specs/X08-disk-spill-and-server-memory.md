@@ -1090,11 +1090,29 @@ natively, its largest eager output is expected to exceed half of the memory it m
 and the state the cursor keeps, with its batch headroom, is expected to fit in half. The
 memory it may use is what the query's budget leaves, never more than the capacity of its
 grant's pool, and it does not depend on how much of the pool other queries hold, so a query
-gets the same plan under load. The cursor's state is estimated per operator: the build
-side of each join, the groups of a grouping, the rows of a DISTINCT or a full sort, the
-rows a top-k keeps and the key set and pattern state of each EXISTS it answers from one.
-Other operators the cursor runs natively keep nothing, and an operator the estimate does
-not know counts its whole output. `spill_admitted` compares with the same memory.
+gets the same plan under load. The cursor's state is estimated per operator. It counts
+the build side of each join with its hash index, the groups of a grouping with their
+aggregate states, the rows of a DISTINCT or a full sort, the rows a top-k keeps, and the
+key set and pattern state of each EXISTS that the cursor answers from one. Rows found
+through a hash table also count the table's buckets, which coexist with the old buckets
+while the table grows, and rows kept in a vector count twice their bytes for its growth.
+A DISTINCT aggregate also counts its distinct input rows. A BIND whose expression is not a
+variable or a constant counts 128 bytes per row, because the terms it generates stay in
+the query-local vocabulary until the query ends. A GROUP_CONCAT keeps text whose length
+the estimates do not tell, so a plan with one is not admitted this way. Other operators
+the cursor runs natively keep nothing, and an operator the estimate does not know counts
+its whole output. `spill_admitted` compares with the same memory. The estimate rests on
+the planner's row estimates, so a plan whose estimates are far too low can still be
+admitted and then fail at its budget, as an eager plan with the same estimates can.
+
+The review of this change found three estimates too low. Counting only a hash join's
+build rows admitted a cursor that failed in a 6 MiB pool on a join that eager execution
+answered there. Counting one row per group admitted a `COUNT(DISTINCT …)` over a large
+product, and treating BIND as stateless admitted `BIND(STRUUID() AS ?u)` over a
+million-row product, which then failed after more than 100,000 rows. The tests in
+`crates/sparkles-core/tests/memory_admission.rs` and the decision table in
+`automatic_admission_streams_a_product_whose_cursor_state_fits_without_spill` cover these
+cases.
 
 On forge at 10M quads, with the default 5.2 GiB pool, q4 with ProductType6 answers in
 15.1 s with a peak server RSS of 282 MB, where it was refused. With a 12 GB pool, eager

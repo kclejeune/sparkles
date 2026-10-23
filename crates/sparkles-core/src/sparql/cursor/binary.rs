@@ -106,7 +106,7 @@ pub(super) struct HashIndex {
 }
 
 /// The bytes a hash map of `capacity` entries of `entry` bytes allocates.
-fn map_bytes(capacity: usize, entry: u64) -> u64 {
+pub(super) fn map_bytes(capacity: usize, entry: u64) -> u64 {
     let buckets = (capacity.saturating_mul(8) / 7).next_power_of_two() as u64;
     buckets.saturating_mul(entry + 1)
 }
