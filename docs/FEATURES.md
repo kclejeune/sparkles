@@ -385,16 +385,16 @@ that work by priority and links each item to its design spec.
   still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3 and
   [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
 * Group commit on datasets with a full-text, spatial or embedding index has passed its
-  crash runs, and its forge acceptance of 2026-10-23 met the memory gate in all ten cells.
-  It met 28 of 36 serial checks and 3 of 6 four-writer throughput gates. The misses follow
-  the drive's flush time, which moved between processes by a factor of seven, more than the
-  engine, whose overhead differed by at most 3.6% in 8 of the 10 serial cells that can
-  compute it. The text and
-  spatial reader latency gates are not established. Every mixed cell failed the 50 ms
-  schedule lag requirement, and the full-text cells stop all writers for 70 to 150 ms about
-  every 5.4 s, with grouping and without it, probably in the locked background checkpoint.
-  [Roadmap](ROADMAP.md) item 99 covers that stall, and item 86 keeps the rerun and the
-  decision on two gate amendments. [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates)
+  crash runs. Its forge acceptance of 2026-10-23 met the amended gates for memory, for
+  four-writer throughput and for 35 of 36 serial checks. The p90 of spatial serial inserts
+  at 10.5M was 1.077 times its ordinary neighbour, which is [roadmap](ROADMAP.md) item
+  111, and a fence synchronizes in 1.4 to 1.5 ms against about 1.0 ms for one commit, which
+  is item 112. The text and spatial reader latency gates are not established, because every
+  mixed cell failed the 50 ms schedule lag requirement. The full-text cells stop all
+  writers for 70 to 150 ms about every 5.4 s, with grouping and without it, probably in the
+  locked background checkpoint, and item 110 covers that stall and the rerun. The serial
+  and throughput gates were amended after the campaign, so the next forge run is the first
+  to judge them blind. [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates)
   has the gates and the [Phase 4 Outcome](specs/X09-group-commit-by-default.md#phase-4) the
   results.
 * **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.

@@ -543,7 +543,10 @@ counters, and for the serial scenarios the engine overhead, which is the mean re
 latency less that synchronization time. A drive whose flush latency changes between
 processes moves the synchronization column, and the overhead column shows whether the
 two writers still differ once that change is taken out. The pass and fail marks come from
-the harness's own `gate-summary.json`, and the report changes no verdict.
+the harness's own `gate-summary.json`, which keeps the verdicts of the gates as first written.
+The report also judges the serial and four-writer throughput gates as X09 section 17.9
+amended them, on the ratios between neighbouring processes, and prints those verdicts as
+amended gate lines.
 
 ## Continuous integration
 
