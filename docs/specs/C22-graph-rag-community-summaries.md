@@ -809,7 +809,8 @@ citations of a replaced child stay resolvable.
 reports the estimate and waits for `POST /$/graphrag/{ds}/confirm` unless the caller
 confirmed beforehand. The run checks its settings, its model configuration, its
 providers, their send levels and the principal's view again after the confirmation,
-before every HTTP attempt including retries and fallbacks, and before each commit. A
+before every HTTP attempt including retries and fallbacks, after a provider's token
+count, and before each commit. A
 replaced model configuration refuses the run even when its role pairs are unchanged. The
 run fails without committing when a review changed a report link while
 it ran. All branches of a dataset share its daily ledger. An accounting anomaly stops
