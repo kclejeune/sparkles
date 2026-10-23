@@ -1415,18 +1415,21 @@ The other 30 queries of the DBpedia suite gave the same answers, and none of tho
 patterns do not answer, and stayed at 0.38 ms. The class profiles endpoint took 24.2 s with
 both binaries, because almost every DBpedia predicate is used by an instance of some class.
 
-At 10.5M synthetic triples, an interleaved Namespace screen of three A, B, B, A rounds
-gave the following medians. The 30 queries returned the same answers.
+At 10.5M synthetic triples, forge ran three A, B, B, A rounds of ten timed requests each.
+An interleaved Namespace screen of all 30 synthetic queries found the same answers, and
+forge timed the queries it flagged again. `order-by-full`, `star-join` and `subquery-agg`
+were within 2%, and `path-plus` took 0.023 ms against 0.022 ms.
 
 | Query at 10.5M | Before | After |
 |---|---:|---:|
-| `predicate-subjects` | 678 ms | 0.026 ms |
-| `class-predicates` | 519 ms | 8.0 ms |
-| `class-predicate-list` | 75 ms | 7.9 ms |
+| `predicate-subjects` | 469 ms | 0.020 ms |
+| `class-predicates` | 508 ms | 10.2 ms |
+| `class-predicate-list` | 73 ms | 10.2 ms |
 
 The patterns take 24.1 MB, 1.6% of the 1.53 GB index, on the DBpedia slice, and 2.9 MiB, 1.0% of
 the index, at 10.5M, where 24 patterns cover 1.52 million subjects. Writing them took 0.36 s of the slice's 26.0 s load, and the load's peak
-RSS stayed at 3.23 GB. The collector holds at most 1 GiB of distinct patterns by default
+RSS stayed at 3.23 GB. At 10.5M the load took 4.1 s against 4.6 s and peaked at 2.07 GB
+against 1.96 GB, in one load each. The collector holds at most 1 GiB of distinct patterns by default
 and skips the patterns of a generation that needs more.
 
 ## Loading and index builds

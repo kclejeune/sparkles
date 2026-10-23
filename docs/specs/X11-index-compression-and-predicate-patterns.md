@@ -527,6 +527,7 @@ pass. The other 31 queries of the DBpedia suite returned the same answers, and n
 those above 0.3 ms was more than 5% slower.
 
 At 10.5M synthetic triples the file takes 2.9 MiB, 1.0% of the index, with 24 patterns
-for 1.52 million subjects, so both datasets meet the gate of 3%. An interleaved Namespace
-screen put `predicate-subjects` at 0.026 ms against 678 ms, `class-predicates` at 8.0 ms
-against 519 ms and `class-predicate-list` at 7.9 ms against 75 ms.
+for 1.52 million subjects, so both datasets meet the gate of 3%. On forge
+`predicate-subjects` took 0.020 ms against 469 ms, `class-predicates` 10.2 ms against
+508 ms and `class-predicate-list` 10.2 ms against 73 ms. The load peaked at 2.07 GB
+against 1.96 GB, in one load each.
