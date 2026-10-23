@@ -46,7 +46,8 @@ Three tracks run through the tiers:
 | **Graph features** | 8 → 12 → 20 | F14 → C22 → F01 |
 | **Reasoning** | 9 → 87 → 19 → 18, with 17 before F18 Phase 3 | F16 → F16 follow-up → F17 → F18 Phases 1–2 → F13 → F18 Phase 3 |
 
-The UI items (11, 21, 27–31) fill time when a track is waiting on benchmark results.
+The UI items (11, 21, 27–31 and the graph-interaction items 101–107) fill time when a
+track is waiting on benchmark results.
 
 The next cold-read work is the corrected-source measurement gate for item 4. It
 compares warm instruction counts and read hints before repeating the cold targets
@@ -159,6 +160,39 @@ These items are cheap or foundational.
 | 91 | **SP²Bench planner losses are partly addressed.** UNION pruning reduces `q8` and `q12b` work, bounded ASK avoids oversized `q12a` candidates, and string equality pruning answers `q5a` at 10M within the default budgets. In item 1's reference run at 10M, `q5a` returns all 385,208 rows in 3.9 s and matches an independent oracle, and `q8` takes 8.3 ms. On 2026-10-23 keyed left joins let `q6` answer its 906,313 rows at 10M in 0.95 s, matching Jena's answer, and an eager `q4` that outgrows the query pool runs again as a cursor without spill. The `q4` answer is 1.96 GB of TSV, so it still needs a `--max-result-mb` above the default 1 GiB. Jena stays 12× faster on `q12a` and Oxigraph 1.7× on `q12b`. | [X06](specs/X06-benchmark-coverage.md#sp2bench-planner-follow-up-2026-10-21), [follow-up](specs/X06-benchmark-coverage.md#sp2bench-q4-and-q6-follow-up-2026-10-23) | M |
 | 99 | **Truncated eager responses are logged as complete.** When the serialized response of an eager SELECT reaches `--max-result-mb`, the server stops the body there and the client sees an incomplete response. The access log still records the outcome `ok` with the full row count, so the failure is invisible in the logs and the metrics. The response should end with an error the client can detect, and the log should record the outcome `budget` with the rows sent. SP²Bench `q4` at 10M showed it on the base build as well. | [X06](specs/X06-benchmark-coverage.md#sp2bench-q4-and-q6-follow-up-2026-10-23) | S |
 | 100 | Several GraphRAG configurations per dataset, so readers with different views each get reports built from their own view. `graphrag.json` would take a list of named configurations, routes and the CLI would name one, and the build state and ledger would be kept per configuration under a new format version. Consumers would use the first configuration whose reports graph the caller may read. | [C22](specs/C22-graph-rag-community-summaries.md#13-open-questions) | M |
+
+### Graph-interaction UI (2026-10-23)
+
+The user approved ten graph-interaction features on 2026-10-23. They are grouped into
+four new specs and four phases added to existing ones, and each row below is one spec or
+one added phase. Rows that need backend work name it as their first phase.
+
+| # | Item | Spec | Size | Impact |
+|---|---|---|---|---|
+| 101 | **A two-way visual query builder.** A canvas beside the editor that draws any query's pattern and edits a subset of SPARQL as splices of the text, with locked blocks for the rest and a stable layout. Phase 1 adds a `pattern` export to the formatter's browser module and draws patterns read-only. | [U08](specs/U08-visual-query-builder.md) | L | Medium–high |
+| 102 | **The plan on the pattern.** Estimated and actual rows drawn on U08's pattern graph, with misestimates marked. It first adds structured pattern references to plan nodes. | [U04](specs/U04-live-query-profiling.md#11-phase-4-the-plan-drawn-on-the-querys-pattern-2026-10-23) Phase 4 | S–M | Medium |
+| 103 | **A path finder.** The shortest or k shortest paths between two entities, drawn and animated in Explore. It first adds excluded predicates and a hub degree limit to F07's path search. | [U09](specs/U09-path-finder.md) | M | Medium–high |
+| 104 | **A time-lapse and commit diffs on the canvas.** A commit's changes drawn as a graph, playback from each step's diff, and the overview through time. It first adds a diff grouped by class. | [U01](specs/U01-time-slider.md#phase-4-time-lapse-and-commit-diffs-on-the-canvas-2026-10-23) Phase 4 | M | Medium |
+| 105 | **Lenses on the canvas.** Size, colour, badge and edge-style lenses with legends, inferred edges drawn dashed, algorithm lenses from view-only F14 runs, and the derivation tree of an inferred edge. Phase 2 first caches view-only runs on the server, and Phase 3 first adds an explanation search over a materialized closure. | [U10](specs/U10-canvas-lenses.md) | L | Medium–high |
+| 106 | **A validation overlay.** SHACL and ShEx results badged on drawn nodes, with the failing shape, the triples involved and a suggested fix previewed through C15. It first lets the validation routes take a set of focus nodes and the guard's stored shapes. | [U07](specs/U07-data-quality-and-schema-diagram.md#11-phase-4-a-validation-overlay-on-the-graph-2026-10-23) Phase 4 | M | Medium |
+| 107 | **Linked views.** Arcs between located entities on the map, facet histograms whose brushes filter the canvas and the query, and an embedding map whose lasso becomes a `VALUES` block. Phases 2 and 3 first add a facets route and a vector projection route. | [U11](specs/U11-linked-views.md) | L | Medium |
+
+An orchestrator should start these in the following order, for the reasons given.
+
+1. **Item 101 Phase 1 and item 105 Phase 1 in parallel.** U08's pattern export and
+   read-only pane are the base of items 102 and 107's query edits, and U10's lens model is
+   the base of item 106 and the rest of item 105. Neither depends on the other.
+2. **Items 103 and 104 alongside them.** Both are self-contained, and each starts with a
+   small server phase that a separate lane can build first.
+3. **Item 101 Phase 2, then item 102.** The plan overlay needs only U08 Phase 1, but it is
+   most useful once people build queries on the canvas. Its live counts wait for item 27.
+4. **Item 106 and item 105 Phase 2.** Both need U10 Phase 1. Item 105 Phase 2 closes the
+   community-colouring part of item 8's gap.
+5. **Item 107 by phase.** Phase 1 has no dependency and can start at any time. Phase 2
+   needs U08 Phase 2's splices, and Phase 3 needs U08 Phase 3's inline `VALUES`.
+6. **Item 105 Phase 3 last.** Its explanation search is the most open engine work of the
+   set, and U10's open question 1 asks whether to build it before F17 or to wait for item
+   18.
 
 ### Spill performance investigation
 

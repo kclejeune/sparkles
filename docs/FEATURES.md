@@ -263,7 +263,8 @@ that work by priority and links each item to its design spec.
   deadline unless the request or `--update-timeout` gives one, so a run that waits for
   `--algo-threads` waits until a thread is free or the run is cancelled. Thread admission
   has no queue order, so a call that needs several threads can wait while one-thread
-  calls keep taking the free slots. [Roadmap](ROADMAP.md) item 8.
+  calls keep taking the free slots. [Roadmap](ROADMAP.md) item 8, and item 105 for
+  colouring and sizing a graph view by algorithm results.
 
 * **Large graph rendering remainder.** The Explore overview and the WebGL view shipped
   with U06 Phases 1 and 2, but layouts computed and cached on the server and the binary
