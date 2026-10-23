@@ -381,14 +381,17 @@ that work by priority and links each item to its design spec.
   still be read as a legacy commit or refused. [Roadmap](ROADMAP.md) item 3 and
   [X09 Phase 3](specs/X09-group-commit-by-default.md#phase-3).
 * Group commit on datasets with a full-text, spatial or embedding index has passed its
-  crash runs, but complete performance acceptance on forge remains open. Partial
-  full-text pilots do not establish the full serial, concurrent and mixed-load gates.
-  Background file synchronization releases the full-text publication mutex, and
-  after three checkpoints in a row that writes raced, the next one holds it so that
-  the recovery marker still clears. WAL and vocabulary synchronization, publication
-  during a group fence and that locked checkpoint still need native latency
-  acceptance. Spatial and embedding acceptance also remain open. [Roadmap](ROADMAP.md) item 86 and
-  [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates).
+  crash runs, and its forge acceptance of 2026-10-23 met the memory gate in all ten cells.
+  It met 28 of 36 serial checks and 3 of 6 four-writer throughput gates. The misses follow
+  the drive's flush time, which moved between processes by a factor of seven, more than the
+  engine, whose overhead differed by at most 3.6% in 16 of 18 serial cells. The text and
+  spatial reader latency gates are not established. Every mixed cell failed the 50 ms
+  schedule lag requirement, and the full-text cells stop all writers for 70 to 150 ms about
+  every 5.4 s, with grouping and without it, probably in the locked background checkpoint.
+  [Roadmap](ROADMAP.md) item 99 covers that stall, and item 86 keeps the rerun and the
+  decision on two gate amendments. [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates)
+  has the gates and the [Phase 4 Outcome](specs/X09-group-commit-by-default.md#phase-4) the
+  results.
 * **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.
   The bounded automatic ASK policy covers `q12a`, and string equality pruning lets
   `q5a` answer at 10M within the default budgets. The remaining budget work is `q4`

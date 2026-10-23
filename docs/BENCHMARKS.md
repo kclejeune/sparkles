@@ -1780,6 +1780,153 @@ grouping off for every index. With sixteen writers it peaked 15 MiB higher with 
 full-text index, 18 MiB higher with the embedding index and 21 MiB higher with the spatial
 index, at 210, 188 and 174 MiB.
 
+### Group commit on indexed datasets on forge
+
+These runs apply the gates of [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates)
+to a release binary of 5b40d0ec on `forge`, an Intel Core i5-13500 with an SK hynix NVMe
+drive behind LUKS, LVM and ext4. They ran on 2026-10-23 with `scripts/bench-indexed-commit.py`
+under the host's bench and heavy locks. The binary was built on `forge` before timing, and the
+ordinary writer is the same binary with `--no-group-commit`. Native storage was used with no
+added delay. The server ran on the six performance cores and their sibling threads, and the
+client ran on two efficiency cores. Every cell is one index on one dataset of 1.05M or 10.5M
+triples, with five blocks of four processes in the order ordinary, grouped, grouped,
+ordinary, so each scenario has ten processes per setting. Every process started from a fresh
+copy of the seed store, checked every acknowledgement and the index answers, and reopened
+cold to check them again. The serial scenarios commit 2,000 single changes after 200 warmup
+changes. The writer scenario sends 50,000 changes from four clients. The mixed scenario paces
+four writers at a common rate of 80% of the slowest unpaced rate and runs two readers that
+count the matches of a text query or a spatial window. Raw results stay on `forge` under
+`~/lanes/item86-acceptance-20261023`.
+
+Each gate below is marked as the harness computed it. The summary is 28 of 36 serial checks
+met, 3 of 6 throughput gates met, 10 of 10 memory gates met, and all 8 reader latency ratios
+within 10%. The reader gates are still not established, because the harness requirement that
+a mixed run keep its offered schedule failed in all four mixed cells for both settings.
+
+#### Serial commits
+
+A serial commit finds the group idle and takes the ordinary path, so the grouped column
+measures the same code as the ordinary one. The ratios are those of the medians over ten
+processes, and the gate asks for both ratios to lie between 0.95 and 1.05. The last column
+is the ratio of the engine overhead, which is the mean request latency less the mean time
+of a commit synchronization read from the server's counters.
+
+| Index | Dataset | Change | p50 ordinary (ms) | p50 grouped (ms) | p50 ratio | p90 ordinary (ms) | p90 grouped (ms) | p90 ratio | Overhead ratio |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Full-text | 1.05M | literal | 1.774 | 1.768 | 0.997 met | 1.874 | 1.966 | 1.049 met | 0.983 |
+| Full-text | 1.05M | iri | 0.464 | 1.053 | 2.267 **missed** | 1.106 | 1.723 | 1.558 **missed** | 0.965 |
+| Full-text | 1.05M | delete | 0.412 | 0.407 | 0.987 met | 0.431 | 0.427 | 0.990 met | 0.993 |
+| Full-text | 10.5M | literal | 0.437 | 0.443 | 1.015 met | 1.188 | 0.483 | 0.407 **missed** | 1.033 |
+| Full-text | 10.5M | iri | 0.412 | 0.414 | 1.003 met | 0.458 | 0.446 | 0.974 met | 1.005 |
+| Full-text | 10.5M | delete | 0.411 | 0.410 | 0.999 met | 0.432 | 0.428 | 0.990 met | 0.988 |
+| Spatial | 1.05M | literal | 1.733 | 0.433 | 0.250 **missed** | 1.822 | 1.163 | 0.639 **missed** | 0.923 |
+| Spatial | 1.05M | iri | 0.411 | 0.413 | 1.005 met | 0.456 | 0.456 | 1.001 met | 1.030 |
+| Spatial | 1.05M | delete | 0.406 | 0.409 | 1.008 met | 0.431 | 0.428 | 0.993 met | 1.007 |
+| Spatial | 10.5M | literal | 1.736 | 1.786 | 1.029 met | 1.846 | 1.950 | 1.057 **missed** | 0.994 |
+| Spatial | 10.5M | iri | 0.409 | 0.414 | 1.011 met | 0.449 | 0.463 | 1.032 met | 1.036 |
+| Spatial | 10.5M | delete | 0.412 | 0.411 | 0.998 met | 0.435 | 0.429 | 0.986 met | 0.990 |
+| Embedding | 1.05M | literal | 0.473 | 0.441 | 0.933 **missed** | 1.536 | 0.797 | 0.519 **missed** | 0.775 |
+| Embedding | 1.05M | iri | 0.410 | 0.415 | 1.012 met | 0.431 | 0.448 | 1.040 met | 1.020 |
+| Embedding | 1.05M | delete | 0.411 | 0.410 | 0.998 met | 0.435 | 0.434 | 0.996 met | 0.993 |
+| Embedding | 10.5M | literal | 0.381 | 0.376 | 0.987 met | 1.852 | 1.843 | 0.995 met | 0.991 |
+| Embedding | 10.5M | iri | 0.411 | 0.412 | 1.003 met | 0.437 | 0.441 | 1.008 met | 0.999 |
+| Embedding | 10.5M | delete | 0.415 | 0.417 | 1.005 met | 0.441 | 0.452 | 1.024 met | 0.999 |
+
+Eight of the 36 checks missed, and the misses do not follow the setting. In five of the eight
+the grouped process was the faster one, with ratios between 0.25 and 0.93. The evidence
+points to the drive. The mean time of a commit synchronization, which the server counts, was about 0.23 ms
+in some processes and between 1.2 and 1.7 ms in others of the same cell and setting, and it
+often changed inside a block. Literal inserts met the slow state more often than IRI inserts
+and deletes. A median over ten processes then follows how many of them met the slow state,
+which is why the full-text IRI inserts at 1.05M missed with the ratio 2.27 although their
+engine overhead was the same to within 4%. The engine overhead differs by at most 3.6% between the settings in every cell
+except two literal cells with embedding or spatial work, where grouping was 22.5% and 7.7%
+lower. Pairing each process with its neighbour in the same block gives a median p50 ratio
+between 0.978 and 1.025 for all six literal cells. These figures are context, and the table
+keeps the harness verdict. A shift of 5% cannot be resolved on this drive with ten processes.
+
+#### Four writers
+
+The ratio is that of the median transactions per second over ten processes, and the gate asks
+for at least 1.5. The paired ratio takes each process against its neighbour in the same
+block. The last column is the certified peak resident memory difference of the gate, which
+subtracts the ordinary process's sampled peak inside the write interval from the grouped
+process's peak over the whole window, and the limit is 64 MiB.
+
+| Index | Dataset | Ordinary tx/s | Grouped tx/s | Ratio | Paired ratio | Peak RSS difference |
+|---|---|---:|---:|---:|---:|---:|
+| Full-text | 1.05M | 926 (637–1,008) | 1,241 (1,207–1,503) | 1.340 **missed** | 1.496 | 8.5 MiB met |
+| Full-text | 10.5M | 795 (634–1,028) | 1,311 (1,154–1,543) | 1.648 met | 1.675 | -3.4 MiB met |
+| Spatial | 1.05M | 860 (638–1,071) | 1,284 (1,199–4,106) | 1.492 **missed** | 1.522 | 7.8 MiB met |
+| Spatial | 10.5M | 929 (726–1,035) | 1,243 (1,118–3,634) | 1.338 **missed** | 1.593 | 9.3 MiB met |
+| Embedding | 1.05M | 650 (463–740) | 1,549 (766–1,816) | 2.381 met | 2.382 | 19.6 MiB met |
+| Embedding | 10.5M | 608 (569–662) | 1,245 (1,151–1,256) | 2.047 met | 2.059 | 0.1 MiB met |
+
+Grouping gave 1.34 to 2.38 times the ordinary throughput, and three of the six cells missed
+the gate of 1.5. With four clients a fence carried a median of 1.9 to 2.0 commits in the
+text and spatial cells, so a commit waits for about two synchronizations and the gain is
+bounded near 2. The mean synchronization in the grouped processes was between 1.4 and 1.5 ms
+against about 1.0 ms for the ordinary ones, since a fence writes the records of several
+commits. The ordinary writer also ran at 950 to 1,010 transactions/s in the first position of
+a block and at 700 to 740 in the last, after two grouped runs, in the text and spatial cells.
+The gain therefore depends on the neighbour. It is 1.26 to 1.60 against the first position
+and 1.56 to 2.26 against the last, and the pooled ratio lies between them. The grouped spatial
+processes at 3,634 and 4,106 transactions/s ran in the fast state of the drive, where the mean
+synchronization was 0.44 ms, and they barely move the medians. A rerun would not necessarily
+pass the three cells that missed.
+
+#### Readers during writes
+
+The mixed scenario paces four writers at 504 to 575 transactions/s, the same offered rate for
+both settings, and two readers run the index query throughout. Reader latencies include every
+request that started during the writes. The ratio is that of the median of the readers' p50
+or p99 over ten processes, and the gate asks for at most 1.10. The last columns give the
+median over the processes of the largest schedule lag, with the range, which the harness
+limits to 50 ms.
+
+| Index | Dataset | Reader p50 ordinary (ms) | Reader p50 grouped (ms) | p50 ratio | Reader p99 ordinary (ms) | Reader p99 grouped (ms) | p99 ratio | Max schedule lag ordinary (ms) | Max schedule lag grouped (ms) | Peak RSS difference |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Full-text | 1.05M | 4.492 | 4.432 | 0.987 met | 6.873 | 6.874 | 1.000 met | 167 (153–182) | 168 (153–575) | 0.3 MiB met |
+| Full-text | 10.5M | 4.538 | 4.523 | 0.997 met | 7.109 | 6.982 | 0.982 met | 169 (156–584) | 171 (155–177) | 3.0 MiB met |
+| Spatial | 1.05M | 1.040 | 1.003 | 0.964 met | 1.602 | 1.482 | 0.925 met | 151 (78–209) | 9 (6–12) | 3.4 MiB met |
+| Spatial | 10.5M | 1.036 | 1.039 | 1.002 met | 1.452 | 1.515 | 1.044 met | 20 (8–84) | 10 (5–50) | 5.6 MiB met |
+
+All eight reader ratios lie between 0.925 and 1.044, and every mixed process achieved its
+offered rate to within 0.3%. The schedule lag requirement failed in all four cells, so the
+harness does not accept the comparison, and the reader gates stay not established.
+
+The full-text failure belongs to the index and not to grouping. In every text process, with
+either setting, all four writers stopped together for a median of 70 to 150 ms about every
+5.4 s, with the longest stalls of most processes at 150 to 190 ms. One grouped process at 1.05M
+reached 575 ms and one ordinary process at 10.5M reached 584 ms. This is the period of the
+locked fallback of the background checkpoint, which holds the
+live writer lock through the file synchronization after three raced checkpoints, with a tick
+of 1 s. The run recorded no ticks, so the cause is probable and not confirmed. The spatial
+processes with grouping had no stall and kept a lag of 5 to 12 ms at 1.05M and up to 50 ms at
+10.5M, 8 µs over the limit in one process. The ordinary spatial processes at 1.05M reached 78
+to 209 ms without any request slower than 22 ms, so their lag was a backlog. The common
+rate of 80% of the slowest unpaced process left too little room when the synchronization time
+moves by a factor of five. The write p99 of the mixed runs was lower with grouping, 6.8 against
+10.1 ms for full-text at 10.5M and 3.7 against 7.1 ms for spatial at 10.5M.
+
+#### Memory
+
+Every cell stayed under the 64 MiB limit. The certified peak resident memory difference was
+between -3.4 and 19.6 MiB for the writer scenarios and between 0.3 and 5.6 MiB for the mixed
+scenarios, where both settings run for the same time. The largest value, 19.6 MiB, came from
+the embedding cell at 1.05M, and the same cell at 10.5M differed by 0.1 MiB. The certificate
+subtracts the lower sampled bound of the ordinary process, so it errs upward.
+
+#### Limits of these runs
+
+A block carries over its state. The drive's flush time lasts for minutes and crosses blocks,
+so ten processes are not ten independent draws. The order of ordinary, grouped, grouped and
+ordinary cancels a linear drift but not what the previous process wrote, and the ordinary
+writer ran slower after two grouped runs than before them. A later run needs a quiet
+interval and a flush probe before each process, and a randomized order. The mixed rate
+calibration needs more headroom than 20% when the synchronization time varies this much.
+The embedding cell has no reader gate, and its worker called a deterministic local provider.
+
 ### Reader tail of group commit on forge
 
 Four writers and two readers ran against the 10.5M dataset on `forge` with its NVMe device,

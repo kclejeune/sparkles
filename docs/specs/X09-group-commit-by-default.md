@@ -1381,8 +1381,8 @@ locked attempt itself, because a Tantivy merge writes without the lock and can s
 race it. A test publishes inside every unlocked synchronization and requires the
 fourth tick to clear the marker, and after a merge's write races the locked attempt it
 requires the next three ticks to release the lock again. It fails when the fallback is
-disabled or when the count is kept after a raced locked attempt. The latency cost of the locked
-attempt has not been measured on native hardware.
+disabled or when the count is kept after a raced locked attempt. The forge acceptance of
+2026-10-23 below measured the latency cost of the locked attempt.
 
 This change removes the background file-synchronization wait from the live writer
 lock. Tantivy publication can still occur inside a group leader's fence, and WAL
@@ -1390,16 +1390,72 @@ and vocabulary synchronization can still delay writes. It does not establish the
 50 ms load-quality rule or the serial, throughput, reader and memory gates of
 section 17.9.
 
-**Open under item 86.** Complete forge acceptance under section 17.9 remains open,
-including text and spatial query latency under a four-writer load, a spatial dataset
-with geometries and an embedding index whose worker runs. Partial full-text pilots
-have run. The revised background checkpoint has targeted concurrency and durability
-coverage, while its native performance acceptance remains open. Until the full
-gates pass the item stays partly done, or the user amends a gate as for Phase 3. Three smaller items wait for that
-work. Staged documents could count their bytes in the queue's limit,
-since a queue of long literals now holds more than 4 MiB of them. The leader applies a
-prefix's text changes, a Tantivy commit included when the batch is full, while its fence
-is still active, which delays the next fence and is question 4 of section 17.10, and the
-text p99 gate will show whether it needs its own thread. The model test has no write
-transaction that searches text, so the wait of a search on a speculative head has only
-unit tests.
+**Forge acceptance.** The gates of section 17.9 ran on `forge` on 2026-10-23 with
+`scripts/bench-indexed-commit.py` and a release binary of 5b40d0ec built on `forge` before
+timing. Each of six cells, one index on a dataset of 1.05M or 10.5M triples, ran five blocks
+of an ordinary, a grouped, a grouped and an ordinary process on native storage, with the
+server pinned to the performance cores. Every process checked its acknowledgements and index
+answers live and after a cold reopen. [BENCHMARKS.md](../BENCHMARKS.md#group-commit-on-indexed-datasets-on-forge)
+has the tables. The harness verdicts are the following.
+
+| Gate | Result |
+|---|---|
+| Serial commits, p50 and p90 within 5% | 28 of 36 checks met. Eight missed, five of them with grouping faster than 0.95 of the ordinary path. |
+| Four writers, at least 1.5 times | Met for full-text at 10.5M and for embedding at both sizes, with 1.65, 2.38 and 2.05. Missed for full-text at 1.05M, 1.34, and for spatial at 1.05M and 10.5M, 1.49 and 1.34. |
+| Text query p50 and p99 during four writers | Ratios of 0.987 and 1.000 at 1.05M and 0.997 and 0.982 at 10.5M. Not established, because the schedule lag requirement failed for both settings. |
+| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established for the same reason. |
+| Peak resident memory within 64 MiB | Met in all ten cells. The largest certified difference was 19.6 MiB, for embedding at 1.05M. |
+
+The serial misses and the narrow throughput misses follow the drive more than the engine.
+The server's own counters show the mean time of a commit synchronization at about 0.23 ms in
+some processes and between 1.2 and 1.7 ms in others of the same cell and setting, and it
+changed inside blocks. The engine overhead, which is the mean request latency less that
+time, differs by at most 3.6% between the settings in 16 of the 18 serial cells and by
+22.5% and 7.7% less with grouping in the other two. A neighbour-paired median of the p50
+is within 2.5% of 1 in all six literal cells. A median over ten processes follows how many
+of them met the slow state, so a shift of 5% is not resolved on this drive. With four writers
+a fence carried a median of 1.9 to 2.0 commits in the text and spatial cells, and the
+ordinary writer ran 22% to 31% slower in the last position of a block than in the first, so
+the gain is 1.26 to 1.60 against one neighbour and 1.56 to 2.26 against the other. Neither
+reading is a verdict, and the table keeps the harness's.
+
+Every mixed process in the text cells stopped all four writers together for a median of 70
+to 150 ms about every 5.4 s, with grouping and without. That is the period of the locked
+fallback of the background checkpoint, and the run recorded no ticks, so the cause is probable
+and not confirmed. The longest stall of most processes was 150 to 190 ms, and the extremes
+were 575 ms for a grouped process and 584 ms for an ordinary one. It fails the 50 ms schedule
+lag of the load-quality rule in both settings, so no text reader comparison can be
+certified. Grouping did not cause it, and the ordinary path shows the same cadence and larger
+extremes. The spatial processes with grouping had no such stall, and only one of them exceeded the
+limit, by 8 µs at 10.5M. The ordinary spatial processes exceeded it at both sizes. At 1.05M
+they fell behind their schedule by 78 to 209 ms without any request slower than 22 ms, which
+shows that the rate of 80% of the slowest unpaced process left too little room. The write p99 of the mixed
+runs was lower with grouping.
+
+An Opus agent was consulted read-only on these results before this record was written. It
+found the diagnosis of the stall plausible and suggested that a short run under `strace`
+on another host would confirm it. It agreed that the harness verdicts stand as measured and
+that the lane should not change the engine, because the locked checkpoint belongs to the
+durability design and any change to `text.rs` would need a rerun of every text scenario. It
+also found the carry-over between positions of a block and the calibration headroom that this
+section describes. The lane followed its advice. It changed no engine code, and it did not
+rerun a cell to chase a pass.
+
+**Open under item 86.** Item 86 stays partly done, because three of the six throughput
+gates, eight serial checks and both reader gates did not pass or are not established.
+[ROADMAP](../ROADMAP.md) item 99 bounds the write stall of the locked checkpoint, and the
+text mixed cells need a rerun after it, with the stall confirmed by tracing the ticks. The
+gates themselves are the user's to amend, and two amendments follow from the data. A serial
+gate could ask that grouping be no more than 5% slower, instead of within 5% on either side,
+and could pair each grouped process with its neighbour so that a change of the drive's state
+cancels. A throughput gate could be stated against the measured synchronization time, since
+the gain of four writers is bounded near 2 and shrinks as the drive gets faster. A later
+campaign should also quiet the drive and probe its flush time before each process, randomize
+the order and leave more headroom in the mixed rate. Three smaller items wait for that
+work. Staged documents could count their bytes in the queue's limit, since a queue of long
+literals now holds more than 4 MiB of them. The leader applies a prefix's text changes, a
+Tantivy commit included when the batch is full, while its fence is still active, which delays
+the next fence and is question 4 of section 17.10. The forge runs showed no text stall that
+this causes beyond the locked checkpoint's, but they do not rule it out, since the mixed
+cells cannot be certified. The model test has no write transaction that searches text, so the
+wait of a search on a speculative head has only unit tests.
