@@ -25,6 +25,9 @@ import {
   type LensNode,
   type SelectFn,
   type ValueCache,
+  limiter,
+  propertiesQuery,
+  ROWS,
 } from './lens-sources';
 
 const iri = (v: string): Term => ({ type: 'uri', value: v });
@@ -93,11 +96,62 @@ describe('query text', () => {
   const q = [`${EX}a`, `${EX}b`];
   it('names the nodes in one VALUES block', () => {
     expect(degreeQuery(q)).toBe(
-      `SELECT ?n (COUNT(*) AS ?c) WHERE { VALUES ?n { <${EX}a> <${EX}b> } { ?n ?p ?o } UNION { ?s ?p ?n } } GROUP BY ?n`,
+      `SELECT ?n (COUNT(*) AS ?c) WHERE { VALUES ?n { <${EX}a> <${EX}b> } { ?n ?p ?o } UNION { ?s ?p ?n FILTER(?s != ?n) } } GROUP BY ?n`,
     );
     expect(propertyQuery(q, `${EX}age`)).toContain(`?n <${EX}age> ?v`);
     expect(classQuery(q)).toContain('<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?v');
     expect(graphQuery(q)).toContain('FILTER(?v != <urn:x-sparkles:inferred>)');
+  });
+});
+
+describe('review fixes', () => {
+  it('reads a node with 50,000 values of a property quickly (review 1)', async () => {
+    const rows = Array.from({ length: 50_000 }, (_, i) => ({
+      n: iri(`${EX}a`),
+      v: lit(String(i)),
+    }));
+    const t0 = performance.now();
+    const cache: ValueCache = new Map();
+    await readValues(
+      { ds: 'ds', select: async () => rows },
+      [node('a')],
+      (b) => propertyQuery(b, `${EX}p`),
+      cache,
+    );
+    expect(cache.get(`<${EX}a>`)!.length).toBe(50_000);
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
+
+  it('refuses an answer cut at the row limit instead of caching it (review 4)', async () => {
+    const rows = Array.from({ length: ROWS }, () => ({ n: iri(`${EX}a`), v: lit('1') }));
+    const cache: ValueCache = new Map();
+    await expect(
+      readValues({ ds: 'ds', select: async () => rows }, [node('a')], classQuery, cache),
+    ).rejects.toThrow(/too many/);
+    expect(cache.size).toBe(0);
+  });
+
+  it('classes a value as numeric by its lexical form, as the size lens does (review 6)', () => {
+    expect(propertiesQuery([`${EX}a`])).toContain('REGEX(STR(?o)');
+    expect(propertiesQuery([`${EX}a`])).not.toContain('isNumeric');
+    expect(numberOf(lit(' 41'))).toBeNull();
+  });
+
+  it('keeps four reads in flight across both passes of a verified check (review 7)', async () => {
+    const edges: LensEdge[] = Array.from({ length: 1000 }, (_, i) => ({
+      id: `e${i}`,
+      source: 'a',
+      target: `n${i}`,
+      triple: [iri(`${EX}a`), iri(`${EX}p`), iri(`${EX}n${i}`)],
+    }));
+    const r = recorder();
+    await readInferred({ ds: 'ds', select: r.select, limiter: limiter() }, edges, new Map(), true);
+    expect(r.calls.length).toBe(10);
+    expect(r.most()).toBeLessThanOrEqual(IN_FLIGHT);
+  });
+
+  it('counts a self-loop once in the dataset degree (review 9)', () => {
+    expect(degreeQuery([`${EX}a`])).toContain('{ ?s ?p ?n FILTER(?s != ?n) }');
   });
 });
 

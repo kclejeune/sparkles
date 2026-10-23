@@ -17,7 +17,10 @@ import {
   type Results,
 } from './lens';
 import {
+  BATCH,
   categoryOf,
+  iriNodes,
+  limiter,
   classQuery,
   DEFAULT_GRAPH,
   drawnDegrees,
@@ -81,6 +84,12 @@ export type LensInput = {
   ds: string;
   /** The state the canvas shows, empty for the head. */
   at?: string;
+  /**
+   * Changes whenever the page draws its graph from new reads, such as a refocus or a re-read
+   * at the head. Lens values read for another epoch are read again, since the head may have
+   * moved since.
+   */
+  epoch?: number | string;
   branch?: string | null;
   nodes: LensNode[];
   edges: LensEdge[];
@@ -164,6 +173,13 @@ export class Lenses {
   #ctl: Partial<Record<Channel, AbortController>> = {};
   #timer: ReturnType<typeof setTimeout> | undefined;
   #propsKey = '';
+  /** The slots all of this canvas's lens reads share (§5: at most four in flight). */
+  #limiter = limiter();
+  /** The inferred-edge read of an input, which the badge and edge lenses share. */
+  #inferredRead: {
+    input: LensInput;
+    promise: Promise<{ inferred: Set<string>; unchecked: Set<string> }>;
+  } | null = null;
   #dsKey = '';
 
   /** What the canvas draws now. Lenses whose data it changes run again. */
@@ -186,12 +202,24 @@ export class Lenses {
         this.choice.edge = { lens: 'inferred' };
       if (!input.reasoning)
         for (const ch of ['badge', 'edge'] as const)
-          if (this.choice[ch].lens === 'inferred') this.choice[ch] = { lens: 'none' };
+          if (this.choice[ch].lens === 'inferred') {
+            this.choice[ch] = { lens: 'none' };
+            this.#ctl[ch]?.abort();
+            this.#seq[ch]++;
+            this.results[ch] = null;
+            this.status[ch] = { busy: false };
+          }
       this.blocked =
         input.nodes.length > MAX_LENS_NODES
           ? `Lenses apply to at most ${MAX_LENS_NODES.toLocaleString('en-US')} drawn nodes, and this graph has ${input.nodes.length.toLocaleString('en-US')}.`
           : null;
-      const stateChanged = !prev || prev.at !== input.at || prev.ds !== input.ds;
+      const stateChanged =
+        !prev || prev.at !== input.at || prev.ds !== input.ds || prev.epoch !== input.epoch;
+      if (prev && prev.epoch !== input.epoch) {
+        // values read before the redraw may be of an older head
+        this.#caches.clear();
+        this.#inferredRead = null;
+      }
       this.#schedule(stateChanged);
     });
   }
@@ -225,7 +253,11 @@ export class Lenses {
   async loadProperties() {
     const input = this.#input;
     if (!input) return;
-    const key = `${input.ds}|${input.at ?? ''}|${input.nodes.length}`;
+    const sample = iriNodes(input.nodes)
+      .slice(0, BATCH)
+      .map((n) => n.iri)
+      .join(' ');
+    const key = `${input.ds}|${input.at ?? ''}|${input.epoch ?? ''}|${sample}`;
     if (key === this.#propsKey) return;
     this.#propsKey = key;
     try {
@@ -260,7 +292,13 @@ export class Lenses {
   }
 
   #ctx(input: LensInput, signal?: AbortSignal): ReadContext {
-    return { ds: input.ds, at: input.at || undefined, signal, select: this.select };
+    return {
+      ds: input.ds,
+      at: input.at || undefined,
+      signal,
+      select: this.select,
+      limiter: this.#limiter,
+    };
   }
 
   #cache<T extends ValueCache | Map<string, boolean>>(key: string, make: () => T): T {
@@ -395,7 +433,17 @@ export class Lenses {
           key(`inferred:${input.verify ? 'v' : ''}`),
           () => new Map(),
         );
-        const { inferred, unchecked } = await readInferred(ctx, input.edges, cache, input.verify);
+        // one read serves both the badge and the edge lens
+        let read = this.#inferredRead;
+        if (!read || read.input !== input) {
+          const p = readInferred({ ...ctx, signal: undefined }, input.edges, cache, input.verify);
+          read = this.#inferredRead = { input, promise: p };
+          p.catch(() => {
+            if (this.#inferredRead === read) this.#inferredRead = null;
+          });
+        }
+        const { inferred, unchecked } = await read.promise;
+        signal.throwIfAborted();
         if (channel === 'edge')
           return inferredResult({
             lens: 'inferred',

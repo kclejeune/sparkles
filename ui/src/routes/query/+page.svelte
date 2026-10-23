@@ -97,7 +97,7 @@
   import GraphListView, { type ListRow } from '$components/GraphListView.svelte';
   import LensMenu from '$components/LensMenu.svelte';
   import LensLegend from '$components/LensLegend.svelte';
-  import { describe as lensDescribe, OTHER } from '$lib/lens';
+  import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
   import { Lenses } from '$lib/lenses.svelte';
 
   /**
@@ -1753,7 +1753,9 @@
   onDestroy(() => lenses.destroy());
   /** The drawn graph as a list, with a column per active lens. */
   let graphList = $state(false);
-  let lensPick = $state<{ key: string; ids: string[] } | null>(null);
+  /** The legend entry whose nodes are selected, and its nodes while it exists. */
+  let lensPick = $state<string | null>(null);
+  const lensMarked = $derived(entryIds(lenses.results, lensPick));
   /** The graph on the canvas: the WebGL view's or the canvas renderer's. */
   const drawnGraph = $derived(choice.renderer === 'webgl' ? graph : canvasGraph);
   $effect(() => {
@@ -1764,8 +1766,9 @@
     lenses.setInput({
       ds: onBranch(o.ds, o.branch),
       branch: o.branch,
-      // the lenses read the state the result was read at
-      at: at?.historical && at.commit != null ? `commit:${at.commit}` : undefined,
+      // the lenses read the state the result was read at, the head's commit included
+      at: at?.commit != null ? `commit:${at.commit}` : undefined,
+      epoch: o.startedAt,
       nodes: drawnGraph.nodes.map((n) => ({ id: n.id, term: n.term })),
       edges: drawnGraph.edges
         .filter((e) => e.change !== 'removed')
@@ -1790,7 +1793,7 @@
       degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
     }
     const look = lenses.encoding.nodes;
-    const pick = new Set(lensPick?.ids ?? []);
+    const pick = new Set(lensMarked ?? []);
     return drawnGraph.nodes.map((n) => {
       const v = size?.values.get(n.id);
       const c = look.get(n.id)?.colour;
@@ -1798,7 +1801,7 @@
         key: n.id,
         label: n.label,
         kind: n.kind === 'iri' ? 'resource' : n.kind,
-        size: typeof v === 'number' ? v : -1,
+        size: typeof v === 'number' ? v : -Infinity,
         degree: degree.get(n.id) ?? 0,
         color:
           c == null
@@ -3034,12 +3037,12 @@
                     onopen={(k) => (largeSelected = k)}
                     onfail={(reason) => (webglReason = reason)}
                     lens={lenses.encoding}
-                    marked={lensPick?.ids ?? null}
+                    marked={lensMarked}
                   />
                 {:else}
                   <GraphView
                     lens={lenses.encoding}
-                    marked={lensPick?.ids ?? null}
+                    marked={lensMarked}
                     nodes={canvasGraph.nodes}
                     edges={canvasGraph.edges}
                     onexpand={(id) => id.startsWith('<') && openIri(id.slice(1, -1))}
@@ -3050,8 +3053,8 @@
                 {/if}
                 <LensLegend
                   results={lenses.results}
-                  selected={lensPick?.key ?? null}
-                  onselect={(key, ids) => (lensPick = key ? { key, ids } : null)}
+                  selected={lensMarked ? lensPick : null}
+                  onselect={(key) => (lensPick = key)}
                 />
               </div>
               {#if choice.renderer === 'webgl'}

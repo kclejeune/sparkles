@@ -385,6 +385,18 @@ export function encode(results: Results): Encoding {
   };
 }
 
+/**
+ * The nodes of the legend entry `key` (`channel:entry`), or null when no active lens has
+ * that entry any more, so that a selection does not outlive its entry.
+ */
+export function entryIds(results: Results, key: string | null): string[] | null {
+  if (!key) return null;
+  const i = key.indexOf(':');
+  const r = results[key.slice(0, i) as Channel];
+  const e = r?.legend.find((x) => x.key === key.slice(i + 1));
+  return e ? e.ids : null;
+}
+
 /** A node's or an edge's lens values as text, such as "degree 12, class Person". */
 export function describe(id: string, results: Results): string {
   return CHANNELS.flatMap((ch) => {

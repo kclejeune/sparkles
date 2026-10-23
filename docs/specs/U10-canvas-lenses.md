@@ -516,6 +516,12 @@ white.
   are marked in the overview, and leaves the single selection of the side panel alone.
 - *Keys.* `Shift+1` to `Shift+4` read the key's position, so they work on keyboards whose
   shifted digits are other characters.
+- *Budgets and freshness.* The four requests in flight of §5 are shared by all of a
+  canvas's lenses, and the badge and edge lenses share one inferred-edge read. A read that
+  reaches 100,000 rows is refused with an error instead of being kept, since its answer may
+  be cut. Lens values are kept per state and per drawing, so a graph drawn again from new
+  reads, such as a refocus or a re-read at the head, reads them again. The query page reads
+  them at the commit its result names.
 - *Open question 3.* Lens choices are not part of the URL.
 
 **Deferred.** The compare-mode deltas of §4.3, a numeric lens's change since the left

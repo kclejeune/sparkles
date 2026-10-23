@@ -51,7 +51,7 @@
   import GraphListView, { type ListRow } from '$components/GraphListView.svelte';
   import LensMenu from '$components/LensMenu.svelte';
   import LensLegend from '$components/LensLegend.svelte';
-  import { describe as lensDescribe, OTHER } from '$lib/lens';
+  import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
   import { Lenses } from '$lib/lenses.svelte';
   import type { EdgeTriple } from '$lib/explore-time';
 
@@ -172,6 +172,7 @@
     seenTerms = new Map();
     changes = null;
     lensPick = null;
+    graphEpoch++;
   }
   let graphView: GraphView | undefined = $state();
   // the reads of a view that goes away stop with it
@@ -384,8 +385,12 @@
   const lenses = new Lenses();
   /** The drawn graph as a list, with a column per active lens. */
   let listView = $state(false);
-  /** The legend entry whose nodes are selected, and those nodes. */
-  let lensPick = $state<{ key: string; ids: string[] } | null>(null);
+  /** The legend entry whose nodes are selected. */
+  let lensPick = $state<string | null>(null);
+  /** Its nodes while the entry exists. */
+  const lensMarked = $derived(entryIds(lenses.results, lensPick));
+  /** Bumped whenever the graph is drawn from new reads, so that lens values are read again. */
+  let graphEpoch = $state(0);
   const dsInfo = $derived(app.datasets.find((d) => d.name === ds));
   /** Materialized inferences or RDFS on read: the inferred-edge lens exists (§2.7). */
   const hasReasoning = $derived(!!dsInfo?.reasoning || !!dsInfo?.rdfs);
@@ -395,6 +400,7 @@
     lenses.setInput({
       ds: name,
       at: graphTimeOpen && exAt ? exAt : undefined,
+      epoch: graphEpoch,
       nodes: gNodes.map((n) => ({ id: n.id, term: n.term })),
       // the ghosts of a comparison are not in the state the lenses read
       edges: gEdges
@@ -421,7 +427,7 @@
         key: n.id,
         label: n.label,
         kind: n.change === 'removed' ? 'removed' : n.kind === 'iri' ? 'resource' : n.kind,
-        size: typeof v === 'number' ? v : -1,
+        size: typeof v === 'number' ? v : -Infinity,
         degree: degree.get(n.id) ?? 0,
         color:
           c == null
@@ -430,7 +436,7 @@
               ? 'var(--lens-other)'
               : `var(--lens-${c + 1})`,
         openable: n.kind === 'iri',
-        marked: !!lensPick?.ids.includes(n.id),
+        marked: !!lensMarked?.includes(n.id),
         title: [n.title ?? n.label, lensDescribe(n.id, lenses.results)].filter(Boolean).join('\n'),
       };
     });
@@ -668,6 +674,7 @@
           present.add(termKey(nb.term));
         }
       }
+      graphEpoch++;
       // the graph is rebuilt in one step, so that what stays keeps its place
       const rootTerm = seenTerms.get(root);
       if (!rootTerm) return;
@@ -1493,13 +1500,13 @@
                 onselect={select}
                 onexpand={expand}
                 lens={lenses.encoding}
-                marked={lensPick?.ids ?? null}
+                marked={lensMarked}
               />
             {/if}
             <LensLegend
               results={lenses.results}
-              selected={lensPick?.key ?? null}
-              onselect={(key, ids) => (lensPick = key ? { key, ids } : null)}
+              selected={lensMarked ? lensPick : null}
+              onselect={(key) => (lensPick = key)}
             />
           </div>
           <div class="hint faint">

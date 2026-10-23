@@ -8,6 +8,7 @@ import {
   colourResult,
   describe as describeLens,
   encode,
+  entryIds,
   inferredResult,
   LENS_TOKENS,
   NO_VALUE,
@@ -120,6 +121,24 @@ describe('colourResult', () => {
       (v) => ({ z: 'Alpha', y: 'Beta' })[v]!,
     );
     expect(order).toEqual(['z', 'y']);
+  });
+});
+
+describe('entryIds', () => {
+  it('gives the nodes of a legend entry while it exists, and null after (review 8)', () => {
+    const colour = colourResult({
+      lens: 'class',
+      name: 'class',
+      values: new Map([
+        ['a', 'Person'],
+        ['b', 'Person'],
+      ]),
+      computedAt: at,
+    });
+    expect(entryIds({ colour }, 'colour:cat-Person')).toEqual(['a', 'b']);
+    expect(entryIds({ colour }, 'colour:cat-Robot')).toBeNull();
+    expect(entryIds({}, 'colour:cat-Person')).toBeNull();
+    expect(entryIds({ colour }, null)).toBeNull();
   });
 });
 

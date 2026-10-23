@@ -21,6 +21,27 @@ export type LensEdge = { id: string; source: string; target: string; triple?: Ed
 type Row = Record<string, Term | undefined>;
 export type SelectFn = (ds: string, sparql: string, opts: api.QueryOptions) => Promise<Row[]>;
 
+/** Takes one of a fixed number of slots, and gives a function that hands it back. */
+export type Limiter = () => Promise<() => void>;
+
+/** A limiter of `n` slots, which a canvas's lens reads share so that at most `n` run at once. */
+export function limiter(n = IN_FLIGHT): Limiter {
+  let free = n;
+  const waiting: (() => void)[] = [];
+  const release = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else free++;
+  };
+  return () =>
+    new Promise((resolve) => {
+      if (free > 0) {
+        free--;
+        resolve(release);
+      } else waiting.push(() => resolve(release));
+    });
+}
+
 /** Where and how the lens queries read: the canvas's dataset (with its branch) and state. */
 export type ReadContext = {
   ds: string;
@@ -28,18 +49,31 @@ export type ReadContext = {
   signal?: AbortSignal;
   /** The query function, `api.select` unless a test gives another. */
   select?: SelectFn;
+  /** The slots the reads of one canvas share, `IN_FLIGHT` of them. */
+  limiter?: Limiter;
 };
 
-const ROWS = 100_000;
+/** Rows one lens query may answer. An answer this long may be cut, so it is refused. */
+export const ROWS = 100_000;
 
-function run(ctx: ReadContext, sparql: string, extra: api.QueryOptions = {}): Promise<Row[]> {
+async function run(ctx: ReadContext, sparql: string, extra: api.QueryOptions = {}): Promise<Row[]> {
   const select = ctx.select ?? api.select;
-  return select(ctx.ds, sparql, {
-    send: ROWS,
-    ...(ctx.at ? { at: ctx.at } : {}),
-    signal: ctx.signal,
-    ...extra,
-  });
+  const done = ctx.limiter ? await ctx.limiter() : () => {};
+  try {
+    const rows = await select(ctx.ds, sparql, {
+      send: ROWS,
+      ...(ctx.at ? { at: ctx.at } : {}),
+      signal: ctx.signal,
+      ...extra,
+    });
+    if (rows.length >= ROWS)
+      throw new Error(
+        `The drawn nodes have too many values for this lens: one read reached ${ROWS.toLocaleString('en-US')} rows.`,
+      );
+    return rows;
+  } finally {
+    done();
+  }
 }
 
 /** `xs` in chunks of `n`. */
@@ -79,7 +113,8 @@ const values = (iris: readonly string[]) => `VALUES ?n { ${iris.map(sparqlIri).j
 
 /** The triples each node takes part in, as subject or object (§3.1, one grouped count). */
 export function degreeQuery(iris: readonly string[]): string {
-  return `SELECT ?n (COUNT(*) AS ?c) WHERE { ${values(iris)} { ?n ?p ?o } UNION { ?s ?p ?n } } GROUP BY ?n`;
+  // a self-loop is one triple, which the first branch already counts
+  return `SELECT ?n (COUNT(*) AS ?c) WHERE { ${values(iris)} { ?n ?p ?o } UNION { ?s ?p ?n FILTER(?s != ?n) } } GROUP BY ?n`;
 }
 
 /** The values of one property of each node. */
@@ -97,9 +132,15 @@ export function graphQuery(iris: readonly string[]): string {
   return `SELECT DISTINCT ?n ?v WHERE { ${values(iris)} GRAPH ?v { { ?n ?p ?o } UNION { ?s ?p ?n } } FILTER(?v != ${sparqlIri(INFERRED_GRAPH)}) }`;
 }
 
-/** The properties of the nodes, most used first, with how many of their values are numbers. */
+/** A number's lexical form, as `numberOf` reads it and the property picker counts it. */
+const NUMBER_FORM = '^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][+-]?[0-9]+)?$';
+
+/**
+ * The properties of the nodes, most used first, with how many of their values are numbers
+ * by the rule of `numberOf`, so that a number written as a plain string counts too.
+ */
 export function propertiesQuery(iris: readonly string[]): string {
-  return `SELECT ?p (COUNT(*) AS ?c) (SUM(IF(isNumeric(?o), 1, 0)) AS ?num) WHERE { ${values(iris)} ?n ?p ?o } GROUP BY ?p ORDER BY DESC(?c) LIMIT 200`;
+  return `SELECT ?p (COUNT(*) AS ?c) (SUM(IF(isLiteral(?o) && REGEX(STR(?o), "${NUMBER_FORM}"), 1, 0)) AS ?num) WHERE { ${values(iris)} ?n ?p ?o } GROUP BY ?p ORDER BY DESC(?c) LIMIT 200`;
 }
 
 /** Cached values per node id. A node that was read and has nothing holds an empty list. */
@@ -118,14 +159,21 @@ export async function readValues(
 ): Promise<ValueCache> {
   const missing = iriNodes(nodes).filter((n) => !cache.has(n.id));
   const byIri = new Map<string, string[]>();
-  for (const n of missing) byIri.set(n.iri, [...(byIri.get(n.iri) ?? []), n.id]);
+  for (const n of missing) {
+    const ids = byIri.get(n.iri);
+    if (ids) ids.push(n.id);
+    else byIri.set(n.iri, [n.id]);
+  }
   const iris = [...byIri.keys()];
   const answers = await pool(chunk(iris), (b) => run(ctx, query(b), extra));
   const got = new Map<string, Term[]>();
   for (const rows of answers)
     for (const r of rows) {
       const n = str(r.n);
-      if (n && r.v) got.set(n, [...(got.get(n) ?? []), r.v]);
+      if (!n || !r.v) continue;
+      const list = got.get(n);
+      if (list) list.push(r.v);
+      else got.set(n, [r.v]);
     }
   for (const [iri, ids] of byIri) for (const id of ids) cache.set(id, got.get(iri) ?? []);
   return cache;
@@ -168,13 +216,12 @@ export function drawnDegrees(
   return out;
 }
 
-const NUMERIC = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+const NUMERIC = new RegExp(NUMBER_FORM);
 
 /** A term as a number: a literal whose lexical form is one, otherwise null. */
 export function numberOf(t: Term): number | null {
   if (t.type !== 'literal') return null;
-  const s = t.value.trim();
-  return NUMERIC.test(s) ? Number(s) : null;
+  return NUMERIC.test(t.value) ? Number(t.value) : null;
 }
 
 /** The largest numeric value of each node, null for a node with none. */
@@ -288,6 +335,8 @@ export async function readInferred(
   cache: Map<string, boolean>,
   verify = false,
 ): Promise<{ inferred: Set<string>; unchecked: Set<string> }> {
+  // both reads share four slots
+  if (!ctx.limiter) ctx = { ...ctx, limiter: limiter() };
   const unchecked = new Set<string>();
   const todo: { id: string; triple: EdgeTriple }[] = [];
   for (const e of edges) {
