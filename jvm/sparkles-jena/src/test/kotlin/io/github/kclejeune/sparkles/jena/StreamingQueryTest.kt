@@ -217,8 +217,9 @@ class StreamingQueryTest {
      * `abort` runs `requestCancel` on another thread while the iterator's thread finishes
      * and releases its native query. The abort must never fail because the native object
      * was closed in between, and a cancellation that wins still ends the read cleanly.
+     * Its 9,000 races take about 3 s on a quiet machine and passed 30 s under a loaded gate.
      */
-    @Test fun abort_racing_the_release_of_a_query_never_throws() {
+    @Test @Timeout(120) fun abort_racing_the_release_of_a_query_never_throws() {
         people(300).use { ds ->
             val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
             for (streaming in listOf(null, true, false)) {
