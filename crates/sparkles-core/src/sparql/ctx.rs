@@ -548,6 +548,11 @@ const PROMOTED: u64 = 1 << 63;
 /// estimate by less than one step.
 const EAGER_STEP: u64 = 64 << 10;
 
+/// How far above what a finished eager result keeps its pool contribution may stay
+/// before [`Ctx::shrink_retained`] lowers it. Below this the ledger's lock costs more
+/// than the memory it would return.
+const RETAIN_SLACK: u64 = 1 << 20;
+
 /// The memory account of an eager context until something needs the query ledger: a
 /// graph algorithm call, a lease that outlives an operator, cursor accounting or a
 /// change of the grant. Plain queries charge and check it with a few atomic operations
@@ -1445,6 +1450,39 @@ impl Ctx {
     }
 
     /// The highest memory estimate of this context so far.
+    /// Lower a finished eager query's retained pool contribution to what its result
+    /// keeps: `result` bytes of output, the terms computed into its local vocabulary,
+    /// its cached decoded values and its live charges (X08-P1-retained-results). The
+    /// contribution otherwise stays at the query's highest admitted estimate, including
+    /// build and transient state, until the context drops. A contribution within
+    /// [`RETAIN_SLACK`] of what the result keeps is left alone, so that a small query
+    /// never takes the ledger.
+    pub(super) fn shrink_retained(&self, result: u64) -> Result<()> {
+        if self.cursor_memory.is_some() {
+            return Ok(());
+        }
+        let values = self
+            .values
+            .iter()
+            .map(|shard| shard.read().len() as u64)
+            .sum::<u64>()
+            .saturating_mul(96);
+        let keep = result
+            .saturating_add(self.local.read().bytes() as u64)
+            .saturating_add(values);
+        let admitted = match self.memory.get() {
+            Some(_) => u64::MAX,
+            None => match self.fast.grant.get() {
+                Some(Some(_)) => self.fast.eager.load(Ordering::Acquire),
+                _ => return Ok(()),
+            },
+        };
+        if admitted <= keep.saturating_add(RETAIN_SLACK) {
+            return Ok(());
+        }
+        self.memory().shrink_eager(keep)
+    }
+
     pub fn mem_peak(&self) -> u64 {
         let fast = self.fast.peak.load(Ordering::Relaxed);
         self.memory
