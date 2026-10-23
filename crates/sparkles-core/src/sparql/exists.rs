@@ -274,6 +274,19 @@ fn exists_of(e: &Expr) -> Option<(&ExistsSpec, bool)> {
     }
 }
 
+/// The unsubstituted plan of the key set that would answer the filter conjunct `e`,
+/// when `e` is `EXISTS { P }` or `NOT EXISTS { P }` and `P` is in the admitted algebra.
+/// Automatic execution streams only an EXISTS that it can answer this way. Any other
+/// EXISTS is evaluated once per distinct outer key, which measured slower in the cursor
+/// than in eager execution.
+pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr) -> Option<Node> {
+    if !ctx.opt.decorrelate_exists {
+        return None;
+    }
+    let (spec, _) = exists_of(e)?;
+    admit(ctx, spec).ok().map(|plan| plan.node)
+}
+
 /// Apply the filter conjuncts `EXISTS { P }` / `NOT EXISTS { P }` that can be answered
 /// from a key set to `t`. Returns the conjuncts left to evaluate, or `None` when no
 /// conjunct was applied.

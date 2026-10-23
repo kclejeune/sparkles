@@ -76,21 +76,28 @@ fn automatic(
     }
 }
 
-/// Groupings and counts over 20,000 input rows or more, with EXISTS in filters, in
-/// OPTIONAL conditions, in BIND, under MINUS and GRAPH, nested, and over empty patterns.
+/// Groupings and counts over 20,000 input rows or more whose EXISTS are FILTER
+/// conjuncts that a key set answers: under OPTIONAL, MINUS and GRAPH, nested, and over
+/// empty patterns.
 const STREAMED: &[&str] = &[
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?s <urn:q> ?o } }",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:q> ?o . ?o <urn:r> ?k } }",
     "SELECT ?v (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:q> ?o } } GROUP BY ?v ORDER BY ?v",
-    "SELECT ?v (COUNT(?o) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } } GROUP BY ?v ORDER BY ?v",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o } FILTER NOT EXISTS { ?o <urn:r> ?k } }",
-    "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(EXISTS { ?s <urn:q> ?o } AS ?b) } GROUP BY ?b ORDER BY ?b",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v MINUS { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } }",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?s <urn:q> ?o FILTER NOT EXISTS { ?o <urn:r> ?k } } }",
     "SELECT ?g (COUNT(*) AS ?n) { GRAPH ?g { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:p> ?w FILTER(?w > 2) } } } GROUP BY ?g ORDER BY ?g",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { GRAPH ?g { ?s <urn:p> ?w } } }",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:absent> ?o } }",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?s <urn:absent> ?o } }",
+];
+
+/// EXISTS that the cursor evaluates once per distinct outer key: in an OPTIONAL
+/// condition, in BIND, inside a larger expression and in an aggregate argument. These
+/// measured slower in the cursor, so automatic execution keeps them eager.
+const PER_KEY: &[&str] = &[
+    "SELECT ?v (COUNT(?o) AS ?n) { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } } } GROUP BY ?v ORDER BY ?v",
+    "SELECT ?b (COUNT(*) AS ?n) { ?s <urn:p> ?v BIND(EXISTS { ?s <urn:q> ?o } AS ?b) } GROUP BY ?b ORDER BY ?b",
     "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER (?v < 10 || EXISTS { ?s <urn:q> <urn:o:5> }) }",
     "SELECT (SUM(IF(EXISTS { ?s <urn:q> ?o }, 1, 0)) AS ?n) { ?s <urn:p> ?v }",
 ];
@@ -116,6 +123,18 @@ fn large_groupings_with_exists_stream_and_match_eager() {
                 assert_eq!(bag(got), bag(expected.clone()), "{q}; {rows}");
             }
         }
+    }
+}
+
+#[test]
+fn exists_evaluated_per_key_stays_eager_and_matches() {
+    let s = store();
+    for q in PER_KEY {
+        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let (got, streamed) = automatic(&s, q, &Default::default(), &Default::default())
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert!(!streamed, "{q}: streamed");
+        assert_eq!(ordered(got), ordered(expected), "{q}");
     }
 }
 

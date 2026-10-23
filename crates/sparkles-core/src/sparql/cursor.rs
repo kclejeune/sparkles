@@ -1134,24 +1134,26 @@ pub(super) fn native(node: &Node) -> bool {
 const AUTO_EXISTS_DEPTH: usize = 4;
 
 /// Whether every operator of `node` has a cursor implementation, as [`native`] asks,
-/// where an operator that evaluates EXISTS also counts when the plan of each of its
-/// patterns does. The cursor answers such an EXISTS from a key set that a child cursor
-/// fills, or evaluates it once per distinct outer key with the same pattern
-/// substituted, so neither runs an eager subtree. The patterns are planned here only
-/// to read their operators. Planning interns their variables in `ctx` and runs no
-/// part of them.
+/// where a FILTER whose conjuncts include `EXISTS { P }` or `NOT EXISTS { P }` also
+/// counts when the cursor can answer each of them from a key set and the plan of each
+/// `P` counts in turn. The key set is filled by a child cursor under the query's
+/// charges. An EXISTS anywhere else, such as in BIND, in an OPTIONAL condition or
+/// inside a larger expression, is evaluated once per distinct outer key. On Namespace
+/// at 10.5M quads that took 1.15 times as long in the cursor as in eager execution,
+/// while the key-set filters took 0.68 to 0.99 times as long, so such plans stay eager.
+/// The patterns are planned here only to read their operators. Planning interns their
+/// variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
     fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
-        let mut specs = Vec::new();
-        for expr in own_exprs(&node.kind) {
-            expr.exists_specs(&mut specs);
-        }
-        let exists = specs.iter().all(|spec| {
-            depth < AUTO_EXISTS_DEPTH
-                && super::plan::Planner::new(ctx)
-                    .plan(&spec.pattern, &spec.graph, Vec::new())
-                    .is_ok_and(|planned| at(ctx, &planned, depth + 1))
-        });
+        let exists = match &node.kind {
+            Kind::Filter(exprs) => exprs.iter().all(|e| {
+                !e.has_exists()
+                    || (depth < AUTO_EXISTS_DEPTH
+                        && super::exists::keyed_plan(ctx, e)
+                            .is_some_and(|planned| at(ctx, &planned, depth + 1)))
+            }),
+            kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
+        };
         exists
             && (supported(&node.kind)
                 || binary::eligible(node)
@@ -4038,9 +4040,14 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER NOT EXISTS {?s <urn:q> ?b . FILTER NOT EXISTS {?b <urn:p> ?s}}}",
                 true,
             ),
+            // an EXISTS evaluated per distinct key, in an OPTIONAL condition or BIND
             (
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
-                true,
+                false,
+            ),
+            (
+                "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
+                false,
             ),
             (
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER EXISTS {SERVICE <http://example.org/sparql> {?s ?p ?o}}}",
