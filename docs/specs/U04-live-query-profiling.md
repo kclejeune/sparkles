@@ -6,7 +6,9 @@
 > `GET /$/running/{id}` as JSON and server-sent events, cancellation by id, and the query
 > page's plan tree updating while a query runs. Phase 2 adds hot-spot marks, **Stop and
 > explain**, and the server page's list of running queries. Phase 3 shows C18's verified
-> rewrite suggestions in the live plan once C18 Phase 6 exists.
+> rewrite suggestions in the live plan once C18 Phase 6 exists. Phase 4, added on
+> 2026-10-23 in §11, draws estimated and actual rows on the query's pattern graph from
+> [U08](U08-visual-query-builder.md) and marks misestimates.
 >
 > **User docs:** none, because nothing is built.
 >
@@ -253,6 +255,8 @@ reveal the size of hidden data.
 2. **Phase 2.** Hot-spot marks, **Stop and explain**, `GET /$/running` and the server
    page's card.
 3. **Phase 3.** **Find a faster query** and rule hints, after C18 Phase 6.
+4. **Phase 4.** Structured pattern references in plans, then the plan drawn on U08's
+   pattern graph (§11). It needs U08 Phase 1, and its live counts need Phase 1 here.
 
 ## 7. Acceptance examples
 
@@ -314,6 +318,179 @@ already implements and which stops early when the query is cancelled.
 3. Whether the Running queries card should show other principals' queries to dataset
    administrators, not only server administrators.
 
+## 11. Phase 4: the plan drawn on the query's pattern (2026-10-23)
+
+This section was added on 2026-10-23, when the user approved a set of graph-interaction
+features. It extends the plan views of this spec to the pattern graph of
+[U08](U08-visual-query-builder.md). It was written from the same sources as the rest of
+this spec, together with U08 and the plan JSON of `/{ds}/explain`,
+`POST /{ds}/sparql/explain` and `meta.plan`.
+
+### 11.1 Goals and non-goals
+
+The plan tree says which operator was slow, but a reader thinks of a query as its
+pattern, and the tree's operators are hard to match with the triples they read. Phase 4
+draws the plan's numbers on U08's pattern graph, so a person sees at once which edge the
+engine expected to match a hundred rows and which matched a million.
+
+**Goals**
+
+1. Every triple pattern and filter of the pattern graph shows the estimated rows of the
+   operator that reads it, and its actual rows when the query ran.
+2. A misestimate is marked on the edge, with the same rule the plan tree uses.
+3. Joins are shown where they happen, on the variable they join on, in the order the
+   engine ran them.
+4. While a query runs with progress, the counts on the pattern update from the stream of
+   Phases 1 and 2.
+5. Nothing appears on the pattern that the plan tree would not show the same caller.
+
+**Non-goals**
+
+- Changing the plan from the pattern, such as forcing a join order. Sparkles has no plan
+  hints.
+- Drawing operators that read no part of the pattern, such as `Project` or `Limit`. They
+  stay in the tree.
+- Drawing a plan over text that differs from the query that produced it. A stale overlay
+  is hidden, not guessed.
+
+### 11.2 User-visible behaviour
+
+The Plan tab and U08's Pattern tab get a shared **Plan on pattern** switch. With it on,
+the Pattern tab draws the numbers of the plan of the same request.
+
+```
+   (?person) ──ex:worksFor── est 214 · rows 214 ──▶ (?org)
+       │                                              │
+   ex:name  est 900 · rows 1,204,331 ⚠ ×1,338          ex:partOf+  est 9 · rows 4,100 ⚠
+       ▼                                              ▼
+   (?name) [regex "^Ana"]  est 900 · rows 14     ① hash join on ?org  ② join on ?person
+```
+
+- **Edges.** Each edge carries `est N · rows M`. Its width grows with the logarithm of
+  the actual rows, or of the estimate before a run, so the heavy parts of the pattern
+  stand out.
+- **Misestimates.** An edge whose actual rows are over ten times its estimate, or under a
+  tenth of it, gets `⚠` and the ratio as text, such as `×1,338` or `÷40`. The rule is the
+  one PlanView and C18's notes already use, and the legend states it.
+- **Filters.** A filter chip shows the rows that reached it and the rows that passed it.
+- **Joins.** A join appears as a numbered badge on the variable node it joins on, in the
+  order the plan runs the joins, with its operator and its rows. Hovering or focusing the
+  badge highlights the edges below it in the plan.
+- **Time.** A **Time** toggle replaces rows with each operator's own time, and the
+  operator with the largest share is marked `●` as in §2.1.
+- **Cross-highlighting.** Selecting an edge selects its operator in the plan tree, and
+  selecting an operator in the tree highlights its edges and nodes on the pattern.
+- **Locked blocks.** A locked block shows the rows of the operator that evaluates it when
+  the plan maps it to one operator, and no number otherwise.
+- **Live counts.** With progress on, edges show the rows so far and the running mark of
+  §2.1, and update from the same `progress` events as the tree.
+
+The overlay adds nothing to U08's focus order. Each element's description gains its
+numbers, such as "edge ex:name, estimated 900 rows, actual 1,204,331, more than ten times
+the estimate". `J` moves focus through the join badges in plan order, and `T` toggles
+**Time**.
+
+At 390 px the pattern and the tree are two tabs. A tap on an edge opens a sheet with its
+operator, its numbers and **Show in plan**, which switches to the tree with the operator
+selected. Labels shorten to `214 / 1.2M ⚠`.
+
+### 11.3 Server and API changes
+
+The plan JSON names operators and describes them in text, which the browser cannot match
+with the pattern reliably. Phase 4 therefore starts with one backend change.
+
+**Prerequisite.** Every `PlanNode` that reads triple patterns gains an additive member
+`patterns`, which lists the patterns it reads in query order.
+
+```ts
+type PlanPattern = {
+  s: string; p: string; o: string;   // N-Triples terms, or "?name" for a variable of the query
+  graph?: string;                    // the graph term inside GRAPH
+  occurrence: number;                // index among equal patterns in the query, from 0
+};
+type PlanNodeAdditions = {
+  patterns?: PlanPattern[];          // IndexScan, IndexRangeScan, IndexJoin, StarJoin, TransitivePath, CountFromIndex and the like
+  filterVars?: string[];             // Filter: the query variables the expression reads
+  joinVars?: string[];               // joins: the variables they join on
+};
+```
+
+A variable that the planner generated, such as the hidden variables of paths and blank
+nodes, is written as `?_`, so the browser does not try to match it. The members are added
+to `/{ds}/explain`, `POST /{ds}/sparql/explain`, `meta.plan`, the plan in a budget error
+body, and the `plan` event of §3.2. They are additive under the plan's
+`additionalProperties`, so `planFormat` does not change, and a client that does not know
+them ignores them. The OpenAPI description, `docs/API.md` and the route tests change with
+them.
+
+The browser matches a plan pattern with a triple of the pattern graph by its three terms
+after prefix expansion and by its occurrence index. A plan pattern that matches nothing,
+such as one the planner rewrote, is listed under the pattern as "operators not drawn" with
+its numbers, so nothing is hidden. Two triples that the planner merged into one star join
+share that operator's numbers, and both edges say so.
+
+No other route is needed. The numbers come from the plans the query page already
+receives.
+
+### 11.4 Access, branches and past states
+
+The overlay draws only numbers that are already in the plan the caller received. For a
+caller whose view is limited by C12 or C12b, estimates arrive as `-1`, so edges show
+actual rows only and no `⚠` mark, as §2.5 already says for the tree. `patterns` carries
+only terms that appear in the query text, so it reveals nothing the caller did not write.
+A plan read with `at=` or on a branch is drawn the same way, and the overlay's header names
+the commit and branch of the plan, which is the state the numbers describe.
+
+### 11.5 Limits
+
+The overlay draws on U08's canvas within its caps of 300 triple patterns. A plan deeper
+than 256 levels uses plan format 2, whose ids the client derives, and matching works the
+same way. Matching is linear in the plan's nodes and the pattern's triples. Live updates
+redraw at most four times a second, as the tree does.
+
+### 11.6 Testing
+
+- **Rust.** `patterns`, `filterVars` and `joinVars` for each operator kind, generated
+  variables written as `?_`, occurrence indexes for repeated patterns, star joins with
+  several probes, plan format 2, and redaction for limited views beside the plan tests of
+  C12 §7.3.
+- **Router.** The members appear in `/{ds}/explain`, `POST /{ds}/sparql/explain`,
+  `meta.plan` and a budget error body, and the OpenAPI test keeps the schema equal.
+- **Vitest.** `lib/plan-pattern.ts` (new), for matching by terms and occurrence, unmatched
+  operators, merged star joins, the misestimate rule, the width scale and the join order.
+- **Playwright against the mock server.** A14 to A16 and A19, with the mock's fabricated
+  plans gaining `patterns`, and the 390 px sheet.
+- **Playwright against a real server.** A14, A15 and A17, and A18 once Phase 1 lands.
+
+### 11.7 Acceptance examples
+
+The dataset is §7's `big`.
+
+- **A14. Estimates.** `/{ds}/explain` of a query with three triple patterns returns
+  `patterns` on each operator that reads them, and the Pattern tab shows `est N` on each of
+  the three edges, equal to the tree's estimates.
+- **A15. Misestimate.** After a run in which an edge's actual rows exceed ten times its
+  estimate, that edge shows `⚠` with the ratio, and the tree marks the same operator.
+- **A16. Cross-highlight.** Selecting that edge selects its operator in the tree, and
+  selecting a join in the tree highlights the edges below it.
+- **A17. Limited view.** For a caller whose grants exclude a named graph, every edge shows
+  actual rows and no estimate or `⚠`.
+- **A18. Live.** With progress on, the slow filter of A1 shows rows so far on its chip,
+  and the number increases at least twice before the query ends.
+- **A19. Stale text.** Editing the editor's text after a run hides the overlay on the
+  editor's pane and keeps it on the result's Pattern tab, which draws the text that ran.
+- **A20. Speed.** For a plan of 200 triple patterns, matching and drawing the overlay
+  takes under 50 ms at the median in the performance project of U08 A10.
+
+### 11.8 Open questions
+
+1. Whether the planner should keep each triple pattern's source range from the parser.
+   Matching would be exact, but the range would have to be carried through spargebra's
+   algebra.
+2. Whether edges should show an estimate from the schema report before any plan exists,
+   which is U08's open question 3.
+
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 27.
+Not built. See [ROADMAP](../ROADMAP.md) item 27 for Phases 1 to 3 and item 102 for
+Phase 4.
