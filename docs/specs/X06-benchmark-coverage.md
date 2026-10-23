@@ -1005,14 +1005,10 @@ equality over independent inputs, with both variables certainly bound. The input
 must contain only scans, values, projections, variable sorts and inner joins.
 Every compared runtime value must be a simple or `xsd:string` literal. A charged
 lexical string index emits matching pairs in their original order and preserves
-duplicates and term ids. The index owns its lexical payloads alongside the inputs
-and matching output. Its slots, strings and dictionary reconstruction scratch are
-charged before allocation. Sorting, pair expansion and output copying check
-cancellation in bounded chunks. Matching pairs are counted before their single
-allocation, and their capacity stays charged while probing reconstructs keys and
-while the output columns are copied. The original SPARQL equality filter still
-runs. A pruned
-subset never uses the unfiltered product's result-cache key.
+duplicates and term ids. The index, the matching pairs and the output are charged
+against the memory budget before they are allocated, and every long loop checks
+for cancellation. The original SPARQL equality filter still runs on the pruned
+pairs, and a pruned subset never uses the unfiltered product's result-cache key.
 
 Numeric promotion, language-tagged values, datatype errors, unbound variables and
 mixed domains retain the ordinary kernel. No equality is replaced by RDF-term
