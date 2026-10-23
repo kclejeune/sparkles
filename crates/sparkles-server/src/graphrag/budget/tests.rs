@@ -156,6 +156,47 @@ fn the_provider_endpoint_counts_when_allowed() {
     );
 }
 
+/// The live check runs again after the provider's counting request, so a change made
+/// while the count runs stops the inference request (round 8).
+#[test]
+fn a_change_during_the_count_stops_the_request() {
+    let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let c2 = changed.clone();
+    let mock = MockModel::start(move |r: &Received, _| {
+        if r.path.ends_with("/count_tokens") {
+            c2.store(true, std::sync::atomic::Ordering::SeqCst);
+            (200, json!({ "input_tokens": 42 }))
+        } else {
+            (200, mock::anthropic(r#"{"query":"ASK {}"}"#))
+        }
+    });
+    let m = models(json!({ "p": { "kind": "anthropic", "endpoint": mock.url() } }));
+    let c3 = changed.clone();
+    let a = BuildAdmission::new(
+        ledger(1_000_000, 1_000_000),
+        Tokenizers::default(),
+        &budget(true),
+    )
+    .with_check(Arc::new(move || {
+        if c3.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("the settings changed".into())
+        } else {
+            Ok(())
+        }
+    }));
+    let e = call(&m, "p", &a).unwrap_err();
+    assert!(
+        matches!(
+            e.error,
+            StepError::Call(CallError::Admission("run-changed", ..))
+        ),
+        "{e:?}"
+    );
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].path.ends_with("/count_tokens"));
+}
+
 #[test]
 fn a_failed_count_falls_back_to_the_byte_bound() {
     let mock = MockModel::start(|r: &Received, _| {

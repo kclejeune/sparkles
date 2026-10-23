@@ -454,15 +454,20 @@ impl Settle for Reserved {
 
 impl Admission for BuildAdmission {
     fn admit(&self, a: &Attempt<'_>) -> Result<Ticket, CallError> {
-        if let Some(check) = &self.check
-            && let Err(m) = check()
-        {
-            return Err(CallError::Admission("run-changed", m, false));
-        }
+        let live = || match &self.check {
+            Some(check) => check().map_err(|m| CallError::Admission("run-changed", m, false)),
+            None => Ok(()),
+        };
+        live()?;
         if let Some(an) = self.ledger.anomaly() {
             return Err(Refusal::Anomaly(an).into_call_error());
         }
         let bound = self.bound(a);
+        // a provider's counting endpoint is a request that can take a while, and the
+        // configuration may change while it runs
+        if bound.source == Source::ProviderEndpoint {
+            live()?;
+        }
         let tokens = bound
             .tokens
             .saturating_add(u64::from(a.request.max_output_tokens));
