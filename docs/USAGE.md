@@ -1553,6 +1553,42 @@ to its URL while the slider is open, and Explore uses `at`, `from` and `against`
 existing `ds`, `iri` and `tab`. Opening such a link restores the same handles and the same
 table.
 
+### Commit diffs on the graph
+
+**Show on graph** draws the changes between two commits as a graph of their own in
+Explore. It is on each commit in the dataset page's History panel, in the commit graph's
+details, on a write receipt and in the slider's compare caption. Added triples are solid
+with a `+` badge, removed ones are dashed ghosts with a `−` badge, and nothing else is
+drawn unless **context** adds up to 20 unchanged edges around each changed resource. `A`
+and `R` toggle the added and removed triples, `X` toggles context, `L` lists the changes
+as rows, the arrow keys move both commits by one while keeping the distance between them,
+and `Escape` leaves the diff. The address keeps the diff in `diff`, `diffFrom`,
+`diffBranch` and `group`.
+
+A diff with more than 500 changes draws its first 500 and offers **Group by class** (`G`).
+The grouped view draws a node for each class with its change, such as `Person +600`, and
+an edge for each predicate between classes, such as `worksFor +600`. Classes are read in
+the state where each change was seen, so a reader who cannot read a resource's type sees
+it under no class.
+
+**Play** on the diff graph runs a time-lapse. Each step asks for one commit's changes and
+applies them to what is drawn, so additions fade in and removals become ghosts that go at
+the next step unless **Keep ghosts** is on. A range of more than 500 commits steps through
+timeline buckets. A step with more changes than the canvas can hold switches the rest of
+the time-lapse to grouping by class and says so. The speeds are 1, 2, 5 and 10 steps a
+second, and at 5 and 10 the new nodes are placed next to a neighbour without a layout.
+The graph's history slider and the overview's have a **Play mode** menu. **Re-read** reads
+the view again at each commit as before, and **Time-lapse** applies each commit's diff to
+the drawn resources instead.
+
+The Explore overview has its own slider, opened with **Overview history** or `Shift+H`.
+Moving it reads the class level at that commit. Compare mode labels each class and
+predicate edge with its change from the grouped diff, and the time-lapse updates the counts
+in place with the layout held still.
+
+At 390 px the diff graph's options fold into a sheet, the play controls stay in a bar at
+the bottom, and the change list opens as a second tab beside the graph.
+
 ## Automatic compaction
 
 A server compacts each dataset in the background when its delta of updates grows large,

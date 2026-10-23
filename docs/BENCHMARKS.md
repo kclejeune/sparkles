@@ -2036,6 +2036,24 @@ the native store, a read of the middle of a 50,000-commit history takes 42.33 ms
 use and 1.82 µs from the snapshot cache, a diff of one commit at the head 0.126 ms and of
 100 commits 0.181 ms, and reopening with a replay of all 50,000 commits 221.51 ms.
 
+### Diffs grouped by class
+
+These numbers are approximate. They come from a laptop that was running other work, and
+they wait for confirmation on forge. A base of 200,000 typed resources with one link each
+takes one commit of 1,000, 10,000 or 100,000 changes, half of them type triples of new
+resources and half links from those resources to the base. `Diff::group_by_class` reads
+the classes of both ends of each change, which here gives 30 groups. Times are the best of
+five, and `cargo test --release -p sparkles-core --test diff_groups -- --ignored` runs it.
+
+| Changes | Diff | Grouping by class |
+|---:|---:|---:|
+| 1,000 | 0.68 ms | 1.30 ms |
+| 10,000 | 5.35 ms | 11.21 ms |
+| 100,000 | 78.63 ms | 119.54 ms |
+
+Grouping costs about 1.2 µs per change on top of the diff, and it grows with the changes
+rather than with the dataset.
+
 <a id="backup-repositories-105m-triples"></a>
 
 ### Backup repositories

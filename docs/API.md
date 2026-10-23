@@ -3737,8 +3737,10 @@ they are many next to them. The classes are looked up in the state as the caller
 reads it, with its graphs and its protections of triples, so a hidden `rdf:type` triple
 leaves its resource in the `null` group and never names the class. What the grouping holds,
 and the diff it groups, count against the request's memory budget (`--query-memory-mb`,
-lowered by `memory-mb`) and the server memory pool. A grouping past them answers `507`
-with `budget: "memory"` or `"server-memory"`, and `max-rows` lowers the rows budget too.
+lowered by `memory-mb`) and the server memory pool until the response is written. The
+memory budget also caps the changes the diff may hold, at about 96 bytes each, before the
+diff is built. A grouping past them answers `507` with `budget: "memory"` or
+`"server-memory"`, and `max-rows` lowers the rows budget too.
 The request's timeout covers the whole grouping, and a client that disconnects stops it.
 A grouped diff between two `commit:` selectors gets its own weak entity tag. `group=class`
 answers JSON only, and with `quads=true`, the diff lines or an RDF Patch it answers `400`.
