@@ -761,3 +761,32 @@ fn row_limits_count_rows() {
         }
     }
 }
+
+/// Review round 3: a limited pattern scan checks its final row count, so an OFFSET
+/// cannot hide its rows past the row limit.
+#[test]
+fn a_limited_scan_checks_its_final_rows() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut ttl = String::new();
+    for i in 0..6000 {
+        ttl.push_str(&format!("<urn:s{i}> <urn:p> 1 .\n"));
+    }
+    load(&s, &ttl, RdfFormat::Turtle);
+    let text =
+        format!("{SPK}SELECT ?s ?p WHERE {{ ?s spk:hasPredicate ?p }} OFFSET 4000 LIMIT 1000");
+    // the scan's 5,000 rows pass the limit of 4,500 (the generic plan's intermediates
+    // differ, and it answers within the limit)
+    let o = QueryOptions {
+        max_rows: Some(4500),
+        ..opts(Optimizations::ALL)
+    };
+    match query(s.snapshot(), &text, &o) {
+        Err(crate::error::Error::BudgetExceeded(b)) => {
+            assert_eq!(b.kind, crate::error::BudgetKind::Rows, "{b:?}")
+        }
+        other => panic!("{:?}", other.map(|r| solutions(&r).len())),
+    }
+    // and within the limit it answers as the generic plan does
+    let r = same(&s, &text, Some(true));
+    assert_eq!(r.len(), 1000);
+}

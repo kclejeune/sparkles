@@ -380,5 +380,8 @@ pub(super) fn run_scan(
             })?;
         }
     }
+    // the rows between the last power of two and the end, which a limited run returns
+    // without the eager executor's output check
+    ctx.check_output(out.len(), out.width())?;
     Ok((out, u.note(), stopped))
 }
