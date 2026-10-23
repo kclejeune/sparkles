@@ -390,15 +390,15 @@ pub async fn granted(st: &AppState, req: Request, next: Next) -> Response {
     match acquire(st).await {
         Ok(Some(grant)) => GRANT.scope(Arc::new(grant), next.run(req)).await,
         Ok(None) => next.run(req).await,
-        Err(rejected) => rejected,
+        Err(rejected) => rejected.into_response(),
     }
 }
 
 /// An initial grant of the query memory pool, waiting in arrival order up to
-/// `--query-admission-wait`. `None` without a pool, and the `503` response with
+/// `--query-admission-wait`. `None` without a pool, and the `503` error with
 /// `Retry-After` when the wait passes. MCP calls, which name their class in their body,
 /// take their grant here and hand it to their tool through the request.
-pub async fn acquire(st: &AppState) -> Result<Option<PoolGrant>, Response> {
+pub async fn acquire(st: &AppState) -> Result<Option<PoolGrant>, crate::http::ApiError> {
     let Some(pool) = st.catalog.pool() else {
         return Ok(None);
     };
@@ -423,7 +423,7 @@ pub async fn acquire(st: &AppState) -> Result<Option<PoolGrant>, Response> {
                             break g;
                         }
                         pool.note_rejected();
-                        return Err(crate::http::ApiError::from(pool.exhausted(want)).into_response());
+                        return Err(crate::http::ApiError::from(pool.exhausted(want)));
                     }
                 }
             }

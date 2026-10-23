@@ -398,7 +398,7 @@ impl Endpoint {
                     req.extensions_mut().insert(GrantShare(Arc::new(grant)));
                 }
                 Ok(None) => {}
-                Err(rejected) => return rejected,
+                Err(rejected) => return rejected.into_response(),
             }
         }
         self.forward(req, p).await
