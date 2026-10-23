@@ -54,7 +54,7 @@ pub fn check_send(assistant: &AssistantSettings, pairs: &[Pair]) -> Result<(), S
 }
 
 /// Whether a graph IRI is one the settings' projection names.
-fn named(settings: &GraphragSettings, iri: &str) -> bool {
+pub(crate) fn named(settings: &GraphragSettings, iri: &str) -> bool {
     settings
         .projection
         .graphs
