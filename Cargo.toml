@@ -46,6 +46,7 @@ lz4_flex = "0.14"
 fsst-rs = "=0.6.0"
 rayon = "1.12"
 regex = "1"
+aho-corasick = "1"
 memchr = "2"
 # stack segments for planning and evaluating deeply nested queries
 stacker = "0.1"
