@@ -882,7 +882,7 @@ pub(super) fn auto_streaming(
         return true;
     }
     let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
-    if !(scanned || grouped(node)) {
+    if !(scanned || grouped(ctx, node)) {
         return false;
     }
     let cap = options
@@ -1067,7 +1067,7 @@ pub(super) const AUTO_GROUP_ROWS: f64 = 20_000.0;
 /// the cursor aggregates column-wise over an estimated [`AUTO_GROUP_ROWS`] input rows
 /// or more, with a cursor implementation for every operator. This covers counts over
 /// OPTIONAL and MINUS, which the cursor now joins and counts with branch-free kernels.
-fn grouped(node: &Node) -> bool {
+fn grouped(ctx: &Ctx, node: &Node) -> bool {
     let mut group = node;
     while matches!(
         group.kind,
@@ -1085,7 +1085,7 @@ fn grouped(node: &Node) -> bool {
         Kind::GroupCountScan { .. } => group.est,
         _ => return false,
     };
-    rows.is_finite() && rows >= AUTO_GROUP_ROWS && native(node)
+    rows.is_finite() && rows >= AUTO_GROUP_ROWS && streams_natively(ctx, node)
 }
 
 /// Whether automatic execution runs `node` as a cursor because eager execution is
@@ -1097,7 +1097,7 @@ fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
     kind == QueryKind::Select
         && ctx.spill.is_some()
         && ctx.snap.delta.is_empty()
-        && native(node)
+        && streams_natively(ctx, node)
         && {
             let bytes = largest_output_bytes(node);
             bytes.is_finite() && bytes * 2.0 > ctx.memory_remaining() as f64
@@ -1127,6 +1127,42 @@ pub(super) fn native(node: &Node) -> bool {
             || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
                 && node.children.len() == 1))
         && node.children.iter().all(native)
+}
+
+/// How deep automatic admission follows EXISTS patterns nested in EXISTS patterns. A
+/// deeper nesting keeps the plan eager.
+const AUTO_EXISTS_DEPTH: usize = 4;
+
+/// Whether every operator of `node` has a cursor implementation, as [`native`] asks,
+/// where an operator that evaluates EXISTS also counts when the plan of each of its
+/// patterns does. The cursor answers such an EXISTS from a key set that a child cursor
+/// fills, or evaluates it once per distinct outer key with the same pattern
+/// substituted, so neither runs an eager subtree. The patterns are planned here only
+/// to read their operators. Planning interns their variables in `ctx` and runs no
+/// part of them.
+pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
+    fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
+        let mut specs = Vec::new();
+        for expr in own_exprs(&node.kind) {
+            expr.exists_specs(&mut specs);
+        }
+        let exists = specs.iter().all(|spec| {
+            depth < AUTO_EXISTS_DEPTH
+                && super::plan::Planner::new(ctx)
+                    .plan(&spec.pattern, &spec.graph, Vec::new())
+                    .is_ok_and(|planned| at(ctx, &planned, depth + 1))
+        });
+        exists
+            && (supported(&node.kind)
+                || binary::eligible(node)
+                || group::eligible(node)
+                || expand::eligible(node)
+                || walk::eligible(node)
+                || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
+                    && node.children.len() == 1))
+            && node.children.iter().all(|child| at(ctx, child, depth))
+    }
+    at(ctx, node, 0)
 }
 
 /// Whether nothing in `node` has effects that running it twice would repeat or
@@ -3996,6 +4032,22 @@ mod tests {
             ),
             (
                 "SELECT ?a (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER EXISTS {?s <urn:q> ?b}} GROUP BY ?a",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER NOT EXISTS {?s <urn:q> ?b . FILTER NOT EXISTS {?b <urn:p> ?s}}}",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER EXISTS {SERVICE <http://example.org/sparql> {?s ?p ?o}}}",
+                false,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER EXISTS {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c FILTER EXISTS {?c <urn:p> ?d FILTER EXISTS {?d <urn:p> ?e FILTER EXISTS {?e <urn:p> ?f}}}}}}",
                 false,
             ),
         ];
@@ -4316,8 +4368,12 @@ mod tests {
             // an unlimited budget never admits by memory
             assert!(!decide(q, some.clone(), u64::MAX, 1e6), "{q}");
         }
+        // EXISTS whose patterns have cursor plans runs in the cursor
+        assert!(decide(exists, some.clone(), 16 << 20, 1e6));
+        assert!(!decide(exists, None, 16 << 20, 1e6));
         // plans with an operator the cursor runs eagerly stay eager
-        assert!(!decide(exists, some.clone(), 16 << 20, 1e6));
+        let remote = "SELECT ?s { ?s <urn:p> ?o FILTER EXISTS { SERVICE <http://example.org/sparql> { ?s ?p ?x } } } ORDER BY ?s";
+        assert!(!decide(remote, some.clone(), 16 << 20, 1e6));
         assert!(!decide(service, some.clone(), 16 << 20, 1e6));
         // an unknown estimate stays eager
         assert!(!decide(sort, some.clone(), 16 << 20, f64::INFINITY));
