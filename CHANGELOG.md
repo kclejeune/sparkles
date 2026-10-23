@@ -4,6 +4,16 @@
 
 ### Changed
 
+Automatic execution now streams groupings and counts over an estimated 20,000 input rows
+or more whose EXISTS and NOT EXISTS are FILTER conjuncts that a key set answers. On a
+Namespace instance at 10.5M quads these ran 0.68 to 0.99 times as long as eagerly. An
+EXISTS in BIND, an OPTIONAL condition or a larger expression keeps the plan eager.
+
+A finished eager SELECT or ASK now keeps only its result's estimate in the query memory
+pool instead of its query's peak, so a held result, a Python or Node result object or a
+cached result no longer reserves the memory of the tables it was built from. CONSTRUCT and
+DESCRIBE results keep their peak as before.
+
 Group commit now covers datasets with a full-text, spatial or embedding index, which used
 to take the ordinary path. On a Namespace instance whose synchronizations were slowed to
 4 ms each, four writers on such a dataset committed about twice as fast and sixteen

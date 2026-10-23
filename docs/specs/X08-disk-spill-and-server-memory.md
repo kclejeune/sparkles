@@ -1032,10 +1032,9 @@ latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
   and wake only the waiters that fit when memory returns. Today admission happens before
   the body is read, and the server sets no body read timeout, so a slow client holds its
   grant while it sends. Every release wakes every waiter.
-* **X08-P1-retained-results.** Shrink an eager context's retained estimate to its result's
-  size when the query finishes. Today an eager `QueryResult` keeps its query's peak
-  estimate until it is dropped, and a Python or Node result object keeps it until the
-  object is collected.
+* **X08-P1-retained-results.** Done on 2026-10-23 for SELECT and ASK, as the section
+  below describes. A CONSTRUCT or DESCRIBE result still keeps its query's peak estimate,
+  because its decoded triples are not measured when the query finishes.
 * A lock-free `try_grant` when no request waits, measured with the latency gate above.
   Admission takes the queue's lock on every request.
 * The 10.5M and DBpedia runs of the profile gate in §3.3, warm and cold, which the Phase
@@ -1049,6 +1048,40 @@ latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
+
+### Retained eager results (2026-10-23)
+
+An eager context's contribution to its grant used to stay at its highest admitted
+estimate until its last owner dropped. That estimate includes the build tables, the
+intermediate results and the deduplication state of the query, so a held `QueryResult`,
+a Python or Node result object, or a result in the result cache reserved its query's peak
+long after the query finished. A DISTINCT of a million-row product with a thousand rows
+of answer kept about 40 MB of the pool while its result was alive.
+
+When an eager SELECT or ASK finishes, `Ctx::shrink_retained` now lowers the contribution
+to what the result keeps. That is the result table's estimate, the bytes of the terms
+computed into the query's local vocabulary, 96 bytes for each cached decoded value and
+every live charge. `QueryMemoryLedger::shrink_eager` lowers the primary account to the
+higher of its live bytes and that estimate, lowers every other account to its live bytes,
+and returns the excess to each account's own grant outside the ledger's lock. A cursor
+ledger keeps no eager contribution and a ledger with a running algorithm call keeps its
+contribution, so both are left alone. A later charge on the context grows its
+contribution again as before. A contribution within 1 MiB of the retained estimate is
+left alone, so a small query keeps its lock-free fast account and takes no ledger. A
+larger one is handed to the ledger first, which makes the shrink and any concurrent
+charge take the same lock.
+
+The computed terms and cached values were never charged in eager execution, and the peak
+estimate covered them only by accident. Counting them keeps them covered after the
+shrink. A CONSTRUCT or DESCRIBE result keeps its peak estimate, because its decoded
+triples and quads are not measured when the query finishes.
+
+`a_finished_eager_result_retains_only_what_it_holds` holds the thousand-row DISTINCT under
+2 MiB of the pool where it held 40 MB, and checks that a million-row result keeps at least
+its rows. `a_retained_small_result_leaves_its_peak_to_other_queries` runs that DISTINCT
+twice in a pool that fits one peak and a half while the first result is alive, which
+failed with `server-memory` before. `shrinking_a_finished_eager_query_keeps_live_and_result_bytes`
+covers two accounts on different grants, live charges and a cursor ledger.
 
 ### Phase 2a: batch kernels (2026-10-17)
 

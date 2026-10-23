@@ -7886,10 +7886,12 @@ pool cannot cover its next step, the query fails with `server-memory`, and the p
 therefore cannot deadlock. While requests wait, a query may not hold more than half of the
 pool. A query that exceeds its own `memory` budget still answers `507`.
 
-An eager query keeps its highest estimate in the pool until its result is released, so
-results held by the caller keep their share. In an embedded catalog with a pool, a
-`QueryResult` and the Python and Node result objects keep their query's peak estimate
-until they are dropped or collected, even when the result is much smaller. A SERVICE call
+An eager result keeps its share of the pool until it is released, so results held by the
+caller keep their share. When a SELECT or ASK finishes, its share drops to the estimate
+of its rows, its computed terms and its live charges. A CONSTRUCT or DESCRIBE result
+keeps its query's peak estimate until it is dropped or collected, even when the result is
+much smaller. This holds for a `QueryResult` and for the Python and Node result objects
+in an embedded catalog with a pool. A SERVICE call
 to the same server is admitted like any request, so it can answer `503` while its caller
 holds memory. Uploads and Graph Store writes take an admission grant for the whole load,
 and the memory of the load itself is not counted in the pool.

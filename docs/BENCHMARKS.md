@@ -2161,6 +2161,31 @@ mixed. The cursor also holds much less. At 10.5M its ledger peaked at 2.2 MB for
 102.1 MB. A full sort stays eager by default, because the in-memory cursor sort holds its
 whole input with decoded keys, 580 MB in the ledger against 31 MB eagerly.
 
+<a id="automatic-exists"></a>
+
+**Groupings with EXISTS.** Until 2026-10-23 automatic execution kept every plan with an
+EXISTS eager, although the cursor answers a FILTER EXISTS or NOT EXISTS from a key set
+of its pattern. On 2026-10-23 `scripts/nsc-bench.sh` compared eager and automatic
+execution of commit 16c69fdb, which admitted every EXISTS, on an 8-vCPU AMD EPYC
+Namespace instance, with one Rayon thread, four A, B, B, A rounds and
+fresh servers per round. Both modes returned the same answers. The table gives the
+median server execution time of automatic execution divided by that of eager execution.
+
+| Ratio of automatic to eager | 1.05M | 10.5M |
+|---|---:|---:|
+| `not-exists-knows`, COUNT of `knows` edges without a reverse edge | **0.91** | **0.68** |
+| `not-exists`, the bench query | 0.96, eager at this size | **0.96** |
+| `exists-join`, the bench query | 1.01, eager at this size | **0.98** |
+| `exists-group`, a grouped COUNT over FILTER EXISTS, top 10 | 1.01 | 0.99 |
+| `exists-bind`, a COUNT grouped by BIND(EXISTS …) | 1.07 | 1.15 |
+
+At 1.05M `not-exists` and `exists-join` filter fewer than 20,000 estimated rows and stay
+eager, so their ratios compare a mode with itself. The filters that a key set answers
+were as fast or faster, and they now stream from 20,000 estimated input rows like other
+groupings. An EXISTS in BIND, in an OPTIONAL condition or inside a larger expression is
+evaluated once per distinct outer key, which was slower in the cursor, so plans with one
+stay eager.
+
 Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
 10.5M. The spill directory was on the instance's local disk.
 
