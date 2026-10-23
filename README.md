@@ -299,6 +299,14 @@ agent memory, the map view and a merge preview.
     <td>A query compared between two commits</td>
     <td>A graph compared between two commits</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>The pattern of a query, drawn beside its text</td>
+    <td></td>
+  </tr>
 </table>
 
 </details>

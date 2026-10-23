@@ -574,7 +574,10 @@ side of an `OPTIONAL`. A
 prefixed name whose prefix neither the query nor the dataset declares is refused before
 that, and a typed term is resolved under the query's prefixes and `BASE` to find the
 group that holds its patterns. New nodes are placed by an fcose run with every known node
-fixed, after which the known nodes are put back exactly where they were. A variable that
+fixed, after which the known nodes are put back exactly where they were. The dotted link
+from a locked block or a chip to a variable has half the ideal length of a triple's edge,
+so a block sits next to the variables it uses. `docs/images/pattern.png`, which
+`mise run docs:screenshots:mock` takes, shows the pane beside a query. A variable that
 only a locked block mentions gets a node beside it, except for a `MINUS`, which binds
 nothing outside itself, and such a node does not count as a disconnected part. `FROM`
 clauses, a `CONSTRUCT` template and the terms of `DESCRIBE` are locked nodes too, joined

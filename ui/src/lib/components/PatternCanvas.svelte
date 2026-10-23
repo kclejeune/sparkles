@@ -382,7 +382,7 @@
       fit: false,
       quality: 'default',
       nodeRepulsion: () => 5000,
-      idealEdgeLength: () => 80,
+      idealEdgeLength: edgeLength,
       nodeSeparation: 50,
       fixedNodeConstraint: fixed,
       stop: () => {
@@ -394,6 +394,10 @@
     } as cytoscape.LayoutOptions);
     running.run();
   }
+
+  /** A triple's edge gets room for its label; a dotted link to a locked block or a chip
+   * stays short, so a block sits next to the variables it uses. */
+  const edgeLength = (e: cytoscape.EdgeSingular) => (e.data('style') === 'dotted' ? 40 : 80);
 
   function runLayout(fit: boolean) {
     if (!cy) return;
@@ -407,7 +411,7 @@
       padding: 30,
       quality: n > 300 ? 'draft' : 'default',
       nodeRepulsion: () => 5000,
-      idealEdgeLength: () => 80,
+      idealEdgeLength: edgeLength,
       nodeSeparation: 50,
       packComponents: true,
       stop: () => {
