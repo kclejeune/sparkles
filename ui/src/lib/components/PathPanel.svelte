@@ -12,6 +12,7 @@
   import { fmtInt } from '$lib/format';
   import { shortLabel } from '$lib/graph';
   import { displayIri, termKey } from '$lib/rdf';
+  import { datasetKindUrl, readKind } from '$lib/settings';
   import * as pf from '$lib/paths';
   import EntityPicker, { type Picked } from './EntityPicker.svelte';
   import Icon from './Icon.svelte';
@@ -54,6 +55,23 @@
   let follow = $state<'except' | 'only'>('except');
   let excluded = $state<string[]>([...pf.DEFAULT_EXCLUDED]);
   let only = $state<string[]>([]);
+  /** The person changed the skipped predicates, so the dataset's defaults leave them. */
+  let excludedTouched = false;
+  // the dataset's defaults (the `paths` settings kind), else the built-in ones
+  $effect(() => {
+    const name = ds;
+    const c = new AbortController();
+    readKind(datasetKindUrl(name, 'paths'), c.signal)
+      .then((k) => {
+        const list = k.effective?.excludedPredicates;
+        if (!excludedTouched && Array.isArray(list) && list.every((p) => typeof p === 'string'))
+          excluded = list as string[];
+      })
+      .catch(() => {
+        // a server without the kind: the built-in defaults stay
+      });
+    return () => c.abort();
+  });
   /** False once the server refused the Phase 1 parameters. */
   let phase1 = $state(true);
 
@@ -250,12 +268,15 @@
     predErr = '';
     predText = '';
     if (follow === 'except' && phase1) {
+      excludedTouched = true;
       if (!excluded.includes(iri)) excluded = [...excluded, iri];
     } else if (!only.includes(iri)) only = [...only, iri];
   }
   function removePredicate(iri: string) {
-    if (follow === 'except' && phase1) excluded = excluded.filter((p) => p !== iri);
-    else only = only.filter((p) => p !== iri);
+    if (follow === 'except' && phase1) {
+      excludedTouched = true;
+      excluded = excluded.filter((p) => p !== iri);
+    } else only = only.filter((p) => p !== iri);
   }
   const shownPreds = $derived(follow === 'except' && phase1 ? excluded : only);
 

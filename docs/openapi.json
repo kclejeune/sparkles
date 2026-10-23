@@ -15008,7 +15008,8 @@
               "memory",
               "ingest",
               "prefixes",
-              "graphrag"
+              "graphrag",
+              "paths"
             ],
             "type": "string"
           },
