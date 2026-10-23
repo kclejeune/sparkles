@@ -891,7 +891,7 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRul
                     seen = (b, 0);
                 }
                 seen.1 |= ((1u64 << (span.1 - span.0)) - 1) << span.0;
-                if seen.1.count_ones() as usize > idx.dense_limit(b) {
+                if seen.1.count_ones() as usize > idx.prefetch_dense_limit(b) {
                     idx.mark_dense(b);
                     last_span = None;
                     if last != Some(b) {

@@ -35,6 +35,15 @@ const MAX_SEG_ROWS: usize = 4096;
 
 /// Whether a reader opens a segment directory of `n` rows per segment: from
 /// [`MIN_SEG_ROWS`] to [`MAX_SEG_ROWS`], dividing [`BLOCK_ROWS`]. `check` uses the same rule.
+pub(crate) fn exp_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("SPARKLES_SEG_EXP").as_deref() {
+        Ok("whole") => 1,
+        Ok("pf2") => 2,
+        _ => 0,
+    })
+}
+
 pub(crate) fn supported_segment_rows(n: usize) -> bool {
     (MIN_SEG_ROWS..=MAX_SEG_ROWS).contains(&n) && BLOCK_ROWS.is_multiple_of(n)
 }
@@ -1304,6 +1313,9 @@ impl PermIndex {
     /// only a prefetch or a decode changes the answer.
     pub fn segment_span(&self, b: usize, lo: &Key, hi: &Key) -> Option<(usize, usize)> {
         let d = self.segs.as_ref()?;
+        if exp_mode() == 1 {
+            return None;
+        }
         let m = &self.blocks[b];
         if (m.first >= *lo && m.last <= *hi) || d.dense(b) {
             return None;
@@ -1347,6 +1359,14 @@ impl PermIndex {
 
     /// The segments of block `b` a request may read one by one before it reads the block
     /// whole (see [`mark_dense`](Self::mark_dense)).
+    pub(crate) fn prefetch_dense_limit(&self, b: usize) -> usize {
+        if exp_mode() == 2 {
+            (self.dense_limit(b) / 2).max(1)
+        } else {
+            self.dense_limit(b)
+        }
+    }
+
     pub(crate) fn dense_limit(&self, b: usize) -> usize {
         self.segs.as_ref().map_or(0, |d| d.dense_limit(b) as usize)
     }
