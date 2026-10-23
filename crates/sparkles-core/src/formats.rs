@@ -159,7 +159,7 @@ fn list(v: &[u32]) -> String {
 /// The generation index formats this build reads (`format_version` of `meta.json`).
 /// [`crate::builder::FORMAT_VERSION`] is the one it writes. A change that is read and
 /// rewritten at compaction adds the new format here and keeps the previous one.
-pub const READABLE_INDEX_FORMATS: &[u32] = &[2];
+pub const READABLE_INDEX_FORMATS: &[u32] = &[2, 3];
 
 /// The write-ahead log version this build writes: a header record with the magic and
 /// this version starts every new `wal.log` (see [`crate::store::wal`]). Version 0 is a
@@ -870,9 +870,9 @@ mod tests {
 
     #[test]
     fn refusals_say_what_to_do() {
-        let e = INDEX.refuse("gen-0003", 3, Some("0.4.0")).to_string();
+        let e = INDEX.refuse("gen-0003", 4, Some("0.4.0")).to_string();
         assert!(
-            e.contains("index version 3, written by Sparkles 0.4.0"),
+            e.contains("index version 4, written by Sparkles 0.4.0"),
             "{e}"
         );
         assert!(e.contains("newer release"), "{e}");

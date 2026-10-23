@@ -171,7 +171,9 @@ pub struct IndexMeta {
     pub patterns: Option<crate::patterns::PatternInfo>,
 }
 
-pub const FORMAT_VERSION: u32 = 2;
+/// The index format this build writes. Format 3 stores each column as one frame per
+/// segment with a `.seg` directory (spec X07 §6.5), and format 2 as one frame per column.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The `format_version` of a generation's `meta.json` whose bytes are `bytes`, read on
 /// its own so that a newer meta in another shape is refused as newer instead of being

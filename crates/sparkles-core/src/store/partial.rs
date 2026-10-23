@@ -290,7 +290,7 @@ fn rewrite(
     let mut decoded = 0usize;
     for seg in segs {
         match *seg {
-            Seg::Copy(b) => w.push_raw(&idx.blocks[b], idx.raw_block(b)?)?,
+            Seg::Copy(b) => w.push_block(idx, b)?,
             Seg::Run { lo, hi, rows } => {
                 let mut cuts = Cuts::new(rows);
                 let mut written = 0u64;

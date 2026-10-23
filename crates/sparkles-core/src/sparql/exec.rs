@@ -1310,10 +1310,14 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
     }
     /// The blocks of a scan with the columns the reader decodes of each, or nothing for a
     /// scan of more than `FEW_BLOCKS` blocks.
-    fn blocks(ctx: &Ctx, spec: &ScanSpec, ranges: &[(Key, Key)]) -> Vec<(usize, ColMask)> {
+    fn blocks(
+        ctx: &Ctx,
+        spec: &ScanSpec,
+        ranges: &[(Key, Key)],
+    ) -> Vec<(usize, ColMask, Key, Key)> {
         let index = ctx.snap.perm(spec.perm);
         let scan = scan_mask(ctx, spec);
-        let mut out: Vec<(usize, ColMask)> = Vec::new();
+        let mut out: Vec<(usize, ColMask, Key, Key)> = Vec::new();
         for range in ranges {
             let (b0, b1) = index.key_block_range(&range.0, &range.1);
             if b1 - b0 > FEW_BLOCKS {
@@ -1321,9 +1325,13 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
             }
             for b in b0..b1 {
                 let mask = wanted(index, scan, range, b);
+                // a block that two ranges share is asked for by its union
                 match out.last_mut() {
-                    Some((last, wanted)) if *last == b => *wanted |= mask,
-                    _ => out.push((b, mask)),
+                    Some((last, wanted, _, hi)) if *last == b => {
+                        *wanted |= mask;
+                        *hi = range.1;
+                    }
+                    _ => out.push((b, mask, range.0, range.1)),
                 }
             }
             if out.len() > FEW_BLOCKS {
@@ -1358,13 +1366,14 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
             // a warm scan costs this one probe, before any other block is listed
             let first = ranges.iter().find_map(|r| {
                 let (b0, b1) = index.key_block_range(&r.0, &r.1);
-                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0)))
+                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0), r))
             });
-            if let Some((b, mask)) = first
-                && !ctx.snap.cache.has_cols(index, b, mask)
+            if let Some((b, mask, r)) = first
+                && !index.range_cached(&ctx.snap.cache, b, &r.0, &r.1, mask)
             {
-                for (b, mask) in blocks(ctx, spec, &ranges) {
-                    index.prefetch(&ctx.snap.cache, b, mask);
+                // a range of a few rows of a segmented block asks for its segments only
+                for (b, mask, lo, hi) in blocks(ctx, spec, &ranges) {
+                    index.prefetch_range(&ctx.snap.cache, b, &lo, &hi, mask);
                 }
             }
         }

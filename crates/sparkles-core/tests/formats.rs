@@ -304,7 +304,7 @@ fn a_newer_index_meta_in_a_new_shape_is_unsupported() {
     two_generation_database(&root);
     for p in &find_files(&root, "meta.json") {
         let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
-        v["format_version"] = 3.into();
+        v["format_version"] = 4.into();
         v.as_object_mut().unwrap().remove("created");
         v.as_object_mut().unwrap().remove("quads");
         std::fs::write(p, serde_json::to_vec(&v).unwrap()).unwrap();

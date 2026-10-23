@@ -306,19 +306,22 @@ fn statistics_report_reads_no_more_blocks_as_the_store_grows() {
     // 400,000 and 1,000,000 quads: about 12 and 30 blocks of 32 Ki rows per permutation
     let mut reads = Vec::new();
     let mut exact = Vec::new();
+    // measured in decoded bytes: a read of a few rows of a segmented block decodes
+    // segments of it, so lookups no longer count blocks
     for n in [80_000, 200_000] {
         let s = synthetic(n);
         let snap = s.snapshot();
-        let before = snap.cache.lookups();
+        let before = snap.cache.bytes();
         let r = discover(&snap, &stats_opts(GraphSelection::Default)).unwrap();
         assert_eq!(r.basis, Basis::Statistics);
-        reads.push(snap.cache.lookups() - before);
-        let before = snap.cache.lookups();
+        reads.push((snap.cache.bytes() - before) >> 13);
+        let before = snap.cache.bytes();
         discover(&snap, &SchemaOptions::default()).unwrap();
-        exact.push(snap.cache.lookups() - before);
+        exact.push((snap.cache.bytes() - before) >> 13);
     }
     // the exact report reads every block of PSO and POS, so it grows with the store,
-    // while the labels and declarations the statistics report reads do not
+    // while the labels and declarations the statistics report reads do not (in units of
+    // 8 KiB, one segment column)
     assert!(2 * exact[1] > 3 * exact[0], "exact: {exact:?}");
     assert!(reads[1] <= reads[0] + 8, "statistics: {reads:?}");
     assert!(

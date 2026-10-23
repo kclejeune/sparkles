@@ -237,7 +237,7 @@ impl Generation {
             vocab: Arc::new(Vocab::open(dir)?),
             perms: Perm::ALL
                 .iter()
-                .map(|&p| PermIndex::open(dir, p))
+                .map(|&p| PermIndex::open_format(dir, p, meta.format_version))
                 .collect::<Result<_>>()?,
             stats,
             meta,
