@@ -109,7 +109,7 @@ Queries and updates follow the W3C recommendations and Jena ARQ's extensions, ch
 
 Full-text, vector and path search run inside SPARQL and join with the rest of a query.
 
-* Full-text search with a subset of Jena's `text:query`, ranked by BM25 through Tantivy. Each quad is a document, kept current in each commit: a write stages its documents, and the next search or a 1 s tick commits them. A search returns the top k within a graph. The query string can be a variable that the rest of the group binds, and a join can pass a search the subjects it already has. A bulk commit updates the index by the documents it changes, and `POST /$/text/{ds}/rebuild` rebuilds it while writes go on. An index can be enabled when a dataset is created. Missing or damaged configured indexes recover in the background at open while RDF remains usable; text searches return `503` until recovery succeeds. It needs the `text` cargo feature, which the server enables.
+* Full-text search with a subset of Jena's `text:query`, ranked by BM25 through Tantivy. Each quad is a document, kept current in each commit: a write stages its documents, and the next search or a 1 s tick commits them. A search returns the top k within a graph. The query string can be a variable that the rest of the group binds, and a join can pass a search the subjects it already has. A bulk commit updates the index by the documents it changes, and `POST /$/text/{ds}/rebuild` rebuilds it while writes go on. An index can be enabled when a dataset is created. Missing or damaged configured indexes recover in the background at open while RDF remains usable; text searches return `503` until recovery succeeds. Document publication can continue while a background checkpoint synchronizes segment files, and index reconfiguration waits for old writers and checkpoints before reusing their paths. It needs the `text` cargo feature, which the server enables.
 * Stemming per language for full-text search. The index stems the literals of configured languages with Tantivy's Snowball stemmers and stop words, and `lang:` searches use them, as with jena-text's multilingual support ([API.md](API.md#full-text-search)).
 * Vector similarity over `spk:vector` literals and their compact base64 form `spk:vectorB64`, with `spk:cosine`, `spk:dot` and `spk:euclidean`. `spk:vectorSearch` returns the top k within the active graph. Its query can be a literal, an entity or a variable bound by the rest of the group, and it takes `ef:`, `exact:true`, `distinct:subject` and `candidates:join`. `ORDER BY DESC(spk:cosine(?v, C)) LIMIT k` over one pattern runs as an exact vector search.
 * Vector indexes (`vector.json`, `/$/vector/{ds}/{name}`, `sparkles vector`). An index packs one predicate's vectors and builds an HNSW graph over them in the background, written to a file of the generation and mapped after a restart. Rows that commits add are inserted into the graph in the background after each commit, and a compaction carries the graph over to the new generation, so neither waits for a full rebuild. Searches overlay each snapshot's deleted vectors and the inserted ones the graph does not hold yet exactly, past commits are searched exactly, and `M`, `efConstruction` and `efSearch` are set per index and `ef:` per query ([API.md](API.md#vector-indexes)).
@@ -257,10 +257,12 @@ that work by priority and links each item to its design spec.
   has no queue order, so a call that needs several threads can wait while one-thread
   calls keep taking the free slots. [Roadmap](ROADMAP.md) item 8.
 
-* **Community summaries.** Leiden can compute a community hierarchy, but Sparkles
-  does not build or store GraphRAG community reports with citations, provenance and
-  review status. Global Ask answers from those reports, community context in memory
-  tools and incremental report refresh are not built. [Roadmap](ROADMAP.md) item 12.
+* **Community summaries.** Leiden can compute a community hierarchy, and model
+  settings accept a `community` role that inherits the resolved `summarize` list when
+  unset. An explicit empty list disables it. Sparkles does not build or store GraphRAG
+  reports with citations, provenance and review status. Global Ask answers from those
+  reports, community context in memory tools and incremental report refresh are not
+  built. [Roadmap](ROADMAP.md) item 12.
 
 * **Cold sparse reads.** The constant, scan and result-term prefetch paths and I/O
   profiling are implemented. Corrected-source warm instruction and read-hint gates,
@@ -285,8 +287,10 @@ that work by priority and links each item to its design spec.
   plain scans of a thousand rows or more and groupings of an estimated 20,000 input rows
   or more. A bounded pure ASK with an equality-filtered Cartesian product also streams
   when its estimated candidate table exceeds an existing row or memory budget. It stops
-  at the first qualifying pair and keeps the actual work limits. Other plans stream
-  only when the caller asks for
+  at the first qualifying pair and keeps the actual work limits. Eager execution can
+  prune an oversized independent string-equality product before its residual filter.
+  It preserves matching bags and uses the ordinary kernel for mixed or other value
+  types and expression-bearing inputs. Other plans stream only when the caller asks for
   `execution=streaming` ([X05](specs/X05-streaming-query-execution.md)). Streaming runs scans,
   joins, DISTINCT and eligible aggregates batch by batch. ORDER BY with LIMIT reads its
   input batch by batch into a heap of the rows it returns. Sorts without LIMIT and
@@ -344,9 +348,9 @@ that work by priority and links each item to its design spec.
 * Group commit on datasets with a full-text, spatial or embedding index has passed its
   crash runs, but complete performance acceptance on forge remains open. Partial
   full-text pilots do not establish the full serial, concurrent and mixed-load gates.
-  A background full-text checkpoint holds the publication mutex while synchronizing
-  files, so indexed writes can wait for that I/O. Spatial and embedding acceptance
-  also remain open. [Roadmap](ROADMAP.md) item 86 and
+  Background file synchronization releases the full-text publication mutex, while
+  WAL and vocabulary synchronization and publication during a group fence still
+  need native latency acceptance. Spatial and embedding acceptance also remain open. [Roadmap](ROADMAP.md) item 86 and
   [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates).
 * **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.
   The remaining budget work includes `q4` memory use, the large candidate products
