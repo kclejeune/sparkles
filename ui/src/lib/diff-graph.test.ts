@@ -11,6 +11,8 @@ import {
   diffGraphHref,
   emptyCanvas,
   groupedElements,
+  groupKeyOf,
+  lapseGroupsStep,
   lapseSteps,
   quadIds,
   seqOf,
@@ -296,5 +298,79 @@ describe('the sizes of steps', () => {
       { from: 0, to: 600, changes: 12 },
       { from: 600, to: 1200, changes: 5 },
     ]);
+  });
+});
+
+describe('changes between graphs', () => {
+  it('draws a move between graphs as a removal and an addition', () => {
+    const t = q('+', 'alice', 'knows', 'bob');
+    const { canvas } = diffCanvas([
+      { ...t, op: '-', graph: `<${EX}g1>` },
+      { ...t, graph: `<${EX}g2>` },
+    ]);
+    const { edges } = canvasElements(canvas, all, label, short);
+    expect(edges.map((e) => [e.change, e.title]).sort()).toEqual([
+      ['added', `${EX}knows in <${EX}g2>`],
+      ['removed', `${EX}knows in <${EX}g1>`],
+    ]);
+  });
+});
+
+describe('a grouped time-lapse', () => {
+  const works = (added: number, removed: number): DiffGroup => ({
+    subjectClass: `${EX}Person`,
+    predicate: `${EX}worksFor`,
+    object: { class: `${EX}Org` },
+    added,
+    removed,
+  });
+
+  it('keeps net counts, marks the step and lets a group go at nothing', () => {
+    let s = lapseGroupsStep(new Map(), [works(600, 0)], false);
+    expect(s.groups).toEqual([works(600, 0)]);
+    // a step that does not touch it: drawn without a mark
+    s = lapseGroupsStep(s.live, [], false);
+    expect(s.groups).toEqual([works(0, 0)]);
+    // all removed: a ghost for its step, then gone
+    s = lapseGroupsStep(s.live, [works(0, 600)], false);
+    expect(s.groups).toEqual([works(0, 600)]);
+    s = lapseGroupsStep(s.live, [], false);
+    expect(s.groups).toEqual([]);
+    expect(s.live.size).toBe(0);
+    // Keep ghosts keeps it as a ghost
+    let k = lapseGroupsStep(new Map(), [works(5, 0)], true);
+    k = lapseGroupsStep(k.live, [works(0, 5)], true);
+    k = lapseGroupsStep(k.live, [], true);
+    expect(k.groups).toEqual([works(0, 5)]);
+    expect(groupKeyOf(works(1, 0))).toBe(groupKeyOf(works(0, 9)));
+  });
+
+  it('keeps at most `max` groups, ghosts first out', () => {
+    const g = (i: number, a: number, r: number): DiffGroup => ({
+      ...works(a, r),
+      predicate: `${EX}p${i}`,
+    });
+    let s = lapseGroupsStep(new Map(), [g(1, 0, 3), g(2, 4, 0), g(3, 2, 0)], true, 2);
+    expect(s.live.size).toBe(2);
+    expect(s.groups.map((x) => x.predicate).sort()).toEqual([`${EX}p2`, `${EX}p3`]);
+    s = lapseGroupsStep(s.live, [], true, 2);
+    expect(s.groups).toHaveLength(2);
+  });
+});
+
+describe('the grouped picture', () => {
+  it('stays within the node cap, the largest groups first', () => {
+    const groups: DiffGroup[] = Array.from({ length: 1000 }, (_, i) => ({
+      subjectClass: `${EX}S${i}`,
+      predicate: `${EX}p`,
+      object: { class: `${EX}O${i}` },
+      added: 1000 - i,
+      removed: 0,
+    }));
+    const el = groupedElements({ groups }, short);
+    expect(el.nodes.length).toBeLessThanOrEqual(1500);
+    expect(el.omitted).toBe(250);
+    expect(el.nodes[0].label).toMatch(/S0/);
+    expect(groupedElements({ groups: groups.slice(0, 3) }, short).omitted).toBe(0);
   });
 });

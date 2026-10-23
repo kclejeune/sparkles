@@ -351,3 +351,40 @@ export function applyOverviewChanges(
   }
   return { nodes: kept, edges: edges.list() };
 }
+
+/**
+ * The class level of a comparison with what it removed entirely: a class whose last
+ * instances the range removed and an edge whose last triples it removed are added with no
+ * size, so that their `−` marks are drawn and listed.
+ */
+export function withRemoved(
+  g: OvGraph,
+  c: OvChanges,
+  label: (iri: string) => string = (i) => i,
+): OvGraph {
+  const nodes = [...g.nodes];
+  const have = new Set(nodes.map((n) => n.key));
+  const gone = (key: string) => {
+    if (have.has(key)) return;
+    have.add(key);
+    const cls = key.slice(2);
+    nodes.push({ key, kind: 'class', label: label(cls), size: 0, cls, iri: cls, openable: false });
+  };
+  for (const [cls, d] of c.classes) if (d.removed > 0) gone(`c:${cls}`);
+  const edges = [...g.edges];
+  const known = new Set(edges.map((e) => e.key));
+  for (const [key, d] of c.edges) {
+    if (known.has(key) || d.removed === 0) continue;
+    const [source, target] = key.split('\u0001');
+    gone(source);
+    gone(target);
+    edges.push({
+      key,
+      source,
+      target,
+      count: 0,
+      predicates: [...d.predicates.keys()].map((iri) => ({ iri, count: 0 })),
+    });
+  }
+  return { nodes, edges };
+}

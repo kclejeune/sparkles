@@ -42,6 +42,8 @@ export type DEdge = {
   step: number;
   /** An unchanged edge read around a changed resource, which **context** shows. */
   context?: boolean;
+  /** The named graph of the change, in N-Triples; none for the default graph. */
+  graph?: string;
 };
 
 /** What the canvas draws: elements keyed by id, in the order they were first drawn. */
@@ -138,7 +140,11 @@ export function applyStep(
     else if (change === 'added' && isGhost(n)) nodes.set(id, { ...n, change: 'added', step });
   };
   for (const q of quads) {
-    const { s, o, p, sid, oid, edge, lit } = quadIds(q);
+    const ids = quadIds(q);
+    const { s, o, p, sid, oid, lit } = ids;
+    // the same triple in two graphs is two changes, so a move between graphs draws both
+    const graph = q.graph ?? undefined;
+    const edge = graph ? `${ids.edge}|${graph}` : ids.edge;
     if (q.op === '+') {
       added++;
       node(sid, s, false, 'added');
@@ -151,6 +157,7 @@ export function applyStep(
         lit,
         change: 'added',
         step,
+        ...(graph ? { graph } : {}),
       });
       continue;
     }
@@ -165,6 +172,7 @@ export function applyStep(
       lit,
       change: 'removed',
       step,
+      ...(graph ? { graph } : {}),
     });
     touched.add(sid).add(oid);
   }
@@ -335,7 +343,7 @@ export function canvasElements(
         source: e.source,
         target: e.target,
         label: short(e.predicate),
-        title: e.predicate,
+        title: e.graph ? `${e.predicate} in ${e.graph}` : e.predicate,
         isType: e.predicate === RDF_TYPE,
         change: e.change === 'kept' ? undefined : e.change,
       })),
@@ -454,6 +462,8 @@ export function countsText(added: number, removed: number): string {
 export type ClassElements = {
   nodes: (GNode & { cls: string | null; added: number; removed: number })[];
   edges: (GEdge & { added: number; removed: number })[];
+  /** Groups left out because their nodes would pass `maxNodes`. */
+  omitted: number;
 };
 
 /**
@@ -461,7 +471,11 @@ export type ClassElements = {
  * changes added and removed, a node per datatype of each class's literals and one for IRIs
  * without a class, and an edge per predicate between them labelled with its changes.
  */
-export function groupedElements(g: GroupedDiff, short: (iri: string) => string): ClassElements {
+export function groupedElements(
+  g: Pick<GroupedDiff, 'groups'>,
+  short: (iri: string) => string,
+  maxNodes = MAX_CANVAS_NODES,
+): ClassElements {
   const nodes = new Map<string, ClassElements['nodes'][number]>();
   const edges = new Map<string, ClassElements['edges'][number]>();
   const ensure = (
@@ -480,7 +494,15 @@ export function groupedElements(g: GroupedDiff, short: (iri: string) => string):
   };
   const classNode = (c: string | null) =>
     ensure(classKey(c), c == null ? 'No class' : short(c), c, 'iri', c ?? undefined);
-  for (const x of g.groups) {
+  // the largest groups first, and no group whose nodes would pass the cap
+  const order = [...g.groups].sort((a, b) => b.added + b.removed - (a.added + a.removed));
+  let omitted = 0;
+  for (const x of order) {
+    const fresh = new Set([classKey(x.subjectClass), objectKey(x)].filter((k) => !nodes.has(k)));
+    if (nodes.size + fresh.size > maxNodes) {
+      omitted++;
+      continue;
+    }
     const s = classNode(x.subjectClass);
     if (x.predicate === RDF_TYPE && 'class' in x.object) {
       // instances that gained or lost a class
@@ -514,7 +536,60 @@ export function groupedElements(g: GroupedDiff, short: (iri: string) => string):
     e.change = markOf(e.added, e.removed);
     e.isType = e.title === RDF_TYPE;
   }
-  return { nodes: [...nodes.values()], edges: [...edges.values()] };
+  return { nodes: [...nodes.values()], edges: [...edges.values()], omitted };
+}
+
+/** The key of a group: its subject class, predicate and object. */
+export function groupKeyOf(g: DiffGroup): string {
+  return `${g.subjectClass}|${g.predicate}|${JSON.stringify(g.object)}`;
+}
+
+/** A group a grouped time-lapse has drawn: its net change since the start. */
+export type LiveGroup = { group: DiffGroup; net: number; lastRemoved: number };
+
+/**
+ * One step of a grouped time-lapse. Each group keeps its net change since the start. A
+ * group the step changed carries the step's counts, so it is marked as the canvas marks a
+ * step, one with a positive net change stays unmarked, and one that fell to nothing or below
+ * goes after its step unless `keepGhosts`, then stays as a ghost. At most `max` groups are
+ * kept, ghosts going first.
+ */
+export function lapseGroupsStep(
+  live: ReadonlyMap<string, LiveGroup>,
+  step: readonly DiffGroup[],
+  keepGhosts: boolean,
+  max = 5000,
+): { live: Map<string, LiveGroup>; groups: DiffGroup[] } {
+  const next = new Map(live);
+  const changed = new Map<string, DiffGroup>();
+  for (const x of step) {
+    const k = groupKeyOf(x);
+    const prev = next.get(k);
+    next.set(k, {
+      group: x,
+      net: (prev?.net ?? 0) + x.added - x.removed,
+      lastRemoved: x.removed || (prev?.lastRemoved ?? 0),
+    });
+    changed.set(k, x);
+  }
+  const groups: DiffGroup[] = [];
+  for (const [k, v] of next) {
+    const c = changed.get(k);
+    if (c) groups.push(c);
+    else if (v.net > 0) groups.push({ ...v.group, added: 0, removed: 0 });
+    else if (keepGhosts) groups.push({ ...v.group, added: 0, removed: Math.max(1, v.lastRemoved) });
+    else next.delete(k);
+  }
+  if (next.size > max) {
+    const drop = [...next.entries()]
+      .sort((a, b) => Number(a[1].net > 0) - Number(b[1].net > 0) || a[1].net - b[1].net)
+      .slice(0, next.size - max)
+      .map(([k]) => k);
+    const gone = new Set(drop);
+    for (const k of drop) next.delete(k);
+    return { live: next, groups: groups.filter((x) => !gone.has(groupKeyOf(x))) };
+  }
+  return { live: next, groups };
 }
 
 /** The class a node of the grouped graph stands for, to open it into its members. */

@@ -31,7 +31,7 @@
     schemaAnnouncement,
     schemaChanges,
   } from '$lib/explore-time';
-  import type { SchemaChanges } from '$lib/explore-time';
+  import type { EdgeTriple, SchemaChanges } from '$lib/explore-time';
   import ClassTree from '$components/ClassTree.svelte';
   import GeoMapCard from '$components/GeoMapCard.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
@@ -678,17 +678,55 @@
         signal,
       });
       if (!owns()) return;
+      const quads = d.quads ?? [];
+      // a step that cannot be applied whole is read instead, so no change is lost for the
+      // steps after it: one that listed only some of its changes, or one past the node cap
+      const fresh = new Set<string>();
+      for (const q of quads) {
+        if (q.op !== '+') continue;
+        const { sid, oid } = quadIds(q);
+        if (!nodes[sid] && !nodes[oid]) continue;
+        for (const id of [sid, oid]) if (!nodes[id]) fresh.add(id);
+      }
+      if (
+        quads.length < d.added + d.removed ||
+        Object.keys(nodes).length + fresh.size > MAX_NODES
+      ) {
+        graphReading = false;
+        await rereadGraph();
+        if (graphTimeOpen)
+          graphNote = `Commit ${d.to.commit.seq} changed more than a step can apply, so the graph was read again at it.`;
+        return;
+      }
+      // the diff lists every graph's changes and the drawn graph reads one view of them, so
+      // each change is checked against the state it leads to, read as the graph is read
+      const candidates = new Map<string, EdgeTriple>();
+      for (const q of quads) {
+        const { s, o, p, sid, oid, edge } = quadIds(q);
+        if (q.op === '+' ? !nodes[sid] && !nodes[oid] : !edges[edge]) continue;
+        candidates.set(edge, [s, { type: 'uri', value: p }, o]);
+      }
+      const holds = candidates.size
+        ? await ex.presentEdges(
+            name,
+            [...candidates.values()],
+            toAt === 'head' ? undefined : toAt,
+            signal,
+          )
+        : new Set<string>();
+      if (!owns()) return;
       const addedNodes = new Set<string>();
       const addedEdges = new Set<string>();
       const ghostEdges: Record<string, EEdge> = {};
       const ghostNodes: Record<string, ENode> = {};
       let added = 0;
       let removed = 0;
-      for (const q of d.quads ?? []) {
+      for (const q of quads) {
         const { s, o, p, sid, oid, edge, lit } = quadIds(q);
         if (q.op === '+') {
           if (!nodes[sid] && !nodes[oid]) continue;
-          if (Object.keys(nodes).length >= MAX_NODES) continue;
+          // added in a graph the drawn view does not read
+          if (!holds.has(edge)) continue;
           if (!nodes[sid]) {
             ensureNode(s, undefined, sid);
             addedNodes.add(sid);
@@ -705,7 +743,8 @@
           continue;
         }
         const e = edges[edge];
-        if (e) {
+        // a triple removed from one graph that the drawn view still reads stays
+        if (e && !holds.has(edge)) {
           ghostEdges[edge] = e;
           delete edges[edge];
           removed++;
@@ -722,9 +761,6 @@
       graphReadMs = performance.now() - t0;
       const a = seqOf(fromAt) ?? 0;
       graphAnnounce = stepAnnouncement({ from: a, to: d.to.commit.seq }, added, removed);
-      const listed = d.quads?.length ?? 0;
-      if (listed < d.added + d.removed)
-        graphNote = `The step changed ${fmtInt(d.added + d.removed)} triples of the drawn resources, and the first ${fmtInt(listed)} are drawn.`;
     } catch (e) {
       if (!owns() || isAbort(e)) return;
       const gone = timeFailure(e);

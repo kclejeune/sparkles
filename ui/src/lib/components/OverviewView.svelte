@@ -12,7 +12,7 @@
    * compare mode, and plays a time-lapse that applies each step's grouped diff to the counts
    * while the positions hold still.
    */
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { ApiError, type ClassProfile, type GroupsBy } from '$lib/api';
   import { fmtCompact, fmtInt } from '$lib/format';
@@ -23,6 +23,7 @@
   import {
     applyOverviewChanges,
     overviewChanges,
+    withRemoved,
     type OvChanges,
     classLevel,
     describe,
@@ -104,7 +105,13 @@
   const profileBase = $derived.by(() =>
     profiles ? classLevel(profiles, { builtins, label }) : { nodes: [], edges: [], hidden: 0 },
   );
-  const base = $derived(lapsed ? { ...lapsed, hidden: profileBase.hidden } : profileBase);
+  const base = $derived.by(() => {
+    if (lapsed) return { ...lapsed, hidden: profileBase.hidden };
+    // a comparison also draws the classes and edges it removed entirely, with their marks
+    if (ovCompare && marks)
+      return { ...withRemoved(profileBase, marks, label), hidden: profileBase.hidden };
+    return profileBase;
+  });
   const picture: OvGraph = $derived(visible(base, path, label));
   const announce = $derived(profiles ? describe(picture, path, fmtInt) : '');
   const classColor = $derived.by(() => {
@@ -225,19 +232,25 @@
     return e instanceof Error ? e.message : String(e);
   }
 
+  /** Read the class profiles at `at` and draw them; a failure is the caller's. */
+  async function readProfiles(at: string | undefined, signal: AbortSignal) {
+    const t = performance.now();
+    const p = await api.schemaProfiles(ds, { signal, ...(at ? { at } : {}) });
+    if (signal.aborted) throw new DOMException('superseded', 'AbortError');
+    profiles = p.classes;
+    baseCommit = p.snapshot.commit ?? null;
+    loadMs = performance.now() - t;
+    // a dataset of built-in classes only keeps them, others start without them
+    builtins = !p.classes.some((c) => !c.builtin && c.instances > 0);
+  }
+
   async function load(at?: string) {
     controller?.abort();
     controller = new AbortController();
     loading = true;
     loadError = null;
-    const t = performance.now();
     try {
-      const p = await api.schemaProfiles(ds, { signal: controller.signal, ...(at ? { at } : {}) });
-      profiles = p.classes;
-      baseCommit = p.snapshot.commit ?? null;
-      loadMs = performance.now() - t;
-      // a dataset of built-in classes only keeps them, others start without them
-      builtins = !p.classes.some((c) => !c.builtin && c.instances > 0);
+      await readProfiles(at, controller.signal);
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
       loadError = errorText(e);
@@ -390,12 +403,15 @@
         if (g.truncated)
           timeNote = `The step has ${fmtInt(g.groupCount)} groups, of which the ${fmtInt(g.groups.length)} largest are counted.`;
       } else {
-        lapsed = null;
         path = [];
-        await load(at || undefined);
+        // a failed read rejects the move instead of drawing the state before it
+        await readProfiles(at || undefined, signal);
+        lapsed = null;
+        loadError = null;
         marks = null;
         if (ovCompare && ovFrom) {
           const g = await api.diffGroups(ds, { from: ovFrom, to: at || undefined, signal });
+          if (signal.aborted) return;
           marks = overviewChanges(g);
           timeAnnounce = `Commit ${g.to.commit.seq}: ${fmtInt(g.added)} added, ${fmtInt(g.removed)} removed since commit ${g.from.commit.seq}`;
         } else {
@@ -404,6 +420,7 @@
             : 'Class overview at the head';
         }
       }
+      if (signal.aborted) return;
       drawnAt = at;
       slider?.accept();
       timeMs = performance.now() - t0;
@@ -424,6 +441,27 @@
       timeBusy = false;
     }
   }
+
+  /**
+   * The time-lapse moves the counts from each grouped diff, which cannot see links that a
+   * reclassified resource keeps or a type that two graphs hold. When it stops, the profiles
+   * of the state it reached are read, so what stays on screen is exact.
+   */
+  $effect(() => {
+    if (playing || !lapsed || !timeOpen || timeBusy) return;
+    untrack(() => {
+      timeCtl?.abort();
+      timeCtl = new AbortController();
+      const signal = timeCtl.signal;
+      void readProfiles(drawnAt || undefined, signal)
+        .then(() => {
+          if (!signal.aborted) lapsed = null;
+        })
+        .catch((e) => {
+          if (!(e instanceof DOMException && e.name === 'AbortError')) timeNote = errorText(e);
+        });
+    });
+  });
 
   let timeKey = '';
   $effect(() => {

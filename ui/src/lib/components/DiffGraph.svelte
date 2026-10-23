@@ -20,6 +20,7 @@
     diffCanvas,
     emptyCanvas,
     groupedElements,
+    lapseGroupsStep,
     lapseSteps,
     MAX_CANVAS_NODES,
     seqOf,
@@ -33,6 +34,7 @@
     type Canvas,
     type ContextEdge,
     type LapseStep,
+    type LiveGroup,
     type Speed,
   } from '$lib/diff-graph';
   import * as ex from '$lib/explore';
@@ -86,9 +88,14 @@
   let toSel = $state(untrack(() => to));
 
   let diff = $state<api.Diff | null>(null);
+  /** The changes the list shows: of the diff, of a time-lapse step or of a class's members. */
+  let listQuads = $state.raw<api.DiffQuad[]>([]);
   let groups = $state<api.GroupedDiff | null>(null);
   let canvas = $state.raw<Canvas>(emptyCanvas());
   let context = $state.raw<Map<string, ContextEdge[]>>(new Map());
+  /** The diff the context was read for. */
+  let contextFor = $state('');
+  const diffKey = (d: api.Diff) => `${d.from.commit.seq}..${d.to.commit.seq}|${listQuads.length}`;
   let loading = $state(false);
   let error = $state<string | null>(null);
   let note = $state('');
@@ -125,10 +132,7 @@
         (e.change !== 'added' || showAdded) && (e.change !== 'removed' || showRemoved);
       const edges = classView.edges.filter(keepE);
       const ends = new Set(edges.flatMap((e) => [e.source, e.target]));
-      return {
-        nodes: classView.nodes.filter((n) => ends.has(n.id) || n.added || n.removed),
-        edges,
-      };
+      return { nodes: classView.nodes.filter((n) => ends.has(n.id) || keepE(n)), edges };
     }
     return canvasElements(drawnCanvas, shown, label, short);
   });
@@ -162,6 +166,14 @@
     ctl = new AbortController();
     const signal = ctl.signal;
     stopLapse();
+    // a new range: Play starts from its first commit, and context is read again for it
+    steps = [];
+    stepIndex = -1;
+    stepCount = 0;
+    lapseGroups = null;
+    context = new Map();
+    contextFor = '';
+    listQuads = [];
     loading = true;
     error = null;
     note = '';
@@ -173,9 +185,17 @@
           groups = g;
           diff = null;
           canvas = emptyCanvas();
-          note = g.truncated
-            ? `The ${fmtInt(g.groups.length)} largest of ${fmtInt(g.groupCount)} groups are drawn.`
-            : '';
+          const omitted = groupedElements(g, short).omitted;
+          note = [
+            g.truncated
+              ? `The ${fmtInt(g.groups.length)} largest of ${fmtInt(g.groupCount)} groups are drawn.`
+              : '',
+            omitted
+              ? `${fmtInt(omitted)} smaller groups are left out to stay within ${fmtInt(MAX_CANVAS_NODES)} nodes.`
+              : '',
+          ]
+            .filter(Boolean)
+            .join(' ');
           announce = `Commit ${g.to.commit.seq}: ${fmtInt(g.added)} added, ${fmtInt(g.removed)} removed, in ${fmtInt(g.groupCount)} groups`;
           return;
         } catch (e) {
@@ -196,6 +216,7 @@
       });
       diff = d;
       groups = null;
+      listQuads = d.quads ?? [];
       const r = diffCanvas(d.quads ?? []);
       canvas = r.overflow ? emptyCanvas() : r.canvas;
       const n = d.added + d.removed;
@@ -208,7 +229,6 @@
         .filter(Boolean)
         .join(' ');
       announce = `Commit ${d.to.commit.seq}: ${fmtInt(d.added)} added, ${fmtInt(d.removed)} removed`;
-      if (showContext) await readContext(signal);
     } catch (e) {
       if (isAbort(e)) return;
       error = errorText(e);
@@ -220,7 +240,9 @@
   /** The unchanged edges of the changed resources at the `to` state. */
   async function readContext(signal: AbortSignal) {
     const quads = diff?.quads ?? [];
-    const at = toSel && toSel !== 'head' ? toSel : undefined;
+    // the state the diff resolved to, which a moving head does not change
+    const seq = diff?.to.commit.seq;
+    const at = seq != null ? `commit:${seq}` : undefined;
     const out = new Map<string, ContextEdge[]>();
     for (const iri of changedResources(quads, 30)) {
       const r = await ex.neighbours(ds, iri, at, signal);
@@ -230,7 +252,10 @@
         ...r.inc.map((n) => ({ s: n.term, p: n.predicate, o: me })),
       ]);
     }
-    if (!signal.aborted) context = out;
+    if (!signal.aborted && diff) {
+      context = out;
+      contextFor = diffKey(diff);
+    }
   }
 
   /** The changed members of a class of the grouped picture, 500 changes at a time. */
@@ -241,13 +266,19 @@
     loading = true;
     error = null;
     try {
-      const at = toSel && toSel !== 'head' ? toSel : undefined;
-      const rows = await api.select(
-        ds,
-        `SELECT DISTINCT ?s WHERE { ?s a <${cls}> } ORDER BY ?s LIMIT 1000 OFFSET ${offset}`,
-        { at, signal },
+      // a removal counts under the class its subject had before, an addition under the one
+      // it has after, so the members are read at both states
+      const ends = [groups?.from.commit.seq, groups?.to.commit.seq].map((n) =>
+        n != null ? `commit:${n}` : undefined,
       );
-      const terms = rows.map((r) => r.s).flatMap((t) => (t?.type === 'uri' ? [t.value] : []));
+      const query = `SELECT DISTINCT ?s WHERE { ?s a <${cls}> } ORDER BY ?s LIMIT 1000 OFFSET ${offset}`;
+      const reads = await Promise.all(
+        ends.map((at) => api.select(ds, query, { ...(at ? { at } : {}), signal })),
+      );
+      const full = reads.some((rows) => rows.length === 1000);
+      const terms = [
+        ...new Set(reads.flat().flatMap((r) => (r.s?.type === 'uri' ? [r.s.value] : []))),
+      ].slice(0, 1000);
       const d = terms.length
         ? await api.diff(ds, {
             from: fromSel || undefined,
@@ -260,9 +291,11 @@
         : null;
       const r = diffCanvas(d?.quads ?? []);
       canvas = r.canvas;
-      members = { cls, offset, more: terms.length === 1000 };
+      listQuads = d?.quads ?? [];
+      const cut = d != null && (d.quads?.length ?? 0) < d.added + d.removed;
+      members = { cls, offset, more: full };
       note = d
-        ? `The changes of ${fmtInt(terms.length)} members of ${short(cls)}${(d.quads?.length ?? 0) < d.added + d.removed ? `, the first ${fmtInt(d.quads?.length ?? 0)} of ${fmtInt(d.added + d.removed)}` : ''}.`
+        ? `The changes of ${fmtInt(terms.length)} members of ${short(cls)}${cut ? `, the first ${fmtInt(d.quads?.length ?? 0)} of ${fmtInt(d.added + d.removed)}, which touch other resources too` : ''}.`
         : `No changed members of ${short(cls)} to draw.`;
       announce = note;
     } catch (e) {
@@ -313,7 +346,7 @@
   let frames: number[] = [];
   let lapseCaption = $state('');
   /** The time-lapse switched to grouping, adding each step's groups. */
-  let lapseGroups: Map<string, api.DiffGroup> | null = null;
+  let lapseGroups: Map<string, LiveGroup> | null = null;
   let wrap: HTMLDivElement | undefined = $state();
 
   function stopLapse() {
@@ -354,14 +387,13 @@
       }
       groups = null;
       diff = null;
+      listQuads = [];
+      context = new Map();
+      contextFor = '';
       note = '';
     }
     playing = true;
     void nextStep();
-  }
-
-  function groupKey(g: api.DiffGroup) {
-    return `${g.subjectClass}|${g.predicate}|${JSON.stringify(g.object)}`;
   }
 
   async function nextStep() {
@@ -410,6 +442,7 @@
         } else {
           const t1 = performance.now();
           canvas = r.canvas;
+          listQuads = d.quads ?? [];
           await frame();
           frameMs = performance.now() - t1;
           frameMax = Math.max(frameMax, frameMs);
@@ -443,20 +476,14 @@
         });
         inFlight--;
         commit = g.to.commit;
-        for (const x of g.groups) {
-          const k = groupKey(x);
-          const have = lapseGroups.get(k);
-          lapseGroups.set(
-            k,
-            have
-              ? { ...have, added: have.added + x.added, removed: have.removed + x.removed }
-              : { ...x },
-          );
-        }
+        const next = lapseGroupsStep(lapseGroups, g.groups, keepGhosts);
+        lapseGroups = next.live;
+        listQuads = [];
         groups = {
           ...g,
-          groups: [...lapseGroups.values()],
-          groupCount: lapseGroups.size,
+          groups: next.groups,
+          groupCount: next.groups.length,
+          // the running totals since the start, for the caption
           added: (groups?.added ?? canvas.added) + g.added,
           removed: (groups?.removed ?? canvas.removed) + g.removed,
         };
@@ -549,7 +576,7 @@
   }
 
   $effect(() => {
-    if (showContext && diff && !context.size && !grouped) {
+    if (showContext && diff && !grouped && !playing && contextFor !== diffKey(diff)) {
       const c = new AbortController();
       untrack(() => void readContext(c.signal).catch(() => {}));
       return () => c.abort();
@@ -564,9 +591,7 @@
     ctl?.abort();
   });
 
-  const rows = $derived(
-    members || !grouped ? changeRows(diff?.quads ?? []).slice(0, STEP_QUADS) : [],
-  );
+  const rows = $derived(members || !grouped ? changeRows(listQuads).slice(0, STEP_QUADS) : []);
   const emptyChanges = $derived(!loading && !error && head && total === 0);
 
   function selectNode(id: string | null) {

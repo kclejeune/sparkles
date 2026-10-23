@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ClassProfile, DiffGroup, GroupedDiff } from './api';
-import { applyOverviewChanges, classLevel, overviewChanges } from './overview';
+import { applyOverviewChanges, classLevel, overviewChanges, withRemoved } from './overview';
 
 const EX = 'http://example.org/';
 const T = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -97,5 +97,40 @@ describe('the overview through time', () => {
     expect(again.edges.map((e) => [e.key, e.count])).toEqual(
       base.edges.map((e) => [e.key, e.count]),
     );
+  });
+});
+
+describe('a comparison that removes a class entirely', () => {
+  it('draws the class and its edge with no size, so their marks show', () => {
+    const at = classLevel([profile('Org', 1)]);
+    const c = overviewChanges(
+      grouped([
+        {
+          subjectClass: `${EX}Person`,
+          predicate: T,
+          object: { class: `${EX}Person` },
+          added: 0,
+          removed: 1,
+        },
+        {
+          subjectClass: `${EX}Person`,
+          predicate: `${EX}worksFor`,
+          object: { class: `${EX}Org` },
+          added: 0,
+          removed: 1,
+        },
+      ]),
+    );
+    const g = withRemoved(at, c);
+    expect(g.nodes.map((n) => [n.key, n.size])).toEqual([
+      [`c:${EX}Org`, 1],
+      [`c:${EX}Person`, 0],
+    ]);
+    expect(g.edges.map((e) => [e.key, e.count])).toEqual([[`c:${EX}Person\u0001c:${EX}Org`, 0]]);
+    // nothing removed entirely: nothing added
+    expect(withRemoved(at, overviewChanges(grouped([])))).toEqual({
+      nodes: at.nodes,
+      edges: at.edges,
+    });
   });
 });

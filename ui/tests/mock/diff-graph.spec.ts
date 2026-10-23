@@ -257,6 +257,33 @@ test('the overview plays a time-lapse from grouped diffs with its positions held
   await expect(slider).toHaveCount(0);
 });
 
+test('the list follows the time-lapse, and moving the range starts it again', async ({ page }) => {
+  await page.goto(diffUrl(3, 0));
+  await expect.poll(async () => (await drawn(page)).nodes.length).toBeGreaterThan(0);
+  await view(page).getByRole('combobox', { name: 'Steps a second' }).selectOption('10');
+  await view(page).getByRole('button', { name: 'Play the time-lapse' }).click();
+  await expect(view(page).getByText(/^step \d\/3$/)).toHaveText('step 3/3');
+  await expect(view(page).getByRole('button', { name: 'Play the time-lapse' })).toBeVisible();
+  // the list shows the last step's changes, not the range's
+  await page.keyboard.press('l');
+  const list = view(page).getByRole('region', { name: 'Changes' });
+  await expect(list.locator('tbody tr')).toHaveCount(2);
+  await expect(list).toContainText('carol');
+  await page.keyboard.press('l');
+  // what earlier steps drew stays: Alice's name from commit 1
+  expect((await drawn(page)).nodes.map(([l]) => l)).toContain('Alice');
+  // a new range plays from its own first commit
+  await page.keyboard.press('ArrowRight');
+  await expect(view(page)).toContainText('commit 1 → 4');
+  const asked: string[] = [];
+  page.on('request', (r) => {
+    if (/\/chrono4\/diff\?/.test(r.url())) asked.push(decodeURIComponent(r.url()));
+  });
+  await view(page).getByRole('button', { name: 'Play the time-lapse' }).click();
+  await expect(view(page).getByText(/^step \d\/3$/)).toHaveText('step 3/3', { timeout: 30_000 });
+  expect(asked[0]).toContain('from=commit:1');
+});
+
 test('a write receipt on the query page shows the write on the graph', async ({ page }) => {
   await page.goto('/ui/query');
   const editor = page.locator('.cm-content');
