@@ -931,7 +931,8 @@ above a Cartesian product of 62,956 and 2,474 rows materializes the product, whi
 same product without the filter streams. At sixteen clients, q2 instances of about
 450 MB each queue for the pool and some exceed the admission wait. The `503` carries
 `Retry-After` even when the request is larger than the whole pool and cannot succeed on
-retry. [Roadmap](ROADMAP.md) item 96 covers both. QLever's driver failed with a refused
+retry. [Roadmap](ROADMAP.md) item 96 has since fixed both, as described after the
+table, and the driver cells have not been rerun. QLever's driver failed with a refused
 connection at one client and HTTP 500 at four and sixteen clients. Jena and Oxigraph
 timed out at every client count.
 
@@ -945,6 +946,24 @@ Fluree alone completed two driver cells. Their result-count check has no success
 competing engine to compare, and its fixed q2, q3, q6, q7 and q8 answers disagree.
 Its QMpH figures are observations and are not ranked. No throughput winner is
 established by this run.
+
+Roadmap item 96 was measured on forge on 2026-10-23 on the same 10M store, with the
+release binaries of 6192b8ad before the change and 933b7f4e after it, each alone under
+the default 5.2 GiB pool. With automatic execution, q4 with ProductType6 answered `503`
+in 0.2 s before the change. After it, the query streams and answers in 15.1 s with a
+peak resident size of 282 MB. Under a 12 GiB pool, the same query took 17.0 s and 8.3 GB
+before the change and 15.05 s and 287 MB after it, and forced eager execution took
+17.7 s and 8.3 GB. All of the answers are identical. A request larger than the whole pool
+now answers `507` without `Retry-After`.
+
+The 24 fixed instances were timed in rounds of A, B, B and A, five times after one
+warm-up per round. q1 to q5, q7 and q8 stayed within 5% of the previous median, apart from
+the 6 to 12 ms instances of q1 and q8, which moved by up to 12% in both directions. The
+first run put q6 between 17% and 48% slower. A second run of q6 alone, in eight
+alternating rounds of 30 samples, measured the three instances at 0.96, 0.87 and 1.12
+times the previous medians with the same minima. Those instances take 10 to 20 ms, close
+to the 10 ms limit below which a query runs on the thread that received it, so their
+samples split between two modes and their medians move between runs.
 
 ### Full-text search
 
