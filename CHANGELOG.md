@@ -4,6 +4,21 @@
 
 ### Changed
 
+The reasoner's limit of 50 million inferred triples is now a setting. `sparkles infer
+--max-inferred N`, `serve --reason-max-inferred N`, the `maxInferred` field, form field
+or query parameter of `POST /$/reason/{ds}`, `ReasonRequest::max_inferred`, Python's
+`max_inferred=`, Node's `maxInferred` and the JVM's `ReasonOptions.maxInferred` set it,
+and 0 removes it. A request may only lower the server's limit, and a higher one is
+refused with `400`. A run past its limit now fails with the error code `inferred-limit`
+instead of an invalid-input error, so Python raises `SparklesError` with that code where
+it raised `InvalidInputError`, and the message names the rule that produced the most
+candidates and the settings that raise the limit.
+
+The `small` memory profile no longer slows cold lookups. A prefetch request may add an
+eighth of the block cache, but at least 64 MiB or a quarter of the cache, whichever is
+smaller, so the profile's 256 MiB cache admits the parallel decode that a cold
+`star-lookup` at 10.5M needs. Caches of 512 MiB and more keep the eighth.
+
 Group commit now covers datasets with a full-text, spatial or embedding index, which used
 to take the ordinary path. On a Namespace instance whose synchronizations were slowed to
 4 ms each, four writers on such a dataset committed about twice as fast and sixteen
