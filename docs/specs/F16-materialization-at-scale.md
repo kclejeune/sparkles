@@ -1337,3 +1337,122 @@ bulk threshold. `checked` in the report of an incremental run now depends on the
 count, since the chunks of a round do not share what they learn, and no test proves that
 the parallel round search runs. The answers are checked against a scan only with one input
 graph.
+
+**Second pass of item 87 (2026-10-23).** Profiles of the first change on LUBM-style data
+with 100 universities found five costs. The reads of the base tier decoded whole blocks of
+32,768 rows for a few rows each. The insertion gave each binding of a split plan step a work
+item and an evaluation of its own for each share of its candidates. A few lookups of the
+backward search without a bound subject, such as the members of `Person`, scanned up to 1.1
+million rows of the inferred graph, whose quads share the input graphs' permutations. The
+merges probed their candidates in the base tier on one thread, through whole blocks, and
+counted predicates by decoding the blocks at both ends of their ranges. Writing the changes
+checked each candidate against the store one after another. The work changes each of them,
+and two smaller costs that the measurements on forge then showed.
+
+* On a segmented generation, a read of a few rows of a block that no reader holds whole
+  decodes the 2,048-row segments that can hold them. Scans, probes, sorted probes and the
+  cuts of a scan into shares use the segments, and a cut needs no read at all.
+* A binding whose candidates at the split step fit one block and one chunk joins a batch of
+  at least eight consecutive bindings that one work item evaluates in turn. Only bindings
+  with many candidates keep a work item per share. The items keep the order of a sequential
+  evaluation.
+* When the backward search reaches an atom whose base-tier range spans several blocks, it
+  reads up to 64 in-memory candidates first, then the base tier, then the other candidates.
+  A search that stops at its first proof rarely starts the long scan. The bound keeps a
+  search from exploring a large derived relation before the explicit fact that proves its
+  target, which a review showed can cost one scan per derived fact.
+* Sorted probes run in parallel in runs of at least 64 triples. Predicate counts come from
+  the generation's statistics. A merge counts each predicate-object pair of its candidates
+  once, in parallel, in a list charged to the run's budget and dropped with the merge.
+* Writing the changes checks at least 256 distinct candidates against the snapshot in
+  parallel when the transaction has no writes yet.
+* A backward search lends one memo of blocks to its evaluations in turn, where each
+  evaluation started with an empty one, and drops it when its chunk or round ends. The block
+  cache counts the hits of a read once, where it added each column's hit to one shared
+  counter that every thread contended on.
+
+Lending the memo without the change to the hit counter measured no difference on the
+Namespace instance, which cannot resolve a change of a millisecond or two. Forge measured the
+two together, below.
+
+**Outcome of the second pass.** The runs repeat the `keep` measurement on forge, an Intel
+Core i5-13500, on 2026-10-23, with LUBM-style data with 100 universities, 13.1 million
+triples, in index format 2, the one format that `a6179e58` reads. The builds ran one at a
+time under the bench lock, on a fresh copy of the dataset, in an order that rotated from
+round to round. The first table compares `a6179e58`, before the follow-up, with this work at
+`534a7ad3` over six rounds at 16 threads, and gives `7334e3db`, the first pass of item 87,
+from three rounds of an earlier batch. The table gives the median and the range. These are
+development A/B measurements on the benchmark host, not published benchmarks. A generation
+in format 2 has no segments, so the segment reads took no part in these runs, and they were
+not measured on their own. The other changes made the difference.
+
+| Run, 16 threads, 1,000 changes | Before the follow-up | First pass | Second pass |
+|---|---|---|---|
+| RDFS, change | 17.5 ms, 17 to 20 | 36 ms, 32 to 37 | 19 ms, 18 to 21 |
+| RDFS, undo | 13 ms, 12 to 21 | 16 ms, 15 to 19 | 14.5 ms, 13 to 27 |
+| RDFS, change again | 15 ms, 13 to 23 | 13 ms, 12 to 14 | 13.5 ms, 11 to 18 |
+| OWL 2 RL, change | 37 ms, 35 to 46 | 104 ms, 101 to 108 | 43.5 ms, 37 to 50 |
+| OWL 2 RL, undo | 43 ms, 42 to 43 | 51 ms, 50 to 51 | 48.5 ms, 42 to 75 |
+| OWL 2 RL, change again | 26 ms, 25 to 38 | 44 ms, 43 to 44 | 26 ms, 24 to 35 |
+| RDFS, peak heap of the change | 462 MiB | 24 to 28 MiB | 13 to 16 MiB |
+| OWL 2 RL, peak heap of the change | 594 MiB | 35 to 45 MiB | 16 to 23 MiB |
+| RDFS, full run | 16.0 s | 14.4 s | 14.8 s |
+| OWL 2 RL, full run | 21.9 s | 20.1 s | 20.9 s |
+| RDFS, change read back from the dataset | 5.77 s | 3.77 s | 3.46 s |
+| OWL 2 RL, change read back from the dataset | 4.38 s | 2.55 s | 1.94 s |
+
+The goal is met. By the medians, the changes take 0.90 to 1.09 times their time before the
+follow-up for RDFS and 1.00 to 1.18 times for OWL 2 RL, at most 1.2 times in every row, and
+the kept closure stays at 927 MiB for RDFS and 1,244 MiB for OWL 2 RL, 41% and 47% of the
+closure that held the explicit facts. `0188dc48`, the second pass without the memo and the
+counter, took 1.22 times for the OWL 2 RL change and 1.28 times for its undo in the same six
+rounds. Each build had single slow runs, such as 27 ms for the RDFS undo and 75 ms for the
+OWL 2 RL undo of the second pass, so the medians decide. The second pass adds no memory
+beyond a memo of at most eight blocks per search while its chunk runs, and the peak heap of
+a change fell. Full runs of `0188dc48` measured 1.5% slower for RDFS and 2.5% for OWL 2 RL
+than the first pass in the batch that ran both, close to the spread between batches, and
+they stay faster than before the follow-up.
+
+The runs at other sizes and at 1 thread measured `0188dc48`, the commit before the memo and
+the counter, against `a6179e58` on forge, in two rounds for the sizes and three for 1 thread.
+The memo and the counter change only the backward search, so the times of the deletion
+rounds may now be lower than these.
+
+| Run | Before the follow-up | `0188dc48` |
+|---|---|---|
+| RDFS, 1 change, 16 threads | 1 to 2.5 ms | 1 to 2 ms |
+| OWL 2 RL, 1 change, 16 threads | 2 to 5.5 ms | 2.5 to 4.5 ms |
+| RDFS, 100 changes, 16 threads, change, undo, again | 7, 3, 4 ms | 14, 5.5, 3 ms |
+| OWL 2 RL, 100 changes, 16 threads, change, undo, again | 13, 8.5, 6 ms | 21.5, 19.5, 10 ms |
+| RDFS, 10,000 changes, 16 threads, change, undo, again | 119, 115, 120.5 ms | 106, 106, 99 ms |
+| OWL 2 RL, 10,000 changes, 16 threads, change, undo, again | 233.5, 389.5, 220.5 ms | 247, 417.5, 217 ms |
+| RDFS, 1,000 changes, 1 thread, change, undo, again | 185, 14, 15 ms | 40, 18, 15 ms |
+| OWL 2 RL, 1,000 changes, 1 thread, change, undo, again | 249, 47, 29 ms | 79, 76, 33 ms |
+| RDFS, 100 changes, 1 thread, change | 185 ms | 30.5 ms |
+| OWL 2 RL, 100 changes, 1 thread, change | 216.5 ms | 42 ms |
+| RDFS, 10,000 changes, 1 thread, change, undo, again | 300.5, 119, 124 ms | 294, 182.5, 134 ms |
+| OWL 2 RL, 10,000 changes, 1 thread, change, undo, again | 452, 418.5, 235 ms | 443.5, 745.5, 301.5 ms |
+
+The first change is much faster than before the follow-up at 1 thread at every size, because
+the kept closure no longer copies the input graphs into memory. Changes of 10,000 triples at
+16 threads take about their time before the follow-up. Two costs remain outside the goal.
+Changes of 100 triples at 16 threads take 1.6 to 2.3 times their time before the follow-up,
+a few milliseconds, except the RDFS change made again. Undos at 1 thread take 1.3 to 1.8
+times, and the OWL 2 RL change of 10,000 triples made again takes 1.3 times. A lookup of the backward
+search that the remembered answers cannot serve reads a decoded block of the store, or
+decodes a segment the first time, where it probed an in-memory table before the follow-up.
+Small changes have too few searches to spread those reads over 16 threads, and at 1 thread
+nothing spreads them. Closing those gaps would take an in-memory index of the input facts
+that the searches touch, which costs memory that the follow-up gave up.
+[ROADMAP](../ROADMAP.md) item 101 records them, and item 87 is done.
+
+The tests cover the new paths. `segment_reads_match_whole_blocks` in `facts.rs` reads a
+segmented generation through every pattern of bound positions, with and without remembered
+lookups, cut into shares of 1, 100 and 4,096 rows, and probes it in sorted runs.
+`closure_kept_over_a_segmented_generation` in `tests/incremental.rs` keeps a closure over
+a segmented generation through random deletions and additions for RDFS and OWL 2 RL at 1 and
+6 threads. `backward_search_reaches_an_explicit_proof_past_many_derived_rows` fails with the
+derived rows read first without a bound, at 80,003 scans of the input graphs, and passes with
+the bound. The reviews found an uncharged table of predicate-object answers, the unbounded
+order of rows-first, a pair list whose capacity passed its charge and memos kept until a
+round ended, and each is fixed.
