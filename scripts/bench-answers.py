@@ -23,6 +23,10 @@ things for <engine> under <query-name> in <answers.json>:
 
 Solutions are compared as multisets over variables sorted by name, since ORDER BY ties
 may be broken differently and engines list the result variables in different orders.
+With `ANSWERS_RAW_DIR` set, the response body is also kept as `<query-name>.<engine>.json`
+(or `.nt` for a graph) in that directory, so that a disagreement can be examined value by
+value. The fingerprints do not depend on it.
+
 `--count-only` records just the row count, for LIMIT-without-ORDER probes whose
 solutions are legitimately engine-dependent. A failed request records `error`.
 
@@ -639,8 +643,15 @@ def main():
                      "Content-Type": "application/x-www-form-urlencoded"})
 
     max_time = float(os.environ.get("MAX_TIME", "300"))
+    raw_dir = os.environ.get("ANSWERS_RAW_DIR")
     try:
         body = fetch(request(query), max_time)
+        if raw_dir:
+            # the whole response, for a later look at a disagreement the digests only detect
+            os.makedirs(raw_dir, exist_ok=True)
+            ext = "nt" if graph else "json"
+            with open(os.path.join(raw_dir, f"{name}.{engine}.{ext}"), "wb") as f:
+                f.write(body)
         if graph:
             rec = graph_record(body.decode(), count_only, no_check)
         else:

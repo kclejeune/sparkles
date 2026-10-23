@@ -407,7 +407,7 @@ class RequestTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def answer(self, path, query, max_time="5"):
+    def answer(self, path, query, max_time="5", **env):
         qf = os.path.join(self.tmp.name, "q.rq")
         with open(qf, "w") as f:
             f.write(query)
@@ -415,7 +415,7 @@ class RequestTests(unittest.TestCase):
         port = self.server.server_address[1]
         t0 = time.monotonic()
         subprocess.run([sys.executable, PATH, f"127.0.0.1:{port}{path}", qf, out, "q", "e"],
-                       env=dict(os.environ, MAX_TIME=max_time), capture_output=True, text=True)
+                       env=dict(os.environ, MAX_TIME=max_time, **env), capture_output=True, text=True)
         with open(out) as f:
             return json.load(f)["q"]["e"], time.monotonic() - t0
 
@@ -450,6 +450,16 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(len(Handler.bodies), 2)
         self.assertIn("LIMIT+3", Handler.bodies[1][1])
         self.assertNotIn("boundary_probe", rec)
+
+    def test_raw_responses_are_kept_on_request(self):
+        raw = os.path.join(self.tmp.name, "raw")
+        plain, _ = self.answer("/ok", "SELECT ?x { ?s ?p ?x }")
+        self.assertFalse(os.path.exists(raw))
+        kept, _ = self.answer("/ok", "SELECT ?x { ?s ?p ?x }", ANSWERS_RAW_DIR=raw)
+        self.assertEqual(plain, kept)
+        with open(os.path.join(raw, "q.e.json")) as f:
+            body = json.load(f)
+        self.assertEqual([b["x"]["value"] for b in body["results"]["bindings"]], ["2", "1"])
 
 
 if __name__ == "__main__":
