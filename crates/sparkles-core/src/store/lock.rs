@@ -7,11 +7,21 @@ use std::ops::Deref;
 /// forked child retains the same open file description before exec. Unlock that
 /// description explicitly when ownership ends, before File closes the descriptor.
 /// Copies made with `try_clone` are descriptors, not additional logical owners.
-pub(crate) struct ProcessLock(File);
+///
+/// A forked child shares the open file description and so the lock itself. Only the
+/// process that acquired the lock unlocks it, so a child that drops an inherited
+/// guard, such as a Python worker started with `fork`, leaves the parent's lock held.
+pub(crate) struct ProcessLock {
+    file: File,
+    owner: u32,
+}
 
 impl ProcessLock {
     pub(crate) fn from_locked_file(file: File) -> Self {
-        Self(file)
+        Self {
+            file,
+            owner: std::process::id(),
+        }
     }
 }
 
@@ -19,12 +29,14 @@ impl Deref for ProcessLock {
     type Target = File;
 
     fn deref(&self) -> &File {
-        &self.0
+        &self.file
     }
 }
 
 impl Drop for ProcessLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        if std::process::id() == self.owner {
+            let _ = self.file.unlock();
+        }
     }
 }

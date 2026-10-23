@@ -326,3 +326,30 @@ fn startup_needs_no_write_permission_on_the_parent() {
     std::fs::set_permissions(&parent, original).unwrap();
     drop(opened.unwrap());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_forked_child_dropping_the_guard_keeps_the_parents_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = lock_database(dir.path()).unwrap();
+    // A forked child shares the open file description, and with it the flock. Its
+    // guard is a copy of the parent's ownership, not a logical owner of its own.
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        // Only async-signal-safe work happens in the child: the guard's Drop is an
+        // unlock and a close, followed by _exit without unwinding or atexit handlers.
+        let guard = std::mem::ManuallyDrop::new(unsafe { std::ptr::read(&guard) });
+        drop(std::mem::ManuallyDrop::into_inner(guard));
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    assert!(
+        matches!(lock_database(dir.path()), Err(Error::Locked { .. })),
+        "a forked child's drop released the parent's database lock"
+    );
+    drop(guard);
+    assert!(lock_database(dir.path()).is_ok());
+}
