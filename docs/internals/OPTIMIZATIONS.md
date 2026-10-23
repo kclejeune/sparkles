@@ -298,7 +298,7 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   on these candidate pairs, 64K pairs at a time, so the result and its bag multiplicity
   are the product's. SP²Bench `q6` links its OPTIONAL to the outer pattern only by
   `?author = ?author2`. At 10M triples the product has 1.58 × 10¹² rows, while the
-  candidate pairs number about 10.7 million. EXPLAIN notes `[keyed on ?a = ?b: N
+  candidate pairs number 7.4 million. EXPLAIN notes `[keyed on ?a = ?b: N
   candidate pairs]`.
 * **Flat hash joins** (`flat_hash_join`). A hash join groups the rows of its smaller input
   by key in flat arrays instead of a list per key. It counts each key's rows and then

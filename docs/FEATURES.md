@@ -89,6 +89,7 @@ Queries and updates follow the W3C recommendations and Jena ARQ's extensions, ch
 
 * SPARQL 1.1 Query: BGP, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries, GROUP BY and aggregates, ORDER BY, DISTINCT, LIMIT/OFFSET and EXISTS.
 * The planner moves an eligible small basic graph pattern into pure UNION branches so each branch can use its bindings when choosing its join order. A bounded screen checks repeated unbound scan relations and estimated ordinary work before allocating eligibility data. Further guards require shared anchor variables and keep hidden anchor columns on the ordinary path. It preserves duplicate solutions and FILTER scope, retains the ordinary plan for outer FILTERs, bounds both the anchor estimate and copied patterns, and chooses the cheaper estimated complete plan. This avoids enumerating unrelated coauthor walks in SP²Bench `q8` and `q12b` ([roadmap](ROADMAP.md) item 91).
+* An OPTIONAL whose sides share no variable, but whose condition has a conjunct `?a = ?b` with one variable from each side, pairs its rows through that equality instead of forming their product. IRIs and blank nodes meet only the same id, other values meet the other side's values of other kinds, and the whole condition is then tested on those candidates, so errors, unbound values and duplicates are kept. SP²Bench `q6` at 10M tests 7.4 million candidate pairs where its product had 1.6 × 10¹² rows ([internals](internals/OPTIMIZATIONS.md), [roadmap](ROADMAP.md) item 91).
 * RDF 1.2 and SPARQL 1.2 in every RDF syntax. This covers triple terms (`<<( s p o )>>`), the reification syntax `<< >>`, annotations, base-direction literals (`"x"@en--rtl`), and the functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`.
 * Property paths. `p*`, `p+` and `p?` run as a breadth-first search over the index, starting from the side the join input binds.
 * The value space: numeric promotion, comparisons, effective boolean values and the total order for ORDER BY.
@@ -383,10 +384,12 @@ that work by priority and links each item to its design spec.
   acceptance. Spatial and embedding acceptance also remain open. [Roadmap](ROADMAP.md) item 86 and
   [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates).
 * **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.
-  The bounded automatic ASK policy covers `q12a`, and string equality pruning lets
-  `q5a` answer at 10M within the default budgets. The remaining budget work is `q4`
-  memory use and the candidate product before the equality filter in `q6`. Reference
-  timings at 10M wait for the benchmark refresh. [Roadmap](ROADMAP.md) item 91.
+  The bounded automatic ASK policy covers `q12a`, string equality pruning lets `q5a`
+  answer at 10M within the default budgets, and keyed left joins do the same for `q6`.
+  An eager `q4` that outgrows the query memory pool runs again as a cursor without
+  spill. Its answer at 10M is 1.96 GB of TSV, which is more than the default response
+  budget of 1 GiB, so it answers only with a larger `--max-result-mb`. Jena stays
+  faster on `q12a` and Oxigraph on `q12b`. [Roadmap](ROADMAP.md) item 91.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Derived facts still use
   the ordinary inferred graph. A separate derived-fact layer and canonical

@@ -72,8 +72,9 @@ On larger and standard workloads:
   on `q2`.
 * **SP²Bench at 10M triples.** Sparkles answers 15 of 17 queries and is fastest on 13. It
   is the only engine that answers `q5a`, whose rows match an independent oracle. Jena is
-  12× faster on the ASK query `q12a` and Oxigraph 1.7× on `q12b`. The default query
-  memory budget still refuses `q4` and `q6`.
+  12× faster on the ASK query `q12a` and Oxigraph 1.7× on `q12b`. In this table the
+  default budgets refuse `q4` and `q6`. A later build answers `q6` in 0.95 s, and its `q4`
+  answer of 1.96 GB is larger than the default response budget.
 * **BSBM Explore at 10M triples.** Sparkles has the lowest pooled median on seven of the
   ten templates whose answers are checked. Fluree is 2.9× faster on q5, and Oxigraph is
   faster on q7 and q8. Fluree's driver throughput is two to three times Sparkles' in both
@@ -342,6 +343,25 @@ Two queries are losses. Jena answers the ASK query `q12a` in 6.2 ms, 12× faster
 Sparkles' 73.7 ms, and Oxigraph answers `q12b` in 4.2 ms against Sparkles' 7.2 ms
 ([roadmap](ROADMAP.md) item 91). On `q11` the unchecked times of QLever and Fluree, 42.8
 and 51.7 ms, are lower than Sparkles' 103.1 ms.
+
+A lane build of 2026-10-23 answers `q6` at 10M with the default budgets
+([roadmap](ROADMAP.md) item 91). Its OPTIONAL shares no variable with the outer pattern,
+and a keyed left join now pairs the rows through `?author = ?author2` and tests 7.4
+million candidate pairs instead of a product of 1.6 × 10¹² rows. Over two interleaved
+rounds of 10 runs on forge, under the same 12 GiB server cap, `q6` took a mean of 948 ms
+and returned 906,313 rows with the exact and value digests of Jena's answer. That is
+115× faster than Jena's 108.6 s. The other 15 queries stayed within 4% of the base
+build, `q5a` at 1.015 times and `q8` at 0.965 times its time.
+
+The same build no longer refuses `q4` for memory. Its eager join outgrew the 5,344 MiB
+query pool, and the query now runs again as a cursor without spill. Its answer has
+41,073,618 rows and 1,955,839,207 bytes of TSV, which is more than the default response
+budget of 1 GiB, so `q4` stays an error with the default settings. Single runs on one
+thread without the server cap and with `--max-result-mb 4096` show the effect of
+comparing stored strings without decoding them. A streamed answer took 30.4 s against
+62.2 s for the base build, and an eager answer took 16.3 s against 53.1 s. The sorted
+answers of both builds are identical, and at 1M they match Oxigraph's and an
+independent oracle's.
 
 Three corrections since the run of 2026-10-19 account for the changes. A planner
 correction moved the selective author pattern into eligible UNION branches before their
@@ -2599,7 +2619,6 @@ than 10%. Fluree's warm advantages on `distinct-obj` at 1.05M and on two small D
 | WatDiv `L1-1`, 10.97M | Fluree 1.11× | Sparkles has the lowest mean on 19 of 20 templates, ties Fluree on S7 and leads on 81 of 88 instances. |
 | BSBM Explore `q5`, `q7` and `q8`, 10M | Fluree 2.9× on `q5`, Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
 | BSBM BI `q2` and `q3`, 10M | QLever 11.2× on `q2` and 1.24× on `q3` | The three fixed-instance answer checks agree. The generated driver mix fails on a Sparkles budget refusal ([roadmap](ROADMAP.md) item 96). |
-| SP²Bench `q4` and `q6`, 10M | Jena answers `q6` in 108.6 s | The default query memory budget refuses both. Disk spill is off by default ([roadmap](ROADMAP.md) items 7 and 93). |
 | LUBM(100) `q2` | QLever 3.7× | Sparkles is fastest on 13 of 14 queries. |
 | Changed-store `two-hop-count`, 1.05M | Fluree 1.10× | Sparkles takes 8.6 ms against 7.8 ms with 5,000 changes in its delta, and 5.1 ms on the loaded store. |
 | Serial durable commits | Oxigraph 1.84× on literal inserts at 1.05M and 1.39× at 10.5M | The same durability difference. |
