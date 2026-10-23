@@ -1864,6 +1864,8 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::mcp::branches::metrics(&mut o);
     #[cfg(feature = "mcp")]
     crate::mcp::memory::pending::metrics(st, &mut o);
+    #[cfg(feature = "mcp")]
+    crate::graphrag::http::metrics(st, &mut o);
     io_metrics(&mut o);
     if let Some(rss) = resident_bytes() {
         family(

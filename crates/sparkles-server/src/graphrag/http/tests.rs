@@ -128,6 +128,13 @@ async fn a_build_runs_as_a_task_and_its_reports_can_be_read_and_reviewed() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
+    let (_, inbox) = call(&f.app, "GET", "/$/memory/org/inbox", None).await;
+    assert_eq!(inbox["communities"]["unreviewed"], 2, "{inbox}");
+    assert_eq!(
+        inbox["communities"]["reports"].as_array().map(Vec::len),
+        Some(2),
+        "{inbox}"
+    );
     // a status review
     let (s, r) = call(
         &f.app,
@@ -184,6 +191,26 @@ async fn a_build_runs_as_a_task_and_its_reports_can_be_read_and_reviewed() {
         new["iri"].as_str().unwrap(),
     ));
     assert_eq!(own.len(), 1);
+
+    // the inbox lists the report that waits, and the metrics count the statuses
+    let (s, inbox) = call(&f.app, "GET", "/$/memory/org/inbox", None).await;
+    assert_eq!(s, StatusCode::OK, "{inbox}");
+    let c = &inbox["communities"];
+    assert_eq!(c["available"], true, "{inbox}");
+    assert_eq!(
+        c["unreviewed"], 1,
+        "the other community still waits: {inbox}"
+    );
+    assert_eq!(c["anomalies"], json!([]), "{inbox}");
+    let m = crate::obs::render_prometheus(&f.st);
+    assert!(
+        m.contains("sparkles_graphrag_reports{dataset=\"org\",status=\"reviewed\"} 1"),
+        "{m}"
+    );
+    assert!(
+        m.contains("sparkles_graphrag_tokens_total{dataset=\"org\",phase=\"build\"}"),
+        "{m}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

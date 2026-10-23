@@ -5670,6 +5670,26 @@ export interface components {
             /** @description The id of the waiting task. */
             task: string;
         };
+        /** @description The community reports that wait for review, present when GraphRAG is enabled for the dataset. */
+        GraphragInbox: {
+            /** @description For a dataset admin only. */
+            anomalies?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Whether the caller may read the reports graph. When it is `false`, nothing else derived from the reports is listed. */
+            available: boolean;
+            /** @description Up to 50 unreviewed reports, highest rating first. */
+            reports?: {
+                community: string;
+                level?: number | null;
+                rating?: number | null;
+                report: string;
+                title?: string | null;
+            }[];
+            reportsGraph: string;
+            truncated?: boolean;
+            unreviewed?: number;
+        };
         /** @description A review of a community report. */
         GraphragReviewRequest: {
             /** @description The report's IRI. */
@@ -6110,6 +6130,7 @@ export interface components {
                 retracts?: number;
             }[];
             commit: number;
+            communities?: components["schemas"]["GraphragInbox"];
             dataset: string;
             /** @description Unreviewed facts plus open review branches. */
             open: number;

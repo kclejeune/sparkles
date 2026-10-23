@@ -841,6 +841,7 @@ fn review(put: &mut dyn FnMut(&str, J)) {
                     "open": with_desc(int(), "Unreviewed facts plus open review branches."),
                     "truncated": boolean(),
                     "prefixes": any_object("The prefixes the compact terms use."),
+                    "communities": sref("GraphragInbox"),
                 }),
             ),
             "Everything that waits for a person: unreviewed session facts with their signals, by session, and the open review branches.",
@@ -1848,6 +1849,30 @@ fn graphrag(put: &mut dyn FnMut(&str, J)) {
                 }),
             ),
             "A review of a community report.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragInbox",
+        doc(
+            obj(
+                &["reportsGraph", "available"],
+                json!({
+                    "reportsGraph": string(),
+                    "available": with_desc(boolean(), "Whether the caller may read the reports graph. When it is `false`, nothing else derived from the reports is listed."),
+                    "unreviewed": int(),
+                    "reports": with_desc(array(obj(&["community", "report"], json!({
+                        "community": string(),
+                        "report": string(),
+                        "title": or_null(string()),
+                        "rating": or_null(int()),
+                        "level": or_null(int()),
+                    }))), "Up to 50 unreviewed reports, highest rating first."),
+                    "truncated": boolean(),
+                    "anomalies": with_desc(array(any_object("An accounting anomaly.")), "For a dataset admin only."),
+                }),
+            ),
+            "The community reports that wait for review, present when GraphRAG is enabled for the dataset.",
             "graphrag",
         ),
     );

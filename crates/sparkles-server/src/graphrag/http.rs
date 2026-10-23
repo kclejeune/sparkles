@@ -775,5 +775,144 @@ fn revision_text(
     ))
 }
 
+/// The most unreviewed reports the inbox lists.
+const MAX_INBOX_REPORTS: usize = 50;
+
+/// The `communities` member of the review inbox (§2.3): the current unreviewed reports,
+/// for a caller for whom the reports graph is proven, and for a dataset admin the
+/// accounting anomalies (§3.5). `None` when GraphRAG is off for the dataset.
+pub(crate) fn inbox_member(st: &AppState, ds: &Dataset, p: &Principal) -> Option<Value> {
+    let s = settings_of(st, ds);
+    if !s.enabled {
+        return None;
+    }
+    let mut out = json!({ "reportsGraph": s.reports_graph });
+    if p.can(&ds.name, Level::Admin) {
+        let anomalies = match ds.store.root() {
+            Some(db) => super::ledger::DatasetLedger::open(db)
+                .map(|l| l.anomalies())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        out["anomalies"] = serde_json::to_value(anomalies).unwrap_or_default();
+    }
+    if !proven(ds, p, &s.reports_graph) {
+        out["available"] = false.into();
+        return Some(out);
+    }
+    out["available"] = true.into();
+    let graph = &s.reports_graph;
+    let opts = caller_options(ds, p);
+    let q = format!(
+        "SELECT ?c ?r ?title ?rating ?l WHERE {{ GRAPH <{graph}> {{ ?c <{report}> ?r ; <{level}> ?l . ?r <{status}> \"unreviewed\" . OPTIONAL {{ ?r <{label}> ?title }} OPTIONAL {{ ?r <{rating}> ?rating }} }} }} ORDER BY DESC(?rating) ?c LIMIT {}",
+        MAX_INBOX_REPORTS + 1,
+        report = gr("report"),
+        level = gr("level"),
+        status = gr("status"),
+        label = store::RDFS_LABEL,
+        rating = gr("rating"),
+    );
+    let mut list: Vec<Value> = rows(ds, &opts, &q)
+        .ok()?
+        .into_iter()
+        .map(|r| {
+            json!({
+                "community": iri(&r[0]),
+                "report": iri(&r[1]),
+                "title": lit(&r[2]),
+                "rating": int(&r[3]),
+                "level": int(&r[4]),
+            })
+        })
+        .collect();
+    let truncated = list.len() > MAX_INBOX_REPORTS;
+    list.truncate(MAX_INBOX_REPORTS);
+    let counts = statuses(ds, &opts, graph).ok()?;
+    out["unreviewed"] = counts.get("unreviewed").copied().unwrap_or(0).into();
+    out["reports"] = list.into();
+    out["truncated"] = truncated.into();
+    Some(out)
+}
+
+/// The metrics of §8: reports by status, tokens by phase, stale communities and
+/// accounting anomalies, as of the last build or review since the server started.
+pub fn metrics(st: &AppState, out: &mut String) {
+    use std::fmt::Write;
+    let figures = st.graphrag.figures();
+    if figures.is_empty() {
+        return;
+    }
+    let esc = |v: &str| {
+        v.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    };
+    let family = |o: &mut String, name: &str, kind: &str, help: &str| {
+        let _ = writeln!(o, "# HELP {name} {help}");
+        let _ = writeln!(o, "# TYPE {name} {kind}");
+    };
+    family(
+        out,
+        "sparkles_graphrag_reports",
+        "gauge",
+        "Current GraphRAG community reports by status, as of the last build or review.",
+    );
+    for (ds, f) in &figures {
+        for s in Status::ALL {
+            let n = f.reports.get(s.as_str()).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "sparkles_graphrag_reports{{dataset=\"{}\",status=\"{}\"}} {n}",
+                esc(ds),
+                s.as_str()
+            );
+        }
+    }
+    family(
+        out,
+        "sparkles_graphrag_tokens_total",
+        "counter",
+        "Tokens counted against GraphRAG budgets, by phase (build or refresh).",
+    );
+    for (ds, f) in &figures {
+        for phase in ["build", "refresh"] {
+            let n = f.tokens.get(phase).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "sparkles_graphrag_tokens_total{{dataset=\"{}\",phase=\"{phase}\"}} {n}",
+                esc(ds)
+            );
+        }
+    }
+    family(
+        out,
+        "sparkles_graphrag_stale_communities",
+        "gauge",
+        "Communities the last GraphRAG run left pending for a later one.",
+    );
+    for (ds, f) in &figures {
+        let _ = writeln!(
+            out,
+            "sparkles_graphrag_stale_communities{{dataset=\"{}\"}} {}",
+            esc(ds),
+            f.stale
+        );
+    }
+    family(
+        out,
+        "sparkles_graphrag_accounting_anomalies_total",
+        "counter",
+        "Model responses whose reported usage passed their reservation.",
+    );
+    for (ds, f) in &figures {
+        let _ = writeln!(
+            out,
+            "sparkles_graphrag_accounting_anomalies_total{{dataset=\"{}\"}} {}",
+            esc(ds),
+            f.anomalies
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests;

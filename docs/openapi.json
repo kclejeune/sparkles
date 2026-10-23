@@ -7851,6 +7851,90 @@
         ],
         "type": "object"
       },
+      "GraphragInbox": {
+        "description": "The community reports that wait for review, present when GraphRAG is enabled for the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "anomalies": {
+            "description": "For a dataset admin only.",
+            "items": {
+              "additionalProperties": true,
+              "description": "An accounting anomaly.",
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "available": {
+            "description": "Whether the caller may read the reports graph. When it is `false`, nothing else derived from the reports is listed.",
+            "type": "boolean"
+          },
+          "reports": {
+            "description": "Up to 50 unreviewed reports, highest rating first.",
+            "items": {
+              "properties": {
+                "community": {
+                  "type": "string"
+                },
+                "level": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "rating": {
+                  "oneOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "report": {
+                  "type": "string"
+                },
+                "title": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "community",
+                "report"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "reportsGraph": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "unreviewed": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "reportsGraph",
+          "available"
+        ],
+        "type": "object"
+      },
       "GraphragReviewRequest": {
         "additionalProperties": false,
         "description": "A review of a community report.",
@@ -9291,6 +9375,9 @@
           },
           "commit": {
             "type": "integer"
+          },
+          "communities": {
+            "$ref": "#/components/schemas/GraphragInbox"
           },
           "dataset": {
             "type": "string"

@@ -227,6 +227,10 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_embedding_backlog` | gauge. Subjects (per graph) waiting to be embedded, the status's `backlog`. | `dataset`, `index` |
 | `sparkles_embedding_lag_commits` | gauge. Commits since the newest one whose text is all embedded, which is `headSeq − appliedSeq` of the status. | `dataset`, `index` |
 | `sparkles_graphql_groups` | histogram (1 … 64). The fetch groups, which are SPARQL queries, that each GraphQL request ran. | `dataset` |
+| `sparkles_graphrag_reports` | gauge. A dataset's current [community reports](#graphrag) by status, as of the last build or review since the server started. | `dataset`, `status` = `unreviewed` \| `reviewed` \| `rejected` \| `stale` \| `failed` |
+| `sparkles_graphrag_tokens_total` | counter. Tokens counted against a dataset's GraphRAG budgets since the server started. | `dataset`, `phase` = `build` \| `refresh` |
+| `sparkles_graphrag_stale_communities` | gauge. The communities the last GraphRAG run left pending for a later one. | `dataset` |
+| `sparkles_graphrag_accounting_anomalies_total` | counter. Model responses whose reported usage passed their reservation, which stop a GraphRAG run. | `dataset` |
 | `sparkles_memory_review_pending` | gauge. The open items of a dataset's [memory review inbox](#open-review-items): unreviewed facts of kinds `session` and `import`, and open review branches of the other kinds, each branch counting once. Only datasets with memory settings report, with every kind. | `dataset`, `kind` = `session` \| `import` \| `consolidation` \| `ingest` \| `review` \| `inbox` \| `proposal` |
 | `sparkles_memory_review_oldest_seconds` | gauge. The age of the oldest open item of the kind, `0` when none is open. | `dataset`, `kind` |
 | `process_resident_memory_bytes` | gauge (Linux) | |
@@ -10617,6 +10621,14 @@ edit is a new report with status `reviewed` that copies the old report's finding
 citations, supersedes it with `prov:wasRevisionOf`, and is committed with the caller as
 its author. Builds and reviews write commits of kind `graphrag`, whose messages hold no
 report text.
+
+When GraphRAG is enabled for a dataset, the [review inbox](#review-inbox) gains a
+`communities` member. It lists up to 50 unreviewed reports for a caller who may read the
+reports graph, and the accounting anomalies for a dataset admin. The metrics
+`sparkles_graphrag_reports`, `sparkles_graphrag_tokens_total`,
+`sparkles_graphrag_stale_communities` and `sparkles_graphrag_accounting_anomalies_total`
+count reports, tokens, pending communities and anomalies per dataset. They hold the
+figures of the runs and reviews since the server started.
 
 ### Settings
 
