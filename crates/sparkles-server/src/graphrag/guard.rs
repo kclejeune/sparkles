@@ -46,6 +46,23 @@ pub fn path_in(db: &Path) -> PathBuf {
     db.join("graphrag").join("disclosure.json")
 }
 
+/// Serializes registry installs in the process.
+static INSTALLS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Create `dir` inside the database directory `db`, flushing `db` when `dir` is new so
+/// that a file written in it survives a power loss.
+pub(crate) fn create_dir_durably(db: &Path, dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    std::fs::File::open(db)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = db;
+    Ok(())
+}
+
 /// A graph set as the footprint keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
@@ -469,7 +486,10 @@ impl Registry {
     /// Add entries and write the registry durably: a new file, a flush and a rename.
     /// The registry on disk is read again first, so an entry written by another build
     /// is kept, and an unreadable registry refuses the install.
+    /// Installs are serialized in the process, so two cannot both read the old registry
+    /// and lose each other's entries.
     pub fn install(db: &Path, entries: Vec<Entry>) -> Result<Registry, RegistryError> {
+        let _serial = INSTALLS.lock();
         let mut r = Registry::load(db)?;
         for e in entries {
             if !r.entries.contains(&e) {
@@ -483,7 +503,7 @@ impl Registry {
         }
         let path = path_in(db);
         let dir = path.parent().expect("the registry has a directory");
-        std::fs::create_dir_all(dir)?;
+        create_dir_durably(db, dir)?;
         let tmp = dir.join("disclosure.json.tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
@@ -525,7 +545,9 @@ pub type Resolved = (uuid::Uuid, Option<PathBuf>);
 pub type Resolver = Box<dyn Fn(&str) -> Option<Resolved> + Send + Sync>;
 
 /// The registry file's length and modification time, which tell a changed file apart.
-type Stamp = Option<(u64, std::time::SystemTime)>;
+/// The registry file's size, modification time and, on Unix, inode. Every install
+/// renames a new file into place, so the inode changes even within one clock tick.
+type Stamp = Option<(u64, std::time::SystemTime, u64)>;
 
 struct Cached {
     id: uuid::Uuid,
@@ -552,7 +574,13 @@ impl std::fmt::Debug for Guard {
 
 fn stamp(db: &Path) -> Result<Stamp, std::io::Error> {
     match std::fs::metadata(path_in(db)) {
-        Ok(m) => Ok(Some((m.len(), m.modified()?))),
+        Ok(m) => {
+            #[cfg(unix)]
+            let ino = std::os::unix::fs::MetadataExt::ino(&m);
+            #[cfg(not(unix))]
+            let ino = 0;
+            Ok(Some((m.len(), m.modified()?, ino)))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -564,6 +592,15 @@ impl Guard {
             resolve,
             cache: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// The footprints the guard knows for `ds`, `None` when its registry is invalid.
+    #[cfg(test)]
+    fn footprints(&self, ds: &str) -> Option<usize> {
+        match self.known(ds) {
+            Known::Valid(m) => Some(m.values().map(Vec::len).sum()),
+            Known::Invalid => None,
         }
     }
 
@@ -607,7 +644,16 @@ impl Guard {
                 }
             },
         };
-        self.cache.write().insert(
+        let mut cache = self.cache.write();
+        // an install may have published a newer registry since the read above: an
+        // in-memory dataset's entry is never replaced by its initial empty registry
+        if root.is_none()
+            && let Some(c) = cache.get(ds)
+            && c.id == id
+        {
+            return c.known.clone();
+        }
+        cache.insert(
             ds.to_string(),
             Cached {
                 id,
@@ -627,6 +673,8 @@ impl Guard {
         match root {
             Some(db) => {
                 Registry::install(&db, entries)?;
+                // a reader that loaded the old file keeps its old stamp, so the next
+                // decision reads the new file
                 self.cache.write().remove(ds);
             }
             None => {

@@ -702,6 +702,9 @@ pub struct Principal {
     /// the disclosure guard of reports graphs (spec C22 §6); without one, no guarded
     /// graph is proven for a restricted view
     guard: Option<Arc<crate::graphrag::guard::Guard>>,
+    /// the server's access epoch read before this principal was authenticated, when the
+    /// policy decides its views; a long-lived read ends once the epoch moves (C22 §6.3)
+    epoch: Option<u64>,
 }
 
 impl std::fmt::Debug for Principal {
@@ -729,6 +732,7 @@ impl Principal {
             branch: None,
             hidden: None,
             guard: None,
+            epoch: None,
         });
         LOCAL.clone()
     }
@@ -743,14 +747,28 @@ impl Principal {
             branch: None,
             hidden: None,
             guard: None,
+            epoch: None,
         }
     }
 
     /// This principal with the server's disclosure guard, which proves guarded graphs
     /// for its restricted views.
-    pub fn with_guard(mut self, guard: Arc<crate::graphrag::guard::Guard>) -> Principal {
+    /// `epoch` is [`AppState::access_epoch`](crate::state::AppState::access_epoch) read
+    /// before the principal was authenticated.
+    pub fn with_guard(
+        mut self,
+        guard: Arc<crate::graphrag::guard::Guard>,
+        epoch: u64,
+    ) -> Principal {
         self.guard = Some(guard);
+        self.epoch = Some(epoch);
         self
+    }
+
+    /// The access epoch this principal's views were decided under, when a policy decides
+    /// them.
+    pub fn access_epoch(&self) -> Option<u64> {
+        self.epoch
     }
 
     pub fn with_info(mut self, info: PrincipalInfo) -> Principal {

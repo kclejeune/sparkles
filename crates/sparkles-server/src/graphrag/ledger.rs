@@ -89,7 +89,7 @@ impl LedgerFile {
     pub fn save(&self, db: &Path) -> std::io::Result<()> {
         let path = path_in(db);
         let dir = path.parent().expect("the ledger has a directory");
-        std::fs::create_dir_all(dir)?;
+        super::guard::create_dir_durably(db, dir)?;
         let tmp = dir.join("ledger.json.tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
@@ -158,14 +158,13 @@ impl DatasetLedger {
 }
 
 impl Persist for DatasetLedger {
+    /// The file's day always follows the latest day given, also when a write fails, so
+    /// a later write (of the day or of an anomaly) carries every settled usage. A failed
+    /// reservation's rollback is written the same way, so the file never under-counts.
     fn day(&self, d: &DayLedger) -> Result<(), String> {
         let mut f = self.file.lock();
-        let before = f.day;
         f.day = *d;
-        f.save(&self.db).map_err(|e| {
-            f.day = before;
-            e.to_string()
-        })
+        f.save(&self.db).map_err(|e| e.to_string())
     }
 
     fn anomaly(&self, a: &Anomaly) {
@@ -236,6 +235,24 @@ mod tests {
         assert!(e.contains("ledger"), "{e}");
         assert_eq!(dl.day.lock().used, 0, "nothing stays reserved");
         assert_eq!(l.build_used(), 0);
+    }
+
+    /// An overrun whose day write fails is still on disk after the next write.
+    #[test]
+    fn a_failed_day_write_is_carried_by_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let dl = DatasetLedger::open(dir.path()).unwrap();
+        let l = Ledger::new(1_000, 1_000, dl.day.clone(), || 4).persisted(dl.clone());
+        let day = l.reserve_for_test(100).unwrap();
+        // a directory where the temporary file goes makes the next writes fail
+        let tmp = dir.path().join("graphrag").join("ledger.json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        l.settle_for_test(100, day, 150);
+        assert_eq!(LedgerFile::load(dir.path()).unwrap().day.used, 100);
+        std::fs::remove_dir(&tmp).unwrap();
+        dl.anomaly(&anomaly(1));
+        let back = LedgerFile::load(dir.path()).unwrap();
+        assert_eq!(back.day, DayLedger { day: 4, used: 150 });
     }
 
     #[test]

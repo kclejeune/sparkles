@@ -606,6 +606,16 @@ fn guard_for(catalog: &sparkles::Catalog) -> Arc<crate::graphrag::guard::Guard> 
 }
 
 impl AppState {
+    /// Moves whenever the access policy is reloaded or a disclosure registry gains an
+    /// entry (spec C22 §6.3). Both counters only grow, so their sum moves when either does.
+    pub fn access_epoch(&self) -> u64 {
+        #[cfg(feature = "auth")]
+        let policy = self.auth.as_ref().map_or(0, |a| a.epoch());
+        #[cfg(not(feature = "auth"))]
+        let policy = 0;
+        self.graphrag_guard.epoch() + policy
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         data_dir: &Path,

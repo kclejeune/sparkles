@@ -1014,6 +1014,8 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .extensions()
         .get::<crate::ratelimit::ClientAddr>()
         .map(|c| c.0.network());
+    // read before the policy is, so a reload during authentication ends long-lived reads
+    let epoch = st.access_epoch();
     let authed = match auth
         .authenticate(
             req.headers(),
@@ -1113,7 +1115,7 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
     let p = authed
         .principal
         .on_branch(branch.as_deref())
-        .with_guard(st.graphrag_guard.clone());
+        .with_guard(st.graphrag_guard.clone(), epoch);
     let clear = authed.clear_cookie.then(|| {
         auth.cookie_mode(req.headers())
             .set(super::SESSION_COOKIE, "", 0)

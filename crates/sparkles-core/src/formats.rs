@@ -584,6 +584,12 @@ pub const SETTINGS: &[SettingsFile] = &[
 /// otherwise. A newer version of one of them never refuses a dataset.
 pub const INFORMATIONAL_SETTINGS: &[&str] = &["origin.json", "restore.json"];
 
+/// Dataset settings files whose own reader confines a refusal to what the file
+/// describes. A newer version of one of them never refuses the dataset. The GraphRAG
+/// disclosure registry is one: a registry this build cannot read leaves every reports
+/// graph without a valid footprint, so restricted readers lose those graphs only.
+pub const CONFINED_SETTINGS: &[&str] = &["graphrag/disclosure.json"];
+
 /// Whether `name` is one of the [`INFORMATIONAL_SETTINGS`].
 pub fn informational(name: &str) -> bool {
     INFORMATIONAL_SETTINGS.contains(&name)
@@ -640,10 +646,9 @@ pub(crate) fn check_dataset_tree(root: &std::path::Path) -> Result<()> {
 /// gives an error that names the directory and keeps its variant.
 pub fn dataset_dir_refusals(dir: &std::path::Path) -> Vec<Error> {
     let mut out = Vec::new();
-    for s in SETTINGS
-        .iter()
-        .filter(|s| s.scope == Scope::Dataset && !informational(s.name))
-    {
+    for s in SETTINGS.iter().filter(|s| {
+        s.scope == Scope::Dataset && !informational(s.name) && !CONFINED_SETTINGS.contains(&s.name)
+    }) {
         let bytes = match std::fs::read(dir.join(s.name)) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -913,6 +918,28 @@ mod tests {
             .to_string();
         assert!(e.contains("format 9") && e.contains("newer release"), "{e}");
         assert!(settings_from_slice::<serde_json::Value>(name, br#"{"format": "x"}"#).is_err());
+    }
+
+    /// A newer disclosure registry hides reports graphs, never the dataset (C22 §6.2).
+    #[test]
+    fn confined_files_never_refuse_the_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graphrag")).unwrap();
+        std::fs::write(
+            dir.path().join("graphrag/disclosure.json"),
+            br#"{"version": 2, "entries": []}"#,
+        )
+        .unwrap();
+        assert!(check_dataset_dir(dir.path()).is_ok());
+        std::fs::write(
+            dir.path().join("graphrag/ledger.json"),
+            br#"{"version": 2}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            check_dataset_dir(dir.path()),
+            Err(Error::Unsupported(_))
+        ));
     }
 }
 

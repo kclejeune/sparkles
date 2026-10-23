@@ -400,13 +400,37 @@ async fn streams_end_when_access_changes() {
     let mut other = entry.clone();
     other.footprint.source_commit += 1;
     s.state.graphrag_guard.install("rag", vec![other]).unwrap();
-    update_as(&s.app, "rag", &b("tadmin"), &up(3)).await;
-    loop {
-        let (event, data) = next(&mut body, &mut buf).await;
-        if event == "error" {
-            assert!(data.contains("access-changed"), "{data}");
-            break;
-        }
-        assert_eq!(event, "commit");
-    }
+    // the second commit of the page read before the install is dropped
+    let (event, data) = next(&mut body, &mut buf).await;
+    assert_eq!(event, "error", "{data}");
+    assert!(data.contains("access-changed"), "{data}");
+}
+
+/// A long poll that waited across a policy reload answers `access-changed` instead of
+/// reading under the old view (§6.3).
+#[tokio::test]
+async fn long_polls_end_when_access_changes() {
+    let s = server_with(false);
+    let app = s.app.clone();
+    let poll = tokio::spawn(async move {
+        get(
+            &app,
+            "tlift",
+            "/rag/changes?after=1&wait=10",
+            "application/json",
+        )
+        .await
+    });
+    // let the poll start waiting
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.write_config(&s.fixture);
+    s.auth().reload().unwrap();
+    let up = "INSERT DATA { GRAPH <urn:g:a> { <http://ex/n> <http://ex/p> 1 } }";
+    update_as(&s.app, "rag", &b("tadmin"), up).await;
+    let r = tokio::time::timeout(Duration::from_secs(10), poll)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
+    assert_eq!(r.err()["code"], "access-changed");
 }

@@ -204,14 +204,25 @@ pub(super) async fn changes(
         graphs,
     };
     let restricted = ask.graphs.is_some();
+    let epoch = p.access_epoch();
     if sse {
-        return Ok(event_stream(st, ds, ask, fmt).into_response());
+        return Ok(event_stream(st, ds, ask, fmt, epoch).into_response());
     }
     // subscribe before reading, so a commit made in between wakes the wait
     let mut rx = ds.store.subscribe_commits();
     let mut p = page(&ds, &ask).await?;
     if p.commits.is_empty() && !wait.is_zero() {
         wait_for_commit(&st, &ds, &mut rx, after, Instant::now() + wait).await;
+        // the view was decided before the wait (spec C22 §6.3)
+        if epoch.is_some_and(|e| e != st.access_epoch()) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": "the access policy or a disclosure registry changed; ask again to read under the new rules",
+                    "code": "access-changed",
+                }),
+            ));
+        }
         p = page(&ds, &ask).await?;
     }
     let id = ds.store.dataset_id();
@@ -319,9 +330,9 @@ struct Feed {
     queue: std::collections::VecDeque<Event>,
     until: Instant,
     done: bool,
-    /// the guard's epoch when the stream started: a new policy or disclosure registry
-    /// ends the stream before it reads another page (spec C22 §6.3)
-    epoch: u64,
+    /// the access epoch the caller's view was decided under: a new policy or disclosure
+    /// registry ends the stream before it sends another event (spec C22 §6.3)
+    epoch: Option<u64>,
 }
 
 impl Feed {
@@ -343,17 +354,10 @@ impl Feed {
     /// The next event, waiting for commits; `None` when the stream ends.
     async fn next(mut self) -> Option<(Result<Event, std::convert::Infallible>, Feed)> {
         loop {
-            if let Some(e) = self.queue.pop_front() {
-                return Some((Ok(e), self));
-            }
-            if self.done
-                || Instant::now() >= self.until
-                || self.st.phase() == crate::obs::Phase::Draining
-            {
-                return None;
-            }
-            if access_epoch(&self.st) != self.epoch {
+            // checked before every event, so events read under the old view are dropped
+            if !self.done && self.epoch.is_some_and(|e| e != self.st.access_epoch()) {
                 self.done = true;
+                self.queue.clear();
                 return Some((
                     Ok(Event::default().event("error").data(
                         json!({
@@ -364,6 +368,15 @@ impl Feed {
                     )),
                     self,
                 ));
+            }
+            if let Some(e) = self.queue.pop_front() {
+                return Some((Ok(e), self));
+            }
+            if self.done
+                || Instant::now() >= self.until
+                || self.st.phase() == crate::obs::Phase::Draining
+            {
+                return None;
             }
             match page(&self.ds, &self.ask).await {
                 Ok(p) if p.commits.is_empty() => {
@@ -403,19 +416,13 @@ impl Feed {
     }
 }
 
-/// Changes whenever the access policy is reloaded or a disclosure registry gains an
-/// entry. Both counters only grow, so their sum changes when either does.
-fn access_epoch(st: &AppState) -> u64 {
-    st.graphrag_guard.epoch() + st.auth.as_ref().map_or(0, |a| a.epoch())
-}
-
 fn event_stream(
     st: Arc<AppState>,
     ds: Arc<Dataset>,
     ask: Ask,
     fmt: DiffFormat,
+    epoch: Option<u64>,
 ) -> impl IntoResponse {
-    let epoch = access_epoch(&st);
     let feed = Feed {
         rx: ds.store.subscribe_commits(),
         st,

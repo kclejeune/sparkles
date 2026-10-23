@@ -280,6 +280,28 @@ impl Ledger {
             .map_err(|r| r.into_call_error().to_string())
     }
 
+    /// [`Ledger::settle`] of a reservation made today, for other modules' tests.
+    #[cfg(test)]
+    pub fn settle_for_test(&self, reserved: u64, day: u64, used: u64) {
+        let bound = InputBound {
+            tokens: reserved,
+            source: Source::ByteBound,
+            counter: None,
+            provider: "p".into(),
+            model: "m".into(),
+            request_digest: [0; 32],
+        };
+        self.settle(
+            &bound,
+            reserved,
+            day,
+            Usage {
+                input: used,
+                output: 0,
+            },
+        );
+    }
+
     fn persist_day(&self, d: &DayLedger) {
         if let Some(p) = &self.persist
             && let Err(m) = p.day(d)

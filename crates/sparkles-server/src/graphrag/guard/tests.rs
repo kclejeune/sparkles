@@ -335,3 +335,54 @@ fn installs_bump_the_epoch() {
         .unwrap();
     assert!(g.epoch() > before);
 }
+
+fn numbered(n: u64) -> Entry {
+    let c = caller("reports", &[]);
+    let mut fp = footprint(None, &[A], &c);
+    fp.source_commit = n;
+    entry(fp)
+}
+
+/// Concurrent installs into one persistent registry keep every entry.
+#[test]
+fn concurrent_installs_lose_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Arc::new(guard_for(Some(dir.path())));
+    let threads: Vec<_> = (0..8u64)
+        .map(|t| {
+            let g = g.clone();
+            std::thread::spawn(move || {
+                for i in 0..10 {
+                    g.install("ds", vec![numbered(t * 100 + i)]).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(Registry::load(dir.path()).unwrap().entries.len(), 80);
+    assert_eq!(g.footprints("ds"), Some(80));
+}
+
+/// A first read of an in-memory dataset racing an install never replaces the installed
+/// registry with an empty one.
+#[test]
+fn first_reads_keep_concurrent_installs() {
+    for round in 0..200u64 {
+        let g = Arc::new(guard_for(None));
+        let reader = {
+            let g = g.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    g.footprints("ds");
+                }
+            })
+        };
+        g.install("ds", vec![numbered(round)]).unwrap();
+        reader.join().unwrap();
+        assert_eq!(g.footprints("ds"), Some(1), "round {round}");
+        g.install("ds", vec![numbered(round + 1_000)]).unwrap();
+        assert_eq!(g.footprints("ds"), Some(2), "round {round}");
+    }
+}

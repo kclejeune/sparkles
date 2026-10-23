@@ -30,7 +30,7 @@ pub struct Projection {
 }
 
 /// Every provider of the role's pairs may receive facts (§6, A10): its `send` level,
-/// from `sendByProvider` or the dataset's `send`, must be at least `rows`.
+/// the lower of `sendByProvider` and the dataset's `send`, must be at least `rows`.
 pub fn check_send(assistant: &AssistantSettings, pairs: &[Pair]) -> Result<(), String> {
     if pairs.is_empty() {
         return Err(
@@ -38,14 +38,14 @@ pub fn check_send(assistant: &AssistantSettings, pairs: &[Pair]) -> Result<(), S
         );
     }
     for p in pairs {
-        let level = assistant
-            .send_by_provider
-            .get(&p.provider)
-            .copied()
-            .unwrap_or(assistant.send);
-        if level < Send::Rows {
+        if assistant.send_to(&p.provider) < Send::Rows {
+            let which = if assistant.send < Send::Rows {
+                "send"
+            } else {
+                "sendByProvider"
+            };
             return Err(format!(
-                "sendByProvider allows provider {} the schema only, and community reports send facts; allow it rows or remove it from the community role",
+                "{which} allows provider {} the schema only, and community reports send facts; allow it rows or remove it from the community role",
                 p.provider
             ));
         }
@@ -276,7 +276,12 @@ mod tests {
             e.contains("sendByProvider") && e.contains("provider q"),
             "{e}"
         );
+        // a provider entry never raises the dataset-wide limit
         a.send = Send::Schema;
+        a.send_by_provider.insert("p".into(), Send::Rows);
+        a.send_by_provider.insert("q".into(), Send::Rows);
+        let e = check_send(&a, &pairs).unwrap_err();
+        assert!(e.starts_with("send allows provider p"), "{e}");
         a.send_by_provider.clear();
         assert!(check_send(&a, &pairs).is_err());
         assert!(check_send(&a, &[]).is_err());
