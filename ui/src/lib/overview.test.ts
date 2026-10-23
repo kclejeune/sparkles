@@ -3,6 +3,7 @@ import type { ClassProfile, GroupsAnswer } from './api';
 import {
   chooseRenderer,
   communityLevel,
+  fallbackNode,
   isReports,
   classLevel,
   describe,
@@ -288,5 +289,19 @@ group('the GraphRAG communities', () => {
     ]);
     expect(describe(g, path, String)).toBe('Team A opened into 2 communities.');
     expect(describe(base, [], String, 0)).toBe('GraphRAG communities at level 0: 2 communities.');
+  });
+
+  // review round 1: without WebGL every community was drawn in the one IRI colour, so the
+  // status legend described colours the picture did not have
+  it('keeps the colouring and the marks in the Cytoscape fallback', () => {
+    const [a] = communityLevel(reports(), (i) => i).nodes;
+    expect(fallbackNode(a, 'Team A (6)', '#1a7f37', false)).toEqual({
+      id: 'g:r1.a',
+      label: 'Team A (6)',
+      kind: 'iri',
+      title: 'r1.a',
+      color: '#1a7f37',
+    });
+    expect(fallbackNode(a, 'Team A (6)', '#1a7f37', true).label).toBe('★ Team A (6)');
   });
 });

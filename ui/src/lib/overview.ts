@@ -16,6 +16,7 @@
  */
 import type { ClassProfile, GroupsAnswer } from './api';
 import type { CommunityStatus } from './graphrag';
+import type { GNode } from './components/GraphView.svelte';
 
 export type OvKind = 'class' | 'group' | 'member';
 
@@ -270,6 +271,21 @@ export function seed(
 }
 
 /** The drawn radius of a node of `size` instances when the largest has `max`. */
+/**
+ * A node of the Cytoscape fallback, which carries the overview's colouring so that the
+ * legend still describes the picture without WebGL. `color` must be a real colour, since
+ * Cytoscape does not read CSS variables.
+ */
+export function fallbackNode(n: OvNode, label: string, color: string, marked: boolean): GNode {
+  return {
+    id: n.key,
+    label: marked ? `★ ${label}` : label,
+    kind: 'iri',
+    title: n.key.slice(2),
+    color,
+  };
+}
+
 export function nodeRadius(size: number, max: number, kind: OvKind): number {
   if (kind === 'member') return 4;
   const t = Math.log1p(Math.max(0, size)) / Math.log1p(Math.max(1, max));

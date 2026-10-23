@@ -587,10 +587,14 @@ impl Answer<'_, '_> {
                 x.children = children.get(c.as_str()).copied().unwrap_or(0);
             }
         }
-        // the members a folded child left with this community
-        if !s.path.is_empty() && out.len() < limit {
+        // the members a folded child left with this community, which count against the
+        // limit like any group, so a full answer that leaves them out says it was cut
+        let mut truncated = truncated;
+        if !s.path.is_empty() && !truncated {
             let folded = self.size(&s.child(None))?;
-            if folded > 0 {
+            if folded > 0 && out.len() >= limit {
+                truncated = true;
+            } else if folded > 0 {
                 out.push(Group {
                     community: None,
                     size: folded,

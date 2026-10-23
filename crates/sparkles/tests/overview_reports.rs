@@ -272,6 +272,38 @@ fn a_community_opens_into_the_level_below_and_its_folded_members() {
     assert_eq!(b["within"]["size"], 3);
 }
 
+/// Review round 1: the folded members count against the limit, so an answer that the
+/// limit fills with child communities says it left them out.
+#[test]
+fn a_full_answer_that_leaves_out_the_folded_members_is_truncated() {
+    let ds = dataset();
+    let a_id = id(&top(&ds), "Team A");
+    let full = groups(&ds, json!({ "within": { "group": a_id }, "limit": 2 }));
+    assert_eq!(full["groups"].as_array().unwrap().len(), 2);
+    assert_eq!(full["truncated"], true);
+    let room = groups(&ds, json!({ "within": { "group": a_id }, "limit": 3 }));
+    assert_eq!(room["groups"].as_array().unwrap().len(), 3);
+    assert_eq!(room["truncated"], false);
+}
+
+/// Review round 1: a group id names its reports graph, so a server default for the
+/// dataset's graph does not replace it when a client opens the group.
+#[test]
+fn a_group_keeps_its_reports_graph_under_a_server_default() {
+    let ds = dataset();
+    let a_id = id(&top(&ds), "Team A");
+    let mut r = req(json!({ "within": { "group": a_id }, "by": { "reports": {} } }));
+    r.default_reports_graph("urn:x-sparkles:graphrag:elsewhere");
+    let a = ds.graph().groups(&r, &QueryOptions::default()).unwrap();
+    assert_eq!(a["within"]["title"], "Team A");
+    assert_eq!(a["within"]["reports"]["graph"], REPORTS);
+    // the default applies to a request for the whole dataset
+    let mut r = req(json!({ "by": { "reports": {} } }));
+    r.default_reports_graph("urn:x-sparkles:graphrag:elsewhere");
+    let none = ds.graph().groups(&r, &QueryOptions::default()).unwrap();
+    assert_eq!(none["unavailable"], "none");
+}
+
 #[test]
 fn requests_that_do_not_fit_are_refused() {
     let ds = dataset();

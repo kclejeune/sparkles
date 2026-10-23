@@ -151,6 +151,51 @@ test('off main the communities are not read', async ({ page }) => {
   expect(groups).toEqual([]);
 });
 
+// review round 1: the report of the dataset left stayed beside the next dataset's overview,
+// and a read of it still in flight could land there after the switch
+test('switching datasets drops the report, even one still being read', async ({ page }) => {
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  await page.route(/\/\$\/graphrag\/org\/community\?/, async (route) => {
+    if (route.request().url().includes(encodeURIComponent('urn:x-sparkles:graphrag:org:1:plat')))
+      await held;
+    await route.continue();
+  });
+  const ov = await communities(page);
+  await row(ov, 'Engineering').getByRole('button', { name: 'Open' }).click();
+  const side = page.getByTestId('community-side');
+  await expect(side.getByRole('heading', { name: 'Engineering' })).toBeVisible();
+  // the platform team's report is held while the dataset changes
+  await row(ov, 'The platform team').getByRole('button', { name: 'The platform team' }).click();
+  await page.getByRole('button', { name: /^org/ }).first().click();
+  await page
+    .getByRole('listbox', { name: 'Datasets' })
+    .getByRole('option', { name: /^foaf/ })
+    .click();
+  await expect(page).toHaveURL(/ds=foaf/);
+  release();
+  await expect(page.getByTestId('overview-communities-unavailable')).toContainText(
+    'No GraphRAG communities',
+  );
+  await expect(side).toHaveCount(0);
+  await expect(page).not.toHaveURL(/community=/);
+});
+
+// review round 1: a root answer that the server cut said nothing about it
+test('a cut list of communities says so', async ({ page }) => {
+  await page.route(/\/\$\/graph\/org\/groups$/, async (route) => {
+    const body = route.request().postDataJSON() as { within?: unknown };
+    if (body.within) return route.continue();
+    const res = await route.fetch();
+    const json = await res.json();
+    await route.fulfill({ response: res, json: { ...json, truncated: true } });
+  });
+  await page.goto('/ui/explore?ds=org&overview=communities');
+  await expect(page.getByTestId('overview')).toContainText(
+    'Some communities or links were left out.',
+  );
+});
+
 test.describe('on a phone', () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
 

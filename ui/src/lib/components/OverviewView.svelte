@@ -31,6 +31,7 @@
     classLevel,
     communityLevel,
     describe,
+    fallbackNode,
     hasWebGL2,
     isReports,
     MAX_CLASSES,
@@ -246,12 +247,9 @@
   );
   // the Cytoscape fallback
   const gnodes: GNode[] = $derived(
-    picture.nodes.map((n) => ({
-      id: n.key,
-      label: markedSet.has(n.key) ? `★ ${nodeLabel(n)}` : nodeLabel(n),
-      kind: 'iri',
-      title: n.key.slice(2),
-    })),
+    picture.nodes.map((n) =>
+      fallbackNode(n, nodeLabel(n), drawn(colorOf(n)), markedSet.has(n.key)),
+    ),
   );
   const gedges: GEdge[] = $derived(
     picture.edges.map((e) => ({
@@ -551,7 +549,10 @@
   const crumbs = $derived(path.map((l, i) => ({ i, label: l.label })));
   const note = $derived.by(() => {
     if (!current) {
-      if (communities) return reports?.note ?? '';
+      if (communities)
+        return [reports?.note, reports?.truncated ? 'Some communities or links were left out.' : '']
+          .filter(Boolean)
+          .join(' ');
       return base.hidden ? `The ${fmtInt(MAX_CLASSES)} largest classes are drawn.` : '';
     }
     const a = current.answer;

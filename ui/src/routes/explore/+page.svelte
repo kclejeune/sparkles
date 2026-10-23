@@ -103,7 +103,8 @@
   let overviewMode = $state<'classes' | 'communities'>(
     page.url.searchParams.get('overview') === 'communities' ? 'communities' : 'classes',
   );
-  const overviewFocus = page.url.searchParams.get('community');
+  /** The community the page was opened at, for the first dataset only. */
+  let overviewFocus = $state(page.url.searchParams.get('community'));
   /** The reports belong to main: a page on another branch draws no communities. */
   const overviewBranch = $derived(branchParam(page.url.searchParams.get('branch')));
   let community = $state<OverviewCommunity | null>(null);
@@ -1123,6 +1124,10 @@
         schemaFor = null;
         schemaGraph = 'default';
         selectedClass = null;
+        // the report beside the overview belongs to the dataset left, and a pending
+        // read of it is dropped by the new sequence number
+        overviewFocus = null;
+        void showCommunity(null);
         syncUrl(null);
       }
       if (tab === 'schema') void loadSchema(name);

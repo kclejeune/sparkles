@@ -231,10 +231,12 @@ impl GroupsRequest {
         Ok(())
     }
 
-    /// Fill in the reports graph a server's settings name, when the request groups by
-    /// reports without naming one.
+    /// Fill in the reports graph a server's settings name, when the request groups the
+    /// whole dataset by reports without naming one. A group id names its own graph, so a
+    /// request that opens a group keeps it even when the settings have moved since.
     pub fn default_reports_graph(&mut self, graph: &str) {
-        if let By::Reports(r) = &mut self.by
+        if matches!(self.within, Within::Dataset)
+            && let By::Reports(r) = &mut self.by
             && r.graph.is_none()
         {
             r.graph = Some(graph.to_string());
