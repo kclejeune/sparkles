@@ -872,6 +872,30 @@ impl Snapshot {
         Ok((base + ins).saturating_sub(del))
     }
 
+    /// The exact number of quads of one predicate, from the generation's statistics and
+    /// the delta, for a prefix that binds only the predicate of `Pso` or `Pos`. `None`
+    /// for any other prefix, and when the statistics do not describe this base (a store
+    /// built before predicate statistics, or statistics whose quad total disagrees with
+    /// the index). [`count`](Self::count) gives the same number, but it decodes the
+    /// blocks at both ends of the predicate's range, which on a server that has just
+    /// started is most of the time of planning a small query (spec X07, the remaining
+    /// cold gaps).
+    pub fn predicate_count(&self, perm: Perm, prefix: &[u64]) -> Option<u64> {
+        let (Perm::Pso | Perm::Pos, &[p]) = (perm, prefix) else {
+            return None;
+        };
+        let stats = &self.generation.stats;
+        if stats.predicates.is_empty() || stats.quads != self.perm(perm).rows {
+            return None;
+        }
+        // the statistics list every predicate of the base, so one not listed has no quads
+        let base = stats.predicate(p).map_or(0, |s| s.count);
+        let pi = perm.index();
+        let ins = Delta::count_prefix(&self.delta.ins[pi], prefix);
+        let del = Delta::count_prefix(&self.delta.del[pi], prefix);
+        Some((base + ins).saturating_sub(del))
+    }
+
     /// Cheap estimate of the number of quads with a key prefix (no block decoding).
     pub fn estimate(&self, perm: Perm, prefix: &[u64]) -> u64 {
         let base = self.perm(perm).estimate(prefix);
@@ -7946,6 +7970,69 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
         let ps = s.predicate_stat(old_p.0).unwrap();
         assert_eq!(ps.count, 5);
         assert_eq!(ps.distinct_subjects, 3);
+    }
+
+    #[test]
+    fn predicate_counts_from_statistics_match_exact_counts() {
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[src()]).unwrap();
+        let named = |t: &str| Term::NamedNode(named(&format!("http://ex.org/{t}")));
+        let mut t = store.write();
+        let (a, p, q, new) = (
+            t.intern(&named("a")).unwrap(),
+            t.intern(&named("p")).unwrap(),
+            t.intern(&named("q")).unwrap(),
+            t.intern(&named("new")).unwrap(),
+        );
+        for i in 0..40 {
+            t.insert([
+                Id::bnode(i % 4),
+                new,
+                Id::from_i64(i as i64).unwrap(),
+                Id::DEFAULT_GRAPH,
+            ])
+            .unwrap();
+        }
+        t.insert([Id::bnode(9), p, Id::from_i64(9).unwrap(), Id::DEFAULT_GRAPH])
+            .unwrap();
+        assert!(
+            t.delete([a, p, Id::from_i64(1).unwrap(), Id::DEFAULT_GRAPH])
+                .unwrap()
+        );
+        t.commit().unwrap();
+        let snap = store.snapshot();
+        assert!(!snap.generation.stats.predicates.is_empty());
+        let unknown = Id::bnode(77_777).0;
+        for perm in [Perm::Pso, Perm::Pos] {
+            for pid in [p.0, q.0, new.0, unknown] {
+                assert_eq!(
+                    snap.predicate_count(perm, &[pid]),
+                    Some(snap.count(perm, &[pid]).unwrap()),
+                    "{perm:?} {pid}"
+                );
+            }
+        }
+        assert_eq!(snap.predicate_count(Perm::Pso, &[p.0]), Some(4));
+        assert_eq!(snap.predicate_count(Perm::Pso, &[new.0]), Some(40));
+        // only a prefix of the predicate alone is answered from the statistics
+        assert_eq!(snap.predicate_count(Perm::Pso, &[p.0, a.0]), None);
+        assert_eq!(snap.predicate_count(Perm::Spo, &[a.0]), None);
+        assert_eq!(snap.predicate_count(Perm::Pso, &[]), None);
+    }
+
+    #[test]
+    fn predicate_counts_need_statistics_of_the_same_base() {
+        let store = Store::in_memory(StoreOptions::default());
+        store.load(&[src()]).unwrap();
+        let mut snap = (*store.snapshot()).clone();
+        drop(store);
+        let p = snap.generation.stats.predicates[0].p;
+        assert!(snap.predicate_count(Perm::Pso, &[p]).is_some());
+        let g = Arc::get_mut(&mut snap.generation).expect("owned generation");
+        g.stats.quads += 1;
+        assert_eq!(snap.predicate_count(Perm::Pso, &[p]), None);
+        Arc::get_mut(&mut snap.generation).unwrap().stats = Default::default();
+        assert_eq!(snap.predicate_count(Perm::Pos, &[p]), None);
     }
 
     #[test]
