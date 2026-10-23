@@ -265,4 +265,6 @@ test('the WebGL view draws the lenses and the list has their columns', async ({ 
   expect(await overlay.getAttribute('data-arrows')).toBe(
     await overlay.getAttribute('data-inferred'),
   );
+  // no inferred edge here has an inferred reverse, so none is set apart
+  expect(await overlay.getAttribute('data-pairs')).toBe('0');
 });

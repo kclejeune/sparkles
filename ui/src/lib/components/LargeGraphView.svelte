@@ -230,6 +230,7 @@
     const showArrows = edgeType() === 'arrow';
     let lines = 0;
     let arrows = 0;
+    let pairs = 0;
     ctx.save();
     ctx.setLineDash([6, 4]);
     ctx.lineWidth = 1.4;
@@ -259,7 +260,9 @@
       if (len < 1) continue;
       const ux = (b.x - a.x) / len;
       const uy = (b.y - a.y) / len;
-      const back = graph.edges(t, s).some((k) => lens.inferred.has(k));
+      // the reverse direction only: edges() would also return this edge
+      const back = graph.outEdges(t, s).some((k) => k !== key && lens.inferred.has(k));
+      if (back) pairs++;
       const off = back ? 3 : 0;
       const ox = uy * off;
       const oy = -ux * off;
@@ -267,7 +270,9 @@
       const ey = b.y - uy * (b.r + 1) + oy;
       ctx.beginPath();
       ctx.moveTo(a.x + ox, a.y + oy);
-      ctx.lineTo(ex - ux * 6, ey - uy * 6);
+      // the shaft stops where the arrowhead starts, or at the target without one
+      const gap = showArrows ? 6 : 0;
+      ctx.lineTo(ex - ux * gap, ey - uy * gap);
       ctx.stroke();
       lines++;
       if (showArrows) {
@@ -298,6 +303,7 @@
     // for the tests: the overlay has no elements to find
     overlay.dataset.inferred = String(lines);
     overlay.dataset.arrows = String(arrows);
+    overlay.dataset.pairs = String(pairs);
   }
 
   /** The badges: a pill with "i" and the count at the upper right of each badged node. */
