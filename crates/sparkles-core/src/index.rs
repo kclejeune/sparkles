@@ -1061,6 +1061,9 @@ pub(crate) struct Segments {
     /// a bit per block whose entries a reader has asked the kernel for, so that a warm
     /// pass makes no read hint for them again
     hinted: Box<[std::sync::atomic::AtomicU64]>,
+    /// per block, the segments decoded one by one so far, up to the block's limit
+    /// ([`Segments::dense_limit`]), after which readers decode the block whole
+    sparse_reads: Box<[std::sync::atomic::AtomicU8]>,
 }
 
 impl Segments {
@@ -1097,6 +1100,7 @@ impl Segments {
             hinted: (0..blocks.len().div_ceil(64))
                 .map(|_| Default::default())
                 .collect(),
+            sparse_reads: (0..blocks.len()).map(|_| Default::default()).collect(),
             start,
         })
     }
@@ -1105,6 +1109,34 @@ impl Segments {
     #[inline]
     pub(crate) fn count(&self, b: usize) -> usize {
         self.start[b + 1] - self.start[b]
+    }
+
+    /// The segments of block `b` that readers may decode one by one before they read it
+    /// whole: a quarter of them. Past that, decoding the block once costs less than
+    /// decoding more of its segments, one request each.
+    #[inline]
+    fn dense_limit(&self, b: usize) -> u8 {
+        (self.count(b) / SPARSE_SEGMENTS_DIV).max(1) as u8
+    }
+
+    /// Whether readers have decoded enough of block `b`'s segments one by one to read it
+    /// whole from now on.
+    #[inline]
+    fn dense(&self, b: usize) -> bool {
+        self.sparse_reads[b].load(std::sync::atomic::Ordering::Relaxed) >= self.dense_limit(b)
+    }
+
+    /// Count a segment of block `b` decoded on its own.
+    fn note_sparse_read(&self, b: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let limit = self.dense_limit(b);
+        let _ =
+            self.sparse_reads[b].fetch_update(Relaxed, Relaxed, |n| (n < limit).then_some(n + 1));
+    }
+
+    /// Have readers read block `b` whole from now on.
+    fn mark_dense(&self, b: usize) {
+        self.sparse_reads[b].store(self.dense_limit(b), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The directory entries of block `b`.
@@ -1241,13 +1273,14 @@ impl PermIndex {
 
     /// The segments `[s0, s1)` of block `b` to decode one by one for the rows of the
     /// block with keys in `[lo, hi]`, or `None` when the reader decodes whole columns:
-    /// the permutation is not segmented, the range covers the whole block, or it spans
-    /// more than a quarter of the block's segments (spec X07 §6.5). The answer depends
-    /// on the directory alone, so a prefetch and the reader after it agree.
+    /// the permutation is not segmented, the range covers the whole block, it spans more
+    /// than a quarter of the block's segments, or readers have already decoded a quarter
+    /// of them one by one (spec X07 §6.5). A prefetch and the reader after it agree, since
+    /// only a prefetch or a decode changes the answer.
     pub(crate) fn segment_span(&self, b: usize, lo: &Key, hi: &Key) -> Option<(usize, usize)> {
         let d = self.segs.as_ref()?;
         let m = &self.blocks[b];
-        if m.first >= *lo && m.last <= *hi {
+        if (m.first >= *lo && m.last <= *hi) || d.dense(b) {
             return None;
         }
         let n = d.count(b);
@@ -1271,6 +1304,20 @@ impl PermIndex {
     ) -> Option<(usize, usize)> {
         let span = self.segment_span(b, lo, hi)?;
         (!cache.holds_whole(self, b, mask)).then_some(span)
+    }
+
+    /// Have readers of block `b` decode it whole from now on: a prefetch found that a
+    /// request reads more than a quarter of its segments.
+    pub(crate) fn mark_dense(&self, b: usize) {
+        if let Some(d) = &self.segs {
+            d.mark_dense(b);
+        }
+    }
+
+    /// The segments of block `b` a request may read one by one before it reads the block
+    /// whole (see [`mark_dense`](Self::mark_dense)).
+    pub(crate) fn dense_limit(&self, b: usize) -> usize {
+        self.segs.as_ref().map_or(0, |d| d.dense_limit(b) as usize)
     }
 
     /// Whether segment `s` of block `b` is the block's last.
@@ -1765,7 +1812,22 @@ impl BlockCache {
         mask: ColMask,
         hint: bool,
     ) -> Result<Block> {
+        self.segment_counted(idx, b, s, mask, hint, true)
+    }
+
+    /// [`get_segment`](Self::get_segment), counting a decode toward the block's limit of
+    /// segments read one by one when `count` (a prefetch counts its segments itself).
+    fn segment_counted(
+        &self,
+        idx: &PermIndex,
+        b: usize,
+        s: usize,
+        mask: ColMask,
+        hint: bool,
+        count: bool,
+    ) -> Result<Block> {
         let (r0, r1) = idx.segment_rows(b, s);
+        let mut decoded = false;
         let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
         for (c, col) in cols.iter_mut().enumerate() {
             if mask & (1 << c) == 0 {
@@ -1798,6 +1860,13 @@ impl BlockCache {
                 self.cache.insert(key, v.clone());
             }
             *col = v;
+            decoded = true;
+        }
+        if decoded
+            && count
+            && let Some(d) = &idx.segs
+        {
+            d.note_sparse_read(b);
         }
         Ok(Block {
             cols,
@@ -2108,13 +2177,24 @@ impl WarmColumns<'_> {
                     self.cache.get_cols_hinted(self.idx, b, 1 << c, false)
                 } else {
                     self.cache
-                        .get_segment(self.idx, b, seg as usize - 1, 1 << c, false)
+                        .segment_counted(self.idx, b, seg as usize - 1, 1 << c, false, false)
                 };
                 Ok(())
             };
             match decode_pool() {
                 Some(pool) => pool.install(|| self.work.par_iter().try_for_each(decode))?,
                 None => self.work.iter().try_for_each(decode)?,
+            }
+            // each segment decoded counts once toward its block's limit, whatever its
+            // columns (the work lists a segment's columns one after another)
+            if let Some(d) = &self.idx.segs {
+                let mut last = None;
+                for &(b, _, seg) in &self.work {
+                    if seg != WHOLE && last != Some((b, seg)) {
+                        last = Some((b, seg));
+                        d.note_sparse_read(b);
+                    }
+                }
             }
         }
         // Cancellation during the final already-started decode must not be hidden.
@@ -2520,7 +2600,7 @@ mod tests {
     #[test]
     fn segmented_reads_answer_as_whole_block_reads() {
         let keys = run_keys();
-        let (_d3, i3, _d2, i2) = both_layouts(&keys);
+        let (d3, _i3, _d2, i2) = both_layouts(&keys);
         let (c3, c2) = (BlockCache::new(1 << 26), BlockCache::new(1 << 26));
         let rows = |idx: &PermIndex, cache: &BlockCache, lo: &Key, hi: &Key| {
             let mut out = Vec::new();
@@ -2533,6 +2613,9 @@ mod tests {
         };
         let mut r = 12345u64;
         for t in 0..400 {
+            // opened afresh, so that no block has turned to whole reads and every lookup
+            // reads segments where it can
+            let i3 = PermIndex::open(d3.path(), Perm::Spo).unwrap();
             r ^= r << 13;
             r ^= r >> 7;
             r ^= r << 17;
@@ -2557,6 +2640,7 @@ mod tests {
             );
         }
         // a cache holding whole columns serves segment reads, and the reverse
+        let i3 = PermIndex::open(d3.path(), Perm::Spo).unwrap();
         let (lo, hi) = (
             pad(&keys[40_000][..1], 0),
             pad(&keys[40_000][..1], u64::MAX),
@@ -2598,6 +2682,37 @@ mod tests {
             [m.last[0] - 1, u64::MAX, u64::MAX, u64::MAX],
         );
         assert_eq!(i3.segment_span(b, &lo, &hi), None);
+    }
+
+    #[test]
+    fn a_block_read_by_many_segments_is_read_whole_after_a_quarter_of_them() {
+        let keys = run_keys();
+        let (_d3, i3, _d2, _i2) = both_layouts(&keys);
+        let cache = BlockCache::new(1 << 26);
+        let b = 1;
+        let n = i3.segs.as_ref().unwrap().count(b);
+        let limit = i3.dense_limit(b);
+        assert!(limit >= 1 && limit < n);
+        // one lookup in each segment of the block, in order
+        let mut sparse = 0;
+        for s in 0..n {
+            let (r0, _) = i3.segment_rows(b, s);
+            let k = i3.decode_col(b, 0).unwrap()[r0 + 1];
+            let (lo, hi) = (pad(&[k], 0), pad(&[k], u64::MAX));
+            if i3.read_span(&cache, b, &lo, &hi, 1).is_some() {
+                sparse += 1;
+            }
+            let mut rows = 0;
+            i3.for_each_key_range_cols(&cache, &lo, &hi, 1 << O, |_, a, z| {
+                rows += z - a;
+                Ok(true)
+            })
+            .unwrap();
+            assert!(rows > 0);
+        }
+        // the first `limit` lookups decoded their segments, and the rest the whole block
+        assert_eq!(sparse, limit);
+        assert!(cache.holds_whole(&i3, b, 1));
     }
 
     #[test]
