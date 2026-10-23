@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The state format this server reads and writes.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 /// The most communities the state may hold.
 pub const MAX_COMMUNITIES: usize = 200_000;
 /// The most member entries over all communities.
@@ -354,11 +354,14 @@ mod tests {
 
     #[test]
     fn unknown_versions_are_refused_before_their_members() {
-        let e = BuildState::parse(br#"{"version": 2, "whatever": [1]}"#).unwrap_err();
-        assert!(matches!(e, StateError::UnknownVersion(2)), "{e}");
+        let e = BuildState::parse(br#"{"version": 3, "whatever": [1]}"#).unwrap_err();
+        assert!(matches!(e, StateError::UnknownVersion(3)), "{e}");
+        // version 1 had no record of the reports graph and footprint, and is refused
+        let e = BuildState::parse(br#"{"version": 1}"#).unwrap_err();
+        assert!(matches!(e, StateError::UnknownVersion(1)), "{e}");
         let e = BuildState::parse(br#"{"lastBuild": null}"#).unwrap_err();
         assert!(matches!(e, StateError::Corrupt(_)), "{e}");
-        let e = BuildState::parse(br#"{"version": 1, "extra": 1}"#).unwrap_err();
+        let e = BuildState::parse(br#"{"version": 2, "extra": 1}"#).unwrap_err();
         assert!(matches!(e, StateError::Corrupt(_)), "{e}");
         assert!(matches!(
             BuildState::parse(b"not json"),

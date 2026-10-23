@@ -318,12 +318,13 @@ pub fn delete_subjects(graph: &str, subjects: &[String]) -> Option<String> {
 }
 
 /// The SPARQL update that removes the reports of `graph` that no community links to and
-/// no linked report cites with `gr:citesReport`, with their findings and activities. A
-/// report a kept parent still cites stays until that parent is replaced, so its findings
-/// remain resolvable, and the history keeps every removed report.
+/// that no linked report reaches through one or more `gr:citesReport` links, with their
+/// findings and activities. A report a kept parent still cites, directly or through
+/// another cited report, stays until that parent is replaced, so its findings remain
+/// resolvable, and the history keeps every removed report.
 pub fn delete_unreachable_reports(graph: &str) -> String {
     format!(
-        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{report_t}> FILTER NOT EXISTS {{ ?c <{report}> ?r }} FILTER NOT EXISTS {{ ?c2 <{report}> ?r2 . ?r2 <{cites}> ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
+        "DELETE {{ GRAPH <{graph}> {{ ?x ?p ?o }} }} WHERE {{ {{ SELECT DISTINCT ?r WHERE {{ GRAPH <{graph}> {{ ?r a <{report_t}> FILTER NOT EXISTS {{ ?c <{report}> ?r }} FILTER NOT EXISTS {{ ?c2 <{report}> ?r2 . ?r2 <{cites}>+ ?r }} }} }} }} GRAPH <{graph}> {{ ?x ?p ?o }} FILTER(?x = ?r || STRSTARTS(STR(?x), CONCAT(STR(?r), \"#\"))) }}",
         report_t = gr("Report"),
         report = gr("report"),
         cites = gr("citesReport"),

@@ -635,7 +635,11 @@ async fn post_review(
         }
         // only an unrestricted writer writes a guarded graph (§6.2): a restricted one
         // could otherwise write past its grants, or copy a report it sees only in part
-        if p.view(&ds.name, Endpoint::Update).is_some() {
+        // a read-only grant on the update endpoint also has no restrictions, so the
+        // caller must be allowed to write through that endpoint as well
+        if !p.can_at(&ds.name, Endpoint::Update, Level::Write)
+            || p.view(&ds.name, Endpoint::Update).is_some()
+        {
             return Err(err_code(
                 StatusCode::FORBIDDEN,
                 "restricted-writer",

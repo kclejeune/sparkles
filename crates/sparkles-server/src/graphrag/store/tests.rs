@@ -243,6 +243,10 @@ fn unreachable_reports_go_and_cited_ones_stay() {
         ins("urn:r:new-child", t, &rep),
         ins("urn:r:old-child", t, &rep),
         ins("urn:r:old-child#f1", &gr("about"), "http://ex/a"),
+        // which in turn cites an old leaf report
+        ins("urn:r:old-child", &gr("citesReport"), "urn:r:old-leaf"),
+        ins("urn:r:old-leaf", t, &rep),
+        ins("urn:r:old-leaf#f1", &gr("about"), "http://ex/a"),
         // a superseded report nothing cites
         ins("urn:r:gone", t, &rep),
         ins("urn:r:gone#f1", &gr("about"), "http://ex/a"),
@@ -265,6 +269,11 @@ fn unreachable_reports_go_and_cited_ones_stay() {
         left.contains("<urn:r:old-child>") && left.contains("<urn:r:old-child#f1>"),
         "{left:?}"
     );
+    // and so is the report the cited one cites (round 7)
+    assert!(
+        left.contains("<urn:r:old-leaf>") && left.contains("<urn:r:old-leaf#f1>"),
+        "{left:?}"
+    );
     assert!(
         !left.iter().any(|x| x.starts_with("<urn:r:gone")),
         "{left:?}"
@@ -285,7 +294,7 @@ fn unreachable_reports_go_and_cited_ones_stay() {
         &format!("SELECT DISTINCT ?s WHERE {{ GRAPH <{G}> {{ ?s ?p ?o }} }}"),
     );
     assert!(
-        !left.iter().any(|r| r[0].starts_with("<urn:r:old-child")),
+        !left.iter().any(|r| r[0].starts_with("<urn:r:old-")),
         "{left:?}"
     );
 }

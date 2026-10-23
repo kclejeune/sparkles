@@ -352,6 +352,7 @@ impl Run<'_> {
     /// Called after the confirmation, before every model request and before every commit.
     fn recheck(
         &self,
+        models: &Arc<Models>,
         pairs: &[Pair],
         footprint: &Footprint,
         graphs: &[String],
@@ -363,7 +364,14 @@ impl Run<'_> {
                 "the GraphRAG settings changed during the run; start a new run".into(),
             ));
         }
-        let (_, now_pairs, principal) = self.admit()?;
+        let (now_models, now_pairs, principal) = self.admit()?;
+        // any change of the model configuration, such as a provider's endpoint, TLS
+        // settings or budget, replaces it as a whole
+        if !Arc::ptr_eq(&now_models, models) {
+            return Err(RunError::Refused(
+                "the model configuration changed during the run; start a new run".into(),
+            ));
+        }
         if now_pairs != pairs {
             return Err(RunError::Refused(
                 "the community role's providers changed during the run; start a new run".into(),
@@ -988,6 +996,9 @@ impl Run<'_> {
                     let code = f.error.code();
                     match f.error {
                         StepError::Budget(m) => return Err(Stop::Budget(m)),
+                        _ if code == "run-changed" => {
+                            return Err(Stop::Changed(f.error.message()));
+                        }
                         _ if code == "accounting-anomaly" => {
                             return Err(Stop::Budget(format!(
                                 "accounting anomaly: {}",
@@ -1010,6 +1021,8 @@ impl Run<'_> {
 #[derive(Debug)]
 enum Stop {
     Budget(String),
+    /// what the run was admitted with changed, so it stops without committing
+    Changed(String),
     Cancelled,
 }
 
@@ -1072,10 +1085,36 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         }
     }
     // the confirmation may have waited long: what the run was admitted with must hold
-    r.recheck(&pairs, &prep.footprint, &prep.projection_graphs)?;
+    r.recheck(&models, &pairs, &prep.footprint, &prep.projection_graphs)?;
     let ledger = r.ledger()?;
     let tokenizers = Tokenizers::default();
-    let admission = BuildAdmission::new(ledger.clone(), tokenizers, &r.settings.budget);
+    let check: Arc<super::budget::LiveCheck> = {
+        let st = r.st.clone();
+        let ds = r.ds.clone();
+        let settings = r.settings.clone();
+        let models = models.clone();
+        let pairs = pairs.clone();
+        let footprint = prep.footprint.clone();
+        let graphs = prep.projection_graphs.clone();
+        let cancel = r.cancel.clone();
+        let mode = r.mode;
+        Arc::new(move || {
+            let run = Run {
+                st: &st,
+                ds: ds.clone(),
+                settings: settings.clone(),
+                mode,
+                confirmed: true,
+                task: None,
+                task_id: String::new(),
+                cancel: cancel.clone(),
+            };
+            run.recheck(&models, &pairs, &footprint, &graphs)
+                .map_err(|e| e.to_string())
+        })
+    };
+    let admission =
+        BuildAdmission::new(ledger.clone(), tokenizers, &r.settings.budget).with_check(check);
     let system = system_text(&r.settings.language);
     let memory = crate::assist::memory_settings(r.st, &r.ds);
     let patterns: Vec<(String, String)> = memory
@@ -1173,7 +1212,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             );
             // nothing is sent under settings, providers or a view the run was not
             // admitted with
-            r.recheck(&pairs, &prep.footprint, &prep.projection_graphs)?;
+            r.recheck(&models, &pairs, &prep.footprint, &prep.projection_graphs)?;
             let res = r.write_report(
                 &models,
                 &pairs,
@@ -1187,6 +1226,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             let iri = store::new_report_iri();
             let (status, body, activity) = match res {
                 Err(Stop::Cancelled) => return Err(RunError::Cancelled),
+                Err(Stop::Changed(m)) => return Err(RunError::Refused(m)),
                 Err(Stop::Budget(m)) => {
                     stopped = Some(m);
                     pending.push(n.iri.clone());
@@ -1235,7 +1275,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         // builds and reviews of one dataset commit one at a time
         let lock = r.st.graphrag.lock(&r.ds.name);
         let _held = lock.lock();
-        r.recheck(&pairs, &prep.footprint, &prep.projection_graphs)?;
+        r.recheck(&models, &pairs, &prep.footprint, &prep.projection_graphs)?;
         // a review or another writer changed a report link since the run read it: the
         // run's plan no longer describes the graph, and committing would undo that change
         let (now, _) = r.existing(&r.ds.store.snapshot())?;

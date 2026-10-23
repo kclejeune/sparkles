@@ -81,19 +81,7 @@ pub(crate) fn fixture_with(
 ) -> Fixture {
     let mock = MockModel::start(handler);
     let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
-    let cfg = json!({
-        "providers": { "p": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 5,
-                              "allowedModels": ["m"], "structuredOutput": "json-schema" } },
-        "roles": { "community": [pair] }
-    });
-    st.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
-        ModelsConfig::parse(&cfg.to_string()).unwrap(),
-        Default::default(),
-        sparkles::outbound::OutboundPolicy {
-            allow_private: true,
-            ..Default::default()
-        },
-    ));
+    st.models = arc_swap::ArcSwapOption::from_pointee(models_for(&mock.url(), &pair));
     let st = Arc::new(st);
     let ds = st.attach("org", DbType::Mem, None).unwrap();
     ds.store
@@ -105,6 +93,23 @@ pub(crate) fn fixture_with(
         .unwrap();
     let app = crate::http::router(st.clone());
     Fixture { st, app, mock }
+}
+
+/// The model configuration of a fixture whose provider listens at `url`.
+fn models_for(url: &str, pair: &Value) -> Models {
+    let cfg = json!({
+        "providers": { "p": { "kind": "openai", "endpoint": url, "requestTimeoutSecs": 5,
+                              "allowedModels": ["m"], "structuredOutput": "json-schema" } },
+        "roles": { "community": [pair] }
+    });
+    Models::new(
+        ModelsConfig::parse(&cfg.to_string()).unwrap(),
+        Default::default(),
+        sparkles::outbound::OutboundPolicy {
+            allow_private: true,
+            ..Default::default()
+        },
+    )
 }
 
 pub(crate) async fn patch(app: &axum::Router, uri: &str, body: Value) -> StatusCode {
@@ -528,6 +533,62 @@ async fn settings_changed_during_the_wait_refuse_the_run() {
             "{r:?}"
         );
         assert!(f.mock.requests().is_empty());
+    })
+    .await
+    .unwrap();
+}
+
+/// A model configuration replaced while a run waits refuses the run, even when its role
+/// pairs stay the same, since a provider's endpoint or limits may have changed (round 7,
+/// finding 3).
+#[tokio::test(flavor = "multi_thread")]
+async fn models_replaced_during_the_wait_refuse_the_run() {
+    let f = fixture(3);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let h = f.waiting(settings(json!({})), Mode::Build, "w1");
+        let pair = json!({ "provider": "p", "model": "m" });
+        f.st.models
+            .store(Some(Arc::new(models_for(&f.mock.url(), &pair))));
+        assert!(f.st.graphrag.answer("org", "w1", true));
+        let r = h.join().unwrap();
+        assert!(
+            matches!(&r, Err(RunError::Refused(m)) if m.contains("model configuration changed")),
+            "{r:?}"
+        );
+        assert!(f.mock.requests().is_empty());
+    })
+    .await
+    .unwrap();
+}
+
+/// The live check runs before every request, so a retry after a failed attempt does not
+/// send the facts once the configuration has changed (round 7, finding 2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_rechecks_the_live_configuration() {
+    let slot: Arc<std::sync::OnceLock<(Arc<AppState>, String)>> = Default::default();
+    let slot2 = slot.clone();
+    let f = fixture_with(
+        3,
+        move |r, i| {
+            if i == 0 {
+                // the administrator changes the configuration after the first attempt
+                if let Some((st, url)) = slot2.get() {
+                    let pair = json!({ "provider": "p", "model": "m" });
+                    st.models.store(Some(Arc::new(models_for(url, &pair))));
+                }
+                return (503, json!({ "error": { "message": "busy" } }));
+            }
+            (200, mock::openai(&answer(r)))
+        },
+        json!({ "provider": "p", "model": "m" }),
+    );
+    slot.set((f.st.clone(), f.mock.url())).ok().unwrap();
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let r = f.run(settings(json!({})), Mode::Build);
+        assert!(matches!(&r, Err(RunError::Refused(_))), "{r:?}");
+        assert_eq!(f.mock.requests().len(), 1);
     })
     .await
     .unwrap();

@@ -90,6 +90,19 @@ graphs = ["urn:g:*", "{REPORTS}"]
 lifts = ["own"]
 
 [[users]]
+name = "tmixed"
+password = "{tmixed}"
+[[users.grants]]
+dataset = "rag"
+level = "read"
+endpoints = ["query", "update"]
+[[users.grants]]
+dataset = "rag"
+level = "write"
+graphs = ["urn:g:a"]
+endpoints = ["info"]
+
+[[users]]
 name = "tnarrow"
 password = "{tnarrow}"
 [[users.grants]]
@@ -111,6 +124,7 @@ lifts = ["own"]
         tnarrow = h("tnarrow-pw"),
         tzero = h("tzero-pw"),
         twrite = h("twrite-pw"),
+        tmixed = h("tmixed-pw"),
     )
 }
 
@@ -542,6 +556,21 @@ async fn restricted_writers_cannot_review() {
         "/$/graphrag/rag/review",
         &[
             ("authorization", &b("twrite")),
+            ("content-type", "application/json"),
+        ],
+        r#"{"report":"http://ex/r","status":"reviewed"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert!(r.text().contains("restricted-writer"), "{}", r.text());
+    // a read-only update grant is unrestricted too, and a write grant through another
+    // endpoint does not make it a writer (round 7)
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/graphrag/rag/review",
+        &[
+            ("authorization", &b("tmixed")),
             ("content-type", "application/json"),
         ],
         r#"{"report":"http://ex/r","status":"reviewed"}"#,

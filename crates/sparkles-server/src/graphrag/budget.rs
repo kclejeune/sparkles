@@ -360,7 +360,13 @@ pub struct BuildAdmission {
     budget: Budget,
     /// the bound of every admitted attempt, in order
     bounds: Mutex<Vec<InputBound>>,
+    /// a check that what the run was admitted with still holds, made before each
+    /// attempt and before any request that counts its tokens
+    check: Option<Arc<LiveCheck>>,
 }
+
+/// A check of a run's live state before an attempt; `Err` refuses the attempt.
+pub type LiveCheck = dyn Fn() -> Result<(), String> + Send + Sync;
 
 impl BuildAdmission {
     pub fn new(ledger: Arc<Ledger>, tokenizers: Tokenizers, budget: &Budget) -> Self {
@@ -370,7 +376,14 @@ impl BuildAdmission {
             provider_counting: budget.provider_counting,
             budget: budget.clone(),
             bounds: Mutex::new(Vec::new()),
+            check: None,
         }
+    }
+
+    /// Refuse every attempt for which `check` fails, before it is counted or sent.
+    pub fn with_check(mut self, check: Arc<LiveCheck>) -> Self {
+        self.check = Some(check);
+        self
     }
 
     pub fn bounds(&self) -> Vec<InputBound> {
@@ -441,6 +454,11 @@ impl Settle for Reserved {
 
 impl Admission for BuildAdmission {
     fn admit(&self, a: &Attempt<'_>) -> Result<Ticket, CallError> {
+        if let Some(check) = &self.check
+            && let Err(m) = check()
+        {
+            return Err(CallError::Admission("run-changed", m, false));
+        }
         if let Some(an) = self.ledger.anomaly() {
             return Err(Refusal::Anomaly(an).into_call_error());
         }
