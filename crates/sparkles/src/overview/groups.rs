@@ -1,4 +1,4 @@
-//! The answer of the groups route, from SPARQL queries over the caller's view.
+//! The answer of a groups request, from SPARQL queries over the caller's view.
 //!
 //! A set is a class and a path of partitions with the key of each, as a group id holds
 //! them. Its SPARQL pattern types the node with the class and, per partition, requires
@@ -10,23 +10,22 @@
 
 use super::ids::{GroupId, Key, Level, MAX_DEPTH, MAX_ID, Step, canonical_term};
 use super::{By, GroupsRequest, Within};
-use crate::http::{ApiError, ApiResult, err};
-use axum::http::StatusCode;
+use crate::error::{Error, Result};
+use crate::sparql::QueryOptions;
+use crate::store::Snapshot;
 use oxrdf::Term;
 use serde_json::{Value as J, json};
-use sparkles::sparql::QueryOptions;
-use sparkles::store::Snapshot;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Groups or members in one answer at most, and the size under which a set opens into
 /// its members.
-pub(crate) const MAX_LIMIT: usize = 5_000;
+pub const MAX_LIMIT: usize = 5_000;
 /// Edges in one answer at most.
-pub(crate) const MAX_EDGES: usize = 20_000;
+pub const MAX_EDGES: usize = 20_000;
 /// Values or ranges of a property partition, by default and at most.
-pub(crate) const DEFAULT_BUCKETS: usize = 12;
-pub(crate) const MAX_BUCKETS: usize = 48;
+pub const DEFAULT_BUCKETS: usize = 12;
+pub const MAX_BUCKETS: usize = 48;
 /// Rows of one aggregated edge query at most, before they are merged.
 const EDGE_ROWS: usize = 100_000;
 /// Instances read to choose a grouping property.
@@ -49,7 +48,7 @@ const LABELS: [&str; 5] = [
     "http://schema.org/name",
 ];
 
-pub(in crate::http) struct Run<'a> {
+pub(super) struct Run<'a> {
     pub snap: Arc<Snapshot>,
     pub opts: &'a QueryOptions,
 }
@@ -349,9 +348,9 @@ impl Edges {
 }
 
 impl Run<'_> {
-    fn select(&self, q: &str) -> ApiResult<Rows> {
-        let r = sparkles::sparql::query_with_plan(self.snap.clone(), q, self.opts)
-            .map_err(|f| ApiError::from(f.error))?;
+    fn select(&self, q: &str) -> Result<Rows> {
+        let r =
+            crate::sparql::query_with_plan(self.snap.clone(), q, self.opts).map_err(|f| f.error)?;
         Ok(Rows {
             rows: r.rows(),
             vars: r.vars,
@@ -359,11 +358,11 @@ impl Run<'_> {
     }
 
     /// The answer to a request.
-    pub(in crate::http) fn answer(&self, req: &GroupsRequest) -> ApiResult<J> {
+    pub(super) fn answer(&self, req: &GroupsRequest) -> Result<J> {
         let (class, path, group) = match &req.within {
             Within::Class(c) => (c.clone(), Vec::new(), None),
             Within::Group(id) => {
-                let g = GroupId::decode(id).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+                let g = GroupId::decode(id).map_err(Error::invalid)?;
                 (g.class, g.path, Some(id.clone()))
             }
         };
@@ -393,19 +392,15 @@ impl Run<'_> {
             }
             By::Community(p) => Some(self.communities(&class, &path, p, req.limit)?.ok_or_else(
                 || {
-                    err(
-                        StatusCode::BAD_REQUEST,
-                        format!("no communities written to <{p}> hold these instances"),
-                    )
+                    Error::invalid(format!(
+                        "no communities written to <{p}> hold these instances"
+                    ))
                 },
             )?),
             By::Property { predicate, buckets } => Some(
                 self.property(&class, &path, predicate, *buckets)?
                     .ok_or_else(|| {
-                        err(
-                            StatusCode::BAD_REQUEST,
-                            format!("these instances have no values of <{predicate}>"),
-                        )
+                        Error::invalid(format!("these instances have no values of <{predicate}>"))
                     })?,
             ),
         };
@@ -434,7 +429,7 @@ impl Run<'_> {
         Ok(answer)
     }
 
-    fn total(&self, class: &str, path: &[Step]) -> ApiResult<u64> {
+    fn total(&self, class: &str, path: &[Step]) -> Result<u64> {
         let q = format!(
             "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{}}}",
             set_pattern(class, path, "s")
@@ -450,7 +445,7 @@ impl Run<'_> {
         path: &[Step],
         level: &Level,
         limit: usize,
-    ) -> ApiResult<(Vec<(Key, u64)>, bool)> {
+    ) -> Result<(Vec<(Key, u64)>, bool)> {
         let q = format!(
             "SELECT ?k (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{}{}}} GROUP BY ?k ORDER BY DESC(?n) ?k LIMIT {}",
             set_pattern(class, path, "s"),
@@ -475,7 +470,7 @@ impl Run<'_> {
     }
 
     /// Labels of IRIs, from the label properties.
-    fn labels(&self, iris: &[&str]) -> ApiResult<HashMap<String, String>> {
+    fn labels(&self, iris: &[&str]) -> Result<HashMap<String, String>> {
         let mut out = HashMap::default();
         for chunk in iris.chunks(1_000) {
             if chunk.is_empty() {
@@ -507,7 +502,7 @@ impl Run<'_> {
         path: &[Step],
         p: &str,
         buckets: usize,
-    ) -> ApiResult<Option<Partition>> {
+    ) -> Result<Option<Partition>> {
         let q = format!(
             "SELECT ?v (COUNT(DISTINCT ?s) AS ?n) WHERE {{\n{}?s <{p}> ?v .\n}} GROUP BY ?v ORDER BY DESC(?n) ?v LIMIT {}",
             set_pattern(class, path, "s"),
@@ -544,8 +539,8 @@ impl Run<'_> {
             vals: vals
                 .iter()
                 .map(|t| canonical_term(&t.to_string()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?,
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::unsupported)?,
         };
         let (sizes, _) = self.sizes(class, path, &level, buckets + 1)?;
         let iris: Vec<&str> = vals
@@ -591,7 +586,7 @@ impl Run<'_> {
         buckets: usize,
         year: bool,
         integral: bool,
-    ) -> ApiResult<Option<Partition>> {
+    ) -> Result<Option<Partition>> {
         let num = if year { "YEAR(?x)" } else { "?x" };
         let q = format!(
             "SELECT (MIN({num}) AS ?lo) (MAX({num}) AS ?hi) WHERE {{\n{}?s <{p}> ?x .\nFILTER({})\n}}",
@@ -691,7 +686,7 @@ impl Run<'_> {
         path: &[Step],
         p: &str,
         limit: usize,
-    ) -> ApiResult<Option<Partition>> {
+    ) -> Result<Option<Partition>> {
         let parent = match path.last() {
             Some(Step {
                 level: Level::Community { p: lp, .. },
@@ -746,7 +741,7 @@ impl Run<'_> {
 
     /// The grouping for a set too large to list: F14's communities when its instances
     /// have some, else the property whose values split a sample of them best.
-    fn auto(&self, class: &str, path: &[Step], limit: usize) -> ApiResult<Option<Partition>> {
+    fn auto(&self, class: &str, path: &[Step], limit: usize) -> Result<Option<Partition>> {
         // a set that is a community opens into its child communities first
         if let Some(Step {
             level: Level::Community { p, .. },
@@ -843,7 +838,7 @@ impl Run<'_> {
     }
 
     /// The first members of a group, with their labels.
-    fn top(&self, class: &str, path: &[Step]) -> ApiResult<Vec<J>> {
+    fn top(&self, class: &str, path: &[Step]) -> Result<Vec<J>> {
         let q = format!(
             "SELECT ?s (SAMPLE(?l) AS ?label) WHERE {{ {{ SELECT DISTINCT ?s WHERE {{\n{}FILTER(isIRI(?s))\n}} LIMIT {TOP_MEMBERS} }} OPTIONAL {{ ?s {} ?l }} }} GROUP BY ?s",
             set_pattern(class, path, "s"),
@@ -880,7 +875,7 @@ impl Run<'_> {
         side: &str,
         new_level: Option<&Level>,
         name: &dyn Fn(Option<&Term>) -> Option<String>,
-    ) -> ApiResult<()> {
+    ) -> Result<()> {
         let l = path.len();
         let mut keys = String::new();
         let mut vars = Vec::new();
@@ -974,7 +969,7 @@ impl Run<'_> {
         path: &[Step],
         mut part: Partition,
         limit: usize,
-    ) -> ApiResult<Option<J>> {
+    ) -> Result<Option<J>> {
         let l = path.len();
         if part.children.len() > limit {
             part.children.truncate(limit);
@@ -1026,7 +1021,7 @@ impl Run<'_> {
         })))
     }
 
-    fn members_answer(&self, class: &str, path: &[Step], limit: usize, size: u64) -> ApiResult<J> {
+    fn members_answer(&self, class: &str, path: &[Step], limit: usize, size: u64) -> Result<J> {
         let q = format!(
             "SELECT ?s (SAMPLE(?l) AS ?label) WHERE {{ {{ SELECT DISTINCT ?s WHERE {{\n{}FILTER(isIRI(?s))\n}} LIMIT {} }} OPTIONAL {{ ?s {} ?l }} }} GROUP BY ?s",
             set_pattern(class, path, "s"),

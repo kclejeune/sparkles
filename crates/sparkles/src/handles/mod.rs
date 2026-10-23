@@ -25,6 +25,7 @@
 pub mod algorithms;
 #[cfg(feature = "backup")]
 pub mod backups;
+pub mod graph;
 #[cfg(feature = "graphql")]
 pub mod graphql;
 pub mod history;
@@ -38,6 +39,7 @@ pub mod validation;
 pub use algorithms::{Algorithms, Projections};
 #[cfg(feature = "backup")]
 pub use backups::Backups;
+pub use graph::Graph;
 #[cfg(feature = "graphql")]
 pub use graphql::GraphQl;
 pub use history::{CommitDetail, CommitRef, History, Snapshots};

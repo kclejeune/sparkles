@@ -1203,7 +1203,8 @@ over `PSO[p]`. Errors are those of `/$/schema/{ds}`, and `400` also covers a mal
 The design is in [U06 Phase 2](specs/U06-large-graph-rendering.md#3-server-and-api-changes).
 
 `POST /$/graph/{ds}/groups` groups the instances of a class, or of a group that an
-earlier answer named, and counts the edges between the groups. Explore draws its
+earlier answer named, and counts the edges between the groups. The Rust library gives
+the same answer through `ds.graph().groups`. Explore draws its
 overview from the class profiles and opens a class or a group with this route.
 
 ```ts

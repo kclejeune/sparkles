@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// The prefix and version of the encoding.
 const PREFIX: &str = "g1.";
 /// Partitions in one path at most.
-pub(super) const MAX_DEPTH: usize = 8;
+pub const MAX_DEPTH: usize = 8;
 /// Bytes of an id at most.
 pub(super) const MAX_ID: usize = 32 << 10;
 
@@ -109,7 +109,7 @@ impl GroupId {
                     let vals = vals
                         .iter()
                         .map(|v| canonical_term(v))
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
                     if let Key::Value(i) = s.key
                         && i >= vals.len()
                     {

@@ -504,18 +504,14 @@ fn a_cancelled_request_stops() {
         ..Default::default()
     };
     opts.timeout = Some(Duration::from_secs(30));
-    let run = super::groups::Run {
-        snap: ds.store.snapshot(),
-        opts: &opts,
-    };
-    let req = super::GroupsRequest::from_json(
+    let req = sparkles::overview::GroupsRequest::from_json(
         &json!({ "within": { "class": format!("{EX}Person") }, "by": { "property": format!("{EX}city") } }),
     )
-    .unwrap_or_else(|e| panic!("{:?}", e.1));
-    let Err(e) = run.answer(&req) else {
+    .unwrap();
+    let Err(e) = sparkles::overview::groups_at(ds.store.snapshot(), &req, &opts) else {
         panic!("a cancelled request answered");
     };
-    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{:?}", e.1);
+    assert!(matches!(e, sparkles::Error::Cancelled), "{e:?}");
 }
 
 /// Review findings of U06: a node with several values in one range is one member, the

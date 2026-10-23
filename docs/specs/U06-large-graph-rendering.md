@@ -356,8 +356,10 @@ Phases 1 and 2 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 29, ahe
 their tier, because the user asked for the overview to be the first thing Explore shows.
 Phase 3 is not built and stays under item 29.
 
-**Server.** `POST /$/graph/{ds}/groups` answers by communities, by property and by
-members, as §3 describes. It reads through the caller's view of C12 and C12b, is admitted
+**Library and server.** The groups computation is in the library as
+`sparkles::overview`, which an embedded program calls as `ds.graph().groups(&req, &opts)`
+with the same answer as the route. `POST /$/graph/{ds}/groups` calls it and answers by
+communities, by property and by members, as §3 describes. It reads through the caller's view of C12 and C12b, is admitted
 through the query memory pool as a query, takes one deadline for all of its queries,
 stops when the client goes away and caps its groups at 5,000 and its edges at 20,000. A
 group id is `g1.` and the base64url of the class and the partitions that lead to the
