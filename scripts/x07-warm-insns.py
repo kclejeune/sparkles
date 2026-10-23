@@ -4,15 +4,16 @@
 The X07 spec (Remaining measurements) defines the gate: start
 `sparkles --result-cache-mb 0 serve --timeout 600` pinned to one core, send 200 warm-up
 requests per query, then count `instructions:u` with `perf stat` over 2,000 further
-requests and divide. A separate warm pass of every query under `strace` counts the
-`madvise` calls, by advice.
+requests and divide. A second server, started under `strace` because yama's
+`ptrace_scope` 1 forbids attaching to a running one, repeats the warm-up and one warm
+pass of every query and counts the `madvise` calls of each window by advice.
 
     x07-warm-insns.py --bin target/release/sparkles --store sparkles.db \
         --queries queries/ --out results/A [--label A]
 
 The script writes one JSON object per query to `<out>/insns.jsonl`, the strace log and a
 `madvise.json` summary, and the SHA-256 of every response body, so two builds can be
-checked for identical answers. It needs `perf` and `strace` on PATH and
+checked for identical answers. It needs `perf` and `strace` (or --perf and --strace) and
 `kernel.perf_event_paranoid` at 2 or less. It starts and stops its own server and leaves
 no process behind.
 """
@@ -151,46 +152,83 @@ def main():
                 rows.flush()
                 print(f"{args.label} {n}: {row['insns_per_req']:.0f} insns/req,"
                       f" {len(hashes)} distinct answer(s)", flush=True)
-        if not args.skip_madvise:
-            # one warm pass of every query under strace, after the measured runs
-            sl = os.path.join(args.out, "madvise.strace")
-            st = subprocess.Popen([args.strace, "-f", "-qq", "-e", "trace=madvise", "-o", sl,
-                                   "-p", str(server.pid)], start_new_session=True)
-            time.sleep(1.0)
-            marks = {}
-            for n in names:
-                before = sum(1 for _ in open(sl)) if os.path.exists(sl) else 0
-                drive(args.port, paths[n], 1)
-                time.sleep(0.05)
-                marks[n] = (before, sum(1 for _ in open(sl)))
-            time.sleep(0.5)
-            st.send_signal(signal.SIGINT)
-            st.wait(timeout=30)
-            lines = open(sl).read().splitlines()
-            per = {}
-            for n, (a, b) in marks.items():
-                adv = {}
-                for l in lines[a:b]:
-                    m = re.search(r"MADV_[A-Z_]+", l)
-                    k = m.group(0) if m else "other"
-                    adv[k] = adv.get(k, 0) + 1
-                per[n] = adv
-            total = {}
-            for l in lines:
-                m = re.search(r"MADV_[A-Z_]+", l)
-                k = m.group(0) if m else "other"
-                total[k] = total.get(k, 0) + 1
-            json.dump({"per_query": per, "total": total, "lines": len(lines)},
-                      open(os.path.join(args.out, "madvise.json"), "w"), indent=1)
-            print(f"{args.label} madvise over one warm pass: {total}", flush=True)
     finally:
-        os.killpg(server.pid, signal.SIGTERM)
-        try:
-            server.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            os.killpg(server.pid, signal.SIGKILL)
-            server.wait()
+        stop(server)
         subprocess.run(["rm", "-rf", data])
+    if not args.skip_madvise:
+        madvise_pass(args, names, paths, client)
+
+
+def stop(server):
+    os.killpg(server.pid, signal.SIGTERM)
+    try:
+        server.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        os.killpg(server.pid, signal.SIGKILL)
+        server.wait()
+
+
+def advice(lines):
+    out = {}
+    for l in lines:
+        m = re.search(r"MADV_[A-Z_]+", l)
+        k = m.group(0) if m else "other"
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def madvise_pass(args, names, paths, client):
+    """Count madvise calls by advice for warm-up and for one warm pass of every query.
+
+    yama's ptrace_scope 1 forbids attaching to a running server, so a second server
+    starts under strace. Each call carries its time (-ttt), and each request's window
+    attributes the calls to a query and phase.
+    """
+    data = tempfile.mkdtemp(prefix="x07-warm-server-")
+    sl = os.path.join(args.out, "madvise.strace")
+    log = open(os.path.join(args.out, "server-strace.log"), "w")
+    server = subprocess.Popen(
+        [args.strace, "-f", "-qq", "-ttt", "-e", "trace=madvise", "-o", sl,
+         "taskset", "-c", args.server_cpu, args.bin, "--result-cache-mb", "0", "serve",
+         "--data", data, "--loc", f"bench={args.store}", "--port", str(args.port),
+         "--timeout", "600"],
+        stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    windows = []
+    try:
+        wait_ready(args.port, server)
+        time.sleep(0.5)
+        for n in names:
+            t0 = time.time()
+            drive(args.port, paths[n], args.warmup)
+            t1 = time.time()
+            drive(args.port, paths[n], 1)
+            t2 = time.time()
+            windows.append((n, t0, t1, t2))
+        time.sleep(0.5)
+    finally:
+        stop(server)
+        subprocess.run(["rm", "-rf", data])
+    calls = []
+    for l in open(sl):
+        f = l.split(None, 2)
+        if len(f) == 3 and "madvise(" in f[2]:
+            calls.append((float(f[1]), f[2]))
+    per = {}
+    for n, t0, t1, t2 in windows:
+        per[n] = {
+            "warmup": advice(c for t, c in calls if t0 <= t < t1),
+            "warm_pass": advice(c for t, c in calls if t1 <= t < t2),
+        }
+    summary = {
+        "per_query": per,
+        "warm_pass_total": advice(c for t, c in calls
+                                  if any(t1 <= t < t2 for _, _, t1, t2 in windows)),
+        "all_calls": advice(c for _, c in calls),
+    }
+    json.dump(summary, open(os.path.join(args.out, "madvise.json"), "w"), indent=1)
+    print(f"{args.label} madvise in the warm pass: {summary['warm_pass_total']},"
+          f" all calls: {summary['all_calls']}", flush=True)
 
 
 if __name__ == "__main__":
