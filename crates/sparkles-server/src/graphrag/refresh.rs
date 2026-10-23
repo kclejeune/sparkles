@@ -20,8 +20,9 @@ use super::build::{self, Mode};
 use super::settings::{GraphragSettings, RefreshMode, is_guarded};
 use super::state::BuildState;
 use crate::auth::Endpoint;
-use crate::state::{AppState, Dataset};
+use crate::state::{AppState, Dataset, task_state};
 use oxrdf::{GraphName, NamedOrBlankNode, Term};
+use sparkles::commit::CommitKind;
 use sparkles::store::ChangesOptions;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -53,6 +54,13 @@ pub struct Watch {
     first_pending: Option<Instant>,
     /// the day a run that left pending communities was last retried
     retried_day: Option<u64>,
+    /// the last check found communities pending
+    has_pending: bool,
+    /// checks or refreshes that failed in a row, and when to try again
+    failures: u32,
+    retry_at: Option<Instant>,
+    /// the refresh task this loop started last, until it ends
+    task: Option<String>,
 }
 
 impl Watch {
@@ -81,9 +89,26 @@ impl Watch {
         }
     }
 
+    /// Whether to check now: after the debounce of new commits, at a retry after a
+    /// failure, or on a new day while communities are pending, which needs no commit.
+    fn wants_check(&mut self, head: u64, now: Instant, debounce: Duration, today: u64) -> bool {
+        let commits = self.due(head, now, debounce);
+        let retry = self.retry_at.is_some_and(|t| now >= t);
+        let pending = self.has_pending && self.retried_day != Some(today);
+        commits || retry || pending
+    }
+
     fn checked(&mut self) {
         self.last_change = None;
         self.first_pending = None;
+        self.retry_at = None;
+    }
+
+    /// A check or a refresh failed: try again after a backoff that doubles up to 64
+    /// debounce periods, without waiting for another commit.
+    fn failed(&mut self, now: Instant, debounce: Duration) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(now + debounce * (1u32 << self.failures.min(6)));
     }
 }
 
@@ -129,7 +154,25 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
         let head = ds.store.head_commit().seq;
         let debounce = Duration::from_secs(settings.refresh.debounce_seconds);
         let w = watches.entry(name.clone()).or_default();
-        if !w.due(head, now, debounce) {
+        // the refresh this loop started: wait for it, and back off when it failed
+        if let Some(id) = &w.task {
+            let state = st
+                .tasks
+                .lock()
+                .iter()
+                .find(|t| &t.id == id)
+                .map(|t| t.state.clone());
+            match state.as_deref() {
+                Some(task_state::QUEUED | task_state::RUNNING) => {
+                    w.due(head, now, debounce);
+                    continue;
+                }
+                Some(task_state::FAILED) => w.failed(now, debounce),
+                _ => w.failures = 0,
+            }
+            w.task = None;
+        }
+        if !w.wants_check(head, now, debounce, build::today()) {
             continue;
         }
         // a running or queued build or refresh goes first, and the check waits for it
@@ -141,12 +184,19 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {e}");
-                None
+                w.failed(now, debounce);
+                continue;
             }
         };
-        if let Some(reason) = reason {
-            tracing::info!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {reason}");
-            build::spawn(st, ds.clone(), settings, Mode::Refresh, true, Some(reason));
+        let Some(reason) = reason else {
+            w.failures = 0;
+            continue;
+        };
+        tracing::info!(target: "sparkles::graphrag", dataset = %name, "automatic refresh: {reason}");
+        match build::spawn(st, ds.clone(), settings, Mode::Refresh, true, Some(reason)) {
+            Ok(t) => w.task = Some(t.id),
+            // a build or refresh started meanwhile: check again after it
+            Err(_) => w.retry_at = Some(now + debounce),
         }
     }
 }
@@ -165,6 +215,7 @@ fn due_reason(
     if b.branch != sparkles::branch::MAIN {
         return Ok(None);
     }
+    w.has_pending = !b.pending.is_empty();
     if !b.pending.is_empty() {
         let today = build::today();
         if w.retried_day != Some(today) {
@@ -174,6 +225,11 @@ fn due_reason(
                 b.pending.len()
             )));
         }
+    }
+    // only GraphRAG's own commits since then: nothing the reports read changed, which
+    // also keeps a refresh from following its own commit when the feed is unavailable
+    if !source_changed(&ds.store, b.source_commit) {
+        return Ok(None);
     }
     let principal = build::authorized_principal(st, ds, &settings.principal)?;
     let o = ChangesOptions {
@@ -201,6 +257,9 @@ fn due_reason(
             Err(e) => return Err(e.to_string()),
         };
         for c in &page.commits {
+            if c.commit.kind == CommitKind::Graphrag {
+                continue;
+            }
             if !c.complete() {
                 return Ok(Some(format!(
                     "commit {} changed too many facts to count",
@@ -227,6 +286,23 @@ fn due_reason(
     }
     Ok(counter.verdict(settings.refresh.min_changed_fraction))
 }
+
+/// Whether a commit after `after` other than GraphRAG's own may have changed data. A
+/// commit whose metadata is gone counts as a change, and so does a long run of commits.
+fn source_changed(store: &sparkles::store::Store, after: u64) -> bool {
+    let head = store.head_commit().seq;
+    if head.saturating_sub(after) > MAX_KIND_CHECKS {
+        return true;
+    }
+    ((after + 1)..=head).any(|seq| {
+        store
+            .commit(seq)
+            .is_none_or(|c| c.kind != CommitKind::Graphrag)
+    })
+}
+
+/// The most commits whose kinds [`source_changed`] reads one by one.
+const MAX_KIND_CHECKS: u64 = 10_000;
 
 /// The changed facts of each stored community.
 struct Counter<'a> {
@@ -397,6 +473,65 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn graphrag_commits_alone_change_no_source() {
+        use sparkles::io::{RdfFormat, Source};
+        let s = sparkles::store::Store::in_memory(Default::default());
+        let load = |t: &str| {
+            s.load(&[Source::from_bytes(
+                t.as_bytes().to_vec(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        };
+        load("<urn:g:a> { <http://ex/a> <http://ex/p> <http://ex/b> . }");
+        let after = s.head_commit().seq;
+        assert!(!source_changed(&s, after));
+        let opts = sparkles::sparql::QueryOptions::default();
+        sparkles::sparql::update::update_as(
+            &s,
+            "INSERT DATA { GRAPH <urn:x-sparkles:graphrag:reports> { <http://ex/r> <http://ex/p> 1 } }",
+            &opts,
+            CommitKind::Graphrag,
+        )
+        .unwrap();
+        assert!(
+            !source_changed(&s, after),
+            "a GraphRAG commit is not a source change"
+        );
+        load("<urn:g:a> { <http://ex/a> <http://ex/p> <http://ex/c> . }");
+        assert!(source_changed(&s, after));
+    }
+
+    #[test]
+    fn pending_communities_and_failures_are_retried_without_a_commit() {
+        let d = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let mut w = Watch::default();
+        assert!(!w.wants_check(5, t0, d, 100));
+        assert!(w.wants_check(5, t0 + d, d, 100));
+        w.checked();
+        // pending communities: once per day, with no new commit
+        w.has_pending = true;
+        w.retried_day = Some(100);
+        assert!(!w.wants_check(5, t0 + d * 2, d, 100));
+        assert!(w.wants_check(5, t0 + d * 2, d, 101));
+        w.has_pending = false;
+        // a failure is retried after a doubling backoff
+        w.failed(t0, d);
+        assert!(!w.wants_check(5, t0 + d, d, 101));
+        assert!(w.wants_check(5, t0 + d * 2, d, 101));
+        w.checked();
+        w.failed(t0, d);
+        assert!(!w.wants_check(5, t0 + d * 3, d, 101));
+        assert!(w.wants_check(5, t0 + d * 4, d, 101));
+        for _ in 0..10 {
+            w.failed(t0, d);
+        }
+        assert_eq!(w.retry_at, Some(t0 + d * 64));
     }
 
     #[test]

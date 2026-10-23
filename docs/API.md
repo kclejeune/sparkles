@@ -10684,7 +10684,9 @@ message starts with `automatic refresh` and the reason, and its `detail` holds t
 reason as `trigger`. The daily token budget bounds it as it bounds any run. The server
 never starts a first build, follows main only, waits while another GraphRAG task of the
 dataset is queued or running, and retries a run that left pending communities once a
-day.
+day without waiting for a commit. Commits that GraphRAG made itself start nothing. A
+check or a refresh that fails is tried again after a backoff that starts at two
+debounce periods and doubles up to 64.
 
 ```json
 { "mode": "build", "sourceCommit": 41, "communities": 12, "written": 12, "kept": 0,

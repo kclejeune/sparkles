@@ -392,6 +392,46 @@ async fn an_automatic_refresh_follows_the_change_feed() {
     .unwrap();
 }
 
+/// Phase 3, round 1 finding 4: a dataset admits one GraphRAG task at a time, whichever
+/// path starts it, so an automatic refresh cannot run beside a build waiting for its
+/// confirmation.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_graphrag_task_runs_per_dataset() {
+    let f = fixture(3);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({}));
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        store_settings(&f.st, &ds, &s);
+        let first = spawn(&f.st, ds.clone(), s.clone(), Mode::Build, false, None).unwrap();
+        let end = Instant::now() + Duration::from_secs(30);
+        while !f.st.graphrag.is_waiting("org", &first.id) {
+            assert!(
+                Instant::now() < end,
+                "the build never waited for confirmation"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let second = spawn(
+            &f.st,
+            ds.clone(),
+            s,
+            Mode::Refresh,
+            true,
+            Some("test".into()),
+        );
+        assert_eq!(second.unwrap_err(), first.id);
+        assert!(f.st.graphrag.answer("org", &first.id, false));
+        while f.st.active_task(TASK_KIND, "org").is_some() {
+            assert!(Instant::now() < end, "the build did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(f.mock.requests().is_empty());
+    })
+    .await
+    .unwrap();
+}
+
 /// A8: a budget smaller than the first reservation sends no request and leaves every
 /// community pending.
 #[tokio::test(flavor = "multi_thread")]

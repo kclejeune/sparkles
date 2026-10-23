@@ -1053,8 +1053,13 @@ fn commit_text(graph: &str, delete: &[String], quads: &[oxrdf::Quad]) -> String 
 
 /// Run a build or a refresh. Returns the outcome; a run stopped by its budget or an
 /// anomaly is an outcome too, with `stopped` set.
-/// Start a run as a task of kind [`TASK_KIND`]. `trigger` names why an automatic refresh
-/// started (§5), and the task's message says so.
+/// Serializes the admission of GraphRAG tasks, so that the check for a dataset's active
+/// task and the listing of the new one are one step.
+static ADMISSION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Start a run as a task of kind [`TASK_KIND`], unless a GraphRAG task of the dataset is
+/// queued or running, whose id the error holds. `trigger` names why an automatic
+/// refresh started (§5), and the task's message says so.
 pub fn spawn(
     st: &Arc<AppState>,
     ds: Arc<Dataset>,
@@ -1062,49 +1067,55 @@ pub fn spawn(
     mode: Mode,
     confirmed: bool,
     trigger: Option<String>,
-) -> crate::state::Task {
+) -> Result<crate::state::Task, String> {
+    let _admission = ADMISSION.lock();
+    if let Some(id) = st.active_task(TASK_KIND, &ds.name) {
+        return Err(id);
+    }
     let id = st.next_task_id();
     let task_id = id.clone();
     let st2 = st.clone();
     let ds_name = ds.name.clone();
-    st.start_task_opts(id, TASK_KIND, &ds_name, None, true, move |h| {
-        let cancel = h.cancel_flag();
-        let r = Run {
-            st: &st2,
-            ds: ds.clone(),
-            settings,
-            mode,
-            confirmed,
-            task: Some(h),
-            task_id,
-            cancel: cancel.clone(),
-        };
-        let prefix = match &trigger {
-            Some(t) => format!("automatic refresh ({t}): "),
-            None => String::new(),
-        };
-        match run(&r) {
-            Ok(o) => {
-                let mut detail = serde_json::to_value(&o).unwrap_or(Value::Null);
-                if let Some(t) = &trigger {
-                    detail["trigger"] = t.clone().into();
+    Ok(
+        st.start_task_opts(id, TASK_KIND, &ds_name, None, true, move |h| {
+            let cancel = h.cancel_flag();
+            let r = Run {
+                st: &st2,
+                ds: ds.clone(),
+                settings,
+                mode,
+                confirmed,
+                task: Some(h),
+                task_id,
+                cancel: cancel.clone(),
+            };
+            let prefix = match &trigger {
+                Some(t) => format!("automatic refresh ({t}): "),
+                None => String::new(),
+            };
+            match run(&r) {
+                Ok(o) => {
+                    let mut detail = serde_json::to_value(&o).unwrap_or(Value::Null);
+                    if let Some(t) = &trigger {
+                        detail["trigger"] = t.clone().into();
+                    }
+                    h.set_detail(detail);
+                    Ok(match &o.stopped {
+                        Some(why) => format!(
+                            "{prefix}{} reports written, {} pending: {why}",
+                            o.written, o.pending
+                        ),
+                        None => format!(
+                            "{prefix}{} reports written, {} kept, {} failed",
+                            o.written, o.kept, o.failed
+                        ),
+                    })
                 }
-                h.set_detail(detail);
-                Ok(match &o.stopped {
-                    Some(why) => format!(
-                        "{prefix}{} reports written, {} pending: {why}",
-                        o.written, o.pending
-                    ),
-                    None => format!(
-                        "{prefix}{} reports written, {} kept, {} failed",
-                        o.written, o.kept, o.failed
-                    ),
-                })
+                Err(RunError::Cancelled) => Err(sparkles::Error::Cancelled.into()),
+                Err(e) => Err(anyhow::anyhow!("{prefix}{e}")),
             }
-            Err(RunError::Cancelled) => Err(sparkles::Error::Cancelled.into()),
-            Err(e) => Err(anyhow::anyhow!("{prefix}{e}")),
-        }
-    })
+        }),
+    )
 }
 
 /// The persisted state of a dataset's builds.

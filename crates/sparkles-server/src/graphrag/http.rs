@@ -187,7 +187,15 @@ async fn start(
         .check()
         .map_err(|m| err_code(StatusCode::BAD_REQUEST, "invalid-settings", m))?;
     crate::http::task_start_check(&st, Some(build::TASK_KIND), &ds.name)?;
-    let task = build::spawn(&st, ds, settings, mode, b.confirm, None);
+    let task = build::spawn(&st, ds, settings, mode, b.confirm, None).map_err(|id| {
+        err(
+            StatusCode::CONFLICT,
+            format!(
+                "a {} task of /{name} is already queued or running (task {id})",
+                build::TASK_KIND
+            ),
+        )
+    })?;
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 

@@ -905,7 +905,10 @@ baseline stays until it is rewritten. An edge between two entities that no commu
 holds starts no refresh, since such entities form at most a community too small for a
 report. The task needs no confirmation and runs within `tokensPerDay`, the loop never
 starts a first build or works on a branch, and a run that left pending communities is
-retried once a day. Counting from an F13 view waits for roadmap item 17.
+retried once a day without a new commit. Only commits of other kinds than GraphRAG's own
+count as activity, so a refresh never follows its own commit. A failed check or
+refresh is retried after a backoff of two to 64 debounce periods, and one admission lock
+lets only one GraphRAG task of a dataset be listed at a time. Counting from an F13 view waits for roadmap item 17.
 
 ### Shared memory representation follow-up
 
