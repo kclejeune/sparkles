@@ -2153,28 +2153,31 @@ impl Ctx {
             (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
         };
         if self.is_cursor() {
-            // A cursor charges the reconstruction of both keys, as its decoding does. A
-            // charge that fails fails the cursor, and the generic comparison follows.
-            let order = self.with_cursor_vocab_key(x, |kx| {
-                let rx = lexical(kx)?;
-                match self.with_cursor_vocab_key(y, |ky| {
-                    let ry = lexical(ky)?;
-                    Some(kx[rx.clone()].cmp(&ky[ry]))
-                }) {
-                    Ok(order) => order.flatten(),
-                    Err(error) => {
-                        self.fail_cursor(&error);
-                        None
-                    }
-                }
-            });
-            return match order {
-                Ok(order) => order.flatten(),
-                Err(error) => {
-                    self.fail_cursor(&error);
-                    None
+            // A cursor reserves the reconstruction of both keys before it grows them,
+            // within the high-water envelope of its transient decoding
+            // ([`Ctx::cursor_decode`]). That envelope covers a key of the largest size
+            // seen so far on every worker, both keys of a comparison included, is
+            // charged once when it grows and is released when the cursor ends, so a
+            // comparison of keys within it takes no lock. A reservation that fails
+            // fails the cursor, and the generic comparison follows.
+            let reserve = |need: usize| {
+                if self.cursor_decode(need) {
+                    Ok(())
+                } else {
+                    Err(())
                 }
             };
+            let order = v.get_with_checked(x, reserve, |kx| {
+                let rx = lexical(kx)?;
+                v.get_with_checked(y, reserve, |ky| {
+                    let ry = lexical(ky)?;
+                    Some(kx[rx.clone()].cmp(&ky[ry]))
+                })
+                .ok()
+                .flatten()
+                .flatten()
+            });
+            return order.ok().flatten().flatten();
         }
         v.get_with(x, |kx| {
             let rx = lexical(kx)?;

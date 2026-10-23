@@ -1146,4 +1146,61 @@ mod tests {
         drop(ctx);
         assert_eq!(grant.used(), 0);
     }
+
+    /// A cursor that compares stored strings reserves their keys within its decoding
+    /// envelope, which grows with the largest key and not with the number of
+    /// comparisons, so 2,000 comparisons take the ledger about as often as a filter
+    /// that compares nothing. The cursor's end releases the envelope to the pool.
+    #[test]
+    fn cursor_string_comparisons_take_a_bounded_number_of_ledger_operations() {
+        use crate::io::{RdfFormat, Source};
+        use crate::sparql::{CursorOptions, QueryOptions, select_cursor};
+        let pool = QueryPool::new(64 * MB);
+        let opts = QueryOptions {
+            prefixes: vec![("ex".into(), "http://ex.org/".into())],
+            pool: Some(pool.clone()),
+            max_memory_bytes: Some(32 * MB),
+            no_cache: true,
+            ..Default::default()
+        };
+        let mut ops = Vec::new();
+        let n = 2000;
+        for filter in ["BOUND(?x)", "?x < ?y"] {
+            let mut data = String::from("@prefix ex: <http://ex.org/> .\n");
+            for i in 0..n {
+                data.push_str(&format!(
+                    "ex:s{i} ex:p \"name {i:05}\" ; ex:q \"name {:05}\" .\n",
+                    (i * 7) % n
+                ));
+            }
+            let store = Store::in_memory(StoreOptions::default());
+            store
+                .load(&[Source::from_bytes(
+                    data.into_bytes(),
+                    RdfFormat::Turtle,
+                    None,
+                )])
+                .unwrap();
+            let before = LEDGER_OPS.with(|n| n.get());
+            let mut cursor = select_cursor(
+                store.snapshot(),
+                &format!("SELECT ?s WHERE {{ ?s ex:p ?x ; ex:q ?y FILTER({filter}) }}"),
+                &opts,
+                &CursorOptions {
+                    batch_rows: 64,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut rows = 0;
+            while let Some(batch) = cursor.next_batch().unwrap() {
+                rows += batch.len();
+            }
+            assert!(rows >= n / 4, "{filter}: {rows} of {n}");
+            drop(cursor);
+            ops.push(LEDGER_OPS.with(|n| n.get()) - before);
+            assert_eq!(pool.granted(), 0, "the cursor released its envelope");
+        }
+        assert!(ops[1] <= ops[0] + 16, "{ops:?}");
+    }
 }
