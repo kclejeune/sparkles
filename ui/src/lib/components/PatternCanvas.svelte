@@ -145,6 +145,16 @@
           'text-max-width': '260px',
         },
       },
+      // a node that waits for an edge, and a block that uses what nothing binds; both also
+      // say so in text
+      {
+        selector: 'node[?waiting]',
+        style: { opacity: 0.6, 'border-style': 'dashed' },
+      },
+      {
+        selector: 'node[?warn]',
+        style: { 'border-color': cssVar('--danger'), 'border-style': 'solid', 'border-width': 2 },
+      },
       {
         selector: ':parent',
         style: {
@@ -235,6 +245,8 @@
       label,
       kind: n.kind,
       title: n.title,
+      waiting: !!n.waiting,
+      warn: !!n.warn,
       ...size(label, n.kind),
       ...(n.parent ? { parent: n.parent } : {}),
     };
@@ -262,6 +274,26 @@
         pos[n.id()] = [Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10];
       });
     wrap.dataset.positions = JSON.stringify(pos);
+    exposeScreen();
+  }
+
+  let sizeObserver: ResizeObserver | undefined;
+
+  /** Where each node is on screen, relative to the canvas, for the tests' taps. */
+  let screenFrame = 0;
+  function exposeScreen() {
+    cancelAnimationFrame(screenFrame);
+    screenFrame = requestAnimationFrame(() => {
+      if (!cy || !wrap) return;
+      const out: Record<string, [number, number]> = {};
+      cy.nodes()
+        .not(':parent')
+        .forEach((n) => {
+          const p = n.renderedPosition();
+          out[n.id()] = [Math.round(p.x), Math.round(p.y)];
+        });
+      wrap.dataset.screen = JSON.stringify(out);
+    });
   }
 
   /** Report the positions of every node with a key worth keeping. */
@@ -285,7 +317,8 @@
     if (wrap) wrap.dataset.settled = String(settled);
   }
 
-  /** Seeds next to the first neighbour with a position, spread around it. */
+  /** Seeds next to the first neighbour with a position, spread around it, or beside the
+   * drawing when it has none. */
   function seed(n: cytoscape.NodeSingular, i: number) {
     const placed = n
       .neighborhood('node')
@@ -294,6 +327,15 @@
     const base = placed.nonempty() ? placed[0].position() : null;
     const angle = (i * 2.4) % (2 * Math.PI);
     if (base) n.position({ x: base.x + Math.cos(angle) * 110, y: base.y + Math.sin(angle) * 110 });
+    else if (cy) {
+      // a node with no placed neighbour, such as a waiting node, goes beside the drawing
+      // instead of on top of it
+      const known = cy.nodes().filter((m) => !m.isParent() && !m.hasClass('fresh'));
+      if (known.nonempty()) {
+        const bb = known.boundingBox();
+        n.position({ x: bb.x2 + 120, y: bb.y1 + i * 70 });
+      }
+    }
   }
 
   function sync() {
@@ -375,6 +417,10 @@
     }
     // place only the new nodes: every known node is fixed where it is
     const fixed = known.nodes().map((k) => ({ nodeId: k.id(), position: { ...k.position() } }));
+    // a new node with no edges keeps its seat beside the drawing, which gravity would undo
+    const lone = fresh
+      .filter((n) => n.connectedEdges().empty() && !n.isParent())
+      .map((n) => ({ n, position: { ...n.position() } }));
     running = cy.layout({
       name: 'fcose',
       randomize: false,
@@ -388,6 +434,14 @@
       stop: () => {
         // the known nodes exactly where they were
         for (const f of fixed) cy!.getElementById(f.nodeId).position(f.position);
+        for (const l of lone) l.n.position(l.position);
+        // a new node placed outside the view brings the whole drawing into view
+        const ext = cy!.extent();
+        const outside = cy!.nodes('.fresh').some((n) => {
+          const b = n.boundingBox();
+          return b.x1 < ext.x1 || b.x2 > ext.x2 || b.y1 < ext.y1 || b.y2 > ext.y2;
+        });
+        if (outside) cy!.fit(cy!.elements(), 30);
         cy!.nodes('.fresh').removeClass('fresh');
         done();
       },
@@ -445,6 +499,14 @@
     cy.on('tap', (e) => {
       if (e.target === cy) onselect?.(null);
     });
+    cy.on('viewport', exposeScreen);
+    // a form or bar opening above the canvas moves and shrinks it: cytoscape keeps the
+    // container's box, so taps would land beside their nodes until it measures again
+    sizeObserver = new ResizeObserver(() => {
+      cy?.resize();
+      exposeScreen();
+    });
+    sizeObserver.observe(host);
     cy.on('dragfree', 'node', () => {
       expose();
       report();
@@ -472,6 +534,8 @@
   }
 
   onDestroy(() => {
+    cancelAnimationFrame(screenFrame);
+    sizeObserver?.disconnect();
     themeObserver?.disconnect();
     media?.removeEventListener('change', restyle);
     running?.stop();
@@ -648,8 +712,9 @@
   <div class="cy" bind:this={host}></div>
   <p class="sr-only" id="pattern-keys">
     Tab moves through the pattern in text order, arrow keys move to the nearest element, Shift with
-    an arrow moves a node, Enter opens its panel, Delete removes an edge, O toggles optional, N adds
-    a triple, and Escape returns to the editor.
+    an arrow moves a node, Enter opens its panel, Delete removes it, O toggles optional, N adds a
+    node, E adds an edge from the focused node, F adds a filter on the focused variable, and Escape
+    returns to the editor.
   </p>
   <p class="sr-only" aria-live="polite" data-testid="pattern-focus">{announce}</p>
 </div>

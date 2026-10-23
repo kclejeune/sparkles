@@ -14,12 +14,54 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [
+          {
+            "expression": false,
+            "range": {
+              "from": 40,
+              "to": 47
+            },
+            "var": "person",
+            "varRefs": [
+              {
+                "name": "person",
+                "range": {
+                  "from": 40,
+                  "to": 47
+                }
+              }
+            ]
+          },
+          {
+            "expression": false,
+            "range": {
+              "from": 48,
+              "to": 52
+            },
+            "var": "org",
+            "varRefs": [
+              {
+                "name": "org",
+                "range": {
+                  "from": 48,
+                  "to": 52
+                }
+              }
+            ]
+          }
+        ],
+        "keyword": {
+          "from": 33,
+          "to": 39
+        },
         "locked": false,
         "range": {
           "from": 33,
           "to": 52
         },
         "star": false,
+        "starRange": null,
         "vars": ["person", "org"]
       },
       "prologue": {
@@ -35,6 +77,7 @@
           }
         ]
       },
+      "queryStart": 33,
       "root": {
         "inner": {
           "from": 60,
@@ -275,18 +318,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 17,
+          "to": 23
+        },
         "locked": false,
         "range": {
           "from": 17,
           "to": 25
         },
         "star": true,
+        "starRange": {
+          "from": 24,
+          "to": 25
+        },
         "vars": []
       },
       "prologue": {
         "base": "http://x/",
         "prefixes": []
       },
+      "queryStart": 17,
       "root": {
         "inner": {
           "from": 27,
@@ -419,12 +473,22 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 33,
+          "to": 39
+        },
         "locked": false,
         "range": {
           "from": 33,
           "to": 41
         },
         "star": true,
+        "starRange": {
+          "from": 40,
+          "to": 41
+        },
         "vars": []
       },
       "prologue": {
@@ -440,6 +504,7 @@
           }
         ]
       },
+      "queryStart": 33,
       "root": {
         "inner": {
           "from": 49,
@@ -501,6 +566,7 @@
             "type": "triple"
           },
           {
+            "binds": ["y"],
             "dot": null,
             "end": 98,
             "kind": "BIND",
@@ -510,6 +576,15 @@
             },
             "text": "BIND(YEAR(NOW()) AS ?y) # year",
             "type": "locked",
+            "varRefs": [
+              {
+                "name": "y",
+                "range": {
+                  "from": 95,
+                  "to": 97
+                }
+              }
+            ],
             "vars": ["y"]
           },
           {
@@ -579,6 +654,15 @@
             },
             "text": "FILTER(STRSTARTS(?name, \"A\"))",
             "type": "filter",
+            "varRefs": [
+              {
+                "name": "name",
+                "range": {
+                  "from": 151,
+                  "to": 156
+                }
+              }
+            ],
             "vars": ["name"]
           }
         ],
@@ -606,6 +690,7 @@
       "form": "construct",
       "locked": [
         {
+          "binds": [],
           "dot": null,
           "end": 32,
           "kind": "CONSTRUCT",
@@ -614,9 +699,26 @@
             "to": 32
           },
           "text": "{ ?s <http://x/q> ?o }",
+          "varRefs": [
+            {
+              "name": "s",
+              "range": {
+                "from": 12,
+                "to": 14
+              }
+            },
+            {
+              "name": "o",
+              "range": {
+                "from": 28,
+                "to": 30
+              }
+            }
+          ],
           "vars": ["s", "o"]
         },
         {
+          "binds": [],
           "dot": null,
           "end": 48,
           "kind": "FROM",
@@ -625,6 +727,7 @@
             "to": 48
           },
           "text": "FROM <http://g>",
+          "varRefs": [],
           "vars": []
         }
       ],
@@ -635,6 +738,7 @@
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 56,
@@ -713,18 +817,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -854,6 +969,7 @@
       "form": "describe",
       "locked": [
         {
+          "binds": [],
           "dot": null,
           "end": 21,
           "kind": "DESCRIBE",
@@ -862,6 +978,7 @@
             "to": 21
           },
           "text": "DESCRIBE <http://x/a>",
+          "varRefs": [],
           "vars": []
         }
       ],
@@ -872,6 +989,7 @@
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": null
     },
     "text": "DESCRIBE <http://x/a>"
@@ -884,18 +1002,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -1044,6 +1173,15 @@
             },
             "text": "FILTER(?v > 1)",
             "type": "filter",
+            "varRefs": [
+              {
+                "name": "v",
+                "range": {
+                  "from": 82,
+                  "to": 84
+                }
+              }
+            ],
             "vars": ["v"]
           }
         ],
@@ -1064,18 +1202,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -1277,18 +1426,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -1490,18 +1650,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 16,
@@ -1525,12 +1696,22 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 33,
+          "to": 39
+        },
         "locked": false,
         "range": {
           "from": 33,
           "to": 41
         },
         "star": true,
+        "starRange": {
+          "from": 40,
+          "to": 41
+        },
         "vars": []
       },
       "prologue": {
@@ -1546,6 +1727,7 @@
           }
         ]
       },
+      "queryStart": 33,
       "root": {
         "inner": {
           "from": 43,
@@ -1840,18 +2022,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -1984,18 +2177,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -2128,12 +2332,22 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 33,
+          "to": 39
+        },
         "locked": false,
         "range": {
           "from": 33,
           "to": 41
         },
         "star": true,
+        "starRange": {
+          "from": 40,
+          "to": 41
+        },
         "vars": []
       },
       "prologue": {
@@ -2149,6 +2363,7 @@
           }
         ]
       },
+      "queryStart": 33,
       "root": {
         "inner": {
           "from": 49,
@@ -2210,6 +2425,7 @@
             "type": "triple"
           },
           {
+            "binds": ["c"],
             "dot": null,
             "end": 85,
             "kind": "BIND",
@@ -2219,9 +2435,26 @@
             },
             "text": "BIND(?b + 1 AS ?c)",
             "type": "locked",
+            "varRefs": [
+              {
+                "name": "b",
+                "range": {
+                  "from": 72,
+                  "to": 74
+                }
+              },
+              {
+                "name": "c",
+                "range": {
+                  "from": 82,
+                  "to": 84
+                }
+              }
+            ],
             "vars": ["b", "c"]
           },
           {
+            "binds": [],
             "dot": null,
             "end": 108,
             "kind": "MINUS",
@@ -2231,6 +2464,22 @@
             },
             "text": "MINUS { ?a ex:q ?d }",
             "type": "locked",
+            "varRefs": [
+              {
+                "name": "a",
+                "range": {
+                  "from": 96,
+                  "to": 98
+                }
+              },
+              {
+                "name": "d",
+                "range": {
+                  "from": 104,
+                  "to": 106
+                }
+              }
+            ],
             "vars": ["a", "d"]
           }
         ],
@@ -2251,18 +2500,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -2270,6 +2530,7 @@
         },
         "items": [
           {
+            "binds": ["s"],
             "dot": null,
             "end": 43,
             "kind": "triples",
@@ -2279,6 +2540,15 @@
             },
             "text": "?s <http://p> [ <http://q> 1 ] # c",
             "type": "locked",
+            "varRefs": [
+              {
+                "name": "s",
+                "range": {
+                  "from": 13,
+                  "to": 15
+                }
+              }
+            ],
             "vars": ["s"]
           }
         ],
@@ -2299,18 +2569,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -2389,18 +2670,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -2479,12 +2771,22 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 33,
+          "to": 39
+        },
         "locked": false,
         "range": {
           "from": 33,
           "to": 41
         },
         "star": true,
+        "starRange": {
+          "from": 40,
+          "to": 41
+        },
         "vars": []
       },
       "prologue": {
@@ -2500,6 +2802,7 @@
           }
         ]
       },
+      "queryStart": 33,
       "root": {
         "inner": {
           "from": 49,
@@ -2773,18 +3076,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -2919,6 +3233,15 @@
                 },
                 "text": "FILTER(?o > 2)",
                 "type": "filter",
+                "varRefs": [
+                  {
+                    "name": "o",
+                    "range": {
+                      "from": 67,
+                      "to": 69
+                    }
+                  }
+                ],
                 "vars": ["o"]
               },
               {
@@ -2934,6 +3257,15 @@
                 },
                 "text": "FILTER(?x > 3)",
                 "type": "filter",
+                "varRefs": [
+                  {
+                    "name": "x",
+                    "range": {
+                      "from": 82,
+                      "to": 84
+                    }
+                  }
+                ],
                 "vars": ["x"]
               }
             ],
@@ -2957,6 +3289,15 @@
             },
             "text": "FILTER(?o < 9)",
             "type": "filter",
+            "varRefs": [
+              {
+                "name": "o",
+                "range": {
+                  "from": 99,
+                  "to": 101
+                }
+              }
+            ],
             "vars": ["o"]
           }
         ],
@@ -2977,12 +3318,22 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 33,
+          "to": 39
+        },
         "locked": false,
         "range": {
           "from": 33,
           "to": 41
         },
         "star": true,
+        "starRange": {
+          "from": 40,
+          "to": 41
+        },
         "vars": []
       },
       "prologue": {
@@ -2998,6 +3349,7 @@
           }
         ]
       },
+      "queryStart": 33,
       "root": {
         "inner": {
           "from": 43,
@@ -3145,18 +3497,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -3304,18 +3667,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 11,
+          "to": 17
+        },
         "locked": false,
         "range": {
           "from": 11,
           "to": 19
         },
         "star": true,
+        "starRange": {
+          "from": 18,
+          "to": 19
+        },
         "vars": []
       },
       "prologue": {
         "base": "../",
         "prefixes": []
       },
+      "queryStart": 11,
       "root": {
         "inner": {
           "from": 21,
@@ -3463,18 +3837,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,
@@ -3622,12 +4007,22 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 33,
+          "to": 39
+        },
         "locked": false,
         "range": {
           "from": 33,
           "to": 41
         },
         "star": true,
+        "starRange": {
+          "from": 40,
+          "to": 41
+        },
         "vars": []
       },
       "prologue": {
@@ -3643,6 +4038,7 @@
           }
         ]
       },
+      "queryStart": 33,
       "root": {
         "inner": {
           "from": 43,
@@ -3775,12 +4171,22 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 33,
+          "to": 39
+        },
         "locked": false,
         "range": {
           "from": 33,
           "to": 41
         },
         "star": true,
+        "starRange": {
+          "from": 40,
+          "to": 41
+        },
         "vars": []
       },
       "prologue": {
@@ -3796,6 +4202,7 @@
           }
         ]
       },
+      "queryStart": 33,
       "root": {
         "inner": {
           "from": 43,
@@ -3982,18 +4389,29 @@
       "ok": true,
       "projection": {
         "distinct": false,
+        "distinctRange": null,
+        "items": [],
+        "keyword": {
+          "from": 0,
+          "to": 6
+        },
         "locked": false,
         "range": {
           "from": 0,
           "to": 8
         },
         "star": true,
+        "starRange": {
+          "from": 7,
+          "to": 8
+        },
         "vars": []
       },
       "prologue": {
         "base": null,
         "prefixes": []
       },
+      "queryStart": 0,
       "root": {
         "inner": {
           "from": 10,

@@ -59,6 +59,32 @@ pub struct Projection {
     pub distinct: bool,
     pub locked: bool,
     pub range: Range<usize>,
+    /// the `SELECT` keyword
+    pub keyword: Range<usize>,
+    /// the `DISTINCT` (or `REDUCED`) keyword and the `*`, when present
+    pub distinct_range: Option<Range<usize>>,
+    pub star_range: Option<Range<usize>>,
+    /// the items of the projection in order: a plain variable, or an expression
+    /// `(… AS ?v)`, with the range of the whole item
+    pub items: Vec<ProjectionItem>,
+}
+
+/// One item of a `SELECT` clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionItem {
+    pub var: String,
+    /// whether it is `(expression AS ?v)` rather than a plain variable
+    pub expression: bool,
+    pub range: Range<usize>,
+    /// every variable token of the item
+    pub var_refs: Vec<VarRef>,
+}
+
+/// One occurrence of a variable: its name and the range of its token, `?` included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VarRef {
+    pub name: String,
+    pub range: Range<usize>,
 }
 
 /// `LIMIT` or `OFFSET` and its number.
@@ -86,6 +112,8 @@ pub struct Pattern {
     /// the locked parts outside the `WHERE` group: `FROM` clauses, a `CONSTRUCT`
     /// template, the terms of `DESCRIBE`
     pub locked: Vec<Locked>,
+    /// where the query form starts, after the prologue
+    pub query_start: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +278,8 @@ pub struct FilterForm {
 pub struct Filter {
     pub form: Option<FilterForm>,
     pub vars: Vec<String>,
+    /// every variable token in the filter, for a rename
+    pub var_refs: Vec<VarRef>,
     pub text: String,
     pub range: Range<usize>,
     /// the `.` token that follows the filter in its group, if any
@@ -264,6 +294,13 @@ pub struct Filter {
 pub struct Locked {
     pub kind: String,
     pub vars: Vec<String>,
+    /// the variables the block binds for the rest of its group: the target of a `BIND`
+    /// or `LET`, the variables of `VALUES`, a subquery's projection, and every variable of
+    /// a group, `OPTIONAL`, `UNION`, `GRAPH`, `SERVICE`, `LATERAL` or locked statement;
+    /// none for `MINUS`, the modifiers and the clauses outside the `WHERE` group
+    pub binds: Vec<String>,
+    /// every variable token in the block, for a rename the person confirms
+    pub var_refs: Vec<VarRef>,
     pub text: String,
     pub range: Range<usize>,
     /// the end of the block's last token, before a trailing comment
@@ -440,6 +477,7 @@ impl<'t, 's> Reader<'t, 's> {
             offset: None,
             modifiers: Vec::new(),
             locked: Vec::new(),
+            query_start: t.range(q).start,
         };
         for n in t.child_nodes(q) {
             match t.kind(n) {
@@ -538,13 +576,27 @@ impl<'t, 's> Reader<'t, 's> {
             distinct: false,
             locked: false,
             range: t.range(n),
+            keyword: t.range(n).start..t.range(n).start,
+            distinct_range: None,
+            star_range: None,
+            items: Vec::new(),
         };
         for e in t.children(n) {
             match *e {
                 Element::Token(tok) => match t.token_kind(tok) {
-                    TokenKind::Star => pr.star = true,
-                    TokenKind::Kw(Kw::Distinct) => pr.distinct = true,
-                    TokenKind::Kw(Kw::Reduced) => pr.locked = true,
+                    TokenKind::Star => {
+                        pr.star = true;
+                        pr.star_range = Some(t.token(tok).range());
+                    }
+                    TokenKind::Kw(Kw::Select) => pr.keyword = t.token(tok).range(),
+                    TokenKind::Kw(Kw::Distinct) => {
+                        pr.distinct = true;
+                        pr.distinct_range = Some(t.token(tok).range());
+                    }
+                    TokenKind::Kw(Kw::Reduced) => {
+                        pr.locked = true;
+                        pr.distinct_range = Some(t.token(tok).range());
+                    }
                     _ => {}
                 },
                 Element::Node(item) => {
@@ -558,12 +610,52 @@ impl<'t, 's> Reader<'t, 's> {
                         .rev()
                         .find(|&&v| matches!(t.token_kind(v), TokenKind::Var1 | TokenKind::Var2))
                     {
-                        pr.vars.push(t.token_text(v)[1..].to_string());
+                        let var = t.token_text(v)[1..].to_string();
+                        pr.items.push(ProjectionItem {
+                            var: var.clone(),
+                            expression: toks.len() > 1,
+                            range: t.range(item),
+                            var_refs: self.var_refs(item),
+                        });
+                        pr.vars.push(var);
                     }
                 }
             }
         }
         pr
+    }
+
+    /// Every variable token of `n`, in order.
+    fn var_refs(&self, n: NodeId) -> Vec<VarRef> {
+        let t = self.tree;
+        self.tokens(n)
+            .into_iter()
+            .filter(|&v| matches!(t.token_kind(v), TokenKind::Var1 | TokenKind::Var2))
+            .map(|v| VarRef {
+                name: t.token_text(v)[1..].to_string(),
+                range: t.token(v).range(),
+            })
+            .collect()
+    }
+
+    /// The variables a locked block of `kind` over `n` binds for the rest of its group.
+    fn binds(&self, n: NodeId, kind: &str, vars: &[String]) -> Vec<String> {
+        let t = self.tree;
+        match kind {
+            "BIND" => {
+                // the variable after `AS`
+                let toks = self.tokens(n);
+                toks.windows(2)
+                    .find(|w| t.token_kind(w[0]) == TokenKind::Kw(Kw::As))
+                    .filter(|w| matches!(t.token_kind(w[1]), TokenKind::Var1 | TokenKind::Var2))
+                    .map(|w| vec![t.token_text(w[1])[1..].to_string()])
+                    .unwrap_or_default()
+            }
+            "LET" => self.vars(n).into_iter().take(1).collect(),
+            "MINUS" | "ORDER BY" | "GROUP BY" | "HAVING" | "LIMIT" | "OFFSET" | "CONSTRUCT"
+            | "DESCRIBE" | "FROM" | "SEMIJOIN" | "ANTIJOIN" => Vec::new(),
+            _ => vars.to_vec(),
+        }
     }
 
     /// A locked block over node `n`, to the end of a comment on the line of its last
@@ -581,6 +673,8 @@ impl<'t, 's> Reader<'t, 's> {
         };
         Locked {
             kind: kind.to_string(),
+            binds: self.binds(n, kind, &vars),
+            var_refs: self.var_refs(n),
             vars,
             text: self.tree.src[range.clone()].to_string(),
             end: self.tree.range(n).end,
@@ -681,6 +775,7 @@ impl<'t, 's> Reader<'t, 's> {
                 Item::Filter(Filter {
                     form: self.filter_form(c),
                     vars: self.vars(c),
+                    var_refs: self.var_refs(c),
                     text: t.src[range.clone()].to_string(),
                     range,
                     dot: None,

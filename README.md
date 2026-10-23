@@ -240,7 +240,7 @@ orders every item by difficulty and impact and links each to its design spec.
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
-graphs and maps, with arcs for the relations between located entities, a pattern view of each query that edits it as text, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
+graphs and maps, with arcs for the relations between located entities, a visual query builder that draws each query and edits it as text, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
 merges, a time slider over past commits with commit diffs drawn as graphs, the Ask bar, and agent memory. The first screenshots show an answered question,
 agent memory, the map view and a merge preview.
 
@@ -316,7 +316,7 @@ agent memory, the map view and a merge preview.
     <td>The three shortest paths between two people</td>
   </tr>
   <tr>
-    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block"></td>
+    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes and the count of matches under the canvas"></td>
     <td><img src="docs/images/diff-graph.png" alt="The diff graph of one commit with context, drawing a new start date in green and the corrected one as a dashed ghost around the unchanged edges of the person"></td>
   </tr>
   <tr>
@@ -330,6 +330,14 @@ agent memory, the map view and a merge preview.
   <tr>
     <td>A time-lapse that applies one commit's diff per step</td>
     <td>Lenses that size and colour the graph and dash its inferred edges</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>A query built on the canvas from the schema</td>
+    <td></td>
   </tr>
 </table>
 

@@ -234,9 +234,17 @@ fn pattern_json(text: &str, p: &Pattern) -> J {
         "projection": p.projection.as_ref().map(|x| json!({
             "vars": x.vars, "star": x.star, "distinct": x.distinct, "locked": x.locked,
             "range": u.range(&x.range),
+            "keyword": u.range(&x.keyword),
+            "distinctRange": x.distinct_range.as_ref().map(|r| u.range(r)),
+            "starRange": x.star_range.as_ref().map(|r| u.range(r)),
+            "items": x.items.iter().map(|i| json!({
+                "var": i.var, "expression": i.expression, "range": u.range(&i.range),
+                "varRefs": var_refs_json(&u, &i.var_refs),
+            })).collect::<Vec<J>>(),
         })),
         "modifiers": p.modifiers.iter().map(|l| locked_json(&u, l)).collect::<Vec<J>>(),
         "locked": p.locked.iter().map(|l| locked_json(&u, l)).collect::<Vec<J>>(),
+        "queryStart": u.at(p.query_start),
     });
     for (key, n) in [("limit", &p.limit), ("offset", &p.offset)] {
         if let Some(n) = n {
@@ -279,6 +287,7 @@ fn item_json(u: &Units, i: &Item) -> J {
             "type": "filter",
             "expr": f.form.as_ref().map(|x| json!({ "op": x.op, "var": x.var, "args": x.args })),
             "vars": f.vars,
+            "varRefs": var_refs_json(u, &f.var_refs),
             "text": f.text,
             "range": u.range(&f.range),
             "dot": f.dot.as_ref().map(|d| u.range(d)),
@@ -317,9 +326,19 @@ fn path_json(p: &Path) -> J {
 
 fn locked_json(u: &Units, l: &Locked) -> J {
     json!({
-        "kind": l.kind, "vars": l.vars, "text": l.text, "range": u.range(&l.range),
+        "kind": l.kind, "vars": l.vars, "binds": l.binds,
+        "varRefs": var_refs_json(u, &l.var_refs),
+        "text": l.text, "range": u.range(&l.range),
         "end": u.at(l.end), "dot": l.dot.as_ref().map(|d| u.range(d)),
     })
+}
+
+fn var_refs_json(u: &Units, refs: &[sparkles_fmt::pattern::VarRef]) -> J {
+    json!(
+        refs.iter()
+            .map(|v| json!({ "name": v.name, "range": u.range(&v.range) }))
+            .collect::<Vec<J>>()
+    )
 }
 
 /// A finding as `POST /$/lint` writes it: lines and columns as `sparkles lint` prints

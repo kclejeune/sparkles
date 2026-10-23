@@ -1763,7 +1763,8 @@ const builtin = (iri) => Object.values(NS).some((ns) => iri.startsWith(ns));
 /**
  * `/$/schema/{ds}/profiles`: for each class asked for, its instance count and the predicates
  * its instances use, over the default graph of `ds` (a store at a past commit for `at=`).
- * The kinds of value are left out.
+ * Literal values are counted by datatype, and the predicates that point at instances are
+ * listed as `incoming`. The other kinds of value are left out.
  */
 function classProfiles(ds, p) {
   const all = ds.store
@@ -1780,11 +1781,26 @@ function classProfiles(ds, p) {
   const profile = (iri) => {
     const members = typed.get(iri) ?? new Set();
     const used = new Map();
+    // the datatypes of the literal values per predicate, and the predicates pointing in
+    const literals = new Map();
+    const incoming = new Map();
     for (const q of all) {
+      if (q.predicate.value !== RDF_TYPE_IRI && members.has(String(q.object))) {
+        const e = incoming.get(q.predicate.value) ?? { triples: 0, subjects: new Set() };
+        e.triples++;
+        e.subjects.add(String(q.object));
+        incoming.set(q.predicate.value, e);
+      }
       if (q.predicate.value === RDF_TYPE_IRI || !members.has(String(q.subject))) continue;
       const e = used.get(q.predicate.value) ?? new Map();
       e.set(String(q.subject), (e.get(String(q.subject)) ?? 0) + 1);
       used.set(q.predicate.value, e);
+      if (q.object.termType === 'Literal') {
+        const l = literals.get(q.predicate.value) ?? new Map();
+        const dt = q.object.datatype.value;
+        l.set(dt, (l.get(dt) ?? 0) + 1);
+        literals.set(q.predicate.value, l);
+      }
     }
     return {
       class: iri,
@@ -1796,10 +1812,21 @@ function classProfiles(ds, p) {
         triples: [...per.values()].reduce((a, b) => a + b, 0),
         minPerInstance: Math.min(...per.values()),
         maxPerInstance: Math.max(...per.values()),
-        objects: {},
+        objects: literals.has(predicate)
+          ? {
+              literals: [...literals.get(predicate)].map(([datatype, triples]) => ({
+                datatype,
+                triples,
+              })),
+            }
+          : {},
         objectClasses: [],
       })),
-      incoming: [],
+      incoming: [...incoming].map(([predicate, e]) => ({
+        predicate,
+        triples: e.triples,
+        instances: e.subjects.size,
+      })),
     };
   };
   return {

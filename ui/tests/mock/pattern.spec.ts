@@ -96,7 +96,7 @@ test('A1: the pattern of U03 A3 draws three nodes, with classes as subtitles', a
   ]);
   // the strip shows the projection and LIMIT
   await expect(pane(page).getByLabel('Projection and modifiers')).toContainText('?person');
-  await expect(pane(page).getByLabel('Projection and modifiers')).toContainText('LIMIT 1000');
+  await expect(pane(page).getByLabel('LIMIT', { exact: true })).toHaveValue('1000');
 });
 
 test('A2: a BIND is a locked block, comment included, joined to ?y', async ({ page }) => {
@@ -168,10 +168,10 @@ SELECT * WHERE {
   await openPane(page, text);
   await pane(page).getByRole('button', { name: 'List' }).click();
   // add a triple, make one optional, delete one
-  await pane(page).getByRole('button', { name: 'Triple' }).click();
-  await pane(page).getByLabel('Subject').fill('?y');
-  await pane(page).getByLabel('Predicate').fill('ex:of');
-  await pane(page).getByLabel('Object').fill('?person');
+  await pane(page).getByRole('button', { name: 'Edge', exact: true }).click();
+  await pane(page).getByLabel('From', { exact: true }).fill('?y');
+  await pane(page).getByLabel('Predicate', { exact: true }).fill('ex:of');
+  await pane(page).getByLabel('To', { exact: true }).fill('?person');
   await pane(page).getByRole('button', { name: 'Add', exact: true }).click();
   await expect.poll(() => textOf(page)).toContain('?y ex:of ?person .');
   const rows = pane(page).locator('li');
@@ -261,9 +261,9 @@ test('A11: the keyboard reaches every element and edits with announcements', asy
   await expect(pane(page).getByRole('dialog', { name: 'Pattern element' })).toBeVisible();
   await page.keyboard.press('Escape');
   await expect(pane(page).getByRole('dialog', { name: 'Pattern element' })).toHaveCount(0);
-  // N adds a triple from a form
-  await page.keyboard.press('n');
-  await expect(pane(page).getByLabel('Subject')).toBeFocused();
+  // E adds an edge from a form
+  await page.keyboard.press('e');
+  await expect(pane(page).getByLabel('From', { exact: true })).toBeFocused();
   await page.keyboard.type('?org');
   await page.keyboard.press('Tab');
   await page.keyboard.type('ex:name');
@@ -288,7 +288,7 @@ test('error states: broken text, updates and disconnected parts', async ({ page 
   await setText(page, A3.replace('ex:lyon .', 'ex:lyon . ?x'));
   await expect(canvas(page)).toHaveAttribute('data-dim', 'true');
   await expect(pane(page)).toContainText('does not parse at line 6');
-  await expect(pane(page).getByRole('button', { name: 'Triple' })).toHaveCount(0);
+  await expect(pane(page).getByRole('button', { name: 'Edge', exact: true })).toHaveCount(0);
   await setText(page, 'INSERT DATA { <http://x/a> <http://x/b> 1 }');
   await expect(pane(page)).toContainText('Updates are not drawn. The builder edits queries.');
   await setText(page, 'SELECT * { ?a <http://x/p> ?b . ?c <http://x/q> ?d }');
@@ -388,9 +388,13 @@ test('each editor tab keeps its own positions', async ({ page }) => {
   const first = (await positions(c))['v:person'];
   // the same query in a second tab, ?person moved the other way
   await page.getByRole('button', { name: 'New query tab' }).click();
+  // an empty tab draws an empty canvas first, so wait for the query's own layout to end
+  await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);
+  const empty = await settled(canvas(page));
   await setText(page, A3);
   await expect(pane(page)).toHaveAttribute('data-state', 'ok');
-  await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);
+  await redrawn(canvas(page), empty);
+  await expect.poll(async () => (await positions(canvas(page)))['v:person']?.[0]).toBeDefined();
   await canvas(page).focus();
   for (let i = 0; i < 10; i++) await page.keyboard.press('Shift+ArrowLeft');
   const second = (await positions(canvas(page)))['v:person'];
@@ -435,9 +439,9 @@ test('undo, redo and Escape work in the list and from the panel', async ({ page 
   await page.keyboard.press('Escape');
   await expect(panel).toHaveCount(0);
   // typing in the add form keeps the field's own undo
-  await pane(page).getByRole('button', { name: 'Triple' }).click();
-  await pane(page).getByLabel('Subject').fill('?x');
-  await pane(page).getByLabel('Subject').press('ControlOrMeta+Z');
+  await pane(page).getByRole('button', { name: 'Edge', exact: true }).click();
+  await pane(page).getByLabel('From', { exact: true }).fill('?x');
+  await pane(page).getByLabel('From', { exact: true }).press('ControlOrMeta+Z');
   await expect.poll(() => textOf(page)).toBe(A3);
 });
 
@@ -445,10 +449,10 @@ test('a prefix nobody declares is refused, and DESCRIBE draws its locked terms',
   page,
 }) => {
   await openPane(page, 'SELECT * { ?s <http://x/p> ?o }');
-  await pane(page).getByRole('button', { name: 'Triple' }).click();
-  await pane(page).getByLabel('Subject').fill('?o');
-  await pane(page).getByLabel('Predicate').fill('missing:p');
-  await pane(page).getByLabel('Object').fill('?z');
+  await pane(page).getByRole('button', { name: 'Edge', exact: true }).click();
+  await pane(page).getByLabel('From', { exact: true }).fill('?o');
+  await pane(page).getByLabel('Predicate', { exact: true }).fill('missing:p');
+  await pane(page).getByLabel('To', { exact: true }).fill('?z');
   await pane(page).getByRole('button', { name: 'Add', exact: true }).click();
   await expect(pane(page).getByRole('alert')).toHaveText('The prefix "missing:" is not declared');
   expect(await textOf(page)).toBe('SELECT * { ?s <http://x/p> ?o }');
