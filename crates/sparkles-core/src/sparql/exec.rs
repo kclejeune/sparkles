@@ -5187,6 +5187,12 @@ pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<E
 
 /// Evaluate the filter row by row.
 pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
+    if let [Expr::Cmp(a, b, op)] = exprs
+        && let (Expr::Var(x), Expr::Var(y)) = (&**a, &**b)
+        && let Some(keep) = string_order_mask(ctx, t, (*x, *y), *op, &exprs[0])?
+    {
+        return Ok(keep);
+    }
     let t0 = Instant::now();
     let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
     tracing::debug!(target: "sparkles::sparql::exec", "decoded values in {:?}", t0.elapsed());
@@ -5205,6 +5211,104 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
     let keep = map_rows(ctx, t.len(), par, test)?;
     tracing::debug!(target: "sparkles::sparql::exec", "filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
     Ok(keep)
+}
+
+/// The rows from which [`string_order_mask`] replaces decoding both columns.
+const STRING_ORDER_ROWS: usize = 4096;
+
+/// The rows whose values the first test of [`string_order_mask`] reads.
+const STRING_ORDER_SAMPLE: usize = 64;
+
+/// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
+/// are stored simple literals. Their order is read from their base-vocabulary ids and
+/// each string's floor ([`Ctx::string_floor`]), computed once per distinct id in a cache
+/// of each worker, so neither column is decoded. A row with another kind of value is
+/// evaluated as the generic filter would. `None` when the table is small or its first
+/// rows hold other values, so that the generic filter decodes the columns instead, and
+/// in a cursor.
+fn string_order_mask(
+    ctx: &Ctx,
+    t: &Table,
+    (x, y): (VarId, VarId),
+    op: super::expr::CmpOp,
+    expr: &Expr,
+) -> Result<Option<Vec<bool>>> {
+    use super::expr::CmpOp;
+    let n = t.len();
+    let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
+        return Ok(None);
+    };
+    // A cursor's batch would rebuild the cache for each batch. Its rows compare their
+    // two keys directly instead (see `val_cmp`).
+    if n < STRING_ORDER_ROWS || ctx.is_cursor() {
+        return Ok(None);
+    }
+    let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
+    let sample = n.min(STRING_ORDER_SAMPLE);
+    if !(0..sample).all(|i| ctx.string_floor(xs[i]).is_some() && ctx.string_floor(ys[i]).is_some())
+    {
+        return Ok(None);
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let par = n > PAR_THRESHOLD && threads > 1;
+    let workers = if par { threads } else { 1 };
+    // each worker's cache holds at most one entry per distinct id of its rows
+    let entries = n.saturating_mul(2).min(1 << 21) as u64;
+    let Ok(_cache) = ctx.charge(entries.saturating_mul(24).saturating_mul(workers as u64)) else {
+        return Ok(None);
+    };
+    let map = t.var_map(ctx.nvars());
+    let generic = |i: usize| {
+        let row = Row {
+            table: t,
+            i,
+            map: &map,
+            dec: None,
+        };
+        ebv(expr, &row, ctx).unwrap_or(false)
+    };
+    let floor = |cache: &mut FxHashMap<Id, u64>, id: Id| -> Option<u64> {
+        let f = *cache
+            .entry(id)
+            .or_insert_with(|| ctx.string_floor(id).unwrap_or(u64::MAX));
+        (f != u64::MAX).then_some(f)
+    };
+    let test = |cache: &mut FxHashMap<Id, u64>, i: usize| -> Result<bool> {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let (a, b) = (xs[i], ys[i]);
+        let (Some(fa), Some(fb)) = (floor(cache, a), floor(cache, b)) else {
+            return Ok(generic(i));
+        };
+        let (pa, pb) = (a.payload(), b.payload());
+        let order = match pa.cmp(&pb) {
+            Ordering::Equal => Ordering::Equal,
+            Ordering::Less if pa < fb => Ordering::Less,
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater if pb < fa => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+        };
+        Ok(match op {
+            CmpOp::Lt => order == Ordering::Less,
+            CmpOp::Le => order != Ordering::Greater,
+            CmpOp::Gt => order == Ordering::Greater,
+            CmpOp::Ge => order != Ordering::Less,
+        })
+    };
+    let keep = if par {
+        (0..n)
+            .into_par_iter()
+            .with_min_len(n.div_ceil(workers))
+            .map_init(FxHashMap::default, |cache, i| test(cache, i))
+            .collect::<Result<Vec<bool>>>()?
+    } else {
+        let mut cache = FxHashMap::default();
+        (0..n)
+            .map(|i| test(&mut cache, i))
+            .collect::<Result<Vec<bool>>>()?
+    };
+    Ok(Some(keep))
 }
 
 /// BIND: the value of `e` on every row (unbound on an error), once per distinct input

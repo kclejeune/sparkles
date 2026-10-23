@@ -2163,6 +2163,36 @@ impl Ctx {
         .flatten()
     }
 
+    /// For a base-vocabulary simple literal, the first base id whose key starts with its
+    /// lexical form, which is the first of the strings it is a proper prefix of, or its
+    /// own id when it is a prefix of none. `None` for any other id.
+    ///
+    /// The vocabulary sorts a string's key `"` lexical 0xFF after the keys of its
+    /// extensions, so id order is lexical order except for those. For simple literals
+    /// `a < b` by id, the lexical form of `a` is less than that of `b` exactly when `a`
+    /// is below `b`'s floor, since the keys between `b`'s floor and `b` all start with
+    /// `b`'s lexical form.
+    pub(super) fn string_floor(&self, id: Id) -> Option<u64> {
+        if id.tag() != Tag::Vocab {
+            return None;
+        }
+        let v = &self.snap.generation.vocab;
+        let p = id.payload();
+        if p >= v.first_triple() {
+            return None;
+        }
+        let key = v.get(p)?;
+        if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
+            return None;
+        }
+        let prefix = &key[..key.len() - 1];
+        // most strings extend none: the key before them does not start with them
+        if p == 0 || !v.get_with(p - 1, |k| k.starts_with(prefix))? {
+            return Some(p);
+        }
+        Some(v.prefix_range(prefix).0)
+    }
+
     pub fn local_len(&self) -> u64 {
         self.local.read().len()
     }
