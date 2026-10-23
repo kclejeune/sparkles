@@ -281,6 +281,7 @@ impl Tables {
         })
     }
 
+    /// Read `vocab.fsst` in `dir`.
     pub fn read(dir: &Path) -> Result<Tables> {
         let path = dir.join(FILE);
         let buf = std::fs::read(&path).map_err(|e| {
@@ -299,6 +300,22 @@ impl Tables {
     pub fn write(&self, dir: &Path) -> Result<()> {
         crate::store::write_synced(&dir.join(FILE), &self.encode())
     }
+}
+
+/// The version of the table file at `path`, read from its header alone.
+pub fn file_version(path: &Path) -> Result<u32> {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    std::fs::File::open(path)?
+        .read_exact(&mut head)
+        .map_err(|_| Error::Corrupt(format!("{}: cut short", path.display())))?;
+    if &head[..8] != MAGIC {
+        return Err(Error::Corrupt(format!(
+            "{}: not a table file",
+            path.display()
+        )));
+    }
+    Ok(u32::from_le_bytes(head[8..12].try_into().unwrap()))
 }
 
 fn checksum(b: &[u8]) -> u64 {

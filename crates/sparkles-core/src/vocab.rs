@@ -1301,6 +1301,9 @@ pub struct VocabWriter {
 
 /// Keys an FSST-coded vocabulary collects before it codes them, in parallel by block.
 const FSST_BATCH: usize = FC_BLOCK * 4096;
+/// Bytes of suffixes an FSST-coded vocabulary collects at most before it codes them, at
+/// the end of a block, so that long keys do not hold [`FSST_BATCH`] of them.
+const FSST_BATCH_BYTES: usize = 64 << 20;
 
 /// The keys of an FSST-coded vocabulary not written yet (see [`VocabWriter::flush_fsst`]).
 struct FsstWriter {
@@ -1311,6 +1314,10 @@ struct FsstWriter {
     bytes: Vec<u8>,
     /// per key, its shared-prefix length and the end of its suffix in `bytes`
     ents: Vec<(u32, u32)>,
+    /// the batch is coded once `bytes` holds this many at the end of a block
+    batch_bytes: usize,
+    /// the most bytes of suffixes held at once, for tests
+    peak_bytes: usize,
 }
 
 impl VocabWriter {
@@ -1323,6 +1330,8 @@ impl VocabWriter {
             split: None,
             bytes: Vec::new(),
             ents: Vec::with_capacity(FSST_BATCH),
+            batch_bytes: FSST_BATCH_BYTES,
+            peak_bytes: 0,
         }));
         Ok(w)
     }
@@ -1402,7 +1411,9 @@ impl VocabWriter {
         let end = u32::try_from(f.bytes.len())
             .map_err(|_| crate::error::Error::invalid("a vocabulary batch is over 4 GiB"))?;
         f.ents.push((shared32, end));
-        let full = f.ents.len() == FSST_BATCH;
+        f.peak_bytes = f.peak_bytes.max(f.bytes.len());
+        let full = f.ents.len() == FSST_BATCH
+            || (f.bytes.len() >= f.batch_bytes && f.ents.len().is_multiple_of(FC_BLOCK));
         self.prev.clear();
         self.prev.extend_from_slice(key);
         self.num.push(key)?;
@@ -2490,6 +2501,33 @@ mod tests {
             w.push(k).unwrap();
         }
         w.finish().unwrap();
+    }
+
+    /// Long keys are coded in batches bounded by their bytes, which end at a block.
+    #[test]
+    fn fsst_batches_are_bounded_by_bytes() {
+        let keys: Vec<Vec<u8>> = (0..400)
+            .map(|i| format!("\"{i:05} {}", "payload words ".repeat(300)).into_bytes())
+            .chain((0..50).map(|i| format!("<http://e/{i:03}/{}", "x".repeat(9000)).into_bytes()))
+            .collect();
+        let d = tempfile::tempdir().unwrap();
+        let sample: Vec<&[u8]> = keys.iter().map(|k| &k[..200]).collect();
+        let mut w =
+            VocabWriter::create_fsst(d.path(), fsst::Encoder::train([&sample, &sample])).unwrap();
+        w.fsst.as_mut().unwrap().batch_bytes = 64 << 10;
+        for k in &keys {
+            w.push(k).unwrap();
+        }
+        let peak = w.fsst.as_ref().unwrap().peak_bytes;
+        w.finish().unwrap();
+        // one block of these keys past the budget at most
+        assert!(peak < (64 << 10) + FC_BLOCK * 10_000, "{peak}");
+        let v = Vocab::open(d.path()).unwrap();
+        assert_eq!(v.len(), keys.len() as u64);
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(v.get(i as u64).as_ref(), Some(k), "{i}");
+            assert_eq!(v.find(k), Ok(i as u64));
+        }
     }
 
     /// An FSST-coded vocabulary answers every read as the front-coded one of the same

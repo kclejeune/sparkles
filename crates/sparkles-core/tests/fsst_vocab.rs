@@ -263,3 +263,42 @@ fn a_format_3_reader_refuses_format_4() {
     );
     assert!(sparkles_core::formats::INDEX.reads(4));
 }
+
+/// `sparkles migrate --check` refuses what opening the store refuses: an unknown index
+/// feature, and FSST tables of a version this build does not read.
+#[test]
+fn migration_preflight_checks_features_and_tables() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    let s = load(&root, Some(VocabCodec::Fsst));
+    let dir = gen_dir(&s);
+    drop(s);
+    let plan = sparkles_core::migrate::plan(&root).unwrap();
+    assert!(plan.refused.is_empty(), "{:?}", plan.refused);
+    assert!(plan.files.iter().any(|f| f.kind == "vocab-fsst"));
+    let meta_path = dir.join("meta.json");
+    let meta = std::fs::read(&meta_path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+    v["features"] = serde_json::json!(["fsst-vocab", "zz-future-blocks"]);
+    std::fs::write(&meta_path, serde_json::to_vec(&v).unwrap()).unwrap();
+    let plan = sparkles_core::migrate::plan(&root).unwrap();
+    assert!(
+        plan.refused.iter().any(|r| r.contains("zz-future-blocks")),
+        "{:?}",
+        plan.refused
+    );
+    std::fs::write(&meta_path, &meta).unwrap();
+    let tables = dir.join("vocab.fsst");
+    let mut b = std::fs::read(&tables).unwrap();
+    b[8..12].copy_from_slice(&2u32.to_le_bytes());
+    std::fs::write(&tables, &b).unwrap();
+    let plan = sparkles_core::migrate::plan(&root).unwrap();
+    assert!(
+        plan.refused
+            .iter()
+            .any(|r| r.contains("vocab-fsst") && r.contains("version 2")),
+        "{:?}",
+        plan.refused
+    );
+    assert!(Store::open(&root, StoreOptions::default()).is_err());
+}
