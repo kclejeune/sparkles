@@ -263,3 +263,34 @@ async fn a_build_waits_for_its_confirmation() {
     assert_eq!(t["state"], "done", "{t}");
     assert!(!f.mock.requests().is_empty());
 }
+
+/// The record of the last run describes the graph that run wrote: once the settings
+/// name another reports graph, the status leaves it out (round 6, finding 6).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_run_shows_only_for_its_own_graph() {
+    let f = fixture(3);
+    f.allow_rows().await;
+    enable(&f.app).await;
+    let (_, task) = call(
+        &f.app,
+        "POST",
+        "/$/graphrag/org/build",
+        Some(json!({ "confirm": true })),
+    )
+    .await;
+    let t = finished(&f.app, task["id"].as_str().unwrap()).await;
+    assert_eq!(t["state"], "done", "{t}");
+    let (_, st) = call(&f.app, "GET", "/$/graphrag/org", None).await;
+    assert!(st["lastBuild"].is_object(), "{st}");
+    assert_eq!(
+        patch(
+            &f.app,
+            "/$/settings/org/graphrag",
+            json!({ "reportsGraph": "urn:x-sparkles:graphrag:other" })
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (_, st) = call(&f.app, "GET", "/$/graphrag/org", None).await;
+    assert!(st.get("lastBuild").is_none(), "{st}");
+}

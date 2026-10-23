@@ -99,6 +99,7 @@ fn a_report_reads_back_with_citations_as_triple_terms() {
             parent: None,
             members: vec!["<http://ex/ana>".into(), "<http://ex/team>".into()],
             fact_count: 2,
+            footprint: None,
         },
         G,
     );
@@ -216,4 +217,75 @@ fn statuses_round_trip() {
         assert_eq!(Status::parse(s.as_str()), Some(s));
     }
     assert_eq!(Status::parse("pending"), None);
+}
+
+/// Reports go once no community links them and no linked report cites them, so a kept
+/// parent's citations of a replaced child stay resolvable.
+#[test]
+fn unreachable_reports_go_and_cited_ones_stay() {
+    let ins = |s: &str, p: &str, o: &str| {
+        Quad::new(
+            NamedNode::new_unchecked(s),
+            NamedNode::new_unchecked(p),
+            NamedNode::new_unchecked(o),
+            GraphName::NamedNode(NamedNode::new_unchecked(G)),
+        )
+    };
+    let t = RDF_TYPE;
+    let rep = gr("Report");
+    let quads = vec![
+        // the parent community links its report, which cites the old child report
+        ins("urn:c:parent", &gr("report"), "urn:r:parent"),
+        ins("urn:r:parent", t, &rep),
+        ins("urn:r:parent", &gr("citesReport"), "urn:r:old-child"),
+        // the child community links its new report
+        ins("urn:c:child", &gr("report"), "urn:r:new-child"),
+        ins("urn:r:new-child", t, &rep),
+        ins("urn:r:old-child", t, &rep),
+        ins("urn:r:old-child#f1", &gr("about"), "http://ex/a"),
+        // a superseded report nothing cites
+        ins("urn:r:gone", t, &rep),
+        ins("urn:r:gone#f1", &gr("about"), "http://ex/a"),
+        ins(
+            "urn:r:gone#activity",
+            t,
+            "http://www.w3.org/ns/prov#Activity",
+        ),
+    ];
+    let s = load(&quads);
+    sparql::update::update(&s, &delete_unreachable_reports(G), &QueryOptions::default()).unwrap();
+    let left: BTreeSet<String> = rows(
+        &s,
+        &format!("SELECT DISTINCT ?s WHERE {{ GRAPH <{G}> {{ ?s ?p ?o }} }}"),
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect();
+    assert!(
+        left.contains("<urn:r:old-child>") && left.contains("<urn:r:old-child#f1>"),
+        "{left:?}"
+    );
+    assert!(
+        !left.iter().any(|x| x.starts_with("<urn:r:gone")),
+        "{left:?}"
+    );
+    // once the parent no longer cites it, the old child goes too
+    sparql::update::update(
+        &s,
+        &format!(
+            "DELETE DATA {{ GRAPH <{G}> {{ <urn:r:parent> <{}> <urn:r:old-child> }} }}",
+            gr("citesReport")
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    sparql::update::update(&s, &delete_unreachable_reports(G), &QueryOptions::default()).unwrap();
+    let left = rows(
+        &s,
+        &format!("SELECT DISTINCT ?s WHERE {{ GRAPH <{G}> {{ ?s ?p ?o }} }}"),
+    );
+    assert!(
+        !left.iter().any(|r| r[0].starts_with("<urn:r:old-child")),
+        "{left:?}"
+    );
 }

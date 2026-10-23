@@ -58,6 +58,38 @@ fn settings_of(st: &AppState, ds: &Dataset) -> GraphragSettings {
     crate::settings::effective(st, ds, &crate::settings::GRAPHRAG)
 }
 
+/// The daily ledger and the anomalies of a dataset, which its branches share.
+fn ledger_of(
+    st: &AppState,
+    ds: &Dataset,
+) -> (super::budget::DayLedger, Vec<super::budget::Anomaly>) {
+    let main = ds.main();
+    let owner: &Dataset = main.as_deref().unwrap_or(ds);
+    match owner.store.root() {
+        Some(db) => match super::ledger::DatasetLedger::open(db) {
+            Ok(l) => (*l.day.lock(), l.anomalies()),
+            Err(_) => (Default::default(), Vec::new()),
+        },
+        None => (
+            *st.graphrag.day(&owner.name).lock(),
+            st.graphrag.anomalies(&owner.name),
+        ),
+    }
+}
+
+/// Whether footprint `fp` covers `graph` in the head snapshot.
+fn footprint_present(ds: &Dataset, fp: &str, graph: &str) -> bool {
+    let (Ok(f), Ok(g)) = (oxrdf::NamedNode::new(fp), oxrdf::NamedNode::new(graph)) else {
+        return false;
+    };
+    let q = format!(
+        "SELECT ?x WHERE {{ GRAPH <{}> {{ {f} <{}> {g} BIND(1 AS ?x) }} }} LIMIT 1",
+        super::guard::DISCLOSURE_GRAPH,
+        gr("covers"),
+    );
+    rows(ds, &QueryOptions::default(), &q).is_ok_and(|r| !r.is_empty())
+}
+
 /// The caller's query options on `ds`.
 fn caller_options(ds: &Dataset, p: &Principal) -> QueryOptions {
     let mut opts = ds.dataset.query_options();
@@ -287,7 +319,14 @@ async fn get_status(
             Some(db) => super::state::BuildState::load(db).ok(),
             None => Some(st2.graphrag.state(&ds.name)),
         };
-        if let Some(b) = state.and_then(|s| s.last_build) {
+        // the record of the last run says what that run read: it shows only for the
+        // configured graph, and to a restricted caller only while the run's footprint is
+        // part of the graph the caller is proven for (§6.4)
+        let restricted = p.view(&ds.name, Endpoint::Query).is_some();
+        if let Some(b) = state.and_then(|s| s.last_build)
+            && b.reports_graph == graph
+            && (!restricted || footprint_present(&ds, &b.footprint, &graph))
+        {
             out["lastBuild"] = json!({
                 "sourceCommit": b.source_commit,
                 "branch": b.branch,
@@ -297,13 +336,7 @@ async fn get_status(
             });
         }
         if p.can(&ds.name, Level::Admin) {
-            let (day, anomalies) = match ds.store.root() {
-                Some(db) => match super::ledger::DatasetLedger::open(db) {
-                    Ok(l) => (*l.day.lock(), l.anomalies()),
-                    Err(_) => (Default::default(), Vec::new()),
-                },
-                None => (*st2.graphrag.day(&ds.name).lock(), Vec::new()),
-            };
+            let (day, anomalies) = ledger_of(&st2, &ds);
             let used = if day.day == build::today() { day.used } else { 0 };
             out["budget"] = json!({
                 "tokensPerBuild": s.budget.tokens_per_build,
@@ -600,6 +633,15 @@ async fn post_review(
         if !proven(&ds, &p, &graph) {
             return Err(none());
         }
+        // only an unrestricted writer writes a guarded graph (§6.2): a restricted one
+        // could otherwise write past its grants, or copy a report it sees only in part
+        if p.view(&ds.name, Endpoint::Update).is_some() {
+            return Err(err_code(
+                StatusCode::FORBIDDEN,
+                "restricted-writer",
+                "reviewing a community report needs write access to the dataset without graph or triple restrictions",
+            ));
+        }
         // reviews and builds of the dataset commit one at a time, and the report is read
         // under the same lock
         let lock = st2.graphrag.lock(&ds.name);
@@ -635,7 +677,7 @@ async fn post_review(
                 author: author.clone(),
                 ..Default::default()
             },
-            ..Default::default()
+            ..ds.dataset.query_options()
         };
         let stats =
             sparkles::sparql::update::update_as(&ds.store, &text, &o, sparkles::commit::CommitKind::Graphrag)
@@ -788,12 +830,7 @@ pub(crate) fn inbox_member(st: &AppState, ds: &Dataset, p: &Principal) -> Option
     }
     let mut out = json!({ "reportsGraph": s.reports_graph });
     if p.can(&ds.name, Level::Admin) {
-        let anomalies = match ds.store.root() {
-            Some(db) => super::ledger::DatasetLedger::open(db)
-                .map(|l| l.anomalies())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let (_, anomalies) = ledger_of(st, ds);
         out["anomalies"] = serde_json::to_value(anomalies).unwrap_or_default();
     }
     if !proven(ds, p, &s.reports_graph) {

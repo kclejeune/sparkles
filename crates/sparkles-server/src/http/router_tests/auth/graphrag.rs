@@ -77,6 +77,19 @@ level = "read"
 graphs = ["urn:g:a", "{REPORTS}"]
 
 [[users]]
+name = "tzero"
+password = "{tzero}"
+
+[[users]]
+name = "twrite"
+password = "{twrite}"
+[[users.grants]]
+dataset = "rag"
+level = "write"
+graphs = ["urn:g:*", "{REPORTS}"]
+lifts = ["own"]
+
+[[users]]
 name = "tnarrow"
 password = "{tnarrow}"
 [[users.grants]]
@@ -96,6 +109,8 @@ lifts = ["own"]
         tlift = h("tlift-pw"),
         tpart = h("tpart-pw"),
         tnarrow = h("tnarrow-pw"),
+        tzero = h("tzero-pw"),
+        twrite = h("twrite-pw"),
     )
 }
 
@@ -503,4 +518,35 @@ async fn graphrag_routes_follow_coverage() {
     )
     .await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+/// A build reads as a principal that may query the dataset: a user without any grant
+/// has no view, which must not read as unrestricted (round 6, finding 2).
+#[tokio::test]
+async fn a_principal_without_a_grant_cannot_build() {
+    let s = server();
+    let ds = s.state.datasets().get("rag").cloned().unwrap();
+    let e = crate::graphrag::build::authorized_principal(&s.state, &ds, "tzero").unwrap_err();
+    assert!(e.contains("may not query"), "{e}");
+    assert!(crate::graphrag::build::authorized_principal(&s.state, &ds, "tua").is_ok());
+}
+
+/// Only an unrestricted writer reviews a report, so a restricted writer can neither
+/// write past its grants nor copy a report it sees in part (round 6, findings 3 and 8).
+#[tokio::test]
+async fn restricted_writers_cannot_review() {
+    let s = server_with(false);
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/graphrag/rag/review",
+        &[
+            ("authorization", &b("twrite")),
+            ("content-type", "application/json"),
+        ],
+        r#"{"report":"http://ex/r","status":"reviewed"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    assert!(r.text().contains("restricted-writer"), "{}", r.text());
 }

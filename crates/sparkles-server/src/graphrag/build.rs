@@ -112,6 +112,8 @@ fn failed(e: impl std::fmt::Display) -> RunError {
     RunError::Failed(e.to_string())
 }
 
+const REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
+
 /// The UTC day number.
 pub fn today() -> u64 {
     std::time::SystemTime::now()
@@ -143,6 +145,27 @@ pub fn principal_of(st: &AppState, name: &str) -> Result<Principal, String> {
     }
     let _ = (st, name);
     Ok(Principal::local())
+}
+
+/// The principal a run of `ds` reads as, on the dataset's branch, refused unless it may
+/// query the dataset there. A user without any grant has no view at all, which would
+/// otherwise read as unrestricted (§6.1).
+pub fn authorized_principal(st: &AppState, ds: &Dataset, name: &str) -> Result<Principal, String> {
+    let principal = principal_of(st, name)?;
+    let branch = branch_name(ds);
+    let principal = if branch == sparkles::branch::MAIN {
+        principal
+    } else {
+        principal.on_branch(Some(&branch))
+    };
+    #[cfg(feature = "auth")]
+    if st.auth.is_some() && !principal.can_at(&ds.name, Endpoint::Query, crate::auth::Level::Read) {
+        return Err(format!(
+            "the GraphRAG principal {name} may not query /{} on {branch}",
+            ds.name
+        ));
+    }
+    Ok(principal)
 }
 
 /// The query options of the principal on `ds`.
@@ -237,8 +260,6 @@ struct Prepared {
     nodes: Vec<Node>,
     info: HashMap<String, EntityInfo>,
     existing: HashMap<String, Existing>,
-    /// reports of the graph whose community the run no longer has
-    orphans: Vec<String>,
     /// communities of the graph the run no longer has
     gone: Vec<String>,
     footprint: Footprint,
@@ -321,9 +342,40 @@ impl Run<'_> {
         let assistant: crate::assistant::AssistantSettings =
             crate::settings::effective(self.st, &self.ds, &crate::settings::ASSISTANT);
         projection::check_send(&assistant, &pairs).map_err(RunError::Refused)?;
-        let principal =
-            principal_of(self.st, &self.settings.principal).map_err(RunError::Refused)?;
+        let principal = authorized_principal(self.st, &self.ds, &self.settings.principal)
+            .map_err(RunError::Refused)?;
         Ok((models, pairs, principal))
+    }
+
+    /// Check that what the run was admitted with still holds: the dataset's live GraphRAG
+    /// settings, the pairs and their send levels, and the principal's view (§3.5, §6.2).
+    /// Called after the confirmation, before every model request and before every commit.
+    fn recheck(
+        &self,
+        pairs: &[Pair],
+        footprint: &Footprint,
+        graphs: &[String],
+    ) -> Result<(), RunError> {
+        let live: GraphragSettings =
+            crate::settings::effective(self.st, &self.ds, &crate::settings::GRAPHRAG);
+        if live != self.settings {
+            return Err(RunError::Refused(
+                "the GraphRAG settings changed during the run; start a new run".into(),
+            ));
+        }
+        let (_, now_pairs, principal) = self.admit()?;
+        if now_pairs != pairs {
+            return Err(RunError::Refused(
+                "the community role's providers changed during the run; start a new run".into(),
+            ));
+        }
+        if &self.footprint(&principal, footprint.source_commit, graphs)? != footprint {
+            return Err(RunError::Refused(
+                "the principal's view or the access policy changed during the run; start a new run"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The footprint of the principal's current view for the run's graphs.
@@ -472,23 +524,47 @@ impl Run<'_> {
                         owner.insert(m.as_str(), c);
                     }
                 }
+                // a folded member, too small for a community of its own, is reported
+                // by its parent (§2.1): all its facts go in, as a leaf's would
+                let folded: BTreeSet<String> = nodes[i]
+                    .members
+                    .iter()
+                    .filter(|m| !owner.contains_key(m.as_str()))
+                    .cloned()
+                    .collect();
+                let own = report::select_facts(
+                    &folded,
+                    &facts
+                        .iter()
+                        .filter(|f| folded.contains(&f.s))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    self.settings.max_facts_per_community as usize,
+                );
                 let mut edges: Vec<Fact> = facts
                     .iter()
                     .filter(|f| {
                         f.o.starts_with('<')
                             && match (owner.get(f.s.as_str()), owner.get(f.o.as_str())) {
                                 (Some(a), Some(b)) => a != b,
-                                // a folded member's edges inside the community
-                                (None, _) | (_, None) => {
-                                    nodes[i].members.binary_search(&f.o).is_ok()
-                                }
+                                (Some(_), None) => folded.contains(&f.o),
+                                (None, _) => false,
                             }
                     })
                     .cloned()
                     .collect();
                 edges.sort();
                 edges.dedup();
-                edges.truncate(self.settings.max_facts_per_community as usize);
+                let room =
+                    (self.settings.max_facts_per_community as usize).saturating_sub(own.len());
+                edges.truncate(room);
+                let mut d: Vec<u64> = own.iter().map(fact_digest).collect();
+                d.sort_unstable();
+                d.dedup();
+                nodes[i].digests = d;
+                edges.extend(own);
+                edges.sort();
+                edges.dedup();
                 nodes[i].fact_count = facts.len() as u64;
                 nodes[i].facts = edges;
             }
@@ -539,25 +615,18 @@ impl Run<'_> {
         // what the reports graph holds now, read without a view: the build writes it
         let (existing, all) = self.existing(&snap)?;
         let keep: HashSet<&str> = nodes.iter().map(|n| n.iri.as_str()).collect();
-        let mut orphans = Vec::new();
-        let mut gone = Vec::new();
-        for (c, e) in &all {
-            if !keep.contains(c.as_str()) {
-                gone.push(c.clone());
-                orphans.extend(e.report.clone());
-            }
-        }
-        // reports whose community link is gone, such as those of a failed run
-        orphans.extend(self.unlinked_reports(&snap)?);
-        orphans.sort();
-        orphans.dedup();
+        // the reports of gone communities go with them, once nothing cites them
+        let mut gone: Vec<String> = all
+            .keys()
+            .filter(|c| !keep.contains(c.as_str()))
+            .cloned()
+            .collect();
         gone.sort();
         Ok(Prepared {
             snap,
             nodes,
             info,
             existing,
-            orphans,
             gone,
             footprint,
             projection_graphs: proj.graphs,
@@ -594,10 +663,13 @@ impl Run<'_> {
             format!("FILTER(?p NOT IN ({}))", excluded.join(", "))
         };
         for chunk in members.chunks(CHUNK) {
+            // one named reifier per fact, read through the same view, so that a citation
+            // names the assertion as well as the triple (§4)
             let q = format!(
-                "SELECT DISTINCT ?s ?p ?o WHERE {{ VALUES ?g {{ {} }} VALUES ?s {{ {} }} GRAPH ?g {{ ?s ?p ?o }} FILTER(?p != <{}> && !isBlank(?o)) {filter} }}",
+                "SELECT ?s ?p ?o (MIN(?rf) AS ?r) WHERE {{ VALUES ?g {{ {} }} VALUES ?s {{ {} }} GRAPH ?g {{ ?s ?p ?o OPTIONAL {{ ?rf <{}> <<( ?s ?p ?o )>> FILTER(isIRI(?rf)) }} }} FILTER(?p != <{}> && !isBlank(?o) && !isTRIPLE(?o)) {filter} }} GROUP BY ?s ?p ?o",
                 iri_list(graphs),
                 iri_list(chunk),
+                REIFIES,
                 store::RDF_TYPE
             );
             for r in rows(snap, &q, opts)? {
@@ -606,7 +678,7 @@ impl Run<'_> {
                         s,
                         p,
                         o,
-                        reifier: None,
+                        reifier: nt(&r[3]),
                     });
                 }
             }
@@ -643,23 +715,6 @@ impl Run<'_> {
             }
         }
         Ok((all.clone().into_iter().collect(), all))
-    }
-
-    /// Reports in the graph that no community links to.
-    fn unlinked_reports(&self, snap: &Arc<Snapshot>) -> Result<Vec<String>, RunError> {
-        let g = self.graph();
-        let q = format!(
-            "SELECT ?r WHERE {{ GRAPH <{g}> {{ ?r a <{}> FILTER NOT EXISTS {{ ?c <{}> ?r }} }} }}",
-            super::guard::gr("Report"),
-            super::guard::gr("report"),
-        );
-        Ok(rows(snap, &q, &QueryOptions::default())?
-            .into_iter()
-            .filter_map(|r| match &r[0] {
-                Some(Term::NamedNode(n)) => Some(n.as_str().to_string()),
-                _ => None,
-            })
-            .collect())
     }
 
     /// A stored report as a child input.
@@ -721,6 +776,12 @@ impl Run<'_> {
             return plans;
         }
         let frac = self.settings.refresh.min_changed_fraction;
+        // communities the previous run left for a later one
+        let pending: HashSet<&str> = previous
+            .last_build
+            .iter()
+            .flat_map(|b| b.pending.iter().map(String::as_str))
+            .collect();
         // finest first, so that a parent sees its children's plans
         for i in (0..prep.nodes.len()).rev() {
             let n = &prep.nodes[i];
@@ -730,6 +791,9 @@ impl Run<'_> {
             let Some(o) = old.get(inherited.as_str()) else {
                 continue;
             };
+            if pending.contains(inherited.as_str()) {
+                continue;
+            }
             let Some(e) = prep.existing.get(&n.iri) else {
                 continue;
             };
@@ -741,18 +805,24 @@ impl Run<'_> {
             if o.members != n.members {
                 continue;
             }
+            // the share of the facts the report was written from that changed: a leaf's
+            // facts, and a parent's folded members' facts
+            let before: HashSet<u64> = o.facts.iter().copied().collect();
+            let after: HashSet<u64> = n.digests.iter().copied().collect();
+            let facts_changed = if before.is_empty() && after.is_empty() {
+                0.0
+            } else {
+                before.symmetric_difference(&after).count() as f64 / before.len().max(1) as f64
+            };
             let changed = if n.leaf() {
-                let before: HashSet<u64> = o.facts.iter().copied().collect();
-                let after: HashSet<u64> = n.digests.iter().copied().collect();
-                let diff = before.symmetric_difference(&after).count();
-                diff as f64 / before.len().max(1) as f64
+                facts_changed
             } else {
                 let rewritten = n
                     .children
                     .iter()
                     .filter(|&&c| matches!(plans[c], Plan::Write))
                     .count();
-                rewritten as f64 / n.children.len().max(1) as f64
+                facts_changed.max(rewritten as f64 / n.children.len().max(1) as f64)
             };
             if changed < frac || (changed == 0.0 && frac == 0.0) {
                 plans[i] = Plan::Keep(report.clone());
@@ -790,9 +860,11 @@ impl Run<'_> {
         let kind = models
             .provider(&pair.provider)
             .map_or("openai", |p| p.kind.as_str());
-        let out = models
-            .resolved(pair)
-            .map_or(0, |r| u64::from(r.max_output_tokens));
+        // the output limit the request will carry: the pair's own, else the model's
+        let out = pair
+            .max_output_tokens
+            .or_else(|| models.resolved(pair).map(|r| r.max_output_tokens))
+            .map_or(0, u64::from);
         let bb = self.settings.budget.byte_bound_of(kind);
         let fixed = system.len() + schema.schema.to_string().len() + ENVELOPE_BYTES;
         let mut tokens = 0u64;
@@ -836,7 +908,10 @@ impl Run<'_> {
     /// The ledger of the run.
     fn ledger(&self) -> Result<Arc<Ledger>, RunError> {
         let b = &self.settings.budget;
-        Ok(Arc::new(match self.ds.store.root() {
+        // the daily budget belongs to the dataset, so every branch shares main's ledger
+        let main = self.ds.main();
+        let owner: &Dataset = main.as_deref().unwrap_or(&self.ds);
+        Ok(Arc::new(match owner.store.root() {
             Some(db) => {
                 let dl = DatasetLedger::open(db).map_err(failed)?;
                 let st = self.st.clone();
@@ -855,7 +930,7 @@ impl Run<'_> {
             None => Ledger::new(
                 b.tokens_per_build,
                 b.tokens_per_day,
-                self.st.graphrag.day(&self.ds.name),
+                self.st.graphrag.day(&owner.name),
                 today,
             ),
         }))
@@ -913,7 +988,13 @@ impl Run<'_> {
                     let code = f.error.code();
                     match f.error {
                         StepError::Budget(m) => return Err(Stop::Budget(m)),
-                        _ if code == "budget-exceeded" => {
+                        _ if code == "accounting-anomaly" => {
+                            return Err(Stop::Budget(format!(
+                                "accounting anomaly: {}",
+                                f.error.message()
+                            )));
+                        }
+                        _ if matches!(code, "budget-exceeded" | "ledger-unavailable") => {
                             return Err(Stop::Budget(f.error.message()));
                         }
                         _ => last = f.error.message(),
@@ -952,6 +1033,7 @@ fn commit_text(graph: &str, delete: &[String], quads: &[oxrdf::Quad]) -> String 
         }
         parts.push(format!("INSERT DATA {{\n{body}}}"));
     }
+    parts.push(store::delete_unreachable_reports(graph));
     parts.push(store::delete_unlinked_footprints(graph));
     parts.join(" ;\n")
 }
@@ -989,11 +1071,20 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             return Err(RunError::NotConfirmed);
         }
     }
+    // the confirmation may have waited long: what the run was admitted with must hold
+    r.recheck(&pairs, &prep.footprint, &prep.projection_graphs)?;
     let ledger = r.ledger()?;
     let tokenizers = Tokenizers::default();
     let admission = BuildAdmission::new(ledger.clone(), tokenizers, &r.settings.budget);
     let system = system_text(&r.settings.language);
-    let secret = report::secret_checker(&[]);
+    let memory = crate::assist::memory_settings(r.st, &r.ds);
+    let patterns: Vec<(String, String)> = memory
+        .imports
+        .iter()
+        .flat_map(|i| i.secret_patterns.iter())
+        .map(|p| (p.name.clone(), p.regex.clone()))
+        .collect();
+    let secret = report::secret_checker(&patterns);
     let total = plans
         .iter()
         .filter(|p| matches!(p, Plan::Write))
@@ -1005,7 +1096,21 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
     let mut current: HashMap<usize, String> = HashMap::new();
     let mut statuses: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut pending: Vec<String> = Vec::new();
-    let depths: u32 = prep.nodes.iter().map(|n| n.depth + 1).max().unwrap_or(0);
+    // the links the reports graph should hold before each commit: what the run read,
+    // then what its own commits wrote (§6.2, a review between them fails the run)
+    let mut expected: BTreeMap<String, Option<String>> = prep
+        .existing
+        .iter()
+        .map(|(c, e)| (c.clone(), e.report.clone()))
+        .collect();
+    // an empty hierarchy still commits once, to remove what the graph no longer has
+    let depths: u32 = prep
+        .nodes
+        .iter()
+        .map(|n| n.depth + 1)
+        .max()
+        .unwrap_or(0)
+        .max(1);
     let graph = r.graph().to_string();
     let fp_quads = prep.footprint.quads(&graph);
     let fp_iri = prep.footprint.iri();
@@ -1013,6 +1118,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         r.check()?;
         let mut delete: Vec<String> = Vec::new();
         let mut quads: Vec<oxrdf::Quad> = fp_quads.clone();
+        let mut links: Vec<(String, Option<String>)> = Vec::new();
         for (i, n) in prep
             .nodes
             .iter()
@@ -1029,6 +1135,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                     parent,
                     members: n.members.clone(),
                     fact_count: n.fact_count,
+                    footprint: Some(fp_iri.clone()),
                 },
                 &graph,
             ));
@@ -1043,6 +1150,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             if let Plan::Keep(rep) = &plans[i] {
                 link(&mut quads, rep);
                 current.insert(i, rep.clone());
+                links.push((n.iri.clone(), Some(rep.clone())));
                 outcome.kept += 1;
                 *statuses
                     .entry(ex.status.unwrap_or(Status::Unreviewed).as_str())
@@ -1055,6 +1163,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                     link(&mut quads, rep);
                     current.insert(i, rep.clone());
                 }
+                links.push((n.iri.clone(), ex.report.clone()));
                 continue;
             }
             let input = r.render(&prep, i, &current)?;
@@ -1062,6 +1171,9 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 0.15 + 0.8 * done as f32 / total as f32,
                 &format!("writing reports at level {depth}"),
             );
+            // nothing is sent under settings, providers or a view the run was not
+            // admitted with
+            r.recheck(&pairs, &prep.footprint, &prep.projection_graphs)?;
             let res = r.write_report(
                 &models,
                 &pairs,
@@ -1082,6 +1194,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                         link(&mut quads, rep);
                         current.insert(i, rep.clone());
                     }
+                    links.push((n.iri.clone(), ex.report.clone()));
                     continue;
                 }
                 Ok(Ok((checked, activity))) => (
@@ -1098,9 +1211,6 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 outcome.written += 1;
             }
             *statuses.entry(status.as_str()).or_default() += 1;
-            if let Some(old) = &ex.report {
-                delete.push(old.clone());
-            }
             quads.extend(report_quads(
                 &NewReport {
                     iri: iri.clone(),
@@ -1115,22 +1225,25 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                 },
                 &graph,
             ));
+            links.push((n.iri.clone(), Some(iri.clone())));
             current.insert(i, iri);
         }
-        // communities and reports the run no longer has go with the coarsest commit
+        // communities the run no longer has go with the coarsest commit
         if depth == 0 {
             delete.extend(prep.gone.iter().cloned());
-            delete.extend(prep.orphans.iter().cloned());
         }
         // builds and reviews of one dataset commit one at a time
         let lock = r.st.graphrag.lock(&r.ds.name);
         let _held = lock.lock();
-        // the principal's view must still be the one the run read (§6.2)
-        let now = r.admit().map(|(_, _, p)| p)?;
-        let again = r.footprint(&now, prep.snap.commit, &prep.projection_graphs)?;
-        if again != prep.footprint {
+        r.recheck(&pairs, &prep.footprint, &prep.projection_graphs)?;
+        // a review or another writer changed a report link since the run read it: the
+        // run's plan no longer describes the graph, and committing would undo that change
+        let (now, _) = r.existing(&r.ds.store.snapshot())?;
+        let now: BTreeMap<String, Option<String>> =
+            now.into_iter().map(|(c, e)| (c, e.report)).collect();
+        if now != expected {
             return Err(RunError::Failed(
-                "the principal's view or the access policy changed during the run; start a new build"
+                "the reports changed during the run, by a review or another writer; start a new run"
                     .into(),
             ));
         }
@@ -1150,29 +1263,61 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         if let Some(c) = stats.commit {
             outcome.commits.push(c.commit.seq);
         }
+        for (c, rep) in links {
+            expected.insert(c, rep);
+        }
+        if depth == 0 {
+            for g in &prep.gone {
+                expected.remove(g);
+            }
+        }
     }
     outcome.pending = pending.len();
     outcome.tokens = ledger.build_used();
+    let anomaly = ledger.anomaly();
+    if let Some(a) = &anomaly
+        && r.ds.store.root().is_none()
+    {
+        // a dataset without a directory keeps its anomalies in the server
+        r.st.graphrag.record_anomaly(&r.ds.name, a.clone());
+    }
     outcome.stopped = stopped.or_else(|| {
-        ledger.anomaly().map(|a| {
+        anomaly.map(|a| {
             format!(
                 "accounting anomaly: provider {} reported {} tokens for a reservation of {}",
                 a.provider, a.reported, a.reserved
             )
         })
     });
-    // the state the next run matches against
+    // the state the next run matches against: a kept or pending report keeps the
+    // baseline it was written from, so that small changes add up (§5)
+    let old: HashMap<&str, &StoredCommunity> = previous
+        .last_build
+        .iter()
+        .flat_map(|b| b.communities.iter())
+        .map(|c| (c.iri.as_str(), c))
+        .collect();
+    let pending_set: HashSet<&str> = pending.iter().map(String::as_str).collect();
     let communities: Vec<StoredCommunity> = prep
         .nodes
         .iter()
         .enumerate()
-        .map(|(i, n)| StoredCommunity {
-            depth: n.depth,
-            iri: n.iri.clone(),
-            parent: n.parent.map(|p| prep.nodes[p].iri.clone()),
-            members: n.members.clone(),
-            report: current.get(&i).cloned(),
-            facts: n.digests.clone(),
+        .map(|(i, n)| {
+            let carried = matches!(plans[i], Plan::Keep(_)) || pending_set.contains(n.iri.as_str());
+            let baseline = n
+                .inherited
+                .as_deref()
+                .and_then(|p| old.get(p))
+                .filter(|_| carried)
+                .map(|o| o.facts.clone());
+            StoredCommunity {
+                depth: n.depth,
+                iri: n.iri.clone(),
+                parent: n.parent.map(|p| prep.nodes[p].iri.clone()),
+                members: n.members.clone(),
+                report: current.get(&i).cloned(),
+                facts: baseline.unwrap_or_else(|| n.digests.clone()),
+            }
         })
         .collect();
     r.save_state(BuildState {
@@ -1183,6 +1328,8 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             communities,
             pending: pending.clone(),
             tokens: outcome.tokens,
+            reports_graph: graph.clone(),
+            footprint: fp_iri.clone(),
         }),
         ..BuildState::default()
     })?;

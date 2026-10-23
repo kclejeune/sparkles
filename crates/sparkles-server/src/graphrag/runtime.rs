@@ -58,6 +58,8 @@ pub struct Runtime {
     /// the build state and the daily ledger of datasets without a directory
     states: Mutex<HashMap<String, super::state::BuildState>>,
     days: Mutex<HashMap<String, Arc<Mutex<super::budget::DayLedger>>>>,
+    /// the accounting anomalies of datasets without a directory
+    anomalies: Mutex<HashMap<String, Vec<super::budget::Anomaly>>>,
     /// one lock per dataset, so that builds and reviews never interleave their commits
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
@@ -70,6 +72,14 @@ impl Runtime {
             .lock()
             .insert(task.to_string(), (dataset.to_string(), w.clone()));
         w
+    }
+
+    /// Whether a build of `dataset` waits for confirmation under `task`.
+    pub fn is_waiting(&self, dataset: &str, task: &str) -> bool {
+        self.waiting
+            .lock()
+            .get(task)
+            .is_some_and(|(d, _)| d == dataset)
     }
 
     /// Forget a build's confirmation.
@@ -120,6 +130,27 @@ impl Runtime {
             .entry(dataset.to_string())
             .or_default()
             .clone()
+    }
+
+    /// Keep an anomaly of a dataset without a directory, and count it (§3.5).
+    pub fn record_anomaly(&self, dataset: &str, a: super::budget::Anomaly) {
+        let mut all = self.anomalies.lock();
+        let list = all.entry(dataset.to_string()).or_default();
+        // the latest ones, as the dataset ledger's file keeps them
+        list.push(a);
+        let over = list.len().saturating_sub(super::ledger::MAX_ANOMALIES);
+        list.drain(..over);
+        drop(all);
+        self.update(dataset, |f| f.anomalies += 1);
+    }
+
+    /// The anomalies of a dataset without a directory.
+    pub fn anomalies(&self, dataset: &str) -> Vec<super::budget::Anomaly> {
+        self.anomalies
+            .lock()
+            .get(dataset)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn figures(&self) -> BTreeMap<String, Figures> {

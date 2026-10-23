@@ -92,6 +92,12 @@ pub struct BuildRecord {
     /// tokens the build used, reserved or reported
     #[serde(default)]
     pub tokens: u64,
+    /// the reports graph the build wrote, and the IRI of its footprint, which decide
+    /// who may see this record (§6.4)
+    #[serde(default)]
+    pub reports_graph: String,
+    #[serde(default)]
+    pub footprint: String,
 }
 
 /// `graphrag/state.json`.
@@ -329,6 +335,8 @@ mod tests {
                 communities: vec![community("a", &["<urn:a>", "<urn:b>"])],
                 pending: Vec::new(),
                 tokens: 10,
+                reports_graph: "urn:x-sparkles:graphrag:reports".into(),
+                footprint: "urn:x-sparkles:graphrag:footprint:00".into(),
             }),
             ..BuildState::default()
         }

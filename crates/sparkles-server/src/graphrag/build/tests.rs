@@ -66,12 +66,25 @@ pub(crate) struct Fixture {
 }
 
 pub(crate) fn fixture(n: usize) -> Fixture {
-    let mock = MockModel::start(|r, _| (200, mock::openai(&answer(r))));
+    fixture_with(
+        n,
+        |r, _| (200, mock::openai(&answer(r))),
+        json!({ "provider": "p", "model": "m" }),
+    )
+}
+
+/// A fixture whose provider answers with `handler`, and whose community role is `pair`.
+pub(crate) fn fixture_with(
+    n: usize,
+    handler: impl Fn(&Received, usize) -> (u16, Value) + Send + Sync + 'static,
+    pair: Value,
+) -> Fixture {
+    let mock = MockModel::start(handler);
     let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
     let cfg = json!({
         "providers": { "p": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 5,
                               "allowedModels": ["m"], "structuredOutput": "json-schema" } },
-        "roles": { "community": [{ "provider": "p", "model": "m" }] }
+        "roles": { "community": [pair] }
     });
     st.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
         ModelsConfig::parse(&cfg.to_string()).unwrap(),
@@ -141,6 +154,7 @@ impl Fixture {
 
     fn run(&self, settings: GraphragSettings, mode: Mode) -> Result<Outcome, RunError> {
         let ds = self.st.datasets().get("org").cloned().unwrap();
+        store_settings(&self.st, &ds, &settings);
         run(&Run {
             st: &self.st,
             ds,
@@ -178,6 +192,17 @@ impl Fixture {
             super::super::guard::gr("status"),
         ))
     }
+}
+
+/// Make `s` the dataset's live settings, which a run checks against its own.
+pub(crate) fn store_settings(st: &AppState, ds: &Dataset, s: &GraphragSettings) {
+    crate::settings::store_runtime(
+        st,
+        ds,
+        &crate::settings::GRAPHRAG,
+        &serde_json::to_value(s).unwrap(),
+    )
+    .unwrap();
 }
 
 /// A1: two clusters make two communities at the finest level, each with a report whose
@@ -308,6 +333,7 @@ async fn runs_wait_for_confirmation() {
         let st2 = st.clone();
         let h = std::thread::spawn(move || {
             let ds = st2.datasets().get("org").cloned().unwrap();
+            store_settings(&st2, &ds, &settings(json!({})));
             run(&Run {
                 st: &st2,
                 ds,
@@ -392,4 +418,407 @@ async fn parents_are_written_from_their_children() {
         cites = super::super::guard::gr("citesReport"),
     ));
     assert!(uncited.is_empty(), "{uncited:?}");
+}
+
+fn gr(n: &str) -> String {
+    super::super::guard::gr(n)
+}
+
+const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
+
+impl Fixture {
+    fn ds(&self) -> Arc<Dataset> {
+        self.st.datasets().get("org").cloned().unwrap()
+    }
+
+    fn load(&self, trig: String) {
+        self.ds()
+            .store
+            .load(&[Source::from_bytes(trig.into_bytes(), RdfFormat::TriG, None)])
+            .unwrap();
+    }
+
+    /// Add `k` new literal facts about `subject`.
+    fn add_notes(&self, subject: &str, from: usize, k: usize) {
+        let mut t = format!("<{ORG}> {{\n");
+        for i in from..from + k {
+            t.push_str(&format!("<{subject}> <http://ex/note> \"note {i}\" .\n"));
+        }
+        t.push_str("}\n");
+        self.load(t);
+    }
+
+    /// Start a run that waits for its confirmation, and return it with its task id.
+    fn waiting(
+        &self,
+        s: GraphragSettings,
+        mode: Mode,
+        id: &str,
+    ) -> std::thread::JoinHandle<Result<Outcome, RunError>> {
+        let st = self.st.clone();
+        let id2 = id.to_string();
+        store_settings(&st, &self.ds(), &s);
+        let h = std::thread::spawn(move || {
+            let ds = st.datasets().get("org").cloned().unwrap();
+            run(&Run {
+                st: &st,
+                ds,
+                settings: s,
+                mode,
+                confirmed: false,
+                task: None,
+                task_id: id2,
+                cancel: Arc::new(AtomicBool::new(false)),
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        // probe with a refusal that is never sent: wait until the run registered
+        while !self.st.graphrag.is_waiting("org", id) {
+            assert!(Instant::now() < deadline, "the run never waited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        h
+    }
+}
+
+/// Every community links the footprint of the run that wrote its counts and members,
+/// so a run that keeps every report keeps its own footprint (round 6, finding 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn community_records_keep_the_footprint_that_read_them() {
+    let f = fixture(5);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({}));
+        f.run(s.clone(), Mode::Build).unwrap();
+        f.add_notes("http://ex/x1", 0, 1);
+        let o = f.run(s, Mode::Refresh).unwrap();
+        assert_eq!(o.written, 0, "{o:?}");
+        let missing = f.rows(&format!(
+            "SELECT ?c ?f WHERE {{ GRAPH <{REPORTS}> {{ ?c a <{}> ; <{}> ?f }} FILTER NOT EXISTS {{ GRAPH <{}> {{ ?f <{}> <{REPORTS}> }} }} }}",
+            gr("Community"),
+            gr("disclosure"),
+            super::super::guard::DISCLOSURE_GRAPH,
+            gr("covers"),
+        ));
+        assert!(missing.is_empty(), "{missing:?}");
+        let linked = f.rows(&format!(
+            "SELECT DISTINCT ?f WHERE {{ GRAPH <{REPORTS}> {{ ?c a <{}> ; <{}> ?f }} }}",
+            gr("Community"),
+            gr("disclosure"),
+        ));
+        assert_eq!(linked.len(), 1, "{linked:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// Settings changed while a run waits for its confirmation refuse the run before it
+/// sends anything (round 6, finding 5).
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_changed_during_the_wait_refuse_the_run() {
+    let f = fixture(3);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let h = f.waiting(settings(json!({})), Mode::Build, "w1");
+        store_settings(&f.st, &f.ds(), &settings(json!({ "language": "de" })));
+        assert!(f.st.graphrag.answer("org", "w1", true));
+        let r = h.join().unwrap();
+        assert!(
+            matches!(&r, Err(RunError::Refused(m)) if m.contains("settings changed")),
+            "{r:?}"
+        );
+        assert!(f.mock.requests().is_empty());
+    })
+    .await
+    .unwrap();
+}
+
+/// A review that changes a report link while a refresh waits fails the refresh, which
+/// would otherwise relink the old report (round 6, finding 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_does_not_undo_a_concurrent_edit() {
+    let f = fixture(4);
+    f.allow_rows().await;
+    let f = tokio::task::spawn_blocking(move || {
+        f.run(settings(json!({})), Mode::Build).unwrap();
+        f
+    })
+    .await
+    .unwrap();
+    let rep = f.reports()[0][1].trim_matches(['<', '>']).to_string();
+    let f = Arc::new(f);
+    let f2 = f.clone();
+    let h =
+        tokio::task::spawn_blocking(move || f2.waiting(settings(json!({})), Mode::Refresh, "w2"))
+            .await
+            .unwrap();
+    // a person edits the report while the refresh waits
+    let res = f
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/$/graphrag/org/review")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "report": rep, "title": "Edited" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let f3 = f.clone();
+    tokio::task::spawn_blocking(move || {
+        assert!(f3.st.graphrag.answer("org", "w2", true));
+        let r = h.join().unwrap();
+        assert!(
+            matches!(&r, Err(RunError::Failed(m)) if m.contains("changed during the run")),
+            "{r:?}"
+        );
+        let titles = f3.rows(&format!(
+            "SELECT ?t WHERE {{ GRAPH <{REPORTS}> {{ ?c <{}> ?r . ?r <{}> ?t }} }}",
+            gr("report"),
+            store::RDFS_LABEL
+        ));
+        assert!(titles.iter().any(|t| t[0].contains("Edited")), "{titles:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// Small changes add up: a kept report keeps the baseline it was written from, so two
+/// refreshes that each change less than the fraction rewrite it together (round 6,
+/// finding 9).
+#[tokio::test(flavor = "multi_thread")]
+async fn small_changes_add_up_across_refreshes() {
+    let f = fixture(5);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({ "refresh": { "minChangedFraction": 0.1 } }));
+        f.run(s.clone(), Mode::Build).unwrap();
+        f.add_notes("http://ex/x1", 0, 1);
+        assert_eq!(f.run(s.clone(), Mode::Refresh).unwrap().written, 0);
+        f.add_notes("http://ex/x1", 1, 1);
+        let o = f.run(s, Mode::Refresh).unwrap();
+        assert_eq!(o.written, 1, "{o:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// A refresh that finds no community removes the old ones (round 6, finding 10).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_hierarchy_removes_the_old_communities() {
+    let f = fixture(3);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({}));
+        f.run(s.clone(), Mode::Build).unwrap();
+        assert_eq!(f.reports().len(), 2);
+        let ds = f.ds();
+        sparql::update::update(
+            &ds.store,
+            &format!("CLEAR GRAPH <{ORG}>"),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let o = f.run(s, Mode::Refresh).unwrap();
+        assert_eq!(o.communities, 0, "{o:?}");
+        let left = f.rows(&format!(
+            "SELECT ?s WHERE {{ GRAPH <{REPORTS}> {{ ?s ?p ?o }} }}"
+        ));
+        assert!(left.is_empty(), "{left:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// A cited fact that has a reifier is cited with its reifier too (round 6, finding 13).
+#[tokio::test(flavor = "multi_thread")]
+async fn cited_facts_carry_their_reifiers() {
+    let f = fixture(3);
+    f.allow_rows().await;
+    // every fact of the two clusters gets a reifier
+    let mut t = format!("<{ORG}> {{\n");
+    for (k, line) in data(3)
+        .lines()
+        .filter(|l| l.starts_with("<http"))
+        .enumerate()
+    {
+        let triple = line.trim_end_matches(" .");
+        t.push_str(&format!(
+            "<http://ex/rf{k}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( {triple} )>> .\n"
+        ));
+    }
+    t.push_str("}\n");
+    f.load(t);
+    tokio::task::spawn_blocking(move || {
+        f.run(settings(json!({})), Mode::Build).unwrap();
+        let cites = f.rows(&format!(
+            "SELECT ?f ?x WHERE {{ GRAPH <{REPORTS}> {{ ?f <{}> ?x }} }}",
+            gr("cites")
+        ));
+        let terms = cites.iter().filter(|c| c[1].starts_with("<<(")).count();
+        let reifiers = cites
+            .iter()
+            .filter(|c| c[1].starts_with("<http://ex/rf"))
+            .count();
+        assert!(terms > 0 && terms == reifiers, "{cites:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// The estimate counts the output limit the requests will carry: the pair's own
+/// (round 6, finding 14).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_estimate_uses_the_pairs_output_limit() {
+    let f = fixture_with(
+        3,
+        |r, _| (200, mock::openai(&answer(r))),
+        json!({ "provider": "p", "model": "m", "maxOutputTokens": 4096 }),
+    );
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let ds = f.ds();
+        let s = settings(json!({}));
+        store_settings(&f.st, &ds, &s);
+        let r = Run {
+            st: &f.st,
+            ds,
+            settings: s,
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: "e".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (models, pairs, p) = r.admit().unwrap();
+        let prep = r.prepare(&p, &BuildState::default()).unwrap();
+        let plans = r.plan(&prep, &BuildState::default());
+        let e = r.estimate(&models, &pairs, &prep, &plans);
+        assert_eq!(e["outputLimit"], 4096, "{e}");
+    })
+    .await
+    .unwrap();
+}
+
+/// An accounting anomaly stops the run: the remaining communities stay pending rather
+/// than failed, and a dataset without a directory keeps the anomaly (round 6, findings
+/// 15 and 17).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anomaly_leaves_the_rest_pending() {
+    let f = fixture_with(
+        5,
+        |r, _| {
+            let mut v = mock::openai(&answer(r));
+            v["usage"] = json!({ "prompt_tokens": 50_000_000, "completion_tokens": 5 });
+            (200, v)
+        },
+        json!({ "provider": "p", "model": "m" }),
+    );
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let o = f.run(settings(json!({})), Mode::Build).unwrap();
+        assert_eq!(o.failed, 0, "{o:?}");
+        assert!(o.pending >= 1, "{o:?}");
+        assert!(
+            o.stopped.as_deref().is_some_and(|m| m.contains("anomaly")),
+            "{o:?}"
+        );
+        assert_eq!(f.mock.requests().len(), 1);
+        assert_eq!(f.st.graphrag.anomalies("org").len(), 1);
+        assert_eq!(f.st.graphrag.figures()["org"].anomalies, 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// The dataset's own secret patterns apply to generated reports (round 6, finding 16).
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_secret_patterns_apply_to_reports() {
+    let f = fixture_with(
+        3,
+        |r, _| {
+            let text = answer(r).replace("People who know each other.", "Their key is ACME-12345.");
+            (200, mock::openai(&text))
+        },
+        json!({ "provider": "p", "model": "m" }),
+    );
+    f.allow_rows().await;
+    assert_eq!(
+        patch(
+            &f.app,
+            "/$/settings/org/memory",
+            json!({ "agentGraphs": ["urn:x-sparkles:import/*"], "imports": { "base": "urn:x-sparkles:import/", "secretPatterns": [{ "name": "acme", "regex": "ACME-[0-9]+" }] } })
+        )
+        .await,
+        StatusCode::OK
+    );
+    tokio::task::spawn_blocking(move || {
+        let o = f.run(settings(json!({})), Mode::Build).unwrap();
+        assert_eq!(o.written, 0, "{o:?}");
+        assert_eq!(o.failed, 2, "{o:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// Every branch of a dataset spends the dataset's one daily ledger (round 6, finding 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn branches_share_the_daily_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fixture(3);
+    f.allow_rows().await;
+    let main =
+        f.st.attach("disk", DbType::Persistent, Some(&dir.path().join("db")))
+            .unwrap();
+    main.store
+        .load(&[Source::from_bytes(
+            data(3).into_bytes(),
+            RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    assert_eq!(
+        patch(
+            &f.app,
+            "/$/settings/disk/assistant",
+            json!({ "send": "rows" })
+        )
+        .await,
+        StatusCode::OK
+    );
+    tokio::task::spawn_blocking(move || {
+        main.store
+            .create_branch("dev", &Default::default())
+            .unwrap();
+        let dev = f.st.branch_dataset(&main, "dev").unwrap();
+        let s = settings(json!({}));
+        store_settings(&f.st, &dev, &s);
+        let o = run(&Run {
+            st: &f.st,
+            ds: dev.clone(),
+            settings: s,
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: "b".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        assert!(o.tokens > 0, "{o:?}");
+        let root = main.store.root().unwrap();
+        let used = super::super::ledger::DatasetLedger::open(root)
+            .unwrap()
+            .day
+            .lock()
+            .used;
+        assert_eq!(used, o.tokens);
+        assert_ne!(dev.store.root(), main.store.root());
+    })
+    .await
+    .unwrap();
 }

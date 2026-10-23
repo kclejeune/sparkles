@@ -10595,7 +10595,11 @@ end it without sending anything. Only one GraphRAG task of a dataset runs at a t
 and a second one is a `409`. A task can be cancelled between model calls with
 `DELETE /$/tasks/{id}`. The task's result counts the reports written, kept and failed,
 and the communities left `pending` when the budget or an accounting anomaly stopped the
-run.
+run. A later refresh writes every pending community. The run checks its settings, its
+providers and the principal's view again after the confirmation, before each model
+request and before each commit, and it fails without sending or committing when any of
+them changed. It also fails when a review changed a report link while it ran. All
+branches of a dataset share its daily token ledger.
 
 ```json
 { "mode": "build", "sourceCommit": 41, "communities": 12, "written": 12, "kept": 0,
@@ -10603,7 +10607,9 @@ run.
 ```
 
 `GET /$/graphrag/{ds}` needs `read` and reports the settings in force, the current
-reports by status, the communities per level and the last build. A dataset admin also
+reports by status, the communities per level and the last build. The last build shows
+only when it wrote the configured reports graph, and to a restricted caller only while
+that build's footprint is in the graph. A dataset admin also
 gets the budget used today and the accounting anomalies. A caller for whom the reports
 graph is not proven, because its access does not cover everything the build read, gets
 `"available": false` and nothing derived from the reports.
@@ -10614,8 +10620,10 @@ community with its members, its children and its report with findings and citati
 Both read through the caller's view, and a community the caller may not read is a
 `404`.
 
-`POST /$/graphrag/{ds}/review` needs `write` on the dataset and a reports graph the
-caller may read. The body `{"report": "<iri>", "status": "reviewed"}` sets a report's
+`POST /$/graphrag/{ds}/review` needs `write` on the dataset without graph or triple
+restrictions, because only an unrestricted writer may write a reports graph. A caller
+for whom the reports graph is not proven gets a `404`, and a restricted writer gets a
+`403` with the code `restricted-writer`. The body `{"report": "<iri>", "status": "reviewed"}` sets a report's
 status to `reviewed` or `rejected`. A body with `title` or `summary` is an edit. The
 edit is a new report with status `reviewed` that copies the old report's findings and
 citations, supersedes it with `prov:wasRevisionOf`, and is committed with the caller as
