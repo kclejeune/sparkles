@@ -546,6 +546,9 @@ pub struct Manifest {
     pub commit: ManifestCommit,
     pub generation: String,
     pub index_format: u32,
+    /// the generation's index features (spec X11 §7.3), absent when it has none
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_features: Vec<String>,
     pub created: String,
     pub completed: String,
     pub millis: u64,

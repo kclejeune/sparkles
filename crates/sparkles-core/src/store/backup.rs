@@ -207,6 +207,8 @@ pub struct BackupCapture {
     pub generation: String,
     /// the index format of that generation (`builder::FORMAT_VERSION` when it was built)
     pub index_format: u32,
+    /// the index features of that generation (`IndexMeta::features`)
+    pub index_features: Vec<String>,
     /// every file of the backup, in a stable order: the generation's files, then
     /// `commits.bin`, then the meta files (`CURRENT`, `dataset.json`, `prefixes.json`,
     /// and when present `annotations.bin`, `text.json`, `origin.json`, `validation.json`,
@@ -581,6 +583,7 @@ impl Store {
             commit,
             generation: generation.to_string(),
             index_format: meta.format_version,
+            index_features: meta.features.clone(),
             files,
             lock_hold,
             lease: LeaseGuard {
@@ -759,6 +762,7 @@ impl Store {
             commit: head,
             generation,
             index_format: snap.generation.meta.format_version,
+            index_features: snap.generation.meta.features.clone(),
             files,
             lock_hold,
             lease,
@@ -975,7 +979,7 @@ mod tests {
         let c = s.backup_capture("b1").unwrap();
         assert_eq!(c.commit.seq, 3);
         assert_eq!(c.generation, "gen-0001");
-        assert_eq!(c.index_format, crate::builder::FORMAT_VERSION);
+        assert_eq!(c.index_format, crate::builder::PLAIN_FORMAT_VERSION);
         assert_eq!(c.lease.generation(), 1);
         assert_eq!(c.lease.label(), "b1");
         let paths: Vec<&str> = c.files.iter().map(|f| f.path.as_str()).collect();

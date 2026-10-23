@@ -83,6 +83,12 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
             ),
         ));
     }
+    // a feature of the generation that this build does not read, by name
+    if let Err(e) =
+        sparkles_core::builder::check_features("backup", &m.index_features, Some(&m.server.version))
+    {
+        return Err(BackupError::new(Code::IncompatibleFormat, e.to_string()));
+    }
     if let Some(encryption) = m.encryption.as_ref().filter(|e| !e.is_null()) {
         #[cfg(feature = "encryption")]
         let supported = encryption.as_object().is_some_and(|e| e.len() == 2)
@@ -520,6 +526,20 @@ mod tests {
         m.commit.reference = "commit:0".into();
         m.commit.parent = None;
         validate(&m, PIECE, &[2]).unwrap();
+    }
+
+    /// A backup of a generation with an index feature this build does not read is
+    /// refused before anything is written, naming the feature (spec X11 §7.3).
+    #[test]
+    fn an_unknown_index_feature_is_incompatible() {
+        let mut m = good();
+        m.index_format = 4;
+        m.index_features = vec!["fsst-vocab".into()];
+        validate(&m, PIECE, sparkles_core::formats::READABLE_INDEX_FORMATS).unwrap();
+        m.index_features.push("zz-future".into());
+        let e = validate(&m, PIECE, sparkles_core::formats::READABLE_INDEX_FORMATS).unwrap_err();
+        assert_eq!(e.code(), Code::IncompatibleFormat);
+        assert!(e.to_string().contains("`zz-future`"), "{e}");
     }
 
     #[test]
