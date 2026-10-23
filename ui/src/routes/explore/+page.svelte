@@ -44,6 +44,9 @@
   import TimeSlider from '$components/TimeSlider.svelte';
   import MemoryTab from '$components/MemoryTab.svelte';
   import OverviewView from '$components/OverviewView.svelte';
+  import PathPanel from '$components/PathPanel.svelte';
+  import type { Picked } from '$components/EntityPicker.svelte';
+  import * as pf from '$lib/paths';
   import TextSearchView from '$components/TextSearchView.svelte';
 
   type ENode = {
@@ -305,7 +308,24 @@
     const ghosts = Object.values(changes?.ghostNodes ?? {})
       .filter((n) => showLiterals || !n.lit)
       .map((n) => toG(n, 'removed'));
-    return [...real, ...ghosts];
+    if (!pathOverlay) return [...real, ...ghosts];
+    // the path finder's overlay: on the drawn nodes, plus the nodes it adds
+    const on = new Map(pathOverlay.nodes.map((n) => [n.key, n]));
+    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const have = new Set(drawn.map((n) => n.id));
+    const marked = drawn.map((n) => (on.has(n.id) ? { ...n, paths: on.get(n.id)!.paths } : n));
+    const extra = pathOverlay.nodes
+      .filter((n) => !have.has(n.key))
+      .map((n): GNode => ({
+        id: n.key,
+        label: pathLabels.get(n.key) ?? labelFor(n.term),
+        kind: n.term.type === 'uri' ? 'iri' : n.term.type,
+        title: n.term.type === 'uri' ? n.term.value : undefined,
+        paths: n.paths,
+        order: n.order,
+        near: pathNear.get(n.key),
+      }));
+    return [...marked, ...extra];
   });
   const gEdges = $derived.by((): GEdge[] => {
     const keep = (e: EEdge) => (showLiterals || !e.lit) && (!hideTypes || !e.isType);
@@ -315,9 +335,131 @@
     const ghosts = Object.values(changes?.ghostEdges ?? {})
       .filter(keep)
       .map((e) => ({ ...e, change: 'removed' as const }));
-    return [...real, ...ghosts];
+    if (!pathOverlay) return [...real, ...ghosts];
+    const on = new Map(pathOverlay.edges.map((e) => [e.id, e]));
+    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const have = new Set(drawn.map((e) => e.id));
+    const marked = drawn.map((e) => (on.has(e.id) ? { ...e, paths: on.get(e.id)!.paths } : e));
+    const extra = pathOverlay.edges
+      .filter((e) => !have.has(e.id))
+      .map((e): GEdge => ({
+        id: e.id,
+        source: termKey(e.s),
+        target: termKey(e.o),
+        label: shortLabel(e.p, prefixes),
+        title: e.p,
+        isType: e.p === RDF_TYPE,
+        paths: e.paths,
+        order: e.order,
+      }));
+    return [...marked, ...extra];
   });
   const nodeCount = $derived(Object.keys(nodes).length);
+
+  // --- the path finder (docs/specs/U09-path-finder.md) ----------------------------------
+
+  /** The most nodes a path overlay adds to the graph. */
+  const MAX_PATH_NODES = 400;
+  let pathsOpen = $state(false);
+  let pathFrom = $state<Picked | null>(null);
+  let pathTo = $state<Picked | null>(null);
+  let pathHighlight = $state<number | null>(null);
+  let pathOverlay = $state<ReturnType<typeof pf.overlay> | null>(null);
+  let pathLabels = $state(new Map<string, string>());
+  /** Each new node's neighbours on its paths, between which it is placed. */
+  let pathNear = $state(new Map<string, string[]>());
+  /** The paths are drawn without the graph, which could not take them. */
+  let pathsAlone = $state(false);
+  let pathPanel: PathPanel | undefined = $state();
+  /** The node selected before the current one: with both, Paths fills From and To. */
+  let prevSelectedId: string | null = null;
+  let menu = $state<{ id: string; x: number; y: number } | null>(null);
+
+  const pickedOf = (id: string): Picked | null => {
+    const n = nodes[id];
+    return n && n.term.type === 'uri' ? { term: n.term, label: n.label } : null;
+  };
+
+  function openPaths(opts: { from?: string; to?: string } = {}) {
+    if (opts.from || opts.to) {
+      if (opts.from) pathFrom = pickedOf(opts.from) ?? pathFrom;
+      if (opts.to) pathTo = pickedOf(opts.to) ?? pathTo;
+    } else if (!pathsOpen && selectedId) {
+      // two nodes chosen one after the other fill both ends
+      const cur = pickedOf(selectedId);
+      const prev =
+        prevSelectedId && prevSelectedId !== selectedId ? pickedOf(prevSelectedId) : null;
+      if (cur && prev) {
+        pathFrom = prev;
+        pathTo = cur;
+      } else if (cur && !pathFrom) pathFrom = cur;
+    }
+    tab = 'graph';
+    pathsOpen = true;
+    menu = null;
+    queueMicrotask(() => pathPanel?.focus());
+  }
+
+  function closePaths() {
+    pathsOpen = false;
+    clearPaths();
+  }
+
+  function clearPaths() {
+    pathOverlay = null;
+    pathHighlight = null;
+    pathsAlone = false;
+  }
+
+  function showPaths(r: { paths: pf.FoundPath[]; labels: Map<string, string> } | null) {
+    if (!r) return clearPaths();
+    const o = pf.overlay(r.paths);
+    const labels = new Map<string, string>();
+    for (const n of o.nodes)
+      if (n.term.type === 'uri' && r.labels.has(n.term.value))
+        labels.set(n.key, r.labels.get(n.term.value)!);
+    const near = new Map<string, string[]>();
+    for (const p of r.paths)
+      p.nodes.forEach((t, i) => {
+        const k = termKey(t);
+        const around = [p.nodes[i - 1], p.nodes[i + 1]].filter(Boolean).map((x) => termKey(x!));
+        near.set(k, [...new Set([...(near.get(k) ?? []), ...around])]);
+      });
+    const fresh = o.nodes.filter((n) => !nodes[n.key]).length;
+    pathsAlone = nodeCount + Math.min(fresh, MAX_PATH_NODES) > MAX_NODES;
+    if (pathsAlone)
+      toasts.push(
+        'info',
+        'Paths drawn on their own',
+        `The graph has ${nodeCount} nodes, so the paths are drawn without it.`,
+      );
+    if (o.nodes.length > MAX_PATH_NODES) {
+      const keep = new Set(o.nodes.slice(0, MAX_PATH_NODES).map((n) => n.key));
+      o.nodes = o.nodes.filter((n) => keep.has(n.key));
+      o.edges = o.edges.filter((e) => keep.has(termKey(e.s)) && keep.has(termKey(e.o)));
+    }
+    pathLabels = labels;
+    pathNear = near;
+    pathHighlight = null;
+    pathOverlay = o;
+  }
+
+  /** The paths become ordinary elements of the graph, and the panel closes. */
+  function addPathsToGraph() {
+    const o = pathOverlay;
+    if (!o) return;
+    if (pathsAlone) resetGraph();
+    for (const n of o.nodes) ensureNode(n.term, pathLabels.get(n.key), n.key);
+    for (const e of o.edges) addEdge(termKey(e.s), e.p, termKey(e.o), e.o.type === 'literal');
+    if (o.nodes.some((n) => n.term.type === 'literal')) showLiterals = true;
+    if (!focusId && o.nodes[0]) focusId = o.nodes[0].key;
+    pathsOpen = false;
+    clearPaths();
+  }
+
+  function fitPath(p: pf.FoundPath) {
+    graphView?.fitTo(p.nodes.map((t) => termKey(t)));
+  }
 
   function labelFor(t: Term, label?: string) {
     if (label) return label;
@@ -640,7 +782,9 @@
   }
 
   function select(id: string | null) {
+    if (id && selectedId && id !== selectedId) prevSelectedId = selectedId;
     selectedId = id;
+    menu = null;
     if (id) void loadDetails(id);
   }
 
@@ -700,6 +844,7 @@
 
   function clearGraph() {
     resetGraph();
+    clearPaths();
     focusId = null;
     selectedId = null;
     syncUrl(null);
@@ -1129,9 +1274,36 @@
     };
     // H opens and closes the History strip of the selected resource, Shift+H the one over the graph
     const onKey = (e: KeyboardEvent) => {
-      if ((e.key !== 'h' && e.key !== 'H') || e.metaKey || e.ctrlKey || e.altKey) return;
-      if ((e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable]'))
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const target = e.target as HTMLElement;
+      if (target?.closest?.('input, textarea, select, [contenteditable]')) return;
+      // Shift+P opens the path finder; with it open, the graph takes its keys too
+      if (e.key === 'P' && e.shiftKey && ds && tab !== 'schema') {
+        e.preventDefault();
+        openPaths();
         return;
+      }
+      if (pathsOpen && tab === 'graph' && !target?.closest?.('.paths')) {
+        const count = pathOverlay ? new Set(pathOverlay.edges.flatMap((x) => x.paths)).size : 0;
+        if (/^[1-9]$/.test(e.key) && Number(e.key) <= count) {
+          e.preventDefault();
+          pathHighlight = Number(e.key);
+          return;
+        }
+        if ((e.key === 'a' || e.key === 'A') && pathOverlay) {
+          e.preventDefault();
+          pathHighlight = null;
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          if (menu) menu = null;
+          else if (pathHighlight != null) pathHighlight = null;
+          else closePaths();
+          return;
+        }
+      }
+      if (e.key !== 'h' && e.key !== 'H') return;
       if (tab !== 'graph') return;
       if (e.shiftKey) {
         if (!nodeCount) return;
@@ -1251,9 +1423,9 @@
       />
     {/key}
   {:else if tab === 'graph'}
-    <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen}>
+    <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen && !pathsOpen}>
       <div class="canvas">
-        {#if nodeCount > 0 || graphTimeOpen}
+        {#if nodeCount > 0 || graphTimeOpen || pathsOpen}
           <div class="gtools">
             <label class="row check"
               ><input type="checkbox" bind:checked={showLiterals} /> Literals</label
@@ -1263,6 +1435,13 @@
             >
             <span class="spacer"></span>
             <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
+            <button
+              class="btn sm"
+              aria-pressed={pathsOpen}
+              title="Find the paths between two entities (Shift+P)"
+              onclick={() => (pathsOpen ? closePaths() : openPaths())}
+              ><Icon name="route" size={13} /> Paths</button
+            >
             {#if nodeCount}
               <button
                 class="btn sm"
@@ -1303,17 +1482,23 @@
             {#if graphNote}<p class="faint small graph-note">{graphNote}</p>{/if}
           </div>
         {/if}
-        {#if nodeCount === 0}
-          <div class="ov-host">
-            {#key ds}
-              <OverviewView
-                {ds}
-                {prefixes}
-                onresource={(iri, label) => focusOn(iri, label)}
-                onschema={() => setTab('schema')}
-              />
-            {/key}
-          </div>
+        {#if nodeCount === 0 && !pathOverlay}
+          {#if pathsOpen}
+            <div class="cy-host paths-empty faint">
+              <p>Choose two entities and find the paths between them.</p>
+            </div>
+          {:else}
+            <div class="ov-host">
+              {#key ds}
+                <OverviewView
+                  {ds}
+                  {prefixes}
+                  onresource={(iri, label) => focusOn(iri, label)}
+                  onschema={() => setTab('schema')}
+                />
+              {/key}
+            </div>
+          {/if}
         {:else}
           <div class="cy-host">
             <GraphView
@@ -1324,7 +1509,37 @@
               selected={selectedId}
               onselect={select}
               onexpand={expand}
+              highlight={pathHighlight}
+              onmenu={(id, at) => (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
             />
+            {#if menu}
+              <div
+                class="node-menu"
+                role="menu"
+                aria-label="Node actions"
+                style="left: {menu.x}px; top: {menu.y}px"
+              >
+                <button
+                  role="menuitem"
+                  class="btn sm ghost"
+                  onclick={() => openPaths({ from: menu!.id })}>Paths from here</button
+                >
+                <button
+                  role="menuitem"
+                  class="btn sm ghost"
+                  onclick={() => openPaths({ to: menu!.id })}>Paths to here</button
+                >
+                <button
+                  role="menuitem"
+                  class="btn sm ghost"
+                  onclick={() => {
+                    const id = menu!.id;
+                    menu = null;
+                    void expand(id);
+                  }}>Expand</button
+                >
+              </div>
+            {/if}
           </div>
           <div class="hint faint">
             Double-click a node to load its neighbours. Blue-ringed nodes are expanded.
@@ -1332,7 +1547,24 @@
         {/if}
       </div>
 
-      {#if nodeCount > 0 || graphTimeOpen}
+      {#if pathsOpen && ds}
+        <aside class="side side-paths" aria-label="Path finder">
+          <PathPanel
+            bind:this={pathPanel}
+            {ds}
+            {prefixes}
+            at={graphTimeOpen ? exAt : ''}
+            bind:from={pathFrom}
+            bind:to={pathTo}
+            bind:highlight={pathHighlight}
+            onresult={showPaths}
+            onadd={addPathsToGraph}
+            onclear={clearPaths}
+            onclose={closePaths}
+            onfit={fitPath}
+          />
+        </aside>
+      {:else if nodeCount > 0 || graphTimeOpen}
         <aside class="side" aria-label="Resource details">
           {#if selected}
             {@const n = selected}
@@ -1384,6 +1616,15 @@
                   {/if}
                   <button class="btn sm" onclick={() => describeInQuery(n.iri)}
                     ><Icon name="query" size={13} /> Describe</button
+                  >
+                  <button
+                    class="btn sm"
+                    title="Find paths from this resource (Shift+P)"
+                    onclick={() => openPaths({ from: n.id })}
+                    ><Icon name="route" size={13} /> Paths from here</button
+                  >
+                  <button class="btn sm" onclick={() => openPaths({ to: n.id })}
+                    >Paths to here</button
                   >
                   <button
                     class="btn sm"
@@ -2205,6 +2446,25 @@
     display: flex;
     flex-direction: column;
   }
+  .node-menu {
+    position: absolute;
+    z-index: 20;
+    display: grid;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    box-shadow: var(--shadow, 0 6px 18px rgb(0 0 0 / 0.15));
+  }
+  .node-menu .btn {
+    justify-content: flex-start;
+  }
+  .paths-empty {
+    display: grid;
+    place-items: center;
+    text-align: center;
+    padding: 24px;
+  }
   .split.overview {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
@@ -2678,6 +2938,25 @@
     .search {
       flex-basis: 100%;
       max-width: none;
+    }
+    .gtools {
+      flex-wrap: wrap;
+      gap: 6px 10px;
+    }
+    /* the path finder is a sheet over the graph, which folds to its first path */
+    .split {
+      position: relative;
+    }
+    .side-paths {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 15;
+      max-height: 85%;
+      border-top: 1px solid var(--border-strong);
+      border-radius: 12px 12px 0 0;
+      box-shadow: 0 -6px 18px rgb(0 0 0 / 0.12);
     }
   }
 </style>

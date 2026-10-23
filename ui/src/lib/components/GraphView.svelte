@@ -16,6 +16,12 @@
     expanded?: boolean;
     /** Between two states of the time slider: added, removed or kept. */
     change?: Mark;
+    /** The numbers of the found paths through the node (the path finder's overlay). */
+    paths?: number[];
+    /** When the path animation draws a new element, in steps of 250 ms. */
+    order?: number;
+    /** The node's neighbours on a path, between which a new node is placed. */
+    near?: string[];
   };
   export type GEdge = {
     id: string;
@@ -25,6 +31,8 @@
     title?: string;
     isType?: boolean;
     change?: Mark;
+    paths?: number[];
+    order?: number;
   };
 </script>
 
@@ -40,6 +48,8 @@
     onexpand,
     emptyText = 'Nothing to draw',
     animate = false,
+    highlight = null,
+    onmenu,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -52,6 +62,10 @@
      * are (the time slider). Off with `prefers-reduced-motion`, then changes appear at once.
      */
     animate?: boolean;
+    /** The found path to highlight, dimming the rest; null for none. */
+    highlight?: number | null;
+    /** A node's context menu was asked for (right click or long press), at a point of the view. */
+    onmenu?: (id: string, at: { x: number; y: number }) => void;
   } = $props();
 
   let host: HTMLDivElement;
@@ -64,6 +78,8 @@
     if (wrap) wrap.dataset.animations = String(animations);
   };
   const FADE_MS = 300;
+  /** The path animation draws one edge in this time. */
+  const STEP_MS = 250;
   const reduced = () =>
     typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
   const motion = () => animate && !reduced();
@@ -221,11 +237,27 @@
         },
       },
       { selector: '.faded', style: { opacity: 0.25 } },
+      // the path finder's overlay: path elements stand out, a highlight dims the others
+      {
+        selector: 'edge[?onpath]',
+        style: { 'line-color': spark, 'target-arrow-color': spark, width: 2.2, color: text },
+      },
+      { selector: 'node[?onpath]', style: { 'border-color': spark, 'border-width': 2 } },
+      {
+        selector: 'edge.phl',
+        style: { width: 3.4, 'text-opacity': 1, 'font-weight': 600 },
+      },
+      { selector: 'node.phl', style: { 'border-width': 3 } },
+      { selector: '.pdim', style: { opacity: 0.3 } },
     ];
   }
 
   /** The sign a changed element's label starts with, so that colour is not the only cue. */
   const sign = (c: Mark | undefined) => (c === 'added' ? '+ ' : c === 'removed' ? '− ' : '');
+
+  /** An edge's label with the numbers of the paths it is on. */
+  const edgeLabel = (e: GEdge) =>
+    sign(e.change) + e.label + (e.paths?.length ? ` · ${e.paths.join(',')}` : '');
 
   const toEl = {
     node: (n: GNode): ElementDefinition => ({
@@ -239,6 +271,8 @@
         focus: !!n.focus,
         expanded: !!n.expanded,
         w: Math.min(190, n.label.length * 6 + 14),
+        paths: (n.paths ?? []).join(','),
+        onpath: !!n.paths?.length,
       },
     }),
     edge: (e: GEdge): ElementDefinition => ({
@@ -247,10 +281,12 @@
         id: e.id,
         source: e.source,
         target: e.target,
-        label: sign(e.change) + e.label,
+        label: edgeLabel(e),
         change: e.change ?? '',
         title: e.title,
         isType: !!e.isType,
+        paths: (e.paths ?? []).join(','),
+        onpath: !!e.paths?.length,
       },
     }),
   };
@@ -266,6 +302,16 @@
     el.animate(
       { style: { opacity: 1 } },
       { duration: FADE_MS, complete: () => el.removeStyle('opacity') },
+    );
+  }
+
+  /** Show a new path element at its step of the path animation. */
+  function reveal(el: El, order: number) {
+    started();
+    el.style('opacity', 0);
+    el.delay(order * STEP_MS).animate(
+      { style: { opacity: 1 } },
+      { duration: STEP_MS, complete: () => el.removeStyle('opacity') },
     );
   }
 
@@ -321,6 +367,8 @@
     );
     let added = 0;
     const fresh = new Set<string>();
+    let pathAdded = false;
+    const stepping = !reduced();
     const fade = motion() && !wasEmpty;
     motionOn = motion();
     cy.batch(() => {
@@ -349,12 +397,28 @@
             expanded: !!n.expanded,
             title: n.title,
             w: Math.min(190, n.label.length * 6 + 14),
+            paths: (n.paths ?? []).join(','),
+            onpath: !!n.paths?.length,
           });
         } else {
           const el = cy!.add(toEl.node(n));
           added++;
           fresh.add(n.id);
-          if (fade) fadeIn(el);
+          if (n.order != null) {
+            pathAdded = true;
+            if (stepping) reveal(el, n.order);
+          } else if (fade) fadeIn(el);
+          // a new node of a path goes between its neighbours on the path
+          const near = (n.near ?? [])
+            .map((id) => cy!.getElementById(id))
+            .filter((x) => x.nonempty() && !fresh.has(x.id()));
+          if (near.length) {
+            const xs = near.map((x) => x.position());
+            const x = xs.reduce((a, p) => a + p.x, 0) / xs.length;
+            const y = xs.reduce((a, p) => a + p.y, 0) / xs.length;
+            el.position({ x: x + (Math.random() - 0.5) * 60, y: y + (Math.random() - 0.5) * 60 });
+            continue;
+          }
           // Seed position next to an existing neighbour so incremental layouts stay calm.
           const neighbour = edges.find((e) => e.target === n.id || e.source === n.id);
           const other = neighbour
@@ -373,14 +437,22 @@
         const have = cy!.getElementById(e.id);
         if (have.empty()) {
           const el = cy!.add(toEl.edge(e));
-          if (fade) fadeIn(el);
+          if (e.order != null) {
+            pathAdded = true;
+            if (stepping) reveal(el, e.order);
+          } else if (fade) fadeIn(el);
         } else {
           if (have.hasClass('leaving')) {
             have.stop(true);
             have.removeClass('leaving');
             have.removeStyle('opacity');
           }
-          have.data({ change: e.change ?? '', label: sign(e.change) + e.label });
+          have.data({
+            change: e.change ?? '',
+            label: edgeLabel(e),
+            paths: (e.paths ?? []).join(','),
+            onpath: !!e.paths?.length,
+          });
         }
       }
     });
@@ -388,8 +460,9 @@
     if (wrap && nodes.length <= 300)
       wrap.dataset.graph = JSON.stringify({
         nodes: [...wantNodes.values()].map((n) => [n.label, n.change ?? '']),
-        edges: [...wantEdges.values()].map((e) => [e.label, e.change ?? '']),
+        edges: [...wantEdges.values()].map((e) => [edgeLabel(e), e.change ?? '']),
       });
+    applyHighlight();
     // Too many edge labels turn into noise: show them only on hover/selection.
     cy.edges().toggleClass('quiet', cy.edges().length > 60);
     // Incremental layouts keep the user's arrangement, but when most of the graph is new
@@ -397,12 +470,13 @@
     if (added) {
       const randomize = wasEmpty || cy.nodes().length - added <= 2;
       // in the time slider the nodes that stay keep their places
-      const keep = animate
-        ? cy
-            .nodes()
-            .not('.leaving')
-            .filter((k) => !fresh.has(k.id()))
-        : undefined;
+      const keep =
+        animate || pathAdded
+          ? cy
+              .nodes()
+              .not('.leaving')
+              .filter((k) => !fresh.has(k.id()))
+          : undefined;
       layout(randomize, randomize ? undefined : keep);
     }
   }
@@ -436,6 +510,7 @@
       if (e.target === cy) onselect?.(null);
     });
     cy.on('dbltap', 'node', (e) => onexpand?.(e.target.id()));
+    cy.on('cxttap taphold', 'node', (e) => onmenu?.(e.target.id(), e.renderedPosition));
     cy.on('mouseover', 'node', (e) => {
       const n = e.target;
       cy!.elements().not(n.closedNeighborhood()).addClass('faded');
@@ -476,6 +551,37 @@
       if (n.nonempty()) n.select();
     }
   });
+
+  /** Highlight the elements of one path and dim the rest. */
+  function applyHighlight() {
+    if (!cy) return;
+    const h = highlight;
+    cy.batch(() => {
+      cy!.elements().removeClass('phl pdim');
+      if (h == null) return;
+      cy!.elements().forEach((el) => {
+        const on = String(el.data('paths') ?? '')
+          .split(',')
+          .includes(String(h));
+        el.addClass(on ? 'phl' : 'pdim');
+      });
+    });
+    if (wrap) wrap.dataset.highlight = h == null ? '' : String(h);
+  }
+
+  $effect(() => {
+    void highlight;
+    applyHighlight();
+  });
+
+  /** Fit the view to some nodes, such as a path's. */
+  export function fitTo(ids: string[]) {
+    if (!cy) return;
+    const els = cy.collection();
+    for (const id of ids) els.merge(cy.getElementById(id));
+    if (els.empty()) return;
+    cy.animate({ fit: { eles: els, padding: 40 }, duration: reduced() ? 0 : 250 });
+  }
 
   export function fit() {
     if (!cy) return;

@@ -33,6 +33,7 @@ import {
   resolveBranch,
 } from './branches.mjs';
 import { handleDescribe } from './describe.mjs';
+import { PathError, pathSearch } from './paths.mjs';
 import { handleModels } from './models.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
@@ -1169,6 +1170,72 @@ function handleSearchQuery(req, res, ds, p, query) {
   return true;
 }
 
+/** Answer a `SERVICE path:search` query; false when the query has none. */
+function handlePathSearch(req, res, ds, query, seq, headers) {
+  const t0 = performance.now();
+  let r;
+  try {
+    r = pathSearch(ds.store, query);
+  } catch (e) {
+    if (!(e instanceof PathError)) throw e;
+    fail(res, 400, e.message);
+    return true;
+  }
+  if (!r) return false;
+  const execMs = performance.now() - t0;
+  const rows = r.rows.map((row) => row.map((t) => (t ? termJson(t) : null)));
+  if (!String(req.headers.accept ?? '').includes('application/x-sparkles+json')) {
+    const bindings = rows.map((row) =>
+      Object.fromEntries(r.vars.flatMap((v, i) => (row[i] ? [[v, row[i]]] : []))),
+    );
+    send(
+      res,
+      200,
+      { head: { vars: r.vars }, results: { bindings } },
+      'application/sparql-results+json',
+    );
+    return true;
+  }
+  send(
+    res,
+    200,
+    {
+      queryType: 'SELECT',
+      vars: r.vars,
+      rows,
+      meta: {
+        totalRows: rows.length,
+        sentRows: rows.length,
+        timing: {
+          parseMs: 0.05,
+          planMs: 0.04,
+          execMs: +execMs.toFixed(3),
+          serializeMs: 0.02,
+          totalMs: +(execMs + 0.11).toFixed(3),
+        },
+        plan: {
+          operator: 'PathSearch',
+          description: 'path:search',
+          columns: r.vars.map((v) => `?${v}`),
+          sortedOn: [],
+          estimatedRows: rows.length,
+          estimatedCost: rows.length,
+          actualRows: rows.length,
+          timeMs: +execMs.toFixed(3),
+          cached: false,
+          children: [],
+          counters: r.counters,
+        },
+        commit: seq,
+        datasetId: ds.id,
+      },
+    },
+    'application/x-sparkles+json',
+    { ...commitHeaders(ds, seq), ...headers },
+  );
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // SPARQL query endpoint
 
@@ -1211,6 +1278,7 @@ async function handleQuery(req, res, ds, p) {
     if (at.store) ds = pastView(ds, at.store);
   }
   if (handleSearchQuery(req, res, ds, p, query)) return;
+  if (handlePathSearch(req, res, ds, query, readSeq, atHeaders)) return;
   const near = geoQuery(ds, query, Number(p.get('send') ?? Infinity), headCommit(ds).seq);
   if (near) return send(res, 200, near, 'application/x-sparkles+json', commitHeaders(ds));
   const accept = String(req.headers.accept ?? '');
