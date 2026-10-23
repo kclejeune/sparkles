@@ -299,6 +299,14 @@ agent memory, the map view and a merge preview.
     <td>A query compared between two commits</td>
     <td>A graph compared between two commits</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest paths from Ada Okafor to Carlos Mendes and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>The three shortest paths between two people</td>
+    <td></td>
+  </tr>
 </table>
 
 </details>

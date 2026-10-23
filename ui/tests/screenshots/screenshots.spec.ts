@@ -153,6 +153,29 @@ test('explore', async ({ page }) => {
   await shoot(page, 'explore');
 });
 
+test('path-finder', async ({ page }) => {
+  // without the step-by-step animation, so the picture shows every path at once
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto(
+    `/ui/explore?ds=${DATASET}&iri=${encodeURIComponent('http://example.org/person/ada-okafor')}`,
+  );
+  await expect(page.locator('canvas').first()).toBeVisible();
+  await page.getByRole('button', { name: 'Paths', exact: true }).click();
+  const panel = page.getByRole('region', { name: 'Paths' });
+  await expect(panel.locator('#path-from').locator('..')).toContainText('Ada Okafor');
+  await panel.getByRole('combobox', { name: 'To' }).fill('Carlos');
+  await panel
+    .getByRole('option', { name: /Carlos Mendes/ })
+    .first()
+    .click();
+  await panel.getByLabel('k shortest').check();
+  await panel.getByRole('button', { name: 'Find paths' }).click();
+  await expect(panel.getByRole('listbox', { name: 'Paths found' }).getByRole('option')).toHaveCount(
+    3,
+  );
+  await shoot(page, 'path-finder');
+});
+
 test('dataset', async ({ page }) => {
   await page.goto(`/ui/datasets/${DATASET}`);
   await expect(page.getByRole('heading', { name: 'Top classes' })).toBeVisible();
