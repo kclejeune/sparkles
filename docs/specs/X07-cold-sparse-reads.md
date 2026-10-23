@@ -329,6 +329,8 @@ one, and the block is marked dense when that count reaches a quarter of its segm
 The join prefetch also marks a block dense when its ranges together span more than a
 quarter of the block's segments. A query that touches most of a block through many small
 ranges then pays one whole read instead of many small reads with their own page faults.
+A property path walk marks every block of its predicate's rows dense once it has reached
+two nodes per block, because a walk that wide meets most of those blocks again.
 Otherwise it reads the segments whose first keys can hold the range, found by a binary
 search in the block's directory. The range scan (`for_each_key_range_masked`), the
 counts of edge blocks (`count_between`), the full-key test (`contains`), the index-join
@@ -959,17 +961,19 @@ refuses a format 3 store with an error that names both versions. The fixtures in
 `testsuite/formats/` hold a store of each format, and the format tests open both in
 place, compact them and query them.
 
-The gates were measured on forge on 2026-10-23, with main at `63d8a36d` against the
-segmented build at `8dd019da`, under the bench lock and in interleaved rounds. Cold
-medians come from two rounds of 11 samples per build and size, after evicting the store
-with `posix_fadvise(POSIX_FADV_DONTNEED)` before each fresh server.
+The gates were measured on forge on 2026-10-23 under the bench lock and in interleaved
+rounds, after evicting the store with `posix_fadvise(POSIX_FADV_DONTNEED)` before each
+fresh server. The cold rows at 10.5M compare main at `72d85c7f` with the final build at
+`e86a371a` over four rounds of 11 samples each, and those at 1.05M over two rounds. The
+warm, size, load and export rows compare main at `63d8a36d` with the build at `8dd019da`,
+and a later instruction check of the final build matched them.
 
 | Gate | Result |
 |---|---|
-| Cold `star-lookup` | 15.7 to 13.8 ms at 1.05M and 20.1 to 11.7 ms at 10.5M. |
-| Cold `employee-docs` | 12.3 to 10.6 ms at 1.05M and 16.7 to 12.9 ms at 10.5M. |
-| Other cold queries | `values-star` and `path-plus` are 23% to 49% faster. `knows-reach` is 4.7% and 5.2% slower and `star-join` 4.5% slower at 10.5M. |
-| Warm instructions | Every query is within 0.969 to 1.024 of main, and `employee-docs` is at 0.978. |
+| Cold `star-lookup` | 15.4 to 14.9 ms at 1.05M and 20.4 to 12.7 ms at 10.5M. |
+| Cold `employee-docs` | 13.2 to 11.7 ms at 1.05M and 16.8 to 12.2 ms at 10.5M. |
+| Other cold queries | `values-star` and `path-plus` are 21% to 38% faster. `knows-reach` is within 1% at 10.5M. `star-join` is 7% faster at 1.05M and 6% to 8% slower at 10.5M. |
+| Warm instructions | Every query is within 0.969 to 1.024 of main, and `employee-docs` is at 0.971 to 0.978. |
 | Warm read hints | A warm pass makes no `madvise(MADV_WILLNEED)` call. |
 | Full scans and export | `export-500k` is at 0.98 to 0.99 of main cold and 0.99 to 1.02 warm. `order-by-full` is within 4% warm. |
 | Index size | The generation at 10.5M grows by 3.0%, from 300.6 MB to 309.7 MB, and the permutation files by 3.3%. |
@@ -987,9 +991,21 @@ up to twice its warm time, because each request cut segments out of columns the 
 already held whole. A reader now uses cached whole columns in place, cut segments are
 cached, and the join prefetch skips its work when the first range is cached.
 
-The remaining cost of `knows-reach` is the first few segment reads of each block before
-it is read whole. A traversal that knows it will touch most blocks could ask for whole
-blocks from the start, and that is left for a later change.
+That left `knows-reach` 5% slower at 10.5M, from the first few segment reads of each
+block before it turned dense. A property path walk now marks every block of its
+predicate's rows dense once it has reached two nodes per block, which brought
+`knows-reach` to 0.98 to 0.99 of main without slowing `path-plus`.
+
+`star-join` at 10.5M is a known cost of 6% to 8%, measured in two runs of 12 interleaved
+rounds. Its profile decodes 108 MiB where main decodes 92 MiB, because the index join
+reads up to a quarter of a block's segments one by one, across several requests, before
+the block turns dense. Two fixes were measured and dropped. Halving the dense limit in
+the join prefetch brought `star-join` to 1.01 of main in two rounds but made
+`employee-docs` 6% slower. Copying a block's cached segments into its whole columns, so
+that only the missing frames are decoded, left `star-join` at 1.07 of main, so the cost
+is not the decoding itself. With segment reads turned off the same format 3 store ran
+`star-join` at 0.97 of main, so the cost lies in the reads by segment of this join. It
+is a follow-up under roadmap item 4.
 
 ### Not done
 
