@@ -2,7 +2,11 @@
 //! [`sparkles::overview`], which groups the instances of
 //! a class, or of a group from an earlier answer, by community, by a property's values or
 //! into the members themselves, and counts the edges between the groups, to the sibling
-//! groups and to the other classes.
+//! groups and to the other classes. With `by: {reports}` it groups the whole dataset by
+//! the GraphRAG community hierarchy of spec C22 instead, reading the reports graph that
+//! the dataset's GraphRAG settings name, on main only. The library reads that graph only
+//! when the caller's view proves it by C22 §6.3, as the GraphRAG routes do, and otherwise
+//! answers that the grouping is unavailable with nothing from the reports.
 //!
 //! Every count comes from SPARQL queries run under the caller's view through the query
 //! endpoint, with the request's memory grant, its deadline and the cancellation of a

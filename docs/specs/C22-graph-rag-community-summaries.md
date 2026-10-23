@@ -568,7 +568,10 @@ The guard must cover every path that can return report-derived data:
 - the MCP data, memory, schema and history tools and the MCP resources, the REST forms
   of the memory tools, Ask and `recall`;
 - graph algorithm runs, geographic feature reads, and `/$/tasks`;
-- the GraphRAG status, task, inbox and Communities responses of §6.4.
+- the GraphRAG status, task, inbox and Communities responses of §6.4;
+- the graph overview of [U06](U06-large-graph-rendering.md) grouped by the reports, which
+  reads the hierarchy only when the caller's view proves the reports graph by §6.3 and
+  otherwise answers that the grouping is unavailable, with nothing from the reports.
 
 Ask keeps a history of answers for the person who asked. An answer built from reports
 in Phase 2 keeps the report identities it used, and a history entry shows its text only
@@ -909,6 +912,17 @@ retried once a day without a new commit. Only commits of other kinds than GraphR
 count as activity, so a refresh never follows its own commit. A failed check or
 refresh is retried after a backoff of two to 64 debounce periods, and one admission lock
 lets only one GraphRAG task of a dataset be listed at a time. Counting from an F13 view waits for roadmap item 17.
+
+The Explore overview of U06 is a reader of the reports since 2026-10-23. Its
+`by: {reports}` grouping draws the communities of a level with their titles, statuses
+and member counts, and opens a community into its children and the finest level into its
+members. It applies the coverage check of §6.3 that the GraphRAG routes apply, against
+the snapshot its queries read, in every build that has the `auth` feature and whether or
+not the GraphRAG routes are compiled in. A reader without coverage learns only that the
+grouping is unavailable, and learns no report identity, title or count, nor whether any
+report exists. It reads main, and `at` reads the reports of that point of main. The
+Communities tab and the overview link to each other, and the overview shows a report
+through the same component as the tab.
 
 ### Shared memory representation follow-up
 

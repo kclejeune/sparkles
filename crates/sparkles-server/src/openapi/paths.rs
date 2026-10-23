@@ -855,7 +855,7 @@ fn schema(p: &mut Paths) {
             "Schema",
             "Groups of a class or group",
         )
-        .doc("Groups the instances of a class, or of a group from an earlier answer, by the communities F14 wrote, by a property's most frequent values or ranges, or into the members themselves, and counts the edges between the groups, to the sibling groups of the path and to the other classes. `by` is `auto` (the default), `members`, `{\"community\": IRI}` or `{\"property\": IRI, \"buckets\": n}`. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query. Answers hold at most 5,000 groups or members and 20,000 edges, and say when they were cut. An edge's ends are `g:` and a group id, `c:` and a class IRI, or `m:` and a member IRI.")
+        .doc("Groups the instances of a class, or of a group from an earlier answer, by the communities F14 wrote, by a property's most frequent values or ranges, or into the members themselves, and counts the edges between the groups, to the sibling groups of the path and to the other classes. `by` is `auto` (the default), `members`, `{\"community\": IRI}`, `{\"property\": IRI, \"buckets\": n}` or `{\"reports\": {\"level\": n}}`. The last groups the whole dataset by its GraphRAG community hierarchy, leaves `within` out, reads only main and answers `available: false` with a reason, and nothing from the reports, when the caller's access does not cover the reports graph. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query. Answers hold at most 5,000 groups or members and 20,000 edges, and say when they were cut. An edge's ends are `g:` and a group id, `c:` and a class IRI, or `m:` and a member IRI.")
         .see("graph-overview")
         .param("timeout")
         .param("reasoning")
@@ -864,11 +864,10 @@ fn schema(p: &mut Paths) {
             "What to group and how.",
             json!({ "application/json": { "schema": {
                 "type": "object",
-                "required": ["within"],
                 "additionalProperties": false,
                 "properties": {
-                    "within": { "type": "object", "description": "`{\"class\": IRI}` or `{\"group\": id}`." },
-                    "by": { "description": "`auto`, `members`, `{\"community\": IRI}` or `{\"property\": IRI, \"buckets\": n}` (2 to 48, 12 by default)." },
+                    "within": { "type": "object", "description": "`{\"class\": IRI}` or `{\"group\": id}`. It is required except with `by: {\"reports\": {}}`." },
+                    "by": { "description": "`auto`, `members`, `{\"community\": IRI}`, `{\"property\": IRI, \"buckets\": n}` with 2 to 48 buckets and 12 by default, or `{\"reports\": {\"level\": n, \"graph\": IRI}}` with a level from 0 to 15 and 0 by default." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 5000, "description": "Groups or members at most, and the size under which `auto` lists the members." },
                     "at": { "type": "string", "description": "A commit, time or named snapshot." }
                 }
@@ -889,7 +888,11 @@ fn schema(p: &mut Paths) {
                     "members": { "type": "array", "items": { "type": "object" } },
                     "edges": { "type": "array", "items": { "type": "object" } },
                     "truncated": { "type": "boolean" },
-                    "note": { "type": "string" }
+                    "note": { "type": "string" },
+                    "available": { "type": "boolean", "description": "A GraphRAG grouping only. It is false when the caller may not read the reports graph or the reports hold no communities." },
+                    "unavailable": { "type": "string", "enum": ["access", "none"] },
+                    "reason": { "type": "string" },
+                    "levels": { "type": "array", "items": { "type": "object" }, "description": "A GraphRAG grouping only. The levels of the hierarchy and their community counts." }
                 }
             } } })),
         )

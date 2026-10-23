@@ -193,6 +193,42 @@ class GraphOverviewTest {
         }
     }
 
+    @Test fun the_dataset_groups_by_its_graphrag_communities() {
+        SparklesDatasets.memory().use { ds ->
+            load(ds, data)
+            val byReports = GroupsRequest(by = GroupsBy.Reports())
+            val none = ds.graph().groups(byReports)
+            assertFalse(none.get("available").asBoolean.value)
+            assertEquals("none", none.getString("unavailable"))
+            val trig = """
+                @prefix ex: <http://ex.org/> .
+                @prefix gr: <urn:x-sparkles:graphrag#> .
+                @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+                @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+                <urn:x-sparkles:graphrag:reports> {
+                  <urn:c:A> a gr:Community ; gr:level 0 ; gr:memberCount 3 ;
+                    gr:member ex:a, ex:b, ex:c ; gr:report <urn:r:A> .
+                  <urn:r:A> rdfs:label "Team A" ; gr:status "reviewed" .
+                  <urn:c:A1> a gr:Community ; gr:level 1 ; skos:broader <urn:c:A> ; gr:memberCount 2 ;
+                    gr:member ex:a, ex:b .
+                }
+            """.trimIndent()
+            ds.load(ByteArrayInputStream(trig.toByteArray()), Lang.TRIG)
+            val top = ds.graph().groups(byReports)
+            assertTrue(top.get("available").asBoolean.value)
+            assertEquals("reports", top.get("grouping").asObject.getString("kind"))
+            val team = top.get("groups").asArray.single().asObject
+            assertEquals("Team A", team.getString("label"))
+            assertEquals(3, team.getNumber("size").toInt())
+            assertEquals("reviewed", team.get("report").asObject.getString("status"))
+            val below = ds.graph().groups(GroupsRequest(GroupsWithin.OfGroup(team.getString("id"))))
+            assertEquals(listOf(2, 1), below.get("groups").asArray.map { it.asObject.getNumber("size").toInt() })
+            // a → b inside A1, b → c from A1 to the member that no child holds
+            assertEquals(listOf(1, 1), below.get("edges").asArray.map { it.asObject.getNumber("count").toInt() })
+            assertThrows(SparklesInvalidException::class.java) { ds.graph().groups(GroupsRequest(by = GroupsBy.Reports(level = 99))) }
+        }
+    }
+
     @Test fun the_timeout_covers_all_of_the_queries() {
         // the answer takes many queries, each of which is shorter than the timeout
         val rows = (0 until 200000).joinToString("\n") { i ->

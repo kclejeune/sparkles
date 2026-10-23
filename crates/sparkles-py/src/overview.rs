@@ -15,15 +15,17 @@ impl PyGraphOverview {
     /// Group the instances of a class, or of a group from an earlier answer, and count
     /// the edges between the groups, to their sibling groups and to the other classes.
     /// `within` is `{"class": iri}` or `{"group": id}`, `by` is `"auto"`, `"members"`,
-    /// `{"community": iri}` or `{"property": iri, "buckets": n}`, and `at` is a commit
+    /// `{"community": iri}`, `{"property": iri, "buckets": n}` or
+    /// `{"reports": {"level": n}}`. The last groups the whole dataset by its GraphRAG
+    /// communities and is the one form that leaves `within` out. `at` is a commit
     /// number or a `time:` or `snapshot:` point. The other keyword arguments are those
     /// of `Dataset.query`. Returns the answer as a dict.
-    #[pyo3(signature = (within, *, by = None, limit = None, at = None, base_iri = None, prefixes = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None))]
+    #[pyo3(signature = (within = None, *, by = None, limit = None, at = None, base_iri = None, prefixes = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None))]
     #[allow(clippy::too_many_arguments)]
     fn groups<'py>(
         &self,
         py: Python<'py>,
-        within: &Bound<'py, PyAny>,
+        within: Option<&Bound<'py, PyAny>>,
         by: Option<&Bound<'py, PyAny>>,
         limit: Option<u64>,
         at: Option<Bound<'py, PyAny>>,
@@ -40,7 +42,9 @@ impl PyGraphOverview {
     ) -> PyResult<Bound<'py, PyAny>> {
         let ds = self.ds(py)?;
         let mut body = serde_json::Map::new();
-        body.insert("within".into(), admin::from_py(within, "within")?);
+        if let Some(within) = within.filter(|w| !w.is_none()) {
+            body.insert("within".into(), admin::from_py(within, "within")?);
+        }
         if let Some(by) = by.filter(|b| !b.is_none()) {
             body.insert("by".into(), admin::from_py(by, "by")?);
         }

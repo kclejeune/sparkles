@@ -415,6 +415,48 @@ test('graph overview groups a class and opens a group', async (t) => {
     ds.graph.groups({ within: { class: ex + 'Person' } }, { signal: controller.signal }),
   );
 });
+test('graph overview groups the dataset by its GraphRAG communities', async (t) => {
+  const ex = 'http://ex.org/';
+  const ds = t.resource(Dataset.memory());
+  const none = await ds.graph.groups({ by: { reports: {} } });
+  assert.equal(none.available, false);
+  assert.equal(none.unavailable, 'none');
+  await ds.update(`PREFIX ex: <${ex}>
+    PREFIX gr: <urn:x-sparkles:graphrag#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+    PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+    INSERT DATA {
+      ex:a ex:knows ex:b . ex:b ex:knows ex:c .
+      GRAPH <urn:x-sparkles:graphrag:reports> {
+        <urn:c:A> a gr:Community ; gr:level 0 ; gr:memberCount 3 ;
+          gr:member ex:a, ex:b, ex:c ; gr:report <urn:r:A> .
+        <urn:r:A> rdfs:label "Team A" ; gr:status "reviewed" .
+        <urn:c:A1> a gr:Community ; gr:level 1 ; skos:broader <urn:c:A> ; gr:memberCount 2 ;
+          gr:member ex:a, ex:b .
+      }
+    }`);
+  const top = await ds.graph.groups({ by: { reports: {} } });
+  assert.equal(top.available, true);
+  assert.deepEqual(top.grouping, { kind: 'reports', predicate: null, level: 0 });
+  assert.equal(top.groups.length, 1);
+  const [team] = top.groups;
+  assert.deepEqual([team.label, team.size, team.children], ['Team A', 3, 1]);
+  assert.deepEqual(team.report, { iri: 'urn:r:A', title: 'Team A', status: 'reviewed' });
+  const below = await ds.graph.groups({ within: { group: team.id } });
+  assert.deepEqual(
+    below.groups.map((g) => [g.size, g.folded ?? false]),
+    [
+      [2, false],
+      [1, true],
+    ],
+  );
+  // a → b inside A1, b → c from A1 to the members that no child holds
+  assert.deepEqual(
+    below.edges.map((e) => e.count),
+    [1, 1],
+  );
+  await assert.rejects(ds.graph.groups({ by: { reports: { level: 99 } } }), InvalidInputError);
+});
 test('the timeout of graph overview covers all of its queries', async (t) => {
   const ex = 'http://ex.org/';
   const ds = t.resource(Dataset.memory());
