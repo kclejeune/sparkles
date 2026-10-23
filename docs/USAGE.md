@@ -493,6 +493,7 @@ happens to materialized inferences, and the limits.
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. Declared prefixes count toward the limit, and well-known ones do not. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. The limit counts the closure's derived triples, which take about 135 bytes each, and the input graphs are read from the store's indexes. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 | `--reason-threads N` | half the cores | The threads that materializations evaluate rules on. All runs share this pool, so a run leaves the other cores to queries and writes. A request's `threads` field can ask for fewer. Runs are admitted in arrival order while their threads fit the pool, so a run that asks for fewer threads waits until they are free, and runs that use the whole pool run together. With `0`, runs use the pool that queries also use, which has a thread per core. |
+| `--reason-max-inferred N` | `50000000` | The derived triples a materialization may produce before it fails. Every run of the server has this limit, including automatic runs, and a request's `maxInferred` can ask for a lower one. A run that passes the limit fails with the rule that produced the most candidates and commits nothing. With `0`, runs have no limit, and only `ReasonOptions::max_memory` or the memory of the host stops a runaway rule. |
 
 `sparkles serve --help` lists the other options. They include `--read-only`,
 `--union-default-graph`, `--auto-reason`, `--auth-config`, `--unix-socket`,
@@ -598,6 +599,7 @@ sparkles infer   --loc db --profile owl-rl --full   # materialize in full
 sparkles infer   --loc db --status            # are the inferences up to date?
 sparkles infer   --loc db --check             # OWL 2 RL inconsistency checks (exit 1 on violations)
 sparkles infer   --loc db --profile owl-rl --threads 8   # evaluate the rules on 8 threads
+sparkles infer   --loc db --profile rdfs --max-inferred 200000000   # allow 200 million derived triples
 sparkles infer   --loc db --vocab geosparql --geo-default-geometry   # + GeoSPARQL axioms, default geometries
 sparkles infer   --loc db --ontology-graph http://ex.org/onto --imports fetch   # input graphs and owl:imports
 sparkles text-index --loc db                  # full-text index: --predicate, --exclude-graph, --language en|all,

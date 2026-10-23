@@ -25,7 +25,7 @@ impl PyReasoning {
                 .map(|s| status_json(&s)),
         )
     }
-    #[pyo3(signature=(profile="rdfs",*,rules=None,inputs=None,incremental=true,cancel=None,progress=None,timeout=None))]
+    #[pyo3(signature=(profile="rdfs",*,rules=None,inputs=None,incremental=true,cancel=None,progress=None,timeout=None,max_inferred=None))]
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -37,6 +37,7 @@ impl PyReasoning {
         cancel: Option<&Bound<'_, PyAny>>,
         progress: Option<&Bound<'_, PyAny>>,
         timeout: Option<f64>,
+        max_inferred: Option<u64>,
     ) -> PyResult<crate::validate::PyReasonReport> {
         let ds = self.write(py)?;
         #[cfg(feature = "reasoning")]
@@ -56,6 +57,13 @@ impl PyReasoning {
                     .transpose()?
                     .unwrap_or_default(),
                 incremental,
+                // 0 sets no limit
+                max_inferred: max_inferred.map(|n| {
+                    usize::try_from(n)
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .unwrap_or(usize::MAX)
+                }),
                 ..Default::default()
             };
             let r = interrupt::controlled(py, cancel, progress, timeout, move |ctl| {
@@ -74,6 +82,7 @@ impl PyReasoning {
                 cancel,
                 progress,
                 timeout,
+                max_inferred,
             );
             Err(crate::errors::new_err(
                 py,

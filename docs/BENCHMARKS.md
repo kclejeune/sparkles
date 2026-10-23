@@ -404,6 +404,28 @@ RDFS closure took 12.7 s in this run and derived the same 5,527,675 triples. Int
 runs of the two binaries on the same store took 11.3 s for both, so the slower single
 run is not a regression (F16's Outcome has the details).
 
+### Materialization at LUBM(1000)
+
+F16's acceptance run A1 materializes the RDFS closure of LUBM with 1,000 universities,
+138,278,680 generated triples. Forge's 16 GiB cannot hold it, so the run used a Namespace
+instance with 16 vCPUs and 32 GiB, with each materialization alone on the instance in a
+cgroup of 28 GiB without swap. The head is commit 0e0fa5b4, run with `--max-inferred 0`,
+and the baseline is c7a6811c, the commit before F16's Phase 1, with its fixed limit of
+50 million inferred triples raised to 4 billion. Both ran with 16 Rayon threads.
+
+| Run | Head | Baseline |
+|---|---|---|
+| LUBM(100), `rdfs` | 8.6 s, 3,125 MiB peak RSS | 13.5 s, 4,903 MiB |
+| LUBM(1000), `rdfs` | 90.9 s, 15,187 MiB, 55,069,413 derived triples | Killed at 28 GiB after 4 min 41 s. With swap, 360.4 s and at least 34,935 MiB of RSS and swap |
+| OWL2Bench, 2 universities, `owl-rl` | 25.0 s, 1,892 MiB, 4,914,915 derived triples | 162.5 s, 13,713 MiB |
+| OWL2Bench, 5 universities, `owl-rl` | Killed at 28 GiB after 12 min 50 s | Killed at 28 GiB after 31 s |
+
+The closures of the runs that both binaries finished have the same SHA-256, LUBM(1000)
+included. The head's peak RSS at LUBM(1000) is at most 0.43 of the resident and swapped
+memory the baseline needed, which meets A1. These are development numbers from a
+Namespace instance, not forge. [F16's Outcome](specs/F16-materialization-at-scale.md#outcome)
+has the method and the decision.
+
 ### DBpedia at the 50M slice
 
 The subject-hash slice of DBpedia 2022.12.01 contains 50,143,058 input statements.
@@ -2140,6 +2162,18 @@ Turning the cache off saves 547 MiB of RSS after the run, below QLever's 653 MiB
 costs about 46% of throughput and a 3.4× slower suite. A 256 MiB cache saves 138 MiB at
 the same speed on this workload, which touches about 378 MiB of blocks. A larger cache
 adds nothing here.
+
+**The `small` memory profile** sets a 256 MiB block cache and smaller result, SERVICE and
+history caches and query budgets. Until 2026-10-23 its cold `star-lookup` at 10.5M took
+1.6 to 1.8 times as long as the default's, because a prefetch request may decode only an
+eighth of the block cache in parallel and a larger request warms nothing. That budget now
+has a floor of 64 MiB, at most a quarter of the cache. On forge, with the result cache off,
+the retuned profile's geometric means are within 1% of the default profile's warm and cold
+at 1.05M and 10.5M and on the DBpedia 50M slice, and its cold `star-lookup` takes 18.5 ms
+against 18.1 ms. After every 10.5M query ran three times the server held 709 to 720 MiB of
+RSS against 775 to 794 MiB with the default profile.
+[X08's Outcome](specs/X08-disk-spill-and-server-memory.md#small-profile-retune-and-the-phase-1a-control-item-97-2026-10-23)
+has the runs.
 
 **The result cache** answers repeated queries from memory, up to 512 MiB per dataset
 (`--result-cache-mb`). It was off in every run on this page.

@@ -693,7 +693,8 @@ without reasoning, and the status is fresh within 10 s after the writes stop.
 ## Outcome
 
 **Phase 1 built** on 2026-10-13. A review on 2026-10-16 led to the fixes recorded below.
-Its acceptance runs are open under [ROADMAP](../ROADMAP.md) item 1. A follow-up of item 9
+Item 1 ran its acceptance runs on 2026-10-23, and item 98 decided A1 at 1,000 universities
+the same day, as "A1 at 1,000 universities" below records. A follow-up of item 9
 built §3.5 and §8's coverage on 2026-10-18, as recorded under "Kept closure without the
 explicit facts" and "`dt-not-type` coverage" below, with the fixes of its review under
 "Review of the follow-up". Phases 2, 3 and 4 are not built.
@@ -1072,10 +1073,57 @@ A3 is met. All eight runs derived the same closure. The head's peak RSS is 0.65 
 half for LUBM(1000), which neither binary can finish. OWL2Bench under OWL 2 RL from five
 universities on also stops at the limit in both binaries.
 
-A1 at 1,000 universities is not decided. The reasoner's limit of 50 million inferred
-triples is fixed, and the RDFS closure of LUBM(1000) passes it in the first iteration,
-so the run needs a configurable limit and a host with more than forge's 16 GiB.
-[Roadmap](../ROADMAP.md) item 98 takes both.
+These runs left A1 at 1,000 universities open, because the reasoner's limit of 50 million
+inferred triples was fixed and the RDFS closure of LUBM(1000) passes it in the first
+iteration. Item 98 made the limit configurable and decided A1, as the next section
+records.
+
+**A1 at 1,000 universities, item 98 (2026-10-23).** `sparkles infer --max-inferred`,
+`serve --reason-max-inferred`, a request's `maxInferred`, `ReasonRequest::max_inferred`
+and the Python, Node and JVM bindings now set the limit. It stays at 50 million by
+default, and 0 removes it. The default still guards against runaway rules. OWL2Bench
+under OWL 2 RL at five universities, for example, grows past 28 GiB in both engines
+before it ends, and a user who expects a closure above 50 million triples, such as RDFS
+on LUBM(1000), raises the limit for that run. A run past its limit fails with
+`InferredLimitExceeded`, the code `inferred-limit` outside the reasoner, the rule that
+produced the most candidates and the settings that raise the limit, and it commits
+nothing.
+
+The runs used a Namespace instance with 16 vCPUs and 32 GiB, the largest shape the
+account allows, because forge has 16 GiB. Both binaries were built there with Rust 1.98.1,
+one from 0e0fa5b4, whose code the item's commit keeps, and one from c7a6811c, the commit
+before Phase 1, with its fixed limit raised to 4 billion so that only memory could stop
+it. Each materialization ran alone with 16 Rayon threads, after the page cache was
+dropped, in a cgroup of 28 GiB without swap, on the store its own binary loaded from the
+inputs of the item 1 refresh. The digest is the SHA-256 of the sorted derived triples.
+
+| Run | Head | Baseline c7a6811c, limit raised |
+|---|---|---|
+| LUBM(100), `rdfs` | 8.6 s, 3,125 MiB peak RSS, 1,213 MiB peak heap estimate | 13.5 s, 4,903 MiB |
+| LUBM(1000), 138.3M triples, `rdfs` | 90.9 s, 15,187 MiB peak RSS, 12,319 MiB peak heap estimate, 55,069,413 derived triples | Killed at the 28 GiB limit after 4 min 41 s, at 28,614 MiB RSS. With swap allowed, 360.4 s and at least 34,935 MiB of RSS and swap together |
+| OWL2Bench, 1 university, `owl-rl` | 3.0 s, 809 MiB, 499 MiB | 19.8 s, 3,031 MiB |
+| OWL2Bench, 2 universities, `owl-rl` | 25.0 s, 1,892 MiB, 1,755 MiB, 4,914,915 derived triples | 162.5 s, 13,713 MiB |
+| OWL2Bench, 5 universities, `owl-rl` | Killed at the 28 GiB limit after 12 min 50 s | Killed at the 28 GiB limit after 31 s |
+
+A first run of the baseline on LUBM(1000) was killed at the 28 GiB limit, which leaves
+open how much it needs. A second run on a new instance kept the 28 GiB limit on memory but
+allowed swap, on a swap file of 96 GiB, and sampled the process's resident and swapped
+memory once a second. It finished in 360.4 s, slowed by the swapping, and its resident
+and swapped memory together reached at least 34,935 MiB. The sampling started about 5
+minutes into the run, so the true peak may be higher. The cgroup's own peaks were the
+28 GiB limit and 19,463 MiB of swap, which also count the page cache.
+
+Every run that both binaries finished derived the same closure by digest, LUBM(1000) and
+the LUBM(100) RDFS closure included, so A1's last condition holds. The LUBM(1000) run also
+left 11,170,179 generalized triples unwritten, as both engines do. A1 is met. The head
+completes LUBM(1000) under RDFS. Its peak heap estimate of 12,319 MiB is well within 3
+times the derived tier plus 1 GiB, which at about 135 bytes for each of its 66.2 million
+derived rows comes to about 26 GiB. The baseline has no heap estimate, so the half is
+measured on resident memory, where the head's peak RSS of 15,187 MiB is at most 0.43 of
+the baseline's 34,935 MiB or more of resident and swapped memory. OWL2Bench under OWL 2 RL
+is 6.5 times faster with 0.14 times the RSS at two universities, where the baseline now
+finishes. From five universities on, neither binary fits 28 GiB, so the larger sizes were
+not run.
 
 **Deviations.**
 * §3.5 expected the same cache limit to keep the closure of an input about four times

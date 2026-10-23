@@ -1232,6 +1232,21 @@ fn decode_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
+/// The smallest budget of one warm request in a cache of at least four times its size,
+/// see [`warm_budget`].
+const WARM_FLOOR: u64 = 64 << 20;
+
+/// The most decoded bytes one prefetch request may add to a cache of `capacity` bytes: an
+/// eighth of the cache, so that one request cannot push out what the other queries hold,
+/// but at least [`WARM_FLOOR`] or a quarter of the cache, whichever is smaller. A request
+/// over its budget warms nothing, so with an eighth alone the 256 MiB cache of the `small`
+/// memory profile declined the parallel decode of a cold `star-lookup` at 10.5M triples,
+/// which the 1 GiB default admits, and the query took 1.6 to 1.7 times as long (roadmap
+/// item 97). Caches of 512 MiB and more keep the eighth.
+fn warm_budget(capacity: u64) -> u64 {
+    (capacity / 8).max(WARM_FLOOR.min(capacity / 4))
+}
+
 #[derive(Clone)]
 struct BlockWeighter;
 impl quick_cache::Weighter<(u64, u32, u32), Col> for BlockWeighter {
@@ -1404,7 +1419,7 @@ impl BlockCache {
             work: Vec::new(),
             seen: Default::default(),
             bytes: 0,
-            budget: self.cache.capacity() / 8,
+            budget: warm_budget(self.cache.capacity()),
             eligible: self.fill,
         }
     }
@@ -1480,8 +1495,7 @@ pub(crate) struct WarmColumns<'a> {
     work: Vec<(usize, u8)>,
     seen: rustc_hash::FxHashSet<(usize, u8)>,
     bytes: u64,
-    /// the most decoded bytes one request may add, an eighth of the cache so that one
-    /// request cannot push out what the other queries hold
+    /// the most decoded bytes one request may add, see [`warm_budget`]
     budget: u64,
     eligible: bool,
 }
@@ -2210,6 +2224,27 @@ mod tests {
             16,
             "budget and work count distinct missing keys"
         );
+    }
+
+    #[test]
+    fn warm_budget_is_an_eighth_with_a_floor_for_small_caches() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(warm_budget(1024 * MIB), 128 * MIB, "the default profile");
+        assert_eq!(warm_budget(512 * MIB), 64 * MIB);
+        assert_eq!(warm_budget(256 * MIB), 64 * MIB, "the small profile");
+        assert_eq!(warm_budget(64 * MIB), 16 * MIB, "a quarter below the floor");
+        assert_eq!(warm_budget(0), 0);
+        // the floor admits a request that an eighth of a 256 MiB cache declines
+        let (_dir, idx) = warm_fixture(48 * BLOCK_ROWS);
+        let blocks = (0..48).collect::<Vec<_>>();
+        // 48 blocks of 4 columns of 256 KiB: 48 MiB, over 32 and under 64
+        let cache = BlockCache::new(256 * MIB);
+        cache.warm(&idx, &blocks, ALL_COLS, &|| Ok(())).unwrap();
+        assert_eq!(cache.misses(), 192);
+        // and a quarter of a small cache still bounds it
+        let cache = BlockCache::new(128 * MIB);
+        cache.warm(&idx, &blocks, ALL_COLS, &|| Ok(())).unwrap();
+        assert_eq!(cache.misses(), 0, "48 MiB is over a quarter of 128 MiB");
     }
 
     #[test]

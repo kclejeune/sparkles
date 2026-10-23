@@ -728,9 +728,12 @@ RSS, and do not establish a performance result.
 
 Roadmap item 2 finished Phase 1 on 2026-10-18, when its A1 and latency gates were met.
 Roadmap item 1 ran the Phase 1a suite at 10.5M and on DBpedia on 2026-10-23, comparing the
-two profiles. The `small` profile is more than 5% slower than the default on several cold
-queries, and the control run with the earlier defaults is still missing, as
-[the profile runs](#profile-runs-at-105m-and-on-dbpedia-2026-10-23) describe.
+two profiles, and found the `small` profile more than 5% slower on several cold queries,
+as [the profile runs](#profile-runs-at-105m-and-on-dbpedia-2026-10-23) describe. Item 97
+found the cause the same day, retuned the warm budget that the profile's smaller cache
+cut, and ran the control with the earlier defaults. Both profiles now meet the Phase 1a
+gate at 1.05M, 10.5M and on DBpedia, as
+[the retune](#small-profile-retune-and-the-phase-1a-control-item-97-2026-10-23) records.
 Phase 2 is built for sorts, groupings and DISTINCT under item 7, and item 85 added
 hash-join spill, the merge-join spool, DISTINCT below an ORDER BY and encryption on
 2026-10-18. Spill remains opt-in. Item 93 records the full-scale acceptance runs,
@@ -1537,6 +1540,75 @@ since a cold `star-lookup` reads more blocks than that cache keeps while the sam
 within 1% warm. [Roadmap](../ROADMAP.md) item 97 retunes the profile and repeats the
 runs with the control. The DBpedia cold differences come from one sample per query and run, so the retune
 should take more cold samples there.
+
+### Small profile retune and the Phase 1a control, item 97 (2026-10-23)
+
+**Cause.** A cold A/B on forge with the release binary of d1c699fd, 16 cold samples of each
+query and configuration at 10.5M, separated the profile's settings. The `small` profile
+took 33.9 ms for `star-lookup` against the default's 19.9 ms. With `--cache-mb 1024` it
+took 19.6 ms, the default profile with `--cache-mb 256` took 34.4 ms, and the `small`
+profile with the default's query budget and a pool of 6 GiB still took 33.6 ms. The block
+cache's size alone made the difference, and `star-lookup` reads far less than 256 MiB, so
+eviction was not the cause. The join prefetch warms the blocks of a cold lookup on the
+decode pool when their decoded columns fit one request's budget, an eighth of the block
+cache, and otherwise warms nothing. A cold `star-lookup` needs between 32 and 128 MiB, which
+the default's 1 GiB cache admits and the `small` profile's 256 MiB declines, so its blocks
+were decoded one at a time on the query's thread. An experimental build that raised the
+budget to at least 64 MiB brought the `small` profile's `star-lookup` to 19.8 ms, and a
+floor of 128 MiB gave 19.9 ms.
+
+**Change.** A warm request may now add an eighth of the block cache, but at least 64 MiB
+or a quarter of the cache, whichever is smaller. Caches of 512 MiB and more keep the
+eighth, so the default profile is unchanged. The cost is that under the `small` profile
+one cold request can push up to 64 MiB of other queries' blocks out of the 256 MiB cache,
+a quarter of it instead of an eighth. The cache's capacity, and so the profile's memory
+saving, stays the same. After every 10.5M query ran three times, the server's RSS was 775
+and 794 MiB with the default profile, 709 and 720 MiB with the retuned `small` profile and
+721 and 726 MiB with the `small` profile before the change.
+
+**Runs.** Forge ran the release binary of 05d149b2, whose code the item's commit keeps,
+under the bench lock with nothing else running, with four configurations interleaved in
+rounds that alternate their order. D is the default profile and S the retuned `small`
+profile. P is the control, the defaults from before the profiles, which were a block cache
+of 1,024 MiB, a SERVICE cache of 64 MiB and a history cache of 1,024 MiB. The result cache
+was off in every run, as the harness turns it off, so its earlier default of 512 MiB did
+not apply. S0 is the `small` profile of d1c699fd, before the change. Each cold sample
+restarted the server with the store's files evicted, on CPUs 0 to 10 with the client on
+CPU 11. The warm runs pinned the server to CPU 2 with one Rayon thread and the client to
+CPU 4. The table gives the geometric mean of each configuration's median times against D
+and the queries more than 5% slower.
+
+| Run | S against D | P against D | S0 against D |
+|---|---|---|---|
+| 10.5M, cold, 40 samples | 1.002, none | 1.000, `star-lookup` 1.07 | 1.024, `star-lookup` 1.84, `path-plus` 1.06, `lang-filter` 1.05 |
+| 10.5M, warm, 80 samples | 0.999, none | 0.997, none | 1.001, none |
+| 1.05M, cold, 40 samples | 0.993, none | 0.990, none | not run |
+| 1.05M, warm, 120 samples | 1.000, none | 1.001, none | not run |
+| DBpedia 50M, cold, 32 samples | 1.005, `count-all` 1.07, `costar-birthplace` 1.05 | 1.016, six queries from 1.05 to 1.21 | not run |
+| DBpedia 50M, warm, 40 samples | 1.000, `film-director-optional` 1.07 | 0.997, `film-director-optional` 1.06 | not run |
+
+The retuned `small` profile's cold `star-lookup` takes 18.5 ms against the default's 18.1
+ms, where the old profile took 33.3 ms. Every query flagged above has round medians that
+overlap the default's. The control P differs from D only in caches these runs do not use,
+yet it shows single cold queries up to 21% slower on DBpedia, so differences of that size
+between single cold queries are the run-to-run spread here, not an effect of a profile.
+
+**Gate.** §3.3 asks that neither profile's values regress a query by more than 5% at the
+tie threshold against the defaults from before the profiles. The default profile matches
+the control within the spread at both synthetic scales and on DBpedia, so its Phase 1a gate
+is met. The retuned `small` profile is within 1% of the default in every geometric mean
+and has no query outside the spread, so it meets the gate as well. Since the result cache
+is off in the harness and each server serves one dataset, the control shows that the
+smaller shared result and history caches cost nothing on these suites, and does not
+measure a workload that relies on the result cache.
+
+**A measurement note.** Warm runs whose server may use CPUs 0 to 10 were not usable for
+this gate. At 10.5M, `minus`, `optional-count`, `employee-docs` and `values-star` settled in
+each server process at one of two levels about twice apart, 6.6 or 3.2 ms for `minus`, the
+same for every configuration. The slower level is also about twice the time of a server
+pinned to one CPU with one Rayon thread, 3.1 ms for `minus`. Leaving out CPU 10, the
+sibling of the client's CPU, did not remove it. The warm rows above therefore come from
+pinned servers.
 
 ### Full-scale spill acceptance, item 93 (2026-10-21)
 

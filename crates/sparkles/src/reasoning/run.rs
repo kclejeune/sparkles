@@ -41,6 +41,10 @@ pub struct ReasonRequest {
     /// local terms, candidates, caches, previous closure and write buffers (see
     /// [`sparkles_reasoner::ReasonOptions::max_memory`]). `None` sets no limit.
     pub max_memory: Option<usize>,
+    /// The derived triples a run may produce before it fails with the code
+    /// [`INFERRED_LIMIT`]. `None` takes [`sparkles_reasoner::DEFAULT_MAX_INFERRED`], 50
+    /// million, and `Some(usize::MAX)` sets no limit.
+    pub max_inferred: Option<usize>,
 }
 
 impl Default for ReasonRequest {
@@ -56,6 +60,7 @@ impl Default for ReasonRequest {
             load: QueryOptions::default(),
             threads: None,
             max_memory: None,
+            max_inferred: None,
         }
     }
 }
@@ -71,6 +76,10 @@ pub struct ReasonOutcome {
 /// The error code of a run that yielded to a waiting write
 /// ([`ReasonRequest::yield_to_writers`]).
 pub const SUPERSEDED: &str = "superseded";
+
+/// The error code of a run that passed its limit of inferred triples
+/// ([`ReasonRequest::max_inferred`]).
+pub const INFERRED_LIMIT: &str = "inferred-limit";
 
 /// Materialize the inferences of `req` into `ds`, then record the run: the data first,
 /// then the record, so a crash in between reads as stale.
@@ -118,6 +127,9 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
         inputs: req.inputs.clone(),
         threads: req.threads,
         max_memory: req.max_memory,
+        max_inferred: req
+            .max_inferred
+            .unwrap_or(sparkles_reasoner::DEFAULT_MAX_INFERRED),
         pool: super::reason_pool(),
         ..Default::default()
     };
@@ -167,7 +179,15 @@ pub(crate) fn run(ds: &Dataset, req: &ReasonRequest, ctl: &Control) -> Result<Re
             ))));
         }
         Err(_) if ctl.cancel.is_cancelled() => return Err(Error::Cancelled),
-        Err(e) => return Err(from_anyhow(e)),
+        Err(e) => {
+            if let Some(l) = e.downcast_ref::<sparkles_reasoner::InferredLimitExceeded>() {
+                return Err(Error::Component(Box::new(
+                    ComponentError::new("reasoner", INFERRED_LIMIT, l.to_string())
+                        .with_source(l.clone()),
+                )));
+            }
+            return Err(from_anyhow(e));
+        }
     };
     let mut record = recorded(&req.profile, &req.extras, &report, store);
     record_inputs(&mut record, &req.inputs, &report, fetched);

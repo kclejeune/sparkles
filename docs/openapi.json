@@ -11867,6 +11867,11 @@
             },
             "type": "array"
           },
+          "maxInferred": {
+            "description": "The derived triples the run may produce before it fails, at most the server's `--reason-max-inferred`, which is also the default.",
+            "minimum": 1,
+            "type": "integer"
+          },
           "ontologyGraphs": {
             "description": "`default` or graph IRIs.",
             "items": {

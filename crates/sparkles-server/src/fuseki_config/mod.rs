@@ -396,6 +396,7 @@ pub fn start(st: &std::sync::Arc<crate::state::AppState>, add: &ServeAdditions) 
             false,
             false,
             None,
+            None,
         );
         tracing::info!(
             "fuseki-config: materializing the inferences of /{name} (task {})",
