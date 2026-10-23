@@ -1091,7 +1091,7 @@ and the state the cursor keeps, with its batch headroom, is expected to fit in h
 memory it may use is what the query's budget leaves, never more than the capacity of its
 grant's pool, and it does not depend on how much of the pool other queries hold, so a query
 gets the same plan under load. The cursor's state is estimated per operator. It counts
-the build side of each join with its hash index, the groups of a grouping with their
+the build side of each join, with its hash index when the join has a key, the groups of a grouping with their
 aggregate states, the rows of a DISTINCT or a full sort, the rows a top-k keeps, and the
 key set and pattern state of each EXISTS that the cursor answers from one. Rows found
 through a hash table also count the table's buckets, which coexist with the old buckets
@@ -1112,7 +1112,9 @@ product, and treating BIND as stateless admitted `BIND(STRUUID() AS ?u)` over a
 million-row product, which then failed after more than 100,000 rows. The tests in
 `crates/sparkles-core/tests/memory_admission.rs` and the decision table in
 `automatic_admission_streams_a_product_whose_cursor_state_fits_without_spill` cover these
-cases.
+cases. The second review found that the first fix also charged a hash index to a Cartesian
+product, which has no key and builds none, and so kept a count over such a product eager
+where it does not fit. A join without a shared variable now counts only its build rows.
 
 On forge at 10M quads, with the default 5.2 GiB pool, q4 with ProductType6 answers in
 15.1 s with a peak server RSS of 282 MB, where it was refused. With a 12 GB pool, eager

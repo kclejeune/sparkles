@@ -41,15 +41,16 @@ fn pooled(bytes: u64) -> QueryOptions {
 }
 
 /// How automatic execution of `q` went.
+#[derive(Debug)]
 enum Auto {
     /// It chose eager execution, which answered these rows.
     Eager(Vec<Vec<Option<Term>>>),
     /// It chose a cursor, which answered these rows.
     Streamed(Vec<Vec<Option<Term>>>),
-    /// It failed before answering a row.
+    /// It refused the query before choosing a cursor, as eager execution does.
     Refused,
     /// It chose a cursor, which failed after yielding this many rows.
-    FailedAfter(usize),
+    CursorFailed(usize),
 }
 
 fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Auto {
@@ -70,11 +71,10 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Auto {
                         }
                     }
                     Ok(None) => return Auto::Streamed(rows),
-                    Err(e) if rows.is_empty() => {
-                        eprintln!("cursor refused: {e}");
-                        return Auto::Refused;
+                    Err(e) => {
+                        eprintln!("the cursor failed after {} rows: {e}", rows.len());
+                        return Auto::CursorFailed(rows.len());
                     }
-                    Err(_) => return Auto::FailedAfter(rows.len()),
                 }
             }
         }
@@ -84,6 +84,16 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Auto {
             eprintln!("refused before a cursor: {e}");
             Auto::Refused
         }
+    }
+}
+
+/// A query that does not fit must be refused, or answered, but never admitted as a
+/// cursor that then fails.
+fn assert_not_admitted_to_fail(outcome: Auto, rows: usize) {
+    match outcome {
+        Auto::CursorFailed(n) => panic!("a cursor was admitted and failed after {n} rows"),
+        Auto::Eager(r) | Auto::Streamed(r) => assert_eq!(r.len(), rows),
+        Auto::Refused => {}
     }
 }
 
@@ -113,14 +123,14 @@ fn a_hash_join_whose_index_does_not_fit_is_not_streamed_without_spill() {
     assert_eq!(eager, 1);
     match automatic(&s, q, &opts) {
         Auto::Eager(rows) | Auto::Streamed(rows) => assert_eq!(rows.len(), 1),
-        Auto::Refused => panic!("automatic execution refused a query that eager answers"),
-        Auto::FailedAfter(n) => panic!("the cursor failed after {n} rows"),
+        other => panic!("automatic execution failed a query that eager answers: {other:?}"),
     }
 }
 
 /// A COUNT(DISTINCT *) keeps every distinct input row although it answers one row, so a
-/// million-row input does not fit a small budget whether it streams or not, and it must
-/// fail before it answers, as eager execution does.
+/// million-row input does not fit a small pool whether it streams or not. Under a UNION,
+/// where the rule for groupings does not stream it, only the memory estimate could admit
+/// it as a cursor, which would fail at its first pull.
 #[test]
 fn a_distinct_aggregate_over_a_large_input_is_not_streamed_without_spill() {
     let mut data = String::new();
@@ -128,15 +138,10 @@ fn a_distinct_aggregate_over_a_large_input_is_not_streamed_without_spill() {
         data.push_str(&format!("<urn:s:{i}> <urn:p> {i} .\n"));
     }
     let s = store(data);
-    let q = "SELECT (COUNT(DISTINCT *) AS ?n) {
-        { ?a <urn:p> ?b . ?c <urn:p> ?d } UNION { ?a <urn:p> ?b } }";
-    match automatic(&s, q, &pooled(16 << 20)) {
-        Auto::FailedAfter(n) => panic!("the cursor failed after {n} rows"),
-        Auto::Streamed(rows) | Auto::Eager(rows) => {
-            assert_eq!(rows.len(), 1, "one count");
-        }
-        Auto::Refused => {}
-    }
+    let q = "SELECT ?n {
+        { SELECT (COUNT(DISTINCT *) AS ?n) { ?a <urn:p> ?b . ?c <urn:p> ?d } }
+        UNION { VALUES ?n { 0 } } }";
+    assert_not_admitted_to_fail(automatic(&s, q, &pooled(16 << 20)), 2);
 }
 
 /// GROUP_CONCAT keeps text whose length the row estimates do not tell, so its plans are
@@ -145,16 +150,15 @@ fn a_distinct_aggregate_over_a_large_input_is_not_streamed_without_spill() {
 fn a_group_concat_over_a_large_input_is_not_streamed_without_spill() {
     let mut data = String::new();
     for i in 0..1_000 {
-        data.push_str(&format!("<urn:s:{i}> <urn:p> \"value number {i}\" .\n"));
+        data.push_str(&format!(
+            "<urn:s:{i}> <urn:p> \"a value long enough to outgrow the pool, number {i}\" .\n"
+        ));
     }
     let s = store(data);
-    let q = "SELECT (GROUP_CONCAT(?b) AS ?all) {
-        { ?a <urn:p> ?b . ?c <urn:p> ?d } UNION { ?a <urn:p> ?b } }";
-    match automatic(&s, q, &pooled(16 << 20)) {
-        Auto::FailedAfter(n) => panic!("the cursor failed after {n} rows"),
-        Auto::Streamed(rows) | Auto::Eager(rows) => assert_eq!(rows.len(), 1),
-        Auto::Refused => {}
-    }
+    let q = "SELECT ?all {
+        { SELECT (GROUP_CONCAT(?b) AS ?all) { ?a <urn:p> ?b . ?c <urn:p> ?d } }
+        UNION { VALUES ?all { 0 } } }";
+    assert_not_admitted_to_fail(automatic(&s, q, &pooled(16 << 20)), 2);
 }
 
 /// A BIND that generates a new term for every row grows the query-local vocabulary by a
@@ -168,11 +172,7 @@ fn a_bind_that_generates_a_term_per_row_is_not_streamed_without_spill() {
     }
     let s = store(data);
     let q = "SELECT (STRUUID() AS ?u) { ?a <urn:p> ?b . ?c <urn:p> ?d }";
-    match automatic(&s, q, &pooled(16 << 20)) {
-        Auto::FailedAfter(n) => panic!("the cursor failed after {n} rows"),
-        Auto::Streamed(rows) | Auto::Eager(rows) => assert_eq!(rows.len(), 1_000_000),
-        Auto::Refused => {}
-    }
+    assert_not_admitted_to_fail(automatic(&s, q, &pooled(16 << 20)), 1_000_000);
 }
 
 /// A BIND of a variable generates no term, so the product it extends still streams
@@ -194,7 +194,33 @@ fn a_bind_of_a_variable_over_a_large_product_still_streams() {
                 Some(Term::Literal(oxrdf::Literal::from(1_001_000i64)))
             );
         }
-        Auto::Refused => panic!("refused"),
-        Auto::FailedAfter(n) => panic!("the cursor failed after {n} rows"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A Cartesian product has no key, so it builds no hash index, and counting one would
+/// keep a count over the product eager, where it does not fit.
+#[test]
+fn a_count_over_a_keyless_product_still_streams() {
+    let mut data = String::new();
+    for i in 0..1_000 {
+        data.push_str(&format!("<urn:a:{i}> <urn:p> {i} .\n"));
+    }
+    for i in 0..80_000 {
+        data.push_str(&format!("<urn:c:{i}> <urn:q> {i} .\n"));
+    }
+    let s = store(data);
+    let q = "SELECT ?n {
+        { SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?b . ?c <urn:q> ?d } }
+        UNION { VALUES ?n { 0 } } }";
+    match automatic(&s, q, &budget(8 << 20)) {
+        Auto::Streamed(rows) => {
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows.iter()
+                    .any(|r| r[0] == Some(Term::Literal(oxrdf::Literal::from(80_000_000i64))))
+            );
+        }
+        other => panic!("not streamed: {other:?}"),
     }
 }

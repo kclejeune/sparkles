@@ -1170,8 +1170,14 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
     };
     let own = match &node.kind {
         _ if binary::eligible(node) => {
+            let probe = &node.children[binary::probe_side(node)];
             let build = &node.children[1 - binary::probe_side(node)];
-            hashed(build, build.est)
+            // a join with no shared variable has no key, so it builds no hash index
+            if build.vars.iter().any(|v| probe.vars.contains(v)) {
+                hashed(build, build.est)
+            } else {
+                rows(build, build.est)
+            }
         }
         Kind::Group { aggs, .. } => {
             let input = node.children.first().map_or(0.0, |c| c.est.max(0.0));
