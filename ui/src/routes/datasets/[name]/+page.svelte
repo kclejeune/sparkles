@@ -755,6 +755,7 @@ ex:PersonShape a sh:NodeShape ;
     >
       <CommunitiesPanel
         ds={name}
+        {branch}
         {readOnly}
         {prefixes}
         canAdmin={auth.can(name, 'admin')}

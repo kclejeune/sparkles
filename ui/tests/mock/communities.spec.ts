@@ -38,6 +38,41 @@ test('the tab shows the tree and a report, and reviews it', async ({ page }) => 
   await expect(panel).toContainText('edited revision');
 });
 
+test('off main the tab offers no action on main', async ({ page }) => {
+  const graphrag: string[] = [];
+  page.on('request', (r) => {
+    if (r.url().includes('/$/graphrag/')) graphrag.push(`${r.method()} ${r.url()}`);
+  });
+  await page.goto('/ui/datasets/org?branch=scratch-s2&tab=communities');
+  const panel = page.getByTestId('communities');
+  await expect(panel.getByTestId('communities-off-main')).toContainText('scratch-s2');
+  await expect(panel.getByRole('button', { name: 'Build' })).toHaveCount(0);
+  await expect(panel.getByRole('button', { name: 'Refresh' })).toHaveCount(0);
+  await expect(panel.getByRole('navigation', { name: 'Community hierarchy' })).toHaveCount(0);
+  expect(graphrag).toEqual([]);
+});
+
+test('a slow answer for an earlier community does not replace a later one', async ({ page }) => {
+  // hold Engineering's answer until the platform team's has arrived
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  await page.route(/\/\$\/graphrag\/org\/community\?/, async (route) => {
+    if (decodeURIComponent(route.request().url()).includes('0:org')) await held;
+    await route.continue();
+  });
+  await page.goto('/ui/datasets/org?tab=communities');
+  const panel = page.getByTestId('communities');
+  const tree = panel.getByRole('navigation', { name: 'Community hierarchy' });
+  await expect(tree).toContainText('Engineering');
+  await tree.getByRole('button', { name: /Engineering/ }).click();
+  await tree.getByRole('button', { name: /The platform team/ }).click();
+  await expect(panel.getByRole('heading', { name: 'The platform team' })).toBeVisible();
+  release();
+  await page.waitForTimeout(300);
+  await expect(panel.getByRole('heading', { name: 'The platform team' })).toBeVisible();
+  await expect(panel.getByRole('heading', { name: 'Engineering' })).toHaveCount(0);
+});
+
 test.describe('on a phone', () => {
   test.use({ ...phone, viewport: { width: 390, height: 844 } });
 

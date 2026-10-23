@@ -17,12 +17,15 @@
 
   let {
     ds,
+    branch = null,
     canAdmin = false,
     canWrite = false,
     readOnly = false,
     prefixes = {},
   }: {
     ds: string;
+    /** The branch the page shows, null for main. The reports belong to main only. */
+    branch?: string | null;
     canAdmin?: boolean;
     canWrite?: boolean;
     readOnly?: boolean;
@@ -76,6 +79,7 @@
       list = l;
       error = null;
       if (selected && !l.communities.some((c) => c.iri === selected)) {
+        detailSeq++;
         selected = null;
         detail = null;
       }
@@ -86,25 +90,40 @@
     }
   }
 
+  // the latest detail request: an answer to an earlier one is dropped, so a slow answer
+  // never replaces the community chosen after it
+  let detailSeq = 0;
+
   async function open(iri: string) {
+    const seq = ++detailSeq;
     selected = iri;
     detailLoading = true;
+    detailError = null;
+    // another community's report must not stay actionable while this one loads
+    if (detail?.iri !== iri) detail = null;
     try {
-      detail = await gr.community(ds, iri);
-      detailError = null;
+      const d = await gr.community(ds, iri);
+      if (seq !== detailSeq) return;
+      detail = d;
     } catch (e) {
+      if (seq !== detailSeq) return;
       detail = null;
       detailError = e;
     } finally {
-      detailLoading = false;
+      if (seq === detailSeq) detailLoading = false;
     }
   }
 
   $effect(() => {
     void ds;
+    const onMain = !branch;
     untrack(() => {
+      detailSeq++;
       selected = null;
       detail = null;
+      st = null;
+      list = null;
+      if (!onMain) return;
       void load();
       void findRunning();
     });
@@ -271,7 +290,7 @@
     {#if st?.enabled && list?.available}<span class="badge">{fmtInt(list.communities.length)}</span
       >{/if}
     <span class="spacer"></span>
-    {#if canAdmin && st?.enabled}
+    {#if canAdmin && st?.enabled && !branch}
       <button
         class="btn sm"
         disabled={readOnly || running || starting}
@@ -291,13 +310,18 @@
       title="Reload"
       aria-label="Reload communities"
       onclick={load}
-      disabled={loading}
+      disabled={loading || !!branch}
     >
       {#if loading}<span class="spinner"></span>{:else}<Icon name="refresh" size={13} />{/if}
     </button>
   </div>
 
-  {#if error && !st}
+  {#if branch}
+    <p class="pad faint" data-testid="communities-off-main">
+      <Icon name="branch" size={12} /> This tab shows the community reports of main only, and this page
+      shows the <span class="mono">{branch}</span> branch. Switch to main to read, build or review them.
+    </p>
+  {:else if error && !st}
     <div class="pad">
       <div class="error-box">
         <strong>Could not load the communities.</strong>
