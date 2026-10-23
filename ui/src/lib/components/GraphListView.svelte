@@ -12,6 +12,8 @@
     openable: boolean;
     /** Marked, such as an entity of the chosen finding. */
     marked?: boolean;
+    /** The tooltip of the name, the key without its prefix by default. */
+    title?: string;
   };
 </script>
 
@@ -22,6 +24,7 @@
    * accessible companion of the canvas.
    */
   import { fmtInt } from '$lib/format';
+  import type { LensColumn } from '$lib/lenses.svelte';
 
   let {
     rows,
@@ -30,6 +33,9 @@
     onopen,
     openLabel = 'Open',
     clsLabel = 'Class',
+    plain = false,
+    lensColumns = [],
+    label = 'Drawn nodes',
   }: {
     rows: ListRow[];
     selected?: string | null;
@@ -38,6 +44,14 @@
     openLabel?: string;
     /** The heading of the class column. */
     clsLabel?: string;
+    /**
+     * A list of drawn resources rather than the overview's groups: no size or class column,
+     * and `size` only orders the rows, such as by the size lens's value.
+     */
+    plain?: boolean;
+    /** A column per active lens (docs/specs/U10-canvas-lenses.md §2.1). */
+    lensColumns?: LensColumn[];
+    label?: string;
   } = $props();
 
   const LIMIT = 500;
@@ -58,13 +72,16 @@
 </script>
 
 <div class="list-wrap">
-  <table class="list">
+  <table class="list" aria-label={label}>
     <thead>
       <tr>
         <th scope="col">Name</th>
-        <th scope="col" class="num">Size</th>
+        {#if !plain}<th scope="col" class="num">Size</th>{/if}
+        {#each lensColumns as c (c.channel)}
+          <th scope="col" class="lens-col" data-lens={c.channel}>{c.title}</th>
+        {/each}
         <th scope="col" class="hide-sm">Kind</th>
-        <th scope="col" class="hide-sm">{clsLabel}</th>
+        {#if !plain}<th scope="col" class="hide-sm">{clsLabel}</th>{/if}
         <th scope="col" class="num hide-sm">Links</th>
         <th scope="col"><span class="sr-only">Actions</span></th>
       </tr>
@@ -78,15 +95,22 @@
           aria-selected={r.key === selected}
         >
           <td>
-            <button class="name" onclick={() => onselect?.(r.key)} title={r.key.slice(2)}>
+            <button
+              class="name"
+              onclick={() => onselect?.(r.key)}
+              title={r.title ?? r.key.slice(2)}
+            >
               <span class="dot" style:background={r.color} aria-hidden="true"></span>
               <span class="lbl">{r.label}</span>{#if r.marked}<span class="sr-only">, marked</span
                 >{/if}
             </button>
           </td>
-          <td class="num">{r.kind === 'member' ? '' : fmtInt(r.size)}</td>
+          {#if !plain}<td class="num">{r.kind === 'member' ? '' : fmtInt(r.size)}</td>{/if}
+          {#each lensColumns as c (c.channel)}
+            <td class="lens-col" data-lens={c.channel}>{c.cells.get(r.key) ?? ''}</td>
+          {/each}
           <td class="hide-sm faint">{r.kind}</td>
-          <td class="hide-sm faint mono small">{r.cls ?? ''}</td>
+          {#if !plain}<td class="hide-sm faint mono small">{r.cls ?? ''}</td>{/if}
           <td class="num hide-sm">{fmtInt(r.degree)}</td>
           <td class="act">
             <button class="btn sm" onclick={() => onopen?.(r.key)}
@@ -128,6 +152,12 @@
     padding: 3px 8px;
     border-bottom: 1px solid var(--border);
     vertical-align: middle;
+  }
+  .lens-col {
+    max-width: 22ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .num {
     text-align: right;

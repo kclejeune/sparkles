@@ -48,6 +48,12 @@
   import * as gr from '$lib/graphrag';
   import { branchParam } from '$lib/branches';
   import TextSearchView from '$components/TextSearchView.svelte';
+  import GraphListView, { type ListRow } from '$components/GraphListView.svelte';
+  import LensMenu from '$components/LensMenu.svelte';
+  import LensLegend from '$components/LensLegend.svelte';
+  import { describe as lensDescribe, OTHER } from '$lib/lens';
+  import { Lenses } from '$lib/lenses.svelte';
+  import type { EdgeTriple } from '$lib/explore-time';
 
   type ENode = {
     id: string;
@@ -165,10 +171,12 @@
     expandLog = [];
     seenTerms = new Map();
     changes = null;
+    lensPick = null;
   }
   let graphView: GraphView | undefined = $state();
   // the reads of a view that goes away stop with it
   onDestroy(() => {
+    lenses.destroy();
     expandCtl.abort();
     for (const r of [graphRuns, detailRuns, schemaRuns, profileRuns, histRuns]) r.abortAll();
   });
@@ -340,6 +348,7 @@
       focus: n.id === focusId,
       expanded: n.expanded,
       change,
+      term: n.term,
     });
     const real = Object.values(nodes)
       .filter((n) => showLiterals || !n.lit)
@@ -351,15 +360,81 @@
   });
   const gEdges = $derived.by((): GEdge[] => {
     const keep = (e: EEdge) => (showLiterals || !e.lit) && (!hideTypes || !e.isType);
+    const tripleOf = (e: EEdge): EdgeTriple | undefined => {
+      const s = nodes[e.source]?.term;
+      const o = nodes[e.target]?.term;
+      return s && o && e.title ? [s, { type: 'uri', value: e.title }, o] : undefined;
+    };
     const real = Object.values(edges)
       .filter(keep)
-      .map((e) => (changes?.addedEdges.has(e.id) ? { ...e, change: 'added' as const } : e));
+      .map((e) => ({
+        ...e,
+        triple: tripleOf(e),
+        ...(changes?.addedEdges.has(e.id) ? { change: 'added' as const } : {}),
+      }));
     const ghosts = Object.values(changes?.ghostEdges ?? {})
       .filter(keep)
       .map((e) => ({ ...e, change: 'removed' as const }));
     return [...real, ...ghosts];
   });
   const nodeCount = $derived(Object.keys(nodes).length);
+
+  // --- lenses (docs/specs/U10-canvas-lenses.md) ------------------------------------------
+
+  const lenses = new Lenses();
+  /** The drawn graph as a list, with a column per active lens. */
+  let listView = $state(false);
+  /** The legend entry whose nodes are selected, and those nodes. */
+  let lensPick = $state<{ key: string; ids: string[] } | null>(null);
+  const dsInfo = $derived(app.datasets.find((d) => d.name === ds));
+  /** Materialized inferences or RDFS on read: the inferred-edge lens exists (§2.7). */
+  const hasReasoning = $derived(!!dsInfo?.reasoning || !!dsInfo?.rdfs);
+  $effect(() => {
+    const name = ds;
+    if (!name) return;
+    lenses.setInput({
+      ds: name,
+      at: graphTimeOpen && exAt ? exAt : undefined,
+      nodes: gNodes.map((n) => ({ id: n.id, term: n.term })),
+      // the ghosts of a comparison are not in the state the lenses read
+      edges: gEdges
+        .filter((e) => e.change !== 'removed')
+        .map((e) => ({ id: e.id, source: e.source, target: e.target, triple: e.triple })),
+      reasoning: hasReasoning,
+      label: (id) => nodes[id]?.label ?? id,
+      short: (iri) => shortLabel(iri, prefixes),
+    });
+  });
+  /** The list view's rows: the drawn nodes, ordered by the size lens when one is on. */
+  const listRows = $derived.by((): ListRow[] => {
+    const size = lenses.results.size;
+    const degree = new Map<string, number>();
+    for (const e of gEdges) {
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+    const look = lenses.encoding.nodes;
+    return gNodes.map((n) => {
+      const v = size?.values.get(n.id);
+      const c = look.get(n.id)?.colour;
+      return {
+        key: n.id,
+        label: n.label,
+        kind: n.change === 'removed' ? 'removed' : n.kind === 'iri' ? 'resource' : n.kind,
+        size: typeof v === 'number' ? v : -1,
+        degree: degree.get(n.id) ?? 0,
+        color:
+          c == null
+            ? `var(--${n.kind === 'iri' ? 'iri' : n.kind})`
+            : c === OTHER
+              ? 'var(--lens-other)'
+              : `var(--lens-${c + 1})`,
+        openable: n.kind === 'iri',
+        marked: !!lensPick?.ids.includes(n.id),
+        title: [n.title ?? n.label, lensDescribe(n.id, lenses.results)].filter(Boolean).join('\n'),
+      };
+    });
+  });
 
   function labelFor(t: Term, label?: string) {
     if (label) return label;
@@ -1319,6 +1394,17 @@
             <span class="spacer"></span>
             <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
             {#if nodeCount}
+              <LensMenu
+                {lenses}
+                short={(iri) => shortLabel(iri, prefixes)}
+                keys={tab === 'graph'}
+              />
+              <button
+                class="btn sm"
+                aria-pressed={listView}
+                title="The drawn nodes as a list, with a column per lens"
+                onclick={() => (listView = !listView)}><Icon name="table" size={13} /> List</button
+              >
               <button
                 class="btn sm"
                 aria-pressed={graphTimeOpen}
@@ -1383,14 +1469,37 @@
           </div>
         {:else}
           <div class="cy-host">
-            <GraphView
-              bind:this={graphView}
-              animate={graphTimeOpen}
-              nodes={gNodes}
-              edges={gEdges}
-              selected={selectedId}
-              onselect={select}
-              onexpand={expand}
+            {#if listView}
+              <GraphListView
+                rows={listRows}
+                plain
+                label="Drawn nodes"
+                lensColumns={lenses.columns}
+                selected={selectedId}
+                onselect={select}
+                openLabel="Focus"
+                onopen={(id) => {
+                  const n = nodes[id];
+                  if (n?.term.type === 'uri') void focusOn(n.iri, n.label);
+                }}
+              />
+            {:else}
+              <GraphView
+                bind:this={graphView}
+                animate={graphTimeOpen}
+                nodes={gNodes}
+                edges={gEdges}
+                selected={selectedId}
+                onselect={select}
+                onexpand={expand}
+                lens={lenses.encoding}
+                marked={lensPick?.ids ?? null}
+              />
+            {/if}
+            <LensLegend
+              results={lenses.results}
+              selected={lensPick?.key ?? null}
+              onselect={(key, ids) => (lensPick = key ? { key, ids } : null)}
             />
           </div>
           <div class="hint faint">
@@ -2301,6 +2410,8 @@
   .cy-host {
     flex: 1;
     min-height: 0;
+    /* the lens legend docks in its corner */
+    position: relative;
   }
   .ov-host {
     flex: 1;
@@ -2786,6 +2897,10 @@
     .search {
       flex-basis: 100%;
       max-width: none;
+    }
+    .gtools {
+      flex-wrap: wrap;
+      gap: 6px 12px;
     }
   }
 </style>
