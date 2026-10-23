@@ -1823,7 +1823,16 @@ impl<'q> QuoteIndex<'q> {
         // per quote: the byte offset of its first occurrence, and whether another follows
         // it without overlap (the matches of one quote come in the order of their starts)
         let mut seen: Vec<Option<(usize, bool)>> = vec![None; distinct.len()];
-        for m in automaton.find_overlapping_iter(text) {
+        // Matches that overlap are many when the quotes are short pieces of a repetitive
+        // text: a text of 2 MiB of one letter and quotes of 1 to 1,000 of them has two
+        // billion. Past a bound on the work, each quote is searched for on its own, which
+        // stops at its second occurrence.
+        let budget = 8 * distinct.len() + text.len();
+        for (n, m) in automaton.find_overlapping_iter(text).enumerate() {
+            if n >= budget {
+                index.complete = false;
+                return index;
+            }
             let slot = &mut seen[m.pattern().as_usize()];
             match slot {
                 None => *slot = Some((m.start(), false)),
@@ -2639,6 +2648,27 @@ mod tests {
         let few = QuoteIndex::new(text, ["beta"]);
         assert_eq!(few.find(text, "gamma", true), None);
         assert_eq!(QuoteIndex::new("", ["x"]).find("", "x", true), None);
+    }
+
+    /// Quotes that match everywhere in a repetitive text do not make the index enumerate
+    /// every overlapping match, which are two billion for this text and took 14 s.
+    #[test]
+    fn quote_index_gives_up_on_repetitive_text_and_still_answers() {
+        let text = "a".repeat(2 << 20);
+        let quotes: Vec<String> = (1..=1000).map(|n| "a".repeat(n)).collect();
+        let began = std::time::Instant::now();
+        let index = QuoteIndex::new(&text, quotes.iter().map(String::as_str));
+        assert!(!index.complete);
+        for q in &quotes {
+            for first in [false, true] {
+                assert_eq!(index.find(&text, q, first), find_quote(&text, q, first));
+            }
+        }
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
     }
 
     /// Finding the quotes of a long text takes time in proportion to its length. With a
