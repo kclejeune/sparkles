@@ -17,8 +17,8 @@ answer (`<query>.<engine>.json`, as bench-answers.py writes it with ANSWERS_RAW_
 it. A value agrees when it is within the error bound of a float summation in any order,
 n * 2^-24 of the sum of magnitudes plus one rounding of the quotient, which the bound
 follows from the standard analysis of recursive summation. Integers (q5's review counts),
-IRIs and the row set must match exactly, except that q4's top ten may differ at a rank
-whose exact ratio is within the bound of the ratio that would replace it.
+IRIs and the row set must match exactly, each row once, except that q4's top ten may leave
+out a feature whose ratio can rank below every returned one within the bounds.
 """
 import json
 import re
@@ -143,9 +143,12 @@ def term(b):
 def check_q4(rows, order, answer, limit=10):
     got = [(term(b.get("feature")), Fraction(b["priceRatio"]["value"])) for b in answer["results"]["bindings"]]
     problems = []
-    if len(got) != min(limit, len(order)):
-        problems.append(f"{len(got)} rows, expected {min(limit, len(order))}")
-    cutoff = rows[order[limit - 1]] if len(order) >= limit else None
+    want = min(limit, len(order))
+    if len(got) != want:
+        problems.append(f"{len(got)} rows, expected {want}")
+    feats = [f for f, _ in got]
+    for f in sorted({f for f in feats if feats.count(f) > 1}, key=str):
+        problems.append(f"{f} appears {feats.count(f)} times")
     for feat, val in got:
         if feat not in rows:
             problems.append(f"{feat} is not a feature with both averages")
@@ -153,16 +156,27 @@ def check_q4(rows, order, answer, limit=10):
         exact, bound = rows[feat]
         if abs(val - exact) > bound:
             problems.append(f"{feat}: {float(val)!r} is {float(abs(val - exact) / bound):.1f} bounds from {float(exact)!r}")
-        elif feat not in order[:limit] and not (cutoff and exact + bound >= cutoff[0] - cutoff[1]):
-            problems.append(f"{feat} is outside the top {limit} by more than the rounding")
+    # The returned features must be a top `limit` that some float summation can produce: every
+    # feature left out must be able to rank below every feature returned, and the returned
+    # order must be possible too.
+    kept = [f for f in dict.fromkeys(feats) if f in rows]
+    if kept:
+        lowest = min(kept, key=lambda f: rows[f][0] + rows[f][1])
+        floor = rows[lowest][0] + rows[lowest][1]
+        for f in order:
+            if f not in kept and rows[f][0] - rows[f][1] > floor:
+                problems.append(f"{f} is left out, but it ranks above {lowest} by more than the rounding")
+        for a, b in zip(kept, kept[1:]):
+            if rows[a][0] + rows[a][1] < rows[b][0] - rows[b][1]:
+                problems.append(f"{a} is ranked above {b} by more than the rounding allows")
     return problems
 
 
 def check_q5(rows, answer):
-    problems, seen = [], set()
+    problems, seen = [], {}
     for b in answer["results"]["bindings"]:
         key = (term(b.get("country")), term(b.get("product")))
-        seen.add(key)
+        seen[key] = seen.get(key, 0) + 1
         if key not in rows:
             problems.append(f"{key} is not a country's most reviewed product")
             continue
@@ -172,7 +186,10 @@ def check_q5(rows, answer):
         val = Fraction(b["avgPrice"]["value"])
         if abs(val - exact) > bound:
             problems.append(f"{key}: {float(val)!r} is {float(abs(val - exact) / bound):.1f} bounds from {float(exact)!r}")
-    for key in set(rows) - seen:
+    for key, k in seen.items():
+        if k > 1:
+            problems.append(f"{key} appears {k} times")
+    for key in set(rows) - set(seen):
         problems.append(f"{key} is missing")
     return problems
 
@@ -188,6 +205,8 @@ def main():
     import glob
     import os
     names = sorted(os.path.basename(p)[:-3] for p in glob.glob(f"{qdir}/bi-q[45]-*.rq"))
+    if not names:
+        sys.exit(f"no bi-q4-* or bi-q5-* queries in {qdir}")
     types = {n: ptype_of(f"{qdir}/{n}.rq") for n in names}
     d = load(data, set(types.values()))
     report = {}
@@ -209,9 +228,11 @@ def main():
             dts = sorted({b[var].get("datatype", "") for b in answer["results"]["bindings"] if var in b})
             report.setdefault(n, {})[engine] = {"status": "ok" if not problems else "disagrees",
                                                 "datatypes": dts, "problems": problems[:5]}
-            print(f"{n} {engine}: {'ok' if not problems else '; '.join(problems[:3])} {types}")
+            print(f"{n} {engine}: {'ok' if not problems else '; '.join(problems[:3])}")
     if out:
         json.dump(report, open(out, "w"), indent=1)
+    if not report:
+        sys.exit(f"no raw answers to {', '.join(names)} in {raw}, so nothing was checked")
     sys.exit(1 if any(v["status"] != "ok" for r in report.values() for v in r.values()) else 0)
 
 

@@ -131,6 +131,53 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(st, {"ok": "ok", "count": "disagrees", "value": "disagrees"})
         self.assertEqual(rep["bi-q5-1"]["ok"]["datatypes"], [FLOAT])
 
+    def test_a_repeated_row_is_a_disagreement(self):
+        q4 = q4_answer(f32)
+        b = q4["results"]["bindings"]
+        b[1] = dict(b[0])
+        good = mean([PRICES["o1"], PRICES["o2"]], f32)
+        q5 = q5_answer(good)
+        q5["results"]["bindings"] *= 2
+        p, rep = self.run_oracle([("bi-q4-1", "dup", q4), ("bi-q5-1", "dup", q5)])
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(rep["bi-q4-1"]["dup"]["status"], "disagrees")
+        self.assertEqual(rep["bi-q5-1"]["dup"]["status"], "disagrees")
+
+    def ranked(self, values, bound="1/1000"):
+        rows = {f"<f{i}>": (oracle.Fraction(v), oracle.Fraction(bound)) for i, v in enumerate(values)}
+        order = sorted(rows, key=lambda f: (-rows[f][0], f))
+        return rows, order
+
+    def answer_of(self, rows, feats):
+        return {"results": {"bindings": [{"feature": {"type": "uri", "value": f[1:-1]},
+                                          "priceRatio": {"type": "literal", "value": str(float(rows[f][0]))}}
+                                         for f in feats]}}
+
+    def test_a_left_out_winner_is_not_rounding(self):
+        # ranks 2 to 11 without the clear first, although ranks 10 and 11 overlap
+        rows, order = self.ranked([100] + [20 - i for i in range(8)] + ["11.001", "11.0005"])
+        got = self.answer_of(rows, order[1:11])
+        self.assertTrue(any("left out" in x for x in oracle.check_q4(rows, order, got)))
+
+    def test_a_swap_within_the_rounding_is_accepted(self):
+        rows, order = self.ranked([100] + [20 - i for i in range(8)] + ["11.001", "11.0005"])
+        got = self.answer_of(rows, order[:9] + [order[10]])
+        self.assertEqual(oracle.check_q4(rows, order, got), [])
+
+    def test_nothing_to_check_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            data, q = fixture(d)
+            p = subprocess.run([sys.executable, "-I", ORACLE, data, q, os.path.join(d, "raw")],
+                               capture_output=True, text=True)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("nothing was checked", p.stderr)
+            empty = os.path.join(d, "none")
+            os.mkdir(empty)
+            p = subprocess.run([sys.executable, "-I", ORACLE, data, empty, os.path.join(d, "raw")],
+                               capture_output=True, text=True)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("no bi-q4", p.stderr)
+
     def test_float_parsing_is_binary32(self):
         self.assertEqual(oracle.f32("0.1"), oracle.Fraction(f32(0.1)))
         self.assertNotEqual(oracle.f32("0.1"), oracle.Fraction(0.1))
