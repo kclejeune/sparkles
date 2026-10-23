@@ -1835,6 +1835,7 @@ impl<'q> QuoteIndex<'q> {
             // of one letter and quotes of 1 to 1,000 of them has two billion. A pass that
             // reaches its bound keeps the quotes it settled and goes again without them.
             let mut seen: Vec<Option<(usize, bool)>> = vec![None; active.len()];
+            let mut matches = vec![0usize; active.len()];
             let budget = 8 * active.len() + text.len();
             let mut cut = false;
             for (n, m) in automaton.find_overlapping_iter(text).enumerate() {
@@ -1842,6 +1843,7 @@ impl<'q> QuoteIndex<'q> {
                     cut = true;
                     break;
                 }
+                matches[m.pattern().as_usize()] += 1;
                 let slot = &mut seen[m.pattern().as_usize()];
                 match slot {
                     None => *slot = Some((m.start(), false)),
@@ -1854,9 +1856,13 @@ impl<'q> QuoteIndex<'q> {
                 }
             }
             let mut rest = Vec::new();
-            for (quote, state) in active.iter().zip(&seen) {
+            let mut settled = 0;
+            for ((quote, state), n) in active.iter().zip(&seen).zip(&matches) {
                 match *state {
-                    Some((byte, more)) if more || !cut => firsts.push((*quote, byte, more)),
+                    Some((byte, more)) if more || !cut => {
+                        firsts.push((*quote, byte, more));
+                        settled += n;
+                    }
                     // not settled by a pass that was cut short: another pass, or a scan
                     _ if cut => rest.push(*quote),
                     // absent from the text
@@ -1867,8 +1873,9 @@ impl<'q> QuoteIndex<'q> {
                 active.clear();
                 break;
             }
-            if rest.len() == active.len() {
-                // nothing was settled, so another pass would be as long
+            if settled < budget / 2 {
+                // The quotes that are left would still take most of another pass, which
+                // would be a pass for little: they are scanned for on their own.
                 break;
             }
             active = rest;
@@ -2730,6 +2737,24 @@ mod tests {
             "{:?}",
             began.elapsed()
         );
+    }
+
+    /// Long quotes that cannot settle beside a short one that does give the same answers
+    /// as scans, which a second pass for the short one's sake would not change.
+    #[test]
+    fn quote_index_does_not_repeat_a_pass_for_little() {
+        let period: String = (0..50u8).map(|i| char::from(b'A' + i)).collect();
+        let text = period.repeat(30);
+        let mut quotes: Vec<String> = (0..50)
+            .map(|r| period.chars().cycle().skip(r).take(900).collect::<String>())
+            .collect();
+        quotes.push("A".into());
+        let index = QuoteIndex::new(&text, quotes.iter().map(String::as_str));
+        for q in &quotes {
+            for first in [false, true] {
+                assert_eq!(index.find(&text, q, first), find_quote(&text, q, first));
+            }
+        }
     }
 
     /// Finding the quotes of a long text takes time in proportion to its length. With a
