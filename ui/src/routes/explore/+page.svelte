@@ -225,10 +225,15 @@
       // a move inside the diff graph keeps it; another address reads the new diff
       diffView = d;
       diffKey++;
-      if (d) tab = 'graph';
+      if (d) {
+        tab = 'graph';
+        // the diff graph takes the canvas, so the path finder closes with its overlay
+        closePaths();
+      }
     });
   });
   function openDiff(to: string, from: string) {
+    closePaths();
     diffView = { to, from, branch: '', group: false };
     diffKey++;
     syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);

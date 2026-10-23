@@ -258,18 +258,25 @@
       },
       { selector: '.faded', style: { opacity: 0.25 } },
       { selector: '.muted', style: { opacity: 0.22 } },
-      // the path finder's overlay: path elements stand out, a focused path dims the others
+      // the path finder's overlay: path elements stand out, a focused path dims the others.
+      // A path element that a comparison marks keeps the colour of its change.
       {
-        selector: 'edge[?onpath]',
-        style: { 'line-color': spark, 'target-arrow-color': spark, width: 2.2, color: text },
+        selector: 'edge[?onpath][change != "added"][change != "removed"]',
+        style: { 'line-color': spark, 'target-arrow-color': spark, width: 2.2 },
       },
-      { selector: 'node[?onpath]', style: { 'border-color': spark, 'border-width': 2 } },
+      { selector: 'edge[?onpath]', style: { color: text } },
+      {
+        selector: 'node[?onpath][change != "added"][change != "removed"]',
+        style: { 'border-color': spark, 'border-width': 2 },
+      },
       {
         selector: 'edge.phl',
         style: { width: 3.4, 'text-opacity': 1, 'font-weight': 600 },
       },
       { selector: 'node.phl', style: { 'border-width': 3 } },
       { selector: '.pdim', style: { opacity: 0.3 } },
+      // off the focused path and outside the selection: dimmer than either alone
+      { selector: '.pdim.muted', style: { opacity: 0.12 } },
     ];
   }
 
@@ -550,6 +557,8 @@
       boxSelectionEnabled: false,
       pixelRatio: pixelRatio(),
     });
+    // tests read the drawn styles through the wrapper
+    if (wrap) (wrap as unknown as { __cy?: Core }).__cy = cy;
     // Keep small graphs at a readable scale after fitting.
     cy.on('layoutstop', () => {
       if (cy && cy.zoom() > 1.25) {

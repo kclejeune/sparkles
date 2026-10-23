@@ -55,6 +55,20 @@ const drawn = async (page: Page): Promise<Drawn> => {
 };
 const edgeLabels = async (page: Page) => (await drawn(page)).edges.map(([l]) => l);
 
+type CyLike = {
+  elements(sel?: string): {
+    map<T>(f: (el: { style(name: string): string; data(k: string): unknown }) => T): T[];
+  };
+};
+/** A style of the drawn elements that match a selector, read from Cytoscape. */
+const styleOf = (page: Page, selector: string, name: string) =>
+  page
+    .locator('.wrap[data-graph]')
+    .evaluate(
+      (el, [s, n]) => (el as unknown as { __cy: CyLike }).__cy.elements(s).map((x) => x.style(n)),
+      [selector, name] as const,
+    );
+
 const panel = (page: Page) => page.getByRole('region', { name: 'Paths' });
 const list = (page: Page) => panel(page).getByRole('listbox', { name: 'Paths found' });
 
@@ -122,6 +136,8 @@ test('A4: k shortest paths from Alice to Lyon, listed and drawn in order', async
 });
 
 test('the focused path and the shared selection dim apart', async ({ page }) => {
+  // the paths appear at once, so no element is part way through its reveal
+  await page.emulateMedia({ reducedMotion: 'reduce' });
   await openAlice(page);
   const wrap = page.locator('.wrap[data-graph]');
   // the selection mutes what it does not hold, and the focused path dims what is off it
@@ -146,6 +162,17 @@ test('the focused path and the shared selection dim apart', async ({ page }) => 
   await expect(wrap).toHaveAttribute('data-path-focus', '2');
   // focusing a path leaves the selection's dimming as it was, and clearing it too
   await expect(wrap).toHaveAttribute('data-muted', muted!);
+  // what is off the path and outside the selection is dimmer than what only one dims
+  const both = (await styleOf(page, '.muted.pdim', 'opacity')).map(Number);
+  const one = [
+    ...(await styleOf(page, '.muted.phl', 'opacity')),
+    ...(await styleOf(page, '.pdim', 'opacity')),
+  ]
+    .map(Number)
+    .filter((o) => !both.includes(o));
+  expect(both.length).toBeGreaterThan(0);
+  expect(one.length).toBeGreaterThan(0);
+  expect(Math.max(...both)).toBeLessThan(Math.min(...one));
   await page.keyboard.press('a');
   await expect(wrap).toHaveAttribute('data-path-focus', '');
   await expect(wrap).toHaveAttribute('data-muted', muted!);
@@ -372,6 +399,12 @@ test('compare mode marks the path edges the earlier state lacks', async ({ page 
       .map(([, c]) => c)
       .sort();
   await expect.poll(marks).toEqual(['', 'added']);
+  // the added path edge keeps the colour of its change, not the path's
+  const added = await styleOf(page, 'edge[?onpath][change = "added"]', 'line-color');
+  const plain = await styleOf(page, 'edge[?onpath][change = ""]', 'line-color');
+  expect(added.length).toBeGreaterThan(0);
+  expect(plain.length).toBeGreaterThan(0);
+  expect(added[0]).not.toBe(plain[0]);
   // from the empty dataset to commit 2 both edges are added
   await bar.getByRole('slider', { name: 'Compared from' }).focus();
   await page.keyboard.press('Home');
@@ -382,6 +415,15 @@ test('compare mode marks the path edges the earlier state lacks', async ({ page 
   await page.keyboard.press('ArrowLeft');
   await expect(bar).toContainText('from commit 0 to commit 1');
   await expect.poll(marks).toEqual(['', 'added']);
+  // Show on graph opens the diff graph, which closes the path finder with its overlay, so
+  // leaving the diff shows no stale paths
+  await bar.getByRole('button', { name: 'Show on graph' }).click();
+  await expect(page.locator('.dg')).toBeVisible();
+  await expect(panel(page)).toHaveCount(0);
+  await page.getByRole('button', { name: 'Exit diff' }).click();
+  await expect(page.locator('.dg')).toHaveCount(0);
+  await expect.poll(() => edgeLabels(page)).not.toContain('knows · 1');
+  await expect(panel(page)).toHaveCount(0);
 });
 
 test('compare mode keeps the marks of path edges when the graph changes under them', async ({
