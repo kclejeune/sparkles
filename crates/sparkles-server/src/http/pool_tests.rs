@@ -524,3 +524,38 @@ async fn a_body_read_ahead_is_not_copied_again() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn a_query_larger_than_the_whole_pool_answers_507_without_retry_after() {
+    let s = server(64, Duration::from_millis(200));
+    let ds = s.state.get("ds").unwrap();
+    let nt: String = (0..3000)
+        .map(|i| format!("<urn:s{i}> <urn:q> <urn:o{i}> .\n"))
+        .collect();
+    ds.store
+        .load(&[Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    // an eager product of 9 million rows needs far more than the 64 MiB pool
+    let q = "SELECT * WHERE { ?a <urn:q> ?b . ?c <urn:q> ?d }";
+    let uri = format!(
+        "/ds/sparql?execution=eager&query={}",
+        percent_encoding::utf8_percent_encode(q, percent_encoding::NON_ALPHANUMERIC)
+    );
+    let (status, headers, body) = get(&s.app, &uri).await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+    assert!(headers.get(header::RETRY_AFTER).is_none(), "{headers:?}");
+    let j: J = serde_json::from_str(&body).unwrap();
+    assert_eq!(j["budget"], "server-memory");
+    assert!(
+        j["error"]
+            .as_str()
+            .unwrap()
+            .contains("more than the server's whole query memory pool"),
+        "{body}"
+    );
+    assert_eq!(pool(&s).granted(), 0);
+}

@@ -485,7 +485,9 @@ impl ApiError {
             resp.extensions_mut()
                 .insert(validation::RejectionTurtle(t.to_string()));
         }
-        if budget == Some(BudgetKind::ServerMemory) {
+        // only a refusal that a retry can pass says when to retry: a request larger than
+        // the whole pool answers 507 without it
+        if budget == Some(BudgetKind::ServerMemory) && self.0 == StatusCode::SERVICE_UNAVAILABLE {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
@@ -691,6 +693,12 @@ impl From<Error> for ApiError {
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
             Error::BudgetExceeded(b) if b.kind == BudgetKind::DecompressedBytes => {
                 StatusCode::PAYLOAD_TOO_LARGE
+            }
+            // more memory than the whole pool: no retry can succeed
+            Error::BudgetExceeded(b)
+                if b.kind == BudgetKind::ServerMemory && b.requested > b.limit =>
+            {
+                StatusCode::INSUFFICIENT_STORAGE
             }
             // the server's query memory is in use: a retry can succeed
             Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory => {
