@@ -1261,6 +1261,67 @@ mod tests {
         v
     }
 
+    /// `focus_map`: each selector checked for the given nodes alone (spec U07 §11.3).
+    #[test]
+    fn focus_map_checks_each_node() {
+        let store = store();
+        let snap = store.snapshot();
+        let data = DataGraph::new(snap.clone(), None, &[], &[]).unwrap();
+        let map = parse(
+            "{FOCUS a ex:Person}@ex:Person, ex:acme@ex:Org, {ex:bob ex:knows FOCUS}@ex:Knows,
+             {_ ex:knows FOCUS}@START, {FOCUS ex:knows _}@ex:Knower, {FOCUS a ex:Person}@ex:Person",
+            &schema_prefixes(),
+            None,
+        )
+        .unwrap();
+        let pairs = |nodes: &[Term]| -> Vec<(String, String)> {
+            focus_map(&map, nodes, &data)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|a| {
+                    let NodeSelector::Term(Term::NamedNode(n)) = a.node else {
+                        panic!("{a:?}")
+                    };
+                    let shape = match a.shape {
+                        ShapeLabel::Iri(i) => i.trim_start_matches(EX).to_string(),
+                        l => format!("{l:?}"),
+                    };
+                    (n.as_str().trim_start_matches(EX).to_string(), shape)
+                })
+                .collect()
+        };
+        let p = |a: &str, b: &str| (a.to_string(), b.to_string());
+        // carol is in ex:g1, outside the default graph, but bob knows her there
+        assert_eq!(
+            pairs(&[iri("alice"), iri("carol"), iri("acme"), iri("nobody")]),
+            vec![
+                p("alice", "Person"),
+                p("alice", "Knows"),
+                p("alice", "Start"),
+                p("alice", "Knower"),
+                p("carol", "Knows"),
+                p("carol", "Start"),
+                p("acme", "Org"),
+            ]
+        );
+        // a node given twice appears once per shape
+        assert_eq!(pairs(&[iri("acme"), iri("acme")]), vec![p("acme", "Org")]);
+        // SPARQL selectors are left out
+        let sparql = parse(
+            "SPARQL 'SELECT ?x { ?x ?p ?o }'@ex:S",
+            &schema_prefixes(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            focus_map(&sparql, &[iri("alice")], &data)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
     #[test]
     fn expansion() {
         let store = store();
