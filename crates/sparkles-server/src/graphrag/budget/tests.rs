@@ -160,12 +160,18 @@ fn the_provider_endpoint_counts_when_allowed() {
 /// while the count runs stops the inference request (round 8).
 #[test]
 fn a_change_during_the_count_stops_the_request() {
+    change_during_the_count(200);
+    // a failed count falls back to the byte bound, and the change still stops the request
+    change_during_the_count(500);
+}
+
+fn change_during_the_count(status: u16) {
     let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let c2 = changed.clone();
     let mock = MockModel::start(move |r: &Received, _| {
         if r.path.ends_with("/count_tokens") {
             c2.store(true, std::sync::atomic::Ordering::SeqCst);
-            (200, json!({ "input_tokens": 42 }))
+            (status, json!({ "input_tokens": 42 }))
         } else {
             (200, mock::anthropic(r#"{"query":"ASK {}"}"#))
         }

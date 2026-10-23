@@ -464,8 +464,8 @@ impl Admission for BuildAdmission {
         }
         let bound = self.bound(a);
         // a provider's counting endpoint is a request that can take a while, and the
-        // configuration may change while it runs
-        if bound.source == Source::ProviderEndpoint {
+        // configuration may change while it runs, whether the count succeeds or not
+        if self.provider_counting && a.provider_count.is_some() {
             live()?;
         }
         let tokens = bound
