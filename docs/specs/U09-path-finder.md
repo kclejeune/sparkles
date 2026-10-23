@@ -1,17 +1,19 @@
 # U09: A path finder between two entities
 
-> **Status:** specified
+> **Status:** partly implemented
 >
-> **Phases:** None shipped. Phase 1 adds two parameters to F07's path search, excluded
-> predicates and a degree limit for the nodes a search passes through. Phase 2 is the path
-> finder in Explore, which draws the shortest path or the k shortest paths between two
-> entities and animates them, with predicate, direction and length filters. Phase 3 adds
-> weights from reifiers, paths in the query page's graph results and the WebGL view.
+> **Phases:** Phases 1 and 2 shipped on 2026-10-23. Phase 1 adds two parameters to F07's
+> path search, excluded predicates and a degree limit for the nodes a search passes
+> through. Phase 2 is the path finder in Explore, which draws the shortest path or the k
+> shortest paths between two entities and animates them, with predicate, direction and
+> length filters. Phase 3, which adds weights from reifiers, paths in the query page's
+> graph results and the WebGL view, is not built.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API: Path search](../API.md#path-search) ·
+> [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../FEATURES.md#web-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how it landed.
 
 This design was written from the Sparkles code and specs: path search
 ([F07](F07-path-search.md)), the Explore graph and its time slider
@@ -292,6 +294,9 @@ and city typed.
 
 ## 11. Open questions
 
+Both questions were decided before implementation, and the [Outcome](#outcome) records
+how.
+
 1. Whether the default excluded predicates should be a dataset setting under C19, so a
    dataset with a hub predicate of its own, such as `dct:subject`, can exclude it for every
    reader.
@@ -301,4 +306,51 @@ and city typed.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 103.
+Phases 1 and 2 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 103. Phase 3 is
+not built and stays under item 103.
+
+**Decisions.** The default excluded predicates are a dataset setting, as question 1
+proposed. C19 gained the settings kind `paths`, kept in `paths.json` at version 1, whose
+one field `excludedPredicates` defaults to `rdf:type` and `owl:sameAs` and holds at most 50
+absolute IRIs without duplicates. The panel reads it when it opens and uses it until the
+person edits the list. MCP's `find_paths` does not read it, because an agent names its
+own filters. For question 2, the degree counts the edges in the call's direction, as §3.1
+says, so a forward search does not skip a node that has many incoming edges.
+
+**Phase 1.** F07 §4.9 defines `path:excludePredicate` and `path:maxDegree`, and
+[F07's Outcome](F07-path-search.md#skipped-predicates-and-hubs-2026-10-23) describes
+how the engine reads them. The degree comes from the index's counts with no extra scan
+when every quad is in the active graph, and from at most `maxDegree + 1` edges of the
+node otherwise, in both cases in the caller's view. While testing the hub limit, a probe
+found that searches backward and both ways passed through literals, against F07 §4.1 and
+§10 of this spec. That is fixed in the same change, so a literal now ends a path in every
+direction.
+
+**Phase 2.** The **Paths** button of Explore's toolbar, `Shift+P`, the node menu on a
+right click or long press, and the **Paths from here** and **Paths to here** buttons of the
+side panel open the panel. The node menu stands in for the selection of two nodes, and the
+panel takes the previous and the current selection as its ends. The ends are comboboxes
+over Explore's search that also take a pasted IRI, prefixed name or quoted literal. The
+panel runs the query of §3.2 at Explore's commit of `main`, since Explore reads no other
+branch, lists the paths as a listbox,
+and overlays them on the graph with an order on each node and edge, animated one step per
+250 ms unless reduced motion is set. **Open in editor** opens the query in the query page,
+and **Add to graph** keeps the paths' nodes in the drawn graph. Above 1,500 drawn nodes the
+paths are drawn alone. At 390 px the panel is a bottom sheet that folds to a handle.
+
+**Tests.** The Rust tests are listed in F07's Outcome. The router tests
+`paths_stay_inside_the_readers_view`, `degrees_are_counted_in_the_readers_view` and
+`malformed_filters_are_a_400` cover A3 and A6 on the server, and
+`find_paths_skips_predicates_and_hubs` covers MCP. `ui/src/lib/paths.test.ts` has 16
+Vitest tests, and `ui/tests/mock/paths.spec.ts` runs A4, A5 and A7 to A10, the empty states
+and **Open in editor** against the mock server, whose path search is a breadth-first
+search with Yen's algorithm for k shortest. The Playwright tests against a real server
+that §9 lists for A1, A4, A6 and A7 are not written, and ROADMAP item 103 keeps them
+with Phase 3. The Rust and router tests cover A1, A2, A3 and A6 on the engine.
+`mise run docs:screenshots` writes `docs/images/path-finder.png`, the three shortest paths
+between two people of the demo dataset, which the README shows.
+
+**Measurements.** A Namespace screen of the path searches that use neither new parameter
+found no change above the noise, with a geometric mean of 0.97 for the new build over the
+old one. [BENCHMARKS](../BENCHMARKS.md#skipped-predicates-and-hubs-2026-10-23) has the
+table. A forge A/B is a follow-up after the merge.

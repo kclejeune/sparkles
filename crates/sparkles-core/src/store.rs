@@ -27,6 +27,7 @@ mod compaction;
 mod compaction_tests;
 mod describe;
 mod diff;
+mod diff_groups;
 mod embed;
 mod geo;
 mod group;
@@ -88,6 +89,7 @@ pub use compaction::{
 };
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
+pub use diff_groups::{CHANGE_BYTES, ClassGroup, ClassGroups, MAX_GROUPS, ObjectGroup};
 pub use history_query::{HistoryBound, HistoryChange, HistoryQuery, HistoryResult};
 #[cfg(feature = "failpoints")]
 pub use history_query::{HistoryCheckObserver, HistoryCheckOutcome, set_history_check_observer};

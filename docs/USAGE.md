@@ -34,6 +34,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Branches and merges](#branches-and-merges)
 * [The Explore overview](#the-explore-overview)
 * [Arcs on the map](#arcs-on-the-map)
+* [Lenses on the graph](#lenses-on-the-graph)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
@@ -1559,6 +1560,102 @@ a phone's width the controls grow to 44 px and the map takes the page's width.
 A map draws at most 20,000 places and 20,000 links before merging, and says when a result
 had more. [U11](specs/U11-linked-views.md#outcome) records the measurements.
 
+## The Pattern pane
+
+The query page can draw the graph pattern of the query in the editor. **Pattern** in the
+editor's toolbar, or `Alt+P`, opens a pane beside the editor, and the divider between
+them can be dragged. Each variable is a round node, each IRI a rectangle with its
+prefixed name, and each literal a small rounded box. A triple pattern is an edge labelled
+with its predicate, a variable predicate is dashed, and a simple path such as
+`ex:partOf+` labels its edge with the path. `?x a ex:Person` puts the class under the
+node instead of drawing an edge. A filter over one variable and constants, such as
+`STRSTARTS(?name, "A")`, is a chip on its variable, and an `OPTIONAL` group is a dashed
+hull around the nodes only it binds. The strip under the drawing lists the projection,
+`DISTINCT`, `LIMIT`, `OFFSET` and the other solution modifiers.
+
+The pane draws any query that parses, but it edits only a part of SPARQL: triple
+patterns, filters and one level of `OPTIONAL`. Everything else, such as `BIND`, `MINUS`,
+`UNION`, `GRAPH`, subqueries, `SERVICE` and `VALUES`, is a locked block. A locked block
+shows its kind and its text, comments included, and dotted lines join it to the
+variables it shares. The editor edits locked blocks, and edits made in the pane never
+change their text.
+
+The pane makes three edits. **+ Triple** (`N`) adds a triple pattern written as a
+subject, a predicate and an object. It goes into the group that holds the subject's
+patterns, after the last part of it the pane edits, and also after any locked block that
+follows and uses a variable the new triple binds. A prefixed name whose prefix the query
+does not declare, but the dataset does, adds its `PREFIX` line, and one that neither
+declares is refused. Selecting an edge offers **Optional**, which moves the triple into
+`OPTIONAL { … }` or back out of it, and **Delete**, which removes it from its statement.
+Each edit changes only the text it must, as one change to the editor, so `Ctrl+Z` (`⌘Z`
+on a Mac) in the editor or anywhere in the pane undoes it in one step, the same as typing.
+The pane makes an edit only when the server would accept the result and the result holds
+exactly the change asked for.
+
+The pane redraws 150 ms after typing stops. Text that does not parse leaves the last
+drawing on screen, dimmed, with the line and column of the error, and the pane makes no
+edits until the text parses again. A node keeps its place while the text around it
+changes, a new node appears next to the nodes it connects to, and a variable renamed in
+the editor keeps its position. **Tidy** lays the whole pattern out again. The browser
+keeps the positions of each query, at most 200 queries, so a query opened again from the
+history or as a stored query draws the same picture.
+
+**List** shows the same elements as rows in the order of the text, which is also how a
+screen reader reads the pattern. With the canvas focused, `Tab` and `Shift+Tab` move
+through the elements in text order, the arrow keys move to the nearest element in that
+direction, `Shift` with an arrow moves the focused node by 16 pixels, `Enter` opens the
+element's panel, `Delete` removes the focused edge, `O` toggles optional on it, and
+`Escape` returns to the editor. A polite live region announces each edit.
+
+A result has a **Pattern** tab that draws the query that produced it, read-only, and
+**Edit** puts that query in the editor with the pane open. On a phone the editor and the
+pane are two tabs, **Text** and **Pattern**, over the same query, and every control
+keeps a 44-pixel touch target. The pane needs the formatter's WebAssembly module (see
+[ui/README.md](../ui/README.md#formatting-in-the-browser)). Without it the pane says so
+and draws nothing.
+
+## Lenses on the graph
+
+A lens changes how the graph draws its nodes and edges from data about them. The resource
+graph in Explore and the query page's graph view have a **Lenses** menu in their toolbar
+(shortcut `Shift+L`) with one row per channel, and each channel has at most one lens on at
+a time.
+
+* **Size** draws a node's area in five steps of the drawn values, so that one outlier does
+  not flatten the rest. It offers the degree in the drawn graph, the degree in the dataset
+  and a numeric property of the drawn nodes. A node without a value keeps the smallest
+  size, and the legend counts it as "no value".
+* **Colour** gives twelve colours to the categories with the most nodes and "other" to the
+  rest. It offers the node's class, the named graph it is used in and a property's values.
+  The class lens reads the asserted classes, since with reasoning every node would also
+  be in each superclass. A node with several values takes the one most drawn nodes share.
+* **Badges** puts a pill with an `i` and a count in the corner of each node that has
+  inferred edges.
+* **Edges** draws the edges that the reasoner added dashed, with an `i` before their
+  label. An edge counts as inferred when the graph shows it and a read without reasoning
+  does not, which covers materialized inferences and RDFS on read alike. A triple that is
+  both asserted and inferred stays solid. While the lens is on, `rdf:type` edges are no
+  longer dashed, so that a dash means one thing.
+
+The edge lens is on by default when the dataset has materialized inferences or RDFS on
+read, and the badge and edge lenses are absent when it has neither. `Shift+1` to `Shift+4`
+turn the size, colour, badge and edge lens off and on again.
+
+The legend in the canvas's corner lists each encoding in words, such as "size is degree
+in the dataset, larger is higher" and "colour 3 is ex:Employee", with the number of nodes
+of each entry. Clicking an entry, or `Enter` on it, rings its nodes and fades the rest,
+and a second click clears them. **List** shows the drawn nodes as a table with a column
+per active lens, ordered by the size lens's value when one is on, and a screen reader
+hears each lens's result in a polite announcement. On a phone the menu is a bottom sheet
+and the legend a strip along the top of the graph that opens on a tap.
+
+The lenses read the drawn nodes with one query per 200 terms and at most four queries in
+flight, at the state the graph shows, so they follow the time slider. They read under the
+signed-in user's view, and a grown graph reads only its new nodes. Nothing they compute is
+saved. Lenses apply to at most 20,000 drawn nodes. On the query page, the edges of a
+`CONSTRUCT` result are also read with reasoning, so that a constructed triple that is not
+in the data is not taken for an inferred one.
+
 ## The time slider
 
 The web UI reads a past state of a dataset with a slider. It is a bar under the toolbar of
@@ -1618,6 +1715,44 @@ The address keeps the view. The query page adds `ds`, `at`, `from`, `against` an
 to its URL while the slider is open, and Explore uses `at`, `from` and `against` next to its
 existing `ds`, `iri` and `tab`. Opening such a link restores the same handles and the same
 table.
+
+### Commit diffs on the graph
+
+**Show on graph** draws the changes between two commits as a graph of their own in
+Explore. It is on each commit in the dataset page's History panel, in the commit graph's
+details, on a write receipt and in the slider's compare caption. Added triples are solid
+with a `+` badge, removed ones are dashed ghosts with a `−` badge, and nothing else is
+drawn unless **context** adds up to 20 unchanged edges around each changed resource. `A`
+and `R` toggle the added and removed triples, `X` toggles context, `L` lists the changes
+as rows, the arrow keys move both commits by one while keeping the distance between them,
+and `Escape` leaves the diff. The address keeps the diff in `diff`, `diffFrom`,
+`diffBranch` and `group`.
+
+A diff with more than 500 changes draws its first 500 and offers **Group by class** (`G`).
+The grouped view draws a node for each class with its change, such as `Person +600`, and
+an edge for each predicate between classes, such as `worksFor +600`. Classes are read in
+the state where each change was seen, so a reader who cannot read a resource's type sees
+it under no class.
+
+**Play** on the diff graph runs a time-lapse. Each step asks for one commit's changes and
+applies them to what is drawn, so additions fade in and removals become ghosts that go at
+the next step unless **Keep ghosts** is on. A range of more than 500 commits steps through
+timeline buckets. A step with more changes than the canvas can hold switches the rest of
+the time-lapse to grouping by class and says so. The speeds are 1, 2, 5 and 10 steps a
+second, and at 5 and 10 the new nodes are placed next to a neighbour without a layout.
+The graph's history slider and the overview's have a **Play mode** menu. **Re-read** reads
+the view again at each commit as before, and **Time-lapse** applies each commit's diff to
+the drawn resources instead.
+
+The Explore overview has its own slider, opened with **Overview history** or `Shift+H`.
+Moving it reads the class level at that commit. Compare mode labels each class and
+predicate edge with its change from the grouped diff, and the time-lapse updates the counts
+in place with the layout held still. The slider reads classes only, so the overview does
+not offer it while **Group by** draws the GraphRAG communities, and switching to the
+communities closes it.
+
+At 390 px the diff graph's options fold into a sheet, the play controls stay in a bar at
+the bottom, and the change list opens as a second tab beside the graph.
 
 ## Automatic compaction
 
@@ -2223,6 +2358,14 @@ predicates when you can, because a search without them follows every triple, inc
 the limit with `path:maxVisited`, or narrow the search with `path:maxLength` or
 predicates.
 
+When the predicates to follow are not known in advance, name the ones to skip instead.
+`path:excludePredicate rdf:type, owl:sameAs` follows every other triple. A node with
+thousands of edges, such as a country or a popular class, connects almost everything
+through itself, so a path through it says little. `path:maxDegree 1000` keeps paths from
+passing through a node with more than 1,000 edges in the search's direction, while the
+source and the target may have any number. EXPLAIN ANALYZE reports the nodes skipped this
+way as `skippedHubs`.
+
 A predicate can be followed in its own direction. A family tree stored with
 `ex:parent` from child to parent and `ex:sibling` both ways is searched from an
 ancestor down to a person with `path:predicate (ex:parent path:backward), (ex:sibling
@@ -2248,6 +2391,38 @@ Paths are computed per query and nothing is indexed ahead of time. On the 10.5M-
 benchmark data, the shortest path between two people 17 edges apart takes about 3 ms,
 where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
 runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
+
+### Finding paths in Explore
+
+Explore's **Paths** button, or `Shift+P`, opens a panel beside the graph that runs these
+searches. **From** and **To** search the dataset as Explore's search box does, and they
+also take a pasted IRI, a prefixed name or a quoted literal. A right click or a long press
+on a node offers **Paths from here** and **Paths to here**, and so do the buttons of the
+side panel, and the panel then fills **From** with the node selected before. **Mode**
+chooses the shortest path, every shortest path up to 50 or the k shortest paths, with k
+from 2 to 20.
+
+**Filters** sets the length, up to 8 edges, the direction, the hub limit and the
+predicates. By default a search goes both ways, skips nodes with more than 1,000 edges and
+follows every predicate except those of the dataset's `paths` setting, which are
+`rdf:type` and `owl:sameAs` unless an administrator changes them. **only** follows the
+listed predicates instead, and the predicate box suggests those of the schema.
+
+The paths are drawn over the graph one edge at a time, in order of length, with each
+edge labelled by the paths that use it. With reduced motion they appear at once. The list
+under the form describes each path in words, and the keys `1` to `9` show one path, `A`
+shows them all and `Escape` shows them all again before it closes the panel. A shown path
+dims the elements off it, separately from the [shared selection](#arcs-on-the-map), which
+keeps its own dimming, and an element that two of them dim, or a lens legend entry and one
+of them, is dimmer still. Under the inferred-edge [lens](#lenses-on-the-graph) an inferred
+edge on a path keeps its dash and takes the path's colour. The paths are drawn on the graph and not on the map, so opening the
+panel switches Explore's canvas back to the graph, and **Map** and `Shift+M` wait until the
+panel closes. **Open in editor** opens the query in
+the query page, **Add to graph** keeps the paths' nodes in the explored graph, and **Clear**
+removes the overlay. The search reads the commit of `main` that Explore shows. When it reaches
+its limit of a million visited nodes or ten seconds, the panel says so and suggests a
+shorter length, a lower hub limit or fewer predicates. At phone width the panel is a sheet
+at the bottom of the screen that folds to its handle.
 
 ## Graph algorithms
 
@@ -2718,6 +2893,7 @@ The tools are read-only unless the operator turns on the write tool:
 * `find_paths` finds the shortest path, all shortest paths, the k shortest or all paths
   up to a length between two nodes, or from one node, as
   [`SERVICE path:search`](#finding-paths) does, and returns each path's edges.
+  `excludePredicates` skips predicates and `maxDegree` skips hubs.
 * `graph_algorithm` runs PageRank, communities, similarity, components or embeddings on
   a projection of the graph, as [`SERVICE algo:…`](#graph-algorithms) does, and returns
   the best rows with the statistics of the run. It never writes.

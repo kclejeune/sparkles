@@ -30,6 +30,10 @@ const row = (ov: ReturnType<Page['getByTestId']>, name: string) =>
 test('the picker draws the communities, which open into the level below', async ({ page }) => {
   const ov = await communities(page);
   await expect(ov).toHaveAttribute('data-mode', 'communities');
+  // the overview's history reads the classes, so the communities do not offer it
+  await expect(ov.getByRole('button', { name: 'Overview history' })).toHaveCount(0);
+  await page.keyboard.press('Shift+H');
+  await expect(ov.locator('.ov-time')).toHaveCount(0);
   await expect(row(ov, 'Engineering')).toContainText('unreviewed');
   await expect(ov.getByRole('combobox', { name: 'Colour by' })).toHaveValue('status');
   await expect(ov).toContainText('1 community at level 0');

@@ -578,3 +578,72 @@ async fn the_commit_graph_of_every_branch_in_pages() {
     let (r, _) = get(&app, "/$/commit-graph/ds?limit=0").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }
+
+/// The `(added, removed)` of the group of a `group=class` diff with this subject class,
+/// predicate and object.
+fn class_group(d: &J, s: &str, p: &str, o: J) -> Option<(u64, u64)> {
+    d["groups"].as_array().unwrap().iter().find_map(|g| {
+        (g["subjectClass"] == s && g["predicate"] == p && g["object"] == o)
+            .then(|| (g["added"].as_u64().unwrap(), g["removed"].as_u64().unwrap()))
+    })
+}
+
+#[tokio::test]
+async fn grouped_diffs_read_classes_on_each_branch() {
+    const TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    const INT: &str = "http://www.w3.org/2001/XMLSchema#integer";
+    let dir = tempfile::tempdir().unwrap();
+    let (_st, app) = setup(dir.path()).await;
+    update(&app, "ds", "INSERT DATA { <urn:a> a <urn:A> }").await;
+    json_req(&app, "POST", "/$/branches/ds", json!({ "name": "dev" })).await;
+    update(&app, "ds@dev", "DELETE DATA { <urn:a> <urn:age> 30 }").await;
+    // dev's own commit: the removed quad's class comes from the state dev shares with main
+    let (r, _) = get(&app, "/ds@dev/diff?group=class").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let d = r.json();
+    assert_eq!(d["removed"], 1, "{d}");
+    assert_eq!(
+        class_group(&d, "urn:A", "urn:age", json!({ "literal": INT })),
+        Some((0, 1)),
+        "{d}"
+    );
+    update(&app, "ds", "INSERT DATA { <urn:x> a <urn:Main> }").await;
+    update(
+        &app,
+        "ds@dev",
+        "INSERT DATA { <urn:x> a <urn:Dev> . <urn:x> <urn:q> <urn:o> }",
+    )
+    .await;
+    // across branches, each side's classes are read on its own branch
+    let (r, _) = get(&app, "/ds/diff?fromBranch=main&toBranch=dev&group=class").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let d = r.json();
+    assert_eq!(
+        (d["added"].as_u64(), d["removed"].as_u64()),
+        (Some(2), Some(2)),
+        "{d}"
+    );
+    assert_eq!(
+        class_group(&d, "urn:Dev", "urn:q", json!({ "iri": true })),
+        Some((1, 0)),
+        "{d}"
+    );
+    assert_eq!(
+        class_group(&d, "urn:Dev", TYPE, json!({ "class": "urn:Dev" })),
+        Some((1, 0)),
+        "{d}"
+    );
+    assert_eq!(
+        class_group(&d, "urn:Main", TYPE, json!({ "class": "urn:Main" })),
+        Some((0, 1)),
+        "{d}"
+    );
+    assert_eq!(
+        class_group(&d, "urn:A", "urn:age", json!({ "literal": INT })),
+        Some((0, 1)),
+        "{d}"
+    );
+    // a branch that does not exist is 404, as for any diff
+    let (r, _) = get(&app, "/ds/diff?fromBranch=main&toBranch=nope&group=class").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}

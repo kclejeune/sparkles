@@ -11,7 +11,13 @@
     /** Kept in place while the layout runs (it was laid out before). */
     fixed?: boolean;
   };
-  export type LEdge = { key: string; source: string; target: string; size?: number };
+  export type LEdge = {
+    key: string;
+    source: string;
+    target: string;
+    size?: number;
+    color?: string;
+  };
 </script>
 
 <script lang="ts">
@@ -28,6 +34,7 @@
   import type Graph from 'graphology';
   import type Sigma from 'sigma';
   import type { LayoutStart, LayoutTick } from '$lib/layout.worker';
+  import { NO_ENCODING, OTHER, readPalette, sizeFactor, type Encoding } from '$lib/lens';
 
   let {
     nodes,
@@ -40,6 +47,8 @@
     iterations = 300,
     label = 'Graph',
     marked = null,
+    still = false,
+    lens = NO_ENCODING,
   }: {
     nodes: LNode[];
     edges: LEdge[];
@@ -54,6 +63,17 @@
     onfail?: (reason: string) => void;
     iterations?: number;
     label?: string;
+    /**
+     * Update sizes, colours and labels in place without a new layout, so the picture
+     * holds still while a time-lapse changes its counts (U01 Phase 4).
+     */
+    still?: boolean;
+    /**
+     * What the active lenses make each element look like (docs/specs/U10-canvas-lenses.md):
+     * sizes and colours go through the node reducer, badges and the dashed inferred edges are
+     * drawn on the overlay, since sigma's edge programs have no dashes.
+     */
+    lens?: Encoding;
   } = $props();
 
   let host: HTMLDivElement;
@@ -70,7 +90,15 @@
   let lost = 0;
   let themeObserver: MutationObserver | undefined;
   let media: MediaQueryList | undefined;
-  let colors = { text: '#888', text2: '#888', surface: '#fff', edge: '#ccc', spark: '#e5a117' };
+  let colors = {
+    text: '#888',
+    text2: '#888',
+    surface: '#fff',
+    edge: '#ccc',
+    spark: '#e5a117',
+    onSpark: '#1a1300',
+  };
+  let palette: string[] = [];
   let ready = $state(false);
 
   const reduced = () =>
@@ -87,7 +115,9 @@
       surface: cssVar('--surface'),
       edge: cssVar('--border-strong'),
       spark: cssVar('--spark'),
+      onSpark: cssVar('--on-spark'),
     };
+    palette = readPalette(host);
     renderer?.setSetting('labelColor', { color: colors.text });
     renderer?.setSetting('defaultEdgeColor', colors.edge);
     renderer?.refresh();
@@ -167,9 +197,143 @@
       ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
       ctx.stroke();
     };
+    drawInferred(ctx, w, h);
     ring(selected, false);
     if (focusKey !== selected) ring(focusKey, true);
     for (const m of marked ?? []) if (m !== selected) ring(m, true);
+    drawBadges(ctx, w, h);
+  }
+
+  /** Inferred edges the overlay draws at most; past that they are drawn as other edges. */
+  const MAX_DASHED = 4000;
+  /** Badges the overlay draws at most, on screen. */
+  const MAX_BADGES = 1500;
+
+  /** The viewport position and radius of a node, or null when it is not drawn. */
+  function place(key: string) {
+    if (!renderer || !graph?.hasNode(key)) return null;
+    const d = renderer.getNodeDisplayData(key);
+    if (!d || d.hidden) return null;
+    const p = renderer.framedGraphToViewport({ x: d.x, y: d.y });
+    return { x: p.x, y: p.y, r: renderer.scaleSize(d.size) };
+  }
+
+  const dashOverlay = () => lens.edge && lens.inferred.size > 0 && lens.inferred.size <= MAX_DASHED;
+
+  /** The inferred edges, dashed, with an "i" at the middle of the longer ones. */
+  function drawInferred(ctx: CanvasRenderingContext2D, w: number, h: number) {
+    if (!dashOverlay() || !graph) {
+      overlay.dataset.inferred = overlay.dataset.arrows = '0';
+      return;
+    }
+    // the arrowheads follow sigma's own: drawn while its edges are arrows
+    const showArrows = edgeType() === 'arrow';
+    let lines = 0;
+    let arrows = 0;
+    let pairs = 0;
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 1.4;
+    ctx.font = `600 10px ${renderer?.getSetting('labelFont') ?? 'sans-serif'}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const focus = hovered ?? selected;
+    for (const key of lens.inferred) {
+      if (!graph.hasEdge(key)) continue;
+      const [s, t] = graph.extremities(key);
+      const a = place(s);
+      const b = place(t);
+      if (!a || !b) continue;
+      if (
+        (a.x < 0 && b.x < 0) ||
+        (a.y < 0 && b.y < 0) ||
+        (a.x > w && b.x > w) ||
+        (a.y > h && b.y > h)
+      )
+        continue;
+      const faded = near && !(near.has(s) && near.has(t) && (s === focus || t === focus));
+      ctx.strokeStyle = faded ? colors.edge : colors.text2;
+      ctx.globalAlpha = faded ? 0.5 : 1;
+      // the direction: an arrowhead at the edge of the target, and the two directions of a
+      // reciprocal pair each set off to their own left so that they stay apart
+      const len = Math.hypot(b.x - a.x, b.y - a.y);
+      if (len < 1) continue;
+      const ux = (b.x - a.x) / len;
+      const uy = (b.y - a.y) / len;
+      // the reverse direction only: edges() would also return this edge
+      const back = graph.outEdges(t, s).some((k) => k !== key && lens.inferred.has(k));
+      if (back) pairs++;
+      const off = back ? 3 : 0;
+      const ox = uy * off;
+      const oy = -ux * off;
+      const ex = b.x - ux * (b.r + 1) + ox;
+      const ey = b.y - uy * (b.r + 1) + oy;
+      ctx.beginPath();
+      ctx.moveTo(a.x + ox, a.y + oy);
+      // the shaft stops where the arrowhead starts, or at the target without one
+      const gap = showArrows ? 6 : 0;
+      ctx.lineTo(ex - ux * gap, ey - uy * gap);
+      ctx.stroke();
+      lines++;
+      if (showArrows) {
+        arrows++;
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.beginPath();
+        ctx.moveTo(ex, ey);
+        ctx.lineTo(ex - ux * 8 - uy * 4, ey - uy * 8 + ux * 4);
+        ctx.lineTo(ex - ux * 8 + uy * 4, ey - uy * 8 - ux * 4);
+        ctx.closePath();
+        ctx.fill();
+      }
+      if (Math.hypot(b.x - a.x, b.y - a.y) > 60 && lens.inferred.size <= 600) {
+        const mx = (a.x + b.x) / 2;
+        const my = (a.y + b.y) / 2;
+        ctx.setLineDash([]);
+        ctx.fillStyle = colors.surface;
+        ctx.beginPath();
+        ctx.arc(mx, my, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = colors.text2;
+        ctx.fillText('i', mx, my + 0.5);
+        ctx.setLineDash([6, 4]);
+      }
+    }
+    ctx.restore();
+    // for the tests: the overlay has no elements to find
+    overlay.dataset.inferred = String(lines);
+    overlay.dataset.arrows = String(arrows);
+    overlay.dataset.pairs = String(pairs);
+  }
+
+  /** The badges: a pill with "i" and the count at the upper right of each badged node. */
+  function drawBadges(ctx: CanvasRenderingContext2D, w: number, h: number) {
+    if (!lens.badge || !lens.nodes.size) return;
+    ctx.save();
+    ctx.font = `700 10px ${renderer?.getSetting('labelFont') ?? 'sans-serif'}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    let drawn = 0;
+    for (const [key, look] of lens.nodes) {
+      if (!look.badge || drawn >= MAX_BADGES) continue;
+      const p = place(key);
+      if (!p || p.x < -20 || p.y < -20 || p.x > w + 20 || p.y > h + 20) continue;
+      const text = `i${look.badge > 99 ? '99+' : look.badge}`;
+      const bw = 8 + text.length * 6;
+      const x = p.x + p.r * 0.7;
+      const y = p.y - p.r * 0.7 - 7;
+      ctx.fillStyle = colors.spark;
+      ctx.strokeStyle = colors.surface;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(x - 2, y, bw, 14, 7);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = colors.onSpark;
+      ctx.fillText(text, x - 2 + bw / 2, y + 7.5);
+      drawn++;
+    }
+    ctx.restore();
   }
 
   function edgeType() {
@@ -206,6 +370,10 @@
         defaultDrawNodeHover: drawHover as never,
         nodeReducer: (key, data) => {
           const res = { ...data };
+          const look = lens.nodes.get(key);
+          if (lens.size) res.size = (data.size as number) * sizeFactor(look?.size);
+          if (lens.colour && look?.colour != null)
+            res.color = palette[look.colour] ?? palette[OTHER] ?? res.color;
           if (near && !near.has(key)) {
             res.color = colors.edge;
             res.label = '';
@@ -222,6 +390,11 @@
         },
         edgeReducer: (key, data) => {
           const res = { ...data };
+          // the overlay draws the inferred edges dashed
+          if (dashOverlay() && lens.inferred.has(key)) {
+            res.hidden = true;
+            return res;
+          }
           if (near && graph) {
             const [s, t] = graph.extremities(key);
             if (
@@ -428,6 +601,7 @@
       graph.addEdgeWithKey(e.key, e.source, e.target, {
         size: e.size ?? 1,
         weight: e.size ?? 1,
+        ...(e.color ? { color: e.color } : {}),
       });
     }
     renderer.setSetting('defaultEdgeType', edgeType());
@@ -439,18 +613,52 @@
     startLayout(true);
   }
 
+  /** The props' sizes, colours and labels on the drawn graph, positions kept and no layout. */
+  function update() {
+    if (!graph || !renderer) return;
+    const g = graph;
+    const want = new Set(nodes.map((n) => n.key));
+    g.forEachNode((k) => {
+      if (!want.has(k)) g.dropNode(k);
+    });
+    for (const n of nodes) {
+      const a = { label: n.label, size: n.size, color: n.color };
+      if (g.hasNode(n.key)) g.mergeNodeAttributes(n.key, a);
+      else g.addNode(n.key, { ...a, x: n.x, y: n.y, fixed: true });
+    }
+    const wantE = new Set(edges.map((e) => e.key));
+    g.forEachEdge((k) => {
+      if (!wantE.has(k)) g.dropEdge(k);
+    });
+    for (const e of edges) {
+      if (e.source === e.target || !g.hasNode(e.source) || !g.hasNode(e.target)) continue;
+      const a = { size: e.size ?? 1, weight: e.size ?? 1, ...(e.color ? { color: e.color } : {}) };
+      if (g.hasEdge(e.key)) g.mergeEdgeAttributes(e.key, a);
+      else if (!g.hasEdge(e.source, e.target)) g.addEdgeWithKey(e.key, e.source, e.target, a);
+    }
+    setFocusSet();
+    renderer.refresh();
+  }
+
   // the props change as a whole (a new level), so one rebuild per change. The rebuild
-  // reads other state, such as the selection, which must not start another one.
+  // reads other state, such as the selection, which must not start another one. While the
+  // picture holds still, the drawn graph is updated in place instead.
   $effect(() => {
     void nodes;
     void edges;
-    if (ready) untrack(sync);
+    if (ready) untrack(() => (still && graph && graph.order > 0 ? update() : sync()));
   });
 
   $effect(() => {
     void selected;
     void marked;
     if (ready) setFocusSet();
+  });
+
+  // a lens's new look is drawn in place, without a layout
+  $effect(() => {
+    void lens;
+    if (ready) untrack(() => renderer?.refresh());
   });
 
   /** Nodes up to which every label is drawn and the fit makes room for it. */

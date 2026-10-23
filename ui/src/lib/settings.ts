@@ -40,7 +40,7 @@ export type SettingsKind = {
 export type DatasetSettings = { dataset: string; kinds: Record<string, SettingsKind> };
 
 /** The kinds of a dataset, in the order the Settings tab shows them. */
-export const DATASET_KINDS = ['assistant', 'memory', 'ingest', 'graphrag'] as const;
+export const DATASET_KINDS = ['assistant', 'memory', 'ingest', 'graphrag', 'paths'] as const;
 export type DatasetKind = (typeof DATASET_KINDS)[number];
 
 /** The URL of a dataset's kind. */

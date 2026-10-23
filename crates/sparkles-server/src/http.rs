@@ -1161,11 +1161,12 @@ fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiError {
 /// The options of a query request: the dataset's query defaults (RDFS on read, the
 /// inferred overlay and DESCRIBE, see [`sparkles::Dataset::query_options`]) with the
 /// server's limits and the request's parameters. `reasoning=false` leaves the inferred
-/// overlay out.
+/// overlay and RDFS on read out, so the request reads the asserted data alone.
 fn query_options(st: &AppState, ds: &Dataset, params: &Params) -> QueryOptions {
     let mut defaults = ds.dataset.query_options();
     if params.get("reasoning") == Some("false") {
         defaults.default_graph_extra.clear();
+        defaults.rdfs = None;
     }
     QueryOptions {
         timeout: Some(timeout_param(st, params)),

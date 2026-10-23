@@ -32,6 +32,8 @@ export type DatasetInfo = {
     stale?: boolean | null;
     commitsSince?: number | null;
   };
+  /** RDFS on read, null when the dataset has none; absent on servers that predate it. */
+  rdfs?: null | { source: 'upload' | 'graph'; graph?: string };
   /** Clones: the source dataset id and commit this dataset was copied from. */
   forkedFrom?: { id: string; seq: number };
   /** Clones: the source and when the copy was made (`origin.json`). */
@@ -2712,7 +2714,34 @@ export type DiffOptions = {
   signal?: AbortSignal;
 };
 
-export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
+/**
+ * One group of `GET /{ds}/diff?group=class`: the changes with one subject class, predicate
+ * and class or kind of object. IRIs are given without angle brackets.
+ */
+export type DiffGroup = {
+  /** Read at the `to` state for an addition and at the `from` state for a removal. */
+  subjectClass: string | null;
+  predicate: string;
+  /** The object of `rdf:type` is the class it names. */
+  object: { class: string | null } | { literal: string } | { iri: true };
+  added: number;
+  removed: number;
+};
+
+/** `GET /{ds}/diff?group=class`: a diff's counts by class, without the quads. */
+export type GroupedDiff = Omit<Diff, 'quads'> & {
+  group: 'class';
+  /** The groups found, of which `groups` lists at most `limit`. */
+  groupCount: number;
+  truncated: boolean;
+  /** The largest groups first. */
+  groups: DiffGroup[];
+};
+
+/** The most groups a grouped diff lists. */
+export const MAX_DIFF_GROUPS = 5000;
+
+function diffParams(opts: DiffOptions): URLSearchParams {
   const p = new URLSearchParams();
   if (opts.from) p.set('from', opts.from);
   if (opts.to) p.set('to', opts.to);
@@ -2722,7 +2751,21 @@ export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
   if (opts.fromBranch) p.set('fromBranch', opts.fromBranch);
   if (opts.toBranch) p.set('toBranch', opts.toBranch);
   for (const t of opts.terms ?? []) p.append('term', t);
-  const qs = p.toString();
+  return p;
+}
+
+/** The diff's counts grouped by class (`group=class`): `quads` does not apply. */
+export function diffGroups(
+  ds: string,
+  opts: Omit<DiffOptions, 'quads'> = {},
+): Promise<GroupedDiff> {
+  const p = diffParams({ ...opts, quads: false });
+  p.set('group', 'class');
+  return json<GroupedDiff>(`/${enc(ds)}/diff?${p}`, { signal: opts.signal });
+}
+
+export function diff(ds: string, opts: DiffOptions = {}): Promise<Diff> {
+  const qs = diffParams(opts).toString();
   return json<Diff>(`/${enc(ds)}/diff${qs ? `?${qs}` : ''}`, {
     signal: opts.signal,
   });

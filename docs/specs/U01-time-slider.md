@@ -1,14 +1,14 @@
 # U01: A time slider over graphs, results, entities and the schema
 
-> **Status:** implemented (Phases 1–3), Phase 4 specified
+> **Status:** implemented (Phases 1–4)
 >
-> **Phases:** Phases 1 to 3 shipped. Phase 1 is the slider component, the query page's
+> **Phases:** All four phases shipped. Phase 1 is the slider component, the query page's
 > table and graph results at any commit with row diffs, and an entity's properties in
 > Explore over time. Phase 2 adds the Explore graph with animated additions and removals,
 > the schema tab, a bucketed commit timeline and a term filter on diffs. Phase 3 adds
 > comparison across branches, result diffs computed on the server and the map view.
-> [Phase 4](#phase-4-time-lapse-and-commit-diffs-on-the-canvas-2026-10-23), added on
-> 2026-10-23, plays a time-lapse on the canvas from each commit's changes, draws the diff
+> [Phase 4](#phase-4-time-lapse-and-commit-diffs-on-the-canvas-2026-10-23), added and
+> built on 2026-10-23, plays a time-lapse on the canvas from each commit's changes, draws the diff
 > of two commits as a graph of its own, and moves the Explore overview through time.
 >
 > **User docs:** [USAGE: The time slider](../USAGE.md#the-time-slider), and in
@@ -694,4 +694,95 @@ The data is §7's, with commit 4 adding 600 people of class `ex:Person` who work
 
 ### Phase 4 outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 104.
+Phase 4 is built, and [ROADMAP](../ROADMAP.md) item 104 is done. The grouped diff is
+`Diff::group_by_class` in `sparkles-core/src/store/diff_groups.rs`, and `GET /{ds}/diff`
+takes `group=class` in `http/diff.rs`. The diff graph is
+`ui/src/lib/components/DiffGraph.svelte`, its canvas and step model are
+`ui/src/lib/diff-graph.ts`, and the overview's counts through time are in
+`ui/src/lib/overview.ts`. `docs/API.md`, the route table, the OpenAPI description and the
+client types list the new parameters.
+
+#### What was checked
+
+- **Rust.** `tests/diff_groups.rs` compares the grouping with one done from the two states
+  over random histories with types that come and go. It also covers resources with several
+  classes and with none, the group cap, a view that hides a type triple, budgets and
+  cancellation. The router tests cover the `400` pairs, the group limit, the row and memory
+  budgets, the server memory pool, a `410` for a gone commit, the entity tag, both
+  branches of a diff, a reader limited to some graphs and a reader under a protection.
+- **Vitest.** `diff-graph.test.ts` covers the canvas of a diff, context, applying steps,
+  ghost expiry and its cap, the switch at the node cap, bucket steps, the step delay, the
+  announcement, the grouped class graph and the address. `overview-time.test.ts` covers
+  counts updated from a grouped diff.
+- **Playwright.** The mock suite covers A11 to A14 and A16, the time-lapse on the Explore
+  graph and on the overview, a receipt's **Show on graph**, the `507` fallback and the
+  layout at 390 px. The real-server suite covers A11, A12 and A14.
+- **A15.** The mock suite's `diff-graph-perf.spec.ts` plays 200 commits of 50 changes at
+  10 steps a second. On atlas, a 20-core host that was otherwise quiet, under `vite dev`,
+  six runs had a median frame of 19.6 to 21.2 ms, a 95th percentile of 24.5 to 33.8 ms and
+  a slowest frame of 32.4 to 48.4 ms, and each run took 20.0 s. These numbers are
+  approximate and wait for confirmation on forge.
+- **Grouped diff size against time.** Over a base of 200,000 typed resources, grouping a
+  commit of 1,000, 10,000 and 100,000 changes took 1.30, 11.21 and 119.54 ms on top of
+  diffs of 0.68, 5.35 and 78.63 ms, about 1.2 µs per change. These are local numbers from
+  a busy laptop, recorded in [BENCHMARKS](../BENCHMARKS.md#diffs-grouped-by-class), and
+  wait for confirmation on forge.
+
+#### Where the build differs from the design
+
+- **Most frequent class.** A resource with several classes counts under the class that
+  most of the resources looked up on its side of the diff share, and a tie goes to the
+  smallest IRI. The design did not say what the frequency is counted over.
+- **Object groups.** An IRI object without a class is `{ iri: true }`, and a blank node or
+  a quoted triple without one is `{ class: null }`. The object of an `rdf:type` triple is
+  grouped as the class it names.
+- **Class lookups.** Each state seeks the type triples of each resource, or reads all type
+  triples in one scan when the resources are many against them. Lookups cover every graph
+  the caller can read.
+- **Budgets.** The grouping charges about 96 bytes per change, 64 bytes per resource and
+  the strings each group owns to the request's memory budget and to the server memory
+  pool, and holds the charge until the response is written. The memory budget also caps the
+  number of changes the diff may hold before it is built. The pool learns of the diff only
+  once it is built, so a diff without a memory budget is bounded by `--max-rows` alone, as
+  every diff of this route is. The request's `memory-mb` and `max-rows` overrides apply as
+  they do to queries, and `limit` takes 1 to 5,000 groups.
+- **Where the step model lives.** The step model is in `lib/diff-graph.ts` beside the
+  diff graph's canvas instead of in `lib/explore-time.ts`, and it takes `MAX_GHOSTS` from
+  there.
+- **Earlier steps.** What earlier steps of a time-lapse drew stays drawn as unchanged,
+  and **context** shows only the unchanged edges read around changed resources. A change
+  keeps its graph on the diff graph, so a triple moved between graphs is drawn as a removal
+  and an addition.
+- **The Explore graph's time-lapse.** Each step's changes are checked against the step's
+  state as the graph reads it, so a change in a graph the view does not read is skipped. A
+  step that lists only some of its changes, or that would pass the node cap, reads the
+  graph again at its commit instead.
+- **The grouped time-lapse.** When a time-lapse switches to grouping after drawing some
+  steps, one grouped diff from its start to the step before counts what those steps drew,
+  so their classes stay on the picture. A13 therefore makes five requests, still one at a
+  time. When that diff passes the memory budget, the groups start at the large step and
+  the time-lapse plays on with a note. The node cap also counts the ends that a removal of an undrawn triple adds as
+  ghosts.
+  Each group keeps its net change since the start. A group the
+  step changed is marked with the step's counts, and one that falls to nothing goes after
+  its step unless **Keep ghosts** is on. The grouped picture draws at most 1,500 nodes,
+  the largest groups first, and says how many groups it left out.
+- **The overview's time-lapse.** During play the counts move by each grouped diff, which
+  cannot see a link that a reclassified resource keeps or a type that two graphs hold.
+  When the time-lapse stops, the profiles of the state it reached are read again, so the
+  picture that stays is exact. A comparison also draws the classes and edges it removed
+  entirely, with no size and their `−` marks.
+- **Members of a class.** Opening a class of the grouped picture reads its members at both
+  states and draws their first 500 changes. Paging through more than 500 changes of the
+  same members would need an offset on the diff route, which was not added.
+- **Fast play.** At 5 and 10 steps a second nothing fades and no layout runs. A new node
+  is placed next to a drawn neighbour, or inside the drawn area when it has none. The
+  frame time of A15 depends on this.
+- **A15 in ordinary runs.** A frame is timed from a step's changes to the animation frame
+  after they are drawn, so it moves in steps of one display refresh and with the load on
+  the machine. Ordinary runs record the numbers, and `SPARKLES_PERF=1` turns on the 50 ms
+  gate, as U06 does for its frame rate. No separate performance project was added.
+- **Opening a class at a past state.** The overview reads groups at the head, so opening a
+  class while the overview shows a past state returns it to the head first and says so.
+- **Open questions.** Grouping by named graph and exporting a time-lapse as a video were
+  not built.

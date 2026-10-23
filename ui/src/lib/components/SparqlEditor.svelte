@@ -6,7 +6,9 @@
     historyKeymap,
     indentWithTab,
     isolateHistory,
+    redo as cmRedo,
     toggleComment,
+    undo as cmUndo,
   } from '@codemirror/commands';
   import { bracketMatching, indentOnInput } from '@codemirror/language';
   import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
@@ -32,9 +34,12 @@
     onchange,
     onrun,
     onformat,
+    onpattern,
     completion,
     placeholder = 'SELECT * WHERE { ?s ?p ?o } LIMIT 100',
   }: {
+    /** Open or close the Pattern pane, or move focus to it (Alt+P). */
+    onpattern?: () => void;
     /** Identity of the document; switching it swaps editor state (keeps per-tab undo history). */
     docId: string;
     value: string;
@@ -144,6 +149,11 @@
             preventDefault: true,
           },
           { key: 'Mod-/', run: toggleComment },
+          {
+            key: 'Alt-p',
+            run: () => (onpattern ? (onpattern(), true) : false),
+            preventDefault: true,
+          },
         ]),
       ),
       lineNumbers(),
@@ -237,6 +247,30 @@
       userEvent: 'input.format',
       annotations: isolateHistory.of('full'),
     });
+  }
+
+  /**
+   * Apply a canvas edit of the Pattern pane (spec U08 §4.3): the changes, in the current
+   * text's coordinates, as one transaction with the user event `input.pattern`, kept apart
+   * from neighbouring typing so that one undo reverts exactly this edit.
+   */
+  export function applyPattern(changes: { from: number; to: number; insert: string }[]) {
+    if (!view) return;
+    view.dispatch({
+      changes: [...changes].sort((a, b) => a.from - b.from || a.to - b.to),
+      userEvent: 'input.pattern',
+      annotations: isolateHistory.of('full'),
+      scrollIntoView: false,
+    });
+  }
+
+  /** Undo and redo in the editor's history, which the Pattern pane shares. */
+  export function undo() {
+    if (view) cmUndo(view);
+  }
+
+  export function redo() {
+    if (view) cmRedo(view);
   }
 
   export function forget(id: string) {

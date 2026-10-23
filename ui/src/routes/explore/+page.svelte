@@ -27,11 +27,12 @@
   import {
     confirmPlan,
     deltaText,
+    edgeIdOf,
     planDiff,
     schemaAnnouncement,
     schemaChanges,
   } from '$lib/explore-time';
-  import type { SchemaChanges } from '$lib/explore-time';
+  import type { EdgeTriple, SchemaChanges } from '$lib/explore-time';
   import ClassTree from '$components/ClassTree.svelte';
   import GeoMapCard from '$components/GeoMapCard.svelte';
   import GraphMap from '$components/GraphMap.svelte';
@@ -50,7 +51,17 @@
   import CommunityReport from '$components/CommunityReport.svelte';
   import * as gr from '$lib/graphrag';
   import { branchParam } from '$lib/branches';
+  import PathPanel from '$components/PathPanel.svelte';
+  import type { Picked } from '$components/EntityPicker.svelte';
+  import * as pf from '$lib/paths';
+  import DiffGraph from '$components/DiffGraph.svelte';
+  import { quadIds, seqOf, stepAnnouncement, STEP_QUADS } from '$lib/diff-graph';
   import TextSearchView from '$components/TextSearchView.svelte';
+  import GraphListView, { type ListRow } from '$components/GraphListView.svelte';
+  import LensMenu from '$components/LensMenu.svelte';
+  import LensLegend from '$components/LensLegend.svelte';
+  import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
+  import { Lenses } from '$lib/lenses.svelte';
 
   type ENode = {
     id: string;
@@ -173,11 +184,14 @@
     seenTerms = new Map();
     changes = null;
     selection.clear();
+    lensPick = null;
+    graphEpoch++;
   }
   let graphView: GraphView | undefined = $state();
   // the reads of a view that goes away stop with it
   onDestroy(() => {
     selection.clear();
+    lenses.destroy();
     expandCtl.abort();
     for (const r of [graphRuns, detailRuns, schemaRuns, profileRuns, histRuns]) r.abortAll();
   });
@@ -187,6 +201,56 @@
   const urlAt = page.url.searchParams.get('at');
   const urlFrom = page.url.searchParams.get('from');
   const urlAgainst = page.url.searchParams.get('against');
+  // --- the diff graph (docs/specs/U01-time-slider.md, Phase 4) -------------------------
+
+  type DiffView = { to: string; from: string; branch: string; group: boolean };
+  const diffOfUrl = (u: URL): DiffView | null => {
+    const to = u.searchParams.get('diff');
+    if (!to) return null;
+    return {
+      to,
+      from: u.searchParams.get('diffFrom') ?? '',
+      branch: u.searchParams.get('diffBranch') ?? '',
+      group: u.searchParams.get('group') === 'class',
+    };
+  };
+  /** The diff drawn as a graph, in place of the resource graph and the overview. */
+  let diffView = $state<DiffView | null>(diffOfUrl(page.url));
+  /** Bumped when the address names another diff, so that the view reads it again. */
+  let diffKey = $state(0);
+  $effect(() => {
+    const d = diffOfUrl(page.url);
+    untrack(() => {
+      const same =
+        (!d && !diffView) ||
+        (d &&
+          diffView &&
+          d.to === diffView.to &&
+          d.from === diffView.from &&
+          d.branch === diffView.branch &&
+          d.group === diffView.group);
+      if (same) return;
+      // a move inside the diff graph keeps it; another address reads the new diff
+      diffView = d;
+      diffKey++;
+      if (d) {
+        tab = 'graph';
+        // the diff graph takes the canvas, so the path finder closes with its overlay
+        closePaths();
+      }
+    });
+  });
+  function openDiff(to: string, from: string) {
+    closePaths();
+    diffView = { to, from, branch: '', group: false };
+    diffKey++;
+    syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
+  }
+  function exitDiff() {
+    diffView = null;
+    syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
+  }
+
   /** The History strip of the selected resource. */
   let stripOpen = $state(
     !!(urlAt || urlFrom || urlAgainst) && urlTab !== 'schema' && urlTab !== 'search',
@@ -349,6 +413,7 @@
       focus: n.id === focusId,
       expanded: n.expanded,
       change,
+      term: n.term,
     });
     const real = Object.values(nodes)
       .filter((n) => showLiterals || !n.lit)
@@ -356,19 +421,285 @@
     const ghosts = Object.values(changes?.ghostNodes ?? {})
       .filter((n) => showLiterals || !n.lit)
       .map((n) => toG(n, 'removed'));
-    return [...real, ...ghosts];
+    if (!pathOverlay) return [...real, ...ghosts];
+    // the path finder's overlay: on the drawn nodes, plus the nodes it adds
+    const on = new Map(pathOverlay.nodes.map((n) => [n.key, n]));
+    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const have = new Set(drawn.map((n) => n.id));
+    const marked = drawn.map((n) => (on.has(n.id) ? { ...n, paths: on.get(n.id)!.paths } : n));
+    const extra = pathOverlay.nodes
+      .filter((n) => !have.has(n.key))
+      .map((n): GNode => ({
+        id: n.key,
+        label: pathLabels.get(n.key) ?? labelFor(n.term),
+        kind: n.term.type === 'uri' ? 'iri' : n.term.type,
+        title: n.term.type === 'uri' ? n.term.value : undefined,
+        paths: n.paths,
+        order: n.order,
+        near: pathNear.get(n.key),
+        // the lenses read the path's nodes as they read the drawn ones
+        term: n.term,
+      }));
+    return [...marked, ...extra];
   });
   const gEdges = $derived.by((): GEdge[] => {
     const keep = (e: EEdge) => (showLiterals || !e.lit) && (!hideTypes || !e.isType);
+    const tripleOf = (e: EEdge): EdgeTriple | undefined => {
+      const s = nodes[e.source]?.term;
+      const o = nodes[e.target]?.term;
+      return s && o && e.title ? [s, { type: 'uri', value: e.title }, o] : undefined;
+    };
     const real = Object.values(edges)
       .filter(keep)
-      .map((e) => (changes?.addedEdges.has(e.id) ? { ...e, change: 'added' as const } : e));
+      .map((e) => ({
+        ...e,
+        triple: tripleOf(e),
+        ...(changes?.addedEdges.has(e.id) ? { change: 'added' as const } : {}),
+      }));
     const ghosts = Object.values(changes?.ghostEdges ?? {})
       .filter(keep)
       .map((e) => ({ ...e, change: 'removed' as const }));
-    return [...real, ...ghosts];
+    if (!pathOverlay) return [...real, ...ghosts];
+    const on = new Map(pathOverlay.edges.map((e) => [e.id, e]));
+    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const have = new Set(drawn.map((e) => e.id));
+    const marked = drawn.map((e) => (on.has(e.id) ? { ...e, paths: on.get(e.id)!.paths } : e));
+    const extra = pathOverlay.edges
+      .filter((e) => !have.has(e.id))
+      .map((e): GEdge => ({
+        id: e.id,
+        source: termKey(e.s),
+        target: termKey(e.o),
+        label: shortLabel(e.p, prefixes),
+        title: e.p,
+        isType: e.p === RDF_TYPE,
+        paths: e.paths,
+        order: e.order,
+        change: pathChange.get(e.id),
+        triple: [e.s, { type: 'uri', value: e.p }, e.o],
+      }));
+    return [...marked, ...extra];
   });
   const nodeCount = $derived(Object.keys(nodes).length);
+
+  // --- the path finder (docs/specs/U09-path-finder.md) ----------------------------------
+
+  /** The most nodes a path overlay adds to the graph. */
+  const MAX_PATH_NODES = 400;
+  let pathsOpen = $state(false);
+  let pathFrom = $state<Picked | null>(null);
+  let pathTo = $state<Picked | null>(null);
+  let pathHighlight = $state<number | null>(null);
+  let pathOverlay = $state<ReturnType<typeof pf.overlay> | null>(null);
+  let pathLabels = $state(new Map<string, string>());
+  /** Each new node's neighbours on its paths, between which it is placed. */
+  let pathNear = $state(new Map<string, string[]>());
+  /** The paths are drawn without the graph, which could not take them. */
+  let pathsAlone = $state(false);
+  /** The path edges that a comparison marks, by the overlay's edge id. */
+  let pathChange = $state(new Map<string, 'added' | 'removed'>());
+  // comparing: a path edge that is not drawn is marked as the drawn ones are. Every path
+  // edge is checked, whether or not the graph draws it now, since the graph can change
+  // under the paths. An edge is added when it holds at the later state and not at the
+  // earlier one, and removed the other way round. Both are read, because the paths may come
+  // from a third state, and an edge
+  // the check cannot read, such as one with a blank node, is found at neither and stays
+  // unmarked.
+  $effect(() => {
+    const o = pathOverlay;
+    const name = ds;
+    const comparing = graphTimeOpen && exCompare && !!(exFrom || exAgainst);
+    const against = exAgainst;
+    const from = exFrom;
+    const later = exAt;
+    if (!o || !name || !comparing || !o.edges.length) {
+      pathChange = new Map();
+      return;
+    }
+    const c = new AbortController();
+    const triples = o.edges.map((e): [Term, Term, Term] => [e.s, { type: 'uri', value: e.p }, e.o]);
+    Promise.all([
+      ex.presentEdges(
+        against ? `${name}@${against}` : name,
+        triples,
+        against ? undefined : from,
+        c.signal,
+      ),
+      ex.presentEdges(name, triples, later || undefined, c.signal),
+    ])
+      .then(([before, after]) => {
+        if (c.signal.aborted) return;
+        const marks = new Map<string, 'added' | 'removed'>();
+        o.edges.forEach((e, i) => {
+          const id = edgeIdOf(triples[i]);
+          if (after.has(id) && !before.has(id)) marks.set(e.id, 'added');
+          else if (before.has(id) && !after.has(id)) marks.set(e.id, 'removed');
+        });
+        pathChange = marks;
+      })
+      .catch(() => {
+        // the marks are a nicety: the paths stand without them
+        if (!c.signal.aborted) pathChange = new Map();
+      });
+    return () => c.abort();
+  });
+  let pathPanel: PathPanel | undefined = $state();
+  /** The node selected before the current one: with both, Paths fills From and To. */
+  let prevSelectedId: string | null = null;
+  let menu = $state<{ id: string; x: number; y: number } | null>(null);
+
+  const pickedOf = (id: string): Picked | null => {
+    const n = nodes[id];
+    return n && n.term.type === 'uri' ? { term: n.term, label: n.label } : null;
+  };
+
+  function openPaths(opts: { from?: string; to?: string } = {}) {
+    if (opts.from || opts.to) {
+      if (opts.from) pathFrom = pickedOf(opts.from) ?? pathFrom;
+      if (opts.to) pathTo = pickedOf(opts.to) ?? pathTo;
+    } else if (!pathsOpen && selectedId) {
+      // two nodes chosen one after the other fill both ends
+      const cur = pickedOf(selectedId);
+      const prev =
+        prevSelectedId && prevSelectedId !== selectedId ? pickedOf(prevSelectedId) : null;
+      if (cur && prev) {
+        pathFrom = prev;
+        pathTo = cur;
+      } else if (cur && !pathFrom) pathFrom = cur;
+    }
+    tab = 'graph';
+    // the paths are drawn on the graph, not on the map or the diff graph
+    if (diffView) exitDiff();
+    if (canvasMode === 'map') setCanvasMode('graph');
+    // and on the canvas, not the list
+    listView = false;
+    pathsOpen = true;
+    menu = null;
+    queueMicrotask(() => pathPanel?.focus());
+  }
+
+  function closePaths() {
+    pathsOpen = false;
+    clearPaths();
+  }
+
+  function clearPaths() {
+    pathOverlay = null;
+    pathHighlight = null;
+    pathsAlone = false;
+  }
+
+  function showPaths(r: { paths: pf.FoundPath[]; labels: Map<string, string> } | null) {
+    if (!r) return clearPaths();
+    const o = pf.overlay(r.paths);
+    const labels = new Map<string, string>();
+    for (const n of o.nodes)
+      if (n.term.type === 'uri' && r.labels.has(n.term.value))
+        labels.set(n.key, r.labels.get(n.term.value)!);
+    const near = new Map<string, string[]>();
+    for (const p of r.paths)
+      p.nodes.forEach((t, i) => {
+        const k = termKey(t);
+        const around = [p.nodes[i - 1], p.nodes[i + 1]].filter(Boolean).map((x) => termKey(x!));
+        near.set(k, [...new Set([...(near.get(k) ?? []), ...around])]);
+      });
+    const fresh = o.nodes.filter((n) => !nodes[n.key]).length;
+    pathsAlone = nodeCount + Math.min(fresh, MAX_PATH_NODES) > MAX_NODES;
+    if (pathsAlone)
+      toasts.push(
+        'info',
+        'Paths drawn on their own',
+        `The graph has ${nodeCount} nodes, so the paths are drawn without it.`,
+      );
+    if (o.nodes.length > MAX_PATH_NODES) {
+      const keep = new Set(o.nodes.slice(0, MAX_PATH_NODES).map((n) => n.key));
+      o.nodes = o.nodes.filter((n) => keep.has(n.key));
+      o.edges = o.edges.filter((e) => keep.has(termKey(e.s)) && keep.has(termKey(e.o)));
+    }
+    pathLabels = labels;
+    pathNear = near;
+    pathHighlight = null;
+    pathOverlay = o;
+  }
+
+  /** The paths become ordinary elements of the graph, and the panel closes. */
+  function addPathsToGraph() {
+    const o = pathOverlay;
+    if (!o) return;
+    if (pathsAlone) resetGraph();
+    for (const n of o.nodes) ensureNode(n.term, pathLabels.get(n.key), n.key);
+    for (const e of o.edges) addEdge(termKey(e.s), e.p, termKey(e.o), e.o.type === 'literal');
+    if (o.nodes.some((n) => n.term.type === 'literal')) showLiterals = true;
+    if (!focusId && o.nodes[0]) focusId = o.nodes[0].key;
+    pathsOpen = false;
+    clearPaths();
+  }
+
+  function fitPath(p: pf.FoundPath) {
+    graphView?.fitTo(p.nodes.map((t) => termKey(t)));
+  }
+
+  // --- lenses (docs/specs/U10-canvas-lenses.md) ------------------------------------------
+
+  const lenses = new Lenses();
+  /** The drawn graph as a list, with a column per active lens. */
+  let listView = $state(false);
+  /** The legend entry whose nodes are selected. */
+  let lensPick = $state<string | null>(null);
+  /** Its nodes while the entry exists. */
+  const lensMarked = $derived(entryIds(lenses.results, lensPick));
+  /** Bumped whenever the graph is drawn from new reads, so that lens values are read again. */
+  let graphEpoch = $state(0);
+  const dsInfo = $derived(app.datasets.find((d) => d.name === ds));
+  /** Materialized inferences or RDFS on read: the inferred-edge lens exists (§2.7). */
+  const hasReasoning = $derived(!!dsInfo?.reasoning || !!dsInfo?.rdfs);
+  $effect(() => {
+    const name = ds;
+    if (!name) return;
+    lenses.setInput({
+      ds: name,
+      at: graphTimeOpen && exAt ? exAt : undefined,
+      epoch: graphEpoch,
+      nodes: gNodes.map((n) => ({ id: n.id, term: n.term })),
+      // the ghosts of a comparison are not in the state the lenses read
+      edges: gEdges
+        .filter((e) => e.change !== 'removed')
+        .map((e) => ({ id: e.id, source: e.source, target: e.target, triple: e.triple })),
+      reasoning: hasReasoning,
+      label: (id) => nodes[id]?.label ?? id,
+      short: (iri) => shortLabel(iri, prefixes),
+    });
+  });
+  /** The list view's rows: the drawn nodes, ordered by the size lens when one is on. */
+  const listRows = $derived.by((): ListRow[] => {
+    const size = lenses.results.size;
+    const degree = new Map<string, number>();
+    for (const e of gEdges) {
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+    const look = lenses.encoding.nodes;
+    return gNodes.map((n) => {
+      const v = size?.values.get(n.id);
+      const c = look.get(n.id)?.colour;
+      return {
+        key: n.id,
+        label: n.label,
+        kind: n.change === 'removed' ? 'removed' : n.kind === 'iri' ? 'resource' : n.kind,
+        size: typeof v === 'number' ? v : -Infinity,
+        degree: degree.get(n.id) ?? 0,
+        color:
+          c == null
+            ? `var(--${n.kind === 'iri' ? 'iri' : n.kind})`
+            : c === OTHER
+              ? 'var(--lens-other)'
+              : `var(--lens-${c + 1})`,
+        openable: n.kind === 'iri',
+        marked: !!lensMarked?.includes(n.id),
+        title: [n.title ?? n.label, lensDescribe(n.id, lenses.results)].filter(Boolean).join('\n'),
+      };
+    });
+  });
 
   function labelFor(t: Term, label?: string) {
     if (label) return label;
@@ -602,6 +933,7 @@
           present.add(termKey(nb.term));
         }
       }
+      graphEpoch++;
       // the graph is rebuilt in one step, so that what stays keeps its place
       const rootTerm = seenTerms.get(root);
       if (!rootTerm) return;
@@ -648,13 +980,162 @@
     }
   }
 
-  // the graph follows the graph slider
+  // --- the time-lapse on the graph (U01 Phase 4) ---------------------------------------
+
+  /** Play re-reads the graph at each commit, or applies each step's changes to it. */
+  let graphPlayMode = $state<'reread' | 'lapse'>('reread');
+  let graphPlaying = $state(false);
+
+  /**
+   * One time-lapse step from `fromAt` to `toAt`: the changes that touch drawn resources (the
+   * `term` filter, up to 1,000 of them) are applied to the graph. An added triple draws its
+   * edge and a new end next to its neighbour, so the picture grows as the data did. A removed
+   * one leaves a ghost for this step, and a node left without edges goes with it.
+   */
+  async function lapseGraph(fromAt: string, toAt: string) {
+    const name = ds;
+    if (!name || !focusId) return;
+    const owns = graphRuns.claim('graph');
+    const signal = graphRuns.signal('graph');
+    graphReading = true;
+    graphNote = '';
+    const t0 = performance.now();
+    try {
+      const iris = Object.values(nodes)
+        .filter((n) => n.term.type === 'uri')
+        .map((n) => n.iri)
+        .slice(0, 1000);
+      const d = await api.diff(name, {
+        from: fromAt,
+        to: toAt,
+        terms: iris,
+        quads: true,
+        limit: STEP_QUADS,
+        signal,
+      });
+      if (!owns()) return;
+      const quads = d.quads ?? [];
+      // a step that cannot be applied whole is read instead, so no change is lost for the
+      // steps after it: one that listed only some of its changes, or one past the node cap
+      const fresh = new Set<string>();
+      for (const q of quads) {
+        if (q.op !== '+') continue;
+        const { sid, oid } = quadIds(q);
+        if (!nodes[sid] && !nodes[oid]) continue;
+        for (const id of [sid, oid]) if (!nodes[id]) fresh.add(id);
+      }
+      if (
+        quads.length < d.added + d.removed ||
+        Object.keys(nodes).length + fresh.size > MAX_NODES
+      ) {
+        graphReading = false;
+        await rereadGraph();
+        if (graphTimeOpen)
+          graphNote = `Commit ${d.to.commit.seq} changed more than a step can apply, so the graph was read again at it.`;
+        return;
+      }
+      // the diff lists every graph's changes and the drawn graph reads one view of them, so
+      // each change is checked against the state it leads to, read as the graph is read
+      const candidates = new Map<string, EdgeTriple>();
+      for (const q of quads) {
+        const { s, o, p, sid, oid, edge } = quadIds(q);
+        if (q.op === '+' ? !nodes[sid] && !nodes[oid] : !edges[edge]) continue;
+        candidates.set(edge, [s, { type: 'uri', value: p }, o]);
+      }
+      // a blank node or a quoted triple cannot be checked by value: read the graph instead
+      if (
+        [...candidates.values()].some((t) =>
+          t.some((x) => x.type !== 'uri' && x.type !== 'literal'),
+        )
+      ) {
+        graphReading = false;
+        await rereadGraph();
+        return;
+      }
+      // the state the diff resolved to, which a write after it does not move
+      const holds = candidates.size
+        ? await ex.presentEdges(name, [...candidates.values()], `commit:${d.to.commit.seq}`, signal)
+        : new Set<string>();
+      if (!owns()) return;
+      const addedNodes = new Set<string>();
+      const addedEdges = new Set<string>();
+      const ghostEdges: Record<string, EEdge> = {};
+      const ghostNodes: Record<string, ENode> = {};
+      let added = 0;
+      let removed = 0;
+      for (const q of quads) {
+        const { s, o, p, sid, oid, edge, lit } = quadIds(q);
+        if (q.op === '+') {
+          if (!nodes[sid] && !nodes[oid]) continue;
+          // added in a graph the drawn view does not read
+          if (!holds.has(edge)) continue;
+          if (!nodes[sid]) {
+            ensureNode(s, undefined, sid);
+            addedNodes.add(sid);
+          }
+          if (!nodes[oid]) {
+            ensureNode(o, undefined, oid);
+            addedNodes.add(oid);
+          }
+          if (!edges[edge]) {
+            addEdge(sid, p, oid, lit);
+            addedEdges.add(edge);
+            added++;
+          }
+          continue;
+        }
+        const e = edges[edge];
+        // a triple removed from one graph that the drawn view still reads stays
+        if (e && !holds.has(edge)) {
+          ghostEdges[edge] = e;
+          delete edges[edge];
+          removed++;
+        }
+      }
+      const incident = new Set(Object.values(edges).flatMap((e) => [e.source, e.target]));
+      for (const [id, n] of Object.entries(nodes)) {
+        if (id === focusId || incident.has(id)) continue;
+        ghostNodes[id] = n;
+        delete nodes[id];
+      }
+      changes = { addedNodes, addedEdges, ghostNodes, ghostEdges };
+      graphSlider?.accept();
+      graphReadMs = performance.now() - t0;
+      const a = seqOf(fromAt) ?? 0;
+      graphAnnounce = stepAnnouncement({ from: a, to: d.to.commit.seq }, added, removed);
+    } catch (e) {
+      if (!owns() || isAbort(e)) return;
+      const gone = timeFailure(e);
+      if (gone) {
+        toasts.push('error', gone.title, gone.detail);
+        graphSlider?.reject({ seq: gone.seq, readable: gone.readable });
+        drawnKey = timeKey();
+        return;
+      }
+      graphSlider?.fail();
+      toasts.error('Could not read the changes of that commit', e);
+    } finally {
+      if (owns()) graphReading = false;
+    }
+  }
+
+  // the graph follows the graph slider: a time-lapse step applies its changes, any other
+  // move reads the graph again
   $effect(() => {
     const key = timeKey();
     untrack(() => {
       if (key === drawnKey) return;
+      const prev = drawnKey;
       drawnKey = key;
-      if (focusId) void rereadGraph();
+      if (!focusId) return;
+      const before = prev === 'head' ? null : prev.split('|')[0];
+      const a = seqOf(before);
+      const b = seqOf(exAt);
+      // the head is always after the state drawn
+      const forward = a != null && (b != null ? b > a : exAt === '');
+      if (graphPlayMode === 'lapse' && graphPlaying && !exCompare && forward)
+        void lapseGraph(`commit:${a}`, b != null ? `commit:${b}` : 'head');
+      else void rereadGraph();
     });
   });
 
@@ -684,6 +1165,12 @@
       if (community) p.set('community', community.iri);
     }
     if (overviewBranch) p.set('branch', overviewBranch);
+    if (diffView && tab === 'graph') {
+      p.set('diff', diffView.to);
+      if (diffView.from) p.set('diffFrom', diffView.from);
+      if (diffView.branch) p.set('diffBranch', diffView.branch);
+      if (diffView.group) p.set('group', 'class');
+    }
     const timed =
       tab === 'schema'
         ? schemaTimeOpen
@@ -697,7 +1184,9 @@
   }
 
   function select(id: string | null) {
+    if (id && selectedId && id !== selectedId) prevSelectedId = selectedId;
     selectedId = id;
+    menu = null;
     if (id) void loadDetails(id);
     // a click on the canvas is a selection the map shows too
     if (id) selection.set([id], 'the graph');
@@ -798,6 +1287,7 @@
 
   function clearGraph() {
     resetGraph();
+    clearPaths();
     focusId = null;
     selectedId = null;
     syncUrl(null);
@@ -1169,6 +1659,10 @@
       if (!first) {
         // Dataset switched in the sidebar: start over.
         resetGraph();
+        pathsOpen = false;
+        pathFrom = null;
+        pathTo = null;
+        clearPaths();
         focusId = null;
         selectedId = null;
         schema = null;
@@ -1232,14 +1726,41 @@
     // H opens and closes the History strip of the selected resource, Shift+H the one over the graph
     const onKey = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if ((e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable]'))
-        return;
-      // Shift+M shows the drawn graph on a map and back
+      const target = e.target as HTMLElement;
+      if (target?.closest?.('input, textarea, select, [contenteditable]')) return;
+      // Shift+M shows the drawn graph on a map and back; paths are drawn on the graph only,
+      // so the map waits until the path finder closes
       if (e.key === 'M' && e.shiftKey) {
-        if (tab !== 'graph' || !nodeCount) return;
+        if (tab !== 'graph' || !nodeCount || pathsOpen || diffView) return;
         e.preventDefault();
         setCanvasMode(canvasMode === 'map' ? 'graph' : 'map');
         return;
+      }
+      // Shift+P opens the path finder; with it open, the graph takes its keys too
+      if (e.key === 'P' && e.shiftKey && ds && tab !== 'schema') {
+        e.preventDefault();
+        openPaths();
+        return;
+      }
+      if (pathsOpen && tab === 'graph' && !target?.closest?.('.paths')) {
+        const count = pathOverlay ? new Set(pathOverlay.edges.flatMap((x) => x.paths)).size : 0;
+        if (/^[1-9]$/.test(e.key) && Number(e.key) <= count) {
+          e.preventDefault();
+          pathHighlight = Number(e.key);
+          return;
+        }
+        if ((e.key === 'a' || e.key === 'A') && pathOverlay) {
+          e.preventDefault();
+          pathHighlight = null;
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          if (menu) menu = null;
+          else if (pathHighlight != null) pathHighlight = null;
+          else closePaths();
+          return;
+        }
       }
       if (e.key !== 'h' && e.key !== 'H') return;
       if (tab !== 'graph') return;
@@ -1360,15 +1881,37 @@
         onopen={(iri, label) => focusOn(iri, label)}
       />
     {/key}
+  {:else if tab === 'graph' && diffView}
+    <div class="diff-host">
+      {#key `${ds}|${diffKey}`}
+        <DiffGraph
+          ds={diffView.branch ? `${ds}@${diffView.branch}` : ds}
+          from={diffView.from}
+          to={diffView.to}
+          group={diffView.group}
+          {prefixes}
+          onexit={exitDiff}
+          onchange={(c) => {
+            if (!diffView) return;
+            diffView = { ...diffView, from: c.from, to: c.to, group: c.group };
+            syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
+          }}
+          onopen={(iri) => {
+            diffView = null;
+            void focusOn(iri);
+          }}
+        />
+      {/key}
+    </div>
   {:else if tab === 'graph'}
     <div
       class="split"
-      class:overview={nodeCount === 0 && !graphTimeOpen && !community}
-      class:reporting={nodeCount === 0 && !!community}
-      class:mapmode={canvasMode === 'map' && nodeCount > 0}
+      class:overview={nodeCount === 0 && !graphTimeOpen && !community && !pathsOpen}
+      class:reporting={nodeCount === 0 && !!community && !pathsOpen}
+      class:mapmode={canvasMode === 'map' && nodeCount > 0 && !pathsOpen}
     >
       <div class="canvas">
-        {#if nodeCount > 0 || graphTimeOpen}
+        {#if nodeCount > 0 || graphTimeOpen || pathsOpen}
           <div class="gtools">
             <label class="row check"
               ><input type="checkbox" bind:checked={showLiterals} /> Literals</label
@@ -1378,6 +1921,13 @@
             >
             <span class="spacer"></span>
             <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
+            <button
+              class="btn sm"
+              aria-pressed={pathsOpen}
+              title="Find the paths between two entities (Shift+P)"
+              onclick={() => (pathsOpen ? closePaths() : openPaths())}
+              ><Icon name="route" size={13} /> Paths</button
+            >
             {#if nodeCount}
               <div class="seg" role="group" aria-label="Show the graph as">
                 <button
@@ -1388,10 +1938,27 @@
                 <button
                   class="btn sm"
                   aria-pressed={canvasMode === 'map'}
-                  title="Show the drawn entities on a map, with arcs for their relations (Shift+M)"
+                  disabled={pathsOpen}
+                  title={pathsOpen
+                    ? 'Close the path finder to show the graph on a map'
+                    : 'Show the drawn entities on a map, with arcs for their relations (Shift+M)'}
                   onclick={() => setCanvasMode('map')}><Icon name="map" size={13} /> Map</button
                 >
               </div>
+              {#if canvasMode === 'graph'}
+                <LensMenu
+                  {lenses}
+                  short={(iri) => shortLabel(iri, prefixes)}
+                  keys={tab === 'graph' && canvasMode === 'graph'}
+                />
+                <button
+                  class="btn sm"
+                  aria-pressed={listView}
+                  title="The drawn nodes as a list, with a column per lens"
+                  onclick={() => (listView = !listView)}
+                  ><Icon name="table" size={13} /> List</button
+                >
+              {/if}
               <button
                 class="btn sm"
                 aria-pressed={graphTimeOpen}
@@ -1423,6 +1990,10 @@
               bind:against={exAgainst}
               label="Graph history"
               canFollow={false}
+              lapse
+              bind:playMode={graphPlayMode}
+              bind:playing={graphPlaying}
+              onshowdiff={(from, to) => openDiff(to, from)}
               onchange={() => syncUrl(selected?.term.type === 'uri' ? selected.iri : null)}
               onclose={() => {
                 closeGraphTime();
@@ -1432,31 +2003,37 @@
             {#if graphNote}<p class="faint small graph-note">{graphNote}</p>{/if}
           </div>
         {/if}
-        {#if nodeCount === 0}
-          <div class="ov-host">
-            {#key ds}
-              <OverviewView
-                {ds}
-                {prefixes}
-                onresource={(iri, label) => focusOn(iri, label)}
-                onschema={() => setTab('schema')}
-                branch={overviewBranch}
-                start={overviewMode}
-                focus={overviewFocus}
-                {marked}
-                oncommunity={(c) => {
-                  void showCommunity(c);
-                  syncUrl(null);
-                }}
-                onmode={(m) => {
-                  overviewMode = m;
-                  syncUrl(null);
-                }}
-              />
-            {/key}
-          </div>
+        {#if nodeCount === 0 && !pathOverlay}
+          {#if pathsOpen}
+            <div class="cy-host paths-empty faint">
+              <p>Choose two entities and find the paths between them.</p>
+            </div>
+          {:else}
+            <div class="ov-host">
+              {#key ds}
+                <OverviewView
+                  {ds}
+                  {prefixes}
+                  onresource={(iri, label) => focusOn(iri, label)}
+                  onschema={() => setTab('schema')}
+                  branch={overviewBranch}
+                  start={overviewMode}
+                  focus={overviewFocus}
+                  {marked}
+                  oncommunity={(c) => {
+                    void showCommunity(c);
+                    syncUrl(null);
+                  }}
+                  onmode={(m) => {
+                    overviewMode = m;
+                    syncUrl(null);
+                  }}
+                />
+              {/key}
+            </div>
+          {/if}
         {:else}
-          {#if canvasMode === 'map' && ds}
+          {#if canvasMode === 'map' && ds && !pathsOpen}
             <div class="cy-host">
               <GraphMap
                 {ds}
@@ -1470,15 +2047,69 @@
             </div>
           {:else}
             <div class="cy-host">
-              <GraphView
-                bind:this={graphView}
-                animate={graphTimeOpen}
-                nodes={gNodes}
-                edges={gEdges}
-                selected={selectedId}
-                highlight={selection.ids}
-                onselect={select}
-                onexpand={expand}
+              {#if listView}
+                <GraphListView
+                  rows={listRows}
+                  plain
+                  label="Drawn nodes"
+                  lensColumns={lenses.columns}
+                  selected={selectedId}
+                  onselect={select}
+                  openLabel="Focus"
+                  onopen={(id) => {
+                    const n = nodes[id];
+                    if (n?.term.type === 'uri') void focusOn(n.iri, n.label);
+                  }}
+                />
+              {:else}
+                <GraphView
+                  bind:this={graphView}
+                  animate={graphTimeOpen}
+                  nodes={gNodes}
+                  edges={gEdges}
+                  selected={selectedId}
+                  onselect={select}
+                  onexpand={expand}
+                  highlight={selection.ids}
+                  pathFocus={pathHighlight}
+                  onmenu={(id, at) =>
+                    (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
+                  lens={lenses.encoding}
+                  marked={lensMarked}
+                />
+                {#if menu}
+                  <div
+                    class="node-menu"
+                    role="menu"
+                    aria-label="Node actions"
+                    style="left: {menu.x}px; top: {menu.y}px"
+                  >
+                    <button
+                      role="menuitem"
+                      class="btn sm ghost"
+                      onclick={() => openPaths({ from: menu!.id })}>Paths from here</button
+                    >
+                    <button
+                      role="menuitem"
+                      class="btn sm ghost"
+                      onclick={() => openPaths({ to: menu!.id })}>Paths to here</button
+                    >
+                    <button
+                      role="menuitem"
+                      class="btn sm ghost"
+                      onclick={() => {
+                        const id = menu!.id;
+                        menu = null;
+                        void expand(id);
+                      }}>Expand</button
+                    >
+                  </div>
+                {/if}
+              {/if}
+              <LensLegend
+                results={lenses.results}
+                selected={lensMarked ? lensPick : null}
+                onselect={(key) => (lensPick = key)}
               />
             </div>
             <div class="hint faint">
@@ -1488,7 +2119,26 @@
         {/if}
       </div>
 
-      {#if nodeCount > 0 || graphTimeOpen}
+      {#if pathsOpen && ds}
+        <aside class="side side-paths" aria-label="Path finder">
+          {#key ds}
+            <PathPanel
+              bind:this={pathPanel}
+              {ds}
+              {prefixes}
+              at={graphTimeOpen ? exAt : ''}
+              bind:from={pathFrom}
+              bind:to={pathTo}
+              bind:highlight={pathHighlight}
+              onresult={showPaths}
+              onadd={addPathsToGraph}
+              onclear={clearPaths}
+              onclose={closePaths}
+              onfit={fitPath}
+            />
+          {/key}
+        </aside>
+      {:else if nodeCount > 0 || graphTimeOpen}
         <aside class="side" aria-label="Resource details">
           {#if selected}
             {@const n = selected}
@@ -1540,6 +2190,15 @@
                   {/if}
                   <button class="btn sm" onclick={() => describeInQuery(n.iri)}
                     ><Icon name="query" size={13} /> Describe</button
+                  >
+                  <button
+                    class="btn sm"
+                    title="Find paths from this resource (Shift+P)"
+                    onclick={() => openPaths({ from: n.id })}
+                    ><Icon name="route" size={13} /> Paths from here</button
+                  >
+                  <button class="btn sm" onclick={() => openPaths({ to: n.id })}
+                    >Paths to here</button
                   >
                   <button
                     class="btn sm"
@@ -2360,6 +3019,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .diff-host {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
   .split {
     flex: 1;
     min-height: 0;
@@ -2391,6 +3056,8 @@
   .cy-host {
     flex: 1;
     min-height: 0;
+    /* the lens legend docks in its corner */
+    position: relative;
   }
   .seg {
     display: inline-flex;
@@ -2410,6 +3077,25 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+  }
+  .node-menu {
+    position: absolute;
+    z-index: 20;
+    display: grid;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    box-shadow: var(--shadow, 0 6px 18px rgb(0 0 0 / 0.15));
+  }
+  .node-menu .btn {
+    justify-content: flex-start;
+  }
+  .paths-empty {
+    display: grid;
+    place-items: center;
+    text-align: center;
+    padding: 24px;
   }
   .split.overview {
     grid-template-columns: minmax(0, 1fr);
@@ -2904,6 +3590,25 @@
     .gtools .seg .btn {
       min-height: 44px;
       min-width: 44px;
+    }
+    .gtools {
+      flex-wrap: wrap;
+      gap: 6px 12px;
+    }
+    /* the path finder is a sheet over the graph, which folds to its first path */
+    .split {
+      position: relative;
+    }
+    .side-paths {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 15;
+      max-height: 85%;
+      border-top: 1px solid var(--border-strong);
+      border-radius: 12px 12px 0 0;
+      box-shadow: 0 -6px 18px rgb(0 0 0 / 0.12);
     }
   }
 </style>

@@ -1640,3 +1640,320 @@ async fn the_timeline_range_is_clamped_to_the_head_before_it_is_capped() {
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.json()["commits"], 0);
 }
+
+// --- group=class (docs/specs/U01-time-slider.md, Phase 4) -----------------------------
+
+const EX: &str = "http://ex/";
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// A local name under `http://ex/`, or an IRI as it is.
+fn full_iri(n: &str) -> String {
+    if n.contains(':') {
+        n.to_string()
+    } else {
+        format!("{EX}{n}")
+    }
+}
+
+/// The group of a grouped diff with this subject class, predicate and object, as
+/// `(added, removed)`.
+fn group_of(d: &J, s: Option<&str>, p: &str, o: J) -> Option<(u64, u64)> {
+    let s = s.map(full_iri);
+    let p = full_iri(p);
+    d["groups"].as_array().unwrap().iter().find_map(|g| {
+        (g["subjectClass"].as_str().map(str::to_string) == s
+            && g["predicate"] == p.as_str()
+            && g["object"] == o)
+            .then(|| (g["added"].as_u64().unwrap(), g["removed"].as_u64().unwrap()))
+    })
+}
+
+fn cls(n: &str) -> J {
+    json!({ "class": full_iri(n) })
+}
+
+/// `h` with commit 5: people and an organization; 6: 600 people who work for acme and a
+/// few links; 7: alice stops knowing bob, and bob loses his class.
+async fn class_server(limits: impl FnOnce(&mut crate::state::Limits)) -> Server {
+    let s = server(limits).await;
+    update(
+        &s.app,
+        "h",
+        "PREFIX ex: <http://ex/> INSERT DATA { ex:alice a ex:Person ; ex:knows ex:bob . \
+         ex:bob a ex:Person . ex:acme a ex:Org . ex:carol a ex:Person , ex:Agent . \
+         ex:dave a ex:Y , ex:X . }",
+    )
+    .await;
+    let mut u = String::from("PREFIX ex: <http://ex/> INSERT DATA {");
+    for i in 0..600 {
+        u.push_str(&format!(
+            " ex:p{i} a ex:Person ; ex:worksFor ex:acme ; ex:name \"p{i}\" ."
+        ));
+    }
+    u.push_str(
+        " ex:carol ex:worksFor ex:acme . ex:dave ex:knows ex:nobody . ex:zed ex:knows ex:carol . }",
+    );
+    update(&s.app, "h", &u).await;
+    update(
+        &s.app,
+        "h",
+        "PREFIX ex: <http://ex/> DELETE DATA { ex:alice ex:knows ex:bob . ex:bob a ex:Person . }",
+    )
+    .await;
+    s
+}
+
+#[tokio::test]
+async fn grouped_diffs_count_changes_by_class() {
+    let s = class_server(|_| {}).await;
+    let r = get(&s.app, "/h/diff?from=commit:5&to=commit:6&group=class").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let d = r.json();
+    assert_eq!(d["group"], "class");
+    assert_eq!(d["added"], 1803, "{d}");
+    assert_eq!(d["removed"], 0);
+    assert!(d.get("quads").is_none());
+    // 600 people and carol working for an organization, their classes and their names
+    assert_eq!(
+        group_of(&d, Some("Person"), "worksFor", cls("Org")),
+        Some((601, 0)),
+        "{d}"
+    );
+    assert_eq!(
+        group_of(&d, Some("Person"), RDF_TYPE_IRI, cls("Person")),
+        Some((600, 0))
+    );
+    assert_eq!(
+        group_of(
+            &d,
+            Some("Person"),
+            "name",
+            json!({ "literal": "http://www.w3.org/2001/XMLSchema#string" })
+        ),
+        Some((600, 0))
+    );
+    // of two classes, the one most resources share, and on a tie the smallest IRI; an
+    // object without a class is an IRI
+    assert_eq!(
+        group_of(&d, Some("X"), "knows", json!({ "iri": true })),
+        Some((1, 0)),
+        "{d}"
+    );
+    // a subject without a class is in the null group
+    assert_eq!(
+        group_of(&d, None, "knows", cls("Person")),
+        Some((1, 0)),
+        "{d}"
+    );
+    // the largest group first
+    assert_eq!(d["groups"][0]["added"], 601);
+    assert_eq!(d["groupCount"], 5);
+    assert_eq!(d["truncated"], false);
+    // a removed quad is grouped by the classes of the earlier state: bob was a person
+    let d = get(&s.app, "/h/diff?from=commit:6&to=commit:7&group=class")
+        .await
+        .json();
+    assert_eq!(d["removed"], 2, "{d}");
+    assert_eq!(
+        group_of(&d, Some("Person"), "knows", cls("Person")),
+        Some((0, 1)),
+        "{d}"
+    );
+    assert_eq!(
+        group_of(&d, Some("Person"), RDF_TYPE_IRI, cls("Person")),
+        Some((0, 1)),
+        "{d}"
+    );
+    // the grouped counts add up to the diff's
+    let d = get(&s.app, "/h/diff?from=commit:4&to=commit:7&group=class")
+        .await
+        .json();
+    let sum = |k: &str| {
+        d["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g[k].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    assert_eq!(J::from(sum("added")), d["added"]);
+    assert_eq!(J::from(sum("removed")), d["removed"]);
+    // the term filter narrows what is grouped
+    let d = get(
+        &s.app,
+        "/h/diff?from=commit:5&to=commit:6&group=class&term=http%3A%2F%2Fex%2Fdave",
+    )
+    .await
+    .json();
+    assert_eq!(d["added"], 1, "{d}");
+    assert_eq!(d["groupCount"], 1, "{d}");
+}
+
+#[tokio::test]
+async fn grouped_diffs_refuse_other_formats_and_cap_their_groups() {
+    let s = class_server(|_| {}).await;
+    for q in [
+        "group=class&quads=true",
+        "group=class&format=patch",
+        "group=class&format=patch-binary",
+        "group=class&format=diff",
+        "group=predicate",
+        "group=class&limit=0",
+        "group=class&limit=5001",
+    ] {
+        let r = get(&s.app, &format!("/h/diff?from=commit:5&to=commit:6&{q}")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{q}: {}", r.text());
+    }
+    // nor do the lines that Accept would choose
+    let r = get_with(
+        &s.app,
+        "/h/diff?from=commit:5&to=commit:6&group=class",
+        "accept",
+        super::diff::DIFF_MEDIA_TYPE,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    // at most `limit` groups, the largest first
+    let d = get(
+        &s.app,
+        "/h/diff?from=commit:5&to=commit:6&group=class&limit=2",
+    )
+    .await
+    .json();
+    assert_eq!(d["groups"].as_array().unwrap().len(), 2, "{d}");
+    assert_eq!(d["groupCount"], 5);
+    assert_eq!(d["truncated"], true);
+    assert_eq!(d["groups"][0]["added"], 601);
+    // a fixed pair of commits is tagged, apart from the plain diff and from other limits
+    let r = get(&s.app, "/h/diff?from=commit:5&to=commit:6&group=class").await;
+    let tag = r.header("etag").unwrap();
+    assert!(tag.contains("json+groups"), "{tag}");
+    let plain = get(&s.app, "/h/diff?from=commit:5&to=commit:6").await;
+    assert_ne!(plain.header("etag").unwrap(), tag);
+    let r = get_with(
+        &s.app,
+        "/h/diff?from=commit:5&to=commit:6&group=class",
+        "if-none-match",
+        &tag,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    let r = get_with(
+        &s.app,
+        "/h/diff?from=commit:5&to=commit:6&group=class&limit=2",
+        "if-none-match",
+        &tag,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn grouped_diffs_keep_the_row_and_memory_budgets() {
+    // the diff itself is held under --max-rows, and under the max-rows a request asks for
+    let s = class_server(|_| {}).await;
+    let r = get(
+        &s.app,
+        "/h/diff?from=commit:5&to=commit:6&group=class&max-rows=100",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(r.json()["budget"], "rows");
+    // the grouping and the diff it holds are charged to the memory budget
+    let ds = s.state.datasets()["h"].clone();
+    let nt: String = (0..20_000)
+        .map(|i| format!("<urn:r{i}> <{RDF_TYPE_IRI}> <urn:C> .\n"))
+        .collect();
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let head = ds.store.head_commit().seq;
+    let uri = format!("/h/diff?to=commit:{head}&group=class");
+    let r = get(&s.app, &format!("{uri}&memory-mb=1")).await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(r.json()["budget"], "memory");
+    let r = get(&s.app, &uri).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(
+        group_of(&r.json(), Some("urn:C"), RDF_TYPE_IRI, cls("urn:C")),
+        Some((20_000, 0))
+    );
+    // a small grouping fits the same budget
+    let r = get(
+        &s.app,
+        "/h/diff?from=commit:6&to=commit:7&group=class&memory-mb=1",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    // a request that cannot finish in time stops
+    let r = get(&s.app, &format!("{uri}&timeout=0.000001")).await;
+    assert!(
+        matches!(
+            r.status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "{} {}",
+        r.status,
+        r.text()
+    );
+}
+
+#[tokio::test]
+async fn grouped_diffs_charge_the_server_memory_pool_and_give_it_back() {
+    const MIB: u64 = 1 << 20;
+    let s = server_with_pool(Some(4 * MIB), |_| {}).await;
+    let pool = s.state.catalog.pool().expect("a pool").clone();
+    let ds = s.state.datasets()["h"].clone();
+    // 60,000 typed resources: the diff of their load is more than the pool holds
+    let nt: String = (0..60_000)
+        .map(|i| format!("<urn:r{i}> <{RDF_TYPE_IRI}> <urn:C> .\n"))
+        .collect();
+    ds.store
+        .load(&[sparkles::io::Source::from_bytes(
+            nt.into_bytes(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    update(&s.app, "h", "INSERT DATA { <urn:r1> <urn:q> <urn:o> }").await;
+    let head = ds.store.head_commit().seq;
+    let r = get(
+        &s.app,
+        &format!("/h/diff?to=commit:{}&group=class", head - 1),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    assert_eq!(r.json()["budget"], "server-memory");
+    assert_eq!(pool.granted(), 0);
+    // one change among many typed resources: a seek for its class
+    let r = get(&s.app, &format!("/h/diff?to=commit:{head}&group=class")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let d = r.json();
+    assert_eq!(
+        group_of(&d, Some("urn:C"), "urn:q", json!({ "iri": true })),
+        Some((1, 0)),
+        "{d}"
+    );
+    assert_eq!(pool.granted(), 0);
+}
+
+#[tokio::test]
+async fn grouped_diffs_of_a_gone_commit_are_410() {
+    let s = server(|_| {}).await;
+    // without the change log, the gone state cannot be diffed through it
+    let r = put_json(
+        &s.app,
+        "/$/history/h",
+        r#"{"changeLog": {"enabled": false}}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    compact_until_gone(&s).await;
+    let r = get(&s.app, "/h/diff?from=commit:1&to=commit:2&group=class").await;
+    assert_eq!(r.status, StatusCode::GONE, "{}", r.text());
+    assert_eq!(r.json()["code"], "history-gone", "{}", r.text());
+}

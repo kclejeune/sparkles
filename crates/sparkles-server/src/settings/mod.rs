@@ -18,6 +18,7 @@
 
 pub mod http;
 pub mod merge;
+pub mod paths;
 #[cfg(test)]
 mod prefix_tests;
 pub mod prefixes;
@@ -174,8 +175,21 @@ pub static GRAPHRAG: Kind = Kind {
     check: check_as::<crate::graphrag::settings::GraphragSettings>,
 };
 
+/// The path finder's defaults (spec U09).
+pub static PATHS: Kind = Kind {
+    name: "paths",
+    scope: Scope::Dataset,
+    file: paths::PATHS_FILE,
+    members: paths::MEMBERS,
+    removable: &[],
+    shared: false,
+    defaults: defaults_of::<paths::PathSettings>,
+    normalize: normalize_as::<paths::PathSettings>,
+    check: check_as::<paths::PathSettings>,
+};
+
 /// Every dataset-wide kind, in the order the answers list them.
-pub static KINDS: [&Kind; 5] = [&ASSISTANT, &MEMORY, &INGEST, &PREFIXES, &GRAPHRAG];
+pub static KINDS: [&Kind; 6] = [&ASSISTANT, &MEMORY, &INGEST, &PREFIXES, &GRAPHRAG, &PATHS];
 
 /// The server-wide `notifications` kind (spec C21 §5): channels, routes and delivery,
 /// declared in the settings file's `server.notifications` and kept at runtime in

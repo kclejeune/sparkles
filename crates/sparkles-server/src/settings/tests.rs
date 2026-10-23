@@ -782,3 +782,65 @@ async fn models_reload() {
     let v = st.settings.status_json(&st);
     assert!(v["models"]["error"].is_string(), "{v}");
 }
+
+/// The `paths` kind (U09): the path finder's skipped predicates, declared per dataset,
+/// changed at runtime, kept in `paths.json` with its format member, and checked.
+#[tokio::test(flavor = "multi_thread")]
+async fn path_finder_defaults_are_a_dataset_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("settings.json");
+    let subject = "http://purl.org/dc/terms/subject";
+    std::fs::write(
+        &f,
+        json!({"datasets": {"dbp": {"paths": {"excludedPredicates": [subject]}}}}).to_string(),
+    )
+    .unwrap();
+    let st = state(&dir.path().join("data"), Some(&f));
+    st.create("dbp", DbType::Persistent).unwrap();
+    st.create("plain", DbType::Persistent).unwrap();
+    let app = crate::http::router(st.clone());
+    let (s, v, _) = send(&app, req("GET", "/$/settings/plain/paths", None)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["effective"]["excludedPredicates"],
+        json!([
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://www.w3.org/2002/07/owl#sameAs"
+        ])
+    );
+    assert_eq!(v["sources"]["excludedPredicates"], "default");
+    let (_, v, _) = send(&app, req("GET", "/$/settings/dbp/paths", None)).await;
+    assert_eq!(v["effective"]["excludedPredicates"], json!([subject]));
+    assert_eq!(v["sources"]["excludedPredicates"], "declared");
+    // a runtime change, kept in paths.json with its format member
+    let both = json!(["http://www.w3.org/1999/02/22-rdf-syntax-ns#type", subject]);
+    let (s, v, _) = send(
+        &app,
+        req(
+            "PATCH",
+            "/$/settings/dbp/paths",
+            Some(json!({"excludedPredicates": both})),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["effective"]["excludedPredicates"], both);
+    let ds = st.get("dbp").unwrap();
+    let file: Value = serde_json::from_slice(
+        &std::fs::read(ds.store.root().unwrap().join("paths.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(file, json!({"format": 1, "excludedPredicates": both}));
+    // a value that is not an IRI is refused
+    let (s, v, _) = send(
+        &app,
+        req(
+            "PATCH",
+            "/$/settings/dbp/paths",
+            Some(json!({"excludedPredicates": ["dc subject"]})),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("not an absolute IRI"), "{v}");
+}

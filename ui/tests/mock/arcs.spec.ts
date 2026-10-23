@@ -633,3 +633,26 @@ test.describe('at 390 px', () => {
     await page.screenshot({ path: `${SHOTS}/result-arcs-390.png` });
   });
 });
+
+test('the path finder draws on the graph, so opening it leaves the map until it closes', async ({
+  page,
+}) => {
+  await openExploreMap(page);
+  const seg = page.getByRole('group', { name: 'Show the graph as' });
+  await page.locator('body').click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press('Shift+P');
+  await expect(page.getByRole('region', { name: 'Paths' })).toBeVisible();
+  await expect(page.locator('.arcmap')).toHaveCount(0);
+  await expect(page.locator('.wrap[data-graph]')).toBeVisible();
+  await expect(seg.getByRole('button', { name: 'Graph' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(seg.getByRole('button', { name: 'Map' })).toBeDisabled();
+  // Shift+M waits for the path finder to close
+  await page.locator('.wrap[data-graph]').click({ position: { x: 5, y: 5 } });
+  await page.keyboard.press('Shift+M');
+  await expect(page.locator('.arcmap')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Paths', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Paths' })).toHaveCount(0);
+  await expect(seg.getByRole('button', { name: 'Map' })).toBeEnabled();
+  await page.keyboard.press('Shift+M');
+  await expect(page.locator('.arcmap')).toHaveAttribute('data-loading', 'false');
+});

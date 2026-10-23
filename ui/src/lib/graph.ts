@@ -86,6 +86,7 @@ export function triplesToGraph(
       label: labels.get(id) ?? nodeLabel(t, prefixes),
       kind: kindOf(t),
       title: t.type === 'uri' ? t.value : t.value.toString(),
+      term: t,
     });
     return true;
   };
@@ -119,6 +120,7 @@ export function triplesToGraph(
       label: p.type === 'uri' ? shortLabel(p.value, prefixes) : nodeLabel(p, prefixes),
       title: p.type === 'uri' ? p.value : undefined,
       isType,
+      triple: [s, p, o],
       ...(mark ? { change: mark } : {}),
     });
   });

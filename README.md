@@ -240,8 +240,8 @@ orders every item by difficulty and impact and links each to its design spec.
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
-graphs and maps, with arcs for the relations between located entities, a resource explorer, schema and validation views, branch history and
-merges, a time slider over past commits, the Ask bar, and agent memory. The first screenshots show an answered question,
+graphs and maps, with arcs for the relations between located entities, a pattern view of each query that edits it as text, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
+merges, a time slider over past commits with commit diffs drawn as graphs, the Ask bar, and agent memory. The first screenshots show an answered question,
 agent memory, the map view and a merge preview.
 
 <table>
@@ -309,11 +309,27 @@ agent memory, the map view and a merge preview.
   </tr>
   <tr>
     <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing two GraphRAG communities inside Engineering, with the payments team's report beside the picture and one of its findings chosen"></td>
-    <td></td>
+    <td><img src="docs/images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest paths from Ada Okafor to Carlos Mendes and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
   </tr>
   <tr>
     <td>The dataset grouped by its GraphRAG communities, with a report beside it</td>
-    <td></td>
+    <td>The three shortest paths between two people</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block"></td>
+    <td><img src="docs/images/diff-graph.png" alt="The diff graph of one commit with context, drawing a new start date in green and the corrected one as a dashed ghost around the unchanged edges of the person"></td>
+  </tr>
+  <tr>
+    <td>The pattern of a query, drawn beside its text</td>
+    <td>A commit's changes drawn as a graph of their own</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/diff-lapse.png" alt="A time-lapse over four commits with ghosts kept, showing the changes of each commit added in green and removed ones as dashed ghosts, with a running total of changes since the start"></td>
+    <td><img src="docs/images/explore-lenses.png" alt="The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend in the corner"></td>
+  </tr>
+  <tr>
+    <td>A time-lapse that applies one commit's diff per step</td>
+    <td>Lenses that size and colour the graph and dash its inferred edges</td>
   </tr>
 </table>
 

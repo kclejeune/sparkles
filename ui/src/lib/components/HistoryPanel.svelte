@@ -28,6 +28,7 @@
   import { load, save } from '$lib/storage';
   import { LatestRun } from '$lib/supersede';
   import CommitGraph from './CommitGraph.svelte';
+  import { diffGraphHref } from '$lib/diff-graph';
   import DiffLines from './DiffLines.svelte';
   import Icon from './Icon.svelte';
 
@@ -212,6 +213,22 @@
     }
   }
 
+  /** Draw what commit `c` changed as a graph in Explore (U01 Phase 4). */
+  function showOnGraph(c: api.Commit) {
+    app.setDataset(name);
+    goto(
+      diffGraphHref(
+        resolve('/explore'),
+        name,
+        `commit:${c.seq}`,
+        `commit:${Math.max(c.seq - 1, 0)}`,
+        {
+          branch,
+        },
+      ),
+    );
+  }
+
   function queryAt(c: api.Commit) {
     app.setDataset(name);
     app.queryBranch = branch ?? '';
@@ -392,6 +409,13 @@
                       title="Show what this commit changed"
                       disabled={c.seq === 0}
                       onclick={() => showDiff(c)}>Diff</button
+                    >
+                    <button
+                      class="btn ghost icon sm"
+                      aria-label="Show commit {c.seq} on the graph"
+                      title="Draw what this commit changed as a graph"
+                      disabled={c.seq === 0}
+                      onclick={() => showOnGraph(c)}><Icon name="graph" size={12} /></button
                     >
                     <button
                       class="btn ghost icon sm"

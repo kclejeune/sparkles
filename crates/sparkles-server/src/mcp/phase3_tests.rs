@@ -89,6 +89,69 @@ async fn find_paths() {
     assert_eq!(e["code"], "bad-argument");
 }
 
+/// `ex:a` reaches `ex:d` through the hub `ex:h` in two edges, or along a chain of
+/// `ex:next` in three. The hub has six edges, and `ex:tag` links both ends to a class.
+const HUB: &str = r#"@prefix ex: <http://ex.org/> .
+ex:a ex:next ex:b . ex:b ex:next ex:c . ex:c ex:next ex:d .
+ex:a ex:near ex:h . ex:h ex:near ex:d .
+ex:h ex:near ex:x1 , ex:x2 , ex:x3 , ex:x4 .
+ex:a ex:tag ex:T . ex:d ex:tag ex:T .
+"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn find_paths_skips_predicates_and_hubs() {
+    let mut c = Client::start(server_with(&[("t", &[HUB])], McpConfig::default()));
+    let length = |s: &Value| s["paths"][0]["length"].clone();
+    let both = json!({"source": "ex:a", "target": "ex:d", "direction": "both"});
+    let with = |extra: Value| {
+        let mut a = both.clone();
+        a.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        a
+    };
+    // both ways, the class and the hub are each two edges
+    let s = c.structured("find_paths", both.clone()).await;
+    assert_eq!(length(&s), 2);
+    let s = c
+        .structured(
+            "find_paths",
+            with(json!({"excludePredicates": ["ex:tag"], "algorithm": "allShortest"})),
+        )
+        .await;
+    assert_eq!(
+        s["paths"],
+        json!([{"source": "ex:a", "target": "ex:d", "length": 2, "cost": 2,
+            "edges": ["ex:a ex:near ex:h", "ex:h ex:near ex:d"]}])
+    );
+    // the hub has six edges both ways
+    let s = c
+        .structured(
+            "find_paths",
+            with(json!({"excludePredicates": ["ex:tag"], "maxDegree": 5})),
+        )
+        .await;
+    assert_eq!(length(&s), 3, "{s}");
+    let s = c
+        .structured(
+            "find_paths",
+            with(json!({"excludePredicates": ["ex:tag"], "maxDegree": 6})),
+        )
+        .await;
+    assert_eq!(length(&s), 2, "{s}");
+    // errors
+    let (t, e) = c
+        .error(
+            "find_paths",
+            with(json!({"predicates": ["ex:next"], "excludePredicates": ["ex:tag"]})),
+        )
+        .await;
+    assert!(t.contains("not both"), "{t}");
+    assert_eq!(e["code"], "bad-argument");
+    let (t, _) = c.error("find_paths", with(json!({"maxDegree": 0}))).await;
+    assert!(t.contains("maxDegree"), "{t}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_algorithm() {
     let mut c = Client::start(server_with(&[("t", &[CHAIN])], McpConfig::default()));

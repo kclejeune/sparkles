@@ -573,7 +573,7 @@ fn parameters() -> Map<String, J> {
         q(
             "reasoning",
             json!({ "type": "boolean" }),
-            "Include materialized inferences. The default is true when the dataset has any.",
+            "Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off.",
         ),
     );
     put(

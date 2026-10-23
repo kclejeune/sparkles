@@ -1146,6 +1146,37 @@ because the bidirectional search stops where its frontiers meet. Searching from 
 person to everyone costs 1.4–1.8× the `+` count, since it also keeps path parents and
 levels, and weighted search costs 5.6–6.3× the unweighted search.
 
+#### Skipped predicates and hubs (2026-10-23)
+
+[U09](specs/U09-path-finder.md) Phase 1 added `path:excludePredicate` and
+`path:maxDegree`, and stopped searches backward and both ways from passing through
+literals. A Namespace screen checked that searches which use neither parameter cost the
+same. It ran on an 8-vCPU AMD EPYC instance with the 10.5M-triple data, in four rounds of
+A, B, B, A with 20 timed requests per query and server process, one server CPU and one
+client CPU. A is the build before the change and B the lane's tip. The queries are the
+path searches of the table above and `ps-every-both`, a search both ways over every
+triple from person 0 to the last person.
+
+| query | A median | B median | B/A |
+|---|---:|---:|---:|
+| `ps-pair` | 2.93 | 2.66 | 0.91 |
+| `ps-pair-all` | 2.85 | 2.65 | 0.93 |
+| `ps-pair-both` | 1.26 | 1.30 | 1.03 |
+| `ps-pair-k5` | 73.2 | 69.2 | 0.95 |
+| `ps-values10` | 14.3 | 13.7 | 0.95 |
+| `ps-all4` | 0.093 | 0.102 | 1.09 |
+| `ps-any` | 388 | 393 | 1.01 |
+| `ps-every-both` | 16.7 | 15.2 | 0.91 |
+
+Times are the server's execution times in milliseconds, and the geometric mean of B/A is
+0.97. The medians of one build varied by up to 77% between server processes, so no change
+here is above the noise. A first screen of the literal fix checked for literals in every
+search with a lane read by the object, forward ones included, and made `ps-every-both`
+12% slower. The check now runs only in the lanes that can leave a literal, so a forward
+search never makes it. `ps-every-both` returns a different path of the same length as
+before, because skipping literal predecessors changes the order in which ties are found.
+Both answers pass through `rdf:type` classes and no literal.
+
 ### Graph algorithm polling
 
 Roadmap item 8 moved the cancellation and deadline checks of the graph algorithms
@@ -2234,6 +2265,24 @@ the commits in between, so a first read of an uncached state costs more than a r
 the native store, a read of the middle of a 50,000-commit history takes 42.33 ms on first
 use and 1.82 µs from the snapshot cache, a diff of one commit at the head 0.126 ms and of
 100 commits 0.181 ms, and reopening with a replay of all 50,000 commits 221.51 ms.
+
+### Diffs grouped by class
+
+These numbers are approximate. They come from a laptop that was running other work, and
+they wait for confirmation on forge. A base of 200,000 typed resources with one link each
+takes one commit of 1,000, 10,000 or 100,000 changes, half of them type triples of new
+resources and half links from those resources to the base. `Diff::group_by_class` reads
+the classes of both ends of each change, which here gives 30 groups. Times are the best of
+five, and `cargo test --release -p sparkles-core --test diff_groups -- --ignored` runs it.
+
+| Changes | Diff | Grouping by class |
+|---:|---:|---:|
+| 1,000 | 0.68 ms | 1.30 ms |
+| 10,000 | 5.35 ms | 11.21 ms |
+| 100,000 | 78.63 ms | 119.54 ms |
+
+Grouping costs about 1.2 µs per change on top of the diff, and it grows with the changes
+rather than with the dataset.
 
 <a id="backup-repositories-105m-triples"></a>
 
