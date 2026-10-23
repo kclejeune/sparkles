@@ -58,6 +58,21 @@
   --removed: var(--danger);
   --added-soft: var(--ok-soft);
   --removed-soft: var(--danger-soft);
+  /* the lens palette (docs/specs/U10-canvas-lenses.md §4.2): twelve qualitative colours and
+     "other", each at least 3:1 against --surface (lib/lens.test.ts checks it) */
+  --lens-1: #1f6fc5;
+  --lens-2: #d1580b;
+  --lens-3: #1b8a4a;
+  --lens-4: #c62f3b;
+  --lens-5: #7b4fc4;
+  --lens-6: #8c5a2b;
+  --lens-7: #c23d8e;
+  --lens-8: #0f7f86;
+  --lens-9: #7a7a00;
+  --lens-10: #3b3f9e;
+  --lens-11: #a3195b;
+  --lens-12: #a66a00;
+  --lens-other: #737b8c;
 
   --shadow-pop: 0 10px 30px -8px rgba(20, 26, 40, 0.25), 0 0 0 1px rgba(20, 26, 40, 0.06);
   --focus: 0 0 0 2px var(--surface), 0 0 0 4px rgba(36, 89, 199, 0.55);
@@ -92,6 +107,19 @@
     --danger: #ff7a70;
     --danger-soft: rgba(255, 122, 112, 0.12);
     --ok-soft: rgba(76, 201, 135, 0.12);
+    --lens-1: #6ea8ff;
+    --lens-2: #ff9a4d;
+    --lens-3: #4cc987;
+    --lens-4: #ff6b6b;
+    --lens-5: #b593ff;
+    --lens-6: #d29a63;
+    --lens-7: #ff7fc6;
+    --lens-8: #3ccfd6;
+    --lens-9: #c9c94a;
+    --lens-10: #8f94ff;
+    --lens-11: #ff6fa3;
+    --lens-12: #f0b84a;
+    --lens-other: #8b93a4;
     --shadow-pop: 0 14px 40px -10px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.06);
     --focus: 0 0 0 2px var(--surface), 0 0 0 4px rgba(126, 168, 255, 0.6);
   }
@@ -125,6 +153,19 @@
   --danger: #ff7a70;
   --danger-soft: rgba(255, 122, 112, 0.12);
   --ok-soft: rgba(76, 201, 135, 0.12);
+  --lens-1: #6ea8ff;
+  --lens-2: #ff9a4d;
+  --lens-3: #4cc987;
+  --lens-4: #ff6b6b;
+  --lens-5: #b593ff;
+  --lens-6: #d29a63;
+  --lens-7: #ff7fc6;
+  --lens-8: #3ccfd6;
+  --lens-9: #c9c94a;
+  --lens-10: #8f94ff;
+  --lens-11: #ff6fa3;
+  --lens-12: #f0b84a;
+  --lens-other: #8b93a4;
   --shadow-pop: 0 14px 40px -10px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.06);
   --focus: 0 0 0 2px var(--surface), 0 0 0 4px rgba(126, 168, 255, 0.6);
 }

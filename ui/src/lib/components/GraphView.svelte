@@ -3,6 +3,8 @@
   import fcose from 'cytoscape-fcose';
 
   import type { Mark } from '$lib/rowdiff';
+  import type { Term } from '$lib/api';
+  import type { EdgeTriple } from '$lib/explore-time';
 
   cytoscape.use(fcose);
 
@@ -24,6 +26,8 @@
     order?: number;
     /** The node's neighbours on a path, between which a new node is placed. */
     near?: string[];
+    /** The term the node stands for, for the lenses' reads. */
+    term?: Term;
   };
   export type GEdge = {
     id: string;
@@ -35,11 +39,14 @@
     change?: Mark;
     paths?: number[];
     order?: number;
+    /** The triple the edge stands for, for the inferred-edge lens. */
+    triple?: EdgeTriple;
   };
 </script>
 
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { badgeSvg, NO_ENCODING, OTHER, readPalette, sizeFactor, type Encoding } from '$lib/lens';
   import Icon from './Icon.svelte';
 
   let {
@@ -54,6 +61,8 @@
     pathFocus = null,
     onmenu,
     layoutNew = true,
+    lens = NO_ENCODING,
+    marked = null,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -85,6 +94,10 @@
      * no layout.
      */
     layoutNew?: boolean;
+    /** What the active lenses make each element look like (docs/specs/U10-canvas-lenses.md). */
+    lens?: Encoding;
+    /** Nodes to ring while the rest fade, such as those of a legend entry. */
+    marked?: string[] | null;
   } = $props();
 
   let host: HTMLDivElement;
@@ -105,7 +118,19 @@
   let motionOn = $state(false);
   let themeObserver: MutationObserver | undefined;
   let media: MediaQueryList | undefined;
-  const restyle = () => cy?.style(styles());
+  let palette: string[] = [];
+  let badgeInk = { fill: '#e5a117', ink: '#1a1300' };
+  const restyle = () => {
+    readLensColours();
+    cy?.style(styles());
+    applyLens();
+  };
+
+  function readLensColours() {
+    if (!host) return;
+    palette = readPalette(host);
+    badgeInk = { fill: cssVar('--spark'), ink: cssVar('--on-spark') };
+  }
 
   function cssVar(name: string) {
     return getComputedStyle(host).getPropertyValue(name).trim() || '#888';
@@ -184,6 +209,26 @@
           'font-weight': 600,
         },
       },
+      // lenses: size by step, colour by palette, a badge in the corner
+      { selector: 'node[lw > 0]', style: { width: 'data(lw)', height: 'data(lw)' } },
+      { selector: 'node[kind != "literal"][lc != ""]', style: { 'background-color': 'data(lc)' } },
+      { selector: 'node[kind = "literal"][lc != ""]', style: { 'border-color': 'data(lc)' } },
+      {
+        selector: 'node[badge != ""]',
+        style: {
+          'background-image': 'data(badge)',
+          'background-width': 'data(bw)',
+          'background-height': 14,
+          'background-position-x': '100%',
+          'background-position-y': '0%',
+          'background-offset-x': 'data(bx)',
+          'background-offset-y': -9,
+          'background-clip': 'none',
+          'background-image-containment': 'over',
+          'background-image-opacity': 1,
+          'bounds-expansion': 24,
+        },
+      },
       // compare mode: a solid green outline and "+" for what a later state added, a dashed
       // red outline and "−" for what it removed (the label carries the sign too)
       {
@@ -231,6 +276,11 @@
         },
       },
       { selector: 'edge[?isType]', style: { 'line-style': 'dashed', 'line-dash-pattern': [4, 3] } },
+      // the inferred-edge lens: dashed, with an "i" marker in the label
+      {
+        selector: 'edge[?inferred]',
+        style: { 'line-style': 'dashed', 'line-dash-pattern': [6, 4], width: 1.6 },
+      },
       {
         selector: 'edge[change = "added"]',
         style: { 'line-color': added, 'target-arrow-color': added, width: 2.4 },
@@ -274,18 +324,62 @@
         style: { width: 3.4, 'text-opacity': 1, 'font-weight': 600 },
       },
       { selector: 'node.phl', style: { 'border-width': 3 } },
+      { selector: '.dim', style: { opacity: 0.22 } },
+      {
+        selector: 'node.marked',
+        style: {
+          'underlay-color': spark,
+          'underlay-opacity': 0.3,
+          'underlay-padding': 6,
+          'underlay-shape': 'ellipse',
+        },
+      },
+      // the three dimmings (the selection, a focused path, a lens legend entry) compose:
+      // an element two of them dim is dimmer than one alone
       { selector: '.pdim', style: { opacity: 0.3 } },
-      // off the focused path and outside the selection: dimmer than either alone
-      { selector: '.pdim.muted', style: { opacity: 0.12 } },
+      { selector: '.pdim.muted, .dim.muted, .dim.pdim', style: { opacity: 0.12 } },
     ];
   }
 
   /** The sign a changed element's label starts with, so that colour is not the only cue. */
   const sign = (c: Mark | undefined) => (c === 'added' ? '+ ' : c === 'removed' ? '− ' : '');
 
-  /** An edge's label with the numbers of the paths it is on. */
+  /** The numbers of the found paths an edge is on, after its label. */
+  const pathSuffix = (e: GEdge) => (e.paths?.length ? ` · ${e.paths.join(',')}` : '');
+
+  /**
+   * An edge's label: its change sign, an "i" when it was inferred, the predicate and the
+   * numbers of the paths it is on.
+   */
   const edgeLabel = (e: GEdge) =>
-    sign(e.change) + e.label + (e.paths?.length ? ` · ${e.paths.join(',')}` : '');
+    sign(e.change) + (lens.inferred.has(e.id) ? 'ⓘ ' : '') + e.label + pathSuffix(e);
+
+  /** The data a node's lens look draws from. */
+  function nodeLens(n: Pick<GNode, 'id' | 'kind'>) {
+    const look = lens.nodes.get(n.id);
+    const base = n.kind === 'bnode' ? 12 : 18;
+    const lw = lens.size && n.kind !== 'literal' ? Math.round(base * sizeFactor(look?.size)) : 0;
+    const c = lens.colour ? look?.colour : undefined;
+    const lc = c == null ? '' : (palette[c] ?? palette[OTHER] ?? '');
+    const b = lens.badge ? (look?.badge ?? 0) : 0;
+    const text = b > 99 ? '99+' : String(b);
+    const bw = 16 + text.length * 6;
+    return {
+      lw,
+      lc,
+      badge: b ? badgeSvg(b, badgeInk.fill, badgeInk.ink) : '',
+      bw,
+      bx: Math.round(bw / 2),
+    };
+  }
+
+  /** The data an edge's lens look draws from. */
+  const edgeLens = (e: GEdge) => ({
+    inferred: lens.inferred.has(e.id),
+    // while inferred edges are dashed, a dash means nothing else
+    isType: !!e.isType && !lens.edge,
+    label: edgeLabel(e),
+  });
 
   const toEl = {
     node: (n: GNode): ElementDefinition => ({
@@ -302,6 +396,7 @@
         w: Math.min(190, n.label.length * 6 + 14),
         paths: (n.paths ?? []).join(','),
         onpath: !!n.paths?.length,
+        ...nodeLens(n),
       },
     }),
     edge: (e: GEdge): ElementDefinition => ({
@@ -310,12 +405,11 @@
         id: e.id,
         source: e.source,
         target: e.target,
-        label: edgeLabel(e),
         change: e.change ?? '',
         title: e.title,
-        isType: !!e.isType,
         paths: (e.paths ?? []).join(','),
         onpath: !!e.paths?.length,
+        ...edgeLens(e),
       },
     }),
   };
@@ -428,6 +522,7 @@
           const label = sign(n.change) + n.label;
           const color = n.color ?? '';
           const paths = (n.paths ?? []).join(',');
+          const look = nodeLens(n);
           const d = existing.data();
           if (
             d.label !== label ||
@@ -437,7 +532,10 @@
             d.expanded !== !!n.expanded ||
             d.title !== n.title ||
             d.color !== color ||
-            d.paths !== paths
+            d.paths !== paths ||
+            d.lw !== look.lw ||
+            d.lc !== look.lc ||
+            d.badge !== look.badge
           )
             existing.data({
               label,
@@ -450,6 +548,7 @@
               w: Math.min(190, n.label.length * 6 + 14),
               paths,
               onpath: !!n.paths?.length,
+              ...look,
             });
         } else {
           const el = cy!.add(toEl.node(n));
@@ -503,23 +602,20 @@
             have.removeClass('leaving');
             have.removeStyle('opacity');
           }
-          const label = edgeLabel(e);
+          const look = edgeLens(e);
           const paths = (e.paths ?? []).join(',');
           if (
-            have.data('label') !== label ||
+            have.data('label') !== look.label ||
             have.data('change') !== (e.change ?? '') ||
-            have.data('paths') !== paths
+            have.data('paths') !== paths ||
+            have.data('inferred') !== look.inferred ||
+            have.data('isType') !== look.isType
           )
-            have.data({ change: e.change ?? '', label, paths, onpath: !!e.paths?.length });
+            have.data({ change: e.change ?? '', paths, onpath: !!e.paths?.length, ...look });
         }
       }
     });
-    // what is drawn, as text, for the tests: the canvas has no elements to find
-    if (wrap && nodes.length <= 300)
-      wrap.dataset.graph = JSON.stringify({
-        nodes: [...wantNodes.values()].map((n) => [n.label, n.change ?? '']),
-        edges: [...wantEdges.values()].map((e) => [edgeLabel(e), e.change ?? '']),
-      });
+    writeTestData(wantNodes, wantEdges);
     applyPathFocus();
     // Too many edge labels turn into noise: show them only on hover/selection.
     const quiet = cy.edges().length > 60;
@@ -541,6 +637,64 @@
   }
 
   /**
+   * What is drawn, as text, for the tests: the canvas has no elements to find. Under a lens
+   * a node also has its look (its size step, palette index and badge) and an edge
+   * whether it is drawn as inferred.
+   */
+  function writeTestData(
+    wantNodes = new Map(nodes.map((n) => [n.id, n])),
+    wantEdges = new Map(edges.map((e) => [e.id, e])),
+  ) {
+    if (!wrap || nodes.length > 300) return;
+    const on = lens.size || lens.colour || lens.badge || lens.edge;
+    wrap.dataset.graph = JSON.stringify({
+      nodes: [...wantNodes.values()].map((n) =>
+        on ? [n.label, n.change ?? '', lens.nodes.get(n.id) ?? {}] : [n.label, n.change ?? ''],
+      ),
+      edges: [...wantEdges.values()].map((e) =>
+        on
+          ? [e.label + pathSuffix(e), e.change ?? '', lens.inferred.has(e.id) ? 'inferred' : '']
+          : [e.label + pathSuffix(e), e.change ?? ''],
+      ),
+    });
+  }
+
+  /** Draw the lenses' look on the elements already drawn. */
+  function applyLens() {
+    if (!cy) return;
+    const byNode = new Map(nodes.map((n) => [n.id, n]));
+    const byEdge = new Map(edges.map((e) => [e.id, e]));
+    cy.batch(() => {
+      cy!.nodes().forEach((el) => {
+        const n = byNode.get(el.id());
+        if (n) el.data(nodeLens(n));
+      });
+      cy!.edges().forEach((el) => {
+        const e = byEdge.get(el.id());
+        if (e) el.data(edgeLens(e));
+      });
+    });
+    writeTestData();
+  }
+
+  /** Ring the marked nodes and fade the rest. */
+  function applyMarks() {
+    if (!cy) return;
+    const set = new Set(marked ?? []);
+    cy.batch(() => {
+      cy!.elements().removeClass('marked dim');
+      if (!set.size) return;
+      cy!.nodes().forEach((el) => {
+        if (set.has(el.id())) el.addClass('marked');
+        else el.addClass('dim');
+      });
+      cy!.edges().forEach((el) => {
+        if (!(set.has(el.source().id()) && set.has(el.target().id()))) el.addClass('dim');
+      });
+    });
+  }
+
+  /**
    * Canvas resolution. Cytoscape defaults to devicePixelRatio, which on 1× and fractional
    * (1.25 / 1.5) displays leaves node edges and labels visibly jagged: elements are drawn
    * from cached textures rendered at power-of-two scales and resampled. Rendering at
@@ -549,6 +703,7 @@
   const pixelRatio = () => Math.min(3, Math.max(2, Math.ceil(window.devicePixelRatio || 1)));
 
   onMount(() => {
+    readLensColours();
     cy = cytoscape({
       container: host,
       style: styles(),
@@ -601,6 +756,18 @@
     void nodes;
     void edges;
     sync();
+    applyMarks();
+  });
+
+  // a lens's new look is drawn in place, without a layout
+  $effect(() => {
+    void lens;
+    applyLens();
+  });
+
+  $effect(() => {
+    void marked;
+    applyMarks();
   });
 
   $effect(() => {

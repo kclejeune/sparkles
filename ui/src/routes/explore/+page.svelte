@@ -57,6 +57,11 @@
   import DiffGraph from '$components/DiffGraph.svelte';
   import { quadIds, seqOf, stepAnnouncement, STEP_QUADS } from '$lib/diff-graph';
   import TextSearchView from '$components/TextSearchView.svelte';
+  import GraphListView, { type ListRow } from '$components/GraphListView.svelte';
+  import LensMenu from '$components/LensMenu.svelte';
+  import LensLegend from '$components/LensLegend.svelte';
+  import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
+  import { Lenses } from '$lib/lenses.svelte';
 
   type ENode = {
     id: string;
@@ -179,11 +184,14 @@
     seenTerms = new Map();
     changes = null;
     selection.clear();
+    lensPick = null;
+    graphEpoch++;
   }
   let graphView: GraphView | undefined = $state();
   // the reads of a view that goes away stop with it
   onDestroy(() => {
     selection.clear();
+    lenses.destroy();
     expandCtl.abort();
     for (const r of [graphRuns, detailRuns, schemaRuns, profileRuns, histRuns]) r.abortAll();
   });
@@ -405,6 +413,7 @@
       focus: n.id === focusId,
       expanded: n.expanded,
       change,
+      term: n.term,
     });
     const real = Object.values(nodes)
       .filter((n) => showLiterals || !n.lit)
@@ -428,14 +437,25 @@
         paths: n.paths,
         order: n.order,
         near: pathNear.get(n.key),
+        // the lenses read the path's nodes as they read the drawn ones
+        term: n.term,
       }));
     return [...marked, ...extra];
   });
   const gEdges = $derived.by((): GEdge[] => {
     const keep = (e: EEdge) => (showLiterals || !e.lit) && (!hideTypes || !e.isType);
+    const tripleOf = (e: EEdge): EdgeTriple | undefined => {
+      const s = nodes[e.source]?.term;
+      const o = nodes[e.target]?.term;
+      return s && o && e.title ? [s, { type: 'uri', value: e.title }, o] : undefined;
+    };
     const real = Object.values(edges)
       .filter(keep)
-      .map((e) => (changes?.addedEdges.has(e.id) ? { ...e, change: 'added' as const } : e));
+      .map((e) => ({
+        ...e,
+        triple: tripleOf(e),
+        ...(changes?.addedEdges.has(e.id) ? { change: 'added' as const } : {}),
+      }));
     const ghosts = Object.values(changes?.ghostEdges ?? {})
       .filter(keep)
       .map((e) => ({ ...e, change: 'removed' as const }));
@@ -456,6 +476,7 @@
         paths: e.paths,
         order: e.order,
         change: pathChange.get(e.id),
+        triple: [e.s, { type: 'uri', value: e.p }, e.o],
       }));
     return [...marked, ...extra];
   });
@@ -550,6 +571,8 @@
     // the paths are drawn on the graph, not on the map or the diff graph
     if (diffView) exitDiff();
     if (canvasMode === 'map') setCanvasMode('graph');
+    // and on the canvas, not the list
+    listView = false;
     pathsOpen = true;
     menu = null;
     queueMicrotask(() => pathPanel?.focus());
@@ -615,6 +638,68 @@
   function fitPath(p: pf.FoundPath) {
     graphView?.fitTo(p.nodes.map((t) => termKey(t)));
   }
+
+  // --- lenses (docs/specs/U10-canvas-lenses.md) ------------------------------------------
+
+  const lenses = new Lenses();
+  /** The drawn graph as a list, with a column per active lens. */
+  let listView = $state(false);
+  /** The legend entry whose nodes are selected. */
+  let lensPick = $state<string | null>(null);
+  /** Its nodes while the entry exists. */
+  const lensMarked = $derived(entryIds(lenses.results, lensPick));
+  /** Bumped whenever the graph is drawn from new reads, so that lens values are read again. */
+  let graphEpoch = $state(0);
+  const dsInfo = $derived(app.datasets.find((d) => d.name === ds));
+  /** Materialized inferences or RDFS on read: the inferred-edge lens exists (§2.7). */
+  const hasReasoning = $derived(!!dsInfo?.reasoning || !!dsInfo?.rdfs);
+  $effect(() => {
+    const name = ds;
+    if (!name) return;
+    lenses.setInput({
+      ds: name,
+      at: graphTimeOpen && exAt ? exAt : undefined,
+      epoch: graphEpoch,
+      nodes: gNodes.map((n) => ({ id: n.id, term: n.term })),
+      // the ghosts of a comparison are not in the state the lenses read
+      edges: gEdges
+        .filter((e) => e.change !== 'removed')
+        .map((e) => ({ id: e.id, source: e.source, target: e.target, triple: e.triple })),
+      reasoning: hasReasoning,
+      label: (id) => nodes[id]?.label ?? id,
+      short: (iri) => shortLabel(iri, prefixes),
+    });
+  });
+  /** The list view's rows: the drawn nodes, ordered by the size lens when one is on. */
+  const listRows = $derived.by((): ListRow[] => {
+    const size = lenses.results.size;
+    const degree = new Map<string, number>();
+    for (const e of gEdges) {
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+    const look = lenses.encoding.nodes;
+    return gNodes.map((n) => {
+      const v = size?.values.get(n.id);
+      const c = look.get(n.id)?.colour;
+      return {
+        key: n.id,
+        label: n.label,
+        kind: n.change === 'removed' ? 'removed' : n.kind === 'iri' ? 'resource' : n.kind,
+        size: typeof v === 'number' ? v : -Infinity,
+        degree: degree.get(n.id) ?? 0,
+        color:
+          c == null
+            ? `var(--${n.kind === 'iri' ? 'iri' : n.kind})`
+            : c === OTHER
+              ? 'var(--lens-other)'
+              : `var(--lens-${c + 1})`,
+        openable: n.kind === 'iri',
+        marked: !!lensMarked?.includes(n.id),
+        title: [n.title ?? n.label, lensDescribe(n.id, lenses.results)].filter(Boolean).join('\n'),
+      };
+    });
+  });
 
   function labelFor(t: Term, label?: string) {
     if (label) return label;
@@ -848,6 +933,7 @@
           present.add(termKey(nb.term));
         }
       }
+      graphEpoch++;
       // the graph is rebuilt in one step, so that what stays keeps its place
       const rootTerm = seenTerms.get(root);
       if (!rootTerm) return;
@@ -1859,6 +1945,20 @@
                   onclick={() => setCanvasMode('map')}><Icon name="map" size={13} /> Map</button
                 >
               </div>
+              {#if canvasMode === 'graph'}
+                <LensMenu
+                  {lenses}
+                  short={(iri) => shortLabel(iri, prefixes)}
+                  keys={tab === 'graph' && canvasMode === 'graph'}
+                />
+                <button
+                  class="btn sm"
+                  aria-pressed={listView}
+                  title="The drawn nodes as a list, with a column per lens"
+                  onclick={() => (listView = !listView)}
+                  ><Icon name="table" size={13} /> List</button
+                >
+              {/if}
               <button
                 class="btn sm"
                 aria-pressed={graphTimeOpen}
@@ -1947,46 +2047,70 @@
             </div>
           {:else}
             <div class="cy-host">
-              <GraphView
-                bind:this={graphView}
-                animate={graphTimeOpen}
-                nodes={gNodes}
-                edges={gEdges}
-                selected={selectedId}
-                onselect={select}
-                onexpand={expand}
-                highlight={selection.ids}
-                pathFocus={pathHighlight}
-                onmenu={(id, at) => (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
-              />
-              {#if menu}
-                <div
-                  class="node-menu"
-                  role="menu"
-                  aria-label="Node actions"
-                  style="left: {menu.x}px; top: {menu.y}px"
-                >
-                  <button
-                    role="menuitem"
-                    class="btn sm ghost"
-                    onclick={() => openPaths({ from: menu!.id })}>Paths from here</button
+              {#if listView}
+                <GraphListView
+                  rows={listRows}
+                  plain
+                  label="Drawn nodes"
+                  lensColumns={lenses.columns}
+                  selected={selectedId}
+                  onselect={select}
+                  openLabel="Focus"
+                  onopen={(id) => {
+                    const n = nodes[id];
+                    if (n?.term.type === 'uri') void focusOn(n.iri, n.label);
+                  }}
+                />
+              {:else}
+                <GraphView
+                  bind:this={graphView}
+                  animate={graphTimeOpen}
+                  nodes={gNodes}
+                  edges={gEdges}
+                  selected={selectedId}
+                  onselect={select}
+                  onexpand={expand}
+                  highlight={selection.ids}
+                  pathFocus={pathHighlight}
+                  onmenu={(id, at) =>
+                    (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
+                  lens={lenses.encoding}
+                  marked={lensMarked}
+                />
+                {#if menu}
+                  <div
+                    class="node-menu"
+                    role="menu"
+                    aria-label="Node actions"
+                    style="left: {menu.x}px; top: {menu.y}px"
                   >
-                  <button
-                    role="menuitem"
-                    class="btn sm ghost"
-                    onclick={() => openPaths({ to: menu!.id })}>Paths to here</button
-                  >
-                  <button
-                    role="menuitem"
-                    class="btn sm ghost"
-                    onclick={() => {
-                      const id = menu!.id;
-                      menu = null;
-                      void expand(id);
-                    }}>Expand</button
-                  >
-                </div>
+                    <button
+                      role="menuitem"
+                      class="btn sm ghost"
+                      onclick={() => openPaths({ from: menu!.id })}>Paths from here</button
+                    >
+                    <button
+                      role="menuitem"
+                      class="btn sm ghost"
+                      onclick={() => openPaths({ to: menu!.id })}>Paths to here</button
+                    >
+                    <button
+                      role="menuitem"
+                      class="btn sm ghost"
+                      onclick={() => {
+                        const id = menu!.id;
+                        menu = null;
+                        void expand(id);
+                      }}>Expand</button
+                    >
+                  </div>
+                {/if}
               {/if}
+              <LensLegend
+                results={lenses.results}
+                selected={lensMarked ? lensPick : null}
+                onselect={(key) => (lensPick = key)}
+              />
             </div>
             <div class="hint faint">
               Double-click a node to load its neighbours. Blue-ringed nodes are expanded.
@@ -2932,6 +3056,8 @@
   .cy-host {
     flex: 1;
     min-height: 0;
+    /* the lens legend docks in its corner */
+    position: relative;
   }
   .seg {
     display: inline-flex;
@@ -3467,7 +3593,7 @@
     }
     .gtools {
       flex-wrap: wrap;
-      gap: 6px 10px;
+      gap: 6px 12px;
     }
     /* the path finder is a sheet over the graph, which folds to its first path */
     .split {

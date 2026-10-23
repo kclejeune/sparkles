@@ -32,6 +32,8 @@ export type DatasetInfo = {
     stale?: boolean | null;
     commitsSince?: number | null;
   };
+  /** RDFS on read, null when the dataset has none; absent on servers that predate it. */
+  rdfs?: null | { source: 'upload' | 'graph'; graph?: string };
   /** Clones: the source dataset id and commit this dataset was copied from. */
   forkedFrom?: { id: string; seq: number };
   /** Clones: the source and when the copy was made (`origin.json`). */

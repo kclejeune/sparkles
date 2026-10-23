@@ -325,11 +325,11 @@ agent memory, the map view and a merge preview.
   </tr>
   <tr>
     <td><img src="docs/images/diff-lapse.png" alt="A time-lapse over four commits with ghosts kept, showing the changes of each commit added in green and removed ones as dashed ghosts, with a running total of changes since the start"></td>
-    <td></td>
+    <td><img src="docs/images/explore-lenses.png" alt="The resource explorer with lenses on, sizing nodes by their degree in the dataset, colouring them by class, badging the nodes with inferred edges and drawing those edges dashed, with the legend in the corner"></td>
   </tr>
   <tr>
     <td>A time-lapse that applies one commit's diff per step</td>
-    <td></td>
+    <td>Lenses that size and colour the graph and dash its inferred edges</td>
   </tr>
 </table>
 

@@ -34,6 +34,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Branches and merges](#branches-and-merges)
 * [The Explore overview](#the-explore-overview)
 * [Arcs on the map](#arcs-on-the-map)
+* [Lenses on the graph](#lenses-on-the-graph)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
@@ -1613,6 +1614,48 @@ keeps a 44-pixel touch target. The pane needs the formatter's WebAssembly module
 [ui/README.md](../ui/README.md#formatting-in-the-browser)). Without it the pane says so
 and draws nothing.
 
+## Lenses on the graph
+
+A lens changes how the graph draws its nodes and edges from data about them. The resource
+graph in Explore and the query page's graph view have a **Lenses** menu in their toolbar
+(shortcut `Shift+L`) with one row per channel, and each channel has at most one lens on at
+a time.
+
+* **Size** draws a node's area in five steps of the drawn values, so that one outlier does
+  not flatten the rest. It offers the degree in the drawn graph, the degree in the dataset
+  and a numeric property of the drawn nodes. A node without a value keeps the smallest
+  size, and the legend counts it as "no value".
+* **Colour** gives twelve colours to the categories with the most nodes and "other" to the
+  rest. It offers the node's class, the named graph it is used in and a property's values.
+  The class lens reads the asserted classes, since with reasoning every node would also
+  be in each superclass. A node with several values takes the one most drawn nodes share.
+* **Badges** puts a pill with an `i` and a count in the corner of each node that has
+  inferred edges.
+* **Edges** draws the edges that the reasoner added dashed, with an `i` before their
+  label. An edge counts as inferred when the graph shows it and a read without reasoning
+  does not, which covers materialized inferences and RDFS on read alike. A triple that is
+  both asserted and inferred stays solid. While the lens is on, `rdf:type` edges are no
+  longer dashed, so that a dash means one thing.
+
+The edge lens is on by default when the dataset has materialized inferences or RDFS on
+read, and the badge and edge lenses are absent when it has neither. `Shift+1` to `Shift+4`
+turn the size, colour, badge and edge lens off and on again.
+
+The legend in the canvas's corner lists each encoding in words, such as "size is degree
+in the dataset, larger is higher" and "colour 3 is ex:Employee", with the number of nodes
+of each entry. Clicking an entry, or `Enter` on it, rings its nodes and fades the rest,
+and a second click clears them. **List** shows the drawn nodes as a table with a column
+per active lens, ordered by the size lens's value when one is on, and a screen reader
+hears each lens's result in a polite announcement. On a phone the menu is a bottom sheet
+and the legend a strip along the top of the graph that opens on a tap.
+
+The lenses read the drawn nodes with one query per 200 terms and at most four queries in
+flight, at the state the graph shows, so they follow the time slider. They read under the
+signed-in user's view, and a grown graph reads only its new nodes. Nothing they compute is
+saved. Lenses apply to at most 20,000 drawn nodes. On the query page, the edges of a
+`CONSTRUCT` result are also read with reasoning, so that a constructed triple that is not
+in the data is not taken for an inferred one.
+
 ## The time slider
 
 The web UI reads a past state of a dataset with a slider. It is a bar under the toolbar of
@@ -2370,7 +2413,9 @@ edge labelled by the paths that use it. With reduced motion they appear at once.
 under the form describes each path in words, and the keys `1` to `9` show one path, `A`
 shows them all and `Escape` shows them all again before it closes the panel. A shown path
 dims the elements off it, separately from the [shared selection](#arcs-on-the-map), which
-keeps its own dimming. The paths are drawn on the graph and not on the map, so opening the
+keeps its own dimming, and an element that two of them dim, or a lens legend entry and one
+of them, is dimmer still. Under the inferred-edge [lens](#lenses-on-the-graph) an inferred
+edge on a path keeps its dash and takes the path's colour. The paths are drawn on the graph and not on the map, so opening the
 panel switches Explore's canvas back to the graph, and **Map** and `Shift+M` wait until the
 panel closes. **Open in editor** opens the query in
 the query page, **Add to graph** keeps the paths' nodes in the explored graph, and **Clear**

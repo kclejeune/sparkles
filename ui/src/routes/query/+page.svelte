@@ -2,7 +2,7 @@
   import { afterNavigate, goto, replaceState } from '$app/navigation';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
-  import { onMount, tick, untrack } from 'svelte';
+  import { onDestroy, onMount, tick, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -28,7 +28,7 @@
   import { geoColumns } from '$lib/geo';
   import { locateEntities } from '$lib/locate';
   import { entityColumns, readAt } from '$lib/result-arcs';
-  import { triplesToGraph, type Triple } from '$lib/graph';
+  import { shortLabel, triplesToGraph, type Triple } from '$lib/graph';
   import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
   import { formatAny, lintAny } from '$lib/fmt-wasm';
@@ -98,6 +98,11 @@
   import { askPayload, decodeHandoff, type Handoff } from '$lib/handoff';
   import { parseCompact } from '$lib/compact';
   import TermView from '$components/TermView.svelte';
+  import GraphListView, { type ListRow } from '$components/GraphListView.svelte';
+  import LensMenu from '$components/LensMenu.svelte';
+  import LensLegend from '$components/LensLegend.svelte';
+  import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
+  import { Lenses, resultState } from '$lib/lenses.svelte';
 
   /**
    * A query tab; `stored` names the saved query it was opened from, and `ask` holds the
@@ -1855,6 +1860,74 @@
     graphTriples.some(([, p]) => p.type === 'uri' && p.value === RDF_TYPE),
   );
 
+  // --- lenses (docs/specs/U10-canvas-lenses.md) ------------------------------------------
+
+  const lenses = new Lenses();
+  onDestroy(() => lenses.destroy());
+  /** The drawn graph as a list, with a column per active lens. */
+  let graphList = $state(false);
+  /** The legend entry whose nodes are selected, and its nodes while it exists. */
+  let lensPick = $state<string | null>(null);
+  const lensMarked = $derived(entryIds(lenses.results, lensPick));
+  /** The graph on the canvas: the WebGL view's or the canvas renderer's. */
+  const drawnGraph = $derived(choice.renderer === 'webgl' ? graph : canvasGraph);
+  $effect(() => {
+    const o = outcome;
+    if (!o || o.view !== 'graph' || o.status !== 'done' || !o.result) return;
+    const info = app.datasets.find((d) => d.name === o.ds);
+    lenses.setInput({
+      ds: onBranch(o.ds, o.branch),
+      branch: o.branch,
+      // the lenses read the state the result was read at, the head's commit included
+      at: resultState(o.result),
+      epoch: o.startedAt,
+      nodes: drawnGraph.nodes.map((n) => ({ id: n.id, term: n.term })),
+      edges: drawnGraph.edges
+        .filter((e) => e.change !== 'removed')
+        .map((e) => ({ id: e.id, source: e.source, target: e.target, triple: e.triple })),
+      reasoning: (!!info?.reasoning && o.reasoning !== false) || !!info?.rdfs,
+      // a result's triples need not be in the data, so they are read with reasoning too
+      verify: true,
+      label: (id) => drawnGraph.nodes.find((n) => n.id === id)?.label ?? id,
+      short: (iri) => shortLabel(iri, prefixes),
+    });
+  });
+  $effect(() => {
+    void drawnGraph;
+    lensPick = null;
+  });
+  const graphRows = $derived.by((): ListRow[] => {
+    if (!graphList) return [];
+    const size = lenses.results.size;
+    const degree = new Map<string, number>();
+    for (const e of drawnGraph.edges) {
+      degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+      degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    }
+    const look = lenses.encoding.nodes;
+    const pick = new Set(lensMarked ?? []);
+    return drawnGraph.nodes.map((n) => {
+      const v = size?.values.get(n.id);
+      const c = look.get(n.id)?.colour;
+      return {
+        key: n.id,
+        label: n.label,
+        kind: n.kind === 'iri' ? 'resource' : n.kind,
+        size: typeof v === 'number' ? v : -Infinity,
+        degree: degree.get(n.id) ?? 0,
+        color:
+          c == null
+            ? `var(--${n.kind === 'iri' ? 'iri' : n.kind === 'triple' ? 'text-2' : n.kind})`
+            : c === OTHER
+              ? 'var(--lens-other)'
+              : `var(--lens-${c + 1})`,
+        openable: n.kind === 'iri',
+        marked: pick.has(n.id),
+        title: [n.title ?? n.label, lensDescribe(n.id, lenses.results)].filter(Boolean).join('\n'),
+      };
+    });
+  });
+
   // --- raw / downloads -------------------------------------------------------
 
   const rawJson = $derived.by(() => {
@@ -3107,6 +3180,20 @@
                   </select>
                 </label>
                 <span class="spacer"></span>
+                {#if drawnGraph.nodes.length}
+                  <LensMenu
+                    {lenses}
+                    short={(iri) => shortLabel(iri, prefixes)}
+                    keys={outcome.view === 'graph'}
+                  />
+                  <button
+                    class="btn sm"
+                    aria-pressed={graphList}
+                    title="The drawn nodes as a list, with a column per lens"
+                    onclick={() => (graphList = !graphList)}
+                    ><Icon name="table" size={13} /> List</button
+                  >
+                {/if}
                 <span class="faint"
                   >{fmtInt(
                     choice.renderer === 'webgl' ? graph.nodes.length : canvasGraph.nodes.length,
@@ -3140,7 +3227,18 @@
                 </div>
               {/if}
               <div class="gcanvas">
-                {#if choice.renderer === 'webgl'}
+                {#if graphList}
+                  <GraphListView
+                    rows={graphRows}
+                    plain
+                    label="Drawn nodes"
+                    lensColumns={lenses.columns}
+                    selected={largeSelected}
+                    onselect={(k) => (largeSelected = k)}
+                    openLabel="Explore"
+                    onopen={(k) => k.startsWith('<') && openIri(k.slice(1, -1))}
+                  />
+                {:else if choice.renderer === 'webgl'}
                   <LargeGraphView
                     nodes={largeNodes}
                     edges={largeEdges}
@@ -3149,9 +3247,13 @@
                     onselect={(k) => (largeSelected = k)}
                     onopen={(k) => (largeSelected = k)}
                     onfail={(reason) => (webglReason = reason)}
+                    lens={lenses.encoding}
+                    marked={lensMarked}
                   />
                 {:else}
                   <GraphView
+                    lens={lenses.encoding}
+                    marked={lensMarked}
                     nodes={canvasGraph.nodes}
                     edges={canvasGraph.edges}
                     onexpand={(id) => id.startsWith('<') && openIri(id.slice(1, -1))}
@@ -3160,6 +3262,11 @@
                       : 'No triples to draw'}
                   />
                 {/if}
+                <LensLegend
+                  results={lenses.results}
+                  selected={lensMarked ? lensPick : null}
+                  onselect={(key) => (lensPick = key)}
+                />
               </div>
               {#if choice.renderer === 'webgl'}
                 <div class="ghint faint">
@@ -4047,6 +4154,8 @@
   .gcanvas {
     flex: 1;
     min-height: 0;
+    /* the lens legend docks in its corner */
+    position: relative;
   }
   .ghint {
     padding: 4px 12px;

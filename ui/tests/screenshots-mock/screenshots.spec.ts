@@ -403,3 +403,40 @@ test('diff-lapse', async ({ page }) => {
   await page.waitForTimeout(1000);
   await shoot(page, 'diff-lapse');
 });
+
+test('explore-lenses', async ({ page, request }) => {
+  // the `foaf` dataset with OWL 2 RL materialized by the mock's reasoner: the symmetric
+  // foaf:knows and the domains and ranges add edges, which the inferred-edge lens dashes
+  const t = await request.post('/$/reason/foaf', { form: { profile: 'owl-rl' } });
+  expect(t.ok()).toBe(true);
+  await expect
+    .poll(async () => (await (await request.get('/$/reason/foaf')).json()).profile, {
+      timeout: 20_000,
+    })
+    .toBe('owl-rl');
+  const rows = await request.post('/foaf/sparql', {
+    headers: {
+      'Content-Type': 'application/sparql-query',
+      Accept: 'application/sparql-results+json',
+    },
+    data: `PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?p (COUNT(?o) AS ?n) WHERE { ?p foaf:knows ?o FILTER(STRSTARTS(STR(?p), "http://example.org/resource/")) }
+GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT 1`,
+  });
+  const person = (await rows.json()).results.bindings[0].p.value as string;
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
+  await page.goto(`/ui/explore?ds=foaf&iri=${encodeURIComponent(person)}`);
+  await expect(page.locator('.wrap[data-graph]')).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await menu.getByRole('combobox', { name: 'Size' }).selectOption('degree-dataset');
+  await menu.getByRole('combobox', { name: 'Colour' }).selectOption('class');
+  await menu.getByRole('combobox', { name: 'Badges' }).selectOption('inferred');
+  await expect(page.getByTestId('lens-status-colour')).toContainText('categor', {
+    timeout: 30_000,
+  });
+  await expect(page.getByTestId('lens-status-edge')).toContainText('inferred');
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: 'Fit to view' }).click();
+  await shoot(page, 'explore-lenses');
+});

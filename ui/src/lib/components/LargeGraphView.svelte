@@ -34,6 +34,7 @@
   import type Graph from 'graphology';
   import type Sigma from 'sigma';
   import type { LayoutStart, LayoutTick } from '$lib/layout.worker';
+  import { NO_ENCODING, OTHER, readPalette, sizeFactor, type Encoding } from '$lib/lens';
 
   let {
     nodes,
@@ -47,6 +48,7 @@
     label = 'Graph',
     marked = null,
     still = false,
+    lens = NO_ENCODING,
   }: {
     nodes: LNode[];
     edges: LEdge[];
@@ -66,6 +68,12 @@
      * holds still while a time-lapse changes its counts (U01 Phase 4).
      */
     still?: boolean;
+    /**
+     * What the active lenses make each element look like (docs/specs/U10-canvas-lenses.md):
+     * sizes and colours go through the node reducer, badges and the dashed inferred edges are
+     * drawn on the overlay, since sigma's edge programs have no dashes.
+     */
+    lens?: Encoding;
   } = $props();
 
   let host: HTMLDivElement;
@@ -82,7 +90,15 @@
   let lost = 0;
   let themeObserver: MutationObserver | undefined;
   let media: MediaQueryList | undefined;
-  let colors = { text: '#888', text2: '#888', surface: '#fff', edge: '#ccc', spark: '#e5a117' };
+  let colors = {
+    text: '#888',
+    text2: '#888',
+    surface: '#fff',
+    edge: '#ccc',
+    spark: '#e5a117',
+    onSpark: '#1a1300',
+  };
+  let palette: string[] = [];
   let ready = $state(false);
 
   const reduced = () =>
@@ -99,7 +115,9 @@
       surface: cssVar('--surface'),
       edge: cssVar('--border-strong'),
       spark: cssVar('--spark'),
+      onSpark: cssVar('--on-spark'),
     };
+    palette = readPalette(host);
     renderer?.setSetting('labelColor', { color: colors.text });
     renderer?.setSetting('defaultEdgeColor', colors.edge);
     renderer?.refresh();
@@ -179,9 +197,104 @@
       ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
       ctx.stroke();
     };
+    drawInferred(ctx, w, h);
     ring(selected, false);
     if (focusKey !== selected) ring(focusKey, true);
     for (const m of marked ?? []) if (m !== selected) ring(m, true);
+    drawBadges(ctx, w, h);
+  }
+
+  /** Inferred edges the overlay draws at most; past that they are drawn as other edges. */
+  const MAX_DASHED = 4000;
+  /** Badges the overlay draws at most, on screen. */
+  const MAX_BADGES = 1500;
+
+  /** The viewport position and radius of a node, or null when it is not drawn. */
+  function place(key: string) {
+    if (!renderer || !graph?.hasNode(key)) return null;
+    const d = renderer.getNodeDisplayData(key);
+    if (!d || d.hidden) return null;
+    const p = renderer.framedGraphToViewport({ x: d.x, y: d.y });
+    return { x: p.x, y: p.y, r: renderer.scaleSize(d.size) };
+  }
+
+  const dashOverlay = () => lens.edge && lens.inferred.size > 0 && lens.inferred.size <= MAX_DASHED;
+
+  /** The inferred edges, dashed, with an "i" at the middle of the longer ones. */
+  function drawInferred(ctx: CanvasRenderingContext2D, w: number, h: number) {
+    if (!dashOverlay() || !graph) return;
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 1.4;
+    ctx.font = `600 10px ${renderer?.getSetting('labelFont') ?? 'sans-serif'}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const focus = hovered ?? selected;
+    for (const key of lens.inferred) {
+      if (!graph.hasEdge(key)) continue;
+      const [s, t] = graph.extremities(key);
+      const a = place(s);
+      const b = place(t);
+      if (!a || !b) continue;
+      if (
+        (a.x < 0 && b.x < 0) ||
+        (a.y < 0 && b.y < 0) ||
+        (a.x > w && b.x > w) ||
+        (a.y > h && b.y > h)
+      )
+        continue;
+      const faded = near && !(near.has(s) && near.has(t) && (s === focus || t === focus));
+      ctx.strokeStyle = faded ? colors.edge : colors.text2;
+      ctx.globalAlpha = faded ? 0.5 : 1;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+      if (Math.hypot(b.x - a.x, b.y - a.y) > 60 && lens.inferred.size <= 600) {
+        const mx = (a.x + b.x) / 2;
+        const my = (a.y + b.y) / 2;
+        ctx.setLineDash([]);
+        ctx.fillStyle = colors.surface;
+        ctx.beginPath();
+        ctx.arc(mx, my, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = colors.text2;
+        ctx.fillText('i', mx, my + 0.5);
+        ctx.setLineDash([6, 4]);
+      }
+    }
+    ctx.restore();
+  }
+
+  /** The badges: a pill with "i" and the count at the upper right of each badged node. */
+  function drawBadges(ctx: CanvasRenderingContext2D, w: number, h: number) {
+    if (!lens.badge || !lens.nodes.size) return;
+    ctx.save();
+    ctx.font = `700 10px ${renderer?.getSetting('labelFont') ?? 'sans-serif'}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    let drawn = 0;
+    for (const [key, look] of lens.nodes) {
+      if (!look.badge || drawn >= MAX_BADGES) continue;
+      const p = place(key);
+      if (!p || p.x < -20 || p.y < -20 || p.x > w + 20 || p.y > h + 20) continue;
+      const text = `i${look.badge > 99 ? '99+' : look.badge}`;
+      const bw = 8 + text.length * 6;
+      const x = p.x + p.r * 0.7;
+      const y = p.y - p.r * 0.7 - 7;
+      ctx.fillStyle = colors.spark;
+      ctx.strokeStyle = colors.surface;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(x - 2, y, bw, 14, 7);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = colors.onSpark;
+      ctx.fillText(text, x - 2 + bw / 2, y + 7.5);
+      drawn++;
+    }
+    ctx.restore();
   }
 
   function edgeType() {
@@ -218,6 +331,10 @@
         defaultDrawNodeHover: drawHover as never,
         nodeReducer: (key, data) => {
           const res = { ...data };
+          const look = lens.nodes.get(key);
+          if (lens.size) res.size = (data.size as number) * sizeFactor(look?.size);
+          if (lens.colour && look?.colour != null)
+            res.color = palette[look.colour] ?? palette[OTHER] ?? res.color;
           if (near && !near.has(key)) {
             res.color = colors.edge;
             res.label = '';
@@ -234,6 +351,11 @@
         },
         edgeReducer: (key, data) => {
           const res = { ...data };
+          // the overlay draws the inferred edges dashed
+          if (dashOverlay() && lens.inferred.has(key)) {
+            res.hidden = true;
+            return res;
+          }
           if (near && graph) {
             const [s, t] = graph.extremities(key);
             if (
@@ -492,6 +614,12 @@
     void selected;
     void marked;
     if (ready) setFocusSet();
+  });
+
+  // a lens's new look is drawn in place, without a layout
+  $effect(() => {
+    void lens;
+    if (ready) untrack(() => renderer?.refresh());
   });
 
   /** Nodes up to which every label is drawn and the fit makes room for it. */

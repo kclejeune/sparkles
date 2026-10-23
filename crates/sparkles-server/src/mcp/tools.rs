@@ -639,6 +639,7 @@ impl Tools<'_> {
             .unwrap_or_default();
         if !reasoning {
             defaults.default_graph_extra.clear();
+            defaults.rdfs = None;
         }
         let mut opts = QueryOptions {
             timeout: Some(remaining(deadline)?),

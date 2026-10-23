@@ -9171,7 +9171,7 @@ export interface components {
         policy: string;
         /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
         profile: "io";
-        /** @description Include materialized inferences. The default is true when the dataset has any. */
+        /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
         reasoning: boolean;
         /** @description Add a commit receipt to the body. */
         receipt: boolean;
@@ -11655,7 +11655,7 @@ export interface operations {
             query?: {
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
             };
             header?: never;
@@ -14501,7 +14501,7 @@ export interface operations {
                 graph?: components["parameters"]["graphSel"];
                 /** @description The graphs read for declarations; the same as `graph` by default. */
                 declaredGraph?: string;
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description `all` also reads declarations from the inferred graph. */
                 declared?: "asserted" | "all";
@@ -14561,7 +14561,7 @@ export interface operations {
                 graph?: components["parameters"]["graphSel"];
                 /** @description The graphs read for declarations; the same as `graph` by default. */
                 declaredGraph?: string;
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description `all` also reads declarations from the inferred graph. */
                 declared?: "asserted" | "all";
@@ -14644,7 +14644,7 @@ export interface operations {
                 to?: string;
                 /** @description `default`, `union` or a graph IRI. `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph` work too. */
                 graph?: components["parameters"]["graphSel"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
@@ -14683,7 +14683,7 @@ export interface operations {
                 graph?: components["parameters"]["graphSel"];
                 /** @description The graphs read for declarations; the same as `graph` by default. */
                 declaredGraph?: string;
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description `all` also reads declarations from the inferred graph. */
                 declared?: "asserted" | "all";
@@ -14731,7 +14731,7 @@ export interface operations {
             query?: {
                 /** @description `default`, `union` or a graph IRI. `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph` work too. */
                 graph?: components["parameters"]["graphSel"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
@@ -14772,7 +14772,7 @@ export interface operations {
             query?: {
                 /** @description `default`, `union` or a graph IRI. `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph` work too. */
                 graph?: components["parameters"]["graphSel"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The share of instances a constraint must hold for. */
                 support?: number;
@@ -16352,7 +16352,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
@@ -16513,7 +16513,7 @@ export interface operations {
                 "named-graph-uri"?: components["parameters"]["namedGraphUri"];
                 /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
                 format?: components["parameters"]["format"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
@@ -16885,7 +16885,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
             };
             header?: {
@@ -17119,7 +17119,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
             };
             header?: {
@@ -17222,7 +17222,7 @@ export interface operations {
             query: {
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -17259,7 +17259,7 @@ export interface operations {
             query?: {
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -17374,7 +17374,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
             };
             header?: {
@@ -17422,7 +17422,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
             };
             header?: {
@@ -17464,7 +17464,7 @@ export interface operations {
             query?: {
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -17582,7 +17582,7 @@ export interface operations {
             query?: {
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -18100,7 +18100,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -18165,7 +18165,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Bypass the query result cache. */
                 nocache?: components["parameters"]["nocache"];
@@ -18246,7 +18246,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
@@ -18317,7 +18317,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
@@ -18417,7 +18417,7 @@ export interface operations {
                 graph?: components["parameters"]["graphSel"];
                 /** @description Validate one node, an IRI or prefixed name. */
                 target?: string;
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
@@ -18485,7 +18485,7 @@ export interface operations {
                 base?: string;
                 /** @description `default`, `union` or a graph IRI. `urn:x-arq:DefaultGraph` and `urn:x-arq:UnionGraph` work too. */
                 graph?: components["parameters"]["graphSel"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
@@ -18617,7 +18617,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
@@ -18688,7 +18688,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
@@ -18792,7 +18792,7 @@ export interface operations {
                 limit?: number;
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
                 branch?: components["parameters"]["branch"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
             };
             header?: never;
@@ -19122,7 +19122,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
             };
             header?: {
@@ -19348,7 +19348,7 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
                 reasoning?: components["parameters"]["reasoning"];
             };
             header?: {
