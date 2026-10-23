@@ -1255,8 +1255,10 @@ struct Engine<'a> {
     skipped_hubs: Cell<u64>,
     /// how a node's degree is counted in this call's view
     degree: DegreeCount,
-    /// some lane follows triples from their object, so a literal could be left by an
-    /// edge, which F07 §4.1 forbids: literals are then checked before they are expanded
+    /// some lane could leave a literal, which F07 §4.1 forbids: a successor lane read by
+    /// the object of its triples, or a predecessor lane read by the subject, whose
+    /// predecessors are objects. Literals are then checked before they are expanded. A
+    /// forward search has neither, so it never checks.
     sinks: bool,
 }
 
@@ -1339,7 +1341,12 @@ impl<'a> Engine<'a> {
             (Some(t), Some(vars)) => PatternEdges::of(t, vars),
             _ => PatternEdges::default(),
         };
-        let sinks = succ.iter().chain(&pred).any(|s: &Side| s.rev);
+        let sinks = succ
+            .iter()
+            .any(|s: &Side| s.lane.pattern || !s.lane.subject_side)
+            || pred
+                .iter()
+                .any(|s: &Side| s.lane.pattern || s.lane.subject_side);
         let degree = match spec.max_degree {
             None => DegreeCount::Scan,
             Some(_) => degree_count(ctx, &spec.graph)?,
@@ -1577,25 +1584,28 @@ impl<'a> Engine<'a> {
         if frontier.is_empty() {
             return Ok(());
         }
-        let start = out.len();
         let sides = if succ { &self.succ } else { &self.pred };
         for s in sides {
+            let start = out.len();
             // with both directions a self-loop is one edge, read from the first side
             if s.lane.pattern {
                 self.pattern_lane(&s.lane, frontier, s.rev, s.skip_self, out);
             } else {
                 self.scan_lane(&s.lane, frontier, s.rev, s.skip_self, out, usize::MAX)?;
             }
-        }
-        // a predecessor's edge leaves it, so a literal is never one
-        if self.sinks && !succ {
-            let snap = &self.ctx.snap;
-            let tail = out.split_off(start);
-            out.extend(
-                tail.into_iter().filter(|(_, st)| {
-                    snap.term_kind(Id(st.node)) != crate::store::TermKind::Literal
-                }),
-            );
+            // a predecessor's edge leaves it, so a literal is never one. Only a lane read
+            // by the subject, or a pattern, gives objects as predecessors.
+            if !succ && (s.lane.pattern || s.lane.subject_side) {
+                let snap = &self.ctx.snap;
+                let mut w = start;
+                for r in start..out.len() {
+                    if snap.term_kind(Id(out[r].1.node)) != crate::store::TermKind::Literal {
+                        out[w] = out[r];
+                        w += 1;
+                    }
+                }
+                out.truncate(w);
+            }
         }
         self.ctx.check()
     }
