@@ -12,6 +12,7 @@
   import { fmtInt, fmtRelative } from '$lib/format';
   import { displayIri } from '$lib/rdf';
   import * as gr from '$lib/graphrag';
+  import CommunityReport from './CommunityReport.svelte';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
 
@@ -22,6 +23,7 @@
     canWrite = false,
     readOnly = false,
     prefixes = {},
+    initial = null,
   }: {
     ds: string;
     /** The branch the page shows, null for main. The reports belong to main only. */
@@ -30,6 +32,8 @@
     canWrite?: boolean;
     readOnly?: boolean;
     prefixes?: Record<string, string>;
+    /** The community to show first (`?community=`), such as one Explore opened. */
+    initial?: string | null;
   } = $props();
 
   let st = $state<gr.GraphragStatus | null>(null);
@@ -136,6 +140,7 @@
       if (!onMain) return;
       void load();
       void findRunning();
+      if (initial) void open(initial);
     });
   });
 
@@ -267,14 +272,7 @@
     }
   }
 
-  const statusClass = (s: gr.ReportStatus | null | undefined) =>
-    s === 'reviewed'
-      ? 'ok'
-      : s === 'rejected' || s === 'failed'
-        ? 'danger'
-        : s === 'stale'
-          ? 'warn'
-          : 'spark';
+  const statusClass = gr.statusClass;
   const settingsHref = $derived(`${resolve('/datasets/[name]', { name: ds })}?tab=settings`);
 </script>
 
@@ -434,124 +432,25 @@
           {:else if detailError}
             <div class="error-box">{api.errorMessage(detailError)}</div>
           {:else if detail}
-            {@const r = detail.report}
-            <header>
-              <h3>{r?.title ?? short(detail.iri)}</h3>
-              <p class="faint mono small iri">{detail.iri}</p>
-              <p class="small">
-                Level {detail.level} · {fmtInt(detail.memberCount)} members · {fmtInt(
-                  detail.factCount,
-                )} facts
-                {#if detail.parent}
-                  · part of <button class="link" onclick={() => open(detail!.parent!)}
-                    >{short(detail.parent)}</button
-                  >
-                {/if}
-              </p>
-            </header>
-            {#if r}
-              <div class="row status-line">
-                <span class="badge {statusClass(r.status)}">{r.status}</span>
-                {#if r.rating != null}<span class="faint">importance {r.rating}/10</span>{/if}
-                {#if r.revisionOf}<span class="faint">edited revision</span>{/if}
-                <span class="spacer"></span>
-                {#if canWrite && !readOnly && r.status !== 'failed'}
-                  <button
-                    class="btn sm"
-                    disabled={reviewing || r.status === 'reviewed'}
-                    onclick={() => setStatus('reviewed')}
-                    ><Icon name="check" size={12} /> Reviewed</button
-                  >
-                  <button
-                    class="btn sm"
-                    disabled={reviewing || r.status === 'rejected'}
-                    onclick={() => setStatus('rejected')}><Icon name="x" size={12} /> Reject</button
-                  >
-                  <button class="btn sm" disabled={reviewing} onclick={startEdit}>Edit</button>
-                {/if}
-              </div>
-              {#if r.failure}
-                <div class="error-box"><strong>No report.</strong> {r.failure}</div>
-              {/if}
-              {#if r.summary}<p class="summary-text">{r.summary}</p>{/if}
-              {#if r.findings.length}
-                <ol class="findings">
-                  {#each r.findings as f, i (i)}
-                    <li>
-                      <p>{f.text}</p>
-                      {#if f.unmatchedNames.length}
-                        <p class="small warn-text">
-                          <Icon name="alert" size={11} /> Not found among the members: {f.unmatchedNames.join(
-                            ', ',
-                          )}
-                        </p>
-                      {/if}
-                      {#if f.cites.length}
-                        <details>
-                          <summary class="small faint"
-                            >{f.cites.length} citation{f.cites.length === 1 ? '' : 's'}</summary
-                          >
-                          <ul class="cites">
-                            {#each f.cites as c (c)}<li class="mono small">
-                                {gr.citeText(c)}
-                              </li>{/each}
-                          </ul>
-                        </details>
-                      {/if}
-                    </li>
-                  {/each}
-                </ol>
-              {/if}
-              <p class="small faint">
-                {#if r.activity}Written by {r.activity.model} from commit {r.sourceCommit}, {fmtInt(
-                    r.activity.inputTokens,
-                  )}
-                  + {fmtInt(r.activity.outputTokens)} tokens.{/if}
-                {#if r.droppedCitations || r.droppedUnsupported}
-                  The checks dropped {r.droppedCitations ?? 0} invalid citation{r.droppedCitations ===
-                  1
-                    ? ''
-                    : 's'} and
-                  {r.droppedUnsupported ?? 0} unsupported finding{r.droppedUnsupported === 1
-                    ? ''
-                    : 's'}.
-                {/if}
-              </p>
-            {:else}
-              <p class="faint">
-                This community has no report. It is smaller than the minimum size or still pending.
-              </p>
-            {/if}
-            {#if detail.children.length}
-              <h4>Sub-communities</h4>
-              <ul class="plain">
-                {#each detail.children as c (c.iri)}
-                  <li>
-                    <button class="link" onclick={() => open(c.iri)}
-                      >{c.title ?? short(c.iri)}</button
-                    >
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-            <h4>Members</h4>
-            <ul class="members">
-              {#each detail.members as m (m.iri)}
-                <li>
-                  <a
-                    href="{resolve('/explore')}?ds={encodeURIComponent(ds)}&iri={encodeURIComponent(
-                      m.iri,
-                    )}"
-                    title={m.iri}>{m.label ?? short(m.iri)}</a
-                  >
-                </li>
-              {/each}
-            </ul>
-            {#if detail.members.length < detail.memberCount}
-              <p class="small faint">
-                The first {detail.members.length} of {fmtInt(detail.memberCount)} members.
-              </p>
-            {/if}
+            {@const d = detail}
+            <CommunityReport
+              {ds}
+              detail={d}
+              {prefixes}
+              onopen={(iri) => open(iri)}
+              review={canWrite && !readOnly
+                ? { busy: reviewing, onstatus: setStatus, onedit: startEdit }
+                : null}
+            >
+              {#snippet actions()}
+                <a
+                  class="btn sm"
+                  href={gr.exploreHref(resolve('/explore'), ds, d.iri)}
+                  title="Draw this community among the others in the Explore overview"
+                  ><Icon name="graph" size={12} /> Show in Explore</a
+                >
+              {/snippet}
+            </CommunityReport>
           {/if}
         </div>
       </div>
@@ -689,75 +588,8 @@
     padding: 10px 14px;
     min-width: 0;
   }
-  .detail h3 {
-    margin: 0;
-    overflow-wrap: anywhere;
-  }
-  .detail h4 {
-    margin: 14px 0 4px;
-    font-size: var(--fs-sm);
-  }
-  .iri {
-    margin: 2px 0;
-    overflow-wrap: anywhere;
-  }
   .small {
     font-size: var(--fs-sm);
-  }
-  .status-line {
-    flex-wrap: wrap;
-    gap: 6px;
-    margin: 8px 0;
-  }
-  .summary-text {
-    line-height: 1.5;
-  }
-  .findings {
-    padding-left: 20px;
-  }
-  .findings li {
-    margin-bottom: 8px;
-  }
-  .findings p {
-    margin: 0 0 2px;
-  }
-  .cites {
-    margin: 4px 0;
-    padding-left: 16px;
-  }
-  .cites li {
-    overflow-wrap: anywhere;
-  }
-  .warn-text {
-    color: var(--warn, inherit);
-  }
-  .members {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px 12px;
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    font-size: var(--fs-sm);
-  }
-  .members li {
-    overflow-wrap: anywhere;
-  }
-  .plain {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    font-size: var(--fs-sm);
-  }
-  .link {
-    border: 0;
-    padding: 0;
-    background: none;
-    color: var(--link, var(--spark));
-    font: inherit;
-    cursor: pointer;
-    text-align: left;
-    overflow-wrap: anywhere;
   }
   .field {
     display: grid;

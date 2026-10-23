@@ -756,6 +756,7 @@ ex:PersonShape a sh:NodeShape ;
       <CommunitiesPanel
         ds={name}
         {branch}
+        initial={page.url.searchParams.get('community')}
         {readOnly}
         {prefixes}
         canAdmin={auth.can(name, 'admin')}

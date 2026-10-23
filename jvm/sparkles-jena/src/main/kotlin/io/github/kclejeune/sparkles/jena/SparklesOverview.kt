@@ -35,11 +35,22 @@ public sealed class GroupsBy {
     /** The values of this predicate, in 2 to 48 buckets when they are numbers or dates, 12 when [buckets] is null. */
     public data class Property @JvmOverloads public constructor(public val predicate: String, public val buckets: Int? = null) : GroupsBy()
 
+    /**
+     * The whole dataset by its GraphRAG community hierarchy (C22), starting at [level], which is 0
+     * when null. [graph] is the reports graph and defaults to `urn:x-sparkles:graphrag:reports`.
+     * A request with this grouping leaves `within` null. A caller who may not read the reports
+     * gets an answer whose `available` is false.
+     */
+    public data class Reports @JvmOverloads public constructor(public val level: Int? = null, public val graph: String? = null) : GroupsBy()
+
     internal fun value(): JsonValue = when (this) {
         Auto -> JsonString("auto")
         Members -> JsonString("members")
         is Community -> JsonObject().also { it.put("community", predicate) }
         is Property -> JsonObject().also { j -> j.put("property", predicate); buckets?.let { j.put("buckets", it.toLong()) } }
+        is Reports -> JsonObject().also { j ->
+            j.put("reports", JsonObject().also { r -> level?.let { r.put("level", it.toLong()) }; graph?.let { r.put("graph", it) } })
+        }
     }
 }
 
@@ -47,16 +58,17 @@ public sealed class GroupsBy {
  * A request for the overview of a graph. [limit] is 1 to 5,000 and defaults to 5,000. [at] is a
  * commit, time or named snapshot as `commit:N`, `time:<RFC 3339>` or `snapshot:<name>`, and the
  * default is the head. A call inside a transaction reads the transaction's view, and so does one on a dataset pinned with `at`, and these reject a request that names a point. The native library checks the
- * request and throws [SparklesInvalidException] for one that is malformed.
+ * request and throws [SparklesInvalidException] for one that is malformed. [within] is null only
+ * with [GroupsBy.Reports], which groups the whole dataset.
  */
 public data class GroupsRequest @JvmOverloads public constructor(
-    public val within: GroupsWithin,
+    public val within: GroupsWithin? = null,
     public val by: GroupsBy = GroupsBy.Auto,
     public val limit: Int? = null,
     public val at: String? = null,
 ) {
     internal fun value(): JsonObject = JsonObject().also { j ->
-        j.put("within", within.value())
+        within?.let { j.put("within", it.value()) }
         j.put("by", by.value())
         limit?.let { j.put("limit", it.toLong()) }
         at?.let { j.put("at", it) }

@@ -2,6 +2,9 @@ import { describe as group, expect, it } from 'vitest';
 import type { ClassProfile, GroupsAnswer } from './api';
 import {
   chooseRenderer,
+  communityLevel,
+  fallbackNode,
+  isReports,
   classLevel,
   describe,
   hash01,
@@ -175,5 +178,130 @@ group('the renderer', () => {
       renderer: 'cytoscape',
       reason: 'WebGL is not available in this browser',
     });
+  });
+});
+
+/** The GraphRAG communities of the whole dataset: two teams, the first with two below. */
+function reports(over: Partial<GroupsAnswer> = {}): GroupsAnswer {
+  return {
+    commit: 4,
+    available: true,
+    within: { reports: { graph: 'urn:x-sparkles:graphrag:reports', level: 0 }, size: 9 },
+    grouping: { kind: 'reports', predicate: null, level: 0 },
+    communities: false,
+    groups: [
+      {
+        id: 'r1.a',
+        label: 'Team A',
+        size: 6,
+        top: [],
+        community: 'urn:c:A',
+        level: 0,
+        children: 2,
+        report: { iri: 'urn:r:A', title: 'Team A', status: 'reviewed' },
+      },
+      {
+        id: 'r1.b',
+        label: 'Team B',
+        size: 3,
+        top: [],
+        community: 'urn:c:B',
+        level: 0,
+        children: 0,
+        report: null,
+      },
+    ],
+    edges: [
+      { source: 'g:r1.a', target: 'g:r1.a', predicate: `${EX}knows`, count: 5 },
+      { source: 'g:r1.a', target: 'g:r1.b', predicate: `${EX}knows`, count: 1 },
+    ],
+    truncated: false,
+    ...over,
+  };
+}
+
+group('the GraphRAG communities', () => {
+  it('draws one node per community, sized by members, coloured by its own key', () => {
+    const a = reports();
+    expect(isReports(a)).toBe(true);
+    expect(isReports(answer({}))).toBe(false);
+    const g = communityLevel(a, (i) => i);
+    expect(g.nodes.map((n) => [n.key, n.label, n.size, n.status, n.cls])).toEqual([
+      ['g:r1.a', 'Team A', 6, 'reviewed', 'g:r1.a'],
+      ['g:r1.b', 'Team B', 3, 'pending', 'g:r1.b'],
+    ]);
+    // links inside a community are its own count, not a loop
+    expect(g.nodes[0].internal).toBe(5);
+    expect(g.edges.map((e) => [e.source, e.target, e.count])).toEqual([['g:r1.a', 'g:r1.b', 1]]);
+    expect(g.nodes[0].openable && g.nodes[0].children).toBe(2);
+  });
+
+  it('opens a community into the level below, under the colour of its root', () => {
+    const base = communityLevel(reports(), (i) => i);
+    const below = reports({
+      within: {
+        reports: { graph: 'urn:x-sparkles:graphrag:reports', level: 0 },
+        group: 'r1.a',
+        community: 'urn:c:A',
+        level: 0,
+        title: 'Team A',
+        size: 6,
+      },
+      grouping: { kind: 'reports', predicate: null, level: 1 },
+      groups: [
+        {
+          id: 'r1.a1',
+          label: 'A one',
+          size: 3,
+          top: [],
+          community: 'urn:c:A1',
+          level: 1,
+          children: 0,
+          report: { iri: 'urn:r:A1', title: 'A one', status: 'stale' },
+        },
+        {
+          id: 'r1.af',
+          label: 'Members of no community below',
+          size: 1,
+          top: [],
+          community: null,
+          folded: true,
+          level: 1,
+          children: 0,
+          report: null,
+        },
+      ],
+      edges: [
+        { source: 'g:r1.a1', target: 'g:r1.b', predicate: null, count: 1 },
+        { source: 'g:r1.af', target: 'g:r1.a1', predicate: null, count: 1 },
+      ],
+    });
+    const path = [{ key: 'g:r1.a', label: 'Team A', answer: below }];
+    const g = visible(base, path);
+    expect(g.nodes.map((n) => [n.key, n.cls, n.status])).toEqual([
+      ['g:r1.b', 'g:r1.b', 'pending'],
+      ['g:r1.a1', 'g:r1.a', 'stale'],
+      ['g:r1.af', 'g:r1.a', 'pending'],
+    ]);
+    expect(g.edges.map((e) => [e.source, e.target]).sort()).toEqual([
+      ['g:r1.a1', 'g:r1.b'],
+      ['g:r1.af', 'g:r1.a1'],
+    ]);
+    expect(describe(g, path, String)).toBe('Team A opened into 2 communities.');
+    expect(describe(base, [], String, 0)).toBe('GraphRAG communities at level 0: 2 communities.');
+  });
+
+  // review round 1: without WebGL every community was drawn in the one IRI colour, so the
+  // status legend described colours the picture did not have
+  it('keeps the colouring and the marks in the Cytoscape fallback', () => {
+    const [a] = communityLevel(reports(), (i) => i).nodes;
+    expect(fallbackNode(a, 'Team A (6)', '#1a7f37', false)).toEqual({
+      id: 'g:r1.a',
+      label: 'Team A (6)',
+      kind: 'iri',
+      title: 'r1.a',
+      color: '#1a7f37',
+    });
+    expect(fallbackNode(a, 'Team A (6)', '#1a7f37', true).label).toBe('★ Team A (6)');
   });
 });

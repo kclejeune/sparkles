@@ -1856,8 +1856,10 @@ round. The time is still in the engine's write path.
 `DatasetGraphSparkles.graph().groups(request, options)` binds the library's
 `ds.graph().groups` from [U06](U06-large-graph-rendering.md#outcome). The request is a
 `GroupsRequest` with a `GroupsWithin` that is `OfClass` or `OfGroup`, a `GroupsBy` that is
-`Auto`, `Members`, `Community` or `Property`, a `limit`, and an `at` that takes `commit:N`,
-`time:` or `snapshot:` points. A call reads what the thread's other reads do, which is the head,
+`Auto`, `Members`, `Community`, `Property` or `Reports`, a `limit`, and an `at` that takes `commit:N`,
+`time:` or `snapshot:` points. `Reports` groups the whole dataset by its GraphRAG communities
+from [C22](C22-graph-rag-community-summaries.md), and it is the one grouping whose request leaves `within`
+null. A call reads what the thread's other reads do, which is the head,
 the snapshot of its read transaction, the view of its write transaction with the changes so far,
 or the commit that a dataset pinned with `at(...)` holds. Only a call on the head can name a point
 in history in `at`. The default graph is the union of the named graphs when the dataset's setting

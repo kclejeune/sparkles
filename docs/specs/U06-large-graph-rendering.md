@@ -127,6 +127,33 @@ double-click, a click or tap on a class or a group opens it, and `Enter` does th
 from the keyboard. The open path is a single chain from one class down, which the
 breadcrumb shows, so opening a node of an earlier level closes the levels below it.
 
+**Amendment (user request, 2026-10-23).** The overview can also start from the GraphRAG
+communities of [C22](C22-graph-rag-community-summaries.md) instead of the classes. The
+group-by picker above the overview has a **GraphRAG communities** choice, which draws the
+communities of one level of the hierarchy over the whole dataset. Level 0 is the coarsest
+and the default, and a level picker chooses another. A node is a community. Its size is
+its member count, and its colour is its report's status by default, with the community
+colouring as the other choice. Edges count the links between members of different
+communities, and a node's links among its own members are its internal count, as for the
+other groups. Opening a community draws its children at the next level, and a community
+of the finest level opens into its members. Members of a community that no child holds
+are drawn as one group, labelled as the members of no community below. The breadcrumb
+reads `Communities › Engineering › The payments team`.
+
+Selecting or opening a community shows its report beside the canvas, with its title,
+status, summary, findings and the review actions of the Communities tab, and the panel is
+the same component that the tab uses. Choosing a finding rings the entities it is about,
+in the canvas and in the list view. When those entities are inside a community that is
+drawn closed, a note says how many are drawn and offers to draw the community's members.
+**Open report** goes to the report in the Communities tab, and that tab's **Show in
+Explore** comes back to the community in the overview.
+
+The grouping reads the reports of main, where they are built. On another branch the
+overview shows the notice that the Communities tab shows and reads nothing. A caller whose
+access does not cover the reports graph, by the rule of C22 §6.3, sees only that the
+communities are not available to them, and a dataset without reports says that none were
+built. Both notices offer to go back to the classes.
+
 ### 2.4 Keyboard and accessibility
 
 A WebGL canvas has no accessible content, so the view has a companion: **List view**
@@ -192,6 +219,26 @@ type GroupsAnswer = {
   It runs under the caller's view, timeout and memory budget, and fails with `507` like a
   query. Group ids are stable for a commit and a request, so a later request can name
   them.
+- **By GraphRAG reports (amendment, 2026-10-23).** `by: { reports: { level?, graph? } }`
+  groups the whole dataset by the community hierarchy that C22 stores in its reports
+  graph, so the request leaves `within` out. `level` runs from 0, the coarsest and the
+  default, to 15, and `graph` defaults to the dataset's reports graph and must lie in the
+  `urn:x-sparkles:graphrag:` namespace. A group is a community, and its answer adds the
+  community IRI, its level, its number of children and its report as an IRI, a title and a
+  status, or null when it has none. Opening a group answers its children at the next
+  level, with one more group for the members that no child holds, and a group with no
+  children opens into its members. Edges count the links between members in the default
+  graph and the named graphs outside the GraphRAG namespace, so report triples are never
+  counted as links. A group id is `r1.` and the base64url of the reports graph, the start
+  level and the path of communities. The server checks that the path is a chain of
+  `skos:broader` in the reports and refuses an id that names any other set.
+- **Access to the reports.** The route reads the reports graph only when the caller's
+  view proves that graph by the coverage rule of C22 §6.3, which is the check of the
+  GraphRAG routes. Otherwise the answer has `available: false`, `unavailable: "access"`
+  and a reason, and holds nothing from the reports, whether or not they exist. A reader
+  who may read them gets `unavailable: "none"` when the graph holds no communities. The
+  grouping reads main, where the reports are built, and refuses another branch with a
+  `400`. A request with `at` reads the reports as they were at that point of main.
 
 Phase 3 adds **`GET /$/graph/{ds}/layout`**, which returns positions for an answer of
 `groups` or for a result's node list, computed on the server with the same ForceAtlas2
@@ -378,6 +425,21 @@ the breadcrumb and Backspace close levels, and a member opens in the resource vi
 list view, the live region, the keyboard of §2.4 and both themes work at phone and desktop
 widths. The query page uses the same view for graph results above 2,000 nodes, with a
 renderer switch and node limits up to 100,000.
+
+**GraphRAG communities.** The amendments of §2.3 and §3 for C22's communities shipped on
+2026-10-23. `ds.graph().groups` and the route take `by: {reports: {level, graph}}`, and
+the Python, Node and JVM bindings pass it through with `within` left out. The route fills
+in the dataset's reports graph from its GraphRAG settings. The answer is cached with the
+other group answers, under a key that holds the caller's view, so one caller's answer is
+never served to another whose view differs. Tests build a hierarchy by hand in the
+library and with stub providers through the server's build, and they check the counts
+against the Communities routes. Router tests cover an unrestricted reader, a restricted
+reader with and without coverage, a build with only the `auth` feature, a branch other
+than main and a reports graph that the settings moved. The overview shows the report
+beside the canvas through the `CommunityReport` component, which the Communities tab
+also uses, and mock browser tests cover the picker, opening levels, the report panel, a
+finding's highlight, the unavailable and off-main notices, the links between the two
+pages and a 390 px phone.
 
 **Measurements.** On an 8-vCPU Namespace instance with the 10.5M-triple dataset, the
 first overview request took a median of 1.12 s with the parallel profiles and 2.30 s

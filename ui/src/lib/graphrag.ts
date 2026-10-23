@@ -211,3 +211,51 @@ export function citeText(c: string): string {
   const m = /^<<\(\s*(.*?)\s*\)>>$/.exec(c.trim());
   return m ? m[1] : c;
 }
+
+/** The badge class of a report status. */
+export function statusClass(s: ReportStatus | null | undefined): string {
+  return s === 'reviewed'
+    ? 'ok'
+    : s === 'rejected' || s === 'failed'
+      ? 'danger'
+      : s === 'stale'
+        ? 'warn'
+        : 'spark';
+}
+
+/**
+ * The entities a finding is about: those it names, and the subjects and objects of the
+ * facts it cites that are IRIs. A cited reifier or child finding is not an entity.
+ */
+export function findingEntities(f: Finding): string[] {
+  const out = new Set(f.about);
+  for (const c of f.cites) {
+    // subject, predicate and object: the predicate is not an entity, nor a literal
+    const m = /^<<\(\s*(<[^<>\s]*>|_:\S+)\s+<[^<>\s]*>\s+(.*?)\s*\)>>$/.exec(c.trim());
+    if (!m) continue;
+    if (m[1].startsWith('<')) out.add(m[1].slice(1, -1));
+    if (/^<[^<>\s]*>$/.test(m[2])) out.add(m[2].slice(1, -1));
+  }
+  return [...out];
+}
+
+/** Explore's overview grouped by the communities, opened down to `community`. */
+export function exploreHref(explore: string, ds: string, community: string): string {
+  return `${explore}?ds=${enc(ds)}&overview=communities&community=${enc(community)}`;
+}
+
+/** The Communities tab of a dataset, showing `community`. */
+export function reportHref(datasetPage: string, community: string): string {
+  return `${datasetPage}?tab=communities&community=${enc(community)}`;
+}
+
+/** The overview's legend: a report status, or `pending` for a community without one. */
+export type CommunityStatus = ReportStatus | 'pending';
+export const COMMUNITY_STATUSES: readonly CommunityStatus[] = [
+  'reviewed',
+  'unreviewed',
+  'stale',
+  'pending',
+  'rejected',
+  'failed',
+];

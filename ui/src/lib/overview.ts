@@ -9,8 +9,14 @@
  *
  * Node keys follow the answers' edge ends: `c:` and a class IRI, `g:` and a group id, and
  * `m:` and a member IRI.
+ *
+ * The overview can also start from the GraphRAG communities (C22) instead of the classes:
+ * the base level is then the answer for the whole dataset at one level of the hierarchy,
+ * and the path opens communities into the level below and the finest into members.
  */
 import type { ClassProfile, GroupsAnswer } from './api';
+import type { CommunityStatus } from './graphrag';
+import type { GNode } from './components/GraphView.svelte';
 
 export type OvKind = 'class' | 'group' | 'member';
 
@@ -32,6 +38,13 @@ export type OvNode = {
   openable: boolean;
   /** Links among the node's own instances, which are not drawn as a loop. */
   internal?: number;
+  /** A GraphRAG community: its report's status, `pending` without a report. */
+  status?: CommunityStatus;
+  /** The community's IRI, null for the members no community below holds. */
+  community?: string | null;
+  level?: number;
+  /** Communities one level below. */
+  children?: number;
 };
 
 export type OvEdge = {
@@ -116,9 +129,21 @@ class Edges {
   }
 }
 
-/** The nodes an answer adds below the node it opened. */
-export function answerNodes(a: GroupsAnswer, label: (iri: string) => string): OvNode[] {
-  const cls = a.within.class;
+/** Whether an answer groups by the GraphRAG communities. */
+export function isReports(a: GroupsAnswer): boolean {
+  return a.within.reports != null;
+}
+
+/**
+ * The nodes an answer adds below the node it opened. `root` is the class, or for the
+ * communities the coarsest group of the path, that colours them by community.
+ */
+export function answerNodes(
+  a: GroupsAnswer,
+  label: (iri: string) => string,
+  root?: string,
+): OvNode[] {
+  const cls = root ?? a.within.class ?? '';
   if (a.grouping.kind === 'members') {
     return (a.members ?? []).map((m) => ({
       key: `m:${m.iri}`,
@@ -128,6 +153,22 @@ export function answerNodes(a: GroupsAnswer, label: (iri: string) => string): Ov
       cls,
       iri: m.iri,
       openable: false,
+    }));
+  }
+  if (isReports(a)) {
+    return a.groups.map((g) => ({
+      key: `g:${g.id}`,
+      kind: 'group',
+      label: g.label,
+      size: g.size,
+      cls: root ?? `g:${g.id}`,
+      group: g.id,
+      top: g.top,
+      openable: g.size > 0,
+      status: g.report ? (g.report.status ?? 'unreviewed') : 'pending',
+      community: g.community ?? null,
+      level: g.level,
+      children: g.children ?? 0,
     }));
   }
   return a.groups.map((g) => ({
@@ -143,8 +184,31 @@ export function answerNodes(a: GroupsAnswer, label: (iri: string) => string): Ov
 }
 
 /**
- * The picture for a class level and a path: the classes but the opened one, the nodes of
- * every answer on the path but those opened further, and the edges between drawn nodes.
+ * The base level of the communities: one node per community of the answer for the whole
+ * dataset, sized by its members, and the counted links between them. Links inside a
+ * community are its `internal` count.
+ */
+export function communityLevel(a: GroupsAnswer, label: (iri: string) => string): OvGraph {
+  const nodes = answerNodes(a, label);
+  const keys = new Map(nodes.map((n) => [n.key, n]));
+  const edges = new Edges();
+  for (const e of a.edges) {
+    if (!keys.has(e.source) || !keys.has(e.target)) continue;
+    if (e.source === e.target) {
+      const n = keys.get(e.source)!;
+      n.internal = (n.internal ?? 0) + e.count;
+      continue;
+    }
+    edges.add(e.source, e.target, e.predicate, e.count);
+  }
+  return { nodes, edges: edges.list() };
+}
+
+/**
+ * The picture for a base level and a path: the base nodes but the opened one, the nodes
+ * of every answer on the path but those opened further, and the edges between drawn
+ * nodes. Below the communities, every node takes the coarsest group of the path as its
+ * community.
  */
 export function visible(
   base: OvGraph,
@@ -154,8 +218,9 @@ export function visible(
   if (!path.length) return base;
   const opened = new Set(path.map((l) => l.key));
   const nodes: OvNode[] = base.nodes.filter((n) => !opened.has(n.key)).map((n) => ({ ...n }));
+  const root = isReports(path[0].answer) ? path[0].key : undefined;
   for (const level of path) {
-    for (const n of answerNodes(level.answer, label)) if (!opened.has(n.key)) nodes.push(n);
+    for (const n of answerNodes(level.answer, label, root)) if (!opened.has(n.key)) nodes.push(n);
   }
   const drawn = new Map(nodes.map((n) => [n.key, n]));
   const edges = new Edges();
@@ -206,6 +271,21 @@ export function seed(
 }
 
 /** The drawn radius of a node of `size` instances when the largest has `max`. */
+/**
+ * A node of the Cytoscape fallback, which carries the overview's colouring so that the
+ * legend still describes the picture without WebGL. `color` must be a real colour, since
+ * Cytoscape does not read CSS variables.
+ */
+export function fallbackNode(n: OvNode, label: string, color: string, marked: boolean): GNode {
+  return {
+    id: n.key,
+    label: marked ? `★ ${label}` : label,
+    kind: 'iri',
+    title: n.key.slice(2),
+    color,
+  };
+}
+
 export function nodeRadius(size: number, max: number, kind: OvKind): number {
   if (kind === 'member') return 4;
   const t = Math.log1p(Math.max(0, size)) / Math.log1p(Math.max(1, max));
@@ -236,9 +316,21 @@ export function hasWebGL2(): boolean {
   }
 }
 
-/** What the live region says about the picture. */
-export function describe(g: OvGraph, path: OvLevel[], fmt: (n: number) => string): string {
+/**
+ * What the live region says about the picture. `communities` is the level the
+ * GraphRAG communities opened at, when the overview starts from them.
+ */
+export function describe(
+  g: OvGraph,
+  path: OvLevel[],
+  fmt: (n: number) => string,
+  communities?: number,
+): string {
   const classes = g.nodes.filter((n) => n.kind === 'class').length;
+  if (!path.length && communities != null) {
+    const n = g.nodes.length;
+    return `GraphRAG communities at level ${communities}: ${fmt(n)} ${n === 1 ? 'community' : 'communities'}.`;
+  }
   if (!path.length) {
     const preds = new Set<string>();
     for (const e of g.edges) for (const p of e.predicates) preds.add(p.iri ?? '');
@@ -252,7 +344,7 @@ export function describe(g: OvGraph, path: OvLevel[], fmt: (n: number) => string
       ? n === 1
         ? 'member'
         : 'members'
-      : a.grouping.kind === 'communities'
+      : a.grouping.kind === 'communities' || a.grouping.kind === 'reports'
         ? n === 1
           ? 'community'
           : 'communities'

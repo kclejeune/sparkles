@@ -118,9 +118,21 @@ const setting = <T>(call: AdminCall, name: string): Setting<T> => ({
 });
 /** What a graph overview request groups and how (see "Graph overview" in API.md). */
 export interface GroupsRequest {
-  /** A class IRI, or a group id from an earlier answer. */
-  within: { class: string } | { group: string };
-  by?: 'auto' | 'members' | { community: string } | { property: string; buckets?: number };
+  /**
+   * A class IRI, or a group id from an earlier answer. It is left out only with
+   * `by: { reports }`, which groups the whole dataset.
+   */
+  within?: { class: string } | { group: string };
+  by?:
+    | 'auto'
+    | 'members'
+    | { community: string }
+    | { property: string; buckets?: number }
+    /**
+     * The GraphRAG community hierarchy (C22), starting at `level`, which is 0 by default.
+     * `graph` is the reports graph and defaults to `urn:x-sparkles:graphrag:reports`.
+     */
+    | { reports: { level?: number; graph?: string } };
   /** Groups or members, 1 to 5,000 (the default). */
   limit?: number;
   /** A commit, a time or a named snapshot (`snapshot:<name>`). */
@@ -131,13 +143,26 @@ export type GroupsOptions = Omit<
   QueryOptions,
   'at' | 'execution' | 'allowMaterialization' | 'bindings' | 'factory' | 'batchSize' | 'batchBytes'
 >;
+/** A GraphRAG report's review status (C22). */
+export type GroupReportStatus = 'unreviewed' | 'reviewed' | 'rejected' | 'stale' | 'failed';
 /** The answer of `graph.groups`. `commit` is the commit the answer was computed at. */
 export interface GroupsAnswer {
   commit: bigint;
-  within: { class: string; group?: string; size: number };
+  within: {
+    class?: string;
+    group?: string;
+    size: number;
+    /** The reports graph of a GraphRAG grouping and the level it started at. */
+    reports?: { graph: string; level: number };
+    community?: string;
+    level?: number;
+    title?: string;
+    folded?: boolean;
+  };
   grouping: {
-    kind: 'members' | 'values' | 'ranges' | 'communities';
+    kind: 'members' | 'values' | 'ranges' | 'communities' | 'reports';
     predicate: string | null;
+    level?: number;
   };
   communities: boolean;
   groups: {
@@ -145,11 +170,25 @@ export interface GroupsAnswer {
     label: string;
     size: number;
     top: { iri: string; label?: string }[];
+    /** The community of a GraphRAG group, null for the members that no child holds. */
+    community?: string | null;
+    level?: number;
+    /** The number of communities one level below. */
+    children?: number;
+    /** The community's report, null when it has none. */
+    report?: { iri: string; title: string | null; status: GroupReportStatus | null } | null;
+    /** True for the members that no community below holds. */
+    folded?: boolean;
   }[];
   members?: { iri: string; label?: string; class?: string }[];
   edges: { source: string; target: string; predicate: string | null; count: number }[];
   truncated: boolean;
   note?: string;
+  /** False for a GraphRAG grouping that the caller may not read or that has no reports. */
+  available?: boolean;
+  unavailable?: 'access' | 'none';
+  reason?: string;
+  levels?: { level: number; communities: number }[];
 }
 export class Administration {
   readonly snapshots;

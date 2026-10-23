@@ -299,6 +299,14 @@ agent memory, the map view and a merge preview.
     <td>A query compared between two commits</td>
     <td>A graph compared between two commits</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing two GraphRAG communities inside Engineering, with the payments team's report beside the picture and one of its findings chosen"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>The dataset grouped by its GraphRAG communities, with a report beside it</td>
+    <td></td>
+  </tr>
 </table>
 
 </details>
