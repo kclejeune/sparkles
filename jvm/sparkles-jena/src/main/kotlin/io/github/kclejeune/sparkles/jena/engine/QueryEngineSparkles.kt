@@ -234,10 +234,12 @@ internal class QueryIterSparkles(
     private val input: Binding = input
     private val cancelSignal = Context.getCancelSignal(context)
     private val parent: Binding? = input.takeUnless { it.isEmpty }
-    private var ffiQuery: FfiQuery? = dsg.source().prepareQuery(text, opts)
+    // requestCancel reads these three from Jena's timeout or abort thread while the
+    // iterator's own thread opens and releases them, so their writes must be visible.
+    @Volatile private var ffiQuery: FfiQuery? = dsg.source().prepareQuery(text, opts)
     /** The transaction the query runs in, after whose end the iterator refuses to read. */
     private val txn = dsg.txn()
-    private var cursor: FfiSelectCursor? = null
+    @Volatile private var cursor: FfiSelectCursor? = null
     private var started = false
     private var done = false
     /**
@@ -246,7 +248,7 @@ internal class QueryIterSparkles(
      * `release` always runs, because it also records the cursor's final statistics.
      */
     private var drained = false
-    private var delegate: QueryIterator? = null
+    @Volatile private var delegate: QueryIterator? = null
     private val decoder = RowDecoder()
     private var batch: RowBatch? = null
     private var row = 0
@@ -407,10 +409,24 @@ internal class QueryIterSparkles(
         release()
     }
 
+    /**
+     * Runs on Jena's timeout or abort thread and can race [release] on the iterator's own
+     * thread. A native object that was closed meanwhile throws `IllegalStateException`
+     * from its call counter, which means its query already finished, so there is nothing
+     * left to cancel and the exception is not the caller's.
+     */
     override fun requestCancel() {
         delegate?.cancel()
-        cursor?.cancel()
-        ffiQuery?.cancel()
+        cancelNative { cursor?.cancel() }
+        cancelNative { ffiQuery?.cancel() }
+    }
+
+    private inline fun cancelNative(cancel: () -> Unit) {
+        try {
+            cancel()
+        } catch (_: IllegalStateException) {
+            // released on the iterator's thread since the field was read
+        }
     }
 
     override fun output(out: IndentedWriter, sCxt: SerializationContext?) {

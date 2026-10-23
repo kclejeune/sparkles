@@ -213,6 +213,46 @@ class StreamingQueryTest {
         }
     }
 
+    /**
+     * `abort` runs `requestCancel` on another thread while the iterator's thread finishes
+     * and releases its native query. The abort must never fail because the native object
+     * was closed in between, and a cancellation that wins still ends the read cleanly.
+     */
+    @Test fun abort_racing_the_release_of_a_query_never_throws() {
+        people(300).use { ds ->
+            val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+            for (streaming in listOf(null, true, false)) {
+                repeat(3000) {
+                    execution(ds, scan, streaming).use { e ->
+                        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+                        val canceller = Thread {
+                            while (!stop.get()) {
+                                try {
+                                    e.abort()
+                                } catch (t: Throwable) {
+                                    failures.add(t)
+                                    return@Thread
+                                }
+                            }
+                        }
+                        canceller.start()
+                        try {
+                            val rs = e.execSelect()
+                            while (rs.hasNext()) rs.next()
+                        } catch (_: QueryCancelledException) {
+                            // the abort won before the rows ran out
+                        } finally {
+                            stop.set(true)
+                            canceller.join()
+                        }
+                    }
+                }
+            }
+            assertTrue(failures.isEmpty(), "abort failed: ${failures.firstOrNull()}")
+            assertEquals(300, execution(ds, scan, null).use { ResultSetFormatter.consume(it.execSelect()) })
+        }
+    }
+
     @Test fun reading_after_the_read_transaction_ends_fails_cleanly() {
         people(5000).use { ds ->
             for (streaming in listOf(null, true, false)) {

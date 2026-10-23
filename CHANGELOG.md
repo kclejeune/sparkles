@@ -14,6 +14,10 @@ pool instead of its query's peak, so a held result or a Python or Node result ob
 longer reserves the memory of the tables it was built from. CONSTRUCT and
 DESCRIBE results keep their peak as before.
 
+In the JVM library, `abort()` or a timeout that raced the end of a query could throw
+`IllegalStateException` because the query's native object had just been released. Such a
+cancel is now ignored, since the query has already finished.
+
 Group commit now covers datasets with a full-text, spatial or embedding index, which used
 to take the ordinary path. On a Namespace instance whose synchronizations were slowed to
 4 ms each, four writers on such a dataset committed about twice as fast and sixteen
