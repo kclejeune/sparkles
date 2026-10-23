@@ -3013,12 +3013,12 @@ mod imp {
             };
             if live.raced >= RACED_BEFORE_LOCKED {
                 // Writes raced the last unlocked attempts. Holding live keeps text
-                // publication out of this one, so only a merge can still race it.
+                // publication out of this one, so only a merge can still race it. The
+                // count starts again either way, so a merge that races this attempt
+                // does not make the next ticks hold live as well.
+                live.raced = 0;
                 match dir.prepare_checkpoint().run() {
-                    Ok(true) => {
-                        live.dirty_since = None;
-                        live.raced = 0;
-                    }
+                    Ok(true) => live.dirty_since = None,
                     Ok(false) => {}
                     Err(e) => self.fail_locked(&mut live, &e.into()),
                 }
@@ -3408,7 +3408,9 @@ mod imp {
 
         /// A publication races every unlocked background checkpoint, inside its file
         /// synchronization. After `RACED_BEFORE_LOCKED` such ticks the next one holds
-        /// live, the publication cannot race it, and the marker clears.
+        /// live, the publication cannot race it, and the marker clears. When a merge's
+        /// write races that locked attempt instead, the count starts again, so the
+        /// following ticks release live and at most one tick in four holds it.
         #[test]
         fn steady_publication_cannot_starve_the_background_checkpoint() {
             use super::super::lazydir::TestPoint;
@@ -3419,11 +3421,14 @@ mod imp {
             }
             publish_checkpoint_document(&inner, 1).unwrap();
             let seq = Arc::new(AtomicU64::new(1));
-            for round in 0..2 {
+            for round in 0..3 {
+                // the locked attempt of this round meets a merge's write
+                let merge = round == 1;
                 for attempt in 0..=RACED_BEFORE_LOCKED {
                     let locked = attempt == RACED_BEFORE_LOCKED;
                     inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
-                    let (hook_inner, hook_seq) = (inner.clone(), seq.clone());
+                    let (hook_inner, hook_seq, hook_dir) =
+                        (inner.clone(), seq.clone(), dir.clone());
                     let (raced_tx, raced_rx) = std::sync::mpsc::channel();
                     dir.test_hook(TestPoint::CheckpointFileSync, move || {
                         // The unlocked tick has released live, so the publication runs
@@ -3433,6 +3438,13 @@ mod imp {
                             let next = hook_seq.fetch_add(1, Ordering::SeqCst) + 1;
                             publish_checkpoint_document(&hook_inner, next)
                                 .map_err(std::io::Error::other)?;
+                        } else if merge {
+                            // a merge writes without live
+                            tantivy::directory::Directory::atomic_write(
+                                &hook_dir,
+                                Path::new("merge-probe"),
+                                b"merge",
+                            )?;
                         }
                         let _ = raced_tx.send(free);
                         Ok(())
@@ -3444,7 +3456,11 @@ mod imp {
                     assert_eq!(raced, !locked, "round {round}, attempt {attempt}");
                     assert!(inner.healthy());
                     let live = inner.live.lock();
-                    if locked {
+                    if locked && merge {
+                        assert!(dir.is_marked(), "round {round}: a raced checkpoint cleared");
+                        assert!(live.dirty_since.is_some());
+                        assert_eq!(live.raced, 0, "the next tick would hold live again");
+                    } else if locked {
                         assert!(!dir.is_marked(), "round {round}: the marker never cleared");
                         assert!(live.dirty_since.is_none());
                         assert_eq!(live.raced, 0);

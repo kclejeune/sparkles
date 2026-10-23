@@ -1374,9 +1374,12 @@ checkpoints in a row, the tick now holds the live writer lock through the next
 synchronization, as an explicit checkpoint does, so no text publication can race it.
 That attempt blocks text publication for one synchronization, at most once in four
 checkpoint ticks under steady writes, and in exchange the time in which a crash pays
-verification stays bounded. Any clean checkpoint resets the count. A test publishes
-inside every unlocked synchronization and requires the fourth tick to clear the
-marker. It fails when the fallback is disabled. The latency cost of the locked
+verification stays bounded. Any clean checkpoint resets the count, and so does the
+locked attempt itself, because a Tantivy merge writes without the lock and can still
+race it. A test publishes inside every unlocked synchronization and requires the
+fourth tick to clear the marker, and after a merge's write races the locked attempt it
+requires the next three ticks to release the lock again. It fails when the fallback is
+disabled or when the count is kept after a raced locked attempt. The latency cost of the locked
 attempt has not been measured on native hardware.
 
 This change removes the background file-synchronization wait from the live writer
