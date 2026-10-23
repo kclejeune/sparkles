@@ -338,11 +338,13 @@ pub(super) fn run_scan(
             stopped = true;
             return Ok(false);
         }
-        // the columns double as they fill: admit the next size before they grow
+        // the columns double as they fill: admit the next size's bytes before they
+        // grow, and the rows there are against the row limits
         let n = out.len();
         if n >= 4096 && n.is_power_of_two() {
             ctx.check()?;
-            ctx.check_output(n.saturating_mul(2), width)?;
+            ctx.check_output_rows(n)?;
+            ctx.check_output_bytes(n.saturating_mul(2), width)?;
         }
         if let Some(c) = sc {
             row[c] = Id(s);

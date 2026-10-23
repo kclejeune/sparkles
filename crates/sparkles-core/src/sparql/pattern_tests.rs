@@ -712,3 +712,52 @@ fn partial_compaction_honours_patterns_off() {
     );
     check_all_unchecked(&s);
 }
+
+/// Review round 2: row limits count output rows, not reserved capacity, and a native
+/// pattern count in a cursor checks its rows as the eager executor does.
+#[test]
+fn row_limits_count_rows() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut nt = String::new();
+    for i in 0..5000 {
+        nt.push_str(&format!("<urn:s{i}> <urn:p0> 1 .\n"));
+    }
+    for i in 0..5000 {
+        nt.push_str(&format!("<urn:one> <urn:q{i}> 1 .\n"));
+    }
+    nt.push_str("<urn:one> <urn:p0> 2 .\n");
+    load(&s, &nt, RdfFormat::Turtle);
+    // 5,001 subjects with ex:p0 or more: the pairs of the p0 subjects alone are 5,001
+    let text = format!("{SPK}SELECT ?s WHERE {{ ?s spk:hasPredicate ?p }} LIMIT 5000");
+    let limited = QueryOptions {
+        max_rows: Some(5000),
+        ..opts(Optimizations::ALL)
+    };
+    let r = query(s.snapshot(), &text, &limited).unwrap();
+    assert_eq!(solutions(&r).len(), 5000);
+    assert!(has_op(&r.plan, "PatternScan"), "{:#?}", r.plan);
+    // one subject with 5,001 predicates under a limit of 100 rows
+    let text = format!(
+        "{SPK}SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE {{ ?s <urn:p0> 2 . ?s ?p ?o }} GROUP BY ?p LIMIT 1"
+    );
+    for opt in [Optimizations::ALL, Optimizations::NONE] {
+        let o = QueryOptions {
+            max_rows: Some(100),
+            ..opts(opt)
+        };
+        let c = CursorOptions {
+            fallback: FallbackPolicy::AllowMaterialization,
+            ..Default::default()
+        };
+        let res = select_cursor(s.snapshot(), &text, &o, &c).and_then(|mut cur| {
+            while cur.next_batch()?.is_some() {}
+            cur.plan_json()
+        });
+        match res {
+            Err(crate::error::Error::BudgetExceeded(b)) => {
+                assert_eq!(b.kind, crate::error::BudgetKind::Rows, "{b:?}")
+            }
+            other => panic!("{opt:?}: {other:?}"),
+        }
+    }
+}

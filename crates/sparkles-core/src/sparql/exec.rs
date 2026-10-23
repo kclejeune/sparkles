@@ -2305,7 +2305,10 @@ pub(super) fn apply_blocking(
         }
         Kind::OrderBy { keys, limit } => Ok(order_by(ctx, table, keys, *limit, report)?.0),
         Kind::PatternCount(spec) => {
-            Ok(super::patternplan::run_count(ctx, spec, Some(&table), &node.vars)?.0)
+            let out = super::patternplan::run_count(ctx, spec, Some(&table), &node.vars)?.0;
+            // one row per predicate, checked as the eager executor checks an output
+            ctx.check_output(out.len(), out.width())?;
+            Ok(out)
         }
         _ => unreachable!("not a native blocking cursor operator"),
     }

@@ -1410,6 +1410,13 @@ impl Ctx {
     #[inline]
     pub fn check_output(&self, rows: usize, width: usize) -> Result<()> {
         self.check_output_rows(rows)?;
+        self.check_output_bytes(rows, width)
+    }
+
+    /// The memory half of [`Ctx::check_output`]: admit the bytes of `rows` rows of
+    /// `width` columns, such as capacity reserved ahead of the rows, without counting
+    /// them against the row limits.
+    pub(super) fn check_output_bytes(&self, rows: usize, width: usize) -> Result<()> {
         let bytes = table_bytes(rows, width);
         if let Some(checked) = self.fast_admit(bytes, false) {
             return checked;
