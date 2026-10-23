@@ -234,13 +234,14 @@ impl EqualityIndex {
         }
         let charge = ctx.retained_charge(count as u64 * 4 + 1024)?;
         let mut loose = Vec::with_capacity(count);
-        loose.extend(
-            values
-                .iter()
-                .enumerate()
-                .filter(|&(_, &value)| is_loose(value))
-                .map(|(row, _)| row as u32),
-        );
+        for (row, &value) in values.iter().enumerate() {
+            if row.is_multiple_of(1024) {
+                ctx.check()?;
+            }
+            if is_loose(value) {
+                loose.push(row as u32);
+            }
+        }
         Ok(Self {
             by_id,
             loose,
