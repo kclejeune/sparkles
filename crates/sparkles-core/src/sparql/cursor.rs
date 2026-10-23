@@ -878,13 +878,29 @@ pub(super) fn auto_streaming(
     if node.est > ctx.max_rows as f64 || node.est > ctx.max_rows_produced as f64 {
         return false;
     }
-    if spill_admitted(ctx, node, kind) {
+    if spill_admitted(ctx, node, kind) || memory_admitted(ctx, node, kind, options) {
         return true;
     }
     let scanned = node.est.is_finite() && node.est >= AUTO_SCAN_ROWS && scan(ctx, node);
     if !(scanned || grouped(ctx, node)) {
         return false;
     }
+    let headroom = cursor_headroom(ctx, node, options);
+    kind == QueryKind::Select
+        && ctx.snap.delta.is_empty()
+        && batches_admitted(options)
+        && headroom < u64::MAX
+        && ctx.memory_remaining() >= headroom
+}
+
+/// Whether the cursor's batches are large enough for automatic admission to pay off.
+fn batches_admitted(options: &CursorOptions) -> bool {
+    options.batch_rows >= 4096 && options.batch_bytes >= 4096 * 32
+}
+
+/// The memory a cursor over `node` needs besides the state its operators keep: one
+/// index block of input, one batch of output and the query's variables.
+fn cursor_headroom(ctx: &Ctx, node: &Node, options: &CursorOptions) -> u64 {
     let cap = options
         .batch_rows
         .min(options.batch_bytes / node.vars.len().max(1).saturating_mul(8));
@@ -897,16 +913,10 @@ pub(super) fn auto_streaming(
     // A projection can be narrower than its scan. Admission must leave room for the
     // scan's input batches as well as the result.
     let row_bytes = (width(node) as u64).saturating_mul(8).saturating_add(16);
-    let headroom = (crate::index::BLOCK_ROWS as u64 * 32 + 512)
+    (crate::index::BLOCK_ROWS as u64 * 32 + 512)
         .saturating_add((cap as u64).saturating_mul(row_bytes))
         .saturating_add((ctx.nvars() as u64).saturating_mul(16))
-        .saturating_add(4096);
-    kind == QueryKind::Select
-        && ctx.snap.delta.is_empty()
-        && options.batch_rows >= 4096
-        && options.batch_bytes >= 4096 * 32
-        && headroom < u64::MAX
-        && ctx.memory_remaining() >= headroom
+        .saturating_add(4096)
 }
 
 /// An ASK with a pure equality filter can stop at its first matching pair instead
@@ -1100,8 +1110,74 @@ fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
         && streams_natively(ctx, node)
         && {
             let bytes = largest_output_bytes(node);
-            bytes.is_finite() && bytes * 2.0 > ctx.memory_remaining() as f64
+            bytes.is_finite() && bytes * 2.0 > admission_room(ctx)
         }
+}
+
+/// Whether automatic execution runs `node` as a cursor because eager execution is
+/// expected to outgrow the memory it may use, while the state the cursor keeps is
+/// expected to fit with room to spare, so that the cursor needs no spill (roadmap item
+/// 96). A `FILTER NOT EXISTS` over a Cartesian product under a grouping is the measured
+/// case: eager execution holds the whole product, and the cursor holds the product's
+/// smaller input, the key set of the NOT EXISTS and one row per group.
+fn memory_admitted(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
+    kind == QueryKind::Select && ctx.snap.delta.is_empty() && batches_admitted(options) && {
+        let room = admission_room(ctx);
+        let eager = largest_output_bytes(node);
+        eager.is_finite() && eager * 2.0 > room && streams_natively(ctx, node) && {
+            let state = cursor_state_bytes(ctx, node);
+            let headroom = cursor_headroom(ctx, node, options) as f64;
+            state.is_finite() && state * 2.0 + headroom <= room
+        }
+    }
+}
+
+/// The memory automatic admission compares a plan's estimates with: what the query's
+/// own budget leaves, and never more than the whole query memory pool of its grant. It
+/// does not depend on how much of the pool other queries hold at the moment, so the same
+/// query gets the same plan under load.
+fn admission_room(ctx: &Ctx) -> f64 {
+    let own = ctx.memory_remaining();
+    let room = match ctx.grant() {
+        Some(grant) => own.min(grant.pool().capacity()),
+        None => own,
+    };
+    room as f64
+}
+
+/// The estimated bytes of the state a cursor over `node` keeps at once: the build
+/// side of each join, the groups of each grouping, the rows of each DISTINCT and full
+/// sort, the rows each top-k keeps and the key set of each EXISTS it answers from one.
+/// The cursor streams the rest. Operators the estimate does not know count their whole
+/// output.
+fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
+    let rows = |n: &Node, est: f64| est.max(0.0) * (n.vars.len().max(1) * 8) as f64;
+    let own = match &node.kind {
+        _ if binary::eligible(node) => {
+            let build = &node.children[1 - binary::probe_side(node)];
+            rows(build, build.est)
+        }
+        Kind::Group { .. } | Kind::Distinct | Kind::Sort(_) => rows(node, node.est),
+        Kind::OrderBy { limit: Some(k), .. } => rows(node, (*k as f64).min(node.est)),
+        Kind::OrderBy { limit: None, .. } => rows(node, node.est),
+        Kind::Filter(exprs) if node.children.len() == 1 => exprs
+            .iter()
+            .filter(|e| e.has_exists())
+            .map(|e| {
+                super::exists::keyed_plan(ctx, e, &node.children[0])
+                    .map_or(f64::INFINITY, |planned| {
+                        rows(&planned, planned.est) + cursor_state_bytes(ctx, &planned)
+                    })
+            })
+            .sum(),
+        _ if supported(&node.kind) => 0.0,
+        _ => rows(node, node.est),
+    };
+    own + node
+        .children
+        .iter()
+        .map(|c| cursor_state_bytes(ctx, c))
+        .sum::<f64>()
 }
 
 /// The estimated bytes of the largest operator output in `node`, as eager execution
@@ -4320,6 +4396,63 @@ mod tests {
     /// The decision table of spill admission (X08 §6.8): a query streams when it may
     /// spill, reads an immutable snapshot, has only cursor operators and is expected
     /// to hold more than half its memory budget eagerly.
+    #[test]
+    fn automatic_admission_streams_a_product_whose_cursor_state_fits_without_spill() {
+        use super::super::plan::JoinAlgo;
+        use crate::io::Source;
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:s> <urn:p> 1 . <urn:s> <urn:q> <urn:f> .".to_vec(),
+                oxrdfio::RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        // BSBM BI q4's shape: two groupings joined, one over a NOT EXISTS above a
+        // Cartesian product of offers and features
+        let q4 = "SELECT * {
+            { SELECT ?f (COUNT(?o) AS ?n) {
+                ?s <urn:p> ?o . { SELECT DISTINCT ?f { ?x <urn:q> ?f } }
+                FILTER NOT EXISTS { ?s <urn:q> ?f } } GROUP BY ?f }
+            { SELECT ?f (COUNT(?y) AS ?m) { ?y <urn:q> ?f } GROUP BY ?f } }";
+        let sort = "SELECT ?s ?o { ?s <urn:p> ?o } ORDER BY ?o";
+        // every scan and grouping holds 1,000 rows, and a product the rows of both
+        // inputs, so only the product is large
+        fn estimate(node: &mut Node) -> f64 {
+            let kids: Vec<f64> = node.children.iter_mut().map(estimate).collect();
+            node.est = match &node.kind {
+                Kind::Join {
+                    algo: JoinAlgo::Cross,
+                    ..
+                } => kids.iter().product(),
+                Kind::Group { .. } => 1_000.0,
+                _ if kids.is_empty() => 1_000.0,
+                _ => kids.iter().copied().fold(0.0, f64::max),
+            };
+            node.est
+        }
+        let decide = |q: &str, memory: u64| {
+            let q = super::super::parse_query(q, None, &[]).unwrap();
+            let options = QueryOptions {
+                max_memory_bytes: Some(memory),
+                ..Default::default()
+            };
+            let mut p =
+                super::super::prepare_query(store.snapshot(), &q, &options, None, None).unwrap();
+            estimate(&mut p.node);
+            auto_streaming(&p.ctx, &p.node, p.kind, &Default::default())
+        };
+        // a product of a million rows is about 24 MB eagerly, more than half of 32 MiB,
+        // while the cursor keeps a thousand features, the key set and the groups
+        assert!(decide(q4, 32 << 20));
+        // when eager execution fits, it stays eager
+        assert!(!decide(q4, 1 << 30));
+        // a full sort keeps all of its rows in the cursor too, so without spill it stays
+        // eager
+        assert!(!decide(sort, 32 << 20));
+    }
+
     #[test]
     fn automatic_admission_streams_plans_expected_to_outgrow_memory_when_they_can_spill() {
         use crate::io::Source;
