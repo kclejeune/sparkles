@@ -916,7 +916,8 @@
     align-items: center;
   }
   .by select {
-    max-width: 16ch;
+    /* room for "GraphRAG communities" and the arrow */
+    max-width: 24ch;
   }
   .ov-notes {
     padding: 4px 12px;
