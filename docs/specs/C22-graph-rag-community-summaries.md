@@ -226,9 +226,11 @@ the text is a heuristic.
 
 After those checks, a heuristic looks for names in each kept finding's text that match
 no entity of the input. It takes as candidate names the runs of capitalised words, the
-quoted phrases and the words with inner capitals or digits, and compares each candidate,
-without regard to case, with the labels and IRI local names of the input's entities. A
-candidate that matches none is recorded on the finding as an unmatched name, and the
+quoted phrases and the words with inner capitals or digits. A single capitalised word
+that starts a sentence is not a candidate. It compares each candidate, without regard to
+case, with the labels and IRI local names of the input's entities, and a candidate
+matches when it equals one of them, is part of one, or contains one. A candidate that
+matches none is recorded on the finding as an unmatched name, and the
 report's review shows it. The heuristic does not drop the finding. It misses names
 written in lower case, pronouns and paraphrases, and it flags capitalised words that are
 not names, so a report with no unmatched names is not proof that its text names only

@@ -12,5 +12,7 @@ pub mod hierarchy;
 pub mod identity;
 pub mod ledger;
 pub mod projection;
+#[cfg(feature = "mcp")]
+pub mod report;
 pub mod settings;
 pub mod state;
