@@ -134,13 +134,15 @@ def test_the_timeout_covers_all_of_the_queries() -> None:
         f"<{EX}s{i}> a <{EX}T> ; <{EX}region> <{EX}r{i % 12}> ; <{EX}knows> <{EX}s{(i * 7) % 200000}> ."
         for i in range(200000)
     )
-    # two copies, so that the result cache of the first has nothing to serve the second
-    measured, bounded = Dataset(), Dataset()
-    measured.load(rows, "turtle")
-    bounded.load(rows, "turtle")
+    # separate copies, so that the result cache of one has nothing to serve another
+    warmup, measured, bounded = Dataset(), Dataset(), Dataset()
+    for ds in (warmup, measured, bounded):
+        ds.load(rows, "turtle")
     request = {"class": EX + "T"}
     by = {"property": EX + "region"}
 
+    # a first call pays one-time costs, which would make the measured time too long
+    warmup.graph.groups(request, by=by)
     start = time.perf_counter()
     answer = measured.graph.groups(request, by=by)
     whole = time.perf_counter() - start
