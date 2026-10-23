@@ -327,7 +327,7 @@ pub fn schema() -> OutputSchema {
             "additionalProperties": false
         }),
         from_text: |t| {
-            crate::models::fenced(t, &["json"]).and_then(|j| serde_json::from_str(&j).ok())
+            crate::models::fenced(t, &["json"]).and_then(|j| serde_json::from_str(j).ok())
         },
         text_instruction: "Write the report as one JSON object in a fenced json block.",
     }

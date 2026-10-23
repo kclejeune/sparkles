@@ -1110,7 +1110,10 @@ async fn enforce(st: &AppState, auth: &super::Auth, mut req: Request, next: Next
         .extensions()
         .get::<crate::http::branches::SelectedBranch>()
         .map(|b| b.0.clone());
-    let p = authed.principal.on_branch(branch.as_deref());
+    let p = authed
+        .principal
+        .on_branch(branch.as_deref())
+        .with_guard(st.graphrag_guard.clone());
     let clear = authed.clear_cookie.then(|| {
         auth.cookie_mode(req.headers())
             .set(super::SESSION_COOKIE, "", 0)

@@ -1,8 +1,8 @@
 //! The `graphrag` settings of a dataset (spec C22 §2.1), kept in `<db>/graphrag.json`.
 //!
-//! The object carries a format `version`. A reader refuses a version it does not know
-//! rather than guessing at its members, and every number has a range so that a build
-//! cannot be asked for unbounded work.
+//! The file carries the settings layer's `format` member, registered in
+//! `sparkles::formats`, so a file of a newer format is refused rather than misread.
+//! Every number has a range so that a build cannot be asked for unbounded work.
 
 use crate::settings::{Providers, Typed};
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,6 @@ pub const GRAPHRAG_FILE: &str = "graphrag.json";
 
 /// The kind's top-level members.
 pub const MEMBERS: &[&str] = &[
-    "version",
     "enabled",
     "principal",
     "projection",
@@ -26,9 +25,6 @@ pub const MEMBERS: &[&str] = &[
     "budget",
 ];
 
-/// The settings format this server reads and writes.
-pub const SETTINGS_VERSION: u32 = 1;
-
 /// The namespace of reports graphs. Every graph under it is guarded by the disclosure
 /// guard of C22 §6, so a reports graph must be named inside it.
 pub const GUARDED_PREFIX: &str = "urn:x-sparkles:graphrag:";
@@ -40,9 +36,6 @@ pub const MAX_FACTS_PER_COMMUNITY: u32 = 10_000;
 /// The largest `minCommunitySize`.
 pub const MAX_MIN_COMMUNITY_SIZE: u32 = 10_000;
 
-fn version() -> u32 {
-    SETTINGS_VERSION
-}
 fn levels() -> u32 {
     3
 }
@@ -220,8 +213,6 @@ impl Default for Budget {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GraphragSettings {
-    #[serde(default = "version")]
-    pub version: u32,
     #[serde(default)]
     pub enabled: bool,
     /// whose view the projection and the reports read; required when enabled
@@ -250,7 +241,6 @@ pub struct GraphragSettings {
 impl Default for GraphragSettings {
     fn default() -> GraphragSettings {
         GraphragSettings {
-            version: SETTINGS_VERSION,
             enabled: false,
             principal: String::new(),
             projection: Projection::default(),
@@ -272,15 +262,8 @@ pub fn is_guarded(iri: &str) -> bool {
 }
 
 impl GraphragSettings {
-    /// The checks of the values. The version is checked first, so that an object of an
-    /// unknown version is refused as a whole.
+    /// The checks of the values.
     pub fn check(&self) -> Result<(), String> {
-        if self.version != SETTINGS_VERSION {
-            return Err(format!(
-                "version {} of the graphrag settings is not supported; this server reads version {SETTINGS_VERSION}",
-                self.version
-            ));
-        }
         if self.levels > MAX_LEVELS {
             return Err(format!("levels must be at most {MAX_LEVELS}"));
         }
@@ -408,7 +391,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(s.refresh.mode, RefreshMode::Auto);
-        assert_eq!(s.version, SETTINGS_VERSION);
     }
 
     #[test]
@@ -428,11 +410,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_versions_are_refused() {
-        let e = parse(json!({ "version": 2 })).unwrap_err();
-        assert!(e.contains("version 2"), "{e}");
-        let e = parse(json!({ "version": 0 })).unwrap_err();
-        assert!(e.contains("not supported"), "{e}");
+    fn newer_formats_are_refused() {
+        assert!(sparkles::formats::check_settings(GRAPHRAG_FILE, &json!({ "format": 1 })).is_ok());
+        let e = sparkles::formats::check_settings(GRAPHRAG_FILE, &json!({ "format": 2 }))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("newer release"), "{e}");
     }
 
     #[test]

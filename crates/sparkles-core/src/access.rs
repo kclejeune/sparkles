@@ -63,6 +63,18 @@ pub struct GraphRule {
     /// IRI patterns with `*` that are never in the set, whatever else names them
     /// (made by [`Graphs::without_pattern`])
     pub excluded: Vec<String>,
+    /// patterns whose graphs are in the set only when a guard exempts them, on top of
+    /// every other rule (made by [`Graphs::guarded`])
+    pub guards: Vec<GraphGuard>,
+}
+
+/// Graphs a guard keeps out of a set, except those it exempts by exact IRI.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GraphGuard {
+    /// an IRI pattern with `*`
+    pub pattern: String,
+    /// exact IRIs the guard lets through (sorted)
+    pub exempt: Vec<String>,
 }
 
 impl GraphRule {
@@ -97,6 +109,13 @@ impl GraphRule {
             v.sort_unstable();
             v.dedup();
         }
+        for g in &mut self.guards {
+            g.exempt.sort_unstable();
+            g.exempt.dedup();
+        }
+        self.guards
+            .sort_unstable_by(|a, b| (&a.pattern, &a.exempt).cmp(&(&b.pattern, &b.exempt)));
+        self.guards.dedup();
     }
 
     /// Add `other`'s graphs.
@@ -107,12 +126,19 @@ impl GraphRule {
         self.patterns.extend(other.patterns.iter().cloned());
         self.protected.extend(other.protected.iter().cloned());
         self.excluded.extend(other.excluded.iter().cloned());
+        // a union keeps every guard of both sides, so it never admits more
+        self.guards.extend(other.guards.iter().cloned());
         self.normalize();
     }
 
     /// Whether the named graph `iri` is in the set.
     pub fn matches_iri(&self, iri: &str) -> bool {
         if self.excluded.iter().any(|p| glob(p, iri)) {
+            return false;
+        }
+        if self.guards.iter().any(|g| {
+            glob(&g.pattern, iri) && g.exempt.binary_search_by(|x| x.as_str().cmp(iri)).is_err()
+        }) {
             return false;
         }
         if self.iris.binary_search_by(|x| x.as_str().cmp(iri)).is_ok() {
@@ -209,6 +235,27 @@ impl Graphs {
             Graphs::Only(r) => r.clone(),
         };
         r.excluded.push(pattern.to_string());
+        r.normalize();
+        Graphs::Only(r)
+    }
+
+    /// The set without the named graphs that `pattern` matches, except the IRIs in
+    /// `exempt`, which stay in the set when it otherwise holds them. Unlike
+    /// [`without_pattern`](Self::without_pattern), an exempt graph is not removed.
+    pub fn guarded(&self, pattern: &str, exempt: &[String]) -> Graphs {
+        let mut r = match self {
+            Graphs::All => GraphRule {
+                default_graph: true,
+                patterns: vec!["*".into()],
+                blank_nodes: true,
+                ..Default::default()
+            },
+            Graphs::Only(r) => r.clone(),
+        };
+        r.guards.push(GraphGuard {
+            pattern: pattern.to_string(),
+            exempt: exempt.to_vec(),
+        });
         r.normalize();
         Graphs::Only(r)
     }
@@ -431,6 +478,37 @@ mod tests {
         assert!(glob("http://ex/a/*", "http://ex/a/1"));
         assert!(!glob("http://ex/a/*", "http://ex/b/1"));
         assert!(glob("http://ex/*/x", "http://ex/a/b/x"));
+    }
+
+    #[test]
+    fn guards_keep_out_all_but_their_exempt_graphs() {
+        let g = Graphs::All.guarded("urn:x-guarded:*", &["urn:x-guarded:a".into()]);
+        assert!(g.allows_iri("urn:x-guarded:a"));
+        assert!(!g.allows_iri("urn:x-guarded:b"));
+        assert!(g.allows_iri("http://ex/other"));
+        assert!(g.default_graph());
+        // an exempt graph still needs the rule to hold it
+        let only = Graphs::Only(GraphRule::new(["http://ex/*"], &[]))
+            .guarded("urn:x-guarded:*", &["urn:x-guarded:a".into()]);
+        assert!(!only.allows_iri("urn:x-guarded:a"));
+        // an exact grant does not pass a guard
+        let exact =
+            Graphs::Only(GraphRule::new(["urn:x-guarded:b"], &[])).guarded("urn:x-guarded:*", &[]);
+        assert!(!exact.allows_iri("urn:x-guarded:b"));
+        // without_pattern still removes an exempt graph
+        assert!(
+            !g.without_pattern("urn:x-guarded:a")
+                .allows_iri("urn:x-guarded:a")
+        );
+        // a union keeps both sides' guards
+        let u = g.union(&Graphs::All.guarded("urn:x-guarded:*", &[]));
+        assert!(!u.allows_iri("urn:x-guarded:a"));
+        assert!(!u.allows_iri("urn:x-guarded:b"));
+        assert_eq!(
+            g,
+            Graphs::All.guarded("urn:x-guarded:*", &["urn:x-guarded:a".into()]),
+            "normalized"
+        );
     }
 
     #[test]

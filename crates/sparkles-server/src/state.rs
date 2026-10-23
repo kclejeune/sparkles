@@ -319,6 +319,8 @@ impl Drop for Leaving<'_> {
 pub struct AppState {
     pub data_dir: PathBuf,
     pub catalog: sparkles::Catalog,
+    /// the disclosure registries of the datasets' reports graphs (spec C22 §6)
+    pub graphrag_guard: Arc<crate::graphrag::guard::Guard>,
     /// HTTP routing state and observers, keyed by dataset name. Only map lookups and
     /// changes happen under this lock, never catalog work or file system work.
     routing: Mutex<BTreeMap<String, Arc<Dataset>>>,
@@ -592,6 +594,17 @@ impl Limits {
     }
 }
 
+/// The disclosure guard of a catalog's datasets, which finds a dataset's directory
+/// through the catalog.
+fn guard_for(catalog: &sparkles::Catalog) -> Arc<crate::graphrag::guard::Guard> {
+    let catalog = catalog.clone();
+    Arc::new(crate::graphrag::guard::Guard::new(Box::new(move |name| {
+        catalog
+            .get(name)
+            .map(|d| (d.dataset_id(), d.store().root().map(Path::to_path_buf)))
+    })))
+}
+
 impl AppState {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
@@ -613,9 +626,11 @@ impl AppState {
         std::fs::create_dir_all(data_dir.join("databases"))?;
         let mut options: sparkles::CatalogOptions = store_opts.clone().into();
         options.memory.pool_bytes = pool_bytes;
+        let catalog = sparkles::Catalog::open(data_dir, options)?;
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
-            catalog: sparkles::Catalog::open(data_dir, options)?,
+            graphrag_guard: guard_for(&catalog),
+            catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),
@@ -677,9 +692,11 @@ impl AppState {
     /// the datasets themselves.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub fn standalone(store_opts: StoreOptions, default_timeout: std::time::Duration) -> AppState {
+        let catalog = sparkles::Catalog::memory(store_opts.clone().into());
         AppState {
             data_dir: PathBuf::new(),
-            catalog: sparkles::Catalog::memory(store_opts.clone().into()),
+            graphrag_guard: guard_for(&catalog),
+            catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
             leaving: Mutex::new(BTreeSet::new()),

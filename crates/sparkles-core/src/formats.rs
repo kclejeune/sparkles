@@ -561,6 +561,10 @@ pub const SETTINGS: &[SettingsFile] = &[
     ds("query-suggestions.json", 1),
     ds("maintenance.json", 1),
     ds("review.json", 1),
+    ds("graphrag.json", 1),
+    named(ds("graphrag/state.json", 1), "version"),
+    named(ds("graphrag/ledger.json", 1), "version"),
+    named(ds("graphrag/disclosure.json", 1), "version"),
     // the data directory
     server("config.json", 1),
     server("models.json", 1),

@@ -636,6 +636,9 @@ impl Drop for Waiting<'_> {
 /// login flows in progress and the password machinery.
 pub struct Auth {
     path: Option<PathBuf>,
+    /// the number of policy reloads; a long-lived read made before ends when it sees a
+    /// new value (spec C22 §6.3)
+    epoch: AtomicU64,
     policy: ArcSwap<Policy>,
     creds: Mutex<Creds>,
     argon: Argon,
@@ -690,6 +693,7 @@ impl Auth {
         let cloudflare = parking_lot::RwLock::new(None);
         rebuild_cloudflare(&cloudflare, &policy)?;
         Ok(Auth {
+            epoch: AtomicU64::new(0),
             path: None,
             policy: ArcSwap::from_pointee(policy),
             creds: Mutex::new(Creds::default()),
@@ -775,6 +779,8 @@ impl Auth {
                 .map_err(anyhow::Error::msg)?;
             self.policy.store(Arc::new(p));
             self.creds.lock().cache.clear();
+            // long-lived reads made under the old policy end (spec C22 §6.3)
+            self.epoch.fetch_add(1, Ordering::SeqCst);
             Ok(warnings)
         })();
         self.metrics.reloads[usize::from(r.is_err())].fetch_add(1, Ordering::Relaxed);
@@ -820,6 +826,33 @@ impl Auth {
                 .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"https")),
         };
         CookieMode { secure }
+    }
+
+    /// The number of policy reloads.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// The configured user `name` as a principal, without a credential, for work the
+    /// server does as that user, such as reading a GraphRAG build's projection as its
+    /// `principal` (spec C22 §6). `None` when the policy has no such user.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn user_principal(&self, name: &str) -> Option<Principal> {
+        let policy = self.policy.load_full();
+        let u = policy.users.get(name)?;
+        Some(
+            Principal::new(Kind::User, name, Scheme::None, Access::of(u.grants.clone())).with_info(
+                PrincipalInfo {
+                    owner: Some(Identity {
+                        kind: Kind::User,
+                        name: name.to_string(),
+                        groups: Vec::new(),
+                        display_name: None,
+                    }),
+                    ..Default::default()
+                },
+            ),
+        )
     }
 
     /// The anonymous principal of the current policy.

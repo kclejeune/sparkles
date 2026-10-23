@@ -13,6 +13,7 @@ mod branches;
 mod cli_grants;
 #[cfg(feature = "graphql")]
 mod graphql;
+mod graphrag;
 pub(super) mod graphs;
 mod idp;
 mod io_profile;

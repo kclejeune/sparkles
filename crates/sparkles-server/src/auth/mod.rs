@@ -699,6 +699,9 @@ pub struct Principal {
     /// graph IRIs or `*` patterns hidden from this principal's reads on top of its
     /// grants (`reviewedOnly` of `POST /{ds}/ask` hides agent memory)
     hidden: Option<Arc<[String]>>,
+    /// the disclosure guard of reports graphs (spec C22 §6); without one, no guarded
+    /// graph is proven for a restricted view
+    guard: Option<Arc<crate::graphrag::guard::Guard>>,
 }
 
 impl std::fmt::Debug for Principal {
@@ -725,6 +728,7 @@ impl Principal {
             info: Arc::default(),
             branch: None,
             hidden: None,
+            guard: None,
         });
         LOCAL.clone()
     }
@@ -738,7 +742,15 @@ impl Principal {
             info: Arc::default(),
             branch: None,
             hidden: None,
+            guard: None,
         }
+    }
+
+    /// This principal with the server's disclosure guard, which proves guarded graphs
+    /// for its restricted views.
+    pub fn with_guard(mut self, guard: Arc<crate::graphrag::guard::Guard>) -> Principal {
+        self.guard = Some(guard);
+        self
     }
 
     pub fn with_info(mut self, info: PrincipalInfo) -> Principal {
@@ -814,11 +826,16 @@ impl Principal {
     /// The graphs of `ds` this principal reads and writes through endpoint `e`, when
     /// its grants do not cover every graph (`None` otherwise, and always without auth).
     pub fn view(&self, ds: &str, e: Endpoint) -> Option<Arc<sparkles::access::GraphAccess>> {
+        let qualified = self.qualified(ds);
         let view = if self.is_local() {
             None
         } else {
-            self.access.view(&self.qualified(ds), e, self.caller())
+            self.access.view(&qualified, e, self.caller())
         };
+        // reports graphs are readable only when the guard proves the view covers what
+        // their builds read; an unrestricted view has nothing to prove
+        let view =
+            view.map(|v| crate::graphrag::guard::apply(v, &qualified, self.guard.as_deref()));
         let Some(hidden) = &self.hidden else {
             return view.map(Arc::new);
         };

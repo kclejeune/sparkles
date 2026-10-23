@@ -319,6 +319,9 @@ struct Feed {
     queue: std::collections::VecDeque<Event>,
     until: Instant,
     done: bool,
+    /// the guard's epoch when the stream started: a new policy or disclosure registry
+    /// ends the stream before it reads another page (spec C22 §6.3)
+    epoch: u64,
 }
 
 impl Feed {
@@ -348,6 +351,19 @@ impl Feed {
                 || self.st.phase() == crate::obs::Phase::Draining
             {
                 return None;
+            }
+            if access_epoch(&self.st) != self.epoch {
+                self.done = true;
+                return Some((
+                    Ok(Event::default().event("error").data(
+                        json!({
+                            "error": "the access policy or a disclosure registry changed; reconnect to read under the new rules",
+                            "code": "access-changed",
+                        })
+                        .to_string(),
+                    )),
+                    self,
+                ));
             }
             match page(&self.ds, &self.ask).await {
                 Ok(p) if p.commits.is_empty() => {
@@ -387,12 +403,19 @@ impl Feed {
     }
 }
 
+/// Changes whenever the access policy is reloaded or a disclosure registry gains an
+/// entry. Both counters only grow, so their sum changes when either does.
+fn access_epoch(st: &AppState) -> u64 {
+    st.graphrag_guard.epoch() + st.auth.as_ref().map_or(0, |a| a.epoch())
+}
+
 fn event_stream(
     st: Arc<AppState>,
     ds: Arc<Dataset>,
     ask: Ask,
     fmt: DiffFormat,
 ) -> impl IntoResponse {
+    let epoch = access_epoch(&st);
     let feed = Feed {
         rx: ds.store.subscribe_commits(),
         st,
@@ -402,6 +425,7 @@ fn event_stream(
         queue: Default::default(),
         until: Instant::now() + MAX_STREAM,
         done: false,
+        epoch,
     };
     let events = futures_util::stream::unfold(feed, Feed::next);
     Sse::new(events).keep_alive(KeepAlive::default())

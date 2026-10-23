@@ -8,6 +8,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub mod budget;
+pub mod guard;
 pub mod hierarchy;
 pub mod identity;
 pub mod ledger;

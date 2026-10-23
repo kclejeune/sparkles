@@ -773,20 +773,26 @@ every model attempt from an exact local tokenizer, the provider's counting endpo
 the byte bound. The daily ledger and the anomalies persist in a small versioned file in
 the dataset's GraphRAG directory, written before each request can be sent. The
 `graphrag` kind is registered with C19's settings, so `/$/settings` validates and keeps
-it, and no build reads it. None of these parts is wired into a build or a
-route, and local mock providers test them. The byte bound's default allowances are
-unmeasured. Measuring them against real providers needs paid or provider runs, which
-wait for the user's approval. Phase 1 still needs the projection reader, the
-report inputs and checks, the whole-build estimate, the disclosure guard, report
-storage with provenance, the build task and routes, the CLI, the Communities tab, the
-inbox kind and manual refresh. Global Ask and memory integration remain Phase 2, and
+it, and no build reads it. The projection reader reads as the build's principal and
+checks each provider's send level. The report inputs and the checks of §3.4 are in
+place with the prose heuristic. The disclosure guard of §6 is in the common access
+path. Every restricted view hides the guarded namespace unless the dataset's versioned
+footprint registry proves coverage, and a policy reload or a registry install ends open
+change feed streams. Router tests cover the paths of §6.6 for SPARQL, time travel, the
+Graph Store, the schema report and the change feed. Nothing writes a reports graph yet,
+so the guard has no effect on current data. None of these parts is wired into a build
+or a route, and local mock providers test the model parts. The byte bound's default
+allowances are unmeasured. Measuring them against real providers needs paid or provider
+runs, which wait for the user's approval. Phase 1 still needs the whole-build estimate,
+report storage with provenance, the build task and routes, the CLI, the Communities
+tab, the inbox kind and manual refresh. Global Ask and memory integration remain Phase 2, and
 automatic refresh remains Phase 3. [ROADMAP](../ROADMAP.md) item 12 tracks this work.
 
 The contracts that the first draft left open are settled in §14. Token budgets use
 conservative reservations before every HTTP attempt, and findings carry entity numbers
 that are checked exactly, with a labelled heuristic for the prose. §6 now holds the
 design of the disclosure footprint and the common read guard. Reports stay unpublished
-until that guard is implemented and reviewed, and the paths of §6.6 are tested.
+until that guard has passed review.
 
 ### Shared memory representation follow-up
 
