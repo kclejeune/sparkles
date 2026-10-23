@@ -507,10 +507,9 @@ The data is U03 §7's.
 Phase 1 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 101. Phase 2's splice
 core shipped with it, ahead of the rest of Phase 2, so that the round-trip properties and
 the shared undo history could be tested on real edits. That core adds a triple, deletes a
-triple and turns optional on or off for an edge. The schema picker, filter forms, paths,
-projection and modifier edits, renames, deleting locked blocks, **Count matches** and the
-phone layout for building a query remain in Phase 2. Phase 3 is not built. Both stay
-under item 101.
+triple and turns optional on or off for an edge. The rest of Phase 2 shipped later on
+2026-10-23, and its section below describes it. Phase 3 is not built and stays under
+item 101.
 
 **The pattern export.** The classification is `sparkles_fmt::pattern`, which reads the
 lossless tree of X02 and answers a `Pattern` with byte ranges. The browser module's third
@@ -590,13 +589,83 @@ the pane loads the module on its own glob, `VITE_PATTERN_WASM=off` leaves it out
 `mise run ui:e2e:mock` builds it first.
 
 **Differences from the acceptance examples.** A1 draws three nodes and two edges, not
-three edges, because the two `a` triples are the subtitles of §2.1. The empty state says
-"Add a node to start" without the five largest classes, which need the schema reads of
-Phase 2. A history entry and a stored query have no **Show pattern**, because the query
-page has no list of past runs and a stored query opens in an editor tab, where the pane
-draws it. A11 and A12 are met in part. The keyboard and taps reach every element and make
-the three edits of the splice core, but a new triple is typed into a form, since the
-pickers that would build A1 with taps alone are Phase 2. A13 waits for the picker too.
+three edges, because the two `a` triples are the subtitles of §2.1. A history entry and a
+stored query have no **Show pattern**, because the query page has no list of past runs
+and a stored query opens in an editor tab, where the pane draws it. Phase 2 met A11, A12
+and A13, as its section says.
+
+**Phase 2.** The rest of Phase 2 shipped on 2026-10-23. `sparkles-fmt` gives the edits
+the ranges they need. The projection has its keyword, the range of `DISTINCT` and of `*`,
+and an item per variable or expression. Filters and locked blocks have the ranges of
+their variable references, a locked block lists the variables it binds, and the answer
+gives where the query form starts, after the prologue. `ui/src/lib/pattern-edits.ts`
+holds the edits of §2.2 beyond the splice core, each a list of changes checked against
+R3 on the strict parse of its result, as the core's are. A predicate change replaces
+the predicate token. When the triple shares its predicate with others in a `,` list, it
+moves out into a new `;` entry, so the others keep theirs. A filter is appended after the
+last triple of its group that binds the variable, as one `FILTER(…)` item. A rename
+replaces the variable's tokens in triples, understood filters and the projection, and in
+the locked blocks, modifiers and projection expressions only after the person confirms
+in a dialog that shows those blocks. A rename to a name already in the query is refused,
+since it would merge two variables. Deleting a node deletes its triples one at a time,
+parsing again between them, and composes the steps with `ChangeSet.compose` into one
+change. It also deletes each understood filter whose variables the deleted triples bound
+and that nothing binds any more. A locked block of the `WHERE` group goes after a
+confirmation that shows its text. Blocks outside it, such as `FROM` or a `CONSTRUCT`
+template, are not offered for deletion. The first projection change writes the
+variables of `SELECT *` out in the order they first appear, removing the last projected
+variable is refused because a query projects at least one, and a new `LIMIT` or `OFFSET`
+goes after the group and the other modifiers.
+
+`pattern-schema.ts` reads the pickers' terms. It reads the first page of
+`/$/schema/{ds}`, with 1,000 classes and 1,000 predicates, once per dataset, branch and
+**At** state, and further pages when the person asks for more from the schema, keeping
+at most 10,000 of each. Profiles are read one class at a time and kept per commit, at
+most 50. Predicates are ranked by the source class's profile, then by the target
+class's `incoming`, then by their triples. Variable names follow U03 §4.2, so
+`ex:Person` gives `?person`, a clash gets a number and the names stored queries reserve
+are skipped. `pattern-filters.ts` holds the filter forms. The forms a variable offers
+come from the datatypes the profiles of its subjects' classes saw for the predicate, and
+every form writes an expression the reader understands, so its chip opens again in the
+same form, which a test checks for each form. `PatternPicker.svelte` is the combobox of
+the pickers, in the WAI-ARIA pattern. A schema read that fails leaves the pickers empty
+with a note that says why, and typed names still work.
+
+A waiting node lives in the pane only, since it is not text. It is not kept across a
+reload, and a pane per editor tab means each tab has its own. An edge whose end is a
+waiting class node writes `?x a C` and the edge in one change, and an empty editor is
+edited as `SELECT * WHERE { }`, so the first edge writes the whole query. A node with no
+edges is placed beside the drawing rather than where fcose's gravity would put it, and
+the view fits when a new node lands outside it. Cytoscape now measures its container
+again when the container's box changes, because a bar or form opening above the canvas
+moved it and taps landed beside their nodes. The warning mark of §4.2 rule 4 is a red
+border and a subtitle on the block, which the screen reader's description of the block
+includes. **Count matches** sends the query of §2.2 with the prologue and `FROM` clauses
+of the text, `timeout=5` and the page's **At** state, and a `408` shows "More than the
+count could finish". A count belongs to the text it ran on and clears when the text
+changes. On a phone the strip folds into a **Query options** sheet, **+ Edge** is the
+two-tap mode of §2.6, and the node and edge forms fill the screen.
+
+A11 builds A1's shape from an empty editor with `N`, `E`, `Tab` and `F`, with each edit
+announced. A12 builds a query at 390 px with taps on the empty state's classes, the node
+form and two canvas taps, with no sideways scrolling. A13 runs against a real server
+with a reader whose view hides `ex:worksFor`. Graph grants can hide only whole graphs,
+and the queries read the default graph, so the test hides the predicate with a protection
+of triples (C12b), which every schema read applies as a graph grant does. The picker
+does not list `ex:worksFor`, a typed `ex:worksFor` is accepted, and the count under the
+reader's view is 0. The screenshot pipeline takes `docs/images/pattern-edit.png`, which
+shows **+ Edge** with the ranked predicate picker, and `pattern.png` now shows the strip's
+checkboxes and a count.
+
+Vitest checks every Phase 2 edit's exact text, the refusals, and an A5 run over seeded
+edits of every kind, asserting R3 on each applied edit. It also checks the schema source's
+paging and caching, predicate ranking, variable names, the filter forms and their
+constants. `ui/tests/mock/pattern-edit.spec.ts` covers A11, A12, filters by datatype with
+chip editing, predicate and path changes, the rename and locked-block confirmations, the
+warning mark, node deletion with its filters, the strip, the count and its timeout, and
+the schema failure note. `ui/tests/e2e/pattern.spec.ts` covers A1, A6, a count and A13
+on a real server. The mock server's class profiles now count literal datatypes and
+incoming predicates, as the real route does.
 
 **Tests.** In Rust, `crates/sparkles-fmt/tests/pattern.rs` checks the classification of
 each construct, the ranges of `;` and `,` lists, paths, modifiers, the other query forms,

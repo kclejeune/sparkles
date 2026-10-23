@@ -1513,13 +1513,48 @@ shows its kind and its text, comments included, and dotted lines join it to the
 variables it shares. The editor edits locked blocks, and edits made in the pane never
 change their text.
 
-The pane makes three edits. **+ Triple** (`N`) adds a triple pattern written as a
-subject, a predicate and an object. It goes into the group that holds the subject's
-patterns, after the last part of it the pane edits, and also after any locked block that
-follows and uses a variable the new triple binds. A prefixed name whose prefix the query
-does not declare, but the dataset does, adds its `PREFIX` line, and one that neither
-declares is refused. Selecting an edge offers **Optional**, which moves the triple into
-`OPTIONAL { … }` or back out of it, and **Delete**, which removes it from its statement.
+The pane builds and edits queries. **+ Node** (`N`) asks for a variable, an IRI or a
+class, and the picker lists the dataset's classes with their instance counts. The new
+node waits on the canvas, dimmed and dashed, because SPARQL has no free variables, and
+nothing is written until an edge uses it. A class becomes a variable named after it, such
+as `?person` for `ex:Person`, and the edge that first uses it writes `?person a
+ex:Person` too. With an empty editor the pane offers **+ Node** and the five classes with
+the most instances, and the first edge writes the whole query.
+
+**+ Edge** (`E`, or **Edge from here** in a node's panel) writes a triple pattern from a
+source, a predicate and a target. The predicate picker lists first the predicates that
+instances of the source's class use, then those whose values are instances of the
+target's class, each with its count, then the rest. Typing narrows the list, and a full
+IRI or a prefixed name that the list lacks is accepted as it is. The triple goes into the
+group that holds the source's patterns, after the last part of it the pane edits, and
+also after any locked block that follows and uses a variable the new triple binds. A
+prefixed name whose prefix the query does not declare, but the dataset does, adds its
+`PREFIX` line, and one that neither declares is refused. When the schema cannot be read,
+the pickers say why and take typed names only. The schema and the counts are read at the
+query page's branch and **At** state, under the reader's own view, so a predicate the
+reader cannot see is not listed.
+
+An edge's panel changes its predicate, offers the paths `p+`, `p*`, `p?` and `^p`, and
+takes a typed sequence or alternative such as `ex:a/ex:b`. **Optional** moves the triple
+into `OPTIONAL { … }` or back out of it, and **Delete** removes it from its statement. A
+variable's panel adds a filter (`F`) from a form chosen by the datatypes its values were
+seen with, with ranges for numbers and dates, `CONTAINS`, `STRSTARTS`, `STRENDS` and
+`REGEX` for strings, `LANGMATCHES` for language-tagged strings, and `BOUND`, `isIRI` and
+`isLiteral`. The filter goes after the last triple that binds the variable, and its chip
+opens the same form again to change or delete it. The panel also renames the variable
+everywhere the pane edits. When a locked block uses the variable, the pane shows the
+block and asks whether to rename it there too. **Delete** on a node removes every triple
+that touches it, with the filters left without a bound variable. A locked block is
+deleted only after a confirmation that shows its text. A locked block that uses a
+variable nothing binds any more, for example after its triple was deleted, gets a red
+border and the note "uses ?y, which nothing binds now".
+
+The strip under the drawing has a checkbox per variable, and the first change turns
+`SELECT *` into the list of variables. It also sets `DISTINCT`, `LIMIT` and `OFFSET`.
+**Count matches** runs `SELECT (COUNT(*) AS ?n)` over the pattern with a five-second
+timeout and shows the count, or "More than the count could finish" when the time runs
+out.
+
 Each edit changes only the text it must, as one change to the editor, so `Ctrl+Z` (`⌘Z`
 on a Mac) in the editor or anywhere in the pane undoes it in one step, the same as typing.
 The pane makes an edit only when the server would accept the result and the result holds
@@ -1537,13 +1572,17 @@ history or as a stored query draws the same picture.
 screen reader reads the pattern. With the canvas focused, `Tab` and `Shift+Tab` move
 through the elements in text order, the arrow keys move to the nearest element in that
 direction, `Shift` with an arrow moves the focused node by 16 pixels, `Enter` opens the
-element's panel, `Delete` removes the focused edge, `O` toggles optional on it, and
-`Escape` returns to the editor. A polite live region announces each edit.
+element's panel, `Delete` removes the focused element, `O` toggles optional on an edge,
+`N`, `E` and `F` add a node, an edge from the focused node and a filter on the focused
+variable, and `Escape` closes a form or panel, then returns to the editor. A polite live
+region announces each edit.
 
 A result has a **Pattern** tab that draws the query that produced it, read-only, and
 **Edit** puts that query in the editor with the pane open. On a phone the editor and the
 pane are two tabs, **Text** and **Pattern**, over the same query, and every control
-keeps a 44-pixel touch target. The pane needs the formatter's WebAssembly module (see
+keeps a 44-pixel touch target. The strip folds into a **Query options** sheet, and
+**+ Edge** takes two taps, on the source and on the target or **New node**, then opens
+the predicate picker on the whole screen. The pane needs the formatter's WebAssembly module (see
 [ui/README.md](../ui/README.md#formatting-in-the-browser)). Without it the pane says so
 and draws nothing.
 
