@@ -1801,9 +1801,13 @@ struct QuoteIndex<'q> {
     complete: bool,
 }
 
+/// The passes over the text that [`QuoteIndex`] makes at most. Each drops the quotes that
+/// the one before settled, so a pass that is cut short by its bound still counts.
+const QUOTE_PASSES: usize = 8;
+
 impl<'q> QuoteIndex<'q> {
     fn new(text: &str, quotes: impl IntoIterator<Item = &'q str>) -> QuoteIndex<'q> {
-        let distinct: Vec<&str> = quotes
+        let mut active: Vec<&str> = quotes
             .into_iter()
             .filter(|q| !q.is_empty())
             .collect::<BTreeSet<_>>()
@@ -1813,48 +1817,69 @@ impl<'q> QuoteIndex<'q> {
             found: HashMap::new(),
             complete: true,
         };
-        if distinct.is_empty() {
-            return index;
-        }
-        let Ok(automaton) = aho_corasick::AhoCorasick::new(&distinct) else {
-            index.complete = false;
-            return index;
-        };
         // per quote: the byte offset of its first occurrence, and whether another follows
-        // it without overlap (the matches of one quote come in the order of their starts)
-        let mut seen: Vec<Option<(usize, bool)>> = vec![None; distinct.len()];
-        // Matches that overlap are many when the quotes are short pieces of a repetitive
-        // text: a text of 2 MiB of one letter and quotes of 1 to 1,000 of them has two
-        // billion. Past a bound on the work, each quote is searched for on its own, which
-        // stops at its second occurrence.
-        let budget = 8 * distinct.len() + text.len();
-        for (n, m) in automaton.find_overlapping_iter(text).enumerate() {
-            if n >= budget {
+        // it without overlap
+        let mut firsts: Vec<(&str, usize, bool)> = Vec::new();
+        for _ in 0..QUOTE_PASSES {
+            if active.is_empty() {
+                break;
+            }
+            let Ok(automaton) = aho_corasick::AhoCorasick::new(&active) else {
                 index.complete = false;
-                return index;
-            }
-            let slot = &mut seen[m.pattern().as_usize()];
-            match slot {
-                None => *slot = Some((m.start(), false)),
-                Some((first, more)) if !*more && m.start() >= *first + (m.end() - m.start()) => {
-                    *more = true;
+                break;
+            };
+            // The matches of one quote come in the order of their starts. Every match of a
+            // quote that starts a whole quote after its first settles it, and a quote has
+            // at most its own length of matches before that. Matches that overlap are
+            // many when the quotes are short pieces of a repetitive text: a text of 2 MiB
+            // of one letter and quotes of 1 to 1,000 of them has two billion. A pass that
+            // reaches its bound keeps the quotes it settled and goes again without them.
+            let mut seen: Vec<Option<(usize, bool)>> = vec![None; active.len()];
+            let budget = 8 * active.len() + text.len();
+            let mut cut = false;
+            for (n, m) in automaton.find_overlapping_iter(text).enumerate() {
+                if n >= budget {
+                    cut = true;
+                    break;
                 }
-                Some(_) => {}
+                let slot = &mut seen[m.pattern().as_usize()];
+                match slot {
+                    None => *slot = Some((m.start(), false)),
+                    Some((first, more))
+                        if !*more && m.start() >= *first + (m.end() - m.start()) =>
+                    {
+                        *more = true;
+                    }
+                    Some(_) => {}
+                }
             }
+            let mut rest = Vec::new();
+            for (quote, state) in active.iter().zip(&seen) {
+                match *state {
+                    Some((byte, more)) if more || !cut => firsts.push((*quote, byte, more)),
+                    // not settled by a pass that was cut short: another pass, or a scan
+                    _ if cut => rest.push(*quote),
+                    // absent from the text
+                    _ => {}
+                }
+            }
+            if !cut {
+                active.clear();
+                break;
+            }
+            if rest.len() == active.len() {
+                // nothing was settled, so another pass would be as long
+                break;
+            }
+            active = rest;
         }
+        index.complete &= active.is_empty();
         // the code point offsets of the first occurrences, in one pass over the text
-        let mut order: Vec<(usize, usize)> = seen
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.map(|(byte, _)| (byte, i)))
-            .collect();
-        order.sort_unstable();
+        firsts.sort_unstable_by_key(|f| f.1);
         let (mut byte, mut chars) = (0, 0);
-        for (at, i) in order {
+        for (quote, at, more) in firsts {
             chars += text[byte..at].chars().count();
             byte = at;
-            let quote = distinct[i];
-            let more = seen[i].is_some_and(|(_, more)| more);
             index
                 .found
                 .insert(quote, ((chars, chars + quote.chars().count()), more));
@@ -1864,11 +1889,11 @@ impl<'q> QuoteIndex<'q> {
 
     /// [`find_quote`] on the text the index was built over, for a quote it was built with.
     fn find(&self, text: &str, quote: &str, first: bool) -> Option<(usize, usize)> {
-        if !self.complete {
-            return find_quote(text, quote, first);
+        match self.found.get(quote) {
+            Some(&(span, more)) => (first || !more).then_some(span),
+            None if self.complete => None,
+            None => find_quote(text, quote, first),
         }
-        let (span, more) = *self.found.get(quote)?;
-        (first || !more).then_some(span)
     }
 }
 
@@ -2651,18 +2676,54 @@ mod tests {
     }
 
     /// Quotes that match everywhere in a repetitive text do not make the index enumerate
-    /// every overlapping match, which are two billion for this text and took 14 s.
+    /// every overlapping match, which are two billion for this text and took 14 s. The
+    /// quotes of such a text that are not repetitive are still found in a pass.
     #[test]
-    fn quote_index_gives_up_on_repetitive_text_and_still_answers() {
+    fn quote_index_survives_repetitive_text() {
         let text = "a".repeat(2 << 20);
         let quotes: Vec<String> = (1..=1000).map(|n| "a".repeat(n)).collect();
         let began = std::time::Instant::now();
         let index = QuoteIndex::new(&text, quotes.iter().map(String::as_str));
-        assert!(!index.complete);
         for q in &quotes {
             for first in [false, true] {
                 assert_eq!(index.find(&text, q, first), find_quote(&text, q, first));
             }
+        }
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+
+        // 250,000 letters, then 18,000 passages that occur once, and the quotes of both: the
+        // repetitive quotes use up the bound of the first pass, and the passages are
+        // found by the second. One scan for each of them took 12 s.
+        let mut text = "a".repeat(250_000);
+        let passages: Vec<String> = (0..18_000)
+            .map(|i| format!("Passage {i} says {}.", "words ".repeat(5)))
+            .collect();
+        for p in &passages {
+            text.push_str(p);
+            text.push(' ');
+        }
+        let mut quotes: Vec<&str> = passages.iter().map(String::as_str).collect();
+        let letters: Vec<String> = (1..=10).map(|n| "a".repeat(n)).collect();
+        quotes.extend(letters.iter().map(String::as_str));
+        let began = std::time::Instant::now();
+        let index = QuoteIndex::new(&text, quotes.iter().copied());
+        assert!(index.complete);
+        let sample: Vec<&str> = quotes
+            .iter()
+            .copied()
+            .step_by(37)
+            .chain(letters.iter().map(String::as_str))
+            .collect();
+        for q in sample {
+            assert_eq!(
+                index.find(&text, q, false),
+                find_quote(&text, q, false),
+                "{q}"
+            );
         }
         assert!(
             began.elapsed() < std::time::Duration::from_secs(5),
