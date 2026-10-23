@@ -312,7 +312,7 @@ Serving a projection filtered by view is open question 1. The class colouring re
 of each point under the caller's view, which for an unrestricted caller is the whole dataset.
 
 Facets and the map read at the canvas's `at` and branch, and move with U01's slider. Vector
-indexes answer at the head only, and past states fall back to exact scans (F04 §4.6), so the
+indexes answer at the head only, and F04 falls back to exact scans at past states, so the
 embedding map is offered at the head of the branch that holds the index, and at other states
 it says "The embedding map shows the head".
 
