@@ -315,3 +315,108 @@ fn budgets_and_cancellation_stop_a_grouping() {
     assert_eq!(g.total, 2);
     assert!(charged >= 500 * 64, "{charged}");
 }
+
+#[test]
+fn the_charge_counts_the_strings_each_group_owns() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    let long = format!("urn:{}", "c".repeat(20_000));
+    let mut u = format!("INSERT DATA {{ <urn:a> a <{long}> .");
+    for i in 0..50 {
+        u.push_str(&format!(" <urn:a> <urn:p{i}> {i} ."));
+    }
+    u.push('}');
+    update(&s, &u, &QueryOptions::default()).unwrap();
+    let o = DiffOptions::default();
+    let d = s.diff(&At::Commit(0), &At::Commit(1), &o).unwrap();
+    let mut charged = 0u64;
+    let g = d
+        .group_by_class(&mut |_| Ok(snapshot(&s, 1)), &o, 5_000, &mut |n| {
+            charged += n;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(g.total, 51);
+    let strings: u64 = g
+        .groups
+        .iter()
+        .map(|x| {
+            let obj = match &x.object {
+                ObjectGroup::Class(Some(c)) => c.len(),
+                ObjectGroup::Literal(dt) => dt.len(),
+                _ => 0,
+            };
+            (x.subject_class.as_ref().map_or(0, String::len) + x.predicate.len() + obj) as u64
+        })
+        .sum();
+    // every group holds the long class name of its subject
+    assert!(strings > 51 * 20_000, "{strings}");
+    assert!(charged >= strings, "{charged} < {strings}");
+}
+
+/// Diff size against time, for the numbers in the U01 Phase 4 outcome. Run it with
+/// `cargo test --release -p sparkles-core --test diff_groups -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_grouping_time_by_diff_size() {
+    use sparkles_core::io::{RdfFormat, Source};
+    use std::fmt::Write as _;
+    use std::time::Instant;
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+    let mut base = String::new();
+    for i in 0..200_000 {
+        writeln!(base, "<urn:r{i}> <{TYPE}> <urn:C{}> .", i % 20).unwrap();
+        writeln!(base, "<urn:r{i}> <urn:p> <urn:r{}> .", (i * 7) % 200_000).unwrap();
+    }
+    s.load(&[Source::from_bytes(
+        base.into_bytes(),
+        RdfFormat::NTriples,
+        None,
+    )])
+    .unwrap();
+    let o = DiffOptions::default();
+    let mut offset = 0;
+    for n in [1_000usize, 10_000, 100_000] {
+        let before = s.head_commit().seq;
+        let mut add = String::new();
+        for i in 0..n / 2 {
+            let k = offset + i;
+            writeln!(add, "<urn:n{k}> <{TYPE}> <urn:D{}> .", k % 10).unwrap();
+            writeln!(add, "<urn:n{k}> <urn:q> <urn:r{}> .", k % 200_000).unwrap();
+        }
+        offset += n;
+        s.load(&[Source::from_bytes(
+            add.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let after = s.head_commit().seq;
+        let mut best = (f64::MAX, f64::MAX);
+        let mut groups = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let d = s.diff(&At::Commit(before), &At::Commit(after), &o).unwrap();
+            let diff_ms = t.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(d.len(), n);
+            let t = Instant::now();
+            let (fa, fb) = (d.from.commit.seq, d.to.commit.seq);
+            let g = d
+                .group_by_class(
+                    &mut |op| Ok(snapshot(&s, if op == DiffOp::Add { fb } else { fa })),
+                    &o,
+                    5_000,
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+            let group_ms = t.elapsed().as_secs_f64() * 1e3;
+            groups = g.total;
+            best = (best.0.min(diff_ms), best.1.min(group_ms));
+        }
+        println!(
+            "changes {n:>7}: diff {:8.2} ms, grouping {:8.2} ms, {groups} groups",
+            best.0, best.1
+        );
+    }
+}

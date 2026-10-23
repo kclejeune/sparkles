@@ -264,9 +264,17 @@ pub(super) async fn diff(
     }
     // a client that goes away stops the diff and the class lookups
     let (cancel, _cancel_on_drop) = cancel_on_drop();
+    let rows = opts.max_rows.unwrap_or(st.limits.max_rows) as u64;
+    // a grouping holds the diff it groups, so the memory budget also caps the diff's size
+    // before it is built
+    let memory_cap = match opts.max_memory_bytes {
+        Some(m) if group => Some((m / sparkles::store::CHANGE_BYTES).max(1)),
+        _ => None,
+    }
+    .filter(|&c| rows == 0 || c < rows);
     let o = DiffOptions {
         graph,
-        max_quads: opts.max_rows.unwrap_or(st.limits.max_rows) as u64,
+        max_quads: memory_cap.unwrap_or(rows),
         cancel: opts.cancel.clone().or(Some(cancel)),
         deadline: opts.timeout.map(|t| std::time::Instant::now() + t),
         graphs: view.clone(),
@@ -305,7 +313,24 @@ pub(super) async fn diff(
         let ds = ds.clone();
         let (fb, tb) = (fb.clone(), tb.clone());
         move || {
-            let d = diff_of(&ds, &main, &here, cross, (&fb, from), (&tb, to), &o)?;
+            let d =
+                diff_of(&ds, &main, &here, cross, (&fb, from), (&tb, to), &o).map_err(
+                    |e| match e {
+                        sparkles::Error::BudgetExceeded(b)
+                            if b.kind == sparkles::BudgetKind::Rows
+                                && Some(b.limit) == memory_cap =>
+                        {
+                            sparkles::Error::BudgetExceeded(sparkles::Budget {
+                                kind: sparkles::BudgetKind::Memory,
+                                limit: opts.max_memory_bytes.unwrap_or_default(),
+                                requested: b
+                                    .requested
+                                    .saturating_mul(sparkles::store::CHANGE_BYTES),
+                            })
+                        }
+                        e => e,
+                    },
+                )?;
             if !group {
                 return Ok((d, None));
             }
@@ -415,7 +440,7 @@ pub(super) async fn diff(
         }
         // the summary, then the quads or the groups one by one
         let mut head = serde_json::to_vec(&summary).map_err(std::io::Error::other)?;
-        if let Some(g) = &grouped {
+        if let Some((g, _held)) = &grouped {
             head.pop(); // the closing brace
             w.write_all(&head)?;
             write!(
@@ -489,7 +514,7 @@ fn diff_of(
     (fb, from): (&str, Option<At>),
     (tb, to): (&str, At),
     o: &DiffOptions,
-) -> ApiResult<Diff> {
+) -> sparkles::Result<Diff> {
     if cross {
         let from = from.unwrap_or(At::Head);
         return Ok(main.store.branch_diff(fb, &from, tb, &to, o)?);
@@ -510,16 +535,17 @@ fn diff_of(
     match ds.dataset.history().diff(&from, &to, o) {
         // a commit the branch shares with its upstream
         Err(e) if sparkles::branch::inherited_commit(&e).is_some() => {
-            Ok(main.store.branch_diff(here, &from, here, &to, o)?)
+            main.store.branch_diff(here, &from, here, &to, o)
         }
-        r => Ok(r?),
+        r => r,
     }
 }
 
 /// `group=class`: the diff's counts by the classes of its resources, which are read at
 /// each side's state under the caller's view (`o.graphs`). What the grouping holds, and
 /// the diff it groups, are charged to the request's memory budget and to its grant in the
-/// server memory pool, so a grouping past them answers `507`.
+/// server memory pool, so a grouping past them answers `507`. The charge is returned with
+/// the groups and held until the response is written.
 #[allow(clippy::too_many_arguments)]
 fn group_by_class(
     ds: &Dataset,
@@ -530,7 +556,7 @@ fn group_by_class(
     o: &DiffOptions,
     opts: &sparkles::sparql::QueryOptions,
     limit: usize,
-) -> ApiResult<ClassGroups> {
+) -> ApiResult<(ClassGroups, super::sparql_diff::Charge)> {
     let mut charge = super::sparql_diff::Charge::new(opts);
     charge.charge((d.len() as u64).saturating_mul(sparkles::store::CHANGE_BYTES))?;
     let ho = sparkles::history::HistoryOptions {
@@ -556,7 +582,9 @@ fn group_by_class(
             Ok(main.store.branch_snapshot_at(branch, &at, &ho)?.0)
         }
     };
-    Ok(d.group_by_class(&mut state, o, limit, &mut |n| charge.charge(n))?)
+    let g = d.group_by_class(&mut state, o, limit, &mut |n| charge.charge(n))?;
+    // the charge stays with the groups until the body that lists them is dropped
+    Ok((g, charge))
 }
 
 /// A group of `group=class` as JSON: IRIs without angle brackets.

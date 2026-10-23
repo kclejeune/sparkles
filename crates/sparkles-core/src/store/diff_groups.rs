@@ -298,7 +298,12 @@ impl Diff {
             };
             let key = (classes.get(&k[1]).cloned(), k[2].clone(), object);
             if !groups.contains_key(&key) {
-                charge(GROUP_BYTES)?;
+                // a literal's datatype is a string of the group's own
+                let own = match &key.2 {
+                    ObjKey::Literal(d) => d.len() as u64,
+                    _ => 0,
+                };
+                charge(GROUP_BYTES + own)?;
             }
             let e = groups.entry(key).or_default();
             match op {
@@ -307,9 +312,16 @@ impl Diff {
             }
         }
         let total = groups.len();
-        let mut list: Vec<ClassGroup> = groups
-            .into_iter()
-            .map(|((s, p, ob), (a, r))| ClassGroup {
+        let mut list: Vec<ClassGroup> = Vec::with_capacity(total);
+        for ((s, p, ob), (a, r)) in groups {
+            // the strings each group owns, charged before they are made
+            let len = |k: &Option<Arc<[u8]>>| k.as_ref().map_or(0, |k| k.len() as u64);
+            let obj = match &ob {
+                ObjKey::Class(c) => len(c),
+                _ => 0,
+            };
+            charge(len(&s) + p.len() as u64 + obj)?;
+            list.push(ClassGroup {
                 subject_class: s.as_deref().map(iri_of),
                 predicate: iri_of(&p),
                 object: match ob {
@@ -319,8 +331,8 @@ impl Diff {
                 },
                 added: a,
                 removed: r,
-            })
-            .collect();
+            });
+        }
         list.sort_by(|a, b| {
             (b.added + b.removed)
                 .cmp(&(a.added + a.removed))
