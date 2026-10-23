@@ -3921,3 +3921,141 @@ mod tests {
         assert!(idx.decode_block(0).is_err());
     }
 }
+
+/// A measurement for spec X11 Phase 3, not a check: the bytes each permutation of the
+/// store in `SPARKLES_CODEC_PROBE` would take under other column encodings. Run with
+/// `cargo test --release -p sparkles-core --lib codec_probe -- --ignored --nocapture`.
+#[cfg(test)]
+mod codec_probe {
+    use super::*;
+
+    fn varint_len(v: u64) -> usize {
+        (64 - v.max(1).leading_zeros() as usize).div_ceil(7)
+    }
+    fn zz(d: i64) -> u64 {
+        ((d << 1) ^ (d >> 63)) as u64
+    }
+    /// zig-zag delta varints of `vals` (deltas restart where `restart[i]`), LZ4'd
+    fn lz4_size(vals: &[u64], restart: &[bool]) -> usize {
+        let mut s = Vec::new();
+        let mut prev = 0u64;
+        for (i, &v) in vals.iter().enumerate() {
+            let p = if restart[i] { 0 } else { prev };
+            write_varint(&mut s, zz(v.wrapping_sub(p) as i64));
+            prev = v;
+        }
+        lz4_flex::compress_prepend_size(&s).len()
+    }
+    #[cfg(feature = "zstd")]
+    fn zstd_size(vals: &[u64], level: i32) -> usize {
+        let mut s = Vec::new();
+        let mut prev = 0u64;
+        for &v in vals {
+            write_varint(&mut s, zz(v.wrapping_sub(prev) as i64));
+            prev = v;
+        }
+        zstd::bulk::compress(&s, level).unwrap().len() + 4
+    }
+    #[cfg(not(feature = "zstd"))]
+    fn zstd_size(_: &[u64], _: i32) -> usize {
+        0
+    }
+    /// patched frame of reference over frames of 128 of the deltas: each frame a
+    /// varint minimum, a width byte, the packed values at the width that covers 90% of
+    /// them, and per exception a position byte and a varint
+    fn pfor_size(vals: &[u64], restart: &[bool]) -> usize {
+        let mut d = Vec::with_capacity(vals.len());
+        let mut prev = 0u64;
+        for (i, &v) in vals.iter().enumerate() {
+            let p = if restart[i] { 0 } else { prev };
+            d.push(zz(v.wrapping_sub(p) as i64));
+            prev = v;
+        }
+        if d.iter().all(|&x| x == d[0]) {
+            return 1 + varint_len(d[0]);
+        }
+        let mut total = 0;
+        for f in d.chunks(128) {
+            let min = *f.iter().min().unwrap();
+            let mut w: Vec<u32> = f.iter().map(|&x| 64 - (x - min).leading_zeros()).collect();
+            w.sort_unstable();
+            let b = w[(w.len() * 9 / 10).min(w.len() - 1)] as usize;
+            let ex: usize = f
+                .iter()
+                .filter(|&&x| (64 - (x - min).leading_zeros()) as usize > b)
+                .map(|&x| 1 + varint_len(x - min))
+                .sum();
+            total += varint_len(min) + 1 + (f.len() * b).div_ceil(8) + ex;
+        }
+        total
+    }
+
+    #[test]
+    #[ignore]
+    fn codec_probe() {
+        let Ok(dir) = std::env::var("SPARKLES_CODEC_PROBE") else {
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        let format = meta["format_version"].as_u64().unwrap() as u32;
+        let mut grand = [0usize; 5];
+        for &p in Perm::ALL.iter() {
+            let pi = PermIndex::open_format(dir, p, format).unwrap();
+            let on_disk = std::fs::metadata(dir.join(format!("{}.dat", p.name())))
+                .unwrap()
+                .len() as usize;
+            // current (delta across the column), lz4 with run restarts, pfor with
+            // run restarts, per column
+            let mut cur = [0usize; 4];
+            let mut run = [0usize; 4];
+            let mut pf = [0usize; 4];
+            let mut z3 = [0usize; 4];
+            let mut z9 = [0usize; 4];
+            for b in 0..pi.blocks.len() {
+                let blk = pi.decode_block(b).unwrap();
+                let n = blk.len();
+                for s in (0..n).step_by(SEG_ROWS) {
+                    let e = (s + SEG_ROWS).min(n);
+                    let keys: Vec<Key> = (s..e).map(|i| blk.key(i)).collect();
+                    for c in 0..4 {
+                        let vals: Vec<u64> = keys.iter().map(|k| k[c]).collect();
+                        let none = vec![false; vals.len()];
+                        let mut first = vec![false; vals.len()];
+                        first[0] = true;
+                        // a column restarts where any column before it changes
+                        let restart: Vec<bool> = (0..vals.len())
+                            .map(|i| i == 0 || (c > 0 && keys[i][..c] != keys[i - 1][..c]))
+                            .collect();
+                        cur[c] += lz4_size(&vals, &first) + 4;
+                        run[c] += lz4_size(&vals, &restart) + 4;
+                        pf[c] += pfor_size(&vals, &restart);
+                        z3[c] += zstd_size(&vals, 3);
+                        z9[c] += zstd_size(&vals, 9);
+                        let _ = none;
+                    }
+                }
+            }
+            let sum = |a: &[usize; 4]| a.iter().sum::<usize>();
+            println!(
+                "{}: on disk {on_disk}; current {} {cur:?}; lz4 restarts {} {run:?}; pfor {} {pf:?}; zstd3 {}; zstd9 {}",
+                p.name(),
+                sum(&cur),
+                sum(&run),
+                sum(&pf),
+                sum(&z3),
+                sum(&z9)
+            );
+            grand[4] += sum(&z3);
+            grand[0] += on_disk;
+            grand[1] += sum(&cur);
+            grand[2] += sum(&run);
+            grand[3] += sum(&pf);
+        }
+        println!(
+            "all: on disk {}, current {}, lz4 restarts {}, pfor {}, zstd3 {}",
+            grand[0], grand[1], grand[2], grand[3], grand[4]
+        );
+    }
+}

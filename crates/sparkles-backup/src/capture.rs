@@ -20,6 +20,8 @@ pub struct Source {
     pub generation: String,
     /// the index format of the generation
     pub index_format: u32,
+    /// the index features of the generation
+    pub index_features: Vec<String>,
     /// every file, with its kind and captured length (see `BackupCapture::files`)
     pub files: Vec<CapturedFile>,
     /// writer-lock hold time of the capture (zero for a closed directory)
@@ -42,6 +44,7 @@ impl From<BackupCapture> for Source {
             commit: c.commit,
             generation: c.generation,
             index_format: c.index_format,
+            index_features: c.index_features,
             files: c.files,
             lock_hold: c.lock_hold,
             lease: c.lease,
@@ -162,7 +165,10 @@ mod tests {
         assert_eq!(src.dataset_id, id);
         assert_eq!(src.commit.seq, head);
         assert_eq!(src.generation, "gen-0001");
-        assert_eq!(src.index_format, sparkles_core::builder::FORMAT_VERSION);
+        assert_eq!(
+            src.index_format,
+            sparkles_core::builder::PLAIN_FORMAT_VERSION
+        );
         assert_eq!(src.lease.generation(), 1);
         let current = src.file("CURRENT").unwrap();
         assert_eq!(Source::read_file(current).unwrap(), b"gen-0001");

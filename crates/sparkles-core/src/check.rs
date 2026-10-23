@@ -737,7 +737,17 @@ impl Checker<'_> {
                     Err(e) => {
                         run.add(Issue::error(format!("does not parse: {e}")).file(&meta_file))
                     }
-                    Ok(m) => self.meta = Some(m),
+                    Ok(m) => {
+                        let written_by = dir.parent().and_then(crate::commit::read_written_by);
+                        match crate::builder::check_features(
+                            name,
+                            &m.features,
+                            written_by.as_deref(),
+                        ) {
+                            Err(e) => run.add(Issue::error(e.to_string()).file(&meta_file)),
+                            Ok(()) => self.meta = Some(m),
+                        }
+                    }
                 },
             },
         }
@@ -814,6 +824,25 @@ impl Checker<'_> {
             }
         };
         let data: &[u8] = data.as_deref().unwrap_or(&[]);
+        // the FSST tables of a vocabulary whose meta.json says it is FSST-coded
+        let fsst_file = format!("{name}/{}", crate::vocab::fsst::FILE);
+        let fsst = match &self.meta {
+            Some(m) if m.has_feature(crate::builder::FEATURE_FSST_VOCAB) => {
+                match crate::vocab::fsst::Tables::read(dir) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        run.add(Issue::error(e.to_string()).file(&fsst_file));
+                        return VocabRun {
+                            millis: run.millis(),
+                            run,
+                            summary: "unreadable".into(),
+                        };
+                    }
+                }
+            }
+            _ => None,
+        };
+        let fsst = fsst.as_ref();
         if off.len() < 8 || off.len() % 8 != 0 {
             run.add(
                 Issue::error(format!(
@@ -898,10 +927,16 @@ impl Checker<'_> {
                             let id = (b * FC_BLOCK + i) as u64;
                             let at = pos as u64;
                             let parsed = read_varint_checked(data, &mut pos).and_then(|shared| {
-                                let len = read_varint_checked(data, &mut pos)?;
-                                Some((shared as usize, len as usize))
+                                let word = read_varint_checked(data, &mut pos)? as usize;
+                                // an FSST-coded entry after the first of its block
+                                // stores its length shifted, with the low bit set
+                                // when its bytes are codes
+                                Some(match fsst {
+                                    Some(_) if i > 0 => (shared as usize, word >> 1, word & 1 == 1),
+                                    _ => (shared as usize, word, false),
+                                })
                             });
-                            let Some((shared, len)) = parsed.filter(|&(s, l)| {
+                            let Some((shared, len, coded)) = parsed.filter(|&(s, l, _)| {
                                 (i > 0 || s == 0)
                                     && s <= key.len()
                                     && pos.checked_add(l).is_some_and(|e| e <= end)
@@ -920,7 +955,24 @@ impl Checker<'_> {
                             };
                             let prev = std::mem::take(&mut key);
                             key.extend_from_slice(&prev[..shared]);
-                            key.extend_from_slice(&data[pos..pos + len]);
+                            let bytes = &data[pos..pos + len];
+                            match fsst {
+                                Some(t) if coded => {
+                                    let t = t.table(id);
+                                    if !t.valid(bytes) {
+                                        issues.push(
+                                            Issue::error(format!(
+                                                "term {id} has FSST codes that the table does not hold"
+                                            ))
+                                            .block(b)
+                                            .offset(at)
+                                            .id(id.to_string()),
+                                        );
+                                    }
+                                    t.decode_exact(bytes, &mut key);
+                                }
+                                _ => key.extend_from_slice(bytes),
+                            }
                             pos += len;
                             if have_prev && key <= prev {
                                 issues.push(
@@ -971,6 +1023,9 @@ impl Checker<'_> {
                 }
             }
             summary.push_str(", every key checked for order");
+            if fsst.is_some() {
+                summary.push_str(" and its FSST codes");
+            }
         } else {
             // the first key of each block: what lookups binary-search
             let mut prev: Option<&[u8]> = None;

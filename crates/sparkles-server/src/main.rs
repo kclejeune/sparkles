@@ -179,6 +179,12 @@ struct Cli {
     /// generation that needs more is built without them
     #[arg(long, global = true, default_value_t = 1024)]
     pattern_memory_mb: usize,
+    /// How a bulk load or a full compaction stores the vocabulary: `front` (front-coded
+    /// keys) or `fsst` (front-coded keys whose suffixes are FSST-compressed, an index of
+    /// format 4 that releases reading only format 3 cannot open)
+    /// (default: front for a new database, and the current generation's for a compaction)
+    #[arg(long, global = true)]
+    vocab_codec: Option<sparkles::builder::VocabCodec>,
     /// Write without write-time validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
@@ -2130,6 +2136,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         build: sparkles::builder::BuildOptions {
             patterns: !cli.no_patterns,
             pattern_bytes: cli.pattern_memory_mb << 20,
+            vocab_codec: cli.vocab_codec,
             ..Default::default()
         },
         ..Default::default()
@@ -4014,6 +4021,11 @@ fn run() -> Result<()> {
                 "terms           {} (+{} delta)",
                 g.vocab.len(),
                 g.dvocab.len()
+            );
+            println!(
+                "index format    {}, vocabulary {}",
+                g.meta.format_version,
+                if g.vocab.is_fsst() { "fsst" } else { "front" }
             );
             println!("subjects        {}", g.stats.distinct_subjects);
             println!("predicates      {}", g.stats.distinct_predicates);

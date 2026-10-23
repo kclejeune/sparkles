@@ -10,6 +10,7 @@
 //! * [`LocalVocab`] — per-query dictionary for computed terms.
 
 pub mod delta;
+pub mod fsst;
 pub mod numeric;
 mod sync;
 pub(crate) use delta::DeltaFile;
@@ -308,6 +309,19 @@ pub struct Vocab {
     prefetched: Box<[AtomicU64]>,
     /// the values of the numeric literals (`vocab.num`), when the generation has them
     num: Option<numeric::NumColumn>,
+    /// the FSST tables of the suffixes, when the vocabulary is FSST-coded (see [`fsst`])
+    fsst: Option<Box<fsst::Tables>>,
+}
+
+/// One entry of a front-coded block: the length of the prefix it shares with the key
+/// before it, and where its stored bytes are.
+#[derive(Clone, Copy)]
+struct Entry {
+    shared: usize,
+    start: usize,
+    len: usize,
+    /// the bytes are FSST codes
+    coded: bool,
 }
 
 impl Vocab {
@@ -321,10 +335,30 @@ impl Vocab {
             sparse: None,
             prefetched: Box::new([]),
             num: None,
+            fsst: None,
         }
     }
 
+    /// Open the vocabulary in `dir`, FSST-coded when `vocab.fsst` is there. A generation
+    /// opens its vocabulary with [`Vocab::open_codec`] and the codec its `meta.json`
+    /// names instead.
     pub fn open(dir: &Path) -> Result<Vocab> {
+        Self::open_codec(dir, dir.join(fsst::FILE).exists())
+    }
+
+    /// Whether the suffixes are FSST-coded.
+    pub fn is_fsst(&self) -> bool {
+        self.fsst.is_some()
+    }
+
+    /// Open the vocabulary in `dir`, whose suffixes are FSST-coded when `fsst` (and then
+    /// `vocab.fsst` must be there).
+    pub fn open_codec(dir: &Path, fsst: bool) -> Result<Vocab> {
+        let tables = if fsst {
+            Some(Box::new(fsst::Tables::read(dir)?))
+        } else {
+            None
+        };
         // A lookup reads a few hundred bytes of the data, so the data is read a page at
         // a time (see `crate::index::io_hints`). With the sparse index, a lookup reads
         // one range of the offsets, which are mapped for random access too. Without it, a
@@ -356,6 +390,7 @@ impl Vocab {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             num: None,
+            fsst: tables,
         };
         // a cheap test that the index belongs to these files: its first and last data
         // offsets (`sparkles check` compares every entry)
@@ -521,21 +556,73 @@ impl Vocab {
         // Single-key callers own this fresh buffer throughout their scan.
         let mut key = Vec::with_capacity(64);
         for i in 0..n {
-            Self::reconstruct_key(data, &mut pos, &mut key);
+            self.reconstruct_key(data, &mut pos, (start + i) as u64, i == 0, &mut key);
             if !f(i, &key) {
                 return;
             }
         }
     }
 
-    /// One front-coded key; shared by the fresh-buffer and reusable-buffer loops.
+    /// The entry at `pos` (advanced past it), the first of its block when `first`.
     #[inline(always)]
-    fn reconstruct_key(data: &[u8], pos: &mut usize, key: &mut Vec<u8>) {
+    fn entry(&self, data: &[u8], pos: &mut usize, first: bool) -> Entry {
         let shared = read_varint(data, pos) as usize;
-        let len = read_varint(data, pos) as usize;
-        key.truncate(shared);
-        key.extend_from_slice(&data[*pos..*pos + len]);
+        let word = read_varint(data, pos) as usize;
+        let (len, coded) = if self.fsst.is_some() && !first {
+            (word >> 1, word & 1 == 1)
+        } else {
+            (word, false)
+        };
+        let start = *pos;
         *pos += len;
+        Entry {
+            shared,
+            start,
+            len,
+            coded,
+        }
+    }
+
+    /// The length of the suffix `e` (of key `id`) stands for.
+    #[inline(always)]
+    fn suffix_len(&self, data: &[u8], e: Entry, id: u64) -> usize {
+        match &self.fsst {
+            Some(t) if e.coded => t.table(id).decoded_len(&data[e.start..e.start + e.len]),
+            _ => e.len,
+        }
+    }
+
+    /// Append the suffix of entry `e` (of key `id`) to `key`. With `exact`, the buffer
+    /// grows by no more than the suffix (see [`fsst::Table::decode_exact`]).
+    #[inline(always)]
+    fn push_suffix(&self, data: &[u8], e: Entry, id: u64, key: &mut Vec<u8>, exact: bool) {
+        let bytes = &data[e.start..e.start + e.len];
+        match &self.fsst {
+            Some(t) if e.coded => {
+                if exact {
+                    t.table(id).decode_exact(bytes, key)
+                } else {
+                    t.table(id).decode_into(bytes, key)
+                }
+            }
+            _ => key.extend_from_slice(bytes),
+        }
+    }
+
+    /// One front-coded key, `id`, the first of its block when `first`; shared by the
+    /// fresh-buffer and reusable-buffer loops.
+    #[inline(always)]
+    fn reconstruct_key(
+        &self,
+        data: &[u8],
+        pos: &mut usize,
+        id: u64,
+        first: bool,
+        key: &mut Vec<u8>,
+    ) {
+        let e = self.entry(data, pos, first);
+        key.truncate(e.shared);
+        self.push_suffix(data, e, id, key, false);
     }
 
     /// Each block starts with an empty reconstruction, while capacity can be reused
@@ -555,7 +642,7 @@ impl Vocab {
         let start = b * FC_BLOCK;
         let n = FC_BLOCK.min((self.len as usize) - start);
         for i in 0..n {
-            Self::reconstruct_key(data, &mut pos, key);
+            self.reconstruct_key(data, &mut pos, (start + i) as u64, i == 0, key);
             if !f(i, key) {
                 return;
             }
@@ -636,16 +723,18 @@ impl Vocab {
             self.touch_block(b);
             key.clear();
             for at in 0..=last {
-                let shared = read_varint(data, &mut pos) as usize;
-                let len = read_varint(data, &mut pos) as usize;
-                let need = key.len().min(shared).saturating_add(len);
+                let id = (b * FC_BLOCK + at) as u64;
+                let e = self.entry(data, &mut pos, at == 0);
+                let need = key
+                    .len()
+                    .min(e.shared)
+                    .saturating_add(self.suffix_len(data, e, id));
                 if need > key.capacity() {
                     reserve(need)?;
                     key.reserve_exact(need - key.len());
                 }
-                key.truncate(shared);
-                key.extend_from_slice(&data[pos..pos + len]);
-                pos += len;
+                key.truncate(e.shared);
+                self.push_suffix(data, e, id, &mut key, true);
                 if w < wanted.len() && wanted[w] as usize % FC_BLOCK == at {
                     f(wanted[w], &key)?;
                     w += 1;
@@ -1007,12 +1096,12 @@ impl Vocab {
         let n = FC_BLOCK.min(self.len as usize - b * FC_BLOCK);
         let mut key = Vec::new();
         for i in 0..n {
-            let shared = read_varint(data, &mut pos) as usize;
-            let len = read_varint(data, &mut pos) as usize;
+            let id = (b * FC_BLOCK + i) as u64;
+            let e = self.entry(data, &mut pos, i == 0);
             let need = key
                 .len()
-                .min(shared)
-                .checked_add(len)
+                .min(e.shared)
+                .checked_add(self.suffix_len(data, e, id))
                 .ok_or_else(|| crate::error::Error::invalid("vocabulary scratch overflows"))?;
             if need > key.capacity() {
                 reserve(need)?;
@@ -1030,9 +1119,8 @@ impl Vocab {
                     key.capacity(),
                 ));
             }
-            key.truncate(shared);
-            key.extend_from_slice(&data[pos..pos + len]);
-            pos += len;
+            key.truncate(e.shared);
+            self.push_suffix(data, e, id, &mut key, true);
             if !f(i, &key)? {
                 break;
             }
@@ -1207,9 +1295,47 @@ pub struct VocabWriter {
     /// the numeric column, built along
     num: numeric::NumWriter,
     dir: std::path::PathBuf,
+    /// the FSST coding of the suffixes, for an FSST-coded vocabulary
+    fsst: Option<Box<FsstWriter>>,
+}
+
+/// Keys an FSST-coded vocabulary collects before it codes them, in parallel by block.
+const FSST_BATCH: usize = FC_BLOCK * 4096;
+/// Bytes of suffixes an FSST-coded vocabulary collects at most before it codes them, at
+/// the end of a block, so that long keys do not hold [`FSST_BATCH`] of them.
+const FSST_BATCH_BYTES: usize = 64 << 20;
+
+/// The keys of an FSST-coded vocabulary not written yet (see [`VocabWriter::flush_fsst`]).
+struct FsstWriter {
+    enc: fsst::Encoder,
+    /// the first id of the second kind of key, once pushed
+    split: Option<u64>,
+    /// the suffixes of the keys, one after another
+    bytes: Vec<u8>,
+    /// per key, its shared-prefix length and the end of its suffix in `bytes`
+    ents: Vec<(u32, u32)>,
+    /// the batch is coded once `bytes` holds this many at the end of a block
+    batch_bytes: usize,
+    /// the most bytes of suffixes held at once, for tests
+    peak_bytes: usize,
 }
 
 impl VocabWriter {
+    /// A writer of a front-coded vocabulary whose suffixes are FSST-coded with the
+    /// tables of `enc` (see [`fsst`]).
+    pub fn create_fsst(dir: &Path, enc: fsst::Encoder) -> Result<VocabWriter> {
+        let mut w = Self::create(dir)?;
+        w.fsst = Some(Box::new(FsstWriter {
+            enc,
+            split: None,
+            bytes: Vec::new(),
+            ents: Vec::with_capacity(FSST_BATCH),
+            batch_bytes: FSST_BATCH_BYTES,
+            peak_bytes: 0,
+        }));
+        Ok(w)
+    }
+
     pub fn create(dir: &Path) -> Result<VocabWriter> {
         Ok(VocabWriter {
             data: BufWriter::with_capacity(
@@ -1224,6 +1350,7 @@ impl VocabWriter {
             sparse: Vec::new(),
             num: numeric::NumWriter::create(dir)?,
             dir: dir.to_path_buf(),
+            fsst: None,
         })
     }
 
@@ -1231,6 +1358,9 @@ impl VocabWriter {
     /// Returns the assigned id.
     pub fn push(&mut self, key: &[u8]) -> Result<u64> {
         debug_assert!(self.count == 0 || key > self.prev.as_slice());
+        if self.fsst.is_some() {
+            return self.push_fsst(key);
+        }
         self.buf.clear();
         let shared = if (self.count as usize).is_multiple_of(FC_BLOCK) {
             self.offsets.write_all(&self.pos.to_le_bytes())?;
@@ -1258,6 +1388,102 @@ impl VocabWriter {
         Ok(id)
     }
 
+    /// [`VocabWriter::push`] of an FSST-coded vocabulary: the key waits until its batch
+    /// is coded.
+    fn push_fsst(&mut self, key: &[u8]) -> Result<u64> {
+        let id = self.count;
+        let shared = if (id as usize).is_multiple_of(FC_BLOCK) {
+            0
+        } else {
+            self.prev
+                .iter()
+                .zip(key)
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        let f = self.fsst.as_mut().unwrap();
+        if f.split.is_none() && !fsst::is_first_kind(key) {
+            f.split = Some(id);
+        }
+        let shared32 = u32::try_from(shared)
+            .map_err(|_| crate::error::Error::invalid("a vocabulary key is over 4 GiB"))?;
+        f.bytes.extend_from_slice(&key[shared..]);
+        let end = u32::try_from(f.bytes.len())
+            .map_err(|_| crate::error::Error::invalid("a vocabulary batch is over 4 GiB"))?;
+        f.ents.push((shared32, end));
+        f.peak_bytes = f.peak_bytes.max(f.bytes.len());
+        let full = f.ents.len() == FSST_BATCH
+            || (f.bytes.len() >= f.batch_bytes && f.ents.len().is_multiple_of(FC_BLOCK));
+        self.prev.clear();
+        self.prev.extend_from_slice(key);
+        self.num.push(key)?;
+        self.count += 1;
+        if full {
+            self.flush_fsst()?;
+        }
+        Ok(id)
+    }
+
+    /// Code and write the keys an FSST-coded vocabulary collected. They start a block,
+    /// so the blocks are coded in parallel. A block's first key is written plain, and
+    /// another key's suffix is written as its codes when they are shorter (see
+    /// [`fsst`]).
+    fn flush_fsst(&mut self) -> Result<()> {
+        use rayon::prelude::*;
+        let f = self.fsst.as_mut().unwrap();
+        if f.ents.is_empty() {
+            return Ok(());
+        }
+        let first = self.count - f.ents.len() as u64;
+        debug_assert!((first as usize).is_multiple_of(FC_BLOCK));
+        let split = f.split.unwrap_or(u64::MAX);
+        let (enc, bytes, ents) = (&f.enc, &f.bytes, &f.ents);
+        let blocks: Vec<Vec<u8>> = ents
+            .par_chunks(FC_BLOCK)
+            .enumerate()
+            .map(|(bi, chunk)| {
+                let base = bi * FC_BLOCK;
+                let mut out = Vec::with_capacity(1024);
+                let mut codes = Vec::new();
+                for (j, &(shared, end)) in chunk.iter().enumerate() {
+                    let i = base + j;
+                    let start = if i == 0 { 0 } else { ents[i - 1].1 as usize };
+                    let suffix = &bytes[start..end as usize];
+                    write_varint(&mut out, shared as u64);
+                    let id = first + i as u64;
+                    if j == 0 {
+                        write_varint(&mut out, suffix.len() as u64);
+                        out.extend_from_slice(suffix);
+                    } else if enc.encode(usize::from(id >= split), suffix, &mut codes) {
+                        write_varint(&mut out, ((codes.len() as u64) << 1) | 1);
+                        out.extend_from_slice(&codes);
+                    } else {
+                        write_varint(&mut out, (suffix.len() as u64) << 1);
+                        out.extend_from_slice(suffix);
+                    }
+                }
+                out
+            })
+            .collect();
+        let first_block = first as usize / FC_BLOCK;
+        for (bi, block) in blocks.iter().enumerate() {
+            let b = first_block + bi;
+            self.offsets.write_all(&self.pos.to_le_bytes())?;
+            if b.is_multiple_of(IDX_BLOCKS) {
+                // the first key is plain: shared 0, its length, the key
+                let mut p = 0;
+                let _ = read_varint(block, &mut p);
+                let len = read_varint(block, &mut p) as usize;
+                self.sparse.push((self.pos, block[p..p + len].to_vec()));
+            }
+            self.data.write_all(block)?;
+            self.pos += block.len() as u64;
+        }
+        f.bytes.clear();
+        f.ents.clear();
+        Ok(())
+    }
+
     /// Keys pushed so far.
     pub fn len(&self) -> u64 {
         self.count
@@ -1268,6 +1494,9 @@ impl VocabWriter {
     }
 
     pub fn finish(mut self) -> Result<u64> {
+        if self.fsst.is_some() {
+            self.flush_fsst()?;
+        }
         self.offsets.write_all(&self.count.to_le_bytes())?;
         self.data.flush()?;
         self.offsets.flush()?;
@@ -1275,6 +1504,11 @@ impl VocabWriter {
         self.offsets.get_ref().get_ref().sync_all()?;
         write_sparse_index(&self.dir, &self.sparse)?;
         self.num.finish(&self.dir, self.count)?;
+        if let Some(f) = &self.fsst {
+            f.enc
+                .tables(f.split.unwrap_or(self.count))
+                .write(&self.dir)?;
+        }
         Ok(self.count)
     }
 }
@@ -2227,6 +2461,169 @@ mod tests {
         assert!(v.find(b"<http://example.org/resource/00010x").is_err());
         let (lo, hi) = v.prefix_range(b"<http://example.org/resource/001");
         assert_eq!(hi - lo, 100);
+    }
+
+    /// Mixed keys of every kind, in order: literals with long shared and unshared parts,
+    /// triple terms, IRIs of a few shapes, and adversarial bytes.
+    fn mixed_keys(n: usize) -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = (0..n)
+            .flat_map(|i| {
+                [
+                    format!("<http://example.org/resource/{i:06}").into_bytes(),
+                    format!("<http://dbpedia.org/resource/Thing_{}", i * 7919 % 100_003)
+                        .into_bytes(),
+                    format!("\"A description of item {i}, which is a thing\"@en").into_bytes(),
+                    format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer", i * 31)
+                        .into_bytes(),
+                    format!("(<s{i}> <p> \"o\")").into_bytes(),
+                ]
+            })
+            .collect();
+        keys.push(b"\"".to_vec());
+        keys.push([b"\"".as_slice(), &[255u8; 64]].concat());
+        keys.push([b"<".as_slice(), &(1..=255u8).collect::<Vec<_>>()].concat());
+        keys.push(format!("<x{}", "y".repeat(5000)).into_bytes());
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    fn write_codec(dir: &Path, keys: &[Vec<u8>], fsst: bool) {
+        let mut w = if fsst {
+            let sample: Vec<&[u8]> = keys.iter().step_by(3).map(|k| &k[..]).collect();
+            let (a, b): (Vec<&[u8]>, Vec<&[u8]>) =
+                sample.iter().partition(|k| fsst::is_first_kind(k));
+            VocabWriter::create_fsst(dir, fsst::Encoder::train([&a, &b])).unwrap()
+        } else {
+            VocabWriter::create(dir).unwrap()
+        };
+        for k in keys {
+            w.push(k).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    /// Long keys are coded in batches bounded by their bytes, which end at a block.
+    #[test]
+    fn fsst_batches_are_bounded_by_bytes() {
+        let keys: Vec<Vec<u8>> = (0..400)
+            .map(|i| format!("\"{i:05} {}", "payload words ".repeat(300)).into_bytes())
+            .chain((0..50).map(|i| format!("<http://e/{i:03}/{}", "x".repeat(9000)).into_bytes()))
+            .collect();
+        let d = tempfile::tempdir().unwrap();
+        let sample: Vec<&[u8]> = keys.iter().map(|k| &k[..200]).collect();
+        let mut w =
+            VocabWriter::create_fsst(d.path(), fsst::Encoder::train([&sample, &sample])).unwrap();
+        w.fsst.as_mut().unwrap().batch_bytes = 64 << 10;
+        for k in &keys {
+            w.push(k).unwrap();
+        }
+        let peak = w.fsst.as_ref().unwrap().peak_bytes;
+        w.finish().unwrap();
+        // one block of these keys past the budget at most
+        assert!(peak < (64 << 10) + FC_BLOCK * 10_000, "{peak}");
+        let v = Vocab::open(d.path()).unwrap();
+        assert_eq!(v.len(), keys.len() as u64);
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(v.get(i as u64).as_ref(), Some(k), "{i}");
+            assert_eq!(v.find(k), Ok(i as u64));
+        }
+    }
+
+    /// An FSST-coded vocabulary answers every read as the front-coded one of the same
+    /// keys does (X11 A7), and is smaller.
+    #[test]
+    fn fsst_reads_like_front() {
+        let keys = mixed_keys(3000);
+        let (fd, sd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_codec(fd.path(), &keys, false);
+        write_codec(sd.path(), &keys, true);
+        let (f, s) = (
+            Vocab::open(fd.path()).unwrap(),
+            Vocab::open(sd.path()).unwrap(),
+        );
+        assert!(!f.is_fsst() && s.is_fsst());
+        assert_eq!(f.len(), s.len());
+        assert_eq!(
+            (f.first_triple(), f.first_iri()),
+            (s.first_triple(), s.first_iri())
+        );
+        let fsize = std::fs::metadata(fd.path().join("vocab.dat"))
+            .unwrap()
+            .len();
+        let ssize = std::fs::metadata(sd.path().join("vocab.dat"))
+            .unwrap()
+            .len();
+        assert!(ssize < fsize * 3 / 4, "{ssize} against {fsize}");
+        for (i, k) in keys.iter().enumerate() {
+            let id = i as u64;
+            assert_eq!(s.get(id).as_ref(), Some(k), "{i}");
+            assert_eq!(s.find(k), Ok(id));
+            assert_eq!(s.find_with_checked(k, |_| Ok(())).unwrap(), Ok(id));
+            let mut absent = k.clone();
+            absent.push(0);
+            assert_eq!(s.find(&absent), f.find(&absent));
+            assert_eq!(
+                s.get_with_fallible(id, |_| Ok(()), |k| k.to_vec())
+                    .unwrap()
+                    .as_ref(),
+                Some(k)
+            );
+        }
+        let ids: Vec<u64> = (0..keys.len() as u64).step_by(5).collect();
+        let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+        f.get_sorted(&ids, |i, k| a.push((i, k.to_vec())));
+        s.get_sorted(&ids, |i, k| b.push((i, k.to_vec())));
+        s.get_sorted_checked::<()>(
+            &ids,
+            |_| Ok(()),
+            |i, k| {
+                c.push((i, k.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        let mut all = Vec::new();
+        s.for_each(|i, k| all.push((i, k.to_vec())));
+        assert_eq!(all.len(), keys.len());
+        assert!(all.iter().zip(&keys).all(|((_, a), b)| a == b));
+        for p in [
+            &b"\"A description of item 1"[..],
+            b"<http://example.org/resource/0012",
+            b"(",
+        ] {
+            assert_eq!(s.prefix_range(p), f.prefix_range(p));
+        }
+        // the checked decode grows its buffer only by what it reserved
+        let reserved = std::cell::Cell::new(0);
+        for id in (0..keys.len() as u64).step_by(97) {
+            s.get_sorted_checked::<()>(
+                &[id],
+                |n| {
+                    reserved.set(n);
+                    Ok(())
+                },
+                |_, k| {
+                    assert!(k.len() <= reserved.get());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// A generation opens its vocabulary by the codec its meta.json names: one marked
+    /// FSST-coded needs its tables.
+    #[test]
+    fn an_fsst_vocabulary_without_its_tables_is_refused() {
+        let keys = mixed_keys(200);
+        let d = tempfile::tempdir().unwrap();
+        write_codec(d.path(), &keys, true);
+        std::fs::remove_file(d.path().join(fsst::FILE)).unwrap();
+        let e = Vocab::open_codec(d.path(), true).err().unwrap().to_string();
+        assert!(e.contains("vocab.fsst") && e.contains("missing"), "{e}");
     }
 
     /// A vocabulary of `n` keys spread over several sparse-index groups, in `dir`.

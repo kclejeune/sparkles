@@ -159,7 +159,7 @@ fn list(v: &[u32]) -> String {
 /// The generation index formats this build reads (`format_version` of `meta.json`).
 /// [`crate::builder::FORMAT_VERSION`] is the one it writes. A change that is read and
 /// rewritten at compaction adds the new format here and keeps the previous one.
-pub const READABLE_INDEX_FORMATS: &[u32] = &[2, 3];
+pub const READABLE_INDEX_FORMATS: &[u32] = &[2, 3, 4];
 
 /// The write-ahead log version this build writes: a header record with the magic and
 /// this version starts every new `wal.log` (see [`crate::store::wal`]). Version 0 is a
@@ -177,10 +177,13 @@ pub const DATASET: FileKind = FileKind {
 };
 
 /// A generation's index: `gen-*/meta.json` and the permutation and vocabulary files.
+/// Format 4 is format 3 with a `features` list in meta.json (spec X11 §7.1), written
+/// only for a generation that uses a feature, such as `fsst-vocab`, that a reader of
+/// format 3 cannot read. A generation without one is written as format 3.
 pub const INDEX: FileKind = FileKind {
     id: "index",
     files: "gen-*/meta.json and the index files",
-    marker: "`format_version` of meta.json",
+    marker: "`format_version` of meta.json, and from format 4 its `features`, each of which the reader must know",
     class: Class::Primary,
     writes: crate::builder::FORMAT_VERSION,
     reads: READABLE_INDEX_FORMATS,
@@ -193,6 +196,17 @@ pub const VOCAB_INDEX: FileKind = FileKind {
     marker: "magic `SPKVIDX1`",
     class: Class::Primary,
     writes: 1,
+    reads: &[1],
+};
+
+/// The FSST symbol tables of a generation's vocabulary (spec X11 Phase 2a), present
+/// when meta.json lists the `fsst-vocab` feature.
+pub const VOCAB_FSST: FileKind = FileKind {
+    id: "vocab-fsst",
+    files: "gen-*/vocab.fsst",
+    marker: "the u32 after the `SPKFSST\\0` magic",
+    class: Class::Primary,
+    writes: crate::vocab::fsst::VERSION,
     reads: &[1],
 };
 
@@ -449,6 +463,7 @@ pub const KINDS: &[&FileKind] = &[
     &DATASET,
     &INDEX,
     &VOCAB_INDEX,
+    &VOCAB_FSST,
     &NUMERIC_COLUMN,
     &PATTERNS,
     &DELTA_VOCAB,
@@ -847,6 +862,7 @@ mod tests {
         assert!(INDEX.reads(crate::builder::FORMAT_VERSION));
         assert_eq!(DELTA_VOCAB.writes, crate::vocab::delta::VERSION);
         assert_eq!(PATTERNS.writes, crate::patterns::VERSION);
+        assert_eq!(VOCAB_FSST.writes, crate::vocab::fsst::VERSION);
         assert_eq!(DATASET.writes, crate::commit::DATASET_READER);
         assert_eq!(
             *DATASET.reads.last().unwrap(),
@@ -873,9 +889,9 @@ mod tests {
 
     #[test]
     fn refusals_say_what_to_do() {
-        let e = INDEX.refuse("gen-0003", 4, Some("0.4.0")).to_string();
+        let e = INDEX.refuse("gen-0003", 5, Some("0.4.0")).to_string();
         assert!(
-            e.contains("index version 4, written by Sparkles 0.4.0"),
+            e.contains("index version 5, written by Sparkles 0.4.0"),
             "{e}"
         );
         assert!(e.contains("newer release"), "{e}");

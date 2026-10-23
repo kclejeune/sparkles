@@ -1522,6 +1522,32 @@ RSS stayed at 3.23 GB. At 10.5M the load took 4.1 s against 4.6 s and peaked at 
 against 1.96 GB, in one load each. The collector holds at most 1 GiB of distinct patterns by default
 and skips the patterns of a generation that needs more.
 
+### FSST vocabulary suffixes
+
+X11 Phase 2a compresses the front-coded vocabulary's suffixes with FSST when a load runs
+with `--vocab-codec fsst` ([X11](specs/X11-index-compression-and-predicate-patterns.md#phase-2a-measurements)).
+Forge compared the release binary of `e294b817` with the FSST branch at `1ed20337` on
+2026-10-23. Each variant loaded both datasets twice in A, B, B, A order. Warm 10.5M cells
+are medians of four rounds of 15 requests, warm DBpedia cells of two rounds of 10, and
+cold cells of two rounds of five cold samples.
+
+| Measurement | 10.5M front | 10.5M FSST | DBpedia 50M front | DBpedia 50M FSST |
+|---|---:|---:|---:|---:|
+| `vocab.dat` | 25.87 MB | 17.69 MB | 485.06 MB | 344.48 MB |
+| Store on disk | 312.8 MB | 304.7 MB | 1,577.5 MB | 1,436.9 MB |
+| Mean load time | 3.8 s | 3.8 s | 24.0 s | 24.9 s |
+| Warm geometric mean | 1 | 1.018 | 1 | 1.054 |
+| Cold geometric mean | 1 | 0.966 | 1 | 0.977 |
+| Warm `export-500k` | 161.7 ms | 180.6 ms | | |
+| Warm `contains` | 24.6 ms | 27.7 ms | | |
+
+The geometric means cover the queries at 0.3 ms or more. Load peak RSS stayed within the
+spread between loads, at 2.0 to 2.1 GB at 10.5M and 3.1 to 3.3 GB on DBpedia. Warm
+queries that decode many strings, such as `export-500k`, `contains` and `lang-filter` at
+10.5M, ran 11% to 13% slower, which misses X11's warm gate of 5%, so front coding stays
+the default. Cold queries ran 2% to 3% faster on average, because fewer vocabulary pages
+are read, but cold `export-500k` still took 1.11 times as long.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
@@ -2739,7 +2765,8 @@ harness errors.
 
 * **Larger scale.** The largest dataset is English DBpedia at 1.24 billion triples. QLever
   is built for 10⁹–10¹¹ triples and runs Wikidata and UniProt, and its lazy evaluation,
-  FSST vocabulary compression and IRI encoding matter more as data grows. Sparkles spills
+  FSST vocabulary compression and IRI encoding matter more as data grows. Sparkles'
+  FSST option was measured only up to the DBpedia 50M slice. Sparkles spills
   cursor sorts, groupings, DISTINCT and joins. A query still fails when its eager state
   outgrows its budget.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of

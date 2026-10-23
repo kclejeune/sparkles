@@ -380,6 +380,7 @@ pub(crate) fn write(
         "vocab.off",
         "vocab.idx",
         crate::vocab::numeric::FILE,
+        crate::vocab::fsst::FILE,
     ] {
         match std::fs::copy(from.join(f), dir.join(f)) {
             Ok(_) => File::open(dir.join(f))?.sync_all()?,
@@ -453,8 +454,11 @@ pub(crate) fn write(
             stats.quads
         )));
     }
+    // the vocabulary is copied, and with it its features
+    let features = g.meta.features.clone();
     let meta = IndexMeta {
-        format_version: crate::builder::FORMAT_VERSION,
+        format_version: crate::builder::format_for(&features),
+        features,
         quads,
         terms: g.meta.terms,
         next_bnode: next_bnode.max(g.meta.next_bnode),

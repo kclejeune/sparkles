@@ -1496,8 +1496,14 @@ impl Store {
         o: &CompactOptions,
         mode: PartialMode,
     ) -> Result<(IndexMeta, How)> {
+        let codec = snap.generation.vocab_codec();
         let why = match mode {
             PartialMode::Off => "partial compaction is off".to_string(),
+            // a partial compaction copies the vocabulary as it is
+            _ if self.opts.build.vocab_codec.is_some_and(|c| c != codec) => format!(
+                "the vocabulary codec changes from {codec} to {}",
+                self.opts.build.vocab_codec.unwrap()
+            ),
             _ => match partial::plan(snap) {
                 Err(why) => why,
                 Ok(plan)
@@ -1635,6 +1641,9 @@ impl Store {
     ) -> Result<IndexMeta> {
         let mut bopts = self.opts.build.clone();
         bopts.first_bnode = next_bnode;
+        bopts
+            .vocab_codec
+            .get_or_insert(snap.generation.vocab_codec());
         if let Some(t) = o.threads {
             bopts.threads = t.max(1);
         }

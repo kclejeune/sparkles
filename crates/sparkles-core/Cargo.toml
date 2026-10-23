@@ -20,6 +20,7 @@ rustc-hash.workspace = true
 hashbrown.workspace = true
 memmap2.workspace = true
 lz4_flex.workspace = true
+fsst-rs.workspace = true
 rayon.workspace = true
 regex.workspace = true
 # Explicit caches and reported program size for budgeted cursor expressions.

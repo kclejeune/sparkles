@@ -328,6 +328,19 @@ in a new generation directory that replaces the old one in one step. Releases th
 only format 2 refuse a format 3 store with an error that names both versions. At 10.5M
 triples a generation grows by 3.0%, from 300.6 MB to 309.7 MB.
 
+A bulk load or a full compaction run with the new global flag `--vocab-codec fsst`
+writes index format 4. Its `meta.json` lists the feature `fsst-vocab`, and the new file
+`vocab.fsst`, the primary kind `vocab-fsst` version 1 with the magic `SPKFSST\0`, holds
+the symbol tables that code the vocabulary's key suffixes. `vocab.dat` shrinks by 29% on
+the DBpedia 50M slice and 32% at 10.5M, and warm queries that decode many terms run up to
+13% slower, so a new database stays front-coded and in format 3. This build refuses a
+generation that lists an unknown feature and names it, and releases that read only
+formats 2 and 3 refuse format 4 as newer. A compaction keeps the codec of the generation
+it replaces unless the flag asks for another, and then it rebuilds in full. Backup
+manifests carry the generation's features as `indexFeatures`, and a restore refuses an
+unknown one. `sparkles stats` names the vocabulary codec, and `sparkles check` verifies the
+tables.
+
 The Ask evaluation cost ledger is in version 2. Reserve and settle lines carry a time,
 and a reconcile line replaces a charge held at its bound. A reconcile line that raises
 a charge carries `"raise": true`. A reader refuses a ledger of version 1, which no paid

@@ -223,6 +223,15 @@ impl Generation {
         Self::open_with(dir, name, dvocab)
     }
 
+    /// How the generation's vocabulary stores its suffixes.
+    pub fn vocab_codec(&self) -> crate::builder::VocabCodec {
+        if self.vocab.is_fsst() {
+            crate::builder::VocabCodec::Fsst
+        } else {
+            crate::builder::VocabCodec::Front
+        }
+    }
+
     fn open_with(dir: &Path, name: &str, dvocab: DeltaVocab) -> Result<Generation> {
         // the database's directory holds the generation (a branch's holds its own)
         let written_by = dir.parent().and_then(commit::read_written_by);
@@ -234,7 +243,10 @@ impl Generation {
             uid: crate::index::next_uid(),
             name: name.to_string(),
             dir: Some(dir.to_path_buf()),
-            vocab: Arc::new(Vocab::open(dir)?),
+            vocab: Arc::new(Vocab::open_codec(
+                dir,
+                meta.has_feature(crate::builder::FEATURE_FSST_VOCAB),
+            )?),
             perms: Perm::ALL
                 .iter()
                 .map(|&p| PermIndex::open_format(dir, p, meta.format_version))
@@ -3660,6 +3672,16 @@ impl Store {
     }
 
     /// Current read snapshot.
+    /// The build options for a generation that replaces the current one: the store's,
+    /// with the current generation's vocabulary codec unless they name one.
+    pub(crate) fn build_options(&self) -> BuildOptions {
+        let mut o = self.opts.build.clone();
+        if o.vocab_codec.is_none() {
+            o.vocab_codec = Some(self.snapshot().generation.vocab_codec());
+        }
+        o
+    }
+
     pub fn snapshot(&self) -> Arc<Snapshot> {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
         self.current.load_full()
@@ -4682,7 +4704,7 @@ impl Store {
                 (t.path().to_path_buf(), "mem".to_string(), Some(t))
             }
         };
-        let mut bopts = self.opts.build.clone();
+        let mut bopts = self.build_options();
         bopts.first_bnode = w.next_bnode;
         let wopts = check.as_ref().map(|(_, o)| (*o).clone());
         let interrupt = self.build_interrupt(wopts.clone(), &dir);
@@ -5043,7 +5065,7 @@ impl Store {
         keep: impl FnMut(&[Id; 4]) -> Result<bool>,
         indexing: impl FnOnce(),
     ) -> Result<IndexMeta> {
-        let mut bopts = self.opts.build.clone();
+        let mut bopts = self.build_options();
         bopts.first_bnode = next_bnode;
         let mut builder = Builder::new(gdir, bopts)?;
         if let Some(reserve) = reserve {

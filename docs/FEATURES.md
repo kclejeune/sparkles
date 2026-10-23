@@ -26,7 +26,7 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
 
 * 64-bit tagged ids. `xsd:integer`, `xsd:decimal`, `xsd:double`, `xsd:boolean`, `xsd:dateTime` and `xsd:date` values are stored inline when their lexical form is canonical.
 * A bulk write path. Large update and inference batches are merged into a rebuilt generation, published by an atomic `CURRENT` switch.
-* A sorted, front-coded, memory-mapped base vocabulary, and an append-only delta vocabulary.
+* A sorted, front-coded, memory-mapped base vocabulary, and an append-only delta vocabulary. With `--vocab-codec fsst`, a load or compaction also compresses each key's suffix with FSST, which shrinks `vocab.dat` by about 30% and makes the generation index format 4. It stays off by default, because warm queries that decode many terms run up to 13% slower, which item 108 of the roadmap follows up ([X11](specs/X11-index-compression-and-predicate-patterns.md#phase-2a-fsst-suffixes)).
 * A numeric column next to the base vocabulary (`vocab.num`). It holds the exact value of every numeric literal whose lexical form is not canonical, such as DBpedia's `xsd:float` coordinates or any `xsd:int`, so range filters, sorts and aggregates over them read 8 bytes per value instead of decoding the key. Loads and compactions write it, and `sparkles vocab-index` adds it to a database without one ([USAGE.md](USAGE.md#command-line-tools)).
 * 7 permutations (SPO, SOP, PSO, POS, OSP, OPS, GSPO) in compressed blocks of 32k rows.
 * Cold-read tuning ([X07](specs/X07-cold-sparse-reads.md)). A query hints the vocabulary groups of all its constants in one batch, requests the blocks of its first scans at plan time, and reads each scan pass with its own read-ahead window that grows from 1 MiB to a limit set by `SPARKLES_READ_WINDOW_KB`. A warm repeat of a query makes no read hint. Index joins decode the columns they asked for on a separate pool, and optional warmup checks cancellation and deadlines. `profile=io` on a query returns its phase times, index columns decoded, bytes requested and sampled page residency to callers with the `metrics` permission, and `/$/metrics` counts decoded columns, read-ahead bytes and vocabulary groups read. Each step has an `Optimizations` flag. Index format 3 splits each block column into frames of 2,048 rows with a directory of their first keys, so a point lookup, short range scan or index join decodes only the frames that can hold its rows. Format 2 stores open as before and are rewritten at the next compaction. See [API.md](API.md#the-io-profile).
@@ -332,8 +332,9 @@ that work by priority and links each item to its design spec.
   in plain and encrypted modes under 64 MiB. Item 93 retains the execution
   follow-ups, performance investigation and review of enabling spill by default.
   The UI's result table, the MCP tools and the Python and JVM query calls
-  run eagerly, because they report exact totals or return collected results. There is no
-  FSST vocabulary compression, IRI encoding, pinned results, materialized views or live
+  run eagerly, because they report exact totals or return collected results. FSST
+  vocabulary compression is an option that is off by default. There is no IRI encoding,
+  zstd or frame-of-reference index block codec, pinned results, materialized views or live
   query monitoring. Predicate patterns do not answer `COUNT(*)` per predicate, which
   counts triples. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40, 93.
 * **Large basic graph patterns.** A query whose plan would nest deeper than 4000 levels
