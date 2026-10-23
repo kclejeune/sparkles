@@ -36,7 +36,7 @@ enum Test {
     },
     Regex {
         arg: Arg,
-        re: KeyRegex,
+        re: Box<KeyRegex>,
         /// the text every match starts with, for a pattern anchored at the start
         prefix: Option<Arc<str>>,
     },
@@ -70,10 +70,11 @@ impl Clone for KeyRegex {
     }
 }
 
+/// Compiled programs by pattern and flags, `None` for one that does not compile.
+type Programs = rustc_hash::FxHashMap<(String, String), Option<Arc<regex_automata::meta::Regex>>>;
+
 thread_local! {
-    static KEY_REGEX: std::cell::RefCell<
-        rustc_hash::FxHashMap<(String, String), Option<Arc<regex_automata::meta::Regex>>>,
-    > = Default::default();
+    static KEY_REGEX: std::cell::RefCell<Programs> = Default::default();
 }
 
 impl KeyRegex {
@@ -108,6 +109,17 @@ impl KeyRegex {
         self.program
             .search_half_with(
                 &mut self.cache.lock(),
+                &regex_automata::Input::new(text).earliest(true),
+            )
+            .is_some()
+    }
+
+    /// [`Self::is_match`] for the clone's owner, which reaches its cache without the lock.
+    #[inline]
+    fn is_match_mut(&mut self, text: &str) -> bool {
+        self.program
+            .search_half_with(
+                self.cache.get_mut(),
                 &regex_automata::Input::new(text).earliest(true),
             )
             .is_some()
@@ -333,7 +345,7 @@ impl KeyFilter {
                         },
                         None => Test::Regex {
                             arg: Arg::of(a, v)?,
-                            re: KeyRegex::compile(pattern, flags)?,
+                            re: Box::new(KeyRegex::compile(pattern, flags)?),
                             prefix: regex_prefix(pattern, flags).map(Into::into),
                         },
                     }
@@ -390,19 +402,47 @@ impl KeyFilter {
         })
     }
 
+    /// [`Self::test`] for a filter the caller owns, such as the clone of one parallel
+    /// task. Its regular expression tests use their search caches without locking them.
+    pub fn test_mut(&mut self, key: &[u8]) -> bool {
+        if !self.0.iter().any(|t| matches!(t, Test::Regex { .. })) {
+            return self.test(key);
+        }
+        let k = split(key);
+        for t in self.0.iter_mut() {
+            let pass = match t {
+                Test::Regex { arg, re, .. } => arg
+                    .read(&k)
+                    .and_then(|(s, _)| std::str::from_utf8(s).ok())
+                    .is_some_and(|s| re.is_match_mut(s)),
+                t => Self::passes(t, &k),
+            };
+            if !pass {
+                return false;
+            }
+        }
+        k.valid()
+    }
+
     /// Whether the term with this key passes (type errors fail the filter).
     pub fn test(&self, key: &[u8]) -> bool {
         let key = split(key);
+        self.0.iter().all(|t| Self::passes(t, &key)) && key.valid()
+    }
+
+    /// Whether one test passes, before the key's final validity check.
+    #[inline]
+    fn passes(t: &Test, key: &Key<'_>) -> bool {
         // UTF-8 is self-synchronizing: a byte match of a UTF-8 needle in a UTF-8 string
         // is a match of the strings
-        self.0.iter().all(|t| match t {
+        match t {
             Test::Str {
                 f,
                 arg,
                 needle,
                 finder,
                 lang,
-            } => arg.read(&key).is_some_and(|(s, l)| {
+            } => arg.read(key).is_some_and(|(s, l)| {
                 compatible_bytes(l, lang.as_deref())
                     && match f {
                         Function::Contains => finder.find(s).is_some(),
@@ -411,14 +451,14 @@ impl KeyFilter {
                     }
             }),
             Test::Regex { arg, re, .. } => arg
-                .read(&key)
+                .read(key)
                 .and_then(|(s, _)| std::str::from_utf8(s).ok())
                 .is_some_and(|s| re.is_match(s)),
             Test::CursorRegex { arg, re, .. } => arg
-                .read(&key)
+                .read(key)
                 .and_then(|(s, _)| std::str::from_utf8(s).ok())
                 .is_some_and(|s| re.is_match(s)),
-            Test::LangMatches(range) => match &key {
+            Test::LangMatches(range) => match key {
                 // Basic language filtering only compares bytes. The final validity
                 // check rejects malformed UTF-8 after all predicates pass.
                 Key::Literal { lang, .. } => {
@@ -426,7 +466,7 @@ impl KeyFilter {
                 }
                 _ => false,
             },
-        }) && key.valid()
+        }
     }
 }
 
