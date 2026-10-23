@@ -148,14 +148,23 @@ own global answering.
 
 1. **Projection.** The settings' projection, as an F14 named projection
    `graphrag`, built undirected from the principal's view at the head commit.
-2. **Leiden.** `algo:leiden` with the settings' resolution and levels and a fixed seed,
-   which yields a community per node and level. Communities smaller than
-   `minCommunitySize` are folded into their parent.
-3. **Stable identities.** Each new community is matched with the previous build's
-   community at the same level that shares the most members, when their Jaccard
-   similarity is at least 0.5, and inherits its IRI. Others get a new IRI
-   `urn:x-sparkles:graphrag:{ds}:{level}:{uuid}`. Unchanged members and a stable IRI let
-   §5 reuse reports.
+2. **Leiden.** `algo:leiden` with the settings' resolution and a fixed seed, run until
+   it converges, which yields a community per node and level. The levels are numbered
+   from the coarsest, and the build keeps levels 0 to `levels`. A run that reaches the
+   algorithm's level cap without converging is refused, since its coarsest level is not
+   known, and a run stopped by its deadline or memory limit fails as a whole. Leiden's
+   levels need not nest, so each level below the coarsest is intersected with the level
+   above and split into its connected pieces, which makes every community a connected
+   part of its parent. Communities smaller than `minCommunitySize` are folded into their
+   nearest kept ancestor, whose report input then includes their members.
+3. **Stable identities.** A new community inherits the IRI of a previous build's
+   community at the same level when their Jaccard similarity is at least 0.5, and each
+   IRI is inherited at most once. The build takes every qualifying pair of a level in
+   order of decreasing similarity, compared exactly as fractions, then by the old IRI,
+   then by a versioned digest of the new community's sorted members, then by those
+   members themselves, and accepts a pair when neither side has matched yet. Others get
+   a new IRI `urn:x-sparkles:graphrag:{ds}:{level}:{uuid}`. Unchanged members and a
+   stable IRI let §5 reuse reports.
 
 ### 3.2 The input of a report
 
@@ -747,9 +756,15 @@ order and inherits the resolved `summarize` list when neither layer explicitly
 configures `community`. An explicit empty list disables the role. Configuration,
 server/dataset precedence and UI guidance have focused regression tests.
 
-No phase is complete. The foundation adds no model calls, GraphRAG settings, report
-storage, build task or route. Phase 1 still needs the hierarchy adapter, stable
-identities, report checks, budgets, provenance, access control, CLI, Communities tab,
+No phase is complete. The foundation adds no model calls, report storage, build task or
+route. The first Phase 1 parts that need no publication are in the server: the
+versioned `graphrag` settings type, the bounded and versioned build state, the hierarchy
+adapter of §3.1 with its stable identities, and the admission of §3.5, which reserves
+every model attempt from an exact local tokenizer, the provider's counting endpoint or
+the byte bound. Local mock providers test them. They are not wired into a build, a
+settings kind or a route. Phase 1 still needs the projection reader, the
+report inputs and checks, the whole-build estimate, the disclosure guard, report
+storage with provenance, the build task and routes, the CLI, the Communities tab, the
 inbox kind and manual refresh. Global Ask and memory integration remain Phase 2, and
 automatic refresh remains Phase 3. [ROADMAP](../ROADMAP.md) item 12 tracks this work.
 

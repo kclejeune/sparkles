@@ -36,6 +36,8 @@ mod geo;
 mod geo_index_cmd;
 #[cfg(feature = "graphql")]
 mod graphql;
+#[cfg(feature = "mcp")]
+mod graphrag;
 mod http;
 #[cfg(feature = "mcp")]
 mod ingest;
