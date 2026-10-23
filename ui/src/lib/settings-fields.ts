@@ -244,10 +244,133 @@ export const INGEST_FIELDS: readonly FieldDef[] = [
   },
 ];
 
+export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
+  {
+    path: 'enabled',
+    group: 'Build',
+    label: 'Community reports',
+    type: 'bool',
+    fallback: false,
+    help: 'Whether the dataset can build GraphRAG community reports.',
+  },
+  {
+    path: 'principal',
+    group: 'Build',
+    label: 'Read as',
+    type: 'text',
+    optional: true,
+    placeholder: 'a user name',
+    help: 'The user whose view the build reads. Only callers whose access covers that view can read the reports.',
+  },
+  {
+    path: 'projection.graphs',
+    group: 'Build',
+    label: 'Graphs',
+    type: 'lines',
+    placeholder: 'urn:graph:org',
+    help: 'Graph IRIs or patterns with *, one per line, whose resources are grouped.',
+  },
+  {
+    path: 'projection.exclude',
+    group: 'Build',
+    label: 'Predicates left out',
+    type: 'lines',
+    help: 'Predicates that do not join resources, such as rdf:type.',
+  },
+  {
+    path: 'levels',
+    group: 'Hierarchy',
+    label: 'Levels',
+    type: 'int',
+    min: 0,
+    max: 7,
+    fallback: 3,
+    help: 'The deepest level of the hierarchy kept, from 0 (coarsest).',
+  },
+  {
+    path: 'resolution',
+    group: 'Hierarchy',
+    label: 'Resolution',
+    type: 'number',
+    min: 0,
+    fallback: 1,
+    help: 'Higher values make smaller communities.',
+  },
+  {
+    path: 'minCommunitySize',
+    group: 'Hierarchy',
+    label: 'Smallest community',
+    type: 'int',
+    min: 1,
+    fallback: 3,
+    help: 'Smaller communities get no report of their own.',
+  },
+  {
+    path: 'maxFactsPerCommunity',
+    group: 'Hierarchy',
+    label: 'Facts per report',
+    type: 'int',
+    min: 1,
+    max: 10000,
+    fallback: 400,
+    help: 'The facts sent for a leaf community.',
+  },
+  {
+    path: 'reportsGraph',
+    group: 'Reports',
+    label: 'Reports graph',
+    type: 'text',
+    fallback: 'urn:x-sparkles:graphrag:reports',
+    help: 'Where the reports are stored. It must be under urn:x-sparkles:graphrag:.',
+  },
+  {
+    path: 'language',
+    group: 'Reports',
+    label: 'Language',
+    type: 'text',
+    fallback: 'en',
+  },
+  {
+    path: 'refresh.minChangedFraction',
+    group: 'Reports',
+    label: 'Rewrite after a change of',
+    type: 'number',
+    min: 0,
+    max: 1,
+    fallback: 0.1,
+    help: "The share of a community's facts that must change before a refresh rewrites its report.",
+  },
+  {
+    path: 'budget.tokensPerBuild',
+    group: 'Budget',
+    label: 'Tokens per build',
+    type: 'int',
+    min: 0,
+    fallback: 2000000,
+  },
+  {
+    path: 'budget.tokensPerDay',
+    group: 'Budget',
+    label: 'Tokens per day',
+    type: 'int',
+    min: 0,
+    fallback: 500000,
+  },
+  {
+    path: 'budget.providerCounting',
+    group: 'Budget',
+    label: 'Ask the provider to count tokens',
+    type: 'bool',
+    fallback: true,
+    help: "Use the provider's token counting endpoint for reservations when it has one.",
+  },
+];
+
 export const DATASET_FIELDS: Record<DatasetKind, readonly FieldDef[]> = {
   assistant: ASSISTANT_FIELDS,
   memory: MEMORY_FIELDS,
   ingest: INGEST_FIELDS,
+  graphrag: GRAPHRAG_FIELDS,
 };
 
 export const KIND_TITLES: Record<DatasetKind, { title: string; text: string }> = {
@@ -262,5 +385,9 @@ export const KIND_TITLES: Record<DatasetKind, { title: string; text: string }> =
   ingest: {
     title: 'Ingest',
     text: 'What the dataset keeps of ingested documents, and when an ingestion asks first.',
+  },
+  graphrag: {
+    title: 'GraphRAG',
+    text: 'Community reports: what the build reads, the hierarchy it keeps and its token budget.',
   },
 };

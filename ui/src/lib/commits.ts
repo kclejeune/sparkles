@@ -17,6 +17,7 @@ const KIND_LABELS: Record<CommitKind, string> = {
   embed: 'embeddings',
   patch: 'RDF Patch',
   merge: 'merge',
+  graphrag: 'community reports',
   unknown: 'unknown',
 };
 

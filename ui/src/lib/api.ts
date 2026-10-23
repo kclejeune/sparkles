@@ -343,6 +343,7 @@ export type TaskKind =
   | 'backup-restore'
   | 'backup-verify'
   | 'backup-gc'
+  | 'graphrag'
   | 'backup-policy';
 /** `queued`: waiting for a task slot; `cancelled`: stopped by `DELETE /$/tasks/{id}`. */
 export type TaskState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -1779,6 +1780,7 @@ export type CommitKind =
   | 'embed'
   | 'patch'
   | 'merge'
+  | 'graphrag'
   | 'unknown';
 
 /** One commit: the state after a write that changed data. */
