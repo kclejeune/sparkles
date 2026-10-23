@@ -381,7 +381,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             crate::obs::observe,
         ))
-        .layer(axum::middleware::from_fn(crate::alloc::track))
         .layer(axum::middleware::map_request(authority_host))
         .with_state(state.clone());
     // the branch a request chooses, before the routes above see it: the path form
@@ -393,6 +392,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             state,
             branches::select,
         ))
+        // outermost, so that a request counts as active from its first byte to the end
+        // of its response body (see `alloc`)
+        .layer(axum::middleware::from_fn(crate::alloc::track))
 }
 
 /// HTTP/2 requests carry their host as the `:authority` pseudo-header, not `Host`: it is
@@ -1432,7 +1434,7 @@ pub(crate) async fn run_query(
     let first_run = history == inline::History::Unseen
         && timeout.is_some()
         && inline::first_run_in_place(&query)
-        && crate::alloc::idle_besides_this(inline::FIRST_RUN_QUIET);
+        && inline::idle_for_first_run();
     let in_place = quick.is_some() || first_run;
     if first_run {
         // Until a run of the text ends quick and whole, it counts as slow, so a first run

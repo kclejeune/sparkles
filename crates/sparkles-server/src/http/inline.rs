@@ -120,11 +120,14 @@ pub enum History {
 /// How long the server must have been without requests for the first run of a text it
 /// has not seen to run in place. A run under steady load stays on the blocking pool,
 /// whose threads are then awake.
-#[cfg(not(test))]
 pub const FIRST_RUN_QUIET: std::time::Duration = std::time::Duration::from_millis(10);
-/// Tests send requests back to back.
-#[cfg(test)]
-pub const FIRST_RUN_QUIET: std::time::Duration = std::time::Duration::ZERO;
+
+/// Whether the server is idle enough for a first run in place ([`FIRST_RUN_QUIET`]).
+/// Router tests run many servers in one process and send requests back to back, so they
+/// skip this condition, and `alloc`'s tests cover it.
+pub fn idle_for_first_run() -> bool {
+    cfg!(test) || crate::alloc::idle_besides_this(FIRST_RUN_QUIET)
+}
 
 /// Whether the first run of `query`, a text the server has not seen, may run in place
 /// under a timeout. A SERVICE call may wait on another server or run a graph algorithm,

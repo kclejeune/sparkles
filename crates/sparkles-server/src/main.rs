@@ -3027,6 +3027,7 @@ fn run() -> Result<()> {
                 .thread_name(|i| format!("query-{i}"))
                 .build_global();
             rayon::broadcast(|_| ());
+            alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .thread_stack_size(THREAD_STACK)

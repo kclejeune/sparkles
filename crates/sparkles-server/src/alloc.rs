@@ -31,30 +31,92 @@ fn now_ms() -> u64 {
     epoch().elapsed().as_millis() as u64
 }
 
-/// Whether the request calling this is the only one in flight and no other request has
-/// ended for `quiet`: the server's threads have been idle, so a wake-up of another
-/// thread would be slow.
-pub fn idle_besides_this(quiet: Duration) -> bool {
-    ACTIVE.load(Ordering::SeqCst) <= 1
-        && now_ms().saturating_sub(LAST_END_MS.load(Ordering::SeqCst)) >= quiet.as_millis() as u64
+/// Start the clock that request activity is measured on. The server calls it at start,
+/// so that a first request after a quiet start counts the time since then.
+pub fn start_clock() {
+    epoch();
 }
 
-/// Middleware counting in-flight requests.
+/// Whether the request calling this is the only one in flight and no other request has
+/// ended for `quiet`: the server's threads have been idle, so a wake-up of another
+/// thread would be slow. A request counts until its response body has ended.
+pub fn idle_besides_this(quiet: Duration) -> bool {
+    idle(
+        ACTIVE.load(Ordering::SeqCst),
+        now_ms().saturating_sub(LAST_END_MS.load(Ordering::SeqCst)),
+        quiet,
+    )
+}
+
+/// [`idle_besides_this`] for `active` requests in flight, including the caller, the last
+/// of the others having ended `since_end_ms` ago.
+fn idle(active: usize, since_end_ms: u64, quiet: Duration) -> bool {
+    active <= 1 && since_end_ms >= quiet.as_millis() as u64
+}
+
+/// One request in flight, counted in `active` until it drops, when it records its end.
+struct Activity {
+    active: &'static AtomicUsize,
+    last_end_ms: &'static AtomicU64,
+}
+
+impl Activity {
+    fn start(active: &'static AtomicUsize, last_end_ms: &'static AtomicU64) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Activity {
+            active,
+            last_end_ms,
+        }
+    }
+}
+
+impl Drop for Activity {
+    fn drop(&mut self) {
+        self.last_end_ms.store(now_ms(), Ordering::SeqCst);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A response body that keeps its request counted as active until the body has been
+/// sent or dropped, since a streamed answer is still being produced after its headers.
+struct Counted {
+    inner: axum::body::Body,
+    _activity: Activity,
+}
+
+impl http_body::Body for Counted {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Middleware counting in-flight requests, each until its response body ends.
 pub async fn track(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    ACTIVE.fetch_add(1, Ordering::SeqCst);
+    let activity = Activity::start(&ACTIVE, &LAST_END_MS);
     DIRTY.store(true, Ordering::SeqCst);
-    struct Done;
-    impl Drop for Done {
-        fn drop(&mut self) {
-            LAST_END_MS.store(now_ms(), Ordering::SeqCst);
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-    let _done = Done;
-    next.run(req).await
+    next.run(req).await.map(|inner| {
+        axum::body::Body::new(Counted {
+            inner,
+            _activity: activity,
+        })
+    })
 }
 
 /// Release free heap memory to the OS once requests have run and then none has been
@@ -120,5 +182,49 @@ fn release() {
     // SAFETY: malloc_trim only returns free memory to the OS.
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn a_server_is_idle_for_a_first_run_only_alone_and_after_the_quiet_time() {
+        let quiet = Duration::from_millis(10);
+        assert!(idle(1, 10, quiet));
+        assert!(idle(1, 5_000, quiet));
+        assert!(!idle(1, 9, quiet), "a request ended 9 ms ago");
+        assert!(!idle(2, 5_000, quiet), "another request is in flight");
+    }
+
+    #[tokio::test]
+    async fn a_request_counts_until_its_body_ends() {
+        use http_body_util::BodyExt;
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        static END: AtomicU64 = AtomicU64::new(u64::MAX);
+        let (tx, rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|b| (Ok::<_, std::convert::Infallible>(b), rx))
+        });
+        let body = Counted {
+            inner: axum::body::Body::from_stream(stream),
+            _activity: Activity::start(&ACTIVE, &END),
+        };
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
+        tx.send("part".into()).await.unwrap();
+        let mut body = Box::pin(body);
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), "part");
+        // the headers and a first part are out, and the body goes on
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
+        assert_eq!(END.load(Ordering::SeqCst), u64::MAX);
+        drop(tx);
+        assert!(body.frame().await.is_none());
+        drop(body);
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+        assert_ne!(END.load(Ordering::SeqCst), u64::MAX);
     }
 }

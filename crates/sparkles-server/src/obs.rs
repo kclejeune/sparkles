@@ -2102,6 +2102,8 @@ pub fn metrics_router(st: Arc<AppState>) -> axum::Router {
             st.rate_limit.clone(),
             crate::ratelimit::admit,
         ))
+        // a scrape keeps the server from counting as idle (see `alloc`)
+        .layer(axum::middleware::from_fn(crate::alloc::track))
         .with_state(st)
 }
 

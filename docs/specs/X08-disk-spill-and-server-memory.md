@@ -1224,7 +1224,11 @@ Warming the heap of the pool's first thread, the alternative for a server withou
 timeout, is not built, because no query lacks one. A text that contains `SERVICE`, or a
 `\u` escape that could spell it, starts on the pool, because a SERVICE call can wait on
 another server or run a graph algorithm. A query that reads a past state with `at` uses
-the pool as before.
+the pool as before. A request counts as in flight from the outermost layer of either
+listener, the metrics listener included, until its response body has ended, so a streamed
+answer still being produced keeps the server from counting as idle. The clock starts with
+the server, so the first request after a quiet start finds it idle also when the release
+of idle heap memory is off.
 
 The idle condition comes from the BSBM explore driver at 10M on forge, whose generated
 parameters make every text new. With every first run on the receiving thread, each query
