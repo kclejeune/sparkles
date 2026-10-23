@@ -1483,9 +1483,10 @@ impl Ctx {
     }
 
     /// The bytes of the state an eager context keeps after execution without a charge:
-    /// the terms computed into its local vocabulary, its cached decoded values and the
-    /// memos of its blank nodes. Each map entry counts its key and value storage and a
-    /// fixed 48 bytes for its slot.
+    /// the terms computed into its local vocabulary, its cached decoded values, its
+    /// parsed geometries and the memos of its blank nodes and callback terms. A map
+    /// counts the slots it has allocated, which clearing it keeps, and the heap storage
+    /// of its live keys and values.
     fn retained_state_bytes(&self) -> u64 {
         fn text(s: &str) -> u64 {
             s.len() as u64 + 16
@@ -1499,24 +1500,38 @@ impl Ctx {
                 _ => 0,
             }
         }
-        const SLOT: u64 = 48;
-        let entry = |key: u64, string: &String| SLOT + key + string.capacity() as u64;
-        let mut bytes = self.local.read().bytes() as u64;
+        /// The slots of a hash map with `capacity` entries of type `T`, with one
+        /// control byte each.
+        fn slots<T>(capacity: usize) -> u64 {
+            (capacity as u64).saturating_mul(std::mem::size_of::<T>() as u64 + 1)
+        }
+        let mut bytes = (self.local.read().bytes() as u64).saturating_add(self.geo.bytes() as u64);
         for shard in &self.values {
-            for v in shard.read().values() {
-                bytes = bytes.saturating_add(SLOT + std::mem::size_of::<Value>() as u64 + value(v));
+            let shard = shard.read();
+            bytes = bytes.saturating_add(slots::<(Id, Value)>(shard.capacity()));
+            for v in shard.values() {
+                bytes = bytes.saturating_add(value(v));
             }
         }
-        for (key, label) in self.bnode_memo.lock().keys() {
-            bytes = bytes.saturating_add(entry(key.capacity() as u64 * 8, label));
+        {
+            let memo = self.bnode_memo.lock();
+            bytes = bytes.saturating_add(slots::<((Vec<Id>, String), Id)>(memo.capacity()));
+            for (key, label) in memo.keys() {
+                bytes = bytes.saturating_add(key.capacity() as u64 * 8 + label.capacity() as u64);
+            }
         }
-        for label in self.outside_bnodes.lock().keys() {
-            bytes = bytes.saturating_add(entry(0, label));
+        for labels in [
+            &self.outside_bnodes,
+            &self.literal_bnodes,
+            &self.callback_bnodes,
+        ] {
+            let labels = labels.lock();
+            bytes = bytes.saturating_add(slots::<(String, Id)>(labels.capacity()));
+            for label in labels.keys() {
+                bytes = bytes.saturating_add(label.capacity() as u64);
+            }
         }
-        for label in self.literal_bnodes.lock().keys() {
-            bytes = bytes.saturating_add(entry(0, label));
-        }
-        bytes
+        bytes.saturating_add(slots::<(Id, u64)>(self.callback_terms.lock().capacity()))
     }
 
     pub fn mem_peak(&self) -> u64 {
@@ -2461,6 +2476,27 @@ mod charge_tests {
         drop(ctx);
         assert_eq!(grant.used(), 0);
         assert_eq!(grant.granted(), 16 * MIB);
+    }
+
+    /// A value cache shard that overflowed is cleared without giving back its slots,
+    /// and a finished result keeps them counted (X08-P1-retained-results).
+    #[test]
+    fn retained_state_counts_the_slots_a_cleared_value_shard_keeps() {
+        let ctx = Ctx::new(Store::in_memory(StoreOptions::default()).snapshot());
+        let empty = ctx.retained_state_bytes();
+        {
+            let mut shard = ctx.values[0].write();
+            for i in 0..70_000u64 {
+                shard.insert(Id(i), Value::Bool(true));
+            }
+            shard.clear();
+        }
+        let slots = 70_000 * std::mem::size_of::<(Id, Value)>() as u64;
+        assert!(
+            ctx.retained_state_bytes() >= empty + slots,
+            "{} bytes for {slots} bytes of slots",
+            ctx.retained_state_bytes()
+        );
     }
 
     #[test]

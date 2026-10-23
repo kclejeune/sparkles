@@ -1062,9 +1062,10 @@ of answer kept about 40 MB of the pool while its result was alive.
 When an eager SELECT or ASK finishes, `Ctx::shrink_retained` now lowers the contribution
 to what the result keeps. That is the capacity its columns have allocated, which a
 filter that compacted them in place leaves above their length, the terms computed into
-the query's local vocabulary, its cached decoded values with their strings, the memos of
-its blank nodes and every live charge. Each map entry counts its key, its strings and 48
-bytes for its slot. `QueryMemoryLedger::shrink_eager` lowers the primary account to the
+the query's local vocabulary, its cached decoded values with their strings, its parsed
+geometries, the memos of its blank nodes and callback terms, and every live charge. A
+map counts every slot it has allocated, since a value cache shard that overflows is
+cleared without giving its slots back, and the heap strings of its live entries. `QueryMemoryLedger::shrink_eager` lowers the primary account to the
 higher of its live bytes and that estimate, lowers every other account to its live bytes,
 and returns the excess to each account's own grant outside the ledger's lock. A cursor
 ledger keeps no eager contribution and a ledger with a running algorithm call keeps its
@@ -1092,7 +1093,10 @@ found that the first version counted only the rows of the result table and none 
 blank-node memos. `a_compacted_result_keeps_its_column_capacity_covered` holds two rows
 whose filtered columns keep 2.4 MB of capacity, which the first version shrank to
 112 bytes, and `a_result_keeps_its_blank_node_memo_covered` holds a COUNT over 100,000
-`BNODE("x")` memo entries, which it shrank to 123 bytes.
+`BNODE("x")` memo entries, which it shrank to 123 bytes. A second review found that it
+counted the entries of a cleared value shard rather than its slots and left out the
+geometry memo. `retained_state_counts_the_slots_a_cleared_value_shard_keeps` covers the
+first.
 
 ### Phase 2a: batch kernels (2026-10-17)
 

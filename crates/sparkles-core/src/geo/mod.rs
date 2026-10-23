@@ -70,6 +70,13 @@ mod smoke_tests;
 pub mod memo {
     #[derive(Default)]
     pub struct GeoMemo;
+
+    impl GeoMemo {
+        /// Estimated bytes held, none without the feature.
+        pub fn bytes(&self) -> usize {
+            0
+        }
+    }
 }
 
 pub use config::{DistanceModel, GeoConfig, GeoStatus, IndexState};
