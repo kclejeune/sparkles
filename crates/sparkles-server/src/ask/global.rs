@@ -451,7 +451,7 @@ impl Asking<'_, '_> {
         }
         // reduce: points above 0, best first, as many as fit
         points.retain(|p| p.score > 0);
-        points.sort_by(|a, b| b.score.cmp(&a.score));
+        points.sort_by_key(|a| std::cmp::Reverse(a.score));
         let mut used = 0u64;
         let mut kept: Vec<Point> = Vec::new();
         for p in points {
