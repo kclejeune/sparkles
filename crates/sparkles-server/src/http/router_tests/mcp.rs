@@ -1463,15 +1463,18 @@ mod auth {
                 .all(|q| !q.contains("b/1") && !q.contains("ex:b1")),
             "{quads:?}"
         );
-        // validation reads every graph
-        let r = tool(
-            &s.app,
-            "validate_shacl",
-            json!({"dataset": "graphs", "shapes": "@prefix sh: <http://www.w3.org/ns/shacl#> ."}),
-            &[("authorization", &gra)],
-        )
-        .await;
-        assert_eq!(tool_error(&r), "forbidden");
+        // validation reads every graph, and the tool exists with SHACL
+        #[cfg(feature = "shacl")]
+        {
+            let r = tool(
+                &s.app,
+                "validate_shacl",
+                json!({"dataset": "graphs", "shapes": "@prefix sh: <http://www.w3.org/ns/shacl#> ."}),
+                &[("authorization", &gra)],
+            )
+            .await;
+            assert_eq!(tool_error(&r), "forbidden");
+        }
         // updates: the write graphs only
         let grad = b("grad");
         let up = |u: &str| json!({"dataset": "graphs", "update": u});
