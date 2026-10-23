@@ -1147,3 +1147,8 @@ could observe, so such queries keep the generic join. A cursor's string comparis
 not charge the keys it rebuilt, the keyed join did not charge its chunk of pairs, and
 the eager floor cache could outgrow its charge. The keyed join first had no cursor
 implementation, so strict streaming refused plans that it had run before.
+A second review found that a finished cursor keyed join kept its equality index until
+the cursor ended and that the index's list of other values grew without charging the
+old buffer during a move. The index is now released with the join's other working sets,
+and the list is counted, charged and allocated once. A third review asked for the
+cancellation check that the list's fill pass had lost, and it was restored.
