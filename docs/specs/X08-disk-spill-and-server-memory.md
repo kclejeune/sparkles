@@ -1145,7 +1145,11 @@ a loopback or unspecified address, `localhost`, `127.0.0.1` or `[::1]`. The path
 `/{ds}/sparql`, `/{ds}/query` or `/{ds}` for a dataset the server serves, with no query
 string, fragment, user information or branch. Any other IRI is an ordinary HTTP call,
 including a DNS name or an alias that happens to resolve to this server. Matching names
-rather than resolved addresses keeps the rule exact. A header that marked a call as
+rather than resolved addresses keeps the rule exact. The IRI must also be written in the
+form the URL parser gives it, since the parser rewrites spellings such as `127.1`,
+`2130706433`, `%6cocalhost`, a port with a leading zero and paths with `.` or `..`
+segments into this server's endpoint. Its raw host, port and path must equal the parsed
+ones, and any other spelling stays an HTTP call. A header that marked a call as
 nested was rejected, because a client could send it to skip admission, and a secret
 header was rejected because a proxy or an alias could carry it to another server. The
 remaining option, leaving the `503` and documenting it, would have kept federation over

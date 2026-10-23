@@ -217,6 +217,16 @@ async fn a_service_iri_that_does_not_name_this_server_goes_over_http() {
         format!("http:////@127.0.0.1:{PORT}/ds/sparql"),
         format!("http:///127.0.0.1:{PORT}/ds/sparql"),
         format!("https://127.0.0.1:{PORT}/ds/sparql"),
+        // spellings that the URL parser rewrites into this server's endpoint
+        format!("http://127.1:{PORT}/ds/sparql"),
+        format!("http://2130706433:{PORT}/ds/sparql"),
+        format!("http://0x7f.0.0.1:{PORT}/ds/sparql"),
+        format!("http://%6cocalhost:{PORT}/ds/sparql"),
+        format!("http://127.0.0.1:0{PORT}/ds/sparql"),
+        format!("http://127.0.0.1:{PORT}/other/%2e%2e/ds/sparql"),
+        format!("http://127.0.0.1:{PORT}/other/../ds/sparql"),
+        format!("http://127.0.0.1:{PORT}/./ds/sparql"),
+        format!("http://127.0.0.1:{PORT}\\ds/sparql"),
     ] {
         let (status, body) = select(
             &s.app,

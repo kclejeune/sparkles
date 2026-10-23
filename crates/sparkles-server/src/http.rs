@@ -1433,6 +1433,12 @@ pub(crate) async fn run_query(
         && timeout.is_some()
         && inline::first_run_in_place(&query);
     let in_place = quick.is_some() || first_run;
+    if first_run {
+        // Until a run of the text ends quick and whole, it counts as slow, so a first run
+        // that fails, stops early or fails to serialize sends the next runs to the pool,
+        // and so does a concurrent request for the same text.
+        QUICK.record(quick_key, f64::INFINITY);
+    }
     // SELECT and graph queries retain their quick eager shortcut. ASK can be quick
     // because its native execution avoids eager candidate storage, so it must keep
     // automatic admission even when scheduled in place. A first run has no history, so
@@ -1616,10 +1622,12 @@ pub(crate) async fn run_query(
     // Try small answers in place; actual encoded bytes decide whether the answer
     // must switch to the blocking serializer, even with very few result cells.
     let body = if in_place && cells <= inline::QUICK_RESULT_CELLS {
-        stream::serialize_quick(limit, write, on_stream_end).await?
+        stream::serialize_quick(limit, write, on_stream_end).await
     } else {
-        stream::serialize(limit, write, on_stream_end).await?
+        stream::serialize(limit, write, on_stream_end).await
     };
+    // a run whose answer could not be written is not known to be quick any more
+    let body = body.inspect_err(|_| QUICK.record(quick_key, f64::INFINITY))?;
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
             let ms = if algorithmic {

@@ -494,3 +494,58 @@ fn only_texts_without_a_service_keyword_run_their_first_run_in_place() {
         "SELECT * { \\U00000053ERVICE <urn:x> { } }"
     ));
 }
+
+/// A first run that fails after it ran, here because its answer outgrows the result
+/// budget, or whose stream a client stops, leaves its text slow, so the next run of the
+/// text uses the blocking pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_run_that_fails_to_answer_sends_the_next_run_to_the_pool() {
+    let s = server();
+    let ds = s.state.attach("big", DbType::Mem, None).unwrap();
+    let mut data = String::new();
+    let long = "x".repeat(600);
+    for i in 0..3000 {
+        data.push_str(&format!("<urn:s{i}> <urn:p> \"{long}{i}\" .\n"));
+    }
+    ds.store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let request = |q: &str, extra: &str| {
+        Request::post(format!("/big/sparql?{extra}"))
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .header(header::ACCEPT, "application/sparql-results+json")
+            .body(Body::from(q.to_string()))
+            .unwrap()
+    };
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let key = crate::http::inline::QuickQueries::key("big", q);
+    for _ in 0..2 {
+        let r = send(&s.app, request(q, "execution=eager&max-result-mb=1")).await;
+        assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
+    }
+    assert_eq!(
+        crate::http::inline::ran_by_key(key),
+        1,
+        "only the first run was in place"
+    );
+    assert_eq!(
+        crate::http::QUICK.history(key),
+        crate::http::inline::History::Slow
+    );
+    // a stream that `send` stops did not answer the whole query
+    let q = "SELECT ?o ?s WHERE { ?s <urn:p> ?o }";
+    let key = crate::http::inline::QuickQueries::key("big", q);
+    for _ in 0..2 {
+        let r = send(&s.app, request(q, "send=10")).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    }
+    assert_eq!(crate::http::inline::ran_by_key(key), 1);
+    assert_eq!(
+        crate::http::QUICK.history(key),
+        crate::http::inline::History::Slow
+    );
+}
