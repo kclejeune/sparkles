@@ -7587,7 +7587,9 @@ same time. The profile is meant for one query on a quiet server. `vocab.finds` a
 vocabulary adds to them millions of times from many threads. `vocabLookup` is the time
 in key lookups, which resolve the constants of the query. `vocabRead` is the time reading
 terms by id. `indexDecode` is the time decompressing index columns, and `indexWait` is the
-time to read their pages into memory before decoding. The times are summed over threads.
+time to read their pages into memory before decoding. In a segmented index (format 3), a
+read of a few rows decodes single segments of a column, and each counts as one entry of
+`columnsDecoded`, with its own rows in `decodedBytes`. The times are summed over threads.
 `pages` comes from `mincore(2)` on the pages the query asked for or read, and `events`
 lists the first 512 requests in order. Overlapping profiles share one epoch inventory
 of at most 65,536 distinct file, mapping and page entries. It retains the first admitted

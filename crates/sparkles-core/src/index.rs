@@ -6,6 +6,13 @@
 //! (delta + zig-zag varint, then LZ4). Block metadata (first/last key, row offset, byte
 //! range) is kept in RAM, so a scan with a bound prefix touches only the blocks that can
 //! contain it, and exact range counts need at most two block decodes.
+//!
+//! Since index format 3 a column is a run of independent LZ4 frames, one per segment of
+//! [`SEG_ROWS`] rows, and `<perm>.seg` holds each segment's first key and frame lengths
+//! (spec X07 §6.5). A reader of a few rows of a block decodes only the segments that can
+//! hold them, and a reader of whole blocks decodes every frame into one column as before.
+//! Format 2 generations, whose columns are one frame each and which have no `.seg` file,
+//! are read as before.
 
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -18,6 +25,31 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const BLOCK_ROWS: usize = 32 * 1024;
+
+/// Rows of a segment in the generations this build writes. The `.seg` header records the
+/// size, and a reader accepts any size from [`MIN_SEG_ROWS`] to [`MAX_SEG_ROWS`] that
+/// divides [`BLOCK_ROWS`].
+pub const SEG_ROWS: usize = 2048;
+const MIN_SEG_ROWS: usize = 512;
+const MAX_SEG_ROWS: usize = 4096;
+
+/// Whether a reader opens a segment directory of `n` rows per segment: from
+/// [`MIN_SEG_ROWS`] to [`MAX_SEG_ROWS`], dividing [`BLOCK_ROWS`]. `check` uses the same rule.
+pub(crate) fn supported_segment_rows(n: usize) -> bool {
+    (MIN_SEG_ROWS..=MAX_SEG_ROWS).contains(&n) && BLOCK_ROWS.is_multiple_of(n)
+}
+const SEG_MAGIC: &[u8; 8] = b"SPKSEG01";
+/// Bytes of the `.seg` header: the magic, the segment size and four reserved bytes.
+const SEG_HEADER: usize = 16;
+/// Bytes of one segment's directory entry: its first key and its frame length in each
+/// column.
+pub(crate) const SEG_ENTRY: usize = 32 + 16;
+/// The most segments of a block a range read decodes one by one, as a share of the
+/// block's segments. A range that spans more reads whole columns.
+const SPARSE_SEGMENTS_DIV: usize = 4;
+/// The segments of a block that readers decode one by one before they read it whole, as a
+/// share of its segments.
+const DENSE_SEGMENTS_DIV: usize = 4;
 
 /// Read hints for the memory-mapped index and vocabulary files (on by default, `off` in
 /// `SPARKLES_IO_HINTS` turns them off for a process).
@@ -691,10 +723,37 @@ pub(crate) fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
     lz4_flex::compress_prepend_size(scratch)
 }
 
+/// Encode `col` as one frame per `seg_rows` rows, each with its deltas restarting at 0,
+/// appended to `out`. Pushes each frame's length to `lens`.
+pub(crate) fn encode_segmented(
+    col: &[u64],
+    seg_rows: usize,
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+    lens: &mut Vec<u32>,
+) {
+    for part in col.chunks(seg_rows) {
+        let frame = encode_column(part, scratch);
+        lens.push(frame.len() as u32);
+        out.extend_from_slice(&frame);
+    }
+}
+
 /// Decode one compressed column of `rows` values. Damaged input is an error, never a
 /// panic: the size prefix must fit `rows` varints, and the values must use exactly the
 /// decompressed bytes.
 pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Col> {
+    // Allocated as the buffer the block cache keeps, so that nothing is copied after
+    // decoding.
+    let mut col: Box<[u64]> = vec![0u64; rows].into_boxed_slice();
+    decode_frame_into(bytes, &mut col)?;
+    Ok(Col::new(col))
+}
+
+/// Decode the frame `bytes` (a size prefix, then LZ4 of zig-zag delta varints starting
+/// from 0) into all of `out`, with the checks of [`decode_column`].
+pub(crate) fn decode_frame_into(bytes: &[u8], out: &mut [u64]) -> Result<()> {
+    let rows = out.len();
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
     let size = bytes
         .get(..4)
@@ -725,17 +784,14 @@ pub(crate) fn decode_column(bytes: &[u8], rows: usize) -> Result<Col> {
                 "block decompression: {n} bytes instead of {size}"
             )));
         }
-        decode_varints(raw, rows)
+        decode_varints_into(raw, out)
     })
 }
 
-/// The `rows` zigzag-delta varints that make up all of `raw`.
-fn decode_varints(raw: &[u8], rows: usize) -> Result<Col> {
+/// The `out.len()` zigzag-delta varints that make up all of `raw`, written to `out`.
+fn decode_varints_into(raw: &[u8], out: &mut [u64]) -> Result<()> {
+    let rows = out.len();
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
-    // Allocated as the buffer the block cache keeps, so that nothing is copied after
-    // decoding.
-    let mut col: Box<[u64]> = vec![0u64; rows].into_boxed_slice();
-    let out = &mut col[..];
     let mut pos = 0;
     let mut prev = 0u64;
     let mut i = 0;
@@ -773,7 +829,7 @@ fn decode_varints(raw: &[u8], rows: usize) -> Result<Col> {
             raw.len() - pos
         )));
     }
-    Ok(Col::new(col))
+    Ok(())
 }
 
 /// [`read_varint_checked`] on a buffer known to hold the 10 bytes a varint can take.
@@ -813,16 +869,40 @@ pub(crate) fn read_varint_checked(buf: &[u8], pos: &mut usize) -> Option<u64> {
 /// Streaming writer for one permutation. Keys must arrive sorted and deduplicated.
 pub struct PermWriter {
     data: BufWriter<crate::disk::WritebackFile>,
+    /// the segment directory (`<perm>.seg`), `None` for an unsegmented (format 2) index
+    seg: Option<BufWriter<File>>,
     meta: Vec<u8>,
     pos: u64,
     rows: u64,
     buf: [Vec<u64>; 4],
     last: Option<Key>,
     scratch: Vec<u8>,
+    /// one block's encoded columns and their frame lengths, reused
+    enc: Vec<u8>,
+    lens: [Vec<u32>; 4],
 }
 
 impl PermWriter {
+    /// A writer of a segmented permutation, the format this build writes.
     pub fn create(dir: &Path, perm: Perm) -> Result<PermWriter> {
+        Self::create_format(dir, perm, true)
+    }
+
+    /// A writer of a segmented permutation or, with `segmented` false, of one in the
+    /// format 2 layout without segments (for tests and fixtures of that format).
+    pub(crate) fn create_format(dir: &Path, perm: Perm, segmented: bool) -> Result<PermWriter> {
+        let seg = if segmented {
+            let mut w = BufWriter::with_capacity(
+                64 << 10,
+                File::create(dir.join(format!("{}.seg", perm.name())))?,
+            );
+            w.write_all(SEG_MAGIC)?;
+            w.write_all(&(SEG_ROWS as u32).to_le_bytes())?;
+            w.write_all(&[0u8; 4])?;
+            Some(w)
+        } else {
+            None
+        };
         Ok(PermWriter {
             data: BufWriter::with_capacity(
                 1 << 20,
@@ -830,12 +910,15 @@ impl PermWriter {
                     dir.join(format!("{}.dat", perm.name())),
                 )?),
             ),
+            seg,
             meta: Vec::new(),
             pos: 0,
             rows: 0,
             buf: Default::default(),
             last: None,
             scratch: Vec::new(),
+            enc: Vec::new(),
+            lens: Default::default(),
         })
     }
 
@@ -875,11 +958,30 @@ impl PermWriter {
         ];
         let mut col_len = [0u32; 4];
         let offset = self.pos;
-        for (col, len) in self.buf.iter_mut().zip(col_len.iter_mut()) {
-            let enc = encode_column(col, &mut self.scratch);
-            self.data.write_all(&enc)?;
-            *len = enc.len() as u32;
-            self.pos += enc.len() as u64;
+        for ((col, lens), len) in self.buf.iter().zip(&mut self.lens).zip(&mut col_len) {
+            self.enc.clear();
+            lens.clear();
+            if self.seg.is_some() {
+                encode_segmented(col, SEG_ROWS, &mut self.scratch, &mut self.enc, lens);
+            } else {
+                self.enc = encode_column(col, &mut self.scratch);
+            }
+            self.data.write_all(&self.enc)?;
+            *len = self.enc.len() as u32;
+            self.pos += self.enc.len() as u64;
+        }
+        if let Some(seg) = self.seg.as_mut() {
+            let mut entry = [0u8; SEG_ENTRY];
+            for s in 0..n.div_ceil(SEG_ROWS) {
+                for c in 0..4 {
+                    entry[c * 8..c * 8 + 8]
+                        .copy_from_slice(&self.buf[c][s * SEG_ROWS].to_le_bytes());
+                    entry[32 + c * 4..36 + c * 4].copy_from_slice(&self.lens[c][s].to_le_bytes());
+                }
+                seg.write_all(&entry)?;
+            }
+        }
+        for col in self.buf.iter_mut() {
             col.clear();
         }
         BlockMeta {
@@ -901,16 +1003,36 @@ impl PermWriter {
         self.flush_block()
     }
 
-    /// Append block `m` as it is encoded (`bytes`, its four columns) after the current
-    /// block, which is ended first. Its keys must follow the keys pushed before.
-    pub(crate) fn push_raw(&mut self, m: &BlockMeta, bytes: &[u8]) -> Result<()> {
+    /// Append block `b` of `src` as one block after the current one, which is ended
+    /// first. Its keys must follow the keys pushed before. When `src` has this writer's
+    /// layout, the block's bytes and directory entries are copied as they are. Otherwise
+    /// (a format 2 block written into a segmented index, or a different segment size) the
+    /// block is decoded and encoded again.
+    pub(crate) fn push_block(&mut self, src: &PermIndex, b: usize) -> Result<()> {
         self.flush_block()?;
+        let m = &src.blocks[b];
         debug_assert!(self.last.is_none_or(|l| l < m.first), "blocks out of order");
+        let same = match (&self.seg, &src.segs) {
+            (None, None) => true,
+            (Some(_), Some(d)) => d.seg_rows == SEG_ROWS,
+            _ => false,
+        };
+        if !same {
+            let block = src.decode_block(b)?;
+            for i in 0..block.len() {
+                self.push(block.key(i))?;
+            }
+            return self.flush_block();
+        }
+        let bytes = src.raw_block(b)?;
         debug_assert_eq!(
             bytes.len() as u64,
             m.col_len.iter().map(|&l| l as u64).sum::<u64>()
         );
         self.data.write_all(bytes)?;
+        if let (Some(seg), Some(d)) = (self.seg.as_mut(), src.segs.as_ref()) {
+            seg.write_all(d.entries(b)?)?;
+        }
         BlockMeta {
             offset: self.pos,
             row_start: self.rows,
@@ -927,10 +1049,154 @@ impl PermWriter {
         self.flush_block()?;
         self.data.flush()?;
         self.data.get_ref().get_ref().sync_all()?;
+        if let Some(mut seg) = self.seg.take() {
+            seg.flush()?;
+            seg.get_ref().sync_all()?;
+        }
         let mut m = File::create(dir.join(format!("{}.meta", perm.name())))?;
         m.write_all(&self.meta)?;
         m.sync_all()?;
         Ok(self.rows)
+    }
+}
+
+/// The segment directory of a segmented permutation (`<perm>.seg`, spec X07 §6.5).
+pub(crate) struct Segments {
+    map: Mmap,
+    /// rows of a segment
+    pub(crate) seg_rows: usize,
+    /// the index of each block's first entry, and the total at the end
+    start: Vec<usize>,
+    /// a bit per block whose entries a reader has asked the kernel for, so that a warm
+    /// pass makes no read hint for them again
+    hinted: Box<[std::sync::atomic::AtomicU64]>,
+    /// per block, the segments decoded one by one so far, up to the block's limit
+    /// ([`Segments::dense_limit`]), after which readers decode the block whole
+    sparse_reads: Box<[std::sync::atomic::AtomicU8]>,
+}
+
+impl Segments {
+    fn open(path: &Path, perm: Perm, blocks: &[BlockMeta]) -> Result<Segments> {
+        let bad = |m: String| Error::Corrupt(format!("{}.seg: {m}", perm.name()));
+        let f = File::open(path)?;
+        let map = map_random(&f)?;
+        if map.len() < SEG_HEADER || &map[..8] != SEG_MAGIC {
+            return Err(bad("not a segment directory".into()));
+        }
+        let seg_rows = u32::from_le_bytes(map[8..12].try_into().unwrap()) as usize;
+        if !supported_segment_rows(seg_rows) {
+            return Err(bad(format!("segment size {seg_rows} is not supported")));
+        }
+        let mut start = Vec::with_capacity(blocks.len() + 1);
+        let mut n = 0usize;
+        for m in blocks {
+            start.push(n);
+            n += (m.rows as usize).div_ceil(seg_rows);
+        }
+        start.push(n);
+        if map.len() != SEG_HEADER + n * SEG_ENTRY {
+            return Err(bad(format!(
+                "{} bytes, {} expected for {n} segments",
+                map.len(),
+                SEG_HEADER + n * SEG_ENTRY
+            )));
+        }
+        // A directory of at most this size is asked for whole at open, as the block
+        // records of `.meta` are read whole: on a cold server a reader would otherwise wait
+        // for a page of it at its first lookup in each block. A larger one (above about
+        // 700M quads) is asked for block by block by the readers that prefetch.
+        const READ_AT_OPEN: usize = 16 << 20;
+        if map.len() <= READ_AT_OPEN {
+            will_need(IoFile::of_perm(perm), &map, 0, map.len());
+        }
+        Ok(Segments {
+            map,
+            seg_rows,
+            hinted: (0..blocks.len().div_ceil(64))
+                .map(|_| Default::default())
+                .collect(),
+            sparse_reads: (0..blocks.len()).map(|_| Default::default()).collect(),
+            start,
+        })
+    }
+
+    /// Segments of block `b`.
+    #[inline]
+    pub(crate) fn count(&self, b: usize) -> usize {
+        self.start[b + 1] - self.start[b]
+    }
+
+    /// The segments of block `b` that readers may decode one by one before they read it
+    /// whole: a quarter of them. Past that, one read and decode of the block costs less
+    /// than more reads of its segments, which on a cold file wait for a page each.
+    #[inline]
+    fn dense_limit(&self, b: usize) -> u8 {
+        (self.count(b) / DENSE_SEGMENTS_DIV).max(1) as u8
+    }
+
+    /// Whether readers have decoded enough of block `b`'s segments one by one to read it
+    /// whole from now on.
+    #[inline]
+    fn dense(&self, b: usize) -> bool {
+        self.sparse_reads[b].load(std::sync::atomic::Ordering::Relaxed) >= self.dense_limit(b)
+    }
+
+    /// Count a segment of block `b` decoded on its own.
+    fn note_sparse_read(&self, b: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let limit = self.dense_limit(b);
+        let _ =
+            self.sparse_reads[b].fetch_update(Relaxed, Relaxed, |n| (n < limit).then_some(n + 1));
+    }
+
+    /// Count a segment of block `b` that a prefetch decoded, short of the limit: the
+    /// reader after the prefetch must still find the block sparse, or it would read whole
+    /// columns and leave the warmed segments unused. Its own next decode reaches the limit.
+    fn note_warm_read(&self, b: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let limit = self.dense_limit(b);
+        let _ = self.sparse_reads[b]
+            .fetch_update(Relaxed, Relaxed, |n| (n + 1 < limit).then_some(n + 1));
+    }
+
+    /// Have readers read block `b` whole from now on.
+    fn mark_dense(&self, b: usize) {
+        self.sparse_reads[b].store(self.dense_limit(b), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The directory entries of block `b`.
+    pub(crate) fn entries(&self, b: usize) -> Result<&[u8]> {
+        let from = SEG_HEADER + self.start[b] * SEG_ENTRY;
+        let to = SEG_HEADER + self.start[b + 1] * SEG_ENTRY;
+        self.map
+            .get(from..to)
+            .ok_or_else(|| Error::Corrupt("segment directory is short".into()))
+    }
+
+    #[inline]
+    fn entry(&self, b: usize, s: usize) -> &[u8] {
+        let at = SEG_HEADER + (self.start[b] + s) * SEG_ENTRY;
+        &self.map[at..at + SEG_ENTRY]
+    }
+
+    /// The first key of segment `s` of block `b`.
+    #[inline]
+    pub(crate) fn first_key(&self, b: usize, s: usize) -> Key {
+        let e = self.entry(b, s);
+        std::array::from_fn(|c| u64::from_le_bytes(e[c * 8..c * 8 + 8].try_into().unwrap()))
+    }
+
+    /// The frame length of segment `s` of block `b` in column `c`.
+    #[inline]
+    pub(crate) fn frame_len(&self, b: usize, s: usize, c: usize) -> usize {
+        let e = self.entry(b, s);
+        u32::from_le_bytes(e[32 + c * 4..36 + c * 4].try_into().unwrap()) as usize
+    }
+
+    /// The bytes of the file that hold block `b`'s entries: `(offset, length)`.
+    fn span(&self, b: usize) -> (usize, usize) {
+        let from = SEG_HEADER + self.start[b] * SEG_ENTRY;
+        (from, self.count(b) * SEG_ENTRY)
     }
 }
 
@@ -943,6 +1209,8 @@ pub struct PermIndex {
     pub rows: u64,
     /// unique id of this permutation instance, used for cache keys
     pub uid: u64,
+    /// the segment directory, `None` for a format 2 permutation
+    pub(crate) segs: Option<Arc<Segments>>,
 }
 
 impl PermIndex {
@@ -953,10 +1221,23 @@ impl PermIndex {
             blocks: Arc::new(Vec::new()),
             rows: 0,
             uid: next_uid(),
+            segs: None,
         }
     }
 
+    /// Open the permutation in `dir`, segmented when its `.seg` file exists.
     pub fn open(dir: &Path, perm: Perm) -> Result<PermIndex> {
+        let segmented = dir.join(format!("{}.seg", perm.name())).exists();
+        Self::open_layout(dir, perm, segmented)
+    }
+
+    /// Open the permutation of a generation in index format `format`: format 3 is
+    /// segmented and needs its `.seg` file, format 2 is not.
+    pub fn open_format(dir: &Path, perm: Perm, format: u32) -> Result<PermIndex> {
+        Self::open_layout(dir, perm, format >= 3)
+    }
+
+    fn open_layout(dir: &Path, perm: Perm, segmented: bool) -> Result<PermIndex> {
         let meta = std::fs::read(dir.join(format!("{}.meta", perm.name())))?;
         if meta.len() % META_BYTES != 0 {
             return Err(Error::Corrupt(format!("{} metadata size", perm.name())));
@@ -974,17 +1255,252 @@ impl PermIndex {
         } else {
             None
         };
+        let segs = if segmented {
+            let path = dir.join(format!("{}.seg", perm.name()));
+            if !path.exists() {
+                return Err(Error::Corrupt(format!(
+                    "{}.seg is missing from a segmented index",
+                    perm.name()
+                )));
+            }
+            Some(Arc::new(Segments::open(&path, perm, &blocks)?))
+        } else {
+            None
+        };
         Ok(PermIndex {
             perm,
             data,
             blocks: Arc::new(blocks),
             rows,
             uid: next_uid(),
+            segs,
         })
     }
 
     pub fn disk_bytes(&self) -> u64 {
-        self.data.as_ref().map_or(0, |d| d.len() as u64) + (self.blocks.len() * META_BYTES) as u64
+        self.data.as_ref().map_or(0, |d| d.len() as u64)
+            + (self.blocks.len() * META_BYTES) as u64
+            + self.segs.as_ref().map_or(0, |d| d.map.len() as u64)
+    }
+
+    /// Whether the permutation is segmented (index format 3).
+    pub fn segmented(&self) -> bool {
+        self.segs.is_some()
+    }
+
+    /// The rows `[from, to)` of block `b` that segment `s` holds.
+    #[inline]
+    pub(crate) fn segment_rows(&self, b: usize, s: usize) -> (usize, usize) {
+        let n = self.segs.as_ref().map_or(BLOCK_ROWS, |d| d.seg_rows);
+        let rows = self.blocks[b].rows as usize;
+        ((s * n).min(rows), ((s + 1) * n).min(rows))
+    }
+
+    /// The segments `[s0, s1)` of block `b` to decode one by one for the rows of the
+    /// block with keys in `[lo, hi]`, or `None` when the reader decodes whole columns:
+    /// the permutation is not segmented, the range covers the whole block, it spans more
+    /// than a quarter of the block's segments, or readers have already decoded a quarter
+    /// of them one by one (spec X07 §6.5). A prefetch and the reader after it agree, since
+    /// only a prefetch or a decode changes the answer.
+    pub(crate) fn segment_span(&self, b: usize, lo: &Key, hi: &Key) -> Option<(usize, usize)> {
+        let d = self.segs.as_ref()?;
+        let m = &self.blocks[b];
+        if (m.first >= *lo && m.last <= *hi) || d.dense(b) {
+            return None;
+        }
+        let n = d.count(b);
+        // the last segment that starts at or before `lo` holds its first row, and the
+        // segments that start after `hi` hold none of the range
+        let s0 = partition(n, |s| d.first_key(b, s) <= *lo).saturating_sub(1);
+        let s1 = partition(n, |s| d.first_key(b, s) <= *hi).max(s0 + 1);
+        (s1 - s0 <= (n / SPARSE_SEGMENTS_DIV).max(1) && s1 - s0 < n).then_some((s0, s1))
+    }
+
+    /// [`segment_span`](Self::segment_span), unless the cache holds block `b`'s columns
+    /// whole (judged by the first column of `mask`): a reader then uses them, as cheap as
+    /// a segment, instead of cutting segments from them on every request.
+    pub(crate) fn read_span(
+        &self,
+        cache: &BlockCache,
+        b: usize,
+        lo: &Key,
+        hi: &Key,
+        mask: ColMask,
+    ) -> Option<(usize, usize)> {
+        let span = self.segment_span(b, lo, hi)?;
+        (!cache.holds_whole(self, b, mask)).then_some(span)
+    }
+
+    /// Have readers of block `b` decode it whole from now on: a prefetch found that a
+    /// request reads more than a quarter of its segments.
+    pub(crate) fn mark_dense(&self, b: usize) {
+        if let Some(d) = &self.segs {
+            d.mark_dense(b);
+        }
+    }
+
+    /// Whether readers read block `b` whole from now on.
+    #[cfg(test)]
+    pub(crate) fn is_dense(&self, b: usize) -> bool {
+        self.segs.as_ref().is_some_and(|d| d.dense(b))
+    }
+
+    /// The segments of block `b` a request may read one by one before it reads the block
+    /// whole (see [`mark_dense`](Self::mark_dense)).
+    pub(crate) fn dense_limit(&self, b: usize) -> usize {
+        self.segs.as_ref().map_or(0, |d| d.dense_limit(b) as usize)
+    }
+
+    /// Whether segment `s` of block `b` is the block's last.
+    #[inline]
+    pub(crate) fn last_segment(&self, b: usize, s: usize) -> bool {
+        self.segs.as_ref().is_none_or(|d| s + 1 >= d.count(b))
+    }
+
+    /// The first key of segment `s` of block `b` (the block's first key when the
+    /// permutation is not segmented).
+    pub(crate) fn segment_first(&self, b: usize, s: usize) -> Key {
+        match &self.segs {
+            Some(d) => d.first_key(b, s),
+            None => self.blocks[b].first,
+        }
+    }
+
+    /// Ask the kernel for block `b`'s directory entries, before a reader searches them,
+    /// once per process: the entries are small and stay in the page cache.
+    pub(crate) fn prefetch_directory(&self, b: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(d) = &self.segs {
+            let bit = 1u64 << (b % 64);
+            let word = &d.hinted[b / 64];
+            if word.load(Relaxed) & bit == 0 && word.fetch_or(bit, Relaxed) & bit == 0 {
+                let (off, len) = d.span(b);
+                will_need(IoFile::of_perm(self.perm), &d.map, off, len);
+            }
+        }
+    }
+
+    /// The bytes of column `c` of block `b`: `(offset, length)` in the data file.
+    fn column_span(&self, b: usize, c: usize) -> (usize, usize) {
+        let m = &self.blocks[b];
+        let off = m.offset as usize + m.col_len[..c].iter().map(|&l| l as usize).sum::<usize>();
+        (off, m.col_len[c] as usize)
+    }
+
+    /// The bytes of the frames of segments `[s0, s1)` of block `b` in column `c`:
+    /// `(offset, length)`, checked to lie inside the column.
+    fn frames_span(&self, b: usize, c: usize, s0: usize, s1: usize) -> Result<(usize, usize)> {
+        let d = self
+            .segs
+            .as_ref()
+            .ok_or_else(|| Error::Corrupt("no segment directory".into()))?;
+        let (off, len) = self.column_span(b, c);
+        let before: usize = (0..s0).map(|s| d.frame_len(b, s, c)).sum();
+        let span: usize = (s0..s1).map(|s| d.frame_len(b, s, c)).sum();
+        if before + span > len {
+            return Err(Error::Corrupt(format!(
+                "{}.seg: block {b} column {c} frames end past the column",
+                self.perm.name()
+            )));
+        }
+        Ok((off + before, span))
+    }
+
+    /// Ask the kernel for the frames of segments `[s0, s1)` of block `b` in the columns of
+    /// `mask`, unless the cache holds them. Returns whether it lacked one.
+    pub(crate) fn prefetch_segments(
+        &self,
+        cache: &BlockCache,
+        b: usize,
+        (s0, s1): (usize, usize),
+        mask: ColMask,
+    ) -> bool {
+        let mask = mask & ALL_COLS;
+        let missing = (s0..s1).any(|s| !cache.has_segment(self, b, s, mask));
+        if !missing || !io_hints() {
+            return missing;
+        }
+        if let Some(data) = self.data.as_ref() {
+            for c in (0..4).filter(|c| mask & (1 << c) != 0) {
+                if let Ok((off, len)) = self.frames_span(b, c, s0, s1) {
+                    will_need(IoFile::of_perm(self.perm), data, off, len);
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the cache holds what a reader of the rows of block `b` in `[lo, hi]`
+    /// decodes, the segments of [`segment_span`](Self::segment_span) or the whole columns
+    /// in `mask`.
+    pub(crate) fn range_cached(
+        &self,
+        cache: &BlockCache,
+        b: usize,
+        lo: &Key,
+        hi: &Key,
+        mask: ColMask,
+    ) -> bool {
+        match self.read_span(cache, b, lo, hi, mask) {
+            Some((s0, s1)) => (s0..s1).all(|s| cache.has_segment(self, b, s, mask)),
+            None => cache.has_cols(self, b, mask),
+        }
+    }
+
+    /// [`prefetch`](Self::prefetch) of what a reader of the rows of block `b` in
+    /// `[lo, hi]` decodes: the segments of [`segment_span`](Self::segment_span), or the
+    /// whole columns in `mask`.
+    pub(crate) fn prefetch_range(
+        &self,
+        cache: &BlockCache,
+        b: usize,
+        lo: &Key,
+        hi: &Key,
+        mask: ColMask,
+    ) -> bool {
+        match self.read_span(cache, b, lo, hi, mask) {
+            Some(span) => self.prefetch_segments(cache, b, span, mask),
+            None => self.prefetch(cache, b, mask),
+        }
+    }
+
+    /// Ask the kernel for the frames of segment `s` of block `b` in the columns of `mask`.
+    pub(crate) fn hint_segment(&self, b: usize, s: usize, mask: ColMask) {
+        if let Some(data) = self.data.as_ref().filter(|_| io_hints()) {
+            for c in (0..4).filter(|c| mask & (1 << c) != 0) {
+                if let Ok((off, len)) = self.frames_span(b, c, s, s + 1) {
+                    will_need(IoFile::of_perm(self.perm), data, off, len);
+                }
+            }
+        }
+    }
+
+    /// Decode segment `s` of column `c` of block `b`, asking the kernel for its bytes
+    /// first when `hint`.
+    pub fn decode_segment(&self, b: usize, c: usize, s: usize, hint: bool) -> Result<Col> {
+        let data = self
+            .data
+            .as_ref()
+            .ok_or_else(|| Error::Corrupt("no data".into()))?;
+        let (off, len) = self.frames_span(b, c, s, s + 1)?;
+        if hint {
+            will_need(IoFile::of_perm(self.perm), data, off, len);
+        }
+        let bytes = data.get(off..off + len).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "{}.dat: block {b} ends past the end of the file",
+                self.perm.name()
+            ))
+        })?;
+        let (r0, r1) = self.segment_rows(b, s);
+        crate::ioacct::column_decoded(self.perm, r1 - r0, len);
+        if crate::ioacct::profiling() {
+            crate::ioacct::touch(IoFile::of_perm(self.perm), data.as_ptr(), off, len);
+            let _wait = crate::ioacct::timer(crate::ioacct::Phase::IndexWait);
+            crate::ioacct::fault_in(bytes);
+        }
+        let _decode = crate::ioacct::timer(crate::ioacct::Phase::IndexDecode);
+        decode_column(bytes, r1 - r0)
     }
 
     /// The encoded bytes of block `b` (its four columns).
@@ -1088,7 +1604,34 @@ impl PermIndex {
             crate::ioacct::fault_in(bytes);
         }
         let _decode = crate::ioacct::timer(crate::ioacct::Phase::IndexDecode);
-        decode_column(bytes, m.rows as usize)
+        match &self.segs {
+            None => decode_column(bytes, m.rows as usize),
+            Some(d) => {
+                // every frame into one buffer, as the block cache keeps it
+                let rows = m.rows as usize;
+                let mut col: Box<[u64]> = vec![0u64; rows].into_boxed_slice();
+                let mut at = 0usize;
+                for (s, out) in col.chunks_mut(d.seg_rows).enumerate() {
+                    let len = d.frame_len(b, s, c);
+                    let frame = bytes.get(at..at + len).ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "{}.seg: block {b} column {c} frames end past the column",
+                            self.perm.name()
+                        ))
+                    })?;
+                    decode_frame_into(frame, out)?;
+                    at += len;
+                }
+                if at != bytes.len() {
+                    return Err(Error::Corrupt(format!(
+                        "{}.seg: block {b} column {c} frames cover {at} of {} bytes",
+                        self.perm.name(),
+                        bytes.len()
+                    )));
+                }
+                Ok(Col::new(col))
+            }
+        }
     }
 
     /// Block index range `[lo, hi)` that may contain keys with this prefix
@@ -1118,14 +1661,20 @@ pub(crate) fn next_uid() -> u64 {
     UID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Cache of decoded block columns, keyed by (permutation instance, block, column and
-/// namespace): readers decode and keep only the columns they use.
+/// Cache of decoded block columns, keyed by (permutation instance, block and segment,
+/// column and namespace): readers decode and keep only the columns they use.
 ///
-/// The third key field holds the column in its low 8 bits and the namespace of the
-/// store that decoded it above them. A permutation instance (`uid`) is unique in the
+/// The second key field holds the block above its low 7 bits and, in them, the segment
+/// plus one, or [`WHOLE`] for the whole column. The third holds the column in its low 8
+/// bits and the namespace of the store that decoded it above them. A permutation instance (`uid`) is unique in the
 /// process, so the namespace only attributes an entry to a dataset. It never separates
 /// entries that would otherwise collide.
 type ColumnCache = quick_cache::sync::Cache<(u64, u32, u32), Col, BlockWeighter>;
+
+/// The segment field of the key of a whole column (see [`ColumnCache`]).
+const WHOLE: u32 = 0;
+/// Bits of the segment field in the second key field.
+const SEG_KEY_BITS: u32 = 7;
 
 /// The decoded-column storage that stores can share. A server holds one for all its
 /// datasets, and each store reads through its own [`BlockCache`] view of it.
@@ -1261,12 +1810,118 @@ fn empty_col() -> Col {
 }
 
 impl BlockCache {
-    /// The block columns this view has looked up, decoded or found (for tests of how
-    /// much a pass reads).
-    #[cfg(test)]
-    pub(crate) fn lookups(&self) -> u64 {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.hits.load(Relaxed) + self.misses.load(Relaxed)
+    /// The key of column `c` of block `b`, whole (`seg` [`WHOLE`]) or of segment
+    /// `seg - 1`.
+    #[inline]
+    fn key(&self, idx: &PermIndex, b: usize, c: usize, seg: u32) -> (u64, u32, u32) {
+        debug_assert!(seg < 1 << SEG_KEY_BITS);
+        (
+            idx.uid,
+            (b as u32) << SEG_KEY_BITS | seg,
+            self.ns << 8 | c as u32,
+        )
+    }
+
+    /// Whether the cache holds the first column of `mask` of block `b` whole, one lookup
+    /// that tells a reader of a few rows to use the whole columns.
+    #[inline]
+    pub(crate) fn holds_whole(&self, idx: &PermIndex, b: usize, mask: ColMask) -> bool {
+        let c = (mask & ALL_COLS).trailing_zeros() as usize;
+        c < 4 && self.cache.peek(&self.key(idx, b, c, WHOLE)).is_some()
+    }
+
+    /// Whether the columns in `mask` of segment `s` of block `b` are in the cache, as the
+    /// segment or in the whole column, without counting a hit or miss.
+    pub(crate) fn has_segment(&self, idx: &PermIndex, b: usize, s: usize, mask: ColMask) -> bool {
+        (0..4).all(|c| {
+            mask & (1 << c) == 0
+                || self
+                    .cache
+                    .peek(&self.key(idx, b, c, s as u32 + 1))
+                    .is_some()
+                || self.cache.peek(&self.key(idx, b, c, WHOLE)).is_some()
+        })
+    }
+
+    /// Segment `s` of block `b` with the columns in `mask` (the others are empty), as a
+    /// block of the segment's rows. A column the cache holds whole is cut from it, and a
+    /// missing one is decoded from its frame alone. Either is kept as the segment.
+    pub fn get_segment(
+        &self,
+        idx: &PermIndex,
+        b: usize,
+        s: usize,
+        mask: ColMask,
+        hint: bool,
+    ) -> Result<Block> {
+        self.segment_counted(idx, b, s, mask, hint, true)
+    }
+
+    /// [`get_segment`](Self::get_segment), counting a decode toward the block's limit of
+    /// segments read one by one when `count` (a prefetch counts its segments itself).
+    fn segment_counted(
+        &self,
+        idx: &PermIndex,
+        b: usize,
+        s: usize,
+        mask: ColMask,
+        hint: bool,
+        count: bool,
+    ) -> Result<Block> {
+        let (r0, r1) = idx.segment_rows(b, s);
+        let mut decoded = false;
+        let mut hinted = !hint;
+        let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
+        for (c, col) in cols.iter_mut().enumerate() {
+            if mask & (1 << c) == 0 {
+                continue;
+            }
+            let key = self.key(idx, b, c, s as u32 + 1);
+            if let Some(v) = self.cache.get(&key) {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                *col = v;
+                continue;
+            }
+            if let Some(whole) = self.cache.get(&self.key(idx, b, c, WHOLE)) {
+                // cut once and kept, so that later requests find the segment
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let v = Col::from(whole[r0..r1].to_vec());
+                if self.fill {
+                    self.cache.insert(key, v.clone());
+                }
+                *col = v;
+                continue;
+            }
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            if let Some(hook) = &self.decode_hook {
+                hook();
+            }
+            // the segment's frames lie apart, one per column: on a cold file, the first
+            // missing one asks for it and the later columns' together, so their reads
+            // overlap
+            if !hinted {
+                hinted = true;
+                idx.hint_segment(b, s, mask & !((1 << c) - 1));
+            }
+            let v = idx.decode_segment(b, c, s, false)?;
+            if self.fill {
+                self.cache.insert(key, v.clone());
+            }
+            *col = v;
+            decoded = true;
+        }
+        if decoded
+            && count
+            && let Some(d) = &idx.segs
+        {
+            d.note_sparse_read(b);
+        }
+        Ok(Block {
+            cols,
+            rows: r1 - r0,
+        })
     }
 
     /// A cache of its own, of at most `bytes`.
@@ -1337,7 +1992,7 @@ impl BlockCache {
             if mask & (1 << c) == 0 {
                 continue;
             }
-            let key = (idx.uid, b as u32, self.ns << 8 | c as u32);
+            let key = self.key(idx, b, c, WHOLE);
             *col = match self.cache.get(&key) {
                 Some(v) => {
                     self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1374,9 +2029,7 @@ impl BlockCache {
             if mask & (1 << c) == 0 {
                 continue;
             }
-            *col = self
-                .cache
-                .get(&(idx.uid, b as u32, self.ns << 8 | c as u32))?;
+            *col = self.cache.get(&self.key(idx, b, c, WHOLE))?;
             found += 1;
         }
         self.hits
@@ -1419,6 +2072,7 @@ impl BlockCache {
             work: Vec::new(),
             seen: Default::default(),
             bytes: 0,
+            segments: 0,
             budget: warm_budget(self.cache.capacity()),
             eligible: self.fill,
         }
@@ -1428,7 +2082,7 @@ impl BlockCache {
     pub(crate) fn evict_column(&self, idx: &PermIndex, b: usize, c: u8) {
         assert!(
             self.cache
-                .remove(&(idx.uid, b as u32, self.ns << 8 | u32::from(c)))
+                .remove(&self.key(idx, b, c as usize, WHOLE))
                 .is_some()
         );
     }
@@ -1438,13 +2092,8 @@ impl BlockCache {
     pub fn has_cols(&self, idx: &PermIndex, b: usize, mask: ColMask) -> bool {
         #[cfg(test)]
         HAS_COLS_CALLS.with(|n| n.set(n.get() + 1));
-        (0..4).all(|c| {
-            mask & (1 << c) == 0
-                || self
-                    .cache
-                    .peek(&(idx.uid, b as u32, self.ns << 8 | c as u32))
-                    .is_some()
-        })
+        (0..4)
+            .all(|c| mask & (1 << c) == 0 || self.cache.peek(&self.key(idx, b, c, WHOLE)).is_some())
     }
 
     /// The bytes this view's namespace holds. A cache of its own counts all its entries.
@@ -1492,9 +2141,12 @@ impl BlockCache {
 pub(crate) struct WarmColumns<'a> {
     cache: &'a BlockCache,
     idx: &'a PermIndex,
-    work: Vec<(usize, u8)>,
-    seen: rustc_hash::FxHashSet<(usize, u8)>,
+    /// (block, column, segment field of the key: [`WHOLE`] or the segment plus one)
+    work: Vec<(usize, u8, u32)>,
+    seen: rustc_hash::FxHashSet<(usize, u8, u32)>,
     bytes: u64,
+    /// the segments among `work`
+    segments: usize,
     /// the most decoded bytes one request may add, see [`warm_budget`]
     budget: u64,
     eligible: bool,
@@ -1502,56 +2154,98 @@ pub(crate) struct WarmColumns<'a> {
 
 impl WarmColumns<'_> {
     pub(crate) fn add(&mut self, b: usize, mask: ColMask) {
-        if !self.eligible {
-            return;
-        }
         for c in 0..4u8 {
-            let key = (b, c);
             if mask & (1 << c) == 0
-                || self.seen.contains(&key)
                 || self
                     .cache
                     .cache
-                    .peek(&(self.idx.uid, b as u32, self.cache.ns << 8 | u32::from(c)))
+                    .peek(&self.cache.key(self.idx, b, c as usize, WHOLE))
                     .is_some()
             {
                 continue;
             }
-            // Match BlockWeighter exactly, including partial tails and empty columns.
-            // Overflow declines the entire optional request before any decode occurs.
-            let next = u64::from(self.idx.blocks[b].rows)
-                .checked_mul(8)
-                .and_then(|weight| self.bytes.checked_add(weight.max(1)));
-            let Some(bytes) = next.filter(|&n| n <= self.budget) else {
-                self.eligible = false;
-                self.work = Vec::new();
-                self.seen = Default::default();
-                self.bytes = 0;
-                return;
-            };
-            self.bytes = bytes;
-            self.seen.insert(key);
-            self.work.push(key);
+            self.push(b, c, WHOLE, self.idx.blocks[b].rows as u64);
         }
+    }
+
+    /// Add segments `[s0, s1)` of block `b` in the columns of `mask`, those the cache
+    /// holds neither as segments nor whole.
+    pub(crate) fn add_segments(&mut self, b: usize, (s0, s1): (usize, usize), mask: ColMask) {
+        for s in s0..s1 {
+            for c in 0..4u8 {
+                if mask & (1 << c) == 0 || self.cache.has_segment(self.idx, b, s, 1 << c) {
+                    continue;
+                }
+                let (r0, r1) = self.idx.segment_rows(b, s);
+                self.push(b, c, s as u32 + 1, (r1 - r0) as u64);
+            }
+        }
+    }
+
+    fn push(&mut self, b: usize, c: u8, seg: u32, rows: u64) {
+        if !self.eligible {
+            return;
+        }
+        let key = (b, c, seg);
+        if self.seen.contains(&key) {
+            return;
+        }
+        // Match BlockWeighter exactly, including partial tails and empty columns.
+        // Overflow declines the entire optional request before any decode occurs.
+        let next = rows
+            .checked_mul(8)
+            .and_then(|weight| self.bytes.checked_add(weight.max(1)));
+        let Some(bytes) = next.filter(|&n| n <= self.budget) else {
+            self.eligible = false;
+            self.work = Vec::new();
+            self.seen = Default::default();
+            self.bytes = 0;
+            self.segments = 0;
+            return;
+        };
+        self.bytes = bytes;
+        self.segments += usize::from(seg != WHOLE);
+        self.seen.insert(key);
+        self.work.push(key);
     }
 
     pub(crate) fn finish(self, check: &(dyn Fn() -> Result<()> + Sync)) -> Result<()> {
         use rayon::prelude::*;
         check()?;
-        // Below this the hand-off costs about what decoding saves. Keep the existing
-        // threshold; capacity admission never warms a partial prefix of an oversized set.
+        // Below this the hand-off costs about what decoding saves: sixteen whole columns,
+        // or 32 segments, which decode in a few microseconds each. Capacity admission
+        // never warms a partial prefix of an oversized set.
         const MIN_COLUMNS: usize = 16;
-        if self.eligible && self.work.len() >= MIN_COLUMNS {
-            let decode = |&(b, c): &(usize, u8)| -> Result<()> {
+        const MIN_SEGMENTS: usize = 32;
+        let whole = self.work.len() - self.segments;
+        if self.eligible && (whole >= MIN_COLUMNS || self.segments >= MIN_SEGMENTS) {
+            let decode = |&(b, c, seg): &(usize, u8, u32)| -> Result<()> {
                 check()?;
                 // Only check errors propagate: an advisory decode error remains
                 // for the consuming reader to encounter if it needs this column.
-                let _ = self.cache.get_cols_hinted(self.idx, b, 1 << c, false);
+                let _ = if seg == WHOLE {
+                    self.cache.get_cols_hinted(self.idx, b, 1 << c, false)
+                } else {
+                    self.cache
+                        .segment_counted(self.idx, b, seg as usize - 1, 1 << c, false, false)
+                };
                 Ok(())
             };
             match decode_pool() {
                 Some(pool) => pool.install(|| self.work.par_iter().try_for_each(decode))?,
                 None => self.work.iter().try_for_each(decode)?,
+            }
+            // each segment decoded counts once toward its block's limit, whatever its
+            // columns (the work lists a segment's columns one after another), but never
+            // reaches it, so that the reader still uses the segments warmed here
+            if let Some(d) = &self.idx.segs {
+                let mut last = None;
+                for &(b, _, seg) in &self.work {
+                    if seg != WHOLE && last != Some((b, seg)) {
+                        last = Some((b, seg));
+                        d.note_warm_read(b);
+                    }
+                }
             }
         }
         // Cancellation during the final already-started decode must not be hidden.
@@ -1594,8 +2288,13 @@ impl PermIndex {
         // once, and a cold one is asked for before either is decoded
         let ends = if hi - 1 == lo { 1 } else { 2 };
         let mut cached: [Option<Block>; 2] = [None, None];
-        for (slot, e) in cached.iter_mut().zip([lo, hi - 1]).take(ends) {
+        let spans = [lo, hi - 1].map(|e| self.read_span(cache, e, &lo_key, &hi_key, bc));
+        for ((slot, e), span) in cached.iter_mut().zip([lo, hi - 1]).zip(spans).take(ends) {
             if partial(e) {
+                if let Some(span) = span {
+                    self.prefetch_segments(cache, e, span, bc);
+                    continue;
+                }
                 *slot = cache.get_cols_cached(self, e, bc);
                 if slot.is_none() {
                     self.prefetch(cache, e, bc);
@@ -1618,6 +2317,14 @@ impl PermIndex {
                 }
                 total += self.blocks[e].row_start + self.blocks[e].rows as u64 - m.row_start;
                 b = e + 1;
+            } else if let Some(span) =
+                if b == lo { spans[0] } else { spans[1] }.filter(|_| b == lo || b == hi - 1)
+            {
+                self.for_each_segment_rows(cache, b, span, &lo_key, &hi_key, bc, |_, s, e| {
+                    total += (e - s) as u64;
+                    Ok(true)
+                })?;
+                b += 1;
             } else {
                 let held = if b == lo {
                     cached[0].take()
@@ -1735,6 +2442,13 @@ impl PermIndex {
             let m = &self.blocks[b];
             let mask = columns(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
+            if !whole && let Some(span) = self.read_span(cache, b, lo_key, hi_key, mask) {
+                // a few rows of the block: the segments that can hold them, one by one
+                if !self.for_each_segment_rows(cache, b, span, lo_key, hi_key, mask, &mut f)? {
+                    break;
+                }
+                continue;
+            }
             let blk = match cache.get_cols_cached(self, b, mask) {
                 Some(blk) => blk,
                 None => {
@@ -1755,11 +2469,44 @@ impl PermIndex {
         Ok(())
     }
 
+    /// Visit the rows with keys in `[lo_key, hi_key]` of segments `[s0, s1)` of block
+    /// `b`, one segment at a time, decoding the columns in `mask` (which must include
+    /// the bound columns of the range): `f(segment, start_row, end_row)` with rows of the
+    /// segment, until it returns `false`. Returns whether it never did.
+    #[allow(clippy::too_many_arguments)]
+    fn for_each_segment_rows(
+        &self,
+        cache: &BlockCache,
+        b: usize,
+        (s0, s1): (usize, usize),
+        lo_key: &Key,
+        hi_key: &Key,
+        mask: ColMask,
+        mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
+    ) -> Result<bool> {
+        for s in s0..s1 {
+            let blk = cache.get_segment(self, b, s, mask, true)?;
+            let (a, z) = blk.key_range(lo_key, hi_key);
+            if a < z && !f(&blk, a, z)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Point lookup of a full key.
     pub fn contains(&self, cache: &BlockCache, key: &Key) -> Result<bool> {
         let b = self.blocks.partition_point(|m| m.last < *key);
         if b >= self.blocks.len() || self.blocks[b].first > *key {
             return Ok(false);
+        }
+        if let Some(span) = self.read_span(cache, b, key, key, ALL_COLS) {
+            let mut found = false;
+            self.for_each_segment_rows(cache, b, span, key, key, ALL_COLS, |_, _, _| {
+                found = true;
+                Ok(false)
+            })?;
+            return Ok(found);
         }
         let blk = cache.get(self, b)?;
         let (s, e) = blk.prefix_range(key);
@@ -1826,6 +2573,343 @@ mod tests {
         assert!(!idx.contains(&cache, &[5, 5, 10, 0]).unwrap());
         let est = idx.estimate(&[7]);
         assert!(est > 0);
+    }
+
+    /// The same sorted keys written segmented (format 3) and not (format 2), in blocks of
+    /// irregular lengths: two full blocks, then a block ended early at a row that is not
+    /// a segment boundary, then a full one and a short tail.
+    fn both_layouts(keys: &[Key]) -> (tempfile::TempDir, PermIndex, tempfile::TempDir, PermIndex) {
+        let write = |segmented: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = PermWriter::create_format(dir.path(), Perm::Spo, segmented).unwrap();
+            for (i, k) in keys.iter().enumerate() {
+                w.push(*k).unwrap();
+                if i + 1 == 2 * BLOCK_ROWS + 5_000 {
+                    w.end_block().unwrap();
+                }
+            }
+            w.finish(dir.path(), Perm::Spo).unwrap();
+            let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+            (dir, idx)
+        };
+        let (d3, i3) = write(true);
+        let (d2, i2) = write(false);
+        assert!(i3.segmented() && !i2.segmented());
+        (d3, i3, d2, i2)
+    }
+
+    /// Keys of runs of 1 to 40 rows per subject, with large id gaps, over five blocks.
+    fn run_keys() -> Vec<Key> {
+        let mut keys = Vec::new();
+        let mut r = 0x9e3779b97f4a7c15u64;
+        let mut s = 1u64;
+        while keys.len() < 4 * BLOCK_ROWS + 7_000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            let n = 1 + r % 40;
+            for o in 0..n {
+                keys.push([s, 7 + o % 3, (r >> 20) + o * 1_000_003, (o % 2) * 5]);
+            }
+            s += 1 + (r >> 50);
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    #[test]
+    fn segmented_columns_decode_whole_and_by_segment() {
+        let keys = run_keys();
+        let (_d3, i3, _d2, i2) = both_layouts(&keys);
+        assert_eq!(i3.blocks.len(), i2.blocks.len());
+        for b in 0..i3.blocks.len() {
+            let n = i3.segs.as_ref().unwrap().count(b);
+            assert_eq!(n, (i3.blocks[b].rows as usize).div_ceil(SEG_ROWS));
+            for c in 0..4 {
+                let whole = i3.decode_col(b, c).unwrap();
+                assert_eq!(&*whole, &*i2.decode_col(b, c).unwrap());
+                for s in 0..n {
+                    let (r0, r1) = i3.segment_rows(b, s);
+                    assert_eq!(&*i3.decode_segment(b, c, s, false).unwrap(), &whole[r0..r1]);
+                    if c == 0 {
+                        assert_eq!(i3.segment_first(b, s)[0], whole[r0]);
+                    }
+                }
+            }
+        }
+        // the directory adds 48 bytes per segment
+        let segs: usize = (0..i3.blocks.len())
+            .map(|b| i3.segs.as_ref().unwrap().count(b))
+            .sum();
+        assert_eq!(
+            i3.segs.as_ref().unwrap().map.len(),
+            SEG_HEADER + segs * SEG_ENTRY
+        );
+    }
+
+    #[test]
+    fn segmented_reads_answer_as_whole_block_reads() {
+        let keys = run_keys();
+        let (d3, _i3, _d2, i2) = both_layouts(&keys);
+        let (c3, c2) = (BlockCache::new(1 << 26), BlockCache::new(1 << 26));
+        let rows = |idx: &PermIndex, cache: &BlockCache, lo: &Key, hi: &Key| {
+            let mut out = Vec::new();
+            idx.for_each_key_range_cols(cache, lo, hi, ALL_COLS, |b, s, e| {
+                out.extend((s..e).map(|i| b.key(i)));
+                Ok(true)
+            })
+            .unwrap();
+            out
+        };
+        let mut r = 12345u64;
+        for t in 0..400 {
+            // opened afresh, so that no block has turned to whole reads and every lookup
+            // reads segments where it can
+            let i3 = PermIndex::open(d3.path(), Perm::Spo).unwrap();
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            let k = keys[(r % keys.len() as u64) as usize];
+            // a subject, a subject and predicate, a full key, and a span of subjects
+            let (lo, hi) = match t % 4 {
+                0 => (pad(&k[..1], 0), pad(&k[..1], u64::MAX)),
+                1 => (pad(&k[..2], 0), pad(&k[..2], u64::MAX)),
+                2 => (k, k),
+                _ => (pad(&k[..1], 0), pad(&[k[0] + (r >> 54)], u64::MAX)),
+            };
+            let want = rows(&i2, &c2, &lo, &hi);
+            assert_eq!(rows(&i3, &c3, &lo, &hi), want, "{lo:?}..{hi:?}");
+            assert_eq!(i3.count_between(&c3, &lo, &hi).unwrap(), want.len() as u64);
+            assert_eq!(i2.count_between(&c2, &lo, &hi).unwrap(), want.len() as u64);
+            assert!(i3.contains(&c3, &k).unwrap());
+            let mut absent = k;
+            absent[2] += 1;
+            assert_eq!(
+                i3.contains(&c3, &absent).unwrap(),
+                i2.contains(&c2, &absent).unwrap()
+            );
+        }
+        // a cache holding whole columns serves segment reads, and the reverse
+        let i3 = PermIndex::open(d3.path(), Perm::Spo).unwrap();
+        let (lo, hi) = (
+            pad(&keys[40_000][..1], 0),
+            pad(&keys[40_000][..1], u64::MAX),
+        );
+        let warm = BlockCache::new(1 << 26);
+        for b in 0..i3.blocks.len() {
+            warm.get(&i3, b).unwrap();
+        }
+        assert_eq!(rows(&i3, &warm, &lo, &hi), rows(&i2, &c2, &lo, &hi));
+    }
+
+    #[test]
+    fn a_point_lookup_decodes_one_segment_per_column() {
+        let keys = run_keys();
+        let (_d3, i3, _d2, _i2) = both_layouts(&keys);
+        let cache = BlockCache::new(1 << 26);
+        let k = keys[3 * BLOCK_ROWS / 2];
+        let (lo, hi) = (pad(&k[..2], 0), pad(&k[..2], u64::MAX));
+        let mut n = 0;
+        i3.for_each_key_range_cols(&cache, &lo, &hi, 1 << O, |_, s, e| {
+            n += e - s;
+            Ok(true)
+        })
+        .unwrap();
+        assert!(n > 0);
+        // the bound columns (subject and predicate) and the object, of one or two
+        // segments: a small share of the block's decoded bytes
+        assert!(cache.misses() <= 6, "{}", cache.misses());
+        assert!(
+            cache.bytes() <= 6 * SEG_ROWS as u64 * 8,
+            "{}",
+            cache.bytes()
+        );
+        // a range over most of a block reads it whole
+        let b = 1;
+        let m = &i3.blocks[b];
+        let (lo, hi) = (
+            [m.first[0] + 1, 0, 0, 0],
+            [m.last[0] - 1, u64::MAX, u64::MAX, u64::MAX],
+        );
+        assert_eq!(i3.segment_span(b, &lo, &hi), None);
+    }
+
+    #[test]
+    fn a_block_read_by_many_segments_is_read_whole_after_a_quarter_of_them() {
+        let keys = run_keys();
+        let (_d3, i3, _d2, _i2) = both_layouts(&keys);
+        let cache = BlockCache::new(1 << 26);
+        let b = 1;
+        let n = i3.segs.as_ref().unwrap().count(b);
+        let limit = i3.dense_limit(b);
+        assert!(limit >= 1 && limit < n);
+        // one lookup in each segment of the block, in order
+        let mut sparse = 0;
+        for s in 0..n {
+            let (r0, _) = i3.segment_rows(b, s);
+            let k = i3.decode_col(b, 0).unwrap()[r0 + 1];
+            let (lo, hi) = (pad(&[k], 0), pad(&[k], u64::MAX));
+            if i3.read_span(&cache, b, &lo, &hi, 1).is_some() {
+                sparse += 1;
+            }
+            let mut rows = 0;
+            i3.for_each_key_range_cols(&cache, &lo, &hi, 1 << O, |_, a, z| {
+                rows += z - a;
+                Ok(true)
+            })
+            .unwrap();
+            assert!(rows > 0);
+        }
+        // the first `limit` lookups decoded their segments, and the rest the whole block
+        assert_eq!(sparse, limit);
+        assert!(cache.holds_whole(&i3, b, 1));
+    }
+
+    #[test]
+    fn segments_warmed_up_to_the_dense_limit_are_still_read_as_segments() {
+        let keys = run_keys();
+        let (_d3, i3, _d2, _i2) = both_layouts(&keys);
+        let cache = BlockCache::new(1 << 26);
+        let blocks: Vec<usize> = (0..i3.blocks.len())
+            .filter(|&b| i3.dense_limit(b) >= 2)
+            .collect();
+        assert!(blocks.len() >= 2);
+        // warm exactly the limit of distinct segments of each block, in every column,
+        // enough work items for the parallel decode to run
+        let mut warm = cache.warm_columns(&i3);
+        let mut wanted = Vec::new();
+        for &b in &blocks {
+            for s in 0..i3.dense_limit(b) {
+                warm.add_segments(b, (2 * s, 2 * s + 1), ALL_COLS);
+                wanted.push((b, 2 * s));
+            }
+        }
+        assert!(wanted.len() * 4 >= 32);
+        warm.finish(&|| Ok(())).unwrap();
+        for &(b, s) in &wanted {
+            assert!(cache.has_segment(&i3, b, s, ALL_COLS));
+            let (r0, _) = i3.segment_rows(b, s);
+            let k = i3.decode_col(b, 0).unwrap()[r0 + 1];
+            let (lo, hi) = (pad(&[k], 0), pad(&[k], u64::MAX));
+            let span = i3.read_span(&cache, b, &lo, &hi, ALL_COLS);
+            assert!(
+                span.is_some_and(|(s0, s1)| s0 <= s && s < s1),
+                "block {b} segment {s}: {span:?}"
+            );
+        }
+        for &b in &blocks {
+            assert!(!cache.holds_whole(&i3, b, ALL_COLS));
+        }
+    }
+
+    #[test]
+    fn partial_compaction_copies_or_re_encodes_blocks_by_layout() {
+        let keys = run_keys();
+        let (_d3, i3, _d2, i2) = both_layouts(&keys);
+        for src in [&i3, &i2] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+            for b in 0..src.blocks.len() {
+                w.push_block(src, b).unwrap();
+            }
+            w.finish(dir.path(), Perm::Spo).unwrap();
+            let out = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+            assert!(out.segmented());
+            assert_eq!(out.blocks.len(), src.blocks.len());
+            for b in 0..out.blocks.len() {
+                assert_eq!(out.blocks[b].rows, src.blocks[b].rows);
+                for c in 0..4 {
+                    assert_eq!(
+                        &*out.decode_col(b, c).unwrap(),
+                        &*src.decode_col(b, c).unwrap()
+                    );
+                }
+                for s in 0..out.segs.as_ref().unwrap().count(b) {
+                    assert_eq!(out.segment_first(b, s), i3.segment_first(b, s));
+                }
+            }
+        }
+    }
+
+    /// The segment size sweep of spec X07 §6.5: the size of every permutation of the
+    /// generation in `SPARKLES_SEGMENT_SWEEP` (any format) encoded with no segments and
+    /// with segments of 512 to 4,096 rows, directories included. Run with
+    /// `cargo test --release -p sparkles-core --lib segment_size_sweep -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn segment_size_sweep() {
+        let dir = std::path::PathBuf::from(std::env::var("SPARKLES_SEGMENT_SWEEP").unwrap());
+        let sizes = [0usize, 512, 1024, 2048, 4096];
+        let mut total = [0u64; 5];
+        for &p in &Perm::ALL {
+            let idx = PermIndex::open(&dir, p).unwrap();
+            let mut bytes = [0u64; 5];
+            let mut scratch = Vec::new();
+            for b in 0..idx.blocks.len() {
+                let rows = idx.blocks[b].rows as usize;
+                for c in 0..4 {
+                    let col = idx.decode_col(b, c).unwrap();
+                    for (i, &n) in sizes.iter().enumerate() {
+                        if n == 0 {
+                            bytes[i] += encode_column(&col, &mut scratch).len() as u64;
+                        } else {
+                            let (mut out, mut lens) = (Vec::new(), Vec::new());
+                            encode_segmented(&col, n, &mut scratch, &mut out, &mut lens);
+                            bytes[i] += out.len() as u64;
+                            if c == 0 {
+                                bytes[i] += (rows.div_ceil(n) * SEG_ENTRY) as u64;
+                            }
+                        }
+                    }
+                }
+            }
+            println!("{} {bytes:?}", p.name());
+            for i in 0..5 {
+                total[i] += bytes[i];
+            }
+        }
+        for (i, &n) in sizes.iter().enumerate() {
+            println!(
+                "segment rows {n}: {} bytes, {:.2}% of unsegmented",
+                total[i],
+                100.0 * total[i] as f64 / total[0] as f64
+            );
+        }
+    }
+
+    #[test]
+    fn damaged_segment_directories_are_errors_not_panics() {
+        let keys = run_keys();
+        let (d3, _i3, _d2, _i2) = both_layouts(&keys);
+        let seg = d3.path().join("spo.seg");
+        let good = std::fs::read(&seg).unwrap();
+        // truncated, a bad magic and an unsupported segment size refuse the open
+        for bad in [
+            good[..good.len() - 1].to_vec(),
+            [b"SPKSEG09".as_slice(), &good[8..]].concat(),
+            [&good[..8], &100u32.to_le_bytes()[..], &good[12..]].concat(),
+        ] {
+            std::fs::write(&seg, &bad).unwrap();
+            assert!(PermIndex::open(d3.path(), Perm::Spo).is_err());
+        }
+        // a missing directory refuses a format 3 open
+        std::fs::remove_file(&seg).unwrap();
+        assert!(PermIndex::open_format(d3.path(), Perm::Spo, 3).is_err());
+        // a frame length that runs past its column is a decode error
+        let mut bad = good.clone();
+        bad[SEG_HEADER + 32..SEG_HEADER + 36].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&seg, &bad).unwrap();
+        let idx = PermIndex::open(d3.path(), Perm::Spo).unwrap();
+        assert!(idx.decode_segment(0, 0, 0, false).is_err());
+        assert!(idx.decode_col(0, 0).is_err());
+        // frames that do not cover their column are a decode error
+        let mut bad = good.clone();
+        let len = u32::from_le_bytes(bad[SEG_HEADER + 32..SEG_HEADER + 36].try_into().unwrap());
+        bad[SEG_HEADER + 32..SEG_HEADER + 36].copy_from_slice(&(len - 1).to_le_bytes());
+        std::fs::write(&seg, &bad).unwrap();
+        let idx = PermIndex::open(d3.path(), Perm::Spo).unwrap();
+        assert!(idx.decode_col(0, 0).is_err());
     }
 
     #[test]
@@ -2801,8 +3885,8 @@ mod tests {
             assert_eq!(&decode_column(&tail, n).unwrap()[..], &col[col.len() - n..]);
         }
         // a varint that runs past 10 bytes is damage
-        assert!(decode_varints(&[0xff; 11], 1).is_err());
-        assert!(decode_varints(&[0xff; 20], 1).is_err());
+        assert!(decode_varints_into(&[0xff; 11], &mut [0]).is_err());
+        assert!(decode_varints_into(&[0xff; 20], &mut [0]).is_err());
     }
 
     #[test]

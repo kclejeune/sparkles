@@ -825,8 +825,38 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRul
         mask = ALL_COLS;
     }
     let mut last = None;
+    let mut last_span: Option<(usize, (usize, usize))> = None;
+    // the segments of the current block that the ranges so far read
+    let mut seen: (usize, u64) = (usize::MAX, 0);
     // created at the first block the cache lacks, so a warm request builds nothing
     let mut warm: Option<crate::index::WarmColumns> = None;
+    if idx.segmented() {
+        // a warm request costs this one probe: when the cache holds what the first range
+        // reads, the others are taken to be cached too, as a scan's prefetch does
+        let (lo, hi) = ranges.get(0);
+        let (b0, b1) = idx.key_block_range(&lo, &hi);
+        if b0 < b1 && idx.range_cached(&ctx.snap.cache, b0, &lo, &hi, mask) {
+            return ctx.check();
+        }
+        // the directories the reads below search, asked for together on a cold server
+        let mut steps = 0u32;
+        for i in 0..ranges.len() {
+            let (lo, hi) = ranges.get(i);
+            let (b0, b1) = idx.key_block_range(&lo, &hi);
+            for b in b0..b1 {
+                steps += 1;
+                if steps >= PREFETCH_CHECK_STEPS {
+                    steps = 0;
+                    ctx.check()?;
+                }
+                if last != Some(b) {
+                    last = Some(b);
+                    idx.prefetch_directory(b);
+                }
+            }
+        }
+        last = None;
+    }
     // a check reads the clock when the request has a deadline, so the loop checks once
     // per `PREFETCH_CHECK_STEPS` ranges and blocks rather than at every one
     let mut steps = 0u32;
@@ -843,6 +873,42 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRul
             if steps >= PREFETCH_CHECK_STEPS {
                 steps = 0;
                 ctx.check()?;
+            }
+            // a range of a few rows of the block: the segments the reader decodes, asked
+            // for once when consecutive ranges share them
+            if let Some((lb, (s0, s1))) = last_span
+                && lb == b
+                && idx.segment_first(b, s0) <= lo
+                && (idx.last_segment(b, s1 - 1) || hi < idx.segment_first(b, s1))
+            {
+                continue;
+            }
+            if let Some(span) = idx.read_span(&ctx.snap.cache, b, &lo, &hi, mask) {
+                last_span = Some((b, span));
+                // ranges that read more than a quarter of the block's segments read it
+                // whole, and so do the readers after them
+                if seen.0 != b {
+                    seen = (b, 0);
+                }
+                seen.1 |= ((1u64 << (span.1 - span.0)) - 1) << span.0;
+                if seen.1.count_ones() as usize > idx.dense_limit(b) {
+                    idx.mark_dense(b);
+                    last_span = None;
+                    if last != Some(b) {
+                        last = Some(b);
+                        if idx.prefetch(&ctx.snap.cache, b, mask) && ctx.opt.parallel_decode {
+                            warm.get_or_insert_with(|| ctx.snap.cache.warm_columns(idx))
+                                .add(b, mask);
+                        }
+                    }
+                    continue;
+                }
+                if idx.prefetch_segments(&ctx.snap.cache, b, span, mask) && ctx.opt.parallel_decode
+                {
+                    warm.get_or_insert_with(|| ctx.snap.cache.warm_columns(idx))
+                        .add_segments(b, span, mask);
+                }
+                continue;
             }
             // consecutive ranges often share a block
             if last != Some(b) {
@@ -1086,10 +1152,11 @@ fn read_ranges_gallop(
     let width: usize = cols.iter().map(Vec::len).sum::<usize>().max(1);
     let total = |out: &[Table]| out.iter().map(Table::len).sum::<usize>();
     let plain_rule = !rule.dedup && rule.eqs.is_empty();
-    // the first block that can hold the next range, the block the cursor holds, and the
-    // row of that block where the range before ended
+    // the first block that can hold the next range, the block the cursor holds (with 0,
+    // or one of its segments, with the segment plus one), and the row of what it holds
+    // where the range before ended
     let mut b = 0usize;
-    let mut cur: Option<(usize, Block)> = None;
+    let mut cur: Option<(usize, usize, Block)> = None;
     let mut row = 0usize;
     let mut seen = 0usize;
     for r in 0..ranges.len() {
@@ -1133,20 +1200,50 @@ fn read_ranges_gallop(
         let t = ranges.part(r);
         let mut last: Option<(usize, Key)> = None;
         let mut x = b;
+        // the segment the range goes on in, after it reached the end of the one before
+        let mut next_seg: Option<usize> = None;
         while x < metas.len() && metas[x].first <= hi {
+            // a held whole block is kept, and otherwise a range of a few rows reads the
+            // segments that can hold it (spec X07 §6.5)
+            let part = match (&cur, next_seg) {
+                (Some((cb, 0, _)), _) if *cb == x => 0,
+                (_, Some(s)) => s + 1,
+                // the held segment reaches the range's start: ranges come in key order, so
+                // the range starts in it, and keys close together need no search
+                (Some((cb, cp, held)), _)
+                    if *cb == x && *cp != 0 && lead_cmp(held, held.len() - 1, &lo, d).is_ge() =>
+                {
+                    *cp
+                }
+                // another segment of the held block, whose columns the cache did not hold
+                // whole when it was read
+                (Some((cb, cp, _)), _) if *cb == x && *cp != 0 => {
+                    idx.segment_span(x, &lo, &hi).map_or(0, |(s0, _)| s0 + 1)
+                }
+                _ => idx
+                    .read_span(&ctx.snap.cache, x, &lo, &hi, mask)
+                    .map_or(0, |(s0, _)| s0 + 1),
+            };
             let from = match &cur {
-                Some((cb, _)) if *cb == x => Some(row),
+                Some((cb, cp, _)) if *cb == x && *cp == part => Some(row),
                 _ => {
                     // a block other than the next one is found by a search
-                    if !cur.as_ref().is_some_and(|(cb, _)| cb + 1 == x) {
+                    let held = cur.as_ref().map(|(cb, _, _)| *cb);
+                    if !held.is_some_and(|cb| cb + 1 == x || cb == x) {
                         stats.seeks += 1;
                     }
-                    cur = Some((x, ctx.snap.cache.get_cols(idx, x, mask)?));
-                    stats.blocks += 1;
+                    if held != Some(x) {
+                        stats.blocks += 1;
+                    }
+                    let blk = match part {
+                        0 => ctx.snap.cache.get_cols(idx, x, mask)?,
+                        p => ctx.snap.cache.get_segment(idx, x, p - 1, mask, true)?,
+                    };
+                    cur = Some((x, part, blk));
                     None
                 }
             };
-            let blk = &cur.as_ref().expect("the cursor holds a block").1;
+            let blk = &cur.as_ref().expect("the cursor holds a block").2;
             let n = blk.len();
             let before = |i: usize| lead_cmp(blk, i, &lo, d).is_lt();
             // in a new block, with no position to start from, a binary search
@@ -1177,7 +1274,15 @@ fn read_ranges_gallop(
             if j < n {
                 break;
             }
-            // the range may go on in the next block
+            // the range may go on in the next segment of the block, or in the next block
+            if part != 0 && !idx.last_segment(x, part - 1) {
+                if idx.segment_first(x, part) > hi {
+                    break;
+                }
+                next_seg = Some(part);
+                continue;
+            }
+            next_seg = None;
             x += 1;
         }
     }

@@ -343,7 +343,7 @@ fn a_shared_generation_with_a_newer_meta_is_unsupported() {
         .join(current.trim())
         .join("meta.json");
     let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
-    v["format_version"] = 3.into();
+    v["format_version"] = 4.into();
     v.as_object_mut().unwrap().remove("created");
     std::fs::write(&meta, serde_json::to_vec(&v).unwrap()).unwrap();
     match s.clone_to(&dir.path().join("dst"), &CloneOptions::default()) {

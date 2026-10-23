@@ -1145,6 +1145,51 @@ fn ordered_top_k_is_chosen_when_it_reads_less() {
 // ---------------------------------------------------------- batched frontiers ------
 
 #[test]
+fn a_wide_walk_reads_its_predicate_blocks_whole() {
+    // 150,000 filler edges fill several blocks of the predicate's rows in a segmented
+    // generation, and a chain of 11 nodes whose subjects sort between the fillers puts a
+    // few seeks of one walk into each block, fewer than the segments a block may have read
+    // one by one before readers read it whole
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), StoreOptions::default()).unwrap();
+    let mut nt = String::new();
+    for i in 0..150_000u64 {
+        nt.push_str(&format!(
+            "<http://ex.org/a{i:06}> <http://ex.org/k> <http://ex.org/z> .\n"
+        ));
+    }
+    let chain = 11u64;
+    for j in 0..chain {
+        nt.push_str(&format!(
+            "<http://ex.org/a{:06}c> <http://ex.org/k> <http://ex.org/a{:06}c> .\n",
+            j * 13_000,
+            (j + 1) * 13_000
+        ));
+    }
+    load(&s, &nt, RdfFormat::NTriples);
+    let snap = s.snapshot();
+    let pso = snap.perm(crate::index::Perm::Pso);
+    let blocks = pso.blocks.len();
+    assert!(pso.segmented() && blocks >= 4, "{blocks} blocks");
+    assert!((chain as usize) >= 2 * blocks);
+    let r = run(
+        &s,
+        "SELECT (COUNT(*) AS ?c) WHERE { ex:a000000c ex:k* ?x }",
+        Optimizations::ALL,
+    );
+    assert_eq!(
+        solutions(&r),
+        vec![format!(
+            "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            chain + 1
+        )]
+    );
+    // the walk reached two nodes per block and had every block read whole
+    let dense = (0..blocks).filter(|&b| pso.is_dense(b)).count();
+    assert_eq!(dense, blocks);
+}
+
+#[test]
 fn transitive_paths_expand_large_frontiers_by_sweeps() {
     let s = Store::in_memory(StoreOptions::default());
     let mut trig = String::from("@prefix ex: <http://ex.org/> .\n");

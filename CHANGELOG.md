@@ -297,6 +297,16 @@ throughout.
 
 ### Format
 
+Index generations are written in index format 3. Each column of a permutation block is a
+run of independent LZ4 frames of 2,048 rows, and a new file `<perm>.seg` beside each
+permutation holds every frame's first key and compressed lengths, under the magic
+`SPKSEG01` and the frame size. A point lookup, a short range scan or an index join then
+decodes the frames that can hold its rows instead of whole 32,768-row columns. This build
+opens format 2 generations as before, and the next compaction rewrites them in format 3
+in a new generation directory that replaces the old one in one step. Releases that read
+only format 2 refuse a format 3 store with an error that names both versions. At 10.5M
+triples a generation grows by 3.0%, from 300.6 MB to 309.7 MB.
+
 The Ask evaluation cost ledger is in version 2. Reserve and settle lines carry a time,
 and a reconcile line replaces a charge held at its bound. A reconcile line that raises
 a charge carries `"raise": true`. A reader refuses a ledger of version 1, which no paid

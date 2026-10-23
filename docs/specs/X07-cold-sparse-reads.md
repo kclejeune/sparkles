@@ -1,8 +1,7 @@
 # X07: Cold sparse reads
 
-> **Status:** implemented in part (Phases 1 and 2). Phases 3 and 4 are not built. The
-> measurements of 2026-10-23 attribute the remaining cold time of the point lookups to block
-> decoding, so Phase 3 is the next step.
+> **Status:** implemented in part (Phases 1, 2 and 3). Phase 4 is not built. Phase 3 landed
+> on 2026-10-23 as index format 3, with the design of §6.5.
 >
 > **Phases:** Phase 1 is per-query I/O accounting and a profile of the cold losses.
 > Phase 2 adds batched resolution of a query's constants, first-scan prefetch, a read
@@ -284,6 +283,89 @@ decodes only the rest and assembles the column. The weigher is unchanged.
 - Warm decoding: a warm full-block scan decodes 32 frames instead of one per column.
   Target: within 5% on the warm suite.
 
+### 6.5 Revised design
+
+This section was written on 2026-10-23 after the profile of the remaining cold gaps, and
+it replaces §6.1 to §6.3 where they differ. It keeps each column contiguous instead of
+the PAX order of §6.1, because every reader in the engine asks for columns by mask, and a
+dense scan or a column-masked scan then reads the same bytes as before.
+
+**Layout.** A block keeps its 32,768 rows, its metadata record and its four columns in
+the order they have today. Each column is now a run of independent LZ4 frames, one per
+segment of `SEG_ROWS` consecutive rows, and the zig-zag deltas restart at 0 at the start
+of every segment. A column's `col_len` in the metadata record is still its total
+compressed length, so read-ahead, prefetch and partial compaction see the same byte
+ranges. A new file `<perm>.seg` starts with a 16-byte header, the magic `SPKSEG01` and
+the segment size, and then holds one 48-byte entry per segment for every block in block
+order. An entry is the segment's first key and the compressed length of its frame in
+each of the four columns. The entries of block `b` start at a position computed at open
+from the row counts of the blocks before it, so the file needs no offset table and the
+in-memory index grows by one integer per block. The file is mapped with `MADV_RANDOM`,
+and a directory of at most 16 MiB is read ahead once at open with `MADV_WILLNEED`. At
+10.5M triples a permutation's directory is about 250 KiB, and reading it whole removed the
+major faults that a binary search otherwise takes on a cold process.
+
+**Segment size.** The writer uses 2,048 rows. The `.seg` header records the size, so a
+later build can write another size without a format change, and the reader accepts any
+size from 512 to 4,096 rows that divides the block. A sweep at 10.5M re-encoded every
+permutation and counted its bytes with the directory. Against the unsegmented layout,
+512 rows gave 110.6%, 1,024 rows 105.9%, 2,048 rows 103.3% and 4,096 rows 101.9%.
+Smaller frames compress worse, and each restarts its deltas and adds a directory entry.
+2,048 rows is the smallest size within the 5% size target of §6.4, and a point lookup
+then decodes 16 KiB per column instead of 256 KiB.
+
+**Decoder entry points.** `PermIndex::decode_segment(b, c, s)` decodes one frame into a
+column of at most `SEG_ROWS` values. `PermIndex::decode_col(b, c)` decodes every frame
+of the column into one buffer of the block's rows, so a full-column reader gets the same
+`Col` as before. A frame that is shorter or longer than its directory says, or that
+decodes to the wrong number of values, is a corruption error and never a panic.
+
+**Reads.** One decision chooses between a whole column and segments, for a reader of
+the rows of block `b` in a key range. It reads whole columns when the generation is not
+segmented, when the range covers the whole block, when the cache already holds the
+columns whole, when the range spans more than a quarter of the block's segments, or
+when the block is marked dense. Each block counts the segments decoded from it one by
+one, and the block is marked dense when that count reaches a quarter of its segments.
+The join prefetch also marks a block dense when its ranges together span more than a
+quarter of the block's segments. A query that touches most of a block through many small
+ranges then pays one whole read instead of many small reads with their own page faults.
+A property path walk marks every block of its predicate's rows dense once it has reached
+two nodes per block, because a walk that wide meets most of those blocks again.
+Otherwise it reads the segments whose first keys can hold the range, found by a binary
+search in the block's directory. The range scan (`for_each_key_range_masked`), the
+counts of edge blocks (`count_between`), the full-key test (`contains`), the index-join
+reader (`read_ranges_gallop`) and the join prefetch all use this decision, so the
+prefetch decodes the same segments that the reader then finds in the cache. A reader of
+segments gets a `Block` that holds one segment, with row numbers relative to it. Range
+scans therefore pass one segment at a time to their callback, and the index-join reader
+moves from one segment to the next when a range continues past the end of a segment.
+It keeps the segment it holds while the next range starts in it, so keys that lie close
+together cost no search of the directory. When a segment misses the cache on a cold
+process, the reader asks the kernel for that segment's frames in every column the reader
+needs in one batch of hints, before it decodes the first one.
+
+**Dense scans.** A whole block, and every reader that asks for whole blocks by number
+(sorted scans, the streaming scan cursor, sampling, the reasoner, exports), decodes the
+whole column from its frames. The work per value is unchanged, and the extra cost is
+one LZ4 frame start and one varint restart per 2,048 rows.
+
+**Cache.** A cached column is keyed by the permutation instance, the block, the column,
+the namespace and the segment. The segment takes the low seven bits of the block field,
+where 0 means the whole column, so a whole column and a segment never shadow each other.
+The weigher counts each entry's decoded bytes as before. A reader of a few rows uses a
+block's whole columns when the cache holds them, because cutting a segment out of them
+on every request costs more than reading them in place.
+
+**Format.** Generations written by this build have index format 3, registered in the
+format table of X12. The reader opens formats 2 and 3. A format 2 generation is read as
+before, and the next compaction writes format 3. A partial compaction that copies a
+block from a format 2 generation into a format 3 one decodes and re-encodes it, and one
+that copies from format 3 copies the block's bytes and its directory entries. A build
+that reads only format 2 refuses a format 3 generation by the check of `meta.json` it
+already has. A compaction writes the new generation in a directory of its own and
+switches to it in one step, so a crash leaves the old generation in use and never a
+half-converted one.
+
 ## 7. Phase 4: optional prewarm
 
 A server can record, at shutdown and every few minutes, which vocabulary groups and
@@ -424,8 +506,9 @@ Phase 1 breakdown attributes the remainder to block reads or decoding.
 
 ## Outcome
 
-Phases 1 and 2 are built. Phase 3 and Phase 4 are not. The [Phase 3 decision](#phase-3-decision)
-records why Phase 3 is the next step.
+Phases 1, 2 and 3 are built. Phase 4 is not. The [Phase 3 decision](#phase-3-decision)
+records why Phase 3 was started, and [Phase 3 results](#phase-3-results) records how it
+landed.
 
 ### What was built
 
@@ -869,9 +952,64 @@ also an on-disk format change, so it needs a new index format version, a clean r
 older builds, fixtures for the stores written before it, and its own index-size, load-time
 and warm-decode gates from §6.4. For those reasons it was not folded into this change.
 
+### Phase 3 results
+
+Phase 3 follows §6.5. Index generations are written in format 3, with each column split
+into frames of 2,048 rows and a `.seg` directory per permutation. This build opens
+format 2 and rewrites it at the next compaction, and a build that reads only format 2
+refuses a format 3 store with an error that names both versions. The fixtures in
+`testsuite/formats/` hold a store of each format, and the format tests open both in
+place, compact them and query them.
+
+The gates were measured on forge on 2026-10-23 under the bench lock and in interleaved
+rounds, after evicting the store with `posix_fadvise(POSIX_FADV_DONTNEED)` before each
+fresh server. The cold rows at 10.5M compare main at `72d85c7f` with the final build at
+`e86a371a` over four rounds of 11 samples each, and those at 1.05M over two rounds. The
+warm, size, load and export rows compare main at `63d8a36d` with the build at `8dd019da`,
+and a later instruction check of the final build matched them.
+
+| Gate | Result |
+|---|---|
+| Cold `star-lookup` | 15.4 to 14.9 ms at 1.05M and 20.4 to 12.7 ms at 10.5M. |
+| Cold `employee-docs` | 13.2 to 11.7 ms at 1.05M and 16.8 to 12.2 ms at 10.5M. |
+| Other cold queries | `values-star` and `path-plus` are 21% to 38% faster. `knows-reach` is within 1% at 10.5M. `star-join` is 7% faster at 1.05M and 6% to 8% slower at 10.5M. |
+| Warm instructions | Every query is within 0.969 to 1.024 of main, and `employee-docs` is at 0.971 to 0.978. |
+| Warm read hints | A warm pass makes no `madvise(MADV_WILLNEED)` call. |
+| Full scans and export | `export-500k` is at 0.98 to 0.99 of main cold and 0.99 to 1.02 warm. `order-by-full` is within 4% warm. |
+| Index size | The generation at 10.5M grows by 3.0%, from 300.6 MB to 309.7 MB, and the permutation files by 3.3%. |
+| Load | The 10.5M load takes 3.7 seconds with a peak resident memory of about 2.05 GB in both builds. |
+
+The first version read segments whenever a range spanned at most a quarter of a block,
+and that made cold `knows-reach` 38% slower, because a traversal of most of the people
+read each block by many separate segments with their own page faults. Three changes
+brought it back to about 5%. A block is read whole once a quarter of its segments have
+been read one by one or once the join prefetch sees its ranges span a quarter of it, the
+frames of a missed segment are hinted for every needed column together, and a small
+directory is read ahead at open. A limit of an eighth instead of a quarter made
+`employee-docs` slower and was dropped. The first warm builds also cost `star-lookup`
+up to twice its warm time, because each request cut segments out of columns the cache
+already held whole. A reader now uses cached whole columns in place, cut segments are
+cached, and the join prefetch skips its work when the first range is cached.
+
+That left `knows-reach` 5% slower at 10.5M, from the first few segment reads of each
+block before it turned dense. A property path walk now marks every block of its
+predicate's rows dense once it has reached two nodes per block, which brought
+`knows-reach` to 0.98 to 0.99 of main without slowing `path-plus`.
+
+`star-join` at 10.5M is a known cost of 6% to 8%, measured in two runs of 12 interleaved
+rounds. Its profile decodes 108 MiB where main decodes 92 MiB, because the index join
+reads up to a quarter of a block's segments one by one, across several requests, before
+the block turns dense. Two fixes were measured and dropped. Halving the dense limit in
+the join prefetch brought `star-join` to 1.01 of main in two rounds but made
+`employee-docs` 6% slower. Copying a block's cached segments into its whole columns, so
+that only the missing frames are decoded, left `star-join` at 1.07 of main, so the cost
+is not the decoding itself. With segment reads turned off the same format 3 store ran
+`star-join` at 0.97 of main, so the cost lies in the reads by segment of this join. It
+is a follow-up under roadmap item 4.
+
 ### Not done
 
-Phase 3 and Phase 4, the 1.01B gates (A5 and its window sweep), the cold targets of
+Phase 4, the 1.01B gates (A5 and its window sweep), the cold targets of
 `values-star`, `path-plus` and 10.5M `star-lookup`, cheaper join probes at planning time
 on a cold process, a per-query set of
 hinted blocks in the context to avoid a second hint of a block, I/O priority for

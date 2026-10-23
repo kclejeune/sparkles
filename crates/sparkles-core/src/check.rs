@@ -29,7 +29,8 @@ use crate::commit::{self, CommitInfo};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{
-    BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, decode_column, read_varint_checked,
+    BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, SEG_ENTRY, decode_column, decode_frame_into,
+    read_varint_checked, supported_segment_rows,
 };
 use crate::store::{Framing, WAL_COMMIT, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC};
 use crate::vocab::{FC_BLOCK, parse_delta};
@@ -1152,9 +1153,15 @@ impl Checker<'_> {
         let full = self.full;
         let quads = self.meta.as_ref().map(|m| m.quads);
         let vocab_len = self.vocab_len;
+        // format 3 generations are segmented (spec X07 §6.5); without a readable meta.json
+        // the `.seg` files say
+        let segmented = |p: Perm| match self.meta.as_ref() {
+            Some(m) => m.format_version >= 3,
+            None => dir.join(format!("{}.seg", p.name())).exists(),
+        };
         let scans: Vec<PermScan> = Perm::ALL
             .par_iter()
-            .map(|&p| scan_perm(dir, name, p, quads, vocab_len, full))
+            .map(|&p| scan_perm(dir, name, p, quads, vocab_len, full, segmented(p)))
             .collect();
         let t0 = Instant::now();
         let mut refs = IdRefs::default();
@@ -2264,11 +2271,13 @@ fn scan_perm(
     quads: Option<u64>,
     vocab_len: Option<u64>,
     full: bool,
+    segmented: bool,
 ) -> PermScan {
     let name = perm.name();
     let mut run = Run::new(format!("perm.{name}"));
     let meta_file = format!("{gen_name}/{name}.meta");
     let dat_file = format!("{gen_name}/{name}.dat");
+    let seg_file = format!("{gen_name}/{name}.seg");
     let fail = |run: Run, summary: &str| PermScan {
         perm,
         check: run.done(summary),
@@ -2388,6 +2397,51 @@ fn scan_perm(
             .offset(end),
         );
     }
+    // the segment directory: its header, and one entry per segment of every block
+    let seg_bytes = if segmented {
+        match std::fs::read(dir.join(format!("{name}.seg"))) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                run.add(Issue::error(format!("{e}: a format 3 index needs it")).file(&seg_file));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // (segment size, the index of each block's first entry)
+    let mut directory: Option<(usize, Vec<usize>)> = None;
+    if let Some(bytes) = &seg_bytes {
+        let seg_rows = (bytes.len() >= 16 && &bytes[..8] == b"SPKSEG01")
+            .then(|| u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize);
+        match seg_rows {
+            None => run.add(Issue::error("not a segment directory").file(&seg_file)),
+            Some(n) if !supported_segment_rows(n) => {
+                run.add(Issue::error(format!("segment size {n} is not supported")).file(&seg_file))
+            }
+            Some(n) => {
+                let mut start = Vec::with_capacity(blocks.len() + 1);
+                let mut total = 0usize;
+                for m in &blocks {
+                    start.push(total);
+                    total += (m.rows as usize).div_ceil(n);
+                }
+                start.push(total);
+                let want = 16 + total * SEG_ENTRY;
+                if bytes.len() != want {
+                    run.add(
+                        Issue::error(format!(
+                            "{} bytes, {want} expected for {total} segments: open fails",
+                            bytes.len()
+                        ))
+                        .file(&seg_file),
+                    );
+                } else {
+                    directory = Some((n, start));
+                }
+            }
+        }
+    }
     if let Some(q) = quads
         && q != rows
     {
@@ -2410,7 +2464,27 @@ fn scan_perm(
     let scans: Vec<Option<BlockScan>> = blocks
         .par_iter()
         .enumerate()
-        .map(|(b, m)| in_file[b].then(|| scan_block(data, perm, b, m, vocab_len, &dat_file)))
+        .map(|(b, m)| {
+            in_file[b].then(|| {
+                // the block's directory entries, or none when the directory is unreadable
+                let segs = match (&directory, &seg_bytes) {
+                    (Some((n, start)), Some(bytes)) => Some((
+                        *n,
+                        &bytes[16 + start[b] * SEG_ENTRY..16 + start[b + 1] * SEG_ENTRY],
+                    )),
+                    _ => None,
+                };
+                if segmented && segs.is_none() {
+                    return BlockScan {
+                        issues: Vec::new(),
+                        id_issues: Vec::new(),
+                        ends: None,
+                        hash: (0, 0),
+                    };
+                }
+                scan_block(data, perm, b, m, vocab_len, &dat_file, segs)
+            })
+        })
         .collect();
     let mut hash = Some((0u64, 0u64));
     let mut id_issues = Vec::new();
@@ -2457,6 +2531,35 @@ fn scan_perm(
     }
 }
 
+/// Decode a format 3 column of `rows` values from its frames, whose lengths in column
+/// `c` the block's directory `entries` give.
+fn decode_segmented(
+    bytes: &[u8],
+    rows: usize,
+    seg_rows: usize,
+    entries: &[u8],
+    c: usize,
+) -> crate::error::Result<crate::index::Col> {
+    let bad = |m: String| crate::error::Error::Corrupt(m);
+    let mut col = vec![0u64; rows];
+    let mut at = 0usize;
+    for (out, e) in col.chunks_mut(seg_rows).zip(entries.chunks(SEG_ENTRY)) {
+        let len = u32::from_le_bytes(e[32 + c * 4..36 + c * 4].try_into().unwrap()) as usize;
+        let frame = bytes
+            .get(at..at + len)
+            .ok_or_else(|| bad("its frames end past the column".into()))?;
+        decode_frame_into(frame, out)?;
+        at += len;
+    }
+    if at != bytes.len() {
+        return Err(bad(format!(
+            "its frames cover {at} of its {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(crate::index::Col::from(col))
+}
+
 fn scan_block(
     data: &[u8],
     perm: Perm,
@@ -2464,6 +2567,7 @@ fn scan_block(
     m: &BlockMeta,
     vocab_len: Option<u64>,
     file: &str,
+    segs: Option<(usize, &[u8])>,
 ) -> BlockScan {
     let mut out = BlockScan {
         issues: Vec::new(),
@@ -2476,7 +2580,13 @@ fn scan_block(
     let mut off = m.offset as usize;
     for c in 0..4 {
         let len = m.col_len[c] as usize;
-        match decode_column(&data[off..off + len], n) {
+        let decoded = match segs {
+            None => decode_column(&data[off..off + len], n),
+            Some((seg_rows, entries)) => {
+                decode_segmented(&data[off..off + len], n, seg_rows, entries, c)
+            }
+        };
+        match decoded {
             Ok(v) => cols.push(v),
             Err(e) => out.issues.push(
                 Issue::error(format!("column {c} does not decode to {n} rows: {e}"))
@@ -2491,6 +2601,26 @@ fn scan_block(
         return out;
     }
     let key = |i: usize| -> Key { [cols[0][i], cols[1][i], cols[2][i], cols[3][i]] };
+    if let Some((seg_rows, entries)) = segs {
+        // each directory entry's first key is the first row of its segment
+        for (s, e) in entries.chunks(SEG_ENTRY).enumerate() {
+            let first: Key = std::array::from_fn(|c| {
+                u64::from_le_bytes(e[c * 8..c * 8 + 8].try_into().unwrap())
+            });
+            if first != key(s * seg_rows) {
+                out.issues.push(
+                    Issue::error(format!(
+                        "segment {s} starts with {:?}, but its directory entry says {first:?}",
+                        key(s * seg_rows)
+                    ))
+                    .file(file)
+                    .block(b)
+                    .offset(m.offset),
+                );
+                break;
+            }
+        }
+    }
     let (first, last) = (key(0), key(n - 1));
     if first != m.first || last != m.last {
         out.issues.push(

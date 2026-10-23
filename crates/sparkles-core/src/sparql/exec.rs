@@ -1310,10 +1310,14 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
     }
     /// The blocks of a scan with the columns the reader decodes of each, or nothing for a
     /// scan of more than `FEW_BLOCKS` blocks.
-    fn blocks(ctx: &Ctx, spec: &ScanSpec, ranges: &[(Key, Key)]) -> Vec<(usize, ColMask)> {
+    fn blocks(
+        ctx: &Ctx,
+        spec: &ScanSpec,
+        ranges: &[(Key, Key)],
+    ) -> Vec<(usize, ColMask, Key, Key)> {
         let index = ctx.snap.perm(spec.perm);
         let scan = scan_mask(ctx, spec);
-        let mut out: Vec<(usize, ColMask)> = Vec::new();
+        let mut out: Vec<(usize, ColMask, Key, Key)> = Vec::new();
         for range in ranges {
             let (b0, b1) = index.key_block_range(&range.0, &range.1);
             if b1 - b0 > FEW_BLOCKS {
@@ -1321,9 +1325,13 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
             }
             for b in b0..b1 {
                 let mask = wanted(index, scan, range, b);
+                // a block that two ranges share is asked for by its union
                 match out.last_mut() {
-                    Some((last, wanted)) if *last == b => *wanted |= mask,
-                    _ => out.push((b, mask)),
+                    Some((last, wanted, _, hi)) if *last == b => {
+                        *wanted |= mask;
+                        *hi = range.1;
+                    }
+                    _ => out.push((b, mask, range.0, range.1)),
                 }
             }
             if out.len() > FEW_BLOCKS {
@@ -1358,13 +1366,14 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
             // a warm scan costs this one probe, before any other block is listed
             let first = ranges.iter().find_map(|r| {
                 let (b0, b1) = index.key_block_range(&r.0, &r.1);
-                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0)))
+                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0), r))
             });
-            if let Some((b, mask)) = first
-                && !ctx.snap.cache.has_cols(index, b, mask)
+            if let Some((b, mask, r)) = first
+                && !index.range_cached(&ctx.snap.cache, b, &r.0, &r.1, mask)
             {
-                for (b, mask) in blocks(ctx, spec, &ranges) {
-                    index.prefetch(&ctx.snap.cache, b, mask);
+                // a range of a few rows of a segmented block asks for its segments only
+                for (b, mask, lo, hi) in blocks(ctx, spec, &ranges) {
+                    index.prefetch_range(&ctx.snap.cache, b, &lo, &hi, mask);
                 }
             }
         }
@@ -6392,7 +6401,35 @@ struct Graph<'a> {
 /// merging a few hundred rows).
 const SWEEP_RATIO: u64 = 512;
 
+/// A walk that has reached this many nodes for each block of its predicate's index rows
+/// reads those blocks whole from then on (spec X07 §6.5). A walk that wide meets most of
+/// the blocks again, and reading their segments one by one first costs more than one
+/// whole read.
+const WALK_WHOLE_PER_BLOCK: usize = 2;
+
 impl Graph<'_> {
+    /// Have readers of a segmented index read the blocks of a simple path's predicate
+    /// whole, once a walk from one node has reached [`WALK_WHOLE_PER_BLOCK`] nodes per
+    /// block. Returns whether it did, so the walk asks once.
+    fn read_walk_whole(&self, forward: bool, reached: usize) -> bool {
+        let Some((p, rev)) = self.spec.simple else {
+            return true;
+        };
+        let perm = if forward != rev { Perm::Pso } else { Perm::Pos };
+        let idx = self.ctx.snap.perm(perm);
+        if !idx.segmented() {
+            return true;
+        }
+        let (b0, b1) = idx.block_range(&[p]);
+        if reached < (b1 - b0).saturating_mul(WALK_WHOLE_PER_BLOCK) {
+            return false;
+        }
+        for b in b0..b1 {
+            idx.mark_dense(b);
+        }
+        true
+    }
+
     /// Neighbours of every node of a sorted, duplicate-free frontier (with duplicates),
     /// for simple predicate paths: per-node seeks for a small frontier, otherwise one
     /// pass over the predicate's index rows between the first and last frontier node,
@@ -6526,9 +6563,13 @@ impl Graph<'_> {
         let mut depth = 0;
         let mut found = Vec::new();
         let mut found_charged = 0usize;
+        let mut whole = self.spec.max_one;
         while !frontier.is_empty() {
             self.ctx.check()?;
             depth += 1;
+            if !whole {
+                whole = self.read_walk_whole(forward, seen.len());
+            }
             let mut next = Vec::new();
             frontier.sort_unstable();
             found.clear();

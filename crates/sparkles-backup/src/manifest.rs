@@ -530,10 +530,15 @@ mod tests {
         assert_eq!(e.code(), Code::IncompatibleFormat);
         assert_eq!(e.http_status(), 422);
         let v = sparkles_core::builder::FORMAT_VERSION;
+        let reads = sparkles_core::formats::READABLE_INDEX_FORMATS
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         assert!(
             e.message()
                 .contains(&format!("index format {}, written by Sparkles", v + 1))
-                && e.message().contains(&format!("this build reads {v}")),
+                && e.message().contains(&format!("this build reads {reads}:")),
             "{e}"
         );
     }

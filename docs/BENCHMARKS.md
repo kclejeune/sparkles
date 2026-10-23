@@ -845,6 +845,35 @@ decoding blocks. In an interleaved A/B on forge at 10.5M it made cold `star-look
 `bench.sh` columns above predate it. [X07](specs/X07-cold-sparse-reads.md#remaining-cold-gaps)
 gives those figures and the profile of the remaining cold time.
 
+##### Segmented blocks
+
+Index format 3 splits each column of a block into frames of 2,048 rows, so a point lookup
+decodes a sixteenth of a column. These figures of 2026-10-23 come from forge, with the
+engine of main at `72d85c7f` against the segmented build at `e86a371a`, each on a store
+loaded by its own build. The cold preparation is the one above. Each 10.5M cell is the
+median of four interleaved rounds of 11 samples timed by `bench-regressions.py --cold`,
+and each 1.05M cell the median of two. The `export-500k` row comes from the earlier
+segmented build at `8dd019da` against main at `63d8a36d`.
+
+| Cold, forge, median ms | 1.05M main | 1.05M segmented | 10.5M main | 10.5M segmented |
+|---|---:|---:|---:|---:|
+| `star-lookup` | 15.4 | **14.9** | 20.4 | **12.7** |
+| `employee-docs` | 13.2 | **11.7** | 16.8 | **12.2** |
+| `values-star` | 9.8 | **7.7** | 10.1 | **7.6** |
+| `path-plus` | 8.0 | **5.0** | 6.7 | **4.7** |
+| `knows-reach` | 33.5 | **32.1** | 198.9 | **197.4** |
+| `star-join` | 27.8 | **25.8** | **82.7** | 89.2 |
+| `export-500k` | 121.8 | **120.4** | 129.8 | **127.7** |
+
+`star-join` at 10.5M is the one cold query that is slower, by 6% to 8% in two runs of 12
+rounds. Its index join reads up to a quarter of a block's segments one by one before the
+block is read whole, and [X07](specs/X07-cold-sparse-reads.md#phase-3-results) records the
+fixes that were tried. Warm instruction counts per request are 0.969 to 1.024 of main for
+every query, 0.971 to 0.978 for `employee-docs` and 0.983 for `export-500k`, and a warm
+pass makes no read hint. The generation at 10.5M grows by 3.0%, from 300.6 MB to
+309.7 MB. The load takes 3.7 seconds in both builds, and its peak resident memory is about
+2.05 GB in both.
+
 ### BSBM Explore at 10M triples
 
 This run used 10,095,035 generated triples and 28,480 products on forge. The other
