@@ -2,7 +2,7 @@
   import { afterNavigate, goto, replaceState } from '$app/navigation';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import * as api from '$lib/api';
   import { app, toasts } from '$lib/app.svelte';
   import { auth } from '$lib/auth.svelte';
@@ -44,6 +44,7 @@
   import ResultTable from '$components/ResultTable.svelte';
   import TimeSlider, { type TimeChange } from '$components/TimeSlider.svelte';
   import SparqlEditor from '$components/SparqlEditor.svelte';
+  import PatternPane from '$components/PatternPane.svelte';
   import QuestionHeader from '$components/QuestionHeader.svelte';
   import AskBar from '$components/AskBar.svelte';
   import AnswerSummary from '$components/AnswerSummary.svelte';
@@ -105,7 +106,7 @@
     | { state: 'loading' }
     | { state: 'done'; d: askApi.Diagnosis }
     | { state: 'error' };
-  type View = 'table' | 'graph' | 'map' | 'plan' | 'raw' | 'explain';
+  type View = 'table' | 'graph' | 'map' | 'plan' | 'pattern' | 'raw' | 'explain';
   type Outcome = {
     status: 'running' | 'done' | 'error';
     ds: string;
@@ -183,6 +184,60 @@
   const fixable = $derived(lintDiagnostics.some((d) => d.fix));
   let renaming = $state<string | null>(null);
   let editor: SparqlEditor | undefined = $state();
+
+  // the Pattern pane beside the editor (spec U08): open or not and its width, per viewer
+  const PATTERN_KEY = 'sparkles.patternPane';
+  const patternSaved = load<{ open?: boolean; w?: number }>(PATTERN_KEY, {});
+  let patternOpen = $state(patternSaved.open === true);
+  let patternW = $state(Math.min(Math.max(patternSaved.w ?? 480, 240), 1400));
+  $effect(() => save(PATTERN_KEY, { open: patternOpen, w: patternW }));
+  let pattern: PatternPane | undefined = $state();
+  /** On a phone the editor and the pane are two tabs over the same query (§2.6). */
+  let phoneTab = $state<'text' | 'pattern'>('text');
+  let isPhone = $state(false);
+  $effect(() => {
+    if (typeof matchMedia !== 'function') return;
+    const m = matchMedia('(max-width: 600px)');
+    isPhone = m.matches;
+    const on = () => (isPhone = m.matches);
+    m.addEventListener('change', on);
+    return () => m.removeEventListener('change', on);
+  });
+  const patternShown = $derived(patternOpen && (!isPhone || phoneTab === 'pattern'));
+
+  /** Alt+P: open the pane and focus it, or move focus back to the editor, or close it. */
+  async function togglePattern(from: 'editor' | 'pane' | 'page') {
+    if (!patternOpen) {
+      patternOpen = true;
+      if (isPhone) phoneTab = 'pattern';
+      await tick();
+      pattern?.focus();
+    } else if (from === 'pane') {
+      if (isPhone) {
+        phoneTab = 'text';
+        await tick();
+      } else patternOpen = false;
+      editor?.focus();
+    } else {
+      if (isPhone) phoneTab = 'pattern';
+      await tick();
+      pattern?.focus();
+    }
+  }
+
+  function startPatternSplit(e: PointerEvent) {
+    e.preventDefault();
+    const x0 = e.clientX;
+    const w0 = patternW;
+    const move = (ev: PointerEvent) =>
+      (patternW = Math.min(Math.max(w0 - (ev.clientX - x0), 240), window.innerWidth - 240));
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
 
   // graph options
   let hideTypes = $state(false);
@@ -1874,6 +1929,18 @@
     }
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement | null;
+      // Alt+P outside the editor (whose own keymap has it): the pane, or back to the editor
+      if (
+        e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        e.code === 'KeyP' &&
+        !el?.closest?.('.cm-editor')
+      ) {
+        e.preventDefault();
+        void togglePattern(el?.closest?.('.ppane') ? 'pane' : 'page');
+        return;
+      }
       if (
         (e.key === 'h' || e.key === 'H') &&
         !e.metaKey &&
@@ -2067,6 +2134,14 @@
         <span class="mono">/{target ?? '…'}/{kind === 'UPDATE' ? 'update' : 'sparql'}</span>
       </span>
       <span class="spacer"></span>
+      <button
+        class="btn sm"
+        aria-pressed={patternOpen}
+        title="Show the query's pattern beside the editor (Alt+P)"
+        onclick={() => (patternOpen ? (patternOpen = false) : void togglePattern('page'))}
+      >
+        <Icon name="graph" size={13} /> Pattern
+      </button>
       <div class="examples">
         <button
           class="btn sm"
@@ -2416,16 +2491,65 @@
     {/if}
   </div>
 
-  <div class="editor-wrap">
-    <SparqlEditor
-      bind:this={editor}
-      docId={active.id}
-      value={active.query}
-      onchange={setQuery}
-      onrun={() => run()}
-      onformat={() => void formatQuery()}
-      {completion}
-    />
+  <div
+    class="editor-wrap"
+    class:with-pattern={patternOpen}
+    class:phone-pattern={isPhone && patternOpen && phoneTab === 'pattern'}
+    style:--pattern-w="{patternW}px"
+  >
+    {#if isPhone && patternOpen}
+      <div class="phone-tabs" role="tablist" aria-label="Query views">
+        <button
+          class="tab"
+          role="tab"
+          aria-selected={phoneTab === 'text'}
+          onclick={() => (phoneTab = 'text')}>Text</button
+        >
+        <button
+          class="tab"
+          role="tab"
+          aria-selected={phoneTab === 'pattern'}
+          onclick={() => (phoneTab = 'pattern')}>Pattern</button
+        >
+      </div>
+    {/if}
+    <div class="editor-cell">
+      <SparqlEditor
+        bind:this={editor}
+        docId={active.id}
+        value={active.query}
+        onchange={setQuery}
+        onrun={() => run()}
+        onformat={() => void formatQuery()}
+        onpattern={() => void togglePattern('editor')}
+        {completion}
+      />
+    </div>
+    {#if patternOpen && !isPhone}
+      <div
+        class="vsplit"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize the Pattern pane"
+        onpointerdown={startPatternSplit}
+      ></div>
+    {/if}
+    {#if patternShown}
+      <div class="pattern-cell">
+        <PatternPane
+          bind:this={pattern}
+          text={active.query}
+          tab={active.id}
+          phone={isPhone}
+          prefixes={app.prefixes(ds)}
+          onedit={(changes) => editor?.applyPattern(changes)}
+          onundo={() => editor?.undo()}
+          onredo={() => editor?.redo()}
+          onescape={() => (isPhone ? (phoneTab = 'text') : editor?.focus())}
+          onclose={() => (patternOpen = false)}
+        />
+      </div>
+    {/if}
   </div>
 
   <div
@@ -2514,6 +2638,16 @@
               >
                 <Icon name="plan" size={14} /> Plan
               </button>
+              {#if outcome.query}
+                <button
+                  class="tab"
+                  role="tab"
+                  aria-selected={outcome.view === 'pattern'}
+                  onclick={() => setView('pattern')}
+                >
+                  <Icon name="graph" size={14} /> Pattern
+                </button>
+              {/if}
               <button
                 class="tab"
                 role="tab"
@@ -2994,6 +3128,21 @@
             {:else}
               <div class="empty">The server did not return a plan for this query.</div>
             {/if}
+          {:else if outcome.view === 'pattern' && outcome.query}
+            <div class="result-pattern">
+              <PatternPane text={outcome.query} readonly phone={isPhone} />
+              <div class="result-pattern-bar">
+                <button
+                  class="btn sm"
+                  title="Put this query in the editor and open the Pattern pane"
+                  onclick={() => {
+                    setQuery(outcome!.query!);
+                    patternOpen = true;
+                    if (isPhone) phoneTab = 'pattern';
+                  }}>Edit</button
+                >
+              </div>
+            </div>
           {:else if outcome.view === 'raw'}
             <div class="raw">
               <div class="dl">
@@ -3588,7 +3737,42 @@
   }
   .editor-wrap {
     min-height: 0;
+    min-width: 0;
     background: var(--surface);
+    display: flex;
+  }
+  .editor-cell {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+  }
+  .pattern-cell {
+    flex: 0 0 var(--pattern-w);
+    max-width: calc(100% - 240px);
+    min-width: 0;
+    min-height: 0;
+    border-left: 1px solid var(--border);
+  }
+  .vsplit {
+    flex: 0 0 6px;
+    cursor: col-resize;
+    background: var(--surface-2);
+    border-left: 1px solid var(--border);
+  }
+  .vsplit:hover {
+    background: var(--surface-3);
+  }
+  .result-pattern {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .result-pattern-bar {
+    position: absolute;
+    top: 6px;
+    right: 120px;
   }
   .splitter {
     cursor: row-resize;
@@ -3851,6 +4035,35 @@
     }
     .toolbar {
       position: relative;
+    }
+    /* the Text and Pattern tabs over the same query */
+    .editor-wrap.with-pattern {
+      flex-direction: column;
+    }
+    .phone-tabs {
+      display: flex;
+      gap: 2px;
+      border-bottom: 1px solid var(--border);
+    }
+    .phone-tabs .tab {
+      flex: 1;
+      min-height: 44px;
+    }
+    .phone-pattern .editor-cell {
+      display: none;
+    }
+    .pattern-cell {
+      flex: 1;
+      max-width: none;
+      border-left: none;
+    }
+    .page:has(.phone-pattern) {
+      --editor-row: max(420px, 65vh);
+    }
+    .result-pattern-bar {
+      right: 8px;
+      top: auto;
+      bottom: 44px;
     }
     .examples,
     .saved,

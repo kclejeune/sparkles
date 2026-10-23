@@ -1493,6 +1493,57 @@ The query page's graph view uses the same WebGL view for results of more than 2,
 nodes. **Max nodes** then offers 10,000, 50,000 and 100,000, and **Renderer** switches
 between the canvas and WebGL views.
 
+## The Pattern pane
+
+The query page can draw the graph pattern of the query in the editor. **Pattern** in the
+editor's toolbar, or `Alt+P`, opens a pane beside the editor, and the divider between
+them can be dragged. Each variable is a round node, each IRI a rectangle with its
+prefixed name, and each literal a small rounded box. A triple pattern is an edge labelled
+with its predicate, a variable predicate is dashed, and a simple path such as
+`ex:partOf+` labels its edge with the path. `?x a ex:Person` puts the class under the
+node instead of drawing an edge. A filter over one variable and constants, such as
+`STRSTARTS(?name, "A")`, is a chip on its variable, and an `OPTIONAL` group is a dashed
+hull around the nodes only it binds. The strip under the drawing lists the projection,
+`DISTINCT`, `LIMIT`, `OFFSET` and the other solution modifiers.
+
+The pane draws any query that parses, but it edits only a part of SPARQL: triple
+patterns, filters and one level of `OPTIONAL`. Everything else, such as `BIND`, `MINUS`,
+`UNION`, `GRAPH`, subqueries, `SERVICE` and `VALUES`, is a locked block. A locked block
+shows its kind and its text, comments included, and dotted lines join it to the
+variables it shares. The editor edits locked blocks, and edits made in the pane never
+change their text.
+
+The pane makes three edits. **+ Triple** (`N`) adds a triple pattern written as a
+subject, a predicate and an object. It goes into the group that holds the subject's
+patterns, after the last part of it the pane edits, and also after any locked block that
+follows and uses a variable the new triple binds. A prefixed name whose prefix the query does not declare, but the dataset does,
+adds its `PREFIX` line. Selecting an edge offers **Optional**, which moves the triple into
+`OPTIONAL { … }` or back out of it, and **Delete**, which removes it from its statement.
+Each edit changes only the text it must, as one change to the editor, so `Ctrl+Z` (`⌘Z`
+on a Mac) in the editor or in the pane undoes it in one step, the same as typing.
+
+The pane redraws 150 ms after typing stops. Text that does not parse leaves the last
+drawing on screen, dimmed, with the line and column of the error, and the pane makes no
+edits until the text parses again. A node keeps its place while the text around it
+changes, a new node appears next to the nodes it connects to, and a variable renamed in
+the editor keeps its position. **Tidy** lays the whole pattern out again. The browser
+keeps the positions of each query, at most 200 queries, so a query opened again from the
+history or as a stored query draws the same picture.
+
+**List** shows the same elements as rows in the order of the text, which is also how a
+screen reader reads the pattern. With the canvas focused, `Tab` and `Shift+Tab` move
+through the elements in text order, the arrow keys move to the nearest element in that
+direction, `Shift` with an arrow moves the focused node by 16 pixels, `Enter` opens the
+element's panel, `Delete` removes the focused edge, `O` toggles optional on it, and
+`Escape` returns to the editor. A polite live region announces each edit.
+
+A result has a **Pattern** tab that draws the query that produced it, read-only, and
+**Edit** puts that query in the editor with the pane open. On a phone the editor and the
+pane are two tabs, **Text** and **Pattern**, over the same query, and every control
+keeps a 44-pixel touch target. The pane needs the formatter's WebAssembly module (see
+[ui/README.md](../ui/README.md#formatting-in-the-browser)). Without it the pane says so
+and draws nothing.
+
 ## The time slider
 
 The web UI reads a past state of a dataset with a slider. It is a bar under the toolbar of

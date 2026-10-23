@@ -1,19 +1,23 @@
 # U08: A two-way visual query builder
 
-> **Status:** specified
+> **Status:** partly implemented
 >
-> **Phases:** None shipped. Phase 1 draws the pattern graph of any query, from the editor's
-> text or from a query that ran, without editing. Phase 2 makes the canvas an editor of
-> the same text: variables, IRIs, literals and predicates picked from the schema,
-> filters, optional parts and simple paths, with every change written back to the text as
-> a small splice and every text change redrawn. Phase 3 adds `UNION`, `GRAPH` and inline
-> `VALUES` to the part of SPARQL the canvas edits, and starting a pattern from a class in
-> the Explore overview.
+> **Phases:** Phase 1 shipped on 2026-10-23, with the splice core of Phase 2. Phase 1
+> draws the pattern graph of any query, from the editor's text or from a query that ran.
+> Phase 2 makes the canvas an editor of the same text: variables, IRIs, literals and
+> predicates picked from the schema, filters, optional parts and simple paths, with every
+> change written back to the text as a small splice and every text change redrawn. Its
+> splices for adding and deleting a triple and for optional on an edge shipped with Phase
+> 1, and the rest of it is not built. Phase 3 adds `UNION`, `GRAPH`, inline `VALUES`,
+> `MINUS` and `FILTER NOT EXISTS` to the part of SPARQL the canvas edits, and starting a
+> pattern from a class in the Explore overview. It is not built.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Usage: The Pattern pane](../USAGE.md#the-pattern-pane) ·
+> [Features](../FEATURES.md#web-ui)
 >
-> This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> This is the design as written before implementation, with the answers to open
+> questions 1 and 2 of §10. The [Outcome](#outcome) section at the end records how
+> Phase 1 landed.
 
 This design was written from the W3C SPARQL 1.1 Query Recommendation and the SPARQL 1.2
 working drafts, the public documentation of Sparnatural and of Neo4j Bloom as examples of
@@ -409,7 +413,9 @@ reuses them.
    paths, projection and modifiers, the shared undo history, and the phone layout for
    editing.
 3. **Phase 3.** `UNION`, `GRAPH` and inline `VALUES` in the subset, and **Build a query**
-   on a class of the Explore overview, which opens the pane with `?x a C`.
+   on a class of the Explore overview, which opens the pane with `?x a C`. Phase 3 also
+   adds `MINUS` and `FILTER NOT EXISTS` over a basic graph pattern to the subset, drawn as
+   red-tinted hulls, as open question 2 decided.
 
 ## 7. Acceptance examples
 
@@ -484,9 +490,13 @@ The data is U03 §7's.
 
 1. Whether a stored query should keep its pattern layout on the server, as a `layout`
    field of the C16 definition, so a shared query opens with the author's picture. U03
-   asks the same question about keeping the pattern.
+   asks the same question about keeping the pattern. **Decided on 2026-10-23:** layouts
+   stay in the browser for now, as §4.4 describes, and C16 gets no `layout` field. This
+   also answers U03's question 2.
 2. Whether `MINUS` and `FILTER NOT EXISTS` over a basic graph pattern should join the
    subset as red-tinted hulls, since they are common in hand-written queries.
+   **Decided on 2026-10-23:** they join the subset in Phase 3, not in Phases 1 or 2.
+   Until then they are locked blocks and locked chips.
 3. Whether the canvas should show estimated counts on edges before a run, from the schema
    report's predicate counts, or leave counts to U04 Phase 4.
 4. Whether to add `POST /$/pattern`, the same answer from the server, for builds where
@@ -494,4 +504,94 @@ The data is U03 §7's.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 101.
+Phase 1 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 101. Phase 2's splice
+core shipped with it, ahead of the rest of Phase 2, so that the round-trip properties and
+the shared undo history could be tested on real edits. That core adds a triple, deletes a
+triple and turns optional on or off for an edge. The schema picker, filter forms, paths,
+projection and modifier edits, renames, deleting locked blocks, **Count matches** and the
+phone layout for building a query remain in Phase 2. Phase 3 is not built. Both stay
+under item 101.
+
+**The pattern export.** The classification is `sparkles_fmt::pattern`, which reads the
+lossless tree of X02 and answers a `Pattern` with byte ranges. The browser module's third
+export, `pattern`, writes it as JSON with UTF-16 ranges, converted through one table per
+text. The answer follows §3.2 with these differences. Each item has a `type` (`triple`,
+`filter`, `group` or `locked`). A group also has `inner`, the range between its braces.
+A triple also has `stmt`, `entry` and `object`, which place it in its statement, and
+`entryRange` and `objectRange`, the ranges of its property list entry with the `;` after
+it and of its object with the `,` after it, which the splices of a `;` or `,` list need.
+Terms carry `kind`, `text` and `value`, where `value` is a variable's name, a full IRI with
+prefixed names expanded, a blank node label or a literal as written. `root` is null for
+a `DESCRIBE` without a `WHERE` group, `projection` is null for the other forms and has a
+`locked` flag, and an error answer has a `code`, which is `syntax`, `update` for an
+update request, or `bad-request`. A locked block's range runs to the end of a comment on
+the line of its last token, so A2's block keeps `# year`.
+
+**Classification.** It follows §4.1, with these choices where the table left room. A
+statement with any part outside the subset is one locked block of kind `triples`, so a
+statement mixes no editable and locked parts. An anonymous `[]` and `()` lock their
+statement like other blank node lists and collections. A path is simple when it is an
+IRI, `a`, one modifier on an IRI, an inverse of either, or a sequence or alternative of
+plain IRIs. A sequence that holds an inverse locks the statement. A `FILTER` the canvas
+does not understand is a locked chip but not a locked block, so an `OPTIONAL` holding one
+stays editable, while an `OPTIONAL` holding any other element is locked whole. `REDUCED`
+locks the projection, and a `LIMIT` or `OFFSET` beyond 2⁶⁴ is a locked modifier. A nested
+group `{ … }` is a locked block of kind `group`, since `UNION` is Phase 3. A subquery
+shares its projected variables, and the other locked blocks share every variable they
+mention.
+
+**The pane.** `ui/src/lib/pattern.ts` holds the answer's types, the drawing, the keys of
+§4.4, the rename match and the splices. `pattern-layout.ts` holds the layout map.
+`PatternCanvas.svelte` draws on Cytoscape, `PatternPanel.svelte` is an element's panel,
+and `PatternPane.svelte` parses, draws and edits. The editor exposes `applyPattern`,
+which dispatches an edit as one transaction with the user event `input.pattern` and an
+isolated history entry, and `undo` and `redo`, which the pane calls for `Mod+Z` and
+`Mod+Shift+Z`. A canvas edit is checked by parsing its result before it is applied, so it
+never lands in text that does not parse. New nodes are placed by an fcose run with every
+known node fixed, after which the known nodes are put back exactly where they were. A
+variable that only a locked block mentions gets a node beside it, except for a `MINUS`,
+which binds nothing outside itself, and such a node does not count as a disconnected
+part. The mock UI tests format through the mock's endpoint with `VITE_FMT_WASM=off`, so
+the pane loads the module on its own glob, `VITE_PATTERN_WASM=off` leaves it out, and
+`mise run ui:e2e:mock` builds it first.
+
+**Differences from the acceptance examples.** A1 draws three nodes and two edges, not
+three edges, because the two `a` triples are the subtitles of §2.1. The empty state says
+"Add a node to start" without the five largest classes, which need the schema reads of
+Phase 2. A history entry and a stored query have no **Show pattern**, because the query
+page has no list of past runs and a stored query opens in an editor tab, where the pane
+draws it. A11 and A12 are met in part. The keyboard and taps reach every element and make
+the three edits of the splice core, but a new triple is typed into a form, since the
+pickers that would build A1 with taps alone are Phase 2. A13 waits for the picker too.
+
+**Tests.** In Rust, `crates/sparkles-fmt/tests/pattern.rs` checks the classification of
+each construct, the ranges of `;` and `,` lists, paths, modifiers, the other query forms,
+errors and byte ranges after multi-byte characters. Its corpus test runs A3 over the
+golden inputs and every positive W3C SPARQL 1.0, 1.1 and 1.2 query the formatter's tests
+read. All 993 queries have a pattern, with 893 editable triples and 448 locked blocks
+between them, every locked block's text is the source at its range, and the items of
+every group cover each of its significant tokens apart from the `.` between items. The
+module's own tests check the JSON and the UTF-16 ranges, and
+`tests/pattern_fixtures.rs` keeps `ui/src/lib/pattern-fixtures.json` equal to the
+module's answers. Vitest checks the drawing, the keys, the rename match, every splice
+with its exact text, the placement rule of §4.2 beside locked blocks, prefix insertion,
+CRLF text, and that each result parses with the `oxigraph` package. With the built
+module present, it runs A4 as twenty seeded edits from each of five seeds on A2's query,
+checking R2, that the locked blocks stay byte-identical and that the only deletion is the
+range the edit names, and R3, that the parse agrees with the edit. The layout map's tests
+cover storage bounds, restore and renames. `ui/tests/mock/pattern.spec.ts` covers A1, A2,
+A6 to A9, A11, locked blocks through a sequence of canvas edits, the error states of
+§2.7, the result's Pattern tab, and the 390 px layout.
+
+**Measurements.** `ui/tests/mock/pattern-perf.spec.ts` runs A10 when `PATTERN_PERF=1`
+is set. On the development laptop, under a load average of about 20 from other builds
+and with the UI served by `vite dev`, a query of 201 triple patterns redrew after a
+keystroke in a median of 24 ms after the debounce over 50 runs when the keystroke changed
+a literal, and 47 ms when it changed a variable, so that a node went and a new one was
+placed by fcose. The slowest run took 120 ms. The parse in the module took a median of
+9.4 ms and building the drawing 1.3 ms, so the parse stays on the main thread as §4.6
+expected. These are not the reference laptop of U06 A2, and the U06 performance project
+does not exist yet, so A10 is recorded here rather than run in CI. The `pattern` export
+adds 40 KB to the browser module, from 1,119 KB to 1,159 KB, and 10 KB once compressed
+with brotli, from 293 KB to 303 KB. The editor already loads the module for **Format**,
+so the pane adds no download of its own.

@@ -17,6 +17,7 @@ import {
   type LintRequest,
   type LintResult,
 } from './api';
+import type { PatternAnswer } from './pattern';
 
 /** What the generated bindings (wasm-bindgen `--target web`) export. */
 export type FmtModule = {
@@ -27,6 +28,9 @@ export type FmtModule = {
   /** a `POST /$/lint` JSON body in, the endpoint's JSON answer out (modules built before
    * the linter have none) */
   lint?: (request: string) => string;
+  /** `{ text }` in, the pattern of the query out (spec U08 §3.2; modules built before the
+   * builder have none) */
+  pattern?: (request: string) => string;
 };
 
 /** The browser formatter is not there: not in this build, not loaded, or broken. */
@@ -56,6 +60,7 @@ function answerOf<T = FormatResult>(text: string): T {
  */
 export function localFormatter(load: (() => Promise<FmtModule>) | undefined) {
   let ready: Promise<FmtModule | null> | undefined;
+  let loaded: FmtModule | null = null;
   let broken = false;
 
   // loaded once; a failure is remembered (the browser caches a failed import anyway)
@@ -64,6 +69,7 @@ export function localFormatter(load: (() => Promise<FmtModule>) | undefined) {
       ? load()
           .then(async (m) => {
             await m.default();
+            loaded = m;
             return m;
           })
           .catch((e) => {
@@ -119,7 +125,36 @@ export function localFormatter(load: (() => Promise<FmtModule>) | undefined) {
     return lintRemote(req, signal);
   }
 
-  return { formatLocal, formatAny, lintLocal, lintAny };
+  /**
+   * The pattern of a query, in the browser only: the builder has no server fallback (U08
+   * §3.2), so without the module this throws `LocalUnavailable`.
+   */
+  async function patternLocal(text: string): Promise<PatternAnswer> {
+    const m = broken ? null : await module();
+    if (!m?.pattern)
+      throw new LocalUnavailable('the visual query builder needs the browser module');
+    try {
+      return JSON.parse(m.pattern(JSON.stringify({ text }))) as PatternAnswer;
+    } catch (e) {
+      broken = true;
+      console.warn('The browser formatter failed; the Pattern pane is off from now on', e);
+      throw new LocalUnavailable('the browser module failed', { cause: e });
+    }
+  }
+
+  /** The pattern answer at once when the module is already loaded, else null. */
+  function patternNow(text: string): PatternAnswer | null {
+    if (!loaded || broken || !loaded.pattern) return null;
+    try {
+      return JSON.parse(loaded.pattern(JSON.stringify({ text }))) as PatternAnswer;
+    } catch (e) {
+      broken = true;
+      console.warn('The browser formatter failed; the Pattern pane is off from now on', e);
+      return null;
+    }
+  }
+
+  return { formatLocal, formatAny, lintLocal, lintAny, patternLocal, patternNow };
 }
 
 // The bindings when the UI was built with them. `VITE_FMT_WASM=off` leaves them out (the
@@ -130,6 +165,27 @@ const bindings: Record<string, () => Promise<FmtModule>> =
     : import.meta.glob<FmtModule>('./wasm/sparkles_fmt_wasm.js');
 
 const shared = localFormatter(bindings['./wasm/sparkles_fmt_wasm.js']);
+
+// The visual query builder has no server fallback, so the mock UI tests, which format
+// through the mock's endpoint (`VITE_FMT_WASM=off`), still load the module for it when it
+// was built. `VITE_PATTERN_WASM=off` leaves it out too.
+const patternBindings: Record<string, () => Promise<FmtModule>> =
+  import.meta.env.VITE_PATTERN_WASM === 'off'
+    ? {}
+    : import.meta.env.VITE_FMT_WASM === 'off'
+      ? import.meta.glob<FmtModule>('./wasm/sparkles_fmt_wasm.js')
+      : bindings;
+
+const forPattern =
+  patternBindings === bindings
+    ? shared
+    : localFormatter(patternBindings['./wasm/sparkles_fmt_wasm.js']);
+
+/** The pattern of a query (U08); throws `LocalUnavailable` without the browser module. */
+export const patternLocal = forPattern.patternLocal;
+
+/** The pattern at once when the module is loaded already, else null (then `patternLocal`). */
+export const patternNow = forPattern.patternNow;
 
 /** Format in the browser; throws `LocalUnavailable` without the module, else like `api.format`. */
 export const formatLocal = shared.formatLocal;

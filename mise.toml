@@ -195,7 +195,8 @@ pnpm e2e
 
 [tasks."ui:e2e:mock"]
 description = "UI end-to-end tests (Playwright) against the mock backend, for pages and states that are hard to reach on a real server; extra args go to `playwright test`"
-depends = ["ui:e2e:browsers"]
+# the Pattern pane's tests need the browser module, which has no server fallback
+depends = ["ui:e2e:browsers", "ui:wasm"]
 dir = "ui"
 run = "pnpm e2e:mock"
 
