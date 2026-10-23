@@ -1141,6 +1141,11 @@ comparison. Eager execution fell from 46.3 s to 9.9 s, and a streamed response f
 stays at 5.69 GB and the streamed one at 1.99 GB, and the keyed join holds its right
 side's index of 24 bytes a row.
 
+After the review fixes, three runs of `q6` in each execution mode on forge returned the
+same sorted answer as before. Automatic and eager execution took 1.19 to 1.20 s of wall
+time with a peak of 267 MB, and a streamed response took 1.25 s with a peak of 191 MB
+through the cursor's keyed join.
+
 Codex reviewed the work, and all five findings were confirmed and fixed. The keyed join
 tested its condition on fewer pairs than the product, which an application function
 could observe, so such queries keep the generic join. A cursor's string comparison did
