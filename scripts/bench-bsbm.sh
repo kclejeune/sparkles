@@ -250,6 +250,12 @@ EOF
           -- "$JAVA" -Dhttp.keepAlive=false -Xmx2g -cp ".:lib/*" benchmark.testdriver.TestDriver -runs "$BSBM_RUNS" -w "$BSBM_WARMUP" \
           -mt "$c" -idir td_data -ucf "$ucf" -t "$DRIVER_TIMEOUT_MS" -o "$WORK/results/driver-${NAME[$e]}-$c$sfx.xml" \
           "http://${URL[$e]}" > "logs/driver-${NAME[$e]}-$c$sfx.log" 2>&1
+        # The driver can exit 0 after connection errors, and requests that fail fast would
+        # inflate the query mixes per hour. A server that no longer answers fails the cell.
+        if ! answering "$e"; then
+          python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c$sfx.xml" "$out" "${NAME[$e]}" "$c" "$label" 1 \
+            "the server stopped answering during the driver run"
+        fi
         # a server that crashed or hung during the mixes is restarted before the next run, so
         # one failure does not fail every later client count and mix (results/restarts.json)
         revive "$e" "$label x$c" results

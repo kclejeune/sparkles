@@ -203,6 +203,7 @@ declare -A NAME=([slow]=slow [fast]=fast) URL=([slow]=localhost/hang [fast]=loca
 ENGINES='slow fast' MIXES=std CLIENTS='1 4' USECASE=bi UCF=bi.txt RDFXML_NRS='' DEAD_ENGINES=''
 BSBM_WARMUP=50 BSBM_RUNS=500 DRIVER_TIMEOUT_MS=300000 BSBM_MAX_TIME=0.5 BSBM_KILL_AFTER=0.2
 revive() { echo "$1 $2" >> revived; }
+answering() { :; }
 bsbm_qmph
 """
         process = subprocess.run(["bash", "-euc", script], cwd=self.work,
@@ -230,6 +231,32 @@ bsbm_qmph
             args = json.loads(line)
             self.assertEqual(args[args.index("-runs") + 1], "500")
             self.assertEqual(args[args.index("-w") + 1], "50")
+
+    def test_a_server_that_stops_answering_fails_its_driver_cell(self):
+        # The fake driver exits 0 with a complete XML file, as BSBM's TestDriver can
+        # after its requests fail with connection errors.
+        source = (ROOT / "scripts/bench-bsbm.sh").read_text()
+        function = source[source.index("bsbm_qmph() {\n"):source.index("\nSUITE_EXTRA=bsbm_qmph")]
+        for name in ("bsbm", "results", "logs"):
+            (self.work / name).mkdir()
+        script = function + """
+declare -A NAME=([dies]=dies [lives]=lives) URL=([dies]=localhost/success [lives]=localhost/success)
+ENGINES='dies lives' MIXES=std CLIENTS='1' USECASE=explore UCF=explore.txt RDFXML_NRS='' DEAD_ENGINES=''
+BSBM_WARMUP=1 BSBM_RUNS=1 DRIVER_TIMEOUT_MS=300000 BSBM_MAX_TIME=5 BSBM_KILL_AFTER=0.2
+revive() { :; }
+answering() { [ "$1" != dies ]; }
+bsbm_qmph
+"""
+        process = subprocess.run(["bash", "-euc", script], cwd=self.work,
+                                 env=self.env | {"ROOT": str(ROOT), "WORK": str(self.work), "JAVA": str(self.fake)},
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        data = json.loads((self.work / "results/qmph.json").read_text())
+        self.assertEqual(data["lives"]["1"]["status"], "ok")
+        self.assertEqual(data["lives"]["1"]["qmph"], 123)
+        self.assertEqual(data["dies"]["1"]["status"], "error")
+        self.assertIsNone(data["dies"]["1"]["qmph"])
+        self.assertIn("stopped answering", data["dies"]["1"]["status_reasons"][0])
 
 
 if __name__ == "__main__":
