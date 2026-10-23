@@ -689,7 +689,8 @@ chip editing, predicate and path changes, the rename and locked-block confirmati
 warning mark, node deletion with its filters, the strip, the count and its timeout, and
 the schema failure note. `ui/tests/e2e/pattern.spec.ts` covers A1, A6, a count and A13
 on a real server. The mock server's class profiles now count literal datatypes and
-incoming predicates, as the real route does.
+incoming predicates, as the real route does. The four code reviews of Phase 2 found 20, 9, 3 and 0
+problems, and each fix has a regression test in Vitest or the mock suite.
 
 **Tests.** In Rust, `crates/sparkles-fmt/tests/pattern.rs` checks the classification of
 each construct, the ranges of `;` and `,` lists, paths, modifiers, the other query forms,
