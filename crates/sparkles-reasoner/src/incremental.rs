@@ -553,6 +553,8 @@ pub(crate) fn update(
                         return Err(e);
                     }
                 }
+                // the round's blocks are not kept until the next round
+                search.memo = Memo::default();
             }
             if dead.is_empty() {
                 break;
@@ -927,6 +929,8 @@ fn prove_all(
                 if s.err.is_some() {
                     abort.store(true, Ordering::Relaxed);
                 }
+                // the chunk's blocks go now, not when the whole round ends
+                s.memo = Memo::default();
                 (found, s)
             })
             .collect()
