@@ -3556,6 +3556,16 @@ impl Store {
         }
     }
 
+    /// Test hook: drive a due full-text background checkpoint through its actual
+    /// unlocked I/O path, returning whether it attempted directory synchronization.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn checkpoint_text_background_for_test(&self) -> bool {
+        self.text
+            .load_full()
+            .is_some_and(|ti| ti.checkpoint_background_for_test())
+    }
+
     /// Test hook: pause (or resume) the full-text index's background tick, so staged
     /// documents stay uncommitted until a search, compaction or close.
     #[cfg(feature = "text")]

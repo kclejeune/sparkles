@@ -2087,7 +2087,9 @@ mod imp {
                         rx.recv_timeout(CHECKPOINT_AFTER)
                     {
                         match weak.upgrade() {
-                            Some(inner) => inner.tick(),
+                            Some(inner) => {
+                                inner.tick();
+                            }
                             None => break,
                         }
                     }
@@ -2193,6 +2195,19 @@ mod imp {
         /// a second after writes, before compaction, and on drop.
         pub fn checkpoint(&self) -> Result<()> {
             self.inner.checkpoint()
+        }
+
+        /// Drive the real background checkpoint without waiting for its timer. This
+        /// only ages existing dirty work; it does not stage or publish documents.
+        #[cfg(feature = "failpoints")]
+        pub(crate) fn checkpoint_background_for_test(&self) -> bool {
+            {
+                let mut live = self.inner.live.lock();
+                if live.dirty_since.is_some() {
+                    live.dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+                }
+            }
+            self.inner.tick()
         }
 
         /// Stop maintenance before the store deletes or reuses this index's path.
@@ -2914,32 +2929,32 @@ mod imp {
 
         /// The tick: seal and settle what the last second staged, and checkpoint an
         /// index that has held unsynced commits for a second.
-        fn tick(&self) {
+        fn tick(&self) -> bool {
             if !self.ticks.load(Ordering::SeqCst) || !self.healthy() {
-                return;
+                return false;
             }
             let mut live = self.live.lock();
             if live.writer.is_none() || !self.healthy() {
-                return;
+                return false;
             }
             if let Err(e) = self.settle_locked(&mut live) {
                 self.fail_locked(&mut live, &e);
-                return;
+                return false;
             }
             if !live
                 .dirty_since
                 .is_some_and(|t| t.elapsed() >= CHECKPOINT_AFTER)
             {
-                return;
+                return false;
             }
             if live.committed != live.applied
                 && let Err(e) = self.commit_locked(&mut live)
             {
                 self.fail_locked(&mut live, &e);
-                return;
+                return false;
             }
             let Some(dir) = live.dir.clone() else {
-                return;
+                return false;
             };
             let generation = live.commit_generation;
             let checkpoint = dir.prepare_checkpoint();
@@ -2959,13 +2974,14 @@ mod imp {
             }
             let mut live = self.live.lock();
             if live.writer.is_none() || !live.dir.as_ref().is_some_and(|d| d.same_directory(&dir)) {
-                return;
+                return true;
             }
             match result {
                 Ok(true) if live.commit_generation == generation => live.dirty_since = None,
                 Ok(_) => {}
                 Err(e) => self.fail_locked(&mut live, &e.into()),
             }
+            true
         }
 
         fn checkpoint_locked(&self, live: &mut Live) -> Result<()> {

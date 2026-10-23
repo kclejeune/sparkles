@@ -11,6 +11,18 @@
 //! finished file or an atomic write) the marker is created and synced. A checkpoint syncs
 //! every file and the directory, and removes the marker only if no such write happened
 //! meanwhile. An index found with its marker is verified before it is trusted.
+//!
+//! Tantivy finishes the segment files before publishing metadata that references them.
+//! Finishing a segment marks it here, and an atomic metadata write marks before its
+//! temporary file is written. Finished segments present before the counter snapshot
+//! are included in the scan; finishing another segment during it changes the counter.
+//! A later metadata publication marks again before changing its file. An in-flight
+//! atomic-write guard also keeps a checkpoint from declaring a metadata replacement
+//! clean while that replacement is still being written or renamed.
+//!
+//! The pathname lease serializes checkpoints with directory replacement. It does not
+//! stop Tantivy publication. The checkpoint streams file handles rather than pinning
+//! every segment at once, so its handle count does not grow with the index.
 
 use parking_lot::{Mutex, MutexGuard};
 use std::fs::{File, OpenOptions};
