@@ -223,9 +223,11 @@ export function clusterPlaces(
 ): { clusters: Cluster[]; of: Map<string, number> } {
   const xy = places.map((p) => mercatorPixel([p.lon, p.lat], zoom));
   const world = TILE * 2 ** zoom;
-  // the columns of the grid wrap, so that places either side of the antimeridian meet
-  const columns = Math.max(1, Math.ceil(world / px));
-  const column = (v: number) => ((Math.floor(v / px) % columns) + columns) % columns;
+  // The columns of the grid wrap and are all the same width, at least `px`, so that places
+  // either side of the antimeridian are in neighbouring columns.
+  const columns = Math.max(1, Math.floor(world / px));
+  const columnWidth = world / columns;
+  const column = (v: number) => ((Math.floor(v / columnWidth) % columns) + columns) % columns;
   const cell = (v: number) => Math.floor(v / px);
   // a grid of cells `px` wide: a place's neighbours within reach are in the 3 by 3 around it
   const grid = new Map<string, number[]>();

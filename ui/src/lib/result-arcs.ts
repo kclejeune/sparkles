@@ -229,7 +229,9 @@ export async function locateEndsCompared(
   const before: Ends = new Map();
   for (const [id, e] of ends) (kept.has(id) ? now : before).set(id, e);
   if (!before.size) return locateEnds(ends, deps);
-  const [a, b] = await Promise.all([locateEnds(now, deps), locateEnds(before, base)]);
+  // one side after the other, so that the lookups in flight stay within `LOCATE_IN_FLIGHT`
+  const a = await locateEnds(now, deps);
+  const b = await locateEnds(before, base);
   const at = new Map([...a.places, ...b.places].map((p) => [p.id, p]));
   const missing = new Map([...a.missing, ...b.missing].map((m) => [m.id, m]));
   return {

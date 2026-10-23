@@ -209,6 +209,8 @@ describe('clustering places closer than 20 px', () => {
     expect(near.of.get('a')).toBe(near.of.get('b'));
     const far = clusterPlaces([place('a', 150, 0), place('b', -150, 0)], 0);
     expect(far.clusters).toHaveLength(2);
+    // 170 and -179 are 15.6 px apart at zoom 0 with the seam between them
+    expect(clusterPlaces([place('a', 170, 0), place('b', -179, 0)], 0).clusters).toHaveLength(1);
     // a place at exactly 180 and one at -180 are the same spot
     expect(clusterPlaces([place('a', 180, 10), place('b', -180, 10)], 3).clusters).toHaveLength(1);
   });

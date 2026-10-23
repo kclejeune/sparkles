@@ -52,47 +52,51 @@ export async function locateEntities(iris: string[], deps: LocateDeps): Promise<
       if (deps.signal?.aborted) return;
       const mine = next++;
       if (mine >= batches.length) return;
-      const batch = batches[mine];
-      let retry: string[] = [];
-      try {
-        const limit = batch.length * 6;
-        const rows = await deps.run(geometriesQuery(batch), limit);
-        if (deps.signal?.aborted) return;
-        // The limit is shared by the batch, so an entity with many geometries can take every
-        // row. A full answer sends the entities it has no row for round again.
-        if (rows.length >= limit) {
-          const answered = new Set<string>();
-          for (const r of rows) if (r.s?.type === 'uri') answered.add(r.s.value);
-          const again = batch.filter((iri) => !answered.has(iri));
-          if (again.length && again.length < batch.length) retry = again;
+      // a batch whose answer came back full is followed here by its retry, so that a
+      // worker that is still busy never leaves a retry behind for workers that have gone
+      let batch: string[] | undefined = batches[mine];
+      while (batch) {
+        let retry: string[] = [];
+        try {
+          const limit = batch.length * 6;
+          const rows = await deps.run(geometriesQuery(batch), limit);
+          if (deps.signal?.aborted) return;
+          // The limit is shared by the batch, so an entity with many geometries can take
+          // every row. A full answer sends the entities it has no row for round again.
+          if (rows.length >= limit) {
+            const answered = new Set<string>();
+            for (const r of rows) if (r.s?.type === 'uri') answered.add(r.s.value);
+            const again = batch.filter((iri) => !answered.has(iri));
+            if (again.length && again.length < batch.length) retry = again;
+          }
+          const lits: { iri: string; lit: GeoLiteral }[] = [];
+          for (const r of rows) {
+            const s = r.s;
+            const l = r.lit;
+            if (s?.type === 'uri' && isGeoLiteral(l))
+              lits.push({ iri: s.value, lit: { value: l.value, datatype: l.datatype } });
+          }
+          const geoms = await resolveGeometries(
+            lits.map((l) => l.lit),
+            deps.convert,
+          );
+          lits.forEach((l, i) => {
+            if (out.found.has(l.iri)) return;
+            const g = geoms[i];
+            if (!g || !('geometry' in g)) return;
+            const p = representativePoint(g.geometry);
+            if (p) out.found.set(l.iri, p);
+          });
+        } catch (e) {
+          if (deps.signal?.aborted) return;
+          retry = [];
+          out.failed += batch.length;
+          out.firstError ??= e instanceof Error ? e.message : String(e);
         }
-        const lits: { iri: string; lit: GeoLiteral }[] = [];
-        for (const r of rows) {
-          const s = r.s;
-          const l = r.lit;
-          if (s?.type === 'uri' && isGeoLiteral(l))
-            lits.push({ iri: s.value, lit: { value: l.value, datatype: l.datatype } });
-        }
-        const geoms = await resolveGeometries(
-          lits.map((l) => l.lit),
-          deps.convert,
-        );
-        lits.forEach((l, i) => {
-          if (out.found.has(l.iri)) return;
-          const g = geoms[i];
-          if (!g || !('geometry' in g)) return;
-          const p = representativePoint(g.geometry);
-          if (p) out.found.set(l.iri, p);
-        });
-        if (retry.length) batches.push(retry);
-      } catch (e) {
-        if (deps.signal?.aborted) return;
-        retry = [];
-        out.failed += batch.length;
-        out.firstError ??= e instanceof Error ? e.message : String(e);
+        done += batch.length - retry.length;
+        deps.onBatch?.(out.found, done, unique.length);
+        batch = retry.length ? retry : undefined;
       }
-      done += batch.length - retry.length;
-      deps.onBatch?.(out.found, done, unique.length);
     }
   };
   await Promise.all(Array.from({ length: Math.min(LOCATE_IN_FLIGHT, batches.length) }, worker));

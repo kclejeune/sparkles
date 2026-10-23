@@ -1275,7 +1275,9 @@
       startedAt: started,
       controller,
       reasoning,
-      ...(keepShown ? { result: keepShown.result, base: keepShown.base } : {}),
+      ...(keepShown
+        ? { result: keepShown.result, base: keepShown.base, baseFrom: keepShown.baseFrom }
+        : {}),
     };
     try {
       if (k === 'UPDATE') {
@@ -1346,7 +1348,7 @@
                 base,
                 baseFrom: against
                   ? { ds: onBranch(dsName, against), at: '' }
-                  : { ds: dsTarget, at: fromAt ?? '' },
+                  : { ds: dsTarget, at: readAt(base.at) || (fromAt ?? '') },
               }
             : {}),
           view: keep ? prevView! : defaultView(result),

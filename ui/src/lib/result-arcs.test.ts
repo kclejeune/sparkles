@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { AtInfo, Term } from './api';
 import { MAX_ARCS } from './arcs';
 import { GEOJSON_LITERAL, WKT_LITERAL } from './geo';
+import { LOCATE_IN_FLIGHT } from './locate';
 import {
   arcColumns,
   defaultArcColumns,
@@ -268,5 +269,31 @@ describe('positions in a comparison', () => {
     });
     expect(found.places.map((p) => p.id)).toEqual(['<http://x/a>']);
     expect(found.missing.map((m) => m.iri)).toEqual(['http://x/b']);
+  });
+
+  it('keeps both sides within the lookups in flight of one', async () => {
+    const people = (prefix: string, n: number) =>
+      Array.from({ length: n }, (_, i): (Term | null)[] => [
+        iri(`http://x/${prefix}${i}`),
+        iri('http://x/org'),
+      ]);
+    const rows = [...people('now', 800), ...people('old', 800)];
+    const r = resultLinks(['a', 'b'], rows, {
+      from: 'a',
+      to: 'b',
+      prefixes,
+      marks: [...Array(800).fill('kept'), ...Array(800).fill('removed')],
+    });
+    let active = 0;
+    let peak = 0;
+    const run = async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      active--;
+      return [];
+    };
+    await locateEndsCompared(r.ends, r.links, { run, convert: never }, { run, convert: never });
+    expect(peak).toBe(LOCATE_IN_FLIGHT);
   });
 });

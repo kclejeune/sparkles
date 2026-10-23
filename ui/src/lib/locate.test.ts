@@ -129,6 +129,26 @@ describe('locating entities', () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
+  it('retries a full answer also when the other workers have gone', async () => {
+    // 201 entities make two batches. The small one finishes first, so its worker has gone
+    // by the time the large one answers full for its first entity alone.
+    const iris = Array.from({ length: LOCATE_BATCH + 1 }, (_, i) => `http://x/e${i}`);
+    const run = vi.fn(async (sparql: string, limit: number) => {
+      const asked = sparql.match(/<http:\/\/x\/e\d+>/g) ?? [];
+      if (asked.length === LOCATE_BATCH) {
+        await new Promise((r) => setTimeout(r, 30));
+        return Array.from({ length: limit }, (_, i) => row('http://x/e0', wkt(`POINT(${i} 0)`)));
+      }
+      if (asked.length === 1 && asked[0] === '<http://x/e200>')
+        return [row('http://x/e200', wkt('POINT(2 2)'))];
+      // the retry: everything the full answer left out
+      return asked.map((a) => row(a.slice(1, -1), wkt('POINT(1 1)')));
+    });
+    const out = await locateEntities(iris, { run, convert: never });
+    expect(out.found.size).toBe(iris.length);
+    expect(out.found.get('http://x/e199')).toEqual([1, 1]);
+  });
+
   it('counts a retried batch once in its progress', async () => {
     const seen: [number, number][] = [];
     const run = async (sparql: string, limit: number) =>
