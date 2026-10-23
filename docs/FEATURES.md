@@ -353,9 +353,11 @@ that work by priority and links each item to its design spec.
 * Group commit on datasets with a full-text, spatial or embedding index has passed its
   crash runs, but complete performance acceptance on forge remains open. Partial
   full-text pilots do not establish the full serial, concurrent and mixed-load gates.
-  Background file synchronization releases the full-text publication mutex, while
-  WAL and vocabulary synchronization and publication during a group fence still
-  need native latency acceptance. Spatial and embedding acceptance also remain open. [Roadmap](ROADMAP.md) item 86 and
+  Background file synchronization releases the full-text publication mutex, and
+  after three checkpoints in a row that writes raced, the next one holds it so that
+  the recovery marker still clears. WAL and vocabulary synchronization, publication
+  during a group fence and that locked checkpoint still need native latency
+  acceptance. Spatial and embedding acceptance also remain open. [Roadmap](ROADMAP.md) item 86 and
   [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates).
 * **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.
   The bounded automatic ASK policy covers `q12a`, and string equality pruning lets

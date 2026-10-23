@@ -1348,6 +1348,37 @@ text/RDF equality. Ten histories and 2,496 replayed crash images passed. This
 fixture is a durability test, not a native latency measurement. The older kill and
 log-writes tables above continue to describe their recorded sources.
 
+The full gate on 2026-10-23 failed one image of this fixture with a panic inside
+Tantivy. The image kept the recovery marker, and `meta.json` named a segment whose
+`.pos` file had been torn to 6 bytes. Open verified the index, as the marker requires,
+and the order of synchronization was correct. Tantivy's footer parser rejects a file
+shorter than 4 bytes but subtracts its 8-byte trailer from the length of a file of 4 to
+7 bytes, so its checksum check panicked and the open failed instead of rebuilding the
+index. The `sparkles check` probe had the same panic. Verification and the probe now
+report a committed file shorter than the trailer as damaged before Tantivy reads it,
+and treat any panic inside the checksum check as damage. Text open also takes a panic
+while it inspects or opens an existing index as damage and rebuilds the index from the
+RDF data. The fault predates this revision, since verification has worked this way
+since F03, and the background fixture made such images more common. A failing image
+needs a committed file torn to that range, and verification visits the files in hash
+set order, so the failure was intermittent. Repeated runs of the background fixture on
+`6699f27d` and `0fd5f81d` under heavy load panicked in 2 of 11 runs that finished. A
+test tears every segment file of a marked index to each length from 0 to 9
+bytes and requires `sparkles check` to report damage and open to rebuild. It panicked
+before the fix.
+
+A background checkpoint that a write raced keeps the marker. Under commits more
+frequent than one synchronization, every attempt could race, the marker would never
+clear, and every crash would pay verification at open. After three raced background
+checkpoints in a row, the tick now holds the live writer lock through the next
+synchronization, as an explicit checkpoint does, so no text publication can race it.
+That attempt blocks text publication for one synchronization, at most once in four
+checkpoint ticks under steady writes, and in exchange the time in which a crash pays
+verification stays bounded. Any clean checkpoint resets the count. A test publishes
+inside every unlocked synchronization and requires the fourth tick to clear the
+marker. It fails when the fallback is disabled. The latency cost of the locked
+attempt has not been measured on native hardware.
+
 This change removes the background file-synchronization wait from the live writer
 lock. Tantivy publication can still occur inside a group leader's fence, and WAL
 and vocabulary synchronization can still delay writes. It does not establish the

@@ -740,7 +740,9 @@ checks, not simulated power-loss measurements.
 - *Commit path.* A Tantivy commit with an fsync on every write cost too much (§5.3, open
   question 11). The first change (`8f3eb13`) stopped fsyncing index commits. The WAL is the
   durable record, and a checkpoint about once a second bounds the unsynced window. At open,
-  a dirty index is verified by checksum and caught up from the WAL instead of rebuilt. The
+  a dirty index is verified by checksum and caught up from the WAL instead of rebuilt.
+  A segment file torn shorter than Tantivy's 8-byte footer trailer counts as damaged,
+  because Tantivy's own check panics on it. The
   second change (`9bc3db2`, `2cc3361`) made the commit lazy. A write only stages its
   documents. They are committed by the next text query that needs them, by a tick about
   once a second, or once about 16,000 changes are staged. Each snapshot still searches
