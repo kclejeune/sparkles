@@ -1756,7 +1756,7 @@ impl BlockCache {
 
     /// Segment `s` of block `b` with the columns in `mask` (the others are empty), as a
     /// block of the segment's rows. A column the cache holds whole is cut from it, and a
-    /// missing one is decoded from its frame alone and kept.
+    /// missing one is decoded from its frame alone. Either is kept as the segment.
     pub fn get_segment(
         &self,
         idx: &PermIndex,
@@ -1778,8 +1778,13 @@ impl BlockCache {
                 continue;
             }
             if let Some(whole) = self.cache.get(&self.key(idx, b, c, WHOLE)) {
+                // cut once and kept, so that later requests find the segment
                 self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                *col = Col::from(whole[r0..r1].to_vec());
+                let v = Col::from(whole[r0..r1].to_vec());
+                if self.fill {
+                    self.cache.insert(key, v.clone());
+                }
+                *col = v;
                 continue;
             }
             self.misses

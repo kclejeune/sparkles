@@ -825,6 +825,7 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRul
         mask = ALL_COLS;
     }
     let mut last = None;
+    let mut last_span: Option<(usize, (usize, usize))> = None;
     // created at the first block the cache lacks, so a warm request builds nothing
     let mut warm: Option<crate::index::WarmColumns> = None;
     if idx.segmented() {
@@ -864,8 +865,17 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRul
                 steps = 0;
                 ctx.check()?;
             }
-            // a range of a few rows of the block: the segments the reader decodes
+            // a range of a few rows of the block: the segments the reader decodes, asked
+            // for once when consecutive ranges share them
+            if let Some((lb, (s0, s1))) = last_span
+                && lb == b
+                && idx.segment_first(b, s0) <= lo
+                && (idx.last_segment(b, s1 - 1) || hi < idx.segment_first(b, s1))
+            {
+                continue;
+            }
             if let Some(span) = idx.read_span(&ctx.snap.cache, b, &lo, &hi, mask) {
+                last_span = Some((b, span));
                 if idx.prefetch_segments(&ctx.snap.cache, b, span, mask) && ctx.opt.parallel_decode
                 {
                     warm.get_or_insert_with(|| ctx.snap.cache.warm_columns(idx))
