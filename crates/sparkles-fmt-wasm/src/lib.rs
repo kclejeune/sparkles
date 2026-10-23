@@ -17,7 +17,9 @@
 use serde_json::{Map, Value as J, json};
 use sparkles_fmt::lint::{self, LintError, LintOptions};
 use sparkles_fmt::options::{self, Value};
+use sparkles_fmt::pattern::{Group, Item, Locked, Path, Pattern, PatternError, Term};
 use sparkles_fmt::{Detection, FormatError, Language, Options};
+use std::ops::Range;
 use wasm_bindgen::prelude::*;
 
 /// Format the document of a `POST /$/format` JSON body; the answer is the endpoint's JSON
@@ -125,6 +127,181 @@ fn run_lint(request: &str) -> Result<J, J> {
             "diagnostics": l.diagnostics.iter().map(|d| diagnostic(text, d)).collect::<Vec<J>>(),
         }))
     }
+}
+
+/// The pattern of a query for the visual query builder (spec U08 §3.2): `{ text }` in,
+/// and out either `{ ok: true, form, prologue, root, projection, limit, offset,
+/// modifiers, locked }` or `{ ok: false, error, line, column }` (`code: "update"` for an
+/// update request, `"bad-request"` for a request that is not `{ text }`). Every range is
+/// `{ from, to }` in UTF-16 code units, as `lint` gives them.
+#[wasm_bindgen]
+pub fn pattern(request: &str) -> String {
+    match run_pattern(request) {
+        Ok(v) | Err(v) => v.to_string(),
+    }
+}
+
+fn run_pattern(request: &str) -> Result<J, J> {
+    let fail = |code: &str, error: &str, line: u32, column: u32| json!({ "ok": false, "code": code, "error": error, "line": line, "column": column });
+    let body: J = serde_json::from_str(request)
+        .map_err(|e| fail("bad-request", &format!("invalid JSON: {e}"), 0, 0))?;
+    let text = body
+        .get("text")
+        .and_then(J::as_str)
+        .ok_or_else(|| fail("bad-request", "expected `text`, the query", 0, 0))?;
+    match sparkles_fmt::pattern::pattern(text) {
+        Ok(p) => Ok(pattern_json(text, &p)),
+        Err(PatternError::Update) => Err(fail(
+            "update",
+            "Updates are not drawn. The builder edits queries.",
+            1,
+            1,
+        )),
+        Err(PatternError::Syntax {
+            message,
+            line,
+            column,
+        }) => Err(fail(
+            "syntax",
+            &format!(
+                "SPARQL syntax error at line {line}, column {column}: {}",
+                short_message(&message)
+            ),
+            line,
+            column,
+        )),
+    }
+}
+
+/// Byte offsets to UTF-16 offsets, through a table built once per text (the identity for
+/// ASCII text).
+struct Units {
+    table: Option<Vec<u32>>,
+}
+
+impl Units {
+    fn new(text: &str) -> Units {
+        if text.is_ascii() {
+            return Units { table: None };
+        }
+        let mut table = vec![0u32; text.len() + 1];
+        let mut at = 0u32;
+        for (i, c) in text.char_indices() {
+            // inside a character: its start
+            table[i..i + c.len_utf8()].fill(at);
+            at += c.len_utf16() as u32;
+        }
+        table[text.len()] = at;
+        Units { table: Some(table) }
+    }
+
+    fn at(&self, byte: usize) -> usize {
+        match &self.table {
+            None => byte,
+            Some(t) => t[byte.min(t.len() - 1)] as usize,
+        }
+    }
+
+    fn range(&self, r: &Range<usize>) -> J {
+        json!({ "from": self.at(r.start), "to": self.at(r.end) })
+    }
+}
+
+fn pattern_json(text: &str, p: &Pattern) -> J {
+    let u = Units::new(text);
+    let mut j = json!({
+        "ok": true,
+        "form": p.form.name(),
+        "prologue": {
+            "prefixes": p.prefixes.iter().map(|x| json!({
+                "prefix": x.prefix, "iri": x.iri, "range": u.range(&x.range),
+            })).collect::<Vec<J>>(),
+        },
+        "root": p.root.as_ref().map(|g| group_json(&u, g)),
+        "projection": p.projection.as_ref().map(|x| json!({
+            "vars": x.vars, "star": x.star, "distinct": x.distinct, "locked": x.locked,
+            "range": u.range(&x.range),
+        })),
+        "modifiers": p.modifiers.iter().map(|l| locked_json(&u, l)).collect::<Vec<J>>(),
+        "locked": p.locked.iter().map(|l| locked_json(&u, l)).collect::<Vec<J>>(),
+    });
+    for (key, n) in [("limit", &p.limit), ("offset", &p.offset)] {
+        if let Some(n) = n {
+            j[key] = json!({ "value": n.value, "range": u.range(&n.range) });
+        }
+    }
+    j
+}
+
+fn group_json(u: &Units, g: &Group) -> J {
+    json!({
+        "kind": g.kind.name(),
+        "range": u.range(&g.range),
+        "inner": u.range(&g.inner),
+        "items": g.items.iter().map(|i| item_json(u, i)).collect::<Vec<J>>(),
+    })
+}
+
+fn item_json(u: &Units, i: &Item) -> J {
+    match i {
+        Item::Triple(t) => json!({
+            "type": "triple",
+            "s": term_json(u, &t.s),
+            "p": {
+                "kind": t.p.kind.name(), "text": t.p.text, "value": t.p.value,
+                "path": t.p.path.as_ref().map(path_json),
+            },
+            "o": term_json(u, &t.o),
+            "range": u.range(&t.range),
+            "sRange": u.range(&t.s.range),
+            "pRange": u.range(&t.p.range),
+            "oRange": u.range(&t.o.range),
+            "stmt": t.stmt,
+            "entry": t.entry,
+            "object": t.object,
+            "entryRange": u.range(&t.entry_range),
+            "objectRange": u.range(&t.object_range),
+        }),
+        Item::Filter(f) => json!({
+            "type": "filter",
+            "expr": f.form.as_ref().map(|x| json!({ "op": x.op, "var": x.var, "args": x.args })),
+            "vars": f.vars,
+            "text": f.text,
+            "range": u.range(&f.range),
+        }),
+        Item::Group(g) => {
+            let mut j = group_json(u, g);
+            j["type"] = json!("group");
+            j
+        }
+        Item::Locked(l) => {
+            let mut j = locked_json(u, l);
+            j["type"] = json!("locked");
+            j
+        }
+    }
+}
+
+fn term_json(u: &Units, t: &Term) -> J {
+    json!({ "kind": t.kind.name(), "text": t.text, "value": t.value, "range": u.range(&t.range) })
+}
+
+fn path_json(p: &Path) -> J {
+    match p {
+        Path::Iri { text, iri } => json!({ "kind": "iri", "text": text, "iri": iri }),
+        Path::Seq(v) => {
+            json!({ "kind": "seq", "items": v.iter().map(path_json).collect::<Vec<J>>() })
+        }
+        Path::Alt(v) => {
+            json!({ "kind": "alt", "items": v.iter().map(path_json).collect::<Vec<J>>() })
+        }
+        Path::Inv(i) => json!({ "kind": "inv", "item": path_json(i) }),
+        Path::Mod { op, item } => json!({ "kind": "mod", "op": op, "item": path_json(item) }),
+    }
+}
+
+fn locked_json(u: &Units, l: &Locked) -> J {
+    json!({ "kind": l.kind, "vars": l.vars, "text": l.text, "range": u.range(&l.range) })
 }
 
 /// A finding as `POST /$/lint` writes it: lines and columns as `sparkles lint` prints
@@ -395,6 +572,76 @@ mod tests {
         assert_eq!(r["status"], 400);
         let r = call_lint(json!({ "text": "SELECT * {", "language": "sparql" }));
         assert_eq!(r["diagnostics"][0]["rule"], "syntax");
+    }
+
+    fn call_pattern(req: J) -> J {
+        serde_json::from_str(&pattern(&req.to_string())).unwrap()
+    }
+
+    #[test]
+    fn patterns_with_utf16_ranges() {
+        let text = "PREFIX ex: <http://example.org/>\n\
+                    SELECT ?s WHERE { ?s ex:label \"\u{1F600}\" ; ex:p ?o . BIND(1 AS ?y) # one\n} LIMIT 3";
+        let r = call_pattern(json!({ "text": text }));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["form"], "select");
+        assert_eq!(r["prologue"]["prefixes"][0]["prefix"], "ex");
+        assert_eq!(r["projection"]["vars"], json!(["s"]));
+        assert_eq!(r["limit"]["value"], 3);
+        assert!(r.get("offset").is_none());
+        let items = r["root"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["type"], "triple");
+        assert_eq!(items[0]["p"]["value"], "http://example.org/label");
+        assert_eq!(items[1]["o"]["value"], "o");
+        let units = |s: &str| s.encode_utf16().count() as u64;
+        // after the emoji, offsets count two code units for it
+        let o = &items[1]["oRange"];
+        let from = units(&text[..text.find("?o").unwrap()]);
+        assert_eq!(
+            (o["from"].as_u64(), o["to"].as_u64()),
+            (Some(from), Some(from + 2))
+        );
+        assert_eq!(items[2]["type"], "locked");
+        assert_eq!(items[2]["kind"], "BIND");
+        assert_eq!(items[2]["text"], "BIND(1 AS ?y) # one");
+        let s: Vec<u16> = text.encode_utf16().collect();
+        let l = &items[2]["range"];
+        let (a, b) = (
+            l["from"].as_u64().unwrap() as usize,
+            l["to"].as_u64().unwrap() as usize,
+        );
+        assert_eq!(String::from_utf16(&s[a..b]).unwrap(), "BIND(1 AS ?y) # one");
+        let path = call_pattern(json!({ "text": "SELECT * { ?a <http://x/p>+ ?b }" }));
+        assert_eq!(
+            path["root"]["items"][0]["p"]["path"],
+            json!({ "kind": "mod", "op": "+", "item": { "kind": "iri", "text": "<http://x/p>", "iri": "http://x/p" } })
+        );
+    }
+
+    #[test]
+    fn pattern_errors() {
+        let r = call_pattern(json!({ "text": "SELECT * {" }));
+        assert_eq!(
+            (
+                r["ok"].as_bool(),
+                r["code"].as_str(),
+                r["line"].as_u64(),
+                r["column"].as_u64()
+            ),
+            (Some(false), Some("syntax"), Some(1), Some(11))
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("SPARQL syntax error at line 1")
+        );
+        let r = call_pattern(json!({ "text": "DELETE WHERE { ?s ?p ?o }" }));
+        assert_eq!(r["code"], "update");
+        assert_eq!(call_pattern(json!({ "nope": 1 }))["code"], "bad-request");
+        assert_eq!(pattern("{"), pattern("{"));
+        assert!(pattern("{").contains("bad-request"));
     }
 
     #[test]
