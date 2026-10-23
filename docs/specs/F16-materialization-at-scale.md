@@ -1401,22 +1401,25 @@ not measured on their own. The other changes made the difference.
 | RDFS, change read back from the dataset | 5.77 s | 3.77 s | 3.46 s |
 | OWL 2 RL, change read back from the dataset | 4.38 s | 2.55 s | 1.94 s |
 
-The goal is met. By the medians, the changes take 0.90 to 1.09 times their time before the
+The goal is met. By the medians, the changes take 0.90 to 1.12 times their time before the
 follow-up for RDFS and 1.00 to 1.18 times for OWL 2 RL, at most 1.2 times in every row, and
 the kept closure stays at 927 MiB for RDFS and 1,244 MiB for OWL 2 RL, 41% and 47% of the
 closure that held the explicit facts. `0188dc48`, the second pass without the memo and the
 counter, took 1.22 times for the OWL 2 RL change and 1.28 times for its undo in the same six
 rounds. Each build had single slow runs, such as 27 ms for the RDFS undo and 75 ms for the
-OWL 2 RL undo of the second pass, so the medians decide. The second pass adds no memory
-beyond a memo of at most eight blocks per search while its chunk runs, and the peak heap of
-a change fell. Full runs of `0188dc48` measured 1.5% slower for RDFS and 2.5% for OWL 2 RL
+OWL 2 RL undo of the second pass, so the medians decide. The kept closure is unchanged. A
+run holds more transient buffers, each charged to its budget: the deduplicated candidates
+and their answers in `write_changes`, the candidates of a merge sorted by the probe they
+need with the list of their predicate-object pairs, and a memo of at most eight blocks per
+search while its chunk runs. They grow with the run's candidates, and the peak heap of a
+change of 1,000 triples still fell. Full runs of `0188dc48` measured 1.5% slower for RDFS and 2.5% for OWL 2 RL
 than the first pass in the batch that ran both, close to the spread between batches, and
 they stay faster than before the follow-up.
 
 The runs at other sizes and at 1 thread measured `0188dc48`, the commit before the memo and
 the counter, against `a6179e58` on forge, in two rounds for the sizes and three for 1 thread.
-The memo and the counter change only the backward search, so the times of the deletion
-rounds may now be lower than these.
+The memo changes only the backward search, and the counter change touches every read of a
+warm block, so these times may now be lower.
 
 | Run | Before the follow-up | `0188dc48` |
 |---|---|---|

@@ -446,10 +446,11 @@ memory the baseline needed, which meets A1. These are development numbers from a
 Namespace instance, not forge. [F16's Outcome](specs/F16-materialization-at-scale.md#outcome)
 has the method and the decision.
 
-### Small incremental runs at LUBM(100)
+### Small incremental runs on LUBM-style data
 
 Roadmap item 87 measured small incremental runs over a kept closure on forge on
-2026-10-23. The data is LUBM with 100 universities, 13.1 million triples, and each run
+2026-10-23. The data is LUBM-style data with 100 universities from the generator of
+`examples/lubm.rs`, 13.1 million triples, not the UBA data of the LUBM section, and each run
 materializes the closure, then changes 1,000 triples, undoes the change and makes it again,
 each time from the closure kept in memory. Commit 534a7ad3 ran against a6179e58, the commit
 before the kept closure dropped the explicit facts, in six interleaved rounds at 16 threads,
