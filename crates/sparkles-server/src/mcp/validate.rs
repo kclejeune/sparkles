@@ -522,6 +522,8 @@ impl Tools<'_> {
                 max_memory_bytes: self.cfg().query_memory_bytes,
                 max_rows_produced: limits.max_rows_produced,
                 forbid_service: true,
+                // the grant the call was admitted with (X08-P1-grant-routing)
+                grant: self.call.grant.clone(),
                 ..Default::default()
             }),
             ..Default::default()

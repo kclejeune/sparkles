@@ -4548,9 +4548,10 @@ can size them separately (`CatalogCaches::Sizes`) or give each dataset its own
 (`CatalogCaches::PerDataset`). `MemoryOptions::pool_bytes` adds a query memory pool, the
 estimated bytes that all the catalog's queries and updates may hold together. A query
 that the pool cannot cover fails with `BudgetKind::ServerMemory`, and nothing queues. An
-eager result, a Rust `QueryResult` or a Python or Node result object, keeps its query's
-peak estimate in the pool until it is dropped or collected, so a program that holds many
-results should release them when it is done. There is no pool by default. A dataset
+eager result, a Rust `QueryResult` or a Python or Node result object, keeps its share of
+the pool until it is dropped or collected, so a program that holds many results should
+release them when it is done. A SELECT or ASK result keeps the estimate of its own rows,
+and a CONSTRUCT or DESCRIBE result keeps its query's peak estimate. There is no pool by default. A dataset
 opened on its own keeps its own caches. Python takes `total_query_memory_bytes` in
 `Catalog(...)` and `Catalog.memory(...)`, and Node takes `totalQueryMemoryBytes` in the
 catalog options. The JVM bindings do not expose the pool.

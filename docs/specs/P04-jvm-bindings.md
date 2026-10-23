@@ -482,7 +482,13 @@ binding. Once the transaction it ran in has ended, the iterator throws
 `QueryIterator.cancel()` from another thread. `QueryIterSparkles.requestCancel` calls
 `FfiQuery.cancel`, which sets the `cancel` flag of the query's `QueryOptions`. Sparkles
 checks it while it runs, and the blocked execute call returns `Cancelled`, which Jena
-reports as `QueryCancelledException`.
+reports as `QueryCancelledException`. The cancel can arrive while the iterator's own
+thread finishes and releases its native query. The iterator's native fields are
+volatile, so the cancelling thread sees a release, and a cancel that reaches an object
+released in between finds its call counter at zero and is ignored, since that query
+has already finished. Until 2026-10-23 that case threw `IllegalStateException` from
+`abort()` or Jena's timeout thread. `abort_racing_the_release_of_a_query_never_throws`
+aborts 9,000 short queries from a second thread while they finish.
 
 **`FROM` and `FROM NAMED`.** Sparkles evaluates them by selecting graphs of the dataset,
 which is what Jena's `DynamicDatasets` does when a dataset is given. Neither engine reads

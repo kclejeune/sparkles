@@ -364,6 +364,7 @@ fn call(p: Principal) -> Call {
         principal: p,
         headers: None,
         held: None,
+        grant: None,
     }
 }
 

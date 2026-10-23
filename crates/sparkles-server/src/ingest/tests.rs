@@ -1686,7 +1686,7 @@ async fn review_refresh_publication_is_ordered() {
             "{metrics}"
         );
     }
-    let current = pending::current(&st, &ds).unwrap();
+    let current = pending::current(&st, &ds, None).unwrap();
     assert!(current.kinds(|_| true).values().all(|k| k.open == 0));
     let (_, maintenance) = send(&app, req("GET", "/$/memory/org/maintenance", Value::Null)).await;
     assert_eq!(maintenance["review"]["open"], 0, "{maintenance}");

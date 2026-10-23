@@ -142,18 +142,28 @@ impl QueryPool {
     }
 
     fn wake(&self) {
-        // the callbacks run outside the lock, so that one may poll its ticket
-        let wakers: Vec<Waker> = self
-            .queue
-            .lock()
-            .waiters
-            .iter()
-            .filter_map(|w| w.wake.clone())
-            .collect();
-        for f in wakers {
+        // the callback runs outside the lock, so that it may poll its ticket
+        let next = self.next_to_serve(&self.queue.lock());
+        if let Some((_, Some(f))) = next {
             f();
         }
         self.changed.notify_all();
+    }
+
+    /// The wake-up of the first waiter that [`Ticket::poll`] would serve now, if it has
+    /// one. Only that waiter is woken. When it takes its grant it wakes the next one that
+    /// fits, so a release wakes the waiters that fit one after another instead of all of
+    /// them. A waiter that was woken but finds the memory taken again passes the wake-up
+    /// on in the same way. Blocking waiters have no callback and wait on `changed`.
+    fn next_to_serve(&self, q: &Queue) -> Option<(u64, Option<Waker>)> {
+        let granted = self.granted.load(Ordering::SeqCst);
+        (0..q.waiters.len())
+            .find(|&pos| {
+                let w = &q.waiters[pos];
+                granted.saturating_add(w.bytes) <= self.capacity
+                    && may_pass(q, pos, granted, self.capacity)
+            })
+            .map(|pos| (q.waiters[pos].ticket, q.waiters[pos].wake.clone()))
     }
 
     /// The most a request can be granted at admission: a pool smaller than the usual
@@ -242,6 +252,19 @@ impl QueryPool {
     }
 }
 
+/// Whether the waiter at `pos` may be served before the waiters ahead of it. The head
+/// may. A waiter behind it may pass only waiters that are larger and wait for memory
+/// (they do not fit now), and only a few times in a row.
+fn may_pass(q: &Queue, pos: usize, granted: u64, capacity: u64) -> bool {
+    let me = q.waiters[pos].bytes;
+    pos == 0
+        || (q.bypassed < MAX_BYPASS
+            && q.waiters
+                .iter()
+                .take(pos)
+                .all(|w| w.bytes > me && granted.saturating_add(w.bytes) > capacity))
+}
+
 /// A place in the admission queue. Dropping it leaves the queue.
 pub struct Ticket {
     pool: Arc<QueryPool>,
@@ -261,15 +284,18 @@ impl Ticket {
         let pool = self.pool.clone();
         let mut q = pool.queue.lock();
         let pos = q.waiters.iter().position(|w| w.ticket == self.ticket)?;
-        // A waiter behind the head may pass only waiters that are larger and wait for
-        // memory (they do not fit now), and only a few times in a row.
         let granted = pool.granted.load(Ordering::SeqCst);
-        let may_pass = pos == 0
-            || (q.bypassed < MAX_BYPASS
-                && q.waiters.iter().take(pos).all(|w| {
-                    w.bytes > self.bytes && granted.saturating_add(w.bytes) > pool.capacity
-                }));
-        if !may_pass || !pool.reserve(self.bytes, pool.capacity) {
+        if !may_pass(&q, pos, granted, pool.capacity) || !pool.reserve(self.bytes, pool.capacity) {
+            // This waiter may have been the one a release woke, and a running grant may
+            // have grown into the memory since. Another waiter may fit in what is left,
+            // so the wake-up goes on to it rather than ending here.
+            let next = pool.next_to_serve(&q);
+            drop(q);
+            if let Some((ticket, Some(f))) = next
+                && ticket != self.ticket
+            {
+                f();
+            }
             return None;
         }
         q.waiters.remove(pos);
@@ -277,10 +303,10 @@ impl Ticket {
         pool.waiting.store(q.waiters.len(), Ordering::SeqCst);
         pool.admitted.fetch_add(1, Ordering::Relaxed);
         self.done = true;
-        // the next waiter may fit now
-        let next: Vec<Waker> = q.waiters.iter().filter_map(|w| w.wake.clone()).collect();
+        // the next waiter may fit in what is left
+        let next = pool.next_to_serve(&q);
         drop(q);
-        for f in next {
+        if let Some((_, Some(f))) = next {
             f();
         }
         pool.changed.notify_all();
@@ -824,6 +850,88 @@ mod tests {
         assert_eq!((g.granted(), g.used()), (0, 0));
         g.charge(0).unwrap();
         assert_eq!((g.granted(), g.used()), (0, 0));
+    }
+
+    #[test]
+    fn a_release_wakes_only_the_waiters_that_fit() {
+        use std::sync::atomic::AtomicUsize;
+        let pool = QueryPool::new(64 * MB);
+        let first = pool.try_grant(32 * MB).unwrap();
+        let second = pool.try_grant(32 * MB).unwrap();
+        let woken: Arc<[AtomicUsize; 3]> = Arc::new(Default::default());
+        let mut tickets: Vec<Ticket> = (0..3)
+            .map(|i| {
+                let w = woken.clone();
+                pool.enter(
+                    16 * MB,
+                    Some(Arc::new(move || {
+                        w[i].fetch_add(1, Ordering::SeqCst);
+                    })),
+                )
+            })
+            .collect();
+        let counts = || {
+            woken
+                .iter()
+                .map(|c| c.load(Ordering::SeqCst))
+                .collect::<Vec<_>>()
+        };
+        // 32 MiB come back: only the head fits first
+        drop(first);
+        assert_eq!(counts(), [1, 0, 0]);
+        let a = tickets[0].poll().unwrap();
+        // the head took 16 MiB, so the second waiter fits in the rest
+        assert_eq!(counts(), [1, 1, 0]);
+        let b = tickets[1].poll().unwrap();
+        // nothing is left for the third
+        assert_eq!(counts(), [1, 1, 0]);
+        assert!(tickets[2].poll().is_none());
+        // a growth that fails wakes nobody, and the next release wakes the third
+        b.charge(20 * MB).unwrap_err();
+        assert_eq!(counts(), [1, 1, 0]);
+        drop(a);
+        assert_eq!(counts(), [1, 1, 1]);
+        assert!(tickets[2].poll().is_some());
+        drop((b, second, tickets));
+        assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn a_woken_waiter_that_no_longer_fits_wakes_the_next() {
+        use std::sync::atomic::AtomicUsize;
+        let pool = QueryPool::new(64 * MB);
+        let freed = pool.try_grant(32 * MB).unwrap();
+        let grows = pool.try_grant(8 * MB).unwrap();
+        let _other = pool.try_grant(24 * MB).unwrap();
+        let woken: Arc<[AtomicUsize; 2]> = Arc::new(Default::default());
+        let mut tickets: Vec<Ticket> = [32 * MB, 16 * MB]
+            .into_iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let w = woken.clone();
+                pool.enter(
+                    bytes,
+                    Some(Arc::new(move || {
+                        w[i].fetch_add(1, Ordering::SeqCst);
+                    })),
+                )
+            })
+            .collect();
+        let counts = || {
+            woken
+                .iter()
+                .map(|c| c.load(Ordering::SeqCst))
+                .collect::<Vec<_>>()
+        };
+        drop(freed);
+        assert_eq!(counts(), [1, 0]);
+        // a running grant takes 16 of the 32 MiB before the head polls
+        grows.charge(24 * MB).unwrap();
+        assert!(tickets[0].poll().is_none());
+        // the smaller waiter fits in the 16 MiB left and may pass the head
+        assert_eq!(counts(), [1, 1]);
+        assert!(tickets[1].poll().is_some());
+        drop(tickets.remove(0));
     }
 
     #[test]

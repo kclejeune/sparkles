@@ -1202,6 +1202,17 @@ inlining decisions of thin LTO with four codegen units. Giving the eager key fil
 explicit per-clone `regex_automata` caches, as the cursor's regular expression filter
 has, would make the call independent of that inlining, and is left to item 7.
 
+Item 7 tried it on 2026-10-23 and measured it slower, so it was reverted. The key test
+held a `regex_automata::meta::Regex` shared through a per-thread program cache and a
+search cache in each clone of the filter, and matched with `search_half_with` and
+`earliest`. On an 8-vCPU AMD Namespace instance at 1M people, with six interleaved rounds
+and eager execution, `regex-iri` took 1.08 times as long as with `regex::Regex` when each
+clone's cache sat behind a lock. Reaching the cache of the task's own clone through
+`Mutex::get_mut` made it 1.17 times as long, while `contains` and `lang-filter` stayed
+within 2%. The lock was therefore not the cost. The search through the meta engine's
+`search_half` is slower here than `regex::Regex::is_match`, and the eager filter keeps
+`regex::Regex`.
+
 ### Batch kernels and disk spill (2026-10-17)
 
 X08 Phase 2 moved the cursor's joins, counts, groupings and DISTINCT to column kernels
@@ -1236,8 +1247,9 @@ which charges its own index, copy and key values. It had charged both.
 
 These follow-ups stay with roadmap item 7. A morsel-parallel cursor scan and filter would
 close the gap of filters and top-k at 12 threads. A range top-k still collects its range
-inside the cursor. EXISTS and DESCRIBE still read their whole input first. The eager
-`regex-iri` key filter still needs per-clone `regex_automata` caches. A one-key index
+inside the cursor. DESCRIBE still reads its whole input first. The eager
+`regex-iri` key filter keeps `regex::Regex`, because per-clone `regex_automata` caches
+measured slower on 2026-10-23. A one-key index
 join that read larger input batches, so that it seeks its index less often, was tried
 and set aside unmeasured, since automatic execution runs those joins eagerly.
 
@@ -1542,3 +1554,40 @@ native boolean can require the cursor to fit its budget, and a later automatic
 request can lower the budget of a previously eager ASK. Both kinds remain
 eligible to run in place while repeating admission. SELECT keeps its existing
 quick eager shortcut, and explicit execution modes keep their requested policy.
+
+### Automatic EXISTS admission (2026-10-23)
+
+The cursor has evaluated EXISTS in every position since the parity work, but automatic
+execution counted any operator with an EXISTS as having no cursor implementation. Every
+plan with an EXISTS therefore ran eagerly by default, including a COUNT over a FILTER
+NOT EXISTS of a quarter of a million rows. `streams_natively` in `cursor.rs` now replaces
+`native` in the grouping and spill rules of automatic admission. It plans each
+`EXISTS { P }` or `NOT EXISTS { P }` that is a conjunct of a FILTER through the same
+admission check that the key set uses, `exists::keyed_plan`, and accepts the FILTER when
+the plan of each `P` has cursor operators in turn, through at most four nested levels.
+`keyed_plan` also rejects what the key set would reject for every row: a variable that a
+FILTER inside `P` reads and that every input row or a substituted constant binds, and an
+input that binds none of the key variables.
+An EXISTS anywhere else, in BIND, an OPTIONAL condition, an ORDER BY key, an aggregate
+argument or inside a larger expression, keeps the plan eager. So does a pattern that
+calls a SERVICE, and so does `decorrelate_exists` turned off. Planning the patterns
+interns their variables and runs none of them.
+
+The rule follows the measurements in
+[BENCHMARKS](../BENCHMARKS.md#automatic-exists). On Namespace with one Rayon thread at
+10.5M, groupings over key-set filters took 0.68 to 0.99 times as long in the cursor as
+eagerly, and a grouping by `BIND(EXISTS …)` took 1.15 times as long. That EXISTS is
+evaluated once per distinct outer key, and the cursor charges each memo entry where eager
+execution does not. The first commit of this work admitted it, and the second restricted
+admission after the measurement.
+
+`tests/exists_auto.rs` compares automatic and eager answers over 60,000 subjects for
+groupings and counts with EXISTS and NOT EXISTS under OPTIONAL, MINUS and GRAPH, nested,
+over empty patterns and at two batch sizes, and checks that each one streams. It also
+checks that the per-key shapes stay eager with the same answers, including an inner
+FILTER that reads a variable every outer row binds, that a SERVICE in the
+pattern or a small input stays eager, that a streamed EXISTS fails with `Cancelled` after
+its flag is set, and that under budgets from 512 KiB to 64 MiB it either matches eager
+execution within its budget or fails on memory. The decision tables in `cursor.rs` cover
+the same rules for groupings and for spill admission.
+

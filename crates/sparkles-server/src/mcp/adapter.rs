@@ -175,6 +175,9 @@ impl Adapter {
             principal,
             headers: parts.map(|p| p.headers.clone()),
             held: parts.and_then(|p| p.extensions.get::<super::http::HeldShare>().cloned()),
+            grant: parts
+                .and_then(|p| p.extensions.get::<super::http::GrantShare>())
+                .map(|g| g.0.clone()),
         })
     }
 }

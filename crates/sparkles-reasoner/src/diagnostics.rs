@@ -232,6 +232,9 @@ pub struct DiagnoseOptions {
     pub timeout: Option<Duration>,
     /// prefixes for the messages (rdf, rdfs, owl and xsd are always known)
     pub prefixes: Vec<(String, String)>,
+    /// the query memory grant the checks' queries charge (`None`: they are not counted
+    /// in a pool)
+    pub grant: Option<Arc<sparkles_core::sparql::pool::PoolGrant>>,
 }
 
 impl Default for DiagnoseOptions {
@@ -244,6 +247,7 @@ impl Default for DiagnoseOptions {
             closure: Closure::Subclass,
             timeout: None,
             prefixes: Vec::new(),
+            grant: None,
         }
     }
 }
@@ -677,6 +681,7 @@ pub fn diagnose_with(
             graphs: &opts.graphs,
             names: &names,
             typings: typings.filter(|_| opts.inferences),
+            grant: opts.grant.as_ref(),
         };
         let found = if check.id == LITERAL_NOT_IN_DATATYPE {
             run.paged_findings(limit)
@@ -741,6 +746,7 @@ struct Run<'a> {
     names: &'a Names,
     /// the literal typings of the inferences, when the check reads them
     typings: Option<&'a LiteralTypings>,
+    grant: Option<&'a Arc<sparkles_core::sparql::pool::PoolGrant>>,
 }
 
 type Row = BTreeMap<String, Term>;
@@ -1001,6 +1007,7 @@ impl Run<'_> {
             default_graph_uris: chosen,
             default_graph_extra: extra,
             initial_bindings: bindings,
+            grant: self.grant.cloned(),
             ..Default::default()
         })
     }

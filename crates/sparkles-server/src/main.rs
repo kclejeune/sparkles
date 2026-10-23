@@ -4188,6 +4188,7 @@ fn run() -> Result<()> {
                 closure,
                 timeout: timeout.map(Duration::from_secs_f64),
                 prefixes: store.prefixes().into_iter().collect(),
+                grant: None,
             };
             let name = loc
                 .file_name()

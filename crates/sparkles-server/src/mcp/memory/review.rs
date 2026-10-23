@@ -148,6 +148,7 @@ impl Tools<'_> {
             principal: self.call.principal.clone().on_branch(b),
             headers: self.call.headers.clone(),
             held: self.call.held.clone(),
+            grant: self.call.grant.clone(),
         })
     }
 

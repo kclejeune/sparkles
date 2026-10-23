@@ -1883,3 +1883,100 @@ mod auth {
         );
     }
 }
+
+/// X08-P1-grant-routing: a tool call waits for the query memory pool in arrival order,
+/// as a query request does, answers `503` with `Retry-After` when the wait passes, and
+/// runs with the grant it was admitted with once memory frees.
+#[tokio::test]
+async fn mcp_calls_wait_for_the_memory_pool() {
+    const MIB: u64 = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(64 * MIB),
+    )
+    .unwrap();
+    st.admission.wait = Duration::from_millis(200);
+    st.mcp = Some(conf(&st, &[]));
+    let state = Arc::new(st);
+    load(&state, "t", FIXTURE);
+    let app = router(state.clone());
+    let pool = state.catalog.pool().unwrap().clone();
+    // other queries hold 56 of the 64 MiB, so the 16 MiB a call starts with is short
+    let held = pool.try_grant(56 * MIB).unwrap();
+    let args =
+        json!({"name": "sparql_query", "arguments": {"query": "SELECT * WHERE { ?s ?p ?o }"}});
+    let started = std::time::Instant::now();
+    let r = modern(&app, "tools/call", args.clone(), &[]).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.body);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert_eq!(r.header("retry-after"), "1");
+    assert_eq!(pool.stats().rejected, 1);
+    assert_eq!(pool.waiting(), 0);
+    drop(held);
+    let result = tool(&app, "sparql_query", args["arguments"].clone(), &[]).await;
+    assert!(result.get("isError").is_none_or(|e| e == false), "{result}");
+    assert_eq!(
+        pool.granted(),
+        0,
+        "the call's grant went back with the call"
+    );
+}
+
+/// The review resource counts its open items under the grant its read was admitted with,
+/// so a pool that the read's own grant fills still answers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_read_counts_under_its_own_grant() {
+    const MIB: u64 = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(16 * MIB),
+    )
+    .unwrap();
+    st.admission.wait = Duration::from_millis(200);
+    st.mcp = Some(conf(&st, &[]));
+    let state = Arc::new(st);
+    load(&state, "t", FIXTURE);
+    let ds = state.get("t").unwrap();
+    crate::settings::store_runtime(
+        &state,
+        &ds,
+        &crate::settings::MEMORY,
+        &json!({"agentGraphs": ["https://example.org/memory/agents/*"]}),
+    )
+    .unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            br#"<https://example.org/memory/agents/a/sessions/s1> {
+  <http://ex.org/ana> <http://ex.org/knows> <http://ex.org/p1> .
+  <urn:r1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://ex.org/ana> <http://ex.org/knows> <http://ex.org/p1> )>> ;
+     <http://www.w3.org/ns/prov#generatedAtTime> "2026-10-08T12:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+}"#
+            .to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let app = router(state.clone());
+    // the counts are not kept yet, so the read counts them now
+    let r = modern(
+        &app,
+        "resources/read",
+        json!({"uri": "sparkles://t/memory/review"}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let text = r.rpc()["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}", r.body))
+        .to_string();
+    let v: J = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["open"], 1, "{v}");
+    assert_eq!(state.catalog.pool().unwrap().granted(), 0);
+}

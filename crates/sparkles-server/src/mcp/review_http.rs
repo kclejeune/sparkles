@@ -90,6 +90,7 @@ async fn run(
         principal: p,
         headers: Some(headers),
         held: None,
+        grant: crate::server_memory::current_grant(),
     };
     let mode = if write { Mode::Write } else { Mode::Internal };
     let server = McpServer::new(st.clone(), config(&st, mode));

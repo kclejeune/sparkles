@@ -648,6 +648,8 @@ impl Tools<'_> {
             outbound: self.server.state.outbound.clone(),
             cancel: Some(self.call.cancel.clone()),
             prefixes: prefix_vec(prefixes),
+            // the grant the call was admitted with (X08-P1-grant-routing)
+            grant: self.call.grant.clone(),
             ..defaults
         };
         // SERVICE and LOAD are the principal's server permissions, and the graphs its

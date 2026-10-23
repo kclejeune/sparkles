@@ -839,7 +839,7 @@ async fn memory_review_resource() {
     )
     .unwrap();
     load(1);
-    super::memory::pending::refresh(&server.state, &ds);
+    super::memory::pending::refresh(&server.state, &ds, None);
     assert!(resource_uris(&mut c, 2).await.contains(&uri.to_string()));
     let r = c
         .request(3, "resources/read", json!({"_meta": m(), "uri": uri}))
@@ -859,7 +859,7 @@ async fn memory_review_resource() {
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     load(2);
-    super::memory::pending::refresh(&server.state, &ds);
+    super::memory::pending::refresh(&server.state, &ds, None);
     let n = next_change(&mut c).await;
     assert_eq!(n["method"], "notifications/resources/updated", "{n}");
     assert_eq!(n["params"]["uri"], uri);

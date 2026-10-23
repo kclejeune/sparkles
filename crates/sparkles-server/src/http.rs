@@ -2647,15 +2647,27 @@ async fn read_body(body: axum::body::Body, limit: Option<u64>, flag: &str) -> Ap
         return Err(too_large());
     }
     let mut stream = body.into_data_stream();
+    // A body that arrives in one frame, such as one the admission layer read ahead, is
+    // kept as it is rather than copied, so that it is not held twice.
+    let mut first: Option<Bytes> = None;
     let mut buf = Vec::new();
+    let mut len = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(body_error)?;
-        if (buf.len() + chunk.len()) as u64 > max {
+        len += chunk.len() as u64;
+        if len > max {
             return Err(too_large());
+        }
+        if buf.is_empty() && first.is_none() {
+            first = Some(chunk);
+            continue;
+        }
+        if let Some(f) = first.take() {
+            buf.extend_from_slice(&f);
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf.into())
+    Ok(first.unwrap_or_else(|| buf.into()))
 }
 
 /// Body extractors with the ceiling of their request class. Only the Graph Store and
@@ -3278,6 +3290,8 @@ async fn gsp_on(
                 .as_ref()
                 .map(|d| dry_run::Request::new(&st, &headers, d, restricted));
             let (wopts, timeout) = wopts.start();
+            // the admitted grant, read on the request's task before the blocking thread
+            let grant = crate::server_memory::current_grant();
             blocking(move || {
                 let snap = ds.store.snapshot();
                 let clear = match &target {
@@ -3306,6 +3320,7 @@ async fn gsp_on(
                             cancel: wopts.cancel.clone(),
                             graphs: wopts.graphs.clone(),
                             write: wopts,
+                            grant,
                             ..Default::default()
                         },
                         sparkles::commit::CommitKind::GspDelete,
@@ -3476,6 +3491,8 @@ async fn upload(
         return Err(err(StatusCode::BAD_REQUEST, "no files in upload"));
     }
     let (wopts, timeout) = wopts.start();
+    // the admitted grant, read on the request's task before the blocking thread
+    let grant = crate::server_memory::current_grant();
     blocking(move || {
         let g = match graph {
             Some(g) => Some(
@@ -3507,7 +3524,7 @@ async fn upload(
             }
         }
         // CSV and TSV files are converted into N-Triples
-        let tables = tabular::convert(&mut files, &mappings, &params, &st, &wopts)?;
+        let tables = tabular::convert(&mut files, &mappings, &params, &st, &wopts, grant.as_ref())?;
         let sources = files
             .iter()
             .map(|p| {
@@ -4823,6 +4840,8 @@ async fn reason_diagnostics(
         closure,
         timeout: Some(timeout_param(&st, &params)),
         prefixes,
+        // the admitted grant, read on the request's task before the blocking thread
+        grant: crate::server_memory::current_grant(),
     };
     blocking(move || {
         let (report, j) =

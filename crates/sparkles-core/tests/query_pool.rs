@@ -398,10 +398,13 @@ fn algorithm_concurrent_contexts_keep_separate_or_shared_grant_ownership() {
             peaks[id] = used;
         }
         assert!(peaks.iter().all(|p| *p > 0));
+        // A finished result keeps its own estimate, at most its query's peak, on the
+        // grant it ran under (X08-P1-retained-results).
         if shared {
-            assert_eq!(a.used(), peaks.iter().sum::<u64>());
+            assert!(a.used() > 0 && a.used() <= peaks.iter().sum::<u64>());
         } else {
-            assert_eq!((a.used(), b.used()), (peaks[0], peaks[1]));
+            assert!(a.used() > 0 && a.used() <= peaks[0]);
+            assert!(b.used() > 0 && b.used() <= peaks[1]);
         }
         drop(results.remove(0));
         assert!(b.used() > 0);
@@ -658,15 +661,17 @@ fn retained_eager_results_add_their_contributions_on_one_explicit_grant() {
     }
     assert!(refused, "all four retained results fit");
     assert!(held.len() >= 2);
-    let peaks: u64 = held.iter().map(|r| r.mem_peak_bytes).sum();
+    // A finished result keeps its table, not its query's peak (X08-P1-retained-results).
     let tables: u64 = held.iter().map(|r| r.table.mem_bytes()).sum();
-    assert!(grant.used() >= peaks && grant.used() >= tables);
+    assert!(grant.used() >= tables);
     assert!(pool.granted() >= grant.used());
+    let used = grant.used();
     let kept = held[0].ctx.clone();
     let first = held.remove(0);
     drop(first);
-    assert!(
-        grant.used() >= peaks,
+    assert_eq!(
+        grant.used(),
+        used,
         "the extra context owner retains its contribution"
     );
     drop(kept);
@@ -912,4 +917,117 @@ fn automatic_immutable_scan_releases_its_transient_contribution() {
     drop(opts);
     drop(grant);
     assert_eq!(pool.granted(), 0);
+}
+
+/// A finished eager result keeps in the pool what it holds, not its query's highest
+/// estimate (X08-P1-retained-results). A query that built a large intermediate table
+/// for a small answer gives the rest back when it finishes, while its result is alive.
+#[test]
+fn a_finished_eager_result_retains_only_what_it_holds() {
+    let s = store();
+    let pool = QueryPool::new(1024 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    // a million-row product reduced to a thousand distinct values
+    let small = "SELECT DISTINCT ?x WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?y >= 0) }";
+    let result = query(s.snapshot(), small, &opts).unwrap();
+    assert_eq!(result.rows().len(), 1_000);
+    assert!(result.mem_peak_bytes > 16 * MB, "{}", result.mem_peak_bytes);
+    let grant = result.ctx.grant().unwrap().clone();
+    assert!(
+        grant.used() <= 2 * MB,
+        "the small result keeps {} bytes of the pool",
+        grant.used()
+    );
+    // a large result keeps its rows
+    let large = query(s.snapshot(), CROSS, &opts).unwrap();
+    let rows = large.rows().len() as u64;
+    let kept = large.ctx.grant().unwrap().used();
+    assert!(kept >= rows * 4 * 8, "{kept} for {rows} rows");
+    drop(large);
+    drop(result);
+    drop(grant);
+    assert_eq!(pool.granted(), 0);
+}
+
+/// While a small result of a large query is alive, another query can take the pool
+/// memory that the first one no longer uses.
+#[test]
+fn a_retained_small_result_leaves_its_peak_to_other_queries() {
+    let s = store();
+    let small = "SELECT DISTINCT ?x WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?y >= 0) }";
+    let peak = {
+        let opts = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let r = query(s.snapshot(), small, &opts).unwrap();
+        r.mem_peak_bytes
+    };
+    // room for one such query at a time, with headroom for its initial granules
+    let pool = QueryPool::new(peak + peak / 2 + 4 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let first = query(s.snapshot(), small, &opts).unwrap();
+    let second = query(s.snapshot(), small, &opts).unwrap();
+    assert_eq!(first.rows(), second.rows());
+    drop((first, second));
+    assert_eq!(pool.granted(), 0);
+}
+
+/// A FILTER that compacts its columns in place keeps their allocations, and the result
+/// that owns them keeps that capacity covered in the pool.
+#[test]
+fn a_compacted_result_keeps_its_column_capacity_covered() {
+    let s = store_rows(100_000);
+    let pool = QueryPool::new(1024 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let q = "SELECT ?s ?v ?w { ?s <urn:p> ?v BIND(?v + 1 AS ?w) FILTER(?w < 3) }";
+    let result = query(s.snapshot(), q, &opts).unwrap();
+    assert_eq!(result.rows().len(), 2);
+    let capacity: u64 = result
+        .table
+        .cols
+        .iter()
+        .map(|c| c.capacity() as u64 * 8)
+        .sum();
+    let used = result.ctx.grant().unwrap().used();
+    assert!(
+        used >= capacity,
+        "{used} bytes cover {capacity} bytes of columns"
+    );
+}
+
+/// The blank nodes that BNODE(string) made for each solution stay in the context's
+/// memo, and a held result does not give up the pool memory that covers them.
+#[test]
+fn a_result_keeps_its_blank_node_memo_covered() {
+    let s = store_rows(100_000);
+    let pool = QueryPool::new(1024 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let q = "SELECT (COUNT(?b) AS ?n) { ?s <urn:p> ?v BIND(BNODE(\"x\") AS ?b) }";
+    let result = query(s.snapshot(), q, &opts).unwrap();
+    assert_eq!(result.rows().len(), 1);
+    // Eager execution never charged the memo, and the query's peak estimate covered it
+    // only in part. The finished result does not drop below either.
+    let used = result.ctx.grant().unwrap().used();
+    let floor = result.mem_peak_bytes.min(100_000 * 32);
+    assert!(
+        used >= floor,
+        "{used} bytes for 100,000 memo entries, at least {floor}"
+    );
 }

@@ -933,6 +933,17 @@ fn execute_prepared(
         let plan = Some(std::mem::take(&mut result.plan));
         return Err(Box::new(Failed { error, plan }));
     }
+    // The operators' state is gone, so the pool keeps only what the result holds. A
+    // graph result's triples are not measured, and it keeps its query's highest
+    // estimate as before.
+    if matches!(kind, QueryKind::Select | QueryKind::Ask)
+        && let Err(error) = ctx.shrink_retained(result.table.capacity_bytes())
+    {
+        return Err(Box::new(Failed {
+            error,
+            plan: Some(std::mem::take(&mut result.plan)),
+        }));
+    }
     Ok(result)
 }
 

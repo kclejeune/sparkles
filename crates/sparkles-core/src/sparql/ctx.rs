@@ -548,6 +548,11 @@ const PROMOTED: u64 = 1 << 63;
 /// estimate by less than one step.
 const EAGER_STEP: u64 = 64 << 10;
 
+/// How far above what a finished eager result keeps its pool contribution may stay
+/// before [`Ctx::shrink_retained`] lowers it. Below this the ledger's lock costs more
+/// than the memory it would return.
+const RETAIN_SLACK: u64 = 1 << 20;
+
 /// The memory account of an eager context until something needs the query ledger: a
 /// graph algorithm call, a lease that outlives an operator, cursor accounting or a
 /// change of the grant. Plain queries charge and check it with a few atomic operations
@@ -1445,6 +1450,90 @@ impl Ctx {
     }
 
     /// The highest memory estimate of this context so far.
+    /// Lower a finished eager query's retained pool contribution to what its result
+    /// keeps: `result` bytes of allocated output columns, the uncharged state that the
+    /// context still owns ([`Ctx::retained_state_bytes`]) and its live charges
+    /// (X08-P1-retained-results). The contribution otherwise stays at the query's
+    /// highest admitted estimate, including build and transient state, until the context
+    /// drops. A fast account within [`RETAIN_SLACK`] of what the result keeps is left
+    /// alone, so that a small query never takes the ledger. The grant and the fast
+    /// account are read before the context's caches, so that a query without a pool or
+    /// with a small contribution takes none of their locks.
+    pub(super) fn shrink_retained(&self, result: u64) -> Result<()> {
+        if self.cursor_memory.is_some() {
+            return Ok(());
+        }
+        let fast = match self.memory.get() {
+            Some(_) => None,
+            None => match self.fast.grant.get() {
+                Some(Some(_)) => Some(self.fast.eager.load(Ordering::Acquire)),
+                _ => return Ok(()),
+            },
+        };
+        // What the context keeps is never less than its columns, so a contribution
+        // within the slack of those cannot shrink by more than the slack.
+        if fast.is_some_and(|admitted| admitted <= result.saturating_add(RETAIN_SLACK)) {
+            return Ok(());
+        }
+        let keep = result.saturating_add(self.retained_state_bytes());
+        if fast.is_some_and(|admitted| admitted <= keep.saturating_add(RETAIN_SLACK)) {
+            return Ok(());
+        }
+        self.memory().shrink_eager(keep)
+    }
+
+    /// The bytes of the state an eager context keeps after execution without a charge:
+    /// the terms computed into its local vocabulary, its cached decoded values, its
+    /// parsed geometries and the memos of its blank nodes and callback terms. A map
+    /// counts the slots it has allocated, which clearing it keeps, and the heap storage
+    /// of its live keys and values.
+    fn retained_state_bytes(&self) -> u64 {
+        fn text(s: &str) -> u64 {
+            s.len() as u64 + 16
+        }
+        fn value(v: &Value) -> u64 {
+            match v {
+                Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
+                Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
+                Value::Other { lex, dt } => text(lex) + text(dt),
+                Value::Triple(t) => 64 + t.to_string().len() as u64,
+                _ => 0,
+            }
+        }
+        /// The slots of a hash map with `capacity` entries of type `T`, with one
+        /// control byte each.
+        fn slots<T>(capacity: usize) -> u64 {
+            (capacity as u64).saturating_mul(std::mem::size_of::<T>() as u64 + 1)
+        }
+        let mut bytes = (self.local.read().bytes() as u64).saturating_add(self.geo.bytes() as u64);
+        for shard in &self.values {
+            let shard = shard.read();
+            bytes = bytes.saturating_add(slots::<(Id, Value)>(shard.capacity()));
+            for v in shard.values() {
+                bytes = bytes.saturating_add(value(v));
+            }
+        }
+        {
+            let memo = self.bnode_memo.lock();
+            bytes = bytes.saturating_add(slots::<((Vec<Id>, String), Id)>(memo.capacity()));
+            for (key, label) in memo.keys() {
+                bytes = bytes.saturating_add(key.capacity() as u64 * 8 + label.capacity() as u64);
+            }
+        }
+        for labels in [
+            &self.outside_bnodes,
+            &self.literal_bnodes,
+            &self.callback_bnodes,
+        ] {
+            let labels = labels.lock();
+            bytes = bytes.saturating_add(slots::<(String, Id)>(labels.capacity()));
+            for label in labels.keys() {
+                bytes = bytes.saturating_add(label.capacity() as u64);
+            }
+        }
+        bytes.saturating_add(slots::<(Id, u64)>(self.callback_terms.lock().capacity()))
+    }
+
     pub fn mem_peak(&self) -> u64 {
         let fast = self.fast.peak.load(Ordering::Relaxed);
         self.memory
@@ -2387,6 +2476,27 @@ mod charge_tests {
         drop(ctx);
         assert_eq!(grant.used(), 0);
         assert_eq!(grant.granted(), 16 * MIB);
+    }
+
+    /// A value cache shard that overflowed is cleared without giving back its slots,
+    /// and a finished result keeps them counted (X08-P1-retained-results).
+    #[test]
+    fn retained_state_counts_the_slots_a_cleared_value_shard_keeps() {
+        let ctx = Ctx::new(Store::in_memory(StoreOptions::default()).snapshot());
+        let empty = ctx.retained_state_bytes();
+        {
+            let mut shard = ctx.values[0].write();
+            for i in 0..70_000u64 {
+                shard.insert(Id(i), Value::Bool(true));
+            }
+            shard.clear();
+        }
+        let slots = 70_000 * std::mem::size_of::<(Id, Value)>() as u64;
+        assert!(
+            ctx.retained_state_bytes() >= empty + slots,
+            "{} bytes for {slots} bytes of slots",
+            ctx.retained_state_bytes()
+        );
     }
 
     #[test]

@@ -275,6 +275,7 @@ impl Run<'_, '_> {
             principal: self.ctx.principal.clone().on_branch(branch),
             headers: None,
             held: None,
+            grant: crate::server_memory::current_grant(),
         };
         Ok(match self.ctx.server.run_now(name, m, &call)? {
             Outcome::Structured(v) => v,

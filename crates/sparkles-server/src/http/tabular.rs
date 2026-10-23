@@ -103,6 +103,7 @@ pub(super) fn convert(
     params: &Params,
     st: &AppState,
     wopts: &WriteOptions,
+    grant: Option<&std::sync::Arc<sparkles::sparql::pool::PoolGrant>>,
 ) -> ApiResult<Vec<J>> {
     let tables = files
         .iter()
@@ -165,6 +166,8 @@ pub(super) fn convert(
         o.query.max_memory_bytes = st.limits.query_memory_bytes;
         o.query.max_rows_produced = st.limits.max_rows_produced;
         o.query.max_rows = Some(st.limits.max_rows);
+        // the upload's admitted grant covers its templates' CONSTRUCT queries
+        o.query.grant = grant.cloned();
         o.check = Some(check.clone());
         let out = f.with_extension("nt");
         let io = |e: std::io::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());

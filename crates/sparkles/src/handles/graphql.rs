@@ -279,6 +279,9 @@ pub struct DraftRequest {
     /// the graphs the caller may read (`None`: every graph)
     pub view: Option<Arc<crate::access::GraphAccess>>,
     pub max_entries: usize,
+    /// the query memory grant the draft's queries charge (`None`: they are not counted in
+    /// a pool)
+    pub grant: Option<Arc<crate::sparql::pool::PoolGrant>>,
 }
 
 impl Default for DraftRequest {
@@ -294,6 +297,7 @@ impl Default for DraftRequest {
             timeout: Duration::from_secs(600),
             view: None,
             max_entries: crate::schema::DEFAULT_MAX_ENTRIES,
+            grant: None,
         }
     }
 }
@@ -327,6 +331,7 @@ pub fn draft_of(
     let qopts = QueryOptions {
         timeout: Some(r.timeout),
         graphs: r.view.clone(),
+        grant: r.grant.clone(),
         ..Default::default()
     };
     let mut prefixes: Vec<(String, String)> = crate::io::standard_prefixes().into_iter().collect();

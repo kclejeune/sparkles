@@ -204,15 +204,175 @@ pub fn current_grant() -> Option<Arc<PoolGrant>> {
 /// concurrency caps answer first). Query and update requests wait here, in arrival
 /// order, for an initial grant. They answer `503` with `Retry-After` when the wait
 /// passes `--query-admission-wait`. Other requests run without a grant.
+///
+/// A request with a body is admitted once its body is read, up to the body limit of its
+/// class, so that a slow client holds no pool memory while it sends
+/// (X08-P1-admit-after-body). Uploads and Graph Store writes stream bodies of any size
+/// and charge none of the load to the pool, so they start with an empty grant and do not
+/// queue.
 pub async fn admit(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let route = req.extensions().get::<MatchedPath>().map(|m| m.as_str());
-    if !matches!(
-        classify(route, req.method(), req.uri(), req.headers()),
-        Some(Class::Query | Class::Update)
-    ) {
-        return next.run(req).await;
+    let class = classify(route, req.method(), req.uri(), req.headers());
+    let limit = match class {
+        Some(Class::Query) => st.limits.max_query_body_bytes,
+        Some(Class::Update) => st.limits.max_update_body_bytes,
+        _ => return next.run(req).await,
+    };
+    if data_write(route, req.method(), req.uri(), req.headers()) {
+        return match st.catalog.pool() {
+            Some(pool) => {
+                GRANT
+                    .scope(Arc::new(pool.empty_grant()), next.run(req))
+                    .await
+            }
+            None => next.run(req).await,
+        };
     }
+    let req = if has_body(&req) && st.catalog.pool().is_some() {
+        read_ahead(req, limit.unwrap_or(BODY_AHEAD).min(BODY_AHEAD)).await
+    } else {
+        req
+    };
     granted(&st, req, next).await
+}
+
+/// The most of a request body read before admission. A larger body is admitted after
+/// this much and streams the rest to its handler, which applies its own limit.
+const BODY_AHEAD: u64 = 256 << 20;
+
+/// Whether a request is an upload or a Graph Store write, whose body streams to the
+/// store and may be of any size: `/{ds}/upload`, a patch, a write to `/{ds}/data` or a
+/// graph, and a request to `/{ds}` that is not a SPARQL query, update or form.
+fn data_write(
+    route: Option<&str>,
+    method: &axum::http::Method,
+    uri: &axum::http::Uri,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    use axum::http::{Method, header};
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+    match route {
+        Some("/{ds}/upload" | "/{ds}/patch" | "/{ds}/data" | "/{ds}/{*graph}") => true,
+        Some("/{ds}") => {
+            let has = |k: &str| {
+                form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).any(|(a, _)| a == k)
+            };
+            let ct = headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let form = *method == Method::POST && ct == "application/x-www-form-urlencoded";
+            let query = has("query") || ct == "application/sparql-query";
+            let update = has("update") || ct == "application/sparql-update";
+            !(form || query || update)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a request may carry a body: it declares a length above zero or a chunked one.
+fn has_body(req: &Request) -> bool {
+    use http_body::Body as _;
+    let hint = req.body().size_hint();
+    hint.upper() != Some(0)
+}
+
+/// Read up to `limit` bytes of the request's body, and give it back with the bytes read
+/// in front of the rest. A body that ends within `limit` is handed on whole. A read error
+/// is handed on after the bytes before it, so the handler answers it as before.
+async fn read_ahead(req: Request, limit: u64) -> Request {
+    use http_body::Body as _;
+    use http_body_util::BodyExt;
+    let (parts, mut body) = req.into_parts();
+    // a declared length above the limit is refused by the handler without reading
+    if body.size_hint().lower() > limit {
+        return Request::from_parts(parts, body);
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut error = None;
+    loop {
+        match body.frame().await {
+            None => {
+                return Request::from_parts(parts, axum::body::Body::from(buf));
+            }
+            Some(Ok(frame)) => {
+                // trailers carry nothing a handler reads
+                if let Ok(data) = frame.into_data() {
+                    buf.extend_from_slice(&data);
+                }
+                if buf.len() as u64 >= limit {
+                    break;
+                }
+            }
+            Some(Err(e)) => {
+                error = Some(e);
+                break;
+            }
+        }
+    }
+    let body = AheadBody {
+        ahead: Some(axum::body::Bytes::from(buf)).filter(|b| !b.is_empty()),
+        rest: if error.is_some() { None } else { Some(body) },
+        error,
+    };
+    Request::from_parts(parts, axum::body::Body::new(body))
+}
+
+/// A request body whose first bytes were read before admission: those bytes, then the
+/// read error that stopped the read or the rest of the body.
+struct AheadBody {
+    ahead: Option<axum::body::Bytes>,
+    error: Option<axum::Error>,
+    rest: Option<axum::body::Body>,
+}
+
+impl http_body::Body for AheadBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        if let Some(b) = self.ahead.take() {
+            return Poll::Ready(Some(Ok(http_body::Frame::data(b))));
+        }
+        if let Some(e) = self.error.take() {
+            return Poll::Ready(Some(Err(e)));
+        }
+        match self.rest.as_mut() {
+            Some(rest) => std::pin::Pin::new(rest).poll_frame(cx),
+            None => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.ahead.is_none()
+            && self.error.is_none()
+            && self.rest.as_ref().is_none_or(|r| r.is_end_stream())
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        let ahead = self.ahead.as_ref().map_or(0, |b| b.len() as u64);
+        let rest = self
+            .rest
+            .as_ref()
+            .map_or_else(|| http_body::SizeHint::with_exact(0), |r| r.size_hint());
+        let mut hint = http_body::SizeHint::new();
+        hint.set_lower(rest.lower().saturating_add(ahead));
+        if let Some(u) = rest.upper() {
+            hint.set_upper(u.saturating_add(ahead));
+        }
+        hint
+    }
 }
 
 /// The initial grant a request asks the pool for: a request whose own budget is below
@@ -227,8 +387,20 @@ pub fn initial_grant(st: &AppState, pool: &sparkles::sparql::pool::QueryPool) ->
 /// up to `--query-admission-wait`, as [`admit`] does for the requests it classifies.
 /// The algorithm route selects its class from its body, so it calls this itself.
 pub async fn granted(st: &AppState, req: Request, next: Next) -> Response {
+    match acquire(st).await {
+        Ok(Some(grant)) => GRANT.scope(Arc::new(grant), next.run(req)).await,
+        Ok(None) => next.run(req).await,
+        Err(rejected) => rejected.into_response(),
+    }
+}
+
+/// An initial grant of the query memory pool, waiting in arrival order up to
+/// `--query-admission-wait`. `None` without a pool, and the `503` error with
+/// `Retry-After` when the wait passes. MCP calls, which name their class in their body,
+/// take their grant here and hand it to their tool through the request.
+pub async fn acquire(st: &AppState) -> Result<Option<PoolGrant>, crate::http::ApiError> {
     let Some(pool) = st.catalog.pool() else {
-        return next.run(req).await;
+        return Ok(None);
     };
     let want = initial_grant(st, pool);
     let started = Instant::now();
@@ -251,14 +423,14 @@ pub async fn granted(st: &AppState, req: Request, next: Next) -> Response {
                             break g;
                         }
                         pool.note_rejected();
-                        return crate::http::ApiError::from(pool.exhausted(want)).into_response();
+                        return Err(crate::http::ApiError::from(pool.exhausted(want)));
                     }
                 }
             }
         }
     };
     st.admission.observe(started.elapsed());
-    GRANT.scope(Arc::new(grant), next.run(req)).await
+    Ok(Some(grant))
 }
 
 // ------------------------------------------------------------------- reports ------

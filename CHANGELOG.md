@@ -4,6 +4,31 @@
 
 ### Changed
 
+Automatic execution now streams groupings and counts over an estimated 20,000 input rows
+or more whose EXISTS and NOT EXISTS are FILTER conjuncts that a key set answers. On a
+Namespace instance at 10.5M quads these ran 0.68 to 0.99 times as long as eagerly. An
+EXISTS in BIND, an OPTIONAL condition or a larger expression keeps the plan eager.
+
+A finished eager SELECT or ASK now keeps only its result's estimate in the query memory
+pool instead of its query's peak, so a held result or a Python or Node result object no
+longer reserves the memory of the tables it was built from. CONSTRUCT and
+DESCRIBE results keep their peak as before.
+
+MCP tool calls and resource reads now wait for the query memory pool like other queries
+and answer `503` with `Retry-After` when the admission wait passes, where they used to fail
+with `server-memory`. The queries of `sparkles ask`, the GraphQL draft, reasoner
+diagnostics, the Graph Store DELETE and tabular uploads now charge the grant their request
+was admitted with instead of taking a second one or none.
+
+With the query memory pool on, the server now admits a query or update after its body has
+arrived, so a client that sends slowly no longer holds 16 MiB of the pool while it sends.
+Uploads, patches and Graph Store writes no longer take an initial grant or wait for the
+pool, and a release of memory wakes only the waiters that fit.
+
+In the JVM library, `abort()` or a timeout that raced the end of a query could throw
+`IllegalStateException` because the query's native object had just been released. Such a
+cancel is now ignored, since the query has already finished.
+
 Group commit now covers datasets with a full-text, spatial or embedding index, which used
 to take the ordinary path. On a Namespace instance whose synchronizations were slowed to
 4 ms each, four writers on such a dataset committed about twice as fast and sixteen

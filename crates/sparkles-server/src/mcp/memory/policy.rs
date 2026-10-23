@@ -83,6 +83,7 @@ pub(crate) fn redirect(
             principal: call.principal.clone().on_branch(Some(&branch)),
             headers: call.headers.clone(),
             held: call.held.clone(),
+            grant: call.grant.clone(),
         },
         notice,
     )))

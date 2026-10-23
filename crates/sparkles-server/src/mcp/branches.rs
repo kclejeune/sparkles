@@ -139,6 +139,7 @@ pub(super) fn branch_call(
         principal: call.principal.clone().on_branch(Some(&b)),
         headers: call.headers.clone(),
         held: call.held.clone(),
+        grant: call.grant.clone(),
     }))
 }
 

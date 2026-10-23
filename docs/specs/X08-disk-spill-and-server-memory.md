@@ -796,9 +796,10 @@ the text:
 
 * **Admission** is an axum layer inside the rate limiter, as §4.2 says, and passes the
   grant to handlers through a task-local that `query_options` reads. A request is a query
-  or an update by the rate limiter's classes. Other requests are not admitted. A query
-  they run, MCP tool calls included, starts with an empty grant from its dataset's pool,
-  does not queue and fails with `server-memory` when the pool is short.
+  or an update by the rate limiter's classes, and an MCP tool call or resource read is
+  admitted the same way, as the grant routing section below describes. Other requests are
+  not admitted. A query they run starts with an empty grant from its dataset's pool, does
+  not queue and fails with `server-memory` when the pool is short.
 * **The initial grant** is 16 MiB, the server's `--query-memory-mb` if that is lower, and
   never more than the pool. It does not follow a request's own `memory-mb`, because the
   parameters are read after admission. The effect is that a request that lowers its budget
@@ -831,7 +832,7 @@ the text:
   `memory/brief` and the `/$/stats`, `/$/schema` and `/$/validate` reads, hold the
   admitted grant idle while a query of their own takes a second grant from the dataset's
   pool. That reserves more than they use but bypasses nothing. Uploads and Graph Store
-  writes hold an admission grant for the whole load, and the memory of the load itself is
+  writes start with an empty grant since 2026-10-23, and the memory of the load itself is
   not charged to the pool.
 * **Errors.** `BudgetKind::ServerMemory` (`server-memory`) answers `503` with
   `Retry-After: 1`, counts as a budget in `sparkles_budget_exceeded_total`, and is
@@ -1025,20 +1026,18 @@ latency gates, and roadmap item 1 ran the 10.5M and DBpedia profile runs on 2026
   could collect on the tokio workers as well, or the caches could charge the sizes that
   mimalloc reports. The item also covers the 3% of extra instructions on queries of a few
   microseconds from 899fb251 to 4d174d02, which profiles did not trace to one cause.
-* **X08-P1-grant-routing.** Admit MCP tool calls and the other requests that never queue,
-  and route the admitted grant into every route that counts as a query.
+* **X08-P1-grant-routing.** Done on 2026-10-23, as the grant routing section below
+  describes. SHACL validation, reasoning, ShEx validation other than its selectors, and the
+  schema, statistics and lint reads still run outside the admitted grant.
 * **X08-P1-nested-service.** Recognise a SERVICE call to the same server, without a header
   that a client could forge, so that it does not wait behind its caller's grant. Today it
   answers `503` after the admission wait, and `SILENT` turns that into empty results.
-* **X08-P1-admit-after-body.** Admit a POST query or update after its body is read under
-  the existing body limit, give uploads and Graph Store writes no 16 MiB initial grant,
-  and wake only the waiters that fit when memory returns. Today admission happens before
-  the body is read, and the server sets no body read timeout, so a slow client holds its
-  grant while it sends. Every release wakes every waiter.
-* **X08-P1-retained-results.** Shrink an eager context's retained estimate to its result's
-  size when the query finishes. Today an eager `QueryResult` keeps its query's peak
-  estimate until it is dropped, and a Python or Node result object keeps it until the
-  object is collected.
+* **X08-P1-admit-after-body.** Done on 2026-10-23, as the section on admission after the
+  body describes. The server still sets no body read timeout, so a slow client holds its
+  rate limiter slot while it sends.
+* **X08-P1-retained-results.** Done on 2026-10-23 for SELECT and ASK, as the section
+  below describes. A CONSTRUCT or DESCRIBE result still keeps its query's peak estimate,
+  because its decoded triples are not measured when the query finishes.
 * A lock-free `try_grant` when no request waits, measured with the latency gate above.
   Admission takes the queue's lock on every request.
 * The profile gate of §3.3. Its runs at 10.5M and on DBpedia on 2026-10-23 compared the
@@ -1049,6 +1048,130 @@ latency gates, and roadmap item 1 ran the 10.5M and DBpedia profile runs on 2026
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
+
+### Grant routing (2026-10-23)
+
+MCP tool calls and resource reads were not admitted, so their queries took an empty grant
+from the dataset's pool and failed with `server-memory` instead of waiting when the pool
+was short. Several routes that were admitted also lost their grant before their query ran,
+because the task-local that carries it does not reach a blocking thread, and their
+queries then took a second grant from the dataset's pool or none at all.
+
+The MCP endpoint now takes an initial grant for every request that the rate limiter
+charges as a tool call or resource read, inside the limiter's caps, and waits for it in
+arrival order up to `--query-admission-wait` as the HTTP query routes do. rmcp runs the
+tool on a task of its own, so the grant travels as a request extension, and the tool's
+queries charge it through `query_options`. The memory tools that run queries for a call
+pass the call's grant on. `sparkles ask` captures the grant on the request task and hands
+it to the queries of every tool call it makes. The Graph Store DELETE, the templates of a
+tabular upload, the GraphQL draft, reasoner diagnostics, `/explain`, the MCP REST routes,
+the review routes, the ingest pipeline and the selector queries of ShEx validation also
+capture the grant before they move to a blocking thread. Without the capture, the GraphQL
+draft and reasoner diagnostics queries were not accounted at all.
+
+`mcp_calls_wait_for_the_memory_pool` holds 56 MiB of a 64 MiB pool and checks that a
+`tools/call` answers `503` with `Retry-After: 1` after the admission wait, that it
+succeeds once the memory returns, and that no grant remains afterwards. SHACL validation,
+reasoning, the rest of ShEx validation and the schema, statistics, format, lint, patch and
+diff routes still run their queries outside the admitted grant, so they hold it idle and
+take a second one from the dataset's pool.
+
+### Admission after the body (2026-10-23)
+
+Admission used to take the initial grant before the server read the request's body.
+The server sets no body read timeout, so a client that sent its query slowly held 16 MiB of
+the pool, and a place ahead of every later request, for as long as it kept sending. An
+upload or Graph Store write held the same 16 MiB for the whole load, although none of the
+load was charged to it. Every release woke every waiter, and all but one of them polled
+the queue's lock for nothing.
+
+`server_memory::admit` now reads the body of a query or update before it asks the pool. It
+reads up to the body limit of the request's class, `--max-query-body-mb` or
+`--max-update-body-mb`, and at most 256 MiB. A body that ends within that limit is handed
+to the handler whole. A longer one is admitted once that much has arrived, and the
+handler receives the bytes read followed by the rest, so its own limit and its error for
+an oversized body are unchanged. A declared length above the limit is not read ahead, so
+the handler refuses it as before, and a read error reaches the handler after the bytes
+before it. The handler's body reader keeps a body that arrives in one frame instead of
+copying it, so the bytes read ahead are the bytes the handler would have buffered and the
+memory outside the pool does not grow. Uploads, patches, writes to `/{ds}/data` or a
+graph, and requests to `/{ds}` that are not a SPARQL query, update or form start with an
+empty grant without queueing, and a query that they run grows it. MCP calls and algorithm
+runs already read their bodies before admission.
+
+`QueryPool` now wakes only the first waiter that `Ticket::poll` would serve, which is the
+head when it fits or a smaller waiter that may pass it under the bypass rule. A waiter
+that takes its grant wakes the next one that fits in what is left, and a waiter that
+leaves the queue wakes the next one as before. Blocking waiters have no callback, so they
+still wait on the condition variable, which is notified on every change.
+
+`a_query_is_admitted_after_its_body_arrives` sends half a query, checks that the pool has
+granted nothing and queued nothing, and then sends the rest. It failed before the change
+with 16 MiB granted. `uploads_and_graph_store_writes_take_no_initial_grant` holds the whole
+pool and sends a graph PUT, a default graph POST and a POST to `/{ds}`, which answered
+`503` before, and checks that a SPARQL update still waits. `a_release_wakes_only_the_waiters_that_fit`
+counts the wake-ups of three waiters through two releases.
+
+A review found three gaps, which are fixed. A woken waiter whose memory a running grant
+took before it polled ended the wake-up there, so a smaller waiter that still fitted
+waited for the next release or its deadline. A failed poll now wakes the next waiter
+that fits, which `a_woken_waiter_that_no_longer_fits_wakes_the_next` covers. The body
+reader copied a read-ahead body into a second buffer, which held an 8 MiB update twice,
+and `a_body_read_ahead_is_not_copied_again` checks that it now keeps the frame. The
+review counts that the memory brief, the review resource and the maintenance report
+compute on demand ran without the request's grant, so in a pool that the request's own
+grant filled the review resource answered as unknown. They now charge the reading
+request's grant, as `a_review_read_counts_under_its_own_grant` checks, and only the
+background refresh counts without one.
+
+### Retained eager results (2026-10-23)
+
+An eager context's contribution to its grant used to stay at its highest admitted
+estimate until its last owner dropped. That estimate includes the build tables, the
+intermediate results and the deduplication state of the query, so a held `QueryResult`
+or a Python or Node result object reserved its query's peak long after the query
+finished. The result cache stores plain columns without a context, so it was not
+affected. A DISTINCT of a million-row product with a thousand rows
+of answer kept about 40 MB of the pool while its result was alive.
+
+When an eager SELECT or ASK finishes, `Ctx::shrink_retained` now lowers the contribution
+to what the result keeps. That is the capacity its columns have allocated, which a
+filter that compacted them in place leaves above their length, the terms computed into
+the query's local vocabulary, its cached decoded values with their strings, its parsed
+geometries, the memos of its blank nodes and callback terms, and every live charge. A
+map counts every slot it has allocated, since a value cache shard that overflows is
+cleared without giving its slots back, and the heap strings of its live entries. `QueryMemoryLedger::shrink_eager` lowers the primary account to the
+higher of its live bytes and that estimate, lowers every other account to its live bytes,
+and returns the excess to each account's own grant outside the ledger's lock. A cursor
+ledger keeps no eager contribution and a ledger with a running algorithm call keeps its
+contribution, so both are left alone. A later charge on the context grows its
+contribution again as before. A fast account whose contribution is within 1 MiB of the
+retained estimate is left alone, so a small query keeps its lock-free account and takes
+no ledger. The grant and the fast account are read first, so a query without a pool, or
+whose contribution is within 1 MiB of its columns, takes none of the caches' locks. A larger one is handed to the ledger first, which makes the shrink and any
+concurrent charge take the same lock. A context that already has a ledger, such as one
+that called a graph algorithm, always shrinks.
+
+The computed terms, cached values and blank-node memos were never charged in eager
+execution, and the peak estimate covered them only by accident. Counting them keeps the
+contribution from falling below them after the shrink, but a contribution that was
+already below them stays where it was, as before. A CONSTRUCT or DESCRIBE result keeps its peak estimate, because its decoded
+triples and quads are not measured when the query finishes.
+
+`a_finished_eager_result_retains_only_what_it_holds` holds the thousand-row DISTINCT under
+2 MiB of the pool where it held 40 MB, and checks that a million-row result keeps at least
+its rows. `a_retained_small_result_leaves_its_peak_to_other_queries` runs that DISTINCT
+twice in a pool that fits one peak and a half while the first result is alive, which
+failed with `server-memory` before. `shrinking_a_finished_eager_query_keeps_live_and_result_bytes`
+covers two accounts on different grants, live charges and a cursor ledger. A review
+found that the first version counted only the rows of the result table and none of the
+blank-node memos. `a_compacted_result_keeps_its_column_capacity_covered` holds two rows
+whose filtered columns keep 2.4 MB of capacity, which the first version shrank to
+112 bytes, and `a_result_keeps_its_blank_node_memo_covered` holds a COUNT over 100,000
+`BNODE("x")` memo entries, which it shrank to 123 bytes. A second review found that it
+counted the entries of a cleared value shard rather than its slots and left out the
+geometry memo. `retained_state_counts_the_slots_a_cleared_value_shard_keeps` covers the
+first.
 
 ### Phase 2a: batch kernels (2026-10-17)
 
