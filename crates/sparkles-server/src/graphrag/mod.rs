@@ -11,5 +11,6 @@ pub mod budget;
 pub mod hierarchy;
 pub mod identity;
 pub mod ledger;
+pub mod projection;
 pub mod settings;
 pub mod state;
