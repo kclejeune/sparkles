@@ -6812,9 +6812,14 @@ export interface components {
             estimatedCost?: number;
             /** @description `-1` when the caller's view hides estimates. */
             estimatedRows?: number;
+            /** @description On a filter, the query variables its expression reads. */
+            filterVars?: string[];
             /** @description The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response. Absent in plan format 2. */
             id?: string;
+            /** @description On a join, the query variables it joins on. */
+            joinVars?: string[];
             operator: string;
+            patterns?: components["schemas"]["PlanPattern"][];
             /**
              * @description On the root only. A plan deeper than 256 levels is in plan format 2, whose nodes have no `id`, and a client derives each id from the shape of the plan. A plan without this member is in format 1. A reader refuses a format it does not know.
              * @enum {integer}
@@ -6836,6 +6841,19 @@ export interface components {
             }[];
         } & {
             [key: string]: unknown;
+        };
+        /** @description A triple pattern or path of the query that a plan node reads, listed in query order on the node's `patterns`. A variable of the query is written `?name`, and a blank node or a variable the planner made is written `?_`. */
+        PlanPattern: {
+            /** @description The graph term of the `GRAPH` around the pattern. */
+            graph?: string;
+            /** @description The object as an N-Triples term or a variable. */
+            o: string;
+            /** @description The pattern's index among equal patterns of the query, from 0. */
+            occurrence: number;
+            /** @description The predicate, or a path with full IRIs in angle brackets and no spaces, such as `<http://example.org/partOf>+`. */
+            p: string;
+            /** @description The subject as an N-Triples term or a variable. */
+            s: string;
         };
         /** @description A backup policy: its settings, where it is defined, and its scheduler state. */
         Policy: {

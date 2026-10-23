@@ -11686,12 +11686,32 @@
             "description": "`-1` when the caller's view hides estimates.",
             "type": "number"
           },
+          "filterVars": {
+            "description": "On a filter, the query variables its expression reads.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "id": {
             "description": "The node id: the path of child indexes from the root, such as `0.1.2`. Valid only within the plan of the same response. Absent in plan format 2.",
             "type": "string"
           },
+          "joinVars": {
+            "description": "On a join, the query variables it joins on.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "operator": {
             "type": "string"
+          },
+          "patterns": {
+            "items": {
+              "$ref": "#/components/schemas/PlanPattern"
+            },
+            "type": "array"
           },
           "planFormat": {
             "description": "On the root only. A plan deeper than 256 levels is in plan format 2, whose nodes have no `id`, and a client derives each id from the shape of the plan. A plan without this member is in format 1. A reader refuses a format it does not know.",
@@ -11751,6 +11771,40 @@
           "operator",
           "description",
           "children"
+        ],
+        "type": "object"
+      },
+      "PlanPattern": {
+        "additionalProperties": false,
+        "description": "A triple pattern or path of the query that a plan node reads, listed in query order on the node's `patterns`. A variable of the query is written `?name`, and a blank node or a variable the planner made is written `?_`.",
+        "properties": {
+          "graph": {
+            "description": "The graph term of the `GRAPH` around the pattern.",
+            "type": "string"
+          },
+          "o": {
+            "description": "The object as an N-Triples term or a variable.",
+            "type": "string"
+          },
+          "occurrence": {
+            "description": "The pattern's index among equal patterns of the query, from 0.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "p": {
+            "description": "The predicate, or a path with full IRIs in angle brackets and no spaces, such as `<http://example.org/partOf>+`.",
+            "type": "string"
+          },
+          "s": {
+            "description": "The subject as an N-Triples term or a variable.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "s",
+          "p",
+          "o",
+          "occurrence"
         ],
         "type": "object"
       },

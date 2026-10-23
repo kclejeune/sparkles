@@ -9,6 +9,7 @@
 //! top-k for ORDER BY + LIMIT).
 
 use super::ctx::Ctx;
+use super::exec::PlanPattern;
 use super::expr::{Compiler, ExistsSpec, Expr};
 use super::table::{Table, VarId};
 use crate::error::{Error, Result};
@@ -78,6 +79,8 @@ pub struct ScanSpec {
     pub graph_col: usize,
     /// drop adjacent duplicate rows (same triple in several graphs)
     pub dedup: bool,
+    /// the triple pattern of the query the scan reads, for the plan's `patterns`
+    pub src: Option<Arc<PlanPattern>>,
 }
 
 /// A numeric range FILTER pushed into a scan whose first free key column holds `var`.
@@ -325,6 +328,8 @@ pub struct PathSpec {
     /// [`PropertyPathExpression::Range`]). `min` above then tells only whether the
     /// range can match a zero-length path.
     pub count: Option<(u64, Option<u64>)>,
+    /// the path pattern of the query, for the plan's `patterns`
+    pub src: Option<Arc<PlanPattern>>,
 }
 
 // `Values` / `Scan` are much larger than the other variants; nodes are few, so this is fine.
@@ -654,6 +659,8 @@ pub(super) enum PT {
 struct Triple {
     t: [PT; 3],
     graph: ActiveGraph,
+    /// the pattern of the query it comes from, if any
+    src: Option<Arc<PlanPattern>>,
 }
 
 // a Node is much larger than a triple pattern, but items are short-lived and few
@@ -671,6 +678,7 @@ struct PathItem {
     path: PropertyPathExpression,
     o: PT,
     graph: ActiveGraph,
+    src: Option<Arc<PlanPattern>>,
 }
 
 pub(super) const FILTER_SELECTIVITY: f64 = 0.3;
@@ -692,7 +700,14 @@ pub struct Planner<'a> {
     pub source: Option<&'a spargebra::Query>,
     /// the source's SSE form, or `None` when every variable counts as used
     source_sse: std::cell::OnceCell<Option<String>>,
+    /// how many times each pattern of the query has been planned, for its occurrence
+    seen: std::cell::RefCell<FxHashMap<PatternKey, u32>>,
+    /// how many times each pattern occurs in the source
+    source_counts: std::cell::OnceCell<FxHashMap<PatternKey, u32>>,
 }
+
+/// A pattern's subject, predicate or path, and object, as [`PlanPattern`] writes them.
+type PatternKey = (String, String, String);
 
 /// `<<( s p o )>>` with variables: the triple term bound to `t` is decomposed into
 /// `parts` (constants must match, variables are bound).
@@ -713,6 +728,8 @@ impl<'a> Planner<'a> {
             unpacks: Default::default(),
             source: None,
             source_sse: Default::default(),
+            seen: Default::default(),
+            source_counts: Default::default(),
         }
     }
 
@@ -1494,7 +1511,13 @@ impl<'a> Planner<'a> {
             } => {
                 let s = self.term_pattern(subject);
                 let o = self.term_pattern(object);
-                self.collect_path(s, path, o, g, items)?;
+                let src = self.source_pattern(
+                    source_term(subject),
+                    super::exec::path_text(path),
+                    source_term(object),
+                    g,
+                );
+                self.collect_path(s, path, o, g, items, &Some(src))?;
                 items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
             }
             GP::Join { left, right } if !super::enhancer::is_loop(right) => {
@@ -1592,15 +1615,16 @@ impl<'a> Planner<'a> {
         o: PT,
         g: &ActiveGraph,
         items: &mut Vec<Item>,
+        src: &Option<Arc<PlanPattern>>,
     ) -> Result<()> {
         use PropertyPathExpression as PP;
         match path {
             // ARQ's `multi(path)`: the path with its closures counting walks
-            PP::Multi(p) => return self.collect_path(s, &counted(p), o, g, items),
+            PP::Multi(p) => return self.collect_path(s, &counted(p), o, g, items, src),
             // ARQ's `distinct(path)`: the pairs the path connects, each once
             PP::Distinct(p) => {
                 let mut sub = Vec::new();
-                self.collect_path(s, p, o, g, &mut sub)?;
+                self.collect_path(s, p, o, g, &mut sub, src)?;
                 let node = self.plan_group(sub, Vec::new())?;
                 let mut vars = Vec::new();
                 for x in [s, o] {
@@ -1628,12 +1652,13 @@ impl<'a> Planner<'a> {
                     o,
                 ],
                 graph: g.clone(),
+                src: src.clone(),
             })),
-            PP::Reverse(p) => self.collect_path(o, p, s, g, items)?,
+            PP::Reverse(p) => self.collect_path(o, p, s, g, items, src)?,
             PP::Sequence(a, b) => {
                 let mid = PT::V(self.ctx.fresh_var());
-                self.collect_path(s, a, mid, g, items)?;
-                self.collect_path(mid, b, o, g, items)?;
+                self.collect_path(s, a, mid, g, items, src)?;
+                self.collect_path(mid, b, o, g, items, src)?;
             }
             // ARQ's PathCompiler: `p{n,m}` with n ≥ 1 is n steps of p, then p{0,m-n}
             // (p{*} when unbounded); the steps are joined like a sequence's. A change to
@@ -1646,7 +1671,7 @@ impl<'a> Planner<'a> {
                     } else {
                         PT::V(self.ctx.fresh_var())
                     };
-                    self.collect_path(from, path, to, g, items)?;
+                    self.collect_path(from, path, to, g, items, src)?;
                     from = to;
                 }
                 if *max != Some(*min) {
@@ -1660,6 +1685,7 @@ impl<'a> Planner<'a> {
                         path: rest,
                         o,
                         graph: g.clone(),
+                        src: src.clone(),
                     }));
                 }
             }
@@ -1668,6 +1694,7 @@ impl<'a> Planner<'a> {
                 path: path.clone(),
                 o,
                 graph: g.clone(),
+                src: src.clone(),
             })),
         }
         Ok(())
@@ -2295,6 +2322,7 @@ impl<'a> Planner<'a> {
         let sub = vec![Item::Triple(Triple {
             t: [s, p, o],
             graph: g.clone(),
+            src: None,
         })];
         let node = self.plan_group(sub, Vec::new())?;
         if let ActiveGraph::Var(gv) = g
@@ -2317,7 +2345,63 @@ impl<'a> Planner<'a> {
                 self.term_pattern(&tp.object),
             ],
             graph: g.clone(),
+            src: Some(self.source_pattern(
+                source_term(&tp.subject),
+                source_named(&tp.predicate),
+                source_term(&tp.object),
+                g,
+            )),
         }
+    }
+
+    /// The pattern `s p o` of the query in graph `g` as the plan names it (spec U04
+    /// §11.3), with its occurrence among the equal patterns planned so far. A part of
+    /// the query that is planned again (the inner pattern of `GRAPH ?g` once per graph)
+    /// counts its patterns again, so the count wraps at the number of equal patterns in
+    /// the source.
+    fn source_pattern(&self, s: String, p: String, o: String, g: &ActiveGraph) -> Arc<PlanPattern> {
+        let key = (s, p, o);
+        let mut seen = self.seen.borrow_mut();
+        let n = seen.entry(key.clone()).or_insert(0);
+        let mut occurrence = *n;
+        *n += 1;
+        drop(seen);
+        if let Some(total) = self.source_counts().get(&key)
+            && *total > 0
+        {
+            occurrence %= *total;
+        }
+        let graph = match g {
+            ActiveGraph::Default => None,
+            ActiveGraph::Union => Some(format!("<{}>", super::ctx::UNION_GRAPH_IRI)),
+            ActiveGraph::Named(id) => self.ctx.term(*id).map(|t| t.to_string()),
+            ActiveGraph::Var(v) => Some(self.pt_str(&PT::V(*v))),
+        };
+        let (s, p, o) = key;
+        Arc::new(PlanPattern {
+            s,
+            p,
+            o,
+            graph,
+            occurrence,
+        })
+    }
+
+    /// How many times each triple pattern and path occurs in the source query.
+    fn source_counts(&self) -> &FxHashMap<PatternKey, u32> {
+        self.source_counts.get_or_init(|| {
+            let mut out = FxHashMap::default();
+            if let Some(q) = self.source {
+                let gp = match q {
+                    spargebra::Query::Select { pattern, .. }
+                    | spargebra::Query::Construct { pattern, .. }
+                    | spargebra::Query::Describe { pattern, .. }
+                    | spargebra::Query::Ask { pattern, .. } => pattern,
+                };
+                count_patterns(gp, &mut out);
+            }
+            out
+        })
     }
 
     fn unpack(&self, input: Node, u: UnpackItem) -> Node {
@@ -2669,6 +2753,7 @@ impl<'a> Planner<'a> {
                     graph,
                     graph_col,
                     dedup,
+                    src: t.src.clone(),
                 }),
                 vars,
                 est,
@@ -3155,7 +3240,7 @@ impl<'a> Planner<'a> {
                 let mut branches = Vec::new();
                 for a in alts {
                     let mut items = Vec::new();
-                    self.collect_path(p.s, a, p.o, &p.graph, &mut items)?;
+                    self.collect_path(p.s, a, p.o, &p.graph, &mut items, &p.src)?;
                     branches.push(self.plan_group(items, Vec::new())?);
                 }
                 return Ok(join(left, union(branches), self.ctx));
@@ -3166,6 +3251,7 @@ impl<'a> Planner<'a> {
                 let t = Triple {
                     t: [p.s, PT::V(pv), p.o],
                     graph: p.graph.clone(),
+                    src: p.src.clone(),
                 };
                 let mut opts = self.scan_options(&t)?;
                 opts.sort_by(|a, b| a.cost.total_cmp(&b.cost));
@@ -3185,7 +3271,7 @@ impl<'a> Planner<'a> {
             }
             _ => {
                 let mut items = Vec::new();
-                self.collect_path(p.s, &p.path, p.o, &p.graph, &mut items)?;
+                self.collect_path(p.s, &p.path, p.o, &p.graph, &mut items, &p.src)?;
                 let n = self.plan_group(items, Vec::new())?;
                 return Ok(join(left, n, self.ctx));
             }
@@ -3220,7 +3306,7 @@ impl<'a> Planner<'a> {
             _ => {
                 let (a, b) = (self.ctx.fresh_var(), self.ctx.fresh_var());
                 let mut items = Vec::new();
-                self.collect_path(PT::V(a), inner, PT::V(b), &p.graph, &mut items)?;
+                self.collect_path(PT::V(a), inner, PT::V(b), &p.graph, &mut items, &None)?;
                 let edges = self.plan_group(items, Vec::new())?;
                 let mut keep = vec![a, b];
                 if let Some(g) = gvar {
@@ -3241,6 +3327,7 @@ impl<'a> Planner<'a> {
             graph_var: gvar,
             edge_vars,
             count,
+            src: p.src.clone(),
         };
         let mut vars = Vec::new();
         for e in [&spec.subj, &spec.obj] {
@@ -4907,6 +4994,7 @@ fn reorder_scan(spec: &ScanSpec, first: VarId) -> Option<ScanSpec> {
         graph: spec.graph.clone(),
         graph_col: perm.col_of(G),
         dedup: spec.dedup,
+        src: spec.src.clone(),
     })
 }
 
@@ -5352,4 +5440,82 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -
 /// Literal helper for tests.
 pub fn lit_int(i: i64) -> Term {
     Term::Literal(Literal::new_typed_literal(i.to_string(), xsd::INTEGER))
+}
+
+/// A subject or object of the query as [`PlanPattern`] writes it: an N-Triples term, a
+/// variable as `?name`, and a blank node or a triple term with variables as `?_`.
+fn source_term(t: &TermPattern) -> String {
+    match t {
+        TermPattern::Variable(v) => format!("?{}", v.as_str()),
+        TermPattern::NamedNode(n) => n.to_string(),
+        TermPattern::Literal(l) => l.to_string(),
+        TermPattern::Triple(tp) => match ground_triple(tp) {
+            Some(t) => Term::Triple(Box::new(t)).to_string(),
+            None => "?_".into(),
+        },
+        TermPattern::BlankNode(_) => "?_".into(),
+    }
+}
+
+/// A predicate of the query as [`PlanPattern`] writes it.
+fn source_named(n: &NamedNodePattern) -> String {
+    match n {
+        NamedNodePattern::NamedNode(n) => n.to_string(),
+        NamedNodePattern::Variable(v) => format!("?{}", v.as_str()),
+    }
+}
+
+/// Count each triple pattern and path of `gp` into `out`, keyed as the planner keys them.
+fn count_patterns(gp: &GraphPattern, out: &mut FxHashMap<PatternKey, u32>) {
+    use GraphPattern as GP;
+    let mut todo = vec![gp];
+    while let Some(gp) = todo.pop() {
+        match gp {
+            GP::Bgp { patterns } => {
+                for t in patterns {
+                    let key = (
+                        source_term(&t.subject),
+                        source_named(&t.predicate),
+                        source_term(&t.object),
+                    );
+                    *out.entry(key).or_insert(0) += 1;
+                }
+            }
+            GP::Path {
+                subject,
+                path,
+                object,
+            } => {
+                let key = (
+                    source_term(subject),
+                    super::exec::path_text(path),
+                    source_term(object),
+                );
+                *out.entry(key).or_insert(0) += 1;
+            }
+            GP::Join { left, right }
+            | GP::LeftJoin { left, right, .. }
+            | GP::Lateral { left, right }
+            | GP::Union { left, right }
+            | GP::SemiJoin { left, right }
+            | GP::AntiJoin { left, right }
+            | GP::Minus { left, right } => {
+                todo.push(left);
+                todo.push(right);
+            }
+            GP::Filter { inner, .. }
+            | GP::Graph { inner, .. }
+            | GP::Extend { inner, .. }
+            | GP::Assign { inner, .. }
+            | GP::Unfold { inner, .. }
+            | GP::OrderBy { inner, .. }
+            | GP::Project { inner, .. }
+            | GP::Distinct { inner }
+            | GP::Reduced { inner }
+            | GP::Slice { inner, .. }
+            | GP::Group { inner, .. }
+            | GP::Service { inner, .. } => todo.push(inner),
+            GP::Values { .. } => {}
+        }
+    }
 }

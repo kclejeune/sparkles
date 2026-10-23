@@ -1337,6 +1337,8 @@ mod pattern_tests;
 #[cfg(test)]
 mod plan_fidelity_tests;
 #[cfg(test)]
+mod plan_refs_tests;
+#[cfg(test)]
 mod sample_tests;
 #[cfg(test)]
 mod stats_tests;

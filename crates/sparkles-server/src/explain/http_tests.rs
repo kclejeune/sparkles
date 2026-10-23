@@ -513,3 +513,81 @@ async fn a57_server_models_need_the_grant() {
     let me = principal("agent-7", true, None).id();
     assert!(st.asks.tokens_today("org", Some(&me)) > 0);
 }
+
+/// Every pattern a plan's nodes name, as `s p o`, sorted.
+fn plan_patterns(plan: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut todo = vec![plan];
+    while let Some(n) = todo.pop() {
+        // a streamed plan's node holds its operator
+        let op = if n["operator"].is_object() {
+            &n["operator"]
+        } else {
+            n
+        };
+        for p in op["patterns"].as_array().into_iter().flatten() {
+            out.push(format!("{} {} {}", p["s"], p["p"], p["o"]).replace('"', ""));
+        }
+        todo.extend(n["children"].as_array().into_iter().flatten());
+    }
+    out.sort();
+    out
+}
+
+/// U04 §11.3: plan nodes name the patterns they read on every route that returns a plan.
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_patterns_are_on_every_route_that_returns_a_plan() {
+    let (_, app) = app(None, 3000);
+    let q = "PREFIX ex: <http://example.org/> SELECT ?p ?n WHERE { ?p ex:team ?t ; ex:name ?n }";
+    let want = vec![
+        "?p <http://example.org/name> ?n".to_string(),
+        "?p <http://example.org/team> ?t".to_string(),
+    ];
+    // GET /{ds}/explain
+    let r = Request::get(format!(
+        "/org/explain?query={}",
+        form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>()
+    ))
+    .body(Body::empty())
+    .unwrap();
+    let (s, t) = send(&app, r).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let v: Value = serde_json::from_str(&t).unwrap();
+    assert_eq!(plan_patterns(&v["plan"]), want, "{v:#}");
+    // POST /{ds}/sparql/explain, estimated and run
+    for profile in ["estimate", "run"] {
+        let (s, v) = explain_json(&app, json!({ "query": q, "profile": profile })).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(plan_patterns(&v["plan"]), want, "{profile}: {v:#}");
+    }
+    // meta.plan of a run
+    let r = Request::post("/org/sparql")
+        .header("content-type", "application/sparql-query")
+        .header("accept", "application/x-sparkles+json")
+        .body(Body::from(q))
+        .unwrap();
+    let (s, t) = send(&app, r).await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let v: Value = serde_json::from_str(&t).unwrap();
+    assert_eq!(plan_patterns(&v["meta"]["plan"]), want, "{v:#}");
+    // the plan in a budget error body, with the filter's variables
+    let slow = "PREFIX ex: <http://example.org/> SELECT * WHERE { ?a ex:v ?x . ?b ex:v ?y FILTER(REGEX(STR(?x + ?y), \"^zzz\")) }";
+    let r = Request::post("/org/sparql?timeout=0.3")
+        .header("content-type", "application/sparql-query")
+        .header("accept", "application/x-sparkles+json")
+        .body(Body::from(slow))
+        .unwrap();
+    let (s, t) = send(&app, r).await;
+    assert_eq!(s, StatusCode::REQUEST_TIMEOUT, "{t}");
+    let err: Value = serde_json::from_str(&t).unwrap();
+    assert_eq!(
+        plan_patterns(&err["plan"]),
+        vec![
+            "?a <http://example.org/v> ?x".to_string(),
+            "?b <http://example.org/v> ?y".to_string(),
+        ],
+        "{err:#}"
+    );
+    let text = err["plan"].to_string();
+    assert!(text.contains("\"filterVars\":[\"x\",\"y\"]"), "{text}");
+}
