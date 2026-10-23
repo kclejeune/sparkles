@@ -1149,7 +1149,8 @@ pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
             Kind::Filter(exprs) => exprs.iter().all(|e| {
                 !e.has_exists()
                     || (depth < AUTO_EXISTS_DEPTH
-                        && super::exists::keyed_plan(ctx, e)
+                        && node.children.len() == 1
+                        && super::exists::keyed_plan(ctx, e, &node.children[0])
                             .is_some_and(|planned| at(ctx, &planned, depth + 1)))
             }),
             kind => !own_exprs(kind).iter().any(|e| e.has_exists()),

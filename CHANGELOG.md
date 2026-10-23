@@ -10,8 +10,8 @@ Namespace instance at 10.5M quads these ran 0.68 to 0.99 times as long as eagerl
 EXISTS in BIND, an OPTIONAL condition or a larger expression keeps the plan eager.
 
 A finished eager SELECT or ASK now keeps only its result's estimate in the query memory
-pool instead of its query's peak, so a held result, a Python or Node result object or a
-cached result no longer reserves the memory of the tables it was built from. CONSTRUCT and
+pool instead of its query's peak, so a held result or a Python or Node result object no
+longer reserves the memory of the tables it was built from. CONSTRUCT and
 DESCRIBE results keep their peak as before.
 
 Group commit now covers datasets with a full-text, spatial or embedding index, which used

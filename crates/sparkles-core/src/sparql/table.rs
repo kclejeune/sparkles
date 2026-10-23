@@ -76,6 +76,22 @@ impl Table {
     }
 
     /// Estimated memory for the query memory budget: the ids plus a fixed overhead.
+    /// The bytes the table's vectors have allocated, which can exceed
+    /// [`Table::mem_bytes`] after a filter compacted its columns in place.
+    pub fn capacity_bytes(&self) -> u64 {
+        let ids = self
+            .cols
+            .iter()
+            .map(|c| c.capacity() as u64)
+            .sum::<u64>()
+            .saturating_mul(std::mem::size_of::<Id>() as u64);
+        let vars = (self.vars.capacity() + self.sorted.capacity()) as u64
+            * std::mem::size_of::<VarId>() as u64;
+        ids.saturating_add(vars)
+            .saturating_add(self.cols.capacity() as u64 * std::mem::size_of::<Vec<Id>>() as u64)
+            .saturating_add(64)
+    }
+
     pub fn mem_bytes(&self) -> u64 {
         super::ctx::table_bytes(self.len, self.width()) + 64
     }

@@ -937,7 +937,7 @@ fn execute_prepared(
     // graph result's triples are not measured, and it keeps its query's highest
     // estimate as before.
     if matches!(kind, QueryKind::Select | QueryKind::Ask)
-        && let Err(error) = ctx.shrink_retained(result.table.mem_bytes())
+        && let Err(error) = ctx.shrink_retained(result.table.capacity_bytes())
     {
         return Err(Box::new(Failed {
             error,

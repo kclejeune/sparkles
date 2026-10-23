@@ -980,3 +980,54 @@ fn a_retained_small_result_leaves_its_peak_to_other_queries() {
     drop((first, second));
     assert_eq!(pool.granted(), 0);
 }
+
+/// A FILTER that compacts its columns in place keeps their allocations, and the result
+/// that owns them keeps that capacity covered in the pool.
+#[test]
+fn a_compacted_result_keeps_its_column_capacity_covered() {
+    let s = store_rows(100_000);
+    let pool = QueryPool::new(1024 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let q = "SELECT ?s ?v ?w { ?s <urn:p> ?v BIND(?v + 1 AS ?w) FILTER(?w < 3) }";
+    let result = query(s.snapshot(), q, &opts).unwrap();
+    assert_eq!(result.rows().len(), 2);
+    let capacity: u64 = result
+        .table
+        .cols
+        .iter()
+        .map(|c| c.capacity() as u64 * 8)
+        .sum();
+    let used = result.ctx.grant().unwrap().used();
+    assert!(
+        used >= capacity,
+        "{used} bytes cover {capacity} bytes of columns"
+    );
+}
+
+/// The blank nodes that BNODE(string) made for each solution stay in the context's
+/// memo, and a held result does not give up the pool memory that covers them.
+#[test]
+fn a_result_keeps_its_blank_node_memo_covered() {
+    let s = store_rows(100_000);
+    let pool = QueryPool::new(1024 * MB);
+    let opts = QueryOptions {
+        pool: Some(pool.clone()),
+        no_cache: true,
+        ..Default::default()
+    };
+    let q = "SELECT (COUNT(?b) AS ?n) { ?s <urn:p> ?v BIND(BNODE(\"x\") AS ?b) }";
+    let result = query(s.snapshot(), q, &opts).unwrap();
+    assert_eq!(result.rows().len(), 1);
+    // Eager execution never charged the memo, and the query's peak estimate covered it
+    // only in part. The finished result does not drop below either.
+    let used = result.ctx.grant().unwrap().used();
+    let floor = result.mem_peak_bytes.min(100_000 * 32);
+    assert!(
+        used >= floor,
+        "{used} bytes for 100,000 memo entries, at least {floor}"
+    );
+}

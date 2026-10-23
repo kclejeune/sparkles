@@ -1053,28 +1053,33 @@ latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
 
 An eager context's contribution to its grant used to stay at its highest admitted
 estimate until its last owner dropped. That estimate includes the build tables, the
-intermediate results and the deduplication state of the query, so a held `QueryResult`,
-a Python or Node result object, or a result in the result cache reserved its query's peak
-long after the query finished. A DISTINCT of a million-row product with a thousand rows
+intermediate results and the deduplication state of the query, so a held `QueryResult`
+or a Python or Node result object reserved its query's peak long after the query
+finished. The result cache stores plain columns without a context, so it was not
+affected. A DISTINCT of a million-row product with a thousand rows
 of answer kept about 40 MB of the pool while its result was alive.
 
 When an eager SELECT or ASK finishes, `Ctx::shrink_retained` now lowers the contribution
-to what the result keeps. That is the result table's estimate, the bytes of the terms
-computed into the query's local vocabulary, 96 bytes for each cached decoded value and
-every live charge. `QueryMemoryLedger::shrink_eager` lowers the primary account to the
+to what the result keeps. That is the capacity its columns have allocated, which a
+filter that compacted them in place leaves above their length, the terms computed into
+the query's local vocabulary, its cached decoded values with their strings, the memos of
+its blank nodes and every live charge. Each map entry counts its key, its strings and 48
+bytes for its slot. `QueryMemoryLedger::shrink_eager` lowers the primary account to the
 higher of its live bytes and that estimate, lowers every other account to its live bytes,
 and returns the excess to each account's own grant outside the ledger's lock. A cursor
 ledger keeps no eager contribution and a ledger with a running algorithm call keeps its
 contribution, so both are left alone. A later charge on the context grows its
 contribution again as before. A fast account whose contribution is within 1 MiB of the
 retained estimate is left alone, so a small query keeps its lock-free account and takes
-no ledger. A larger one is handed to the ledger first, which makes the shrink and any
+no ledger. The grant and the fast account are read first, so a query without a pool, or
+whose contribution is within 1 MiB of its columns, takes none of the caches' locks. A larger one is handed to the ledger first, which makes the shrink and any
 concurrent charge take the same lock. A context that already has a ledger, such as one
 that called a graph algorithm, always shrinks.
 
-The computed terms and cached values were never charged in eager execution, and the peak
-estimate covered them only by accident. Counting them keeps them covered after the
-shrink. A CONSTRUCT or DESCRIBE result keeps its peak estimate, because its decoded
+The computed terms, cached values and blank-node memos were never charged in eager
+execution, and the peak estimate covered them only by accident. Counting them keeps the
+contribution from falling below them after the shrink, but a contribution that was
+already below them stays where it was, as before. A CONSTRUCT or DESCRIBE result keeps its peak estimate, because its decoded
 triples and quads are not measured when the query finishes.
 
 `a_finished_eager_result_retains_only_what_it_holds` holds the thousand-row DISTINCT under
@@ -1082,7 +1087,12 @@ triples and quads are not measured when the query finishes.
 its rows. `a_retained_small_result_leaves_its_peak_to_other_queries` runs that DISTINCT
 twice in a pool that fits one peak and a half while the first result is alive, which
 failed with `server-memory` before. `shrinking_a_finished_eager_query_keeps_live_and_result_bytes`
-covers two accounts on different grants, live charges and a cursor ledger.
+covers two accounts on different grants, live charges and a cursor ledger. A review
+found that the first version counted only the rows of the result table and none of the
+blank-node memos. `a_compacted_result_keeps_its_column_capacity_covered` holds two rows
+whose filtered columns keep 2.4 MB of capacity, which the first version shrank to
+112 bytes, and `a_result_keeps_its_blank_node_memo_covered` holds a COUNT over 100,000
+`BNODE("x")` memo entries, which it shrank to 123 bytes.
 
 ### Phase 2a: batch kernels (2026-10-17)
 

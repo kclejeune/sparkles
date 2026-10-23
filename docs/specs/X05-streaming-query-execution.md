@@ -1553,6 +1553,9 @@ NOT EXISTS of a quarter of a million rows. `streams_natively` in `cursor.rs` now
 `EXISTS { P }` or `NOT EXISTS { P }` that is a conjunct of a FILTER through the same
 admission check that the key set uses, `exists::keyed_plan`, and accepts the FILTER when
 the plan of each `P` has cursor operators in turn, through at most four nested levels.
+`keyed_plan` also rejects what the key set would reject for every row: a variable that a
+FILTER inside `P` reads and that every input row or a substituted constant binds, and an
+input that binds none of the key variables.
 An EXISTS anywhere else, in BIND, an OPTIONAL condition, an ORDER BY key, an aggregate
 argument or inside a larger expression, keeps the plan eager. So does a pattern that
 calls a SERVICE, and so does `decorrelate_exists` turned off. Planning the patterns
@@ -1569,7 +1572,8 @@ admission after the measurement.
 `tests/exists_auto.rs` compares automatic and eager answers over 60,000 subjects for
 groupings and counts with EXISTS and NOT EXISTS under OPTIONAL, MINUS and GRAPH, nested,
 over empty patterns and at two batch sizes, and checks that each one streams. It also
-checks that the per-key shapes stay eager with the same answers, that a SERVICE in the
+checks that the per-key shapes stay eager with the same answers, including an inner
+FILTER that reads a variable every outer row binds, that a SERVICE in the
 pattern or a small input stays eager, that a streamed EXISTS fails with `Cancelled` after
 its flag is set, and that under budgets from 512 KiB to 64 MiB it either matches eager
 execution within its budget or fails on memory. The decision tables in `cursor.rs` cover

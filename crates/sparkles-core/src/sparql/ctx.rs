@@ -1451,36 +1451,72 @@ impl Ctx {
 
     /// The highest memory estimate of this context so far.
     /// Lower a finished eager query's retained pool contribution to what its result
-    /// keeps: `result` bytes of output, the terms computed into its local vocabulary,
-    /// its cached decoded values and its live charges (X08-P1-retained-results). The
-    /// contribution otherwise stays at the query's highest admitted estimate, including
-    /// build and transient state, until the context drops. A contribution within
-    /// [`RETAIN_SLACK`] of what the result keeps is left alone, so that a small query
-    /// never takes the ledger.
+    /// keeps: `result` bytes of allocated output columns, the uncharged state that the
+    /// context still owns ([`Ctx::retained_state_bytes`]) and its live charges
+    /// (X08-P1-retained-results). The contribution otherwise stays at the query's
+    /// highest admitted estimate, including build and transient state, until the context
+    /// drops. A fast account within [`RETAIN_SLACK`] of what the result keeps is left
+    /// alone, so that a small query never takes the ledger. The grant and the fast
+    /// account are read before the context's caches, so that a query without a pool or
+    /// with a small contribution takes none of their locks.
     pub(super) fn shrink_retained(&self, result: u64) -> Result<()> {
         if self.cursor_memory.is_some() {
             return Ok(());
         }
-        let values = self
-            .values
-            .iter()
-            .map(|shard| shard.read().len() as u64)
-            .sum::<u64>()
-            .saturating_mul(96);
-        let keep = result
-            .saturating_add(self.local.read().bytes() as u64)
-            .saturating_add(values);
-        let admitted = match self.memory.get() {
-            Some(_) => u64::MAX,
+        let fast = match self.memory.get() {
+            Some(_) => None,
             None => match self.fast.grant.get() {
-                Some(Some(_)) => self.fast.eager.load(Ordering::Acquire),
+                Some(Some(_)) => Some(self.fast.eager.load(Ordering::Acquire)),
                 _ => return Ok(()),
             },
         };
-        if admitted <= keep.saturating_add(RETAIN_SLACK) {
+        // What the context keeps is never less than its columns, so a contribution
+        // within the slack of those cannot shrink by more than the slack.
+        if fast.is_some_and(|admitted| admitted <= result.saturating_add(RETAIN_SLACK)) {
+            return Ok(());
+        }
+        let keep = result.saturating_add(self.retained_state_bytes());
+        if fast.is_some_and(|admitted| admitted <= keep.saturating_add(RETAIN_SLACK)) {
             return Ok(());
         }
         self.memory().shrink_eager(keep)
+    }
+
+    /// The bytes of the state an eager context keeps after execution without a charge:
+    /// the terms computed into its local vocabulary, its cached decoded values and the
+    /// memos of its blank nodes. Each map entry counts its key and value storage and a
+    /// fixed 48 bytes for its slot.
+    fn retained_state_bytes(&self) -> u64 {
+        fn text(s: &str) -> u64 {
+            s.len() as u64 + 16
+        }
+        fn value(v: &Value) -> u64 {
+            match v {
+                Value::Iri(a) | Value::BNode(a) | Value::Str(a) => text(a),
+                Value::Lang(a, b) | Value::LangDir(a, b, _) => text(a) + text(b),
+                Value::Other { lex, dt } => text(lex) + text(dt),
+                Value::Triple(t) => 64 + t.to_string().len() as u64,
+                _ => 0,
+            }
+        }
+        const SLOT: u64 = 48;
+        let entry = |key: u64, string: &String| SLOT + key + string.capacity() as u64;
+        let mut bytes = self.local.read().bytes() as u64;
+        for shard in &self.values {
+            for v in shard.read().values() {
+                bytes = bytes.saturating_add(SLOT + std::mem::size_of::<Value>() as u64 + value(v));
+            }
+        }
+        for (key, label) in self.bnode_memo.lock().keys() {
+            bytes = bytes.saturating_add(entry(key.capacity() as u64 * 8, label));
+        }
+        for label in self.outside_bnodes.lock().keys() {
+            bytes = bytes.saturating_add(entry(0, label));
+        }
+        for label in self.literal_bnodes.lock().keys() {
+            bytes = bytes.saturating_add(entry(0, label));
+        }
+        bytes
     }
 
     pub fn mem_peak(&self) -> u64 {

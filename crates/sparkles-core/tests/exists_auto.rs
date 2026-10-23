@@ -248,3 +248,21 @@ fn streamed_exists_stays_within_its_memory_budget() {
         }
     }
 }
+
+/// A pattern whose inner FILTER reads a variable that every outer row binds cannot use
+/// its key set, so each distinct outer key is evaluated on its own and the plan stays
+/// eager, like the other per-key shapes.
+#[test]
+fn exists_with_an_outer_bound_risky_variable_stays_eager() {
+    let s = store();
+    for q in [
+        "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:q> ?o FILTER(?v >= 0) } }",
+        "SELECT (COUNT(*) AS ?n) { ?s <urn:p> ?v FILTER NOT EXISTS { ?o <urn:r> ?k } }",
+    ] {
+        let expected = query(s.snapshot(), q, &Default::default()).unwrap().rows();
+        let (got, streamed) = automatic(&s, q, &Default::default(), &Default::default())
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert!(!streamed, "{q}: streamed");
+        assert_eq!(bag(got), bag(expected), "{q}");
+    }
+}

@@ -279,12 +279,34 @@ fn exists_of(e: &Expr) -> Option<(&ExistsSpec, bool)> {
 /// Automatic execution streams only an EXISTS that it can answer this way. Any other
 /// EXISTS is evaluated once per distinct outer key, which measured slower in the cursor
 /// than in eager execution.
-pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr) -> Option<Node> {
+///
+/// `input` is the FILTER's input. The key set cannot answer a row that binds a risky
+/// variable, one that a FILTER inside `P` reads, so a risky variable that a constant or
+/// every input row binds forces evaluation per key, as does an input that binds none of
+/// the key variables. Both are rejected here. A risky variable that only some input rows
+/// bind stays admitted, since the rows that leave it unbound use the key set.
+pub(super) fn keyed_plan(ctx: &Ctx, e: &Expr, input: &Node) -> Option<Node> {
     if !ctx.opt.decorrelate_exists {
         return None;
     }
     let (spec, _) = exists_of(e)?;
-    admit(ctx, spec).ok().map(|plan| plan.node)
+    let plan = admit(ctx, spec).ok()?;
+    let constant = |v: &VarId| spec.bound.iter().any(|(b, _)| b == v);
+    if plan
+        .risky
+        .iter()
+        .any(|v| constant(v) || input.certain.contains(v))
+    {
+        return None;
+    }
+    if !plan
+        .keys
+        .iter()
+        .any(|v| constant(v) || input.vars.contains(v))
+    {
+        return None;
+    }
+    Some(plan.node)
 }
 
 /// Apply the filter conjuncts `EXISTS { P }` / `NOT EXISTS { P }` that can be answered
