@@ -35,7 +35,8 @@ inferred() { python3 -I -c 'import json, sys; sys.exit(sys.argv[2] not in json.l
 # triples, so two binaries' closures can be compared. INFER_THREADS sets `--threads`.
 # CLOSURE_DUMP=0 leaves out <profile>.nt, which only the query engines read, for an
 # acceptance run with no engines whose closure would not fit on the disk (LUBM(1000) is
-# about 30 GB of N-Triples). The total triples are then the base plus the derived ones.
+# about 30 GB of N-Triples). The total triples are then the store's distinct base triples
+# plus the derived ones.
 suite_infer() {
   local p=$1 gtime derived t0 t1 status digest=null threads=()
   gtime=$(gnu_time)
@@ -72,7 +73,13 @@ print(n, h.hexdigest())') || die "dumping the derived graph of $p failed, see lo
   base=$(wc -l < base.nt)
   if [ "${CLOSURE_DUMP:-1}" = 0 ]; then
     [ -z "${ENGINES// /}" ] || die "CLOSURE_DUMP=0 needs ENGINES=\"\", since the engines load $p.nt"
-    total=$((base + derived))
+    # the input can repeat a statement, so the closure's size is the store's distinct base
+    # triples plus the derived ones, which are new by definition
+    local stored
+    stored=$("$SPARKLES" query --loc base.db --results tsv 'SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }' 2> "logs/count-base.log" |
+      sed -n '2s/^"\{0,1\}\([0-9][0-9]*\).*/\1/p')
+    [[ $stored =~ ^[0-9]+$ ]] || die "counting the stored base triples failed, see logs/count-base.log"
+    total=$((stored + derived))
   else
     "$SPARKLES" dump --loc "infer-$p.db" --merge --format nt --out "$p.tmp.nt" > /dev/null 2> "logs/dump-$p.log" ||
       die "dumping the closure of $p failed, see logs/dump-$p.log"

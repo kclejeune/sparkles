@@ -524,6 +524,7 @@ class SuiteTests(unittest.TestCase):
         write_text(stub, """#!/bin/sh
 case $1 in
   load) mkdir -p "$3" ;;
+  query) printf '?n\n"1"^^<http://www.w3.org/2001/XMLSchema#integer>\n' ;;
   infer) for a; do [ "$a" = --status ] && { echo '{"run": {"peakBytes": 5, "threads": 2}}'; exit 0; }; done
          echo "2 inferred triples" ;;
   dump) for a; do [ "$a" = urn:x-sparkles:inferred ] && { printf '<a> <b> <c> .\n<a> <b> <d> .\n'; exit 0; }; done
@@ -534,7 +535,7 @@ esac
         gtime = os.path.join(d, "gtime")
         write_text(gtime, '#!/bin/sh\nshift; out=$2; shift 2\necho "Maximum resident set size (kbytes): 1000" > "$out"\nexec "$@"\n')
         os.chmod(gtime, 0o755)
-        write_text(os.path.join(d, "base.nt"), "<x> <y> <z> .\n")
+        write_text(os.path.join(d, "base.nt"), "<x> <y> <z> .\n" * env.pop("REPEAT", 1))
         os.mkdir(os.path.join(d, "logs"))
         os.mkdir(os.path.join(d, "results"))
         lib, suite = os.path.join(SCRIPTS, "bench-lib.sh"), os.path.join(SCRIPTS, "bench-suite-lib.sh")
@@ -550,6 +551,12 @@ esac
             self.assertFalse(os.path.exists(os.path.join(d, "rdfs.nt")))
             inf = jload(os.path.join(d, "results", "inference.json"))["rdfs"]
             self.assertEqual((inf["base_triples"], inf["derived_triples"], inf["total_triples"]), (1, 2, 3))
+        with tempfile.TemporaryDirectory() as d:
+            # a repeated input statement is stored once, so it counts once in the total
+            p = self.infer(d, ENGINES="", CLOSURE_DUMP="0", REPEAT=2)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            inf = jload(os.path.join(d, "results", "inference.json"))["rdfs"]
+            self.assertEqual((inf["base_triples"], inf["total_triples"]), (2, 3))
             self.assertEqual(inf["peak_bytes"], 5)
             self.assertEqual(len(inf["derived_sha256"]), 64)
         with tempfile.TemporaryDirectory() as d:
