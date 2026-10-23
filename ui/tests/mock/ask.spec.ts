@@ -210,6 +210,10 @@ test('a global question is answered from community reports, and switches to the 
   await page.getByRole('button', { name: 'Answer from summaries' }).click();
   await expect(page.getByTestId('global-answer')).toBeVisible();
   expect(bodies.at(-1)?.mode).toBe('global');
+  // running the query left in the editor never shows the global summary as row citations
+  await page.getByRole('button', { name: /^Run/ }).click();
+  await expect(page.getByRole('region', { name: 'Results' }).locator('.rbar')).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Answer', exact: true })).toHaveCount(0);
 });
 
 test.describe('a global answer on a phone', () => {

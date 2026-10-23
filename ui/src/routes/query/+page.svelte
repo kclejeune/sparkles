@@ -2443,7 +2443,8 @@
     onfocusin={() => (resultsFocused = true)}
     onfocusout={() => (resultsFocused = false)}
   >
-    {#if showSummary && answer?.summary && outcome?.result}
+    <!-- a global answer's summary cites points, not rows, so it never renders here -->
+    {#if showSummary && answer?.summary && !answer.global && outcome?.result}
       <AnswerSummary
         summary={answer.summary}
         rows={outcome.result.rows?.length ?? outcome.result.triples?.length ?? 0}
