@@ -193,12 +193,13 @@ pub(super) async fn groups(
         let key = cache::Key {
             branch: ds.store.branch_id(),
             commit: snap.commit,
-            view: opts
-                .graphs
-                .as_ref()
-                .map(|g| g.read_key())
-                .unwrap_or_default(),
-            extra: opts.default_graph_extra.join("\u{1f}"),
+            view: cache::view_key(opts.graphs.as_ref()),
+            // the dataset a request names with default-graph-uri and named-graph-uri, and
+            // the inferred overlay the dataset adds to the default graph
+            extra: format!(
+                "{:?}|{:?}|{:?}",
+                opts.default_graph_uris, opts.named_graph_uris, opts.default_graph_extra
+            ),
             request: req.key(),
         };
         if let Some(hit) = cache::get(&key) {

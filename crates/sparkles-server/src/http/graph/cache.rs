@@ -42,6 +42,21 @@ static CACHE: Mutex<Cache> = parking_lot::const_mutex(Cache {
     bytes: 0,
 });
 
+/// The key of what a caller's view reads: its graphs and the protections of triples it
+/// keeps (C12 and C12b). Two callers with the same graphs but different lifted
+/// protections read different data, so both parts are in the key.
+pub(in crate::http) fn view_key(
+    graphs: Option<&std::sync::Arc<sparkles::access::GraphAccess>>,
+) -> String {
+    match graphs {
+        None => String::new(),
+        Some(g) => match g.triples.as_ref().filter(|t| t.hides()) {
+            Some(t) => format!("{}\u{1f}{}", g.read_key(), t.read_key()),
+            None => g.read_key(),
+        },
+    }
+}
+
 /// The answer kept for `key`, moved to the newest end.
 pub(in crate::http) fn get(key: &Key) -> Option<Arc<J>> {
     let mut c = CACHE.lock();

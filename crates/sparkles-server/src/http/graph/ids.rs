@@ -15,7 +15,7 @@ const PREFIX: &str = "g1.";
 /// Partitions in one path at most.
 pub(super) const MAX_DEPTH: usize = 8;
 /// Bytes of an id at most.
-const MAX_ID: usize = 32 << 10;
+pub(super) const MAX_ID: usize = 32 << 10;
 
 /// One partition of a set.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

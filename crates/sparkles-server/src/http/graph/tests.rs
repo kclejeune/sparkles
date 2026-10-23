@@ -517,3 +517,69 @@ fn a_cancelled_request_stops() {
     };
     assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{:?}", e.1);
 }
+
+/// Review findings of U06: a node with several values in one range is one member, the
+/// limit applies to property groups, ranges stay within the requested number, and the
+/// deepest group opens into members rather than into ids the route would refuse.
+#[tokio::test]
+async fn ranges_limits_and_depth_hold_at_their_edges() {
+    let s = server();
+    let ds = s.state.get("d").unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            br#"@prefix ex: <http://ex/> .
+ex:a a ex:Q ; ex:n 22 ; ex:knows ex:b .
+ex:b a ex:Q ; ex:n 22, 23 .
+ex:c a ex:Q ; ex:n 60 .
+ex:d a ex:Q ; ex:n 100 ."#
+                .to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // values 20 to 100 in at most 2 ranges
+    let by_n = json!({ "within": { "class": format!("{EX}Q") }, "by": { "property": format!("{EX}n"), "buckets": 2 } });
+    let a = groups(&s.app, by_n).await;
+    assert_eq!(a["grouping"]["kind"], "ranges", "{a}");
+    let sz = sizes(&a);
+    assert!(sz.len() <= 2, "{a}");
+    // the range of a and b: one link from a to b, counted once
+    let label = sz
+        .keys()
+        .find(|l| l.starts_with('0') || l.starts_with("20"))
+        .unwrap()
+        .clone();
+    let m = groups(
+        &s.app,
+        json!({ "within": { "group": group_id(&a, &label) }, "by": "members" }),
+    )
+    .await;
+    assert_eq!(
+        edge_count(&m, &format!("m:{EX}a"), &format!("m:{EX}b")),
+        1,
+        "{m}"
+    );
+    assert_eq!(m["truncated"], false, "{m}");
+
+    // the limit cuts property groups too
+    let a = groups(
+        &s.app,
+        json!({ "within": { "class": format!("{EX}Person") }, "by": { "property": format!("{EX}city") }, "limit": 1 }),
+    )
+    .await;
+    assert_eq!(a["groups"].as_array().unwrap().len(), 1, "{a}");
+    assert_eq!(a["truncated"], true, "{a}");
+
+    // eight levels deep, the group opens into its members
+    let city = json!({ "property": format!("{EX}city") });
+    let mut within = json!({ "class": format!("{EX}Person") });
+    for _ in 0..8 {
+        let a = groups(&s.app, json!({ "within": within, "by": city })).await;
+        assert_eq!(a["grouping"]["kind"], "values", "{a}");
+        within = json!({ "group": group_id(&a, "Oslo") });
+    }
+    let a = groups(&s.app, json!({ "within": within, "by": city })).await;
+    assert_eq!(a["grouping"]["kind"], "members", "{a}");
+    assert!(a["note"].as_str().unwrap().contains("levels deep"), "{a}");
+    assert_eq!(a["members"].as_array().unwrap().len(), 14, "{a}");
+}

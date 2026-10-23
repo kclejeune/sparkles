@@ -8,7 +8,7 @@
 //! set to the groups of every partition on the path at once. A node with several values
 //! of a grouping property is in each of their groups.
 
-use super::ids::{GroupId, Key, Level, Step, canonical_term};
+use super::ids::{GroupId, Key, Level, MAX_DEPTH, MAX_ID, Step, canonical_term};
 use super::{By, GroupsRequest, Within};
 use crate::http::{ApiError, ApiResult, err};
 use axum::http::StatusCode;
@@ -69,7 +69,7 @@ impl Rows {
     }
 }
 
-fn get<'r>(row: &'r [Option<Term>], i: usize) -> Option<&'r Term> {
+fn get(row: &[Option<Term>], i: usize) -> Option<&Term> {
     row.get(i).and_then(Option::as_ref)
 }
 
@@ -196,7 +196,12 @@ fn step_filter(step: &Step, v: &str, i: usize) -> String {
                 (false, true) => f.push(format!("{e} >= {}", n - 1)),
                 (false, false) => f.push(format!("{e} = {b}")),
             }
-            format!("?{v} <{p}> {x} .\nFILTER({})\n", f.join(" && "))
+            // an existence test, so a node with several values in the range is bound
+            // once and its links are not counted once per value
+            format!(
+                "FILTER EXISTS {{ ?{v} <{p}> {x} . FILTER({}) }}\n",
+                f.join(" && ")
+            )
         }
         (Level::Range { p, year, .. }, Key::Other) => format!(
             "FILTER NOT EXISTS {{ ?{v} <{p}> {x} . FILTER({}) }}\n",
@@ -364,8 +369,17 @@ impl Run<'_> {
         };
         let size = self.total(&class, &path)?;
         let mut note = None;
+        // a group at the deepest level opens into its members only, since the ids of its
+        // groups would be refused
+        let deepest = path.len() >= MAX_DEPTH;
         let partition = match &req.by {
             By::Members => None,
+            _ if deepest => {
+                note = Some(format!(
+                    "This group is {MAX_DEPTH} levels deep, the most a group id holds, so the answer lists its members."
+                ));
+                None
+            }
             By::Auto if size <= req.limit as u64 => None,
             By::Auto => {
                 let p = self.auto(&class, &path, req.limit)?;
@@ -400,7 +414,15 @@ impl Run<'_> {
             within["group"] = J::from(g.clone());
         }
         let mut answer = match partition {
-            Some(part) => self.groups_answer(&class, &path, part, req.limit)?,
+            Some(part) => match self.groups_answer(&class, &path, part, req.limit)? {
+                Some(a) => a,
+                None => {
+                    note = Some(
+                        "The ids of these groups would be longer than a group id may be, so the answer lists the members.".into(),
+                    );
+                    self.members_answer(&class, &path, req.limit, size)?
+                }
+            },
             None => self.members_answer(&class, &path, req.limit, size)?,
         };
         if let Some(o) = answer.as_object_mut() {
@@ -446,7 +468,7 @@ impl Run<'_> {
                 None => out.push((key, size)),
             }
         }
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|b| std::cmp::Reverse(b.1));
         let truncated = out.len() > limit;
         out.truncate(limit);
         Ok((out, truncated))
@@ -592,9 +614,17 @@ impl Run<'_> {
         } else {
             1.0
         };
-        let w = nice_width(raw, integral);
-        let lo = (lo / w).floor() * w;
-        let n = (((hi - lo) / w).floor() as u32 + 1).clamp(1, MAX_BUCKETS as u32);
+        // aligning the start can add a range: widen to the next round width until the
+        // ranges are at most the requested number
+        let mut w = nice_width(raw, integral);
+        let (lo, n) = loop {
+            let start = (lo / w).floor() * w;
+            let n = ((hi - start) / w).floor() as u64 + 1;
+            if n <= buckets as u64 || !w.is_finite() {
+                break (start, n.clamp(1, buckets as u64) as u32);
+            }
+            w = nice_width(w * (1.0 + 1e-6), integral);
+        };
         let level = Level::Range {
             p: p.to_string(),
             lo,
@@ -840,6 +870,7 @@ impl Run<'_> {
     /// The edges from the members or groups of a set to the class's other nodes, by the
     /// owner each such node has on the path, and to the other classes. `source` names the
     /// set's side of a row (`?s`), whose variable `side` the query binds.
+    #[allow(clippy::too_many_arguments)]
     fn outward_edges(
         &self,
         edges: &mut Edges,
@@ -935,17 +966,26 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// The answer of a partition, at most `limit` of its groups. `None` when a group's id
+    /// would be longer than [`GroupId::decode`] accepts.
     fn groups_answer(
         &self,
         class: &str,
         path: &[Step],
-        part: Partition,
-        _limit: usize,
-    ) -> ApiResult<J> {
+        mut part: Partition,
+        limit: usize,
+    ) -> ApiResult<Option<J>> {
         let l = path.len();
+        if part.children.len() > limit {
+            part.children.truncate(limit);
+            part.truncated = true;
+        }
         let mut groups = Vec::with_capacity(part.children.len());
         for (i, c) in part.children.iter().enumerate() {
             let id = child(class, path, &part.level, c.key.clone());
+            if id.encode().len() > MAX_ID {
+                return Ok(None);
+            }
             let top = if i < TOP_GROUPS {
                 self.top(class, &id.path)?
             } else {
@@ -977,13 +1017,13 @@ impl Run<'_> {
             &name,
         )?;
         let (edges, edges_truncated) = edges.json();
-        Ok(json!({
+        Ok(Some(json!({
             "grouping": { "kind": part.kind, "predicate": partition_predicate(&part.level) },
             "communities": part.kind == "communities",
             "groups": groups,
             "edges": edges,
             "truncated": part.truncated || edges_truncated,
-        }))
+        })))
     }
 
     fn members_answer(&self, class: &str, path: &[Step], limit: usize, size: u64) -> ApiResult<J> {

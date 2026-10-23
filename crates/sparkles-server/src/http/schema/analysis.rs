@@ -51,13 +51,7 @@ pub(in crate::http) async fn profiles(
             .then(|| super::super::graph::cache::Key {
                 branch: ds.store.branch_id(),
                 commit: ds.store.snapshot().commit,
-                view: req
-                    .report
-                    .options
-                    .graphs
-                    .as_ref()
-                    .map(|g| g.read_key())
-                    .unwrap_or_default(),
+                view: super::super::graph::cache::view_key(req.report.options.graphs.as_ref()),
                 extra: String::new(),
                 request: format!("profiles?{}", uri.query().unwrap_or("")),
             });

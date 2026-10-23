@@ -1,5 +1,6 @@
 //! The graph overview's groups route (U06) under restricted views: a caller limited to
-//! one named graph, a caller under protections of a class and a predicate, and a caller
+//! one named graph, callers under protections of a class and a predicate, all or some of
+//! them lifted, and a caller
 //! whose grant covers only the info endpoint. An answer never holds a class, a count or a
 //! member the caller's SPARQL queries could not read, and the cache never serves one
 //! caller's answer to another.
@@ -61,6 +62,15 @@ password = "{oprot}"
 datasets = {{ ov = "read" }}
 
 [[users]]
+name = "olift"
+password = "{olift}"
+roles = []
+[[users.grants]]
+dataset = "ov"
+level = "read"
+lifts = ["secrets"]
+
+[[users]]
 name = "oinfo"
 password = "{oinfo}"
 [[users.grants]]
@@ -71,6 +81,7 @@ endpoints = ["info"]
         ofull = h("ofull-pw"),
         oga = h("oga-pw"),
         oprot = h("oprot-pw"),
+        olift = h("olift-pw"),
         oinfo = h("oinfo-pw"),
     )
 }
@@ -220,4 +231,72 @@ async fn the_overview_shows_only_what_the_caller_reads() {
     )
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// Callers with the same graphs but different lifted protections read different data, and
+/// the cache keeps their answers apart, for the groups and for the class profiles.
+#[tokio::test]
+async fn partly_lifted_protections_do_not_share_cached_answers() {
+    let (_dir, app) = server();
+    let members = json!({ "within": { "class": "http://ex/Person" }, "by": "members" });
+    // olift lifts the Secret protection only, and warms the cache first
+    let r = groups(&app, "olift", members.clone()).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("c:http://ex/Secret"), "{}", r.text());
+    let r = groups(&app, "oprot", members).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("Secret"), "{}", r.text());
+
+    let profiles = |user: &'static str| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "GET",
+                "/$/schema/ov/profiles",
+                &[("authorization", &b(user))],
+                "",
+            )
+            .await
+        }
+    };
+    let r = profiles("olift").await;
+    assert!(r.text().contains("http://ex/Secret"), "{}", r.text());
+    let r = profiles("oprot").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("http://ex/Secret"), "{}", r.text());
+}
+
+/// The dataset a request names with `default-graph-uri` is part of the cached answer's key.
+#[tokio::test]
+async fn the_selected_default_graph_is_part_of_the_cache_key() {
+    let (_dir, app) = server();
+    let body = json!({ "within": { "class": "http://ex/Person" }, "by": "members" }).to_string();
+    let mut seen = Vec::new();
+    for g in ["http://ex/ga", "http://ex/gb"] {
+        let r = call(
+            &app,
+            "POST",
+            &format!(
+                "/$/graph/ov/groups?default-graph-uri={}",
+                percent_encoding::utf8_percent_encode(g, percent_encoding::NON_ALPHANUMERIC)
+            ),
+            &[
+                ("authorization", &b("ofull")),
+                ("content-type", "application/json"),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let iris: Vec<String> = r.json()["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["iri"].as_str().unwrap().to_string())
+            .collect();
+        seen.push(iris);
+    }
+    assert_eq!(seen[0], ["http://ex/p1", "http://ex/p2"]);
+    assert_eq!(seen[1], ["http://ex/p3", "http://ex/p4"]);
 }
