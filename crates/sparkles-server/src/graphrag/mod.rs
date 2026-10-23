@@ -17,3 +17,5 @@ pub mod projection;
 pub mod report;
 pub mod settings;
 pub mod state;
+#[cfg(feature = "mcp")]
+pub mod store;
