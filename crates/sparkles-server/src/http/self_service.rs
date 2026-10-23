@@ -68,11 +68,16 @@ pub fn install(st: &Arc<AppState>, opts: &mut QueryOptions, p: &Principal) {
 impl SelfEndpoints {
     /// The dataset whose query endpoint `iri` names exactly, if it is this server's.
     fn dataset_of(&self, iri: &str) -> Option<String> {
-        // user information of any form, even an empty one that the parser drops, makes
-        // the IRI something other than this server's endpoint
+        // The IRI is read as written, before the parser normalizes it: an empty
+        // authority, whose extra slashes the parser drops, or user information of any
+        // form, even an empty one, makes the IRI something other than this server's
+        // endpoint.
         let authority = iri.split_once("://")?.1;
-        let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
-        if authority.contains('@') {
+        let authority = authority
+            .split(['/', '?', '#', '\\'])
+            .next()
+            .unwrap_or(authority);
+        if authority.is_empty() || authority.contains('@') {
             return None;
         }
         let url = url::Url::parse(iri).ok()?;

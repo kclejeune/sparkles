@@ -1131,8 +1131,9 @@ A review found six gaps in the first version, which are fixed.
   `a_service_call_to_this_server_keeps_the_callers_lowered_budgets` checks.
 - The listener was recorded by its `--host` value, so a host given as a DNS name was
   accepted by name. It is now recorded by the address the socket bound.
-- An IRI with an empty or password-only user part was accepted. Any `@` in the authority
-  now keeps the call on HTTP.
+- An IRI with an empty or password-only user part was accepted, and so was one with an
+  empty authority that the URL parser normalized away. The resolver now reads the
+  authority as written, and an empty one or any `@` in it keeps the call on HTTP.
 
 ### Admission after the body (2026-10-23)
 

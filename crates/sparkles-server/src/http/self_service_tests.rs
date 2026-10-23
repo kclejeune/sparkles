@@ -214,6 +214,8 @@ async fn a_service_iri_that_does_not_name_this_server_goes_over_http() {
         format!("http://127.0.0.1:{PORT}/ds@b/sparql"),
         format!("http://:pw@127.0.0.1:{PORT}/ds/sparql"),
         format!("http://@127.0.0.1:{PORT}/ds/sparql"),
+        format!("http:////@127.0.0.1:{PORT}/ds/sparql"),
+        format!("http:///127.0.0.1:{PORT}/ds/sparql"),
         format!("https://127.0.0.1:{PORT}/ds/sparql"),
     ] {
         let (status, body) = select(
