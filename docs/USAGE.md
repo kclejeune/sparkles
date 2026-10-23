@@ -4035,7 +4035,10 @@ the confirmation to the Communities tab or to `POST /$/graphrag/{ds}/confirm`. A
 stops before any request whose reservation would pass `budget.tokensPerBuild` or
 `budget.tokensPerDay`, and leaves the remaining communities pending for a later run.
 `refresh` rewrites only the reports of communities whose members changed, or whose
-facts changed by at least `refresh.minChangedFraction`.
+facts changed by at least `refresh.minChangedFraction`. With `"refresh": {"mode":
+"auto"}` in the settings, the server runs that refresh itself once commits have
+changed enough facts and `refresh.debounceSeconds` have passed without a new commit,
+without asking for a confirmation and within `budget.tokensPerDay`.
 
 With `--loc DB` the command opens a database directory in the process and reads the
 model configuration from `--model-config`, as `serve` does.

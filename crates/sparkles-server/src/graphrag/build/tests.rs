@@ -293,6 +293,209 @@ async fn a_refresh_rewrites_only_changed_communities() {
     .unwrap();
 }
 
+/// Phase 3 and A4 with `refresh.mode: "auto"`: the loop starts no refresh while the
+/// changes since the build stay below the fraction, starts one once they pass it after
+/// the debounce, and its own commit of reports starts none.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_automatic_refresh_follows_the_change_feed() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    let f = fixture(5);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({
+            "refresh": { "mode": "auto", "debounceSeconds": 1, "minChangedFraction": 0.1 }
+        }));
+        f.run(s, Mode::Build).unwrap();
+        let before = f.reports();
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        let add = |k: usize| {
+            let mut t = format!("<{ORG}> {{\n");
+            for i in 0..k {
+                t.push_str(&format!(
+                    "<http://ex/x1> <http://ex/note> \"auto {k} {i}\" .\n"
+                ));
+            }
+            t.push_str("}\n");
+            ds.store
+                .load(&[Source::from_bytes(t.into_bytes(), RdfFormat::TriG, None)])
+                .unwrap();
+        };
+        let tasks = |st: &AppState| -> Vec<crate::state::Task> {
+            st.tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == TASK_KIND)
+                .cloned()
+                .collect()
+        };
+        let wait = |st: &AppState| {
+            let end = Instant::now() + Duration::from_secs(60);
+            while st.active_task(TASK_KIND, "org").is_some() {
+                assert!(Instant::now() < end, "the refresh did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let sec = Duration::from_secs(1);
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let mut now = Instant::now();
+        // first sight waits a debounce, then finds nothing changed
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert!(tasks(&f.st).is_empty());
+        // one fact is below the fraction
+        add(1);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert!(tasks(&f.st).is_empty());
+        let requests = f.mock.requests().len();
+        // seven more pass it: not before the debounce, then a refresh
+        add(7);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert!(tasks(&f.st).is_empty());
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        let started = tasks(&f.st);
+        assert_eq!(started.len(), 1, "{started:?}");
+        wait(&f.st);
+        let done = tasks(&f.st);
+        assert_eq!(done[0].state, "done", "{:?}", done[0]);
+        let msg = done[0].message.clone().unwrap_or_default();
+        assert!(msg.starts_with("automatic refresh ("), "{msg}");
+        assert!(f.mock.requests().len() > requests);
+        let after = f.reports();
+        assert_eq!(
+            after.iter().filter(|r| !before.contains(r)).count(),
+            1,
+            "{before:?} {after:?}"
+        );
+        // the refresh's own commit changes no fact of the projection
+        for _ in 0..3 {
+            now += sec;
+            tick_once(&f.st, &mut w, now);
+        }
+        assert_eq!(tasks(&f.st).len(), 1);
+        // manual mode stops the loop
+        let manual = settings(json!({ "refresh": { "mode": "manual" } }));
+        store_settings(&f.st, &ds, &manual);
+        add(20);
+        for _ in 0..3 {
+            now += sec;
+            tick_once(&f.st, &mut w, now);
+        }
+        assert_eq!(tasks(&f.st).len(), 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// Phase 3, round 2: a pending retry whose refresh failed is tried again after the
+/// backoff, on the same day and without a commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_pending_retry_runs_again_after_the_backoff() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        // every community is left pending by a budget that fits no request
+        let s = settings(json!({
+            "budget": { "tokensPerBuild": 10 },
+            "refresh": { "mode": "auto", "debounceSeconds": 1 }
+        }));
+        let o = f.run(s, Mode::Build).unwrap();
+        assert!(o.pending > 0, "{o:?}");
+        let tasks = |st: &AppState| -> Vec<crate::state::Task> {
+            st.tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == TASK_KIND)
+                .cloned()
+                .collect()
+        };
+        let wait = |st: &AppState| {
+            let end = Instant::now() + Duration::from_secs(60);
+            while st.active_task(TASK_KIND, "org").is_some() {
+                assert!(Instant::now() < end, "the refresh did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let models = f.st.models.load_full();
+        f.st.models.store(None);
+        let sec = Duration::from_secs(1);
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let mut now = Instant::now();
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert_eq!(tasks(&f.st).len(), 1);
+        wait(&f.st);
+        assert_eq!(tasks(&f.st)[0].state, "failed", "{:?}", tasks(&f.st));
+        // the next tick sees the failure; the backoff of two periods holds
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert_eq!(tasks(&f.st).len(), 1);
+        f.st.models.store(models);
+        now += sec * 2;
+        tick_once(&f.st, &mut w, now);
+        let all = tasks(&f.st);
+        assert_eq!(all.len(), 2, "{all:?}");
+        wait(&f.st);
+        let all = tasks(&f.st);
+        assert!(
+            all.iter().any(|t| t.state == "done"
+                && t.message.as_deref().is_some_and(|m| m.contains("pending"))),
+            "{all:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// Phase 3, round 1 finding 4: a dataset admits one GraphRAG task at a time, whichever
+/// path starts it, so an automatic refresh cannot run beside a build waiting for its
+/// confirmation.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_graphrag_task_runs_per_dataset() {
+    let f = fixture(3);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        let s = settings(json!({}));
+        let ds = f.st.datasets().get("org").cloned().unwrap();
+        store_settings(&f.st, &ds, &s);
+        let first = spawn(&f.st, ds.clone(), s.clone(), Mode::Build, false, None).unwrap();
+        let end = Instant::now() + Duration::from_secs(30);
+        while !f.st.graphrag.is_waiting("org", &first.id) {
+            assert!(
+                Instant::now() < end,
+                "the build never waited for confirmation"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let second = spawn(
+            &f.st,
+            ds.clone(),
+            s,
+            Mode::Refresh,
+            true,
+            Some("test".into()),
+        );
+        assert_eq!(second.unwrap_err(), first.id);
+        assert!(f.st.graphrag.answer("org", &first.id, false));
+        while f.st.active_task(TASK_KIND, "org").is_some() {
+            assert!(Instant::now() < end, "the build did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(f.mock.requests().is_empty());
+    })
+    .await
+    .unwrap();
+}
+
 /// A8: a budget smaller than the first reservation sends no request and leaves every
 /// community pending.
 #[tokio::test(flavor = "multi_thread")]

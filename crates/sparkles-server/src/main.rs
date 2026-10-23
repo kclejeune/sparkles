@@ -3045,6 +3045,9 @@ fn run() -> Result<()> {
             // backup tasks drive the repository engine on this runtime
             #[cfg(feature = "backup")]
             backup::start(&st, rt.handle());
+            // GraphRAG refreshes that follow the change feed (C22 §5)
+            #[cfg(feature = "mcp")]
+            graphrag::refresh::start(&st, rt.handle());
             let grace = Duration::from_secs_f64(shutdown_grace);
             let st_after = st.clone();
             // The server runs as a task on a worker thread, not on this thread (which

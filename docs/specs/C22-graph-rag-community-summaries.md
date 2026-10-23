@@ -1,13 +1,13 @@
 # C22: Community summaries for global questions (GraphRAG)
 
-> **Status:** Phase 1 implemented, Phase 2 partly implemented; the paid acceptance runs wait for approval
+> **Status:** Phase 1 implemented, Phases 2 and 3 partly implemented; the paid acceptance runs wait for approval
 >
 > **Phases:** Phase 1 is implemented. Phase 1 is the community build from F14's Leiden, the
 > summaries written by the server's model providers with citations to facts, their
 > storage as triples with provenance and review status, the build task and the settings.
 > Phase 2 adds global questions in Ask, community context in `recall` and the brief, and
 > the MCP tool, and is partly implemented. Phase 3 refreshes communities and summaries
-> incrementally after commits.
+> incrementally after commits, and its refresh from the change feed is implemented.
 >
 > **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime)
 > cover configuring the role, and [Community reports](../USAGE.md#community-reports-graphrag)
@@ -399,8 +399,9 @@ build actually used rather than to the principal's current grants. The proof wor
 a disclosure footprint that the build records, and a common guard applies it to every
 read path. No report is published before both exist. Ask and `recall` use reports only
 for callers who may read them, and otherwise answer locally and say so. A dataset whose
-readers have different views can define several GraphRAG configurations, each with its
-own principal and reports graph, as `graphrag.json` takes a list in Phase 2.
+readers have different views could define several GraphRAG configurations, each with
+its own principal and reports graph. That is deferred to roadmap item 100, and §13 holds
+the design.
 
 The model sees the facts of the principal's view. C18 §3.5's `sendByProvider` applies:
 a provider allowed only the schema cannot serve the `community` role, and the build
@@ -667,8 +668,8 @@ thousand changed facts, and Ask latency in global mode.
 and CLI, the Communities tab, the inbox kind, and manual refresh.
 
 **Phase 2.** Global answering in Ask with classification and the mode switch, community
-context in `recall` and the brief, `community_reports`, several configurations, and the
-evaluation.
+context in `recall` and the brief, `community_reports`, and the evaluation. Several
+configurations per dataset moved to roadmap item 100.
 
 **Phase 3.** Automatic refresh from the change feed, then from an F13 view.
 
@@ -746,6 +747,15 @@ evaluation.
    time would serve datasets that never build. The default chosen is a local answer.
 3. **Multilingual reports.** One `language` per configuration. Reports in several
    languages would multiply cost.
+4. **Several configurations per dataset.** Deferred to roadmap item 100, since no
+   deployment needs it yet and it changes the state format. The proposed design keeps
+   today's single object valid and also accepts `{configurations: [{name, ...}]}`, each
+   entry with its own principal, projection and reports graph. The routes take
+   `?config=` and the CLI takes `--config`, defaulting to the first configuration. The
+   build state and the ledger are kept per configuration under a new format version, and
+   a reader refuses versions it does not know. Ask, `community_reports`, `recall` and the
+   brief use the first configuration whose reports graph the caller may read, and the
+   Communities tab offers a picker.
 
 ## 14. Revisions
 
@@ -865,14 +875,40 @@ report. Map batches are sized for the smallest context among the summarize pair 
 fallbacks, so a large model that has a small fallback makes more, smaller calls, in
 exchange for a failover that never sends a batch its pair cannot read. A global answer reads main at its head,
 so an ask with `at` or another branch answers locally. The context of §7.3 is on, and the
-evaluation decides whether it stays on. Several configurations per dataset and the
-evaluation of §9 remain.
+evaluation decides whether it stays on. The evaluation of §9 remains, and several
+configurations per dataset are deferred to roadmap item 100 with the design in §13.
 
 The contracts that the first draft left open are settled in §14. Token budgets use
 conservative reservations before every HTTP attempt, and findings carry entity numbers
 that are checked exactly, with a labelled heuristic for the prose. §6 now holds the
 design of the disclosure footprint and the common read guard. Reports stay unpublished
 until that guard has passed review.
+
+Phase 3 is partly implemented. With `refresh.mode: "auto"`, a loop on the server looks
+at each dataset once a second and follows the debounce of §5. A due dataset reads the
+change feed from the commit of its last build or refresh with the principal's view and
+counts the changed facts of each stored community, the facts being those a report is
+written from. A refresh task starts when a community's count reaches
+`minChangedFraction` of its facts, when an edge joins an entity outside every stored
+community to a member, or when the feed cannot list the changes because a commit is too
+large, the history is gone or the view depends on the data. Tests with stub providers
+cover the debounce, the counting and A4 under automatic refresh.
+
+These Phase 3 choices refine §5. The refresh that the loop starts is the manual refresh
+of Phase 1, so it compares the digests of every report, re-runs Leiden every time rather
+than above 5% of the edges, and rewrites exactly the reports whose facts changed enough.
+A commit the feed lists with counts only therefore starts that refresh rather than a
+full rebuild, because the digests find the changed communities without rewriting the
+rest. The count starts at the last build or refresh, so changes that stay below the
+fraction in every window add up only when some refresh runs, because a kept report's
+baseline stays until it is rewritten. An edge between two entities that no community
+holds starts no refresh, since such entities form at most a community too small for a
+report. The task needs no confirmation and runs within `tokensPerDay`, the loop never
+starts a first build or works on a branch, and a run that left pending communities is
+retried once a day without a new commit. Only commits of other kinds than GraphRAG's own
+count as activity, so a refresh never follows its own commit. A failed check or
+refresh is retried after a backoff of two to 64 debounce periods, and one admission lock
+lets only one GraphRAG task of a dataset be listed at a time. Counting from an F13 view waits for roadmap item 17.
 
 ### Shared memory representation follow-up
 

@@ -24,6 +24,8 @@ pub mod projection;
 #[cfg(feature = "mcp")]
 pub mod read;
 #[cfg(feature = "mcp")]
+pub mod refresh;
+#[cfg(feature = "mcp")]
 pub mod report;
 #[cfg(feature = "mcp")]
 pub mod runtime;

@@ -13,7 +13,7 @@
 //! the head snapshot, so a caller for whom the graph is not proven sees no title, member,
 //! count or status of it (§6.4). Such a caller gets `available: false`.
 
-use super::build::{self, Mode, Run, RunError};
+use super::build::{self, Mode};
 use super::guard::gr;
 use super::settings::GraphragSettings;
 use super::store::{self, Status};
@@ -187,40 +187,15 @@ async fn start(
         .check()
         .map_err(|m| err_code(StatusCode::BAD_REQUEST, "invalid-settings", m))?;
     crate::http::task_start_check(&st, Some(build::TASK_KIND), &ds.name)?;
-    let id = st.next_task_id();
-    let task_id = id.clone();
-    let st2 = st.clone();
-    let ds_name = ds.name.clone();
-    let task = st.start_task_opts(id, build::TASK_KIND, &ds_name, None, true, move |h| {
-        let cancel = h.cancel_flag();
-        let r = Run {
-            st: &st2,
-            ds: ds.clone(),
-            settings,
-            mode,
-            confirmed: b.confirm,
-            task: Some(h),
-            task_id,
-            cancel: cancel.clone(),
-        };
-        match build::run(&r) {
-            Ok(o) => {
-                h.set_detail(serde_json::to_value(&o).unwrap_or(Value::Null));
-                Ok(match &o.stopped {
-                    Some(why) => format!(
-                        "{} reports written, {} pending: {why}",
-                        o.written, o.pending
-                    ),
-                    None => format!(
-                        "{} reports written, {} kept, {} failed",
-                        o.written, o.kept, o.failed
-                    ),
-                })
-            }
-            Err(RunError::Cancelled) => Err(sparkles::Error::Cancelled.into()),
-            Err(e) => Err(anyhow::anyhow!(e.to_string())),
-        }
-    });
+    let task = build::spawn(&st, ds, settings, mode, b.confirm, None).map_err(|id| {
+        err(
+            StatusCode::CONFLICT,
+            format!(
+                "a {} task of /{name} is already queued or running (task {id})",
+                build::TASK_KIND
+            ),
+        )
+    })?;
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
 
