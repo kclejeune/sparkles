@@ -1416,7 +1416,8 @@ race it. A test publishes inside every unlocked synchronization and requires the
 fourth tick to clear the marker, and after a merge's write races the locked attempt it
 requires the next three ticks to release the lock again. It fails when the fallback is
 disabled or when the count is kept after a raced locked attempt. The forge acceptance of
-2026-10-23 below measured the latency cost of the locked attempt.
+2026-10-23 below saw write stalls that match the period of the locked attempt, but it did
+not trace the ticks, and roadmap item 110 confirms the cause.
 
 This change removes the background file-synchronization wait from the live writer
 lock. Tantivy publication can still occur inside a group leader's fence, and WAL

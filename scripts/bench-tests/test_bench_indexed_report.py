@@ -324,6 +324,17 @@ class IndexedReport(unittest.TestCase):
         self.assertTrue(verdict["passed"])
         self.assertAlmostEqual(verdict["paired"], 1.0)
 
+    def test_amended_serial_gate_has_no_lower_limit(self):
+        # Every grouped process is 10% faster than its neighbour, which the first
+        # two-sided gate rejected below 0.95.
+        rows = []
+        for block in range(3):
+            rows += abba(block, (1.0, 1.0, 0.5), (0.9, 0.9, 0.5))
+        amended = self.amended(rows)
+        for key in ("p50_ms", "p90_ms"):
+            self.assertAlmostEqual(amended[key]["paired"], 0.9)
+            self.assertTrue(amended[key]["passed"])
+
     def test_amended_serial_gate_rejects_a_slower_grouped_writer(self):
         rows = []
         for block in range(3):
