@@ -829,6 +829,13 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRul
     // created at the first block the cache lacks, so a warm request builds nothing
     let mut warm: Option<crate::index::WarmColumns> = None;
     if idx.segmented() {
+        // a warm request costs this one probe: when the cache holds what the first range
+        // reads, the others are taken to be cached too, as a scan's prefetch does
+        let (lo, hi) = ranges.get(0);
+        let (b0, b1) = idx.key_block_range(&lo, &hi);
+        if b0 < b1 && idx.range_cached(&ctx.snap.cache, b0, &lo, &hi, mask) {
+            return ctx.check();
+        }
         // the directories the reads below search, asked for together on a cold server
         let mut steps = 0u32;
         for i in 0..ranges.len() {
@@ -1187,6 +1194,11 @@ fn read_ranges_gallop(
                     if *cb == x && *cp != 0 && lead_cmp(held, held.len() - 1, &lo, d).is_ge() =>
                 {
                     *cp
+                }
+                // another segment of the held block, whose columns the cache did not hold
+                // whole when it was read
+                (Some((cb, cp, _)), _) if *cb == x && *cp != 0 => {
+                    idx.segment_span(x, &lo, &hi).map_or(0, |(s0, _)| s0 + 1)
                 }
                 _ => idx
                     .read_span(&ctx.snap.cache, x, &lo, &hi, mask)
