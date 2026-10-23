@@ -36,15 +36,15 @@ fn docs() -> Vec<Doc> {
             let year = 1950 + ((a * 7 + k * 3) % 5) as i64;
             docs.push(Doc {
                 iri: format!("urn:doc:{a}:{k}"),
-                class: if k % 2 == 0 {
+                class: if k.is_multiple_of(2) {
                     "bench:Article"
                 } else {
                     "bench:Inproceedings"
                 },
                 // one document of every fourth author is never issued
-                year: (k != 5 || a % 4 != 0).then_some(year),
+                year: (k != 5 || !a.is_multiple_of(4)).then_some(year),
                 // a coauthor joins every third document
-                authors: if k % 3 == 0 {
+                authors: if k.is_multiple_of(3) {
                     vec![a, (a + 1) % AUTHORS]
                 } else {
                     vec![a]
@@ -64,7 +64,7 @@ fn docs() -> Vec<Doc> {
 
 /// Every third author is a blank node, as SP2Bench writes most persons.
 fn author(a: usize) -> String {
-    if a % 3 == 0 {
+    if a.is_multiple_of(3) {
         format!("_:p{a}")
     } else {
         format!("<urn:person:{a}>")
@@ -381,8 +381,8 @@ fn application_callbacks_in_the_condition_keep_the_generic_join() {
 fn finished_keyed_optionals_release_their_cursor_index() {
     let store = Store::in_memory(StoreOptions::default());
     let mut data = String::new();
-    for i in 0..4096 {
-        if i % 2 == 0 {
+    for i in 0..4096u32 {
+        if i.is_multiple_of(2) {
             data += &format!("<urn:r:{i}> <urn:w> <urn:o:{i}> .\n");
         } else {
             data += &format!("<urn:r:{i}> <urn:w> \"{i}\" .\n");
