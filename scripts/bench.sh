@@ -111,6 +111,11 @@ add distinct-obj 'SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s foaf:knows ?o }'
 add export-500k 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 500000'
 # extended shapes: known strengths of the other engines and stress cases
 add predicate-counts 'SELECT ?p (COUNT(*) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p'
+# predicate listings that the predicate patterns answer (X11): subjects per predicate,
+# overall and for the instances of a class, and the predicates a class uses
+add predicate-subjects 'SELECT ?p (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p'
+add class-predicates 'SELECT ?p (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s a ex:Researcher . ?s ?p ?o } GROUP BY ?p'
+add class-predicate-list 'SELECT DISTINCT ?p WHERE { ?s a ex:Student . ?s ?p ?o }'
 add order-by-full 'SELECT ?p ?n WHERE { ?p foaf:name ?n } ORDER BY ?n'
 add optional-chain 'SELECT ?p ?o ?c WHERE { ?p a ex:Student OPTIONAL { ?p ex:advisor ?a . ?a ex:worksFor ?o OPTIONAL { ?o ex:city ?c } } }'
 add minus 'SELECT (COUNT(*) AS ?c) WHERE { ?p a ex:Researcher MINUS { ?p ex:authorOf ?d } }'

@@ -412,6 +412,19 @@ little and change nothing. Each one has the same answers with it on and off.
   cell as before. With one Rayon thread the writer decodes in turn. Together with
   charging each written row's terms once, this took a streamed TSV export of 500,000 rows
   on forge from 134.7 ms to 72 ms at 12 threads, where eager execution takes 84 ms.
+* **Predicate patterns** (`predicate_patterns`). A generation keeps `patterns.bin`, which
+  gives every subject the number of its set of predicates and lists those sets, once for
+  the default graph and once for the union of the named graphs. A `GROUP BY ?p` that
+  counts distinct subjects over an input binding `?s` joined with `?s ?p ?o`, where `?p`
+  and `?o` appear nowhere else, becomes `PatternCount`. It looks up each distinct input
+  subject's pattern, counts subjects per pattern and adds each count to the pattern's
+  predicates. With no input it reads the per-predicate totals that the file stores.
+  `SELECT DISTINCT ?p` over the same shape and `spk:hasPredicate` (`PatternScan`) use the
+  same tables. The tables describe the base index, and every subject that the snapshot's
+  delta touches is read again from SPO, so the cost grows with the touched subjects. Past
+  one subject per 32 quads (at least 1,024 and at most a million), the query reads the
+  permutations. The plan does not use the tables under a triple-level protection, with
+  RDFS on read, for a set of named graphs or for the named table under a graph view.
 * **Growing filter and top-k inputs** (`grow_input`). A cursor filter starts by asking
   for 32,768 rows and doubles its demand with each read up to 262,144 rows while the row
   budget and the memory ledger have room. The scan below it still stops at the caller's

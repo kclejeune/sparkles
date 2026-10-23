@@ -952,6 +952,21 @@ fn run_node(
         }
         Kind::Project(vars) => child(0, infos)?.project(vars),
         Kind::Distinct => distinct(child(0, infos)?),
+        Kind::PatternCount(spec) => {
+            let input = if n.children.is_empty() {
+                None
+            } else {
+                Some(child(0, infos)?)
+            };
+            let (t, nt) = super::patternplan::run_count(ctx, spec, input.as_ref(), &n.vars)?;
+            note = Some(nt);
+            t
+        }
+        Kind::PatternScan(spec) => {
+            let (t, nt) = super::patternplan::run_scan(ctx, spec, &n.vars)?;
+            note = Some(nt);
+            t
+        }
         Kind::Slice {
             offset,
             limit: Some(limit),

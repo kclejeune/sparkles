@@ -131,7 +131,13 @@ pub struct CountCache {
     /// the masked snapshots of triple-level views, by view key (see
     /// [`crate::access::GraphAccess::masked`])
     masks: Mutex<FxHashMap<String, MaskSlot>>,
+    /// the correction of each predicate pattern table for the snapshot's delta (see
+    /// [`super::patternplan`]), `None` when the delta touches too many subjects
+    patterns: Mutex<FxHashMap<PatternKey, Option<Arc<crate::patterns::Correction>>>>,
 }
+
+/// A pattern table and the size of the delta its correction was worked out for.
+type PatternKey = (crate::patterns::Scope, usize, usize);
 
 /// Where the masked snapshot of one view is built once: a second request waits for the
 /// first, and builds it again only if the first failed.
@@ -198,6 +204,28 @@ impl CountCache {
         let s = MaskSlot::default();
         m.insert(k.to_string(), s.clone());
         s
+    }
+
+    /// The correction of the pattern table of `scope` for the delta of `snap`, worked out
+    /// by `compute` once per snapshot. An error (a cancelled query) is not kept.
+    pub(crate) fn pattern_correction(
+        &self,
+        scope: crate::patterns::Scope,
+        snap: &Snapshot,
+        compute: impl FnOnce(&Snapshot) -> Result<Option<crate::patterns::Correction>>,
+    ) -> Option<Arc<crate::patterns::Correction>> {
+        let spo = Perm::Spo.index();
+        let key = (scope, snap.delta.ins[spo].len(), snap.delta.del[spo].len());
+        if let Some(c) = self.patterns.lock().get(&key) {
+            return c.clone();
+        }
+        let c = compute(snap).ok()?.map(Arc::new);
+        let mut m = self.patterns.lock();
+        if m.len() >= 16 {
+            m.clear();
+        }
+        m.insert(key, c.clone());
+        c
     }
 
     pub(crate) fn put_view(&self, k: String, v: VisibleGraphs) {

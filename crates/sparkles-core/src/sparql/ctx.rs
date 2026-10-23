@@ -209,10 +209,13 @@ pub struct Optimizations {
     /// cursor operators that read their whole input before output, and filters over a
     /// scan, read larger inputs as a long input goes on
     pub grow_input: bool,
+    /// the predicates of a set of subjects, with the subjects having each, and
+    /// `spk:hasPredicate` are read from the generation's predicate patterns
+    pub predicate_patterns: bool,
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 40] = [
+    pub const NAMES: [&str; 41] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -253,6 +256,7 @@ impl Optimizations {
         "parallel_decode",
         "decode_ahead",
         "grow_input",
+        "predicate_patterns",
     ];
 
     /// Everything on.
@@ -297,6 +301,7 @@ impl Optimizations {
         parallel_decode: true,
         decode_ahead: true,
         grow_input: true,
+        predicate_patterns: true,
     };
 
     /// Everything off: the generic operators only.
@@ -341,6 +346,7 @@ impl Optimizations {
         parallel_decode: false,
         decode_ahead: false,
         grow_input: false,
+        predicate_patterns: false,
     };
 
     fn flag(&mut self, name: &str) -> Option<&mut bool> {
@@ -385,6 +391,7 @@ impl Optimizations {
             "parallel_decode" => &mut self.parallel_decode,
             "decode_ahead" => &mut self.decode_ahead,
             "grow_input" => &mut self.grow_input,
+            "predicate_patterns" => &mut self.predicate_patterns,
             _ => return None,
         })
     }

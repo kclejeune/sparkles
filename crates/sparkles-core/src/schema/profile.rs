@@ -10,7 +10,9 @@
 //! and then per predicate one pass over `POS[p]`, which classifies literal objects in
 //! sorted vocabulary batches and counts the incoming arcs of each class, and one pass over
 //! `PSO[p]`, which joins each subject's run of objects with its classes and the classes
-//! of its objects.
+//! of its objects. When the generation has predicate patterns ([`crate::patterns`]), the
+//! pass over `PSO[p]` is skipped for each predicate that no instance of a profiled class
+//! has in any graph.
 
 use super::{
     Budget, Iris, Kind, SchemaError, SchemaOptions, Selected, SnapshotInfo, Src, in_phase, is_iri,
@@ -285,6 +287,22 @@ pub fn profiles(snap: &Arc<Snapshot>, opts: &ProfileOptions) -> Result<ClassProf
     let preds = in_phase(src.distinct_first(Perm::Pso), || {
         "listing predicates".into()
     })?;
+    // the predicates the wanted instances have, from the predicate patterns: a predicate
+    // none of them has needs no pass over its subjects
+    let used = if wanted.is_empty() {
+        None
+    } else {
+        let mut subjects: Vec<u64> = types
+            .iter()
+            .filter(|(_, c)| wanted.contains(c))
+            .map(|(s, _)| *s)
+            .collect();
+        subjects.dedup();
+        in_phase(
+            crate::patterns::predicates_of_subjects(snap, &subjects, &|| budget.check()),
+            || "reading the predicate patterns".into(),
+        )?
+    };
     let mut sfx = Suffixes::default();
     let mut out: FxHashMap<u64, Vec<(u64, Acc)>> = FxHashMap::default();
     let mut incoming: FxHashMap<u64, Vec<(u64, In)>> = FxHashMap::default();
@@ -355,6 +373,10 @@ pub fn profiles(snap: &Arc<Snapshot>, opts: &ProfileOptions) -> Result<ClassProf
             }
             // PSO: each subject's run of objects, under each of its wanted classes
             let mut accs: FxHashMap<u64, Acc> = FxHashMap::default();
+            // no wanted instance has the predicate: its incoming arcs are all there is
+            if used.as_ref().is_some_and(|u| !u.contains(&p)) {
+                return Ok((p, accs, ins, sfx));
+            }
             let mut subject: Option<u64> = None;
             let mut objs: Vec<u64> = Vec::new();
             let mut pos = 0usize;

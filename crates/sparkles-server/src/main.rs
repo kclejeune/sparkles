@@ -170,6 +170,14 @@ struct Cli {
     /// data stops adding its prefixes
     #[arg(long, global = true, default_value_t = sparkles::store::DEFAULT_MAX_PREFIXES)]
     max_prefixes: usize,
+    /// Build no predicate patterns when a bulk load or a compaction writes a generation
+    /// (queries then read the permutations for predicate listings)
+    #[arg(long, global = true)]
+    no_patterns: bool,
+    /// Memory in MiB for the distinct predicate patterns while a generation is built; a
+    /// generation that needs more is built without them
+    #[arg(long, global = true, default_value_t = 1024)]
+    pattern_memory_mb: usize,
     /// Write without write-time validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
@@ -1767,6 +1775,10 @@ enum Cmd {
     Stats {
         #[arg(long)]
         loc: PathBuf,
+        /// Also print the predicate patterns: their number, the subjects per pattern and
+        /// the size of the table
+        #[arg(long)]
+        patterns: bool,
     },
     /// Verify a database without modifying it (safe next to a running server); exits
     /// 0 when clean, 1 on errors, 2 on warnings only
@@ -2103,6 +2115,11 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         group_commit_idle_direct: !cli.no_group_commit_idle_direct,
         change_log: !cli.no_change_log,
         change_log_max_bytes: cli.change_log_mb << 20,
+        build: sparkles::builder::BuildOptions {
+            patterns: !cli.no_patterns,
+            pattern_bytes: cli.pattern_memory_mb << 20,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -3947,7 +3964,7 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Stats { loc } => {
+        Cmd::Stats { loc, patterns } => {
             let store = branch_cmd::open_db(&loc, opts)?;
             let s = store.snapshot();
             let g = &s.generation;
@@ -3990,6 +4007,9 @@ fn run() -> Result<()> {
                     "  {:>12}  {name}  (S {}, O {})",
                     p.count, p.distinct_subjects, p.distinct_objects
                 );
+            }
+            if patterns {
+                print_patterns(&s)?;
             }
             Ok(())
         }
@@ -5408,4 +5428,43 @@ mod group_options_tests {
             "{warning}"
         );
     }
+}
+
+/// `sparkles stats --patterns`: the predicate patterns of the current generation.
+fn print_patterns(s: &sparkles::store::Snapshot) -> anyhow::Result<()> {
+    use sparkles::patterns::Scope;
+    let g = &s.generation;
+    println!("\npredicate patterns:");
+    let Some(file) = g.patterns.file.as_ref() else {
+        let why = g.patterns.missing.as_deref().unwrap_or("none");
+        println!("  none: {why}");
+        return Ok(());
+    };
+    let index = g.disk_bytes().max(1);
+    println!(
+        "  size          {:.1} MiB ({:.2}% of the index)",
+        file.bytes() as f64 / (1 << 20) as f64,
+        file.bytes() as f64 * 100.0 / index as f64
+    );
+    for scope in Scope::ALL {
+        let Some(t) = file.table(scope) else { continue };
+        let n = t.patterns();
+        let subjects = t.subjects();
+        println!(
+            "  {:<13} {n} patterns, {subjects} subjects ({:.1} per pattern), {} predicates",
+            format!("{} table", scope.name()),
+            subjects as f64 / n.max(1) as f64,
+            t.predicates()
+        );
+        let mut buf = Vec::new();
+        for pid in 0..n.min(5) as u32 {
+            t.pattern(pid, &mut buf)?;
+            println!(
+                "    pattern {pid:<4} {} subjects, {} predicates",
+                t.pattern_subjects(pid),
+                buf.len()
+            );
+        }
+    }
+    Ok(())
 }

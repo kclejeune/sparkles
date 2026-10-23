@@ -143,6 +143,8 @@ pub struct Generation {
     pub counts: crate::sparql::stats::CountCache,
     /// the characteristic sets of the statistics by predicate, built on first use
     pub charsets: std::sync::OnceLock<crate::sparql::charsets::CharIndex>,
+    /// the predicate patterns of the base index (see [`crate::patterns`])
+    pub patterns: crate::patterns::Loaded,
     /// The ids of the base vocabulary's literals that `sparkles-reasoner`'s diagnostics
     /// found ill-typed for their own datatype, in id order, and whether the list is
     /// complete. The diagnostics fill it on first use and bound its length, and it lives
@@ -172,6 +174,7 @@ impl Generation {
             geo: Default::default(),
             counts: Default::default(),
             charsets: Default::default(),
+            patterns: Default::default(),
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
@@ -195,6 +198,7 @@ impl Generation {
             geo: Default::default(),
             counts: Default::default(),
             charsets: Default::default(),
+            patterns: base.patterns.clone(),
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,
@@ -225,6 +229,7 @@ impl Generation {
         let meta: IndexMeta = crate::builder::read_index_meta(dir, written_by.as_deref())?;
         let stats: Stats = serde_json::from_slice(&std::fs::read(dir.join("stats.json"))?)
             .map_err(|e| Error::Corrupt(format!("stats.json: {e}")))?;
+        let patterns = crate::patterns::Loaded::open(dir, meta.patterns.as_ref());
         Ok(Generation {
             uid: crate::index::next_uid(),
             name: name.to_string(),
@@ -243,6 +248,7 @@ impl Generation {
             geo: Default::default(),
             counts: Default::default(),
             charsets: Default::default(),
+            patterns,
             ill_typed_literals: Mutex::new(None),
             wal_index: Mutex::new(None),
             link: None,

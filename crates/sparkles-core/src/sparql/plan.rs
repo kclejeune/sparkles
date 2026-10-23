@@ -476,6 +476,12 @@ pub enum Kind {
     /// child 0, if the call has a variable source, is the rest of the group, and the last
     /// child is the nested pattern of edges, if any
     AlgoCall(Box<super::algosvc::AlgoSpec>),
+    /// `GROUP BY ?p` with subject counts over `?s ?p ?o`, read from the predicate
+    /// patterns; child 0, if any, is the input that binds `?s` (see
+    /// [`super::patternplan`])
+    PatternCount(Box<super::patternplan::PatternCountSpec>),
+    /// `spk:hasPredicate` read from the predicate patterns
+    PatternScan(Box<super::patternplan::PatternScanSpec>),
 }
 
 #[derive(Clone)]
@@ -621,6 +627,8 @@ impl Node {
             Kind::PathSearch(_) => "PathSearch",
             Kind::HistoryChanges(_) => "HistoryChanges",
             Kind::AlgoCall(_) => "AlgoCall",
+            Kind::PatternCount(_) => "PatternCount",
+            Kind::PatternScan(_) => "PatternScan",
         }
     }
 }
@@ -1175,6 +1183,19 @@ impl<'a> Planner<'a> {
                 Ok(self.apply_filters(n, filters))
             }
             GP::Distinct { inner } => {
+                // SELECT DISTINCT ?p over ?s ?p ?o: the predicates the patterns list
+                if let GP::Project {
+                    inner: pinner,
+                    variables,
+                } = &**inner
+                    && variables.len() == 1
+                    && self.subst.is_empty()
+                {
+                    self.bnode_scope += 1;
+                    if let Some(n) = self.pattern_count(pinner, variables, &[], g)? {
+                        return Ok(self.apply_filters(n, filters));
+                    }
+                }
                 let child = self.plan(inner, g, Vec::new())?;
                 let mut n = Node::unary(Kind::Distinct, child, String::new());
                 n.est = n.children[0].est; // unknown reduction
@@ -1198,6 +1219,9 @@ impl<'a> Planner<'a> {
                 variables,
                 aggregates,
             } => {
+                if let Some(n) = self.pattern_count(inner, variables, aggregates, g)? {
+                    return Ok(self.apply_filters(n, filters));
+                }
                 let child = self.plan(inner, g, Vec::new())?;
                 let keys: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
                 let aggs: Vec<(VarId, Agg)> = aggregates
@@ -1364,6 +1388,21 @@ impl<'a> Planner<'a> {
     fn collect(&mut self, gp: &GraphPattern, g: &ActiveGraph, items: &mut Vec<Item>) -> Result<()> {
         use GraphPattern as GP;
         match gp {
+            GP::Bgp { patterns }
+                if patterns
+                    .iter()
+                    .any(|t| super::patternplan::is_has_predicate(&t.predicate)) =>
+            {
+                let (calls, rest): (Vec<_>, Vec<_>) = patterns
+                    .iter()
+                    .cloned()
+                    .partition(|t| super::patternplan::is_has_predicate(&t.predicate));
+                self.collect(&GP::Bgp { patterns: rest }, g, items)?;
+                for t in &calls {
+                    let n = self.has_predicate(t, g)?;
+                    items.push(Item::Node(n));
+                }
+            }
             GP::Bgp { patterns } => {
                 if super::propertyext::has_calls(self.ctx, patterns) {
                     let (calls, rest) = super::propertyext::take_calls(self.ctx, patterns)?;
@@ -2033,6 +2072,184 @@ impl<'a> Planner<'a> {
         let mut n = Node::leaf(Kind::TextSearch(Box::new(spec)), vars, est, desc);
         n.cost = est * 4.0;
         Ok(n)
+    }
+
+    /// A GROUP BY that the predicate patterns answer (see [`super::patternplan`]), if
+    /// this one is such and the patterns give the scan's answer here.
+    fn pattern_count(
+        &mut self,
+        inner: &GraphPattern,
+        variables: &[spargebra::term::Variable],
+        aggregates: &[(spargebra::term::Variable, AggregateExpression)],
+        g: &ActiveGraph,
+    ) -> Result<Option<Node>> {
+        use super::patternplan::{Measure, PatternCountSpec, count_shape, usable};
+        if !self.ctx.opt.predicate_patterns || matches!(g, ActiveGraph::Var(_)) {
+            return Ok(None);
+        }
+        // `GRAPH <urn:x-arq:UnionGraph> { … }` around the pattern reads the named table
+        let union;
+        let (inner, g) = match inner {
+            GraphPattern::Graph {
+                name: NamedNodePattern::NamedNode(n),
+                inner,
+            } if n.as_str() == super::ctx::UNION_GRAPH_IRI => {
+                union = ActiveGraph::Union;
+                (&**inner, &union)
+            }
+            _ => (inner, g),
+        };
+        let Some(shape) = count_shape(inner, variables, aggregates) else {
+            return Ok(None);
+        };
+        let (PT::V(s), PT::V(p)) = (self.var(shape.s.as_str()), self.var(variables[0].as_str()))
+        else {
+            return Ok(None);
+        };
+        let Some((gf, None)) = self.graph_filter(g) else {
+            return Ok(None);
+        };
+        let Some(uses) = usable(self.ctx, &gf) else {
+            return Ok(None);
+        };
+        let input = if shape.rest.is_empty() {
+            None
+        } else {
+            let n = self.plan(
+                &GraphPattern::Bgp {
+                    patterns: shape.rest,
+                },
+                g,
+                Vec::new(),
+            )?;
+            if !n.certain.contains(&s) || n.vars.contains(&p) {
+                return Ok(None);
+            }
+            Some(n)
+        };
+        let counts: Vec<(VarId, Measure)> = shape
+            .counts
+            .iter()
+            .map(|(v, m)| (self.ctx.var(v.as_str()), *m))
+            .collect();
+        let mut vars = vec![p];
+        vars.extend(counts.iter().map(|c| c.0));
+        let est = (self.ctx.snap.generation.stats.distinct_predicates.max(1) as f64).min(
+            input
+                .as_ref()
+                .map_or(f64::INFINITY, |i| i.est.max(1.0) * 64.0),
+        );
+        let desc = format!(
+            "?{} by subjects{} [{} table]",
+            self.ctx.var_name(p),
+            if input.is_some() {
+                format!(" of ?{}", self.ctx.var_name(s))
+            } else {
+                String::new()
+            },
+            uses.scope.name()
+        );
+        let cost = match &input {
+            Some(i) => i.cost + i.est,
+            None => est + uses.corr.touched.len() as f64,
+        };
+        let spec = PatternCountSpec {
+            uses,
+            subject: input.as_ref().map(|_| s),
+            pred: p,
+            counts,
+        };
+        let mut n = Node::leaf(Kind::PatternCount(Box::new(spec)), vars, est, desc);
+        n.cost = cost;
+        n.sorted = vec![p];
+        n.children = input.into_iter().collect();
+        Ok(Some(n))
+    }
+
+    /// `?s spk:hasPredicate ?p` (or QLever's `ql:has-predicate`): from the predicate
+    /// patterns when they give the answer here, and otherwise as the distinct subjects
+    /// and predicates of `?s ?p []`.
+    fn has_predicate(&mut self, t: &TriplePattern, g: &ActiveGraph) -> Result<Node> {
+        use super::patternplan::{PatternScanSpec, usable};
+        let s = self.term_pattern(&t.subject);
+        let p = self.term_pattern(&t.object);
+        let mut vars = Vec::new();
+        for x in [s, p] {
+            if let PT::V(v) = x
+                && !vars.contains(&v)
+            {
+                vars.push(v);
+            }
+        }
+        let end = |x: PT| match x {
+            PT::C(id) => PathEnd::Const(id),
+            PT::V(v) => PathEnd::Var(v),
+        };
+        if vars.len() == [s, p].iter().filter(|x| matches!(x, PT::V(_))).count()
+            && !matches!(g, ActiveGraph::Var(_))
+            && let Some((gf, None)) = self.graph_filter(g)
+            && let Some(uses) = usable(self.ctx, &gf)
+        {
+            let stats = &self.ctx.snap.generation.stats;
+            let est = match (s, p) {
+                (PT::C(_), PT::C(_)) => 1.0,
+                (PT::C(_), PT::V(_)) => (stats.distinct_predicates as f64).clamp(1.0, 16.0),
+                (PT::V(_), PT::C(q)) => self
+                    .ctx
+                    .snap
+                    .predicate_stat(q.0)
+                    .map_or(0.0, |st| st.distinct_subjects as f64),
+                (PT::V(_), PT::V(_)) => stats
+                    .predicates
+                    .iter()
+                    .map(|st| st.distinct_subjects as f64)
+                    .sum(),
+            };
+            let desc = format!(
+                "{} spk:hasPredicate {} [{} table]",
+                self.pt_str(&s),
+                self.pt_str(&p),
+                uses.scope.name()
+            );
+            let spec = PatternScanSpec {
+                uses,
+                s: end(s),
+                p: end(p),
+            };
+            let mut n = Node::leaf(Kind::PatternScan(Box::new(spec)), vars.clone(), est, desc);
+            n.sorted = match (s, p) {
+                (PT::V(a), PT::V(b)) => vec![a, b],
+                (PT::V(a), _) | (_, PT::V(a)) => vec![a],
+                _ => Vec::new(),
+            };
+            if let PT::V(a) = s {
+                n.dist
+                    .insert(a, (stats.distinct_subjects as f64).clamp(1.0, est.max(1.0)));
+            }
+            if let PT::V(b) = p {
+                n.dist.insert(
+                    b,
+                    (stats.distinct_predicates as f64).clamp(1.0, est.max(1.0)),
+                );
+            }
+            return Ok(n);
+        }
+        let o = PT::V(self.ctx.fresh_var());
+        let sub = vec![Item::Triple(Triple {
+            t: [s, p, o],
+            graph: g.clone(),
+        })];
+        let node = self.plan_group(sub, Vec::new())?;
+        if let ActiveGraph::Var(gv) = g
+            && node.vars.contains(gv)
+            && !vars.contains(gv)
+        {
+            vars.push(*gv);
+        }
+        let n = project(node, vars, self.ctx);
+        let mut d = Node::unary(Kind::Distinct, n, "spk:hasPredicate".into());
+        d.est = d.children[0].est;
+        Ok(d)
     }
 
     fn triple(&self, tp: &TriplePattern, g: &ActiveGraph) -> Triple {

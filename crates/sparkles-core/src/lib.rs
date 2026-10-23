@@ -21,6 +21,7 @@ pub mod migrate;
 pub mod nesting;
 pub mod outbound;
 pub mod patch;
+pub mod patterns;
 pub mod preview;
 pub mod schema;
 pub mod sparql;
