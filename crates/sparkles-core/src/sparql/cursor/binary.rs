@@ -222,21 +222,25 @@ pub(super) struct EqualityIndex {
 impl EqualityIndex {
     fn new(ctx: &Ctx, build: &Table, column: usize, probe: usize) -> Result<Self> {
         let by_id = HashIndex::new(ctx, build, column, probe)?;
-        let mut charge = ctx.retained_charge(1024)?;
-        let mut loose = Vec::new();
-        for (row, &value) in build.cols[column].iter().enumerate() {
+        let values = &build.cols[column];
+        let is_loose = |value: Id| !value.is_undef() && !atomic(ctx, value);
+        // count first, so the list is charged and allocated once at its exact size
+        let mut count = 0usize;
+        for (row, &value) in values.iter().enumerate() {
             if row.is_multiple_of(1024) {
                 ctx.check()?;
             }
-            if !value.is_undef() && !atomic(ctx, value) {
-                if loose.len() == loose.capacity()
-                    && let Some(charge) = &mut charge
-                {
-                    charge.resize((loose.capacity().max(256) as u64) * 8 + 1024)?;
-                }
-                loose.push(row as u32);
-            }
+            count += usize::from(is_loose(value));
         }
+        let charge = ctx.retained_charge(count as u64 * 4 + 1024)?;
+        let mut loose = Vec::with_capacity(count);
+        loose.extend(
+            values
+                .iter()
+                .enumerate()
+                .filter(|&(_, &value)| is_loose(value))
+                .map(|(row, _)| row as u32),
+        );
         Ok(Self {
             by_id,
             loose,
@@ -863,6 +867,7 @@ impl Binary {
     /// Parents that spill can use this room for their remaining passes.
     pub(super) fn release_working_sets(&mut self) {
         self.index = None;
+        self.equality_index = None;
         self.build = None;
         self.probe = None;
         self.spill = None;

@@ -374,3 +374,38 @@ fn application_callbacks_in_the_condition_keep_the_generic_join() {
     );
     assert!(keyed_candidates(&r.plan).is_empty());
 }
+
+/// A keyed OPTIONAL that has finished releases its equality index, so a cursor that
+/// runs several in turn holds one index at a time.
+#[test]
+fn finished_keyed_optionals_release_their_cursor_index() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..4096 {
+        if i % 2 == 0 {
+            data += &format!("<urn:r:{i}> <urn:w> <urn:o:{i}> .\n");
+        } else {
+            data += &format!("<urn:r:{i}> <urn:w> \"{i}\" .\n");
+        }
+    }
+    for i in 0..8 {
+        data += &format!("<urn:l:{i}> <urn:v> <urn:o:{}> .\n", i * 2);
+    }
+    store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let branch = "{ ?l <urn:v> ?x OPTIONAL { ?r <urn:w> ?y FILTER(?x = ?y) } }";
+    let options = QueryOptions {
+        max_memory_bytes: Some(512 << 10),
+        ..options(1_000_000, true)
+    };
+    let one = format!("SELECT ?l ?r WHERE {branch}");
+    assert_eq!(strict_rows(&store, &one, &options).len(), 8);
+    let four =
+        format!("SELECT ?l ?r WHERE {{ {branch} UNION {branch} UNION {branch} UNION {branch} }}");
+    assert_eq!(strict_rows(&store, &four, &options).len(), 32);
+}
