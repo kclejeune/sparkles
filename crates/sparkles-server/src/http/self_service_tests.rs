@@ -307,7 +307,8 @@ async fn a_service_call_to_this_server_keeps_the_callers_lowered_budgets() {
         .unwrap();
     let body = String::from_utf8_lossy(&body);
     assert_ne!(status, StatusCode::OK, "{body}");
-    assert!(!body.contains("55"), "{body}");
+    // the sum is a row of its own, and a request id in the error may contain "55"
+    assert!(!body.lines().any(|l| l.trim() == "55"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

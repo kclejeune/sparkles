@@ -470,7 +470,13 @@ fn candidates(s: &Value, i: usize) -> Vec<String> {
 /// A5 and A18: exact, ambiguous and missing mentions, with and without a text index.
 #[tokio::test(flavor = "multi_thread")]
 async fn link_entities() {
-    for text in [true, false] {
+    // a build without `text` has no full-text index to turn on
+    let with_text: &[bool] = if cfg!(feature = "text") {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    for &text in with_text {
         let mut c = Client::start(mem(text));
         let s = c
             .structured(
@@ -551,8 +557,9 @@ async fn link_entities() {
     }
 }
 
-/// A11, A12, A15, A17 and A18: facts with citations, superseded facts, the caps and
-/// escaping.
+/// A11, A12, A15 and A17: facts with citations, superseded facts, the caps and
+/// escaping. A query finds its seeds through the full-text index.
+#[cfg(feature = "text")]
 #[tokio::test(flavor = "multi_thread")]
 async fn recall() {
     let mut c = Client::start(mem(true));
@@ -694,7 +701,11 @@ async fn recall() {
         let (_, e) = c.error("recall", bad.clone()).await;
         assert_eq!(e["code"], "bad-argument", "{bad}");
     }
-    // A18: no search index
+}
+
+/// A18: a query needs a search index, and seeds work without one.
+#[tokio::test(flavor = "multi_thread")]
+async fn recall_without_a_search_index() {
     let mut c = Client::start(mem(false));
     let (t, e) = c.error("recall", json!({"query": "payments team"})).await;
     assert_eq!(e, json!({"code": "no-search-index", "status": 400}), "{t}");

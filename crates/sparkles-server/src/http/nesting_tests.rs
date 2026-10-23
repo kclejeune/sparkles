@@ -290,15 +290,19 @@ async fn a_basic_graph_pattern_at_the_plan_limit_runs_and_explains() {
     let r = send(&app, post("/c/explain", ct, bgp(n))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.body.len() > 100 * n, "{}", r.body.len());
-    let explain = Request::post("/c/sparql/explain")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "application/json")
-        .body(Body::from(json!({ "query": bgp(n) }).to_string()))
-        .unwrap();
-    // the explanation reads plans of up to 256 levels, and refuses a deeper one cleanly
-    let r = send(&app, explain).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
-    assert!(r.text().contains("the plan nests deeper than 256 levels"));
+    // the explanation reads plans of up to 256 levels, and refuses a deeper one cleanly; the
+    // route comes with the MCP tools
+    #[cfg(feature = "mcp")]
+    {
+        let explain = Request::post("/c/sparql/explain")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(json!({ "query": bgp(n) }).to_string()))
+            .unwrap();
+        let r = send(&app, explain).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+        assert!(r.text().contains("the plan nests deeper than 256 levels"));
+    }
     let u = delete_where((MAX_PLAN_DEPTH - 2) / 2);
     let r = send(&app, post("/c/update", "application/sparql-update", u)).await;
     assert!(r.status.is_success(), "{}", r.text());
@@ -312,12 +316,16 @@ async fn nested_ranges_get_a_400() {
         let r = send(&app, post(path, "application/sparql-query", q.to_string())).await;
         plan_refused(&r);
     }
-    let explain = Request::post("/c/sparql/explain")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "application/json")
-        .body(Body::from(json!({ "query": q }).to_string()))
-        .unwrap();
-    plan_refused(&send(&app, explain).await);
+    // the JSON explanation route comes with the MCP tools
+    #[cfg(feature = "mcp")]
+    {
+        let explain = Request::post("/c/sparql/explain")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(json!({ "query": q }).to_string()))
+            .unwrap();
+        plan_refused(&send(&app, explain).await);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

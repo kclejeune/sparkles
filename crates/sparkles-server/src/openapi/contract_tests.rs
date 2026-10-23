@@ -285,7 +285,8 @@ async fn admin_responses_match_their_schemas() {
             feature = "text",
             feature = "geo",
             feature = "reasoning",
-            feature = "backup"
+            feature = "backup",
+            feature = "shacl"
         )),
         allow(unused_mut)
     )]
@@ -298,7 +299,6 @@ async fn admin_responses_match_their_schemas() {
         ("/$/queries/{ds}/{name}", "/$/queries/h/labels"),
         ("/$/vector/{ds}", "/$/vector/h"),
         ("/$/vector/{ds}/{name}", "/$/vector/h/v1"),
-        ("/$/validation/{ds}", "/$/validation/h"),
     ];
     let put = |uri: &'static str, body: J| {
         let app = app.clone();
@@ -314,14 +314,17 @@ async fn admin_responses_match_their_schemas() {
             assert!(s.is_success(), "{uri}: {s} {j}");
         }
     };
-    // validation is off first: {config: null}
-    let (_, j) = call(&app, "GET", "/$/validation/h", None).await;
     let doc = build("0.0.0");
     let schema = |template: &str| {
         doc["paths"][template]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
             .clone()
     };
-    assert_eq!(mismatch(&doc, &schema("/$/validation/{ds}"), &j, "$"), None);
+    // validation is off first: {config: null}. A build without SHACL answers `501`.
+    #[cfg(feature = "shacl")]
+    {
+        let (_, j) = call(&app, "GET", "/$/validation/h", None).await;
+        assert_eq!(mismatch(&doc, &schema("/$/validation/{ds}"), &j, "$"), None);
+    }
     put(
         "/$/queries/h/labels",
         json!({ "query": "SELECT ?s ?l WHERE { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?l }", "description": "labels" }),
@@ -334,11 +337,15 @@ async fn admin_responses_match_their_schemas() {
     )
     .await;
     until(&app, "/$/vector/h/v1", |j| j["state"] == "ready").await;
-    put(
-        "/$/validation/h",
-        json!({ "mode": "warn", "shapes": { "inline": "@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://example.org/> . ex:S a sh:NodeShape ; sh:targetClass ex:Thing ; sh:property [ sh:path ex:p ; sh:maxCount 1 ] ." } }),
-    )
-    .await;
+    #[cfg(feature = "shacl")]
+    {
+        put(
+            "/$/validation/h",
+            json!({ "mode": "warn", "shapes": { "inline": "@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix ex: <http://example.org/> . ex:S a sh:NodeShape ; sh:targetClass ex:Thing ; sh:property [ sh:path ex:p ; sh:maxCount 1 ] ." } }),
+        )
+        .await;
+        routes.push(("/$/validation/{ds}", "/$/validation/h"));
+    }
     #[cfg(feature = "text")]
     {
         put("/$/text/h", json!({ "languages": ["en", "ja"] })).await;
@@ -536,6 +543,8 @@ async fn more_answers(doc: &J, app: &axum::Router) {
         .unwrap();
     let j: J = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(mismatch(doc, &sref("DryRunReport"), &j, "$"), None, "{j}");
+    // the report names the guard that /$/validation installed above
+    #[cfg(feature = "shacl")]
     assert!(j["validation"].is_object(), "{j}");
     #[cfg(feature = "shacl")]
     {

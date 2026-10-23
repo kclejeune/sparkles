@@ -517,6 +517,7 @@ const DRAFT_DATA: &str = r#"ex:Employee rdfs:subClassOf ex:Person .
     ex:o a ex:Org ; ex:member ex:a, ex:c .
     GRAPH ex:g { ex:z a ex:Person ; ex:secret "s" }"#;
 
+#[cfg(feature = "shacl")]
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, String, String) {
     let res = app.clone().oneshot(req).await.unwrap();
     let status = res.status();
@@ -628,64 +629,68 @@ async fn drafted_shapes() {
         assert!(text.contains(needle), "{text}");
     }
 
-    // the draft validates the data, and installs as a guard in warn mode
-    let (_, _, turtle) = get_accept(&s.app, "/$/schema/t/shapes?format=turtle", "*/*").await;
-    let (status, _, report) = send(
-        &s.app,
-        Request::post("/t/shacl")
-            .header(header::CONTENT_TYPE, "text/turtle")
-            .header(header::ACCEPT, "application/json")
-            .body(Body::from(turtle.clone()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{report}");
-    let report: J = serde_json::from_str(&report).unwrap();
-    assert_eq!(report["conforms"], true, "{report}");
-    let body = serde_json::json!({
-        "language": "shacl", "mode": "warn", "shapes": { "inline": turtle }
-    });
-    let (status, _, text) = send(
-        &s.app,
-        Request::put("/$/validation/t")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    let j: J = serde_json::from_str(&text).unwrap();
-    assert_eq!(j["status"]["baseline"]["conforms"], true, "{j}");
+    // the draft validates the data, and installs as a guard in warn mode, in builds that
+    // validate with SHACL
+    #[cfg(feature = "shacl")]
+    {
+        let (_, _, turtle) = get_accept(&s.app, "/$/schema/t/shapes?format=turtle", "*/*").await;
+        let (status, _, report) = send(
+            &s.app,
+            Request::post("/t/shacl")
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::from(turtle.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        let report: J = serde_json::from_str(&report).unwrap();
+        assert_eq!(report["conforms"], true, "{report}");
+        let body = serde_json::json!({
+            "language": "shacl", "mode": "warn", "shapes": { "inline": turtle }
+        });
+        let (status, _, text) = send(
+            &s.app,
+            Request::put("/$/validation/t")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let j: J = serde_json::from_str(&text).unwrap();
+        assert_eq!(j["status"]["baseline"]["conforms"], true, "{j}");
 
-    // and so does the SHACLC draft
-    let (_, _, compact) = get_accept(&s.app, "/$/schema/t/shapes?format=shaclc", "*/*").await;
-    let (status, _, report) = send(
-        &s.app,
-        Request::post("/t/shacl")
-            .header(header::CONTENT_TYPE, "text/shaclc")
-            .header(header::ACCEPT, "application/json")
-            .body(Body::from(compact.clone()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{report}");
-    let report: J = serde_json::from_str(&report).unwrap();
-    assert_eq!(report["conforms"], true, "{report}");
-    let body = serde_json::json!({
-        "language": "shacl", "mode": "warn",
-        "shapes": { "inline": compact, "format": "text/shaclc" }
-    });
-    let (status, _, text) = send(
-        &s.app,
-        Request::put("/$/validation/t")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{text}");
-    let j: J = serde_json::from_str(&text).unwrap();
-    assert_eq!(j["status"]["baseline"]["conforms"], true, "{j}");
+        // and so does the SHACLC draft
+        let (_, _, compact) = get_accept(&s.app, "/$/schema/t/shapes?format=shaclc", "*/*").await;
+        let (status, _, report) = send(
+            &s.app,
+            Request::post("/t/shacl")
+                .header(header::CONTENT_TYPE, "text/shaclc")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::from(compact.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        let report: J = serde_json::from_str(&report).unwrap();
+        assert_eq!(report["conforms"], true, "{report}");
+        let body = serde_json::json!({
+            "language": "shacl", "mode": "warn",
+            "shapes": { "inline": compact, "format": "text/shaclc" }
+        });
+        let (status, _, text) = send(
+            &s.app,
+            Request::put("/$/validation/t")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let j: J = serde_json::from_str(&text).unwrap();
+        assert_eq!(j["status"]["baseline"]["conforms"], true, "{j}");
+    }
 
     // the union graph includes the named graph's person
     let j = ok(&s.app, "/$/schema/t/shapes?graph=union").await;
