@@ -973,8 +973,12 @@ async fn get_maintenance(
     // the open review items, for a caller who may review them
     let review = {
         let (st, d) = (st.clone(), d.clone());
-        crate::http::blocking(move || Ok(crate::mcp::memory::pending::review_json(&st, &d, &p)))
-            .await?
+        // the admitted grant, read on the request's task before the blocking thread
+        let grant = crate::server_memory::current_grant();
+        crate::http::blocking(move || {
+            Ok(crate::mcp::memory::pending::review_json(&st, &d, &p, grant))
+        })
+        .await?
     };
     let mut out = json!({
         "dataset": d.name,

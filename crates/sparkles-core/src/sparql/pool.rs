@@ -144,7 +144,7 @@ impl QueryPool {
     fn wake(&self) {
         // the callback runs outside the lock, so that it may poll its ticket
         let next = self.next_to_serve(&self.queue.lock());
-        if let Some(f) = next {
+        if let Some((_, Some(f))) = next {
             f();
         }
         self.changed.notify_all();
@@ -153,8 +153,9 @@ impl QueryPool {
     /// The wake-up of the first waiter that [`Ticket::poll`] would serve now, if it has
     /// one. Only that waiter is woken. When it takes its grant it wakes the next one that
     /// fits, so a release wakes the waiters that fit one after another instead of all of
-    /// them. Blocking waiters have no callback and wait on `changed`.
-    fn next_to_serve(&self, q: &Queue) -> Option<Waker> {
+    /// them. A waiter that was woken but finds the memory taken again passes the wake-up
+    /// on in the same way. Blocking waiters have no callback and wait on `changed`.
+    fn next_to_serve(&self, q: &Queue) -> Option<(u64, Option<Waker>)> {
         let granted = self.granted.load(Ordering::SeqCst);
         (0..q.waiters.len())
             .find(|&pos| {
@@ -162,7 +163,7 @@ impl QueryPool {
                 granted.saturating_add(w.bytes) <= self.capacity
                     && may_pass(q, pos, granted, self.capacity)
             })
-            .and_then(|pos| q.waiters[pos].wake.clone())
+            .map(|pos| (q.waiters[pos].ticket, q.waiters[pos].wake.clone()))
     }
 
     /// The most a request can be granted at admission: a pool smaller than the usual
@@ -285,6 +286,16 @@ impl Ticket {
         let pos = q.waiters.iter().position(|w| w.ticket == self.ticket)?;
         let granted = pool.granted.load(Ordering::SeqCst);
         if !may_pass(&q, pos, granted, pool.capacity) || !pool.reserve(self.bytes, pool.capacity) {
+            // This waiter may have been the one a release woke, and a running grant may
+            // have grown into the memory since. Another waiter may fit in what is left,
+            // so the wake-up goes on to it rather than ending here.
+            let next = pool.next_to_serve(&q);
+            drop(q);
+            if let Some((ticket, Some(f))) = next
+                && ticket != self.ticket
+            {
+                f();
+            }
             return None;
         }
         q.waiters.remove(pos);
@@ -295,7 +306,7 @@ impl Ticket {
         // the next waiter may fit in what is left
         let next = pool.next_to_serve(&q);
         drop(q);
-        if let Some(f) = next {
+        if let Some((_, Some(f))) = next {
             f();
         }
         pool.changed.notify_all();
@@ -883,6 +894,44 @@ mod tests {
         assert!(tickets[2].poll().is_some());
         drop((b, second, tickets));
         assert_eq!(pool.granted(), 0);
+    }
+
+    #[test]
+    fn a_woken_waiter_that_no_longer_fits_wakes_the_next() {
+        use std::sync::atomic::AtomicUsize;
+        let pool = QueryPool::new(64 * MB);
+        let freed = pool.try_grant(32 * MB).unwrap();
+        let grows = pool.try_grant(8 * MB).unwrap();
+        let _other = pool.try_grant(24 * MB).unwrap();
+        let woken: Arc<[AtomicUsize; 2]> = Arc::new(Default::default());
+        let mut tickets: Vec<Ticket> = [32 * MB, 16 * MB]
+            .into_iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let w = woken.clone();
+                pool.enter(
+                    bytes,
+                    Some(Arc::new(move || {
+                        w[i].fetch_add(1, Ordering::SeqCst);
+                    })),
+                )
+            })
+            .collect();
+        let counts = || {
+            woken
+                .iter()
+                .map(|c| c.load(Ordering::SeqCst))
+                .collect::<Vec<_>>()
+        };
+        drop(freed);
+        assert_eq!(counts(), [1, 0]);
+        // a running grant takes 16 of the 32 MiB before the head polls
+        grows.charge(24 * MB).unwrap();
+        assert!(tickets[0].poll().is_none());
+        // the smaller waiter fits in the 16 MiB left and may pass the head
+        assert_eq!(counts(), [1, 1]);
+        assert!(tickets[1].poll().is_some());
+        drop(tickets.remove(0));
     }
 
     #[test]

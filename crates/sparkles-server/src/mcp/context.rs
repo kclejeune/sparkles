@@ -216,8 +216,9 @@ impl McpServer {
             }
             Kind::Review => {
                 let (st, p) = (self.state.clone(), call.principal.clone());
+                let grant = call.grant.clone();
                 let read = tokio::task::spawn_blocking(move || {
-                    super::memory::pending::review_json(&st, &ds, &p)
+                    super::memory::pending::review_json(&st, &ds, &p, grant)
                 })
                 .await
                 .ok()

@@ -1924,3 +1924,59 @@ async fn mcp_calls_wait_for_the_memory_pool() {
         "the call's grant went back with the call"
     );
 }
+
+/// The review resource counts its open items under the grant its read was admitted with,
+/// so a pool that the read's own grant fills still answers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_read_counts_under_its_own_grant() {
+    const MIB: u64 = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = AppState::with_memory(
+        dir.path(),
+        StoreOptions::default(),
+        Duration::from_secs(30),
+        Some(16 * MIB),
+    )
+    .unwrap();
+    st.admission.wait = Duration::from_millis(200);
+    st.mcp = Some(conf(&st, &[]));
+    let state = Arc::new(st);
+    load(&state, "t", FIXTURE);
+    let ds = state.get("t").unwrap();
+    crate::settings::store_runtime(
+        &state,
+        &ds,
+        &crate::settings::MEMORY,
+        &json!({"agentGraphs": ["https://example.org/memory/agents/*"]}),
+    )
+    .unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            br#"<https://example.org/memory/agents/a/sessions/s1> {
+  <http://ex.org/ana> <http://ex.org/knows> <http://ex.org/p1> .
+  <urn:r1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://ex.org/ana> <http://ex.org/knows> <http://ex.org/p1> )>> ;
+     <http://www.w3.org/ns/prov#generatedAtTime> "2026-10-08T12:00:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+}"#
+            .to_vec(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let app = router(state.clone());
+    // the counts are not kept yet, so the read counts them now
+    let r = modern(
+        &app,
+        "resources/read",
+        json!({"uri": "sparkles://t/memory/review"}),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let text = r.rpc()["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}", r.body))
+        .to_string();
+    let v: J = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["open"], 1, "{v}");
+    assert_eq!(state.catalog.pool().unwrap().granted(), 0);
+}

@@ -1092,7 +1092,8 @@ to the handler whole. A longer one is admitted once that much has arrived, and t
 handler receives the bytes read followed by the rest, so its own limit and its error for
 an oversized body are unchanged. A declared length above the limit is not read ahead, so
 the handler refuses it as before, and a read error reaches the handler after the bytes
-before it. The bytes read ahead are the bytes the handler would have buffered, so the
+before it. The handler's body reader keeps a body that arrives in one frame instead of
+copying it, so the bytes read ahead are the bytes the handler would have buffered and the
 memory outside the pool does not grow. Uploads, patches, writes to `/{ds}/data` or a
 graph, and requests to `/{ds}` that are not a SPARQL query, update or form start with an
 empty grant without queueing, and a query that they run grows it. MCP calls and algorithm
@@ -1110,6 +1111,18 @@ with 16 MiB granted. `uploads_and_graph_store_writes_take_no_initial_grant` hold
 pool and sends a graph PUT, a default graph POST and a POST to `/{ds}`, which answered
 `503` before, and checks that a SPARQL update still waits. `a_release_wakes_only_the_waiters_that_fit`
 counts the wake-ups of three waiters through two releases.
+
+A review found three gaps, which are fixed. A woken waiter whose memory a running grant
+took before it polled ended the wake-up there, so a smaller waiter that still fitted
+waited for the next release or its deadline. A failed poll now wakes the next waiter
+that fits, which `a_woken_waiter_that_no_longer_fits_wakes_the_next` covers. The body
+reader copied a read-ahead body into a second buffer, which held an 8 MiB update twice,
+and `a_body_read_ahead_is_not_copied_again` checks that it now keeps the frame. The
+review counts that the memory brief, the review resource and the maintenance report
+compute on demand ran without the request's grant, so in a pool that the request's own
+grant filled the review resource answered as unknown. They now charge the reading
+request's grant, as `a_review_read_counts_under_its_own_grant` checks, and only the
+background refresh counts without one.
 
 ### Retained eager results (2026-10-23)
 

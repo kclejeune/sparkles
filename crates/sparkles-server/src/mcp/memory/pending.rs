@@ -224,8 +224,13 @@ fn applicable(c: &Counts, ds: &Arc<Dataset>) -> bool {
 }
 
 /// Count the open review items again unless their fingerprint is unchanged. A live
-/// dataset without memory settings is forgotten; obsolete instances cannot publish.
-pub(crate) fn refresh(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Counts>> {
+/// dataset without memory settings is forgotten; obsolete instances cannot publish. A
+/// count charges `grant`, the admitted grant of the request that asked, if any.
+pub(crate) fn refresh(
+    st: &Arc<AppState>,
+    ds: &Arc<Dataset>,
+    grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+) -> Option<Arc<Counts>> {
     let reg = &st.ingest.review;
     let gate = reg.gate(&ds.name);
     #[cfg(test)]
@@ -261,7 +266,7 @@ pub(crate) fn refresh(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Count
     {
         return Some(c);
     }
-    match count(st, ds, &memory, fp) {
+    match count(st, ds, &memory, fp, grant) {
         Ok(c) => {
             #[cfg(test)]
             reg.event(tests::Point::Counted, &ds.name);
@@ -284,8 +289,13 @@ pub(crate) fn refresh(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Count
 /// The counts of `ds` for a reader of the maintenance answer, the brief or the resource:
 /// those kept while their fingerprint holds, else a count now, so that a reader never
 /// sees counts older than the dataset (the metrics read the kept counts only).
-pub(crate) fn current(st: &Arc<AppState>, ds: &Arc<Dataset>) -> Option<Arc<Counts>> {
-    refresh(st, ds)
+/// `grant` is the admitted grant of the request that reads them, which a count charges.
+pub(crate) fn current(
+    st: &Arc<AppState>,
+    ds: &Arc<Dataset>,
+    grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+) -> Option<Arc<Counts>> {
+    refresh(st, ds, grant)
 }
 
 /// Refresh every dataset, and forget the datasets that are gone (the maintenance tick).
@@ -303,7 +313,7 @@ pub fn refresh_all(st: &Arc<AppState>) {
         forget_absent(st, &name);
     }
     for ds in datasets.values() {
-        refresh(st, ds);
+        refresh(st, ds, None);
     }
     reg.gates.lock().retain(|_, gate| gate.strong_count() > 0);
 }
@@ -336,7 +346,7 @@ pub(crate) fn touch(st: &Arc<AppState>, name: &str) {
         .spawn(move || {
             loop {
                 if let Some(ds) = st2.get(&worker_name) {
-                    refresh(&st2, &ds);
+                    refresh(&st2, &ds, None);
                 } else {
                     forget_absent(&st2, &worker_name);
                 }
@@ -361,6 +371,7 @@ fn count(
     ds: &Arc<Dataset>,
     memory: &crate::assist::MemorySettings,
     fingerprint: u64,
+    grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
 ) -> Result<Counts, ToolError> {
     #[cfg(test)]
     if st
@@ -386,8 +397,8 @@ fn count(
         principal: Principal::local(),
         headers: None,
         held: None,
-        // a server-side count outside any request
-        grant: None,
+        // the reading request's grant, or none for a count outside any request
+        grant,
     };
     let t = Tools {
         server: &server,
@@ -535,11 +546,16 @@ pub(crate) fn state(st: &AppState, ds: &Dataset, p: &Principal) -> Option<u64> {
 
 /// The review counts of `ds` as `p` sees them, in JSON: `None` when the dataset has no
 /// memory settings or `p` may not review it.
-pub(crate) fn review_json(st: &Arc<AppState>, ds: &Arc<Dataset>, p: &Principal) -> Option<Value> {
+pub(crate) fn review_json(
+    st: &Arc<AppState>,
+    ds: &Arc<Dataset>,
+    p: &Principal,
+    grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+) -> Option<Value> {
     if !may_review(p, &ds.name) {
         return None;
     }
-    let c = current(st, ds)?;
+    let c = current(st, ds, grant)?;
     let pb = p.clone().on_branch(None);
     let visible = |b: &str| pb.level(&on_branch(&ds.name, b)).is_some();
     let kinds = c.kinds(visible);

@@ -2647,15 +2647,27 @@ async fn read_body(body: axum::body::Body, limit: Option<u64>, flag: &str) -> Ap
         return Err(too_large());
     }
     let mut stream = body.into_data_stream();
+    // A body that arrives in one frame, such as one the admission layer read ahead, is
+    // kept as it is rather than copied, so that it is not held twice.
+    let mut first: Option<Bytes> = None;
     let mut buf = Vec::new();
+    let mut len = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(body_error)?;
-        if (buf.len() + chunk.len()) as u64 > max {
+        len += chunk.len() as u64;
+        if len > max {
             return Err(too_large());
+        }
+        if buf.is_empty() && first.is_none() {
+            first = Some(chunk);
+            continue;
+        }
+        if let Some(f) = first.take() {
+            buf.extend_from_slice(&f);
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf.into())
+    Ok(first.unwrap_or_else(|| buf.into()))
 }
 
 /// Body extractors with the ceiling of their request class. Only the Graph Store and

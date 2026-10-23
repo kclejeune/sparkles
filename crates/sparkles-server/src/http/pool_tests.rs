@@ -493,3 +493,34 @@ async fn uploads_and_graph_store_writes_take_no_initial_grant() {
     drop(held);
     assert_eq!(pool(&s).granted(), 0);
 }
+
+#[tokio::test]
+async fn a_body_read_ahead_is_not_copied_again() {
+    // admission hands a body that ended within its limit on as one frame, which the
+    // body extractor keeps instead of copying, so the body is not held twice
+    let bytes = axum::body::Bytes::from(vec![b'x'; 1 << 20]);
+    let at = bytes.as_ptr();
+    let read = super::read_body(Body::from(bytes), Some(2 << 20), "--max-query-body-mb")
+        .await
+        .ok()
+        .unwrap();
+    assert_eq!(read.as_ptr(), at);
+    assert_eq!(read.len(), 1 << 20);
+    // a body of several frames is still joined, and its limit still holds
+    let frames = futures_util::stream::iter(
+        ["ab", "cd", "ef"].map(|s| Ok::<_, std::io::Error>(axum::body::Bytes::from(s))),
+    );
+    let read = super::read_body(Body::from_stream(frames), Some(6), "x")
+        .await
+        .ok()
+        .unwrap();
+    assert_eq!(&read[..], b"abcdef");
+    let frames = futures_util::stream::iter(
+        ["ab", "cd", "ef"].map(|s| Ok::<_, std::io::Error>(axum::body::Bytes::from(s))),
+    );
+    assert!(
+        super::read_body(Body::from_stream(frames), Some(5), "x")
+            .await
+            .is_err()
+    );
+}

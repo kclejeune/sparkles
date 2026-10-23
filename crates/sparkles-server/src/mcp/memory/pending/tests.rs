@@ -106,7 +106,7 @@ impl Paused {
         let thread = std::thread::Builder::new()
             .name("fresh-refresh".into())
             .spawn(move || {
-                let result = refresh(&st, &ds);
+                let result = refresh(&st, &ds, None);
                 let _ = done_tx.send(());
                 result
             })
@@ -139,7 +139,7 @@ pub(crate) fn old_refresh(
     let ds = ds.clone();
     std::thread::Builder::new()
         .name("old-refresh".into())
-        .spawn(move || refresh(&st, &ds))
+        .spawn(move || refresh(&st, &ds, None))
         .unwrap()
 }
 
@@ -197,7 +197,7 @@ fn different_datasets_refresh_concurrently() {
     let (tx, rx) = mpsc::channel();
     let st2 = st.clone();
     let fresh = std::thread::spawn(move || {
-        let counted = refresh(&st2, &other).unwrap();
+        let counted = refresh(&st2, &other, None).unwrap();
         tx.send(()).unwrap();
         counted
     });
@@ -238,15 +238,18 @@ fn replacement_touch_resolves_the_new_dataset() {
         fingerprint(&new, &crate::assist::memory_settings(&st, &new))
     );
     assert!(cached.kinds(|_| true).values().all(|k| k.open == 0));
-    assert!(refresh(&st, &old).is_none(), "obsolete work was accepted");
+    assert!(
+        refresh(&st, &old, None).is_none(),
+        "obsolete work was accepted"
+    );
     assert!(Arc::ptr_eq(&st.ingest.review.get("org").unwrap(), &cached));
 }
 
 #[test]
 fn pruning_rechecks_live_names_and_cache_hits_are_reused() {
     let (st, ds) = fixture();
-    let first = refresh(&st, &ds).unwrap();
-    assert!(Arc::ptr_eq(&first, &refresh(&st, &ds).unwrap()));
+    let first = refresh(&st, &ds, None).unwrap();
+    assert!(Arc::ptr_eq(&first, &refresh(&st, &ds, None).unwrap()));
     assert!(st.delete("org").unwrap());
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -261,7 +264,7 @@ fn pruning_rechecks_live_names_and_cache_hits_are_reused() {
     let pruning = std::thread::spawn(move || refresh_all(&st2));
     receive(&entered_rx);
     let replacement = configured_dataset(&st, "org");
-    let new = refresh(&st, &replacement).unwrap();
+    let new = refresh(&st, &replacement, None).unwrap();
     release_tx.send(()).unwrap();
     pruning.join().unwrap();
     assert!(Arc::ptr_eq(
@@ -280,14 +283,14 @@ fn pruning_rechecks_live_names_and_cache_hits_are_reused() {
 #[test]
 fn expired_gates_are_pruned_and_fallback_never_uses_an_old_instance() {
     let (st, ds) = fixture();
-    let initial = refresh(&st, &ds).unwrap();
+    let initial = refresh(&st, &ds, None).unwrap();
     assert!(st.ingest.review.gates.lock()["org"].upgrade().is_none());
     let branch = st.branch_dataset(&ds, "consolidation.test").unwrap();
     assert!(
-        refresh(&st, &branch).is_some(),
+        refresh(&st, &branch, None).is_some(),
         "live branch owner was rejected"
     );
-    let initial_main = refresh(&st, &ds).unwrap();
+    let initial_main = refresh(&st, &ds, None).unwrap();
     assert_eq!(initial_main.fingerprint, initial.fingerprint);
     ds.store
         .load(&[sparkles::io::Source::from_bytes(
@@ -300,9 +303,12 @@ fn expired_gates_are_pruned_and_fallback_never_uses_an_old_instance() {
         .review
         .fail_count
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    assert!(Arc::ptr_eq(&initial_main, &refresh(&st, &ds).unwrap()));
+    assert!(Arc::ptr_eq(
+        &initial_main,
+        &refresh(&st, &ds, None).unwrap()
+    ));
     assert!(
-        Arc::ptr_eq(&initial_main, &refresh(&st, &branch).unwrap()),
+        Arc::ptr_eq(&initial_main, &refresh(&st, &branch, None).unwrap()),
         "a live branch must retain same-main fallback"
     );
     assert!(st.delete("org").unwrap());
@@ -312,7 +318,7 @@ fn expired_gates_are_pruned_and_fallback_never_uses_an_old_instance() {
     );
     let new = configured_dataset(&st, "org");
     assert!(
-        refresh(&st, &new).is_none(),
+        refresh(&st, &new, None).is_none(),
         "replacement received old-instance fallback"
     );
     assert!(
@@ -333,7 +339,7 @@ fn expired_gates_are_pruned_and_fallback_never_uses_an_old_instance() {
         .review
         .fail_count
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    let recovered = refresh(&st, &new).unwrap();
+    let recovered = refresh(&st, &new, None).unwrap();
     assert_eq!(
         recovered.fingerprint,
         fingerprint(&new, &crate::assist::memory_settings(&st, &new))
@@ -351,7 +357,7 @@ fn expired_gates_are_pruned_and_fallback_never_uses_an_old_instance() {
             .all(|(_, _, open, _)| *open == 0)
     );
     assert!(
-        refresh(&st, &ds).is_none(),
+        refresh(&st, &ds, None).is_none(),
         "stale caller must still be refused"
     );
     assert!(

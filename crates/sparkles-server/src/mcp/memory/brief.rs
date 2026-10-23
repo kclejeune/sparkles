@@ -405,7 +405,12 @@ impl Tools<'_> {
             "reviewed-only"
         };
         // what waits for review, for a caller who may review it
-        let review = super::pending::review_json(&self.server.state, &ds, &self.call.principal);
+        let review = super::pending::review_json(
+            &self.server.state,
+            &ds,
+            &self.call.principal,
+            self.call.grant.clone(),
+        );
         let review_lines = review
             .as_ref()
             .map_or(String::new(), super::pending::brief_lines);
