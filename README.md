@@ -240,7 +240,7 @@ orders every item by difficulty and impact and links each to its design spec.
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
-graphs and maps, with arcs for the relations between located entities, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
+graphs and maps, with arcs for the relations between located entities, a pattern view of each query that edits it as text, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
 merges, a time slider over past commits, the Ask bar, and agent memory. The first screenshots show an answered question,
 agent memory, the map view and a merge preview.
 
@@ -314,6 +314,14 @@ agent memory, the map view and a merge preview.
   <tr>
     <td>The dataset grouped by its GraphRAG communities, with a report beside it</td>
     <td>The three shortest paths between two people</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>The pattern of a query, drawn beside its text</td>
+    <td></td>
   </tr>
 </table>
 

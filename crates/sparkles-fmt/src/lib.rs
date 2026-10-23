@@ -42,6 +42,7 @@ pub mod lint;
 #[doc(hidden)]
 pub mod normalize;
 pub mod options;
+pub mod pattern;
 #[doc(hidden)]
 pub mod pragma;
 #[doc(hidden)]

@@ -142,12 +142,20 @@ the formatter changes. Delete the directory to build without it. The Nix `sparkl
 package always builds it in (`nix/fmt-wasm.nix`).
 
 `lib/fmt-wasm.ts` loads the module the first time something is formatted. The module is a
-hashed asset under `/ui/_app/immutable/`, served compressed (about 250 KB with brotli).
+hashed asset under `/ui/_app/immutable/`, served compressed (about 300 KB with brotli).
 It takes the endpoint's JSON and answers in the same shape, errors included, so the pages
 handle both paths the same way. If the module does not load, or fails while running, the
 request goes to the endpoint. The pages' Content Security Policy includes
 `'wasm-unsafe-eval'` for it. `VITE_FMT_WASM=off` leaves the module out of a build or of
 `vite dev`. The mock tests below set it, so that the mock's stand-in formatter answers.
+
+The query page's Pattern pane (spec U08) reads a query's pattern from the same module's
+`pattern` export, and it has no server fallback. `VITE_FMT_WASM=off` therefore leaves the
+module in for the pane when it was built, and `VITE_PATTERN_WASM=off` takes it out too.
+The mock tests of the pane need the module, so `mise run ui:e2e:mock` builds it first.
+`ui/src/lib/pattern-fixtures.json` holds the module's answers for the unit tests of
+`lib/pattern.ts`, so they run without the module. `cargo test -p sparkles-fmt-wasm` fails
+when it is stale, and `SPARKLES_FMT_BLESS=1` rewrites it.
 
 ## End-to-end tests
 

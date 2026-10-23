@@ -195,7 +195,8 @@ pnpm e2e
 
 [tasks."ui:e2e:mock"]
 description = "UI end-to-end tests (Playwright) against the mock backend, for pages and states that are hard to reach on a real server; extra args go to `playwright test`"
-depends = ["ui:e2e:browsers"]
+# the Pattern pane's tests need the browser module, which has no server fallback
+depends = ["ui:e2e:browsers", "ui:wasm"]
 dir = "ui"
 run = "pnpm e2e:mock"
 
@@ -600,8 +601,8 @@ env = { SPARKLES_UPDATE_OPENAPI = "1" }
 run = "cargo test -p sparkles-server --bin sparkles openapi::tests::checked_in_copy_is_current"
 
 [tasks."docs:screenshots"]
-description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port for the dark-mode pages, the mock backend serves the branch, agent and map-of-relations pages, all in dark mode, Playwright drives the UI, oxipng shrinks the images (not part of ci)"
-depends = ["build", "ui:e2e:browsers"]
+description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port for the dark-mode pages, the mock backend serves the branch, agent, map-of-relations and Pattern pane pages, all in dark mode, Playwright drives the UI, oxipng shrinks the images (not part of ci)"
+depends = ["build", "ui:e2e:browsers", "ui:wasm"]
 dir = "ui"
 tools = { "github:shssoichiro/oxipng" = "10.2.1" }
 run = '''
@@ -611,8 +612,8 @@ oxipng --quiet --opt 4 --strip safe ../docs/images/*.png
 '''
 
 [tasks."docs:screenshots:mock"]
-description = "Only the README's screenshots that the mock backend serves (branches, merges, the Ask bar, handoffs, agent memory, the time sliders, the arcs maps and the GraphRAG communities in Explore), without a release build"
-depends = ["ui:e2e:browsers"]
+description = "Only the README's screenshots that the mock backend serves (branches, merges, the Ask bar, handoffs, agent memory, the time sliders, the arcs maps, the GraphRAG communities in Explore and the Pattern pane), without a release build"
+depends = ["ui:e2e:browsers", "ui:wasm"]
 dir = "ui"
 tools = { "github:shssoichiro/oxipng" = "10.2.1" }
 run = '''

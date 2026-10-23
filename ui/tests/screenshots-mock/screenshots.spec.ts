@@ -329,3 +329,52 @@ test('explore-communities', async ({ page }) => {
   await expect(ov.locator('canvas').first()).toBeVisible();
   await shoot(page, 'explore-communities');
 });
+
+test('pattern', async ({ page }) => {
+  // the Pattern pane beside the editor: required triples, an optional one in its hull, a
+  // filter as a chip on its variable and a BIND as a locked block
+  const query = `PREFIX ex: <http://example.org/ontology#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+# Who is on which team, and since when
+SELECT ?name ?teamName ?year WHERE {
+  ?person a ex:Person ;
+          foaf:name ?name ;
+          ex:memberOf ?team .
+  ?team rdfs:label ?teamName .
+  OPTIONAL { ?person ex:startDate ?start }
+  FILTER(STRSTARTS(?name, "L"))
+  BIND(YEAR(?start) AS ?year) # the year they joined
+}
+ORDER BY ?name`;
+  await page.addInitScript(
+    ([q]) => {
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Teams', query: q }], active: 't1' }),
+      );
+      localStorage.removeItem('sparkles.patternLayouts');
+      localStorage.setItem('sparkles.patternPane', JSON.stringify({ open: true, w: 620 }));
+    },
+    [query],
+  );
+  await page.goto(`/ui/query?ds=${DATASET}`);
+  const pane = page.getByRole('region', { name: 'Pattern', exact: true });
+  await expect(pane).toHaveAttribute('data-state', 'ok');
+  // a taller editor, so the drawing has room
+  const top = (await page.locator('.cm-editor').boundingBox())!.y;
+  const split = (await page.getByRole('separator', { name: 'Resize editor' }).boundingBox())!;
+  await page.mouse.move(split.x + split.width / 2, split.y + split.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(split.x + split.width / 2, top + 470, { steps: 5 });
+  await page.mouse.up();
+  await page.getByRole('button', { name: /^Run/ }).click();
+  await expect(page.getByRole('grid')).toBeVisible({ timeout: 30_000 });
+  const canvas = pane.locator('.pcanvas');
+  await expect
+    .poll(async () => Number(await canvas.getAttribute('data-settled')))
+    .toBeGreaterThan(0);
+  await pane.getByRole('button', { name: 'Fit to view' }).click();
+  await shoot(page, 'pattern');
+});
