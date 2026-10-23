@@ -19,6 +19,7 @@ use super::{
 use crate::id::{Id, Tag};
 use crate::index::Perm;
 use crate::store::Snapshot;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -155,6 +156,10 @@ struct In {
     instances: u64,
 }
 
+/// One predicate's profile: its accumulators per class, its incoming arcs per class, and
+/// the literal suffixes its accumulators refer to.
+type PredicateProfile = (u64, FxHashMap<u64, Acc>, FxHashMap<u64, In>, Suffixes);
+
 /// Literal key suffixes, interned.
 #[derive(Default)]
 struct Suffixes {
@@ -284,132 +289,150 @@ pub fn profiles(snap: &Arc<Snapshot>, opts: &ProfileOptions) -> Result<ClassProf
     let mut out: FxHashMap<u64, Vec<(u64, Acc)>> = FxHashMap::default();
     let mut incoming: FxHashMap<u64, Vec<(u64, In)>> = FxHashMap::default();
     let vocab = &snap.generation.vocab;
-    for (i, &p) in preds.iter().enumerate() {
-        if Some(p) == rdf_type || !is_iri(snap, p) || wanted.is_empty() {
-            continue;
-        }
-        let phase = || format!("profiling predicates ({}/{})", i + 1, preds.len());
-        // POS: incoming arcs per class of the object, and the base-vocabulary literals
-        let mut base_lits: Vec<u64> = Vec::new();
-        let mut ins: FxHashMap<u64, In> = FxHashMap::default();
-        let mut prev: Option<(u64, u64)> = None;
-        let mut run: Option<(u64, u64)> = None;
-        let mut end_object = |o: u64, n: u64, base_lits: &mut Vec<u64>| {
-            let id = Id(o);
-            if id.tag() == Tag::Vocab
-                && !vocab.is_iri(id.payload())
-                && !vocab.is_triple(id.payload())
-            {
-                base_lits.push(id.payload());
-                return;
-            }
-            for (_, c) in classes_of(&types, o) {
-                if wanted.contains(c) {
-                    let e = ins.entry(*c).or_default();
-                    e.triples += n;
-                    e.instances += 1;
-                }
-            }
-        };
-        in_phase(
-            src.for_each_key(Perm::Pos, &[p], &budget, |k| {
-                if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
+    // The predicates are profiled in parallel, each with its own interned literal
+    // suffixes, and merged in predicate order, so the result does not depend on the
+    // schedule.
+    let work: Vec<(usize, u64)> = preds
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, p)| Some(p) != rdf_type && is_iri(snap, p) && !wanted.is_empty())
+        .collect();
+    let profiled: Vec<Result<PredicateProfile, SchemaError>> = work
+        .par_iter()
+        .map(|&(i, p)| -> Result<PredicateProfile, SchemaError> {
+            let mut sfx = Suffixes::default();
+            let phase = || format!("profiling predicates ({}/{})", i + 1, preds.len());
+            // POS: incoming arcs per class of the object, and the base-vocabulary literals
+            let mut base_lits: Vec<u64> = Vec::new();
+            let mut ins: FxHashMap<u64, In> = FxHashMap::default();
+            let mut prev: Option<(u64, u64)> = None;
+            let mut run: Option<(u64, u64)> = None;
+            let mut end_object = |o: u64, n: u64, base_lits: &mut Vec<u64>| {
+                let id = Id(o);
+                if id.tag() == Tag::Vocab
+                    && !vocab.is_iri(id.payload())
+                    && !vocab.is_triple(id.payload())
+                {
+                    base_lits.push(id.payload());
                     return;
                 }
-                prev = Some((k[1], k[2]));
-                match &mut run {
-                    Some((o, n)) if *o == k[1] => *n += 1,
-                    _ => {
-                        if let Some((o, n)) = run {
-                            end_object(o, n, &mut base_lits);
-                        }
-                        run = Some((k[1], 1));
+                for (_, c) in classes_of(&types, o) {
+                    if wanted.contains(c) {
+                        let e = ins.entry(*c).or_default();
+                        e.triples += n;
+                        e.instances += 1;
                     }
                 }
-            }),
-            phase,
-        )?;
-        if let Some((o, n)) = run {
-            end_object(o, n, &mut base_lits);
-        }
-        let mut lit_of: FxHashMap<u64, u32> = FxHashMap::default();
-        for chunk in base_lits.chunks(4096) {
-            in_phase(budget.check(), phase)?;
-            vocab.get_sorted(chunk, |payload, key| {
-                lit_of.insert(Id::vocab(payload).0, sfx.get(literal_suffix(key)));
-            });
-        }
-        // PSO: each subject's run of objects, under each of its wanted classes
-        let mut accs: FxHashMap<u64, Acc> = FxHashMap::default();
-        let mut subject: Option<u64> = None;
-        let mut objs: Vec<u64> = Vec::new();
-        let mut pos = 0usize;
-        let mut flush = |s: u64, objs: &[u64], pos: &mut usize, sfx: &mut Suffixes| {
-            *pos += types[*pos..].partition_point(|t| t.0 < s);
-            let mut end = *pos;
-            while types.get(end).is_some_and(|t| t.0 == s) {
-                end += 1;
-            }
-            let cs: Vec<u64> = types[*pos..end]
-                .iter()
-                .map(|t| t.1)
-                .filter(|c| wanted.contains(c))
-                .collect();
-            if cs.is_empty() {
-                return;
-            }
-            let n = objs.len() as u64;
-            let kinds: Vec<Obj> = objs
-                .iter()
-                .map(|&o| match lit_of.get(&o) {
-                    Some(&l) => Obj::Literal(l),
-                    None => quick_kind(snap, o).map_or(Obj::Other, |k| obj_of(k, sfx)),
-                })
-                .collect();
-            for c in cs {
-                let a = accs.entry(c).or_default();
-                a.min = if a.instances == 0 { n } else { a.min.min(n) };
-                a.max = a.max.max(n);
-                a.instances += 1;
-                a.triples += n;
-                for (&o, k) in objs.iter().zip(&kinds) {
-                    match k {
-                        Obj::Iri => a.iri += 1,
-                        Obj::Blank => a.blank += 1,
-                        Obj::Triple => a.triple += 1,
-                        Obj::Literal(l) => *a.lits.entry(*l).or_default() += 1,
-                        Obj::Other => {}
+            };
+            in_phase(
+                src.for_each_key(Perm::Pos, &[p], &budget, |k| {
+                    if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
+                        return;
                     }
-                    if matches!(k, Obj::Iri | Obj::Blank) {
-                        for (_, oc) in classes_of(&types, o) {
-                            *a.object_classes.entry(*oc).or_default() += 1;
+                    prev = Some((k[1], k[2]));
+                    match &mut run {
+                        Some((o, n)) if *o == k[1] => *n += 1,
+                        _ => {
+                            if let Some((o, n)) = run {
+                                end_object(o, n, &mut base_lits);
+                            }
+                            run = Some((k[1], 1));
                         }
                     }
-                }
+                }),
+                phase,
+            )?;
+            if let Some((o, n)) = run {
+                end_object(o, n, &mut base_lits);
             }
-        };
-        let mut prev: Option<(u64, u64)> = None;
-        in_phase(
-            src.for_each_key(Perm::Pso, &[p], &budget, |k| {
-                if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
+            let mut lit_of: FxHashMap<u64, u32> = FxHashMap::default();
+            for chunk in base_lits.chunks(4096) {
+                in_phase(budget.check(), phase)?;
+                vocab.get_sorted(chunk, |payload, key| {
+                    lit_of.insert(Id::vocab(payload).0, sfx.get(literal_suffix(key)));
+                });
+            }
+            // PSO: each subject's run of objects, under each of its wanted classes
+            let mut accs: FxHashMap<u64, Acc> = FxHashMap::default();
+            let mut subject: Option<u64> = None;
+            let mut objs: Vec<u64> = Vec::new();
+            let mut pos = 0usize;
+            let mut flush = |s: u64, objs: &[u64], pos: &mut usize, sfx: &mut Suffixes| {
+                *pos += types[*pos..].partition_point(|t| t.0 < s);
+                let mut end = *pos;
+                while types.get(end).is_some_and(|t| t.0 == s) {
+                    end += 1;
+                }
+                let cs: Vec<u64> = types[*pos..end]
+                    .iter()
+                    .map(|t| t.1)
+                    .filter(|c| wanted.contains(c))
+                    .collect();
+                if cs.is_empty() {
                     return;
                 }
-                prev = Some((k[1], k[2]));
-                if subject != Some(k[1]) {
-                    if let Some(s) = subject {
-                        flush(s, &objs, &mut pos, &mut sfx);
+                let n = objs.len() as u64;
+                let kinds: Vec<Obj> = objs
+                    .iter()
+                    .map(|&o| match lit_of.get(&o) {
+                        Some(&l) => Obj::Literal(l),
+                        None => quick_kind(snap, o).map_or(Obj::Other, |k| obj_of(k, sfx)),
+                    })
+                    .collect();
+                for c in cs {
+                    let a = accs.entry(c).or_default();
+                    a.min = if a.instances == 0 { n } else { a.min.min(n) };
+                    a.max = a.max.max(n);
+                    a.instances += 1;
+                    a.triples += n;
+                    for (&o, k) in objs.iter().zip(&kinds) {
+                        match k {
+                            Obj::Iri => a.iri += 1,
+                            Obj::Blank => a.blank += 1,
+                            Obj::Triple => a.triple += 1,
+                            Obj::Literal(l) => *a.lits.entry(*l).or_default() += 1,
+                            Obj::Other => {}
+                        }
+                        if matches!(k, Obj::Iri | Obj::Blank) {
+                            for (_, oc) in classes_of(&types, o) {
+                                *a.object_classes.entry(*oc).or_default() += 1;
+                            }
+                        }
                     }
-                    subject = Some(k[1]);
-                    objs.clear();
                 }
-                objs.push(k[2]);
-            }),
-            phase,
-        )?;
-        if let Some(s) = subject {
-            flush(s, &objs, &mut pos, &mut sfx);
-        }
-        for (c, a) in accs {
+            };
+            let mut prev: Option<(u64, u64)> = None;
+            in_phase(
+                src.for_each_key(Perm::Pso, &[p], &budget, |k| {
+                    if !filter.accepts(k[3]) || prev == Some((k[1], k[2])) {
+                        return;
+                    }
+                    prev = Some((k[1], k[2]));
+                    if subject != Some(k[1]) {
+                        if let Some(s) = subject {
+                            flush(s, &objs, &mut pos, &mut sfx);
+                        }
+                        subject = Some(k[1]);
+                        objs.clear();
+                    }
+                    objs.push(k[2]);
+                }),
+                phase,
+            )?;
+            if let Some(s) = subject {
+                flush(s, &objs, &mut pos, &mut sfx);
+            }
+            Ok((p, accs, ins, sfx))
+        })
+        .collect();
+    for r in profiled {
+        let (p, accs, ins, local) = r?;
+        for (c, mut a) in accs {
+            let lits = std::mem::take(&mut a.lits);
+            for (l, n) in lits {
+                *a.lits.entry(sfx.get(&local.names[l as usize])).or_default() += n;
+            }
             out.entry(c).or_default().push((p, a));
         }
         for (c, e) in ins {

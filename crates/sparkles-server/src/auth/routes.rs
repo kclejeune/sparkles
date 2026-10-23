@@ -65,6 +65,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/schema/{ds}/constraints", &["GET"]),
     ("/$/schema/{ds}/profiles", &["GET"]),
     ("/$/schema/{ds}/diff", &["GET"]),
+    ("/$/graph/{ds}/groups", &["POST"]),
     ("/$/compact/{ds}", &["POST"]),
     ("/$/backup/{ds}", &["POST"]),
     ("/$/reason/{ds}", &["GET", "POST", "DELETE"]),
@@ -379,6 +380,7 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/schema/{ds}/constraints"
         | "/$/schema/{ds}/profiles"
         | "/$/schema/{ds}/diff"
+        | "/$/graph/{ds}/groups"
         | "/$/reason/{ds}/diagnostics"
         | "/$/prefixes/{ds}"
         | "/$/commits/{ds}"
@@ -524,7 +526,8 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/memory/brief"
         | "/{ds}/text"
         | "/{ds}/geo"
-        | "/{ds}/queries/{name}" => Endpoint::Query,
+        | "/{ds}/queries/{name}"
+        | "/$/graph/{ds}/groups" => Endpoint::Query,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,

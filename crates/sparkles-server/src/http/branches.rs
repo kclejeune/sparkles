@@ -270,6 +270,7 @@ const ADMIN_BRANCH_ROUTES: &[&str] = &[
     "compact",
     "stats",
     "schema",
+    "graph",
     "reason",
     "validation",
     "prefixes",

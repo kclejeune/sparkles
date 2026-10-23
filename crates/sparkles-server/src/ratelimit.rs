@@ -131,6 +131,7 @@ pub fn classify(
             || admin == "lint"
             || admin.starts_with("validate/")
             || admin.starts_with("schema/")
+            || admin == "graph/{ds}/groups"
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
             || admin == "graphql/{ds}/draft"

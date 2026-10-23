@@ -1055,6 +1055,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/graph/{ds}/groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Groups of a class or group
+         * @description Groups the instances of a class, or of a group from an earlier answer, by the communities F14 wrote, by a property's most frequent values or ranges, or into the members themselves, and counts the edges between the groups, to the sibling groups of the path and to the other classes. `by` is `auto` (the default), `members`, `{"community": IRI}` or `{"property": IRI, "buckets": n}`. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query. Answers hold at most 5,000 groups or members and 20,000 edges, and say when they were cut. An edge's ends are `g:` and a group id, `c:` and a class IRI, or `m:` and a member IRI.
+         */
+        post: operations["getGraphGroups"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/graphql/{ds}": {
         parameters: {
             query?: never;
@@ -11247,6 +11267,66 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getGraphGroups: {
+        parameters: {
+            query?: {
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Include materialized inferences. The default is true when the dataset has any. */
+                reasoning?: components["parameters"]["reasoning"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description What to group and how. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description A commit, time or named snapshot. */
+                    at?: string;
+                    /** @description `auto`, `members`, `{"community": IRI}` or `{"property": IRI, "buckets": n}` (2 to 48, 12 by default). */
+                    by?: unknown;
+                    /** @description Groups or members at most, and the size under which `auto` lists the members. */
+                    limit?: number;
+                    /** @description `{"class": IRI}` or `{"group": id}`. */
+                    within: Record<string, never>;
+                };
+            };
+        };
+        responses: {
+            /** @description The groups or members, and the edges. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        commit: number;
+                        communities?: boolean;
+                        edges: Record<string, never>[];
+                        grouping: Record<string, never>;
+                        groups: Record<string, never>[];
+                        members?: Record<string, never>[];
+                        note?: string;
+                        truncated: boolean;
+                        within: Record<string, never>;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

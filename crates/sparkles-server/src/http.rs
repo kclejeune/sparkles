@@ -35,6 +35,7 @@ mod dry_run;
 #[cfg(feature = "fmt")]
 mod format;
 pub(crate) mod fuseki;
+mod graph;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod hist;
@@ -127,6 +128,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/constraints", get(schema::constraints))
         .route("/$/schema/{ds}/profiles", get(schema::profiles))
         .route("/$/schema/{ds}/diff", get(schema::diff))
+        .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
