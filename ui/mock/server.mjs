@@ -33,6 +33,7 @@ import {
   resolveBranch,
 } from './branches.mjs';
 import { handleDescribe } from './describe.mjs';
+import { handleModels } from './models.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
 import { handleExplain, timedOutPlan } from './explain.mjs';
@@ -2139,6 +2140,8 @@ const server = http.createServer(async (req, res) => {
     // questions, checks and agent memory (mock/memory.mjs)
     if (await handleAsk(req, res, url, seg, { datasets, send, fail, readBody })) return;
     if (await handleExplain(req, res, url, seg, { datasets, send, fail, readBody })) return;
+    // the model configuration of a server without one (mock/models.mjs)
+    if (handleModels(req, res, seg, { send, fail })) return;
     // asking the server, the assistant settings and the history (mock/assistant.mjs)
     if (
       await handleAssistant(req, res, url, seg, {
