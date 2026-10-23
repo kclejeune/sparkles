@@ -32,6 +32,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [GraphQL](#graphql)
   * [Loading CSV and TSV](#loading-csv-and-tsv)
 * [Branches and merges](#branches-and-merges)
+* [The Explore overview](#the-explore-overview)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
@@ -1439,6 +1440,46 @@ A branch costs almost nothing while it stays linked. Its memory then holds the u
 delta at the starting commit, and its first compaction builds a full index, about what a
 clone costs. `--max-branches` (64) limits the branches of a dataset, and the dataset's
 storage quota covers every branch.
+
+## The Explore overview
+
+Explore opens on a picture of the dataset when no resource is selected. Each class with
+instances is a node sized by its instance count, and each predicate between instances of
+two classes is an edge weighted by its triples. The picture comes from the class
+profiles of [API.md](API.md#class-profiles), and it is laid out with ForceAtlas2 in a web
+worker and drawn with WebGL, so it settles while the page stays responsive. The search
+box stays at the top: a resource found there, or an IRI pasted into it, opens the
+resource graph as before.
+
+A click or a tap on a class opens it in place. A class of at most 5,000 instances opens
+into its members with their links. A larger class opens into the communities that a
+graph algorithm run wrote back ([Graph algorithms](#graph-algorithms)), when its
+instances have some, and otherwise into groups by the property whose values split the
+class best: one group per value, ranges of a number or of the years of a date, or the
+most frequent values and the rest. The line under the toolbar names the property, and
+**Group by** chooses another or lists the members. A group opens the same way, and a
+member opens in the resource view. Edges between a group and the rest of the picture
+carry the number of links they stand for.
+
+The breadcrumb above the picture shows the open path, such as `Overview › Researcher ›
+30 – 39`. A crumb, or `Backspace`, closes the levels below it, and the other classes
+and groups stay where they were. Pinching or the mouse wheel zooms, and dragging pans.
+**List** (`L`) shows the drawn nodes as a table with their size, class and links, which
+is also how a screen reader reads the picture. With the picture focused, `Tab` moves
+through the largest nodes on screen, `Enter` opens one, the arrow keys pan, `+` and `−`
+zoom and `0` fits the picture.
+
+The counts are those the signed-in user may read: a user limited to some graphs or
+under protections of triples sees the classes, groups and members of their own view
+only. Opening a large group runs queries under the user's timeout and memory budget, and
+a group that needs more stays closed with the budget's message. Without WebGL the
+picture is drawn with the canvas renderer of the resource graph. **Built-in** shows or
+hides the classes of the RDF, RDFS, OWL and SHACL vocabularies, which are shown by
+default only when the dataset has no other classes.
+
+The query page's graph view uses the same WebGL view for results of more than 2,000
+nodes. **Max nodes** then offers 10,000, 50,000 and 100,000, and **Renderer** switches
+between the canvas and WebGL views.
 
 ## The time slider
 

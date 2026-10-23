@@ -288,6 +288,62 @@ export function render(pkgs) {
 /** Code point order, independent of the locale. */
 const cmp = (/** @type {string} */ a, /** @type {string} */ b) => (a < b ? -1 : a > b ? 1 : 0);
 
+/**
+ * The package directories of a bundle's modules and assets, added to `dirs`.
+ * @param {{ error: (message: string) => never }} ctx
+ * @param {Record<string, any>} bundle
+ * @param {string} root
+ * @param {Set<string>} dirs
+ */
+function collect(ctx, bundle, root, dirs) {
+  const require = createRequire(join(root, 'package.json'));
+  /** @param {string} file */
+  const add = (file) => {
+    const dir = packageDir(file);
+    if (dir) dirs.add(dir);
+  };
+  for (const out of Object.values(bundle)) {
+    if (out.type === 'asset') {
+      for (const f of out.originalFileNames) add(resolve(root, f));
+      continue;
+    }
+    for (const [id, m] of Object.entries(out.modules)) {
+      if (id.startsWith('\0')) {
+        const name = VIRTUAL.find((n) => id.startsWith(`\0${n}/`));
+        if (!name) ctx.error(`licenses: no package known for the virtual module ${id}`);
+        // rolldown is Vite's dependency
+        const from =
+          name === 'vite' ? require : createRequire(require.resolve('vite/package.json'));
+        dirs.add(dirname(from.resolve(`${name}/package.json`)));
+      } else if (/** @type {any} */ (m).renderedLength > 0 || /\.css($|\?)/.test(id)) {
+        add(id);
+      }
+    }
+  }
+}
+
+/**
+ * The packages of the web workers' bundles. Vite bundles a worker while it transforms the
+ * module that starts it, so they are known before the client bundle is generated.
+ * @type {Set<string>}
+ */
+const workerDirs = new Set();
+
+/**
+ * The plugin for `worker.plugins`: it records the packages of each worker bundle for the
+ * client bundle's notices.
+ * @returns {import('vite').Plugin}
+ */
+export function licensesWorker() {
+  return {
+    name: 'sparkles-licenses-worker',
+    apply: 'build',
+    generateBundle(_options, bundle) {
+      collect(/** @type {any} */ (this), bundle, this.environment.config.root, workerDirs);
+    },
+  };
+}
+
 /** @returns {import('vite').Plugin} */
 export function licenses() {
   return {
@@ -296,32 +352,9 @@ export function licenses() {
     applyToEnvironment: (env) => env.name === 'client',
     generateBundle(_options, bundle) {
       const root = this.environment.config.root;
-      const require = createRequire(join(root, 'package.json'));
       /** @type {Set<string>} */
-      const dirs = new Set();
-      /** @param {string} file */
-      const add = (file) => {
-        const dir = packageDir(file);
-        if (dir) dirs.add(dir);
-      };
-      for (const out of Object.values(bundle)) {
-        if (out.type === 'asset') {
-          for (const f of out.originalFileNames) add(resolve(root, f));
-          continue;
-        }
-        for (const [id, m] of Object.entries(out.modules)) {
-          if (id.startsWith('\0')) {
-            const name = VIRTUAL.find((n) => id.startsWith(`\0${n}/`));
-            if (!name) this.error(`licenses: no package known for the virtual module ${id}`);
-            // rolldown is Vite's dependency
-            const from =
-              name === 'vite' ? require : createRequire(require.resolve('vite/package.json'));
-            dirs.add(dirname(from.resolve(`${name}/package.json`)));
-          } else if (m.renderedLength > 0 || /\.css($|\?)/.test(id)) {
-            add(id);
-          }
-        }
-      }
+      const dirs = new Set(workerDirs);
+      collect(/** @type {any} */ (this), bundle, root, dirs);
       for (const dir of [...dirs])
         if (PREBUNDLED.has(readPackage(dir).name))
           for (const dep of bundledDependencies(dir)) dirs.add(dep);

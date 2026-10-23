@@ -23068,6 +23068,165 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/graph/{ds}/groups": {
+      "post": {
+        "description": "Groups the instances of a class, or of a group from an earlier answer, by the communities F14 wrote, by a property's most frequent values or ranges, or into the members themselves, and counts the edges between the groups, to the sibling groups of the path and to the other classes. `by` is `auto` (the default), `members`, `{\"community\": IRI}` or `{\"property\": IRI, \"buckets\": n}`. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query. Answers hold at most 5,000 groups or members and 20,000 edges, and say when they were cut. An edge's ends are `g:` and a group id, `c:` and a class IRI, or `m:` and a member IRI.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-overview"
+        },
+        "operationId": "getGraphGroups",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          },
+          {
+            "$ref": "#/components/parameters/reasoning"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "at": {
+                    "description": "A commit, time or named snapshot.",
+                    "type": "string"
+                  },
+                  "by": {
+                    "description": "`auto`, `members`, `{\"community\": IRI}` or `{\"property\": IRI, \"buckets\": n}` (2 to 48, 12 by default)."
+                  },
+                  "limit": {
+                    "description": "Groups or members at most, and the size under which `auto` lists the members.",
+                    "maximum": 5000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "within": {
+                    "description": "`{\"class\": IRI}` or `{\"group\": id}`.",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "within"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "What to group and how.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "communities": {
+                      "type": "boolean"
+                    },
+                    "edges": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "grouping": {
+                      "type": "object"
+                    },
+                    "groups": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "members": {
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "note": {
+                      "type": "string"
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "within": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "commit",
+                    "within",
+                    "grouping",
+                    "groups",
+                    "edges",
+                    "truncated"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The groups or members, and the edges."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Groups of a class or group",
+        "tags": [
+          "Schema"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/graphql/{ds}": {
       "delete": {
         "externalDocs": {

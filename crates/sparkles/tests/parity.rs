@@ -425,6 +425,10 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("draftShapes", "schema.draft_shapes", |ds| {
             ds.schema().draft_shapes(&Default::default());
         }),
+        // ------------------------------------------------ graph overview (U06)
+        op!("getGraphGroups", "graph.groups", |ds| {
+            ds.graph().groups(&any(), &Default::default());
+        }),
         // ------------------------------------------------ graph algorithms
         op!("runAlgorithm", "algorithms.run", |ds| {
             ds.algorithms().run(&any(), &Default::default());

@@ -42,6 +42,22 @@ pub(in crate::http) async fn profiles(
     let params = Params::from_query(&uri);
     let classes = classes(&params)?;
     blocking(move || {
+        // The head's profiles are kept per commit and view with the groups of the graph
+        // overview, which reads them first (spec U06 §11).
+        let key = req
+            .report
+            .at
+            .is_none()
+            .then(|| super::super::graph::cache::Key {
+                branch: ds.store.branch_id(),
+                commit: ds.store.snapshot().commit,
+                view: super::super::graph::cache::view_key(req.report.options.graphs.as_ref()),
+                extra: String::new(),
+                request: format!("profiles?{}", uri.query().unwrap_or("")),
+            });
+        if let Some(hit) = key.as_ref().and_then(super::super::graph::cache::get) {
+            return Ok(Json((*hit).clone()).into_response());
+        }
         let mut opts = ProfileOptions {
             schema: req.report.options,
             classes,
@@ -52,7 +68,14 @@ pub(in crate::http) async fn profiles(
             .schema()
             .profiles_at(&opts, req.report.at.as_ref())
             .map_err(|e| schema_error(e, req.timeout))?;
-        Ok(Json(profiles).into_response())
+        let j = std::sync::Arc::new(serde_json::to_value(&profiles).unwrap_or_default());
+        // kept only under the commit the profiles read
+        if let Some(k) = key
+            && profiles.snapshot.commit == k.commit
+        {
+            super::super::graph::cache::put(k, j.clone());
+        }
+        Ok(Json((*j).clone()).into_response())
     })
     .await
 }

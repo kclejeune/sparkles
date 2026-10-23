@@ -338,12 +338,13 @@ pub(super) async fn diff(
     } else {
         tag
     };
-    // a view's body differs from the full one
+    // a view's body differs from the full one, and from a view with other protections
+    // of triples lifted
     let tag = match &view {
         Some(v) => format!(
             "{}:view={:016x}\"",
             tag.trim_end_matches('"'),
-            fnv(&v.read_key())
+            fnv(&super::graph::cache::view_key(Some(v)))
         ),
         None => tag,
     };

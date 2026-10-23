@@ -1359,6 +1359,42 @@ the summary in 1.32 to 1.35 s, with 296 to 392 MiB of anonymous memory for both 
 store with changes corrects the statistics with one index probe for each changed value,
 and the report scans instead when that would cost more than a scan.
 
+### The Explore overview
+
+Roadmap item 29 measured the class overview and the groups route of
+[U06](specs/U06-large-graph-rendering.md) on the 10.5M-triple synthetic dataset, on a
+Namespace instance with 8 vCPUs and the database loaded from N-Triples just before. Each
+class-profile figure is the first request after a server start, with five rounds that
+alternate the serial and the parallel build. The groups figures are three rounds of the
+parallel build. These come from Namespace, not forge, so they show the size of the change
+rather than a published comparison.
+
+| Measurement | Time |
+|---|---|
+| Class profiles, first request, serial build | 2.08 to 2.60 s, median 2.30 s |
+| Class profiles, first request, parallel build | 0.95 to 1.62 s, median 1.12 s |
+| Class profiles, repeated at the same commit | 0.5 to 0.8 ms from the cache |
+| Open `Researcher`, 300,002 instances, grouped by salary ranges | 1.35 to 2.26 s, and 1.0 to 1.2 ms repeated |
+| Open one salary range, 24,780 instances, grouped by age ranges | 0.39 to 0.47 s |
+| `Researcher` grouped by `worksFor` | 0.39 to 0.68 s |
+| Open `Company`, 13,333 instances, grouped by city | 0.11 to 0.12 s |
+| Open `Article`, 375,000 instances, grouped by year ranges | 0.51 to 0.82 s |
+| F14 Leiden over `foaf:knows`, 986,333 nodes and 5.0 million edges | 22.2 s |
+
+A later review made a range's key a distinct node and range pair, so that a node with
+several values in one range counts once. Five interleaved rounds on another 8-vCPU
+instance compared the two keys, each request the first after a server start. The medians
+were 1.24 s before and 1.17 s after for `Researcher`, 0.73 s and 0.67 s for one salary
+range, 0.53 s and 0.44 s by `worksFor`, and 0.54 s and 0.52 s for `Article`, with the
+same answers, so the distinct key costs nothing measurable.
+
+The parallel build computes the profile of each predicate on its own rayon task, which
+halves the first picture of the overview on this machine. Its output is the same as the
+serial build's. It uses more threads for the length of one profile request, and the
+profile cache keeps up to 64 answers and 16 MiB of JSON per server, shared with the
+groups route. The Leiden figure is why the groups route does not run a community
+detection inside a request.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all

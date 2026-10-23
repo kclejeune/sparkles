@@ -20,6 +20,7 @@ pub mod embed;
 #[cfg(feature = "fmt")]
 pub mod fmt;
 pub mod handles;
+pub mod overview;
 pub mod querybuilder;
 pub mod reasoning;
 pub mod stats;

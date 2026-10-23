@@ -3128,6 +3128,49 @@ export const schemaProfiles = (ds: string, opts: ProfileOptions = {}) =>
     cache: 'no-store',
   });
 
+// ------------------------------------------------------------ graph overview ------
+
+/** How `POST /$/graph/{ds}/groups` groups a set. */
+export type GroupsBy =
+  | 'auto'
+  | 'members'
+  | { community: string }
+  | { property: string; buckets?: number };
+
+export type GroupsRequest = {
+  within: { class: string } | { group: string };
+  by?: GroupsBy;
+  limit?: number;
+  at?: string;
+};
+
+/** One group of an answer, with its first members. */
+export type GraphGroup = {
+  id: string;
+  label: string;
+  size: number;
+  top: { iri: string; label?: string }[];
+};
+
+/**
+ * `POST /$/graph/{ds}/groups`. An edge's ends are `g:` and a group id, `c:` and a class
+ * IRI, or `m:` and a member IRI.
+ */
+export type GroupsAnswer = {
+  commit: number;
+  within: { class: string; group?: string; size: number };
+  grouping: { kind: 'members' | 'values' | 'ranges' | 'communities'; predicate: string | null };
+  communities: boolean;
+  groups: GraphGroup[];
+  members?: { iri: string; label?: string; class?: string }[];
+  edges: { source: string; target: string; predicate: string | null; count: number }[];
+  truncated: boolean;
+  note?: string;
+};
+
+export const graphGroups = (ds: string, req: GroupsRequest, signal?: AbortSignal) =>
+  json<GroupsAnswer>(`/$/graph/${enc(ds)}/groups`, { ...jsonBody(req), signal });
+
 /** One difference of a field between two reports: a value, or members of a list. */
 export type SchemaChange =
   | { path: string; from: unknown; to: unknown }

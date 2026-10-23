@@ -18,6 +18,7 @@ mod idp;
 mod io_profile;
 mod limits;
 mod oidc;
+mod overview;
 mod proxy;
 mod refused;
 mod rename;

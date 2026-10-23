@@ -632,6 +632,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}/constraints` | *Extension.* The SHACL constraints layer of the report alone. See [Constraints layer](#constraints-layer). |
 | GET    | `/$/schema/{ds}/profiles`    | *Extension.* `ClassProfiles`: the predicates the instances of each class use, and those that point at them. See [Class profiles](#class-profiles). |
 | GET    | `/$/schema/{ds}/diff`        | *Extension.* `SchemaDiff`: the classes and predicates added, removed and changed between two states. See [Schema diffs](#schema-diffs). |
+| POST   | `/$/graph/{ds}/groups`       | *Extension.* `GroupsAnswer`: the groups or members of a class or of a group, with the edges between them, for the Explore overview. See [Graph overview](#graph-overview). |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Writes go on during the build, and the writer lock is held only for the switch. Returns a cancellable `Task`. `409` while a compaction of the dataset is queued or running. The old generation is removed once no reader or retained history needs it, which is what Fuseki's `?deleteOld=true` asks for. `deleteOld` with no value or `true` is accepted, and `deleteOld=false` is a `400`. |
 | GET    | `/$/compaction/{ds}`         | *Extension.* `CompactionStatus`: the dataset's automatic compaction, its settings and what it sees. See [Automatic compaction](#automatic-compaction). |
 | PUT    | `/$/compaction/{ds}`         | *Extension.* Replaces the dataset's own compaction settings with the JSON object's. Returns `CompactionStatus`. |
@@ -1196,6 +1197,75 @@ The counts are measurements of one snapshot, like the report's. A profile costs 
 over the selection's `rdf:type` triples and, per predicate, one pass over `POS[p]` and one
 over `PSO[p]`. Errors are those of `/$/schema/{ds}`, and `400` also covers a malformed
 `class`.
+
+### Graph overview
+
+The design is in [U06 Phase 2](specs/U06-large-graph-rendering.md#3-server-and-api-changes).
+
+`POST /$/graph/{ds}/groups` groups the instances of a class, or of a group that an
+earlier answer named, and counts the edges between the groups. The Rust library gives
+the same answer through `ds.graph().groups`. Explore draws its
+overview from the class profiles and opens a class or a group with this route.
+
+```ts
+type GroupsRequest = {
+  within: { class: string } | { group: string };   // a class IRI, or a group id from an answer
+  by?: "auto"                                       // the default
+     | "members"
+     | { community: string }                        // the predicate F14 wrote communities to
+     | { property: string; buckets?: number };      // 2 to 48 buckets, 12 by default
+  limit?: number;                                   // groups or members, 1 to 5,000 (the default)
+  at?: string;                                      // a commit, time or named snapshot
+};
+type GroupsAnswer = {
+  commit: number;
+  within: { class: string; group?: string; size: number };
+  grouping: { kind: "members" | "values" | "ranges" | "communities"; predicate: string | null };
+  communities: boolean;
+  groups: { id: string; label: string; size: number; top: { iri: string; label?: string }[] }[];
+  members?: { iri: string; label?: string; class?: string }[];
+  edges: { source: string; target: string; predicate: string | null; count: number }[];
+  truncated: boolean;
+  note?: string;
+};
+```
+
+With `by: "auto"`, a set of at most `limit` instances answers with its members. A larger
+set opens into the communities that F14's write-back wrote for its instances, when a
+sample of them holds `urn:x-sparkles:algo:` community resources, and otherwise into the
+values of the property that splits the sample best. A property with few values gives one
+group per value. A numeric property, or a date property by year, gives at most
+`buckets` ranges of a round width. Any other property gives its most frequent values and
+one group for the rest. When no property
+fits, the answer lists the first `limit` members and says so in `note`. A community opens
+into the communities below it through `skos:broader`, and the finest level opens into its
+members. A group eight partitions deep, the most a group id holds, also opens into its
+members, with a `note`.
+
+A group id names the class and the partitions that lead to the group, so a later
+request can open it without server state, and the same group has the same id in every
+answer. A member with several values of the grouping property is in each of their
+groups. Members are IRIs, and blank nodes are left out of the members list.
+
+An edge's `source` and `target` are `g:` followed by a group id, `c:` followed by a class
+IRI, or `m:` followed by a member IRI. An answer counts the edges from its own groups or
+members to each other, to the sibling groups of every group on its path and to the other
+classes, by predicate. A group's links to its own members are an edge from the group to
+itself. An answer holds at most `limit` groups or members and 20,000 edges, and
+`truncated` says when it was cut.
+
+Every count comes from SPARQL queries run under the caller's view, so a caller limited
+to some graphs or under protections of triples sees only what its own queries would
+read. The route needs `read` through the `query` endpoint, takes `timeout` and
+`reasoning` as `/{ds}/sparql` does, waits for a grant of the query memory pool like a
+query, and answers `408`, `503` and `507` as a query does. A request names its branch
+with `?branch=`, as the other dataset routes under `/$/` do, and a `branch` member of the
+body is a `400`. Answers are kept per branch, commit, view and request, at most 64 of
+them and 16 MiB in all, so opening the same group again at the same commit is
+immediate. The view in that key holds the caller's graphs, the protections of triples
+it keeps and the graphs that `default-graph-uri` and `named-graph-uri` select. Explore
+compares each answer's `commit` with the commit of the class profiles it drew, and reads
+the classes again when a write came between them.
 
 ### Schema diffs
 
@@ -8212,6 +8282,7 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/stats`, `/$/backups-list`, `/$/validate/*`, `/$/auth/logout`, `/$/format` (POST), `/$/lint` (POST), `/$/geo/convert` (POST) | | Any caller. `/$/format` and `/$/lint` admit nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. `/$/stats` covers the datasets the caller may read, and `/$/backups-list` the files of the datasets it administers. Cancelling a task (DELETE) needs `admin` on its dataset. |
 | `/$/algo/{ds}/run` | POST | Read-only runs need `read` through `query`. Runs with `write` need `write` through `update`. The body selects the policy before dataset access. |
 | `/$/algo/{ds}/projections[/{name}]` | GET | `read` through `info`. |
+| `/$/graph/{ds}/groups` | POST | `read` through `query`. |
 | `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |

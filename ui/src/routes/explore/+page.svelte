@@ -43,6 +43,7 @@
   import TermView from '$components/TermView.svelte';
   import TimeSlider from '$components/TimeSlider.svelte';
   import MemoryTab from '$components/MemoryTab.svelte';
+  import OverviewView from '$components/OverviewView.svelte';
   import TextSearchView from '$components/TextSearchView.svelte';
 
   type ENode = {
@@ -813,18 +814,15 @@
 
   // --- starting points ------------------------------------------------------------
 
-  let starters = $state<{ iri: string; instances: number }[]>([]);
   /** Named graphs of the dataset (schema graph selector). */
   let namedGraphs = $state<string[]>([]);
   async function loadStarters(name: string) {
     try {
       const s = await api.datasetStats(name);
-      starters = s.classes.slice(0, 10);
       namedGraphs = s.graphs
         .map((g) => g.name)
         .filter((g): g is string => !!g && g !== INFERRED_GRAPH);
     } catch {
-      starters = [];
       namedGraphs = [];
     }
   }
@@ -1253,31 +1251,33 @@
       />
     {/key}
   {:else if tab === 'graph'}
-    <div class="split">
+    <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen}>
       <div class="canvas">
-        <div class="gtools">
-          <label class="row check"
-            ><input type="checkbox" bind:checked={showLiterals} /> Literals</label
-          >
-          <label class="row check"
-            ><input type="checkbox" bind:checked={hideTypes} /> Hide rdf:type</label
-          >
-          <span class="spacer"></span>
-          <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
-          {#if nodeCount}
-            <button
-              class="btn sm"
-              aria-pressed={graphTimeOpen}
-              aria-label="Graph history"
-              title="Move the whole graph through the commits (Shift+H)"
-              onclick={() => (graphTimeOpen ? closeGraphTime() : openGraphTime())}
-              ><Icon name="clock" size={13} /> History</button
+        {#if nodeCount > 0 || graphTimeOpen}
+          <div class="gtools">
+            <label class="row check"
+              ><input type="checkbox" bind:checked={showLiterals} /> Literals</label
             >
-            <button class="btn sm ghost" onclick={clearGraph}
-              ><Icon name="trash" size={13} /> Clear</button
+            <label class="row check"
+              ><input type="checkbox" bind:checked={hideTypes} /> Hide rdf:type</label
             >
-          {/if}
-        </div>
+            <span class="spacer"></span>
+            <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
+            {#if nodeCount}
+              <button
+                class="btn sm"
+                aria-pressed={graphTimeOpen}
+                aria-label="Graph history"
+                title="Move the whole graph through the commits (Shift+H)"
+                onclick={() => (graphTimeOpen ? closeGraphTime() : openGraphTime())}
+                ><Icon name="clock" size={13} /> History</button
+              >
+              <button class="btn sm ghost" onclick={clearGraph}
+                ><Icon name="trash" size={13} /> Clear</button
+              >
+            {/if}
+          </div>
+        {/if}
         {#if graphTimeOpen && ds}
           <div class="graph-time">
             <TimeSlider
@@ -1304,25 +1304,15 @@
           </div>
         {/if}
         {#if nodeCount === 0}
-          <div class="start">
-            <Icon name="explore" size={26} />
-            <h2>Start from a resource</h2>
-            <p class="muted">
-              Search above, paste an IRI, or pick a class to start from one of its instances.
-            </p>
-            {#if starters.length}
-              <div class="chips">
-                {#each starters as s (s.iri)}
-                  <button class="chip" onclick={() => sampleOf(s.iri)} title={s.iri}>
-                    <span class="t-iri mono">{displayIri(s.iri, prefixes)}</span>
-                    <span class="faint">{fmtCompact(s.instances)}</span>
-                  </button>
-                {/each}
-              </div>
-            {/if}
-            <button class="btn sm" onclick={() => setTab('schema')}
-              ><Icon name="tree" size={13} /> Browse the schema</button
-            >
+          <div class="ov-host">
+            {#key ds}
+              <OverviewView
+                {ds}
+                {prefixes}
+                onresource={(iri, label) => focusOn(iri, label)}
+                onschema={() => setTab('schema')}
+              />
+            {/key}
           </div>
         {:else}
           <div class="cy-host">
@@ -1342,251 +1332,262 @@
         {/if}
       </div>
 
-      <aside class="side" aria-label="Resource details">
-        {#if selected}
-          {@const n = selected}
-          <div class="side-head">
-            <div class="side-title">
-              <h2 title={n.label}>{n.label}</h2>
-              {#if n.term.type === 'uri'}
-                <button class="iri-line mono" onclick={() => copy(n.iri)} title="Copy IRI">
-                  {n.iri}
-                  <Icon name="copy" size={12} />
-                </button>
-              {:else}
-                <div class="mono faint">{n.term.type === 'literal' ? 'literal' : n.term.type}</div>
-              {/if}
-            </div>
-            {#if types.length}
-              <div class="types">
-                {#each types as t (termKey(t))}
-                  <button
-                    class="badge iri"
-                    onclick={() => t.type === 'uri' && (setTab('schema'), revealClass(t.value))}
-                    title="Show class in schema"
-                  >
-                    {t.type === 'uri' ? shortLabel(t.value, prefixes) : t.value}
+      {#if nodeCount > 0 || graphTimeOpen}
+        <aside class="side" aria-label="Resource details">
+          {#if selected}
+            {@const n = selected}
+            <div class="side-head">
+              <div class="side-title">
+                <h2 title={n.label}>{n.label}</h2>
+                {#if n.term.type === 'uri'}
+                  <button class="iri-line mono" onclick={() => copy(n.iri)} title="Copy IRI">
+                    {n.iri}
+                    <Icon name="copy" size={12} />
                   </button>
-                {/each}
-              </div>
-            {/if}
-            {#if comment?.length}<p class="comment">{ex.pickLabel(comment)}</p>{/if}
-            {#if n.term.type === 'uri'}
-              <div class="side-actions">
-                <button
-                  class="btn sm"
-                  onclick={() => expand(n.id)}
-                  disabled={n.expanded || expanding[n.id] !== undefined}
-                >
-                  {#if expanding[n.id]}<span class="spinner"></span>{:else}<Icon
-                      name="expand"
-                      size={13}
-                    />{/if}
-                  {n.expanded ? 'Expanded' : 'Expand'}
-                </button>
-                {#if focusId !== n.id}
-                  <button class="btn sm" onclick={() => focusOn(n.iri, n.label)}
-                    ><Icon name="target" size={13} /> Focus</button
-                  >
-                {/if}
-                <button class="btn sm" onclick={() => describeInQuery(n.iri)}
-                  ><Icon name="query" size={13} /> Describe</button
-                >
-                <button
-                  class="btn sm"
-                  aria-pressed={stripOpen}
-                  title="Move through the commits that changed this resource (H)"
-                  onclick={() => (stripOpen ? closeStrip() : (stripOpen = true))}
-                  ><Icon name="clock" size={13} /> History</button
-                >
-                <button
-                  class="btn sm ghost icon"
-                  title="Remove from graph"
-                  aria-label="Remove from graph"
-                  onclick={() => removeNode(n.id)}
-                >
-                  <Icon name="x" size={13} />
-                </button>
-              </div>
-              <div class="tabs side-tabs" role="tablist" aria-label="Resource views">
-                <button
-                  class="tab"
-                  role="tab"
-                  aria-selected={sideTab === 'props'}
-                  onclick={() => (sideTab = 'props')}>Properties</button
-                >
-                <button
-                  class="tab"
-                  role="tab"
-                  aria-selected={sideTab === 'memory'}
-                  onclick={() => (sideTab = 'memory')}
-                  title="What the memory you can read holds about it, with citations"
-                  ><Icon name="brain" size={13} /> Memory</button
-                >
-              </div>
-              {#if stripOpen && sideTab === 'props'}
-                {#if hist}
-                  <TimeSlider
-                    bind:this={strip}
-                    {ds}
-                    commits={hist.commits}
-                    head={hist.head}
-                    authors={hist.authors}
-                    readable={hist.readable}
-                    bind:at={exAt}
-                    bind:from={exFrom}
-                    bind:compare={exCompare}
-                    busy={!detail}
-                    label="Resource history"
-                    canFollow={false}
-                    onchange={() => syncUrl(n.iri)}
-                    onclose={() => {
-                      closeStrip();
-                      syncUrl(n.iri);
-                    }}
-                  />
-                  {#if hist.commits.length === 0}
-                    <p class="faint small">The change log holds no change of this resource.</p>
-                  {/if}
-                  {#if hist.truncated}
-                    <p class="faint small">Only the first 5,000 changes of each kind are listed.</p>
-                  {/if}
-                  {#if hist.note}<p class="faint small">{hist.note}</p>{/if}
-                {:else if histError}
-                  <div class="error-box">{histError}</div>
                 {:else}
-                  <p class="faint row"><span class="spinner"></span> Reading the history…</p>
+                  <div class="mono faint">
+                    {n.term.type === 'literal' ? 'literal' : n.term.type}
+                  </div>
+                {/if}
+              </div>
+              {#if types.length}
+                <div class="types">
+                  {#each types as t (termKey(t))}
+                    <button
+                      class="badge iri"
+                      onclick={() => t.type === 'uri' && (setTab('schema'), revealClass(t.value))}
+                      title="Show class in schema"
+                    >
+                      {t.type === 'uri' ? shortLabel(t.value, prefixes) : t.value}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+              {#if comment?.length}<p class="comment">{ex.pickLabel(comment)}</p>{/if}
+              {#if n.term.type === 'uri'}
+                <div class="side-actions">
+                  <button
+                    class="btn sm"
+                    onclick={() => expand(n.id)}
+                    disabled={n.expanded || expanding[n.id] !== undefined}
+                  >
+                    {#if expanding[n.id]}<span class="spinner"></span>{:else}<Icon
+                        name="expand"
+                        size={13}
+                      />{/if}
+                    {n.expanded ? 'Expanded' : 'Expand'}
+                  </button>
+                  {#if focusId !== n.id}
+                    <button class="btn sm" onclick={() => focusOn(n.iri, n.label)}
+                      ><Icon name="target" size={13} /> Focus</button
+                    >
+                  {/if}
+                  <button class="btn sm" onclick={() => describeInQuery(n.iri)}
+                    ><Icon name="query" size={13} /> Describe</button
+                  >
+                  <button
+                    class="btn sm"
+                    aria-pressed={stripOpen}
+                    title="Move through the commits that changed this resource (H)"
+                    onclick={() => (stripOpen ? closeStrip() : (stripOpen = true))}
+                    ><Icon name="clock" size={13} /> History</button
+                  >
+                  <button
+                    class="btn sm ghost icon"
+                    title="Remove from graph"
+                    aria-label="Remove from graph"
+                    onclick={() => removeNode(n.id)}
+                  >
+                    <Icon name="x" size={13} />
+                  </button>
+                </div>
+                <div class="tabs side-tabs" role="tablist" aria-label="Resource views">
+                  <button
+                    class="tab"
+                    role="tab"
+                    aria-selected={sideTab === 'props'}
+                    onclick={() => (sideTab = 'props')}>Properties</button
+                  >
+                  <button
+                    class="tab"
+                    role="tab"
+                    aria-selected={sideTab === 'memory'}
+                    onclick={() => (sideTab = 'memory')}
+                    title="What the memory you can read holds about it, with citations"
+                    ><Icon name="brain" size={13} /> Memory</button
+                  >
+                </div>
+                {#if stripOpen && sideTab === 'props'}
+                  {#if hist}
+                    <TimeSlider
+                      bind:this={strip}
+                      {ds}
+                      commits={hist.commits}
+                      head={hist.head}
+                      authors={hist.authors}
+                      readable={hist.readable}
+                      bind:at={exAt}
+                      bind:from={exFrom}
+                      bind:compare={exCompare}
+                      busy={!detail}
+                      label="Resource history"
+                      canFollow={false}
+                      onchange={() => syncUrl(n.iri)}
+                      onclose={() => {
+                        closeStrip();
+                        syncUrl(n.iri);
+                      }}
+                    />
+                    {#if hist.commits.length === 0}
+                      <p class="faint small">The change log holds no change of this resource.</p>
+                    {/if}
+                    {#if hist.truncated}
+                      <p class="faint small">
+                        Only the first 5,000 changes of each kind are listed.
+                      </p>
+                    {/if}
+                    {#if hist.note}<p class="faint small">{hist.note}</p>{/if}
+                  {:else if histError}
+                    <div class="error-box">{histError}</div>
+                  {:else}
+                    <p class="faint row"><span class="spinner"></span> Reading the history…</p>
+                  {/if}
                 {/if}
               {/if}
-            {/if}
-          </div>
+            </div>
 
-          {#if n.term.type === 'literal'}
-            <div class="side-body">
-              {#if isVectorLiteral(n.term)}
-                <p class="faint">{literalText(n.term)}</p>
-              {/if}
-              <pre class="literal">{n.term.value}</pre>
-            </div>
-          {:else if n.term.type !== 'uri'}
-            <div class="side-body faint">
-              Blank nodes can only be explored through their neighbours.
-            </div>
-          {:else if sideTab === 'memory' && ds}
-            <div class="side-body scroll">
-              {#key n.iri}
-                <MemoryTab {ds} iri={n.iri} {prefixes} onopen={(iri) => focusOn(iri)} />
-              {/key}
-            </div>
-          {:else if !detail}
-            <div class="side-body row faint"><span class="spinner"></span> Loading properties…</div>
-          {:else if 'error' in detail}
-            <div class="side-body"><div class="error-box">{detail.error}</div></div>
-          {:else}
-            <div class="side-body scroll">
-              {#if histNet && hist}
-                <section class="hist-net" aria-label="Changes between the two commits">
-                  <h3 class="sub">
-                    Changed since commit {selectorSeq(exFrom, hist.head)}
-                    <span class="faint">{histNet.length}</span>
-                  </h3>
-                  {#if histNet.length === 0}
-                    <p class="faint small">Nothing about this resource differs between them.</p>
-                  {:else}
-                    <ul>
-                      {#each histNet as c (c.op + c.dir + c.predicate + c.term + c.graph)}
-                        <li class="net {c.op}">
-                          <span class="sign" aria-label={c.op === 'add' ? 'added' : 'removed'}
-                            >{c.op === 'add' ? '+' : '−'}</span
-                          >
-                          <span class="mono net-body">
-                            <span class="faint">{c.dir === 'out' ? '' : 'referenced by '}</span
-                            ><span class="t-iri">{displayIri(predIri(c.predicate), prefixes)}</span>
-                            <TermView term={parseCompact(c.term, prefixes)} {prefixes} />
-                          </span>
-                          <span class="faint small net-by">
-                            commit {c.commit}{c.author ? ` · ${c.author}` : ''}{c.message
-                              ? ` · “${c.message}”`
-                              : ''}{isReadable(c.commit, hist.readable)
-                              ? ''
-                              : ' · state not readable'}
-                          </span>
-                        </li>
-                      {/each}
-                    </ul>
-                  {/if}
-                </section>
-              {/if}
-              <h3 class="sub">Properties <span class="faint">{detail.props.length}</span></h3>
-              {#if grouped.length === 0}
-                <p class="faint">No outgoing triples. This IRI is only used as an object.</p>
-              {/if}
-              <table class="props">
-                <tbody>
-                  {#each grouped as [p, values] (p)}
-                    <tr>
-                      <th title={p}><span class="t-iri">{displayIri(p, prefixes)}</span></th>
-                      <td>
-                        {#each values.slice(0, 20) as o (termKey(o))}
-                          <div class="val">
-                            <TermView
-                              term={o}
-                              {prefixes}
-                              expandable
-                              onopen={(iri) => addLinked(n.id, p, { type: 'uri', value: iri })}
-                            />
-                          </div>
+            {#if n.term.type === 'literal'}
+              <div class="side-body">
+                {#if isVectorLiteral(n.term)}
+                  <p class="faint">{literalText(n.term)}</p>
+                {/if}
+                <pre class="literal">{n.term.value}</pre>
+              </div>
+            {:else if n.term.type !== 'uri'}
+              <div class="side-body faint">
+                Blank nodes can only be explored through their neighbours.
+              </div>
+            {:else if sideTab === 'memory' && ds}
+              <div class="side-body scroll">
+                {#key n.iri}
+                  <MemoryTab {ds} iri={n.iri} {prefixes} onopen={(iri) => focusOn(iri)} />
+                {/key}
+              </div>
+            {:else if !detail}
+              <div class="side-body row faint">
+                <span class="spinner"></span> Loading properties…
+              </div>
+            {:else if 'error' in detail}
+              <div class="side-body"><div class="error-box">{detail.error}</div></div>
+            {:else}
+              <div class="side-body scroll">
+                {#if histNet && hist}
+                  <section class="hist-net" aria-label="Changes between the two commits">
+                    <h3 class="sub">
+                      Changed since commit {selectorSeq(exFrom, hist.head)}
+                      <span class="faint">{histNet.length}</span>
+                    </h3>
+                    {#if histNet.length === 0}
+                      <p class="faint small">Nothing about this resource differs between them.</p>
+                    {:else}
+                      <ul>
+                        {#each histNet as c (c.op + c.dir + c.predicate + c.term + c.graph)}
+                          <li class="net {c.op}">
+                            <span class="sign" aria-label={c.op === 'add' ? 'added' : 'removed'}
+                              >{c.op === 'add' ? '+' : '−'}</span
+                            >
+                            <span class="mono net-body">
+                              <span class="faint">{c.dir === 'out' ? '' : 'referenced by '}</span
+                              ><span class="t-iri"
+                                >{displayIri(predIri(c.predicate), prefixes)}</span
+                              >
+                              <TermView term={parseCompact(c.term, prefixes)} {prefixes} />
+                            </span>
+                            <span class="faint small net-by">
+                              commit {c.commit}{c.author ? ` · ${c.author}` : ''}{c.message
+                                ? ` · “${c.message}”`
+                                : ''}{isReadable(c.commit, hist.readable)
+                                ? ''
+                                : ' · state not readable'}
+                            </span>
+                          </li>
                         {/each}
-                        {#if values.length > 20}<div class="faint">
-                            +{values.length - 20} more
-                          </div>{/if}
-                      </td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
-
-              {#key n.iri}
-                <GeoMapCard {ds} iri={n.iri} props={detail.props} {prefixes} />
-                <SimilarPanel {ds} iri={n.iri} props={detail.props} {prefixes} />
-              {/key}
-
-              <h3 class="sub">
-                Referenced by <span class="faint">{fmtInt(detail.incomingTotal)}</span>
-              </h3>
-              {#if detail.incoming.length === 0}
-                <p class="faint">Nothing points to this resource.</p>
-              {:else}
+                      </ul>
+                    {/if}
+                  </section>
+                {/if}
+                <h3 class="sub">Properties <span class="faint">{detail.props.length}</span></h3>
+                {#if grouped.length === 0}
+                  <p class="faint">No outgoing triples. This IRI is only used as an object.</p>
+                {/if}
                 <table class="props">
                   <tbody>
-                    {#each detail.incoming.slice(0, 100) as r (termKey(r.s) + r.p)}
+                    {#each grouped as [p, values] (p)}
                       <tr>
-                        <td class="inc-s">
-                          <TermView
-                            term={r.s}
-                            {prefixes}
-                            onopen={(iri) =>
-                              addLinked(n.id, r.p, { type: 'uri', value: iri }, true)}
-                          />
+                        <th title={p}><span class="t-iri">{displayIri(p, prefixes)}</span></th>
+                        <td>
+                          {#each values.slice(0, 20) as o (termKey(o))}
+                            <div class="val">
+                              <TermView
+                                term={o}
+                                {prefixes}
+                                expandable
+                                onopen={(iri) => addLinked(n.id, p, { type: 'uri', value: iri })}
+                              />
+                            </div>
+                          {/each}
+                          {#if values.length > 20}<div class="faint">
+                              +{values.length - 20} more
+                            </div>{/if}
                         </td>
-                        <th title={r.p}><span class="t-iri">{displayIri(r.p, prefixes)}</span></th>
                       </tr>
                     {/each}
                   </tbody>
                 </table>
-                {#if detail.incomingTotal > 100}<p class="faint more-note">
-                    Showing 100 of {fmtInt(detail.incomingTotal)}.
-                  </p>{/if}
-              {/if}
+
+                {#key n.iri}
+                  <GeoMapCard {ds} iri={n.iri} props={detail.props} {prefixes} />
+                  <SimilarPanel {ds} iri={n.iri} props={detail.props} {prefixes} />
+                {/key}
+
+                <h3 class="sub">
+                  Referenced by <span class="faint">{fmtInt(detail.incomingTotal)}</span>
+                </h3>
+                {#if detail.incoming.length === 0}
+                  <p class="faint">Nothing points to this resource.</p>
+                {:else}
+                  <table class="props">
+                    <tbody>
+                      {#each detail.incoming.slice(0, 100) as r (termKey(r.s) + r.p)}
+                        <tr>
+                          <td class="inc-s">
+                            <TermView
+                              term={r.s}
+                              {prefixes}
+                              onopen={(iri) =>
+                                addLinked(n.id, r.p, { type: 'uri', value: iri }, true)}
+                            />
+                          </td>
+                          <th title={r.p}><span class="t-iri">{displayIri(r.p, prefixes)}</span></th
+                          >
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                  {#if detail.incomingTotal > 100}<p class="faint more-note">
+                      Showing 100 of {fmtInt(detail.incomingTotal)}.
+                    </p>{/if}
+                {/if}
+              </div>
+            {/if}
+          {:else}
+            <div class="side-empty faint">
+              <Icon name="info" size={18} />
+              <p>Select a node to see its properties.</p>
             </div>
           {/if}
-        {:else}
-          <div class="side-empty faint">
-            <Icon name="info" size={18} />
-            <p>Select a node to see its properties.</p>
-          </div>
-        {/if}
-      </aside>
+        </aside>
+      {/if}
     </div>
   {:else}
     <!-- schema -->
@@ -2198,6 +2199,16 @@
     flex: 1;
     min-height: 0;
   }
+  .ov-host {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .split.overview {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
   .graph-time {
     flex: none;
     min-width: 0;
@@ -2256,20 +2267,6 @@
     font-size: var(--fs-xs);
     border-top: 1px solid var(--border);
     background: var(--surface);
-  }
-  .start {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    padding: 24px;
-    text-align: center;
-    color: var(--text-2);
-  }
-  .start h2 {
-    color: var(--text);
   }
   .chips {
     display: flex;
