@@ -47,6 +47,7 @@
 # flags (e.g. "--no-access-log --no-metrics"), for comparing configurations.
 # PORT_BASE (default 3931) is the first of the five server ports; the memory probe uses
 # PORT_BASE + 30. KEEP_SCRATCH=1 keeps the store copies of the updates and mixed modes.
+# OHA names the load generator of the mixed mode instead of the flake's package.
 # The query and update latency runs pin hyperfine and its curl processes to one CPU (see
 # client_cpu in scripts/bench-lib.sh); CLIENT_CPU=N picks the CPU and CLIENT_CPU=none
 # turns pinning off.
@@ -327,7 +328,7 @@ case $MODE in
     ;;
   mixed)
     [ -n "${ANSWERS_ONLY:-}" ] || {
-      OHA=$(nixbin oha oha)
+      OHA=${OHA:-$(nixbin oha oha)}
       STORE=$WORK/scratch
       trap 'stop_all; [ -n "${KEEP_SCRATCH:-}" ] || rm -rf "$STORE"' EXIT
       copy_stores
