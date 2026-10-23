@@ -130,9 +130,9 @@ runs every hook over the whole tree.
 The server crate has no library target, so its unit-test binary and the binary that its
 integration tests run each compile the whole crate. In a debug build each of those rustc
 processes peaks at about 10 GB, mostly while it collects monomorphized items, and a
-build that runs both at once needs about 20 GB. `mise run test` therefore builds the
-unit-test binary on its own first (`cargo test --workspace --no-run --bin sparkles`) and
-only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
+build that runs both at once needs about 20 GB. `mise run test` therefore first runs
+`cargo test --workspace --no-run --bin sparkles` to build the unit-test binary on its own,
+and only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
 time, because the second server compile no longer overlaps the first.
 
 Persistent stores and offline migrations hold an exclusive file lock through their
