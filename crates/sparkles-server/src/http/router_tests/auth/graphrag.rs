@@ -1000,5 +1000,5 @@ fn the_overview_uses_the_guarded_namespace_of_the_server() {
         sparkles::overview::DEFAULT_REPORTS_GRAPH,
         GraphragSettings::default().reports_graph
     );
-    assert!(sparkles::overview::MAX_REPORT_LEVEL >= MAX_LEVELS);
+    const { assert!(sparkles::overview::MAX_REPORT_LEVEL >= MAX_LEVELS) };
 }

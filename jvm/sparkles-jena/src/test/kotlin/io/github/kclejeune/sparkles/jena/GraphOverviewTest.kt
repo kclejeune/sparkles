@@ -198,7 +198,7 @@ class GraphOverviewTest {
             load(ds, data)
             val byReports = GroupsRequest(by = GroupsBy.Reports())
             val none = ds.graph().groups(byReports)
-            assertFalse(none.get("available").asBoolean.value)
+            assertFalse(none.get("available").asBoolean.value())
             assertEquals("none", none.getString("unavailable"))
             val trig = """
                 @prefix ex: <http://ex.org/> .
@@ -215,7 +215,7 @@ class GraphOverviewTest {
             """.trimIndent()
             ds.load(ByteArrayInputStream(trig.toByteArray()), Lang.TRIG)
             val top = ds.graph().groups(byReports)
-            assertTrue(top.get("available").asBoolean.value)
+            assertTrue(top.get("available").asBoolean.value())
             assertEquals("reports", top.get("grouping").asObject.getString("kind"))
             val team = top.get("groups").asArray.single().asObject
             assertEquals("Team A", team.getString("label"))
