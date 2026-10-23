@@ -191,6 +191,31 @@ test('A13: the time-lapse makes one request per step and groups the large one', 
   );
 });
 
+test('a grouped seed past the budget leaves the groups to start at the large step', async ({
+  page,
+}) => {
+  await page.goto(diffUrl(4, 0));
+  await expect
+    .poll(async () => (await drawn(page)).nodes.length, { timeout: 30_000 })
+    .toBeGreaterThan(0);
+  // the steps drawn before the large one are too many to group together
+  let refused = 0;
+  await page.route(/\/chrono4\/diff\?from=commit%3A0&to=commit%3A3&group=class/, (route) => {
+    refused++;
+    return route.fulfill({
+      status: 507,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'memory budget', status: 507 }),
+    });
+  });
+  await view(page).getByRole('combobox', { name: 'Steps a second' }).selectOption('2');
+  await view(page).getByRole('button', { name: 'Play the time-lapse' }).click();
+  await expect(view(page).getByText(/^step \d\/4$/)).toHaveText('step 4/4');
+  expect(refused).toBe(1);
+  await expect(view(page)).toContainText('could not be grouped within the budget');
+  await expect.poll(() => labels(page)).toMatch(/Person \+600/);
+});
+
 test('leaving the diff while the time-lapse reads the catalog starts no step', async ({ page }) => {
   const diffs: string[] = [];
   page.on('request', (r) => {

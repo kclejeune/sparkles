@@ -494,13 +494,22 @@
             wrap.dataset.maxInFlight = String(maxInFlight);
           }
         }
-        const before = await api.diffGroups(ds, {
-          from: `commit:${steps[0].from}`,
-          to: `commit:${s.from}`,
-          signal,
-        });
-        inFlight--;
-        lapseGroups = lapseGroupsStep(new Map(), before.groups, false).live;
+        try {
+          const before = await api.diffGroups(ds, {
+            from: `commit:${steps[0].from}`,
+            to: `commit:${s.from}`,
+            signal,
+          });
+          lapseGroups = lapseGroupsStep(new Map(), before.groups, false).live;
+        } catch (e) {
+          // the steps together can pass the memory budget that each fit alone: the groups
+          // then start from this step, and the time-lapse plays on
+          if (!(e instanceof api.ApiError && e.status === 507)) throw e;
+          note +=
+            ' The steps drawn before could not be grouped within the budget, so the groups start here.';
+        } finally {
+          inFlight--;
+        }
       }
       if (lapseGroups) {
         if (inFlight === 0) {

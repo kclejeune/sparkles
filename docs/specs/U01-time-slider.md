@@ -760,7 +760,8 @@ client types list the new parameters.
 - **The grouped time-lapse.** When a time-lapse switches to grouping after drawing some
   steps, one grouped diff from its start to the step before counts what those steps drew,
   so their classes stay on the picture. A13 therefore makes five requests, still one at a
-  time. The node cap also counts the ends that a removal of an undrawn triple adds as
+  time. When that diff passes the memory budget, the groups start at the large step and
+  the time-lapse plays on with a note. The node cap also counts the ends that a removal of an undrawn triple adds as
   ghosts.
   Each group keeps its net change since the start. A group the
   step changed is marked with the step's counts, and one that falls to nothing goes after
