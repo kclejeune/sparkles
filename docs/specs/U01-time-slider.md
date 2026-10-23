@@ -1,12 +1,15 @@
 # U01: A time slider over graphs, results, entities and the schema
 
-> **Status:** implemented
+> **Status:** implemented (Phases 1–3), Phase 4 specified
 >
-> **Phases:** All three shipped. Phase 1 is the slider component, the query page's table
-> and graph results at any commit with row diffs, and an entity's properties in Explore
-> over time. Phase 2 adds the Explore graph with animated additions and removals, the
-> schema tab, a bucketed commit timeline and a term filter on diffs. Phase 3 adds
+> **Phases:** Phases 1 to 3 shipped. Phase 1 is the slider component, the query page's
+> table and graph results at any commit with row diffs, and an entity's properties in
+> Explore over time. Phase 2 adds the Explore graph with animated additions and removals,
+> the schema tab, a bucketed commit timeline and a term filter on diffs. Phase 3 adds
 > comparison across branches, result diffs computed on the server and the map view.
+> [Phase 4](#phase-4-time-lapse-and-commit-diffs-on-the-canvas-2026-10-23), added on
+> 2026-10-23, plays a time-lapse on the canvas from each commit's changes, draws the diff
+> of two commits as a graph of its own, and moves the Explore overview through time.
 >
 > **User docs:** [USAGE: The time slider](../USAGE.md#the-time-slider), and in
 > [API](../API.md) the sections on [the commit timeline](../API.md#the-commit-timeline),
@@ -486,3 +489,209 @@ and the other two have a workable alternative in the slider's comparison with th
 another branch.
 
 See [ROADMAP](../ROADMAP.md) item 11.
+
+## Phase 4: time-lapse and commit diffs on the canvas (2026-10-23)
+
+This phase was added on 2026-10-23, when the user approved a set of graph-interaction
+features. It was written from the same sources as the phases above, together with the
+shipped code of this spec, the Explore overview of [U06](U06-large-graph-rendering.md),
+and the diff and change-feed routes of [F06](F06-snapshots-and-point-in-time.md).
+
+### P4.1 Goals and non-goals
+
+Phases 1 to 3 move a drawn view through time. Play re-reads the drawn neighbourhood at
+each commit, and compare mode marks what changed between two states inside that
+neighbourhood. Two things are still missing. A person cannot start from a change, such as
+what commit 241 did, and see it as a graph unless the changed resources happen to be
+drawn. And a time-lapse over hundreds of commits costs a full read per commit, so it is
+slow and draws only what was already on screen.
+
+**Goals**
+
+1. A **diff graph**, which draws the changes between two commits, or of one commit, as a
+   graph of its own with added and removed triples marked. It opens from the History
+   panel, the commit graph, the slider and a write receipt.
+2. A **time-lapse** that plays a range of commits by applying each step's changes to the
+   canvas, one diff request per step, instead of re-reading the view.
+3. The same time-lapse on the Explore overview, where class nodes grow and shrink and
+   predicate edges thicken and thin with the counts of each step.
+4. Bounded cost. A step never moves more than a fixed number of changes to the browser,
+   and a larger step is drawn as aggregates.
+
+**Non-goals**
+
+- A history store or a new change format. Every step reads `/{ds}/diff` or the grouped
+  form of §P4.3.
+- Editing from the diff graph. Reverts and cherry-picks stay on the History panel.
+- Diffs across branches on the overview. The resource-level diff graph takes `fromBranch`
+  and `toBranch`, as `/{ds}/diff` does.
+
+### P4.2 User-visible behaviour
+
+**The diff graph.** A commit row in the History panel, a node of the commit graph, the
+slider's caption in compare mode and a write receipt get **Show on graph**. It opens
+Explore's graph in diff mode, which draws the changed triples and their ends.
+
+```
+┌─ Explore · diff commit 240 → 241 · upload by etl ─── +1,204 −37 ── [Exit diff] ┐
+│ Show [added ☑] [removed ☑] [context ☐]   Group by [none ▾]   ⏮ ◀ ▶ ⏭ ▷ Play   │
+│                                                                                │
+│   (+ex:p17) ─+ex:worksFor─▶ (ex:acme)   (ex:p3) ┄−ex:email┄▶ ("a@x.org")−      │
+│                                                                                │
+│ Showing 500 of 1,241 changes · [Group by class] to see all                    │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Marks.** Added triples are solid with a `+` badge and removed ones are dashed ghosts
+  with a `−` badge, the marks of §4.3. A node that only removed triples touch is a ghost
+  too.
+- **Context.** **Context** adds the unchanged edges of each changed resource at the `to`
+  state, up to 20 per resource, so a change is seen in its surroundings.
+- **Too many changes.** A diff with more than 500 changes draws the first 500 in the
+  diff's order and offers **Group by class**, which draws the grouped diff of §P4.3. A
+  class node there opens into its changed members, 500 at a time.
+- **Stepping.** ◀ and ▶ move the diff one commit back or forward and keep its width, so
+  `240 → 241` becomes `241 → 242`.
+
+**The time-lapse.** **Play** on the Explore graph and on the diff graph gets a time-lapse
+mode, chosen in the play menu, beside the existing re-read mode.
+
+- **Steps.** Each step requests the changes of one commit, or of one bucket of the
+  timeline when the range has more than 500 commits, and applies them to the canvas.
+  Additions fade in and removals fade to ghosts, which disappear at the next step unless
+  **Keep ghosts** is on.
+- **Scope.** On the Explore graph a step asks only for changes that touch drawn resources,
+  with the `term` filter. On the diff graph a step draws every change of the step up to the
+  500-change cap. A resource that a change introduces is added next to its neighbour, so
+  the picture grows as the data did.
+- **Speed.** 1, 2, 5 or 10 steps a second. A step never starts before the previous one's
+  request and animation have finished, as Phase 2's play already ensures.
+- **Counters.** The caption shows the step's commit, author and message and a running total
+  of additions and removals since the start.
+
+**The overview through time.** The slider opens over the Explore overview with `Shift+H`,
+as it does over the resource graph. Moving the handle redraws the class level at that
+state. Compare mode labels each class with `+N` or `−M` and each predicate edge with its
+change, and colours them with the added and removed tokens. The time-lapse animates node
+sizes and edge widths between steps and holds the layout's positions still. Opening a
+class during a time-lapse pauses it.
+
+**Keyboard.** The slider's keys of §2.2 apply. In diff mode `A` and `R` toggle added and
+removed triples, `X` toggles context, `G` toggles grouping by class, and `Escape` leaves
+diff mode. The list view of U06 §2.4 lists the changes of the current step as rows with
+their `+` or `−`, and the live region announces each step, such as "commit 241, 12 added,
+1 removed".
+
+**At 390 px.** The diff graph's toolbar folds into a sheet, the play controls stay in a bar
+at the bottom, and the change list opens as a second tab beside the graph.
+
+**Empty and error states.** A diff with no visible changes says "No changes you can read
+between these commits". A step that fails with `410 history-gone` stops the time-lapse at
+the last readable step and names the readable range. A grouped diff over the budget answers
+the diff route's `507`, and the diff graph falls back to the first 500 changes.
+
+### P4.3 Server and API changes
+
+The resource-level diff graph and the time-lapse on the resource graph need no new route.
+They read `GET /{ds}/diff` with `quads=true` and `limit=500`, and on the Explore graph with
+`term=` naming the drawn resources, up to its 1,000 terms. The context edges come from the
+`neighbours` reads that Explore already makes, at the `to` state.
+
+The grouped diff and the overview through time need one addition, which comes first in this
+phase.
+
+**Prerequisite, a grouped diff.** `GET /{ds}/diff` gains `group=class`. The answer has the
+diff's counts grouped by the class of the subject, the predicate and the class or kind of
+the object, without the quads.
+
+```ts
+type GroupedDiff = {
+  from: DiffEnd; to: DiffEnd; added: number; removed: number;
+  groups: { subjectClass: string | null; predicate: string;
+            object: { class: string | null } | { literal: string } | { iri: true };
+            added: number; removed: number }[];
+  truncated: boolean;            // more than `limit` groups, 5,000 at most
+};
+```
+
+The class of a resource is read at the `to` state for an added quad and at the `from` state
+for a removed one. A resource with several classes counts under its most frequent class,
+and one with none under `null`. A literal object is grouped by its datatype. The route reads
+the diff as it does today, so its memory follows the changes and the `--max-rows` budget
+applies, and it then looks up classes with one batched type scan per state. It runs under
+the caller's view and timeout, and it is cached like a diff between two `commit:` selectors,
+with the same weak entity tag. The overview uses it to update class counts and predicate
+edges at each step. The class level at a past state reads the class profiles with `at=`,
+which `GET /$/schema/{ds}/profiles` already takes.
+
+The parameter is added to `docs/API.md`, the route table and the OpenAPI description. It
+does not combine with the RDF Patch formats or with `quads=true`, and those pairs answer
+`400`.
+
+### P4.4 Limits and budgets
+
+- **Per step.** At most 500 quads reach the browser per step, and at most 5,000 groups per
+  grouped step.
+- **Per canvas.** The diff graph draws at most 1,500 nodes, Explore's cap. A time-lapse that
+  would pass it switches to grouping by class and says so.
+- **Ghosts.** At most 200 ghost elements are kept, the `MAX_GHOSTS` of `lib/explore-time.ts`.
+- **Requests.** One diff request is in flight per view. A time-lapse over more than 500
+  commits steps through timeline buckets, so a range of 100,000 commits takes at most 200
+  steps at the default bucket count.
+
+### P4.5 Access, branches and past states
+
+Every read is a diff or a profile read under the caller's view, so the diff graph shows only
+changes to triples the caller can read, in the masked states of C12b. For a caller limited
+to some graphs, the caption counts the visible changes, which the diff route already
+computes over the view, and the commit catalog's per-commit counts are not shown, as §2.5
+says. Class lookups in the grouped diff run in the same view, so a hidden `rdf:type` triple
+leaves a resource in the `null` group instead of revealing its class. A diff that names
+`fromBranch` and `toBranch` reads each branch with the caller's grants on it.
+
+### P4.6 Testing
+
+- **Rust.** `group=class` against a diff grouped in the test, classes read at the right
+  state for added and removed quads, resources with several classes and with none, the
+  group cap, a masked view that hides a type triple, the `400` pairs, and the entity tag.
+- **Router.** The grouped diff under a restricted principal, under `--max-rows`, and with a
+  `410` for a gone commit.
+- **Vitest.** `lib/explore-time.ts` gains the time-lapse step model, which covers applying
+  one step's changes, ghost expiry, the switch to grouping at the node cap and bucket steps
+  over long ranges. `lib/overview.ts` gains counts updated from a grouped diff.
+- **Playwright against the mock server.** A11 to A14 and A16, with the mock serving diffs
+  and grouped diffs from its fixed states.
+- **Playwright against a real server.** A11, A12 and A14 on a dataset built by the test.
+- **Performance.** A15 in the performance project of U06.
+
+### P4.7 Acceptance examples
+
+The data is §7's, with commit 4 adding 600 people of class `ex:Person` who work for
+`ex:acme`.
+
+- **A11. Diff graph.** **Show on graph** on commit 3 in the History panel draws
+  `ex:alice ex:knows ex:carol` with a `+` badge and `ex:alice ex:knows ex:bob` as a ghost
+  with a `−` badge, and nothing else.
+- **A12. Grouped.** **Show on graph** on commit 4 draws 500 changes and offers **Group by
+  class**, which draws one edge from `ex:Person` to `ex:Org` labelled `ex:worksFor +600`.
+  The grouped answer has 600 additions in that group.
+- **A13. Time-lapse.** Playing from commit 1 to commit 4 on the diff graph makes four diff
+  requests, never two at once, draws `ex:bob` at step 2, and switches to grouping at step 4
+  with a message.
+- **A14. Overview.** With the slider over the overview, comparing commit 3 with commit 4
+  labels `ex:Person` with `+600`.
+- **A15. Speed.** Over a synthetic history of 200 commits of 50 changes each, the time-lapse
+  at 10 steps a second keeps each step's frame time under 50 ms after its changes arrive.
+- **A16. Limited reader.** For a reader whose grants hide the graph of commit 4's triples,
+  **Show on graph** on commit 4 says "No changes you can read between these commits".
+
+### P4.8 Open questions
+
+1. Whether the grouped diff should also group by named graph, for datasets with one graph
+   per source, given U06's reasons for leaving graph grouping out of the overview.
+2. Whether a time-lapse should be exportable as a video or an animated image, which would
+   need a recorder in the browser and a size limit.
+
+### Phase 4 outcome
+
+Not built. See [ROADMAP](../ROADMAP.md) item 104.

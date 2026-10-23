@@ -322,6 +322,22 @@ ex:lyon .`, `ex:lyon a ex:City ; rdfs:label "Lyon" .`, `ex:paris a ex:City ; rdf
 3. Whether box selection conflicts with panning on touch screens, where the explorer is
    already used.
 
+## 11. Relation to the visual query builder (2026-10-23)
+
+This section was added on 2026-10-23, when the user approved a two-way visual query
+builder as [U08](U08-visual-query-builder.md). U08 lifts the first non-goal of §1 for the
+query page. It edits a query on a canvas that starts empty or from any query text, and it
+keeps the editor's text as the only source of truth. This spec keeps its own scope, which
+is starting from data the person selected in Explore.
+
+The two specs share three things. The filter forms of §2.2 and the variable naming of §4.2
+are defined once, by whichever of this spec's Phase 1 and U08's Phase 2 lands first. **Open
+in editor** opens U08's Pattern pane with the generated query when U08 Phase 1 exists, so
+the person sees the same pattern they selected. Open question 2 of §10 is the same question
+as U08's open question 1 and is decided there.
+
+`UNION`, which §1 leaves out of this spec, is in U08's Phase 3 subset.
+
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 28.
