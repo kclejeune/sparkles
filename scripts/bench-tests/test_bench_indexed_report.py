@@ -33,9 +33,15 @@ def serial(
     people=1000,
     scenario="serial-literal",
     syncs=None,
+    warmup=(0, 0.0),
 ):
-    """A serial process whose counters hold `syncs` commits, by default one per request."""
-    syncs = count if syncs is None else syncs
+    """A serial process whose counters hold `syncs` commits, by default one per request.
+
+    The client sent `count` timed requests of mean latency `mean` after `warmup` untimed
+    requests of the given count and latency.
+    """
+    count_all = count + warmup[0]
+    syncs = count_all if syncs is None else syncs
     return {
         "block": block,
         "scenario": scenario,
@@ -45,7 +51,7 @@ def serial(
         "calibration": False,
         "writers": {"p50_ms": p50, "p90_ms": p50 * 1.1, "mean_ms": mean},
         "sync": (sync_ms * syncs / 1000, syncs),
-        "attempts": (count, mean),
+        "attempts": (count, mean, warmup),
     }
 
 
@@ -73,8 +79,9 @@ class Campaign:
             (run / "before" / "metrics.txt").write_text(scrape(0.5, 10))
             seconds, count = row["sync"]
             (run / "metrics.txt").write_text(scrape(0.5 + seconds, 10 + count))
-            attempts, mean = row["attempts"]
+            attempts, mean, (warmups, warmup_ms) = row["attempts"]
             lines = ["client\tindex\ttimed\tstart_unix\tend_unix\tlatency_ms\tstatus"]
+            lines += [f"0\t{i}\tfalse\t0\t0\t{warmup_ms}\t200" for i in range(warmups)]
             lines += [f"0\t{i}\ttrue\t0\t0\t{mean}\t200" for i in range(attempts)]
             (run / "request-timings.tsv").write_text("\n".join(lines) + "\n")
         (self.root / "results.json").write_text(json.dumps(results))
@@ -121,18 +128,20 @@ class IndexedReport(unittest.TestCase):
         self.assertAlmostEqual(metrics["overhead_ms"]["on"]["median"], 0.2)
 
     def test_overhead_uses_the_commits_the_counters_hold(self):
-        # 200 warmup commits synchronize in 1.6 ms and 2,000 timed ones in 0.23 ms, so
-        # the counters average 0.3 ms over the 2,200 commits the client sent. The
-        # latency of those requests averages 0.5 ms, which leaves an overhead of 0.2 ms.
-        mean = 0.5
+        # 200 warmup requests take 1.0 ms and sync in 1.6 ms, and 2,000 timed requests
+        # take 0.43 ms and sync in 0.23 ms. The counters average 0.3 ms over the 2,200
+        # commits and the requests average 0.482 ms, so the overhead is 0.182 ms. The
+        # timed requests alone would give 0.43 - 0.3 = 0.13 ms.
         sync_ms = (200 * 1.6 + 2000 * 0.23) / 2200
-        rows = abba(0, (mean, mean, sync_ms), (mean, mean, sync_ms))
+        mean = (200 * 1.0 + 2000 * 0.43) / 2200
+        row = (0.43, 0.43, sync_ms)
+        rows = abba(0, row, row, count=2000, warmup=(200, 1.0))
         with tempfile.TemporaryDirectory() as tmp:
             Campaign(tmp, rows)
             entry = REPORT.summarize(REPORT.load(tmp))[0]
-        self.assertAlmostEqual(
-            entry["metrics"]["overhead_ms"]["off"]["median"], mean - sync_ms
-        )
+        overhead = entry["metrics"]["overhead_ms"]["off"]["median"]
+        self.assertAlmostEqual(overhead, mean - sync_ms)
+        self.assertGreater(overhead - (0.43 - sync_ms), 0.05)
 
     def test_no_overhead_when_the_counters_hold_other_commits(self):
         # The delete scenario seeds its rows first, so the counters hold twice the

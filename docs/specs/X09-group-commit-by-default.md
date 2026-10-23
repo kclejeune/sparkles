@@ -1403,7 +1403,7 @@ has the tables. The harness verdicts are the following.
 | Serial commits, p50 and p90 within 5% | 28 of 36 checks met. Eight missed, five of them with grouping faster than 0.95 of the ordinary path. |
 | Four writers, at least 1.5 times | Met for full-text at 10.5M and for embedding at both sizes, with 1.65, 2.38 and 2.05. Missed for full-text at 1.05M, 1.34, and for spatial at 1.05M and 10.5M, 1.49 and 1.34. |
 | Text query p50 and p99 during four writers | Ratios of 0.987 and 1.000 at 1.05M and 0.997 and 0.982 at 10.5M. Not established, because the schedule lag requirement failed for both settings. |
-| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established, because the schedule lag requirement failed for the ordinary writer at both sizes. |
+| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established, because the schedule lag requirement failed for the ordinary writer at both sizes and for one grouped process at 10.5M. |
 | Peak resident memory within 64 MiB | Met in all ten cells. The largest certified difference was 19.6 MiB, for embedding at 1.05M. |
 
 The serial misses and the narrow throughput misses follow the drive more than the engine.

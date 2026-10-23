@@ -1899,7 +1899,8 @@ limits to 50 ms.
 
 All eight reader ratios lie between 0.925 and 1.044, and every mixed process achieved its
 offered rate to within 0.3%. The schedule lag requirement failed in all four cells, in both
-settings for full-text and for the ordinary writer alone for spatial. The harness therefore
+settings for full-text. For spatial it failed for the ordinary writer at 1.05M and in both
+settings at 10.5M. The harness therefore
 does not accept the comparison, and the reader gates stay not established.
 
 The full-text failure belongs to the index and not to grouping. In every text process, with
