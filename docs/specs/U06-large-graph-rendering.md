@@ -388,6 +388,7 @@ commit return from the cache in under 1 ms. Opening the largest class, `Research
 
 **Limits.** A2 and A3, the frame rate and the main-thread checks on a GPU runner, are not
 automated, because the CI browsers run without a GPU. The headless browser used for the
-checks here lost its WebGL context and fell back to Cytoscape, which exercised A9 but
-not A2. Groups by named graph and on-demand community detection are not built, for the
-reasons in §11.
+checks here draws with WebGL in software, which shows the views but measures no frame
+rate. Groups by named graph and on-demand community detection are not built, for the
+reasons in §11. A picture of up to 30 nodes draws every label, and its fit makes room
+for the labels on screen.
