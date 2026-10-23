@@ -304,11 +304,12 @@ that work by priority and links each item to its design spec.
   its whole set, a grouping's single group can outgrow the budget, and eager operators
   still fail at their budget. Completed hash joins release their working memory
   at EOF. Grouping above an ordered spilled join remains a performance follow-up.
-  A build without a usable shared key keeps its real memory budget when spill is enabled. Ordered join output consolidates as it is
-  produced, with at most 128 finished output files and one active writer. A spilled
-  join that must keep its order writes its output
-  once more to merge it. In the initial implementation's historical measurements,
-  this made one join under 4 MiB 8.9 times slower than in memory. The full-scale
+  A build without a usable shared key keeps its real memory budget when spill is
+  enabled. Ordered join output consolidates as it is produced, with at most 128
+  finished output files and one active writer. A spilled join that must keep its
+  order writes its output once more to merge it. In the initial implementation's
+  measurements, this made one join under 4 MiB 8.9 times slower than the same cursor
+  without a memory limit. The full-scale
   20-million-row sort and 10-million-group aggregate and DISTINCT matrix now pass
   in plain and encrypted modes under 64 MiB. Item 93 retains the execution
   follow-ups, performance investigation and review of enabling spill by default.

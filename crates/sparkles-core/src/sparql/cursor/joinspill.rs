@@ -1339,6 +1339,60 @@ mod tests {
             .collect()
     }
 
+    /// A first build batch that does not fit has no rows in front of it. Its own
+    /// shared columns choose the partitioning key, so the join spills instead of
+    /// failing with the memory error that started the spill.
+    #[test]
+    fn a_first_build_batch_that_does_not_fit_spills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 34,
+            query_bytes: 1 << 34,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let int = |i: i64| Id::from_i64(i).unwrap();
+        let table = |vars: Vec<VarId>, rows: Vec<Vec<Id>>| {
+            let mut table = Table::new(vars.clone());
+            for row in &rows {
+                table.push_row(row);
+            }
+            let mut node = Node::leaf(Kind::Empty, vars, rows.len() as f64, String::new());
+            node.certain.clear();
+            node.kind = Kind::Values(table);
+            node
+        };
+        let left = table(
+            vec![KEY, LEFT],
+            (0..10).map(|i| vec![int(i), int(i)]).collect(),
+        );
+        let right = table(
+            vec![KEY, SHARED, RIGHT],
+            (0..8192)
+                .map(|i| vec![int(i % 10), int(i), int(i * 3)])
+                .collect(),
+        );
+        let node = binary(Kind::LeftJoin { expr: None }, left, right);
+        let mut expected = rows(&exec::execute(&context(u64::MAX, None), &node).unwrap().0);
+        expected.sort();
+        let ctx = context(160 << 10, Some(&spill));
+        let before = spill.written_bytes();
+        let mut op = Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+        let options = CursorOptions {
+            batch_rows: 4096,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        while let Some(batch) = op.next(&ctx, &options, 4096).unwrap() {
+            out.extend(rows(&batch.table));
+        }
+        out.sort();
+        assert_eq!(out, expected);
+        assert!(spill.written_bytes() > before, "the join did not spill");
+    }
+
     #[test]
     fn keyless_builds_above_the_proactive_threshold_still_fit() {
         let tmp = tempfile::tempdir().unwrap();

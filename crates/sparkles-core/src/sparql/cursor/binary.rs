@@ -426,7 +426,17 @@ impl Binary {
         error: Error,
     ) -> Result<()> {
         self.index = None;
-        let Some(key) = self.key_column(ctx, &build.table)? else {
+        // The rows read so far choose the key. A first batch that did not fit has no
+        // rows before it, and build rows that leave every shared column unbound select
+        // nothing, so the pending batch chooses the key then.
+        let key = match self.key_column(ctx, &build.table)? {
+            Some(key) => Some(key),
+            None => match &pending {
+                Some(pending) => self.key_column(ctx, &pending.table)?,
+                None => None,
+            },
+        };
+        let Some(key) = key else {
             return Err(error);
         };
         let child = &mut children[1 - self.probe_side];

@@ -1023,16 +1023,34 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
 /// Only an admitted pure ASK product is oriented: build the same smaller input
 /// that eager limited execution collects, while streaming the larger one. Other
 /// cursor and eager plans retain their original children and variable order.
+/// Any other shape, which a future cursor admission might pass here, is left alone.
 fn orient_filtered_ask(node: &mut Node) {
-    let mut filtered = &mut node.children[0];
+    use super::plan::JoinAlgo;
+
+    let Some(mut filtered) = node.children.first_mut() else {
+        return;
+    };
     for _ in 0..8 {
-        if !matches!(filtered.kind, Kind::Project(_)) {
+        if !matches!(filtered.kind, Kind::Project(_)) || filtered.children.len() != 1 {
             break;
         }
         filtered = &mut filtered.children[0];
     }
-    let product = &mut filtered.children[0];
-    if product.children[0].est < product.children[1].est {
+    if !matches!(filtered.kind, Kind::Filter(_)) {
+        return;
+    }
+    let Some(product) = filtered.children.first_mut() else {
+        return;
+    };
+    if matches!(
+        product.kind,
+        Kind::Join {
+            algo: JoinAlgo::Cross,
+            ..
+        }
+    ) && product.children.len() == 2
+        && product.children[0].est < product.children[1].est
+    {
         product.children.swap(0, 1);
     }
 }
@@ -4017,6 +4035,28 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn orienting_leaves_other_ask_shapes_alone() {
+        use crate::store::{Store, StoreOptions};
+        let store = Store::in_memory(StoreOptions::default());
+        for text in ["ASK {?s ?p ?o}", "ASK {?s ?p ?o FILTER(?s = ?o)}", "ASK {}"] {
+            let query = super::super::parse_query(text, None, &[]).unwrap();
+            let options = QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            };
+            let mut p = super::super::prepare_query(store.snapshot(), &query, &options, None, None)
+                .unwrap();
+            fn shape(node: &Node) -> String {
+                let children: Vec<String> = node.children.iter().map(shape).collect();
+                format!("{:?}/{}[{}]", node.vars, node.est, children.join(","))
+            }
+            let before = shape(&p.node);
+            orient_filtered_ask(&mut p.node);
+            assert_eq!(shape(&p.node), before, "{text}");
         }
     }
 

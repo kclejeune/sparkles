@@ -1259,7 +1259,7 @@ tests are `tests/spill_join.rs`, the unit tests of `joinspill.rs`, `merge.rs` an
   quarter of the room left when that is more.
 * Build rows whose key is unbound stay in memory, as §6.3 says, and join each partition
   in its first chunk. Probe rows whose key is unbound go to their own file, which is
-  joined against every build file after the others. OPTIONAL, semi, anti and MINUS joins
+  joined against every build file before the partitions' own jobs run. OPTIONAL, semi, anti and MINUS joins
   keep a bitmap of matched probe rows whenever a partition takes more than one chunk.
 * §6.3 clears the cursor's order claims once a join spills. Claims are fixed when the
   cursor is built, before anything spills, so the build now passes down whether an
