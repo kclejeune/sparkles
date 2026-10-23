@@ -1,7 +1,8 @@
 # X07: Cold sparse reads
 
-> **Status:** implemented in part (Phases 1 and 2). Phases 3 and 4 are not built. Phase 3
-> is deferred until a forge run shows that the remaining cold time is block decoding.
+> **Status:** implemented in part (Phases 1 and 2). Phases 3 and 4 are not built. The
+> measurements of 2026-10-23 attribute the remaining cold time of the point lookups to block
+> decoding, so Phase 3 is the next step.
 >
 > **Phases:** Phase 1 is per-query I/O accounting and a profile of the cold losses.
 > Phase 2 adds batched resolution of a query's constants, first-scan prefetch, a read
@@ -423,7 +424,8 @@ Phase 1 breakdown attributes the remainder to block reads or decoding.
 
 ## Outcome
 
-Phases 1 and 2 are built. Phase 3 and Phase 4 are not.
+Phases 1 and 2 are built. Phase 3 and Phase 4 are not. The [Phase 3 decision](#phase-3-decision)
+records why Phase 3 is the next step.
 
 ### What was built
 
@@ -795,36 +797,87 @@ The 1.01B dense gate A5 and the 1.01B window sweep remain open, because no 1.01B
 was available on forge or atlas. The full counter-cost gate A2 is not isolated by this
 pair, which measures all of X07 together.
 
+### Remaining cold gaps
+
+A cold sample starts a fresh server on an evicted store, and the measurements of
+2026-10-23 found that it costs about as much as a fresh server on a store whose pages are
+all resident. On forge at 10.5M, `star-lookup` took a median of 17.9 ms cold and 14.4 ms
+fresh, and `path-plus` 5.3 ms and 4.9 ms. The page cache misses therefore explain little
+of the gap to Oxigraph, and the cost is CPU time in a process that has not yet run a
+query. `profile=io` on atlas splits a fresh request at 10.5M as follows.
+
+| Query, fresh | Server total ms | Plan ms | Execution ms | Columns decoded | Decoded MiB | Decode CPU ms | Rows read |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `star-lookup` | 14.8 | 1.6 | 11.9 | 136 | 34 | 64.9 | 102 |
+| `employee-docs` | 12.7 | 1.3 | 9.8 | 92 | 23 | 41.4 | 28 |
+| `values-star` | 5.5 | 2.0 | 2.7 | 8 | 2 | 3.8 | 22 |
+| `path-plus` | 2.9 | 0.3 | 2.3 | 4 | 1 | 2.1 | 0 |
+
+The decode CPU time is summed over the decode pool, so it can exceed the execution time.
+Each lookup decodes whole 32,768-row columns of 256 KiB, so `star-lookup` decodes 34 MiB to
+read 102 rows. A `perf` profile of the decode threads on forge put about 37% of their time
+in the kernel clearing fresh pages for the decoded columns, about 37% in the varint
+decoder and about 12% in LZ4. Turning off transparent huge pages for mimalloc made no
+clear difference.
+
+Planning decoded blocks too. The planner took the row count of a predicate's pattern from
+the two edge blocks of its range, and on a cold process those were decoded to plan the
+query. Commit `69714b13` takes the count of a pattern with only its predicate bound from
+the predicate statistics of the generation, adjusted by the uncompacted delta, and falls
+back to the block count when the statistics do not describe the same base. A test shows
+that planning such a pattern decodes no block. In four interleaved rounds of 5 samples
+each on forge, with curl as the client, it moved the cold medians at 10.5M as follows.
+
+| Cold, forge, 10.5M, median ms | Before | After |
+|---|---:|---:|
+| `star-lookup` | 20.3 | 17.9 |
+| `employee-docs` | 16.0 | 14.1 |
+| `values-star` | 9.1 | 8.2 |
+| `path-plus` | 5.5 | 5.3 |
+
+These figures use a different client from the `bench.sh` columns above and compare only
+with each other. The warm protocol of `scripts/x07-warm-insns.py` on atlas, at 1.05M in
+rounds before, after, after, before, put `employee-docs` at 0.990 of the instructions
+before the change and every query of the suite between 0.975 and 1.024. Starting the decode pool before the server listens was tried as well, in
+the same protocol against the build with the statistics change. It moved no query by more
+than the spread of the rounds, and it was not kept.
+
+The probes that estimate joins from a VALUES table still decode up to two blocks per group
+at planning time when the cache does not hold them, which is most of the 2 ms that
+`values-star` spends planning. That budget is a deliberate tradeoff of plan quality
+against plan time, and it was left unchanged. The rest of a fresh request, about 2 ms
+between the server's total and the client's time for `path-plus`, is spent outside query
+execution, in the handoff of a query that the server does not yet know to be quick to a
+blocking thread and in the transfer. Changing that policy belongs to the execution work of
+roadmap item 7 and was not attempted here.
+
 ### Phase 3 decision
 
-Phase 3 was not started. The breakdown attributes `path-plus` and `star-lookup` to
-column decoding, and segments would cut `path-plus` decoding by a large factor. Three
-things are open, and the first two are cheaper than a new block format.
+Phase 3 should start, as its own change. The rule of §10 was that it starts if decoding,
+without page faults, and the index wait are together larger than the gap to the target.
+For `star-lookup` at 10.5M the execution time is 11.9 ms, almost all of it decoding, and
+the gap to the target was 1.5 ms before the statistics change. Without the 37% spent
+clearing pages, decoding still accounts for several times the gap. The same holds for
+`employee-docs`, which decodes 23 MiB to read 28 rows. Segments of 1,024 rows would decode
+about one thirty-second of each block for these lookups, which shrinks the decoder time
+and the page clearing together.
 
-* The request time is larger than the execution time. For `star-lookup` at 10.5M the
-  server reports 12 ms of 25 ms median, and the rest is not split into transfer, client
-  and kernel time. A decode-bound claim needs that split on forge.
-* Decoding takes about 116 µs per 32,768-row column, which is slow for a delta decode,
-  and the decode CPU time doubles on the pool (30.5 against 16.7 ms). Both fit the cost of
-  page faults on the freshly allocated 256 KiB output of each column, which the decode
-  timer includes and concurrent faults make worse. The profile already reports major
-  and minor faults. A warm decode of the same columns remains needed to distinguish
-  fault cost from decoder CPU time before choosing buffer reuse or segmentation.
-* `path-plus` spends about 1.5 ms outside execution, so segments alone cannot reach the
-  2.1 ms target.
-
-The recommendation is a forge run of the four queries at 1.05M and 10.5M with
-`profile=io`, with base and final builds, then a decision. Phase 3 starts if decode, not
-including page faults, and the index wait are together larger than the gap to the target.
+Segments do not close every gap. `path-plus` decodes 1 MiB in about 2 ms, and segments
+could remove most of that, but its target of 2.1 ms is below the fixed cost of a first
+request outside execution. `values-star` also needs cheaper planning probes. Phase 3 is
+also an on-disk format change, so it needs a new index format version, a clean refusal by
+older builds, fixtures for the stores written before it, and its own index-size, load-time
+and warm-decode gates from §6.4. For those reasons it was not folded into this change.
 
 ### Not done
 
 Phase 3 and Phase 4, the 1.01B gates (A5 and its window sweep), the cold targets of
-`values-star`, `path-plus` and 10.5M `star-lookup`, a per-query set of
+`values-star`, `path-plus` and 10.5M `star-lookup`, cheaper join probes at planning time
+on a cold process, a per-query set of
 hinted blocks in the context to avoid a second hint of a block, I/O priority for
 read-ahead, and a `FILTER` constant collector beyond the common comparison nodes.
 `bench-regressions.py` gained `--io` on 2026-10-18 under roadmap item 1, which keeps each
-sample's server times and I/O profile for the forge run of the Phase 3 decision. The
+sample's server times and I/O profile. The
 Namespace screen still reports no I/O counters, and its primary metric excludes the plan time and serialization time in which
 the prefetch work runs. The profile reads `getrusage(RUSAGE_SELF)` for process-wide
 faults, and a per-operator `RUSAGE_THREAD` breakdown is not built. `/$/stats` has no I/O

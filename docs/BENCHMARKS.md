@@ -801,6 +801,12 @@ The A/B columns time requests from a Python client and are not comparable with t
 than 5% slower at either size. The 1, 4 and 16 MiB read windows gave medians within the
 noise of each other at 10.5M. The dense-read gate at 1.01B was not run.
 
+A later change takes a predicate's row count for planning from the statistics instead of
+decoding blocks. In an interleaved A/B on forge at 10.5M it made cold `star-lookup`,
+`employee-docs` and `values-star` 9 to 12% faster and left `path-plus` unchanged. The
+`bench.sh` columns above predate it. [X07](specs/X07-cold-sparse-reads.md#remaining-cold-gaps)
+gives those figures and the profile of the remaining cold time.
+
 ### BSBM Explore at 10M triples
 
 This run used 10,095,035 generated triples and 28,480 products on forge on
