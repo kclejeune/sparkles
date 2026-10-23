@@ -1068,7 +1068,8 @@ number or a `time:` or `snapshot:` point. The call also takes the query argument
 bear on the view and the budgets, which are `default_graph`, `named_graphs`,
 `include_inferred`, `timeout`, `max_rows`, `max_memory_bytes`, `max_rows_produced`,
 `cancel`, `base_iri` and `prefixes`. It returns the answer as a dict. The queries run
-without the GIL, and a malformed request raises `InvalidInputError`.
+without the GIL and share one deadline made from `timeout`, and a malformed request
+raises `InvalidInputError`.
 
 ### Roadmap follow-ups (2026-10-12)
 

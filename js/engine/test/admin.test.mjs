@@ -33,6 +33,7 @@ import {
   factory,
   ConflictError,
   InvalidInputError,
+  QueryTimeoutError,
 } from '../dist/index.js';
 const temp = () => mkdtemp(join(tmpdir(), 'sparkles-node-admin-'));
 for (const mode of ['compute-cancel', 'compute-timeout', 'slot-cancel', 'slot-timeout']) {
@@ -412,6 +413,30 @@ test('graph overview groups a class and opens a group', async (t) => {
   controller.abort();
   await assert.rejects(
     ds.graph.groups({ within: { class: ex + 'Person' } }, { signal: controller.signal }),
+  );
+});
+test('the timeout of graph overview covers all of its queries', async (t) => {
+  const ex = 'http://ex.org/';
+  const ds = t.resource(Dataset.memory());
+  // the answer takes many queries, each of which is shorter than the timeout
+  const rows = Array.from(
+    { length: 200000 },
+    (_, i) =>
+      `<${ex}s${i}> a <${ex}T> ; <${ex}region> <${ex}r${i % 12}> ; <${ex}knows> <${ex}s${(i * 7) % 200000}> .`,
+  ).join('\n');
+  await ds.load(rows, { format: 'ttl' });
+  const request = { within: { class: ex + 'T' }, by: { property: ex + 'region' } };
+  const timed = async () => {
+    const start = performance.now();
+    const answer = await ds.graph.groups(request, { noCache: true });
+    assert.equal(answer.groups.length, 12);
+    return performance.now() - start;
+  };
+  const whole = Math.min(await timed(), await timed());
+  assert.ok(whole > 40, `the answer took ${whole} ms, too fast to bound`);
+  await assert.rejects(
+    ds.graph.groups(request, { noCache: true, timeout: Math.floor(whole / 2) }),
+    QueryTimeoutError,
   );
 });
 test('replacement is atomic and callback snapshot capture is rejected', async (t) => {

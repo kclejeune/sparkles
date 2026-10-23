@@ -1,8 +1,17 @@
 """`Dataset.graph.groups` returns the answer of the library's `ds.graph().groups`."""
 from __future__ import annotations
 
+import time
+
 import pytest
-from sparkles import BudgetExceededError, CancelToken, CancelledError, Dataset, InvalidInputError
+from sparkles import (
+    BudgetExceededError,
+    CancelToken,
+    CancelledError,
+    Dataset,
+    InvalidInputError,
+    QueryTimeoutError,
+)
 
 EX = "http://ex.org/"
 DATA = f"""PREFIX ex: <{EX}>
@@ -117,3 +126,25 @@ def test_errors_and_cancellation(ds: Dataset) -> None:
     ds.close()
     with pytest.raises(InvalidInputError, match="closed"):
         handle.groups({"class": EX + "Person"})
+
+
+def test_the_timeout_covers_all_of_the_queries() -> None:
+    # the answer takes many queries, each of which is shorter than the timeout
+    rows = "\n".join(
+        f"<{EX}s{i}> a <{EX}T> ; <{EX}region> <{EX}r{i % 12}> ; <{EX}knows> <{EX}s{(i * 7) % 200000}> ."
+        for i in range(200000)
+    )
+    # two copies, so that the result cache of the first has nothing to serve the second
+    measured, bounded = Dataset(), Dataset()
+    measured.load(rows, "turtle")
+    bounded.load(rows, "turtle")
+    request = {"class": EX + "T"}
+    by = {"property": EX + "region"}
+
+    start = time.perf_counter()
+    answer = measured.graph.groups(request, by=by)
+    whole = time.perf_counter() - start
+    assert len(answer["groups"]) == 12
+    assert whole > 0.04, f"the answer took {whole} s, too fast to bound"
+    with pytest.raises(QueryTimeoutError):
+        bounded.graph.groups(request, by=by, timeout=whole / 2)

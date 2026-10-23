@@ -1494,7 +1494,8 @@ query that bear on the view and the budgets, such as `defaultGraph`, `namedGraph
 `includeInferred`, `timeout`, `maxRows`, `maxMemoryBytes`, `maxRowsProduced` and
 `signal`. The answer is an object whose `commit` is a bigint, like the other commit
 numbers of the administration calls. The call reads, so it does not wait for the
-writer queue.
+writer queue, but it takes a permit of `maxConcurrentQueries` like a query does and holds
+it while its queries run.
 
 ### Roadmap follow-ups (2026-10-12)
 

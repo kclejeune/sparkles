@@ -243,6 +243,31 @@ test(
   },
 );
 
+test('graph overview waits for a query permit', { timeout: 30000 }, async () => {
+  const ds = Dataset.memory();
+  configure({ maxConcurrentQueries: 1 });
+  try {
+    const data = Array.from({ length: 10000 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
+    await ds.load(data, { format: 'ttl' });
+    // A join of 10^8 rows holds the only permit until its timeout.
+    const slow = ds
+      .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
+        timeout: 5000,
+      })
+      .catch((e) => e);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await assert.rejects(
+      ds.graph.groups({ within: { class: 'urn:C' } }, { noWait: true }),
+      ConflictError,
+    );
+    await slow;
+    assert.equal((await ds.graph.groups({ within: { class: 'urn:C' } })).within.size, 0);
+  } finally {
+    configure({ maxConcurrentQueries: availableParallelism() });
+    await ds.close();
+  }
+});
+
 test('existing cursors use the query limit after reconfiguration', { timeout: 30000 }, async () => {
   const ds = Dataset.memory();
   const controller = new AbortController();

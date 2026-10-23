@@ -399,6 +399,12 @@ impl NativeDataset {
         } else {
             None
         };
+        // the overview runs a number of queries, so it waits for a reader's turn like one
+        let _reader = if op == "graph.groups" {
+            Some(query_permit(&v, &flag).await?)
+        } else {
+            None
+        };
         blocking(move || {
             let ctl = sparkles::task::Control {
                 deadline: write_options(&v, flag.clone())?.deadline,

@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 use sparkles::history::At;
 use sparkles::overview::GroupsRequest;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 handle!(PyGraphOverview, "GraphOverview");
 
@@ -62,6 +63,11 @@ impl PyGraphOverview {
             ..Default::default()
         };
         let (mut opts, at) = query_options(&args)?;
+        // one deadline for all of the overview's queries, not a timeout for each
+        opts.deadline = opts
+            .timeout
+            .take()
+            .and_then(|t| Instant::now().checked_add(t));
         apply_defaults(&mut opts, &ds.query_options(), &args)?;
         req.at = at.filter(|a| *a != At::Head);
         let token = args
