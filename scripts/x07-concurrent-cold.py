@@ -56,31 +56,39 @@ def query(port, q):
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=600) as r:
         body = r.read()
-    ms = (time.perf_counter() - t0) * 1000
-    return ms, hashlib.sha256(b"\n".join(sorted(body.splitlines()))).hexdigest()
+    t1 = time.perf_counter()
+    digest = hashlib.sha256(b"\n".join(sorted(body.splitlines()))).hexdigest()
+    return (t1 - t0) * 1000, digest, t0, t1
 
 
 def start(a, prefix=()):
-    data = tempfile.mkdtemp(prefix="x07-a6-")
     try:
         socket.create_connection(("127.0.0.1", a.port), timeout=0.25).close()
-        raise RuntimeError(f"port {a.port} is in use")
     except OSError:
         pass
+    else:
+        raise RuntimeError(f"port {a.port} is in use")
+    data = tempfile.mkdtemp(prefix="x07-a6-")
     log = open(os.path.join(os.path.dirname(os.path.abspath(a.out)), "a6-server.log"), "ab")
     proc = subprocess.Popen(
         [*prefix, a.bin, "--result-cache-mb", "0", "serve", "--data", data,
          "--loc", f"bench={a.db}", "--port", str(a.port), "--timeout", "600", "--read-only"],
         stdout=log, stderr=log, start_new_session=True)
-    for _ in range(1200):
-        if proc.poll() is not None:
-            raise RuntimeError("server exited")
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{a.port}/$/ping", timeout=1).close()
-            return proc, data
-        except Exception:
-            time.sleep(0.05)
-    raise RuntimeError("server did not start")
+    log.close()
+    try:
+        for _ in range(1200):
+            if proc.poll() is not None:
+                raise RuntimeError("server exited")
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{a.port}/$/ping", timeout=1).close()
+                return proc, data
+            except OSError:
+                time.sleep(0.05)
+        raise RuntimeError("server did not start")
+    except BaseException:
+        # every failed start stops its own server and removes its directory
+        stop(proc, data)
+        raise
 
 
 def stop(proc, data):
@@ -98,10 +106,13 @@ def sample(a, mode, people, prefix=()):
     proc, data = start(a, prefix)
     ready = time.time()
     try:
-        results = {}
+        results, errors = {}, {}
 
         def one(key, q):
-            results[key] = query(a.port, q)
+            try:
+                results[key] = query(a.port, q)
+            except BaseException as e:  # reported by the caller, never dropped
+                errors[key] = e
 
         threads = []
         if mode == "with-export":
@@ -118,7 +129,18 @@ def sample(a, mode, people, prefix=()):
             t.join()
     finally:
         stop(proc, data)
+    if errors:
+        key, e = next(iter(errors.items()))
+        raise RuntimeError(f"{mode} sample: request {key} failed: {e!r}")
+    if mode == "with-export" and "export" not in results:
+        raise RuntimeError("with-export sample has no export result")
     return ready, results
+
+
+def overlaps(r, people):
+    """Whether the export ran during every lookup, from start to end."""
+    _, _, s, e = r["export"]
+    return all(s <= r[i][2] and r[i][3] <= e for i in people)
 
 
 def main():
@@ -142,15 +164,22 @@ def main():
             row = {"sample": s, "mode": mode, "lookups_ms": lk,
                    "lookup_median_ms": statistics.median(lk),
                    "digests": {str(i): r[i][1] for i in people}}
-            if "export" in r:
-                row["export_ms"], row["export_digest"] = r["export"]
+            if mode == "with-export":
+                row["export_ms"], row["export_digest"] = r["export"][:2]
+                # a sample whose export did not span every lookup is kept in the record
+                # but left out of the summary, since it did not test concurrency
+                row["overlap"] = overlaps(r, people)
             out["samples"].append(row)
             print(mode, s, f"median {row['lookup_median_ms']:.2f} ms",
-                  f"export {row.get('export_ms', 0):.1f} ms", flush=True)
+                  f"export {row.get('export_ms', 0):.1f} ms",
+                  "" if row.get("overlap", True) else "(no overlap, excluded)", flush=True)
     for mode in ("alone", "with-export"):
-        meds = [x["lookup_median_ms"] for x in out["samples"] if x["mode"] == mode]
-        allk = [v for x in out["samples"] if x["mode"] == mode for v in x["lookups_ms"]]
-        out[mode] = {"median_of_sample_medians": statistics.median(meds),
+        valid = [x for x in out["samples"] if x["mode"] == mode and x.get("overlap", True)]
+        if not valid:
+            raise SystemExit(f"no valid {mode} sample: raise --delay-ms or check the export")
+        meds = [x["lookup_median_ms"] for x in valid]
+        allk = [v for x in valid for v in x["lookups_ms"]]
+        out[mode] = {"samples": len(valid), "median_of_sample_medians": statistics.median(meds),
                      "median_of_all_lookups": statistics.median(allk)}
     out["ratio_with_export_over_alone"] = (out["with-export"]["median_of_all_lookups"]
                                            / out["alone"]["median_of_all_lookups"])

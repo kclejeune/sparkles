@@ -141,11 +141,15 @@ def main():
                 wall = time.time() - t0
                 hashes = set(json.loads(res.stdout)) | warm
                 c = perf_counts(pf)
+                # an event that perf could not count must fail the run, not read as zero
+                for ev in ("instructions", "cycles"):
+                    if not c.get(ev):
+                        raise RuntimeError(f"perf counted no {ev} for {n}, see {pf}")
                 row = {
                     "label": args.label, "query": n, "requests": args.requests,
-                    "instructions": c.get("instructions"), "cycles": c.get("cycles"),
-                    "insns_per_req": c.get("instructions", 0) / args.requests,
-                    "cycles_per_req": c.get("cycles", 0) / args.requests,
+                    "instructions": c["instructions"], "cycles": c["cycles"],
+                    "insns_per_req": c["instructions"] / args.requests,
+                    "cycles_per_req": c["cycles"] / args.requests,
                     "wall_s": round(wall, 3), "answers": sorted(hashes),
                 }
                 rows.write(json.dumps(row) + "\n")
