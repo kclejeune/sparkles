@@ -1162,3 +1162,7 @@ the cursor ended and that the index's list of other values grew without charging
 old buffer during a move. The index is now released with the join's other working sets,
 and the list is counted, charged and allocated once. A third review asked for the
 cancellation check that the list's fill pass had lost, and it was restored.
+After the rebase onto item 96, a review of the shared rule found that the retry's test of
+the cursor ran before every automatic eager run and planned each EXISTS pattern, which
+slowed successful queries with many EXISTS filters. The test now runs only after an eager
+memory failure, on a fresh plan that keeps the first run's deadline.
