@@ -936,13 +936,13 @@ fn execute_prepared(
     // The operators' state is gone, so the pool keeps only what the result holds. A
     // graph result's triples are not measured, and it keeps its query's highest
     // estimate as before.
-    if matches!(kind, QueryKind::Select | QueryKind::Ask) {
-        if let Err(error) = ctx.shrink_retained(result.table.mem_bytes()) {
-            return Err(Box::new(Failed {
-                error,
-                plan: Some(std::mem::take(&mut result.plan)),
-            }));
-        }
+    if matches!(kind, QueryKind::Select | QueryKind::Ask)
+        && let Err(error) = ctx.shrink_retained(result.table.mem_bytes())
+    {
+        return Err(Box::new(Failed {
+            error,
+            plan: Some(std::mem::take(&mut result.plan)),
+        }));
     }
     Ok(result)
 }
