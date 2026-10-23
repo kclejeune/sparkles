@@ -3,6 +3,7 @@
 
     qmph.py <driver-output.xml> <qmph.json> <engine> <clients> <query-name> [<driver exit status> [<reason>]]
     qmph.py --check <qmph.json> [<comma-separated query numbers to leave out>]
+    qmph.py --unanswered <qmph.json> <engine> <clients> <reason>
 
 The first form adds one run. The driver (benchmark.testdriver.TestDriver) writes an XML file
 with the query mixes per hour it measured and, per query, how often it ran, how many results
@@ -12,7 +13,8 @@ scripts/bench-record.py reads. A missing or unreadable XML file, or a driver tha
 nonzero status, records status `error`, and a run in which any query timed out records `timeout`.
 That outcome is also kept in `driver_status`. The bounded driver wrapper can record a whole-run
 timeout even when the driver did not finish its XML. Reasons are kept in `status_reasons`.
-Interrupted or failed driver processes do not report throughput.
+Interrupted or failed driver processes do not report throughput. The third form fails a run
+whose server no longer answered after it, keeping an earlier timeout or error.
 
 The driver does not look at what a query returns, so a query that fails quickly, or that
 answers wrongly and quickly, makes the query mixes per hour look better. The second form compares
@@ -151,9 +153,24 @@ def check(path, skip=()):
     print(f"{compared} runs compared, {bad} disagree")
 
 
+def unanswered(out, engine, clients, reason):
+    """Fail a recorded run whose server stopped answering during it. A run that already
+    failed keeps its status, and every run loses its throughput and gains the reason."""
+    d = load(out)
+    entry = d.setdefault(engine, {}).setdefault(clients, {"status": "error", "driver_status": "error"})
+    if entry.get("driver_status", entry.get("status")) == "ok":
+        entry["status"] = entry["driver_status"] = "error"
+    entry["qmph"] = None
+    entry["status_reasons"] = entry.get("status_reasons", []) + [reason]
+    save(out, d)
+    print(f"{engine} x{clients}: {entry['status']}, {reason}")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--check":
         check(sys.argv[2], set(sys.argv[3].split(",")) if len(sys.argv) > 3 else set())
+    elif sys.argv[1] == "--unanswered":
+        unanswered(*sys.argv[2:6])
     else:
         xml, out, engine, clients, name = sys.argv[1:6]
         add(xml, out, engine, clients, name, int(sys.argv[6]) if len(sys.argv) > 6 else 0,

@@ -258,6 +258,29 @@ bsbm_qmph
         self.assertIsNone(data["dies"]["1"]["qmph"])
         self.assertIn("stopped answering", data["dies"]["1"]["status_reasons"][0])
 
+    def test_a_timed_out_cell_whose_server_stopped_answering_stays_a_timeout(self):
+        source = (ROOT / "scripts/bench-bsbm.sh").read_text()
+        function = source[source.index("bsbm_qmph() {\n"):source.index("\nSUITE_EXTRA=bsbm_qmph")]
+        for name in ("bsbm", "results", "logs"):
+            (self.work / name).mkdir()
+        script = function + """
+declare -A NAME=([dies]=dies) URL=([dies]=localhost/hang)
+ENGINES='dies' MIXES=std CLIENTS='1' USECASE=explore UCF=explore.txt RDFXML_NRS='' DEAD_ENGINES=''
+BSBM_WARMUP=1 BSBM_RUNS=1 DRIVER_TIMEOUT_MS=300000 BSBM_MAX_TIME=0.5 BSBM_KILL_AFTER=0.2
+revive() { :; }
+answering() { false; }
+bsbm_qmph
+"""
+        process = subprocess.run(["bash", "-euc", script], cwd=self.work,
+                                 env=self.env | {"ROOT": str(ROOT), "WORK": str(self.work), "JAVA": str(self.fake)},
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        entry = json.loads((self.work / "results/qmph.json").read_text())["dies"]["1"]
+        self.assertEqual(entry["status"], "timeout")
+        self.assertIsNone(entry["qmph"])
+        self.assertIn("wall budget", entry["status_reasons"][0])
+        self.assertIn("stopped answering", entry["status_reasons"][1])
+
 
 if __name__ == "__main__":
     unittest.main()

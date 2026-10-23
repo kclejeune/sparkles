@@ -253,7 +253,7 @@ EOF
         # The driver can exit 0 after connection errors, and requests that fail fast would
         # inflate the query mixes per hour. A server that no longer answers fails the cell.
         if ! answering "$e"; then
-          python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" "results/driver-${NAME[$e]}-$c$sfx.xml" "$out" "${NAME[$e]}" "$c" "$label" 1 \
+          python3 -I "$ROOT/scripts/bench-bsbm/qmph.py" --unanswered "$out" "${NAME[$e]}" "$c" \
             "the server stopped answering during the driver run"
         fi
         # a server that crashed or hung during the mixes is restarted before the next run, so
