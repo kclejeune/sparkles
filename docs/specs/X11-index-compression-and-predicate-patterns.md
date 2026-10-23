@@ -655,6 +655,8 @@ where the cold figures apply. Every query returned the same answers with both co
 
 ### Phases not built
 
+Roadmap item 108 follows up on two of these results. It looks for a faster FSST decode path that meets the warm and export gates, and it measures Phase 2b on a dataset where a few prefixes cover most IRIs.
+
 #### Phase 2b, encoded IRIs
 
 §4.5 records that no IRI prefix covers even 1% of the DBpedia
