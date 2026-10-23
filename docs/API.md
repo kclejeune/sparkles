@@ -1204,7 +1204,9 @@ The design is in [U06 Phase 2](specs/U06-large-graph-rendering.md#3-server-and-a
 
 `POST /$/graph/{ds}/groups` groups the instances of a class, or of a group that an
 earlier answer named, and counts the edges between the groups. The Rust library gives
-the same answer through `ds.graph().groups`. Explore draws its
+the same answer through `ds.graph().groups`. Python returns it as a dict from
+`ds.graph.groups(within, by=…, limit=…, at=…)`, and Node.js as an object from
+`ds.graph.groups(request)`, in which `commit` is a bigint. Explore draws its
 overview from the class profiles and opens a class or a group with this route.
 
 ```ts

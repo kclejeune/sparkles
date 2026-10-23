@@ -267,8 +267,9 @@ that work by priority and links each item to its design spec.
   transfer format of Phase 3 are not built, so a WebGL view lays out every result in the
   browser. The frame-rate and main-thread acceptance examples (A2 and A3) have no
   Playwright performance project on a GPU runner, and the overview opens one path
-  below one class at a time, with no grouping by named graph. The Python, Node.js and
-  JVM bindings do not expose `ds.graph().groups` of the Rust library.
+  below one class at a time, with no grouping by named graph. The JVM
+  bindings do not expose `ds.graph().groups` of the Rust library, which Python and
+  Node.js reach as `Dataset.graph.groups`.
   [Roadmap](ROADMAP.md) item 29.
 
 * **Community summaries.** Leiden can compute a community hierarchy, and model
