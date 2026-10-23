@@ -126,7 +126,7 @@ These items are cheap or foundational.
 |---|---|---|---|
 | 27 | Live query profiling with verified rewrite suggestions | [U04](specs/U04-live-query-profiling.md) | M |
 | 28 | Query by example and Bloom-style search phrases | [U03](specs/U03-query-by-example.md) | M |
-| 29 | **Partly done (2026-10-23). Rendering very large graphs with WebGL, with server-side aggregation.** The user moved Phases 1 and 2 up the queue on 2026-10-23, and they shipped that day: Explore opens on a WebGL class overview with semantic zoom through `POST /$/graph/{ds}/groups`, and the query page draws results above 2,000 nodes with WebGL. Server layouts, the binary transfer format and the GPU frame-rate tests of Phase 3 remain, at this tier's priority. | [U06](specs/U06-large-graph-rendering.md#outcome) | M |
+| 29 | **Partly done (2026-10-23). Rendering very large graphs with WebGL, with server-side aggregation.** The user moved Phases 1 and 2 up the queue on 2026-10-23, and they shipped that day: Explore opens on a WebGL class overview with semantic zoom through `POST /$/graph/{ds}/groups`, and the query page draws results above 2,000 nodes with WebGL. Server layouts, the binary transfer format and the GPU frame-rate tests of Phase 3 remain, at this tier's priority, with a library call for the groups route. | [U06](specs/U06-large-graph-rendering.md#outcome) | M |
 | 30 | Notebooks stored in the dataset | [U05](specs/U05-notebooks.md) | M |
 | 31 | Data-quality timeline and schema diagram | [U07](specs/U07-data-quality-and-schema-diagram.md) | M |
 | 32 | Parameterized reusable plans | [X10](specs/X10-reusable-query-plans.md), [P01](specs/P01-python-bindings.md#roadmap-follow-ups-2026-10-12) | L |

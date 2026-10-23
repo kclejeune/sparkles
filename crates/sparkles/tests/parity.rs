@@ -425,6 +425,12 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("draftShapes", "schema.draft_shapes", |ds| {
             ds.schema().draft_shapes(&Default::default());
         }),
+        // ------------------------------------------------ graph overview (U06)
+        // The groups route composes SPARQL SELECTs under the caller's view. A library user
+        // runs the same queries; a dedicated call is part of ROADMAP item 29.
+        op!("getGraphGroups", "dataset.query_with", |ds| {
+            ds.query_with("ASK {}", &Default::default());
+        }),
         // ------------------------------------------------ graph algorithms
         op!("runAlgorithm", "algorithms.run", |ds| {
             ds.algorithms().run(&any(), &Default::default());

@@ -195,6 +195,7 @@ after this spec, or `server-only` with the reason in §6.
 | `getSchemaDiff` | Partial. `sparkles::schema::compare` compares two reports that the handler computes. | No | `ds.schema().diff` |
 | `getClassProfiles` | `sparkles::schema::profile::profiles` | No | `ds.schema().profiles` |
 | `draftShapes` | `sparkles::schema::draft::draft_shapes` | No | `ds.schema().draft_shapes` |
+| `getGraphGroups` | No. The handler of [U06](U06-large-graph-rendering.md) writes SPARQL queries and assembles the groups. | No | `ds.query_with` for the same queries, with a call of its own under [ROADMAP](../ROADMAP.md) item 29 |
 
 ### 2.6 Stored queries and GraphQL
 

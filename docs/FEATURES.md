@@ -267,8 +267,10 @@ that work by priority and links each item to its design spec.
   transfer format of Phase 3 are not built, so a WebGL view lays out every result in the
   browser. The frame-rate and main-thread acceptance examples (A2 and A3) have no
   Playwright performance project on a GPU runner, and the overview opens one path
-  below one class at a time, with no grouping by named graph. [Roadmap](ROADMAP.md)
-  item 29.
+  below one class at a time, with no grouping by named graph. The groups route builds
+  its answer from SPARQL queries inside the server, so the library and the language
+  bindings have no call for it and reach the same counts only by running those queries.
+  [Roadmap](ROADMAP.md) item 29.
 
 * **Community summaries.** Leiden can compute a community hierarchy, and model
   settings accept a `community` role that inherits the resolved `summarize` list when
