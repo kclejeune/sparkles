@@ -874,6 +874,11 @@ fn run_node(
             let r = child(1, infos)?;
             left_join(ctx, &l, &r, expr.as_ref(), &mut note)?
         }
+        Kind::KeyedLeftJoin { expr, left, right } => {
+            let l = child(0, infos)?;
+            let r = child(1, infos)?;
+            keyed_left_join(ctx, &l, &r, expr, (*left, *right), &mut note)?
+        }
         Kind::Minus => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
@@ -4528,17 +4533,136 @@ pub(super) fn left_join(
     for (i, _) in &pairs {
         matched[*i as usize] = true;
     }
-    let missing: Vec<usize> = (0..l.len()).filter(|&i| !matched[i]).collect();
-    if !missing.is_empty() {
-        for (c, col) in l.cols.iter().enumerate() {
-            joined.cols[c].extend(missing.iter().map(|&i| col[i]));
-        }
-        for c in l.width()..joined.width() {
-            joined.cols[c].extend(std::iter::repeat_n(Id::UNDEF, missing.len()));
-        }
-        joined.len += missing.len();
-    }
+    append_unmatched(l, &mut joined, &matched);
     Ok(joined)
+}
+
+/// Append to `joined` each row of `l` that `matched` does not mark, with the right
+/// side's variables unbound.
+fn append_unmatched(l: &Table, joined: &mut Table, matched: &[bool]) {
+    let missing: Vec<usize> = (0..l.len()).filter(|&i| !matched[i]).collect();
+    if missing.is_empty() {
+        return;
+    }
+    for (c, col) in l.cols.iter().enumerate() {
+        joined.cols[c].extend(missing.iter().map(|&i| col[i]));
+    }
+    for c in l.width()..joined.width() {
+        joined.cols[c].extend(std::iter::repeat_n(Id::UNDEF, missing.len()));
+    }
+    joined.len += missing.len();
+}
+
+/// The candidate pairs a keyed OPTIONAL tests its condition on at a time.
+const KEYED_CHUNK: usize = 1 << 16;
+
+/// OPTIONAL keyed on its condition's conjunct `?a = ?b` (see [`Kind::KeyedLeftJoin`]).
+/// `=` holds between two different ids only when neither is an IRI or a blank node, as
+/// `val_eq` decides it. A left row whose value is an IRI or a blank node therefore meets
+/// only the right rows with the same id. A left row with another value meets every right
+/// row whose value is bound and is neither an IRI nor a blank node. An unbound value
+/// meets no row, because `=` raises an error on it and the conjunction cannot hold. The
+/// whole condition is tested on the candidate pairs a chunk at a time, so neither the
+/// product nor the candidate pairs are held at once.
+pub(super) fn keyed_left_join(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    expr: &Expr,
+    (a, b): (VarId, VarId),
+    note: &mut Option<String>,
+) -> Result<Table> {
+    use super::ctx::TermKind;
+    let lay = layout(l, r);
+    let (Some(lc), Some(rc)) = (l.col_of(a), r.col_of(b)) else {
+        return left_join(ctx, l, r, Some(expr), note);
+    };
+    if !lay.shared.is_empty() {
+        return left_join(ctx, l, r, Some(expr), note);
+    }
+    let atomic = |id: Id| matches!(ctx.kind(id), TermKind::Iri | TermKind::BNode);
+    // the right rows by value: IRIs and blank nodes sorted by id, other bound values in
+    // row order; both index vectors are charged before they grow
+    let _index = ctx.charge((r.len() as u64).saturating_mul(16))?;
+    let mut keyed: Vec<(Id, u32)> = Vec::new();
+    let mut loose: Vec<u32> = Vec::new();
+    for (j, &v) in r.cols[rc].iter().enumerate() {
+        if j % 65536 == 0 {
+            ctx.check()?;
+        }
+        if v.is_undef() {
+            continue;
+        }
+        if atomic(v) {
+            keyed.push((v, j as u32));
+        } else {
+            loose.push(j as u32);
+        }
+    }
+    keyed.sort_unstable();
+    let w = lay.vars.len() + 1;
+    let mut matched = vec![false; l.len()];
+    let mut out = Table::new(lay.vars.clone());
+    let mut chunk: Vec<(u32, u32)> = Vec::with_capacity(KEYED_CHUNK);
+    let mut candidates = 0u64;
+    let flush =
+        |chunk: &mut Vec<(u32, u32)>, out: &mut Table, matched: &mut [bool]| -> Result<()> {
+            ctx.check()?;
+            ctx.check_output(out.len().saturating_add(chunk.len()), w)?;
+            let mut joined = materialize(l, r, &lay, chunk);
+            let keep = left_filter(ctx, &joined, expr);
+            for (k, &(i, _)) in keep.iter().zip(chunk.iter()) {
+                if *k {
+                    matched[i as usize] = true;
+                }
+            }
+            joined.filter_rows(&keep);
+            out.append(joined);
+            chunk.clear();
+            Ok(())
+        };
+    for (i, &v) in l.cols[lc].iter().enumerate() {
+        if i % 4096 == 0 {
+            ctx.check()?;
+        }
+        if v.is_undef() {
+            continue;
+        }
+        if atomic(v) {
+            let s = keyed.partition_point(|&(k, _)| k < v);
+            for &(k, j) in &keyed[s..] {
+                if k != v {
+                    break;
+                }
+                chunk.push((i as u32, j));
+                if chunk.len() >= KEYED_CHUNK {
+                    candidates += chunk.len() as u64;
+                    flush(&mut chunk, &mut out, &mut matched)?;
+                }
+            }
+        } else {
+            for &j in &loose {
+                chunk.push((i as u32, j));
+                if chunk.len() >= KEYED_CHUNK {
+                    candidates += chunk.len() as u64;
+                    flush(&mut chunk, &mut out, &mut matched)?;
+                }
+            }
+        }
+    }
+    if !chunk.is_empty() {
+        candidates += chunk.len() as u64;
+        flush(&mut chunk, &mut out, &mut matched)?;
+    }
+    append_unmatched(l, &mut out, &matched);
+    ctx.check_output(out.len(), lay.vars.len())?;
+    *note = Some(format!(
+        "[keyed on ?{} = ?{}: {} candidate pairs]",
+        ctx.var_name(a),
+        ctx.var_name(b),
+        candidates
+    ));
+    Ok(out)
 }
 
 /// A right row index standing for no row: the left row is kept with the right side's

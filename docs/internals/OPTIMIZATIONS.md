@@ -288,6 +288,18 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   is kept alone. At 10.5M triples, `optional-count` runs in 6 ms instead of 15 ms on a
   warm store. EXPLAIN notes `[merge on ?p]`. Other OPTIONALs keep the hash join, which
   puts the unmatched left rows last.
+* **Keyed left joins** (`keyed_left_join`). An OPTIONAL whose two sides share no
+  variable used to join every left row with every right row before its FILTER ran. When
+  the FILTER has a conjunct `?a = ?b` with one variable from each side, the join pairs
+  the rows through that equality instead. An IRI or a blank node equals only itself, so
+  a left row whose value is one meets only the right rows with the same id. A left row
+  with another kind of value meets the right rows whose value is neither unbound nor an
+  IRI or a blank node, and an unbound value meets none. The whole FILTER is then tested
+  on these candidate pairs, 64K pairs at a time, so the result and its bag multiplicity
+  are the product's. SP²Bench `q6` links its OPTIONAL to the outer pattern only by
+  `?author = ?author2`. At 10M triples the product has 1.58 × 10¹² rows, while the
+  candidate pairs number about 10.7 million. EXPLAIN notes `[keyed on ?a = ?b: N
+  candidate pairs]`.
 * **Flat hash joins** (`flat_hash_join`). A hash join groups the rows of its smaller input
   by key in flat arrays instead of a list per key. It counts each key's rows and then
   places every row, so the rows of a key are one span of an array, in row order. An input

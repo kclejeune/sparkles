@@ -163,6 +163,9 @@ pub struct Optimizations {
     /// OPTIONAL on one variable, with both sides sorted on it and always binding it,
     /// runs as a merge in the left side's order
     pub merge_left_join: bool,
+    /// an OPTIONAL whose sides share no variable and whose condition equates a variable
+    /// of each side pairs the rows by that equality instead of forming their product
+    pub keyed_left_join: bool,
     /// a FILTER conjunct over the variables of one triple pattern is tested on a sample
     /// of the pattern's rows, whose share that passes is the planner's estimate of the
     /// share of its input it keeps (instead of 30%)
@@ -215,7 +218,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 41] = [
+    pub const NAMES: [&str; 42] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -241,6 +244,7 @@ impl Optimizations {
         "flat_hash_join",
         "gallop_index_join",
         "merge_left_join",
+        "keyed_left_join",
         "sampled_filters",
         "characteristic_sets",
         "probed_keys",
@@ -286,6 +290,7 @@ impl Optimizations {
         flat_hash_join: true,
         gallop_index_join: true,
         merge_left_join: true,
+        keyed_left_join: true,
         sampled_filters: true,
         characteristic_sets: true,
         probed_keys: true,
@@ -331,6 +336,7 @@ impl Optimizations {
         flat_hash_join: false,
         gallop_index_join: false,
         merge_left_join: false,
+        keyed_left_join: false,
         sampled_filters: false,
         characteristic_sets: false,
         probed_keys: false,
@@ -376,6 +382,7 @@ impl Optimizations {
             "flat_hash_join" => &mut self.flat_hash_join,
             "gallop_index_join" => &mut self.gallop_index_join,
             "merge_left_join" => &mut self.merge_left_join,
+            "keyed_left_join" => &mut self.keyed_left_join,
             "sampled_filters" => &mut self.sampled_filters,
             "characteristic_sets" => &mut self.characteristic_sets,
             "probed_keys" => &mut self.probed_keys,

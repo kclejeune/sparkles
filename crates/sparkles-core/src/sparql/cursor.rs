@@ -2110,6 +2110,7 @@ fn own_exprs(kind: &Kind) -> Vec<&Expr> {
         | Kind::CountFilterScan { filter: exprs, .. } => exprs.iter().collect(),
         Kind::Extend(_, expr) | Kind::Assign(_, expr) | Kind::Unfold { expr, .. } => vec![expr],
         Kind::LeftJoin { expr } => expr.iter().collect(),
+        Kind::KeyedLeftJoin { expr, .. } => vec![expr],
         Kind::OrderBy { keys, .. } => keys.iter().map(|(key, _)| key).collect(),
         Kind::Group { aggs, .. } => aggs
             .iter()
@@ -2220,6 +2221,7 @@ fn value_ordered(node: &Node) -> bool {
         | Kind::HalfJoin { .. }
         | Kind::Minus
         | Kind::LeftJoin { .. }
+        | Kind::KeyedLeftJoin { .. }
         | Kind::Lateral(_) => first(),
         Kind::Union => node.children.len() == 1 && first(),
         // A merge join keeps its left input's order, and a hash join its probe side's,
