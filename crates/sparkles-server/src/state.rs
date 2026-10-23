@@ -321,6 +321,8 @@ pub struct AppState {
     pub catalog: sparkles::Catalog,
     /// the disclosure guard of reports graphs (spec C22 §6)
     pub graphrag_guard: Arc<crate::graphrag::guard::Guard>,
+    /// GraphRAG builds waiting for confirmation, and the figures of the metrics
+    pub graphrag: Arc<crate::graphrag::runtime::Runtime>,
     /// HTTP routing state and observers, keyed by dataset name. Only map lookups and
     /// changes happen under this lock, never catalog work or file system work.
     routing: Mutex<BTreeMap<String, Arc<Dataset>>>,
@@ -629,6 +631,7 @@ impl AppState {
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            graphrag: Default::default(),
             catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
@@ -695,6 +698,7 @@ impl AppState {
         AppState {
             data_dir: PathBuf::new(),
             graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
+            graphrag: Default::default(),
             catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),

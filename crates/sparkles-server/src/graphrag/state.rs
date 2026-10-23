@@ -21,6 +21,8 @@ pub const STATE_VERSION: u32 = 1;
 pub const MAX_COMMUNITIES: usize = 200_000;
 /// The most member entries over all communities.
 pub const MAX_MEMBER_ENTRIES: usize = 5_000_000;
+/// The most fact digests one community may record.
+pub const MAX_FACT_DIGESTS: usize = 100_000;
 /// The longest member term, in bytes.
 pub const MAX_TERM_BYTES: usize = 8_192;
 /// The largest state file read, in bytes.
@@ -65,6 +67,13 @@ pub struct StoredCommunity {
     pub parent: Option<String>,
     /// canonical N-Triples terms, sorted and without repeats
     pub members: Vec<String>,
+    /// the report the build left linked, if any
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    /// digests of the facts a leaf's report was written from, sorted, which a refresh
+    /// compares with the facts it reads (§5)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<u64>,
 }
 
 /// The last completed build.
@@ -76,6 +85,13 @@ pub struct BuildRecord {
     /// RFC 3339
     pub finished_at: String,
     pub communities: Vec<StoredCommunity>,
+    /// communities the build left without a current report, because its budget or an
+    /// accounting anomaly stopped it
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<String>,
+    /// tokens the build used, reserved or reported
+    #[serde(default)]
+    pub tokens: u64,
 }
 
 /// `graphrag/state.json`.
@@ -175,6 +191,12 @@ impl BuildState {
                 return Err(StateError::Bound {
                     what: "bytes in a member term",
                     limit: MAX_TERM_BYTES,
+                });
+            }
+            if c.facts.len() > MAX_FACT_DIGESTS {
+                return Err(StateError::Bound {
+                    what: "fact digests of one community",
+                    limit: MAX_FACT_DIGESTS,
                 });
             }
             if c.members.windows(2).any(|w| w[0] >= w[1]) {
@@ -293,6 +315,8 @@ mod tests {
             iri: format!("urn:x-sparkles:graphrag:ds:0:{iri}"),
             parent: None,
             members: members.iter().map(|m| m.to_string()).collect(),
+            report: Some("urn:uuid:r".into()),
+            facts: vec![1, 2],
         }
     }
 
@@ -303,6 +327,8 @@ mod tests {
                 branch: "main".into(),
                 finished_at: "2026-10-23T00:00:00Z".into(),
                 communities: vec![community("a", &["<urn:a>", "<urn:b>"])],
+                pending: Vec::new(),
+                tokens: 10,
             }),
             ..BuildState::default()
         }

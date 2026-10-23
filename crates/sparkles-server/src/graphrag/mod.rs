@@ -8,6 +8,8 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub mod budget;
+#[cfg(feature = "mcp")]
+pub mod build;
 pub mod guard;
 pub mod hierarchy;
 pub mod identity;
@@ -15,6 +17,7 @@ pub mod ledger;
 pub mod projection;
 #[cfg(feature = "mcp")]
 pub mod report;
+pub mod runtime;
 pub mod settings;
 pub mod state;
 #[cfg(feature = "mcp")]
