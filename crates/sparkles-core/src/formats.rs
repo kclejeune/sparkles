@@ -206,6 +206,18 @@ pub const NUMERIC_COLUMN: FileKind = FileKind {
     reads: &[2],
 };
 
+/// A generation's predicate patterns (X11 Phase 1). Derived from the generation's SPO
+/// permutation: a version this build does not read is left unused, queries read the
+/// permutations instead, and the next full compaction writes the current version.
+pub const PATTERNS: FileKind = FileKind {
+    id: "patterns",
+    files: "gen-*/patterns.bin",
+    marker: "the u32 after the `SPKPATT\\0` magic; another version is not used and is rebuilt at the next full compaction",
+    class: Class::Derived,
+    writes: crate::patterns::VERSION,
+    reads: &[1],
+};
+
 /// The terms added since a generation was built.
 pub const DELTA_VOCAB: FileKind = FileKind {
     id: "delta-vocab",
@@ -438,6 +450,7 @@ pub const KINDS: &[&FileKind] = &[
     &INDEX,
     &VOCAB_INDEX,
     &NUMERIC_COLUMN,
+    &PATTERNS,
     &DELTA_VOCAB,
     &WAL,
     &COMMITS,
@@ -830,6 +843,7 @@ mod tests {
         assert_eq!(INDEX.writes, crate::builder::FORMAT_VERSION);
         assert!(INDEX.reads(crate::builder::FORMAT_VERSION));
         assert_eq!(DELTA_VOCAB.writes, crate::vocab::delta::VERSION);
+        assert_eq!(PATTERNS.writes, crate::patterns::VERSION);
         assert_eq!(DATASET.writes, crate::commit::DATASET_READER);
         assert_eq!(
             *DATASET.reads.last().unwrap(),

@@ -64,6 +64,11 @@ pub struct BuildOptions {
     pub hot_key_bytes: usize,
     /// First blank node id to allocate.
     pub first_bnode: u64,
+    /// Build the predicate patterns (`patterns.bin`, see [`crate::patterns`]).
+    pub patterns: bool,
+    /// Memory for the map of distinct predicate patterns while the build collects them.
+    /// Past it the generation is built without patterns, and the reason is recorded.
+    pub pattern_bytes: usize,
 }
 
 impl Default for BuildOptions {
@@ -75,6 +80,8 @@ impl Default for BuildOptions {
             sort_mem_quads: 64_000_000,
             hot_key_bytes: 1 << 30,
             first_bnode: 0,
+            patterns: true,
+            pattern_bytes: crate::patterns::DEFAULT_BUDGET,
         }
     }
 }
@@ -157,6 +164,11 @@ pub struct IndexMeta {
     pub next_bnode: u64,
     pub prefixes: BTreeMap<String, String>,
     pub created: String,
+    /// The generation's predicate patterns: their file's version, or why it has none.
+    /// Absent in generations written before patterns existed. Readers that do not know
+    /// the member ignore it, and the file next to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patterns: Option<crate::patterns::PatternInfo>,
 }
 
 pub const FORMAT_VERSION: u32 = 2;
@@ -576,9 +588,12 @@ impl Builder {
         built.sort_by_key(|(p, _, _)| p.index());
         let mut stats = Stats::default();
         let mut rows = 0;
+        let mut patterns = None;
         for (perm, col, n) in built {
-            if let Some(col) = col {
-                col.finish(&mut stats);
+            if let Some(col) = col
+                && let Some(p) = col.finish(&mut stats)
+            {
+                patterns = Some(p);
             }
             if perm == Perm::Spo {
                 rows = n;
@@ -591,6 +606,17 @@ impl Builder {
         }
         stats.quads = rows;
         stats.predicates.sort_by_key(|p| p.p);
+        // the patterns are written before meta.json, which publishes the generation
+        let patterns = match patterns {
+            Some(p) => {
+                self.interrupted()?;
+                self.report("writing predicate patterns");
+                let info = p.finish(&self.dir)?;
+                self.phase_done("predicate patterns");
+                info
+            }
+            None => crate::patterns::PatternInfo::skipped("turned off for this build"),
+        };
 
         let meta = IndexMeta {
             format_version: FORMAT_VERSION,
@@ -599,6 +625,7 @@ impl Builder {
             next_bnode: self.next_bnode.load(Ordering::Relaxed),
             prefixes: std::mem::take(&mut *self.prefixes.lock()),
             created: now_rfc3339(),
+            patterns: Some(patterns),
         };
         crate::store::write_synced(
             &self.dir.join("stats.json"),
@@ -847,7 +874,16 @@ impl Builder {
                 });
                 handles.push(s.spawn(move || -> Result<Built> {
                     let mut w = PermWriter::create(dir, perm)?;
-                    let mut col = has_stats(perm).then(|| StatsCollector::new(perm, rdf_type));
+                    let mut col = has_stats(perm).then(|| {
+                        let mut c = StatsCollector::new(perm, rdf_type);
+                        if perm == Perm::Spo && self.opts.patterns {
+                            c.patterns = Some(crate::patterns::PatternCollector::new(
+                                &self.tmp,
+                                self.opts.pattern_bytes,
+                            ));
+                        }
+                        c
+                    });
                     let mut put = |k: Key| -> Result<()> {
                         if let Some(c) = &mut col {
                             c.push(&k);
@@ -1419,6 +1455,8 @@ struct StatsCollector {
     cs_preds: Vec<u64>,
     charsets: FxHashMap<Box<[u64]>, (u64, Vec<u64>)>,
     cs_others: u64,
+    /// the predicate patterns, collected from SPO when the build makes them
+    patterns: Option<crate::patterns::PatternCollector>,
 }
 
 impl StatsCollector {
@@ -1439,6 +1477,7 @@ impl StatsCollector {
             cs_preds: Vec::new(),
             charsets: FxHashMap::default(),
             cs_others: 0,
+            patterns: None,
         }
     }
 
@@ -1491,6 +1530,9 @@ impl StatsCollector {
         self.run_count += 1;
         if self.perm == Perm::Spo {
             // key = (subject, predicate, object, graph)
+            if let Some(p) = &mut self.patterns {
+                p.push(k);
+            }
             if new0 {
                 self.charset_done();
             }
@@ -1527,7 +1569,8 @@ impl StatsCollector {
         self.prev = Some(*k);
     }
 
-    fn finish(mut self, stats: &mut Stats) {
+    /// Add what was collected to `stats`, and hand over the pattern collector.
+    fn finish(mut self, stats: &mut Stats) -> Option<crate::patterns::PatternCollector> {
         if let Some(p) = self.prev
             && self.runs
         {
@@ -1586,6 +1629,7 @@ impl StatsCollector {
             }
             _ => {}
         }
+        self.patterns.take()
     }
 }
 
@@ -1769,6 +1813,8 @@ mod tests {
             threads: 3,
             hot_key_bytes: 1 << 20,
             first_bnode: 0,
+            patterns: true,
+            pattern_bytes: crate::patterns::DEFAULT_BUDGET,
         });
         let no_hot = build(BuildOptions {
             batch_quads: 7,

@@ -34,6 +34,7 @@ The store follows TDB2's model of bulk loads, transactions, compaction and backu
 * External sort for inputs larger than the memory budget.
 * CSV and TSV imports ([C05](specs/C05-tabular-imports.md)). `sparkles load`, `sparkles csv`, `POST /{ds}/upload` and the web UI's upload form map tables to triples with a default mapping (a key column or the row number names each row), with W3C CSVW metadata (datatypes and formats, null values, defaults, lists, virtual columns and RFC 6570 URI templates), or with Tarql-style CONSTRUCT templates run in batches by the SPARQL engine. Tables stream, compressed or not, and an invalid cell stops the load with its row and column ([USAGE.md](USAGE.md#loading-csv-and-tsv)).
 * Planner statistics for predicates (counts, distinct subjects and objects), classes and graphs.
+* Predicate patterns, QLever's pattern trick ([X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)). Each generation keeps every subject's set of predicates by number, for the default graph and for the union of the named graphs. `GROUP BY ?p` with `COUNT(DISTINCT ?s)` over `?s ?p ?o` and an input that binds `?s`, `SELECT DISTINCT ?p` over the same shape, and `spk:hasPredicate` with its QLever name `ql:has-predicate` and a variable predicate read the patterns, corrected for the snapshot's delta per subject. Class profiles skip the subjects of predicates that no profiled instance has. Under a protection of triples, RDFS on read, a set of named graphs or a large delta, the same queries read the permutations.
 * MVCC snapshots with a single writer (MR+SW), and a WAL with crash-safe replay.
 * Durable commits. A commit is acknowledged after its WAL record and any new vocabulary
   entries are synchronized, with the two writes issued in parallel. The update vocabulary
@@ -331,8 +332,9 @@ that work by priority and links each item to its design spec.
   follow-ups, performance investigation and review of enabling spill by default.
   The UI's result table, the MCP tools and the Python and JVM query calls
   run eagerly, because they report exact totals or return collected results. There is no
-  FSST vocabulary compression, IRI encoding, pattern trick, pinned results, materialized
-  views or live query monitoring. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40, 93.
+  FSST vocabulary compression, IRI encoding, pinned results, materialized views or live
+  query monitoring. Predicate patterns do not answer `COUNT(*)` per predicate, which
+  counts triples. [Roadmap](ROADMAP.md) items 1, 7, 16, 17, 27, 40, 93.
 * **Large basic graph patterns.** A query whose plan would nest deeper than 4000 levels
   is refused. A basic graph pattern counts two levels per triple pattern, so it holds at
   most 1998 of them, and a path range counts its unrolled steps, multiplied through

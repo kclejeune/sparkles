@@ -952,6 +952,21 @@ fn run_node(
         }
         Kind::Project(vars) => child(0, infos)?.project(vars),
         Kind::Distinct => distinct(child(0, infos)?),
+        Kind::PatternCount(spec) => {
+            let input = if n.children.is_empty() {
+                None
+            } else {
+                Some(child(0, infos)?)
+            };
+            let (t, nt) = super::patternplan::run_count(ctx, spec, input.as_ref(), &n.vars)?;
+            note = Some(nt);
+            t
+        }
+        Kind::PatternScan(spec) => {
+            let (t, nt, _) = super::patternplan::run_scan(ctx, spec, &n.vars, None)?;
+            note = Some(nt);
+            t
+        }
         Kind::Slice {
             offset,
             limit: Some(limit),
@@ -2289,6 +2304,12 @@ pub(super) fn apply_blocking(
             Ok(table)
         }
         Kind::OrderBy { keys, limit } => Ok(order_by(ctx, table, keys, *limit, report)?.0),
+        Kind::PatternCount(spec) => {
+            let out = super::patternplan::run_count(ctx, spec, Some(&table), &node.vars)?.0;
+            // one row per predicate, checked as the eager executor checks an output
+            ctx.check_output(out.len(), out.width())?;
+            Ok(out)
+        }
         _ => unreachable!("not a native blocking cursor operator"),
     }
 }
@@ -2337,6 +2358,10 @@ fn run_limited(
         Kind::Scan(spec) => {
             let (t, truncated) = scan_limited(ctx, spec, &n.vars, Some(want))?;
             finish(Materialized::plain(t), Vec::new(), !truncated)
+        }
+        Kind::PatternScan(spec) => {
+            let (t, _, stopped) = super::patternplan::run_scan(ctx, spec, &n.vars, Some(want))?;
+            finish(Materialized::plain(t), Vec::new(), !stopped)
         }
         Kind::Filter(_)
         | Kind::Extend(..)

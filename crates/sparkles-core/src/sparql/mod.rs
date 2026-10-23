@@ -33,6 +33,7 @@ mod keyfilter;
 mod keyprobe;
 pub mod lateral;
 pub mod pathsearch;
+pub mod patternplan;
 pub mod plan;
 pub mod pool;
 mod propertyext;
@@ -1292,6 +1293,8 @@ mod joinorder_tests;
 mod keyprobe_tests;
 #[cfg(test)]
 mod opt_tests;
+#[cfg(test)]
+mod pattern_tests;
 #[cfg(test)]
 mod plan_fidelity_tests;
 #[cfg(test)]

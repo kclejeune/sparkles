@@ -51,8 +51,8 @@ The UI items (11, 21, 27–31) fill time when a track is waiting on benchmark re
 The next cold-read work is the corrected-source measurement gate for item 4. It
 compares warm instruction counts and read hints before repeating the cold targets
 on forge. A segmented block layout remains deferred until those measurements justify
-it, and predicate patterns and index compression remain the later performance work
-under item 16.
+it, and index compression remains the later performance work under item 16, whose
+predicate patterns have shipped.
 
 The graph track can prepare the Graphalytics reference harness under item 8 alongside
 Phase 1 of the community summaries under item 12. The summaries use the existing
@@ -100,7 +100,7 @@ These items are cheap or foundational.
 | 13 | **Done (2026-10-16). Current shape standards.** SHACL 1.2 node expressions, ShEx 2.2, recursive ShEx typing that survives restarts, and richer drafted shapes. The SHACL 1.2 Core additions that are not expression syntax, ShEx `RESTRICTS` and the `EXACTLY` reference syntax stay out, and the Outcome sections of the specs list them. | [G03](specs/G03-shaclc.md#roadmap-follow-ups-2026-10-12), [G02](specs/G02-shex.md#roadmap-follow-ups-2026-10-12), [C02](specs/C02-schema-discovery.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 14 | **Partly done. Compaction.** Delta changes located per block, new vocabulary without a full rebuild, adaptive thresholds and automatic compaction in embedded use remain open. The removal at open of a build that a power loss left behind shipped on 2026-10-18. | [C13](specs/C13-automatic-compaction.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
 | 15 | **Ingestion.** *Partly done (2026-10-13).* Office documents, more transcript adapters and CSV entity linking shipped. Images and audio remain, with the follow-ups recorded in C18. | [C18](specs/C18-natural-language-questions-and-ingest.md#roadmap-follow-ups-2026-10-12) | M | Medium–high |
-| 16 | **Predicate patterns (QLever's pattern trick),** FSST vocabulary compression, IRI encoding and index codecs | [X11](specs/X11-index-compression-and-predicate-patterns.md), [X01](specs/X01-compression-codecs.md#roadmap-follow-ups-2026-10-12) | L | High at scale |
+| 16 | **Partly done. Index compression after predicate patterns.** QLever's predicate patterns shipped as X11 Phase 1, in a versioned file of 1.6% of the index that cut DBpedia predicate counts over every subject from 1.9 s to 1.3 ms. FSST vocabulary compression, IRI encoding, index codecs and `COUNT(*)` per predicate from the patterns remain. | [X11](specs/X11-index-compression-and-predicate-patterns.md#outcome), [X01](specs/X01-compression-codecs.md#roadmap-follow-ups-2026-10-12) | L | High at scale |
 | 86 | **Partly done. Group commit for indexed datasets.** Full-text, spatial and embedding datasets group commits without publishing index state above the durable log, and background full-text file synchronization now releases the publication mutex, holding it again only after three raced checkpoints. Full forge acceptance under section 17.9 remains open for serial latency, concurrent throughput, reader latency during writes and memory use. | [X09 section 17](specs/X09-group-commit-by-default.md#17-phase-4-group-commit-for-indexed-datasets) | M–L | Medium–high |
 | 87 | **Small incremental runs over a kept closure.** The kept closure remembers its lookups of the input graphs, and deletion rounds search in parallel. A change of 1,000 triples at 16 threads now takes 1.0 to 1.6 times its time before the F16 follow-up for RDFS and 1.5 to 2.4 times for OWL 2 RL, short of the 1.2 times goal. The first change's cold reads and the OWL 2 RL insertion remain. An Intel rerun on atlas found no cost in the 1-thread OWL 2 RL full run. Item 1's refresh of 2026-10-23 did not measure it again. | [F16](specs/F16-materialization-at-scale.md#roadmap-follow-ups-2026-10-18) | S–M | Medium |
 

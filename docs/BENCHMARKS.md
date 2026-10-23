@@ -1417,6 +1417,43 @@ profile cache keeps up to 64 answers and 16 MiB of JSON per server, shared with 
 groups route. The Leiden figure is why the groups route does not run a community
 detection inside a request.
 
+### Predicate patterns
+
+X11 Phase 1 answers predicate listings and per-predicate subject counts from the predicate
+patterns that each generation keeps ([X11](specs/X11-index-compression-and-predicate-patterns.md#outcome)).
+On the DBpedia 50M slice, forge timed the release binary of the patterns against the one
+of the commit before them on 2026-10-23, in two rounds of A, B, B, A server processes with
+five timed requests each. The times are medians of the server's execution time.
+
+| Query on DBpedia 50M | Before | After |
+|---|---:|---:|
+| `COUNT(DISTINCT ?s)` per predicate over every subject | 1,915 ms | 1.3 ms |
+| The same for `dbo:Person` instances | 264 ms | 21 ms |
+| The same for `dbo:Film` instances | 24 ms | 11.7 ms |
+| `SELECT DISTINCT ?p` of `dbo:Film` instances | 17.4 ms | 10.8 ms |
+
+The other 30 queries of the DBpedia suite gave the same answers, and none of those above
+0.3 ms was more than 5% slower. `predicate-counts` counts triples with `COUNT(*)`, which the
+patterns do not answer, and stayed at 0.38 ms. The class profiles endpoint took 24.2 s with
+both binaries, because almost every DBpedia predicate is used by an instance of some class.
+
+At 10.5M synthetic triples, forge ran three A, B, B, A rounds of ten timed requests each.
+An interleaved Namespace screen of all 30 synthetic queries found the same answers, and
+forge timed the queries it flagged again. `order-by-full`, `star-join` and `subquery-agg`
+were within 2%, and `path-plus` took 0.023 ms against 0.022 ms.
+
+| Query at 10.5M | Before | After |
+|---|---:|---:|
+| `predicate-subjects` | 469 ms | 0.020 ms |
+| `class-predicates` | 508 ms | 10.2 ms |
+| `class-predicate-list` | 73 ms | 10.2 ms |
+
+The patterns take 24.1 MB, 1.6% of the 1.53 GB index, on the DBpedia slice, and 2.9 MiB, 1.0% of
+the index, at 10.5M, where 24 patterns cover 1.52 million subjects. Writing them took 0.36 s of the slice's 26.0 s load, and the load's peak
+RSS stayed at 3.23 GB. At 10.5M the load took 4.1 s against 4.6 s and peaked at 2.07 GB
+against 1.96 GB, in one load each. The collector holds at most 1 GiB of distinct patterns by default
+and skips the patterns of a generation that needs more.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
@@ -1481,6 +1518,7 @@ Decompression runs as one stream in front of the parallel parser and adds 0.1–
 | Spatial index, 180,640 geometries | 0.54 s | 13.8 MiB |
 | RDFS materialization, 1,001,418 triples to 2,751,996 with inferences | 3.974 s, of which inference takes 2.323 s | — |
 | Numeric column added to the DBpedia index by `sparkles vocab-index` | 4.8 s | 20.7 MB |
+| Predicate patterns, DBpedia 50M slice, 41.1M quads | 0.36 s of a 26.0 s load | 24.1 MB, 1.6% of the index |
 
 ### Validation
 

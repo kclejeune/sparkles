@@ -6,8 +6,8 @@
 pub use sparkles_core::{
     access, algo, annotations, branch, builder, check, codec, commit, disk, error, formats, geo,
     guard, history, id, index, io, ioacct, jena_formats, migrate, nesting, outbound, patch,
-    preview, schema, sparql, spill, store, stored, tabular, task, text, trix, validation, vector,
-    vocab, xsd,
+    patterns, preview, schema, sparql, spill, store, stored, tabular, task, text, trix, validation,
+    vector, vocab, xsd,
 };
 
 #[cfg(feature = "backup")]

@@ -1,18 +1,20 @@
 # X11: Index compression and predicate patterns
 
-> **Status:** specified
+> **Status:** Phase 1 built. Phases 2 and 3 are not built.
 >
-> **Phases:** None shipped. Phase 1 is predicate patterns: a per-subject pattern table
-> built with the generation, `spk:hasPredicate`, and the planner's use of patterns for
-> predicate listings and counts. Phase 2 adds the vocabulary codecs: FSST-compressed
-> suffixes and encoded IRIs. Phase 3 adds index column codecs and optional zstd blocks
-> with dictionaries. Each phase that changes the files raises the index format version
-> under the rules of §7.
+> **Phases:** Phase 1 is predicate patterns: a per-subject pattern table built with the
+> generation, `spk:hasPredicate`, and the planner's use of patterns for predicate listings
+> and counts. Phase 2 adds the vocabulary codecs: FSST-compressed suffixes and encoded
+> IRIs. Phase 3 adds index column codecs and optional zstd blocks with dictionaries. Each
+> phase that changes the files raises the index format version under the rules of §7.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Predicate patterns and `spk:hasPredicate`](../API.md#predicate-patterns-and-spkhaspredicate),
+> the `--no-patterns` and `--pattern-memory-mb` flags and `sparkles stats --patterns` in
+> [USAGE.md](../USAGE.md), and the `predicate_patterns` flag in
+> [OPTIMIZATIONS.md](../internals/OPTIMIZATIONS.md).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how Phase 1 landed and where it departs from the design.
 
 This design was written from H. Bast and B. Buchhold, "QLever: A Query Engine for
 Efficient SPARQL+Text Search", CIKM 2017, and the public QLever documentation of
@@ -433,4 +435,99 @@ long old versions stay readable is X12's.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 16.
+Phase 1 is built. Phases 2 and 3 are not, and they remain under [ROADMAP](../ROADMAP.md)
+item 16.
+
+### What was built
+
+Every bulk load, full compaction and partial compaction writes `patterns.bin` into the
+generation directory before `meta.json`, so the patterns are published with the generation
+they describe and a crash leaves either both or neither. The file is a derived kind in the
+format registry with the id `patterns` and version 1. A reader refuses any other version
+with a message that names it, leaves the patterns unused and reads the permutations, and
+the next full compaction writes the file again. `sparkles check` reports such a file as a
+warning, a damaged file as an error, and in full mode compares every subject's pattern and
+every count with SPO. `meta.json` records the number of patterns and subjects per table,
+the file's size and, when a build skipped the patterns, the reason. The index format
+version stays 2, as §7.1 allows, and a release without patterns ignores the file.
+
+The collector reads the SPO stream that the statistics already read. Its memory is charged
+to `BuildOptions::pattern_bytes`, which defaults to 1 GiB and which `--pattern-memory-mb`
+sets. A build that would exceed it writes no patterns and records why. `--no-patterns`
+turns the patterns off. A partial compaction rewrites the file in parallel with the
+statistics. It appends new patterns, changes the counts of the subjects it touches and
+copies the rest of the subjects, so its cost is a pass over the old file and not over SPO.
+
+The planner answers `GROUP BY ?p` with `COUNT(DISTINCT ?s)` over `?s ?p ?o`, and
+`COUNT(?s)` or `COUNT(*)` over `?s spk:hasPredicate ?p`, with a `PatternCount` operator
+when the rest of the group binds `?s` or when the group is the triple alone.
+`SELECT DISTINCT ?p` over the same shape uses `PatternCount` without counts, and
+`spk:hasPredicate` and `ql:has-predicate` with a variable predicate run as `PatternScan`.
+With no input, `PatternCount` reads per-predicate subject totals stored in the file and
+touches no subject. `PatternScan` admits its output against the query's memory budget
+as it grows and stops early under an eager LIMIT. A streaming cursor runs `PatternCount`
+as a native operator, which reads its input before its first row as a sort does, and
+plans `spk:hasPredicate` pairs as the streaming distinct scan of the permutations.
+C02's class profiles take the union of the patterns of the profiled
+instances and skip the PSO pass for predicates outside it.
+
+Under MVCC the patterns describe the base generation. A snapshot's delta gives the
+subjects it touches. Their predicate sets are read again from the snapshot's SPO, which
+covers the delta, a transaction's own writes and a linked branch's base delta, and they
+replace the subjects' base patterns in the counts. The correction is cached per snapshot
+in the count cache. History reads at a commit within the retained generations use that
+snapshot's delta in the same way. Differential tests compare every rewritten shape with
+the generic operators on the delta, an open transaction, a partial and a full compaction,
+a reopened store, a branch, history reads, a C12b protection, a store built without
+patterns, a pattern budget of 1 KiB and random stores with random deltas. The
+triple-protection differential suite includes the shapes.
+
+### Departures from the design
+
+* The patterns are one file, `patterns.bin`, with their own block layout of 1,024
+  subjects per block, a checksum and a footer. §3.1 proposed writing the subject map with
+  `PermWriter`. Another change was replacing the permutation block format at the same
+  time, and a separate format keeps the patterns independent of it.
+* The second table covers the union of the named graphs, without the default graph,
+  because that is what Sparkles' union default graph and `GRAPH <urn:x-arq:UnionGraph>`
+  read. §3.1 said the union of all graphs. Both tables are always written.
+* The permutations answer instead of the patterns under a protection of triples, with
+  RDFS on read, for a set of named graphs, for the union of the named graphs under a C12
+  graph view, and when the delta touches more than one subject per 32 quads of the snapshot,
+  with a floor of 1,024 subjects and a ceiling of one million. §3.3 corrected any delta.
+* A constant predicate in `spk:hasPredicate` reads the predicate's subjects from PSO,
+  because that range is smaller than a walk over every subject's pattern. On the DBpedia
+  slice the walk took 43 ms for `dbo:birthDate`.
+* `SELECT DISTINCT ?p WHERE { <s> ?p ?o }` keeps its SPO range scan, which reads one
+  subject's triples and needs no table.
+* §7.1's `features` list in `IndexMeta` is not added, since patterns alone keep version 2.
+  Phase 2 adds it with the first feature that needs version 3.
+* Open question 1 stays open as a follow-up under [ROADMAP](../ROADMAP.md) item 16.
+  `COUNT(*)` per predicate over `?s ?p ?o` counts triples and reads the permutations.
+
+### Measurements
+
+On the DBpedia 50M slice on forge, with 41,127,700 quads, `patterns.bin` takes 24.1 MB,
+1.6% of the 1.53 GB index. Writing it took 0.36 s of a 26.0 s load, and the load's wall
+time and peak RSS (3.23 GB) did not change measurably. The pattern queries below are
+medians of 40 requests of the server's execution time, from two rounds of A, B, B, A
+server processes, with the commit before the patterns as the baseline.
+
+| Query | Before | After |
+|---|---|---|
+| `COUNT(DISTINCT ?s)` per predicate over every subject | 1,915 ms | 1.3 ms |
+| The same for `dbo:Person` instances | 264 ms | 21 ms |
+| The same for `dbo:Film` instances | 24 ms | 11.7 ms |
+| `SELECT DISTINCT ?p` of `dbo:Film` instances | 17.4 ms | 10.8 ms |
+
+`COUNT(?s)` over `?s spk:hasPredicate dbo:birthDate` takes 2.0 ms from PSO. The class
+profiles endpoint took 24.2 s with and without the patterns on this slice, because almost
+every predicate is used by an instance of some class, so the patterns skip almost no PSO
+pass. The other 31 queries of the DBpedia suite returned the same answers, and none of
+those above 0.3 ms was more than 5% slower.
+
+At 10.5M synthetic triples the file takes 2.9 MiB, 1.0% of the index, with 24 patterns
+for 1.52 million subjects, so both datasets meet the gate of 3%. On forge
+`predicate-subjects` took 0.020 ms against 469 ms, `class-predicates` 10.2 ms against
+508 ms and `class-predicate-list` 10.2 ms against 73 ms. The load peaked at 2.07 GB
+against 1.96 GB, in one load each.

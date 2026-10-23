@@ -67,6 +67,9 @@ fn every_fixture_opens_in_place() {
         let s = Store::open(&db, StoreOptions::default()).unwrap();
         let head = s.snapshot();
         assert_eq!(head.len(), recorded_count(&fixture, "count"));
+        // a generation without predicate patterns answers predicate listings from the
+        // permutations, and one with them from the patterns, alike
+        same_predicate_listing(&head);
         // a past state in a retained generation, kept by the named snapshot
         let (then, _) = s
             .snapshot_at(
@@ -90,7 +93,79 @@ fn every_fixture_opens_in_place() {
         let s = Store::open(&db, StoreOptions::default()).unwrap();
         assert_eq!(s.snapshot().len(), n);
         assert_eq!(n, recorded_count(&fixture, "count") + 1);
+        // the compaction wrote the patterns this build reads
+        assert!(s.snapshot().generation.patterns.file.is_some());
+        same_predicate_listing(&s.snapshot());
     }
+}
+
+const LISTING: &str = "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p";
+
+fn listing(
+    snap: &std::sync::Arc<sparkles_core::store::Snapshot>,
+    opt: sparkles_core::sparql::ctx::Optimizations,
+) -> (Vec<String>, bool) {
+    let r = sparkles_core::sparql::query(
+        snap.clone(),
+        LISTING,
+        &QueryOptions {
+            optimizations: Some(opt),
+            no_cache: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    fn uses(p: &sparkles_core::sparql::exec::PlanInfo) -> bool {
+        p.operator == "PatternCount" || p.children.iter().any(uses)
+    }
+    let mut rows: Vec<String> = r.rows().into_iter().map(|r| format!("{r:?}")).collect();
+    rows.sort();
+    (rows, uses(&r.plan))
+}
+
+fn same_predicate_listing(snap: &std::sync::Arc<sparkles_core::store::Snapshot>) {
+    use sparkles_core::sparql::ctx::Optimizations;
+    let (fast, used) = listing(snap, Optimizations::ALL);
+    let (slow, _) = listing(snap, Optimizations::NONE);
+    assert_eq!(fast, slow);
+    assert_eq!(used, snap.generation.patterns.file.is_some());
+}
+
+/// A pattern file of a newer version is not used: the database opens, queries read the
+/// permutations, `check` warns, and the next full compaction writes the current version.
+#[test]
+fn a_newer_pattern_file_is_not_used() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("db");
+    two_generation_database(&root);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    s.compact().unwrap();
+    let gen_dir = s.snapshot().generation.dir.clone().unwrap();
+    drop(s);
+    let path = gen_dir.join(sparkles_core::patterns::FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let r = check(&root, &CheckOptions { quick: false }).unwrap();
+    let c = r.get("patterns").unwrap();
+    assert_eq!(c.status, Status::Warning, "{}", r.to_text());
+    assert!(r.to_text().contains("version 99"), "{}", r.to_text());
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let snap = s.snapshot();
+    assert!(snap.generation.patterns.file.is_none());
+    assert!(
+        snap.generation
+            .patterns
+            .missing
+            .as_deref()
+            .unwrap()
+            .contains("version 99")
+    );
+    same_predicate_listing(&snap);
+    drop(snap);
+    s.compact().unwrap();
+    assert!(s.snapshot().generation.patterns.file.is_some());
+    same_predicate_listing(&s.snapshot());
 }
 
 // ---------------------------------------------------------- refused datasets ------

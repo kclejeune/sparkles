@@ -372,6 +372,7 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
         let mut done = vocab.run.done(vocab.summary);
         done.millis = vocab.millis;
         c.checks.push(done);
+        c.patterns(&dir, &gen_name);
         // the catalog lags the WAL, so it is read first; the full-text index too
         let catalog = std::fs::read(root.join("commits.bin"));
         let t_text = Instant::now();
@@ -1034,6 +1035,53 @@ impl Checker<'_> {
             run,
             summary,
         }
+    }
+
+    /// The predicate patterns (`patterns.bin`): their layout, and in a full check their
+    /// checksum and every subject's pattern against SPO. A version this build does not
+    /// read is a warning, since queries then read the permutations.
+    fn patterns(&mut self, dir: &Path, name: &str) {
+        let mut run = Run::new("patterns");
+        let file = format!("{name}/{}", crate::patterns::FILE);
+        let recorded = self.meta.as_ref().and_then(|m| m.patterns.clone());
+        let summary = match crate::patterns::PatternFile::open(dir) {
+            Ok(None) => {
+                if recorded.as_ref().is_some_and(|p| p.format > 0) {
+                    run.add(
+                        Issue::warning(
+                            "meta.json records predicate patterns but the file is missing: queries read the permutations",
+                        )
+                        .file(&file),
+                    );
+                }
+                match recorded.and_then(|p| p.skipped) {
+                    Some(why) => format!("none ({why})"),
+                    None => "none".to_string(),
+                }
+            }
+            Err(e @ Error::Unsupported(_)) => {
+                run.add(Issue::warning(e.to_string()).file(&file));
+                "not used".to_string()
+            }
+            Err(e) => {
+                run.add(Issue::error(e.to_string()).file(&file));
+                "unreadable".to_string()
+            }
+            Ok(Some(f)) if !self.full => format!("{} bytes", f.bytes()),
+            Ok(Some(_)) => match crate::patterns::verify(dir, MAX_ISSUES) {
+                Ok((problems, summary)) => {
+                    for p in problems {
+                        run.add(Issue::error(p).file(&file));
+                    }
+                    summary
+                }
+                Err(e) => {
+                    run.add(Issue::error(e.to_string()).file(&file));
+                    "unreadable".to_string()
+                }
+            },
+        };
+        self.checks.push(run.done(summary));
     }
 
     fn delta_vocabulary(&mut self, dir: &Path, name: &str) {

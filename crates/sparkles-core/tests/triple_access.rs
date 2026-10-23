@@ -528,6 +528,13 @@ const QUERIES: &[&str] = &[
     "SELECT * { GRAPH <urn:x-sparkles:inferred> { ?s ?p ?o } }",
     "SELECT * { GRAPH <urn:x-arq:UnionGraph> { ?s ex:p ?o } }",
     "SELECT (COUNT(*) AS ?n) { GRAPH <urn:x-arq:UnionGraph> { ?s ?p ?o } }",
+    // predicate patterns (X11): the masked snapshot reads the permutations, the oracle
+    // store the patterns
+    "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) { ?s ?p ?o } GROUP BY ?p",
+    "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) { ?s a ex:C1 . ?s ?p ?o } GROUP BY ?p",
+    "SELECT ?p (COUNT(DISTINCT ?s) AS ?n) { GRAPH <urn:x-arq:UnionGraph> { ?s ?p ?o } } GROUP BY ?p",
+    "SELECT ?p (COUNT(?s) AS ?n) { ?s spk:hasPredicate ?p } GROUP BY ?p",
+    "SELECT ?s ?p { ?s spk:hasPredicate ?p }",
     "DESCRIBE ex:s1",
     "DESCRIBE ?s WHERE { GRAPH ?g { ?s a ex:C1 } }",
     "CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } }",

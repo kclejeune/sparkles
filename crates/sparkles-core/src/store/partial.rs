@@ -9,7 +9,8 @@
 //! aside. The vocabulary is copied, so a delta that adds terms needs a full build: the
 //! base vocabulary's ids follow the order of its terms, and a new term in the middle
 //! would change the id of every term after it. The statistics are updated from the delta
-//! and exact counts of the old generation.
+//! and exact counts of the old generation, and the predicate patterns from the old
+//! generation's tables and the subjects the delta touches ([`crate::patterns::rewrite`]).
 //!
 //! The C13 spec (Phase 2) has the design and the cost model.
 
@@ -361,6 +362,7 @@ pub(crate) fn write(
     dir: &Path,
     next_bnode: u64,
     prefixes: BTreeMap<String, String>,
+    patterns: bool,
     interrupt: &crate::builder::InterruptFn,
 ) -> Result<IndexMeta> {
     let g = &snap.generation;
@@ -408,16 +410,35 @@ pub(crate) fn write(
             r
         },
         || {
-            let r = update_stats(snap);
-            tracing::debug!(
-                target: "sparkles::store::partial",
-                "partial compaction: statistics updated in {:?}",
-                t0.elapsed()
-            );
-            r
+            rayon::join(
+                || {
+                    let r = update_stats(snap);
+                    tracing::debug!(
+                        target: "sparkles::store::partial",
+                        "partial compaction: statistics updated in {:?}",
+                        t0.elapsed()
+                    );
+                    r
+                },
+                || {
+                    if !patterns {
+                        return Ok(crate::patterns::PatternInfo::skipped(
+                            "turned off for this build",
+                        ));
+                    }
+                    let r = crate::patterns::rewrite(snap, dir, &|| interrupt());
+                    tracing::debug!(
+                        target: "sparkles::store::partial",
+                        "partial compaction: predicate patterns written in {:?}",
+                        t0.elapsed()
+                    );
+                    r
+                },
+            )
         },
     );
-    let (rows, stats) = (rows?, stats?);
+    let (stats, patterns) = stats;
+    let (rows, stats, patterns) = (rows?, stats?, patterns?);
     let quads = rows[Perm::Spo.index()];
     if let Some((p, n)) = Perm::ALL.iter().zip(&rows).find(|(_, n)| **n != quads) {
         return Err(Error::Corrupt(format!(
@@ -439,6 +460,7 @@ pub(crate) fn write(
         next_bnode: next_bnode.max(g.meta.next_bnode),
         prefixes,
         created: crate::builder::now_rfc3339(),
+        patterns: Some(patterns),
     };
     write_synced(
         &dir.join("stats.json"),
