@@ -121,6 +121,33 @@ test('A4: k shortest paths from Alice to Lyon, listed and drawn in order', async
   expect((await drawn(page)).nodes.map(([l]) => l)).toContain('Lyon');
 });
 
+test('the focused path and the shared selection dim apart', async ({ page }) => {
+  await openAlice(page);
+  const wrap = page.locator('.wrap[data-graph]');
+  // the selection mutes what it does not hold, and the focused path dims what is off it
+  await page.getByRole('button', { name: 'Paths', exact: true }).click();
+  await choose(page, 'To', 'Lyon', /Lyon/);
+  await panel(page).getByLabel('k shortest').check();
+  await panel(page).getByRole('button', { name: 'Find paths' }).click();
+  await expect(list(page).getByRole('option')).toHaveCount(3);
+  await page.evaluate(() =>
+    import('/ui/src/lib/selection.svelte.ts').then((m) =>
+      m.selection.set(['<http://example.org/alice>'], 'a test'),
+    ),
+  );
+  await expect.poll(async () => Number(await wrap.getAttribute('data-muted'))).toBeGreaterThan(0);
+  const muted = await wrap.getAttribute('data-muted');
+  await list(page).focus();
+  await page.keyboard.press('2');
+  await expect(wrap).toHaveAttribute('data-path-focus', '2');
+  // focusing a path leaves the selection's dimming as it was, and clearing it too
+  await expect(wrap).toHaveAttribute('data-muted', muted!);
+  await page.keyboard.press('a');
+  await expect(wrap).toHaveAttribute('data-path-focus', '');
+  await expect(wrap).toHaveAttribute('data-muted', muted!);
+  await expect(page.getByRole('region', { name: 'Selection' })).toBeVisible();
+});
+
 test('A5: with reduced motion the paths appear at once', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await openAlice(page);

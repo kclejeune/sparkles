@@ -2276,7 +2276,11 @@ listed predicates instead, and the predicate box suggests those of the schema.
 The paths are drawn over the graph one edge at a time, in order of length, with each
 edge labelled by the paths that use it. With reduced motion they appear at once. The list
 under the form describes each path in words, and the keys `1` to `9` show one path, `A`
-shows them all and `Escape` clears the selection. **Open in editor** opens the query in
+shows them all and `Escape` shows them all again before it closes the panel. A shown path
+dims the elements off it, separately from the [shared selection](#arcs-on-the-map), which
+keeps its own dimming. The paths are drawn on the graph and not on the map, so opening the
+panel switches Explore's canvas back to the graph, and **Map** and `Shift+M` wait until the
+panel closes. **Open in editor** opens the query in
 the query page, **Add to graph** keeps the paths' nodes in the explored graph, and **Clear**
 removes the overlay. The search reads the commit of `main` that Explore shows. When it reaches
 its limit of a million visited nodes or ten seconds, the panel says so and suggests a
