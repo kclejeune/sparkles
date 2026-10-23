@@ -1114,7 +1114,9 @@ million-row product, which then failed after more than 100,000 rows. The tests i
 `automatic_admission_streams_a_product_whose_cursor_state_fits_without_spill` cover these
 cases. The second review found that the first fix also charged a hash index to a Cartesian
 product, which has no key and builds none, and so kept a count over such a product eager
-where it does not fit. A join without a shared variable now counts only its build rows.
+where it does not fit. A join without a shared variable now counts only its build rows. With
+these fixes, q4 with ProductType6 still streams on forge under the default pool, in
+15.4 s with a peak RSS of 288 MB and the same answer.
 
 On forge at 10M quads, with the default 5.2 GiB pool, q4 with ProductType6 answers in
 15.1 s with a peak server RSS of 282 MB, where it was refused. With a 12 GB pool, eager
