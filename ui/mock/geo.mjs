@@ -52,6 +52,55 @@ ex:atlantis a ex:City ; rdfs:label "Atlantis" ; geo:hasGeometry ex:atlantisGeom 
 ex:atlantisGeom geo:asWKT "POINT(1)"^^geo:wktLiteral .
 `;
 
+/**
+ * The `flows` dataset, for the map of relations (U11): ten people in Lyon and four in
+ * Paris who work for an organization in Paris, a person with no geometry, a few `knows`
+ * links both ways, and routes between airports, two of which cross the antimeridian.
+ * Commit 1 also has an eleventh person in Lyon whom commit 2 removes (commit 0 is the empty
+ * start of every dataset), so that
+ * `at` reads differ.
+ */
+const FLOWS_PREFIXES = `@prefix ex: <http://example.org/flows/> .
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+`;
+
+function person(name, label, lon, lat) {
+  return `ex:${name} a ex:Person ; rdfs:label "${label}" ; ex:worksIn ex:acme ; geo:hasDefaultGeometry ex:${name}Geom .
+ex:${name}Geom geo:asWKT "POINT(${lon.toFixed(4)} ${lat.toFixed(4)})"^^geo:wktLiteral .
+`;
+}
+
+function route(name, label, [lon1, lat1], [lon2, lat2]) {
+  return `ex:${name} a ex:Route ; rdfs:label "${label}" ;
+  ex:fromGeom "POINT(${lon1} ${lat1})"^^geo:wktLiteral ; ex:toGeom "POINT(${lon2} ${lat2})"^^geo:wktLiteral .
+`;
+}
+
+export function flowsTurtle() {
+  let ttl = FLOWS_PREFIXES;
+  ttl += `ex:acme a ex:Org ; rdfs:label "Acme Corp" ; geo:hasDefaultGeometry ex:acmeGeom .
+ex:acmeGeom geo:asWKT "POINT(2.3522 48.8566)"^^geo:wktLiteral .
+ex:ghost a ex:Person ; rdfs:label "Ghost" ; ex:worksIn ex:acme .
+`;
+  for (let i = 1; i <= 10; i++)
+    ttl += person(`lyon${i}`, `Lyon ${i}`, 4.8357 + i * 0.001, 45.764 + i * 0.0005);
+  for (let i = 1; i <= 4; i++)
+    ttl += person(`paris${i}`, `Paris ${i}`, 2.3 + i * 0.01, 48.85 + i * 0.004);
+  ttl += `ex:lyon1 ex:knows ex:paris1 . ex:lyon2 ex:knows ex:paris1 . ex:paris1 ex:knows ex:lyon1 .
+`;
+  ttl += route('tokyoSf', 'Tokyo to San Francisco', [139.6917, 35.6895], [-122.4194, 37.7749]);
+  ttl += route(
+    'aucklandHonolulu',
+    'Auckland to Honolulu',
+    [174.7633, -36.8485],
+    [-157.8583, 21.3069],
+  );
+  ttl += route('parisNewYork', 'Paris to New York', [2.3522, 48.8566], [-74.006, 40.7128]);
+  ttl += route('parisLyon', 'Paris to Lyon', [2.3522, 48.8566], [4.8357, 45.764]);
+  return ttl;
+}
+
 let seeded = false;
 
 /** A literal's CRS, its coordinate pairs in longitude/latitude, or an error. */
@@ -256,6 +305,30 @@ function seed(ctx) {
     lastBuild: { at: new Date(Date.now() - 3600_000).toISOString(), ms: 3.2, rows: 6 },
     commit: () => ctx.headCommit(ds).seq,
   };
+  seedFlows(ctx);
+}
+
+function seedFlows(ctx) {
+  if (ctx.datasets.has('flows')) return;
+  const ds = ctx.makeDataset('flows', 'persistent');
+  ds.store.load(flowsTurtle(), { format: 'text/turtle' });
+  // the first commit also has an eleventh person in Lyon, whom the second removes
+  ds.store.load(
+    `${FLOWS_PREFIXES}${person('lyon11', 'Lyon 11', 4.8357 + 0.011, 45.764 + 0.0055)}`,
+    {
+      format: 'text/turtle',
+    },
+  );
+  ds.baseQuads = ds.store.size;
+  ds.prefixes = { ...ds.prefixes, ex: 'http://example.org/flows/', geo: GEO };
+  ctx.addCommit(ds, 'upload', ds.store.size, 0, { bulk: true });
+  const before = ds.store.size;
+  ds.store.update(`PREFIX ex: <http://example.org/flows/>
+DELETE WHERE { ex:lyon11 ?p ?o } ;
+DELETE WHERE { ex:lyon11Geom ?p ?o }`);
+  ctx.addCommit(ds, 'update', 0, before - ds.store.size, {
+    message: 'The eleventh person left Lyon',
+  });
 }
 
 async function json(req, ctx) {

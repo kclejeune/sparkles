@@ -34,7 +34,10 @@
   import type { SchemaChanges } from '$lib/explore-time';
   import ClassTree from '$components/ClassTree.svelte';
   import GeoMapCard from '$components/GeoMapCard.svelte';
+  import GraphMap from '$components/GraphMap.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
+  import SelectionBar from '$components/SelectionBar.svelte';
+  import { selection } from '$lib/selection.svelte';
   import Icon from '$components/Icon.svelte';
   import SchemaDiffDialog from '$components/SchemaDiffDialog.svelte';
   import ShapesDraftDialog from '$components/ShapesDraftDialog.svelte';
@@ -93,6 +96,10 @@
   );
   /** Full-text query of the Search tab (`&q=`). */
   let textQuery = $state(page.url.searchParams.get('q') ?? '');
+  /** The drawn graph as the node-link canvas or on a map (`&map=1`, Shift+M). */
+  let canvasMode = $state<'graph' | 'map'>(
+    page.url.searchParams.get('map') === '1' ? 'map' : 'graph',
+  );
   let nodes = $state<Record<string, ENode>>({});
   let edges = $state<Record<string, EEdge>>({});
   let focusId = $state<string | null>(null);
@@ -123,10 +130,12 @@
     expandLog = [];
     seenTerms = new Map();
     changes = null;
+    selection.clear();
   }
   let graphView: GraphView | undefined = $state();
   // the reads of a view that goes away stop with it
   onDestroy(() => {
+    selection.clear();
     expandCtl.abort();
     for (const r of [graphRuns, detailRuns, schemaRuns, profileRuns, histRuns]) r.abortAll();
   });
@@ -625,6 +634,7 @@
     if (ds) p.set('ds', ds);
     if (iri) p.set('iri', iri);
     if (tab !== 'graph') p.set('tab', tab);
+    if (canvasMode === 'map' && tab === 'graph') p.set('map', '1');
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
     const timed =
@@ -642,6 +652,47 @@
   function select(id: string | null) {
     selectedId = id;
     if (id) void loadDetails(id);
+    // a click on the canvas is a selection the map shows too
+    if (id) selection.set([id], 'the graph');
+    else selection.clear();
+  }
+
+  function setCanvasMode(m: 'graph' | 'map') {
+    if (canvasMode === m) return;
+    canvasMode = m;
+    syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
+  }
+
+  /** The state the graph's map reads positions at, and the earlier one in compare mode. */
+  const mapAt = $derived(timeActive && graphTimeOpen ? exAt : '');
+  const mapFromAt = $derived(graphTimeOpen && exCompare && !exAgainst ? exFrom : '');
+
+  /**
+   * Draw the entities of the selection as the graph: the first one is the focus and each
+   * is expanded, up to 25 of them. Larger sets are drawn as nodes to expand by hand.
+   */
+  async function openSelectionAsGraph(ids: string[]) {
+    if (!ds) return;
+    const terms = ids
+      .filter((id) => id.startsWith('<') && id.endsWith('>'))
+      .slice(0, MAX_NODES)
+      .map((id): Term => ({ type: 'uri', value: id.slice(1, -1) }));
+    if (!terms.length) return;
+    resetGraph();
+    canvasMode = 'graph';
+    const made = terms.map((t) => ensureNode(t));
+    focusId = made[0].id;
+    selectedId = made[0].id;
+    syncUrl(made[0].iri);
+    const many = made.length > 25;
+    if (many)
+      toasts.push(
+        'info',
+        `Drew ${made.length} entities`,
+        'Double-click a node to load its neighbours.',
+      );
+    await Promise.all(many ? [expand(made[0].id)] : made.map((n) => expand(n.id)));
+    void loadDetails(made[0].id);
   }
 
   async function loadDetails(id: string) {
@@ -1129,9 +1180,17 @@
     };
     // H opens and closes the History strip of the selected resource, Shift+H the one over the graph
     const onKey = (e: KeyboardEvent) => {
-      if ((e.key !== 'h' && e.key !== 'H') || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if ((e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable]'))
         return;
+      // Shift+M shows the drawn graph on a map and back
+      if (e.key === 'M' && e.shiftKey) {
+        if (tab !== 'graph' || !nodeCount) return;
+        e.preventDefault();
+        setCanvasMode(canvasMode === 'map' ? 'graph' : 'map');
+        return;
+      }
+      if (e.key !== 'h' && e.key !== 'H') return;
       if (tab !== 'graph') return;
       if (e.shiftKey) {
         if (!nodeCount) return;
@@ -1251,7 +1310,11 @@
       />
     {/key}
   {:else if tab === 'graph'}
-    <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen}>
+    <div
+      class="split"
+      class:overview={nodeCount === 0 && !graphTimeOpen}
+      class:mapmode={canvasMode === 'map' && nodeCount > 0}
+    >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen}
           <div class="gtools">
@@ -1264,6 +1327,19 @@
             <span class="spacer"></span>
             <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
             {#if nodeCount}
+              <div class="seg" role="group" aria-label="Show the graph as">
+                <button
+                  class="btn sm"
+                  aria-pressed={canvasMode === 'graph'}
+                  onclick={() => setCanvasMode('graph')}>Graph</button
+                >
+                <button
+                  class="btn sm"
+                  aria-pressed={canvasMode === 'map'}
+                  title="Show the drawn entities on a map, with arcs for their relations (Shift+M)"
+                  onclick={() => setCanvasMode('map')}><Icon name="map" size={13} /> Map</button
+                >
+              </div>
               <button
                 class="btn sm"
                 aria-pressed={graphTimeOpen}
@@ -1277,6 +1353,7 @@
               >
             {/if}
           </div>
+          <SelectionBar onopengraph={openSelectionAsGraph} />
         {/if}
         {#if graphTimeOpen && ds}
           <div class="graph-time">
@@ -1315,20 +1392,35 @@
             {/key}
           </div>
         {:else}
-          <div class="cy-host">
-            <GraphView
-              bind:this={graphView}
-              animate={graphTimeOpen}
-              nodes={gNodes}
-              edges={gEdges}
-              selected={selectedId}
-              onselect={select}
-              onexpand={expand}
-            />
-          </div>
-          <div class="hint faint">
-            Double-click a node to load its neighbours. Blue-ringed nodes are expanded.
-          </div>
+          {#if canvasMode === 'map' && ds}
+            <div class="cy-host">
+              <GraphMap
+                {ds}
+                nodes={gNodes}
+                edges={gEdges}
+                at={mapAt}
+                fromAt={mapFromAt}
+                fitKey={focusId ?? ''}
+                onopen={(iri) => focusOn(iri)}
+              />
+            </div>
+          {:else}
+            <div class="cy-host">
+              <GraphView
+                bind:this={graphView}
+                animate={graphTimeOpen}
+                nodes={gNodes}
+                edges={gEdges}
+                selected={selectedId}
+                highlight={selection.ids}
+                onselect={select}
+                onexpand={expand}
+              />
+            </div>
+            <div class="hint faint">
+              Double-click a node to load its neighbours. Blue-ringed nodes are expanded.
+            </div>
+          {/if}
         {/if}
       </div>
 
@@ -2184,8 +2276,9 @@
   }
   .gtools {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 14px;
+    gap: 6px 14px;
     padding: 6px 12px;
     border-bottom: 1px solid var(--border);
     background: var(--surface);
@@ -2198,6 +2291,19 @@
   .cy-host {
     flex: 1;
     min-height: 0;
+  }
+  .seg {
+    display: inline-flex;
+    gap: 0;
+  }
+  .seg .btn:first-child {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .seg .btn:last-child {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    margin-left: -1px;
   }
   .ov-host {
     flex: 1;
@@ -2663,6 +2769,16 @@
     .split {
       grid-template-columns: minmax(0, 1fr);
       grid-template-rows: minmax(320px, 1fr) auto;
+    }
+    /* the map takes the height it needs and the page scrolls to the details below it */
+    .split.mapmode {
+      grid-template-rows: auto auto;
+    }
+    .split.mapmode .canvas {
+      overflow: visible;
+    }
+    .split.mapmode .cy-host {
+      flex: none;
     }
     .side {
       border-left: 0;

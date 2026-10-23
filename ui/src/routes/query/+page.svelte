@@ -25,6 +25,8 @@
   import { EXAMPLES } from '$lib/examples';
   import { fmtInt, fmtMs, formatSse } from '$lib/format';
   import { geoColumns } from '$lib/geo';
+  import { locateEntities } from '$lib/locate';
+  import { entityColumns } from '$lib/result-arcs';
   import { triplesToGraph, type Triple } from '$lib/graph';
   import { applyMissingPrefixes, queryKind, RDF_TYPE } from '$lib/rdf';
   import { formatEditor } from '$lib/fmt-edit';
@@ -1328,7 +1330,9 @@
           prevView &&
           prevView !== 'explain' &&
           (prevView !== 'graph' || result.queryType !== 'ASK') &&
-          (prevView !== 'map' || geoColumns(result.vars ?? [], result.rows ?? []).length > 0);
+          (prevView !== 'map' ||
+            geoColumns(result.vars ?? [], result.rows ?? []).length > 0 ||
+            entityColumns(result.vars ?? [], result.rows ?? []).length > 1);
         outcomes[tabId] = {
           status: 'done',
           ds: dsName,
@@ -1682,6 +1686,48 @@
     outcome?.result?.vars && outcome.result.rows
       ? geoColumns(outcome.result.vars, outcome.result.rows)
       : [],
+  );
+
+  /**
+   * A result with two columns of entities and no geometry column gets a Map tab when some
+   * of its entities have geometries (U11 section 2.2). One lookup of the first 200 of them
+   * decides, run when the result arrives and not while the time slider is open.
+   */
+  let arcProbe = $state<{ rows: unknown; ok: boolean } | null>(null);
+  $effect(() => {
+    const r = outcome?.status === 'done' ? outcome.result : undefined;
+    const target = outcome ? onBranch(outcome.ds, outcome.branch) : '';
+    const vars = r?.vars;
+    const rows = r?.rows;
+    // not while the time slider reads state after state: the lookup would be one more read of each
+    if (!r || !vars || !rows || mapColumns.length || timeOpen) return;
+    const cols = entityColumns(vars, rows);
+    if (cols.length < 2) return;
+    const at = r.at?.historical ? r.at.selector : undefined;
+    const iris: string[] = [];
+    const idx = cols.map((c) => vars.indexOf(c));
+    for (const row of rows) {
+      for (const i of idx) {
+        const t = row[i];
+        if (t?.type === 'uri' && iris.length < 200) iris.push(t.value);
+      }
+      if (iris.length >= 200) break;
+    }
+    const ctl = new AbortController();
+    arcProbe = { rows, ok: false };
+    locateEntities(iris, {
+      run: (sparql, limit) => api.select(target, sparql, { at, send: limit, signal: ctl.signal }),
+      convert: async (batch) => (await api.geoConvert(batch, ctl.signal)).results,
+      signal: ctl.signal,
+    })
+      .then((found) => {
+        if (!ctl.signal.aborted) arcProbe = { rows, ok: found.found.size > 0 };
+      })
+      .catch(() => {});
+    return () => ctl.abort();
+  });
+  const hasMap = $derived(
+    mapColumns.length > 0 || (!!arcProbe?.ok && arcProbe.rows === outcome?.result?.rows),
   );
 
   const graph = $derived(
@@ -2496,7 +2542,7 @@
                   <Icon name="graph" size={14} /> Graph
                 </button>
               {/if}
-              {#if mapColumns.length}
+              {#if hasMap}
                 <button
                   class="tab"
                   role="tab"
@@ -2981,6 +3027,8 @@
               columns={mapColumns}
               {prefixes}
               onopen={openIri}
+              ds={onBranch(outcome.ds, outcome.branch)}
+              at={r.at?.historical ? r.at.selector : ''}
             />
           {:else if outcome.view === 'plan'}
             {#if r.meta.plan}
