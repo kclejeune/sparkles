@@ -20,6 +20,11 @@ with `server-memory`. The queries of `sparkles ask`, the GraphQL draft, reasoner
 diagnostics, the Graph Store DELETE and tabular uploads now charge the grant their request
 was admitted with instead of taking a second one or none.
 
+With the query memory pool on, the server now admits a query or update after its body has
+arrived, so a client that sends slowly no longer holds 16 MiB of the pool while it sends.
+Uploads, patches and Graph Store writes no longer take an initial grant or wait for the
+pool, and a release of memory wakes only the waiters that fit.
+
 In the JVM library, `abort()` or a timeout that raced the end of a query could throw
 `IllegalStateException` because the query's native object had just been released. Such a
 cancel is now ignored, since the query has already finished.

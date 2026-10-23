@@ -334,8 +334,7 @@ that work by priority and links each item to its design spec.
   admission wait, which `SILENT` turns into no rows. Routes such as SHACL, ShEx
   validation outside its selectors, diff and the `/$/stats`, `/$/schema` and
   `/$/validate` reads hold their admitted grant idle while their own query takes a
-  second one. A query or update takes its initial grant before the server reads its
-  body, so a slow client holds pool memory while it sends. With a pool set, an eager
+  second one. With a pool set, an eager
   CONSTRUCT or DESCRIBE result keeps its query's peak estimate until the result object is
   released. A SELECT or ASK result keeps only its own estimate.
   [Roadmap](ROADMAP.md) item 7.

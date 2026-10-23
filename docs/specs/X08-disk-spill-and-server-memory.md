@@ -829,7 +829,7 @@ the text:
   `memory/brief` and the `/$/stats`, `/$/schema` and `/$/validate` reads, hold the
   admitted grant idle while a query of their own takes a second grant from the dataset's
   pool. That reserves more than they use but bypasses nothing. Uploads and Graph Store
-  writes hold an admission grant for the whole load, and the memory of the load itself is
+  writes start with an empty grant since 2026-10-23, and the memory of the load itself is
   not charged to the pool.
 * **Errors.** `BudgetKind::ServerMemory` (`server-memory`) answers `503` with
   `Retry-After: 1`, counts as a budget in `sparkles_budget_exceeded_total`, and is
@@ -1029,11 +1029,9 @@ latency gates, and roadmap item 1 takes the 10.5M and DBpedia profile runs.
 * **X08-P1-nested-service.** Recognise a SERVICE call to the same server, without a header
   that a client could forge, so that it does not wait behind its caller's grant. Today it
   answers `503` after the admission wait, and `SILENT` turns that into empty results.
-* **X08-P1-admit-after-body.** Admit a POST query or update after its body is read under
-  the existing body limit, give uploads and Graph Store writes no 16 MiB initial grant,
-  and wake only the waiters that fit when memory returns. Today admission happens before
-  the body is read, and the server sets no body read timeout, so a slow client holds its
-  grant while it sends. Every release wakes every waiter.
+* **X08-P1-admit-after-body.** Done on 2026-10-23, as the section on admission after the
+  body describes. The server still sets no body read timeout, so a slow client holds its
+  rate limiter slot while it sends.
 * **X08-P1-retained-results.** Done on 2026-10-23 for SELECT and ASK, as the section
   below describes. A CONSTRUCT or DESCRIBE result still keeps its query's peak estimate,
   because its decoded triples are not measured when the query finishes.
@@ -1077,6 +1075,41 @@ succeeds once the memory returns, and that no grant remains afterwards. SHACL va
 reasoning, the rest of ShEx validation and the schema, statistics, format, lint, patch and
 diff routes still run their queries outside the admitted grant, so they hold it idle and
 take a second one from the dataset's pool.
+
+### Admission after the body (2026-10-23)
+
+Admission used to take the initial grant before the server read the request's body.
+The server sets no body read timeout, so a client that sent its query slowly held 16 MiB of
+the pool, and a place ahead of every later request, for as long as it kept sending. An
+upload or Graph Store write held the same 16 MiB for the whole load, although none of the
+load was charged to it. Every release woke every waiter, and all but one of them polled
+the queue's lock for nothing.
+
+`server_memory::admit` now reads the body of a query or update before it asks the pool. It
+reads up to the body limit of the request's class, `--max-query-body-mb` or
+`--max-update-body-mb`, and at most 256 MiB. A body that ends within that limit is handed
+to the handler whole. A longer one is admitted once that much has arrived, and the
+handler receives the bytes read followed by the rest, so its own limit and its error for
+an oversized body are unchanged. A declared length above the limit is not read ahead, so
+the handler refuses it as before, and a read error reaches the handler after the bytes
+before it. The bytes read ahead are the bytes the handler would have buffered, so the
+memory outside the pool does not grow. Uploads, patches, writes to `/{ds}/data` or a
+graph, and requests to `/{ds}` that are not a SPARQL query, update or form start with an
+empty grant without queueing, and a query that they run grows it. MCP calls and algorithm
+runs already read their bodies before admission.
+
+`QueryPool` now wakes only the first waiter that `Ticket::poll` would serve, which is the
+head when it fits or a smaller waiter that may pass it under the bypass rule. A waiter
+that takes its grant wakes the next one that fits in what is left, and a waiter that
+leaves the queue wakes the next one as before. Blocking waiters have no callback, so they
+still wait on the condition variable, which is notified on every change.
+
+`a_query_is_admitted_after_its_body_arrives` sends half a query, checks that the pool has
+granted nothing and queued nothing, and then sends the rest. It failed before the change
+with 16 MiB granted. `uploads_and_graph_store_writes_take_no_initial_grant` holds the whole
+pool and sends a graph PUT, a default graph POST and a POST to `/{ds}`, which answered
+`503` before, and checks that a SPARQL update still waits. `a_release_wakes_only_the_waiters_that_fit`
+counts the wake-ups of three waiters through two releases.
 
 ### Retained eager results (2026-10-23)
 

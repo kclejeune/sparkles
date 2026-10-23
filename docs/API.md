@@ -7875,12 +7875,15 @@ off. On a host where the available memory cannot be read, the pool is off until 
 sets it.
 
 Each query and update request is admitted before it parses, after the rate limiter's
-concurrency caps have let it through. Admission takes an initial grant of 16 MiB, or the
+concurrency caps have let it through and after its body has arrived. The server reads up
+to the body limit of the request's class, or 256 MiB when that is higher or unset, before
+it asks the pool, so a client that is still sending holds no pool memory. Admission takes an initial grant of 16 MiB, or the
 request's whole `--query-memory-mb` budget if that is smaller. If the pool cannot give it,
 the request waits in arrival order. After `--query-admission-wait` seconds (default 2) it
 answers `503` with `Retry-After: 1` and the budget `server-memory`. A waiter behind a
 larger one may be served first when the pool has room for it, at most eight times in a
-row. A running query grows its grant in steps of 4 MiB as its estimate grows, and gives
+row. When memory returns, the pool wakes only the first waiter that it can serve, and
+that waiter wakes the next one when it takes its grant. A running query grows its grant in steps of 4 MiB as its estimate grows, and gives
 steps back as its estimate falls. A query never waits for memory once it runs. When the
 pool cannot cover its next step, the query fails with `server-memory`, and the pool
 therefore cannot deadlock. While requests wait, a query may not hold more than half of the
@@ -7893,8 +7896,9 @@ keeps its query's peak estimate until it is dropped or collected, even when the 
 much smaller. This holds for a `QueryResult` and for the Python and Node result objects
 in an embedded catalog with a pool. A SERVICE call
 to the same server is admitted like any request, so it can answer `503` while its caller
-holds memory. Uploads and Graph Store writes take an admission grant for the whole load,
-and the memory of the load itself is not counted in the pool.
+holds memory. Uploads, patches and Graph Store writes start with an empty grant and do not
+wait for the pool, because their bodies stream into the store and the memory of the load
+is not counted in the pool. A query that such a request runs grows the empty grant.
 
 `GET /$/server/memory` needs the `metrics` permission and returns the pool and the shared
 caches.

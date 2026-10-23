@@ -416,3 +416,80 @@ async fn algorithm_runs_wait_for_the_memory_pool() {
     assert_eq!(task.state, "done", "{:?}", task.message);
     assert_eq!(pool(&s).granted(), 0);
 }
+
+#[tokio::test]
+async fn a_query_is_admitted_after_its_body_arrives() {
+    let s = server(64, Duration::from_secs(10));
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    });
+    let app = s.app.clone();
+    let sent = tokio::spawn(async move {
+        let res = app
+            .oneshot(
+                Request::post("/ds/sparql")
+                    .header(header::CONTENT_TYPE, "application/sparql-query")
+                    .header(header::ACCEPT, "application/x-sparkles+json")
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    });
+    tx.send(Ok("SELECT * WHERE ".into())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // a client that is still sending holds no pool memory and no place in the queue
+    assert_eq!(pool(&s).granted(), 0);
+    assert_eq!(pool(&s).waiting(), 0);
+    assert!(!sent.is_finished());
+    tx.send(Ok("{ ?s ?p ?o }".into())).await.unwrap();
+    drop(tx);
+    let (status, body) = sent.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("urn:a"), "{body}");
+    assert_eq!(pool(&s).granted(), 0);
+}
+
+#[tokio::test]
+async fn uploads_and_graph_store_writes_take_no_initial_grant() {
+    let s = server(64, Duration::from_millis(200));
+    // the whole pool is held, so a request that asks for an initial grant would answer 503
+    let held = pool(&s).try_grant(64 * MB).unwrap();
+    let send = |method: &str, uri: &str, ct: &str| {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, ct)
+            .body(Body::from("<urn:c> <urn:p> <urn:d> .\n"))
+            .unwrap();
+        let app = s.app.clone();
+        async move {
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    for (method, uri) in [
+        ("PUT", "/ds/data?graph=urn:g"),
+        ("POST", "/ds/data?default"),
+        ("POST", "/ds"),
+    ] {
+        let (status, body) = send(method, uri, "application/n-triples").await;
+        assert!(status.is_success(), "{method} {uri}: {status} {body}");
+    }
+    assert_eq!(pool(&s).stats().rejected, 0);
+    // a SPARQL update still asks for its initial grant and waits for it
+    let (status, _, body) = post_update(&s.app, "INSERT DATA { <urn:e> <urn:p> <urn:f> }").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    drop(held);
+    assert_eq!(pool(&s).granted(), 0);
+}
