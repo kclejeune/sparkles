@@ -1121,15 +1121,26 @@ fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
 /// case: eager execution holds the whole product, and the cursor holds the product's
 /// smaller input, the key set of the NOT EXISTS and one row per group.
 fn memory_admitted(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
-    kind == QueryKind::Select && ctx.snap.delta.is_empty() && batches_admitted(options) && {
-        let room = admission_room(ctx);
-        let eager = largest_output_bytes(node);
-        eager.is_finite() && eager * 2.0 > room && streams_natively(ctx, node) && {
+    let eager = largest_output_bytes(node);
+    eager.is_finite() && eager * 2.0 > admission_room(ctx) && cursor_fits(ctx, node, kind, options)
+}
+
+/// Whether a cursor over `node` can run without spill: the query is a SELECT over an
+/// immutable snapshot, every operator streams natively, and the state the cursor keeps,
+/// with its batch headroom, is expected to fit in half of the memory the query may use.
+/// Automatic admission asks this when eager execution is expected not to fit, and the
+/// eager memory retry asks it when eager execution has failed, so both send the same
+/// plans to a cursor without spill (roadmap items 91 and 96).
+fn cursor_fits(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
+    kind == QueryKind::Select
+        && ctx.snap.delta.is_empty()
+        && batches_admitted(options)
+        && streams_natively(ctx, node)
+        && {
             let state = cursor_state_bytes(ctx, node);
             let headroom = cursor_headroom(ctx, node, options) as f64;
-            state.is_finite() && state * 2.0 + headroom <= room
+            state.is_finite() && state * 2.0 + headroom <= admission_room(ctx)
         }
-    }
 }
 
 /// The memory automatic admission compares a plan's estimates with: what the query's
@@ -1172,8 +1183,11 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
         _ if binary::eligible(node) => {
             let probe = &node.children[binary::probe_side(node)];
             let build = &node.children[1 - binary::probe_side(node)];
-            // a join with no shared variable has no key, so it builds no hash index
-            if build.vars.iter().any(|v| probe.vars.contains(v)) {
+            // a join with no shared variable has no key, so it builds no hash index,
+            // except a keyed OPTIONAL, which indexes its equality column
+            if build.vars.iter().any(|v| probe.vars.contains(v))
+                || matches!(node.kind, Kind::KeyedLeftJoin { .. })
+            {
                 hashed(build, build.est)
             } else {
                 rows(build, build.est)
@@ -1458,11 +1472,12 @@ pub fn query_execution_with_plan(
             let levels = levels.max(prepared.plan_depth);
             // An eager SELECT that runs out of memory runs again once as a cursor that
             // may spill (X08 §6.8). Eager execution writes nothing before it finishes,
-            // so the failure always comes before any output. Without spill the cursor
-            // still holds only its operators' state rather than every intermediate
-            // result, so a plan whose operators all stream runs again too.
+            // so the failure always comes before any output. Without spill it runs
+            // again when automatic admission would have streamed it had its estimates
+            // foreseen the failure: its operators all stream and their state fits.
             let retry = kind == QueryKind::Select
-                && (options.spill.is_some() || native(&prepared.node))
+                && (options.spill.is_some()
+                    || cursor_fits(&prepared.ctx, &prepared.node, kind, cursor))
                 && options.extensions.is_none()
                 && options.initial_bindings.is_empty()
                 && retryable(&prepared.node)

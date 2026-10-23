@@ -1,8 +1,11 @@
 //! An automatic SELECT whose eager run exceeds its memory budget runs again as a cursor
-//! when every operator of its plan streams, also without disk spill. SP2Bench v1.01 q4
-//! joins articles of the same journal before a FILTER and a DISTINCT keep few of the
-//! pairs. Eager execution holds the whole join, and the cursor holds only the smaller
-//! join input and the distinct pairs.
+//! without disk spill when automatic admission would have streamed it had its estimates
+//! foreseen the failure: every operator streams and the cursor's state is expected to
+//! fit. SP2Bench v1.01 q4 joins articles of the same journal before a FILTER and a
+//! DISTINCT keep few of the pairs. Eager execution holds the whole join, and the cursor
+//! holds only the smaller join input and the distinct pairs. As at 10M, the journals'
+//! sizes are skewed, so the join is much larger than the planner estimates and automatic
+//! admission keeps the query eager.
 use oxrdf::Term;
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
@@ -14,8 +17,9 @@ use sparkles_core::{BudgetKind, Error};
 
 const Q4: &str = include_str!("fixtures/sp2b-q4.rq");
 
-const JOURNALS: usize = 8;
-const ARTICLES: usize = 60;
+/// Eight journals of 200 articles each, and 992 journals of one article.
+const JOURNALS: usize = 1000;
+const ARTICLES: usize = 200;
 
 fn fixture() -> Store {
     let store = Store::in_memory(StoreOptions::default());
@@ -27,7 +31,8 @@ fn fixture() -> Store {
          @prefix swrc: <http://swrc.ontoware.org/ontology#> .\n",
     );
     for j in 0..JOURNALS {
-        for a in 0..ARTICLES {
+        let articles = if j < 8 { ARTICLES } else { 1 };
+        for a in 0..articles {
             // authors recur across journals, so DISTINCT removes repeated pairs
             let person = (j * 17 + a) % 200;
             data.push_str(&format!(
@@ -80,9 +85,9 @@ fn automatic(s: &Store, q: &str, opts: &QueryOptions) -> Result<(Rows, Option<St
     }
 }
 
-/// A budget the eager join's 28,800 rows of seven columns exceed, while the cursor's
-/// join input of 480 rows and its distinct pairs fit.
-const MEMORY: u64 = 1 << 20;
+/// A budget the eager join's 320,992 rows of seven columns exceed, while the planner
+/// estimates a join that fits and the cursor's state fits too.
+const MEMORY: u64 = 12 << 20;
 
 #[test]
 fn q4_eager_memory_failure_runs_again_as_a_cursor_without_spill() {
@@ -125,4 +130,29 @@ fn a_retry_that_the_cursor_cannot_hold_still_fails_within_the_budget() {
         automatic(&s, &q, &opts),
         Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory
     ));
+}
+
+/// The retry asks what automatic admission asks of a cursor without spill. When the
+/// cursor's estimated state and batch headroom do not fit in half of the budget, the
+/// eager failure is the answer and no cursor starts.
+#[test]
+fn no_cursor_starts_when_its_estimated_state_does_not_fit() {
+    let s = fixture();
+    let opts = QueryOptions {
+        max_memory_bytes: Some(2 << 20),
+        no_cache: true,
+        ..Default::default()
+    };
+    let started = query_execution(
+        s.snapshot(),
+        Q4,
+        &opts,
+        &CursorOptions::default(),
+        ExecutionMode::Auto,
+    );
+    assert!(
+        matches!(&started, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{:?}",
+        started.as_ref().err()
+    );
 }
