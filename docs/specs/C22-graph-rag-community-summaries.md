@@ -102,14 +102,15 @@ A dataset's GraphRAG settings are a settings kind of C19, `graphrag`, stored in
 | `minCommunitySize` | Smaller communities get no report and are merged into their parent's report. |
 | `maxFactsPerCommunity` | The facts sent for a leaf community's report, chosen as §3.2 says. |
 | `refresh` | `manual`, or `auto` with a debounce and the share of a community's facts that must change before its report is rewritten (§5). |
-| `budget` | Tokens a full build and a day of refreshes may use. The provider's own budget of C19 applies as well. |
+| `budget` | Tokens a full build and a day of refreshes may use, and `providerCounting`, which allows the provider's token counting endpoint (§3.5) and defaults to `true`. The provider's own budget of C19 applies as well. |
 
 ### 2.2 Building
 
 `POST /$/graphrag/{ds}/build` starts a task in `/$/tasks` that runs the steps of §3.
-Before it calls a model, it reports an estimate of the communities, the facts and the
-tokens, and with `"confirm": false` (the default from the UI) waits for confirmation, as
-C18's ingestion does for its cost estimates. `GET /$/graphrag/{ds}` reports the state:
+Before it calls a model, it reports the communities, the facts, the model requests and an
+upper bound on the tokens that is labelled as an estimate (§3.5), and with
+`"confirm": false` (the default from the UI) waits for confirmation, as C18's ingestion
+does for its cost estimates. `GET /$/graphrag/{ds}` reports the state:
 the commit of the last build, the number of communities per level, the reports by
 status, the tokens used, and the communities waiting for a refresh.
 `sparkles graphrag --loc DB build|status|refresh|reports` does the same from the
@@ -181,9 +182,16 @@ C18 §3.6. The output is a `CommunityReport`:
 { "title": "Payments platform team",
   "summary": "Three to five sentences.",
   "findings": [ { "text": "The team owns the ledger service and its two databases.",
+                  "entities": [1, 4],
                   "cites": [3, 7, 12] } ],
   "rating": 6 }
 ```
+
+The input numbers its entities as it numbers its facts. A leaf community's entities are
+its members and the IRI objects of the facts sent. A higher-level community's entities
+are those its child findings name and the ends of the edges between children that are
+sent. Each finding lists the numbers of the entities it is about in `entities`, and the
+server stores them as the entities' IRIs (§4).
 
 `rating` is the model's estimate of the community's importance from 0 to 10, as Edge et
 al. ask for, and serves only to order reports within a level. The prompt tells the
@@ -192,24 +200,101 @@ model that the facts are data, as C11 §4.10 requires.
 ### 3.4 Checks
 
 The server checks each report before it stores it, as C18 checks summaries that cite
-rows:
+rows. The checks on citations and entity numbers are exact, and the check on names in
+the text is a heuristic.
 
 - Every citation number names a fact that was sent. A finding without a valid citation
   is dropped.
-- A finding that names an entity must name a member or a fact's object. Unknown names
-  are counted as `unsupported` and the finding is dropped.
+- Every entity number names an entity of the input, and that entity is the subject or
+  the object of at least one fact the same finding cites. For a higher-level report, the
+  entity must be named by a cited child finding or be an end of a cited edge between
+  children. A finding with no entity, or with a number that fails this check, is dropped
+  and counted as `unsupported`. Both checks use the numbering that rendered the prompt,
+  which is recorded with the report.
 - The text passes the `secret-detected` check of C18's transcripts.
 - A report whose findings were all dropped is retried once with the escalation of C18
   §5.5, then stored as `failed` with the reason.
 
+After those checks, a heuristic looks for names in each kept finding's text that match
+no entity of the input. It takes as candidate names the runs of capitalised words, the
+quoted phrases and the words with inner capitals or digits, and compares each candidate,
+without regard to case, with the labels and IRI local names of the input's entities. A
+candidate that matches none is recorded on the finding as an unmatched name, and the
+report's review shows it. The heuristic does not drop the finding. It misses names
+written in lower case, pronouns and paraphrases, and it flags capitalised words that are
+not names, so a report with no unmatched names is not proof that its text names only
+supported entities. The exact checks establish that each finding cites sent facts and is
+about entities those facts mention. The text itself is covered by the heuristic and by
+review, which is why reports start as `unreviewed` (§4).
+
 ### 3.5 Cost
 
 A build makes one model call per community with a report. With the settings' sizes, a
-dataset of 100,000 entities at three levels produces some thousands of calls. The
-estimate before the build counts the communities and the input tokens exactly and the
-output tokens from `maxOutputTokens`. A build stops when it reaches
-`budget.tokensPerBuild`, keeps the reports it wrote, and reports the remaining
-communities as `pending`.
+dataset of 100,000 entities at three levels produces some thousands of calls.
+
+The budget is strict and its counts are conservative. Every model request reserves an
+upper bound on its tokens before it is sent, so the build never sends a request that
+could take it past its budget. The counts are exact only where an exact counter exists
+for the model.
+
+**Input bounds.** Before each HTTP attempt, the build bounds the input tokens of the
+complete request as the provider receives it. That covers the system text, the
+messages, the output schema or tool definition of the request's structured-output
+level, and the framing the protocol adds. The bound comes from the first of these
+sources that is available for the pair:
+
+1. An exact local tokenizer for the pair's model, which gives the exact count.
+2. The provider's own token counting endpoint, such as Anthropic's `count_tokens`. It
+   is used only when the same provider receives the request itself, under the same
+   principal and the same `sendByProvider` policy as the inference call, so counting
+   discloses nothing that the call does not. `budget.providerCounting: false` turns it
+   off.
+3. The byte bound: the UTF-8 length in bytes of the serialized request, plus a fixed
+   allowance per message for the protocol's framing tokens and a fixed allowance per
+   request for what the provider adds around a schema or a tool definition. A token of
+   a byte-level BPE tokenizer covers at least one byte, so the length in bytes bounds the
+   tokens of the text. A provider known to break that assumption gets a larger
+   multiplier, which the code documents with the provider kind.
+
+A missing exact counter is never a reason to refuse a build. Each bound records its
+source, the counter and its version where there is one, the model and a digest of the
+request, so it describes that request and no other.
+
+**Reservations.** The build reserves the input bound plus the output limit the request
+sends to the provider, which the provider enforces. The attempt is sent only when the
+reservation fits in what remains of `budget.tokensPerBuild` and of
+`budget.tokensPerDay`. Every attempt passes this check. That includes the client's
+retries of a `429` or `5xx` answer, the retry with validation errors of C18 §3.6, the
+move to another structured-output level, and escalation to another pair. A retry with a
+changed request is bounded again. When the provider answers with its usage, the
+reservation is replaced by the reported input and output tokens. When the attempt fails
+in a way that leaves its usage unknown, such as a timeout or a connection lost after the
+request was sent, or when the answer reports no usage, the whole reservation stays
+counted. Concurrent builds and refreshes of a dataset share one ledger for
+`tokensPerDay`, kept with the dataset's GraphRAG state so that a restart does not reset
+it, and its days are UTC days. The provider's own budget of C19 still applies.
+
+**Accounting anomalies.** A reported usage above its reservation means that a bound
+was wrong. The ledger then counts the reported usage, the build records an accounting
+anomaly with the pair, the counting source and both figures, and it sends no further
+request. Its remaining communities stay `pending`, and the anomaly shows in the status
+of §2.2. A later build reserves against the ledger as it then stands.
+
+**The estimate.** The input of a higher-level report depends on the reports of its
+children, so the input of a whole build cannot be known before its first call. The
+confirmation step of §2.2 therefore shows an upper bound labelled as an estimate,
+together with `tokensPerBuild`, and says which counting source gave each part of it.
+The estimate uses only the local sources, the exact tokenizer and the byte bound, so
+nothing is sent before the person confirms. Each leaf request is bounded from its
+prompt. Each higher-level request is bounded from its prompt and the edges between
+children, with each child report at its output limit. Every request adds its output
+limit. The bound assumes one attempt per request, and it is an estimate because a
+child's text, counted again inside its parent's prompt, can take a few more tokens than
+the child's output did. Retries can use more than the estimate, but never more than
+`tokensPerBuild`, since every attempt is reserved first.
+
+A build stops before an attempt whose reservation does not fit, keeps the reports it
+wrote, and reports the remaining communities as `pending`.
 
 ## 4. Storage
 
@@ -238,6 +323,7 @@ PREFIX spk:  <urn:x-sparkles:>
     prov:wasGeneratedBy <urn:uuid:…a1> .
 
 <urn:uuid:…f1> gr:text "The team owns the ledger service and its two databases."@en ;
+    gr:about ex:payments, ex:ledger ;
     gr:cites <<( ex:payments ex:owns ex:ledger )>>, <urn:uuid:…reifier-of-a-fact> .
 
 <urn:uuid:…a1> a prov:Activity ;
@@ -248,7 +334,9 @@ PREFIX spk:  <urn:x-sparkles:>
 ```
 
 A cited fact is a triple term, and also the fact's reifier when it has one, so the
-citation reaches the fact's own sources through C17's provenance. A report for a higher
+citation reaches the fact's own sources through C17's provenance. `gr:about` holds the
+entities of the finding's `entities` member. A name that the heuristic of §3.4 found
+unmatched is a `gr:unmatchedName` literal on the finding. A report for a higher
 level cites the child reports it used with `gr:citesReport`.
 
 **Statuses.** `unreviewed` until a person reviews it in the inbox, then `reviewed` or
@@ -285,17 +373,171 @@ rebuild under the budget, since its changes are not known per community.
 
 ## 6. Access control
 
-A report summarizes facts as the settings' `principal` reads them. A caller may read the
-reports graph only when its view covers the principal's, the rule of F13 §6.1, which the
-server enforces by refusing reads of the reports graph to other callers with a C12
-graph rule that the settings install. Ask and `recall` use reports only for callers who
-may read them, and otherwise answer locally and say so. A dataset whose readers have
-different views can define several GraphRAG configurations, each with its own principal
-and reports graph, as `graphrag.json` takes a list in Phase 2.
+A report summarizes facts as the settings' `principal` read them at the build's commit.
+A caller may read a report only when the server can prove that the caller may read
+everything the build read, which is the rule of F13 §6.1 applied to the inputs the
+build actually used rather than to the principal's current grants. The proof works from
+a disclosure footprint that the build records, and a common guard applies it to every
+read path. No report is published before both exist. Ask and `recall` use reports only
+for callers who may read them, and otherwise answer locally and say so. A dataset whose
+readers have different views can define several GraphRAG configurations, each with its
+own principal and reports graph, as `graphrag.json` takes a list in Phase 2.
 
 The model sees the facts of the principal's view. C18 §3.5's `sendByProvider` applies:
 a provider allowed only the schema cannot serve the `community` role, and the build
 refuses to start.
+
+### 6.1 Guarded graphs
+
+Reports graphs live under `urn:x-sparkles:graphrag:`, and `reportsGraph` must name a
+graph there. Every graph under that prefix is a guarded graph, whether or not a
+configuration names it and whether or not a footprint exists for it, so deleting
+`graphrag.json` or restoring triples without their footprint never exposes a report. A
+projection may not read a guarded graph, so that reports are not built from reports.
+
+### 6.2 The disclosure footprint
+
+A build captures a footprint of what it read, at its start and again before it
+publishes. The footprint holds:
+
+- the format version, the dataset, the branch and the source commit;
+- the principal's name, and the caller attributes its triple protections can bind:
+  `?user`, each `?role` and each `?group`;
+- the endpoint whose grants resolved the principal's view;
+- the concrete graphs the projection and the report inputs read at the source commit,
+  including the inferred graph when it was read;
+- for each of those graphs, the protections in force for the principal there, each with
+  its full definition: predicates, classes, `subclasses`, graphs, pattern, prefixes and
+  `hide_inferences`;
+- the identities of the reports and child reports it covers.
+
+The footprint describes the whole principal-filtered projection, because the
+membership, counts, labels, fact selection and child reports of a report all depend on
+it, and not only the facts one prompt cited. A footprint whose protections cannot be
+written in this form, such as one that would need a graph named by a blank node, makes
+the build refuse to start.
+
+The footprints of a dataset are kept in a versioned registry file in the dataset's
+directory. A reader that finds a version it does not know, a file it cannot parse or an
+entry that fails its checks treats every guarded graph as having no valid footprint.
+
+**Installation.** The build writes the footprint to the registry and makes it durable,
+with a write to a new file, a flush and a rename, before the commit that adds the first
+report triple. A crash between the two leaves a footprint without reports, which only
+restricts. Before that commit the build compares the principal's resolved view, the
+settings and the policy with the footprint captured at its start. Any difference stops
+the build before it publishes, and a new build captures a new footprint.
+
+**Retention.** Entries are only added. Replacing a build, rewriting a report, deleting a
+configuration or shrinking the principal's grants removes no entry, so the guard never
+weakens for reports that older commits or other branches still hold. Removing an entry
+is a declassification, which this spec does not define. A later design must make it an
+explicit operation of a dataset administrator.
+
+### 6.3 Coverage
+
+The guard answers `proven`, `denied` or `unproven` for a reader and a guarded graph, and
+only `proven` admits the graph. A guarded graph with no valid footprint is proven only
+for an unrestricted reader. A graph with several footprints is proven only when every
+one is. These rules are admitted initially:
+
+1. **Unrestricted reader.** A reader whose view, before the guard, reads every graph with
+   no protection in force may read everything the build read. Dataset administrators,
+   server administrators and callers of a server without authentication are of this
+   kind.
+2. **Identical resolved view.** A reader whose resolved view, at its endpoint, equals the
+   footprint's: the same graphs, the same protections in force on each with identical
+   definitions, and the same values of every caller variable a pattern of those
+   protections uses.
+3. **Structural inclusion.** A reader whose read graphs include every graph of the
+   footprint, and for whom, on each of those graphs, every protection in force is also in
+   force in the footprint with an identical definition, and every caller variable its
+   pattern uses has the footprint's values. Every quad the principal saw is then visible
+   to the reader under the same snapshot semantics. Each protection that applies to the
+   reader there either was also applied to the principal and its pattern gives the same
+   answer for both, or does not apply to the reader at all.
+
+Every other case is `unproven` and fails closed. This includes a reader whose grants
+name the same roles but bind different users or groups, coverage that would have to be
+inferred from the graphs present at some commit, and coverage that depends on class
+membership or pattern solutions changing after the build. The rules compare definitions
+and caller attributes, never data, so a decision does not depend on the snapshot read.
+Rule 1 holds at any commit because such a reader may read the build's commit itself.
+Rules 2 and 3 hold because the protections the reader shares with the footprint give
+the same answers as they gave the principal at the build's commit.
+
+A decision is made when a request resolves its view, from the policy and the registry in
+force at that moment, as views are today. A policy reload or a new registry entry
+therefore applies to the next request. A long-lived read, such as the change feed
+stream, ends when either changes, and the client reconnects under the new decision.
+
+### 6.4 The guard
+
+The guard is applied where a request's view is resolved, in the server's principal
+view, before any path reads data. A guarded graph that is not proven for the reader is
+removed from the reader's read graphs, in the way C12 hides a graph. The reader then has
+a restricted view, and every path treats the graph as one that does not exist, through
+the machinery C12 and C12b already use for a restricted view. A caller who had no view
+before gains one, so the routes that refuse restricted callers refuse it as well. A
+route-local check is not enough, and the GraphRAG routes use the same decision as every
+other path.
+
+Report-derived output outside the reports graph follows the same decision.
+`GET /$/graphrag/{ds}`, the build task in `/$/tasks`, the review inbox and the
+Communities tab show titles, members, counts, statuses, citations and token figures of a
+reports graph only to callers for whom that graph is proven. Commits of kind `graphrag`
+carry a message without report content, since commit messages reach restricted callers.
+The metrics of §8 carry counts per dataset and status, never text, under the existing
+permission of the metrics endpoint.
+
+### 6.5 History, branches and restores
+
+The registry belongs to the dataset, not to a branch or a commit. Point-in-time reads,
+snapshots and every branch see the same guarded graphs and the same footprints, and a
+branch created from a commit with reports inherits their guard with nothing to copy.
+Because entries are never removed implicitly, a report still held at an old commit
+keeps its footprint after the head rebuilds or drops it. A build on a branch records its
+branch and commit in its footprint and adds to the same registry.
+
+A backup includes the registry, copied after the store snapshot, so the copy holds every
+entry for the reports the snapshot holds. A restore installs the backup's registry
+together with its data, and keeps any entry of the replaced registry, since dropping one
+would be a declassification. A restore, a clone or a replica without a registry leaves
+the reports readable only by unrestricted readers. Offline access to the database files
+stays under the operator's authority, as for every other graph.
+
+### 6.6 Read paths
+
+The guard must cover every path that can return report-derived data:
+
+- SPARQL `SELECT`, `ASK`, `CONSTRUCT` and `DESCRIBE`, stored queries, explain, the
+  `WHERE` of updates and transactions, and SPARQL diffs;
+- the Graph Store Protocol's `GET` and `HEAD` of a graph, of the default graph and of
+  the whole dataset, which is also the export path of restricted callers;
+- GraphQL queries and the GraphQL schema draft;
+- full-text search, vector search and `spk:hybridSearch`, and the search and similarity
+  tools of MCP;
+- the schema routes, shapes and constraints, the dataset descriptions and listings with
+  their counts, the service description's graph list, `/$/stats/{ds}` and every route
+  that refuses restricted callers today;
+- the change feed and its stream, `/{ds}/diff`, `/{ds}/history`, the commit listings and
+  the timeline;
+- point-in-time reads through `?at=` and Memento, snapshots, and reads on every branch;
+- the MCP data, memory, schema and history tools and the MCP resources, the REST forms
+  of the memory tools, Ask and `recall`;
+- graph algorithm runs, geographic feature reads, and `/$/tasks`;
+- the GraphRAG status, task, inbox and Communities responses of §6.4.
+
+Ask keeps a history of answers for the person who asked. An answer built from reports
+in Phase 2 keeps the report identities it used, and a history entry shows its text only
+while those reports' graph is proven for its reader.
+
+Before reports are published, local tests must show for direct and indirect paths that
+an unproven reader gets no report triple and no metadata, together with a positive case
+for each admitted rule. They cover the principal losing a graph after a build, callers
+with the same roles and different `?user` or `?group` bindings, a hidden input graph,
+a lifted protection, a policy change during a build, a branch, an old snapshot, a
+missing or unknown registry, and the schema and count paths.
 
 ## 7. Global answering
 
@@ -404,12 +646,33 @@ evaluation.
   is classified `global`, and the answer cites reports whose findings cite facts.
 - **A7.** With `reviewedOnly`, the same question uses only reviewed reports, and with
   none it answers locally.
-- **A8.** A build whose estimate passes `tokensPerBuild` stops at the budget and lists
-  the remaining communities as `pending`.
+- **A8.** A build whose estimate passes `tokensPerBuild` stops before the first attempt
+  whose reservation does not fit, sends no further request, and lists the remaining
+  communities as `pending`.
 - **A9.** `recall` with `communities: true` for `ex:ana` adds the report of her team's
   community after her facts.
 - **A10.** A dataset whose `sendByProvider` limits the `community` role's provider to the
   schema refuses to build, naming the setting.
+- **A11.** Three pairs, one with an exact local tokenizer, one whose provider offers a
+  counting endpoint and one with neither, each reserve before every attempt, from the
+  tokenizer, the endpoint and the byte bound in turn. With `providerCounting: false`,
+  the second pair uses the byte bound and its counting endpoint receives no request.
+- **A12.** A provider that answers `503` and then `200` costs two reservations. The first
+  stays counted at its full size, because the failed attempt reported no usage, and the
+  second is replaced by the reported usage. A provider that reports more usage than its
+  reservation causes an accounting anomaly, and the build sends no further request.
+- **A13.** A finding that cites a valid fact but lists entity 9 when the input has eight
+  entities is dropped and counted as `unsupported`.
+- **A14.** A kept finding whose text names "Globex" when no input entity has that label
+  carries the unmatched name `Globex`, and the review shows it.
+- **A15.** After a build whose principal reads graphs A and B, the principal loses B. A
+  reader whose grants cover A only still cannot read the reports graph, at the head or
+  at the build's commit.
+- **A16.** Two callers hold the principal's grants, and a protection in force for all
+  three has a pattern that binds `?group`. The caller whose groups equal the principal's
+  reads the reports, and the other caller's
+  queries, Graph Store reads, schema routes and counts behave as if the reports graph
+  did not exist.
 
 ## 12. Rejected alternatives
 
@@ -441,6 +704,41 @@ evaluation.
 3. **Multilingual reports.** One `language` per configuration. Reports in several
    languages would multiply cost.
 
+## 14. Revisions
+
+**2026-10-23, token counts and entity checks.** The user decided two questions that the
+first draft left open, and §2.2, §3.3, §3.4, §3.5, §4 and §11 changed to match.
+
+The first draft promised an exact count of a build's input tokens before the build. A
+higher-level report's input contains its children's reports, which do not exist until
+the build writes them, so no exact total can be known before the first call. The draft
+also did not say how a budget holds when requests are retried. The decision makes the
+budget strict and the counts conservative. Every HTTP attempt reserves an upper bound on
+its input plus its output limit before it is sent, actual usage settles the
+reservation, and unknown usage stays reserved. The bound is exact where a local
+tokenizer exists, comes from the provider's counting endpoint where that provider
+receives the request anyway and the setting allows it, and is otherwise the byte length
+of the request with fixed framing allowances. A missing exact counter is never a reason
+to refuse. A usage above its reservation is an accounting anomaly that stops the build.
+The confirmation shows a whole-build upper bound labelled as an estimate and with its
+counting sources. The user first chose exact local counts with a refusal for models
+without a counter, and replaced that choice with this contract on the same day.
+
+The first draft required that a finding naming an entity name a member or a fact's
+object. The schema gave findings prose only, and no check can enumerate every name in
+free text, so the requirement could not be enforced as written. The decision splits it.
+Each finding carries entity numbers and citations, and both are checked exactly against
+the facts sent, with the drop and retry policy of §3.4. A heuristic over the prose and
+the review status cover the free text, and the spec describes the heuristic as one and
+not as proof.
+
+**2026-10-23, the disclosure guard.** §6 gained the design of the disclosure footprint
+and the common read guard that reports need before they become visible. The first draft
+compared readers with the build principal's current grants through a C12 graph rule,
+which exposes old reports when the principal later loses access to an input, and which
+cannot tell apart callers whose triple protections bind different `?user`, `?role` or
+`?group` values.
+
 ## Outcome
 
 The `community` model role is implemented in the server configuration, dataset role
@@ -455,18 +753,11 @@ identities, report checks, budgets, provenance, access control, CLI, Communities
 inbox kind and manual refresh. Global Ask and memory integration remain Phase 2, and
 automatic refresh remains Phase 3. [ROADMAP](../ROADMAP.md) item 12 tracks this work.
 
-Before report publication, the implementation needs contracts for the exact pre-build
-token count of §3.5 and the unsupported entity check of §3.4. Higher-level report inputs
-depend on generated child reports, so an exact count for an individual request does not
-establish an exact count for the whole build before its first call. Citation validation
-alone does not establish that every entity named in free text is supported.
-
-The report-read guard of §6 must retain the input disclosure boundary from the build,
-including caller-bound triple protections. Comparing a reader only with the build
-principal's current grants is insufficient after those grants change. Direct report
-reads, metadata, branches and historical snapshots need the same protection before
-reports become visible. These are implementation prerequisites, not guarantees supplied
-by the role foundation.
+The contracts that the first draft left open are settled in §14. Token budgets use
+conservative reservations before every HTTP attempt, and findings carry entity numbers
+that are checked exactly, with a labelled heuristic for the prose. §6 now holds the
+design of the disclosure footprint and the common read guard. Reports stay unpublished
+until that guard is implemented and reviewed, and the paths of §6.6 are tested.
 
 ### Shared memory representation follow-up
 
