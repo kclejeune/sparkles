@@ -273,16 +273,23 @@
     renderer = undefined;
   }
 
+  /** Whether a lost context's renderer is being replaced. */
+  let restoring = false;
+
   function onLost(e: Event) {
     e.preventDefault();
-    if (destroyed) return;
+    // one GPU reset loses the contexts of every canvas of the renderer: it counts once,
+    // and a loss counts again only on the renderer that replaced it
+    if (destroyed || restoring || lost > 1) return;
     lost++;
     if (lost > 1) {
       onfail?.('WebGL is not available in this browser: the context was lost twice');
       return;
     }
     // restore once: a new renderer on the same graph
+    restoring = true;
     setTimeout(() => {
+      restoring = false;
       if (destroyed) return;
       release();
       ready = false;

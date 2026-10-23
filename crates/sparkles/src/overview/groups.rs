@@ -237,10 +237,11 @@ fn key_expr(level: &Level, v: &str, i: usize, out: &str) -> String {
             "OPTIONAL {{ VALUES {out} {{ {} }} ?{v} <{p}> {out} }}\n",
             vals.join(" ")
         ),
+        // one row per node and range, however many of its values fall in the range
         Level::Range { p, lo, w, year, .. } => format!(
-            "OPTIONAL {{ ?{v} <{p}> {y} . FILTER({}) BIND({} AS {out}) }}\n",
-            range_type(&y, *year),
-            range_expr(&y, *lo, *w, *year)
+            "OPTIONAL {{ SELECT DISTINCT ?{v} ({} AS {out}) WHERE {{ ?{v} <{p}> {y} . FILTER({}) }} }}\n",
+            range_expr(&y, *lo, *w, *year),
+            range_type(&y, *year)
         ),
         Level::Community { p, parent } => format!(
             "OPTIONAL {{ ?{v} <{p}> {out} . {} }}\n",
@@ -603,22 +604,30 @@ impl Run<'_> {
         };
         // a round width (1, 2, 2.5 or 5 times a power of ten) and a start on a multiple of
         // it, so that the labels read as round numbers
-        let raw = if hi > lo {
-            let span = if integral { hi - lo + 1.0 } else { hi - lo };
-            span / buckets as f64
-        } else {
-            1.0
-        };
+        let span = if integral { hi - lo + 1.0 } else { hi - lo };
+        // values too far apart for a finite width are grouped by value instead
+        if !lo.is_finite() || !hi.is_finite() || !span.is_finite() {
+            return Ok(None);
+        }
+        let raw = if hi > lo { span / buckets as f64 } else { 1.0 };
         // aligning the start can add a range: widen to the next round width until the
         // ranges are at most the requested number
         let mut w = nice_width(raw, integral);
         let (lo, n) = loop {
             let start = (lo / w).floor() * w;
-            let n = ((hi - start) / w).floor() as u64 + 1;
-            if n <= buckets as u64 || !w.is_finite() {
-                break (start, n.clamp(1, buckets as u64) as u32);
+            let count = ((hi - start) / w).floor();
+            if !w.is_finite() || !start.is_finite() || !count.is_finite() {
+                return Ok(None);
             }
-            w = nice_width(w * (1.0 + 1e-6), integral);
+            let n = count as u64 + 1;
+            if n <= buckets as u64 {
+                break (start, n.max(1) as u32);
+            }
+            let wider = nice_width(w * (1.0 + 1e-6), integral);
+            if wider <= w {
+                return Ok(None);
+            }
+            w = wider;
         };
         let level = Level::Range {
             p: p.to_string(),
@@ -707,9 +716,15 @@ impl Run<'_> {
             p: p.to_string(),
             parent,
         };
-        let (sizes, truncated) = self.sizes(class, path, &level, limit)?;
+        // whether a community holds the set is decided before the limit cuts the
+        // groups, which may leave only the largest, the instances without one
+        let (mut sizes, mut truncated) = self.sizes(class, path, &level, MAX_LIMIT)?;
         if !sizes.iter().any(|(k, _)| matches!(k, Key::Community(_))) {
             return Ok(None);
+        }
+        if sizes.len() > limit {
+            sizes.truncate(limit);
+            truncated = true;
         }
         let iris: Vec<&str> = sizes
             .iter()

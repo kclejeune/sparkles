@@ -579,3 +579,79 @@ ex:d a ex:Q ; ex:n 100 ."#
     assert!(a["note"].as_str().unwrap().contains("levels deep"), "{a}");
     assert_eq!(a["members"].as_array().unwrap().len(), 14, "{a}");
 }
+
+/// Second review round of U06: grouped edges count a node once per range, far-apart
+/// numbers fall back to values, a community limit keeps the communities, and a change of
+/// RDFS on read, which makes no commit, is not answered from the cache.
+#[tokio::test]
+async fn grouped_ranges_overflow_community_limits_and_rdfs() {
+    let s = server();
+    let ds = s.state.get("d").unwrap();
+    ds.store
+        .load(&[Source::from_bytes(
+            br#"@prefix ex: <http://ex/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+ex:a a ex:Q ; ex:n 22 ; ex:knows ex:b .
+ex:b a ex:Q ; ex:n 22, 23 .
+ex:c a ex:Q ; ex:n 60 .
+ex:d a ex:Q ; ex:n 100 .
+ex:f1 a ex:F ; ex:x "-1e308"^^xsd:double .
+ex:f2 a ex:F ; ex:x "0"^^xsd:double .
+ex:f3 a ex:F ; ex:x "1e308"^^xsd:double .
+ex:r1 a ex:R .
+ex:r2 a ex:R .
+ex:r3 a ex:R ; ex:community <urn:x-sparkles:algo:r9:0:1> ."#
+                .to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    // a and b share the first range: their one link is one edge of that group
+    let a = groups(
+        &s.app,
+        json!({ "within": { "class": format!("{EX}Q") }, "by": { "property": format!("{EX}n"), "buckets": 2 } }),
+    )
+    .await;
+    let first = sizes(&a).keys().next().unwrap().clone();
+    let g = format!("g:{}", group_id(&a, &first));
+    assert_eq!(edge_count(&a, &g, &g), 1, "{a}");
+
+    // numbers too far apart for a finite range width are grouped by value
+    let (st, f) = post(
+        &s.app,
+        "/$/graph/d/groups",
+        &json!({ "within": { "class": format!("{EX}F") }, "by": { "property": format!("{EX}x"), "buckets": 2 } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{f}");
+    assert_eq!(f["grouping"]["kind"], "values", "{f}");
+
+    // the limit keeps a community partition whose largest group has no community
+    let c = groups(
+        &s.app,
+        json!({ "within": { "class": format!("{EX}R") }, "by": { "community": COMMUNITY }, "limit": 1 }),
+    )
+    .await;
+    assert_eq!(c["grouping"]["kind"], "communities", "{c}");
+    assert_eq!(c["groups"].as_array().unwrap().len(), 1, "{c}");
+    assert_eq!(c["truncated"], true, "{c}");
+
+    // RDFS on read: Person becomes a kind of Agent without a commit
+    let agents = json!({ "within": { "class": format!("{EX}Agent") } });
+    assert_eq!(groups(&s.app, agents.clone()).await["within"]["size"], 0);
+    let res = s
+        .app
+        .clone()
+        .oneshot(
+            Request::put("/$/rdfs/d")
+                .header("content-type", "text/turtle")
+                .body(Body::from(
+                    "<http://ex/Person> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex/Agent> .",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(groups(&s.app, agents).await["within"]["size"], 40);
+}

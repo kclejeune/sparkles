@@ -222,7 +222,9 @@
         selected = null;
         await load();
         changed = true;
-        if (key.startsWith('c:')) path = [{ key, label: target?.label ?? key, answer }];
+        // the classes may have moved on again: keep the answer only at their commit
+        if (key.startsWith('c:') && answer.commit === baseCommit)
+          path = [{ key, label: target?.label ?? key, answer }];
         return;
       }
       // a node of an earlier level closes the levels below it first

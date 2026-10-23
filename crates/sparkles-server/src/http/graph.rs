@@ -30,6 +30,22 @@ pub(super) mod cache;
 
 use sparkles::overview::GroupsRequest;
 
+/// The RDFS on read the queries use, for the cache key: a setting can change without a
+/// commit. A fixed schema is named by a hash of its content, a graph source by its graph,
+/// whose content the commit already names.
+fn rdfs_key(rdfs: Option<&sparkles::sparql::rdfs::RdfsOnRead>) -> String {
+    use std::hash::{Hash, Hasher};
+    match rdfs.map(|r| &r.source) {
+        None => String::new(),
+        Some(sparkles::sparql::rdfs::SchemaSource::Graph(g)) => format!("rdfs:graph:{g:?}"),
+        Some(sparkles::sparql::rdfs::SchemaSource::Fixed(schema)) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{schema:?}").hash(&mut h);
+            format!("rdfs:fixed:{:016x}", h.finish())
+        }
+    }
+}
+
 /// `POST /$/graph/{ds}/groups`
 pub(super) async fn groups(
     st: St,
@@ -61,8 +77,11 @@ pub(super) async fn groups(
             // the dataset a request names with default-graph-uri and named-graph-uri, and
             // the inferred overlay the dataset adds to the default graph
             extra: format!(
-                "{:?}|{:?}|{:?}",
-                opts.default_graph_uris, opts.named_graph_uris, opts.default_graph_extra
+                "{:?}|{:?}|{:?}|{}",
+                opts.default_graph_uris,
+                opts.named_graph_uris,
+                opts.default_graph_extra,
+                rdfs_key(opts.rdfs.as_deref())
             ),
             request: req.key(),
         };
