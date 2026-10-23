@@ -357,6 +357,18 @@
 
   let fitAfter = false;
 
+  /**
+   * Room around the fitted picture for the labels drawn right of the nodes: the longest
+   * label of a small picture, at most a quarter of the shorter side of the view.
+   */
+  function stagePadding(): number {
+    if (nodes.length > 300) return 60;
+    let chars = 0;
+    for (const n of nodes) chars = Math.max(chars, n.label.length);
+    const side = Math.min(host?.clientWidth ?? 800, host?.clientHeight ?? 800);
+    return Math.round(Math.min(Math.max(60, 30 + chars * 7), side / 4));
+  }
+
   /** Rebuild the graph from the props, keeping the positions of nodes already drawn. */
   function sync() {
     if (!graph || !renderer) return;
@@ -383,6 +395,7 @@
     }
     renderer.setSetting('defaultEdgeType', edgeType());
     renderer.setSetting('hideEdgesOnMove', edges.length > 50000);
+    renderer.setSetting('stagePadding', stagePadding());
     setFocusSet();
     // a new level is fitted into view once it has settled
     startLayout(true);
