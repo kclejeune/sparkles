@@ -543,3 +543,21 @@ patterns.
   codec passes its gate.
 * **Spill files.** The query spill files of [X08](X08-disk-spill-and-server-memory.md)
   §6.6 encode their columns with `encode_column` and LZ4, the index blocks' codec.
+
+### Index codecs measured (2026-10-23)
+
+X11 Phase 2a built FSST for the vocabulary as an option, `--vocab-codec fsst`, and
+compared it with front coding as §U8 asked. Its sizes and query times are in the
+[X11 Outcome](X11-index-compression-and-predicate-patterns.md#outcome). Format 3 already
+took the version that X11 §7 planned, so a generation with a codec is format 4.
+
+For §U7, an ignored test in `index.rs` (`codec_probe`) re-encoded every 2,048-row frame
+of the permutations of the 10.5M and DBpedia 50M stores. zstd at level 3 over the same
+delta varints took 221.8 MB where LZ4 takes 280.0 MB at 10.5M, 21% less, and 863.7 MB
+where LZ4 takes 1,046.6 MB on the DBpedia slice, 17% less. Level 9 saved one or two
+points more. With the vocabulary, the whole index would shrink by about 19% and 12%,
+short of the gate's 25%, so zstd blocks were not built. A frame-of-reference coding of
+128 values without LZ4 took 2.6 to 2.7 times the LZ4 size, because LZ4 removes the repeats
+that frame widths cannot. Restarting the deltas of a column at each run of the columns
+before it made the LZ4 frames 18% to 23% larger, since a restart stores a full id where the
+delta was small.
