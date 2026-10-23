@@ -7,7 +7,8 @@
 > limits and the masked view. Searches per named graph under `GRAPH ?g`, planned for
 > Phase 2, came with it, and the MCP tool `find_paths` came later. The rest of Phase 2
 > shipped on 2026-10-03: edges from a nested pattern, a direction per predicate and the
-> `path:edge` binding. Phase 3 waits for the Cypher frontend of [F01](F01-cypher.md),
+> `path:edge` binding. Skipped predicates and a degree limit for hubs (§4.9) shipped on
+> 2026-10-23 with [U09](U09-path-finder.md) Phase 1. Phase 3 waits for the Cypher frontend of [F01](F01-cypher.md),
 > which is not built.
 >
 > **User docs:** [API: Path search](../API.md#path-search) · [Usage: Finding paths](../USAGE.md#finding-paths) · [Features](../FEATURES.md#search)
@@ -297,6 +298,31 @@ without `path:k`, `path:all` without `path:maxLength`, a `path:minLength` above 
 shortest mode, and `GRAPH ?g` around the call. An unbound source and target, a
 `path:kShortest` row without a target, too many visited nodes and a bad weight fail at
 execution.
+
+### 4.9 Skipped predicates and hubs
+
+This section was added with [U09](U09-path-finder.md) Phase 1.
+
+`path:excludePredicate p` removes the triples with predicate `p` from the edges of §4.1.
+It may be given several times, and it cannot be combined with `path:predicate` or with a
+nested pattern of edges, because those already name the edges to follow.
+
+`path:maxDegree n` removes nodes from the graph the search runs on. The degree of a node
+`x` is the number of distinct edges that leave `x` in path order, under the call's
+predicates and directions and in the active graph of the caller's view, with a
+self-loop that both directions can follow counted once. A node whose degree is above `n`
+is a hub. The source and the target of each pair are never hubs. The modes of §4.2 and the
+lengths of §4.4 then apply to the graph without the hubs, so no interior node of a path is
+a hub. A path may end at a hub when the target is a variable, because the hub is reached
+without being left. The degree depends only on the node and the call, so it is the same
+whichever side of a bidirectional search reaches the node.
+
+A hub that a search would have expanded counts as visited, and EXPLAIN ANALYZE's
+`PathSearch` counters gain `skippedHubs`. The degree is read from the index's counts when
+every quad of the dataset is in the active graph, minus the counts of the excluded
+predicates and of the node's self-loops. Otherwise the search reads the node's edges up to
+one past the limit. Both read the masked snapshot of §4.6, so a hidden triple never makes a
+node a hub.
 
 ## 5. Design sketch
 
@@ -637,3 +663,37 @@ twin, and `zero_weight_chains_reconstruct_inside_the_deadline` and
 `shortestPath` and `allShortestPaths`, waits for [F01](F01-cypher.md). Nothing in the
 operator needs to change for it beyond the fix above, since Cypher's
 `allShortestPaths` counts hops and would use the unweighted search.
+
+### Skipped predicates and hubs (2026-10-23)
+
+[U09](U09-path-finder.md) Phase 1, under [ROADMAP](../ROADMAP.md) item 103, added
+`path:excludePredicate` and `path:maxDegree` as §4.9 defines them, and MCP's `find_paths`
+gained them as `excludePredicates` and `maxDegree`. A search without predicates skips the
+excluded ones as it scans the SPO and OSP lanes, so no triple of theirs is read twice. The
+hub check runs once per node and call and is cached. When every quad is in the active
+graph it takes one index count per lane. Only a node whose count is above the limit takes
+more, one count per lane and excluded predicate and a few for self-loops. When some quads
+lie outside the active graph, a node above the limit by its counts has at most `n + 1` of
+its edges read. The source and target are exempt, and a bidirectional search never meets at a
+hub. EXPLAIN shows the two parameters in the operator's description.
+
+A probe written for U09 found that searches backward and both ways passed through
+literals, contrary to §4.1. A search both ways stepped from a resource to a literal object
+and on to every other subject that stated the same literal, so two people of the same age
+were two edges apart. The search now never expands a literal to its successors, expands it
+to its predecessors only when it is the root of a search, drops literals from the
+predecessors it reads, and does not meet at a literal. A literal still ends a path forward
+and both ways. This changes answers of earlier releases for searches with `path:backward`
+or `path:both` over predicates with literal objects, which were wrong. The checks run only
+when a lane can leave a literal, which is a lane read by the object on the successor side
+or by the subject on the predecessor side, so a forward search never makes them. The
+[Namespace screen](../BENCHMARKS.md#skipped-predicates-and-hubs-2026-10-23) found no
+change above the noise in the searches that use neither new parameter.
+
+`crates/sparkles-core/tests/path_search_filters.rs` tests both parameters in every mode,
+their errors, the ends exempt from the limit, the degree after predicates and direction,
+the degree in a masked view and per named graph, and the literals. Two differential tests
+compare the search with brute-force paths on random graphs, one in a single graph where
+the counts are used, and one over named graphs with duplicate triples where the edges are
+read. The router tests in `http/router_tests/auth/paths.rs` check that a restricted
+reader's paths and degrees stay inside its view.

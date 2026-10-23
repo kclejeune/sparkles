@@ -377,6 +377,8 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "k": {"type":"integer","minimum":1,"maximum":100,"description":"Paths per pair for algorithm=kShortest"},
                 "limit": {"type":"integer","minimum":1,"maximum":100,"default":10,"description":"The most paths returned"},
                 "maxVisited": {"type":"integer","minimum":1,"description":"The most nodes one search may visit (default 10,000,000)"},
+                "excludePredicates": {"type":"array","items":{"type":"string"},"maxItems":20,"description":"Predicates whose triples are not edges, such as rdf:type. Not with predicates"},
+                "maxDegree": {"type":"integer","minimum":1,"description":"Paths do not pass through a node with more edges than this in the search's direction. The source and target are exempt"},
                 "weight": {"type":"string","description":"The property of an edge's RDF 1.2 reifier that holds its weight"},
                 "defaultWeight": {"type":"number","minimum":0,"description":"The weight of an edge without one (with weight)"},
                 "graph": {"type":"string","default":"default","description":"`default` or a named graph IRI to search in"},

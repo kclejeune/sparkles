@@ -240,7 +240,7 @@ orders every item by difficulty and impact and links each to its design spec.
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
-graphs and maps, with arcs for the relations between located entities, a resource explorer, schema and validation views, branch history and
+graphs and maps, with arcs for the relations between located entities, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
 merges, a time slider over past commits, the Ask bar, and agent memory. The first screenshots show an answered question,
 agent memory, the map view and a merge preview.
 
@@ -309,11 +309,11 @@ agent memory, the map view and a merge preview.
   </tr>
   <tr>
     <td><img src="docs/images/explore-communities.png" alt="The Explore overview drawing two GraphRAG communities inside Engineering, with the payments team's report beside the picture and one of its findings chosen"></td>
-    <td></td>
+    <td><img src="docs/images/path-finder.png" alt="The resource explorer with the Paths panel open, listing the three shortest paths from Ada Okafor to Carlos Mendes and drawing them over her neighbourhood with each edge numbered by the paths that use it"></td>
   </tr>
   <tr>
     <td>The dataset grouped by its GraphRAG communities, with a report beside it</td>
-    <td></td>
+    <td>The three shortest paths between two people</td>
   </tr>
 </table>
 

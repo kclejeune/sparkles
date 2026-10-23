@@ -366,11 +366,24 @@ export const GRAPHRAG_FIELDS: readonly FieldDef[] = [
   },
 ];
 
+/** The path finder's defaults (U09). */
+const PATHS_FIELDS: readonly FieldDef[] = [
+  {
+    path: 'excludedPredicates',
+    group: 'Path finder',
+    label: 'Predicates skipped by default',
+    type: 'lines',
+    placeholder: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type',
+    help: 'Predicate IRIs, one per line, that a search in Explore skips unless the reader changes the list.',
+  },
+];
+
 export const DATASET_FIELDS: Record<DatasetKind, readonly FieldDef[]> = {
   assistant: ASSISTANT_FIELDS,
   memory: MEMORY_FIELDS,
   ingest: INGEST_FIELDS,
   graphrag: GRAPHRAG_FIELDS,
+  paths: PATHS_FIELDS,
 };
 
 export const KIND_TITLES: Record<DatasetKind, { title: string; text: string }> = {
@@ -389,5 +402,9 @@ export const KIND_TITLES: Record<DatasetKind, { title: string; text: string }> =
   graphrag: {
     title: 'GraphRAG',
     text: 'Community reports: what the build reads, the hierarchy it keeps and its token budget.',
+  },
+  paths: {
+    title: 'Paths',
+    text: 'The predicates the path finder in Explore skips unless the reader changes the list.',
   },
 };
