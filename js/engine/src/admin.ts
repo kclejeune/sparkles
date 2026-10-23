@@ -471,8 +471,14 @@ export class Administration {
       ) => call<Configuration>('reasoning.diagnostics', { ...options }, options, false),
       status: (o?: OperationOptions) =>
         call<Configuration | null>('reasoning.status', {}, o, false),
-      run: (options: UpdateOptions & { profile?: string; incremental?: boolean } = {}) =>
-        call<Configuration>('reasoning.run', { profile: 'rdfs', ...options }, options, true),
+      /** `maxInferred` is the derived triples a run may produce before it fails: 50 million by default, 0 for no limit. */
+      run: (
+        options: UpdateOptions & {
+          profile?: string;
+          incremental?: boolean;
+          maxInferred?: number;
+        } = {},
+      ) => call<Configuration>('reasoning.run', { profile: 'rdfs', ...options }, options, true),
       clear: (o?: UpdateOptions) => call<bigint>('reasoning.clear', {}, o, true),
       rdfs: {
         get: (o?: OperationOptions) =>

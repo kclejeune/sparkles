@@ -200,7 +200,8 @@ pub enum Trigger {
 /// the closure the dataset keeps in memory or, after a restart, the one saved with it.
 /// The run reads the graphs of `inputs`. With imports fetched, it first loads the
 /// missing ones under the server's `LOAD` rules, and with `refresh` loads again those
-/// that earlier runs fetched.
+/// that earlier runs fetched. `max_inferred` is a request's limit of inferred triples,
+/// which the server's (`serve --reason-max-inferred`) bounds.
 #[cfg(feature = "reasoning")]
 #[allow(clippy::too_many_arguments)]
 pub fn start_reason(
@@ -213,6 +214,7 @@ pub fn start_reason(
     incremental: bool,
     refresh: bool,
     threads: Option<usize>,
+    max_inferred: Option<usize>,
 ) -> crate::state::Task {
     let st2 = st.clone();
     let name = ds.name.clone();
@@ -246,6 +248,9 @@ pub fn start_reason(
             },
             threads,
             max_memory: None,
+            max_inferred: Some(
+                max_inferred.map_or(st2.reason_max_inferred, |n| n.min(st2.reason_max_inferred)),
+            ),
         };
         ds.closure.set_max_triples(st2.reason_cache_triples);
         let outcome = match ds.dataset.reasoning().run_with(&req, &ctl) {
@@ -534,6 +539,7 @@ pub fn auto_reason_tick(st: &Arc<AppState>, now: Instant) {
             trigger,
             true,
             false,
+            None,
             None,
         );
         p.task = Some((task.id, head));

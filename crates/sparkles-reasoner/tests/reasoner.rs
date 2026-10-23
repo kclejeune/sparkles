@@ -649,7 +649,37 @@ fn limits_and_cancellation() {
         },
     )
     .unwrap_err();
-    assert!(e.to_string().contains("limit"), "{e}");
+    // the typed error names the limit, the rule and how to raise it
+    let l = e
+        .downcast_ref::<sparkles_reasoner::InferredLimitExceeded>()
+        .unwrap_or_else(|| panic!("not the limit error: {e:#}"));
+    assert_eq!(l.limit, 3);
+    let text = e.to_string();
+    assert!(
+        text.contains("limit of 3 inferred triples")
+            && text.contains("rule '")
+            && text.contains("--max-inferred")
+            && text.contains("max_inferred"),
+        "{text}"
+    );
+    // no limit, and the default, let the run finish
+    for max_inferred in [usize::MAX, sparkles_reasoner::DEFAULT_MAX_INFERRED] {
+        let r = materialize(
+            &s,
+            &Profile::OwlRl,
+            &ReasonOptions {
+                max_inferred,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(r.inferred >= 6, "{}", r.inferred);
+        clear(&s).unwrap();
+    }
+    assert_eq!(
+        ReasonOptions::default().max_inferred,
+        sparkles_reasoner::DEFAULT_MAX_INFERRED
+    );
     let e = materialize(
         &s,
         &Profile::OwlRl,

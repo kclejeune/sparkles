@@ -32,6 +32,9 @@ pub struct ReasonSettings {
     pub profile: String,
     pub rules: Option<String>,
     pub incremental: bool,
+    /// The derived triples the run may produce before it fails: `None` for the default
+    /// of 50 million, 0 for no limit.
+    pub max_inferred: Option<u64>,
 }
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct ReasonInfo {
@@ -171,6 +174,7 @@ impl FfiDataset {
             let request = sparkles::reasoning::ReasonRequest {
                 profile,
                 incremental: s.incremental,
+                max_inferred: s.max_inferred.map(max_inferred),
                 ..Default::default()
             };
             let r = self
@@ -424,5 +428,15 @@ impl FfiDataset {
     pub fn guard_reset(&self) -> FfiResult<()> {
         self.inner.check_writable()?;
         Ok(self.inner.ds.validation().guard().reset()?)
+    }
+}
+
+/// A limit of inferred triples from a binding, where 0 means none.
+#[cfg(feature = "reasoning")]
+fn max_inferred(n: u64) -> usize {
+    if n == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(n).unwrap_or(usize::MAX)
     }
 }

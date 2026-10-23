@@ -61,6 +61,26 @@ def test_a11_reasoning() -> None:
         ds.reasoning.run(rules="[broken")
 
 
+CHAIN = """
+@prefix ex: <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+ex:p a owl:TransitiveProperty .
+ex:a0 ex:p ex:a1 . ex:a1 ex:p ex:a2 . ex:a2 ex:p ex:a3 . ex:a3 ex:p ex:a4 .
+"""
+
+
+def test_reasoning_limit_of_inferred_triples() -> None:
+    ds = Dataset()
+    ds.load(CHAIN, "turtle")
+    with pytest.raises(sparkles.SparklesError) as e:
+        ds.reasoning.run("owl-rl", max_inferred=3)
+    assert e.value.code == "inferred-limit"
+    assert "limit of 3 inferred triples" in str(e.value)
+    assert NamedNode(INFERRED_GRAPH) not in ds.named_graphs()
+    # 0 sets no limit
+    assert ds.reasoning.run("owl-rl", max_inferred=0).inferred >= 6
+
+
 def test_a11_shacl(ds: Dataset) -> None:
     report = ds.validation.shacl(SHAPES)
     assert not report.conforms and not report

@@ -89,3 +89,54 @@ fn infer_runs_incrementally() {
         stderr(&o)
     );
 }
+
+/// `--max-inferred` sets the limit of a run, a run past it fails with the limit and how to
+/// raise it, and 0 sets no limit.
+#[test]
+fn infer_stops_at_the_limit_of_inferred_triples() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.ttl");
+    std::fs::write(
+        &data,
+        "@prefix ex: <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         ex:p a owl:TransitiveProperty .
+         ex:a0 ex:p ex:a1 . ex:a1 ex:p ex:a2 . ex:a2 ex:p ex:a3 . ex:a3 ex:p ex:a4 .",
+    )
+    .unwrap();
+    let db = dir.path().join("db").to_str().unwrap().to_string();
+    expect(&["load", "--loc", &db, data.to_str().unwrap()], 0);
+    let o = expect(
+        &[
+            "infer",
+            "--loc",
+            &db,
+            "--profile",
+            "owl-rl",
+            "--max-inferred",
+            "3",
+        ],
+        1,
+    );
+    let e = stderr(&o);
+    assert!(
+        e.contains("exceeded the limit of 3 inferred triples") && e.contains("--max-inferred"),
+        "{e}"
+    );
+    // nothing was recorded
+    let o = expect(&["infer", "--loc", &db, "--status", "--format", "json"], 0);
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(s.get("run").is_none_or(|r| r.is_null()), "{s}");
+    let o = expect(
+        &[
+            "infer",
+            "--loc",
+            &db,
+            "--profile",
+            "owl-rl",
+            "--max-inferred",
+            "0",
+        ],
+        0,
+    );
+    assert!(stderr(&o).contains("inferred triples"), "{}", stderr(&o));
+}

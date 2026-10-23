@@ -173,6 +173,10 @@ pub use crate::write_validation::Validation;
 /// Default of `serve --reason-cache-triples`.
 pub const DEFAULT_REASON_CACHE_TRIPLES: usize = sparkles::reasoning::DEFAULT_CLOSURE_CACHE_TRIPLES;
 
+/// Default of `serve --reason-max-inferred`, the reasoner's own default of 50 million
+/// derived triples (`sparkles_reasoner::DEFAULT_MAX_INFERRED`).
+pub const DEFAULT_REASON_MAX_INFERRED: usize = 50_000_000;
+
 /// A background task. Its JSON form also carries Fuseki's names for its fields
 /// (`taskId`, `task`, `started`, `finished`, `success`; see [`Task::serialize`]).
 #[derive(Clone, Debug)]
@@ -380,6 +384,10 @@ pub struct AppState {
     /// the largest closure a dataset keeps in memory for incremental reasoning, in
     /// derived triples (`serve --reason-cache-triples`)
     pub reason_cache_triples: usize,
+    /// the derived triples a materialization may produce before it fails
+    /// (`serve --reason-max-inferred`, 0 on the command line for no limit, which is
+    /// `usize::MAX` here); a request may ask for less with `maxInferred`
+    pub reason_max_inferred: usize,
     /// automatic compaction (`serve --auto-compact-*`) and what is known of each
     /// dataset's compactions
     pub compaction: crate::compaction::AutoCompact,
@@ -643,6 +651,7 @@ impl AppState {
             http_compression: Default::default(),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
+            reason_max_inferred: DEFAULT_REASON_MAX_INFERRED,
             compaction: Default::default(),
             #[cfg(feature = "backup")]
             backup: None,
@@ -698,6 +707,7 @@ impl AppState {
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
+            reason_max_inferred: DEFAULT_REASON_MAX_INFERRED,
             compaction: Default::default(),
             #[cfg(feature = "backup")]
             backup: None,

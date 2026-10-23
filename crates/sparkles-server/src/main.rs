@@ -1201,6 +1201,10 @@ enum Cmd {
         /// half the cores; 0: all of them, on the pool queries also use)
         #[arg(long, value_name = "N")]
         reason_threads: Option<usize>,
+        /// The derived triples a materialization may produce before it fails, for every
+        /// run of the server; a request may ask for fewer with `maxInferred` (0: no limit)
+        #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_INFERRED)]
+        reason_max_inferred: usize,
         /// Compress responses for clients that accept it: auto or off
         #[arg(long, default_value = "auto", value_name = "MODE")]
         http_compression: String,
@@ -1934,6 +1938,9 @@ enum Cmd {
         /// Threads that the run evaluates rules on (default: all cores)
         #[arg(long, value_name = "N")]
         threads: Option<usize>,
+        /// The derived triples the run may produce before it fails (0: no limit)
+        #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_INFERRED)]
+        max_inferred: usize,
         // where fetched imports may come from
         #[command(flatten)]
         outbound: outbound::OutboundArgs,
@@ -2389,6 +2396,11 @@ fn rejected_exit(e: anyhow::Error) -> anyhow::Error {
 
 /// ` · validation passed in 14 ms`: the write-time validation of a CLI write, for its
 /// summary line (empty when the database is not validated).
+/// A limit of inferred triples from the command line, where 0 means none.
+fn no_limit_if_zero(n: usize) -> usize {
+    if n == 0 { usize::MAX } else { n }
+}
+
 fn validation_note(v: Option<&sparkles::guard::ValidationSummary>) -> String {
     use sparkles::guard::{GuardStatus, Strategy};
     match v {
@@ -2589,6 +2601,7 @@ fn run() -> Result<()> {
             auto_reason_max_delay,
             reason_cache_triples,
             reason_threads,
+            reason_max_inferred,
             http_compression,
             http_compression_level,
             http_compression_algorithms,
@@ -2887,6 +2900,7 @@ fn run() -> Result<()> {
                 );
             }
             st.reason_cache_triples = reason_cache_triples;
+            st.reason_max_inferred = no_limit_if_zero(reason_max_inferred);
             #[cfg(feature = "reasoning")]
             sparkles::reasoning::set_reason_threads(
                 reason_threads.unwrap_or_else(sparkles::reasoning::default_reason_threads),
@@ -4019,6 +4033,7 @@ fn run() -> Result<()> {
             location_mapping,
             refresh_imports,
             threads,
+            max_inferred,
             outbound,
         } => {
             use sparkles_reasoner::diagnostics::{self, Closure, DiagnoseOptions};
@@ -4147,6 +4162,7 @@ fn run() -> Result<()> {
                     &sparkles_reasoner::ReasonOptions {
                         inputs: inputs.clone(),
                         threads,
+                        max_inferred: no_limit_if_zero(max_inferred),
                         ..Default::default()
                     },
                 )?;

@@ -6747,6 +6747,8 @@ export interface components {
                 altPrefix: string;
                 prefix: string;
             })[];
+            /** @description The derived triples the run may produce before it fails, at most the server's `--reason-max-inferred`, which is also the default. */
+            maxInferred?: number;
             /** @description `default` or graph IRIs. */
             ontologyGraphs?: string[];
             /**

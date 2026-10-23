@@ -50,6 +50,11 @@ class AdvancedAdministrationTest {
             val reason = ds.reasoning().run()
             assertTrue(reason.inferred > 0)
             assertTrue(ds.reasoning().clear() > 0)
+            // a run past its limit of inferred triples fails and says how to raise it
+            val limited = assertThrows(RuntimeException::class.java) { ds.reasoning().run(ReasonOptions(maxInferred = 1)) }
+            assertTrue(limited.message!!.contains("limit of 1 inferred triples"), limited.message)
+            assertTrue(ds.reasoning().run(ReasonOptions(maxInferred = 0)).inferred > 0)
+            assertTrue(ds.reasoning().clear() > 0)
             val rdfs = ds.reasoning().rdfs()
             ds.load(ByteArrayInputStream("<http://example/Child> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example/Parent> .".toByteArray()), Lang.NTRIPLES)
             rdfs.set("http://example/schema")

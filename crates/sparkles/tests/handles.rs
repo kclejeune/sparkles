@@ -606,6 +606,46 @@ fn reasoning_runs_records_and_reports_freshness() {
     assert!(ds.reasoning().status().is_none());
 }
 
+/// A run past `ReasonRequest::max_inferred` fails with the `inferred-limit` code and
+/// commits nothing. `Some(usize::MAX)` sets no limit.
+#[cfg(feature = "reasoning")]
+#[test]
+fn reasoning_stops_at_the_requested_limit_of_inferred_triples() {
+    use sparkles::reasoning::ReasonRequest;
+    use sparkles::reasoning::reasoner::Profile;
+    let (_dir, ds) = persistent();
+    ds.update(
+        "PREFIX ex: <http://ex.org/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         INSERT DATA { ex:p a owl:TransitiveProperty .
+           ex:a0 ex:p ex:a1 . ex:a1 ex:p ex:a2 . ex:a2 ex:p ex:a3 . ex:a3 ex:p ex:a4 }",
+    )
+    .unwrap();
+    let head = ds.head_commit().seq;
+    let run = |max_inferred| {
+        ds.reasoning().run(&ReasonRequest {
+            profile: Profile::OwlRl,
+            max_inferred,
+            ..ReasonRequest::default()
+        })
+    };
+    match run(Some(3)) {
+        Err(sparkles::Error::Component(c)) => {
+            assert_eq!(c.component, "reasoner");
+            assert_eq!(c.code, sparkles::reasoning::run::INFERRED_LIMIT);
+            assert!(
+                c.message.contains("limit of 3 inferred triples"),
+                "{}",
+                c.message
+            );
+        }
+        other => panic!("expected the limit error, got {other:?}"),
+    }
+    assert_eq!(ds.head_commit().seq, head);
+    assert!(ds.reasoning().status().is_none());
+    assert!(run(Some(usize::MAX)).unwrap().report.inferred >= 6);
+    assert!(run(None).unwrap().report.inferred >= 6);
+}
+
 /// F16 §8: the literal typings of the generalized facts join the diagnostics only for the
 /// profiles whose rules OWL 2 entails. A Jena rule can type a literal with any datatype,
 /// so the same typing from a rules profile is not reported.

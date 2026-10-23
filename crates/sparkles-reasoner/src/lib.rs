@@ -127,12 +127,33 @@ impl FromStr for Profile {
 /// Progress callback: (fraction done in `[0, 1]`, message).
 pub use sparkles_core::task::ProgressFn;
 
+/// The default of [`ReasonOptions::max_inferred`]: 50 million derived triples.
+pub const DEFAULT_MAX_INFERRED: usize = 50_000_000;
+
+/// A run stopped because it derived, or was about to derive, more triples than
+/// [`ReasonOptions::max_inferred`] allows. The run changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "reasoning exceeded the limit of {limit} inferred triples{context}; raise the limit with \
+     --max-inferred (sparkles infer), --reason-max-inferred or maxInferred (the server), or \
+     max_inferred (the library and bindings)"
+)]
+pub struct InferredLimitExceeded {
+    /// the limit the run had
+    pub limit: usize,
+    /// the rule that produced the most candidates in the last iteration, for the message
+    /// (with a leading space), or empty
+    pub context: String,
+}
+
 /// Reasoning limits, cancellation and progress reporting.
 #[derive(Clone)]
 pub struct ReasonOptions {
     /// Maximum number of semi-naive iterations before giving up.
     pub max_iterations: usize,
-    /// Maximum number of derived triples before giving up.
+    /// Maximum number of derived triples before giving up, [`DEFAULT_MAX_INFERRED`] by
+    /// default. A run that passes it fails with [`InferredLimitExceeded`]. `usize::MAX`
+    /// sets no limit.
     pub max_inferred: usize,
     /// Set to `true` to cancel.
     pub cancel: Option<Arc<AtomicBool>>,
@@ -159,7 +180,7 @@ impl Default for ReasonOptions {
     fn default() -> Self {
         ReasonOptions {
             max_iterations: 10_000,
-            max_inferred: 50_000_000,
+            max_inferred: DEFAULT_MAX_INFERRED,
             cancel: None,
             progress: None,
             inputs: Inputs::default(),

@@ -60,7 +60,8 @@ public class SparklesGeoIndex internal constructor(private val owner: DatasetGra
     public fun await(): GeoStatus? { owner.checkOpen(); return ffi { owner.handle.ffi.geoWait() }?.toStatus() }
 }
 public enum class ReasonProfile { RDFS, RDFS_SIMPLE, OWL_RL, RULES }
-public data class ReasonOptions @JvmOverloads public constructor(public val profile: ReasonProfile = ReasonProfile.RDFS, public val rules: String? = null, public val incremental: Boolean = false)
+/** [maxInferred] is the derived triples a run may produce before it fails: `null` for the default of 50 million, 0 for no limit. */
+public data class ReasonOptions @JvmOverloads public constructor(public val profile: ReasonProfile = ReasonProfile.RDFS, public val rules: String? = null, public val incremental: Boolean = false, public val maxInferred: Long? = null)
 public data class ReasonReport(public val profile: String, public val inferred: Long, public val iterations: Long, public val millis: Long, public val warnings: List<String>)
 public class SparklesReasoning internal constructor(private val owner: DatasetGraphSparkles) {
     public fun status(): org.apache.jena.atlas.json.JsonObject? { owner.checkOpen(); return ffi { owner.handle.ffi.reasonStatus() }?.let { document(it).asObject } }
@@ -74,7 +75,8 @@ public class SparklesReasoning internal constructor(private val owner: DatasetGr
     public fun run(options: ReasonOptions, operation: SparklesOperation): ReasonReport {
         owner.checkNoTxn("reasoning.run")
         val profile = when (options.profile) { ReasonProfile.RDFS -> "rdfs"; ReasonProfile.RDFS_SIMPLE -> "rdfs-simple"; ReasonProfile.OWL_RL -> "owl-rl"; ReasonProfile.RULES -> "rules" }
-        return ffi { owner.handle.ffi.reasonRun(ReasonSettings(profile, options.rules, options.incremental), operation.native) }.let { ReasonReport(it.profile, it.inferred.toLong(), it.iterations.toLong(), it.millis.toLong(), it.warnings) }
+        require(options.maxInferred == null || options.maxInferred >= 0) { "maxInferred must not be negative" }
+        return ffi { owner.handle.ffi.reasonRun(ReasonSettings(profile, options.rules, options.incremental, options.maxInferred?.toULong()), operation.native) }.let { ReasonReport(it.profile, it.inferred.toLong(), it.iterations.toLong(), it.millis.toLong(), it.warnings) }
     }
     public fun clear(): Long { owner.checkNoTxn("reasoning.clear"); return ffi { owner.handle.ffi.reasonClear() }.toLong() }
 }

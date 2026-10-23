@@ -1104,6 +1104,24 @@ fn run_admin(
                 &sparkles::reasoning::ReasonRequest {
                     profile,
                     incremental: a["incremental"].as_bool().unwrap_or(true),
+                    // 0 sets no limit
+                    max_inferred: match &a["maxInferred"] {
+                        Value::Null => None,
+                        v => Some(
+                            v.as_u64()
+                                .ok_or_else(|| {
+                                    EngineError::invalid(
+                                        "maxInferred must be a non-negative integer",
+                                    )
+                                })
+                                .map(|n| {
+                                    usize::try_from(n)
+                                        .ok()
+                                        .filter(|&n| n > 0)
+                                        .unwrap_or(usize::MAX)
+                                })?,
+                        ),
+                    },
                     ..Default::default()
                 },
                 ctl,

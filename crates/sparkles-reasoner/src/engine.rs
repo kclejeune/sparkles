@@ -1521,11 +1521,11 @@ pub(crate) fn run(
         }
         let candidates = produced.load(Ordering::Relaxed);
         if candidates > max_out {
-            anyhow::bail!(
-                "reasoning exceeded the limit of {} inferred triples{}",
-                limits.max_inferred,
-                top_rule(&results)
-            );
+            return Err(crate::InferredLimitExceeded {
+                limit: limits.max_inferred,
+                context: top_rule(&results),
+            }
+            .into());
         }
         let overflow = if (g.len() - base_len) as usize + candidates > limits.max_inferred {
             top_rule(&results)
@@ -1553,10 +1553,11 @@ pub(crate) fn run(
             "reasoner iteration"
         );
         if (g.len() - base_len) as usize > limits.max_inferred {
-            anyhow::bail!(
-                "reasoning exceeded the limit of {} inferred triples{overflow}",
-                limits.max_inferred
-            );
+            return Err(crate::InferredLimitExceeded {
+                limit: limits.max_inferred,
+                context: overflow,
+            }
+            .into());
         }
         limits
             .budget

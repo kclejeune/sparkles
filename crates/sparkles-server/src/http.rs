@@ -4478,6 +4478,22 @@ async fn reason(
             .ok_or_else(|| bad("threads must be a positive number".into()))
     };
     let mut threads = query.get("threads").map(threads_of).transpose()?;
+    // a request's limit of inferred triples, at most the server's
+    let limit = st.reason_max_inferred;
+    let max_inferred_of = |s: &str| {
+        let n = s
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| bad("maxInferred must be a positive number".into()))?;
+        if n > limit {
+            return Err(bad(format!(
+                "maxInferred {n} is above the server's limit of {limit} inferred triples (serve --reason-max-inferred)"
+            )));
+        }
+        Ok(n)
+    };
+    let mut max_inferred = query.get("maxInferred").map(max_inferred_of).transpose()?;
     let (profile_name, rules, rerun, vocabularies, geo_default_geometry, full) =
         if content_type(&headers) == "application/json" && !body.is_empty() {
             let v: J = serde_json::from_slice(&body)
@@ -4499,6 +4515,11 @@ async fn reason(
                 J::Null => {}
                 J::Number(n) => threads = Some(threads_of(&n.to_string())?),
                 _ => return Err(bad("threads must be a positive number".into())),
+            }
+            match &v["maxInferred"] {
+                J::Null => {}
+                J::Number(n) => max_inferred = Some(max_inferred_of(&n.to_string())?),
+                _ => return Err(bad("maxInferred must be a positive number".into())),
             }
             let vocabularies = match &v["vocabularies"] {
                 J::Null => Vec::new(),
@@ -4550,6 +4571,9 @@ async fn reason(
             refresh |= p.get("refreshImports").is_some_and(truthy);
             if let Some(t) = p.get("threads") {
                 threads = Some(threads_of(t)?);
+            }
+            if let Some(n) = p.get("maxInferred") {
+                max_inferred = Some(max_inferred_of(n)?);
             }
             (
                 p.get("profile").unwrap_or("rdfs").to_string(),
@@ -4615,6 +4639,7 @@ async fn reason(
         !full,
         refresh,
         threads,
+        max_inferred,
     );
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
 }
@@ -5192,6 +5217,8 @@ mod obs_tests;
 mod patch_tests;
 #[cfg(test)]
 mod pool_tests;
+#[cfg(all(test, feature = "reasoning"))]
+mod reason_limit_tests;
 #[cfg(test)]
 mod router_tests;
 #[cfg(all(test, feature = "text"))]
