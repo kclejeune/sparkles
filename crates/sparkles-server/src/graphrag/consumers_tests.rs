@@ -333,3 +333,40 @@ async fn the_project_brief_adds_the_coarsest_reports() {
     .await
     .unwrap();
 }
+
+/// §7.1 and §7.3: a question that names an entity linked exactly stays local, and its
+/// draft sees the title and summary of that entity's community.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_entity_is_local_with_its_community() {
+    let f = build(built("global")).await;
+    tokio::task::spawn_blocking(move || {
+        let models = f.st.models().unwrap();
+        let o = AskOptions {
+            dataset: "org".into(),
+            question: "Whom does \"x person 1\" know?".into(),
+            ..Default::default()
+        };
+        let before = f.mock.requests().len();
+        let mut on = |_: &str, _: &Value| {};
+        let out = ask::ask(&server(&f), &models, &Principal::local(), &o, &mut on);
+        assert_eq!(out["mode"], "local", "{out}");
+        let draft = f.mock.requests()[before..]
+            .iter()
+            .find(|r| system_of(r).contains("translate a person's question"))
+            .cloned()
+            .expect("a draft");
+        let body = draft.body.to_string();
+        assert!(
+            !body.contains("ScopedDraft"),
+            "an exact entity offered the scope"
+        );
+        assert!(
+            mock::prompt_of(&draft).contains("Communities of the entities the question names"),
+            "{}",
+            mock::prompt_of(&draft)
+        );
+        assert!(mock::prompt_of(&draft).contains("People who know each other."));
+    })
+    .await
+    .unwrap();
+}

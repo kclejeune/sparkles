@@ -54,6 +54,8 @@ pub const ADDED_LIMIT: u64 = 1000;
 pub const DEFAULT_COMPLEXITY_THRESHOLD: u32 = 8;
 /// The score from which the best stored example's complexity counts (§5.5).
 pub const DEFAULT_EXAMPLE_SCORE: f64 = 0.8;
+/// The most communities a local question's grounding names (C22 §7.3).
+const MAX_COMMUNITIES: usize = 3;
 /// The most earlier turns a follow-up question carries (§5.1).
 pub const MAX_CONTEXT: usize = 5;
 /// Below this context window the grounding is trimmed (§3.6).
@@ -857,6 +859,43 @@ impl Asking<'_, '_> {
                     ctx.push_str("\nEntities that the question may name:\n");
                     ctx.push_str(&lines);
                 }
+            }
+        }
+        // C22 §7.3: the communities of the linked entities, at most three
+        let linked: Vec<Value> = entities
+            .iter()
+            .filter(|e| matches!(e["verdict"].as_str(), Some("exact")))
+            .filter_map(|e| e["candidates"][0]["iri"].as_str().map(Value::from))
+            .take(MAX_COMMUNITIES)
+            .collect();
+        if !linked.is_empty()
+            && let Ok(v) = self.tool(
+                "recall",
+                json!({ "seeds": linked, "hops": 0, "maxTriples": 1, "communities": true, "format": "json" }),
+                true,
+            )
+        {
+            let v = match v {
+                Value::String(t) => serde_json::from_str(&t).unwrap_or_default(),
+                v => v,
+            };
+            let reports: Vec<&Value> = v["communities"]["reports"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(MAX_COMMUNITIES)
+                .collect();
+            if !reports.is_empty() {
+                ctx.push_str("\nCommunities of the entities the question names, from the dataset's community reports:\n");
+                for r in &reports {
+                    ctx.push_str(&format!(
+                        "{} {}: {}\n",
+                        r["community"].as_str().unwrap_or(""),
+                        Value::from(r["title"].as_str().unwrap_or("")),
+                        Value::from(prompts::cut(r["summary"].as_str().unwrap_or(""), 600))
+                    ));
+                }
+                ground_event["communities"] = reports.iter().map(|r| r["iri"].clone()).collect();
             }
         }
         ground_event["entities"] = Value::Array(entities);
