@@ -49,6 +49,7 @@ mod queries;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
 pub(crate) mod sd;
+pub(crate) mod self_service;
 mod shex;
 mod sparql_diff;
 mod stream;
@@ -312,6 +313,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     // consolidation and retention of agent memory (C18 §8.3, §8.4)
     #[cfg(feature = "mcp")]
     let app = app.merge(crate::ingest::maintain::routes());
+    #[cfg(feature = "mcp")]
+    let app = app.merge(crate::graphrag::http::routes());
     // the MCP endpoint (`serve --mcp`)
     #[cfg(feature = "mcp")]
     let app = match crate::mcp::http::route(&state) {
@@ -380,7 +383,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             crate::obs::observe,
         ))
-        .layer(axum::middleware::from_fn(crate::alloc::track))
         .layer(axum::middleware::map_request(authority_host))
         .with_state(state.clone());
     // the branch a request chooses, before the routes above see it: the path form
@@ -392,6 +394,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             state,
             branches::select,
         ))
+        // outermost, so that a request counts as active from its first byte to the end
+        // of its response body (see `alloc`)
+        .layer(axum::middleware::from_fn(crate::alloc::track))
 }
 
 /// HTTP/2 requests carry their host as the `:authority` pseudo-header, not `Host`: it is
@@ -486,7 +491,9 @@ impl ApiError {
             resp.extensions_mut()
                 .insert(validation::RejectionTurtle(t.to_string()));
         }
-        if budget == Some(BudgetKind::ServerMemory) {
+        // only a refusal that a retry can pass says when to retry: a request larger than
+        // the whole pool answers 507 without it
+        if budget == Some(BudgetKind::ServerMemory) && self.0 == StatusCode::SERVICE_UNAVAILABLE {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
@@ -692,6 +699,12 @@ impl From<Error> for ApiError {
             Error::Cancelled => StatusCode::SERVICE_UNAVAILABLE,
             Error::BudgetExceeded(b) if b.kind == BudgetKind::DecompressedBytes => {
                 StatusCode::PAYLOAD_TOO_LARGE
+            }
+            // more memory than the whole pool: no retry can succeed
+            Error::BudgetExceeded(b)
+                if b.kind == BudgetKind::ServerMemory && b.requested > b.limit =>
+            {
+                StatusCode::INSUFFICIENT_STORAGE
             }
             // the server's query memory is in use: a retry can succeed
             Error::BudgetExceeded(b) if b.kind == BudgetKind::ServerMemory => {
@@ -1345,6 +1358,8 @@ pub(crate) async fn run_query(
     asked.apply(&mut opts);
     opts.describe = describe::request_options(&ds, &params)?;
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
+    // a SERVICE call to this server runs in process, as this caller
+    self_service::install(&st, &mut opts, &p);
     // a client that disconnects drops this future: the flag stops the query at its
     // next check
     let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -1405,16 +1420,36 @@ pub(crate) async fn run_query(
     // The first run of a query decides from its parsed algebra whether it has a SERVICE
     // of the algorithm namespace, so a prefixed name counts like the full IRI, and a
     // query that does is never remembered as quick and so never runs in place.
-    let quick = if at.is_none() && inline::available() {
-        QUICK.execution(quick_key)
+    let history = if at.is_none() && inline::available() {
+        QUICK.history(quick_key)
     } else {
-        None
+        inline::History::Slow
     };
-    let in_place = quick.is_some();
+    let quick = match history {
+        inline::History::Quick(execution) => Some(execution),
+        inline::History::Unseen | inline::History::Slow => None,
+    };
+    // The first run of a text the server has not seen runs in place too when a timeout
+    // bounds it, since the blocking pool costs a first request about 2 ms (see
+    // `inline`). It cannot be cancelled when its client disconnects, only by its
+    // timeout, and a slow run sends the text's later runs to the blocking pool.
+    let first_run = history == inline::History::Unseen
+        && timeout.is_some()
+        && inline::first_run_in_place(&query)
+        && inline::idle_for_first_run();
+    let in_place = quick.is_some() || first_run;
+    if first_run {
+        // Until a run of the text ends quick and whole, it counts as slow, so a first run
+        // that fails, stops early or fails to serialize sends the next runs to the pool,
+        // and so does a concurrent request for the same text.
+        QUICK.record(quick_key, f64::INFINITY);
+    }
     // SELECT and graph queries retain their quick eager shortcut. ASK can be quick
     // because its native execution avoids eager candidate storage, so it must keep
-    // automatic admission even when scheduled in place.
-    let auto = auto && (!in_place || quick == Some(inline::QuickExecution::PreserveAuto));
+    // automatic admission even when scheduled in place. A first run has no history, so
+    // it keeps automatic execution as on the blocking pool.
+    let auto =
+        auto && (first_run || !in_place || quick == Some(inline::QuickExecution::PreserveAuto));
     // the error body of the Sparkles format carries the plan as far as it ran
     let failed_plan = sfmt == SolutionsFormat::Sparkles;
     let run = {
@@ -1592,10 +1627,12 @@ pub(crate) async fn run_query(
     // Try small answers in place; actual encoded bytes decide whether the answer
     // must switch to the blocking serializer, even with very few result cells.
     let body = if in_place && cells <= inline::QUICK_RESULT_CELLS {
-        stream::serialize_quick(limit, write, on_stream_end).await?
+        stream::serialize_quick(limit, write, on_stream_end).await
     } else {
-        stream::serialize(limit, write, on_stream_end).await?
+        stream::serialize(limit, write, on_stream_end).await
     };
+    // a run whose answer could not be written is not known to be quick any more
+    let body = body.inspect_err(|_| QUICK.record(quick_key, f64::INFINITY))?;
     let (body, report) = match body {
         stream::Serialized::Whole { body, serialize_ms } => {
             let ms = if algorithmic {
@@ -2303,6 +2340,8 @@ async fn update_endpoint(
     };
     budgets::Overrides::parse(&params)?.apply(&mut opts);
     crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Update);
+    // a SERVICE call to this server in the update's WHERE runs in process, as this caller
+    self_service::install(&st, &mut opts, &p);
     opts.write = validation::write_options(&st, &params, &headers, opts.timeout)?;
     opts.write.graphs = opts.graphs.clone();
     opts.write.author = author(&p);
@@ -2441,6 +2480,11 @@ enum Target {
     /// Fuseki's `?graph=union`: the union of the named graphs, read-only
     Union,
     Dataset,
+}
+
+/// Whether the target is a guarded graph, which a view decides only against a snapshot.
+fn target_is_guarded(t: &Target) -> bool {
+    matches!(t, Target::Named(iri) if crate::graphrag::settings::is_guarded(iri))
 }
 
 fn gsp_target(params: &Params) -> Target {
@@ -3088,31 +3132,26 @@ async fn gsp_on(
                 Some(_) => None,
             };
             let opts = query_options(&st, &ds, &params);
-            let hidden = |t: &Target| match (&view, t) {
+            let hidden = |v: &Option<Arc<sparkles::access::GraphAccess>>, t: &Target| match (v, t) {
                 (Some(v), Target::Default) => !v.read.default_graph(),
                 (Some(v), Target::Named(iri)) => !v.read.allows_iri(iri),
                 _ => false,
             };
             // a graph the caller cannot read answers like a missing one
-            match &target {
-                Target::Default if hidden(&target) => {
-                    return Err(err(
-                        StatusCode::NOT_FOUND,
-                        format!(
-                            "no such graph: <{}>",
-                            sparkles::sparql::ctx::DEFAULT_GRAPH_IRI
-                        ),
-                    ));
-                }
-                Target::Named(iri) if hidden(&target) => {
-                    return Err(err(
-                        StatusCode::NOT_FOUND,
-                        format!("no such graph: <{iri}>"),
-                    ));
-                }
-                _ => {}
+            let missing = |t: &Target| match t {
+                Target::Named(iri) => err(StatusCode::NOT_FOUND, format!("no such graph: <{iri}>")),
+                _ => err(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "no such graph: <{}>",
+                        sparkles::sparql::ctx::DEFAULT_GRAPH_IRI
+                    ),
+                ),
+            };
+            if hidden(&view, &target) && !target_is_guarded(&target) {
+                return Err(missing(&target));
             }
-            let (snap, what, resolved) = blocking({
+            let (snap, what, resolved, view) = blocking({
                 let ds = ds.clone();
                 let read_view = view.clone();
                 move || {
@@ -3121,6 +3160,12 @@ async fn gsp_on(
                         None => at,
                     };
                     let (snap, resolved) = history::snapshot_for(&ds, at.as_ref(), &opts)?;
+                    // guarded graphs are decided against the snapshot read (C22 §6.3)
+                    let read_view = read_view.map(|v| v.bound(&snap));
+                    if hidden(&read_view, &target) {
+                        return Err(missing(&target));
+                    }
+                    let view = read_view.clone();
                     // protections of triples: the graph as the caller sees it, and a
                     // graph whose every quad is hidden answers like a missing one
                     let snap = match &read_view {
@@ -3139,7 +3184,7 @@ async fn gsp_on(
                         Target::Union => Export::Union,
                         Target::Dataset => Export::Dataset,
                     };
-                    Ok((snap, what, resolved))
+                    Ok((snap, what, resolved, view))
                 }
             })
             .await?;
@@ -3659,11 +3704,10 @@ fn dataset_info_for(st: &AppState, d: &Dataset, p: &Principal) -> J {
     }
     if let Some(v) = p.view(&d.name, crate::auth::Endpoint::Info) {
         redact_dataset_info(&mut info);
-        // the quads the caller can read
-        if let Ok(n) = v
-            .masked(&d.store.snapshot())
-            .and_then(|snap| v.visible_quads(&snap))
-        {
+        // the quads the caller can read, its guarded graphs decided at the snapshot
+        let snap = d.store.snapshot();
+        let v = v.bound(&snap);
+        if let Ok(n) = v.masked(&snap).and_then(|snap| v.visible_quads(&snap)) {
             info["quads"] = n.into();
         }
     }
@@ -5242,6 +5286,8 @@ mod pool_tests;
 mod reason_limit_tests;
 #[cfg(test)]
 mod router_tests;
+#[cfg(test)]
+mod self_service_tests;
 #[cfg(all(test, feature = "text"))]
 mod text_tests;
 #[cfg(all(test, feature = "shacl"))]

@@ -46,6 +46,8 @@ const LITERAL_CHARS: usize = 300;
 const MAX_CANDIDATES: usize = 5000;
 /// Import graphs of one project a brief reads at most.
 const MAX_GRAPHS: usize = 2000;
+/// Community reports a project brief shows at most (C22 §2.5).
+const MAX_REPORTS: usize = 5;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -411,9 +413,56 @@ impl Tools<'_> {
             &self.call.principal,
             self.call.grant.clone(),
         );
-        let review_lines = review
+        let mut review_lines = review
             .as_ref()
             .map_or(String::new(), super::pending::brief_lines);
+        // C22 §2.5: the project scope adds the coarsest level's reports
+        let mut communities = if scope == "project" {
+            self.brief_reports(&ds, &r, !include_unreviewed)
+                .map_err(eng)?
+        } else {
+            Vec::new()
+        };
+        let mut community_lines = |list: &[crate::graphrag::read::ReportRef]| {
+            let mut out = String::new();
+            let Some(first) = list.first() else {
+                return out;
+            };
+            let lit = |s: &str| Term::Literal(Literal::new_simple_literal(s));
+            out.push_str(&format!("# communities level={}\n", first.level));
+            for c in list {
+                out.push_str(&format!(
+                    "## {} {} members={} status={}\n",
+                    terms.iri(&c.iri),
+                    terms.term(&lit(&c.title)),
+                    c.member_count,
+                    c.status.as_str()
+                ));
+                out.push_str(&format!("summary {}\n", terms.term(&lit(&c.summary))));
+            }
+            out
+        };
+        // the reports count toward maxChars: the lowest rated go first until the header
+        // without facts fits (round 1, finding 7)
+        let fixed = {
+            let mut sc = String::new();
+            escape_into(&mut sc, &label);
+            FIRST_LINE.chars().count()
+                + 1
+                + format!(
+                    "# dataset={} commit={commit} scope={sc} {status_word} facts={matched} shown=0\n",
+                    ds.name
+                )
+                .chars()
+                .count()
+                + review_lines.chars().count()
+        };
+        while !communities.is_empty()
+            && fixed + community_lines(&communities).chars().count() > max_chars
+        {
+            communities.pop();
+        }
+        review_lines.push_str(&community_lines(&communities));
         // as many facts as fit
         let header = |shown: usize| {
             let mut h = String::from(FIRST_LINE);
@@ -511,7 +560,50 @@ impl Tools<'_> {
         if let Some(r) = review {
             out["review"] = r;
         }
+        if !communities.is_empty() {
+            out["communities"] = communities
+                .iter()
+                .map(|c| {
+                    json!({
+                        "iri": c.iri, "community": c.community, "title": c.title,
+                        "summary": c.summary, "status": c.status.as_str(),
+                        "memberCount": c.member_count,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
+        }
         Ok(Outcome::Structured(out))
+    }
+
+    /// The best rated reports of the coarsest level that the caller may read, reviewed
+    /// ones only when `reviewed_only`.
+    fn brief_reports(
+        &self,
+        ds: &crate::state::Dataset,
+        r: &Reader,
+        reviewed_only: bool,
+    ) -> Result<Vec<crate::graphrag::read::ReportRef>, Error> {
+        use crate::graphrag::read;
+        let settings: crate::graphrag::settings::GraphragSettings =
+            crate::settings::effective(&self.server.state, ds, &crate::settings::GRAPHRAG);
+        if !settings.enabled {
+            return Ok(Vec::new());
+        }
+        let graph = settings.reports_graph;
+        let opts = r.timed()?;
+        if !read::readable(&r.snap, &opts, &graph) {
+            return Ok(Vec::new());
+        }
+        let filter = read::Filter { reviewed_only };
+        let Some(level) = read::level_counts(&r.snap, &opts, &graph, filter)?
+            .keys()
+            .next()
+            .copied()
+        else {
+            return Ok(Vec::new());
+        };
+        read::reports_at(&r.snap, &opts, &graph, Some(level), filter, MAX_REPORTS)
     }
 
     /// The entity of `--entity`: an IRI, or a label that `link_entities` links `exact`.

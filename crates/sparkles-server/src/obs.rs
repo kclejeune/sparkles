@@ -1864,6 +1864,8 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::mcp::branches::metrics(&mut o);
     #[cfg(feature = "mcp")]
     crate::mcp::memory::pending::metrics(st, &mut o);
+    #[cfg(feature = "mcp")]
+    crate::graphrag::http::metrics(st, &mut o);
     io_metrics(&mut o);
     if let Some(rss) = resident_bytes() {
         family(
@@ -2102,6 +2104,8 @@ pub fn metrics_router(st: Arc<AppState>) -> axum::Router {
             st.rate_limit.clone(),
             crate::ratelimit::admit,
         ))
+        // a scrape keeps the server from counting as idle (see `alloc`)
+        .layer(axum::middleware::from_fn(crate::alloc::track))
         .with_state(st)
 }
 

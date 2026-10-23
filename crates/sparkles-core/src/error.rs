@@ -262,6 +262,13 @@ impl std::fmt::Display for Budget {
                 "the access rules of this request hide more than {} quads at this commit",
                 self.limit
             ),
+            // a request larger than the whole pool cannot succeed on retry
+            BudgetKind::ServerMemory if self.requested > self.limit => write!(
+                f,
+                "the request needs about {}, more than the server's whole query memory pool of {}",
+                human_bytes(self.requested),
+                human_bytes(self.limit)
+            ),
             BudgetKind::ServerMemory => write!(
                 f,
                 "the server's query memory is in use (pool of {}, request needs about {}); retry shortly",

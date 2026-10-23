@@ -72,8 +72,9 @@ On larger and standard workloads:
   on `q2`.
 * **SP²Bench at 10M triples.** Sparkles answers 15 of 17 queries and is fastest on 13. It
   is the only engine that answers `q5a`, whose rows match an independent oracle. Jena is
-  12× faster on the ASK query `q12a` and Oxigraph 1.7× on `q12b`. The default query
-  memory budget still refuses `q4` and `q6`.
+  12× faster on the ASK query `q12a` and Oxigraph 1.7× on `q12b`. In this table the
+  default budgets refuse `q4` and `q6`. A later build answers `q6` in 0.95 s, and its `q4`
+  answer of 1.96 GB is larger than the default response budget.
 * **BSBM Explore at 10M triples.** Sparkles has the lowest pooled median on seven of the
   ten templates whose answers are checked. Fluree is 2.9× faster on q5, and Oxigraph is
   faster on q7 and q8. Fluree's driver throughput is two to three times Sparkles' in both
@@ -342,6 +343,25 @@ Two queries are losses. Jena answers the ASK query `q12a` in 6.2 ms, 12× faster
 Sparkles' 73.7 ms, and Oxigraph answers `q12b` in 4.2 ms against Sparkles' 7.2 ms
 ([roadmap](ROADMAP.md) item 91). On `q11` the unchecked times of QLever and Fluree, 42.8
 and 51.7 ms, are lower than Sparkles' 103.1 ms.
+
+A lane build of 2026-10-23 answers `q6` at 10M with the default budgets
+([roadmap](ROADMAP.md) item 91). Its OPTIONAL shares no variable with the outer pattern,
+and a keyed left join now pairs the rows through `?author = ?author2` and tests 7.4
+million candidate pairs instead of a product of 1.6 × 10¹² rows. Over two interleaved
+rounds of 10 runs on forge, under the same 12 GiB server cap, `q6` took a mean of 948 ms
+and returned 906,313 rows with the exact and value digests of Jena's answer. That is
+115× faster than Jena's 108.6 s. The other 15 queries stayed within 4% of the base
+build, `q5a` at 1.015 times and `q8` at 0.965 times its time.
+
+The same build no longer refuses `q4` for memory. Its eager join outgrew the 5,344 MiB
+query pool, and the query now runs again as a cursor without spill. Its answer has
+41,073,618 rows and 1,955,839,207 bytes of TSV, which is more than the default response
+budget of 1 GiB, so `q4` stays an error with the default settings. Single runs on one
+thread without the server cap and with `--max-result-mb 4096` show the effect of
+comparing stored strings without decoding them. A streamed answer took 30.4 s against
+62.2 s for the base build, and an eager answer took 16.3 s against 53.1 s. The sorted
+answers of both builds are identical, and at 1M they match Oxigraph's and an
+independent oracle's.
 
 Three corrections since the run of 2026-10-19 account for the changes. A planner
 correction moved the selective author pattern into eligible UNION branches before their
@@ -845,6 +865,35 @@ decoding blocks. In an interleaved A/B on forge at 10.5M it made cold `star-look
 `bench.sh` columns above predate it. [X07](specs/X07-cold-sparse-reads.md#remaining-cold-gaps)
 gives those figures and the profile of the remaining cold time.
 
+##### Segmented blocks
+
+Index format 3 splits each column of a block into frames of 2,048 rows, so a point lookup
+decodes a sixteenth of a column. These figures of 2026-10-23 come from forge, with the
+engine of main at `72d85c7f` against the segmented build at `e86a371a`, each on a store
+loaded by its own build. The cold preparation is the one above. Each 10.5M cell is the
+median of four interleaved rounds of 11 samples timed by `bench-regressions.py --cold`,
+and each 1.05M cell the median of two. The `export-500k` row comes from the earlier
+segmented build at `8dd019da` against main at `63d8a36d`.
+
+| Cold, forge, median ms | 1.05M main | 1.05M segmented | 10.5M main | 10.5M segmented |
+|---|---:|---:|---:|---:|
+| `star-lookup` | 15.4 | **14.9** | 20.4 | **12.7** |
+| `employee-docs` | 13.2 | **11.7** | 16.8 | **12.2** |
+| `values-star` | 9.8 | **7.7** | 10.1 | **7.6** |
+| `path-plus` | 8.0 | **5.0** | 6.7 | **4.7** |
+| `knows-reach` | 33.5 | **32.1** | 198.9 | **197.4** |
+| `star-join` | 27.8 | **25.8** | **82.7** | 89.2 |
+| `export-500k` | 121.8 | **120.4** | 129.8 | **127.7** |
+
+`star-join` at 10.5M is the one cold query that is slower, by 6% to 8% in two runs of 12
+rounds. Its index join reads up to a quarter of a block's segments one by one before the
+block is read whole, and [X07](specs/X07-cold-sparse-reads.md#phase-3-results) records the
+fixes that were tried. Warm instruction counts per request are 0.969 to 1.024 of main for
+every query, 0.971 to 0.978 for `employee-docs` and 0.983 for `export-500k`, and a warm
+pass makes no read hint. The generation at 10.5M grows by 3.0%, from 300.6 MB to
+309.7 MB. The load takes 3.7 seconds in both builds, and its peak resident memory is about
+2.05 GB in both.
+
 ### BSBM Explore at 10M triples
 
 This run used 10,095,035 generated triples and 28,480 products on forge. The other
@@ -953,7 +1002,8 @@ above a Cartesian product of 62,956 and 2,474 rows materializes the product, whi
 same product without the filter streams. At sixteen clients, q2 instances of about
 450 MB each queue for the pool and some exceed the admission wait. The `503` carries
 `Retry-After` even when the request is larger than the whole pool and cannot succeed on
-retry. [Roadmap](ROADMAP.md) item 96 covers both. QLever's driver failed with a refused
+retry. [Roadmap](ROADMAP.md) item 96 has since fixed both, as described after the
+table, and the driver cells have not been rerun. QLever's driver failed with a refused
 connection at one client and HTTP 500 at four and sixteen clients. Jena and Oxigraph
 timed out at every client count.
 
@@ -967,6 +1017,24 @@ Fluree alone completed two driver cells. Their result-count check has no success
 competing engine to compare, and its fixed q2, q3, q6, q7 and q8 answers disagree.
 Its QMpH figures are observations and are not ranked. No throughput winner is
 established by this run.
+
+Roadmap item 96 was measured on forge on 2026-10-23 on the same 10M store, with the
+release binaries of 6192b8ad before the change and 933b7f4e after it, each alone under
+the default 5.2 GiB pool. With automatic execution, q4 with ProductType6 answered `503`
+in 0.2 s before the change. After it, the query streams and answers in 15.1 s with a
+peak resident size of 282 MB. Under a 12 GiB pool, the same query took 17.0 s and 8.3 GB
+before the change and 15.05 s and 287 MB after it, and forced eager execution took
+17.7 s and 8.3 GB. All of the answers are identical. A request larger than the whole pool
+now answers `507` without `Retry-After`.
+
+The 24 fixed instances were timed in rounds of A, B, B and A, five times after one
+warm-up per round. q1 to q5, q7 and q8 stayed within 5% of the previous median, apart from
+the 6 to 12 ms instances of q1 and q8, which moved by up to 12% in both directions. The
+first run put q6 between 17% and 48% slower. A second run of q6 alone, in eight
+alternating rounds of 30 samples, measured the three instances at 0.96, 0.87 and 1.12
+times the previous medians with the same minima. Those instances take 10 to 20 ms, close
+to the 10 ms limit below which a query runs on the thread that received it, so their
+samples split between two modes and their medians move between runs.
 
 ### Full-text search
 
@@ -1453,6 +1521,32 @@ the index, at 10.5M, where 24 patterns cover 1.52 million subjects. Writing them
 RSS stayed at 3.23 GB. At 10.5M the load took 4.1 s against 4.6 s and peaked at 2.07 GB
 against 1.96 GB, in one load each. The collector holds at most 1 GiB of distinct patterns by default
 and skips the patterns of a generation that needs more.
+
+### FSST vocabulary suffixes
+
+X11 Phase 2a compresses the front-coded vocabulary's suffixes with FSST when a load runs
+with `--vocab-codec fsst` ([X11](specs/X11-index-compression-and-predicate-patterns.md#phase-2a-measurements)).
+Forge compared the release binary of `e294b817` with the FSST branch at `1ed20337` on
+2026-10-23. Each variant loaded both datasets twice in A, B, B, A order. Warm 10.5M cells
+are medians of four rounds of 15 requests, warm DBpedia cells of two rounds of 10, and
+cold cells of two rounds of five cold samples.
+
+| Measurement | 10.5M front | 10.5M FSST | DBpedia 50M front | DBpedia 50M FSST |
+|---|---:|---:|---:|---:|
+| `vocab.dat` | 25.87 MB | 17.69 MB | 485.06 MB | 344.48 MB |
+| Store on disk | 312.8 MB | 304.7 MB | 1,577.5 MB | 1,436.9 MB |
+| Mean load time | 3.8 s | 3.8 s | 24.0 s | 24.9 s |
+| Warm geometric mean | 1 | 1.018 | 1 | 1.054 |
+| Cold geometric mean | 1 | 0.966 | 1 | 0.977 |
+| Warm `export-500k` | 161.7 ms | 180.6 ms | | |
+| Warm `contains` | 24.6 ms | 27.7 ms | | |
+
+The geometric means cover the queries at 0.3 ms or more. Load peak RSS stayed within the
+spread between loads, at 2.0 to 2.1 GB at 10.5M and 3.1 to 3.3 GB on DBpedia. Warm
+queries that decode many strings, such as `export-500k`, `contains` and `lang-filter` at
+10.5M, ran 11% to 13% slower, which misses X11's warm gate of 5%, so front coding stays
+the default. Cold queries ran 2% to 3% faster on average, because fewer vocabulary pages
+are read, but cold `export-500k` still took 1.11 times as long.
 
 ## Loading and index builds
 
@@ -2706,7 +2800,6 @@ than 10%. Fluree's warm advantages on `distinct-obj` at 1.05M and on two small D
 | WatDiv `L1-1`, 10.97M | Fluree 1.11× | Sparkles has the lowest mean on 19 of 20 templates, ties Fluree on S7 and leads on 81 of 88 instances. |
 | BSBM Explore `q5`, `q7` and `q8`, 10M | Fluree 2.9× on `q5`, Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
 | BSBM BI `q2` and `q3`, 10M | QLever 11.2× on `q2` and 1.24× on `q3` | The three fixed-instance answer checks agree. The generated driver mix fails on a Sparkles budget refusal ([roadmap](ROADMAP.md) item 96). |
-| SP²Bench `q4` and `q6`, 10M | Jena answers `q6` in 108.6 s | The default query memory budget refuses both. Disk spill is off by default ([roadmap](ROADMAP.md) items 7 and 93). |
 | LUBM(100) `q2` | QLever 3.7× | Sparkles is fastest on 13 of 14 queries. |
 | Changed-store `two-hop-count`, 1.05M | Fluree 1.10× | Sparkles takes 8.6 ms against 7.8 ms with 5,000 changes in its delta, and 5.1 ms on the loaded store. |
 | Serial durable commits | Oxigraph 1.84× on literal inserts at 1.05M and 1.39× at 10.5M | The same durability difference. |
@@ -2827,7 +2920,8 @@ harness errors.
 
 * **Larger scale.** The largest dataset is English DBpedia at 1.24 billion triples. QLever
   is built for 10⁹–10¹¹ triples and runs Wikidata and UniProt, and its lazy evaluation,
-  FSST vocabulary compression and IRI encoding matter more as data grows. Sparkles spills
+  FSST vocabulary compression and IRI encoding matter more as data grows. Sparkles'
+  FSST option was measured only up to the DBpedia 50M slice. Sparkles spills
   cursor sorts, groupings, DISTINCT and joins. A query still fails when its eager state
   outgrows its budget.
 * **Data larger than RAM.** Every store fits in memory except the DBpedia index of

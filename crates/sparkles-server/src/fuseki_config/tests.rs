@@ -178,9 +178,14 @@ fn endpoint_names() {
         "{}",
         p.report.text()
     );
-    // the SHACL endpoint
+    // the SHACL endpoint, which a build without SHACL does not serve
     let p = plan("examples/config-shacl.ttl");
-    assert!(!p.report.has_unsupported(), "{}", p.report.text());
+    assert_eq!(
+        p.report.has_unsupported(),
+        !cfg!(feature = "shacl"),
+        "{}",
+        p.report.text()
+    );
 }
 
 #[test]
@@ -480,7 +485,9 @@ fn a10_agrees_with_assembler_bodies() {
         checked += 1;
     }
     eprintln!("compared {checked} configurations");
-    assert!(checked >= 5, "only {checked} configurations compared");
+    // the SHACL example is refused by the assembler in a build without SHACL
+    let least = if cfg!(feature = "shacl") { 5 } else { 4 };
+    assert!(checked >= least, "only {checked} configurations compared");
 }
 
 /// Every file of the copied examples converts without an error, and `--check` finds

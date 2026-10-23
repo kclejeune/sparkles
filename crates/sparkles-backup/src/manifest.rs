@@ -83,6 +83,12 @@ pub fn validate(m: &Manifest, piece_bytes: u64, index_formats: &[u32]) -> Result
             ),
         ));
     }
+    // a feature of the generation that this build does not read, by name
+    if let Err(e) =
+        sparkles_core::builder::check_features("backup", &m.index_features, Some(&m.server.version))
+    {
+        return Err(BackupError::new(Code::IncompatibleFormat, e.to_string()));
+    }
     if let Some(encryption) = m.encryption.as_ref().filter(|e| !e.is_null()) {
         #[cfg(feature = "encryption")]
         let supported = encryption.as_object().is_some_and(|e| e.len() == 2)
@@ -522,6 +528,20 @@ mod tests {
         validate(&m, PIECE, &[2]).unwrap();
     }
 
+    /// A backup of a generation with an index feature this build does not read is
+    /// refused before anything is written, naming the feature (spec X11 §7.3).
+    #[test]
+    fn an_unknown_index_feature_is_incompatible() {
+        let mut m = good();
+        m.index_format = 4;
+        m.index_features = vec!["fsst-vocab".into()];
+        validate(&m, PIECE, sparkles_core::formats::READABLE_INDEX_FORMATS).unwrap();
+        m.index_features.push("zz-future".into());
+        let e = validate(&m, PIECE, sparkles_core::formats::READABLE_INDEX_FORMATS).unwrap_err();
+        assert_eq!(e.code(), Code::IncompatibleFormat);
+        assert!(e.to_string().contains("`zz-future`"), "{e}");
+    }
+
     #[test]
     fn a_newer_index_format_is_incompatible() {
         let mut m = good();
@@ -530,10 +550,15 @@ mod tests {
         assert_eq!(e.code(), Code::IncompatibleFormat);
         assert_eq!(e.http_status(), 422);
         let v = sparkles_core::builder::FORMAT_VERSION;
+        let reads = sparkles_core::formats::READABLE_INDEX_FORMATS
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         assert!(
             e.message()
                 .contains(&format!("index format {}, written by Sparkles", v + 1))
-                && e.message().contains(&format!("this build reads {v}")),
+                && e.message().contains(&format!("this build reads {reads}:")),
             "{e}"
         );
     }

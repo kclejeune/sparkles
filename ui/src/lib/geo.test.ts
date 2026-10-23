@@ -8,7 +8,10 @@ import {
   GEOJSON_LITERAL,
   geoCells,
   geoColumns,
+  geometriesQuery,
   geometryQuery,
+  LOCATE_BATCH,
+  representativePoint,
   GML_LITERAL,
   inverseMercator,
   isGeoLiteral,
@@ -334,5 +337,76 @@ describe('explorer queries', () => {
       'spatial:nearbyGeom ("POINT(2.35 48.85)"^^<http://www.opengis.net/ont/geosparql#wktLiteral> 5 uom:kilometre 25)',
     );
     expect(q).toContain('FILTER(?f != <http://ex.org/paris>)');
+  });
+});
+
+describe('representativePoint', () => {
+  const g = (text: string) => parseWkt(text)!;
+  it('is a point itself', () => {
+    expect(representativePoint(g('POINT(3 4)'))).toEqual([3, 4]);
+  });
+  it('is the mean of a multipoint', () => {
+    expect(representativePoint(g('MULTIPOINT((0 0), (4 2))'))).toEqual([2, 1]);
+  });
+  it('is the centroid of a polygon, weighted by area', () => {
+    const p = representativePoint(g('POLYGON((0 0, 4 0, 4 2, 0 2, 0 0))'))!;
+    expect(p[0]).toBeCloseTo(2, 9);
+    expect(p[1]).toBeCloseTo(1, 9);
+    // an L-shape: the legs weigh 3 and 2
+    const l = representativePoint(g('POLYGON((0 0, 3 0, 3 1, 1 1, 1 3, 0 3, 0 0))'))!;
+    expect(l[0]).toBeCloseTo(1.1, 9);
+    expect(l[1]).toBeCloseTo(1.1, 9);
+  });
+  it('subtracts a hole from the polygon', () => {
+    // a square with a hole in its right half: the centroid moves left of the centre
+    const p = representativePoint(
+      g('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (2 1, 3 1, 3 3, 2 3, 2 1))'),
+    )!;
+    expect(p[0]).toBeLessThan(2);
+    expect(p[1]).toBeCloseTo(2, 9);
+  });
+  it('is the length-weighted midpoint of a line', () => {
+    const p = representativePoint(g('LINESTRING(0 0, 2 0, 2 6)'))!;
+    // the long leg weighs three times the short one
+    expect(p[0]).toBeCloseTo(1.75, 9);
+    expect(p[1]).toBeCloseTo(2.25, 9);
+  });
+  it('prefers the polygons of a collection to its points', () => {
+    const p = representativePoint(
+      g('GEOMETRYCOLLECTION(POINT(100 100), POLYGON((0 0, 2 0, 2 2, 0 2, 0 0)))'),
+    )!;
+    expect(p[0]).toBeCloseTo(1, 9);
+  });
+  it('falls back to the centre of the box for a shape with no extent', () => {
+    const p = representativePoint({
+      type: 'Polygon',
+      coordinates: [
+        [
+          [0, 0],
+          [2, 2],
+          [4, 4],
+          [0, 0],
+        ],
+      ],
+    })!;
+    expect(p[0]).toBeCloseTo(2, 9);
+    expect(representativePoint({ type: 'GeometryCollection', geometries: [] })).toBeNull();
+  });
+});
+
+describe('geometriesQuery', () => {
+  it('asks for a batch of resources with VALUES and the routes of geometryQuery', () => {
+    const q = geometriesQuery(['http://x/a', 'http://x/b']);
+    expect(q).toContain('VALUES ?s { <http://x/a> <http://x/b> }');
+    expect(q).toContain('SELECT ?s ?lit');
+    expect(q).toContain('hasDefaultGeometry');
+    expect(q).toContain('wgs84_pos#lat');
+    expect(q).toContain('LIMIT 12');
+  });
+  it('escapes IRIs that would break the query', () => {
+    expect(geometriesQuery(['http://x/a b>'])).toContain('<http://x/a%20b%3E>');
+  });
+  it('names the batch size the lookups use', () => {
+    expect(LOCATE_BATCH).toBe(200);
   });
 });

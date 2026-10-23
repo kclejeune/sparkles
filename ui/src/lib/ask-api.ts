@@ -259,6 +259,45 @@ export type AskRequest = {
   tryHarder?: string;
   reviewedOnly?: boolean;
   query?: string;
+  /** Answer from the data, from the community reports, or as the question needs (C22 §2.4). */
+  mode?: AskMode;
+};
+
+export type AskMode = 'auto' | 'local' | 'global';
+
+/** A finding of a community report, with the facts it cites as N-Triples terms. */
+export type AskFinding = { iri: string; text: string; cites: string[] };
+
+/** A report a global answer used (C22 §7.2). */
+export type AskReport = {
+  iri: string;
+  title: string;
+  level: number;
+  status: string;
+  rating?: number | null;
+  findings: AskFinding[];
+};
+
+/** A point the reduce step read; the summary's `[n]` markers number them. */
+export type AskPoint = {
+  n: number;
+  text: string;
+  score: number;
+  reports: string[];
+  findings: string[];
+};
+
+/** What a global answer read: its points, its reports and how they were chosen. */
+export type AskGlobal = {
+  points: AskPoint[];
+  reports: AskReport[];
+  global: {
+    level?: number;
+    ranking?: 'search' | 'rating';
+    reportsGraph?: string;
+    selected?: number;
+    batches?: number;
+  };
 };
 
 /** The draft's graph variables for the graph view, with or without `?`. */
@@ -303,6 +342,8 @@ export type AskSummary = {
   provider?: string;
   model?: string;
   uncited?: boolean;
+  /** In a global answer, the sentences without a marker. */
+  uncitedSentences?: string[];
 };
 
 export type AskStep = {
@@ -349,6 +390,12 @@ export type AskEvent =
     }
   | { event: 'result'; data: AskResult }
   | { event: 'summary'; data: AskSummary }
+  | { event: 'scope'; data: { scope: 'global'; provider?: string; model?: string } }
+  | {
+      event: 'reports';
+      data: { level?: number; ranking?: string; reports: Pick<AskReport, 'iri' | 'title'>[] };
+    }
+  | { event: 'global'; data: AskGlobal }
   | { event: 'usage'; data: AskUsage }
   | { event: 'error'; data: AskError };
 
@@ -438,6 +485,9 @@ export type AskRecord = {
   result: string;
   outcome: 'none' | 'accepted' | 'edited' | 'rejected';
   note?: string;
+  mode?: 'local' | 'global';
+  /** The reports a global answer used, while the caller may read them. */
+  reports?: string[];
 };
 
 export async function askHistory(ds: string, signal?: AbortSignal): Promise<AskRecord[]> {

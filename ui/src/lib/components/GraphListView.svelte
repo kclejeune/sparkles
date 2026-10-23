@@ -10,6 +10,8 @@
     degree: number;
     color: string;
     openable: boolean;
+    /** Marked, such as an entity of the chosen finding. */
+    marked?: boolean;
   };
 </script>
 
@@ -27,12 +29,15 @@
     onselect,
     onopen,
     openLabel = 'Open',
+    clsLabel = 'Class',
   }: {
     rows: ListRow[];
     selected?: string | null;
     onselect?: (key: string) => void;
     onopen?: (key: string) => void;
     openLabel?: string;
+    /** The heading of the class column. */
+    clsLabel?: string;
   } = $props();
 
   const LIMIT = 500;
@@ -59,18 +64,24 @@
         <th scope="col">Name</th>
         <th scope="col" class="num">Size</th>
         <th scope="col" class="hide-sm">Kind</th>
-        <th scope="col" class="hide-sm">Class</th>
+        <th scope="col" class="hide-sm">{clsLabel}</th>
         <th scope="col" class="num hide-sm">Links</th>
         <th scope="col"><span class="sr-only">Actions</span></th>
       </tr>
     </thead>
     <tbody bind:this={body}>
       {#each shown as r (r.key)}
-        <tr data-key={r.key} class:sel={r.key === selected} aria-selected={r.key === selected}>
+        <tr
+          data-key={r.key}
+          class:sel={r.key === selected}
+          class:marked={r.marked}
+          aria-selected={r.key === selected}
+        >
           <td>
             <button class="name" onclick={() => onselect?.(r.key)} title={r.key.slice(2)}>
               <span class="dot" style:background={r.color} aria-hidden="true"></span>
-              <span class="lbl">{r.label}</span>
+              <span class="lbl">{r.label}</span>{#if r.marked}<span class="sr-only">, marked</span
+                >{/if}
             </button>
           </td>
           <td class="num">{r.kind === 'member' ? '' : fmtInt(r.size)}</td>
@@ -121,6 +132,9 @@
   .num {
     text-align: right;
     font-variant-numeric: tabular-nums;
+  }
+  tr.marked td {
+    box-shadow: inset 3px 0 0 var(--spark);
   }
   tr.sel td {
     background: var(--spark-soft);

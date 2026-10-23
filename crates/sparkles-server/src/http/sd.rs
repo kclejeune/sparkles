@@ -116,7 +116,7 @@ struct DatasetFacts {
 
 fn facts(ds: &Dataset, p: &Principal, reasoning: bool) -> ApiResult<DatasetFacts> {
     let snap = ds.store.snapshot();
-    let view = p.view(&ds.name, Endpoint::Query);
+    let view = p.view(&ds.name, Endpoint::Query).map(|v| v.bound(&snap));
     let full = view.is_none();
     let union = snap.union_default_graph;
     let default_triples = if full && !union && !reasoning {

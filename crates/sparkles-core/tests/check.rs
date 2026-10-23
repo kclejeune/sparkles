@@ -293,6 +293,28 @@ fn a_truncated_permutation_file_is_found_in_both_modes() {
     }
 }
 
+#[test]
+fn an_unsupported_segment_size_is_found_in_both_modes() {
+    // sizes the reader refuses, though some divide the block: too small, too large, zero
+    for size in [256u32, 8192, 0, 1000] {
+        let (_d, root) = fresh();
+        let path = gen_dir(&root).join("spo.seg");
+        let mut b = std::fs::read(&path).unwrap();
+        b[8..12].copy_from_slice(&size.to_le_bytes());
+        std::fs::write(&path, &b).unwrap();
+        assert!(PermIndex::open(&gen_dir(&root), Perm::Spo).is_err());
+        for quick in [true, false] {
+            let r = run(&root, quick);
+            assert_eq!(status(&r, "perm.spo"), Status::Error, "{}", r.to_text());
+            assert!(
+                messages(&r, "perm.spo").contains("not supported"),
+                "{size}: {}",
+                r.to_text()
+            );
+        }
+    }
+}
+
 // ---- crafted blocks: re-encode a permutation with the same block layout ------------
 
 fn encode_column(col: &[u64]) -> Vec<u8> {
@@ -323,15 +345,33 @@ fn rewrite_perm(dir: &Path, perm: Perm, edit: impl FnOnce(&mut Vec<Vec<Key>>)) {
         .collect();
     drop(idx);
     edit(&mut blocks);
+    // the segmented layout of index format 3: a frame per 1,024 rows of a column, and a
+    // directory entry per segment with its first key and frame lengths
+    const SEG: usize = 1024;
     let (mut dat, mut meta) = (Vec::new(), Vec::new());
+    let mut seg = b"SPKSEG01".to_vec();
+    seg.extend_from_slice(&(SEG as u32).to_le_bytes());
+    seg.extend_from_slice(&[0; 4]);
     let mut row_start = 0u64;
     for keys in &blocks {
         let offset = dat.len() as u64;
         let mut col_len = [0u32; 4];
+        let mut lens = vec![[0u32; 4]; keys.len().div_ceil(SEG)];
         for (c, len) in col_len.iter_mut().enumerate() {
-            let enc = encode_column(&keys.iter().map(|k| k[c]).collect::<Vec<_>>());
-            *len = enc.len() as u32;
-            dat.extend_from_slice(&enc);
+            for (s, part) in keys.chunks(SEG).enumerate() {
+                let enc = encode_column(&part.iter().map(|k| k[c]).collect::<Vec<_>>());
+                lens[s][c] = enc.len() as u32;
+                *len += enc.len() as u32;
+                dat.extend_from_slice(&enc);
+            }
+        }
+        for (s, part) in keys.chunks(SEG).enumerate() {
+            for v in part[0] {
+                seg.extend_from_slice(&v.to_le_bytes());
+            }
+            for l in lens[s] {
+                seg.extend_from_slice(&l.to_le_bytes());
+            }
         }
         let (first, last) = (keys[0], keys[keys.len() - 1]);
         for v in first.iter().chain(last.iter()) {
@@ -347,6 +387,7 @@ fn rewrite_perm(dir: &Path, perm: Perm, edit: impl FnOnce(&mut Vec<Vec<Key>>)) {
     }
     std::fs::write(dir.join(format!("{}.dat", perm.name())), dat).unwrap();
     std::fs::write(dir.join(format!("{}.meta", perm.name())), meta).unwrap();
+    std::fs::write(dir.join(format!("{}.seg", perm.name())), seg).unwrap();
 }
 
 #[test]

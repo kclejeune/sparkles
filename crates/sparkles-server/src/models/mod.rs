@@ -21,6 +21,7 @@
 //! stored through `/$/server/secrets/{name}` overrides its `--model-secret` source
 //! (`crate::settings::server`).
 
+pub mod admission;
 mod client;
 mod config;
 pub mod http;
@@ -533,6 +534,24 @@ impl Models {
         out: &OutputSchema,
         deadline: Instant,
     ) -> Result<Answer, Failure> {
+        self.call_admitted(role, pair, system, user, out, deadline, None)
+    }
+
+    /// [`Models::call`] with an admission asked before every HTTP attempt it makes:
+    /// the client's retries, the retry with validation errors and the requests at other
+    /// structured-output levels (spec C22 §3.5). A refusal for the budget ends the step
+    /// with [`StepError::Budget`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_admitted(
+        &self,
+        role: Option<Role>,
+        pair: &Pair,
+        system: &str,
+        user: &str,
+        out: &OutputSchema,
+        deadline: Instant,
+        admission: Option<&dyn admission::Admission>,
+    ) -> Result<Answer, Failure> {
         let mut rec = StepRecord {
             role,
             provider: pair.provider.clone(),
@@ -661,7 +680,7 @@ impl Models {
                     outbound: &outbound,
                     key: key.clone(),
                 };
-                let resp = client::send(&t, &pair.provider, p, &req);
+                let resp = client::send_admitted(&t, &pair.provider, p, &req, admission);
                 drop(_slot);
                 let resp = match resp {
                     Ok(r) => r,
@@ -669,6 +688,20 @@ impl Models {
                         tracing::info!(target: "sparkles::models", "{}: level {} refused, trying the next: {e}", pair.label(), level.as_str());
                         last = Some(StepError::Call(e));
                         break;
+                    }
+                    Err(CallError::Admission(code, m, sent_before)) => {
+                        // a refusal before sending says nothing about the pair's health;
+                        // the request counts when an earlier attempt of it was sent
+                        if !sent_before {
+                            rec.requests -= 1;
+                        }
+                        rec.latency = started.elapsed();
+                        let error = if code == "budget-exceeded" {
+                            StepError::Budget(m)
+                        } else {
+                            StepError::Call(CallError::Admission(code, m, sent_before))
+                        };
+                        return fail(error, rec);
                     }
                     Err(e) => {
                         rec.latency = started.elapsed();

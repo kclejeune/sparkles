@@ -54,12 +54,15 @@ pub enum CommitKind {
     /// another branch's commit applied again (`POST /$/cherry-pick/{ds}`,
     /// `Store::cherry_pick`)
     CherryPick,
+    /// community reports written by a GraphRAG build (spec C22 §4). An older release
+    /// reads the code as [`Unknown`](CommitKind::Unknown).
+    Graphrag,
     /// a WAL commit written by an older version after this one had upgraded the database
     Unknown,
 }
 
 impl CommitKind {
-    const ALL: [CommitKind; 17] = [
+    const ALL: [CommitKind; 18] = [
         CommitKind::Create,
         CommitKind::Baseline,
         CommitKind::Update,
@@ -76,6 +79,7 @@ impl CommitKind {
         CommitKind::Merge,
         CommitKind::Revert,
         CommitKind::CherryPick,
+        CommitKind::Graphrag,
         CommitKind::Unknown,
     ];
 
@@ -98,6 +102,7 @@ impl CommitKind {
             CommitKind::Merge => 13,
             CommitKind::Revert => 14,
             CommitKind::CherryPick => 15,
+            CommitKind::Graphrag => 16,
             CommitKind::Unknown => 255,
         }
     }
@@ -128,6 +133,7 @@ impl CommitKind {
             CommitKind::Merge => "merge",
             CommitKind::Revert => "revert",
             CommitKind::CherryPick => "cherry-pick",
+            CommitKind::Graphrag => "graphrag",
             CommitKind::Unknown => "unknown",
         }
     }

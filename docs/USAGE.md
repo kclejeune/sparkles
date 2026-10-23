@@ -33,6 +33,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Loading CSV and TSV](#loading-csv-and-tsv)
 * [Branches and merges](#branches-and-merges)
 * [The Explore overview](#the-explore-overview)
+* [Arcs on the map](#arcs-on-the-map)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
@@ -492,6 +493,7 @@ happens to materialized inferences, and the limits.
 | `--no-group-commit` | | Give every commit its own synchronization. By default concurrent commits of a persistent dataset share one, and each is acknowledged only once it is durable. Datasets with a full-text, spatial or embedding index group their commits too, except while a full-text index recovers or rebuilds, or while a spatial index builds or after its build failed. Grouping holds up to 64 commits or 4 MiB of log records per dataset in memory, plus the speculative snapshots of the commits in flight. `SPARKLES_GROUP_COMMIT=off`, `false`, `no` or `0` does the same, and an unrecognised value logs a warning and is ignored. Node takes `groupCommit: false` and Python `group_commit=False`. The JVM library has no option and always groups a persistent dataset. A global flag. |
 | `--no-patterns` | | Build no predicate patterns (`patterns.bin`) when a bulk load or a compaction writes a generation. Predicate listings and `spk:hasPredicate` then read the permutations. A global flag. |
 | `--pattern-memory-mb N` | `1024` | Memory for the distinct predicate patterns while a bulk load or a compaction builds them. A generation that needs more is built without patterns, the reason is logged and kept in its `meta.json`, and queries read the permutations. A global flag. |
+| `--vocab-codec front\|fsst` | | How a bulk load or a full compaction stores the vocabulary. `front` front-codes the keys. `fsst` also compresses each key's suffix with FSST when that makes it shorter, with symbol tables in `vocab.fsst`, which makes the generation index format 4. Releases that read only format 3 cannot open it. Without the flag, a new database is front-coded and a compaction keeps the codec of the generation it replaces. A compaction asked for another codec rebuilds the generation in full. A global flag. |
 | `--max-prefixes N` | `1000` | Prefixes per dataset; `0` means unlimited. A global flag. A new prefix past the limit is refused with `400`, and loaded data stops adding its prefixes. Declared prefixes count toward the limit, and well-known ones do not. |
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. The limit counts the closure's derived triples, which take about 135 bytes each, and the input graphs are read from the store's indexes. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 | `--reason-threads N` | half the cores | The threads that materializations evaluate rules on. All runs share this pool, so a run leaves the other cores to queries and writes. A request's `threads` field can ask for fewer. Runs are admitted in arrival order while their threads fit the pool, so a run that asks for fewer threads waits until they are free, and runs that use the whole pool run together. With `0`, runs use the pool that queries also use, which has a thread per core. |
@@ -514,8 +516,16 @@ Short requests run on the thread that received them rather than on a separate po
 they do not wait for other threads to wake up. These are queries whose previous run with
 the same text took under 10 ms, and updates of up to 64 KiB that only use `INSERT DATA`
 and `DELETE DATA`, on a dataset without write-time validation, when no other write holds
-the dataset. Such a request runs to its end even if its client disconnects, though its
-timeout still applies. Everything else runs on the pool and stops on a disconnect.
+the dataset. The first run of a query text that the server does not remember runs there
+too when no other request is in flight and none has ended in the last 10 ms, because
+every query has a timeout, the server's 60 s default or its own `timeout`. That saves
+about 1.8 ms on the first request to an idle server. Under steady load a first run uses
+the pool, whose threads are then awake and which was faster there. A query whose text contains `SERVICE` is the exception and starts on the pool.
+Such a request runs to its end even if its client disconnects, though its timeout still
+applies, so a client that abandons a slow query the server has not seen before leaves it
+running until its timeout. Once a run of a text is slow or fails, its later runs use the
+pool, where they stop on a disconnect, until a run of it is quick again. Everything else
+runs on the pool and stops on a disconnect.
 
 ### Memory and caches
 
@@ -1481,9 +1491,73 @@ picture is drawn with the canvas renderer of the resource graph. **Built-in** sh
 hides the classes of the RDF, RDFS, OWL and SHACL vocabularies, which are shown by
 default only when the dataset has no other classes.
 
+**Group by** also offers **GraphRAG communities**, which draws the dataset as the
+communities of a [GraphRAG build](#community-reports-graphrag) instead of its classes.
+Each node is a community sized by its member count and coloured by its report's status,
+and **Colour by** switches to one colour per community. **Level** picks the level to
+start from, 0 being the coarsest. Opening a community draws the communities below it,
+and a community of the finest level opens into its members. The breadcrumb reads
+`Communities › Engineering › The payments team`. Selecting or opening a community shows
+its report beside the picture, with the same summary, findings and review actions as
+the Communities tab. Choosing a finding rings the entities it is about, and when they lie
+inside a community that is drawn closed, **Draw the members** opens it. **Open report**
+goes to the report in the Communities tab, and that tab's **Show in Explore** comes back.
+
+The communities are those of main, so on another branch the overview says so and draws
+nothing. A user whose access does not cover the reports graph is told that the
+communities are not available to them and learns nothing else about them, and a dataset
+that has no build says that none were built. Both notices offer to go back to the
+classes. The same grouping is `by: {"reports": {}}` in
+[API.md](API.md#graph-overview) and in the bindings.
+
 The query page's graph view uses the same WebGL view for results of more than 2,000
 nodes. **Max nodes** then offers 10,000, 50,000 and 100,000, and **Renderer** switches
 between the canvas and WebGL views.
+
+## Arcs on the map
+
+The maps draw relations as well as places. In Explore, the **Map** button beside **Graph**
+in the graph toolbar, or `Shift+M`, shows the drawn graph on a map. Each drawn entity that
+has a geometry becomes a marker at its point, or at the centre of its line or polygon. Each
+drawn edge between two located entities becomes an arc. An arc is a great circle, bowed a
+little to the left of its direction so that the arcs of both directions between two places
+stay apart, and it ends in an arrowhead at its target. An arc that crosses the antimeridian
+is cut there and drawn on both sides.
+
+The map finds the entities by querying for their geometries, 200 at a time with four
+requests in flight. The queries run in your own view, at the state the graph slider reads,
+so an entity whose geometry you may not read is not located. Entities without a geometry
+are listed under the map as not located, and their edges are not drawn. The map draws only
+the edges the graph already shows and asks for no relations of its own.
+
+Arcs are coloured by predicate, with a checkbox and a legend entry for each, and **Width by**
+chooses between the count and one width. Markers closer than 20 px merge into one marker
+that shows how many places it holds, and the links between two places of one marker are
+counted on the marker instead of drawn. The arcs of one predicate and direction between the
+same two markers merge into one arc whose width and label give the count. Zooming in splits
+the markers and their arcs again. When you compare two states with the graph slider, added
+arcs are green and removed arcs are red and dashed, and their labels start with a plus or a
+minus sign.
+
+On the query page, a result with two columns of geometry literals, or with two columns of
+entities that have geometries, offers **Arcs** on its Map tab. Each row is an arc from the
+first column to the second, and **Label** chooses a third column to write on the arc. A
+result with two entity columns and no geometry column gets the Map tab when a lookup of its
+first 200 entities finds a geometry, and that lookup waits while the time slider is open.
+The lookups run on the result's branch and at the state the result was read at. When you
+compare two states, the entities that only removed rows use are looked up at the earlier one. Picking a row in the list beside the map highlights its arc.
+
+A click on a marker or an arc selects the entities it stands for, and the selection bar
+names the count and the source, with **Clear** and, in Explore, **Open as graph**, which
+draws the selected entities as the graph. The selection dims everything else on the map,
+and Explore's graph canvas dims the nodes outside it too. `Escape` clears it. With the map
+focused, `Tab` moves through the markers in view, the largest first, `Enter` selects one,
+and `Shift+Enter` adds it to the selection. **List of places and links in view** below the
+map lists the same markers and arcs with their counts, for a screen reader and for taps. At
+a phone's width the controls grow to 44 px and the map takes the page's width.
+
+A map draws at most 20,000 places and 20,000 links before merging, and says when a result
+had more. [U11](specs/U11-linked-views.md#outcome) records the measurements.
 
 ## The time slider
 
@@ -2466,7 +2540,7 @@ and 2 when there are warnings only.
 |---|---|
 | `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
 | `generation` | `meta.json` and `stats.json` parse and agree on the quad count, and this release reads the index format. |
-| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
+| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. An FSST-coded vocabulary's tables in `vocab.fsst` read with their checksum, and in full mode every coded suffix uses only codes its table holds. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
 | `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. The summary names its format, `framed` or `legacy`, and the zero bytes preallocated after its last chunk. A torn tail is a warning. |
 | `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
 | `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
@@ -3989,6 +4063,81 @@ in [API.md](API.md#explaining-a-query), and from the MCP tool `explain_query` wi
 `notes: true`. `profile: "run"` runs the query read-only and explains the executed plan.
 The MCP tool calls the server's models only with `useServerModel: true`, which needs a
 grant with `server_models = true`.
+
+## Community reports (GraphRAG)
+
+A community report summarizes one group of closely connected resources, such as a team
+and its projects, with findings that cite the facts they come from. A build groups the
+resources of the projection's graphs into the Leiden hierarchy, has the `community`
+model role write one report per community, and stores the reports as triples in the
+reports graph `urn:x-sparkles:graphrag:reports`. Reports start `unreviewed`, and a
+person marks them `reviewed` or `rejected` or edits them.
+
+Turn the build on in the dataset's `graphrag` settings. `principal` names the user whose
+view the build reads, and the reports are readable only by callers whose access covers
+everything that view read.
+
+```sh
+sparkles settings set org graphrag.enabled=true graphrag.principal=reports \
+  'graphrag.projection.graphs=["urn:graph:org"]'
+sparkles settings set org assistant.send=rows
+```
+
+The build sends facts to the model provider, so the provider must be allowed to receive
+rows, through `assistant.send` or `assistant.sendByProvider`.
+
+```sh
+sparkles graphrag --dataset org build            # shows the estimate and asks
+sparkles graphrag --dataset org build --confirm  # sends without asking
+sparkles graphrag --dataset org status
+sparkles graphrag --dataset org reports --status unreviewed
+sparkles graphrag --dataset org refresh --confirm
+```
+
+Before it calls a model, a build reports an upper bound of the tokens it may use, and
+it waits for a confirmation unless `--confirm` is given. Without a terminal the command
+does not send anything and asks for `--confirm`. `--no-wait` prints the task and leaves
+the confirmation to the Communities tab or to `POST /$/graphrag/{ds}/confirm`. A build
+stops before any request whose reservation would pass `budget.tokensPerBuild` or
+`budget.tokensPerDay`, and leaves the remaining communities pending for a later run.
+`refresh` rewrites only the reports of communities whose members changed, or whose
+facts changed by at least `refresh.minChangedFraction`. With `"refresh": {"mode":
+"auto"}` in the settings, the server runs that refresh itself once commits have
+changed enough facts and `refresh.debounceSeconds` have passed without a new commit,
+without asking for a confirmation and within `budget.tokensPerDay`.
+
+With `--loc DB` the command opens a database directory in the process and reads the
+model configuration from `--model-config`, as `serve` does.
+
+```sh
+sparkles graphrag --loc ./org-db --dataset org --model-config models.json build --confirm
+```
+
+The dataset page's **Communities** tab shows the state of the reports, a **Build** and
+a **Refresh** button for dataset admins, and the estimate to confirm before a run sends
+anything. The hierarchy is a tree, coarsest level first. Choosing a community shows its
+members, its report with findings and citations, and the review actions **Reviewed**,
+**Reject** and **Edit**. An edit is saved as a new reviewed report that supersedes the
+old one. Reviewing needs write access to the dataset without graph or triple
+restrictions. The tab shows the reports of main, and on another branch it asks the reader
+to switch to main. The Settings tab has a GraphRAG section with the fields above, and the
+review inbox lists the unreviewed reports. **Show in Explore** draws the chosen
+community in the [Explore overview](#the-explore-overview), where the communities are a
+grouping of the whole dataset. The routes are described in [API.md](API.md#graphrag).
+
+Once reports exist, Ask can answer questions about the whole dataset from them, such as
+"What are the main areas of work in this organisation?". The draft decides whether a
+question is about the whole dataset, and a question that names one entity is always
+answered with a query. A global answer shows its points and the reports they come from,
+each with the findings used and the facts those findings cite. **Answer from the data**
+asks the same question again with a query, and **Answer from summaries** does the
+opposite. `sparkles ask --mode global` and `"mode": "global"` in `POST /{ds}/ask` do the
+same from the command line and the API. A caller who may not read the reports gets an
+answer from the data and a note that the summaries are unavailable.
+
+Agents read the reports with the MCP tool `community_reports`, and `recall` with
+`"communities": true` adds the report of each seed's community after its facts. A
+project brief lists the best rated reports of the coarsest level.
 
 ## Sending notifications
 

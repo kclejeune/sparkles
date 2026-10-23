@@ -1,5 +1,6 @@
 <script lang="ts" module>
   import type { GeoJsonGeometry } from '$lib/api';
+  import type { ArcLayout } from '$lib/arcs';
 
   /** A geometry to draw; features of one `group` (a result row) highlight together. */
   export type MapFeature = {
@@ -10,6 +11,18 @@
     /** In compare mode, a geometry only the later state has (added) or only the earlier one (removed). */
     change?: 'added' | 'removed';
   };
+
+  /** Arcs and markers drawn over the features (the map of relations, `ArcMap`). */
+  export type Overlay = {
+    base: ArcLayout;
+    /** The arcs and markers of the selection, drawn over the rest in the accent colour. */
+    hot: ArcLayout;
+    /** Draw the base muted, because a selection stands out against it. */
+    dim: boolean;
+  };
+
+  /** What a click on the overlay hit. */
+  export type Pick = { kind: 'marker' | 'arc'; id: string };
 </script>
 
 <script lang="ts">
@@ -17,6 +30,7 @@
   // map mounts; without WebGL the map says so and the page around it keeps working.
   import { mount, onMount, unmount, type Snippet } from 'svelte';
   import { bounds } from '$lib/geo';
+  import { sprite, SPRITE_RATIO, type SpriteColours } from '$lib/map-sprites';
   import SnippetHost from './SnippetHost.svelte';
 
   let {
@@ -26,6 +40,9 @@
     popup,
     fit = true,
     onview,
+    overlay = null,
+    focusId = null,
+    onpick,
     height = '360px',
     label = 'Map',
   }: {
@@ -38,8 +55,19 @@
     popup?: Snippet<[number]>;
     /** Fit the view to the features whenever they change. */
     fit?: boolean;
-    /** The visible box after every move, [west, south, east, north] in degrees. */
-    onview?: (bbox: [number, number, number, number]) => void;
+    /** The visible box after every move, [west, south, east, north] in degrees, and the zoom. */
+    onview?: (
+      bbox: [number, number, number, number],
+      zoom: number,
+      /** The same box with its longitudes as drawn, beyond ±180 in another copy of the world. */
+      drawn: [number, number, number, number],
+    ) => void;
+    /** Arcs and markers over the features. */
+    overlay?: Overlay | null;
+    /** The marker with a focus ring (keyboard focus on the map of relations). */
+    focusId?: string | null;
+    /** A click on the overlay: a marker, an arc, or nothing (null) with the modifier keys. */
+    onpick?: (hit: Pick | null, mods: { shift: boolean; alt: boolean }) => void;
     height?: string;
     label?: string;
   } = $props();
@@ -49,6 +77,7 @@
   type MlPopup = import('maplibre-gl').Popup;
 
   let host: HTMLDivElement;
+  let region: HTMLDivElement;
   let status = $state<'loading' | 'ready' | 'failed'>('loading');
   let failure = $state('');
   let lib: Lib | undefined;
@@ -58,6 +87,8 @@
   let shown: number | null = null;
 
   const LAYERS = ['f-fill', 'f-line', 'f-point'];
+  const HIT_LAYERS = ['o-hot-marker', 'o-marker', 'o-hot-arc', 'o-arc', 'o-arc-removed'];
+  const EMPTY = { type: 'FeatureCollection' as const, features: [] };
   const POLY = ['in', ['geometry-type'], ['literal', ['Polygon', 'MultiPolygon']]];
   const POINT = ['in', ['geometry-type'], ['literal', ['Point', 'MultiPoint']]];
 
@@ -121,6 +152,153 @@
       'circle-stroke-color': halo,
       'circle-stroke-width': 2,
     });
+    addOverlayLayers(m, hot, halo);
+  }
+
+  /** The sources and layers of the overlay, empty until `overlay` has something. */
+  function addOverlayLayers(m: MlMap, hot: string, halo: string) {
+    for (const id of ['arcs', 'heads', 'markers', 'hot-arcs', 'hot-heads', 'hot-markers'])
+      m.addSource(`o-${id}`, { type: 'geojson', data: EMPTY as never });
+    const add = (spec: object) => m.addLayer(spec as never);
+    const gone = ['==', ['get', 'change'], 'removed'];
+    add({
+      id: 'o-arc',
+      type: 'line',
+      source: 'o-arcs',
+      filter: ['!', gone],
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: {
+        'line-color': ['get', 'color'],
+        'line-width': ['get', 'width'],
+        'line-opacity': 0.82,
+      },
+    });
+    // a removed arc is dashed, so that it reads as gone without colour
+    add({
+      id: 'o-arc-removed',
+      type: 'line',
+      source: 'o-arcs',
+      filter: gone,
+      paint: {
+        'line-color': ['get', 'color'],
+        'line-width': ['get', 'width'],
+        'line-dasharray': [2, 2],
+        'line-opacity': 0.7,
+      },
+    });
+    add({
+      id: 'o-hot-halo',
+      type: 'line',
+      source: 'o-hot-arcs',
+      layout: { 'line-cap': 'round' },
+      paint: { 'line-color': hot, 'line-width': ['+', ['get', 'width'], 5], 'line-opacity': 0.55 },
+    });
+    add({
+      id: 'o-hot-arc',
+      type: 'line',
+      source: 'o-hot-arcs',
+      layout: { 'line-cap': 'round' },
+      paint: { 'line-color': ['get', 'color'], 'line-width': ['get', 'width'] },
+    });
+    const head = {
+      type: 'symbol',
+      layout: {
+        'icon-image': ['concat', 'a:', ['get', 'color']],
+        'icon-rotate': ['get', 'bearing'],
+        'icon-rotation-alignment': 'map',
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+      },
+    };
+    add({ ...head, id: 'o-head', source: 'o-heads' });
+    add({ ...head, id: 'o-hot-head', source: 'o-hot-heads' });
+    add({
+      id: 'o-marker',
+      type: 'circle',
+      source: 'o-markers',
+      paint: {
+        'circle-color': token('--iri', '#2459c7'),
+        'circle-radius': ['get', 'radius'],
+        'circle-stroke-color': halo,
+        'circle-stroke-width': 1.5,
+      },
+    });
+    add({
+      id: 'o-hot-marker',
+      type: 'circle',
+      source: 'o-hot-markers',
+      paint: {
+        'circle-color': hot,
+        'circle-radius': ['+', ['get', 'radius'], 2],
+        'circle-stroke-color': halo,
+        'circle-stroke-width': 2,
+      },
+    });
+    add({
+      id: 'o-focus',
+      type: 'circle',
+      source: 'o-markers',
+      filter: ['==', ['get', 'id'], ''],
+      paint: {
+        'circle-color': 'rgba(0,0,0,0)',
+        'circle-radius': ['+', ['get', 'radius'], 5],
+        'circle-stroke-color': token('--text', '#1d2330'),
+        'circle-stroke-width': 2.5,
+      },
+    });
+    const count = {
+      type: 'symbol',
+      layout: {
+        'icon-image': ['case', ['>', ['get', 'size'], 1], ['concat', 'n:', ['get', 'label']], ''],
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+      },
+    };
+    add({ ...count, id: 'o-count', source: 'o-markers' });
+    add({ ...count, id: 'o-hot-count', source: 'o-hot-markers' });
+    add({
+      id: 'o-label',
+      type: 'symbol',
+      source: 'o-arcs',
+      filter: ['!=', ['get', 'label'], ''],
+      layout: {
+        'symbol-placement': 'line-center',
+        'icon-image': ['concat', 'l:', ['get', 'label']],
+        'icon-rotation-alignment': 'viewport',
+        'icon-padding': 3,
+        'symbol-sort-key': ['-', 0, ['get', 'count']],
+      },
+    });
+  }
+
+  /** Put the overlay's data and dimming on the map. */
+  function setOverlay(m: MlMap, o: Overlay | null) {
+    const put = (id: string, data: unknown) =>
+      (m.getSource(`o-${id}`) as { setData(d: unknown): void } | undefined)?.setData(data ?? EMPTY);
+    put('arcs', o?.base.lines);
+    put('heads', o?.base.heads);
+    put('markers', o?.base.markers);
+    put('hot-arcs', o?.hot.lines);
+    put('hot-heads', o?.hot.heads);
+    put('hot-markers', o?.hot.markers);
+    const dim = !!o?.dim;
+    m.setPaintProperty('o-arc', 'line-opacity', dim ? 0.2 : 0.82);
+    m.setPaintProperty('o-arc-removed', 'line-opacity', dim ? 0.15 : 0.7);
+    m.setPaintProperty('o-head', 'icon-opacity', dim ? 0.25 : 1);
+    m.setPaintProperty('o-marker', 'circle-opacity', dim ? 0.3 : 1);
+    m.setPaintProperty('o-marker', 'circle-stroke-opacity', dim ? 0.3 : 1);
+    m.setPaintProperty('o-count', 'icon-opacity', dim ? 0.3 : 1);
+    m.setPaintProperty('o-label', 'icon-opacity', dim ? 0.4 : 1);
+  }
+
+  function spriteColours(): SpriteColours {
+    return {
+      text: token('--text', '#1d2330'),
+      surface: token('--surface', '#ffffff'),
+      border: token('--border-strong', '#c5cad4'),
+      onMarker: '#ffffff',
+      font: token('--font-ui', 'system-ui, sans-serif').replace(/["']/g, ''),
+    };
   }
 
   function highlight(m: MlMap, group: number | null) {
@@ -166,12 +344,21 @@
     if (!onview) return;
     const b = m.getBounds();
     const clamp = (x: number, lim: number) => Math.max(-lim, Math.min(lim, x));
-    onview([
-      clamp(b.getWest(), 180),
-      clamp(b.getSouth(), 90),
-      clamp(b.getEast(), 180),
-      clamp(b.getNorth(), 90),
-    ]);
+    onview(
+      [
+        clamp(b.getWest(), 180),
+        clamp(b.getSouth(), 90),
+        clamp(b.getEast(), 180),
+        clamp(b.getNorth(), 90),
+      ],
+      m.getZoom(),
+      [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()],
+    );
+  }
+
+  /** Fit the view to a box, [west, south, east, north] (the map of relations fits itself). */
+  export function fitBox(box: [number, number, number, number] | null, animate = false) {
+    fitTo(box, animate);
   }
 
   /** The box of a group's geometries. */
@@ -207,16 +394,47 @@
           touchPitch: false,
         });
         map = m;
+        // tests reach the map through its region
+        (region as unknown as { __map?: MlMap }).__map = m;
+        // the images of counts, labels and arrowheads are drawn when a layer asks for one
+        m.setMissingStyleImageResolver((id) => {
+          if (!id || m.hasImage(id)) return;
+          const img = sprite(id, spriteColours());
+          if (img) m.addImage(id, img, { pixelRatio: SPRITE_RATIO });
+        });
         m.addControl(new lib.NavigationControl({ showCompass: false }), 'top-right');
         m.on('load', () => {
           if (dead) return;
           addLayers(m);
           status = 'ready';
+          setOverlay(m, overlay);
           if (fit) fitTo(bounds(features.map((f) => f.geometry)), false);
           if (selected != null) highlight(m, selected);
           view(m);
         });
         m.on('click', (e) => {
+          if (onpick) {
+            const pad = 5;
+            const box: [[number, number], [number, number]] = [
+              [e.point.x - pad, e.point.y - pad],
+              [e.point.x + pad, e.point.y + pad],
+            ];
+            // a marker wins over the arcs that end in it
+            const found =
+              m.queryRenderedFeatures(box, { layers: ['o-hot-marker', 'o-marker'] })[0] ??
+              m.queryRenderedFeatures(box, { layers: HIT_LAYERS })[0];
+            const mods = { shift: e.originalEvent.shiftKey, alt: e.originalEvent.altKey };
+            onpick(
+              found
+                ? {
+                    kind: found.layer.id.includes('marker') ? 'marker' : 'arc',
+                    id: String(found.properties?.id),
+                  }
+                : null,
+              mods,
+            );
+            if (found) return;
+          }
           const hit = m.queryRenderedFeatures(e.point, { layers: LAYERS })[0];
           const group = hit ? Number(hit.properties?.group) : null;
           // already in view, with its popup at the click
@@ -224,7 +442,7 @@
           onselect?.(group);
           if (group != null) showPopup(group, [e.lngLat.lng, e.lngLat.lat]);
         });
-        for (const l of LAYERS) {
+        for (const l of [...LAYERS, ...HIT_LAYERS]) {
           m.on('mouseenter', l, () => (m.getCanvas().style.cursor = 'pointer'));
           m.on('mouseleave', l, () => (m.getCanvas().style.cursor = ''));
         }
@@ -254,6 +472,20 @@
     if (fit) fitTo(bounds(features.map((f) => f.geometry)), false);
   });
 
+  // arcs and markers
+  $effect(() => {
+    const o = overlay;
+    if (status !== 'ready' || !map) return;
+    setOverlay(map, o);
+  });
+
+  // the marker with the keyboard focus
+  $effect(() => {
+    const id = focusId;
+    if (status !== 'ready' || !map) return;
+    map.setFilter('o-focus', ['==', ['get', 'id'], id ?? ''] as never);
+  });
+
   // a group picked outside the map (a table row): highlight it, show it, open its popup
   $effect(() => {
     const group = selected;
@@ -271,6 +503,7 @@
 
 <div
   class="map"
+  bind:this={region}
   style:height
   role="region"
   aria-label={label}

@@ -1,4 +1,5 @@
-// The README's screenshots of branches and of the agent pages, in the dark theme, against
+// The README's screenshots of branches, of the agent pages and of the Explore overview
+// grouped by the GraphRAG communities, in the dark theme, against
 // the mock backend that playwright.screenshots-mock.config.ts starts. The `org` dataset
 // gets a branch whose changes clash with main, so that the dataset page shows branches and
 // the commit graph and the merge page shows conflicts. The Ask bar runs the scripted
@@ -250,4 +251,81 @@ test('time-slider-graph', async ({ page }) => {
   await page.keyboard.press('ArrowLeft');
   await expect(bar.getByRole('status')).toContainText('added', { timeout: 30_000 });
   await shoot(page, 'time-slider-graph');
+});
+
+// the mock's `flows` dataset (mock/geo.mjs): people in Lyon and Paris who work for an
+// organization in Paris, and routes between airports
+const FLOWS = 'http://example.org/flows/';
+
+test('map-arcs', async ({ page }) => {
+  await page.goto(`/ui/explore?ds=flows&iri=${encodeURIComponent(`${FLOWS}acme`)}`);
+  await expect(page.getByText(/\d+ nodes, \d+ edges/)).toBeVisible({ timeout: 30_000 });
+  await page
+    .getByRole('group', { name: 'Show the graph as' })
+    .getByRole('button', { name: 'Map' })
+    .click();
+  const arcmap = page.locator('.arcmap');
+  await expect(arcmap).toHaveAttribute('data-loading', 'false', { timeout: 30_000 });
+  const region = page.getByRole('region', { name: 'Graph map' });
+  await expect(region).toHaveAttribute('data-state', 'ready');
+  // the ten people of Lyon, selected with the keyboard
+  await region.locator('canvas.maplibregl-canvas').focus();
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('region', { name: 'Selection' })).toContainText('selected');
+  await shoot(page, 'map-arcs');
+});
+
+test('result-arcs', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'flows'));
+  const query = `PREFIX ex: <${FLOWS}>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?label ?from ?to WHERE {
+  ?route a ex:Route ; rdfs:label ?label ; ex:fromGeom ?from ; ex:toGeom ?to .
+} ORDER BY ?label`;
+  await page.addInitScript(
+    ([q]) =>
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Routes', query: q }], active: 't1' }),
+      ),
+    [query],
+  );
+  await page.goto('/ui/query?ds=flows');
+  await page.getByRole('button', { name: /^Run/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await expect(results.getByRole('grid')).toBeVisible({ timeout: 30_000 });
+  await results.getByRole('tab', { name: 'Map' }).click();
+  await results.getByRole('button', { name: 'Arcs' }).click();
+  await results.getByLabel('Column that labels the arcs').selectOption('label');
+  const arcmap = page.locator('.arcmap');
+  await expect(arcmap).toHaveAttribute('data-loading', 'false', { timeout: 30_000 });
+  await expect(page.getByRole('region', { name: 'Result arcs' })).toHaveAttribute(
+    'data-state',
+    'ready',
+  );
+  await shoot(page, 'result-arcs');
+});
+
+test('explore-communities', async ({ page }) => {
+  // the overview grouped by the GraphRAG communities of mock/graphrag.mjs, opened at
+  // Engineering, with the payments team's report beside it and a finding's entities marked
+  await page.goto(`/ui/explore?ds=${DATASET}&overview=communities`);
+  const ov = page.getByTestId('overview');
+  await expect(ov).toHaveAttribute('data-mode', 'communities');
+  await ov.getByRole('button', { name: 'List' }).click();
+  const row = (name: RegExp) =>
+    ov.locator('tbody tr').filter({ has: page.getByRole('button', { name }) });
+  await row(/^Engineering/)
+    .getByRole('button', { name: 'Open' })
+    .click();
+  await row(/^The payments team/)
+    .getByRole('button', { name: /^The payments team/ })
+    .click();
+  const side = page.getByTestId('community-side');
+  await expect(side.getByRole('heading', { name: 'The payments team' })).toBeVisible();
+  await side.getByRole('button', { name: /Kai works with the rest/ }).click();
+  await ov.getByRole('button', { name: 'List' }).click();
+  await expect(ov.locator('canvas').first()).toBeVisible();
+  await shoot(page, 'explore-communities');
 });

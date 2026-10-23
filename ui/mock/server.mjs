@@ -36,6 +36,7 @@ import { handleDescribe } from './describe.mjs';
 import { handleModels } from './models.mjs';
 import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from './memory.mjs';
 import { handleAssistant } from './assistant.mjs';
+import { handleGraphrag } from './graphrag.mjs';
 import { handleExplain, timedOutPlan } from './explain.mjs';
 import { handleReview, INGEST_BRANCH } from './review.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
@@ -2142,6 +2143,8 @@ const server = http.createServer(async (req, res) => {
     if (await handleExplain(req, res, url, seg, { datasets, send, fail, readBody })) return;
     // the model configuration of a server without one (mock/models.mjs)
     if (handleModels(req, res, seg, { send, fail })) return;
+    // GraphRAG community reports (mock/graphrag.mjs)
+    if (await handleGraphrag(req, res, url, seg, { datasets, send, fail, readBody })) return;
     // asking the server, the assistant settings and the history (mock/assistant.mjs)
     if (
       await handleAssistant(req, res, url, seg, {

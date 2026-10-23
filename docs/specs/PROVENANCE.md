@@ -2268,6 +2268,72 @@ implementation landed.
   - a separate diagram library with a layered layout;
   - one figure mixing observed and declared multiplicities.
 
+## Two-way visual query builder
+
+- **Spec:** [`U08-visual-query-builder.md`](U08-visual-query-builder.md), written on 2026-10-23 independently from:
+  - the W3C SPARQL 1.1 Query Recommendation and the SPARQL 1.2 working drafts;
+  - the public documentation of Sparnatural (LGPL-3.0) and Neo4j Bloom, whose code was not
+    read or used;
+  - the WAI-ARIA Authoring Practices and the CodeMirror 6 documentation of transactions
+    and history;
+  - the Sparkles code (`sparkles-fmt`'s lossless SPARQL parser, `sparkles-fmt-wasm`,
+    `SparqlEditor`, `GraphView`) and specs C02, C12, C16, C20, U03, U06 and X02.
+- **Implementation:** not built. No new dependency is planned. The canvas uses Cytoscape.js
+  and cytoscape-fcose, which the UI already ships, and the parser is the formatter's.
+- **Rejected** (spec §9):
+  - regenerating the query from a model on every edit;
+  - a JavaScript SPARQL parser such as sparqljs;
+  - layout positions in a comment inside the query;
+  - forms for locked constructs.
+
+## Path finder between two entities
+
+- **Spec:** [`U09-path-finder.md`](U09-path-finder.md), written on 2026-10-23 independently from:
+  - J. Y. Yen, "Finding the k Shortest Loopless Paths in a Network", Management Science, 1971;
+  - the WAI-ARIA combobox and listbox patterns;
+  - the Sparkles code (`pathsearch.rs`, `GraphView`, Explore) and specs C02, C12, C12b, F07,
+    U01 and U06.
+- **Implementation:** not built. No new dependency is planned.
+- **Rejected** (spec §10):
+  - nested patterns as the exclusion mechanism;
+  - paths computed in the browser;
+  - literals excluded by default.
+
+## Lenses on the graph canvas
+
+- **Spec:** [`U10-canvas-lenses.md`](U10-canvas-lenses.md), written on 2026-10-23 independently from:
+  - the public documentation of Gephi's ranking and partition panels and of Cytoscape.js
+    styles and mappers;
+  - the ColorBrewer qualitative palettes;
+  - S. Brin and L. Page, "The Anatomy of a Large-Scale Hypertextual Web Search Engine", 1998,
+    and V. A. Traag, L. Waltman and N. J. van Eck, "From Louvain to Leiden", Scientific
+    Reports, 2019;
+  - the WAI-ARIA Authoring Practices;
+  - the Sparkles code (`algorun.rs`, `GraphView`, `LargeGraphView`, the reasoner's instance
+    search) and specs C08, C12, C12b, C22, F14, F16, F18, U01 and U06.
+- **Implementation:** not built. No new dependency is planned.
+- **Rejected** (spec §11):
+  - algorithms computed in the browser;
+  - lens runs written back to a scratch graph;
+  - inferred edges found by their graph alone;
+  - waiting for F17 before any explanation.
+
+## Linked views beside the graph
+
+- **Spec:** [`U11-linked-views.md`](U11-linked-views.md), written on 2026-10-23 independently from:
+  - B. Shneiderman, "Dynamic Queries for Visual Information Seeking", IEEE Software, 1994,
+    and R. A. Becker and W. S. Cleveland, "Brushing Scatterplots", Technometrics, 1987;
+  - K. Pearson, "On Lines and Planes of Closest Fit to Systems of Points in Space", 1901,
+    and the public description of UMAP by L. McInnes, J. Healy and J. Melville, 2018;
+  - the MapLibre GL JS documentation of line layers and the WAI-ARIA slider and listbox
+    patterns;
+  - the Sparkles code (`MapView`, `ResultMap`, `lib/geo.ts`, the groups route, the vector
+    index) and specs C12, C12b, F04, F12, F14, G01, U01, U06, U08 and U10.
+- **Implementation:** not built. No new dependency is planned. The map uses MapLibre GL JS
+  and the embedding map uses sigma.js, which the UI already ships.
+- **Rejected:** none recorded. The spec's open questions keep the alternatives for access
+  and storage open.
+
 ## OWL 2 ontology API
 
 - **Spec:** [`F21-ontology-api.md`](F21-ontology-api.md), written on 2026-10-12 independently from:

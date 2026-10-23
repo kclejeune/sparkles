@@ -34,7 +34,10 @@
   import type { SchemaChanges } from '$lib/explore-time';
   import ClassTree from '$components/ClassTree.svelte';
   import GeoMapCard from '$components/GeoMapCard.svelte';
+  import GraphMap from '$components/GraphMap.svelte';
   import GraphView, { type GEdge, type GNode } from '$components/GraphView.svelte';
+  import SelectionBar from '$components/SelectionBar.svelte';
+  import { selection } from '$lib/selection.svelte';
   import Icon from '$components/Icon.svelte';
   import SchemaDiffDialog from '$components/SchemaDiffDialog.svelte';
   import ShapesDraftDialog from '$components/ShapesDraftDialog.svelte';
@@ -43,7 +46,10 @@
   import TermView from '$components/TermView.svelte';
   import TimeSlider from '$components/TimeSlider.svelte';
   import MemoryTab from '$components/MemoryTab.svelte';
-  import OverviewView from '$components/OverviewView.svelte';
+  import OverviewView, { type OverviewCommunity } from '$components/OverviewView.svelte';
+  import CommunityReport from '$components/CommunityReport.svelte';
+  import * as gr from '$lib/graphrag';
+  import { branchParam } from '$lib/branches';
   import TextSearchView from '$components/TextSearchView.svelte';
 
   type ENode = {
@@ -93,6 +99,49 @@
   );
   /** Full-text query of the Search tab (`&q=`). */
   let textQuery = $state(page.url.searchParams.get('q') ?? '');
+  /** The drawn graph as the node-link canvas or on a map (`&map=1`, Shift+M). */
+  let canvasMode = $state<'graph' | 'map'>(
+    page.url.searchParams.get('map') === '1' ? 'map' : 'graph',
+  );
+
+  // The overview grouped by the GraphRAG communities (`&overview=communities`), opened
+  // down to a community (`&community=`), with the report of the community it shows in the
+  // side panel and the entities of a chosen finding marked on the canvas (U06 with C22).
+  let overviewMode = $state<'classes' | 'communities'>(
+    page.url.searchParams.get('overview') === 'communities' ? 'communities' : 'classes',
+  );
+  /** The community the page was opened at, for the first dataset only. */
+  let overviewFocus = $state(page.url.searchParams.get('community'));
+  /** The reports belong to main: a page on another branch draws no communities. */
+  const overviewBranch = $derived(branchParam(page.url.searchParams.get('branch')));
+  let community = $state<OverviewCommunity | null>(null);
+  let communityDetail = $state<gr.Community | null>(null);
+  let communityError = $state<unknown>(null);
+  let communityLoading = $state(false);
+  let finding = $state<number | null>(null);
+  let communitySeq = 0;
+  const marked = $derived.by(() => {
+    const f = finding != null ? communityDetail?.report?.findings[finding] : undefined;
+    return f ? gr.findingEntities(f) : null;
+  });
+
+  async function showCommunity(c: OverviewCommunity | null) {
+    const seq = ++communitySeq;
+    community = c;
+    finding = null;
+    communityError = null;
+    if (communityDetail?.iri !== c?.iri) communityDetail = null;
+    if (!c || !ds) return;
+    communityLoading = true;
+    try {
+      const d = await gr.community(ds, c.iri);
+      if (seq === communitySeq) communityDetail = d;
+    } catch (e) {
+      if (seq === communitySeq) communityError = e;
+    } finally {
+      if (seq === communitySeq) communityLoading = false;
+    }
+  }
   let nodes = $state<Record<string, ENode>>({});
   let edges = $state<Record<string, EEdge>>({});
   let focusId = $state<string | null>(null);
@@ -123,10 +172,12 @@
     expandLog = [];
     seenTerms = new Map();
     changes = null;
+    selection.clear();
   }
   let graphView: GraphView | undefined = $state();
   // the reads of a view that goes away stop with it
   onDestroy(() => {
+    selection.clear();
     expandCtl.abort();
     for (const r of [graphRuns, detailRuns, schemaRuns, profileRuns, histRuns]) r.abortAll();
   });
@@ -625,8 +676,14 @@
     if (ds) p.set('ds', ds);
     if (iri) p.set('iri', iri);
     if (tab !== 'graph') p.set('tab', tab);
+    if (canvasMode === 'map' && tab === 'graph') p.set('map', '1');
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
+    if (!iri && tab === 'graph' && overviewMode === 'communities') {
+      p.set('overview', 'communities');
+      if (community) p.set('community', community.iri);
+    }
+    if (overviewBranch) p.set('branch', overviewBranch);
     const timed =
       tab === 'schema'
         ? schemaTimeOpen
@@ -642,6 +699,47 @@
   function select(id: string | null) {
     selectedId = id;
     if (id) void loadDetails(id);
+    // a click on the canvas is a selection the map shows too
+    if (id) selection.set([id], 'the graph');
+    else selection.clear();
+  }
+
+  function setCanvasMode(m: 'graph' | 'map') {
+    if (canvasMode === m) return;
+    canvasMode = m;
+    syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
+  }
+
+  /** The state the graph's map reads positions at, and the earlier one in compare mode. */
+  const mapAt = $derived(timeActive && graphTimeOpen ? exAt : '');
+  const mapFromAt = $derived(graphTimeOpen && exCompare && !exAgainst ? exFrom : '');
+
+  /**
+   * Draw the entities of the selection as the graph: the first one is the focus and each
+   * is expanded, up to 25 of them. Larger sets are drawn as nodes to expand by hand.
+   */
+  async function openSelectionAsGraph(ids: string[]) {
+    if (!ds) return;
+    const terms = ids
+      .filter((id) => id.startsWith('<') && id.endsWith('>'))
+      .slice(0, MAX_NODES)
+      .map((id): Term => ({ type: 'uri', value: id.slice(1, -1) }));
+    if (!terms.length) return;
+    resetGraph();
+    canvasMode = 'graph';
+    const made = terms.map((t) => ensureNode(t));
+    focusId = made[0].id;
+    selectedId = made[0].id;
+    syncUrl(made[0].iri);
+    const many = made.length > 25;
+    if (many)
+      toasts.push(
+        'info',
+        `Drew ${made.length} entities`,
+        'Double-click a node to load its neighbours.',
+      );
+    await Promise.all(many ? [expand(made[0].id)] : made.map((n) => expand(n.id)));
+    void loadDetails(made[0].id);
   }
 
   async function loadDetails(id: string) {
@@ -1077,6 +1175,10 @@
         schemaFor = null;
         schemaGraph = 'default';
         selectedClass = null;
+        // the report beside the overview belongs to the dataset left, and a pending
+        // read of it is dropped by the new sequence number
+        overviewFocus = null;
+        void showCommunity(null);
         syncUrl(null);
       }
       if (tab === 'schema') void loadSchema(name);
@@ -1129,9 +1231,17 @@
     };
     // H opens and closes the History strip of the selected resource, Shift+H the one over the graph
     const onKey = (e: KeyboardEvent) => {
-      if ((e.key !== 'h' && e.key !== 'H') || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if ((e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable]'))
         return;
+      // Shift+M shows the drawn graph on a map and back
+      if (e.key === 'M' && e.shiftKey) {
+        if (tab !== 'graph' || !nodeCount) return;
+        e.preventDefault();
+        setCanvasMode(canvasMode === 'map' ? 'graph' : 'map');
+        return;
+      }
+      if (e.key !== 'h' && e.key !== 'H') return;
       if (tab !== 'graph') return;
       if (e.shiftKey) {
         if (!nodeCount) return;
@@ -1251,7 +1361,12 @@
       />
     {/key}
   {:else if tab === 'graph'}
-    <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen}>
+    <div
+      class="split"
+      class:overview={nodeCount === 0 && !graphTimeOpen && !community}
+      class:reporting={nodeCount === 0 && !!community}
+      class:mapmode={canvasMode === 'map' && nodeCount > 0}
+    >
       <div class="canvas">
         {#if nodeCount > 0 || graphTimeOpen}
           <div class="gtools">
@@ -1264,6 +1379,19 @@
             <span class="spacer"></span>
             <span class="faint">{gNodes.length} nodes, {gEdges.length} edges</span>
             {#if nodeCount}
+              <div class="seg" role="group" aria-label="Show the graph as">
+                <button
+                  class="btn sm"
+                  aria-pressed={canvasMode === 'graph'}
+                  onclick={() => setCanvasMode('graph')}>Graph</button
+                >
+                <button
+                  class="btn sm"
+                  aria-pressed={canvasMode === 'map'}
+                  title="Show the drawn entities on a map, with arcs for their relations (Shift+M)"
+                  onclick={() => setCanvasMode('map')}><Icon name="map" size={13} /> Map</button
+                >
+              </div>
               <button
                 class="btn sm"
                 aria-pressed={graphTimeOpen}
@@ -1277,6 +1405,7 @@
               >
             {/if}
           </div>
+          <SelectionBar onopengraph={openSelectionAsGraph} />
         {/if}
         {#if graphTimeOpen && ds}
           <div class="graph-time">
@@ -1311,24 +1440,51 @@
                 {prefixes}
                 onresource={(iri, label) => focusOn(iri, label)}
                 onschema={() => setTab('schema')}
+                branch={overviewBranch}
+                start={overviewMode}
+                focus={overviewFocus}
+                {marked}
+                oncommunity={(c) => {
+                  void showCommunity(c);
+                  syncUrl(null);
+                }}
+                onmode={(m) => {
+                  overviewMode = m;
+                  syncUrl(null);
+                }}
               />
             {/key}
           </div>
         {:else}
-          <div class="cy-host">
-            <GraphView
-              bind:this={graphView}
-              animate={graphTimeOpen}
-              nodes={gNodes}
-              edges={gEdges}
-              selected={selectedId}
-              onselect={select}
-              onexpand={expand}
-            />
-          </div>
-          <div class="hint faint">
-            Double-click a node to load its neighbours. Blue-ringed nodes are expanded.
-          </div>
+          {#if canvasMode === 'map' && ds}
+            <div class="cy-host">
+              <GraphMap
+                {ds}
+                nodes={gNodes}
+                edges={gEdges}
+                at={mapAt}
+                fromAt={mapFromAt}
+                fitKey={focusId ?? ''}
+                onopen={(iri) => focusOn(iri)}
+              />
+            </div>
+          {:else}
+            <div class="cy-host">
+              <GraphView
+                bind:this={graphView}
+                animate={graphTimeOpen}
+                nodes={gNodes}
+                edges={gEdges}
+                selected={selectedId}
+                highlight={selection.ids}
+                onselect={select}
+                onexpand={expand}
+              />
+            </div>
+            <div class="hint faint">
+              Double-click a node to load its neighbours. Blue-ringed nodes are expanded.
+            </div>
+          {/if}
         {/if}
       </div>
 
@@ -1586,6 +1742,42 @@
               <p>Select a node to see its properties.</p>
             </div>
           {/if}
+        </aside>
+      {:else if community && ds}
+        <aside class="side" aria-label="Community report" data-testid="community-side">
+          <div class="side-body scroll">
+            {#if communityDetail}
+              <CommunityReport
+                {ds}
+                detail={communityDetail}
+                {prefixes}
+                heading="h2"
+                {finding}
+                onfinding={(i) => (finding = i)}
+              >
+                {#snippet actions()}
+                  <a
+                    class="btn sm"
+                    href={gr.reportHref(resolve('/datasets/[name]', { name: ds }), community!.iri)}
+                    title="Review this report in the dataset's Communities tab"
+                    ><Icon name="sparkle" size={12} /> Open report</a
+                  >
+                  <button
+                    class="btn sm ghost"
+                    onclick={() => void showCommunity(null)}
+                    aria-label="Close the report">Close</button
+                  >
+                {/snippet}
+              </CommunityReport>
+            {:else if communityError}
+              <h2 class="side-title-plain">{community.title}</h2>
+              <div class="error-box">{api.errorMessage(communityError)}</div>
+            {:else if communityLoading}
+              <p class="faint">
+                <span class="spinner"></span> Reading the report of {community.title}…
+              </p>
+            {/if}
+          </div>
         </aside>
       {/if}
     </div>
@@ -2184,8 +2376,9 @@
   }
   .gtools {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 14px;
+    gap: 6px 14px;
     padding: 6px 12px;
     border-bottom: 1px solid var(--border);
     background: var(--surface);
@@ -2198,6 +2391,19 @@
   .cy-host {
     flex: 1;
     min-height: 0;
+  }
+  .seg {
+    display: inline-flex;
+    gap: 0;
+  }
+  .seg .btn:first-child {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .seg .btn:last-child {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    margin-left: -1px;
   }
   .ov-host {
     flex: 1;
@@ -2664,10 +2870,25 @@
       grid-template-columns: minmax(0, 1fr);
       grid-template-rows: minmax(320px, 1fr) auto;
     }
+    /* the map takes the height it needs and the page scrolls to the details below it */
+    .split.mapmode {
+      grid-template-rows: auto auto;
+    }
+    .split.mapmode .canvas {
+      overflow: visible;
+    }
+    .split.mapmode .cy-host {
+      flex: none;
+    }
     .side {
       border-left: 0;
       border-top: 1px solid var(--border);
       max-height: 50vh;
+    }
+    /* the overview's toolbars and notes sit above its canvas, so it needs more room
+       than the resource graph to keep the picture usable above a report */
+    .split.reporting {
+      grid-template-rows: minmax(min(480px, 62vh), 1fr) auto;
     }
   }
   /* a phone: the search box on a row of its own, the tabs under it */
@@ -2678,6 +2899,11 @@
     .search {
       flex-basis: 100%;
       max-width: none;
+    }
+    /* taps need 44 px targets: the switch between the graph and the map */
+    .gtools .seg .btn {
+      min-height: 44px;
+      min-width: 44px;
     }
   }
 </style>

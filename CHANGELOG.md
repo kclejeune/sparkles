@@ -4,6 +4,14 @@
 
 ### Changed
 
+The first run of a query text that the server does not remember now runs on the thread
+that received it under the request's timeout when the server has been idle for 10 ms,
+instead of on the blocking pool. On forge that took about 1.8 ms off a fresh server's
+first request, and the BSBM explore mix, whose texts are all new, kept its speed. Such a run cannot be cancelled by a client disconnect, only by its timeout, and a
+text whose run is slow or fails, or that contains `SERVICE`, runs on the pool. A SERVICE
+IRI now names this server only when it is written in the URL parser's own spelling, so
+forms such as `127.1` or a path with `..` are ordinary HTTP calls.
+
 Automatic execution now streams groupings and counts over an estimated 20,000 input rows
 or more whose EXISTS and NOT EXISTS are FILTER conjuncts that a key set answers. On a
 Namespace instance at 10.5M quads these ran 0.68 to 0.99 times as long as eagerly. An
@@ -24,6 +32,19 @@ With the query memory pool on, the server now admits a query or update after its
 arrived, so a client that sends slowly no longer holds 16 MiB of the pool while it sends.
 Uploads, patches and Graph Store writes no longer take an initial grant or wait for the
 pool, and a release of memory wakes only the waiters that fit.
+
+A SERVICE call from the SPARQL query or update endpoint to this server now runs in
+process under the caller's principal, grant and deadline, where it used to wait for the
+memory pool behind its caller and fail with `503`. Only an IRI that names the configured
+public URL or the bound listener exactly counts as this server, and such calls nest at
+most eight deep.
+
+Automatic execution now streams a plan without spill when its eager output is expected
+to outgrow the memory the query may use while the cursor's own state fits. BSBM BI's q4
+with ProductType6, a `FILTER NOT EXISTS` over a Cartesian product, now answers at 10M in
+15.1 s with 282 MB of server memory under the default pool, where the pool refused it. A
+request that needs more than the whole query memory pool now answers `507` without
+`Retry-After`, since a retry cannot succeed.
 
 In the JVM library, `abort()` or a timeout that raced the end of a query could throw
 `IllegalStateException` because the query's native object had just been released. Such a
@@ -296,6 +317,29 @@ frequent predicate gains the least. Planning observes the request's timeout and 
 throughout.
 
 ### Format
+
+Index generations are written in index format 3. Each column of a permutation block is a
+run of independent LZ4 frames of 2,048 rows, and a new file `<perm>.seg` beside each
+permutation holds every frame's first key and compressed lengths, under the magic
+`SPKSEG01` and the frame size. A point lookup, a short range scan or an index join then
+decodes the frames that can hold its rows instead of whole 32,768-row columns. This build
+opens format 2 generations as before, and the next compaction rewrites them in format 3
+in a new generation directory that replaces the old one in one step. Releases that read
+only format 2 refuse a format 3 store with an error that names both versions. At 10.5M
+triples a generation grows by 3.0%, from 300.6 MB to 309.7 MB.
+
+A bulk load or a full compaction run with the new global flag `--vocab-codec fsst`
+writes index format 4. Its `meta.json` lists the feature `fsst-vocab`, and the new file
+`vocab.fsst`, the primary kind `vocab-fsst` version 1 with the magic `SPKFSST\0`, holds
+the symbol tables that code the vocabulary's key suffixes. `vocab.dat` shrinks by 29% on
+the DBpedia 50M slice and 32% at 10.5M, and warm queries that decode many terms run up to
+13% slower, so a new database stays front-coded and in format 3. This build refuses a
+generation that lists an unknown feature and names it, and releases that read only
+formats 2 and 3 refuse format 4 as newer. A compaction keeps the codec of the generation
+it replaces unless the flag asks for another, and then it rebuilds in full. Backup
+manifests carry the generation's features as `indexFeatures`, and a restore refuses an
+unknown one. `sparkles stats` names the vocabulary codec, and `sparkles check` verifies the
+tables.
 
 The Ask evaluation cost ledger is in version 2. Reserve and settle lines carry a time,
 and a reconcile line replaces a charge held at its bound. A reconcile line that raises

@@ -320,8 +320,13 @@ cache = { enabled = true, command_inputs = [
 ] }
 description = "All Rust tests with cargo-nextest (unit, W3C SPARQL + SHACL suites when the Jena checkout is present), then the doctests"
 depends = ["ui:build"]
-# nextest does not run doctests, so `cargo test --doc` runs them afterwards
+# The first step builds the server's unit-test binary on its own. It and the server binary
+# that the integration tests run each compile the whole server crate, at about 10 GB and
+# 9 GB of rustc memory, and nextest would build them at the same time. Building them one
+# after the other halves the peak at the cost of a few minutes. nextest does not run
+# doctests, so `cargo test --doc` runs them afterwards.
 run = [
+  "cargo test --workspace --no-run --bin sparkles",
   "cargo nextest run --workspace --no-fail-fast",
   "cargo test --workspace --doc",
 ]
@@ -595,7 +600,7 @@ env = { SPARKLES_UPDATE_OPENAPI = "1" }
 run = "cargo test -p sparkles-server --bin sparkles openapi::tests::checked_in_copy_is_current"
 
 [tasks."docs:screenshots"]
-description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port for the dark-mode pages, the mock backend serves the branch and agent pages, all in dark mode, Playwright drives the UI, oxipng shrinks the images (not part of ci)"
+description = "The README's screenshots (docs/images/*.png): the release build serves the demo dataset of docs/demo on a free port for the dark-mode pages, the mock backend serves the branch, agent and map-of-relations pages, all in dark mode, Playwright drives the UI, oxipng shrinks the images (not part of ci)"
 depends = ["build", "ui:e2e:browsers"]
 dir = "ui"
 tools = { "github:shssoichiro/oxipng" = "10.2.1" }
@@ -606,7 +611,7 @@ oxipng --quiet --opt 4 --strip safe ../docs/images/*.png
 '''
 
 [tasks."docs:screenshots:mock"]
-description = "Only the README's screenshots that the mock backend serves (branches, merges, the Ask bar, handoffs and agent memory), without a release build"
+description = "Only the README's screenshots that the mock backend serves (branches, merges, the Ask bar, handoffs, agent memory, the time sliders, the arcs maps and the GraphRAG communities in Explore), without a release build"
 depends = ["ui:e2e:browsers"]
 dir = "ui"
 tools = { "github:shssoichiro/oxipng" = "10.2.1" }

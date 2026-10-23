@@ -112,8 +112,11 @@ async fn queued_state_detail_and_other_errors() {
     let id = s.state.next_task_id();
     s.state
         .start_task_opts(id.clone(), "test", "ds", None, true, move |h| {
-            h.set_state(task_state::QUEUED);
+            // The detail comes first. A client polls the task and may read it between
+            // the two updates, so the state that the test waits for must be the last one
+            // set, or the poll can see `queued` before the detail is there.
             h.set_detail(serde_json::json!({"level": "exists"}));
+            h.set_state(task_state::QUEUED);
             while !stop2.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(2));
             }

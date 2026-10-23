@@ -498,9 +498,16 @@ fn parameters() -> Map<String, J> {
     );
     let mut kind = path(
         "kind",
-        "The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server.",
+        "The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server.",
     );
-    kind["schema"]["enum"] = json!(["assistant", "memory", "ingest", "models", "notifications"]);
+    kind["schema"]["enum"] = json!([
+        "assistant",
+        "memory",
+        "ingest",
+        "graphrag",
+        "models",
+        "notifications"
+    ]);
     put("kind", kind);
     put("id", path("id", "The id of the task, token or lock."));
     put(

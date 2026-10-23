@@ -917,11 +917,12 @@ fn rendition_extras(c: &Converted) -> Value {
 
 fn pages_json(c: &Converted, out: &mut Value) {
     if !c.page_starts.is_empty() {
+        let map = convert::PageMap::new(&c.text, &c.page_starts);
         out["pages"] = c
             .page_starts
             .iter()
             .filter_map(|s| {
-                let page = convert::page_of(&c.text, &c.page_starts, *s)?;
+                let page = map.page_of(*s)?;
                 Some(json!({ "page": page, "start": s }))
             })
             .collect::<Vec<_>>()

@@ -828,9 +828,9 @@ the text:
   to Phase 2 and are not built. `meta.memory.grantedBytes` is the most the query held.
 * **Not covered.** SHACL-SPARQL, `/$/reason` and ShEx do not take grants, because they run
   through the engine's contexts without a request grant. A SERVICE call from a query to
-  its own server is admitted like any request, so it can wait for memory that its caller
-  holds, and it ends with `503` at the admission deadline. With `SILENT` the failed call
-  yields no rows for that pattern instead of an error. Routes that count as queries but
+  its own server was admitted like any request until 2026-10-23 and ended with `503` at
+  the admission deadline. It now runs in process, as the section on SERVICE calls to this
+  server describes. Routes that count as queries but
   do not run through the request's options, such as GraphQL, SHACL, ShEx, diff,
   `memory/brief` and the `/$/stats`, `/$/schema` and `/$/validate` reads, hold the
   admitted grant idle while a query of their own takes a second grant from the dataset's
@@ -838,7 +838,8 @@ the text:
   writes start with an empty grant since 2026-10-23, and the memory of the load itself is
   not charged to the pool.
 * **Errors.** `BudgetKind::ServerMemory` (`server-memory`) answers `503` with
-  `Retry-After: 1`, counts as a budget in `sparkles_budget_exceeded_total`, and is
+  `Retry-After: 1`. Since roadmap item 96 a request that needs more than the whole pool
+  answers `507` without `Retry-After` and says so in its message. The kind counts as a budget in `sparkles_budget_exceeded_total`, and is
   `budget-server-memory` in the MCP tools. The optional operator caches that fall back on
   a memory failure treat it like `memory`.
 * **Embedded.** `MemoryOptions::pool_bytes` gives a catalog a pool. Its datasets' queries
@@ -1032,9 +1033,8 @@ latency gates, and roadmap item 1 ran the 10.5M and DBpedia profile runs on 2026
 * **X08-P1-grant-routing.** Done on 2026-10-23, as the grant routing section below
   describes. SHACL validation, reasoning, ShEx validation other than its selectors, and the
   schema, statistics and lint reads still run outside the admitted grant.
-* **X08-P1-nested-service.** Recognise a SERVICE call to the same server, without a header
-  that a client could forge, so that it does not wait behind its caller's grant. Today it
-  answers `503` after the admission wait, and `SILENT` turns that into empty results.
+* **X08-P1-nested-service.** Done on 2026-10-23, as the section on SERVICE calls to this
+  server describes.
 * **X08-P1-admit-after-body.** Done on 2026-10-23, as the section on admission after the
   body describes. The server still sets no body read timeout, so a slow client holds its
   rate limiter slot while it sends.
@@ -1078,6 +1078,197 @@ succeeds once the memory returns, and that no grant remains afterwards. SHACL va
 reasoning, the rest of ShEx validation and the schema, statistics, format, lint, patch and
 diff routes still run their queries outside the admitted grant, so they hold it idle and
 take a second one from the dataset's pool.
+
+### Automatic streaming without spill, item 96 (2026-10-23)
+
+BSBM BI's q4 with ProductType6 joins two groupings. One of them filters a Cartesian
+product of 62,956 offers and 2,474 features with `FILTER NOT EXISTS` and averages the
+prices per feature. Automatic execution kept it eager, because the grouping sits under a
+join, which `grouped` does not look through, and spill was off, which `spill_admitted`
+requires. Eager execution holds the whole product, so the query asked the pool for about
+5.8 GiB and the default pool of 5.2 GiB refused it with `503` and `Retry-After`.
+
+`memory_admitted` now runs a plan as a cursor without spill when the plan streams
+natively, its largest eager output is expected to exceed half of the memory it may use,
+and the state the cursor keeps, with its batch headroom, is expected to fit in half. The
+memory it may use is what the query's budget leaves, never more than the capacity of its
+grant's pool, and it does not depend on how much of the pool other queries hold, so a query
+gets the same plan under load. The cursor's state is estimated per operator. It counts
+the build side of each join, with its hash index when the join has a key, the groups of a grouping with their
+aggregate states, the rows of a DISTINCT or a full sort, the rows a top-k keeps, and the
+key set and pattern state of each EXISTS that the cursor answers from one. Rows found
+through a hash table also count the table's buckets, which coexist with the old buckets
+while the table grows, and rows kept in a vector count twice their bytes for its growth.
+A DISTINCT aggregate also counts its distinct input rows. A BIND whose expression is not a
+variable or a constant counts 128 bytes per row, because the terms it generates stay in
+the query-local vocabulary until the query ends. A GROUP_CONCAT keeps text whose length
+the estimates do not tell, so a plan with one is not admitted this way. Other operators
+the cursor runs natively keep nothing, and an operator the estimate does not know counts
+its whole output. `spill_admitted` compares with the same memory. The estimate rests on
+the planner's row estimates, so a plan whose estimates are far too low can still be
+admitted and then fail at its budget, as an eager plan with the same estimates can.
+
+The eager memory retry without spill (roadmap item 91) uses the same test of the cursor.
+`memory_admitted` asks two things, that eager execution is expected not to fit and that
+`cursor_fits` holds. `cursor_fits` requires a SELECT over an immutable snapshot, batches
+large enough for admission, a plan that streams natively, and a cursor state that fits
+in half of the memory with its batch headroom. An eager run that fails for memory runs
+again as a cursor without spill when `cursor_fits` holds. The failure then stands in
+for the eager estimate that was too low. The retry plans the query again to ask this only after the failure,
+because the test plans each EXISTS pattern, and a query that succeeds should not pay for it. SP²Bench `q4` at 10M is such a plan. The planner
+estimates 26.7 million rows for its largest join where 88.2 million arrive, so admission
+keeps it eager, and the retried cursor answers within 1.99 GB. A plan whose cursor
+state is not expected to fit keeps the eager failure, and no cursor starts. The state
+estimate counts the hash index of a keyed OPTIONAL's equality column, although its sides
+share no variable. `eager_memory_retry.rs` covers both outcomes with skewed journal
+sizes that make the planner's estimate miss as it does at 10M.
+
+The review of this change found three estimates too low. Counting only a hash join's
+build rows admitted a cursor that failed in a 6 MiB pool on a join that eager execution
+answered there. Counting one row per group admitted a `COUNT(DISTINCT …)` over a large
+product, and treating BIND as stateless admitted `BIND(STRUUID() AS ?u)` over a
+million-row product, which then failed after more than 100,000 rows. The tests in
+`crates/sparkles-core/tests/memory_admission.rs` and the decision table in
+`automatic_admission_streams_a_product_whose_cursor_state_fits_without_spill` cover these
+cases. The second review found that the first fix also charged a hash index to a Cartesian
+product, which has no key and builds none, and so kept a count over such a product eager
+where it does not fit. A join without a shared variable now counts only its build rows. With
+these fixes, q4 with ProductType6 still streams on forge under the default pool, in
+15.4 s with a peak RSS of 288 MB and the same answer.
+
+On forge at 10M quads, with the default 5.2 GiB pool, q4 with ProductType6 answers in
+15.1 s with a peak server RSS of 282 MB, where it was refused. With a 12 GB pool, eager
+execution took 17.7 s and 8.3 GB, so the cursor is also about 1.17 times faster here. The
+answers are the same. A request that needs more than the whole pool now answers `507`
+without `Retry-After` instead of `503` with it, since no retry can succeed.
+`automatic_admission_streams_a_product_whose_cursor_state_fits_without_spill` covers the
+decision, and `a_query_larger_than_the_whole_pool_answers_507_without_retry_after` the
+status.
+
+### SERVICE calls to this server (2026-10-23)
+
+A query that called `SERVICE <http://this-server/ds/sparql>` sent an HTTP request to its
+own server. The request was admitted like any other, so it waited for pool memory that
+its caller held, answered `503` at the admission deadline, and `SILENT` turned that into
+no rows. Such a call now runs in process.
+
+The server recognises its own endpoints without anything a client could forge. A
+SERVICE IRI names this server only when it matches the configured public base URL
+(`server.public_url` in the auth configuration), or when its scheme, host and port match
+the bound listener. The host must be the address the listener's socket bound or, for a listener on
+a loopback or unspecified address, `localhost`, `127.0.0.1` or `[::1]`. The path must be
+`/{ds}/sparql`, `/{ds}/query` or `/{ds}` for a dataset the server serves, with no query
+string, fragment, user information or branch. Any other IRI is an ordinary HTTP call,
+including a DNS name or an alias that happens to resolve to this server. Matching names
+rather than resolved addresses keeps the rule exact. The IRI must also be written in the
+form the URL parser gives it, since the parser rewrites spellings such as `127.1`,
+`2130706433`, `%6cocalhost`, a port with a leading zero and paths with `.` or `..`
+segments into this server's endpoint. Its raw host, port and path must equal the parsed
+ones, and any other spelling stays an HTTP call. A header that marked a call as
+nested was rejected, because a client could send it to skip admission, and a secret
+header was rejected because a proxy or an alias could carry it to another server. The
+remaining option, leaving the `503` and documenting it, would have kept federation over
+one server unusable under memory pressure.
+
+The in-process call runs as the calling request's principal on the named dataset, with
+the graphs that principal reads there through the query endpoint, so it can never see
+more than the caller could query directly. A caller without read access to that dataset
+fails with a refusal that `SILENT` does not hide, as with any refused SERVICE. SERVICE
+still needs the `federate` permission and is off under `--no-service`. The call charges the
+caller's grant and keeps its deadline, cancellation, count of rows produced and outbound
+budget. Its answer is never put in the cache of SERVICE results, since it reads the
+current data. Calls nest at most eight deep (`MAX_SERVICE_DEPTH`), and a deeper call fails
+with "SERVICE calls to this server nest more than 8 deep", which `SILENT` hides like any
+other failed SERVICE call. The engine exposes the hook as the `LocalEndpoints` trait in
+`QueryOptions`, and the server installs it on the SPARQL query and update endpoints.
+Other routes, such as MCP tools and GraphQL, still send such a call over HTTP.
+
+`a_service_call_to_this_server_runs_under_its_callers_grant` serves the router over TCP,
+holds 48 MiB of a 64 MiB pool and queries itself through four names of the listener. It
+answered `502` with the inner `503` before the change. `a_service_call_to_this_server_sees_only_the_callers_graphs`
+checks that a caller restricted to two graphs sees only those through the call and that a
+dataset it cannot read is refused. `nested_service_calls_to_this_server_stop_at_the_depth_limit`
+and `a_service_iri_that_does_not_name_this_server_goes_over_http` cover the depth limit
+and the names that stay remote.
+
+A review found six gaps in the first version, which are fixed.
+- An update built its own context without the hook, so a SERVICE in its WHERE still went
+  over HTTP. `an_update_reads_this_server_in_process_under_its_grant` covers it.
+- The resolver looked the dataset up before it checked access. A federating caller could
+  then tell a hidden dataset, which was refused, from a missing one, which went to HTTP
+  and came back empty under `SILENT`. Access is now checked first, so both are refused.
+- The call skipped the checks of a direct request for a dataset that is offline or being
+  restored. It now applies them, fails with a SERVICE error that `SILENT` hides, and holds
+  the dataset's request handle until it ends.
+- The call kept the target dataset's server budgets even when the caller had lowered its
+  own. Its row, memory and work budgets are now never above the caller's, as
+  `a_service_call_to_this_server_keeps_the_callers_lowered_budgets` checks.
+- The listener was recorded by its `--host` value, so a host given as a DNS name was
+  accepted by name. It is now recorded by the address the socket bound.
+- An IRI with an empty or password-only user part was accepted, and so was one with an
+  empty authority that the URL parser normalized away. The resolver now reads the
+  authority as written, and an empty one or any `@` in it keeps the call on HTTP.
+
+### First runs on the receiving thread (2026-10-23)
+
+A query whose previous run with the same text took under 10 ms runs on the thread that
+received it, and every other query ran on the blocking pool. A fresh server answered its
+first `path-plus` at 10.5M triples on forge about 2 ms slower than the second request,
+outside the query's own work. Scratch builds separated the causes, with 40 fresh servers
+per variant, the canonical `path-plus` first, then 20 texts the server had not seen that
+do the same work.
+
+| Variant, median ms | First request | Unseen text |
+|---|---:|---:|
+| Blocking pool | 6.53 | 0.72 |
+| First run on the receiving thread | 4.32 | 0.50 |
+| Pool thread with a warmed allocator heap | 5.32 | 0.71 |
+| Server pinned to the performance cores | 4.48 | 0.57 |
+
+Starting four pool threads instead of one changed nothing, and serializing on the pool
+after running in place cost nothing either. About half of the first-request cost is the
+pool thread's cold allocator heap. The rest is waking an idle core: forge's i5-13500 has an
+idle state with a 1,048 µs exit latency, and a woken thread may land on a slower core.
+The worker that read the request is already running on its core.
+
+The first run of a query text that the server does not remember now runs on the receiving
+thread too, when the request has a timeout, no other request is in flight and none has
+ended in the last 10 ms. Every HTTP query has a timeout, the server's 60 s default or a
+smaller or capped `timeout` parameter, so the timeout condition always holds for queries.
+Warming the heap of the pool's first thread, the alternative for a server without a
+timeout, is not built, because no query lacks one. A text that contains `SERVICE`, or a
+`\u` escape that could spell it, starts on the pool, because a SERVICE call can wait on
+another server or run a graph algorithm. A query that reads a past state with `at` uses
+the pool as before. A request counts as in flight from the outermost layer of either
+listener, the metrics listener included, until its response body has ended, so a streamed
+answer still being produced keeps the server from counting as idle. The clock starts with
+the server, so the first request after a quiet start finds it idle also when the release
+of idle heap memory is off.
+
+The idle condition comes from the BSBM explore driver at 10M on forge, whose generated
+parameters make every text new. With every first run on the receiving thread, each query
+of the mix took 10% to 28% longer than on the pool, and 17% to 38% longer with the server
+pinned to the performance cores, so the slower cores do not explain it. Under steady load
+the pool's threads are awake, and the likely cost is the handoff of the worker's other
+tasks to another thread, which running in place needs, but the cause was not isolated.
+With the idle condition, measured against 030e62ef in rounds A, B, B, A with fresh
+servers, the mix ran 44,600 query mixes per hour on average before and 45,200 after, each query between 0.80 and 1.03
+times its previous time, and the rounds of the old build alone differed by 7%. The first
+`path-plus` of a fresh server fell from a median of 6.59 ms to 4.75 ms over 40 servers each.
+Texts the server had not seen, sent one after another by curl, stayed on the pool and took
+0.80 and 0.75 ms.
+
+The tradeoff is cancellation on disconnect. Work on the receiving thread cannot notice
+that its client went away, so a client that abandons a slow query the server has not seen
+leaves it running until its timeout. The server remembers a text as slow from the moment
+its first run starts, and only a run that ends quick with a whole answer marks it quick.
+A failed, slow or stopped first run therefore sends the text's later runs to the pool,
+where a disconnect stops them, and so does a concurrent request for the same text. The
+memory of texts holds 4,096 entries and starts over when it is full, so a slow text can
+get one more uncancellable first run after that.
+`a_first_run_in_place_still_stops_at_its_timeout`,
+`a_first_run_that_fails_to_answer_sends_the_next_run_to_the_pool` and
+`a_first_run_that_may_call_a_service_uses_the_blocking_pool` cover the rule.
 
 ### Admission after the body (2026-10-23)
 
@@ -1297,9 +1488,11 @@ ramfs, where spilled state would take memory, and warns on a network file system
 **Eager queries.** Both paths of §6.8 are built. With spill, automatic execution streams a
 SELECT whose operators all have cursor implementations when the largest operator output
 the plan estimates would take more than half of the memory left. An eager SELECT that
-fails its `memory` budget runs once more as a cursor within the first run's deadline,
-unless it calls SERVICE or a graph algorithm anywhere, inside an EXISTS included, or has
-extension functions or initial bindings. The cursor plan counts `eagerMemoryRetry`, and
+fails its `memory` budget or the shared pool runs once more as a cursor within the first
+run's deadline, unless it calls SERVICE or a graph algorithm anywhere, inside an EXISTS
+included, or has extension functions or initial bindings. With spill any such plan runs
+again. Without spill it runs again only when `cursor_fits` holds, the condition that
+item 96's `memory_admitted` also requires, as the next section describes. The cursor plan counts `eagerMemoryRetry`, and
 `/$/metrics` counts retries in `sparkles_spill_eager_retries_total`. The access log does
 not record the retry separately.
 

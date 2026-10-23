@@ -936,6 +936,8 @@ async fn a_read_only_server_refuses_settings_writes() {
         ("DELETE", "/$/settings/org/ingest", None),
         ("PUT", "/$/assistant/org", body.clone()),
         ("PUT", "/$/memory/org", body.clone()),
+        // the ingestion settings route comes with the MCP tools
+        #[cfg(feature = "mcp")]
         (
             "PUT",
             "/$/ingest/org/settings",

@@ -765,6 +765,13 @@ fn val_cmp(x: Val, y: Val, ctx: &Ctx) -> EvalResult<Option<Ordering>> {
         match (a.tag(), c.tag()) {
             (Tag::Int, Tag::Int) => return Ok(Some(a.as_i64().cmp(&c.as_i64()))),
             (Tag::Double, Tag::Double) => return Ok(a.as_f64().partial_cmp(&c.as_f64())),
+            // two stored strings compare on their vocabulary keys, unless a column
+            // already holds their decoded values
+            (Tag::Vocab, Tag::Vocab) if matches!((&x, &y), (Val::Id(_), Val::Id(_))) => {
+                if let Some(o) = ctx.simple_literal_cmp(a, c) {
+                    return Ok(Some(o));
+                }
+            }
             _ => {}
         }
     }

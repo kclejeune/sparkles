@@ -304,6 +304,14 @@ struct Derivation {
 
 pub use pool::ReasoningPool;
 
+/// Test hook: the threads of the own pools of reasoning runs that are working now. It
+/// drops before a run gives its workers back, so it never exceeds the capacity of the
+/// reasoning pool the runs are admitted to.
+#[doc(hidden)]
+pub fn run_pool_threads() -> usize {
+    pool::run_pool_threads()
+}
+
 /// A reasoning pool of `threads` threads, for [`ReasonOptions::pool`].
 pub fn thread_pool(threads: usize) -> anyhow::Result<Arc<ReasoningPool>> {
     Ok(Arc::new(ReasoningPool::new(threads)?))

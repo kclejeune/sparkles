@@ -55,6 +55,7 @@ fn data() -> String {
     s
 }
 
+#[cfg(feature = "shacl")]
 const SHAPES: &str = r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix ex: <http://example.org/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
@@ -196,33 +197,37 @@ async fn drafts_installs_and_versions() {
             .unwrap()
             .contains("/$/graphql/org/draft")
     );
-    // A1: from the guard's shapes, only the enforced name is non-null
-    let r = put(
-        &s.app,
-        "/$/validation/org",
-        "application/json",
-        &json!({ "mode": "reject", "shapes": { "inline": SHAPES } }).to_string(),
-    )
-    .await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    let r = get(&s.app, "/$/graphql/org/draft?source=shapes").await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    let sdl = &r.body;
-    assert!(
-        sdl.contains("type Person @rdf(iri: \"ex:Person\")"),
-        "{sdl}"
-    );
-    assert!(sdl.contains("name: String! @rdf"), "{sdl}");
-    assert!(sdl.contains("age: Int @rdf"), "{sdl}");
-    assert_eq!(
-        sdl.lines()
-            .filter(|l| l.contains("! @") && !l.contains("]! @"))
-            .count(),
-        1,
-        "{sdl}"
-    );
-    assert!(sdl.contains("type Employee"), "{sdl}");
-    let shapes_draft = r.body.clone();
+    // A1: from the guard's shapes, only the enforced name is non-null. A build without
+    // SHACL has no guard, so the installs below use the draft of the data.
+    #[cfg(feature = "shacl")]
+    let shapes_draft = {
+        let r = put(
+            &s.app,
+            "/$/validation/org",
+            "application/json",
+            &json!({ "mode": "reject", "shapes": { "inline": SHAPES } }).to_string(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        let r = get(&s.app, "/$/graphql/org/draft?source=shapes").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        let sdl = &r.body;
+        assert!(
+            sdl.contains("type Person @rdf(iri: \"ex:Person\")"),
+            "{sdl}"
+        );
+        assert!(sdl.contains("name: String! @rdf"), "{sdl}");
+        assert!(sdl.contains("age: Int @rdf"), "{sdl}");
+        assert_eq!(
+            sdl.lines()
+                .filter(|l| l.contains("! @") && !l.contains("]! @"))
+                .count(),
+            1,
+            "{sdl}"
+        );
+        assert!(sdl.contains("type Employee"), "{sdl}");
+        r.body.clone()
+    };
     // A2: from the data
     let r = get(&s.app, "/$/graphql/org/draft?source=observed").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
@@ -240,6 +245,10 @@ async fn drafts_installs_and_versions() {
         .json();
     assert_eq!(j["source"], "observed");
     assert!(j["types"].as_array().unwrap().len() >= 3);
+    #[cfg(not(feature = "shacl"))]
+    let shapes_draft = get(&s.app, "/$/graphql/org/draft?source=observed")
+        .await
+        .body;
     // A3: the shapes draft installs as version 1
     let r = install(&s.app, &shapes_draft).await;
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);

@@ -36,6 +36,7 @@ mod geo;
 mod geo_index_cmd;
 #[cfg(feature = "graphql")]
 mod graphql;
+mod graphrag;
 mod http;
 #[cfg(feature = "mcp")]
 mod ingest;
@@ -178,6 +179,12 @@ struct Cli {
     /// generation that needs more is built without them
     #[arg(long, global = true, default_value_t = 1024)]
     pattern_memory_mb: usize,
+    /// How a bulk load or a full compaction stores the vocabulary: `front` (front-coded
+    /// keys) or `fsst` (front-coded keys whose suffixes are FSST-compressed, an index of
+    /// format 4 that releases reading only format 3 cannot open)
+    /// (default: front for a new database, and the current generation's for a compaction)
+    #[arg(long, global = true)]
+    vocab_codec: Option<sparkles::builder::VocabCodec>,
     /// Write without write-time validation (load, update, infer)
     #[arg(long, global = true)]
     no_validate: bool,
@@ -1403,6 +1410,10 @@ enum Cmd {
     /// keep them in sync, and print the brief, recall, queries and facts
     #[cfg(feature = "memory")]
     Memory(memory_cmd::MemoryArgs),
+    /// GraphRAG community reports (C22 §2.2): build or refresh a dataset's reports, and
+    /// print their status and titles
+    #[cfg(feature = "memory")]
+    Graphrag(graphrag::cli::GraphragArgs),
     /// Format SPARQL, Turtle, TriG, N-Triples, N-Quads and JSON-LD: print, check (--check,
     /// -l) or rewrite (--write)
     #[cfg(feature = "fmt")]
@@ -2125,6 +2136,7 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         build: sparkles::builder::BuildOptions {
             patterns: !cli.no_patterns,
             pattern_bytes: cli.pattern_memory_mb << 20,
+            vocab_codec: cli.vocab_codec,
             ..Default::default()
         },
         ..Default::default()
@@ -3027,6 +3039,7 @@ fn run() -> Result<()> {
                 .thread_name(|i| format!("query-{i}"))
                 .build_global();
             rayon::broadcast(|_| ());
+            alloc::start_clock();
             alloc::start_idle_release(Duration::from_millis(idle_release_ms));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .thread_stack_size(THREAD_STACK)
@@ -3039,6 +3052,9 @@ fn run() -> Result<()> {
             // backup tasks drive the repository engine on this runtime
             #[cfg(feature = "backup")]
             backup::start(&st, rt.handle());
+            // GraphRAG refreshes that follow the change feed (C22 §5)
+            #[cfg(feature = "mcp")]
+            graphrag::refresh::start(&st, rt.handle());
             let grace = Duration::from_secs_f64(shutdown_grace);
             let st_after = st.clone();
             // The server runs as a task on a worker thread, not on this thread (which
@@ -3086,6 +3102,15 @@ fn run() -> Result<()> {
                     bail!("--unix-socket needs a Unix platform");
                 }
                 let scheme = if tls_cert.is_some() { "https" } else { "http" };
+                // the address and port the socket bound, which differ from a `--host`
+                // name or `--port 0`, for recognising SERVICE calls to this server
+                if let Some(addr) = tcp.as_ref().and_then(|l| l.local_addr().ok()) {
+                    let _ = st.listener.set(http::self_service::Listener {
+                        scheme,
+                        ip: addr.ip(),
+                        port: addr.port(),
+                    });
+                }
                 let listening = match &unix_socket {
                     Some(p) => format!("unix:{}", p.display()),
                     None => format!("{scheme}://{addr}/"),
@@ -3223,6 +3248,8 @@ fn run() -> Result<()> {
         Cmd::Ingest(args) => ingest::cli::run_cli(args, opts),
         #[cfg(feature = "memory")]
         Cmd::Memory(args) => memory_cmd::run(args, opts),
+        #[cfg(feature = "memory")]
+        Cmd::Graphrag(args) => graphrag::cli::run(args, opts),
         #[cfg(feature = "fmt")]
         Cmd::Fmt(args) => fmt::run(args),
         #[cfg(feature = "fmt")]
@@ -3994,6 +4021,11 @@ fn run() -> Result<()> {
                 "terms           {} (+{} delta)",
                 g.vocab.len(),
                 g.dvocab.len()
+            );
+            println!(
+                "index format    {}, vocabulary {}",
+                g.meta.format_version,
+                if g.vocab.is_fsst() { "fsst" } else { "front" }
             );
             println!("subjects        {}", g.stats.distinct_subjects);
             println!("predicates      {}", g.stats.distinct_predicates);

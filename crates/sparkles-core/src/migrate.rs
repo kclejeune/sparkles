@@ -251,7 +251,12 @@ fn inspect_store(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) ->
         if let Ok(b) = std::fs::read(gdir.join("meta.json")) {
             // only the version: a newer meta may have another shape
             match crate::builder::index_meta_version(&b, &format!("{rel}/meta.json")) {
-                Ok(v) => add(plan, &formats::INDEX, rel.clone(), v, by),
+                Ok(v) => {
+                    add(plan, &formats::INDEX, rel.clone(), v, by);
+                    if formats::INDEX.reads(v) {
+                        inspect_features(plan, &gdir, &rel, &b, by);
+                    }
+                }
                 // one damaged generation does not stop the rest of the report
                 Err(e) => plan.refused.push(e.to_string()),
             }
@@ -287,6 +292,31 @@ fn inspect_store(plan: &mut Plan, dir: &Path, prefix: &str, by: Option<&str>) ->
         }
     }
     Ok(())
+}
+
+/// The index features of a generation whose `meta.json` (`meta`) is of a format this
+/// build reads: a feature it does not know is refused by name, and the FSST tables of an
+/// FSST-coded vocabulary are checked for their version, as opening the store checks them.
+fn inspect_features(plan: &mut Plan, gdir: &Path, rel: &str, meta: &[u8], by: Option<&str>) {
+    let features: Vec<String> = serde_json::from_slice::<serde_json::Value>(meta)
+        .ok()
+        .and_then(|v| v.get("features").cloned())
+        .and_then(|f| serde_json::from_value(f).ok())
+        .unwrap_or_default();
+    if let Err(e) = crate::builder::check_features(rel, &features, by) {
+        plan.refused.push(e.to_string());
+        return;
+    }
+    if features
+        .iter()
+        .any(|f| f == crate::builder::FEATURE_FSST_VOCAB)
+    {
+        let file = format!("{rel}/{}", crate::vocab::fsst::FILE);
+        match crate::vocab::fsst::file_version(&gdir.join(crate::vocab::fsst::FILE)) {
+            Ok(v) => add(plan, &formats::VOCAB_FSST, file, v, by),
+            Err(e) => plan.refused.push(format!("{file}: {e}")),
+        }
+    }
 }
 
 /// A version past every one `kind` reads, for a file whose header refused to parse.

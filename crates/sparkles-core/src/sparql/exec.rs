@@ -874,6 +874,11 @@ fn run_node(
             let r = child(1, infos)?;
             left_join(ctx, &l, &r, expr.as_ref(), &mut note)?
         }
+        Kind::KeyedLeftJoin { expr, left, right } => {
+            let l = child(0, infos)?;
+            let r = child(1, infos)?;
+            keyed_left_join(ctx, &l, &r, expr, (*left, *right), &mut note)?
+        }
         Kind::Minus => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
@@ -1310,10 +1315,14 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
     }
     /// The blocks of a scan with the columns the reader decodes of each, or nothing for a
     /// scan of more than `FEW_BLOCKS` blocks.
-    fn blocks(ctx: &Ctx, spec: &ScanSpec, ranges: &[(Key, Key)]) -> Vec<(usize, ColMask)> {
+    fn blocks(
+        ctx: &Ctx,
+        spec: &ScanSpec,
+        ranges: &[(Key, Key)],
+    ) -> Vec<(usize, ColMask, Key, Key)> {
         let index = ctx.snap.perm(spec.perm);
         let scan = scan_mask(ctx, spec);
-        let mut out: Vec<(usize, ColMask)> = Vec::new();
+        let mut out: Vec<(usize, ColMask, Key, Key)> = Vec::new();
         for range in ranges {
             let (b0, b1) = index.key_block_range(&range.0, &range.1);
             if b1 - b0 > FEW_BLOCKS {
@@ -1321,9 +1330,13 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
             }
             for b in b0..b1 {
                 let mask = wanted(index, scan, range, b);
+                // a block that two ranges share is asked for by its union
                 match out.last_mut() {
-                    Some((last, wanted)) if *last == b => *wanted |= mask,
-                    _ => out.push((b, mask)),
+                    Some((last, wanted, _, hi)) if *last == b => {
+                        *wanted |= mask;
+                        *hi = range.1;
+                    }
+                    _ => out.push((b, mask, range.0, range.1)),
                 }
             }
             if out.len() > FEW_BLOCKS {
@@ -1358,13 +1371,14 @@ pub(super) fn prefetch_scans(ctx: &Ctx, n: &Node) {
             // a warm scan costs this one probe, before any other block is listed
             let first = ranges.iter().find_map(|r| {
                 let (b0, b1) = index.key_block_range(&r.0, &r.1);
-                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0)))
+                (b0 < b1).then(|| (b0, wanted(index, scan_mask(ctx, spec), r, b0), r))
             });
-            if let Some((b, mask)) = first
-                && !ctx.snap.cache.has_cols(index, b, mask)
+            if let Some((b, mask, r)) = first
+                && !index.range_cached(&ctx.snap.cache, b, &r.0, &r.1, mask)
             {
-                for (b, mask) in blocks(ctx, spec, &ranges) {
-                    index.prefetch(&ctx.snap.cache, b, mask);
+                // a range of a few rows of a segmented block asks for its segments only
+                for (b, mask, lo, hi) in blocks(ctx, spec, &ranges) {
+                    index.prefetch_range(&ctx.snap.cache, b, &lo, &hi, mask);
                 }
             }
         }
@@ -4519,17 +4533,149 @@ pub(super) fn left_join(
     for (i, _) in &pairs {
         matched[*i as usize] = true;
     }
-    let missing: Vec<usize> = (0..l.len()).filter(|&i| !matched[i]).collect();
-    if !missing.is_empty() {
-        for (c, col) in l.cols.iter().enumerate() {
-            joined.cols[c].extend(missing.iter().map(|&i| col[i]));
-        }
-        for c in l.width()..joined.width() {
-            joined.cols[c].extend(std::iter::repeat_n(Id::UNDEF, missing.len()));
-        }
-        joined.len += missing.len();
-    }
+    append_unmatched(l, &mut joined, &matched);
     Ok(joined)
+}
+
+/// Append to `joined` each row of `l` that `matched` does not mark, with the right
+/// side's variables unbound.
+fn append_unmatched(l: &Table, joined: &mut Table, matched: &[bool]) {
+    let missing: Vec<usize> = (0..l.len()).filter(|&i| !matched[i]).collect();
+    if missing.is_empty() {
+        return;
+    }
+    for (c, col) in l.cols.iter().enumerate() {
+        joined.cols[c].extend(missing.iter().map(|&i| col[i]));
+    }
+    for c in l.width()..joined.width() {
+        joined.cols[c].extend(std::iter::repeat_n(Id::UNDEF, missing.len()));
+    }
+    joined.len += missing.len();
+}
+
+/// The candidate pairs a keyed OPTIONAL tests its condition on at a time.
+const KEYED_CHUNK: usize = 1 << 16;
+
+/// OPTIONAL keyed on its condition's conjunct `?a = ?b` (see [`Kind::KeyedLeftJoin`]).
+/// `=` holds between two different ids only when neither is an IRI or a blank node, as
+/// `val_eq` decides it. A left row whose value is an IRI or a blank node therefore meets
+/// only the right rows with the same id. A left row with another value meets every right
+/// row whose value is bound and is neither an IRI nor a blank node. An unbound value
+/// meets no row, because `=` raises an error on it and the conjunction cannot hold. The
+/// whole condition is tested on the candidate pairs a chunk at a time, so neither the
+/// product nor the candidate pairs are held at once.
+pub(super) fn keyed_left_join(
+    ctx: &Ctx,
+    l: &Table,
+    r: &Table,
+    expr: &Expr,
+    (a, b): (VarId, VarId),
+    note: &mut Option<String>,
+) -> Result<Table> {
+    use super::ctx::TermKind;
+    let lay = layout(l, r);
+    let (Some(lc), Some(rc)) = (l.col_of(a), r.col_of(b)) else {
+        return left_join(ctx, l, r, Some(expr), note);
+    };
+    if !lay.shared.is_empty() {
+        return left_join(ctx, l, r, Some(expr), note);
+    }
+    let atomic = |id: Id| matches!(ctx.kind(id), TermKind::Iri | TermKind::BNode);
+    // The right rows by value: IRIs and blank nodes sorted by id, other bound values in
+    // row order. Both are charged before they are allocated, the second for its growth.
+    let _index = ctx.charge((r.len() as u64).saturating_mul(16 + 8))?;
+    let mut keyed: Vec<(Id, u32)> = Vec::with_capacity(r.len());
+    let mut loose: Vec<u32> = Vec::new();
+    for (j, &v) in r.cols[rc].iter().enumerate() {
+        if j % 65536 == 0 {
+            ctx.check()?;
+        }
+        if v.is_undef() {
+            continue;
+        }
+        if atomic(v) {
+            keyed.push((v, j as u32));
+        } else {
+            loose.push(j as u32);
+        }
+    }
+    keyed.sort_unstable();
+    let w = lay.vars.len() + 1;
+    // A chunk's pairs, their merged rows and their verdicts, and a mark per left row.
+    // The chunk takes at most a quarter of the room the query has left.
+    let per_pair = 8 + w as u64 * 8 + 1;
+    let room = usize::try_from(ctx.memory_room() / 4 / per_pair).unwrap_or(usize::MAX);
+    let cap = KEYED_CHUNK
+        .min(l.len().saturating_mul(r.len()))
+        .min(room)
+        .max(1);
+    let _scratch = ctx.charge(
+        (cap as u64)
+            .saturating_mul(per_pair)
+            .saturating_add(l.len() as u64),
+    )?;
+    let mut matched = vec![false; l.len()];
+    let mut out = Table::new(lay.vars.clone());
+    let mut chunk: Vec<(u32, u32)> = Vec::with_capacity(cap);
+    let mut candidates = 0u64;
+    let flush =
+        |chunk: &mut Vec<(u32, u32)>, out: &mut Table, matched: &mut [bool]| -> Result<()> {
+            ctx.check()?;
+            ctx.check_output(out.len().saturating_add(chunk.len()), w)?;
+            let mut joined = materialize(l, r, &lay, chunk);
+            let keep = left_filter(ctx, &joined, expr);
+            for (k, &(i, _)) in keep.iter().zip(chunk.iter()) {
+                if *k {
+                    matched[i as usize] = true;
+                }
+            }
+            joined.filter_rows(&keep);
+            out.append(joined);
+            chunk.clear();
+            Ok(())
+        };
+    for (i, &v) in l.cols[lc].iter().enumerate() {
+        if i % 4096 == 0 {
+            ctx.check()?;
+        }
+        if v.is_undef() {
+            continue;
+        }
+        if atomic(v) {
+            let s = keyed.partition_point(|&(k, _)| k < v);
+            for &(k, j) in &keyed[s..] {
+                if k != v {
+                    break;
+                }
+                chunk.push((i as u32, j));
+                if chunk.len() >= cap {
+                    candidates += chunk.len() as u64;
+                    flush(&mut chunk, &mut out, &mut matched)?;
+                }
+            }
+        } else {
+            for &j in &loose {
+                chunk.push((i as u32, j));
+                if chunk.len() >= cap {
+                    candidates += chunk.len() as u64;
+                    flush(&mut chunk, &mut out, &mut matched)?;
+                }
+            }
+        }
+    }
+    if !chunk.is_empty() {
+        candidates += chunk.len() as u64;
+        flush(&mut chunk, &mut out, &mut matched)?;
+    }
+    append_unmatched(l, &mut out, &matched);
+    ctx.check_output(out.len(), lay.vars.len())?;
+    *note = Some(format!(
+        "[keyed on ?{} = ?{}: {} candidate pairs]",
+        ctx.var_name(a),
+        ctx.var_name(b),
+        candidates
+    ));
+    Ok(out)
 }
 
 /// A right row index standing for no row: the left row is kept with the right side's
@@ -5054,6 +5200,12 @@ pub(super) fn apply_filter(ctx: &Ctx, t: &mut Table, exprs: &[Expr]) -> Result<E
 
 /// Evaluate the filter row by row.
 pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bool>> {
+    if let [Expr::Cmp(a, b, op)] = exprs
+        && let (Expr::Var(x), Expr::Var(y)) = (&**a, &**b)
+        && let Some(keep) = string_order_mask(ctx, t, (*x, *y), *op, &exprs[0])?
+    {
+        return Ok(keep);
+    }
     let t0 = Instant::now();
     let dec = decode_for(ctx, t, &exprs.iter().collect::<Vec<_>>());
     tracing::debug!(target: "sparkles::sparql::exec", "decoded values in {:?}", t0.elapsed());
@@ -5072,6 +5224,113 @@ pub(super) fn filter_mask(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Vec<bo
     let keep = map_rows(ctx, t.len(), par, test)?;
     tracing::debug!(target: "sparkles::sparql::exec", "filter evaluated {} rows in {:?}", t.len(), t0.elapsed());
     Ok(keep)
+}
+
+/// The rows from which [`string_order_mask`] replaces decoding both columns.
+const STRING_ORDER_ROWS: usize = 4096;
+
+/// The rows whose values the first test of [`string_order_mask`] reads.
+const STRING_ORDER_SAMPLE: usize = 64;
+
+/// The most ids a worker's cache of string floors holds in [`string_order_mask`].
+const STRING_FLOOR_ENTRIES: usize = 1 << 20;
+
+/// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
+/// are stored simple literals. Their order is read from their base-vocabulary ids and
+/// each string's floor ([`Ctx::string_floor`]), computed once per distinct id in a cache
+/// of each worker, so neither column is decoded. A row with another kind of value is
+/// evaluated as the generic filter would. `None` when the table is small or its first
+/// rows hold other values, so that the generic filter decodes the columns instead, and
+/// in a cursor.
+fn string_order_mask(
+    ctx: &Ctx,
+    t: &Table,
+    (x, y): (VarId, VarId),
+    op: super::expr::CmpOp,
+    expr: &Expr,
+) -> Result<Option<Vec<bool>>> {
+    use super::expr::CmpOp;
+    let n = t.len();
+    let (Some(cx), Some(cy)) = (t.col_of(x), t.col_of(y)) else {
+        return Ok(None);
+    };
+    // A cursor's batch would rebuild the cache for each batch. Its rows compare their
+    // two keys directly instead (see `val_cmp`).
+    if n < STRING_ORDER_ROWS || ctx.is_cursor() {
+        return Ok(None);
+    }
+    let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
+    let sample = n.min(STRING_ORDER_SAMPLE);
+    if !(0..sample).all(|i| ctx.string_floor(xs[i]).is_some() && ctx.string_floor(ys[i]).is_some())
+    {
+        return Ok(None);
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let par = n > PAR_THRESHOLD && threads > 1;
+    let workers = if par { threads } else { 1 };
+    // Each worker's cache holds at most `entries` ids and starts again when it is full.
+    // A table of 16-byte entries with their control bytes, at most 7/8 full, coexists
+    // with its old table while it grows.
+    let entries = n.saturating_mul(2).min(STRING_FLOOR_ENTRIES);
+    let table = ((entries.saturating_mul(8) / 7).next_power_of_two() as u64).saturating_mul(17);
+    let Ok(_cache) = ctx.charge(table.saturating_mul(3) / 2 * workers as u64) else {
+        return Ok(None);
+    };
+    let map = t.var_map(ctx.nvars());
+    let generic = |i: usize| {
+        let row = Row {
+            table: t,
+            i,
+            map: &map,
+            dec: None,
+        };
+        ebv(expr, &row, ctx).unwrap_or(false)
+    };
+    let floor = |cache: &mut FxHashMap<Id, u64>, id: Id| -> Option<u64> {
+        if cache.len() >= entries && !cache.contains_key(&id) {
+            cache.clear();
+        }
+        let f = *cache
+            .entry(id)
+            .or_insert_with(|| ctx.string_floor(id).unwrap_or(u64::MAX));
+        (f != u64::MAX).then_some(f)
+    };
+    let test = |cache: &mut FxHashMap<Id, u64>, i: usize| -> Result<bool> {
+        if i.is_multiple_of(1024) {
+            ctx.check()?;
+        }
+        let (a, b) = (xs[i], ys[i]);
+        let (Some(fa), Some(fb)) = (floor(cache, a), floor(cache, b)) else {
+            return Ok(generic(i));
+        };
+        let (pa, pb) = (a.payload(), b.payload());
+        let order = match pa.cmp(&pb) {
+            Ordering::Equal => Ordering::Equal,
+            Ordering::Less if pa < fb => Ordering::Less,
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater if pb < fa => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+        };
+        Ok(match op {
+            CmpOp::Lt => order == Ordering::Less,
+            CmpOp::Le => order != Ordering::Greater,
+            CmpOp::Gt => order == Ordering::Greater,
+            CmpOp::Ge => order != Ordering::Less,
+        })
+    };
+    let keep = if par {
+        (0..n)
+            .into_par_iter()
+            .with_min_len(n.div_ceil(workers))
+            .map_init(FxHashMap::default, |cache, i| test(cache, i))
+            .collect::<Result<Vec<bool>>>()?
+    } else {
+        let mut cache = FxHashMap::default();
+        (0..n)
+            .map(|i| test(&mut cache, i))
+            .collect::<Result<Vec<bool>>>()?
+    };
+    Ok(Some(keep))
 }
 
 /// BIND: the value of `e` on every row (unbound on an error), once per distinct input
@@ -6392,7 +6651,35 @@ struct Graph<'a> {
 /// merging a few hundred rows).
 const SWEEP_RATIO: u64 = 512;
 
+/// A walk that has reached this many nodes for each block of its predicate's index rows
+/// reads those blocks whole from then on (spec X07 §6.5). A walk that wide meets most of
+/// the blocks again, and reading their segments one by one first costs more than one
+/// whole read.
+const WALK_WHOLE_PER_BLOCK: usize = 2;
+
 impl Graph<'_> {
+    /// Have readers of a segmented index read the blocks of a simple path's predicate
+    /// whole, once a walk from one node has reached [`WALK_WHOLE_PER_BLOCK`] nodes per
+    /// block. Returns whether it did, so the walk asks once.
+    fn read_walk_whole(&self, forward: bool, reached: usize) -> bool {
+        let Some((p, rev)) = self.spec.simple else {
+            return true;
+        };
+        let perm = if forward != rev { Perm::Pso } else { Perm::Pos };
+        let idx = self.ctx.snap.perm(perm);
+        if !idx.segmented() {
+            return true;
+        }
+        let (b0, b1) = idx.block_range(&[p]);
+        if reached < (b1 - b0).saturating_mul(WALK_WHOLE_PER_BLOCK) {
+            return false;
+        }
+        for b in b0..b1 {
+            idx.mark_dense(b);
+        }
+        true
+    }
+
     /// Neighbours of every node of a sorted, duplicate-free frontier (with duplicates),
     /// for simple predicate paths: per-node seeks for a small frontier, otherwise one
     /// pass over the predicate's index rows between the first and last frontier node,
@@ -6526,9 +6813,13 @@ impl Graph<'_> {
         let mut depth = 0;
         let mut found = Vec::new();
         let mut found_charged = 0usize;
+        let mut whole = self.spec.max_one;
         while !frontier.is_empty() {
             self.ctx.check()?;
             depth += 1;
+            if !whole {
+                whole = self.read_walk_whole(forward, seen.len());
+            }
             let mut next = Vec::new();
             frontier.sort_unstable();
             found.clear();
@@ -7774,7 +8065,12 @@ fn service(
         return Err(Error::Service("invalid SERVICE endpoint".into()));
     };
     let store = &ctx.snap.results.service;
-    if matches!(cache, CacheMode::Default | CacheMode::Clear) && ctx.use_cache && store.enabled() {
+    // an in-process call reads the current data, so its answer is never cached
+    if matches!(cache, CacheMode::Default | CacheMode::Clear)
+        && ctx.use_cache
+        && store.enabled()
+        && !is_local(ctx, url.as_str())
+    {
         // the whole result under one key: a SERVICE without `loop` has one input
         let key = super::svccache::key(&ctx.service_scope, url.as_str(), query, &[]);
         let hit = if cache == CacheMode::Default {
@@ -7829,14 +8125,85 @@ fn service(
     Ok(t)
 }
 
+/// Whether `url` names a query endpoint of this process (see [`super::LocalEndpoints`]).
+pub(super) fn is_local(ctx: &Ctx, url: &str) -> bool {
+    ctx.local_endpoints
+        .as_ref()
+        .is_some_and(|l| l.resolve(url).is_some())
+}
+
+/// Run `query` in process on the dataset `target` names, as the caller, and hand each
+/// solution to `on_solution`. The call keeps the caller's deadline, cancellation, grant,
+/// row count and outbound budget, so it can neither wait for admission behind its
+/// caller nor outlive it.
+fn fetch_local(
+    ctx: &Ctx,
+    target: Result<super::LocalTarget>,
+    query: &str,
+    on_solution: &mut dyn FnMut(sparesults::QuerySolution) -> Result<()>,
+) -> Result<()> {
+    if ctx.service_depth >= super::MAX_SERVICE_DEPTH {
+        return Err(Error::Service(format!(
+            "SERVICE calls to this server nest more than {} deep",
+            super::MAX_SERVICE_DEPTH
+        )));
+    }
+    let super::LocalTarget {
+        snap,
+        options: mut opts,
+        hold: _hold,
+    } = target?;
+    // the call can never be given more than its caller has
+    opts.max_rows = Some(opts.max_rows.map_or(ctx.max_rows, |m| m.min(ctx.max_rows)));
+    opts.max_memory_bytes = Some(
+        opts.max_memory_bytes
+            .map_or(ctx.mem_limit, |m| m.min(ctx.mem_limit)),
+    );
+    opts.max_rows_produced = Some(
+        opts.max_rows_produced
+            .map_or(ctx.max_rows_produced, |m| m.min(ctx.max_rows_produced)),
+    );
+    opts.timeout = None;
+    opts.deadline = ctx.current_deadline();
+    opts.cancel = Some(ctx.cancel.clone());
+    opts.cancellation = ctx.cancellation.clone();
+    opts.grant = ctx.grant().cloned();
+    opts.work = Some(ctx.rows_produced.clone());
+    opts.outbound_budget = Some(ctx.outbound_budget.clone());
+    opts.service_depth = ctx.service_depth + 1;
+    ctx.check()?;
+    let r = super::query(snap, query, &opts)?;
+    let vars: std::sync::Arc<[oxrdf::Variable]> = r
+        .vars
+        .iter()
+        .map(|v| oxrdf::Variable::new_unchecked(v.clone()))
+        .collect();
+    for i in 0..r.table.len() {
+        if i % 1024 == 0 {
+            ctx.check()?;
+        }
+        let row: Vec<Option<oxrdf::Term>> = r.table.row(i).iter().map(|id| r.term(*id)).collect();
+        on_solution(sparesults::QuerySolution::from((vars.clone(), row)))?;
+    }
+    Ok(())
+}
+
 /// Send `query` to the endpoint `url` through the outbound policy and hand each
-/// solution of the response to `on_solution` as it is parsed.
+/// solution of the response to `on_solution` as it is parsed. A query endpoint of this
+/// process answers in process instead (see [`fetch_local`]).
 pub(super) fn fetch(
     ctx: &Ctx,
     url: &oxrdf::NamedNode,
     query: &str,
     on_solution: &mut dyn FnMut(sparesults::QuerySolution) -> Result<()>,
 ) -> Result<()> {
+    if let Some(target) = ctx
+        .local_endpoints
+        .as_ref()
+        .and_then(|l| l.resolve(url.as_str()))
+    {
+        return fetch_local(ctx, target, query, on_solution);
+    }
     // the host of the endpoint (no user info, no port)
     let host = oxiri::Iri::parse(url.as_str())
         .ok()

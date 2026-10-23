@@ -699,6 +699,12 @@ pub struct Principal {
     /// graph IRIs or `*` patterns hidden from this principal's reads on top of its
     /// grants (`reviewedOnly` of `POST /{ds}/ask` hides agent memory)
     hidden: Option<Arc<[String]>>,
+    /// the disclosure guard of reports graphs (spec C22 §6); without one, no guarded
+    /// graph is proven for a restricted view
+    guard: Option<Arc<crate::graphrag::guard::Guard>>,
+    /// the server's access epoch read before this principal was authenticated, when the
+    /// policy decides its views; a long-lived read ends once the epoch moves (C22 §6.3)
+    epoch: Option<u64>,
 }
 
 impl std::fmt::Debug for Principal {
@@ -725,6 +731,8 @@ impl Principal {
             info: Arc::default(),
             branch: None,
             hidden: None,
+            guard: None,
+            epoch: None,
         });
         LOCAL.clone()
     }
@@ -738,7 +746,29 @@ impl Principal {
             info: Arc::default(),
             branch: None,
             hidden: None,
+            guard: None,
+            epoch: None,
         }
+    }
+
+    /// This principal with the server's disclosure guard, which proves guarded graphs
+    /// for its restricted views.
+    /// `epoch` is [`AppState::access_epoch`](crate::state::AppState::access_epoch) read
+    /// before the principal was authenticated.
+    pub fn with_guard(
+        mut self,
+        guard: Arc<crate::graphrag::guard::Guard>,
+        epoch: u64,
+    ) -> Principal {
+        self.guard = Some(guard);
+        self.epoch = Some(epoch);
+        self
+    }
+
+    /// The access epoch this principal's views were decided under, when a policy decides
+    /// them.
+    pub fn access_epoch(&self) -> Option<u64> {
+        self.epoch
     }
 
     pub fn with_info(mut self, info: PrincipalInfo) -> Principal {
@@ -814,11 +844,15 @@ impl Principal {
     /// The graphs of `ds` this principal reads and writes through endpoint `e`, when
     /// its grants do not cover every graph (`None` otherwise, and always without auth).
     pub fn view(&self, ds: &str, e: Endpoint) -> Option<Arc<sparkles::access::GraphAccess>> {
+        let qualified = self.qualified(ds);
         let view = if self.is_local() {
             None
         } else {
-            self.access.view(&self.qualified(ds), e, self.caller())
+            self.access.view(&qualified, e, self.caller())
         };
+        // reports graphs are readable only when the guard proves the view covers what
+        // their builds read; an unrestricted view has nothing to prove
+        let view = view.map(|v| crate::graphrag::guard::apply(v, self.guard.as_ref()));
         let Some(hidden) = &self.hidden else {
             return view.map(Arc::new);
         };

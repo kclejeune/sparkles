@@ -1,0 +1,35 @@
+//! Community summaries for global questions (spec C22).
+//!
+//! Phase 1 so far holds the parts that need no report publication: the versioned
+//! settings, the persisted build state, the hierarchy adapter over F14's Leiden, stable
+//! community identities, and the token budget that admits every model attempt. Report
+//! publication, routes and the build task wait for the disclosure guard of C22 §6, so
+//! nothing outside the tests calls this module yet.
+#![cfg_attr(not(test), allow(dead_code))]
+
+pub mod budget;
+#[cfg(feature = "mcp")]
+pub mod build;
+#[cfg(feature = "memory")]
+pub mod cli;
+#[cfg(all(test, feature = "mcp"))]
+mod consumers_tests;
+pub mod guard;
+pub mod hierarchy;
+#[cfg(feature = "mcp")]
+pub mod http;
+pub mod identity;
+pub mod ledger;
+pub mod projection;
+#[cfg(feature = "mcp")]
+pub mod read;
+#[cfg(feature = "mcp")]
+pub mod refresh;
+#[cfg(feature = "mcp")]
+pub mod report;
+#[cfg(feature = "mcp")]
+pub mod runtime;
+pub mod settings;
+pub mod state;
+#[cfg(feature = "mcp")]
+pub mod store;

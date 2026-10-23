@@ -15,9 +15,10 @@
 
 use super::codec::{self, BlockCodec};
 use super::iostat::{Tmp, TmpBytes};
+use crate::builder::VocabCodec;
 use crate::error::{Error, Result};
 use crate::index::read_varint_checked;
-use crate::vocab::{VocabWriter, write_varint};
+use crate::vocab::{VocabWriter, fsst, write_varint};
 use parking_lot::Mutex;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -197,11 +198,13 @@ struct RangeOut {
 
 /// Merge the partial vocabularies into the vocabulary of `dir` with `threads` tasks.
 /// Returns the number of terms and the maps of the batches to global ids.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn merge(
     dir: &Path,
     tmp: &Path,
     parts: &[Partial],
     threads: usize,
+    codec: VocabCodec,
     tmp_bytes: &TmpBytes,
     interrupted: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<(u64, Maps)> {
@@ -228,7 +231,15 @@ pub(super) fn merge(
         0,
     ));
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<RangeOut>)>();
-    let mut w = VocabWriter::create(dir)?;
+    let mut w = match codec {
+        VocabCodec::Front => VocabWriter::create(dir)?,
+        VocabCodec::Fsst => {
+            let [a, b] = training_sample(parts)?;
+            let a: Vec<&[u8]> = a.iter().map(|k| &k[..]).collect();
+            let b: Vec<&[u8]> = b.iter().map(|k| &k[..]).collect();
+            VocabWriter::create_fsst(dir, fsst::Encoder::train([&a, &b]))?
+        }
+    };
     let mut records: Vec<Vec<MapRecord>> = (0..parts.len()).map(|_| Vec::new()).collect();
     let mut starts = Vec::with_capacity(ranges);
     let written: Result<()> = std::thread::scope(|s| {
@@ -313,6 +324,67 @@ pub(super) fn merge(
     }
     tmp_bytes.add(Tmp::Maps, map_len);
     Ok((w.finish()?, maps?))
+}
+
+/// Blocks of partial vocabularies read for the training sample of each kind of key at
+/// most.
+const TRAIN_BLOCKS: usize = 64;
+
+/// Suffixes of keys of each kind ([`fsst::is_first_kind`] or not) to train the FSST
+/// tables on: the keys of up to [`TRAIN_BLOCKS`] blocks of the partial vocabularies, at
+/// samples spread evenly over the samples of that kind, each against the key before it
+/// in its block. That key is the one before it in its batch rather than in the merged
+/// vocabulary, which shares a shorter prefix, but a table trained on these suffixes
+/// codes the merged suffixes as well as one trained on those (measured on the DBpedia
+/// and 10.5M vocabularies). Each kind takes up to [`fsst::TRAIN_BYTES`].
+fn training_sample(parts: &[Partial]) -> Result<[Vec<Vec<u8>>; 2]> {
+    let mut out: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+    for (kind, out) in out.iter_mut().enumerate() {
+        let at: Vec<(usize, u64)> = parts
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| {
+                p.samples
+                    .iter()
+                    .filter(|s| usize::from(!fsst::is_first_kind(&s.2)) == kind)
+                    .map(move |s| (i, s.1))
+            })
+            .collect();
+        let step = at.len().div_ceil(TRAIN_BLOCKS).max(1);
+        let (mut bytes, mut block, mut comp) = (0, Vec::new(), Vec::new());
+        for &(part, offset) in at.iter().step_by(step) {
+            if bytes >= fsst::TRAIN_BYTES {
+                break;
+            }
+            let f = File::open(&parts[part].voc)?;
+            let mut len = [0u8; 8];
+            f.read_exact_at(&mut len, offset)?;
+            let c = u32::from_le_bytes(len[..4].try_into().unwrap()) as usize;
+            let raw = u32::from_le_bytes(len[4..].try_into().unwrap()) as usize;
+            comp.resize(c, 0);
+            f.read_exact_at(&mut comp, offset + 8)?;
+            codec::decompress(&comp, raw, &mut block, "partial vocabulary")?;
+            let bad = || Error::Corrupt("partial vocabulary".into());
+            let (mut pos, mut key) = (0, Vec::new());
+            while pos < block.len() {
+                let shared = read_varint_checked(&block, &mut pos).ok_or_else(bad)? as usize;
+                let n = read_varint_checked(&block, &mut pos).ok_or_else(bad)? as usize;
+                let rest = block.get(pos..pos + n).ok_or_else(bad)?;
+                if shared > key.len() {
+                    return Err(bad());
+                }
+                pos += n;
+                let first = key.is_empty();
+                key.truncate(shared);
+                key.extend_from_slice(rest);
+                if !first && usize::from(!fsst::is_first_kind(&key)) == kind {
+                    bytes += rest.len();
+                    out.push(rest.to_vec());
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The read position of one partial vocabulary within a range.
@@ -687,6 +759,11 @@ mod tests {
 
     #[test]
     fn ranges_merge_like_one_merge() {
+        ranges_merge_like_one_merge_with(VocabCodec::Front);
+        ranges_merge_like_one_merge_with(VocabCodec::Fsst);
+    }
+
+    fn ranges_merge_like_one_merge_with(codec: VocabCodec) {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("tmp");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -705,14 +782,23 @@ mod tests {
                 }
             })
             .collect();
-        let (terms, maps) =
-            merge(dir.path(), &tmp, &parts, 3, &Default::default(), &|| Ok(())).unwrap();
+        let (terms, maps) = merge(
+            dir.path(),
+            &tmp,
+            &parts,
+            3,
+            codec,
+            &Default::default(),
+            &|| Ok(()),
+        )
+        .unwrap();
         let mut all: Vec<&Vec<u8>> = sets.iter().flatten().collect();
         all.sort();
         all.dedup();
         assert_eq!(terms, all.len() as u64);
         assert!(maps.starts.len() > 2);
         let v = Vocab::open(dir.path()).unwrap();
+        assert_eq!(v.is_fsst(), codec == VocabCodec::Fsst);
         for (i, keys) in sets.iter().enumerate() {
             let ids = maps.read(i, keys.len() as u64).unwrap();
             assert_eq!(ids.len(), keys.len());

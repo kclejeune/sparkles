@@ -518,3 +518,16 @@ naming `cax-sco` (OWL 2 RL) or `rdfs9` (RDFS).
 ## Outcome
 
 Not built. See [ROADMAP](../ROADMAP.md) item 18.
+
+### Roadmap follow-ups (2026-10-23)
+
+[U10 §3.3](U10-canvas-lenses.md#33-phase-3-prerequisite-explanations-over-a-materialized-closure)
+proposes a first engine for the `why` mode of `POST /$/reason/{ds}/explain`, so the UI can
+explain inferred edges before F17 exists. It answers with the `Derivation` nodes of §2.1
+and searches rule instances over the materialized closure by iterative deepening, which
+accepts a tree only when every premise is asserted, an axiom or derived at a smaller
+depth. §3.1's objection to the kept closure concerns reading first derivations from its
+row order, and the search does not depend on that order. `whyNot` answers `501` from
+that engine. When Phase 1 lands, its demand engine replaces the search behind the same
+route, and the tests compare the two on the same closures. Whether to build the search
+before F17 is U10's open question 1, and roadmap item 105 carries it.

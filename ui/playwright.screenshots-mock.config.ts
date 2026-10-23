@@ -1,6 +1,6 @@
 import { defineConfig, devices } from '@playwright/test';
 
-// The README's screenshots of branches and of the agent pages (`mise run docs:screenshots`),
+// The README's screenshots of branches, of the agent pages and of the GraphRAG communities (`mise run docs:screenshots`),
 // not a test suite. The pages run against the mock backend, whose `org` dataset has agent
 // memory and whose assistant (mock/assistant.mjs) scripts the ask pipeline without a model.
 // It starts mock/server.mjs and `vite dev` on free ports, as playwright.mock.config.ts does,

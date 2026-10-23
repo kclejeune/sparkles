@@ -161,8 +161,21 @@ pub static INGEST: Kind = Kind {
     check: check_as::<IngestFields>,
 };
 
+/// The community summaries of spec C22 §2.1.
+pub static GRAPHRAG: Kind = Kind {
+    name: "graphrag",
+    scope: Scope::Dataset,
+    file: crate::graphrag::settings::GRAPHRAG_FILE,
+    members: crate::graphrag::settings::MEMBERS,
+    removable: &[],
+    shared: false,
+    defaults: defaults_of::<crate::graphrag::settings::GraphragSettings>,
+    normalize: normalize_as::<crate::graphrag::settings::GraphragSettings>,
+    check: check_as::<crate::graphrag::settings::GraphragSettings>,
+};
+
 /// Every dataset-wide kind, in the order the answers list them.
-pub static KINDS: [&Kind; 4] = [&ASSISTANT, &MEMORY, &INGEST, &PREFIXES];
+pub static KINDS: [&Kind; 5] = [&ASSISTANT, &MEMORY, &INGEST, &PREFIXES, &GRAPHRAG];
 
 /// The server-wide `notifications` kind (spec C21 §5): channels, routes and delivery,
 /// declared in the settings file's `server.notifications` and kept at runtime in

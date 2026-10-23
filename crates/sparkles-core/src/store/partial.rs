@@ -290,7 +290,7 @@ fn rewrite(
     let mut decoded = 0usize;
     for seg in segs {
         match *seg {
-            Seg::Copy(b) => w.push_raw(&idx.blocks[b], idx.raw_block(b)?)?,
+            Seg::Copy(b) => w.push_block(idx, b)?,
             Seg::Run { lo, hi, rows } => {
                 let mut cuts = Cuts::new(rows);
                 let mut written = 0u64;
@@ -380,6 +380,7 @@ pub(crate) fn write(
         "vocab.off",
         "vocab.idx",
         crate::vocab::numeric::FILE,
+        crate::vocab::fsst::FILE,
     ] {
         match std::fs::copy(from.join(f), dir.join(f)) {
             Ok(_) => File::open(dir.join(f))?.sync_all()?,
@@ -453,8 +454,11 @@ pub(crate) fn write(
             stats.quads
         )));
     }
+    // the vocabulary is copied, and with it its features
+    let features = g.meta.features.clone();
     let meta = IndexMeta {
-        format_version: crate::builder::FORMAT_VERSION,
+        format_version: crate::builder::format_for(&features),
+        features,
         quads,
         terms: g.meta.terms,
         next_bnode: next_bnode.max(g.meta.next_bnode),

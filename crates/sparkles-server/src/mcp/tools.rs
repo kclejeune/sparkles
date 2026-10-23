@@ -131,6 +131,7 @@ fn dispatch(t: &Tools, name: &str, args: Map<String, Value>) -> Result<Outcome, 
         "similar_queries" => t.similar_queries(args),
         "link_entities" => t.link_entities(args),
         "recall" => t.recall(args),
+        "community_reports" => t.community_reports(args),
         "why_empty" => t.why_empty(args),
         "share_query" => t.share_query(args),
         "sparql_update" => t.sparql_update(args),
@@ -700,7 +701,10 @@ impl Tools<'_> {
                 });
                 // the quads the caller can read
                 let quads = match p.view(&ds.name, crate::auth::Endpoint::Info) {
-                    Some(v) => v.masked(&snap).and_then(|m| v.visible_quads(&m)).ok(),
+                    Some(v) => {
+                        let v = v.bound(&snap);
+                        v.masked(&snap).and_then(|m| v.visible_quads(&m)).ok()
+                    }
                     None => Some(snap.len()),
                 };
                 let mut j = json!({

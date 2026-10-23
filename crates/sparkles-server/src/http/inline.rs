@@ -9,11 +9,24 @@
 //! another thread first, so nothing else waits behind them.
 //!
 //! A request running in place cannot be cancelled when its client disconnects (the
-//! future that notices is the one doing the work), so only requests known to be short
-//! run there: a query whose last run with the same text took less than
-//! [`QUICK_QUERY_MS`], and a small update that only inserts or deletes data and finds
-//! the writer lock free. Everything else uses the blocking pool as before. Timeouts
-//! apply either way.
+//! future that notices is the one doing the work), so only requests that are short or
+//! bounded run there. Those are a query whose last run with the same text took less
+//! than [`QUICK_QUERY_MS`], the first run of a query text the server has not seen when
+//! the request has a timeout and the server has been idle for [`FIRST_RUN_QUIET`], and a
+//! small update that only inserts or deletes data and
+//! finds the writer lock free. A first run gives up cancellation on disconnect, but its
+//! timeout still stops it. A text whose run was slow or failed uses the blocking pool
+//! until a later run of it is quick again, and so does a text that may call a SERVICE.
+//! Timeouts apply either way.
+//!
+//! The blocking pool costs a first request about 2 ms more on an idle machine. On forge
+//! at 10.5M triples, a fresh server answered its first `path-plus` in a median of 6.5 ms
+//! through the pool and 4.3 ms in place, and a text it had not seen in 0.72 and 0.50 ms.
+//! A woken pool thread may have to leave a deep sleep state, may land on a slower core,
+//! and starts with a cold allocator heap, while the worker that read the request is
+//! already running. Under steady load the opposite held: the BSBM explore driver, whose
+//! texts are all new, ran 10% to 28% slower per query with every first run in place,
+//! so a first run goes in place only on an idle server.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -93,6 +106,42 @@ pub fn run<T>(f: impl FnOnce() -> T) -> super::ApiResult<T> {
     })
 }
 
+/// What the server remembers of a query text, which decides where its next run goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum History {
+    /// No run of the text is remembered.
+    Unseen,
+    /// The last run was quick.
+    Quick(QuickExecution),
+    /// The last run was slow, streamed past one body or failed.
+    Slow,
+}
+
+/// How long the server must have been without requests for the first run of a text it
+/// has not seen to run in place. A run under steady load stays on the blocking pool,
+/// whose threads are then awake.
+pub const FIRST_RUN_QUIET: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Whether the server is idle enough for a first run in place ([`FIRST_RUN_QUIET`]).
+/// Router tests run many servers in one process and send requests back to back, so they
+/// skip this condition, and `alloc`'s tests cover it.
+pub fn idle_for_first_run() -> bool {
+    cfg!(test) || crate::alloc::idle_besides_this(FIRST_RUN_QUIET)
+}
+
+/// Whether the first run of `query`, a text the server has not seen, may run in place
+/// under a timeout. A SERVICE call may wait on another server or run a graph algorithm,
+/// whose work does not always check the deadline, so a text that may contain one,
+/// including through a `\u` escape of the keyword, runs on the blocking pool.
+pub fn first_run_in_place(query: &str) -> bool {
+    !query.contains("\\u")
+        && !query.contains("\\U")
+        && !query
+            .as_bytes()
+            .windows(7)
+            .any(|w| w.eq_ignore_ascii_case(b"service"))
+}
+
 /// How a quick query may execute on its next automatic request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuickExecution {
@@ -101,10 +150,10 @@ pub enum QuickExecution {
     PreserveAuto,
 }
 
-/// The query texts (per dataset) whose last run was quick.
+/// The query texts (per dataset) whose last run is remembered, quick or not.
 #[derive(Default)]
 pub struct QuickQueries {
-    quick: Mutex<HashMap<u64, QuickExecution>>,
+    quick: Mutex<HashMap<u64, History>>,
     /// test hook: queries whose runs count as quick however long they took
     #[cfg(test)]
     timeless: Mutex<HashSet<u64>>,
@@ -121,14 +170,28 @@ impl QuickQueries {
         h.finish()
     }
 
-    /// Read the scheduling and execution hint in one snapshot. A failed concurrent
-    /// request can remove it, but cannot turn this hint into a different policy.
+    /// The execution hint of a quick text (for tests; requests read [`Self::history`]).
+    #[cfg(test)]
     pub fn execution(&self, key: u64) -> Option<QuickExecution> {
+        match self.history(key) {
+            History::Quick(execution) => Some(execution),
+            History::Unseen | History::Slow => None,
+        }
+    }
+
+    /// What is remembered of the text with this key, in one snapshot. A failed
+    /// concurrent request can change it, but cannot turn this hint into a different
+    /// policy.
+    pub fn history(&self, key: u64) -> History {
         #[cfg(test)]
         {
             *self.reads.lock().entry(key).or_default() += 1;
         }
-        self.quick.lock().get(&key).copied()
+        self.quick
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or(History::Unseen)
     }
 
     #[cfg(test)]
@@ -169,14 +232,15 @@ impl QuickQueries {
             ms
         };
         let mut set = self.quick.lock();
-        if ms < QUICK_QUERY_MS {
-            if set.len() >= REMEMBERED && !set.contains_key(&key) {
-                set.clear();
-            }
-            set.insert(key, execution);
-        } else {
-            set.remove(&key);
+        if set.len() >= REMEMBERED && !set.contains_key(&key) {
+            set.clear();
         }
+        let seen = if ms < QUICK_QUERY_MS {
+            History::Quick(execution)
+        } else {
+            History::Slow
+        };
+        set.insert(key, seen);
     }
 }
 

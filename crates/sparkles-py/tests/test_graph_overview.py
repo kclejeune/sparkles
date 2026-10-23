@@ -128,23 +128,69 @@ def test_errors_and_cancellation(ds: Dataset) -> None:
         handle.groups({"class": EX + "Person"})
 
 
+HIERARCHY = f"""PREFIX ex: <{EX}>
+PREFIX gr: <urn:x-sparkles:graphrag#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+INSERT DATA {{ GRAPH <urn:x-sparkles:graphrag:reports> {{
+  <urn:c:A> a gr:Community ; gr:level 0 ; gr:memberCount 3 ;
+    gr:member ex:a, ex:b, ex:c ; gr:report <urn:r:A> .
+  <urn:r:A> rdfs:label "Team A" ; gr:status "reviewed" .
+  <urn:c:A1> a gr:Community ; gr:level 1 ; skos:broader <urn:c:A> ; gr:memberCount 2 ;
+    gr:member ex:a, ex:b .
+}} }}"""
+
+
+def test_grouped_by_the_graphrag_communities(ds: Dataset) -> None:
+    # without reports the grouping is unavailable and says why
+    none = ds.graph.groups(by={"reports": {}})
+    assert none["available"] is False and none["unavailable"] == "none"
+    ds.update(HIERARCHY)
+    top = ds.graph.groups(by={"reports": {}})
+    assert top["available"] is True
+    assert top["grouping"] == {"kind": "reports", "predicate": None, "level": 0}
+    [team] = top["groups"]
+    assert (team["label"], team["size"], team["children"]) == ("Team A", 3, 1)
+    assert team["report"] == {"iri": "urn:r:A", "title": "Team A", "status": "reviewed"}
+    below = ds.graph.groups({"group": team["id"]})
+    assert [g["size"] for g in below["groups"]] == [2, 1]
+    assert below["within"]["title"] == "Team A"
+    with pytest.raises(InvalidInputError):
+        ds.graph.groups(by={"reports": {"level": 99}})
+
+
 def test_the_timeout_covers_all_of_the_queries() -> None:
     # the answer takes many queries, each of which is shorter than the timeout
     rows = "\n".join(
         f"<{EX}s{i}> a <{EX}T> ; <{EX}region> <{EX}r{i % 12}> ; <{EX}knows> <{EX}s{(i * 7) % 200000}> ."
         for i in range(200000)
     )
-    # two copies, so that the result cache of the first has nothing to serve the second
-    measured, bounded = Dataset(), Dataset()
-    measured.load(rows, "turtle")
-    bounded.load(rows, "turtle")
     request = {"class": EX + "T"}
     by = {"property": EX + "region"}
 
-    start = time.perf_counter()
-    answer = measured.graph.groups(request, by=by)
-    whole = time.perf_counter() - start
-    assert len(answer["groups"]) == 12
-    assert whole > 0.04, f"the answer took {whole} s, too fast to bound"
-    with pytest.raises(QueryTimeoutError):
-        bounded.graph.groups(request, by=by, timeout=whole / 2)
+    def fresh() -> Dataset:
+        # a copy of its own, so that the result cache of another has nothing to serve it
+        ds = Dataset()
+        ds.load(rows, "turtle")
+        return ds
+
+    # a first call pays one-time costs, which would make the measured time too long
+    fresh().graph.groups(request, by=by)
+
+    # The timeout is half of the shortest time that a whole answer took. The time of one
+    # call varies by a factor of two or more on a busy machine, so a bounded call can be
+    # faster than half of one measured time and finish in time. A timeout that does not
+    # bound the answer fires in none of the attempts, so one attempt that fires is enough.
+    shortest = float("inf")
+    for _ in range(6):
+        measured = fresh()
+        start = time.perf_counter()
+        answer = measured.graph.groups(request, by=by)
+        shortest = min(shortest, time.perf_counter() - start)
+        assert len(answer["groups"]) == 12
+        assert shortest > 0.04, f"the answer took {shortest} s, too fast to bound"
+        try:
+            fresh().graph.groups(request, by=by, timeout=shortest / 2)
+        except QueryTimeoutError:
+            return
+    pytest.fail(f"no call timed out at {shortest / 2} s, half of the shortest whole answer")

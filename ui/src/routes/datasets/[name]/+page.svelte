@@ -29,6 +29,7 @@
   import { tableKind, tableProblem, UPLOAD_ACCEPT } from '$lib/upload';
   import BackupsPanel from '$components/BackupsPanel.svelte';
   import BranchesPanel from '$components/BranchesPanel.svelte';
+  import CommunitiesPanel from '$components/CommunitiesPanel.svelte';
   import CloneDialog from '$components/CloneDialog.svelte';
   import DatasetDialogs from '$components/DatasetDialogs.svelte';
   import DatasetSettingsTab from '$components/DatasetSettingsTab.svelte';
@@ -116,7 +117,7 @@
   }
 
   // the page's tabs: the overview of the data, and the dataset's settings (`?tab=settings`)
-  type Tab = 'overview' | 'settings';
+  type Tab = 'overview' | 'communities' | 'settings';
   // the open items of the memory review inbox, for a caller who may review them
   const review = $derived(reviewCounts.of(name));
   $effect(() => {
@@ -126,10 +127,13 @@
 
   const TABS: { id: Tab; label: string; icon: string }[] = [
     { id: 'overview', label: 'Overview', icon: 'database' },
+    { id: 'communities', label: 'Communities', icon: 'layers' },
     { id: 'settings', label: 'Settings', icon: 'filter' },
   ];
   const tab = $derived<Tab>(
-    page.url.searchParams.get('tab') === 'settings' ? 'settings' : 'overview',
+    ((t) => (t === 'settings' || t === 'communities' ? t : 'overview'))(
+      page.url.searchParams.get('tab'),
+    ),
   );
   function setTab(t: Tab) {
     goto(withParams({ tab: t === 'overview' ? null : t }), {
@@ -741,6 +745,23 @@ ex:PersonShape a sh:NodeShape ;
       {#key name}
         <DatasetSettingsTab {name} {branch} {readOnly} canAdmin={auth.can(name, 'admin')} />
       {/key}
+    </div>
+  {:else if tab === 'communities'}
+    <div
+      class="tabpanel"
+      role="tabpanel"
+      id="ds-panel-communities"
+      aria-labelledby="ds-tab-communities"
+    >
+      <CommunitiesPanel
+        ds={name}
+        {branch}
+        initial={page.url.searchParams.get('community')}
+        {readOnly}
+        {prefixes}
+        canAdmin={auth.can(name, 'admin')}
+        canWrite={auth.can(name, 'write')}
+      />
     </div>
   {:else if stats}
     <!-- the state the figures describe -->

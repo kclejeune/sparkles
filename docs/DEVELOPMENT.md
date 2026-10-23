@@ -98,8 +98,8 @@ mise run ci           # every check below, with a log per task and a summary (sc
 mise run ci:fast      # fmt:check + lint:doc-paths + lint + test, for iterating
 mise run doc          # API docs of the library crates
 mise run openapi      # rewrite docs/openapi.json after an API change (a test fails until then)
-mise run docs:screenshots # the README's screenshots (docs/images): the demo dataset in docs/demo, and the mock backend for branches and the agent pages
-mise run docs:screenshots:mock # only the branch and agent screenshots, from the mock backend, without a release build
+mise run docs:screenshots # the README's screenshots (docs/images): the demo dataset in docs/demo, and the mock backend for branches, the agent pages, the arcs maps and the GraphRAG communities
+mise run docs:screenshots:mock # only the branch, agent, time slider, arcs and GraphRAG community screenshots, from the mock backend, without a release build
 mise run docker:build # the Docker image of compose.yaml (not in ci)
 mise run gen-data 1000000 target/bench-data/10m.nt
 mise run bench        # Sparkles vs Fuseki, QLever, Fluree and Oxigraph; `bench 1000000 --runs 5` for 10.5M triples
@@ -126,6 +126,14 @@ Run `mise run hooks:install` once per clone to install the hook. `mise run hooks
 runs every hook over the whole tree.
 
 ## Testing
+
+The server crate has no library target, so its unit-test binary and the binary that its
+integration tests run each compile the whole crate. In a debug build each of those rustc
+processes peaks at about 10 GB, mostly while it collects monomorphized items, and a
+build that runs both at once needs about 20 GB. `mise run test` therefore first runs
+`cargo test --workspace --no-run --bin sparkles` to build the unit-test binary on its own,
+and only then runs nextest. That keeps the peak near 10 GB and costs a few minutes of build
+time, because the second server compile no longer overlaps the first.
 
 Persistent stores and offline migrations hold an exclusive file lock through their
 owned cleanup. The lock guard explicitly unlocks before closing its descriptor, so an

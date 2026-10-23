@@ -195,7 +195,7 @@ after this spec, or `server-only` with the reason in §6.
 | `getSchemaDiff` | Partial. `sparkles::schema::compare` compares two reports that the handler computes. | No | `ds.schema().diff` |
 | `getClassProfiles` | `sparkles::schema::profile::profiles` | No | `ds.schema().profiles` |
 | `draftShapes` | `sparkles::schema::draft::draft_shapes` | No | `ds.schema().draft_shapes` |
-| `getGraphGroups` | `sparkles::overview::groups_at`, from [U06](U06-large-graph-rendering.md) | No | `ds.graph().groups`, bound as `Dataset.graph.groups` |
+| `getGraphGroups` | `sparkles::overview::groups_at`, from [U06](U06-large-graph-rendering.md) | No | `ds.graph().groups`, bound as `Dataset.graph.groups` and `DatasetGraphSparkles.graph().groups` |
 
 ### 2.6 Stored queries and GraphQL
 
@@ -1487,9 +1487,10 @@ are available. Catalog opening remains eager after the startup measurements belo
 
 ### Implementation notes
 
-* **`getGraphGroups` in Python and Node.js.** `Dataset.graph.groups` in Python and
-  `ds.graph.groups` in Node.js bind `ds.graph().groups` and return the answer as a dict
-  and as an object. The JVM handle follows in ROADMAP item 29.
+* **`getGraphGroups` in Python, Node.js and the JVM.** `Dataset.graph.groups` in Python,
+  `ds.graph.groups` in Node.js and `DatasetGraphSparkles.graph().groups` in the JVM bind
+  `ds.graph().groups` and return the answer as a dict, as an object and as a Jena
+  `JsonObject`.
 * **`Ctl` stays a struct.** The tests of `sparkles-backup` build `Ctl` from its fields,
   so it is not a re-export of `Control`. It converts from a `Control` with `Ctl::from`
   and back with `Ctl::control`, which is how the server's backup tasks pass their

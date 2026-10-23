@@ -16,6 +16,8 @@
     expanded?: boolean;
     /** Between two states of the time slider: added, removed or kept. */
     change?: Mark;
+    /** A fill in place of the kind's, such as the overview's colouring when it falls back. */
+    color?: string;
   };
   export type GEdge = {
     id: string;
@@ -40,6 +42,7 @@
     onexpand,
     emptyText = 'Nothing to draw',
     animate = false,
+    highlight = null,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -47,6 +50,11 @@
     onselect?: (id: string | null) => void;
     onexpand?: (id: string) => void;
     emptyText?: string;
+    /**
+     * The shared selection (docs/specs/U11-linked-views.md): when it is not empty, the
+     * nodes outside it and the edges that do not join two of its nodes are dimmed.
+     */
+    highlight?: ReadonlySet<string> | null;
     /**
      * Fade added elements in and removed ones out, and keep the nodes that stay where they
      * are (the time slider). Off with `prefers-reduced-motion`, then changes appear at once.
@@ -134,6 +142,7 @@
         style: { 'background-color': bnode, width: 12, height: 12 },
       },
       { selector: 'node[kind = "triple"]', style: { shape: 'diamond', 'background-color': text2 } },
+      { selector: 'node[?color]', style: { 'background-color': 'data(color)' } },
       {
         selector: 'node[?expanded]',
         style: { 'border-color': iri, 'border-width': 2, 'background-opacity': 0.55 },
@@ -221,6 +230,7 @@
         },
       },
       { selector: '.faded', style: { opacity: 0.25 } },
+      { selector: '.muted', style: { opacity: 0.22 } },
     ];
   }
 
@@ -238,6 +248,7 @@
         title: n.title,
         focus: !!n.focus,
         expanded: !!n.expanded,
+        color: n.color ?? '',
         w: Math.min(190, n.label.length * 6 + 14),
       },
     }),
@@ -348,6 +359,7 @@
             focus: !!n.focus,
             expanded: !!n.expanded,
             title: n.title,
+            color: n.color ?? '',
             w: Math.min(190, n.label.length * 6 + 14),
           });
         } else {
@@ -475,6 +487,28 @@
       const n = cy.getElementById(id);
       if (n.nonempty()) n.select();
     }
+  });
+
+  // the shared selection dims what it does not hold
+  $effect(() => {
+    const keep = highlight;
+    void nodes;
+    void edges;
+    if (!cy) return;
+    cy.batch(() => {
+      cy!.elements().removeClass('muted');
+      if (!keep || !keep.size) return;
+      cy!
+        .nodes()
+        .filter((n) => !keep.has(n.id()))
+        .addClass('muted');
+      cy!
+        .edges()
+        .filter((e) => !(keep.has(e.source().id()) && keep.has(e.target().id())))
+        .addClass('muted');
+    });
+    // for the tests: the canvas has no elements to find
+    if (wrap) wrap.dataset.muted = String(cy.elements('.muted').length);
   });
 
   export function fit() {

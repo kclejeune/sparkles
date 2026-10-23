@@ -63,6 +63,28 @@ pub fn draft() -> OutputSchema {
     }
 }
 
+/// The line of the draft prompt that asks for the scope (C22 §7.1).
+pub const SCOPE_FORMAT: &str = "\nAlso give scope: \"global\" when the question asks about the dataset as a whole, such as its main themes, areas or groups, so that no single query answers it, and \"local\" when a query over specific resources answers it.\n";
+
+/// The `Draft` with the `scope` member that classifies the question (C22 §7.1).
+pub fn draft_scoped() -> OutputSchema {
+    let mut d = draft();
+    d.name = "ScopedDraft";
+    d.schema["properties"]["scope"] = json!({ "enum": ["local", "global"] });
+    if let Some(r) = d.schema["required"].as_array_mut() {
+        r.push("scope".into());
+    }
+    d.from_text = scoped_from_text;
+    d
+}
+
+/// A scoped draft at the `text` level: always local, since plain text carries no scope.
+fn scoped_from_text(t: &str) -> Option<Value> {
+    let mut v = draft_from_text(t)?;
+    v["scope"] = "local".into();
+    Some(v)
+}
+
 /// A draft at the `text` level: the first fenced `sparql` block is the query, and the
 /// rest is the explanation. Assumptions and clarification are not available.
 fn draft_from_text(t: &str) -> Option<Value> {

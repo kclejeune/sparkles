@@ -343,6 +343,7 @@ export type TaskKind =
   | 'backup-restore'
   | 'backup-verify'
   | 'backup-gc'
+  | 'graphrag'
   | 'backup-policy';
 /** `queued`: waiting for a task slot; `cancelled`: stopped by `DELETE /$/tasks/{id}`. */
 export type TaskState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
@@ -1779,6 +1780,7 @@ export type CommitKind =
   | 'embed'
   | 'patch'
   | 'merge'
+  | 'graphrag'
   | 'unknown';
 
 /** One commit: the state after a write that changed data. */
@@ -3135,14 +3137,20 @@ export type GroupsBy =
   | 'auto'
   | 'members'
   | { community: string }
-  | { property: string; buckets?: number };
+  | { property: string; buckets?: number }
+  /** The GraphRAG community hierarchy (C22): the whole dataset at `level`, 0 by default. */
+  | { reports: { level?: number } };
 
 export type GroupsRequest = {
-  within: { class: string } | { group: string };
+  /** Absent only with `by: { reports }`, which groups the whole dataset. */
+  within?: { class: string } | { group: string };
   by?: GroupsBy;
   limit?: number;
   at?: string;
 };
+
+/** A report's review status (C22 §4). */
+export type GroupReportStatus = 'unreviewed' | 'reviewed' | 'rejected' | 'stale' | 'failed';
 
 /** One group of an answer, with its first members. */
 export type GraphGroup = {
@@ -3150,6 +3158,15 @@ export type GraphGroup = {
   label: string;
   size: number;
   top: { iri: string; label?: string }[];
+  /** A GraphRAG community group: the community, null for the members it alone holds. */
+  community?: string | null;
+  level?: number;
+  /** The communities one level below. */
+  children?: number;
+  /** The community's report, null when it has none yet. */
+  report?: { iri: string; title: string | null; status: GroupReportStatus | null } | null;
+  /** The members that no community below holds. */
+  folded?: boolean;
 };
 
 /**
@@ -3158,14 +3175,33 @@ export type GraphGroup = {
  */
 export type GroupsAnswer = {
   commit: number;
-  within: { class: string; group?: string; size: number };
-  grouping: { kind: 'members' | 'values' | 'ranges' | 'communities'; predicate: string | null };
+  within: {
+    class?: string;
+    group?: string;
+    size: number;
+    /** A GraphRAG grouping: its reports graph and the level the dataset opened at. */
+    reports?: { graph: string; level: number };
+    community?: string;
+    level?: number;
+    title?: string;
+    folded?: boolean;
+  };
+  grouping: {
+    kind: 'members' | 'values' | 'ranges' | 'communities' | 'reports';
+    predicate: string | null;
+    level?: number;
+  };
   communities: boolean;
   groups: GraphGroup[];
   members?: { iri: string; label?: string; class?: string }[];
   edges: { source: string; target: string; predicate: string | null; count: number }[];
   truncated: boolean;
   note?: string;
+  /** A GraphRAG grouping: false when the caller may not read the reports or none exist. */
+  available?: boolean;
+  unavailable?: 'access' | 'none';
+  reason?: string;
+  levels?: { level: number; communities: number }[];
 };
 
 export const graphGroups = (ds: string, req: GroupsRequest, signal?: AbortSignal) =>
