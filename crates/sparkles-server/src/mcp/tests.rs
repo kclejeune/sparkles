@@ -501,10 +501,23 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "statuses": {"type":"array","items":{"enum":["reviewed","unreviewed","proposed"]},"minItems":1,"maxItems":3,"description":"The review statuses to return when the dataset names agent memory graphs (default all). Unreviewed facts were written by an agent and not yet checked by a person. Proposed facts are asserted only on the review branch you read, not on main"},
                 "unreviewedWeight": {"type":"number","minimum":0,"maximum":1,"default":0.7,"description":"Factor on the score of found seeds whose facts are all unreviewed"},
                 "recency": {"type":"string","pattern":"^[0-9]+(\\.[0-9]+)?[smhdwy]$","description":"A half-life such as 90d: found seeds whose facts are older weigh less, and seeds whose facts several graphs assert weigh more"},
+                "communities": {"type":"boolean","default":false,"description":"After the facts, add the GraphRAG community report of each seed's community, when the dataset has reports you may read"},
+                "communityLevel": {"type":"integer","minimum":0,"maximum":64,"description":"The level of those communities, 0 being the coarsest (default: the finest)"},
                 "format": {"enum":["text","json"],"default":"text"},
                 "reasoning": rs,
                 "timeoutSeconds": to,
                 "atCommit": at, "at": sel}}),
+        ),
+        (
+            "community_reports",
+            json!({"type":"object","additionalProperties":false,"properties":{
+                "dataset": ds,
+                "query": {"type":"string","minLength":1,"maxLength":2000,"description":"The question or the words to search for (default: the best rated reports)"},
+                "level": {"type":"integer","minimum":0,"maximum":64,"description":"The hierarchy level, 0 being the coarsest (default: the finest level with at most 100 reports)"},
+                "reviewedOnly": {"type":"boolean","default":false,"description":"Only reports a person marked reviewed"},
+                "limit": {"type":"integer","minimum":1,"maximum":100,"default":10},
+                "findings": {"type":"boolean","default":true,"description":"Include each report's findings and citations"},
+                "timeoutSeconds": to}}),
         ),
         (
             "why_empty",
@@ -613,6 +626,7 @@ async fn a03_tool_list() {
             "similar_queries",
             "link_entities",
             "recall",
+            "community_reports",
             "why_empty",
             #[cfg(feature = "shacl")]
             "validate_shacl",

@@ -7,7 +7,7 @@
 //! counted for the budgets and `GET /$/models/usage`, and kept in the caller's history
 //! when the dataset keeps one.
 
-use super::{AskOptions, Turn, ask};
+use super::{AskMode, AskOptions, Turn, ask};
 use crate::assistant::{self, Send};
 use crate::auth::Principal;
 use crate::http::{AdminBody, ApiResult, err_code};
@@ -64,6 +64,9 @@ struct AskBody {
     #[serde(default)]
     reviewed_only: bool,
     query: Option<String>,
+    /// `auto`, `local` or `global` (C22 §2.4)
+    #[serde(default)]
+    mode: AskMode,
 }
 
 fn bad(m: impl Into<String>) -> crate::http::ApiError {
@@ -259,6 +262,8 @@ async fn ask_route(
         pairs: Vec::new(),
         // read on the request's task: the pipeline runs on a blocking thread
         grant: crate::server_memory::current_grant(),
+        mode: b.mode,
+        reviewed_only: b.reviewed_only,
     };
     let server = crate::mcp::McpServer::new(st.clone(), cfg);
     let finish = {

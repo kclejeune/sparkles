@@ -20,6 +20,7 @@
 
 mod cli;
 pub mod complexity;
+mod global;
 pub mod http;
 #[cfg(test)]
 mod http_tests;
@@ -87,6 +88,29 @@ pub fn resolve_lists(models: &Models, overrides: &RoleLists) -> RoleLists {
     out
 }
 
+/// Whether a question is answered from the data or from community reports (C22 §2.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AskMode {
+    /// classify the question (C22 §7.1)
+    #[default]
+    Auto,
+    /// answer from the data with a query
+    Local,
+    /// answer from the community reports
+    Global,
+}
+
+impl AskMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskMode::Auto => "auto",
+            AskMode::Local => "local",
+            AskMode::Global => "global",
+        }
+    }
+}
+
 /// An earlier turn of the same conversation (§5.1).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Turn {
@@ -145,6 +169,10 @@ pub struct AskOptions {
     /// queries charge. The pipeline runs on a blocking thread, where the request's
     /// task-local grant does not reach, so the route captures it here.
     pub grant: Option<Arc<sparkles::sparql::pool::PoolGrant>>,
+    /// answer from the data, from community reports, or as the question needs
+    pub mode: AskMode,
+    /// use only reviewed community reports (`reviewedOnly`, C22 A7)
+    pub reviewed_only: bool,
 }
 
 impl Default for AskOptions {
@@ -173,6 +201,8 @@ impl Default for AskOptions {
             full_results: false,
             cancel: None,
             grant: None,
+            mode: AskMode::Auto,
+            reviewed_only: false,
         }
     }
 }
@@ -223,6 +253,7 @@ pub fn ask(
         level: None,
         trimmed: Value::Null,
         answered_by: None,
+        reports: None,
     };
     let mut out = a.run();
     // an event stream learns of the endings without their own event here
@@ -247,6 +278,9 @@ pub fn ask(
         }
         Some("not-run") => (a.on)("result", &out["result"]),
         _ => {}
+    }
+    if out.get("mode").is_none() && out["outcome"] != "error" {
+        out["mode"] = AskMode::Local.as_str().into();
     }
     out["dataset"] = o.dataset.clone().into();
     out["question"] = o.question.clone().into();
@@ -288,6 +322,9 @@ struct Asking<'a, 'e> {
     trimmed: Value,
     /// the role and pair that wrote the final query
     answered_by: Option<(Role, Pair)>,
+    /// the community reports a global answer may use, as `community_reports` returns
+    /// them, when the question may be answered from them (C22 §7)
+    reports: Option<Value>,
 }
 
 /// The grounding of §4.1 step 1.
@@ -297,6 +334,8 @@ struct Ground {
     ambiguous: Option<(String, Vec<Value>)>,
     /// the best stored example's query, when its score reaches `example_score`
     best_example: Option<String>,
+    /// a mention links `exact`, which makes the question local (C22 §7.1)
+    exact: bool,
 }
 
 /// A normalized draft.
@@ -538,6 +577,15 @@ impl Asking<'_, '_> {
         if let Some(q) = self.o.query.clone() {
             return self.given(&q);
         }
+        // C22 §7: the reports a global answer may use, and the explicit global mode
+        if self.o.mode != AskMode::Local {
+            self.reports = self.report_selection();
+            if self.o.mode == AskMode::Global
+                && let Some(sel) = self.reports.take()
+            {
+                return self.global(sel);
+            }
+        }
         if self.pair(Role::Draft).is_none() {
             return self.error("no-model", "no provider and model answers the draft role");
         }
@@ -571,6 +619,10 @@ impl Asking<'_, '_> {
             .resolved(&draft_pair)
             .map_or(crate::models::DEFAULT_CONTEXT_TOKENS, |r| r.context_tokens);
         let ground = self.ground(context_tokens);
+        // C22 §7.1: a question that names an entity linked exactly is local
+        if ground.exact {
+            self.reports = None;
+        }
         // §4.4: an ambiguous mention is asked about before drafting, once
         if self.o.clarification.is_none()
             && let Some((text, candidates)) = &ground.ambiguous
@@ -757,6 +809,7 @@ impl Asking<'_, '_> {
         ground_event["examples"] = examples.iter().map(|e| e["name"].clone()).collect();
         // linked mentions
         let mut ambiguous = None;
+        let mut exact = false;
         let mentions = mentions(&self.o.question);
         let mut entities = Vec::new();
         if !mentions.is_empty() {
@@ -771,6 +824,7 @@ impl Asking<'_, '_> {
                 for m in &ms {
                     let text = m["text"].as_str().unwrap_or("");
                     let verdict = m["verdict"].as_str().unwrap_or("none");
+                    exact |= verdict == "exact";
                     let cands = m["candidates"].as_array().cloned().unwrap_or_default();
                     if verdict == "ambiguous" && ambiguous.is_none() {
                         ambiguous = Some((text.to_string(), cands.clone()));
@@ -819,6 +873,7 @@ impl Asking<'_, '_> {
             context: ctx,
             ambiguous,
             best_example,
+            exact,
         }
     }
 
@@ -841,13 +896,30 @@ impl Asking<'_, '_> {
                     format!("the ask used its {} tokens", self.o.max_tokens),
                 );
             }
-            let user =
+            // the first draft also classifies the question when reports could answer it
+            let scoped = attempt == 1 && self.reports.is_some();
+            let mut user =
                 prompts::draft_user(&self.o.question, &ground.context, notes, repair.as_deref());
-            let (value, level, pair) =
-                match self.call(role, prompts::SYSTEM, &user, &prompts::draft()) {
-                    Ok(x) => x,
-                    Err((code, message)) => return self.error(code, message),
-                };
+            if scoped {
+                user.push_str(prompts::SCOPE_FORMAT);
+            }
+            let schema = if scoped {
+                prompts::draft_scoped()
+            } else {
+                prompts::draft()
+            };
+            let (value, level, pair) = match self.call(role, prompts::SYSTEM, &user, &schema) {
+                Ok(x) => x,
+                Err((code, message)) => return self.error(code, message),
+            };
+            if scoped && value["scope"].as_str() == Some("global") {
+                let sel = self.reports.take().unwrap_or(Value::Null);
+                self.emit(
+                    "scope",
+                    &json!({ "scope": "global", "provider": pair.provider, "model": pair.model }),
+                );
+                return self.global(sel);
+            }
             if self.level.is_none() {
                 self.level = Some(level);
                 if level == Level::Text {

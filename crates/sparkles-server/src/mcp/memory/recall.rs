@@ -96,6 +96,22 @@ struct RecallArgs {
     /// a half-life such as `90d`: found seeds rank by the age of their newest fact and
     /// the number of graphs that assert their facts (C18 §8.4)
     recency: Option<String>,
+    /// add the report of each seed's community (C22 §2.5)
+    #[serde(default)]
+    communities: bool,
+    /// the level of those communities, 0 being the coarsest (default: the finest)
+    community_level: Option<u64>,
+}
+
+/// The community reports a recall adds after its facts (C22 §2.5).
+#[derive(Default)]
+struct Communities {
+    /// the level read
+    level: Option<u32>,
+    /// each report with the seed numbers its community holds
+    reports: Vec<(crate::graphrag::read::ReportRef, Vec<usize>)>,
+    /// why no report is shown, when none can be
+    unavailable: Option<&'static str>,
 }
 
 /// One quad of the view.
@@ -385,6 +401,21 @@ impl Tools<'_> {
             Vec::new()
         };
         let conflicts = self.conflicts(&ds, &r, &entities, &facts, &ctx)?;
+        let communities = if a.communities {
+            let level = match a.community_level {
+                None => None,
+                Some(l) if l <= 64 => Some(l as u32),
+                Some(_) => {
+                    return Err(ToolError::bad_argument(
+                        "communityLevel must be between 0 and 64",
+                    ));
+                }
+            };
+            self.seed_communities(&ds, &r, &entities, level)
+                .map_err(eng)?
+        } else {
+            Communities::default()
+        };
         let doc = Doc {
             dataset: &ds.name,
             commit: r.snap.commit,
@@ -397,6 +428,7 @@ impl Tools<'_> {
             prefixes: &prefixes,
             status: status_kept.as_deref(),
             agent: &agent,
+            communities: a.communities.then_some(&communities),
         };
         // the most facts that fit in maxTriples and maxBytes
         let total = facts.len().min(max_triples);
@@ -611,9 +643,77 @@ impl Tools<'_> {
         Ok(out)
     }
 
+    /// The report of each seed's community at `level` (the finest by default), read
+    /// through the caller's view, which the disclosure guard restricts.
+    fn seed_communities(
+        &self,
+        ds: &crate::state::Dataset,
+        r: &Reader,
+        entities: &[Entity],
+        level: Option<u32>,
+    ) -> Result<Communities, Error> {
+        use crate::graphrag::read;
+        let settings: crate::graphrag::settings::GraphragSettings =
+            crate::settings::effective(&self.server.state, ds, &crate::settings::GRAPHRAG);
+        if !settings.enabled {
+            return Ok(Communities {
+                unavailable: Some("off"),
+                ..Default::default()
+            });
+        }
+        let graph = settings.reports_graph;
+        let opts = r.timed()?;
+        if !read::readable(&r.snap, &opts, &graph) {
+            return Ok(Communities {
+                unavailable: Some("access"),
+                ..Default::default()
+            });
+        }
+        let mut seeds: Vec<(usize, String)> = entities
+            .iter()
+            .filter_map(|e| match (&e.term, e.seed) {
+                (Term::NamedNode(n), Some(s)) => Some((s, n.as_str().to_string())),
+                _ => None,
+            })
+            .collect();
+        seeds.sort();
+        let level = match level {
+            Some(l) => Some(l),
+            None => read::level_counts(&r.snap, &opts, &graph, read::Filter::default())?
+                .keys()
+                .next_back()
+                .copied(),
+        };
+        let Some(level) = level else {
+            return Ok(Communities::default());
+        };
+        let members: Vec<String> = seeds.iter().map(|(_, s)| s.clone()).collect();
+        let found = read::reports_of_members(
+            &r.snap,
+            &opts,
+            &graph,
+            &members,
+            Some(level),
+            read::Filter::default(),
+        )?;
+        let mut reports: Vec<(read::ReportRef, Vec<usize>)> = Vec::new();
+        for (m, rep) in found {
+            let n = seeds.iter().find(|(_, s)| *s == m).map_or(0, |(n, _)| *n);
+            match reports.iter_mut().find(|(r, _)| r.iri == rep.iri) {
+                Some((_, l)) => l.push(n),
+                None => reports.push((rep, vec![n])),
+            }
+        }
+        Ok(Communities {
+            level: Some(level),
+            reports,
+            unavailable: None,
+        })
+    }
+
     /// The predicate of the first vector index, by name, whose provider embeds query
     /// text.
-    fn first_embedding(&self, ds: &crate::state::Dataset) -> Option<NamedNode> {
+    pub(super) fn first_embedding(&self, ds: &crate::state::Dataset) -> Option<NamedNode> {
         let mut list = ds.dataset.indexes().vector().list();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         list.into_iter()
@@ -1041,7 +1141,7 @@ impl Tools<'_> {
     }
 }
 
-fn rank_terms(hits: impl Iterator<Item = (NamedNode, f64)>) -> HashMap<String, usize> {
+pub(super) fn rank_terms(hits: impl Iterator<Item = (NamedNode, f64)>) -> HashMap<String, usize> {
     let mut best: HashMap<String, f64> = HashMap::new();
     for (s, score) in hits {
         let e = best.entry(s.as_str().to_string()).or_insert(score);
@@ -1266,6 +1366,8 @@ struct Doc<'a> {
     status: Option<&'a [Status]>,
     /// whether a graph is agent memory
     agent: &'a dyn Fn(&NamedNode) -> bool,
+    /// the community reports, when the call asked for them
+    communities: Option<&'a Communities>,
 }
 
 /// A time or number as it is when its lexical form is plain, else as a quoted term.
@@ -1457,6 +1559,29 @@ impl Doc<'_> {
                 body.push('\n');
             }
         }
+        if let Some(c) = self.communities {
+            match (c.unavailable, c.level) {
+                (Some(why), _) => body.push_str(&format!("# communities unavailable={why}\n")),
+                (None, Some(l)) => {
+                    body.push_str(&format!("# communities level={l}\n"));
+                    for (r, seeds) in &c.reports {
+                        let lit = |s: &str| Term::Literal(Literal::new_simple_literal(s));
+                        let seeds: Vec<String> = seeds.iter().map(usize::to_string).collect();
+                        body.push_str(&format!(
+                            "## {} {} community={} members={} status={} seeds={}\n",
+                            terms.iri(&r.iri),
+                            terms.term(&lit(&r.title)),
+                            terms.iri(&r.community),
+                            r.member_count,
+                            r.status.as_str(),
+                            seeds.join(",")
+                        ));
+                        body.push_str(&format!("summary {}\n", terms.term(&lit(&r.summary))));
+                    }
+                }
+                (None, None) => body.push_str("# communities none\n"),
+            }
+        }
         let shown_facts: usize = shown.iter().map(|(_, f)| f.len()).sum();
         let mut out = format!(
             "# dataset={} commit={} seeds={} facts={} truncated={}\n",
@@ -1603,6 +1728,23 @@ impl Doc<'_> {
                 })
                 .collect::<Vec<_>>()
                 .into();
+        }
+        if let Some(c) = self.communities {
+            out["communities"] = match c.unavailable {
+                Some(why) => json!({ "unavailable": why, "reports": [] }),
+                None => json!({
+                    "level": c.level,
+                    "reports": c.reports.iter().map(|(r, seeds)| json!({
+                        "iri": terms.iri(&r.iri),
+                        "community": terms.iri(&r.community),
+                        "title": r.title,
+                        "summary": r.summary,
+                        "status": r.status.as_str(),
+                        "memberCount": r.member_count,
+                        "seeds": seeds,
+                    })).collect::<Vec<_>>(),
+                }),
+            };
         }
         out["prefixes"] = json!(terms.used());
         out.to_string()

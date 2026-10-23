@@ -1256,6 +1256,13 @@
                 "id": {
                   "type": "string"
                 },
+                "mode": {
+                  "enum": [
+                    "local",
+                    "global"
+                  ],
+                  "type": "string"
+                },
                 "note": {
                   "type": "string"
                 },
@@ -1275,6 +1282,16 @@
                   "type": "string"
                 },
                 "question": {
+                  "type": "string"
+                },
+                "reports": {
+                  "description": "The reports a global answer used, listed only while their graph is proven for the caller.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "reportsGraph": {
                   "type": "string"
                 },
                 "result": {
@@ -1374,6 +1391,15 @@
             "description": "The rows returned in `result`, 1000 by default.",
             "type": "integer"
           },
+          "mode": {
+            "description": "Answer from the data (`local`), from the community reports (`global`), or as the draft classifies the question (`auto`, the default).",
+            "enum": [
+              "auto",
+              "local",
+              "global"
+            ],
+            "type": "string"
+          },
           "query": {
             "description": "A query to check, run and summarize without drafting, for **Summarize again** after an edit.",
             "type": "string"
@@ -1386,7 +1412,7 @@
             "type": "boolean"
           },
           "reviewedOnly": {
-            "description": "Hide the agent memory graphs of the dataset from the query.",
+            "description": "Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports.",
             "type": "boolean"
           },
           "run": {
@@ -1444,6 +1470,19 @@
             ],
             "type": "object"
           },
+          "global": {
+            "additionalProperties": true,
+            "description": "In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports and the map `batches`.",
+            "type": "object"
+          },
+          "mode": {
+            "description": "Whether the answer came from the data or from community reports.",
+            "enum": [
+              "local",
+              "global"
+            ],
+            "type": "string"
+          },
           "notes": {
             "items": {
               "type": "string"
@@ -1463,8 +1502,54 @@
             ],
             "type": "string"
           },
+          "points": {
+            "description": "In a global answer, the points the reduce step read. The summary's citations number them.",
+            "items": {
+              "properties": {
+                "findings": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "n": {
+                  "type": "integer"
+                },
+                "reports": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "score": {
+                  "type": "integer"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "n",
+                "text",
+                "score",
+                "reports",
+                "findings"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
           "question": {
             "type": "string"
+          },
+          "reports": {
+            "description": "In a global answer, the reports it used.",
+            "items": {
+              "additionalProperties": true,
+              "description": "A report with `iri`, `title`, `level`, `status`, `rating` and the `findings` the answer uses, each with its `cites`.",
+              "type": "object"
+            },
+            "type": "array"
           },
           "result": {
             "additionalProperties": true,
@@ -1490,6 +1575,15 @@
               },
               "text": {
                 "type": "string"
+              },
+              "uncited": {
+                "type": "boolean"
+              },
+              "uncitedSentences": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
               }
             },
             "required": [
@@ -3519,6 +3613,15 @@
           },
           "commit": {
             "type": "integer"
+          },
+          "communities": {
+            "description": "In a project brief, the best rated reports of the coarsest level that the caller may read.",
+            "items": {
+              "additionalProperties": true,
+              "description": "A report with `iri`, `community`, `title`, `summary`, `status` and `memberCount`.",
+              "type": "object"
+            },
+            "type": "array"
           },
           "dataset": {
             "type": "string"
@@ -12838,6 +12941,14 @@
             "description": "Read the snapshot of this commit.",
             "type": "integer"
           },
+          "communities": {
+            "description": "Add the GraphRAG community report of each seed's community.",
+            "type": "boolean"
+          },
+          "communityLevel": {
+            "description": "The level of those communities, 0 being the coarsest. The finest by default.",
+            "type": "integer"
+          },
           "format": {
             "description": "Always `json` here.",
             "enum": [
@@ -12965,6 +13076,67 @@
           },
           "commit": {
             "type": "integer"
+          },
+          "communities": {
+            "description": "With `communities`, the report of each seed's community.",
+            "properties": {
+              "level": {
+                "type": "integer"
+              },
+              "reports": {
+                "items": {
+                  "properties": {
+                    "community": {
+                      "type": "string"
+                    },
+                    "iri": {
+                      "type": "string"
+                    },
+                    "memberCount": {
+                      "type": "integer"
+                    },
+                    "seeds": {
+                      "items": {
+                        "type": "integer"
+                      },
+                      "type": "array"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "title": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "iri",
+                    "community",
+                    "title",
+                    "summary",
+                    "status",
+                    "memberCount",
+                    "seeds"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "unavailable": {
+                "description": "Why no report is listed.",
+                "enum": [
+                  "off",
+                  "access"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "reports"
+            ],
+            "type": "object"
           },
           "conflicts": {
             "items": {

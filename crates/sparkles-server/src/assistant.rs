@@ -713,6 +713,15 @@ pub struct AskRecord {
     pub note: Option<String>,
     /// the routing record: complexity, steps, escalations and the answering pair
     pub routing: Value,
+    /// `global` for an answer from community reports (C22 §7)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// the reports a global answer used, shown only while their graph is proven for the
+    /// reader (C22 §6.6)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reports_graph: Option<String>,
 }
 
 /// Serializes the read-modify-write of history files.
@@ -821,6 +830,14 @@ pub fn record_of(id: &str, principal: &str, out: &Value) -> AskRecord {
         outcome: "none".into(),
         note: None,
         routing,
+        mode: out["mode"].as_str().map(str::to_string),
+        reports: out["reports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r["iri"].as_str().map(str::to_string))
+            .collect(),
+        reports_graph: out["global"]["reportsGraph"].as_str().map(str::to_string),
     }
 }
 
@@ -982,6 +999,22 @@ async fn list_asks(
         };
         list.reverse();
         list.truncate(limit);
+        // C22 §6.6: the reports of a global answer only while their graph is proven
+        let snap = ds.store.snapshot();
+        let opts = {
+            let mut o = ds.dataset.query_options();
+            #[cfg(feature = "auth")]
+            crate::auth::restrict(&mut o, &p, &ds.name, crate::auth::Endpoint::Query);
+            o
+        };
+        for r in &mut list {
+            if let Some(g) = &r.reports_graph
+                && !crate::graphrag::read::readable(&snap, &opts, g)
+            {
+                r.reports.clear();
+                r.reports_graph = None;
+            }
+        }
         Ok(Json(
             json!({ "dataset": ds.name, "historyDays": days, "asks": list }),
         ))

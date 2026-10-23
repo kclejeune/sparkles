@@ -1,7 +1,7 @@
 //! `sparkles ask`: the asking pipeline from the command line (C18 §10), which the
 //! evaluation of §11.4 drives.
 
-use super::{AskOptions, ask};
+use super::{AskMode, AskOptions, ask};
 use crate::auth::Principal;
 use crate::mcp::{McpConfig, McpServer};
 use crate::models::{ModelArgs, Pair, Role};
@@ -53,6 +53,13 @@ pub struct AskArgs {
     /// for: a choice's value
     #[arg(long, value_name = "ANSWER")]
     pub clarification: Option<String>,
+    /// Answer from the data (`local`), from the community reports (`global`), or as the
+    /// question needs (`auto`, spec C22 §7.1)
+    #[arg(long, value_enum, default_value_t = AskMode::Auto)]
+    pub mode: AskMode,
+    /// Use only community reports that a person marked reviewed
+    #[arg(long)]
+    pub reviewed_only: bool,
     /// Stop after the check and print the checked query without running it
     #[arg(long)]
     pub no_run: bool,
@@ -204,6 +211,8 @@ pub fn run_cli(args: AskArgs, store_opts: StoreOptions) -> Result<()> {
         max_tokens: args.max_tokens,
         lists: Some(lists),
         draft_start: args.try_harder.map(|i| i + 1),
+        mode: args.mode,
+        reviewed_only: args.reviewed_only,
         complexity_threshold: routing
             .complexity_threshold
             .or(model_routing.complexity_threshold)
