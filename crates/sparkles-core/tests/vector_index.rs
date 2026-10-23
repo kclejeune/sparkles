@@ -553,6 +553,10 @@ fn inserted_rows_join_the_graph() {
     let (vs, rest) = all.split_at(5_000);
     let (extra, queries) = rest.split_at(1_200);
     let s = store_with(Store::in_memory(StoreOptions::default()), vs);
+    // A parallel build's graph depends on how its threads interleave, so on the machine's
+    // load, and the search below can then miss a node it should find. The graph is built
+    // one node at a time instead, so every run checks the same graph.
+    s.sequential_vector_builds(true);
     s.create_vector_index("emb", config(0)).unwrap();
     s.wait_vector_index("emb").unwrap();
     // held: the new rows are scored exactly
@@ -717,6 +721,14 @@ fn compactions_carry_the_graph_over() {
         Store::open(dir.path(), StoreOptions::default()).unwrap(),
         vs,
     );
+    // The graph that is carried over and the one built from scratch are compared below.
+    // Built in parallel, each depends on how its threads interleave, so on the machine's
+    // load, and their mean recalls then differ by more than the margin of the comparison
+    // from run to run (0.977 against 0.988 on a loaded machine, where the runs on an idle
+    // one differ by under 0.005). Both are built one node at a time instead, so every
+    // run compares the same two graphs, and the margin still catches a carry that loses
+    // links.
+    s.sequential_vector_builds(true);
     s.create_vector_index("emb", config(0)).unwrap();
     s.wait_vector_index("emb").unwrap();
     // 1 % of the rows deleted, 100 new ones, part of them in the graph's live layer
@@ -762,8 +774,8 @@ fn compactions_carry_the_graph_over() {
     let n100 = snap.lookup_iri("urn:n100");
     assert!(n100.is_none_or(|n| hits.iter().all(|h| h.0 != n.0)));
     let carried = mean_recall(&snap, queries, 64);
+    assert!(carried >= 0.97, "carried recall {carried}");
     // the same generation built from scratch
-    s.sequential_vector_builds(false);
     s.rebuild_vector_index("emb").unwrap();
     let st = s.wait_vector_index("emb").unwrap();
     assert!(!st.last_build.as_ref().unwrap().carried);
@@ -971,6 +983,10 @@ fn indexes_created_before_their_predicate_catch_up() {
 fn declined_carries_build_after_the_switch() {
     let all = clustered(3_000, 43);
     let s = store_with(Store::in_memory(StoreOptions::default()), &all);
+    // A parallel build's graph depends on how its threads interleave, so on the machine's
+    // load, and the search below can then miss a node it should find. The graph is built
+    // one node at a time instead, so every run checks the same graph.
+    s.sequential_vector_builds(true);
     s.create_vector_index("emb", config(0)).unwrap();
     s.wait_vector_index("emb").unwrap();
     let mut del = String::new();

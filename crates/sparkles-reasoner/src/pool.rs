@@ -31,8 +31,37 @@ use parking_lot::{Condvar, Mutex};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+
+/// The threads of runs' own pools that are inside their worker loop now. A thread counts
+/// from before it starts to work until its loop has returned, which is before its pool
+/// waits for it to end and so before the run gives its workers back. A count above the
+/// capacity of a reasoning pool then means too many runs were admitted. A count of the
+/// process's threads from `/proc` cannot say this: a thread that has ended stays listed
+/// there for a moment after it was joined.
+static RUN_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// The threads of runs' own pools that are working now, see [`RUN_THREADS`].
+pub(crate) fn run_pool_threads() -> usize {
+    RUN_THREADS.load(Ordering::SeqCst)
+}
+
+/// One thread of a run's own pool in [`RUN_THREADS`] while this lives.
+struct RunThread;
+
+impl RunThread {
+    fn new() -> RunThread {
+        RUN_THREADS.fetch_add(1, Ordering::SeqCst);
+        RunThread
+    }
+}
+
+impl Drop for RunThread {
+    fn drop(&mut self) {
+        RUN_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// A thread pool for rule evaluation, shared by runs that pass it as
 /// [`crate::ReasonOptions::pool`], with the admission of the module documentation.
@@ -243,9 +272,12 @@ impl OwnPool {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .spawn_handler(move |t| {
+                // counted from here, so that a thread that has not started yet is also seen
+                let counted = RunThread::new();
                 let j = std::thread::Builder::new()
                     .name(format!("reason-run-{}", t.index()))
                     .spawn(move || {
+                        let _counted = counted;
                         // the thread ends with the pool, which ends its entry
                         let _holding = holder.map(Holding::new);
                         t.run()

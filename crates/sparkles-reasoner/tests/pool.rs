@@ -130,41 +130,31 @@ fn f16_foreign_pool_writer_reentry() {
     });
 }
 
-/// The reasoning threads alive in the process: the shared pool's and those of runs'
-/// own pools, by name.
-fn reasoning_threads() -> usize {
-    let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
-        return 0;
-    };
-    dir.filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("comm")).ok())
-        .filter(|n| n.starts_with("reason") || n.starts_with("sparkles-reason"))
-        .count()
-}
-
 /// With a pool of eight, four runs that ask for four threads each and one that asks for
-/// none run at once: the threads of the runs' own pools, beside the pool's eight, never
-/// exceed eight, and each run keeps its thread count.
-#[cfg(target_os = "linux")]
+/// none run at once: the threads of the runs' own pools never exceed the pool's eight,
+/// and each run keeps its thread count.
+///
+/// The threads are counted by `sparkles_reasoner::run_pool_threads`, which falls before a
+/// run gives its workers back. Listing the process's threads in `/proc` instead counted a
+/// thread that a run had joined for a moment after it was joined, beside the threads of
+/// the run admitted next, and saw up to eleven where eight were working.
 #[test]
 fn f16_reduced_requests_share_capacity() {
     within(Duration::from_secs(120), "the pool runs", || {
         let pool = thread_pool(8).unwrap();
-        // the pool's own threads start with it, but appear in /proc a little later
-        let t0 = Instant::now();
-        while reasoning_threads() < 8 && t0.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let base = reasoning_threads();
-        assert_eq!(base, 8, "the pool's threads");
+        assert_eq!(pool.threads(), 8);
+        assert_eq!(sparkles_reasoner::run_pool_threads(), 0);
         let stores: Vec<Arc<Store>> = (0..5).map(|_| Arc::new(store(100))).collect();
         let done = Arc::new(AtomicBool::new(false));
         let peak = Arc::new(AtomicUsize::new(0));
+        let admitted = Arc::new(AtomicUsize::new(0));
         let sampler = {
-            let (done, peak) = (done.clone(), peak.clone());
+            let (done, peak, admitted, pool) =
+                (done.clone(), peak.clone(), admitted.clone(), pool.clone());
             std::thread::spawn(move || {
                 while !done.load(Ordering::SeqCst) {
-                    let extra = reasoning_threads().saturating_sub(base);
-                    peak.fetch_max(extra, Ordering::SeqCst);
+                    admitted.fetch_max(pool.admitted_workers(), Ordering::SeqCst);
+                    peak.fetch_max(sparkles_reasoner::run_pool_threads(), Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(2));
                 }
             })
@@ -206,6 +196,9 @@ fn f16_reduced_requests_share_capacity() {
             peak <= 8,
             "{peak} threads of runs' own pools beside the pool's eight"
         );
+        assert!(admitted.load(Ordering::SeqCst) <= 8);
+        // every run's own pool has ended with the run
+        assert_eq!(sparkles_reasoner::run_pool_threads(), 0);
     });
 }
 
