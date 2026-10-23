@@ -2040,7 +2040,9 @@ SELECT ?p (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p
 `?p` and `?o` must appear in no other triple of the group, and the other triples must
 bind `?s`. `spk:hasPredicate` with a variable predicate reads the patterns, and with a
 constant predicate it reads that predicate's subjects from the PSO permutation, which is
-cheaper. `COUNT(*)` over `?s ?p ?o` counts triples and reads the permutations. The
+cheaper. A streaming cursor runs `PatternCount` natively and reads `spk:hasPredicate` pairs
+from the permutations, so that it can stop at a LIMIT. `COUNT(*)` over `?s ?p ?o` counts
+triples and reads the permutations. The
 patterns hold for the base index, and every subject that pending writes or an open
 transaction touch is read again from SPO, so the answers are always those of the
 permutations. The permutations answer instead under a protection of triples, with RDFS
