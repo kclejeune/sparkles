@@ -1202,6 +1202,17 @@ inlining decisions of thin LTO with four codegen units. Giving the eager key fil
 explicit per-clone `regex_automata` caches, as the cursor's regular expression filter
 has, would make the call independent of that inlining, and is left to item 7.
 
+Item 7 tried it on 2026-10-23 and measured it slower, so it was reverted. The key test
+held a `regex_automata::meta::Regex` shared through a per-thread program cache and a
+search cache in each clone of the filter, and matched with `search_half_with` and
+`earliest`. On an 8-vCPU AMD Namespace instance at 1M people, with six interleaved rounds
+and eager execution, `regex-iri` took 1.08 times as long as with `regex::Regex` when each
+clone's cache sat behind a lock. Reaching the cache of the task's own clone through
+`Mutex::get_mut` made it 1.17 times as long, while `contains` and `lang-filter` stayed
+within 2%. The lock was therefore not the cost. The search through the meta engine's
+`search_half` is slower here than `regex::Regex::is_match`, and the eager filter keeps
+`regex::Regex`.
+
 ### Batch kernels and disk spill (2026-10-17)
 
 X08 Phase 2 moved the cursor's joins, counts, groupings and DISTINCT to column kernels
@@ -1237,7 +1248,8 @@ which charges its own index, copy and key values. It had charged both.
 These follow-ups stay with roadmap item 7. A morsel-parallel cursor scan and filter would
 close the gap of filters and top-k at 12 threads. A range top-k still collects its range
 inside the cursor. DESCRIBE still reads its whole input first. The eager
-`regex-iri` key filter still needs per-clone `regex_automata` caches. A one-key index
+`regex-iri` key filter keeps `regex::Regex`, because per-clone `regex_automata` caches
+measured slower on 2026-10-23. A one-key index
 join that read larger input batches, so that it seeks its index less often, was tried
 and set aside unmeasured, since automatic execution runs those joins eagerly.
 

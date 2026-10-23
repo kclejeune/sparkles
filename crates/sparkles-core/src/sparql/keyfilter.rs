@@ -7,7 +7,7 @@
 //! straight off the key are compiled; ids that are not stored terms (inline numbers and
 //! dates, blank nodes, unbound) are left to the general evaluator.
 
-use super::expr::{Expr, Func, lang_matches_bytes};
+use super::expr::{Expr, Func, compile_regex, lang_matches_bytes};
 use super::table::VarId;
 use super::value::Value;
 use crate::id::KEY_SEP;
@@ -36,7 +36,7 @@ enum Test {
     },
     Regex {
         arg: Arg,
-        re: Box<KeyRegex>,
+        re: regex::Regex,
         /// the text every match starts with, for a pattern anchored at the start
         prefix: Option<Arc<str>>,
     },
@@ -47,83 +47,6 @@ enum Test {
     },
     /// `LANGMATCHES(LANG(?v), "range")`
     LangMatches(Arc<str>),
-}
-
-/// The program of an eager REGEX key test with a search cache of its own. Each clone of a
-/// filter, one per parallel task, starts a cache of its own, so a test never reaches the
-/// shared cache pool of `regex::Regex`, whose cost depended on how the compiler inlined
-/// its fast path. The lock only makes the filter shareable between the tasks that clone
-/// it, and the clone that tests keys is the only one that takes it. The cursor's [`super::cursor_regex::RegexHandle`] does the same under
-/// the query's charges. Programs are shared through a small cache on each thread, as the
-/// eager `REGEX` function's are.
-struct KeyRegex {
-    program: Arc<regex_automata::meta::Regex>,
-    cache: parking_lot::Mutex<regex_automata::meta::Cache>,
-}
-
-impl Clone for KeyRegex {
-    fn clone(&self) -> Self {
-        KeyRegex {
-            program: self.program.clone(),
-            cache: parking_lot::Mutex::new(self.program.create_cache()),
-        }
-    }
-}
-
-/// Compiled programs by pattern and flags, `None` for one that does not compile.
-type Programs = rustc_hash::FxHashMap<(String, String), Option<Arc<regex_automata::meta::Regex>>>;
-
-thread_local! {
-    static KEY_REGEX: std::cell::RefCell<Programs> = Default::default();
-}
-
-impl KeyRegex {
-    /// The program of `pattern` with `flags`, built with the size limit of the eager
-    /// `REGEX` function, or `None` when it does not compile.
-    fn compile(pattern: &str, flags: &str) -> Option<Self> {
-        let program = KEY_REGEX.with(|programs| {
-            let mut programs = programs.borrow_mut();
-            if programs.len() > 1000 {
-                programs.clear();
-            }
-            programs
-                .entry((pattern.to_string(), flags.to_string()))
-                .or_insert_with(|| {
-                    let text = super::expr::regex_text(pattern, flags)?;
-                    regex_automata::meta::Regex::builder()
-                        .configure(
-                            regex_automata::meta::Regex::config().nfa_size_limit(Some(1 << 22)),
-                        )
-                        .build(&text)
-                        .ok()
-                        .map(Arc::new)
-                })
-                .clone()
-        })?;
-        let cache = parking_lot::Mutex::new(program.create_cache());
-        Some(KeyRegex { program, cache })
-    }
-
-    #[inline]
-    fn is_match(&self, text: &str) -> bool {
-        self.program
-            .search_half_with(
-                &mut self.cache.lock(),
-                &regex_automata::Input::new(text).earliest(true),
-            )
-            .is_some()
-    }
-
-    /// [`Self::is_match`] for the clone's owner, which reaches its cache without the lock.
-    #[inline]
-    fn is_match_mut(&mut self, text: &str) -> bool {
-        self.program
-            .search_half_with(
-                self.cache.get_mut(),
-                &regex_automata::Input::new(text).earliest(true),
-            )
-            .is_some()
-    }
 }
 
 /// A conjunction of key tests over one variable.
@@ -345,7 +268,7 @@ impl KeyFilter {
                         },
                         None => Test::Regex {
                             arg: Arg::of(a, v)?,
-                            re: Box::new(KeyRegex::compile(pattern, flags)?),
+                            re: compile_regex(pattern, flags).ok()?,
                             prefix: regex_prefix(pattern, flags).map(Into::into),
                         },
                     }
@@ -402,47 +325,19 @@ impl KeyFilter {
         })
     }
 
-    /// [`Self::test`] for a filter the caller owns, such as the clone of one parallel
-    /// task. Its regular expression tests use their search caches without locking them.
-    pub fn test_mut(&mut self, key: &[u8]) -> bool {
-        if !self.0.iter().any(|t| matches!(t, Test::Regex { .. })) {
-            return self.test(key);
-        }
-        let k = split(key);
-        for t in self.0.iter_mut() {
-            let pass = match t {
-                Test::Regex { arg, re, .. } => arg
-                    .read(&k)
-                    .and_then(|(s, _)| std::str::from_utf8(s).ok())
-                    .is_some_and(|s| re.is_match_mut(s)),
-                t => Self::passes(t, &k),
-            };
-            if !pass {
-                return false;
-            }
-        }
-        k.valid()
-    }
-
     /// Whether the term with this key passes (type errors fail the filter).
     pub fn test(&self, key: &[u8]) -> bool {
         let key = split(key);
-        self.0.iter().all(|t| Self::passes(t, &key)) && key.valid()
-    }
-
-    /// Whether one test passes, before the key's final validity check.
-    #[inline]
-    fn passes(t: &Test, key: &Key<'_>) -> bool {
         // UTF-8 is self-synchronizing: a byte match of a UTF-8 needle in a UTF-8 string
         // is a match of the strings
-        match t {
+        self.0.iter().all(|t| match t {
             Test::Str {
                 f,
                 arg,
                 needle,
                 finder,
                 lang,
-            } => arg.read(key).is_some_and(|(s, l)| {
+            } => arg.read(&key).is_some_and(|(s, l)| {
                 compatible_bytes(l, lang.as_deref())
                     && match f {
                         Function::Contains => finder.find(s).is_some(),
@@ -451,14 +346,14 @@ impl KeyFilter {
                     }
             }),
             Test::Regex { arg, re, .. } => arg
-                .read(key)
+                .read(&key)
                 .and_then(|(s, _)| std::str::from_utf8(s).ok())
                 .is_some_and(|s| re.is_match(s)),
             Test::CursorRegex { arg, re, .. } => arg
-                .read(key)
+                .read(&key)
                 .and_then(|(s, _)| std::str::from_utf8(s).ok())
                 .is_some_and(|s| re.is_match(s)),
-            Test::LangMatches(range) => match key {
+            Test::LangMatches(range) => match &key {
                 // Basic language filtering only compares bytes. The final validity
                 // check rejects malformed UTF-8 after all predicates pass.
                 Key::Literal { lang, .. } => {
@@ -466,7 +361,7 @@ impl KeyFilter {
                 }
                 _ => false,
             },
-        }
+        }) && key.valid()
     }
 }
 
@@ -602,47 +497,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.key_prefixes(), None);
-    }
-
-    /// The eager key test's own program answers as the eager `REGEX` function does, for
-    /// every XPath flag, an escaped literal, Unicode text and a flag XPath does not
-    /// define, and its clones share the program.
-    #[test]
-    fn key_regex_matches_the_eager_regex_function() {
-        let patterns = [
-            ("person/1[0-9]{3}$", ""),
-            ("^ADA", "i"),
-            ("a.b", "s"),
-            ("^b$", "m"),
-            ("a b c", "x"),
-            ("a.b(", "q"),
-            ("ünï", ""),
-            ("[[:alpha:]", ""),
-            ("x", "z"),
-        ];
-        let texts = [
-            "http://x/person/1234",
-            "Ada Lovelace",
-            "a\nb",
-            "a\nb\nc",
-            "abc",
-            "xa.b(y",
-            "ünïcode",
-            "",
-        ];
-        for (p, f) in patterns {
-            let eager = super::super::expr::compile_regex(p, f).ok();
-            let key = KeyRegex::compile(p, f);
-            assert_eq!(eager.is_some(), key.is_some(), "{p} {f}");
-            if let (Some(eager), Some(key)) = (eager, key) {
-                let copy = key.clone();
-                assert!(Arc::ptr_eq(&key.program, &copy.program));
-                for t in texts {
-                    assert_eq!(eager.is_match(t), key.is_match(t), "{p} {f} {t:?}");
-                    assert_eq!(key.is_match(t), copy.is_match(t), "{p} {f} {t:?}");
-                }
-            }
-        }
     }
 
     #[test]

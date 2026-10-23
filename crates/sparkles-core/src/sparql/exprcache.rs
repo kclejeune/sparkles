@@ -1024,8 +1024,7 @@ pub(super) fn key_filter_mask(
                         while payloads[j] != p {
                             j += 1;
                         }
-                        // the task's own clone: its regex caches need no lock
-                        h[j] = kf.test_mut(k);
+                        h[j] = kf.test(k);
                     };
                     if ctx.is_cursor() {
                         let scratch = ctx.charge(0)?;

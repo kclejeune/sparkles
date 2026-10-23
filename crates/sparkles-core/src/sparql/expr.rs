@@ -847,29 +847,6 @@ pub fn compile_regex(pattern: &str, flags: &str) -> EvalResult<regex::Regex> {
     shared_regex(pattern, flags).map(|r| (*r).clone())
 }
 
-/// The Rust regular expression of an XPath `pattern` with `flags`, or `None` for a flag
-/// that XPath does not define.
-pub(super) fn regex_text(pattern: &str, flags: &str) -> Option<String> {
-    let mut b = String::new();
-    let mut literal = false;
-    for f in flags.chars() {
-        match f {
-            'i' => b.push_str("(?i)"),
-            's' => b.push_str("(?s)"),
-            'm' => b.push_str("(?m)"),
-            'x' => b.push_str("(?x)"),
-            'q' => literal = true,
-            _ => return None,
-        }
-    }
-    if literal {
-        b.push_str(&regex::escape(pattern));
-    } else {
-        b.push_str(pattern);
-    }
-    Some(b)
-}
-
 /// The compiled pattern, from this thread's cache.
 fn shared_regex(pattern: &str, flags: &str) -> EvalResult<SharedRegex> {
     if let Some(r) = LAST_REGEX.with(|l| {
@@ -887,7 +864,23 @@ fn shared_regex(pattern: &str, flags: &str) -> EvalResult<SharedRegex> {
         }
         c.entry((pattern.to_string(), flags.to_string()))
             .or_insert_with(|| {
-                let b = regex_text(pattern, flags)?;
+                let mut b = String::new();
+                let mut literal = false;
+                for f in flags.chars() {
+                    match f {
+                        'i' => b.push_str("(?i)"),
+                        's' => b.push_str("(?s)"),
+                        'm' => b.push_str("(?m)"),
+                        'x' => b.push_str("(?x)"),
+                        'q' => literal = true,
+                        _ => return None,
+                    }
+                }
+                if literal {
+                    b.push_str(&regex::escape(pattern));
+                } else {
+                    b.push_str(pattern);
+                }
                 regex::RegexBuilder::new(&b)
                     .size_limit(1 << 22)
                     .build()
