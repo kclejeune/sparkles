@@ -503,3 +503,60 @@ fn protections_are_validated() {
     ))
     .unwrap();
 }
+
+/// A diff's ETag names the protections of the caller's view: a caller who lifts one
+/// protection and a caller under it read different bodies, so the tag of one never
+/// revalidates the other's request.
+#[tokio::test]
+async fn diff_etags_differ_between_lifted_and_kept_protections() {
+    let s = server();
+    let r = update_as(
+        &s.app,
+        "hr",
+        &b("tadmin"),
+        "INSERT DATA { <http://ex/zed> <http://ex/salary> 7 }",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let first = call(
+        &s.app,
+        "GET",
+        "/hr/diff",
+        &[("authorization", &b("thr"))],
+        "",
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    let (from, to) = (
+        first.header("sparkles-diff-from"),
+        first.header("sparkles-diff-to"),
+    );
+    let url = format!("/hr/diff?from={from}&to={to}&quads=true");
+    let hr = call(&s.app, "GET", &url, &[("authorization", &b("thr"))], "").await;
+    assert_eq!(hr.status, StatusCode::OK, "{}", hr.text());
+    assert!(hr.text().contains("salary"), "{}", hr.text());
+    let etag = hr.header("etag");
+    assert!(!etag.is_empty());
+    // the same request revalidates for the same caller
+    let again = call(
+        &s.app,
+        "GET",
+        &url,
+        &[("authorization", &b("thr")), ("if-none-match", &etag)],
+        "",
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::NOT_MODIFIED);
+    // a caller under the salary protection gets its own body
+    let staff = call(
+        &s.app,
+        "GET",
+        &url,
+        &[("authorization", &b("tstaff")), ("if-none-match", &etag)],
+        "",
+    )
+    .await;
+    assert_eq!(staff.status, StatusCode::OK, "{}", staff.text());
+    assert!(!staff.text().contains("salary"), "{}", staff.text());
+    assert_ne!(staff.header("etag"), etag);
+}
