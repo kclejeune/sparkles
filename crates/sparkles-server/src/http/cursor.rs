@@ -47,7 +47,8 @@ pub(super) struct Serve {
     /// The quick-query key of an answer that automatic execution chose to stream, and
     /// when its run began on the thread that planned it. A streamed answer that completes in one whole
     /// body is remembered with its time, as an eager one is, so that a quick query runs
-    /// in place again from its next run on.
+    /// in place again from its next run on. ASK retains automatic admission because
+    /// its native path may be necessary to fit the request's budgets.
     pub quick: Option<(u64, Instant)>,
 }
 
@@ -313,7 +314,12 @@ pub(super) async fn serve(
             if let Some((key, began)) = quick
                 && *ended.lock() == Some(sparkles::sparql::CursorStatus::Complete)
             {
-                QUICK.record(key, began.elapsed().as_secs_f64() * 1000.0);
+                let ms = began.elapsed().as_secs_f64() * 1000.0;
+                if kind == QueryKind::Ask {
+                    QUICK.record_ask(key, ms);
+                } else {
+                    QUICK.record(key, ms);
+                }
             }
             Body::from(body)
         }

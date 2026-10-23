@@ -295,3 +295,112 @@ async fn a_quick_streamed_scan_runs_in_place_the_second_time() {
     assert_eq!(stopped.json()["meta"]["status"], "stopped");
     assert!(!crate::http::QUICK.is_quick(key));
 }
+
+const BUDGETED_ASK: &str = "ASK {?left <urn:left> ?x . ?right <urn:right> ?y FILTER(?x = ?y)}";
+
+fn budgeted_ask_server(name: &str) -> Server {
+    let s = server();
+    let ds = s.state.attach(name, DbType::Mem, None).unwrap();
+    let mut data = String::new();
+    for i in 0..64 {
+        data.push_str(&format!("<urn:left:{i}> <urn:left> \"same\" .\n"));
+        data.push_str(&format!("<urn:right:{i}> <urn:right> \"same\" .\n"));
+    }
+    ds.store
+        .load(&[Source::from_bytes(
+            data.into_bytes(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    s
+}
+
+async fn budgeted_ask(app: &Router, name: &str, options: &str) -> Resp {
+    send(
+        app,
+        Request::post(format!("/{name}/sparql?nocache=true&{options}"))
+            .header(header::CONTENT_TYPE, "application/sparql-query")
+            .header(header::ACCEPT, "application/sparql-results+json")
+            .body(Body::from(BUDGETED_ASK))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quick_budgeted_ask_keeps_automatic_admission_on_repeated_http_requests() {
+    let name = "quick-native-ask";
+    let s = budgeted_ask_server(name);
+    let key = crate::http::inline::QuickQueries::key(name, BUDGETED_ASK);
+    crate::http::QUICK.ignore_time(key);
+    for run in 0..4 {
+        let r = budgeted_ask(&s.app, name, "execution=auto&max-rows=1024").await;
+        assert_eq!(r.status, StatusCode::OK, "run {run}: {}", r.text());
+        assert_eq!(r.json()["boolean"], true);
+        assert!(crate::http::QUICK.is_quick(key));
+    }
+    assert_eq!(crate::http::inline::ran_by_key(key), 3);
+    // Keeping Auto is a hint for automatic requests, not a forced execution mode.
+    let eager = budgeted_ask(&s.app, name, "execution=eager&max-rows=1024").await;
+    assert_eq!(eager.status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(eager.json()["budget"], "rows");
+    assert!(!crate::http::QUICK.is_quick(key));
+    let recovered = budgeted_ask(&s.app, name, "execution=auto&max-rows=1024").await;
+    assert_eq!(recovered.status, StatusCode::OK, "{}", recovered.text());
+    assert_eq!(recovered.json()["boolean"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quick_eager_ask_keeps_auto_when_a_repeated_http_request_lowers_its_budget() {
+    let name = "quick-eager-ask";
+    let s = budgeted_ask_server(name);
+    let key = crate::http::inline::QuickQueries::key(name, BUDGETED_ASK);
+    crate::http::QUICK.ignore_time(key);
+    let eager = budgeted_ask(&s.app, name, "execution=eager&max-rows=8192").await;
+    assert_eq!(eager.status, StatusCode::OK, "{}", eager.text());
+    assert_eq!(eager.json()["boolean"], true);
+    assert!(crate::http::QUICK.is_quick(key));
+    for run in 0..3 {
+        let r = budgeted_ask(&s.app, name, "execution=auto&max-rows=1024").await;
+        assert_eq!(r.status, StatusCode::OK, "run {run}: {}", r.text());
+        assert_eq!(r.json()["boolean"], true);
+    }
+    assert_eq!(crate::http::inline::ran_by_key(key), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quick_ordinary_ask_stays_in_place_with_the_same_answer() {
+    let s = server();
+    let query = "ASK {<http://example.org/alice> <http://xmlns.com/foaf/0.1/name> \"Alice\"}";
+    ignore_time(query);
+    let key = crate::http::inline::QuickQueries::key("ds", query);
+    for _ in 0..3 {
+        let r = select(&s.app, query, "application/sparql-results+json").await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json()["boolean"], true);
+    }
+    assert_eq!(crate::http::inline::ran_by_key(key), 2);
+}
+
+/// A current-thread runtime cannot execute in place, so its requests do not need
+/// scheduling history even when the previous response was quick.
+#[tokio::test]
+async fn an_ineligible_request_does_not_read_quick_query_history() {
+    let s = server();
+    let query = "SELECT ?eligibility_probe WHERE { VALUES ?eligibility_probe { 42 } }";
+    let key = crate::http::inline::QuickQueries::key("ds", query);
+    crate::http::QUICK.ignore_time(key);
+    assert!(!crate::http::inline::available());
+    let before = crate::http::QUICK.reads_by_key(key);
+    for _ in 0..2 {
+        let response = select(&s.app, query, "application/sparql-results+json").await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+        assert_eq!(
+            response.json()["results"]["bindings"][0]["eligibility_probe"]["value"],
+            "42"
+        );
+    }
+    assert_eq!(crate::http::inline::ran_by_key(key), 0);
+    assert_eq!(crate::http::QUICK.reads_by_key(key), before);
+}

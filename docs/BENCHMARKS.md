@@ -359,6 +359,12 @@ columns on the ordinary path before constructing an alternative.
 Planning and total server time are checked separately from execution time, which
 excludes the optimizer's work.
 
+The `q12a` follow-up selects the existing ASK cursor for a bounded pure
+variable-equality filter over an over-budget Cartesian candidate estimate. It
+preserves the query's limits and can stop after a qualifying binding. This does
+not replace the historical error or timing cells above. Its 10M acceptance remains
+open, along with the `q4`, `q5a` and `q6` default-budget failures.
+
 Sparkles loads the data in 4.12 s, against 8.90 s for Fluree, 9.70 s for QLever, 20.49 s
 for Oxigraph and 44.88 s for TDB2. Its index takes 307 MiB on disk, against QLever's
 294 MiB, and its load peaks at 2,264 MiB, against Fluree's 1,835 MiB and QLever's

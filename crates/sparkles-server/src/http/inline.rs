@@ -16,6 +16,8 @@
 //! apply either way.
 
 use parking_lot::Mutex;
+use std::collections::HashMap;
+#[cfg(test)]
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
@@ -91,13 +93,24 @@ pub fn run<T>(f: impl FnOnce() -> T) -> super::ApiResult<T> {
     })
 }
 
+/// How a quick query may execute on its next automatic request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickExecution {
+    Eager,
+    /// ASK may be quick because its native path avoids an over-budget eager product.
+    PreserveAuto,
+}
+
 /// The query texts (per dataset) whose last run was quick.
 #[derive(Default)]
 pub struct QuickQueries {
-    quick: Mutex<HashSet<u64>>,
+    quick: Mutex<HashMap<u64, QuickExecution>>,
     /// test hook: queries whose runs count as quick however long they took
     #[cfg(test)]
     timeless: Mutex<HashSet<u64>>,
+    /// Test-only history reads, separated by key for parallel router tests.
+    #[cfg(test)]
+    reads: Mutex<HashMap<u64, u64>>,
 }
 
 impl QuickQueries {
@@ -108,8 +121,24 @@ impl QuickQueries {
         h.finish()
     }
 
+    /// Read the scheduling and execution hint in one snapshot. A failed concurrent
+    /// request can remove it, but cannot turn this hint into a different policy.
+    pub fn execution(&self, key: u64) -> Option<QuickExecution> {
+        #[cfg(test)]
+        {
+            *self.reads.lock().entry(key).or_default() += 1;
+        }
+        self.quick.lock().get(&key).copied()
+    }
+
+    #[cfg(test)]
+    pub fn reads_by_key(&self, key: u64) -> u64 {
+        self.reads.lock().get(&key).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
     pub fn is_quick(&self, key: u64) -> bool {
-        self.quick.lock().contains(&key)
+        self.execution(key).is_some()
     }
 
     /// Test hook: a run of the query with this key that ends with a whole response
@@ -123,6 +152,16 @@ impl QuickQueries {
 
     /// Record how long a run of the query took, in milliseconds of work.
     pub fn record(&self, key: u64, ms: f64) {
+        self.record_execution(key, ms, QuickExecution::Eager);
+    }
+
+    /// A quick ASK can run in place, but still needs its automatic admission check.
+    /// Its eager execution may exceed a lower budget on a later request.
+    pub fn record_ask(&self, key: u64, ms: f64) {
+        self.record_execution(key, ms, QuickExecution::PreserveAuto);
+    }
+
+    fn record_execution(&self, key: u64, ms: f64, execution: QuickExecution) {
         #[cfg(test)]
         let ms = if ms.is_finite() && self.timeless.lock().contains(&key) {
             0.0
@@ -131,10 +170,10 @@ impl QuickQueries {
         };
         let mut set = self.quick.lock();
         if ms < QUICK_QUERY_MS {
-            if set.len() >= REMEMBERED && !set.contains(&key) {
+            if set.len() >= REMEMBERED && !set.contains_key(&key) {
                 set.clear();
             }
-            set.insert(key);
+            set.insert(key, execution);
         } else {
             set.remove(&key);
         }
@@ -164,6 +203,23 @@ mod tests {
         assert!(q.is_quick(a));
         q.record(a, f64::INFINITY);
         assert!(!q.is_quick(a));
+    }
+
+    #[test]
+    fn quick_ask_preserves_auto_until_failure_or_eviction() {
+        let q = QuickQueries::default();
+        let key = u64::MAX;
+        q.record(key, 0.1);
+        assert_eq!(q.execution(key), Some(QuickExecution::Eager));
+        q.record_ask(key, 0.1);
+        assert_eq!(q.execution(key), Some(QuickExecution::PreserveAuto));
+        q.record(key, f64::INFINITY);
+        assert_eq!(q.execution(key), None);
+        q.record_ask(key, 0.1);
+        for i in 0..REMEMBERED as u64 {
+            q.record(i, 0.1);
+        }
+        assert_eq!(q.execution(key), None);
     }
 
     #[test]

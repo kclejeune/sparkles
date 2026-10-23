@@ -100,7 +100,7 @@ Queries and updates follow the W3C recommendations and Jena ARQ's extensions, ch
 * SPARQL 1.1 Update: INSERT DATA, DELETE DATA, DELETE/INSERT WHERE, LOAD, CLEAR, DROP, CREATE, ADD, COPY and MOVE.
 * SERVICE (federated query, with SILENT) under an outbound network policy. On a server, only public destinations are allowed by default. The local `query` and `update` commands also reach private ones. The policy has allowlists, DNS pinning, checked redirects, timeouts and a response ceiling ([USAGE.md](USAGE.md#outbound-requests-service-and-load)).
 * Jena's service enhancer options on SERVICE ([API.md](API.md#service-options-loop-bulk-and-cache), spec [G10](specs/G10-service-enhancer.md)). `loop:` runs a SERVICE once per solution of the patterns before it, on the `LATERAL` operator with Jena's substitution. `bulk+n:` sends `n` solutions per request, as one VALUES block or as Jena's UNION, and asks again one at a time when an endpoint cuts a response short. `cache:` keeps each solution's remote result in a per-dataset cache with a memory budget, apart for each caller, with `cache+clear` and `cache+off`. `urn:x-arq:self` reads the dataset itself. Jena's tests of the module run against an endpoint in process.
-* Snapshot-owning SELECT and graph cursors in Rust, Python and Node, JVM SELECT pulls, and HTTP/CLI execution selection. Direct result writers use bounded output buffers, backpressure, cumulative budgets and body-lifetime cancellation. Joins resume across batches and are computed batch by batch with column kernels. Hash joins, DISTINCT and eligible aggregates retain charged state. ORDER BY with LIMIT keeps only its best rows in a bounded heap. A full sort and unsupported shapes expose budgeted materialization, failing explicitly when the budget is exceeded. Automatic execution, the default over HTTP, in the CLI, in Node and in the JVM library, streams immutable scans expected to return at least a thousand rows and groupings of an estimated 20,000 input rows or more, and runs every other plan eagerly. Cursor result writers decode the next batch ahead, and cursor filters and top-k read growing inputs. A cursor filter over an index scan reads the scan in morsels of whole blocks and filters each morsel in parallel, and a cursor range top-k ranks the parts of its range without value order a morsel at a time, holding only its best rows. `execution=eager` opts out, and explicit streaming can cost more on some workloads.
+* Snapshot-owning SELECT and graph cursors in Rust, Python and Node, JVM SELECT pulls, and HTTP/CLI execution selection. Direct result writers use bounded output buffers, backpressure, cumulative budgets and body-lifetime cancellation. Joins resume across batches and are computed batch by batch with column kernels. Hash joins, DISTINCT and eligible aggregates retain charged state. ORDER BY with LIMIT keeps only its best rows in a bounded heap. A full sort and unsupported shapes expose budgeted materialization, failing explicitly when the budget is exceeded. Automatic execution, the default over HTTP, in the CLI, in Node and in the JVM library, streams immutable scans expected to return at least a thousand rows and groupings of an estimated 20,000 input rows or more, and bounded pure ASK products whose eager candidates exceed a row or memory budget. Other plans run eagerly. Cursor result writers decode the next batch ahead, and cursor filters and top-k read growing inputs. A cursor filter over an index scan reads the scan in morsels of whole blocks and filters each morsel in parallel, and a cursor range top-k ranks the parts of its range without value order a morsel at a time, holding only its best rows. `execution=eager` opts out, and explicit streaming can cost more on some workloads.
 * Disk spill ([X08](specs/X08-disk-spill-and-server-memory.md) Phase 2b, `serve --spill on` or `encrypted`, `QueryOptions::spill`). A streamed sort without LIMIT writes sorted runs and merges them, and a grouping or a DISTINCT keeps what fits and handles the rest in later passes over files partitioned by a hash, so each finishes within its memory budget. In `SELECT DISTINCT … ORDER BY` the DISTINCT runs below the sort and numbers its rows, so it may spill and the order holds. A hash join whose build input outgrows its share partitions both inputs by a hash of the key, up to three levels, joins a heavy key as a block nested loop, and keeps its probe input's order only when an operator above relies on it. A merge join spools a long run of equal keys to a file. `--spill encrypted` seals every frame with AES-256-GCM under a key per file held only in memory. Spill files are versioned, CRC-checked, nameless while written and removed with their query or process, and a start removes what dead processes left. Disk is reserved per query (`--query-spill-mb`, `spill-mb=`) and for the server (`--spill-max-mb`), and a query over it fails with the `spill` budget. With spill on, automatic execution streams a query that eager execution would hold in more than half its budget and runs an eager query that exceeds its budget again as a cursor, unless it calls SERVICE. Spill is off by default until all Phase 2b acceptance gates pass. Enabling it with an unusable directory, one on tmpfs or ramfs or one that other users can write fails the start.
 * Result formats: JSON, XML, CSV, TSV and `x-sparkles+json` (with the executed plan). RDF formats: Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
 * W3C conformance: SPARQL 1.1 query 328/328, SPARQL 1.1 update 157/157, SPARQL 1.0 482/482 and SPARQL 1.2 269/269, with the vendored, patched `spargebra` ([`vendor/spargebra/PATCHED.md`](../vendor/spargebra/PATCHED.md)).
@@ -283,7 +283,10 @@ that work by priority and links each item to its design spec.
   run eagerly, and each operator then materializes its result within budgets. Automatic
   execution, the default over HTTP, in the CLI, in Node and in the JVM library, streams
   plain scans of a thousand rows or more and groupings of an estimated 20,000 input rows
-  or more. Other plans stream only when the caller asks for
+  or more. A bounded pure ASK with an equality-filtered Cartesian product also streams
+  when its estimated candidate table exceeds an existing row or memory budget. It stops
+  at the first qualifying pair and keeps the actual work limits. Other plans stream
+  only when the caller asks for
   `execution=streaming` ([X05](specs/X05-streaming-query-execution.md)). Streaming runs scans,
   joins, DISTINCT and eligible aggregates batch by batch. ORDER BY with LIMIT reads its
   input batch by batch into a heap of the rows it returns. Sorts without LIMIT and
@@ -291,8 +294,9 @@ that work by priority and links each item to its design spec.
   eagerly. With `--spill on` or `encrypted`, sorts, groupings, DISTINCT and joins finish
   within their budget, but a DISTINCT over an ordered input other than an ORDER BY keeps
   its whole set, a grouping's single group can outgrow the budget, and eager operators
-  still fail at their budget. A build without a usable shared key keeps its real
-  memory budget when spill is enabled. Ordered join output consolidates as it is
+  still fail at their budget. Completed hash joins release their working memory
+  at EOF. Grouping above an ordered spilled join remains a performance follow-up.
+  A build without a usable shared key keeps its real memory budget when spill is enabled. Ordered join output consolidates as it is
   produced, with at most 128 finished output files and one active writer. A spilled
   join that must keep its order writes its output
   once more to merge it. In the initial implementation's historical measurements,
@@ -300,7 +304,6 @@ that work by priority and links each item to its design spec.
   20-million-row sort and 10-million-group aggregate and DISTINCT matrix now pass
   in plain and encrypted modes under 64 MiB. Item 93 retains the execution
   follow-ups, performance investigation and review of enabling spill by default.
-  Low-budget grouping above an ordered spilled join remains a performance follow-up.
   The UI's result table, the MCP tools and the Python and JVM query calls
   run eagerly, because they report exact totals or return collected results. There is no
   FSST vocabulary compression, IRI encoding, pattern trick, pinned results, materialized
@@ -347,8 +350,8 @@ that work by priority and links each item to its design spec.
   [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates).
 * **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.
   The remaining budget work includes `q4` memory use, the large candidate products
-  before equality filters in `q5a` and `q6`, and eager candidate materialization in
-  `q12a` despite its ASK limit. [Roadmap](ROADMAP.md) item 91.
+  before equality filters in `q5a` and `q6`. The bounded automatic ASK policy covers
+  `q12a`; published reference acceptance remains open. [Roadmap](ROADMAP.md) item 91.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Derived facts still use
   the ordinary inferred graph. A separate derived-fact layer and canonical

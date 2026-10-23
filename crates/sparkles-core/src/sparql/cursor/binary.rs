@@ -735,6 +735,15 @@ impl Binary {
         Ok(())
     }
 
+    /// Release exhausted input and join state while keeping the operator's metadata.
+    /// Parents that spill can use this room for their remaining passes.
+    pub(super) fn release_working_sets(&mut self) {
+        self.index = None;
+        self.build = None;
+        self.probe = None;
+        self.spill = None;
+    }
+
     pub(super) fn next(
         &mut self,
         ctx: &Arc<Ctx>,
