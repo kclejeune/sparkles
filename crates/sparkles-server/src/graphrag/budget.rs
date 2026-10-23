@@ -136,6 +136,8 @@ pub enum Refusal {
     },
     /// an earlier attempt of this build used more than its reservation
     Anomaly(Anomaly),
+    /// the daily ledger could not be made durable, so nothing is reserved
+    Ledger(String),
 }
 
 impl Refusal {
@@ -160,8 +162,21 @@ impl Refusal {
                 ),
                 false,
             ),
+            Refusal::Ledger(m) => CallError::Admission(
+                "ledger-unavailable",
+                format!("the daily token ledger cannot be written, so no request is sent: {m}"),
+                false,
+            ),
         }
     }
+}
+
+/// Where a ledger keeps its daily ledger and its anomalies across restarts.
+pub trait Persist: Send + Sync {
+    /// Make the daily ledger durable. A reservation is refused when this fails.
+    fn day(&self, d: &DayLedger) -> Result<(), String>;
+    /// Record an anomaly, and raise its notice and metric.
+    fn anomaly(&self, a: &Anomaly);
 }
 
 struct Inner {
@@ -177,9 +192,16 @@ pub struct Ledger {
     inner: Mutex<Inner>,
     day: Arc<Mutex<DayLedger>>,
     today: Box<dyn Fn() -> u64 + Send + Sync>,
+    persist: Option<Arc<dyn Persist>>,
 }
 
 impl Ledger {
+    /// Keep the daily ledger and the anomalies through `p`.
+    pub fn persisted(mut self, p: Arc<dyn Persist>) -> Ledger {
+        self.persist = Some(p);
+        self
+    }
+
     pub fn new(
         tokens_per_build: u64,
         tokens_per_day: u64,
@@ -195,6 +217,7 @@ impl Ledger {
             }),
             day,
             today: Box::new(today),
+            persist: None,
         }
     }
 
@@ -237,9 +260,32 @@ impl Ledger {
                 which: "budget.tokensPerDay",
             });
         }
-        inner.build_used += tokens;
+        let before = *day;
         day.used += tokens;
+        // the reservation is durable before the request can be sent
+        if let Some(p) = &self.persist
+            && let Err(m) = p.day(&day)
+        {
+            *day = before;
+            return Err(Refusal::Ledger(m));
+        }
+        inner.build_used += tokens;
         Ok(today)
+    }
+
+    /// [`Ledger::reserve`] for other modules' tests.
+    #[cfg(test)]
+    pub fn reserve_for_test(&self, tokens: u64) -> Result<u64, String> {
+        self.reserve(tokens)
+            .map_err(|r| r.into_call_error().to_string())
+    }
+
+    fn persist_day(&self, d: &DayLedger) {
+        if let Some(p) = &self.persist
+            && let Err(m) = p.day(d)
+        {
+            tracing::warn!(target: "sparkles::graphrag", "the daily token ledger cannot be written: {m}");
+        }
     }
 
     /// Replace a reservation made on `day` by the reported usage.
@@ -252,8 +298,9 @@ impl Ledger {
             let credit = reserved - actual;
             inner.build_used -= credit;
             // a reservation of a day that has ended stays with that day
-            if same_day {
+            if same_day && credit > 0 {
                 d.used = d.used.saturating_sub(credit);
+                self.persist_day(&d);
             }
             return;
         }
@@ -261,6 +308,7 @@ impl Ledger {
         inner.build_used = inner.build_used.saturating_add(excess);
         if same_day || d.day == (self.today)() {
             d.used = d.used.saturating_add(excess);
+            self.persist_day(&d);
         }
         tracing::warn!(
             target: "sparkles::graphrag",
@@ -268,13 +316,17 @@ impl Ledger {
             bound.provider,
             bound.source.as_str()
         );
-        inner.anomaly.get_or_insert(Anomaly {
+        let a = Anomaly {
             provider: bound.provider.clone(),
             model: bound.model.clone(),
             source: bound.source,
             reserved,
             reported: actual,
-        });
+        };
+        if let Some(p) = &self.persist {
+            p.anomaly(&a);
+        }
+        inner.anomaly.get_or_insert(a);
     }
 }
 

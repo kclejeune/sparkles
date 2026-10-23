@@ -2,14 +2,14 @@
 //! in `<db>/graphrag/state.json`.
 //!
 //! It holds the communities of the last build, which the next build matches for stable
-//! identities, the daily token ledger that concurrent builds share across restarts, and
-//! the accounting anomalies of recent builds. The file carries a format version, and a
+//! identities. The daily token ledger and the anomalies live in a small file of their
+//! own ([`super::ledger`]), since they change with every model request. The file
+//! carries a format version, and a
 //! reader refuses a version it does not know. Every collection has a bound, checked when
 //! the state is read and before it is written, so a damaged or hostile file cannot make a
 //! build allocate without limit. Writes replace the file durably through a temporary
 //! file, a flush and a rename.
 
-use super::budget::{Anomaly, DayLedger};
 use super::identity::Previous;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -23,8 +23,6 @@ pub const MAX_COMMUNITIES: usize = 200_000;
 pub const MAX_MEMBER_ENTRIES: usize = 5_000_000;
 /// The longest member term, in bytes.
 pub const MAX_TERM_BYTES: usize = 8_192;
-/// The anomalies kept, the latest last.
-pub const MAX_ANOMALIES: usize = 32;
 /// The largest state file read, in bytes.
 pub const MAX_FILE_BYTES: u64 = 1 << 30;
 
@@ -87,10 +85,6 @@ pub struct BuildState {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_build: Option<BuildRecord>,
-    #[serde(default)]
-    pub day_ledger: DayLedger,
-    #[serde(default)]
-    pub anomalies: Vec<Anomaly>,
 }
 
 impl Default for BuildState {
@@ -98,8 +92,6 @@ impl Default for BuildState {
         BuildState {
             version: STATE_VERSION,
             last_build: None,
-            day_ledger: DayLedger::default(),
-            anomalies: Vec::new(),
         }
     }
 }
@@ -147,12 +139,6 @@ impl BuildState {
     pub fn check(&self) -> Result<(), StateError> {
         if self.version != STATE_VERSION {
             return Err(StateError::UnknownVersion(self.version.into()));
-        }
-        if self.anomalies.len() > MAX_ANOMALIES {
-            return Err(StateError::Bound {
-                what: "anomalies",
-                limit: MAX_ANOMALIES,
-            });
         }
         let Some(b) = &self.last_build else {
             return Ok(());
@@ -282,13 +268,6 @@ impl BuildState {
         Ok(())
     }
 
-    /// Record an anomaly, keeping the latest [`MAX_ANOMALIES`].
-    pub fn record_anomaly(&mut self, a: Anomaly) {
-        self.anomalies.push(a);
-        let over = self.anomalies.len().saturating_sub(MAX_ANOMALIES);
-        self.anomalies.drain(..over);
-    }
-
     /// The previous build's communities, for identity matching.
     pub fn previous(&self) -> Vec<Previous> {
         self.last_build.as_ref().map_or_else(Vec::new, |b| {
@@ -307,8 +286,6 @@ impl BuildState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graphrag::budget::Source;
-    use serde_json::json;
 
     fn community(iri: &str, members: &[&str]) -> StoredCommunity {
         StoredCommunity {
@@ -327,10 +304,6 @@ mod tests {
                 finished_at: "2026-10-23T00:00:00Z".into(),
                 communities: vec![community("a", &["<urn:a>", "<urn:b>"])],
             }),
-            day_ledger: DayLedger {
-                day: 20_000,
-                used: 7,
-            },
             ..BuildState::default()
         }
     }
@@ -376,23 +349,6 @@ mod tests {
         s.last_build.as_mut().unwrap().communities[0].iri = "urn:other".into();
         assert!(matches!(s.check(), Err(StateError::Corrupt(_))));
         let mut s = state();
-        s.anomalies = vec![
-            Anomaly {
-                provider: "p".into(),
-                model: "m".into(),
-                source: Source::ByteBound,
-                reserved: 1,
-                reported: 2,
-            };
-            MAX_ANOMALIES + 1
-        ];
-        assert!(matches!(s.check(), Err(StateError::Bound { .. })));
-        let v = serde_json::to_vec(&s).unwrap();
-        assert!(matches!(
-            BuildState::parse(&v),
-            Err(StateError::Bound { .. })
-        ));
-        let mut s = state();
         s.last_build.as_mut().unwrap().communities[0].members =
             vec!["x".repeat(MAX_TERM_BYTES + 1)];
         assert!(matches!(s.check(), Err(StateError::Bound { .. })));
@@ -412,26 +368,5 @@ mod tests {
         assert!(matches!(e, StateError::Bound { what: "bytes", .. }), "{e}");
         assert_eq!(BuildState::load(dir.path()).unwrap(), small);
         assert!(!dir.path().join("graphrag/state.json.tmp").exists());
-    }
-
-    #[test]
-    fn anomalies_keep_the_latest() {
-        let mut s = BuildState::default();
-        for i in 0..(MAX_ANOMALIES as u64 + 5) {
-            s.record_anomaly(Anomaly {
-                provider: "p".into(),
-                model: "m".into(),
-                source: Source::ProviderEndpoint,
-                reserved: i,
-                reported: i + 1,
-            });
-        }
-        assert_eq!(s.anomalies.len(), MAX_ANOMALIES);
-        assert_eq!(
-            s.anomalies.last().unwrap().reserved,
-            MAX_ANOMALIES as u64 + 4
-        );
-        s.check().unwrap();
-        let _ = json!(s);
     }
 }
