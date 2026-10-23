@@ -727,8 +727,9 @@ kernels and decoded terms. They exclude allocator metadata, size classes and pro
 RSS, and do not establish a performance result.
 
 Roadmap item 2 finished Phase 1 on 2026-10-18, when its A1 and latency gates were met.
-Roadmap item 1 ran the Phase 1a suite at 10.5M and on DBpedia on 2026-10-23. The default
-profile passes and the `small` profile does not, as
+Roadmap item 1 ran the Phase 1a suite at 10.5M and on DBpedia on 2026-10-23, comparing the
+two profiles. The `small` profile is more than 5% slower than the default on several cold
+queries, and the control run with the earlier defaults is still missing, as
 [the profile runs](#profile-runs-at-105m-and-on-dbpedia-2026-10-23) describe.
 Phase 2 is built for sorts, groupings and DISTINCT under item 7, and item 85 added
 hash-join spill, the merge-join spool, DISTINCT below an ORDER BY and encryption on
@@ -1040,11 +1041,11 @@ latency gates, and roadmap item 1 ran the 10.5M and DBpedia profile runs on 2026
   object is collected.
 * A lock-free `try_grant` when no request waits, measured with the latency gate above.
   Admission takes the queue's lock on every request.
-* The `small` profile's cold reads. The profile gate of §3.3 ran at 10.5M and on DBpedia
-  on 2026-10-23. The default profile passes it, and the `small` profile is more than 5%
-  slower on several cold queries, as
+* The profile gate of §3.3. Its runs at 10.5M and on DBpedia on 2026-10-23 compared the
+  two profiles, without the control run with the defaults from before the profiles. The
+  `small` profile is more than 5% slower than the default on several cold queries, as
   [the profile runs](#profile-runs-at-105m-and-on-dbpedia-2026-10-23) describe.
-  [Roadmap](../ROADMAP.md) item 97 retunes the profile.
+  [Roadmap](../ROADMAP.md) item 97 retunes the profile and adds the control run.
 * A settings-file profile (C19) and the `small` default for the bindings (§8.2).
 * Admitting SHACL-SPARQL, reasoning and ShEx through the pool, an initial grant that
   follows `memory-mb`, and the JVM option.
@@ -1404,12 +1405,14 @@ every run with the same answers.
 | DBpedia 50M, cold | Geometric mean 1.006. Single samples of `outlink-classes-1`, `category-tree`, `costar-birthplace` and `category-people-2` are 21% to 59% slower. |
 | DBpedia 50M, RSS after the run | 797 MiB in both runs against 831 and 839 MiB. |
 
-The default profile is the reference of the comparison and keeps its values. The `small`
-profile saves about 100 MiB of RSS at 10.5M and 40 MiB on DBpedia, and costs little warm,
-but it fails the 5% rule on cold queries. Its 256 MiB block cache is the likely cause,
+The default profile is the reference of this comparison. §3.3 also asks for a run with the
+defaults from before the profiles, which these runs did not include, so they show the
+`small` profile's cost against the default profile but do not decide the default
+profile's own gate. The `small` profile saves about 100 MiB of RSS at 10.5M and 40 MiB on
+DBpedia, and costs little warm, but it is more than 5% slower on cold queries. Its 256 MiB block cache is the likely cause,
 since a cold `star-lookup` reads more blocks than that cache keeps while the same query is
 within 1% warm. [Roadmap](../ROADMAP.md) item 97 retunes the profile and repeats the
-runs. The DBpedia cold differences come from one sample per query and run, so the retune
+runs with the control. The DBpedia cold differences come from one sample per query and run, so the retune
 should take more cold samples there.
 
 ### Full-scale spill acceptance, item 93 (2026-10-21)

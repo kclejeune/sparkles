@@ -869,20 +869,21 @@ including failures, and names the engines it carries over.
 
 Each template has three fixed instances, timed ten times after two warm-ups per
 instance. The table pools those thirty HTTP samples. A dagger marks an answer that
-differs from the majority and is excluded from ranking. QLever's timing run failed from
-q4 on, so its cells there are errors. Oxigraph timed out on two q7 instances, so its
-pooled cell is a timeout.
+differs from the majority and is excluded from ranking. QLever's answer check on forge
+left q4 to q8 without fingerprints, although all its timed requests succeeded, so its
+answers there come from the capture on atlas described below. Oxigraph timed out on two
+q7 instances, so its pooled cell is a timeout.
 
 | Template, median ms | Sparkles | Jena | QLever | Fluree | Oxigraph |
 |---|---:|---:|---:|---:|---:|
 | q1 | **13.59** | 3,241.71 | 52.51 | 155.26 | 2,077.28 |
 | q2 | 2,015.52 | 3,562.21 | **179.28** | 23.10 † | 32,569.39 |
 | q3 | 35.18 | 1,733.90 | **28.45** | 287.78 † | 3,287.87 |
-| q4 | **152.80** | 8,452.57 | error | 162.22 | 6,868.73 |
-| q5 | **27.32** | 198.17 | error | 693.70 | 138.93 |
-| q6 | **16.50** | 23.72 | error | 338.27 † | 28.77 |
-| q7 | **52.62** | 74.60 | error | 210.01 † | timeout |
-| q8 | **35.04** | 121.75 | error | 202.66 † | 184.04 |
+| q4 | **152.80** | 8,452.57 | 1,848.57 | 162.22 | 6,868.73 |
+| q5 | **27.32** | 198.17 | 98.63 | 693.70 | 138.93 |
+| q6 | **16.50** | 23.72 | 67.88 † | 338.27 † | 28.77 |
+| q7 | **52.62** | 74.60 | 59.38 | 210.01 † | timeout |
+| q8 | **35.04** | 121.75 | 68.09 † | 202.66 † | 184.04 |
 
 The answer checks were completed for this refresh. Each engine served the same data
 alone on atlas, with the same binaries, and its raw answers to the 24 fixed instances
@@ -901,7 +902,8 @@ on q2, q3, q6, q7 and q8.
 
 Sparkles has the lowest median on q1 and q4 to q8. Its q4 lead over Fluree is within
 10%. QLever is 11.2 times faster on q2 and 1.24 times on q3, where its answers agree
-with Sparkles'.
+with Sparkles'. QLever's q6 answers and two of its three q8 answers differ from the
+majority, so those cells carry a dagger.
 
 The driver uses generated parameters beyond the three fixed instances. It requested
 fifty warm-up mixes and five hundred measured mixes at each client count, with a

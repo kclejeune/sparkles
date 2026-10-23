@@ -344,9 +344,10 @@ that work by priority and links each item to its design spec.
   1.157 times the anonymous memory that one dataset and the cache bytes predict.
   [Roadmap](ROADMAP.md) item 88.
 * **Memory profiles at scale.** The default and `small` memory profiles were measured at
-  1.05M and 10.5M triples and on the DBpedia 50M slice, warm and cold. The default profile
-  passes the X08 Phase 1a gate. The `small` profile saves about 100 MiB of RSS at 10.5M,
-  but its cold `star-lookup` at 10.5M is 79% slower and several other cold queries are 7%
+  1.05M and 10.5M triples and on the DBpedia 50M slice, warm and cold, but without the
+  control run with the defaults from before the profiles that the X08 Phase 1a gate asks
+  for. The `small` profile saves about 100 MiB of RSS at 10.5M, but its cold `star-lookup`
+  at 10.5M is 79% slower than the default profile's and several other cold queries are 7%
   to 10% slower, past the gate's 5%. [Roadmap](ROADMAP.md) item 97.
 * **EXISTS over a Cartesian product.** A `FILTER NOT EXISTS` above a Cartesian product
   runs eagerly and materializes the product before it filters, while the same product

@@ -1063,9 +1063,11 @@ the sorted derived triples is the comparison.
 
 Both binaries derived the same closure, by digest, in every run that both finished, at
 every OWL2Bench size from 1 to 200 universities under `rdfs` and in both LUBM(100)
-profiles. On LUBM(100) with OWL 2 RL and 20 threads the head is 1.54 times faster than
-the baseline, which meets A3's 1.5 times for 16 threads. A3's 1-thread run was not
-repeated here. The head's peak RSS is 0.65 times the baseline's on LUBM(100) `rdfs` and
+profiles. A3 ran separately on LUBM(100) with OWL 2 RL, with `RAYON_NUM_THREADS` set for
+both binaries because the baseline has no `--threads`, twice per binary in the order head,
+base, base, head. At 16 threads the head took 16.6 and 16.5 s against the baseline's 26.1
+and 25.4 s, 1.56 times faster, and at 1 thread 33.1 and 33.0 s against 36.2 and 36.1 s, so
+A3 is met. All eight runs derived the same closure. The head's peak RSS is 0.65 times the baseline's on LUBM(100) `rdfs` and
 0.62 times on OWL2Bench at 200 universities, short of A1's half, although A1 sets the
 half for LUBM(1000), which neither binary can finish. OWL2Bench under OWL 2 RL from five
 universities on also stops at the limit in both binaries.
