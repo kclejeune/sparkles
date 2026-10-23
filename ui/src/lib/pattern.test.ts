@@ -17,8 +17,11 @@ import {
   overCaps,
   removalRange,
   renamed,
+  missingPrefixes,
   resolveEdit,
+  resolveIri,
   resolveTerm,
+  stillNames,
   textOrder,
   triplesOf,
   type Change,
@@ -419,6 +422,10 @@ describe('edits as splices', () => {
     expect(() => checkTerm('"x"^^<http://t>.?x<http://p>?y', 'o')).toThrow(EditError);
     expect(() => checkTerm('"x"^^xsd:int ?y', 'o')).toThrow(EditError);
     expect(() => checkTerm('<http://a> <http://b>', 's')).toThrow(EditError);
+    // dots inside a prefixed name, not at its end
+    expect(checkTerm('"x"^^ex:version.1', 'o')).toBe('"x"^^ex:version.1');
+    expect(checkTerm('ex:a.b', 's')).toBe('ex:a.b');
+    expect(() => checkTerm('"x"^^ex:v. ?y', 'o')).toThrow(EditError);
   });
 
   it('R3: the gate refuses a result that does not agree with the edit', () => {
@@ -444,7 +451,8 @@ describe('edits as splices', () => {
       o: '?x',
     });
     expect(out).toBe(
-      'SELECT * {\n  ?s <http://p> [ <http://q> 1 ] . # c\n  ?s <http://r> ?x .\n}\n',
+      // no byte of the locked statement and its comment changes: the `.` opens the new line
+      'SELECT * {\n  ?s <http://p> [ <http://q> 1 ] # c\n  . ?s <http://r> ?x .\n}\n',
     );
     expect(parses(out)).toBe(true);
   });
@@ -469,6 +477,48 @@ describe('edits as splices', () => {
       'SELECT * {\n  ?s <http://p> ?v .\n  OPTIONAL { ?s <http://p> ?o } # note\n  . FILTER(?v > 1)\n  .\n  ?v <http://q> ?w .\n}\n',
     );
     expect(parses(added)).toBe(true);
+  });
+
+  it('drops an edge id that typing made ambiguous', () => {
+    const before = drawing(fx('dups').p);
+    const after = drawing(fx('dups-changed').p);
+    const second = before.edges[1].id;
+    // the second required copy's id now names the OPTIONAL copy
+    expect(after.edges.find((x) => x.id === second)!.optional).toBe(true);
+    expect(stillNames(before, after, second)).toBe(false);
+    const a3 = drawing(fx('a3').p);
+    expect(stillNames(a3, a3, a3.edges[0].id)).toBe(true);
+    expect(stillNames(a3, drawing(fx('two').p), a3.edges[0].id)).toBe(false);
+  });
+
+  it('resolves relative IRIs as the parser does, without normalizing them', () => {
+    expect(resolveIri('é', 'http://example.org/')).toBe('http://example.org/é');
+    expect(resolveIri('x', 'http://Example.org:80/a/b')).toBe('http://Example.org:80/a/x');
+    // RFC 3986 §5.4
+    const b = 'http://a/b/c/d;p?q';
+    expect(resolveIri('g', b)).toBe('http://a/b/c/g');
+    expect(resolveIri('../g', b)).toBe('http://a/b/g');
+    expect(resolveIri('../../../g', b)).toBe('http://a/g');
+    expect(resolveIri('//g', b)).toBe('http://g');
+    expect(resolveIri('?y', b)).toBe('http://a/b/c/d;p?y');
+    expect(resolveIri('#s', b)).toBe('http://a/b/c/d;p?q#s');
+    expect(resolveIri('', b)).toBe('http://a/b/c/d;p?q');
+    expect(resolveIri('./g/.', b)).toBe('http://a/b/c/g/');
+    expect(resolveIri('urn:x', b)).toBe('urn:x');
+  });
+
+  it('declares the dataset’s prefixes an add uses, the empty one and datatypes included', () => {
+    const { p } = fx('undeclared');
+    const dataset = { '': 'http://d/', ex: 'http://e/', xsd: 'http://x/' };
+    expect(missingPrefixes([':s', 'ex:p', '"1"^^xsd:int', 'toString:x'], p, dataset)).toEqual([
+      { prefix: '', iri: 'http://d/' },
+      { prefix: 'ex', iri: 'http://e/' },
+      { prefix: 'xsd', iri: 'http://x/' },
+    ]);
+    const { text, p: one } = fx('one-line');
+    expect(() =>
+      edit(text, one, { kind: 'add', s: '?o', p: '<http://x/v>', o: '"1"^^nope:t' }),
+    ).toThrow('The prefix "nope:" is not declared');
   });
 
   it('refuses terms it would not write', () => {
@@ -529,6 +579,26 @@ describe.skipIf(!existsSync(built))('the built module', async () => {
     expect(pattern(scope).ok).toBe(true);
     expect(strict(scope).ok).toBe(false);
     expect(strict('SELECT * { ?s ?p ?o }').ok).toBe(true);
+  });
+
+  it('R3 agrees across a declared prefix and a non-ASCII relative IRI', () => {
+    const cases: [string, Edit][] = [
+      [
+        'SELECT * { ?s ex:p ?o }',
+        { kind: 'add', s: '?o', p: 'ex:q', o: '?z', declare: [{ prefix: 'ex', iri: 'http://e/' }] },
+      ],
+      [
+        'BASE <http://example.org/> SELECT * { ?s ?p ?o }',
+        { kind: 'add', s: '<é>', p: '<p>', o: '?o' },
+      ],
+    ];
+    for (const [text, e] of cases) {
+      const p = pattern(text) as PatternOk;
+      const next = applyChanges(text, edit(text, p, e));
+      const after = pattern(next) as PatternOk;
+      expect(after.ok, next).toBe(true);
+      expect(agrees(p, e, after), next).toBe(true);
+    }
   });
 
   it('answers the fixtures', () => {

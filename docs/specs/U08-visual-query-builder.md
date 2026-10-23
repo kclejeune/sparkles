@@ -557,11 +557,17 @@ isolated history entry, and `undo` and `redo`, which the pane calls for `Mod+Z` 
 fields of the add form, so they work in the list and in an element's panel as on the
 canvas. An edit names its triple by the id of its edge, which is resolved again against
 the text as it is when the edit is made, so typing between a selection and its edit never
-moves the edit to another triple. When the edge is gone the pane refuses with "The
-pattern changed, select the edge again". Before a canvas edit is applied, the pane parses
-its result with `strict: true` and checks R3 on that parse. An added triple must be the
-only new one and carry the terms that were typed. A deleted triple must be the only one
-gone, and an optional toggle must move just that triple in or out of an `OPTIONAL`. A
+moves the edit to another triple. An id that typing made ambiguous, because another copy
+of the same triple changed and the copies were numbered again, does not count as found.
+When the edge is gone or ambiguous the pane refuses with "The pattern changed, select the
+edge again". Before a canvas edit is applied, the pane parses its result with
+`strict: true` and checks R3 on that parse, comparing triples by their terms as written.
+An added triple must be the only new one and carry the terms that were typed. A deleted
+triple must be the only one gone, and an optional toggle must move just that triple in or
+out of an `OPTIONAL`. A locked statement that ends in a comment and lacks its `.` gets the
+`.` at the start of the new triple's line, since no byte of a locked range is written.
+Typed IRIs are resolved against `BASE` by RFC 3986 without normalization, as the reader
+does. A
 prefixed name whose prefix neither the query nor the dataset declares is refused before
 that, and a typed term is resolved under the query's prefixes and `BASE` to find the
 group that holds its patterns. New nodes are placed by an fcose run with every known node
@@ -603,8 +609,8 @@ checking R2, that the locked blocks stay byte-identical and that the only deleti
 range the edit names, and R3, that the parse agrees with the edit. The layout map's tests
 cover storage bounds, restore and renames. `ui/tests/mock/pattern.spec.ts` covers A1, A2,
 A6 to A9, A11, locked blocks through a sequence of canvas edits, the error states of
-§2.7, the result's Pattern tab, and the 390 px layout. Each of the 14 findings of the
-first review has a regression test in one of these suites.
+§2.7, the result's Pattern tab, and the 390 px layout. The two code reviews found 14 and
+then 6 problems, and each fix has a regression test in one of these suites.
 
 **Measurements.** `ui/tests/mock/pattern-perf.spec.ts` runs A10 when `PATTERN_PERF=1`
 is set. On the development laptop, under a load average of about 20 from other builds

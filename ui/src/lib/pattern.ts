@@ -710,11 +710,15 @@ function insertItem(
   if (after) {
     let end = itemRange(after).to;
     if (after.type === 'triple' || (after.type === 'locked' && after.kind === 'triples')) {
-      // a statement that ends without its `.` (which it holds), before a triple statement;
-      // a locked statement's range runs over a trailing comment, so its `.` goes at `end`
+      // a statement that ends without its `.` (which it holds), before a triple statement
       const last = after.type === 'locked' ? (after.end ?? end) : end;
       const dotted = text.slice(after.range.from, last).trimEnd().endsWith('.');
-      if (!dotted && isTriple) changes.push({ from: last, to: last, insert: ' .' });
+      if (!dotted && isTriple) {
+        if (last === end) changes.push({ from: end, to: end, insert: ' .' });
+        // a locked statement's range runs over its trailing comment, which no byte may be
+        // written into, so the `.` opens the new item's line instead
+        else fragment = `. ${fragment}`;
+      }
     } else if (after.dot) {
       // the `.` that follows another element, maybe after a comment or a line break
       end = after.dot.to;
@@ -800,7 +804,9 @@ export type Edit = AddTriple | TripleEdit;
 export class EditError extends Error {}
 
 const IRIREF = String.raw`<[^<>"{}|^${'`'}\\\s]*>`;
-const PNAME = String.raw`(?:[\p{L}][\p{L}\p{N}_.-]*)?:[\p{L}\p{N}_:%-]*`;
+// a prefixed name as SPARQL writes it: dots inside the prefix and the local part, not at
+// their ends; escapes and odd characters are left to the strict parse of the result
+const PNAME = String.raw`(?:[\p{L}](?:[\p{L}\p{N}_.\-]*[\p{L}\p{N}_\-])?)?:(?:[\p{L}\p{N}_:%\-](?:[\p{L}\p{N}_:%.\-]*[\p{L}\p{N}_:%\-])?)?`;
 const TAG = String.raw`(@[a-zA-Z]+(-[a-zA-Z0-9]+)*|\^\^(${IRIREF}|${PNAME}))?`;
 const IRI_RE = new RegExp(`^${IRIREF}$`);
 const PNAME_RE = new RegExp(`^${PNAME}$`, 'u');
@@ -837,14 +843,102 @@ type Prefixes = { prefix: string; iri: string }[];
 const prefixOf = (t: string): string | null =>
   !/^[?$_<"'+\-.\d]/.test(t) && PNAME_RE.test(t) ? t.slice(0, t.indexOf(':')) : null;
 
-/** An IRI resolved against the query's BASE, as the parser resolves it. */
-function resolveIri(iri: string, base: string | null | undefined): string {
-  if (!base || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(iri)) return iri;
-  try {
-    return new URL(iri, base).href;
-  } catch {
-    return iri;
+/** The prefixes a checked term uses: its own, or its datatype's (`"1"^^xsd:int`). */
+export function prefixesIn(term: string): string[] {
+  const own = prefixOf(term);
+  if (own !== null) return [own];
+  const dt = /\^\^([^<].*)$/u.exec(term)?.[1];
+  const p = dt !== undefined ? prefixOf(dt) : null;
+  return p !== null ? [p] : [];
+}
+
+/**
+ * The PREFIX lines an add needs for its terms: each prefix they use that the query does
+ * not declare and the dataset does, the empty prefix of `:p` included, once.
+ */
+export function missingPrefixes(
+  terms: string[],
+  p: PatternOk,
+  dataset: Record<string, string>,
+): Prefixes {
+  const declared = new Set(p.prologue.prefixes.map((x) => x.prefix));
+  const out: Prefixes = [];
+  for (const t of terms)
+    for (const prefix of prefixesIn(t.trim()))
+      if (
+        !declared.has(prefix) &&
+        Object.hasOwn(dataset, prefix) &&
+        !out.some((x) => x.prefix === prefix)
+      )
+        out.push({ prefix, iri: dataset[prefix] });
+  return out;
+}
+
+/** The parts of an IRI reference (RFC 3986 §3), without normalization. */
+function iriParts(iri: string) {
+  const m =
+    /^(?:([a-zA-Z][a-zA-Z0-9+.-]*):)?(?:\/\/([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/u.exec(
+      iri,
+    )!;
+  return { scheme: m[1], authority: m[2], path: m[3], query: m[4], fragment: m[5] };
+}
+
+/** RFC 3986 §5.2.4. */
+function removeDots(path: string): string {
+  let input = path;
+  let out = '';
+  while (input) {
+    if (input.startsWith('../')) input = input.slice(3);
+    else if (input.startsWith('./')) input = input.slice(2);
+    else if (input.startsWith('/./')) input = input.slice(2);
+    else if (input === '/.') input = '/';
+    else if (input.startsWith('/../') || input === '/..') {
+      input = '/' + input.slice(input === '/..' ? 3 : 4);
+      out = out.slice(0, Math.max(out.lastIndexOf('/'), 0));
+    } else if (input === '.' || input === '..') input = '';
+    else {
+      const m = /^\/?[^/]*/.exec(input)![0];
+      out += m;
+      input = input.slice(m.length);
+    }
   }
+  return out;
+}
+
+/**
+ * An IRI resolved against the query's BASE as the parser resolves it (RFC 3986 §5.2, as
+ * oxiri does): no percent-encoding and no normalization of the host or port, which the
+ * WHATWG `URL` would add.
+ */
+export function resolveIri(iri: string, base: string | null | undefined): string {
+  if (!base) return iri;
+  const r = iriParts(iri);
+  if (r.scheme !== undefined) return iri;
+  const b = iriParts(base);
+  let authority = b.authority;
+  let path: string;
+  let query = r.query;
+  if (r.authority !== undefined) {
+    authority = r.authority;
+    path = removeDots(r.path);
+  } else if (r.path === '') {
+    path = b.path;
+    if (query === undefined) query = b.query;
+  } else if (r.path.startsWith('/')) path = removeDots(r.path);
+  else {
+    const merged =
+      b.authority !== undefined && b.path === ''
+        ? `/${r.path}`
+        : b.path.slice(0, b.path.lastIndexOf('/') + 1) + r.path;
+    path = removeDots(merged);
+  }
+  return (
+    `${b.scheme}:` +
+    (authority !== undefined ? `//${authority}` : '') +
+    path +
+    (query !== undefined ? `?${query}` : '') +
+    (r.fragment !== undefined ? `#${r.fragment}` : '')
+  );
 }
 
 /**
@@ -899,15 +993,12 @@ export function edit(text: string, p: PatternOk, e: Edit): Change[] {
     const o = checkTerm(e.o, 'o');
     const declare = declarations(p, e);
     // a prefixed name needs its prefix declared by the query or by the edit
-    for (const t of [s, pr, o]) {
-      const prefix = prefixOf(t);
+    for (const prefix of [s, pr, o].flatMap(prefixesIn))
       if (
-        prefix !== null &&
         !p.prologue.prefixes.some((x) => x.prefix === prefix) &&
         !declare.some((x) => x.prefix === prefix)
       )
         throw new EditError(`The prefix "${prefix}:" is not declared`);
-    }
     const subject = resolveTerm(s, p, declare);
     const binds = bindsOf(subject, resolveTerm(pr, p, declare), resolveTerm(o, p, declare));
     // the group of the subject's patterns
@@ -965,6 +1056,21 @@ function declarations(p: PatternOk, e: AddTriple): Prefixes {
   return out;
 }
 
+/**
+ * Whether an edge id taken from drawing `before` still names the same triple in `after`,
+ * the drawing of the text after typing: the id must be in both, unambiguous in both (its
+ * occurrence number moves when another copy of the same triple changes), and on the same
+ * side of an OPTIONAL. Otherwise the selection is dropped and an edit is refused.
+ */
+export function stillNames(before: Drawing, after: Drawing, edge: string): boolean {
+  const base = edge.slice(0, edge.lastIndexOf('|') + 1);
+  const copies = (d: Drawing) => d.edges.filter((x) => x.id.startsWith(base) && x.triple);
+  const a = copies(before);
+  const b = copies(after);
+  if (a.length !== 1 || b.length !== 1) return false;
+  return a[0].id === edge && b[0].id === edge && a[0].optional === b[0].optional;
+}
+
 /** The triple whose edge has this id in the drawing of `p`. */
 export function resolveEdit(p: PatternOk, edge: string): Placed | undefined {
   return drawing(p).edges.find((x) => x.id === edge)?.triple;
@@ -1008,11 +1114,14 @@ function merge(dels: Change | Change[], inserts: Change[]): Change[] {
   ];
 }
 
-/** A triple as the parse gives it, for comparing two parses (R3). */
-function signature(s: Term, p: { kind: string; value: string; text: string }, o: Term): string {
-  const pred = p.kind === 'path' ? `path:${p.text}` : `${p.kind}:${p.value}`;
-  const obj = o.kind === 'literal' ? `l:${o.value}` : termKey(o);
-  return `${termKey(s)} ${pred} ${obj}`;
+/**
+ * A triple by its terms as written, for comparing two parses (R3). The splices never
+ * rewrite a term, and the only prologue change is a PREFIX line for a prefix the query did
+ * not declare, so the same text means the same term on both sides, while resolved values
+ * would differ for exactly the names that line declares.
+ */
+function signature(s: { text: string }, p: { text: string }, o: { text: string }): string {
+  return `${s.text} ${p.text} ${o.text}`;
 }
 
 /**
@@ -1040,9 +1149,7 @@ export function agrees(before: PatternOk, e: Edit, after: PatternOk): boolean {
   const added = diff(b, a);
   const removed = diff(a, b);
   if (e.kind === 'add') {
-    const declare = declarations(before, e);
-    const t = (x: string) => resolveTerm(x.trim(), before, declare);
-    const want = signature(t(e.s), t(e.p), t(e.o));
+    const want = signature({ text: e.s.trim() }, { text: e.p.trim() }, { text: e.o.trim() });
     return removed.length === 0 && added.length === 1 && added[0].startsWith(`${want}|`);
   }
   const placed = resolveEdit(before, e.edge);

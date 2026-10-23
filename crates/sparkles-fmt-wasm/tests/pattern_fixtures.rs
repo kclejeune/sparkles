@@ -78,6 +78,16 @@ const QUERIES: &[(&str, &str)] = &[
         "literal",
         "SELECT * { ?person <http://name> \"Ana\" ; <http://knows> ?other }",
     ),
+    // the regressions of the second review
+    (
+        "dups",
+        "SELECT * {\n  ?s <http://p> ?o .\n  ?s <http://p> ?o .\n  OPTIONAL { ?s <http://p> ?o }\n}\n",
+    ),
+    (
+        "dups-changed",
+        "SELECT * {\n  ?s <http://q> ?o .\n  ?s <http://p> ?o .\n  OPTIONAL { ?s <http://p> ?o }\n}\n",
+    ),
+    ("undeclared", "SELECT * { ?s ex:p ?o }"),
     (
         "literal-renamed",
         "SELECT * { ?someone <http://name> \"Ana\" ; <http://knows> ?other }",

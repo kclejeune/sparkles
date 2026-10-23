@@ -25,8 +25,10 @@
     EditError,
     lockedOf,
     MAX_TEXT,
+    missingPrefixes,
     overCaps,
     renamed,
+    stillNames,
     textOrder,
     type Change,
     type Drawing,
@@ -114,7 +116,10 @@
     if (selected) {
       const id = 'node' in selected ? selected.node.id : selected.edge.id;
       const node = next.nodes.find((n) => n.id === id);
-      const edge = node ? undefined : next.edges.find((x) => x.id === id);
+      const edge =
+        node || !drawn || !stillNames(drawn, next, id)
+          ? undefined
+          : next.edges.find((x) => x.id === id);
       selected = node ? { node } : edge ? { edge } : null;
     }
     const map = tab ? layouts.get(tab, text) : (layouts.stored(text) ?? {});
@@ -175,7 +180,13 @@
     if (text !== drawnText) {
       const now = patternNow(text);
       if (!now?.ok) return;
+      const prev = drawn;
       show(text, now, 0);
+      // the edge was picked in the drawing before the typing
+      if (e.kind !== 'add' && (!prev || !drawn || !stillNames(prev, drawn, e.edge))) {
+        live = 'The pattern changed, select the edge again';
+        return;
+      }
     }
     const refuse = (why: string) => {
       live = why;
@@ -208,14 +219,7 @@
   function addTriple(ev: SubmitEvent) {
     ev.preventDefault();
     // prefixed names the query does not declare, declared for the dataset
-    const declared = new Set(answer?.prologue.prefixes.map((p) => p.prefix));
-    const declare = [
-      ...new Set(
-        [addS, addP, addO]
-          .map((t) => /^([\p{L}][\p{L}\p{N}_.-]*)?:/u.exec(t.trim())?.[1] ?? null)
-          .filter((p): p is string => p !== null && !declared.has(p) && !!prefixes[p]),
-      ),
-    ].map((prefix) => ({ prefix, iri: prefixes[prefix] }));
+    const declare = answer ? missingPrefixes([addS, addP, addO], answer, prefixes) : [];
     apply({
       kind: 'add',
       s: addS,

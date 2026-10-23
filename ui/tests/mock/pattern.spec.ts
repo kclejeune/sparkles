@@ -352,6 +352,29 @@ test('an open panel keeps its triple when typing moves the text', async ({ page 
   expect(now).toContain('?s ex:z ?z .');
 });
 
+test('a panel closes when typing makes its edge ambiguous', async ({ page }) => {
+  const text =
+    'SELECT * {\n  ?s <http://p> ?o .\n  ?s <http://p> ?o .\n  OPTIONAL { ?s <http://p> ?o }\n}';
+  await openPane(page, text);
+  const c = canvas(page);
+  await expect.poll(() => settled(c)).toBeGreaterThan(0);
+  await c.focus();
+  // ?s, the first edge, ?o, the second edge
+  for (let i = 0; i < 3; i++) await page.keyboard.press('Tab');
+  await page.keyboard.press('Enter');
+  const panel = pane(page).getByRole('dialog', { name: 'Pattern element' });
+  await expect(panel).toBeVisible();
+  // the first copy's predicate changes: the selected id would now name the OPTIONAL copy
+  await editor(page).locator('.cm-line').nth(1).click();
+  await page.keyboard.press('End');
+  for (let i = 0; i < 6; i++) await page.keyboard.press('ArrowLeft');
+  await page.keyboard.press('Backspace');
+  await page.keyboard.type('q');
+  await expect.poll(() => textOf(page)).toContain('?s <http://q> ?o .');
+  await expect(panel).toHaveCount(0);
+  expect(await textOf(page)).toContain('OPTIONAL { ?s <http://p> ?o }');
+});
+
 test('each editor tab keeps its own positions', async ({ page }) => {
   await openPane(page, A3);
   const c = canvas(page);
