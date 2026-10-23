@@ -247,8 +247,12 @@ other RDF stores have and Sparkles does not.
 Each gap ends with the [roadmap](ROADMAP.md) items that address it. The roadmap orders
 that work by priority and links each item to its design spec.
 
-* **Graph algorithm remainder.** There is no LDBC Graphalytics harness and no
-  validation run against its reference outputs. The web UI cannot colour a graph view by
+* **Graph algorithm remainder.** An adapter in `scripts/graphalytics-reference.py`
+  prepares the two small official Graphalytics example graphs and compares saved BFS,
+  WCC and PageRank results with their reference outputs, and a debug build of Sparkles
+  matched all six reference sets on 2026-10-22. There is no full Graphalytics driver, no
+  run on the benchmark's larger datasets, no run of CDLP, LCC or SSSP against reference
+  outputs and no official certification. The web UI cannot colour a graph view by
   community or complete `algo:` names, the JVM binding has no typed algorithm handle, and
   openCypher procedures wait for an openCypher frontend. Write-back commits through the
   store's own writer loop rather than a dedicated bulk writer. A write-back run has no

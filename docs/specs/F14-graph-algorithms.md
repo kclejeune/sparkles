@@ -2,7 +2,7 @@
 
 > **Status:** implemented in part (Phases 1 and 2, and the embeddings of Phase 3)
 >
-> **Phases:** Phases 1 and 2 shipped, apart from the LDBC Graphalytics harness, the web
+> **Phases:** Phases 1 and 2 shipped, apart from the full LDBC Graphalytics harness, the web
 > UI and the JVM binding. Of Phase 3, `algo:fastRP` and `algo:node2vec` shipped, and
 > their vectors reach F04 indexes through SPARQL Update or a write-back run. The
 > openCypher procedures wait for the Cypher frontend of [F01](F01-cypher.md), which is
@@ -689,7 +689,7 @@ gaps listed under "Not built".
 The counter confinement, unit-weight sum, Graphalytics clustering, empty-result
 statistics, transaction projection-cache and operation-control repairs have targeted
 regression coverage. The review follow-ups of roadmap item 8 are resolved as the items
-below describe. The Graphalytics harness and the other surfaces under "Not built" remain.
+below describe. The full Graphalytics harness and the other surfaces under "Not built" remain.
 
 * **Library.** `crates/sparkles-core/src/algo/` holds the algorithms on compressed
   sparse rows. `graph.rs` builds the projection, and the modules `pagerank`,
@@ -913,10 +913,16 @@ run and +0.4% to +0.9% in a repeat, within the noise of the measurement. The tab
   quads, so a run's commits stay ordinary commits. A larger batch takes the bulk path.
 
 **Not built.**
-* The LDBC Graphalytics harness and its validation runs. X06 specifies the harness and
-  has not built it, and no Graphalytics datasets are in the repository. The
-  `algo:graphalytics` switches on PageRank, BFS, SSSP, clustering and the others do what
-  the benchmark's definitions say, and the tests cover them on small graphs only.
+* The full Graphalytics benchmark harness. A
+  [reference adapter](../../testsuite/graphalytics/README.md) prepares RDF and queries
+  for the two small official example graphs and compares saved BFS, WCC and PageRank
+  outputs with the pinned reference files. Its parser, identity and numerical negative
+  controls run without an engine. On 2026-10-22 a debug build of Sparkles matched all
+  six reference sets, which are BFS, WCC and PageRank on the directed and the undirected
+  example. This is a check of the three algorithms on two tiny graphs. It is not the
+  official Graphalytics driver or a certified result. CDLP, LCC and SSSP have no
+  reference run, the larger datasets are not loaded, and X06 has not closed its
+  acceptance item A13.
 * The openCypher procedures, which wait for F01.
 * The web UI: colouring a graph view by community, and `algo:` completions in the
   editor.
