@@ -201,6 +201,7 @@
           } else if (near) {
             res.zIndex = 1;
           }
+          if (allLabels && !(near && !near.has(key))) res.forceLabel = true;
           if (key === selected || key === hovered || key === focusKey) {
             res.forceLabel = true;
             res.zIndex = 2;
@@ -312,7 +313,7 @@
           running = false;
           progress = 1;
           onlayout?.(positions());
-          if (fitAfter) renderer?.getCamera().animatedReset({ duration: reduced() ? 0 : 300 });
+          if (fitAfter) fitPicture();
           fitAfter = false;
         }
       };
@@ -356,6 +357,8 @@
   }
 
   let fitAfter = false;
+  /** Whether every node shows its label (a small picture). */
+  let allLabels = false;
 
   /**
    * Room around the fitted picture for the labels drawn right of the nodes: the longest
@@ -396,6 +399,7 @@
     renderer.setSetting('defaultEdgeType', edgeType());
     renderer.setSetting('hideEdgesOnMove', edges.length > 50000);
     renderer.setSetting('stagePadding', stagePadding());
+    allLabels = nodes.length <= ALL_LABELS;
     setFocusSet();
     // a new level is fitted into view once it has settled
     startLayout(true);
@@ -414,9 +418,68 @@
     if (ready) setFocusSet();
   });
 
-  /** Fit the whole picture in the view. */
+  /** Nodes up to which every label is drawn and the fit makes room for it. */
+  const ALL_LABELS = 30;
+  let measure: CanvasRenderingContext2D | null = null;
+
+  function labelWidth(text: string): number {
+    if (!text || !renderer) return 0;
+    measure ??= document.createElement('canvas').getContext('2d');
+    if (!measure) return text.length * 7;
+    const font = renderer.getSetting('labelFont');
+    measure.font = `${renderer.getSetting('labelWeight')} ${renderer.getSetting('labelSize')}px ${font}`;
+    return measure.measureText(text).width;
+  }
+
+  /**
+   * Fit the whole picture in the view. A small picture is fitted with its labels, which
+   * are drawn right of their nodes at a fixed size: the box of the nodes and their labels
+   * is measured on screen and the camera centred on it and zoomed until it fits, a few
+   * times over, since the labels do not scale with the zoom.
+   */
   export function fit() {
-    renderer?.getCamera().animatedReset({ duration: reduced() ? 0 : 300 });
+    fitPicture();
+  }
+
+  function fitPicture() {
+    if (!renderer || !graph) return;
+    const cam = renderer.getCamera();
+    const duration = reduced() ? 0 : 300;
+    const W = host?.clientWidth ?? 0;
+    const H = host?.clientHeight ?? 0;
+    if (graph.order === 0 || graph.order > ALL_LABELS || W <= 0 || H <= 0) {
+      cam.animatedReset({ duration });
+      return;
+    }
+    const r = renderer;
+    const g = graph;
+    const margin = 12;
+    const before = cam.getState();
+    let state = { x: 0.5, y: 0.5, angle: 0, ratio: 1 };
+    cam.setState(state);
+    for (let i = 0; i < 4; i++) {
+      let [left, right, top, bottom] = [Infinity, -Infinity, Infinity, -Infinity];
+      g.forEachNode((key, attr) => {
+        const p = r.graphToViewport({ x: attr.x, y: attr.y });
+        const size = r.getNodeDisplayData(key)?.size ?? attr.size ?? 4;
+        const text = typeof attr.label === 'string' ? attr.label : '';
+        left = Math.min(left, p.x - size);
+        right = Math.max(right, p.x + size + (text ? labelWidth(text) + 6 : 0));
+        top = Math.min(top, p.y - Math.max(size, 9));
+        bottom = Math.max(bottom, p.y + Math.max(size, 9));
+      });
+      const scale = Math.min(
+        (W - 2 * margin) / Math.max(1, right - left),
+        (H - 2 * margin) / Math.max(1, bottom - top),
+      );
+      const c = r.viewportToFramedGraph({ x: (left + right) / 2, y: (top + bottom) / 2 });
+      state = { ...state, x: c.x, y: c.y, ratio: state.ratio / scale };
+      cam.setState(state);
+    }
+    if (duration) {
+      cam.setState(before);
+      cam.animate(state, { duration });
+    }
   }
 
   /** Centre a node and show its ring. */
