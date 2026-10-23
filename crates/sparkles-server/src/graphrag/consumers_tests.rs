@@ -73,12 +73,22 @@ fn built_with(
     handler: impl Fn(&Received, usize) -> (u16, Value) + Send + Sync + 'static,
     summarize: Value,
 ) -> Fixture {
+    built_models(handler, summarize, json!({}))
+}
+
+/// [`built_with`] with the provider's `models` settings, such as a model's context size.
+fn built_models(
+    handler: impl Fn(&Received, usize) -> (u16, Value) + Send + Sync + 'static,
+    summarize: Value,
+    models: Value,
+) -> Fixture {
     let mock = MockModel::start(handler);
     let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
     let pair = json!({ "provider": "p", "model": "m" });
     let cfg = json!({
         "providers": { "p": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 5,
-                              "allowedModels": ["m", "m2"], "structuredOutput": "json-schema" } },
+                              "allowedModels": ["m", "m2"], "structuredOutput": "json-schema",
+                              "models": models } },
         "roles": { "community": [pair], "draft": [pair], "summarize": summarize }
     });
     st.models = arc_swap::ArcSwapOption::from_pointee(Models::new(
@@ -609,6 +619,53 @@ async fn a_failed_map_moves_to_the_next_pair() {
         assert_eq!(out["outcome"], "answered", "{out}");
         assert!(events.contains(&"escalate".to_string()), "{events:?}");
         assert_eq!(out["usage"]["answeredBy"]["model"], "m2", "{out}");
+    })
+    .await
+    .unwrap();
+}
+
+/// Round 2, finding 2: batches fit the smallest pair a failure can move to, so the
+/// fallback with a small context gets batches it can read.
+#[tokio::test(flavor = "multi_thread")]
+async fn map_batches_fit_the_smallest_fallback() {
+    let inner = handler("global");
+    let long = "People who know each other and many other things besides. ".repeat(12);
+    let f = build(built_models(
+        move |r, i| {
+            let sys = system_of(r);
+            if r.body["model"] == "m" && sys.contains("community reports about one dataset") {
+                return (503, json!({ "error": { "message": "busy" } }));
+            }
+            let (code, body) = inner(r, i);
+            let text = body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("");
+            match serde_json::from_str::<Value>(text) {
+                Ok(mut v) if v.get("summary").is_some() && v.get("findings").is_some() => {
+                    v["summary"] = long.clone().into();
+                    (code, mock::openai(&v.to_string()))
+                }
+                _ => (code, body),
+            }
+        },
+        json!([{ "provider": "p", "model": "m" }, { "provider": "p", "model": "m2" }]),
+        // the smallest context leaves the floor of 256 tokens for the reports
+        json!({ "m": { "contextTokens": 200000 }, "m2": { "contextTokens": 1 } }),
+    ))
+    .await;
+    tokio::task::spawn_blocking(move || {
+        let before = f.mock.requests().len();
+        let (out, _) = ask_with(&f, AskMode::Global, false);
+        assert_eq!(out["outcome"], "answered", "{out}");
+        let maps: Vec<Received> = f.mock.requests()[before..]
+            .iter()
+            .filter(|r| {
+                r.body["model"] == "m2"
+                    && system_of(r).contains("community reports about one dataset")
+            })
+            .cloned()
+            .collect();
+        assert!(maps.len() >= 2, "{} map requests on m2", maps.len());
     })
     .await
     .unwrap();

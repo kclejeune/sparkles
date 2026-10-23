@@ -8,7 +8,7 @@
 //! and says why.
 
 use super::{AskMode, Asking, prompts};
-use crate::models::{OutputSchema, Role};
+use crate::models::{OutputSchema, Pair, Role};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -102,35 +102,42 @@ pub fn reduce_schema() -> OutputSchema {
 /// A report as the map step sees it, numbered from 1 in the selection: its title,
 /// summary and numbered findings, in parts that each fit `budget` tokens. A later part
 /// repeats the title, so every finding keeps its label `F{n}.{i}`, and a line longer than
-/// the budget is cut.
-pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<String> {
+/// the budget is cut. Each part comes with the indexes of the findings it shows.
+pub fn report_blocks(n: usize, r: &Value, budget: u64) -> Vec<(String, Vec<usize>)> {
     let max_chars = (budget * CHARS_PER_TOKEN).max(64) as usize;
     let title = r["title"].as_str().unwrap_or("");
-    let mut lines = vec![format!("Summary: {}", r["summary"].as_str().unwrap_or(""))];
+    let mut lines = vec![(
+        None,
+        format!("Summary: {}", r["summary"].as_str().unwrap_or("")),
+    )];
     for (i, f) in r["findings"].as_array().into_iter().flatten().enumerate() {
-        lines.push(format!(
-            "F{n}.{} {}",
-            i + 1,
-            f["text"].as_str().unwrap_or("")
+        lines.push((
+            Some(i),
+            format!("F{n}.{} {}", i + 1, f["text"].as_str().unwrap_or("")),
         ));
     }
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
     let mut cur = format!("R{n} {title}\n");
+    let mut shown: Vec<usize> = Vec::new();
     let mut has_line = false;
-    for l in lines {
+    for (finding, l) in lines {
         let head = format!("R{n} {title} (continued)\n");
         let l = prompts::cut(
             &l,
             max_chars.saturating_sub(head.chars().count() + 1).max(32),
         );
         if has_line && cur.chars().count() + l.chars().count() + 1 > max_chars {
-            out.push(std::mem::replace(&mut cur, head));
+            out.push((
+                std::mem::replace(&mut cur, head),
+                std::mem::take(&mut shown),
+            ));
         }
         cur.push_str(&l);
         cur.push('\n');
+        shown.extend(finding);
         has_line = true;
     }
-    out.push(cur);
+    out.push((cur, shown));
     out
 }
 
@@ -166,9 +173,10 @@ pub struct Point {
 }
 
 /// The points of one map answer for the reports `batch`, keeping only labels of that
-/// batch. A point keeps only findings that exist, and a point without one is dropped,
-/// since its citation would not resolve to facts (§7.2 step 4).
-pub fn points_of(v: &Value, batch: &[usize], reports: &[Value]) -> Vec<Point> {
+/// batch. A point keeps only the findings the batch showed, as (report, finding)
+/// indexes in `shown`, and a point without one is dropped, since its citation would not
+/// resolve to facts (§7.2 step 4).
+pub fn points_of(v: &Value, batch: &[usize], shown: &[(usize, usize)]) -> Vec<Point> {
     let mut out = Vec::new();
     for p in v["points"].as_array().into_iter().flatten() {
         let text = prompts::cut(p["text"].as_str().unwrap_or("").trim(), POINT_CHARS);
@@ -205,9 +213,7 @@ pub fn points_of(v: &Value, batch: &[usize], reports: &[Value]) -> Vec<Point> {
             if a >= 1
                 && b >= 1
                 && batch.contains(&(a - 1))
-                && reports[a - 1]["findings"]
-                    .as_array()
-                    .is_some_and(|l| b <= l.len())
+                && shown.contains(&(a - 1, b - 1))
                 && !fs.contains(&(a - 1, b - 1))
             {
                 fs.push((a - 1, b - 1));
@@ -373,30 +379,52 @@ impl Asking<'_, '_> {
                 "no provider and model answers the summarize role",
             );
         };
-        // the input a call leaves room for, after the output limit it asks for
-        let (context, output) = self.models.resolved(&pair).map_or(
-            (crate::models::DEFAULT_CONTEXT_TOKENS, OUTPUT_TOKENS),
-            |r| (r.context_tokens, u64::from(r.max_output_tokens)),
-        );
-        let output = pair.max_output_tokens.map_or(output, u64::from);
-        let budget = context.saturating_sub(output + FRAME_TOKENS).max(256);
+        // the input a call leaves room for, after the output limit it asks for, on the
+        // smallest of this pair and the pairs a failure can move the role to, so a batch
+        // fits whichever pair runs it (round 2, finding 2)
+        let budget_of = |p: &Pair| {
+            let (context, output) = self.models.resolved(p).map_or(
+                (crate::models::DEFAULT_CONTEXT_TOKENS, OUTPUT_TOKENS),
+                |r| (r.context_tokens, u64::from(r.max_output_tokens)),
+            );
+            let output = p.max_output_tokens.map_or(output, u64::from);
+            context.saturating_sub(output + FRAME_TOKENS).max(256)
+        };
+        let at = self.pos.get(&Role::Summarize).copied().unwrap_or(0);
+        let budget = self
+            .list(Role::Summarize)
+            .iter()
+            .skip(at)
+            .map(budget_of)
+            .min()
+            .unwrap_or_else(|| budget_of(&pair));
         // each report in parts that fit, with the report each part belongs to
         let mut blocks: Vec<String> = Vec::new();
         let mut owner: Vec<usize> = Vec::new();
+        let mut block_findings: Vec<Vec<usize>> = Vec::new();
         for (i, r) in reports.iter().enumerate() {
-            for b in report_blocks(i + 1, r, budget) {
+            for (b, fs) in report_blocks(i + 1, r, budget) {
                 blocks.push(b);
                 owner.push(i);
+                block_findings.push(fs);
             }
         }
         let groups = batches(&blocks, budget);
-        // the reports of each batch
+        // the reports of each batch, and the findings it shows (round 2, finding 1)
         let batch_reports: Vec<Vec<usize>> = groups
             .iter()
             .map(|g| {
                 let mut v: Vec<usize> = g.iter().map(|b| owner[*b]).collect();
                 v.dedup();
                 v
+            })
+            .collect();
+        let batch_shown: Vec<Vec<(usize, usize)>> = groups
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .flat_map(|b| block_findings[*b].iter().map(|f| (owner[*b], *f)))
+                    .collect()
             })
             .collect();
         // §7.2: 4 + ceil(reports / batch) answers, beside the draft that classified
@@ -465,6 +493,9 @@ impl Asking<'_, '_> {
             });
             let mut chunk_failed = false;
             let mut last = String::new();
+            // every answer of the chunk is recorded before a terminal error returns, so
+            // its tokens are charged (round 2, finding 3)
+            let mut terminal: Option<(&'static str, String)> = None;
             for (gi, r) in results {
                 match r {
                     Ok(a) => {
@@ -475,21 +506,29 @@ impl Asking<'_, '_> {
                         self.push_step(Role::Summarize, *f.record);
                         match f.error {
                             crate::models::StepError::Budget(_) => {
-                                return self.error("budget-exceeded", f.error.message());
+                                terminal.get_or_insert(("budget-exceeded", f.error.message()));
+                                continue;
                             }
                             crate::models::StepError::Deadline => {
-                                return self.error("timeout", f.error.message());
+                                terminal.get_or_insert(("timeout", f.error.message()));
+                                continue;
                             }
                             _ => {}
                         }
-                        self.failed_calls += 1;
                         last = f.error.message();
                         chunk_failed = true;
                         failed.push(gi);
                     }
                 }
             }
-            // §5.5: failures count against the ask, and move the role to its next pair
+            if let Some((code, message)) = terminal {
+                return self.error(code, message);
+            }
+            // §5.5: failures count against the ask, and move the role to its next pair. The
+            // batches of a chunk run at once on one pair, so a chunk fails once.
+            if chunk_failed {
+                self.failed_calls += 1;
+            }
             if chunk_failed
                 && (self.failed_calls >= super::MAX_FAILED_CALLS
                     || !self.escalate(Role::Summarize, "provider-failure"))
@@ -512,7 +551,7 @@ impl Asking<'_, '_> {
         }
         for (gi, a) in answers.iter().enumerate() {
             if let Some(v) = a {
-                points.extend(points_of(v, &batch_reports[gi], &reports));
+                points.extend(points_of(v, &batch_reports[gi], &batch_shown[gi]));
             }
         }
         // reduce: points above 0, best first, as many as fit
@@ -697,7 +736,7 @@ mod tests {
             { "text": "B", "score": 30, "reports": ["R7"], "findings": [] },
             { "text": "", "score": 99, "reports": ["R1"], "findings": [] },
         ] });
-        let p = points_of(&v, &[0], &reports);
+        let p = points_of(&v, &[0], &shown_all(&reports));
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].reports, vec![0]);
         assert_eq!(p[0].findings, vec![(0, 1)]);
@@ -710,7 +749,39 @@ mod tests {
             { "text": "A", "score": 80, "reports": ["R1"], "findings": ["F1.999"] },
             { "text": "B", "score": 80, "reports": ["R1"], "findings": [] },
         ] });
-        assert!(points_of(&v, &[0], &reports).is_empty());
+        assert!(points_of(&v, &[0], &shown_all(&reports)).is_empty());
+    }
+
+    /// Every finding of every report, as a batch that shows them all.
+    fn shown_all(reports: &[Value]) -> Vec<(usize, usize)> {
+        reports
+            .iter()
+            .enumerate()
+            .flat_map(|(r, v)| {
+                (0..v["findings"].as_array().map_or(0, Vec::len)).map(move |f| (r, f))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_split_report_cites_only_findings_its_part_shows() {
+        let findings: Vec<Value> = (0..2)
+            .map(|i| json!({ "text": format!("finding {i} {}", "x".repeat(600)) }))
+            .collect();
+        let r = json!({ "title": "T", "summary": "S", "findings": findings });
+        let parts = report_blocks(1, &r, 200);
+        assert!(parts.len() >= 2, "{}", parts.len());
+        let first: Vec<(usize, usize)> = parts[0].1.iter().map(|f| (0, *f)).collect();
+        assert!(!first.contains(&(0, 1)), "{:?}", parts[0].1);
+        let v = json!({ "points": [
+            { "text": "A", "score": 80, "reports": ["R1"], "findings": ["F1.2"] },
+        ] });
+        assert!(points_of(&v, &[0], &first).is_empty());
+        let shown: Vec<(usize, usize)> = parts
+            .iter()
+            .flat_map(|p| p.1.iter().map(|f| (0, *f)))
+            .collect();
+        assert_eq!(shown, vec![(0, 0), (0, 1)]);
     }
 
     #[test]
@@ -721,7 +792,7 @@ mod tests {
         let r = json!({ "title": "T", "summary": "S", "findings": findings });
         let parts = report_blocks(3, &r, 300);
         assert!(parts.len() > 1, "{}", parts.len());
-        for p in &parts {
+        for (p, _) in &parts {
             assert!(
                 p.chars().count() as u64 <= 300 * CHARS_PER_TOKEN,
                 "{}",
@@ -729,7 +800,7 @@ mod tests {
             );
             assert!(p.starts_with("R3 T"));
         }
-        let all = parts.join("");
+        let all: String = parts.iter().map(|(p, _)| p.as_str()).collect();
         for i in 1..=12 {
             assert!(all.contains(&format!("F3.{i} ")), "F3.{i}");
         }
@@ -737,7 +808,7 @@ mod tests {
         let short = json!({ "title": "T", "summary": "S", "findings": [{ "text": "f" }] });
         assert_eq!(
             report_blocks(1, &short, 300),
-            vec!["R1 T\nSummary: S\nF1.1 f\n".to_string()]
+            vec![("R1 T\nSummary: S\nF1.1 f\n".to_string(), vec![0])]
         );
     }
 

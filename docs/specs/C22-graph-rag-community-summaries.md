@@ -861,7 +861,9 @@ reports, and `maxReports` at 100, rather than settings, until the evaluation set
 `community_reports` ranks by the dataset's full-text index and by every embedding index
 that may hold report text when they cover the reports graph, and by rating otherwise.
 Without `communityLevel`, `recall` gives each seed its finest community that has a
-report. A global answer reads main at its head,
+report. Map batches are sized for the smallest context among the summarize pair and its
+fallbacks, so a large model that has a small fallback makes more, smaller calls, in
+exchange for a failover that never sends a batch its pair cannot read. A global answer reads main at its head,
 so an ask with `at` or another branch answers locally. The context of §7.3 is on, and the
 evaluation decides whether it stays on. Several configurations per dataset and the
 evaluation of §9 remain.

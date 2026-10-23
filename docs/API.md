@@ -10489,10 +10489,11 @@ answered with a query, and the draft of any other question also returns a `scope
 query. The server reads up to 100 reports at the finest level that has at most 100,
 through `community_reports` as the caller, ranked by a search for the question when the
 dataset has a full-text or embedding index and by rating otherwise. The `summarize` role
-reads the reports in batches that fill its context window after the pair's output
-limit, at most four at a time, and a report too long for one batch is split between
-batches with its finding labels kept. Each batch returns scored points that name the
-reports and findings they use, and a point that names no valid finding is dropped. A
+reads the reports in batches that fit the smallest context window, after the output
+limit, among the pair and the pairs a failure can move the role to, at most four at a
+time. A report too long for one batch is split between batches with its finding labels
+kept. Each batch returns scored points that name the reports and findings they use, and
+a point that names no finding the batch showed is dropped. A
 batch whose call fails moves the role to its next pair and runs again there. The points
 above 0, best first, go to the `summarize` role again, which writes the answer with
 `[n]` markers. A marker that names no point is dropped, and the ask stops before the
