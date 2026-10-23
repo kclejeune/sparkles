@@ -915,6 +915,8 @@ export function resolveIri(iri: string, base: string | null | undefined): string
   const r = iriParts(iri);
   if (r.scheme !== undefined) return iri;
   const b = iriParts(base);
+  // a BASE that is not absolute resolves nothing, as in the reader
+  if (b.scheme === undefined) return iri;
   let authority = b.authority;
   let path: string;
   let query = r.query;
@@ -1001,11 +1003,7 @@ export function edit(text: string, p: PatternOk, e: Edit): Change[] {
         throw new EditError(`The prefix "${prefix}:" is not declared`);
     const subject = resolveTerm(s, p, declare);
     const binds = bindsOf(subject, resolveTerm(pr, p, declare), resolveTerm(o, p, declare));
-    // the group of the subject's patterns
-    const key = termKey(subject);
-    const home = triplesOf(p).find(
-      (t) => termKey(t.triple.s) === key || termKey(t.triple.o) === key,
-    );
+    const home = homeOf(p, s, declare);
     const g = home ? home.path[home.path.length - 1] : p.root;
     const changes = insertItem(text, g, anchor(g, binds), statement(s, pr, o), true);
     for (const { prefix, iri } of declare)
@@ -1069,6 +1067,17 @@ export function stillNames(before: Drawing, after: Drawing, edge: string): boole
   const b = copies(after);
   if (a.length !== 1 || b.length !== 1) return false;
   return a[0].id === edge && b[0].id === edge && a[0].optional === b[0].optional;
+}
+
+/**
+ * The first triple that mentions the subject of an add, whose group the add goes in. A
+ * term matches when it is written the same way, which needs no resolution and so holds
+ * even for a prefix only the add declares, or when it resolves to the same term.
+ */
+function homeOf(p: PatternOk, s: string, declare: Prefixes): Placed | undefined {
+  const key = termKey(resolveTerm(s, p, declare));
+  const same = (t: Term) => (t.kind !== 'literal' && t.text === s) || termKey(t) === key;
+  return triplesOf(p).find((t) => same(t.triple.s) || same(t.triple.o));
 }
 
 /** The triple whose edge has this id in the drawing of `p`. */
@@ -1149,8 +1158,12 @@ export function agrees(before: PatternOk, e: Edit, after: PatternOk): boolean {
   const added = diff(b, a);
   const removed = diff(a, b);
   if (e.kind === 'add') {
-    const want = signature({ text: e.s.trim() }, { text: e.p.trim() }, { text: e.o.trim() });
-    return removed.length === 0 && added.length === 1 && added[0].startsWith(`${want}|`);
+    const s = e.s.trim();
+    const want = signature({ text: s }, { text: e.p.trim() }, { text: e.o.trim() });
+    // on the side of an OPTIONAL its subject's patterns are on (§2.2)
+    const home = homeOf(before, s, declarations(before, e));
+    const optional = !!home && home.path.length > 1;
+    return removed.length === 0 && added.length === 1 && added[0] === `${want}|${optional}`;
   }
   const placed = resolveEdit(before, e.edge);
   if (!placed) return false;

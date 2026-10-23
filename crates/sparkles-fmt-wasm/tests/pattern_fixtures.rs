@@ -88,6 +88,15 @@ const QUERIES: &[(&str, &str)] = &[
         "SELECT * {\n  ?s <http://q> ?o .\n  ?s <http://p> ?o .\n  OPTIONAL { ?s <http://p> ?o }\n}\n",
     ),
     ("undeclared", "SELECT * { ?s ex:p ?o }"),
+    // the regressions of the third review
+    (
+        "optional-undeclared",
+        "SELECT * {\n  ?x <http://r> ?y .\n  OPTIONAL { ex:a ex:p ?o }\n}\n",
+    ),
+    (
+        "relative-base",
+        "BASE <../>\nSELECT * {\n  ?x <http://r> ?y .\n  OPTIONAL { <g> <http://p> ?o }\n}\n",
+    ),
     (
         "literal-renamed",
         "SELECT * { ?someone <http://name> \"Ana\" ; <http://knows> ?other }",

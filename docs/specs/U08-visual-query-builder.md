@@ -567,7 +567,10 @@ triple must be the only one gone, and an optional toggle must move just that tri
 out of an `OPTIONAL`. A locked statement that ends in a comment and lacks its `.` gets the
 `.` at the start of the new triple's line, since no byte of a locked range is written.
 Typed IRIs are resolved against `BASE` by RFC 3986 without normalization, as the reader
-does. A
+does, and a `BASE` that is not absolute resolves nothing. The group of a new triple is
+that of the first triple whose subject or object is written like the new subject or
+resolves to the same term, and R3 also checks that the new triple landed on that group's
+side of an `OPTIONAL`. A
 prefixed name whose prefix neither the query nor the dataset declares is refused before
 that, and a typed term is resolved under the query's prefixes and `BASE` to find the
 group that holds its patterns. New nodes are placed by an fcose run with every known node
@@ -609,8 +612,8 @@ checking R2, that the locked blocks stay byte-identical and that the only deleti
 range the edit names, and R3, that the parse agrees with the edit. The layout map's tests
 cover storage bounds, restore and renames. `ui/tests/mock/pattern.spec.ts` covers A1, A2,
 A6 to A9, A11, locked blocks through a sequence of canvas edits, the error states of
-§2.7, the result's Pattern tab, and the 390 px layout. The two code reviews found 14 and
-then 6 problems, and each fix has a regression test in one of these suites.
+§2.7, the result's Pattern tab, and the 390 px layout. The three code reviews found 14,
+6 and 2 problems, and each fix has a regression test in one of these suites.
 
 **Measurements.** `ui/tests/mock/pattern-perf.spec.ts` runs A10 when `PATTERN_PERF=1`
 is set. On the development laptop, under a load average of about 20 from other builds

@@ -255,6 +255,7 @@ test('A11: the keyboard reaches every element and edits with announcements', asy
   await expect.poll(() => textOf(page)).toContain('OPTIONAL { ?org ex:locatedIn ex:lyon . }');
   await expect(pane(page).getByTestId('pattern-live')).toContainText('3 nodes, 2 edges');
   // Enter opens the focused element's panel; Escape closes it, then returns to the editor
+  await expect.poll(async () => (await graph(canvas(page))).hulls).toBe(1);
   await canvas(page).focus();
   await page.keyboard.press('Enter');
   await expect(pane(page).getByRole('dialog', { name: 'Pattern element' })).toBeVisible();

@@ -521,6 +521,30 @@ describe('edits as splices', () => {
     ).toThrow('The prefix "nope:" is not declared');
   });
 
+  it('finds the subject’s OPTIONAL by its spelling when resolution cannot', () => {
+    // a prefix only the add declares, and a BASE that is not absolute
+    const cases: [Name, Edit][] = [
+      [
+        'optional-undeclared',
+        {
+          kind: 'add',
+          s: 'ex:a',
+          p: 'ex:q',
+          o: '?z',
+          declare: [{ prefix: 'ex', iri: 'http://e/' }],
+        },
+      ],
+      ['relative-base', { kind: 'add', s: '<g>', p: '<http://q>', o: '?z' }],
+    ];
+    for (const [name, e] of cases) {
+      const { out } = run(name, e);
+      const added = out.indexOf(`${(e as { s: string }).s} ${(e as { p: string }).p} ?z .`);
+      expect(added, out).toBeGreaterThan(out.indexOf('OPTIONAL {'));
+      expect(added, out).toBeLessThan(out.lastIndexOf('}\n}'));
+    }
+    expect(resolveIri('g', '../')).toBe('g');
+  });
+
   it('refuses terms it would not write', () => {
     expect(() => checkTerm('?a b', 's')).toThrow(EditError);
     expect(() => checkTerm('"x"', 's')).toThrow(EditError);
@@ -599,6 +623,26 @@ describe.skipIf(!existsSync(built))('the built module', async () => {
       expect(after.ok, next).toBe(true);
       expect(agrees(p, e, after), next).toBe(true);
     }
+  });
+
+  it('R3 checks the side of the OPTIONAL an add lands on', () => {
+    const { text, p } = fx('optional-undeclared');
+    const e: Edit = {
+      kind: 'add',
+      s: 'ex:a',
+      p: 'ex:q',
+      o: '?z',
+      declare: [{ prefix: 'ex', iri: 'http://e/' }],
+    };
+    const good = pattern(applyChanges(text, edit(text, p, e))) as PatternOk;
+    expect(agrees(p, e, good)).toBe(true);
+    // the same triple written at the root does not agree
+    const bad = pattern(
+      'PREFIX ex: <http://e/>\n' +
+        text.replace('?x <http://r> ?y .', '?x <http://r> ?y .\n  ex:a ex:q ?z .'),
+    ) as PatternOk;
+    expect(bad.ok).toBe(true);
+    expect(agrees(p, e, bad)).toBe(false);
   });
 
   it('answers the fixtures', () => {
