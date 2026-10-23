@@ -922,6 +922,81 @@ pub fn expand(
     Ok((out, warnings))
 }
 
+/// The associations of `map` that select one of `nodes`, as a fixed map over `data`: for
+/// each node in order, each association whose selector selects it, with the node in
+/// place of the selector. A node selector selects the node it names, and a `{FOCUS p o}`
+/// or `{s p FOCUS}` pattern the nodes with that triple in the data graph, each node
+/// checked by itself so the cost follows `nodes` and not the data. `SPARQL` selectors are
+/// left out. Duplicate (node, label) pairs appear once.
+pub fn focus_map(map: &ShapeMap, nodes: &[Term], data: &DataGraph) -> anyhow::Result<ShapeMap> {
+    let snap = &data.snap;
+    let id_of = |t: &Term| -> Option<Id> {
+        match t {
+            Term::BlankNode(b) => parse_bnode_label(b.as_str()),
+            t => snap.lookup_term(t),
+        }
+    };
+    let mut out = Vec::new();
+    let mut seen: FxHashSet<(Term, ShapeLabel)> = FxHashSet::default();
+    for node in nodes {
+        let nid = id_of(node);
+        for a in &map.0 {
+            let selected = match &a.node {
+                NodeSelector::Term(t) => t == node,
+                NodeSelector::Sparql(_) => false,
+                NodeSelector::Focus {
+                    subject,
+                    predicate,
+                    object,
+                    focus_is_subject,
+                } => {
+                    let (Some(n), Some(p)) = (nid, snap.lookup_iri(predicate.as_str())) else {
+                        continue;
+                    };
+                    let mut hit = false;
+                    if *focus_is_subject {
+                        match object {
+                            None => data.scan_objects(n, p, |_| {
+                                hit = true;
+                                false
+                            })?,
+                            Some(o) => {
+                                let Some(o) = id_of(o) else { continue };
+                                data.scan_objects(n, p, |x| {
+                                    hit = x == o;
+                                    !hit
+                                })?
+                            }
+                        }
+                    } else {
+                        match subject {
+                            None => data.scan_subjects(p, n, |_| {
+                                hit = true;
+                                false
+                            })?,
+                            Some(s) => {
+                                let Some(s) = id_of(s) else { continue };
+                                data.scan_subjects(p, n, |x| {
+                                    hit = x == s;
+                                    !hit
+                                })?
+                            }
+                        }
+                    }
+                    hit
+                }
+            };
+            if selected && seen.insert((node.clone(), a.shape.clone())) {
+                out.push(Association {
+                    node: NodeSelector::Term(node.clone()),
+                    shape: a.shape.clone(),
+                });
+            }
+        }
+    }
+    Ok(ShapeMap(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

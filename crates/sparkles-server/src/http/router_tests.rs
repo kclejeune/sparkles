@@ -1,11 +1,15 @@
 //! In-process tests of the HTTP router (SHACL endpoint, result cache controls).
 
+#[cfg(feature = "shacl")]
+use super::MAX_FOCUS_NODES;
 use super::router;
 use crate::state::{AppState, DbType};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use serde_json::Value as J;
+#[cfg(feature = "shacl")]
+use serde_json::json;
 use sparkles::io::Source;
 use sparkles::store::StoreOptions;
 use std::sync::Arc;
@@ -1313,4 +1317,114 @@ async fn prefixes_can_be_set_read_and_removed() {
         get_uri(&s.app, "/ds/prefixes?prefix=zz").await.status,
         StatusCode::NOT_FOUND
     );
+}
+
+/// A form POST to `/ds/shacl{query}`.
+#[cfg(feature = "shacl")]
+async fn shacl_form(app: &Router, query: &str, form: &str) -> Resp {
+    send(
+        app,
+        Request::post(format!("/ds/shacl{query}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::ACCEPT, "application/json")
+            .body(Body::from(form.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+/// Spec U07 §11.3: `target` repeated validates a set of nodes.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_repeated_targets() {
+    let s = server();
+    // alice conforms, bob is 200, carol is not a person
+    let r = validate_json(
+        &s.app,
+        "?target=ex:alice&target=ex:bob&target=ex:carol",
+        PERSON_SHAPES,
+    )
+    .await;
+    assert_eq!(focus_nodes(&r), vec!["http://example.org/bob"], "{r}");
+    let r = validate_json(
+        &s.app,
+        "?target=ex:alice&target=%3Chttp://example.org/carol%3E",
+        PERSON_SHAPES,
+    )
+    .await;
+    assert_eq!(r["conforms"], true, "{r}");
+    // more than the limit
+    let many: String = (0..=MAX_FOCUS_NODES)
+        .map(|i| format!("&target=urn:n{i}"))
+        .collect();
+    let r = validate(&s.app, &format!("?x=1{many}"), PERSON_SHAPES, None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("too many targets"), "{}", r.text());
+}
+
+/// Spec U07 §11.3: `shapes=guard` and `shapes=<graph>` with an empty body, the targets
+/// in the query string or in a form body.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_stored_shapes() {
+    let s = server();
+    // no guard
+    let r = shacl_form(&s.app, "?shapes=guard", "target=ex:bob").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let put = Request::put("/$/validation/ds")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "mode": "warn", "shapes": { "inline": PERSON_SHAPES } }).to_string(),
+        ))
+        .unwrap();
+    let r = send(&s.app, put).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+
+    let r = shacl_form(&s.app, "?shapes=guard", "target=ex:alice&target=ex:bob").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(focus_nodes(&r.json()), vec!["http://example.org/bob"]);
+    // the query string, and an empty body of another type
+    let r = validate(
+        &s.app,
+        "?shapes=guard&target=ex:alice",
+        "",
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["conforms"], true);
+    // a shapes graph of the dataset
+    let ds = s.state.datasets().get("ds").cloned().unwrap();
+    let trig = r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix ex: <http://example.org/> .
+ex:shapes { ex:NameShape a sh:NodeShape ; sh:targetClass ex:Person ;
+  sh:property [ sh:path foaf:name ; sh:minCount 1 ] . }"#
+        .to_string();
+    ds.store
+        .load(&[Source::from_bytes(
+            trig.into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let r = shacl_form(
+        &s.app,
+        "?shapes=http%3A%2F%2Fexample.org%2Fshapes&graph=http%3A%2F%2Fexample.org%2Fg1",
+        "target=ex:dave",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(focus_nodes(&r.json()), vec!["http://example.org/dave"]);
+    let r = shacl_form(&s.app, "?shapes=http%3A%2F%2Fexample.org%2Fnone", "").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+
+    // a source and a body, a source and graph, an invalid source
+    let r = validate(&s.app, "?shapes=guard", PERSON_SHAPES, None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    assert!(r.text().contains("not both"), "{}", r.text());
+    let r = shacl_form(&s.app, "?shapes=guard&graph=default", "").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let r = shacl_form(&s.app, "?shapes=not%20an%20iri", "").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
 }
