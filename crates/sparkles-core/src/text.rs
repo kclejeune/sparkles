@@ -2205,7 +2205,12 @@ mod imp {
                 ));
             }
             self.inner.ticks.store(false, Ordering::SeqCst);
-            let result = self.inner.close();
+            let result = self.inner.close().map(|()| {
+                // Stale or already-closed writers can still have background I/O.
+                // Drain its pathname lease before the store may reuse the directory.
+                let live = self.inner.live.lock();
+                let _checkpoint = live.dir.as_ref().map(LazySyncDir::checkpoint_lease);
+            });
             if let Err(error) = &result {
                 self.inner.retirement_failed.store(true, Ordering::SeqCst);
                 self.inner.fail_locked(&mut self.inner.live.lock(), error);
@@ -3463,6 +3468,56 @@ mod imp {
             assert_eq!(
                 dir.atomic_read(Path::new("new-owner-probe")).unwrap(),
                 b"new owner content"
+            );
+        }
+
+        #[test]
+        fn retiring_an_already_closed_stale_writer_drains_its_checkpoint() {
+            use std::sync::mpsc;
+            let (_root, inner, dir) = checkpoint_fixture();
+            publish_checkpoint_document(&inner, 1).unwrap();
+            inner.live.lock().dirty_since = Some(Instant::now() - CHECKPOINT_AFTER);
+            let (sync_tx, sync_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            dir.before_checkpoint_file_sync(move || {
+                let _ = sync_tx.send(());
+                resume_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("checkpoint file-sync latch expired");
+            });
+            let tick_inner = inner.clone();
+            let tick = std::thread::spawn(move || tick_inner.tick());
+            let reached = sync_rx.recv_timeout(Duration::from_secs(5));
+            if let Err(error) = reached {
+                let _ = resume_tx.send(());
+                tick.join().unwrap();
+                panic!("checkpoint never reached file synchronization: {error}");
+            }
+            inner.fail_locked(&mut inner.live.lock(), &text_err("stale writer probe"));
+            inner.close().unwrap();
+            assert!(inner.live.lock().writer.is_none());
+            let index = TextIndex {
+                inner: inner.clone(),
+                ticker: None,
+            };
+            let (retired_tx, retired_rx) = mpsc::channel();
+            let retiring = std::thread::spawn(move || {
+                let result = index.retire();
+                let _ = retired_tx.send(result);
+            });
+            let early = retired_rx.recv_timeout(Duration::from_millis(100));
+            let prematurely_retired = early.is_ok();
+            let _ = resume_tx.send(());
+            tick.join().unwrap();
+            let result = match early {
+                Ok(result) => result,
+                Err(_) => retired_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            };
+            retiring.join().unwrap();
+            result.unwrap();
+            assert!(
+                !prematurely_retired,
+                "closed stale retirement returned while its checkpoint still held the pathname"
             );
         }
 

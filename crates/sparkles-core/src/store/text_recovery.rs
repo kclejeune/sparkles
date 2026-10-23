@@ -804,6 +804,85 @@ mod tests {
     }
 
     #[test]
+    fn stale_retirement_waits_for_an_in_flight_background_checkpoint() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        populate(root);
+        let store = Arc::new(Store::open(root, Default::default()).unwrap());
+        wait(&store);
+        let old = store.text.load_full().unwrap();
+        let mut syncing = Pause::new(root, "text-checkpoint-file-sync");
+        let mut completed = Pause::new(root, "text-checkpoint-completed");
+        update(
+            &store,
+            "INSERT DATA { <http://ex/b> <http://www.w3.org/2000/01/rdf-schema#label> \"fox again\" }",
+        );
+        assert_eq!(count(&store), 2);
+        syncing.reached();
+        // A failed removal changes the RDF head but need not create a Tantivy file
+        // or advance the old directory's publication counter.
+        store.fail_next_text_commit();
+        update(
+            &store,
+            "DELETE DATA { <http://ex/b> <http://www.w3.org/2000/01/rdf-schema#label> \"fox again\" }",
+        );
+        assert_eq!(store.text_status().unwrap().state, "stale");
+        let (changed_tx, changed_rx) = mpsc::channel();
+        let lifecycle_store = store.clone();
+        let lifecycle = std::thread::spawn(move || {
+            let result = lifecycle_store
+                .enable_text(TextConfig {
+                    max_hits: 7,
+                    ..Default::default()
+                })
+                .map(|_| ());
+            let _ = changed_tx.send(result);
+        });
+        let early = changed_rx.recv_timeout(Duration::from_secs(2));
+        let prematurely_reused = early.is_ok();
+        if prematurely_reused {
+            assert!(early.as_ref().unwrap().is_ok());
+            store.set_text_ticks(false);
+            update(
+                &store,
+                "INSERT DATA { <http://ex/c> <http://www.w3.org/2000/01/rdf-schema#label> \"fox new owner\" }",
+            );
+            assert_eq!(count(&store), 2);
+            assert!(root.join("text.dirty").exists());
+        }
+        syncing.resume();
+        completed.reached();
+        let changed = match early {
+            Ok(result) => result,
+            Err(_) => changed_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        };
+        lifecycle.join().unwrap();
+        if !prematurely_reused && changed.is_ok() {
+            store.set_text_ticks(false);
+            update(
+                &store,
+                "INSERT DATA { <http://ex/c> <http://www.w3.org/2000/01/rdf-schema#label> \"fox new owner\" }",
+            );
+            assert_eq!(count(&store), 2);
+        }
+        let marker_retained = root.join("text.dirty").exists();
+        completed.resume();
+        drop(old);
+        changed.unwrap();
+        assert!(
+            !prematurely_reused,
+            "stale retirement reused the pathname while an old checkpoint held it; replacement marker retained={marker_retained}"
+        );
+        assert!(marker_retained, "the replacement lost its unsynced marker");
+        drop(store);
+        let reopened = Store::open(root, Default::default()).unwrap();
+        wait(&reopened);
+        assert_eq!(count(&reopened), 2);
+        assert_eq!(reopened.text_status().unwrap().config.max_hits, 7);
+    }
+
+    #[test]
     fn reconfiguration_retires_a_stale_writer_before_rebuilding_from_durable_data() {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
