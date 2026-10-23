@@ -278,7 +278,8 @@ that work by priority and links each item to its design spec.
   different views cannot each have reports built from their own view. The evaluation
   of global answering against local answers and text retrieval has not run, and reports
   are refreshed by hand rather than after commits. The byte bound's default allowances
-  are unmeasured. [Roadmap](ROADMAP.md) item 12.
+  are unmeasured. [Roadmap](ROADMAP.md) item 12, and item 99 for several
+  configurations.
 
 * **Cold sparse reads.** The constant, scan and result-term prefetch paths and I/O
   profiling are implemented and pass the warm instruction, warm read-hint and concurrent

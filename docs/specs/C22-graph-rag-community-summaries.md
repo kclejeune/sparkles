@@ -399,8 +399,9 @@ build actually used rather than to the principal's current grants. The proof wor
 a disclosure footprint that the build records, and a common guard applies it to every
 read path. No report is published before both exist. Ask and `recall` use reports only
 for callers who may read them, and otherwise answer locally and say so. A dataset whose
-readers have different views can define several GraphRAG configurations, each with its
-own principal and reports graph, as `graphrag.json` takes a list in Phase 2.
+readers have different views could define several GraphRAG configurations, each with
+its own principal and reports graph. That is deferred to roadmap item 99, and §13 holds
+the design.
 
 The model sees the facts of the principal's view. C18 §3.5's `sendByProvider` applies:
 a provider allowed only the schema cannot serve the `community` role, and the build
@@ -667,8 +668,8 @@ thousand changed facts, and Ask latency in global mode.
 and CLI, the Communities tab, the inbox kind, and manual refresh.
 
 **Phase 2.** Global answering in Ask with classification and the mode switch, community
-context in `recall` and the brief, `community_reports`, several configurations, and the
-evaluation.
+context in `recall` and the brief, `community_reports`, and the evaluation. Several
+configurations per dataset moved to roadmap item 99.
 
 **Phase 3.** Automatic refresh from the change feed, then from an F13 view.
 
@@ -746,6 +747,15 @@ evaluation.
    time would serve datasets that never build. The default chosen is a local answer.
 3. **Multilingual reports.** One `language` per configuration. Reports in several
    languages would multiply cost.
+4. **Several configurations per dataset.** Deferred to roadmap item 99, since no
+   deployment needs it yet and it changes the state format. The proposed design keeps
+   today's single object valid and also accepts `{configurations: [{name, ...}]}`, each
+   entry with its own principal, projection and reports graph. The routes take
+   `?config=` and the CLI takes `--config`, defaulting to the first configuration. The
+   build state and the ledger are kept per configuration under a new format version, and
+   a reader refuses versions it does not know. Ask, `community_reports`, `recall` and the
+   brief use the first configuration whose reports graph the caller may read, and the
+   Communities tab offers a picker.
 
 ## 14. Revisions
 
@@ -865,8 +875,8 @@ report. Map batches are sized for the smallest context among the summarize pair 
 fallbacks, so a large model that has a small fallback makes more, smaller calls, in
 exchange for a failover that never sends a batch its pair cannot read. A global answer reads main at its head,
 so an ask with `at` or another branch answers locally. The context of §7.3 is on, and the
-evaluation decides whether it stays on. Several configurations per dataset and the
-evaluation of §9 remain.
+evaluation decides whether it stays on. The evaluation of §9 remains, and several
+configurations per dataset are deferred to roadmap item 99 with the design in §13.
 
 The contracts that the first draft left open are settled in §14. Token budgets use
 conservative reservations before every HTTP attempt, and findings carry entity numbers
