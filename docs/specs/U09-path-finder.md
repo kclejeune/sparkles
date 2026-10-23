@@ -347,3 +347,10 @@ and **Open in editor** against the mock server, whose path search is a breadth-f
 search with Yen's algorithm for k shortest. The Playwright tests against a real server
 that §9 lists for A1, A4, A6 and A7 are not written, and ROADMAP item 103 keeps them
 with Phase 3. The Rust and router tests cover A1, A2, A3 and A6 on the engine.
+`mise run docs:screenshots` writes `docs/images/path-finder.png`, the three shortest paths
+between two people of the demo dataset, which the README shows.
+
+**Measurements.** A Namespace screen of the path searches that use neither new parameter
+found no change above the noise, with a geometric mean of 0.97 for the new build over the
+old one. [BENCHMARKS](../BENCHMARKS.md#skipped-predicates-and-hubs-2026-10-23) has the
+table. A forge A/B is a follow-up after the merge.

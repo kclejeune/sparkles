@@ -1146,6 +1146,37 @@ because the bidirectional search stops where its frontiers meet. Searching from 
 person to everyone costs 1.4–1.8× the `+` count, since it also keeps path parents and
 levels, and weighted search costs 5.6–6.3× the unweighted search.
 
+#### Skipped predicates and hubs (2026-10-23)
+
+[U09](specs/U09-path-finder.md) Phase 1 added `path:excludePredicate` and
+`path:maxDegree`, and stopped searches backward and both ways from passing through
+literals. A Namespace screen checked that searches which use neither parameter cost the
+same. It ran on an 8-vCPU AMD EPYC instance with the 10.5M-triple data, in four rounds of
+A, B, B, A with 20 timed requests per query and server process, one server CPU and one
+client CPU. A is the build before the change and B the lane's tip. The queries are the
+path searches of the table above and `ps-every-both`, a search both ways over every
+triple from person 0 to the last person.
+
+| query | A median | B median | B/A |
+|---|---:|---:|---:|
+| `ps-pair` | 2.93 | 2.66 | 0.91 |
+| `ps-pair-all` | 2.85 | 2.65 | 0.93 |
+| `ps-pair-both` | 1.26 | 1.30 | 1.03 |
+| `ps-pair-k5` | 73.2 | 69.2 | 0.95 |
+| `ps-values10` | 14.3 | 13.7 | 0.95 |
+| `ps-all4` | 0.093 | 0.102 | 1.09 |
+| `ps-any` | 388 | 393 | 1.01 |
+| `ps-every-both` | 16.7 | 15.2 | 0.91 |
+
+Times are the server's execution times in milliseconds, and the geometric mean of B/A is
+0.97. The medians of one build varied by up to 77% between server processes, so no change
+here is above the noise. A first screen of the literal fix checked for literals in every
+search with a lane read by the object, forward ones included, and made `ps-every-both`
+12% slower. The check now runs only in the lanes that can leave a literal, so a forward
+search never makes it. `ps-every-both` returns a different path of the same length as
+before, because skipping literal predecessors changes the order in which ties are found.
+Both answers pass through `rdf:type` classes and no literal.
+
 ### Graph algorithm polling
 
 Roadmap item 8 moved the cancellation and deadline checks of the graph algorithms
