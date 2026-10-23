@@ -740,26 +740,25 @@ impl Graph {
         // range of keys per task, so that each task reads few blocks
         if let Some(base) = &base {
             let probes: usize = maybe.iter().map(Vec::len).sum();
-            // the probe list, the found names and those of them by shard
-            work.try_grow(probes * (size_of::<(Triple, u64)>() + 4 * size_of::<u64>()))?;
+            // the probe list, its triples and answers, the found names and those of them
+            // by shard
+            work.try_grow(
+                probes * (size_of::<(Triple, u64)>() + size_of::<Triple>() + 4 * size_of::<u64>()),
+            )?;
             let mut probe: Vec<(Triple, u64)> =
                 maybe.iter().flatten().map(|&h| (get(h), h)).collect();
             drop(maybe);
             probe.par_sort_unstable();
-            let size = probe.len().div_ceil(threads * 4).max(1024);
-            let found: Vec<anyhow::Result<Vec<u64>>> = probe
-                .par_chunks(size)
-                .map(|c| {
-                    let ts: Vec<Triple> = c.iter().map(|x| x.0).collect();
-                    let f = base.contains_sorted(&ts)?;
-                    Ok(c.iter().zip(f).filter(|x| x.1).map(|x| x.0.1).collect())
-                })
+            let ts: Vec<Triple> = probe.iter().map(|x| x.0).collect();
+            let found = base.contains_sorted(&ts)?;
+            drop(ts);
+            let mut gone: Vec<u64> = probe
+                .iter()
+                .zip(found)
+                .filter(|x| x.1)
+                .map(|x| x.0.1)
                 .collect();
             drop(probe);
-            let mut gone: Vec<u64> = Vec::new();
-            for f in found {
-                gone.extend(f?);
-            }
             if !gone.is_empty() {
                 gone.sort_unstable();
                 let mut by_shard: Vec<Vec<u64>> = vec![Vec::new(); SHARDS];

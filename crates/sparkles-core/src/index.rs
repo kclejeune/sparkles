@@ -1290,7 +1290,7 @@ impl PermIndex {
 
     /// The rows `[from, to)` of block `b` that segment `s` holds.
     #[inline]
-    pub(crate) fn segment_rows(&self, b: usize, s: usize) -> (usize, usize) {
+    pub fn segment_rows(&self, b: usize, s: usize) -> (usize, usize) {
         let n = self.segs.as_ref().map_or(BLOCK_ROWS, |d| d.seg_rows);
         let rows = self.blocks[b].rows as usize;
         ((s * n).min(rows), ((s + 1) * n).min(rows))
@@ -1302,7 +1302,7 @@ impl PermIndex {
     /// than a quarter of the block's segments, or readers have already decoded a quarter
     /// of them one by one (spec X07 §6.5). A prefetch and the reader after it agree, since
     /// only a prefetch or a decode changes the answer.
-    pub(crate) fn segment_span(&self, b: usize, lo: &Key, hi: &Key) -> Option<(usize, usize)> {
+    pub fn segment_span(&self, b: usize, lo: &Key, hi: &Key) -> Option<(usize, usize)> {
         let d = self.segs.as_ref()?;
         let m = &self.blocks[b];
         if (m.first >= *lo && m.last <= *hi) || d.dense(b) {
@@ -1319,7 +1319,7 @@ impl PermIndex {
     /// [`segment_span`](Self::segment_span), unless the cache holds block `b`'s columns
     /// whole (judged by the first column of `mask`): a reader then uses them, as cheap as
     /// a segment, instead of cutting segments from them on every request.
-    pub(crate) fn read_span(
+    pub fn read_span(
         &self,
         cache: &BlockCache,
         b: usize,
@@ -1357,9 +1357,15 @@ impl PermIndex {
         self.segs.as_ref().is_none_or(|d| s + 1 >= d.count(b))
     }
 
+    /// The number of segments of block `b`, or `None` when the permutation is not
+    /// segmented.
+    pub fn segment_count(&self, b: usize) -> Option<usize> {
+        self.segs.as_ref().map(|d| d.count(b))
+    }
+
     /// The first key of segment `s` of block `b` (the block's first key when the
     /// permutation is not segmented).
-    pub(crate) fn segment_first(&self, b: usize, s: usize) -> Key {
+    pub fn segment_first(&self, b: usize, s: usize) -> Key {
         match &self.segs {
             Some(d) => d.first_key(b, s),
             None => self.blocks[b].first,
