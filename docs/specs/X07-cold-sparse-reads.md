@@ -284,6 +284,71 @@ decodes only the rest and assembles the column. The weigher is unchanged.
 - Warm decoding: a warm full-block scan decodes 32 frames instead of one per column.
   Target: within 5% on the warm suite.
 
+### 6.5 Revised design
+
+This section was written on 2026-10-23 after the profile of the remaining cold gaps, and
+it replaces §6.1 to §6.3 where they differ. It keeps each column contiguous instead of
+the PAX order of §6.1, because every reader in the engine asks for columns by mask, and a
+dense scan or a column-masked scan then reads the same bytes as before.
+
+**Layout.** A block keeps its 32,768 rows, its metadata record and its four columns in
+the order they have today. Each column is now a run of independent LZ4 frames, one per
+segment of `SEG_ROWS` consecutive rows, and the zig-zag deltas restart at 0 at the start
+of every segment. A column's `col_len` in the metadata record is still its total
+compressed length, so read-ahead, prefetch and partial compaction see the same byte
+ranges. A new file `<perm>.seg` starts with a 16-byte header, the magic `SPKSEG01` and
+the segment size, and then holds one 48-byte entry per segment for every block in block
+order. An entry is the segment's first key and the compressed length of its frame in
+each of the four columns. The entries of block `b` start at a position computed at open
+from the row counts of the blocks before it, so the file needs no offset table and the
+in-memory index grows by one integer per block. The file is mapped with `MADV_RANDOM`
+and stays on disk.
+
+**Segment size.** The writer uses 1,024 rows. The `.seg` header records the size, so a
+later build can write another size without a format change, and the reader accepts any
+size from 512 to 4,096 rows that divides the block. The size was chosen by a sweep of
+512, 1,024, 2,048 and 4,096 rows at 10.5M that measured index size and the decoded bytes
+of the cold point lookups, as the Outcome reports.
+
+**Decoder entry points.** `PermIndex::decode_segment(b, c, s)` decodes one frame into a
+column of at most `SEG_ROWS` values. `PermIndex::decode_col(b, c)` decodes every frame
+of the column into one buffer of the block's rows, so a full-column reader gets the same
+`Col` as before. A frame that is shorter or longer than its directory says, or that
+decodes to the wrong number of values, is a corruption error and never a panic.
+
+**Reads.** One decision chooses between a whole column and segments, for a reader of
+the rows of block `b` in a key range. It reads whole columns when the generation is not
+segmented, when the range covers the whole block, when the cache already holds the
+columns whole, or when the range spans more than a quarter of the block's segments.
+Otherwise it reads the segments whose first keys can hold the range, found by a binary
+search in the block's directory. The range scan (`for_each_key_range_masked`), the
+counts of edge blocks (`count_between`), the full-key test (`contains`), the index-join
+reader (`read_ranges_gallop`) and the join prefetch all use this decision, so the
+prefetch decodes the same segments that the reader then finds in the cache. A reader of
+segments gets a `Block` that holds one segment, with row numbers relative to it. Range
+scans therefore pass one segment at a time to their callback, and the index-join reader
+moves from one segment to the next when a range continues past the end of a segment.
+
+**Dense scans.** A whole block, and every reader that asks for whole blocks by number
+(sorted scans, the streaming scan cursor, sampling, the reasoner, exports), decodes the
+whole column from its frames. The work per value is unchanged, and the extra cost is
+one LZ4 frame start and one varint restart per 1,024 rows.
+
+**Cache.** A cached column is keyed by the permutation instance, the block, the column,
+the namespace and the segment. The segment takes six bits next to the column, where 0
+means the whole column, so a whole column and a segment never shadow each other. The
+weigher counts each entry's decoded bytes as before.
+
+**Format.** Generations written by this build have index format 3, registered in the
+format table of X12. The reader opens formats 2 and 3. A format 2 generation is read as
+before, and the next compaction writes format 3. A partial compaction that copies a
+block from a format 2 generation into a format 3 one decodes and re-encodes it, and one
+that copies from format 3 copies the block's bytes and its directory entries. A build
+that reads only format 2 refuses a format 3 generation by the check of `meta.json` it
+already has. A compaction writes the new generation in a directory of its own and
+switches to it in one step, so a crash leaves the old generation in use and never a
+half-converted one.
+
 ## 7. Phase 4: optional prewarm
 
 A server can record, at shutdown and every few minutes, which vocabulary groups and
