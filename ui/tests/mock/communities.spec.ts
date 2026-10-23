@@ -52,6 +52,53 @@ test('off main the tab offers no action on main', async ({ page }) => {
   expect(graphrag).toEqual([]);
 });
 
+test('leaving main ends a waiting run and never confirms it', async ({ page }) => {
+  // the mock does not run builds, so the build and its task are stubbed here
+  const waiting = {
+    id: 'gr-wait',
+    kind: 'graphrag',
+    dataset: 'org',
+    state: 'running',
+    startedAt: new Date().toISOString(),
+    message: 'Waiting for confirmation',
+    cancellable: true,
+    detail: {
+      phase: 'awaiting-confirmation',
+      estimate: {
+        communities: 3,
+        requests: 3,
+        model: 'p/m',
+        tokens: 9000,
+        tokensPerBuild: 100000,
+        tokensPerDay: 1000000,
+      },
+    },
+  };
+  const confirms: string[] = [];
+  await page.route(/\/\$\/graphrag\/org\/build$/, (route) =>
+    route.fulfill({ status: 202, json: waiting }),
+  );
+  await page.route(/\/\$\/graphrag\/org\/confirm$/, (route) => {
+    confirms.push(route.request().postData() ?? '');
+    return route.fulfill({ status: 200, json: {} });
+  });
+  await page.route(/\/\$\/tasks\/gr-wait$/, (route) => route.fulfill({ json: waiting }));
+  await page.goto('/ui/datasets/org?tab=communities');
+  const panel = page.getByTestId('communities');
+  await panel.getByRole('button', { name: 'Build' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Send this build to the model?' });
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole('combobox', { name: 'Branch' }).selectOption('scratch-s2');
+  await expect(panel.getByTestId('communities-off-main')).toBeVisible();
+  // the follower polls every 700 ms: it must not open the estimate again
+  await page.waitForTimeout(2000);
+  await expect(dialog).toHaveCount(0);
+  await expect(panel.getByTestId('graphrag-run')).toHaveCount(0);
+  expect(confirms).toEqual([]);
+});
+
 test('a slow answer for an earlier community does not replace a later one', async ({ page }) => {
   // hold Engineering's answer until the platform team's has arrived
   let release: () => void = () => {};

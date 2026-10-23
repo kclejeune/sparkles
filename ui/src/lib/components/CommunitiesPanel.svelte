@@ -49,6 +49,9 @@
   let answered = $state<string | null>(null);
   let stop = false;
   onDestroy(() => (stop = true));
+  // the dataset and branch the panel shows: a new one ends every follower and answer of
+  // the previous one, so a run on main is never confirmed from another branch's page
+  let context = 0;
 
   const short = (iri: string) => displayIri(iri, prefixes);
   const running = $derived(task != null && !gr.ended(task));
@@ -72,9 +75,11 @@
   });
 
   async function load() {
+    const ctx = context;
     loading = true;
     try {
       const [s, l] = await Promise.all([gr.status(ds), gr.communities(ds)]);
+      if (ctx !== context) return;
       st = s;
       list = l;
       error = null;
@@ -118,6 +123,11 @@
     void ds;
     const onMain = !branch;
     untrack(() => {
+      context++;
+      task = null;
+      answered = null;
+      estimateOpen = false;
+      editOpen = false;
       detailSeq++;
       selected = null;
       detail = null;
@@ -131,8 +141,10 @@
 
   /** A run of this dataset that is still going, such as one started from the CLI. */
   async function findRunning() {
+    const ctx = context;
     try {
       const all = await api.listTasks();
+      if (ctx !== context) return;
       const t = all.find((x) => x.kind === 'graphrag' && x.dataset === ds && !gr.ended(x));
       if (t) void follow(t);
     } catch {
@@ -141,18 +153,23 @@
   }
 
   async function follow(t: api.Task) {
+    const ctx = context;
+    const live = () => !stop && ctx === context;
     task = t;
-    while (!stop && task && !gr.ended(task)) {
+    while (live() && task && !gr.ended(task)) {
       if (gr.waitingEstimate(task) && answered !== task.id) estimateOpen = true;
       await new Promise((r) => setTimeout(r, 700));
-      if (stop) return;
+      if (!live()) return;
       try {
-        task = await gr.task(t.id);
+        const next = await gr.task(t.id);
+        if (!live()) return;
+        task = next;
       } catch (e) {
-        toasts.error('Lost track of the run', e);
+        if (live()) toasts.error('Lost track of the run', e);
         return;
       }
     }
+    if (!live()) return;
     estimateOpen = false;
     if (!task) return;
     const o = gr.outcomeOf(task);
@@ -164,10 +181,12 @@
   }
 
   async function start(mode: 'build' | 'refresh') {
+    if (branch) return;
+    const ctx = context;
     starting = true;
     try {
       const t = await gr.start(ds, mode, false);
-      void follow(t);
+      if (ctx === context) void follow(t);
     } catch (e) {
       toasts.error(`The ${mode} did not start`, e);
     } finally {
@@ -176,9 +195,10 @@
   }
 
   async function answer(yes: boolean) {
-    if (!task) return;
-    answered = task.id;
     estimateOpen = false;
+    // only a run of the dataset this panel shows on main
+    if (!task || branch || task.dataset !== ds) return;
+    answered = task.id;
     try {
       await gr.confirm(ds, task.id, yes);
     } catch (e) {
@@ -540,7 +560,7 @@
 </section>
 
 <Modal bind:open={estimateOpen} title="Send this build to the model?" width={520}>
-  {#if estimate}
+  {#if estimate && !branch}
     <p>
       The run sends {fmtInt(estimate.requests)} request{estimate.requests === 1 ? '' : 's'} for {fmtInt(
         estimate.communities,
