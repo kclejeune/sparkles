@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import pathlib
 import tempfile
@@ -20,40 +22,71 @@ def scrape(seconds, count, path="direct"):
     )
 
 
-def serial(block, grouped, p50, mean, sync_ms, count=2200):
+def serial(
+    block,
+    grouped,
+    p50,
+    mean,
+    sync_ms,
+    count=2200,
+    index="text",
+    people=1000,
+    scenario="serial-literal",
+    syncs=None,
+):
+    """A serial process whose counters hold `syncs` commits, by default one per request."""
+    syncs = count if syncs is None else syncs
     return {
         "block": block,
-        "scenario": "serial-literal",
+        "scenario": scenario,
         "grouped": grouped,
-        "people": 1000,
-        "index": "text",
+        "people": people,
+        "index": index,
         "calibration": False,
         "writers": {"p50_ms": p50, "p90_ms": p50 * 1.1, "mean_ms": mean},
-        "sync": (sync_ms * count / 1000, count),
+        "sync": (sync_ms * syncs / 1000, syncs),
+        "attempts": (count, mean),
     }
 
 
 class Campaign:
+    """Lays out a campaign directory as bench-indexed-commit.py writes it."""
+
     def __init__(self, root, rows):
         self.root = pathlib.Path(root)
-        cell = self.root / "text-1000"
-        cell.mkdir(parents=True)
         seen = {}
         results = []
         for row in rows:
+            result = {k: v for k, v in row.items() if k not in ("sync", "attempts")}
+            results.append(result)
             if row.get("calibration"):
-                results.append({k: v for k, v in row.items() if k != "sync"})
                 continue
-            key = (row["block"], row["scenario"])
+            key = (row["index"], row["people"], row["block"], row["scenario"])
             position = seen.get(key, 0)
             seen[key] = position + 1
-            run = cell / f"b{row['block']}-{row['scenario']}-{position}"
+            run = (
+                self.root
+                / f"{row['index']}-{row['people']}"
+                / f"b{row['block']}-{row['scenario']}-{position}"
+            )
             (run / "before").mkdir(parents=True)
             (run / "before" / "metrics.txt").write_text(scrape(0.5, 10))
             seconds, count = row["sync"]
             (run / "metrics.txt").write_text(scrape(0.5 + seconds, 10 + count))
-            results.append({k: v for k, v in row.items() if k != "sync"})
+            attempts, mean = row["attempts"]
+            lines = ["client\tindex\ttimed\tstart_unix\tend_unix\tlatency_ms\tstatus"]
+            lines += [f"0\t{i}\ttrue\t0\t0\t{mean}\t200" for i in range(attempts)]
+            (run / "request-timings.tsv").write_text("\n".join(lines) + "\n")
         (self.root / "results.json").write_text(json.dumps(results))
+
+
+def abba(block, off, on, **kwargs):
+    return [
+        serial(block, False, *off, **kwargs),
+        serial(block, True, *on, **kwargs),
+        serial(block, True, *on, **kwargs),
+        serial(block, False, *off, **kwargs),
+    ]
 
 
 class IndexedReport(unittest.TestCase):
@@ -76,12 +109,7 @@ class IndexedReport(unittest.TestCase):
         # request latencies differ by 4x while the engine overhead is equal.
         rows = []
         for block in range(3):
-            rows += [
-                serial(block, False, 1.8, 1.9, 1.6),
-                serial(block, True, 0.45, 0.55, 0.35),
-                serial(block, True, 0.45, 0.55, 0.35),
-                serial(block, False, 1.8, 1.9, 1.6),
-            ]
+            rows += abba(block, (1.8, 1.9, 1.6), (0.45, 0.55, 0.35))
         with tempfile.TemporaryDirectory() as tmp:
             Campaign(tmp, rows)
             entry = REPORT.summarize(REPORT.load(tmp))[0]
@@ -91,6 +119,39 @@ class IndexedReport(unittest.TestCase):
         self.assertAlmostEqual(metrics["sync_ms"]["ratio"], 0.35 / 1.6)
         self.assertAlmostEqual(metrics["overhead_ms"]["off"]["median"], 0.3)
         self.assertAlmostEqual(metrics["overhead_ms"]["on"]["median"], 0.2)
+
+    def test_overhead_uses_the_commits_the_counters_hold(self):
+        # 200 warmup commits synchronize in 1.6 ms and 2,000 timed ones in 0.23 ms, so
+        # the counters average 0.3 ms over the 2,200 commits the client sent. The
+        # latency of those requests averages 0.5 ms, which leaves an overhead of 0.2 ms.
+        mean = 0.5
+        sync_ms = (200 * 1.6 + 2000 * 0.23) / 2200
+        rows = abba(0, (mean, mean, sync_ms), (mean, mean, sync_ms))
+        with tempfile.TemporaryDirectory() as tmp:
+            Campaign(tmp, rows)
+            entry = REPORT.summarize(REPORT.load(tmp))[0]
+        self.assertAlmostEqual(
+            entry["metrics"]["overhead_ms"]["off"]["median"], mean - sync_ms
+        )
+
+    def test_no_overhead_when_the_counters_hold_other_commits(self):
+        # The delete scenario seeds its rows first, so the counters hold twice the
+        # commits of the timed requests, and the embedding worker adds its own.
+        rows = []
+        for block in range(2):
+            rows += abba(
+                block,
+                (0.4, 0.4, 0.23),
+                (0.4, 0.4, 0.23),
+                scenario="serial-delete",
+                syncs=4400,
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            Campaign(tmp, rows)
+            entry = REPORT.summarize(REPORT.load(tmp))[0]
+        self.assertIn("p50_ms", entry["metrics"])
+        self.assertIn("sync_ms", entry["metrics"])
+        self.assertNotIn("overhead_ms", entry["metrics"])
 
     def test_paired_ratio_compares_neighbours_inside_each_block(self):
         # The drive slows down for the second half of every block. A pooled ratio sees
@@ -119,9 +180,8 @@ class IndexedReport(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp:
             Campaign(tmp, rows)
-            (
-                pathlib.Path(tmp) / "text-1000" / "b0-serial-literal-1" / "metrics.txt"
-            ).unlink()
+            run = pathlib.Path(tmp) / "text-1000" / "b0-serial-literal-1"
+            (run / "metrics.txt").unlink()
             entry = REPORT.summarize(REPORT.load(tmp))[0]
         self.assertIn("p50_ms", entry["metrics"])
         self.assertNotIn("sync_ms", entry["metrics"])
@@ -140,7 +200,69 @@ class IndexedReport(unittest.TestCase):
             entry = REPORT.summarize(REPORT.load(tmp))[0]
         self.assertEqual(entry["processes"], {"off": 1, "on": 1})
 
-    def test_marks_and_render_carry_the_harness_verdicts(self):
+    def test_a_campaign_with_several_cells_resolves_each_directory(self):
+        # The default campaign holds one directory per index and size, and every cell
+        # numbers its positions from zero. The cells hold different latencies.
+        rows = []
+        for index, people, p50 in (
+            ("text", 1000, 1.0),
+            ("geo", 1000, 2.0),
+            ("text", 2000, 3.0),
+        ):
+            for block in range(2):
+                rows += abba(
+                    block,
+                    (p50, p50, 0.1),
+                    (p50, p50, 0.1),
+                    index=index,
+                    people=people,
+                )
+        with tempfile.TemporaryDirectory() as tmp:
+            Campaign(tmp, rows)
+            entries = REPORT.summarize(REPORT.load(tmp))
+        medians = {
+            (e["index"], e["people"]): e["metrics"]["p50_ms"]["off"]["median"]
+            for e in entries
+        }
+        self.assertEqual(
+            medians, {("geo", 1000): 2.0, ("text", 1000): 1.0, ("text", 2000): 3.0}
+        )
+        for e in entries:
+            self.assertEqual(e["processes"], {"off": 4, "on": 4})
+            self.assertAlmostEqual(
+                e["metrics"]["sync_ms"]["off"]["median"], 0.1, places=6
+            )
+
+    def test_marks_stay_with_their_campaign(self):
+        # Two campaigns of the same cell with opposite verdicts print their own marks.
+        def campaign(root, passed):
+            Campaign(root, abba(0, (1.0, 1.0, 0.5), (1.0, 1.0, 0.5)))
+            gate = {
+                "people": 1000,
+                "index": "text",
+                "scenario": "serial-literal",
+                "checks": {"p50_ms": {"passed": passed}},
+            }
+            (pathlib.Path(root) / "gate-summary.json").write_text(
+                json.dumps({"gates": [gate]})
+            )
+
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
+            campaign(first, False)
+            campaign(second, True)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                REPORT.main([first, second])
+        before, after = out.getvalue().split(f"campaign {second}")
+        self.assertIn("p50_ms=FAIL", before)
+        self.assertNotIn("p50_ms=ok", before)
+        self.assertIn("p50_ms=ok", after)
+        self.assertNotIn("FAIL", after)
+
+    def test_render_carries_the_harness_verdicts(self):
         rows = [serial(0, False, 1.0, 1.0, 0.5), serial(0, True, 1.0, 1.0, 0.5)]
         with tempfile.TemporaryDirectory() as tmp:
             Campaign(tmp, rows)

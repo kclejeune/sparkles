@@ -1801,7 +1801,7 @@ count the matches of a text query or a spatial window. Raw results stay on `forg
 Each gate below is marked as the harness computed it. The summary is 28 of 36 serial checks
 met, 3 of 6 throughput gates met, 10 of 10 memory gates met, and all 8 reader latency ratios
 within 10%. The reader gates are still not established, because the harness requirement that
-a mixed run keep its offered schedule failed in all four mixed cells for both settings.
+a mixed run keep its offered schedule failed in all four mixed cells for at least one setting.
 
 #### Serial commits
 
@@ -1809,41 +1809,47 @@ A serial commit finds the group idle and takes the ordinary path, so the grouped
 measures the same code as the ordinary one. The ratios are those of the medians over ten
 processes, and the gate asks for both ratios to lie between 0.95 and 1.05. The last column
 is the ratio of the engine overhead, which is the mean request latency less the mean time
-of a commit synchronization read from the server's counters.
+of a commit synchronization read from the server's counters. Both cover the same commits,
+warmup included, only when the counters hold one synchronization for each request. The delete
+scenario seeds its rows first and the embedding worker commits on its own, so those rows
+have no overhead.
 
 | Index | Dataset | Change | p50 ordinary (ms) | p50 grouped (ms) | p50 ratio | p90 ordinary (ms) | p90 grouped (ms) | p90 ratio | Overhead ratio |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Full-text | 1.05M | literal | 1.774 | 1.768 | 0.997 met | 1.874 | 1.966 | 1.049 met | 0.983 |
-| Full-text | 1.05M | iri | 0.464 | 1.053 | 2.267 **missed** | 1.106 | 1.723 | 1.558 **missed** | 0.965 |
-| Full-text | 1.05M | delete | 0.412 | 0.407 | 0.987 met | 0.431 | 0.427 | 0.990 met | 0.993 |
-| Full-text | 10.5M | literal | 0.437 | 0.443 | 1.015 met | 1.188 | 0.483 | 0.407 **missed** | 1.033 |
-| Full-text | 10.5M | iri | 0.412 | 0.414 | 1.003 met | 0.458 | 0.446 | 0.974 met | 1.005 |
-| Full-text | 10.5M | delete | 0.411 | 0.410 | 0.999 met | 0.432 | 0.428 | 0.990 met | 0.988 |
-| Spatial | 1.05M | literal | 1.733 | 0.433 | 0.250 **missed** | 1.822 | 1.163 | 0.639 **missed** | 0.923 |
-| Spatial | 1.05M | iri | 0.411 | 0.413 | 1.005 met | 0.456 | 0.456 | 1.001 met | 1.030 |
-| Spatial | 1.05M | delete | 0.406 | 0.409 | 1.008 met | 0.431 | 0.428 | 0.993 met | 1.007 |
-| Spatial | 10.5M | literal | 1.736 | 1.786 | 1.029 met | 1.846 | 1.950 | 1.057 **missed** | 0.994 |
-| Spatial | 10.5M | iri | 0.409 | 0.414 | 1.011 met | 0.449 | 0.463 | 1.032 met | 1.036 |
-| Spatial | 10.5M | delete | 0.412 | 0.411 | 0.998 met | 0.435 | 0.429 | 0.986 met | 0.990 |
-| Embedding | 1.05M | literal | 0.473 | 0.441 | 0.933 **missed** | 1.536 | 0.797 | 0.519 **missed** | 0.775 |
-| Embedding | 1.05M | iri | 0.410 | 0.415 | 1.012 met | 0.431 | 0.448 | 1.040 met | 1.020 |
-| Embedding | 1.05M | delete | 0.411 | 0.410 | 0.998 met | 0.435 | 0.434 | 0.996 met | 0.993 |
-| Embedding | 10.5M | literal | 0.381 | 0.376 | 0.987 met | 1.852 | 1.843 | 0.995 met | 0.991 |
-| Embedding | 10.5M | iri | 0.411 | 0.412 | 1.003 met | 0.437 | 0.441 | 1.008 met | 0.999 |
-| Embedding | 10.5M | delete | 0.415 | 0.417 | 1.005 met | 0.441 | 0.452 | 1.024 met | 0.999 |
+| Full-text | 1.05M | literal | 1.774 | 1.768 | 0.997 met | 1.874 | 1.966 | 1.049 met | 0.975 |
+| Full-text | 1.05M | iri | 0.464 | 1.053 | 2.267 **missed** | 1.106 | 1.723 | 1.558 **missed** | 1.029 |
+| Full-text | 1.05M | delete | 0.412 | 0.407 | 0.987 met | 0.431 | 0.427 | 0.990 met | n/a |
+| Full-text | 10.5M | literal | 0.437 | 0.443 | 1.015 met | 1.188 | 0.483 | 0.407 **missed** | 0.932 |
+| Full-text | 10.5M | iri | 0.412 | 0.414 | 1.003 met | 0.458 | 0.446 | 0.974 met | 0.994 |
+| Full-text | 10.5M | delete | 0.411 | 0.410 | 0.999 met | 0.432 | 0.428 | 0.990 met | n/a |
+| Spatial | 1.05M | literal | 1.733 | 0.433 | 0.250 **missed** | 1.822 | 1.163 | 0.639 **missed** | 0.977 |
+| Spatial | 1.05M | iri | 0.411 | 0.413 | 1.005 met | 0.456 | 0.456 | 1.001 met | 1.017 |
+| Spatial | 1.05M | delete | 0.406 | 0.409 | 1.008 met | 0.431 | 0.428 | 0.993 met | n/a |
+| Spatial | 10.5M | literal | 1.736 | 1.786 | 1.029 met | 1.846 | 1.950 | 1.057 **missed** | 1.127 |
+| Spatial | 10.5M | iri | 0.409 | 0.414 | 1.011 met | 0.449 | 0.463 | 1.032 met | 1.016 |
+| Spatial | 10.5M | delete | 0.412 | 0.411 | 0.998 met | 0.435 | 0.429 | 0.986 met | n/a |
+| Embedding | 1.05M | literal | 0.473 | 0.441 | 0.933 **missed** | 1.536 | 0.797 | 0.519 **missed** | n/a |
+| Embedding | 1.05M | iri | 0.410 | 0.415 | 1.012 met | 0.431 | 0.448 | 1.040 met | 1.036 |
+| Embedding | 1.05M | delete | 0.411 | 0.410 | 0.998 met | 0.435 | 0.434 | 0.996 met | n/a |
+| Embedding | 10.5M | literal | 0.381 | 0.376 | 0.987 met | 1.852 | 1.843 | 0.995 met | n/a |
+| Embedding | 10.5M | iri | 0.411 | 0.412 | 1.003 met | 0.437 | 0.441 | 1.008 met | 0.997 |
+| Embedding | 10.5M | delete | 0.415 | 0.417 | 1.005 met | 0.441 | 0.452 | 1.024 met | n/a |
 
 Eight of the 36 checks missed, and the misses do not follow the setting. In five of the eight
 the grouped process was the faster one, with ratios between 0.25 and 0.93. The evidence
-points to the drive. The mean time of a commit synchronization, which the server counts, was about 0.23 ms
-in some processes and between 1.2 and 1.7 ms in others of the same cell and setting, and it
-often changed inside a block. Literal inserts met the slow state more often than IRI inserts
-and deletes. A median over ten processes then follows how many of them met the slow state,
-which is why the full-text IRI inserts at 1.05M missed with the ratio 2.27 although their
-engine overhead was the same to within 4%. The engine overhead differs by at most 3.6% between the settings in every cell
-except two literal cells with embedding or spatial work, where grouping was 22.5% and 7.7%
-lower. Pairing each process with its neighbour in the same block gives a median p50 ratio
-between 0.978 and 1.025 for all six literal cells. These figures are context, and the table
-keeps the harness verdict. A shift of 5% cannot be resolved on this drive with ten processes.
+points to the drive. The mean time of a commit synchronization, which the server counts, was
+about 0.23 ms in some processes and between 1.2 and 1.7 ms in others of the same cell and
+setting, and it often changed inside a block. Literal inserts met the slow state more often
+than IRI inserts and deletes. A median over ten processes then follows how many of them met
+the slow state, which is why the full-text IRI inserts at 1.05M missed with the ratio 2.27
+although their engine overhead was the same to within 3%. Where the overhead can be
+computed, it differs by at most 3.6% between the settings in 8 of 10 cells. It is 6.8% lower
+with grouping for full-text literals at 10.5M and 12.7% higher for spatial literals at
+10.5M, at 0.213 against 0.240 ms. The spatial cell also missed its p90 by 0.7 points, so a
+small cost of the spatial view in the serial path is not excluded. Pairing each process with
+its neighbour in the same block gives a median p50 ratio between 0.978 and 1.025 for all six
+literal cells. These figures are context, and the table keeps the harness verdict. A shift
+of 5% cannot be resolved on this drive with ten processes.
 
 #### Four writers
 
@@ -1892,8 +1898,9 @@ limits to 50 ms.
 | Spatial | 10.5M | 1.036 | 1.039 | 1.002 met | 1.452 | 1.515 | 1.044 met | 20 (8–84) | 10 (5–50) | 5.6 MiB met |
 
 All eight reader ratios lie between 0.925 and 1.044, and every mixed process achieved its
-offered rate to within 0.3%. The schedule lag requirement failed in all four cells, so the
-harness does not accept the comparison, and the reader gates stay not established.
+offered rate to within 0.3%. The schedule lag requirement failed in all four cells, in both
+settings for full-text and for the ordinary writer alone for spatial. The harness therefore
+does not accept the comparison, and the reader gates stay not established.
 
 The full-text failure belongs to the index and not to grouping. In every text process, with
 either setting, all four writers stopped together for a median of 70 to 150 ms about every

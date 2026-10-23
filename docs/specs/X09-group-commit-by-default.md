@@ -1403,15 +1403,17 @@ has the tables. The harness verdicts are the following.
 | Serial commits, p50 and p90 within 5% | 28 of 36 checks met. Eight missed, five of them with grouping faster than 0.95 of the ordinary path. |
 | Four writers, at least 1.5 times | Met for full-text at 10.5M and for embedding at both sizes, with 1.65, 2.38 and 2.05. Missed for full-text at 1.05M, 1.34, and for spatial at 1.05M and 10.5M, 1.49 and 1.34. |
 | Text query p50 and p99 during four writers | Ratios of 0.987 and 1.000 at 1.05M and 0.997 and 0.982 at 10.5M. Not established, because the schedule lag requirement failed for both settings. |
-| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established for the same reason. |
+| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established, because the schedule lag requirement failed for the ordinary writer at both sizes. |
 | Peak resident memory within 64 MiB | Met in all ten cells. The largest certified difference was 19.6 MiB, for embedding at 1.05M. |
 
 The serial misses and the narrow throughput misses follow the drive more than the engine.
 The server's own counters show the mean time of a commit synchronization at about 0.23 ms in
 some processes and between 1.2 and 1.7 ms in others of the same cell and setting, and it
 changed inside blocks. The engine overhead, which is the mean request latency less that
-time, differs by at most 3.6% between the settings in 16 of the 18 serial cells and by
-22.5% and 7.7% less with grouping in the other two. A neighbour-paired median of the p50
+time over the same commits, can be computed for 10 of the 18 serial cells. It differs by at
+most 3.6% between the settings in 8 of them. It is 6.8% lower with grouping for full-text
+literals at 10.5M and 12.7% higher for spatial literals at 10.5M, so a small cost of the
+spatial view in the serial path is not excluded. A neighbour-paired median of the p50
 is within 2.5% of 1 in all six literal cells. A median over ten processes follows how many
 of them met the slow state, so a shift of 5% is not resolved on this drive. With four writers
 a fence carried a median of 1.9 to 2.0 commits in the text and spatial cells, and the

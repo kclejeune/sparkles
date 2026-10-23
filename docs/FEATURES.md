@@ -384,7 +384,8 @@ that work by priority and links each item to its design spec.
   crash runs, and its forge acceptance of 2026-10-23 met the memory gate in all ten cells.
   It met 28 of 36 serial checks and 3 of 6 four-writer throughput gates. The misses follow
   the drive's flush time, which moved between processes by a factor of seven, more than the
-  engine, whose overhead differed by at most 3.6% in 16 of 18 serial cells. The text and
+  engine, whose overhead differed by at most 3.6% in 8 of the 10 serial cells that can
+  compute it. The text and
   spatial reader latency gates are not established. Every mixed cell failed the 50 ms
   schedule lag requirement, and the full-text cells stop all writers for 70 to 150 ms about
   every 5.4 s, with grouping and without it, probably in the locked background checkpoint.

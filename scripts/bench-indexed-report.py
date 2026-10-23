@@ -4,14 +4,18 @@ storage synchronization time of every process.
 
 Each argument is the output directory of one campaign, the directory that holds
 results.json. The report prints, for every people, index and scenario, the median and the
-range of each metric with the ordinary writer and with grouping, and the ratio of the two
-medians. For the serial scenarios it also prints the mean time of a commit
-synchronization, read from the server's counters of each process, and the engine
-overhead, which is the mean request latency minus that synchronization time. A
-campaign on a drive whose flush latency moves between processes shows the move in the
-synchronization column, and the overhead column shows whether the two writers differ
-once the move is taken out. The report never changes a gate, and the pass or fail marks
-come from gate-summary.json as the harness wrote them.
+range of each metric with the ordinary writer and with grouping, the ratio of the two
+medians, and the ratio between neighbouring processes of each ABBA block. It also prints
+the mean time of a commit synchronization, read from the server's counters of each
+process. For a serial scenario it prints the engine overhead as well, which is the mean
+request latency less the mean synchronization time, when the two cover the same commits.
+The latency comes from the request timings, which include the warmup requests, and so do
+the counters. A scenario whose counters hold other commits, such as the seeding writes of
+the delete scenario or the embedding worker's own commits, has no overhead row. A campaign
+on a drive whose flush latency moves between processes shows the move in the
+synchronization row, and the overhead row shows whether the two writers still differ once
+the move is taken out. The report never changes a gate, and the pass or fail marks come
+from the gate-summary.json of each campaign as the harness wrote it.
 """
 
 import argparse
@@ -41,40 +45,69 @@ def sync_totals(path):
     return seconds, count
 
 
-def sync_mean_ms(run):
-    """Mean milliseconds per commit synchronization during one process, or None."""
+def sync_delta(run):
+    """Seconds and count of commit synchronizations during one process, or None."""
     after = sync_totals(run / "metrics.txt")
     before = sync_totals(run / "before" / "metrics.txt") or (0.0, 0.0)
     if after is None or after[1] <= before[1]:
         return None
-    return (after[0] - before[0]) / (after[1] - before[1]) * 1000
+    return after[0] - before[0], after[1] - before[1]
 
 
-def cell_directory(root):
-    cells = [
-        p
-        for p in root.iterdir()
-        if p.is_dir() and re.fullmatch(r"[a-z]+-[0-9]+", p.name)
-    ]
-    assert len(cells) == 1, f"{root} holds {len(cells)} cell directories"
-    return cells[0]
+def sync_mean_ms(run):
+    """Mean milliseconds per commit synchronization during one process, or None."""
+    delta = sync_delta(run)
+    return None if delta is None else delta[0] / delta[1] * 1000
+
+
+def attempt_latencies(run):
+    """Latencies in milliseconds of every request the client sent, warmups included."""
+    path = run / "request-timings.tsv"
+    if not path.exists():
+        return []
+    lines = path.read_text().splitlines()
+    column = lines[0].split("\t").index("latency_ms")
+    return [float(line.split("\t")[column]) for line in lines[1:]]
+
+
+def overhead_ms(run):
+    """Mean request latency less the mean synchronization time, over the same commits.
+
+    The two cover the same commits only when the server counted one synchronization for
+    each request the client sent. Otherwise there is no overhead.
+    """
+    delta = sync_delta(run)
+    latencies = attempt_latencies(run)
+    if delta is None or not latencies or round(delta[1]) != len(latencies):
+        return None
+    return statistics.fmean(latencies) - delta[0] / len(latencies) * 1000
 
 
 def load(root):
-    """Rows of one campaign with the synchronization mean of each process."""
+    """Rows of one campaign with the synchronization figures of each process."""
     root = pathlib.Path(root)
     results = json.loads((root / "results.json").read_text())
-    cell = cell_directory(root)
     seen = {}
     rows = []
     for result in results:
         if result.get("calibration"):
             continue
-        key = (result["block"], result["scenario"])
+        key = (result["index"], result["people"], result["block"], result["scenario"])
         position = seen.get(key, 0)
         seen[key] = position + 1
-        run = cell / f"b{result['block']}-{result['scenario']}-{position}"
-        rows.append(dict(result, sync_mean_ms=sync_mean_ms(run), position=position))
+        run = (
+            root
+            / f"{result['index']}-{result['people']}"
+            / f"b{result['block']}-{result['scenario']}-{position}"
+        )
+        rows.append(
+            dict(
+                result,
+                sync_mean_ms=sync_mean_ms(run),
+                overhead_ms=overhead_ms(run),
+                position=position,
+            )
+        )
     return rows
 
 
@@ -146,14 +179,7 @@ def summarize(rows):
             add("p50_ms", lambda r: r["writers"]["p50_ms"])
             add("p90_ms", lambda r: r["writers"]["p90_ms"])
             add("sync_ms", lambda r: r["sync_mean_ms"])
-            add(
-                "overhead_ms",
-                lambda r: (
-                    None
-                    if r["sync_mean_ms"] is None
-                    else r["writers"]["mean_ms"] - r["sync_mean_ms"]
-                ),
-            )
+            add("overhead_ms", lambda r: r["overhead_ms"])
         else:
             add("tps", lambda r: r["tps"])
             add("peak_rss_mib", lambda r: r["peak_rss_kib"] / 1024)
@@ -212,15 +238,18 @@ def main(argv=None):
     parser.add_argument("roots", nargs="+", help="campaign output directories")
     parser.add_argument("--json", action="store_true", help="print JSON, not text")
     args = parser.parse_args(argv)
-    entries = []
-    gate_marks = {}
+    campaigns = []
     for root in args.roots:
-        entries += summarize(load(root))
-        gate_marks.update(marks(root))
+        entries = summarize(load(root))
+        campaigns.append({"campaign": str(root), "entries": entries})
     if args.json:
-        print(json.dumps(entries, indent=2))
+        print(json.dumps(campaigns, indent=2))
     else:
-        print(render(entries, gate_marks))
+        blocks = []
+        for campaign, root in zip(campaigns, args.roots, strict=True):
+            body = render(campaign["entries"], marks(root))
+            blocks.append(f"campaign {campaign['campaign']}\n{body}")
+        print("\n".join(blocks))
 
 
 if __name__ == "__main__":
