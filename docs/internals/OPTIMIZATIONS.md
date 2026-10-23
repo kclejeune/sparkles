@@ -25,6 +25,14 @@ operator or its cost model changes.
 * **Permutation files.** Blocks store each column separately (delta, zig-zag varint,
   LZ4). Each block's first and last key stay in RAM, which allows block skipping on
   bound prefixes and exact counts with at most two block decodes.
+* **Segmented blocks.** Since index format 3 a column is a run of LZ4 frames of 2,048
+  rows each, whose deltas restart at every frame, and `<perm>.seg` holds each frame's
+  first key and length (X07 §6.5). A reader of a few rows of a block, such as an index
+  join's probe, a short range scan or the count of an edge block, decodes only the frames
+  that can hold them, 16 KiB per column instead of 256 KiB. A reader of most of a block
+  decodes all its frames into one column as before. A lookup uses a block's columns
+  whole when the cache already holds them. The cost is index size. At 10.5M triples the
+  permutation files grow 3.3% and the whole generation 3.0%, from 300.6 MB to 309.7 MB.
 * **Bulk build pipeline.** Parallel chunked parsing produces per-batch vocabularies. They
   are merged into one in parallel, over ranges of keys that sampled keys delimit. The
   batches are then read once, in chunks that are remapped to global ids in parallel and
@@ -400,9 +408,9 @@ little and change nothing. Each one has the same answers with it on and off.
   answer. The pool starts at the first request that decodes ahead, which pays for starting
   up to eight threads inside its own deadline. A failure to start the pool leaves the
   decoding to the reader's thread. A lookup that touches dozens of blocks for a few rows
-  each spends most of its time decoding whole 32,768-row columns, and this spreads that
-  time over several cores. Reads through a view that keeps no blocks, such as an export,
-  skip it.
+  each decodes the segments that can hold them, and this spreads that work over several
+  cores when it comes to 32 segments or more. Reads through a view that keeps no blocks,
+  such as an export, skip it.
 * **Decoding the next cursor batch ahead** (`decode_ahead`). A result writer that reads
   a cursor decodes the terms of the next batch on another Rayon thread while it writes the
   current one. It writes the first batch before it pulls the second, so the first rows

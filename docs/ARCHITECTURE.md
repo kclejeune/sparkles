@@ -156,9 +156,12 @@ keep them in the vocabulary.
 
 The six triple permutations each carry the graph column. GSPO adds a graph-leading
 order. Blocks contain up to 32,768 rows, with columns encoded separately using delta
-and zig-zag varints followed by LZ4 compression. In-memory first and last keys and offsets
+and zig-zag varints followed by LZ4 compression. Since index format 3 each column is a
+run of independent frames of 2,048 rows, and a `.seg` file next to the permutation holds
+each frame's first key and length. In-memory first and last keys and offsets
 let scans skip blocks and count ranges without reading every row. Scans can decode
-only the columns they need, and decoded blocks are cached.
+only the columns they need, a lookup of a few rows decodes only the frames that can hold
+them, and decoded columns and frames are cached.
 
 The base vocabulary is front-coded and memory-mapped. A sparse in-memory vocabulary
 index narrows cold lookups to a group of blocks. Read hints suppress indiscriminate

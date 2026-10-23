@@ -845,6 +845,32 @@ decoding blocks. In an interleaved A/B on forge at 10.5M it made cold `star-look
 `bench.sh` columns above predate it. [X07](specs/X07-cold-sparse-reads.md#remaining-cold-gaps)
 gives those figures and the profile of the remaining cold time.
 
+##### Segmented blocks
+
+Index format 3 splits each column of a block into frames of 2,048 rows, so a point lookup
+decodes a sixteenth of a column. These figures of 2026-10-23 come from forge, with the
+engine of main at `63d8a36d` against the segmented build at `8dd019da`, each on a store
+loaded by its own build. The cold preparation is the one above, and each cell is the
+median of two interleaved rounds of 11 samples timed by `bench-regressions.py --cold`.
+
+| Cold, forge, median ms | 1.05M main | 1.05M segmented | 10.5M main | 10.5M segmented |
+|---|---:|---:|---:|---:|
+| `star-lookup` | 15.7 | **13.8** | 20.1 | **11.7** |
+| `employee-docs` | 12.3 | **10.6** | 16.7 | **12.9** |
+| `values-star` | 9.8 | **7.6** | 9.7 | **7.0** |
+| `path-plus` | 8.3 | **4.3** | 6.3 | **4.0** |
+| `knows-reach` | **31.2** | 32.7 | **196.8** | 207.0 |
+| `star-join` | 25.8 | **22.4** | **81.1** | 84.7 |
+| `export-500k` | 121.8 | **120.4** | 129.8 | **127.7** |
+
+Of the 28 queries, only `knows-reach` at both sizes and `star-join` at 10.5M are slower
+cold, by 4.5% to 5.2%. `knows-reach` follows `foaf:knows*` over most of the people, so it
+reads many blocks by a few of their segments before each block is read whole. Warm
+instruction counts per request are 0.969 to 1.024 of main for every query, 0.978 for
+`employee-docs` and 0.983 for `export-500k`, and a warm pass makes no read hint. The
+generation at 10.5M grows by 3.0%, from 300.6 MB to 309.7 MB. The load takes 3.7 seconds
+in both builds, and its peak resident memory is about 2.05 GB in both.
+
 ### BSBM Explore at 10M triples
 
 This run used 10,095,035 generated triples and 28,480 products on forge. The other
