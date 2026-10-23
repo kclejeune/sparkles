@@ -612,6 +612,13 @@ impl Base {
         Ok(completed && last(cur, &mut f))
     }
 
+    /// The number of blocks the scan of a pattern reads, without reading any.
+    pub fn blocks(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> usize {
+        let (perm, lo, hi) = self.access(s, p, o);
+        let (b0, b1) = self.snap.perm(perm).key_block_range(&lo, &hi);
+        b1 - b0
+    }
+
     /// The pattern's scan cut into contiguous shares of about `rows` rows each, in the
     /// order of [`for_each`](Self::for_each): the shares of the first input graph's pass,
     /// then those of the next. No cut separates the rows of one triple, so a share sees
