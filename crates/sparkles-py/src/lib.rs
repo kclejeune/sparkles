@@ -20,6 +20,7 @@ mod handles;
 mod indexes;
 mod interrupt;
 mod io;
+mod overview;
 mod queries;
 mod query_cursor;
 mod querybuilder;
@@ -71,6 +72,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     querybuilder::register(m)?;
     queries::register(m)?;
     algorithms::register(m)?;
+    overview::register(m)?;
     rdflib_nodes::register(m)?;
     m.add_class::<dataset::PyDataset>()?;
     m.add_class::<txn::PyTransaction>()?;
