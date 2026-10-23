@@ -6401,7 +6401,35 @@ struct Graph<'a> {
 /// merging a few hundred rows).
 const SWEEP_RATIO: u64 = 512;
 
+/// A walk that has reached this many nodes for each block of its predicate's index rows
+/// reads those blocks whole from then on (spec X07 §6.5). A walk that wide meets most of
+/// the blocks again, and reading their segments one by one first costs more than one
+/// whole read.
+const WALK_WHOLE_PER_BLOCK: usize = 2;
+
 impl Graph<'_> {
+    /// Have readers of a segmented index read the blocks of a simple path's predicate
+    /// whole, once a walk from one node has reached [`WALK_WHOLE_PER_BLOCK`] nodes per
+    /// block. Returns whether it did, so the walk asks once.
+    fn read_walk_whole(&self, forward: bool, reached: usize) -> bool {
+        let Some((p, rev)) = self.spec.simple else {
+            return true;
+        };
+        let perm = if forward != rev { Perm::Pso } else { Perm::Pos };
+        let idx = self.ctx.snap.perm(perm);
+        if !idx.segmented() {
+            return true;
+        }
+        let (b0, b1) = idx.block_range(&[p]);
+        if reached < (b1 - b0).saturating_mul(WALK_WHOLE_PER_BLOCK) {
+            return false;
+        }
+        for b in b0..b1 {
+            idx.mark_dense(b);
+        }
+        true
+    }
+
     /// Neighbours of every node of a sorted, duplicate-free frontier (with duplicates),
     /// for simple predicate paths: per-node seeks for a small frontier, otherwise one
     /// pass over the predicate's index rows between the first and last frontier node,
@@ -6535,9 +6563,13 @@ impl Graph<'_> {
         let mut depth = 0;
         let mut found = Vec::new();
         let mut found_charged = 0usize;
+        let mut whole = self.spec.max_one;
         while !frontier.is_empty() {
             self.ctx.check()?;
             depth += 1;
+            if !whole {
+                whole = self.read_walk_whole(forward, seen.len());
+            }
             let mut next = Vec::new();
             frontier.sort_unstable();
             found.clear();
