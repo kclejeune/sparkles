@@ -522,16 +522,16 @@ def reuse_engines(man, specs):
         if here and there and here != there:
             sys.exit(f"--reuse {name}: the prior run was on {there}, not {here}")
         if name == "sparkles":
-            pe = {k: (prior.get("sparkles") or {}).get(k) for k in ("binary_commit", "sha256", "scripts_commit")}
-        else:
-            pe = (prior.get("engines") or {}).get(name)
-            if pe is None:
-                sys.exit(f"--reuse {name}: the prior manifest does not list {name}")
-            ce = (man.get("engines") or {}).get(name)
-            if ce:
-                for k in ("version", "sha256"):
-                    if ce.get(k) and pe.get(k) and ce[k] != pe[k]:
-                        sys.exit(f"--reuse {name}: its {k} changed from {pe[k]} to {ce[k]}")
+            # a refresh measures Sparkles itself; only the comparison engines carry over
+            sys.exit("--reuse sparkles: Sparkles' results are measured in every run and cannot be carried over")
+        pe = (prior.get("engines") or {}).get(name)
+        if pe is None:
+            sys.exit(f"--reuse {name}: the prior manifest does not list {name}")
+        ce = (man.get("engines") or {}).get(name)
+        if ce:
+            for k in ("version", "sha256"):
+                if ce.get(k) and pe.get(k) and ce[k] != pe[k]:
+                    sys.exit(f"--reuse {name}: its {k} changed from {pe[k]} to {ce[k]}")
         out[name] = {"started": prior.get("started"), "ended": prior.get("ended"), "host": there,
                      "scripts_commit": (prior.get("sparkles") or {}).get("scripts_commit"), "engine": pe}
     if out:

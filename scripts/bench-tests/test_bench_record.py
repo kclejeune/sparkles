@@ -307,7 +307,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual((e["license"], e["params"], e["bytes"]), ("CC BY-SA 3.0", "slice 50m", 1))
         self.assertEqual(len(e["sha256"]), 64)
 
-    def reuse_fixture(self, prior_host="forge", prior_version="5.1.0"):
+    def reuse_fixture(self, prior_host="forge", prior_version="5.1.0", engine="jena-fuseki"):
         fixture(self.res)
         cur = {"host": {"name": "forge"}, "sparkles": {"binary_commit": "new"},
                "engines": {"jena": {"version": "5.1.0", "sha256": "aa"}}}
@@ -318,7 +318,7 @@ class RecordTests(unittest.TestCase):
         write_path(man, cur)
         write_path(pri, prior)
         out = os.path.join(self.tmp.name, "record.json")
-        p = build(self.res, out, manifest=man, reuse=f"jena-fuseki={pri}")
+        p = build(self.res, out, manifest=man, reuse=f"{engine}={pri}")
         return p, out, pri
 
     def test_reused_engines_are_named_and_marked(self):
@@ -337,6 +337,11 @@ class RecordTests(unittest.TestCase):
         p, _, _ = self.reuse_fixture(prior_version="5.0.0")
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("version changed", p.stderr)
+
+    def test_sparkles_results_are_never_carried_over(self):
+        p, _, _ = self.reuse_fixture(engine="sparkles")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("--reuse sparkles", p.stderr)
 
 
 class NixPackageTests(unittest.TestCase):
