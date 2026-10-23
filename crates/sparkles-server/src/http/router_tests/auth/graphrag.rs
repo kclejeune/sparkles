@@ -785,3 +785,51 @@ async fn a5_unproven_callers_answer_locally() {
     .await
     .unwrap();
 }
+
+/// C22 §6.6 in every build: a history entry lists the reports of a global answer only
+/// while the guard proves their graph for the reader, so a history written by a build
+/// with global answers stays filtered by one without them (round 4, finding 1).
+#[tokio::test]
+async fn history_lists_reports_only_while_proven() {
+    let s = server();
+    let ds = s.state.datasets().get("rag").cloned().unwrap();
+    let at = chrono::Utc::now().to_rfc3339();
+    let users: Vec<&str> = SEES.iter().chain(BLIND.iter()).copied().collect();
+    let records: Vec<crate::assistant::AskRecord> = users
+        .iter()
+        .map(|u| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("ask-{u}"),
+                "principal": s.auth().user_principal(u).unwrap().id(),
+                "at": at,
+                "question": "What are the main groups?",
+                "result": "answered",
+                "outcome": "none",
+                "routing": {},
+                "mode": "global",
+                "reports": ["http://ex/r"],
+                "reportsGraph": REPORTS,
+            }))
+            .unwrap()
+        })
+        .collect();
+    crate::assistant::store_history(&s.state, &ds, &records).unwrap();
+    for u in SEES {
+        let r = get(&s.app, u, "/$/asks/rag", "application/json").await;
+        assert_eq!(r.status, StatusCode::OK, "{u}");
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            v["asks"][0]["reports"],
+            serde_json::json!(["http://ex/r"]),
+            "{u}: {v}"
+        );
+    }
+    for u in BLIND {
+        let r = get(&s.app, u, "/$/asks/rag", "application/json").await;
+        assert_eq!(r.status, StatusCode::OK, "{u}");
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["asks"].as_array().map(Vec::len), Some(1), "{u}: {v}");
+        assert!(v["asks"][0].get("reports").is_none(), "{u}: {v}");
+        assert!(v["asks"][0].get("reportsGraph").is_none(), "{u}: {v}");
+    }
+}

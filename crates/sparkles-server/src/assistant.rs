@@ -763,7 +763,7 @@ fn history_of(st: &AppState, ds: &Dataset) -> Vec<AskRecord> {
     }
 }
 
-fn store_history(st: &AppState, ds: &Dataset, list: &[AskRecord]) -> anyhow::Result<()> {
+pub(crate) fn store_history(st: &AppState, ds: &Dataset, list: &[AskRecord]) -> anyhow::Result<()> {
     write_file(st, ds, ASKS_FILE, &json!({ "format": 1, "asks": list }))
 }
 
@@ -1020,22 +1020,19 @@ async fn list_asks(
         };
         list.reverse();
         list.truncate(limit);
-        // C22 §6.6: the reports of a global answer only while their graph is proven.
-        // Only the mcp feature answers globally.
-        #[cfg(feature = "mcp")]
-        {
-            let snap = ds.store.snapshot();
-            #[cfg_attr(not(feature = "auth"), allow(unused_mut))]
-            let mut opts = ds.dataset.query_options();
-            #[cfg(feature = "auth")]
-            crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
-            for r in &mut list {
-                if let Some(g) = &r.reports_graph
-                    && !crate::graphrag::read::readable(&snap, &opts, g)
-                {
-                    r.reports.clear();
-                    r.reports_graph = None;
-                }
+        // C22 §6.6: the reports of a global answer only while their graph is proven,
+        // in every build, since a history may come from a build with global answers
+        let snap = ds.store.snapshot();
+        #[cfg_attr(not(feature = "auth"), allow(unused_mut))]
+        let mut opts = ds.dataset.query_options();
+        #[cfg(feature = "auth")]
+        crate::auth::restrict(&mut opts, &p, &ds.name, crate::auth::Endpoint::Query);
+        for r in &mut list {
+            if let Some(g) = &r.reports_graph
+                && !crate::graphrag::guard::readable(&snap, &opts, g)
+            {
+                r.reports.clear();
+                r.reports_graph = None;
             }
         }
         Ok(Json(

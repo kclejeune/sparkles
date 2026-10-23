@@ -358,6 +358,15 @@ pub const FOOTPRINT_PREFIX: &str = "urn:x-sparkles:graphrag:footprint:";
 /// The largest footprint literal read, in bytes.
 pub const MAX_FOOTPRINT_BYTES: usize = 4 << 20;
 
+/// Whether the caller's view reads `graph` in `snap`. A view that the guard did not
+/// prove for the reports' footprints does not.
+pub fn readable(snap: &Arc<Snapshot>, opts: &sparkles::sparql::QueryOptions, graph: &str) -> bool {
+    match &opts.graphs {
+        None => true,
+        Some(v) => v.bound(snap).read.allows_iri(graph),
+    }
+}
+
 /// An IRI of the vocabulary.
 pub fn gr(name: &str) -> String {
     format!("{GR}{name}")

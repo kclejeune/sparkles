@@ -73,14 +73,7 @@ impl Filter {
     }
 }
 
-/// Whether the caller's view reads `graph` in `snap`. A view that the guard did not
-/// prove for the reports' footprints does not.
-pub fn readable(snap: &Arc<Snapshot>, opts: &QueryOptions, graph: &str) -> bool {
-    match &opts.graphs {
-        None => true,
-        Some(v) => v.bound(snap).read.allows_iri(graph),
-    }
-}
+pub use super::guard::readable;
 
 fn rows(
     snap: &Arc<Snapshot>,
