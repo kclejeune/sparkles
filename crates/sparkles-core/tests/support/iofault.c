@@ -13,6 +13,10 @@
 //    from 1 over the calls on files whose path ends in SUFFIX) fails with EIO instead of
 //    reaching the kernel, and with N+ so does every later call too.
 //
+// With SPARKLES_IO_SYNC_ENTERED and SPARKLES_IO_SYNC_RELEASE set, the first armed
+// text-file sync signals entry and waits up to five seconds for a designated writer's
+// release. This deterministic crash-fixture interleaving is not a performance mode.
+//
 // Log record, little endian:
 //   u8 kind (1 write begin, 2 write end, 3 truncate, 4 sync begin, 5 sync end, 6 rename,
 //   7 unlink, 8 create),
@@ -34,6 +38,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -61,6 +66,8 @@ static char root[PATH_MAX];
 static size_t root_len;
 static int ready;
 static long delay_us;
+static const char *sync_entered, *sync_release;
+static int sync_gated;
 
 #define MAX_FAULTS 16
 static struct {
@@ -89,6 +96,8 @@ static void init(void) {
   }
   const char *d = getenv("SPARKLES_IO_DELAY_US");
   if (d) delay_us = atol(d);
+  sync_entered = getenv("SPARKLES_IO_SYNC_ENTERED");
+  sync_release = getenv("SPARKLES_IO_SYNC_RELEASE");
   const char *log = getenv("SPARKLES_IO_LOG");
   if (log && root_len) logfd = real_open(log, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
   const char *spec = getenv("SPARKLES_IO_FAULT");
@@ -167,6 +176,34 @@ static void record(uint8_t kind, uint8_t flag, const char *path, uint64_t off, u
   free(b);
 }
 
+static int gate_text_sync(const char *path) {
+  const char *arm = getenv("SPARKLES_IO_ARM");
+  if (!sync_entered || !sync_release || !strstr(path, "/text/") ||
+      (arm && access(arm, F_OK) != 0)) return 0;
+  pthread_mutex_lock(&mu);
+  int gate = !sync_gated;
+  sync_gated = 1;
+  pthread_mutex_unlock(&mu);
+  if (!gate) return 0;
+  int fd = real_open(sync_entered, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return -1;
+  ssize_t written = real_write(fd, "1", 1);
+  int saved = errno;
+  close(fd);
+  if (written != 1) { errno = saved; return -1; }
+  struct timespec start, now;
+  if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return -1;
+  while (access(sync_release, F_OK) != 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    if ((now.tv_sec - start.tv_sec) * 1000000000LL + now.tv_nsec - start.tv_nsec >= 5000000000LL) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    usleep(1000);
+  }
+  return 0;
+}
+
 static int sync_call(const char *op, int fd) {
   init();
   int (*real)(int) = strcmp(op, "fdatasync") == 0 ? real_fdatasync : real_fsync;
@@ -180,6 +217,7 @@ static int sync_call(const char *op, int fd) {
   } else {
     r = real(fd);
     if (delay_us) usleep((useconds_t)delay_us);
+    if (r == 0 && gate_text_sync(path) != 0) r = -1;
   }
   int saved = errno;
   record(K_SYNC_END, r != 0, path, 0, 0, NULL);
