@@ -392,6 +392,70 @@ async fn an_automatic_refresh_follows_the_change_feed() {
     .unwrap();
 }
 
+/// Phase 3, round 2: a pending retry whose refresh failed is tried again after the
+/// backoff, on the same day and without a commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_pending_retry_runs_again_after_the_backoff() {
+    use crate::graphrag::refresh::{Watch, tick_once};
+    let f = fixture(4);
+    f.allow_rows().await;
+    tokio::task::spawn_blocking(move || {
+        // every community is left pending by a budget that fits no request
+        let s = settings(json!({
+            "budget": { "tokensPerBuild": 10 },
+            "refresh": { "mode": "auto", "debounceSeconds": 1 }
+        }));
+        let o = f.run(s, Mode::Build).unwrap();
+        assert!(o.pending > 0, "{o:?}");
+        let tasks = |st: &AppState| -> Vec<crate::state::Task> {
+            st.tasks
+                .lock()
+                .iter()
+                .filter(|t| t.kind == TASK_KIND)
+                .cloned()
+                .collect()
+        };
+        let wait = |st: &AppState| {
+            let end = Instant::now() + Duration::from_secs(60);
+            while st.active_task(TASK_KIND, "org").is_some() {
+                assert!(Instant::now() < end, "the refresh did not finish");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let models = f.st.models.load_full();
+        f.st.models.store(None);
+        let sec = Duration::from_secs(1);
+        let mut w: HashMap<String, Watch> = HashMap::new();
+        let mut now = Instant::now();
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert_eq!(tasks(&f.st).len(), 1);
+        wait(&f.st);
+        assert_eq!(tasks(&f.st)[0].state, "failed", "{:?}", tasks(&f.st));
+        // the next tick sees the failure; the backoff of two periods holds
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        now += sec;
+        tick_once(&f.st, &mut w, now);
+        assert_eq!(tasks(&f.st).len(), 1);
+        f.st.models.store(models);
+        now += sec * 2;
+        tick_once(&f.st, &mut w, now);
+        let all = tasks(&f.st);
+        assert_eq!(all.len(), 2, "{all:?}");
+        wait(&f.st);
+        let all = tasks(&f.st);
+        assert!(
+            all.iter().any(|t| t.state == "done"
+                && t.message.as_deref().is_some_and(|m| m.contains("pending"))),
+            "{all:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
 /// Phase 3, round 1 finding 4: a dataset admits one GraphRAG task at a time, whichever
 /// path starts it, so an automatic refresh cannot run beside a build waiting for its
 /// confirmation.

@@ -93,9 +93,12 @@ impl Watch {
     /// failure, or on a new day while communities are pending, which needs no commit.
     fn wants_check(&mut self, head: u64, now: Instant, debounce: Duration, today: u64) -> bool {
         let commits = self.due(head, now, debounce);
-        let retry = self.retry_at.is_some_and(|t| now >= t);
-        let pending = self.has_pending && self.retried_day != Some(today);
-        commits || retry || pending
+        // an outstanding backoff holds every trigger back
+        match self.retry_at {
+            Some(t) if now < t => false,
+            Some(_) => true,
+            None => commits || (self.has_pending && self.retried_day != Some(today)),
+        }
     }
 
     fn checked(&mut self) {
@@ -167,7 +170,11 @@ pub fn tick_once(st: &Arc<AppState>, watches: &mut HashMap<String, Watch>, now: 
                     w.due(head, now, debounce);
                     continue;
                 }
-                Some(task_state::FAILED) => w.failed(now, debounce),
+                Some(task_state::FAILED) => {
+                    w.failed(now, debounce);
+                    // the failed run used no daily retry of pending communities
+                    w.retried_day = None;
+                }
                 _ => w.failures = 0,
             }
             w.task = None;
@@ -519,6 +526,13 @@ mod tests {
         w.retried_day = Some(100);
         assert!(!w.wants_check(5, t0 + d * 2, d, 100));
         assert!(w.wants_check(5, t0 + d * 2, d, 101));
+        // a backoff holds back the pending retry and new commits alike
+        w.failed(t0, d);
+        assert!(!w.wants_check(5, t0 + d, d, 101));
+        assert!(!w.wants_check(6, t0 + d, d, 101));
+        assert!(w.wants_check(6, t0 + d * 2, d, 101));
+        w.checked();
+        w.failures = 0;
         w.has_pending = false;
         // a failure is retried after a doubling backoff
         w.failed(t0, d);
