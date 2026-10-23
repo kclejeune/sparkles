@@ -28,6 +28,29 @@ pub const MAX_ANOMALIES: usize = 32;
 /// The largest state file read, in bytes.
 pub const MAX_FILE_BYTES: u64 = 1 << 30;
 
+/// A writer that fails once it would pass its limit.
+struct Limited<W> {
+    inner: W,
+    left: u64,
+    over: bool,
+}
+
+impl<W: Write> Write for Limited<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() as u64 > self.left {
+            self.over = true;
+            return Err(std::io::Error::other("the state passes its size limit"));
+        }
+        let n = self.inner.write(buf)?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// The file of a database directory.
 pub fn path_in(db: &Path) -> PathBuf {
     db.join("graphrag").join("state.json")
@@ -218,16 +241,40 @@ impl BuildState {
 
     /// Write the state durably.
     pub fn save(&self, db: &Path) -> Result<(), StateError> {
+        self.save_within(db, MAX_FILE_BYTES)
+    }
+
+    /// Write the state durably in at most `limit` bytes. The state is serialized
+    /// straight into the temporary file through a writer that stops at the limit, so a
+    /// state that would not load again is refused before the previous file is replaced.
+    fn save_within(&self, db: &Path, limit: u64) -> Result<(), StateError> {
         self.check()?;
         let path = path_in(db);
         let dir = path.parent().expect("the state file has a directory");
         std::fs::create_dir_all(dir)?;
-        let bytes = serde_json::to_vec_pretty(self).expect("serializable");
         let tmp = dir.join("state.json.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
+        let written = (|| {
+            let f = std::fs::File::create(&tmp)?;
+            let mut w = Limited {
+                inner: std::io::BufWriter::new(f),
+                left: limit,
+                over: false,
+            };
+            let r = serde_json::to_writer(&mut w, self);
+            if w.over {
+                return Err(StateError::Bound {
+                    what: "bytes",
+                    limit: limit as usize,
+                });
+            }
+            r.map_err(|e| StateError::Corrupt(e.to_string()))?;
+            let f = w.inner.into_inner().map_err(|e| e.into_error())?;
             f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
         std::fs::rename(&tmp, &path)?;
         #[cfg(unix)]
@@ -349,6 +396,22 @@ mod tests {
         s.last_build.as_mut().unwrap().communities[0].members =
             vec!["x".repeat(MAX_TERM_BYTES + 1)];
         assert!(matches!(s.check(), Err(StateError::Bound { .. })));
+    }
+
+    /// A state that would pass the file limit is refused and the previous file stays
+    /// (review finding 4).
+    #[test]
+    fn a_state_past_the_size_limit_keeps_the_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = state();
+        small.save(dir.path()).unwrap();
+        let mut big = state();
+        big.last_build.as_mut().unwrap().communities[0].members =
+            (0..100).map(|i| format!("<urn:e:{i:05}>")).collect();
+        let e = big.save_within(dir.path(), 512).unwrap_err();
+        assert!(matches!(e, StateError::Bound { what: "bytes", .. }), "{e}");
+        assert_eq!(BuildState::load(dir.path()).unwrap(), small);
+        assert!(!dir.path().join("graphrag/state.json.tmp").exists());
     }
 
     #[test]

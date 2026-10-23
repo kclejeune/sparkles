@@ -247,8 +247,10 @@ impl GraphragSettings {
                 return Err("projection.graphs: an entry is empty".into());
             }
             // a pattern that could match a guarded graph would let reports feed reports
-            let stem = g.strip_suffix('*').unwrap_or(g);
-            if is_guarded(g) || GUARDED_PREFIX.starts_with(stem) {
+            let wildcard_above = g
+                .strip_suffix('*')
+                .is_some_and(|stem| GUARDED_PREFIX.starts_with(stem));
+            if is_guarded(g) || wildcard_above {
                 return Err(format!(
                     "projection.graphs: {g:?} may match the guarded namespace {GUARDED_PREFIX}"
                 ));
@@ -380,6 +382,10 @@ mod tests {
         }
         parse(json!({ "enabled": true, "principal": "p",
                       "projection": { "graphs": ["urn:graph:*"] } }))
+        .unwrap();
+        // an exact IRI above the namespace cannot match a guarded graph (review finding 6)
+        parse(json!({ "enabled": true, "principal": "p",
+                      "projection": { "graphs": ["urn:x-sparkles:"] } }))
         .unwrap();
     }
 }

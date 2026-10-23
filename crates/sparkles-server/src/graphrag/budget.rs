@@ -162,6 +162,7 @@ impl Refusal {
                 format!(
                     "the request needs a reservation of {needed} tokens and {left} remain in {which}"
                 ),
+                false,
             ),
             Refusal::Anomaly(a) => CallError::Admission(
                 "accounting-anomaly",
@@ -169,6 +170,7 @@ impl Refusal {
                     "provider {} reported {} tokens for a request that reserved {}, so the build sends no further request",
                     a.provider, a.reported, a.reserved
                 ),
+                false,
             ),
         }
     }

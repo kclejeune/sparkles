@@ -52,6 +52,14 @@ impl Ticket {
         Ticket(Some(s))
     }
 
+    /// The attempt was not sent after all, so it used nothing.
+    pub fn not_sent(self) {
+        self.settle(Some(Usage {
+            input: 0,
+            output: 0,
+        }));
+    }
+
     pub fn settle(mut self, usage: Option<Usage>) {
         if let Some(s) = self.0.take() {
             match usage {

@@ -59,9 +59,6 @@ pub struct ChatResponse {
     pub tool_input: Option<Value>,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// the usage as the provider reported it, `None` when the answer did not report
-    /// both figures; `input_tokens` and `output_tokens` read a missing figure as 0
-    pub usage: Option<super::admission::Usage>,
     /// the provider's reason for stopping, as it gave it
     pub stop: Option<String>,
     pub latency: Duration,
@@ -89,9 +86,9 @@ pub enum CallError {
     Secret(String),
     /// the provider's `tls.caCert` cannot be read or holds no certificate
     Tls(String),
-    /// the caller's admission refused the attempt before it was sent (spec C22 §3.5),
-    /// with its code
-    Admission(&'static str, String),
+    /// the caller's admission refused an attempt before it was sent (spec C22 §3.5),
+    /// with its code, and whether an earlier attempt of the same request was sent
+    Admission(&'static str, String, bool),
 }
 
 impl CallError {
@@ -105,7 +102,7 @@ impl CallError {
             CallError::Invalid(_) => "invalid-output",
             CallError::Secret(_) => "secret-missing",
             CallError::Tls(_) => "tls-config",
-            CallError::Admission(code, _) => code,
+            CallError::Admission(code, ..) => code,
         }
     }
 }
@@ -120,7 +117,7 @@ impl std::fmt::Display for CallError {
             | CallError::Invalid(m)
             | CallError::Secret(m)
             | CallError::Tls(m)
-            | CallError::Admission(_, m) => f.write_str(m),
+            | CallError::Admission(_, m, _) => f.write_str(m),
             CallError::Rejected(s, m) => write!(f, "{m} (status {s})"),
         }
     }
@@ -241,15 +238,30 @@ pub fn build(p: &ProviderConfig, req: &ChatRequest) -> (String, Value) {
     }
 }
 
+/// The usage a response body reports, read apart from its content so that an answer
+/// whose content is refused or malformed still settles what it used.
+pub fn usage_of(kind: Kind, body: &[u8]) -> Option<super::admission::Usage> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let (i, o) = match kind {
+        Kind::Ollama => (&v["prompt_eval_count"], &v["eval_count"]),
+        Kind::Openai => (
+            &v["usage"]["prompt_tokens"],
+            &v["usage"]["completion_tokens"],
+        ),
+        Kind::Anthropic => (&v["usage"]["input_tokens"], &v["usage"]["output_tokens"]),
+        Kind::Local => return None,
+    };
+    Some(super::admission::Usage {
+        input: i.as_u64()?,
+        output: o.as_u64()?,
+    })
+}
+
 /// The answer of a successful (`2xx`) response.
 pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
     let v: Value = serde_json::from_slice(body)
         .map_err(|_| CallError::Invalid("the provider's answer is not JSON".into()))?;
     let n = |x: &Value| x.as_u64().unwrap_or(0);
-    let usage = |i: &Value, o: &Value| match (i.as_u64(), o.as_u64()) {
-        (Some(input), Some(output)) => Some(super::admission::Usage { input, output }),
-        _ => None,
-    };
     match kind {
         Kind::Ollama => {
             let text = v["message"]["content"]
@@ -260,7 +272,6 @@ pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
                 tool_input: None,
                 input_tokens: n(&v["prompt_eval_count"]),
                 output_tokens: n(&v["eval_count"]),
-                usage: usage(&v["prompt_eval_count"], &v["eval_count"]),
                 stop: v["done_reason"].as_str().map(str::to_string),
                 latency: Duration::ZERO,
             })
@@ -294,10 +305,6 @@ pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
                 tool_input,
                 input_tokens: n(&v["usage"]["prompt_tokens"]),
                 output_tokens: n(&v["usage"]["completion_tokens"]),
-                usage: usage(
-                    &v["usage"]["prompt_tokens"],
-                    &v["usage"]["completion_tokens"],
-                ),
                 stop: finish,
                 latency: Duration::ZERO,
             })
@@ -326,7 +333,6 @@ pub fn parse(kind: Kind, body: &[u8]) -> Result<ChatResponse, CallError> {
                 tool_input,
                 input_tokens: n(&v["usage"]["input_tokens"]),
                 output_tokens: n(&v["usage"]["output_tokens"]),
-                usage: usage(&v["usage"]["input_tokens"], &v["usage"]["output_tokens"]),
                 stop,
                 latency: Duration::ZERO,
             })
@@ -430,7 +436,13 @@ fn provider_count(
     name: &str,
     p: &ProviderConfig,
     req: &ChatRequest,
+    timeout: Duration,
 ) -> Result<u64, CallError> {
+    if timeout.is_zero() {
+        return Err(CallError::Unavailable(format!(
+            "provider {name}: no time is left to count tokens"
+        )));
+    }
     let Some((url, body)) = count_request(p, req) else {
         return Err(CallError::Invalid(format!(
             "provider {name} has no token counting endpoint"
@@ -440,7 +452,7 @@ fn provider_count(
     let hrefs: Vec<(&str, &str)> = hs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let bytes = serde_json::to_vec(&body).expect("serializable");
     let key = t.key.as_deref();
-    let posted = sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes, req.timeout)
+    let posted = sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes, timeout)
         .map_err(|f| CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)))?;
     if !(200..300).contains(&posted.status.as_u16()) {
         return Err(CallError::Unavailable(scrub(
@@ -475,38 +487,79 @@ pub fn send_admitted(
     let bytes = serde_json::to_vec(&body).expect("serializable");
     let started = Instant::now();
     let key = t.key.as_deref();
-    let counter = || provider_count(t, name, p, req);
+    // counting spends the request's own time
+    let counter = || {
+        provider_count(
+            t,
+            name,
+            p,
+            req,
+            req.timeout.saturating_sub(started.elapsed()),
+        )
+    };
     let has_counter = count_request(p, req).is_some();
     let mut attempt = 0;
     loop {
-        let left = req.timeout.saturating_sub(started.elapsed());
-        if left.is_zero() {
-            return Err(CallError::Unavailable(format!(
+        let timed_out = || {
+            CallError::Unavailable(format!(
                 "provider {name} did not answer within {:.0} s",
                 req.timeout.as_secs_f64()
-            )));
+            ))
+        };
+        if req.timeout.saturating_sub(started.elapsed()).is_zero() {
+            return Err(timed_out());
         }
         let ticket = match admission {
             None => None,
-            Some(a) => Some(a.admit(&super::admission::Attempt {
-                provider: name,
-                config: p,
-                request: req,
-                url: &url,
-                body: &body,
-                bytes: &bytes,
-                provider_count: if has_counter { Some(&counter) } else { None },
-            })?),
+            Some(a) => Some(
+                a.admit(&super::admission::Attempt {
+                    provider: name,
+                    config: p,
+                    request: req,
+                    url: &url,
+                    body: &body,
+                    bytes: &bytes,
+                    provider_count: if has_counter { Some(&counter) } else { None },
+                })
+                .map_err(|e| match e {
+                    CallError::Admission(c, m, _) => CallError::Admission(c, m, attempt > 0),
+                    e => e,
+                })?,
+            ),
         };
+        // admission may have spent time counting
+        let left = req.timeout.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            if let Some(tk) = ticket {
+                tk.not_sent();
+            }
+            return Err(timed_out());
+        }
         // a ticket dropped on any path below leaves its usage unknown
-        let posted = sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes.clone(), left)
-            .map_err(|f| match f {
-            sparkles::outbound::Failure::Refused(m) => CallError::Refused(scrub(
-                format!("provider {name}: the outbound policy refuses {m}"),
-                key,
-            )),
-            f => CallError::Unavailable(scrub(format!("provider {name}: {f}"), key)),
-        })?;
+        let posted =
+            match sparkles::outbound::post_json(t.outbound, &url, &hrefs, bytes.clone(), left) {
+                Ok(posted) => posted,
+                Err(sparkles::outbound::Failure::Refused(m)) => {
+                    // the policy refuses before anything is sent
+                    if let Some(tk) = ticket {
+                        tk.not_sent();
+                    }
+                    return Err(CallError::Refused(scrub(
+                        format!("provider {name}: the outbound policy refuses {m}"),
+                        key,
+                    )));
+                }
+                Err(f) => {
+                    return Err(CallError::Unavailable(scrub(
+                        format!("provider {name}: {f}"),
+                        key,
+                    )));
+                }
+            };
+        // the usage settles the reservation whatever the content holds
+        if let Some(tk) = ticket {
+            tk.settle(usage_of(p.kind, &posted.body));
+        }
         let status = posted.status.as_u16();
         if (200..300).contains(&status) {
             let mut r = parse(p.kind, &posted.body).map_err(|e| match e {
@@ -514,9 +567,6 @@ pub fn send_admitted(
                 e => e,
             })?;
             r.latency = started.elapsed();
-            if let Some(tk) = ticket {
-                tk.settle(r.usage);
-            }
             return Ok(r);
         }
         let m = scrub(

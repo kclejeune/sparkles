@@ -689,15 +689,17 @@ impl Models {
                         last = Some(StepError::Call(e));
                         break;
                     }
-                    Err(CallError::Admission(code, m)) => {
-                        // a refusal before sending says nothing about the pair's health,
-                        // and the refused attempt was not sent
-                        rec.requests -= 1;
+                    Err(CallError::Admission(code, m, sent_before)) => {
+                        // a refusal before sending says nothing about the pair's health;
+                        // the request counts when an earlier attempt of it was sent
+                        if !sent_before {
+                            rec.requests -= 1;
+                        }
                         rec.latency = started.elapsed();
                         let error = if code == "budget-exceeded" {
                             StepError::Budget(m)
                         } else {
-                            StepError::Call(CallError::Admission(code, m))
+                            StepError::Call(CallError::Admission(code, m, sent_before))
                         };
                         return fail(error, rec);
                     }

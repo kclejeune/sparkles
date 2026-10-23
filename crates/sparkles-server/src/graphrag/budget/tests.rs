@@ -334,3 +334,94 @@ fn a_new_utc_day_starts_an_empty_day_ledger() {
     assert!(l.reserve(20).is_ok());
     assert_eq!(*day.lock(), DayLedger { day: 2, used: 20 });
 }
+
+/// A tokenizer that counts every request as 100 tokens.
+struct Fixed;
+
+impl LocalTokenizer for Fixed {
+    fn identity(&self) -> String {
+        "test-fixed-1".into()
+    }
+    fn count(&self, _: Kind, _: &Value) -> Option<u64> {
+        Some(100)
+    }
+}
+
+/// A refusal that reports usage settles it, so an overrun is still an anomaly
+/// (review finding 1).
+#[test]
+fn usage_of_a_refused_answer_is_settled() {
+    let mock = MockModel::start(|_, _| {
+        (
+            200,
+            json!({ "choices": [{ "message": { "content": null, "refusal": "no" }, "finish_reason": "stop" }],
+                    "usage": { "prompt_tokens": 1_000_000, "completion_tokens": 5 } }),
+        )
+    });
+    let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
+    let mut t = Tokenizers::default();
+    t.insert("p", "m1", Arc::new(Fixed));
+    let l = ledger(10_000_000, 10_000_000);
+    let a = BuildAdmission::new(l.clone(), t, true);
+    let f = call(&m, "p", &a).unwrap_err();
+    assert_eq!(f.error.code(), "refusal");
+    assert_eq!(l.build_used(), 1_000_005);
+    assert!(l.anomaly().is_some());
+}
+
+/// Counting spends the request's remaining time, and an attempt whose time ran out
+/// while counting is not sent (review finding 2).
+#[test]
+fn counting_stays_within_the_deadline() {
+    let mock = MockModel::start(|r: &Received, _| {
+        if r.path.ends_with("/count_tokens") {
+            std::thread::sleep(Duration::from_millis(600));
+            (200, json!({ "input_tokens": 42 }))
+        } else {
+            (200, mock::anthropic(r#"{"query":"ASK {}"}"#))
+        }
+    });
+    let m = models(json!({ "p": { "kind": "anthropic", "endpoint": mock.url() } }));
+    let l = ledger(1_000_000, 1_000_000);
+    let a = BuildAdmission::new(l.clone(), Tokenizers::default(), true);
+    let started = Instant::now();
+    let r = m.call_admitted(
+        Some(Role::Community),
+        &pair("p"),
+        "system text",
+        "user text",
+        &schema(),
+        Instant::now() + Duration::from_millis(300),
+        Some(&a),
+    );
+    assert!(r.is_err(), "the deadline passed while counting");
+    assert!(
+        started.elapsed() < Duration::from_millis(550),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|r| r.path.ends_with("/count_tokens")),
+        "no inference request after the deadline"
+    );
+    // nothing was sent, so nothing stays reserved
+    assert_eq!(l.build_used(), 0);
+}
+
+/// A retry refused after a sent attempt keeps that attempt in the record (review
+/// finding 5).
+#[test]
+fn a_refused_retry_keeps_the_sent_attempt_in_the_record() {
+    let mock = MockModel::start(|_, _| (503, json!({ "error": { "message": "busy" } })));
+    let m = models(json!({ "p": { "kind": "openai", "endpoint": mock.url() } }));
+    let mut t = Tokenizers::default();
+    t.insert("p", "m1", Arc::new(Fixed));
+    // room for exactly one reservation of 100 + MAX_OUT
+    let a = BuildAdmission::new(ledger(100 + u64::from(MAX_OUT), 1_000_000), t, true);
+    let f = call(&m, "p", &a).unwrap_err();
+    assert!(matches!(f.error, StepError::Budget(_)), "{:?}", f.error);
+    assert_eq!(mock.requests().len(), 1);
+    assert_eq!(f.record.requests, 1);
+}

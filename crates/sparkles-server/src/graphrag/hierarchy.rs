@@ -98,17 +98,65 @@ pub fn compute(
     let adj = g
         .simple(ctl)
         .map_err(|e| HierarchyError::Algo(e.to_string()))?;
-    adapt(&out.levels, &adj, levels as usize + 1, min_size as usize)
+    adapt(
+        &out.levels,
+        &adj,
+        levels as usize + 1,
+        min_size as usize,
+        ctl,
+    )
+}
+
+/// Estimated bytes per node and kept depth of the adaptation's workspace: the labels,
+/// the groups with their vector headers, the kept indexes, and the kept communities'
+/// member lists with their headers.
+const BYTES_PER_NODE_AND_DEPTH: u64 = 128;
+/// Steps between checks of the control.
+const CHECK_EVERY: usize = 4096;
+
+/// Memory charged to a control, given back when dropped.
+struct Charged<'a> {
+    ctl: &'a Control,
+    bytes: u64,
+}
+
+impl Drop for Charged<'_> {
+    fn drop(&mut self) {
+        self.ctl.release(self.bytes);
+    }
+}
+
+/// Counts steps and checks the control every [`CHECK_EVERY`] of them.
+struct Ticker<'a> {
+    ctl: &'a Control,
+    steps: usize,
+}
+
+impl Ticker<'_> {
+    fn tick(&mut self, n: usize) -> Result<(), HierarchyError> {
+        self.steps += n;
+        if self.steps >= CHECK_EVERY {
+            self.steps = 0;
+            self.ctl
+                .check()
+                .map_err(|e| HierarchyError::Algo(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 /// Adapt native levels, finest first, over the undirected simple rows `adj`, keeping at
-/// most `keep` depths.
+/// most `keep` depths. The workspace is charged to `ctl` before it is allocated, and
+/// the loops check `ctl`, so a cancellation, a deadline or the memory limit fails the
+/// adaptation as a whole.
 pub fn adapt(
     native: &[Vec<u32>],
     adj: &Csr,
     keep: usize,
     min_size: usize,
+    ctl: &Control,
 ) -> Result<Hierarchy, HierarchyError> {
+    let algo = |e: sparkles::error::Error| HierarchyError::Algo(e.to_string());
     let n = adj.n();
     if let Some(l) = native.iter().find(|l| l.len() != n) {
         return Err(HierarchyError::Malformed(format!(
@@ -120,35 +168,47 @@ pub fn adapt(
         native_levels: native.len(),
         ..Hierarchy::default()
     };
+    ctl.check().map_err(algo)?;
     if n == 0 || native.is_empty() || keep == 0 {
         return Ok(h);
     }
+    let depths = keep.min(native.len()) as u64;
+    let bytes = (n as u64)
+        .saturating_mul(depths)
+        .saturating_mul(BYTES_PER_NODE_AND_DEPTH)
+        .saturating_add(4 * n as u64);
+    ctl.charge(bytes).map_err(algo)?;
+    let _charged = Charged { ctl, bytes };
+    let mut tick = Ticker { ctl, steps: 0 };
     // labels per depth, coarsest first, each nested in the one above
     let mut labels: Vec<Vec<u32>> = Vec::new();
     for lv in native.iter().rev().take(keep) {
         let parent = labels.last();
-        labels.push(pieces(adj, |u, v| {
-            lv[u] == lv[v] && parent.is_none_or(|p| p[u] == p[v])
-        }));
+        let l = pieces(
+            adj,
+            |u, v| lv[u] == lv[v] && parent.is_none_or(|p| p[u] == p[v]),
+            &mut tick,
+        )?;
+        labels.push(l);
     }
     // communities per depth, ordered by their smallest member
-    let groups: Vec<Vec<Vec<u32>>> = labels
-        .iter()
-        .map(|l| {
-            let count = l.iter().map(|&x| x as usize + 1).max().unwrap_or(0);
-            let mut g: Vec<Vec<u32>> = vec![Vec::new(); count];
-            for (u, &c) in l.iter().enumerate() {
-                g[c as usize].push(u as u32);
-            }
-            g
-        })
-        .collect();
+    let mut groups: Vec<Vec<Vec<u32>>> = Vec::with_capacity(labels.len());
+    for l in &labels {
+        let count = l.iter().map(|&x| x as usize + 1).max().unwrap_or(0);
+        let mut g: Vec<Vec<u32>> = vec![Vec::new(); count];
+        for (u, &c) in l.iter().enumerate() {
+            tick.tick(1)?;
+            g[c as usize].push(u as u32);
+        }
+        groups.push(g);
+    }
     // kept index of each native group, per depth
     let mut kept_index: Vec<Vec<Option<usize>>> = Vec::with_capacity(groups.len());
     for (d, gs) in groups.iter().enumerate() {
         let mut idx = vec![None; gs.len()];
         let mut out = Vec::new();
         for (c, members) in gs.iter().enumerate() {
+            tick.tick(members.len() + 1)?;
             if members.len() < min_size.max(1) {
                 continue;
             }
@@ -174,6 +234,7 @@ pub fn adapt(
     // members of folded children, listed on their parent
     for d in 0..h.depths.len().saturating_sub(1) {
         for u in 0..n {
+            tick.tick(1)?;
             let child = labels[d + 1][u] as usize;
             if kept_index[d + 1][child].is_none()
                 && let Some(p) = kept_index[d][labels[d][u] as usize]
@@ -190,7 +251,11 @@ pub fn adapt(
 
 /// Connected pieces of the graph under the edges `same` accepts, numbered by their
 /// smallest node.
-fn pieces(adj: &Csr, same: impl Fn(usize, usize) -> bool) -> Vec<u32> {
+fn pieces(
+    adj: &Csr,
+    same: impl Fn(usize, usize) -> bool,
+    tick: &mut Ticker<'_>,
+) -> Result<Vec<u32>, HierarchyError> {
     let n = adj.n();
     let mut out = vec![u32::MAX; n];
     let mut next = 0u32;
@@ -202,6 +267,7 @@ fn pieces(adj: &Csr, same: impl Fn(usize, usize) -> bool) -> Vec<u32> {
         out[s] = next;
         queue.push_back(s as u32);
         while let Some(u) = queue.pop_front() {
+            tick.tick(adj.deg(u) + 1)?;
             for &v in adj.row(u) {
                 if out[v as usize] == u32::MAX && same(u as usize, v as usize) {
                     out[v as usize] = next;
@@ -211,7 +277,7 @@ fn pieces(adj: &Csr, same: impl Fn(usize, usize) -> bool) -> Vec<u32> {
         }
         next += 1;
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -279,13 +345,13 @@ mod tests {
         // three native levels, finest first: singletons, pairs, one group
         let adj = csr(4, &[(0, 1), (1, 2), (2, 3)]);
         let native = vec![vec![0, 1, 2, 3], vec![0, 0, 1, 1], vec![0, 0, 0, 0]];
-        let h = adapt(&native, &adj, 2, 1).unwrap();
+        let h = adapt(&native, &adj, 2, 1, &Control::unlimited()).unwrap();
         assert_eq!(h.depths.len(), 2);
         assert_eq!(h.depths[0].len(), 1);
         assert_eq!(h.depths[1].len(), 2);
         assert_eq!(h.depths[1][1].parent, Some(0));
         // early convergence keeps the levels there are
-        let h = adapt(&native[2..], &adj, 4, 1).unwrap();
+        let h = adapt(&native[2..], &adj, 4, 1, &Control::unlimited()).unwrap();
         assert_eq!(h.depths.len(), 1);
         assert_eq!(h.native_levels, 1);
     }
@@ -295,7 +361,7 @@ mod tests {
         // the finer native level crosses the coarse boundary between 1 and 2
         let adj = csr(4, &[(0, 1), (1, 2), (2, 3)]);
         let native = vec![vec![0, 1, 1, 2], vec![0, 0, 1, 1]];
-        let h = adapt(&native, &adj, 2, 1).unwrap();
+        let h = adapt(&native, &adj, 2, 1, &Control::unlimited()).unwrap();
         let fine: Vec<Vec<u32>> = h.depths[1].iter().map(|c| c.members.clone()).collect();
         assert_eq!(fine, vec![vec![0], vec![1], vec![2], vec![3]]);
         for c in &h.depths[1] {
@@ -309,7 +375,7 @@ mod tests {
         // native fine community {0, 2} is not connected inside its parent {0, 1, 2}
         let adj = csr(3, &[(0, 1), (1, 2)]);
         let native = vec![vec![0, 1, 0], vec![0, 0, 0]];
-        let h = adapt(&native, &adj, 2, 1).unwrap();
+        let h = adapt(&native, &adj, 2, 1, &Control::unlimited()).unwrap();
         assert_eq!(h.depths[1].len(), 3);
     }
 
@@ -318,7 +384,7 @@ mod tests {
         let adj = csr(7, &[(0, 1), (1, 2), (2, 3), (3, 4), (5, 6)]);
         // coarse: {0..4}, {5, 6}; fine: {0, 1, 2}, {3, 4}, {5, 6}
         let native = vec![vec![0, 0, 0, 1, 1, 2, 2], vec![0, 0, 0, 0, 0, 1, 1]];
-        let h = adapt(&native, &adj, 2, 3).unwrap();
+        let h = adapt(&native, &adj, 2, 3, &Control::unlimited()).unwrap();
         assert_eq!(h.depths[0].len(), 1);
         assert_eq!(h.depths[0][0].members, vec![0, 1, 2, 3, 4]);
         assert_eq!(h.depths[0][0].folded, vec![3, 4]);
@@ -332,9 +398,35 @@ mod tests {
     fn malformed_levels_are_refused() {
         let adj = csr(3, &[(0, 1)]);
         assert!(matches!(
-            adapt(&[vec![0, 0]], &adj, 2, 1),
+            adapt(&[vec![0, 0]], &adj, 2, 1, &Control::unlimited()),
             Err(HierarchyError::Malformed(_))
         ));
+    }
+
+    /// The adaptation after Leiden obeys the control too (review finding 3).
+    #[test]
+    fn the_adaptation_obeys_its_control() {
+        let adj = csr(4, &[(0, 1), (1, 2), (2, 3)]);
+        let native = vec![vec![0, 0, 1, 1], vec![0, 0, 0, 0]];
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ctl = Control::new(cancel, None, u64::MAX);
+        assert!(matches!(
+            adapt(&native, &adj, 2, 1, &ctl),
+            Err(HierarchyError::Algo(_))
+        ));
+        // a memory limit below the workspace refuses before allocating
+        let tiny = Control::new(Default::default(), None, 64);
+        assert!(matches!(
+            adapt(&native, &adj, 2, 1, &tiny),
+            Err(HierarchyError::Algo(_))
+        ));
+        let ctl = Control::unlimited();
+        adapt(&native, &adj, 2, 1, &ctl).unwrap();
+        assert_eq!(
+            ctl.remaining(),
+            Control::unlimited().remaining(),
+            "released"
+        );
     }
 
     #[test]
