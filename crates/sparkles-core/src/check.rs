@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{
     BLOCK_ROWS, BlockMeta, Key, META_BYTES, Perm, SEG_ENTRY, decode_column, decode_frame_into,
-    read_varint_checked,
+    read_varint_checked, supported_segment_rows,
 };
 use crate::store::{Framing, WAL_COMMIT, WAL_DELETE, WAL_HEADER, WAL_INSERT, WAL_REC};
 use crate::vocab::{FC_BLOCK, parse_delta};
@@ -2416,10 +2416,9 @@ fn scan_perm(
             .then(|| u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize);
         match seg_rows {
             None => run.add(Issue::error("not a segment directory").file(&seg_file)),
-            Some(n) if n == 0 || !BLOCK_ROWS.is_multiple_of(n) => run.add(
-                Issue::error(format!("segment size {n} does not divide {BLOCK_ROWS}"))
-                    .file(&seg_file),
-            ),
+            Some(n) if !supported_segment_rows(n) => {
+                run.add(Issue::error(format!("segment size {n} is not supported")).file(&seg_file))
+            }
             Some(n) => {
                 let mut start = Vec::with_capacity(blocks.len() + 1);
                 let mut total = 0usize;

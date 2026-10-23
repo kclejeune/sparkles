@@ -32,6 +32,12 @@ pub const BLOCK_ROWS: usize = 32 * 1024;
 pub const SEG_ROWS: usize = 2048;
 const MIN_SEG_ROWS: usize = 512;
 const MAX_SEG_ROWS: usize = 4096;
+
+/// Whether a reader opens a segment directory of `n` rows per segment: from
+/// [`MIN_SEG_ROWS`] to [`MAX_SEG_ROWS`], dividing [`BLOCK_ROWS`]. `check` uses the same rule.
+pub(crate) fn supported_segment_rows(n: usize) -> bool {
+    (MIN_SEG_ROWS..=MAX_SEG_ROWS).contains(&n) && BLOCK_ROWS.is_multiple_of(n)
+}
 const SEG_MAGIC: &[u8; 8] = b"SPKSEG01";
 /// Bytes of the `.seg` header: the magic, the segment size and four reserved bytes.
 const SEG_HEADER: usize = 16;
@@ -1078,9 +1084,7 @@ impl Segments {
             return Err(bad("not a segment directory".into()));
         }
         let seg_rows = u32::from_le_bytes(map[8..12].try_into().unwrap()) as usize;
-        if !(MIN_SEG_ROWS..=MAX_SEG_ROWS).contains(&seg_rows)
-            || !BLOCK_ROWS.is_multiple_of(seg_rows)
-        {
+        if !supported_segment_rows(seg_rows) {
             return Err(bad(format!("segment size {seg_rows} is not supported")));
         }
         let mut start = Vec::with_capacity(blocks.len() + 1);
@@ -1143,6 +1147,16 @@ impl Segments {
         let limit = self.dense_limit(b);
         let _ =
             self.sparse_reads[b].fetch_update(Relaxed, Relaxed, |n| (n < limit).then_some(n + 1));
+    }
+
+    /// Count a segment of block `b` that a prefetch decoded, short of the limit: the
+    /// reader after the prefetch must still find the block sparse, or it would read whole
+    /// columns and leave the warmed segments unused. Its own next decode reaches the limit.
+    fn note_warm_read(&self, b: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let limit = self.dense_limit(b);
+        let _ = self.sparse_reads[b]
+            .fetch_update(Relaxed, Relaxed, |n| (n + 1 < limit).then_some(n + 1));
     }
 
     /// Have readers read block `b` whole from now on.
@@ -2216,13 +2230,14 @@ impl WarmColumns<'_> {
                 None => self.work.iter().try_for_each(decode)?,
             }
             // each segment decoded counts once toward its block's limit, whatever its
-            // columns (the work lists a segment's columns one after another)
+            // columns (the work lists a segment's columns one after another), but never
+            // reaches it, so that the reader still uses the segments warmed here
             if let Some(d) = &self.idx.segs {
                 let mut last = None;
                 for &(b, _, seg) in &self.work {
                     if seg != WHOLE && last != Some((b, seg)) {
                         last = Some((b, seg));
-                        d.note_sparse_read(b);
+                        d.note_warm_read(b);
                     }
                 }
             }
@@ -2743,6 +2758,43 @@ mod tests {
         // the first `limit` lookups decoded their segments, and the rest the whole block
         assert_eq!(sparse, limit);
         assert!(cache.holds_whole(&i3, b, 1));
+    }
+
+    #[test]
+    fn segments_warmed_up_to_the_dense_limit_are_still_read_as_segments() {
+        let keys = run_keys();
+        let (_d3, i3, _d2, _i2) = both_layouts(&keys);
+        let cache = BlockCache::new(1 << 26);
+        let blocks: Vec<usize> = (0..i3.blocks.len())
+            .filter(|&b| i3.dense_limit(b) >= 2)
+            .collect();
+        assert!(blocks.len() >= 2);
+        // warm exactly the limit of distinct segments of each block, in every column,
+        // enough work items for the parallel decode to run
+        let mut warm = cache.warm_columns(&i3);
+        let mut wanted = Vec::new();
+        for &b in &blocks {
+            for s in 0..i3.dense_limit(b) {
+                warm.add_segments(b, (2 * s, 2 * s + 1), ALL_COLS);
+                wanted.push((b, 2 * s));
+            }
+        }
+        assert!(wanted.len() * 4 >= 32);
+        warm.finish(&|| Ok(())).unwrap();
+        for &(b, s) in &wanted {
+            assert!(cache.has_segment(&i3, b, s, ALL_COLS));
+            let (r0, _) = i3.segment_rows(b, s);
+            let k = i3.decode_col(b, 0).unwrap()[r0 + 1];
+            let (lo, hi) = (pad(&[k], 0), pad(&[k], u64::MAX));
+            let span = i3.read_span(&cache, b, &lo, &hi, ALL_COLS);
+            assert!(
+                span.is_some_and(|(s0, s1)| s0 <= s && s < s1),
+                "block {b} segment {s}: {span:?}"
+            );
+        }
+        for &b in &blocks {
+            assert!(!cache.holds_whole(&i3, b, ALL_COLS));
+        }
     }
 
     #[test]

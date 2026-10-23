@@ -293,6 +293,28 @@ fn a_truncated_permutation_file_is_found_in_both_modes() {
     }
 }
 
+#[test]
+fn an_unsupported_segment_size_is_found_in_both_modes() {
+    // sizes the reader refuses, though some divide the block: too small, too large, zero
+    for size in [256u32, 8192, 0, 1000] {
+        let (_d, root) = fresh();
+        let path = gen_dir(&root).join("spo.seg");
+        let mut b = std::fs::read(&path).unwrap();
+        b[8..12].copy_from_slice(&size.to_le_bytes());
+        std::fs::write(&path, &b).unwrap();
+        assert!(PermIndex::open(&gen_dir(&root), Perm::Spo).is_err());
+        for quick in [true, false] {
+            let r = run(&root, quick);
+            assert_eq!(status(&r, "perm.spo"), Status::Error, "{}", r.to_text());
+            assert!(
+                messages(&r, "perm.spo").contains("not supported"),
+                "{size}: {}",
+                r.to_text()
+            );
+        }
+    }
+}
+
 // ---- crafted blocks: re-encode a permutation with the same block layout ------------
 
 fn encode_column(col: &[u64]) -> Vec<u8> {
