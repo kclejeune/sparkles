@@ -1059,3 +1059,110 @@ builds. These are diagnostic timings without the forge trim protocol. Item 1's
 refresh of 2026-10-23 took the reference numbers with the trim protocol, and `q5a`
 answered in a mean of 3.9 s over ten runs. The product itself runs on one thread,
 and it takes about 3.4 s of the 3.8 s execution.
+
+<a id="sp2bench-q4-and-q6-follow-up-2026-10-23"></a>
+
+### SP²Bench `q4` and `q6` follow-up (2026-10-23)
+
+The `q6` failure came from an OPTIONAL that shares no variable with the pattern
+before it. Its only link is the condition `?author = ?author2 && ?yr2 < ?yr`, so the
+generic left join formed the product of its sides before testing the condition. At
+10M triples that product has 1,577,754,551,569 rows, and the row limit refused the
+query in 0.3 s. The planner now builds a keyed left join when an OPTIONAL's sides
+share no variable and its condition has a top-level conjunct `?a = ?b` with one
+variable from each side. Equality between two different ids can hold only when
+neither is an IRI or a blank node, so a left row whose value is one meets only the
+right rows with the same id. A left row with another kind of value meets every right
+row whose value is bound and is neither an IRI nor a blank node. An unbound value
+meets no row, because `=` then raises an error and the conjunction cannot hold. The
+whole condition is tested on these candidates 64K pairs at a time, so the answer and
+its bag multiplicity are the product's. At 10M the candidate pairs number 7,439,035.
+A cursor runs the same join natively. It indexes the right side's equality column by
+id, keeps the right rows of other bound kinds in a list of their own, and tests the
+condition on the rows that a left value reaches. The planner keeps the generic left
+join when the query calls an application extension, because a registered function
+could observe how many times the condition runs.
+
+The `q4` failure has two parts. Its plan joins 88,192,293 pairs of articles of the
+same journal before `FILTER(?name1 < ?name2)` and DISTINCT, and eager execution holds
+that join at a peak of 5.69 GB. Item 1's reference run capped the server at 12 GiB,
+which makes the query pool 5,344 MiB, so the pool refused the reservation with 503.
+An automatic SELECT whose eager run exceeded its memory budget already ran again as a
+cursor, but only when the query could spill. Item 96's automatic admission streams a plan
+without spill when its eager output is expected to outgrow half of the memory the query
+may use and the cursor's estimated state fits in that half. The planner estimates
+26.7 million rows for the `q4` join, so admission keeps the query eager. The retry now
+asks the same question as admission about the cursor, so one rule decides both paths.
+An eager SELECT that fails its own budget or the shared pool runs again as a cursor
+without spill when every operator streams natively and the cursor's estimated state
+fits. The retry covers the plans whose estimates missed the eager failure, and it starts
+no cursor that admission would have judged too large. The cursor holds 1.99 GB for
+`q4`. A retried cursor that still outgrows the budget fails within it.
+
+The other part is the answer's size. `q4` at 10M returns 41,073,618 rows, and their
+TSV takes 1,955,839,207 bytes. That is larger than the default response budget of
+1 GiB, so with the default settings the response stops at 1 GiB and the client sees an
+incomplete body. No default budget can hold this answer, and `q4` keeps its error in
+the benchmark table. With `--max-result-mb 4096` it answers within the other default
+budgets.
+
+The comparison in `q4` was also slow. An eager filter decoded both name columns before
+comparing them, and at one thread that took 2.0 s of the 2.4 s eager run at 1M. Two
+stored simple literals now compare without decoding. The base vocabulary sorts keys
+`"` lexical 0xFF, which places a string after the strings it is a proper prefix of, so
+id order alone does not decide their order. Each string's floor, the first id whose key
+starts with its lexical form, does. A smaller id is the smaller string unless it lies
+at or above the larger string's floor. An eager filter computes the floor once per
+distinct id in a cache of each worker, which holds at most 2^20 ids and is charged to
+the query. A cursor batch compares the two keys directly and charges the keys it
+reads, as its decoding does. Other kinds of values keep the generic comparison.
+
+The answers were checked against other engines and an independent oracle. At 10M the
+`q6` answer has 906,313 rows and the same exact and value digests as Jena's answer in
+item 1's reference run. At 1M Sparkles and Jena agree on `q6`, with 62,948 rows, and
+Oxigraph timed out at 600 s. At 1M Sparkles and Oxigraph agree on `q4`, with 2,583,025
+rows, and Jena timed out. A Python oracle that reads the N-Triples file and pairs the
+names of each journal's authors gives the same 2,583,025 pairs as the eager and the
+streaming answers. At 10M the sorted `q4` answers of the base build and of this build,
+eager and streaming, are identical.
+
+Regression tests cover the q6 fixture against an oracle, an OPTIONAL whose product
+exceeds the row limit while its keyed pairs fit, and values that mix IRIs, blank
+nodes, numbers equal by value with different ids, language strings, unknown datatypes
+and unbound values, compared with the generic left join. A q4 fixture fails eagerly
+within a 1 MiB budget and answers through the retried cursor without spill. String
+order tests cover prefixes, empty strings and non-ASCII strings below and above the
+4,096 rows where the eager kernel starts, with numbers, a language string and an IRI
+among them.
+
+An A/B on forge ran the 17 queries at 10M with SERVER_MEM_MAX=12G and the default
+budgets, two interleaved rounds of 10 runs after 2 warm-ups for each build. The base was
+1c4583e9. `q6` answered in a mean of 948 ms, and `q4` kept its error for the response
+size. The other 15 queries stayed within 4% of the base, with `q5a` at 1.015, `q8` at
+0.965, `q12a` at 1.001 and `q12b` at 0.975 times the base time. Single runs of `q4` on one
+thread without the server cap and with `--max-result-mb 4096` measured the string
+comparison. Eager execution fell from 46.3 s to 9.9 s, and a streamed response from
+62.2 s to 30.4 s of wall time. These gains cost no memory. The eager `q4` peak
+stays at 5.69 GB and the streamed one at 1.99 GB, and the keyed join holds its right
+side's index of 24 bytes a row.
+
+After the review fixes, three runs of `q6` in each execution mode on forge returned the
+same sorted answer as before. Automatic and eager execution took 1.19 to 1.20 s of wall
+time with a peak of 267 MB, and a streamed response took 1.25 s with a peak of 191 MB
+through the cursor's keyed join.
+
+Codex reviewed the work, and all five findings were confirmed and fixed. The keyed join
+tested its condition on fewer pairs than the product, which an application function
+could observe, so such queries keep the generic join. A cursor's string comparison did
+not charge the keys it rebuilt, the keyed join did not charge its chunk of pairs, and
+the eager floor cache could outgrow its charge. The keyed join first had no cursor
+implementation, so strict streaming refused plans that it had run before.
+A second review found that a finished cursor keyed join kept its equality index until
+the cursor ended and that the index's list of other values grew without charging the
+old buffer during a move. The index is now released with the join's other working sets,
+and the list is counted, charged and allocated once. A third review asked for the
+cancellation check that the list's fill pass had lost, and it was restored.
+After the rebase onto item 96, a review of the shared rule found that the retry's test of
+the cursor ran before every automatic eager run and planned each EXISTS pattern, which
+slowed successful queries with many EXISTS filters. The test now runs only after an eager
+memory failure, on a fresh plan that keeps the first run's deadline.

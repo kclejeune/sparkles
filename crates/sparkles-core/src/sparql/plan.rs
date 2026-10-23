@@ -345,6 +345,16 @@ pub enum Kind {
     LeftJoin {
         expr: Option<Expr>,
     },
+    /// An OPTIONAL whose sides share no variable and whose condition has a conjunct
+    /// `?left = ?right` over a variable of each side. The candidate pairs are the rows
+    /// with the same id where either value is an IRI or a blank node, which no other
+    /// value equals, and the pairs of other values. The whole condition is then tested
+    /// on the candidates, so the result is the generic left join's.
+    KeyedLeftJoin {
+        expr: Expr,
+        left: VarId,
+        right: VarId,
+    },
     Minus,
     /// ARQ's SEMIJOIN (`anti`: ANTIJOIN): the rows of child 0 compatible with a row of
     /// child 1 (with none)
@@ -580,7 +590,7 @@ impl Node {
                 algo: JoinAlgo::Cross,
                 ..
             } => "CartesianProduct",
-            Kind::LeftJoin { .. } => "OptionalJoin",
+            Kind::LeftJoin { .. } | Kind::KeyedLeftJoin { .. } => "OptionalJoin",
             Kind::Minus => "Minus",
             Kind::HalfJoin { anti: false } => "SemiJoin",
             Kind::HalfJoin { anti: true } => "AntiJoin",
@@ -3702,6 +3712,16 @@ fn left_join(l: Node, r: Node, expr: Option<Expr>, ctx: &Ctx) -> Node {
         .filter(|v| r.vars.contains(v))
         .copied()
         .collect();
+    // The keyed join tests the condition on fewer pairs, so an application callback in
+    // it, which may count or depend on its calls, keeps the generic join.
+    if keys.is_empty()
+        && ctx.opt.keyed_left_join
+        && !ctx.calls_extensions
+        && let Some(e) = &expr
+        && let Some((a, b)) = equality_key(e, &l, &r)
+    {
+        return keyed_left_join(l, r, expr.unwrap(), (a, b), ctx);
+    }
     let est = join_est(&l, &r, &keys).max(l.est);
     let mut vars = l.vars.clone();
     vars.extend(r.vars.iter().filter(|v| !l.vars.contains(v)));
@@ -3738,6 +3758,59 @@ fn left_join(l: Node, r: Node, expr: Option<Expr>, ctx: &Ctx) -> Node {
         vars,
         certain: l.certain.clone(),
         sorted,
+        est,
+        cost: l.cost + r.cost + base + est,
+        dist,
+        desc,
+        children: vec![l, r],
+    }
+}
+
+/// The first conjunct `?a = ?b` of an OPTIONAL condition whose variables come one from
+/// each side, as (left variable, right variable). The sides must share no variable, so
+/// that the pair is the only link between them.
+fn equality_key(e: &Expr, l: &Node, r: &Node) -> Option<(VarId, VarId)> {
+    fn find(e: &Expr, l: &Node, r: &Node) -> Option<(VarId, VarId)> {
+        match e {
+            Expr::And(a, b) => find(a, l, r).or_else(|| find(b, l, r)),
+            Expr::Eq(a, b) => match (&**a, &**b) {
+                (Expr::Var(x), Expr::Var(y)) if l.vars.contains(x) && r.vars.contains(y) => {
+                    Some((*x, *y))
+                }
+                (Expr::Var(x), Expr::Var(y)) if l.vars.contains(y) && r.vars.contains(x) => {
+                    Some((*y, *x))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    find(e, l, r)
+}
+
+/// The OPTIONAL of `l` and `r` keyed on the condition's equality of `a` (left) and `b`
+/// (right), estimated as a join on one variable rather than as their product.
+fn keyed_left_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &Ctx) -> Node {
+    let est = join_est_from(l.est, r.est, l.d(a).max(r.d(b))).max(l.est);
+    let mut vars = l.vars.clone();
+    vars.extend(r.vars.iter().filter(|v| !l.vars.contains(v)));
+    let desc = format!(
+        "on ?{} = ?{} filter {}",
+        ctx.var_name(a),
+        ctx.var_name(b),
+        expr.display(ctx)
+    );
+    let dist = merge_dist(&l, &r, est, None);
+    let base = hash_base(Costing::of(ctx).hash_build, l.est, r.est);
+    Node {
+        kind: Kind::KeyedLeftJoin {
+            expr,
+            left: a,
+            right: b,
+        },
+        vars,
+        certain: l.certain.clone(),
+        sorted: Vec::new(),
         est,
         cost: l.cost + r.cost + base + est,
         dist,

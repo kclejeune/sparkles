@@ -1108,6 +1108,21 @@ its whole output. `spill_admitted` compares with the same memory. The estimate r
 the planner's row estimates, so a plan whose estimates are far too low can still be
 admitted and then fail at its budget, as an eager plan with the same estimates can.
 
+The eager memory retry without spill (roadmap item 91) uses the same test of the cursor.
+`memory_admitted` asks two things, that eager execution is expected not to fit and that
+`cursor_fits` holds. `cursor_fits` requires a SELECT over an immutable snapshot, batches
+large enough for admission, a plan that streams natively, and a cursor state that fits
+in half of the memory with its batch headroom. An eager run that fails for memory runs
+again as a cursor without spill when `cursor_fits` holds. The failure then stands in
+for the eager estimate that was too low. The retry plans the query again to ask this only after the failure,
+because the test plans each EXISTS pattern, and a query that succeeds should not pay for it. SP²Bench `q4` at 10M is such a plan. The planner
+estimates 26.7 million rows for its largest join where 88.2 million arrive, so admission
+keeps it eager, and the retried cursor answers within 1.99 GB. A plan whose cursor
+state is not expected to fit keeps the eager failure, and no cursor starts. The state
+estimate counts the hash index of a keyed OPTIONAL's equality column, although its sides
+share no variable. `eager_memory_retry.rs` covers both outcomes with skewed journal
+sizes that make the planner's estimate miss as it does at 10M.
+
 The review of this change found three estimates too low. Counting only a hash join's
 build rows admitted a cursor that failed in a 6 MiB pool on a join that eager execution
 answered there. Counting one row per group admitted a `COUNT(DISTINCT …)` over a large
@@ -1408,9 +1423,11 @@ ramfs, where spilled state would take memory, and warns on a network file system
 **Eager queries.** Both paths of §6.8 are built. With spill, automatic execution streams a
 SELECT whose operators all have cursor implementations when the largest operator output
 the plan estimates would take more than half of the memory left. An eager SELECT that
-fails its `memory` budget runs once more as a cursor within the first run's deadline,
-unless it calls SERVICE or a graph algorithm anywhere, inside an EXISTS included, or has
-extension functions or initial bindings. The cursor plan counts `eagerMemoryRetry`, and
+fails its `memory` budget or the shared pool runs once more as a cursor within the first
+run's deadline, unless it calls SERVICE or a graph algorithm anywhere, inside an EXISTS
+included, or has extension functions or initial bindings. With spill any such plan runs
+again. Without spill it runs again only when `cursor_fits` holds, the condition that
+item 96's `memory_admitted` also requires, as the next section describes. The cursor plan counts `eagerMemoryRetry`, and
 `/$/metrics` counts retries in `sparkles_spill_eager_retries_total`. The access log does
 not record the retry separately.
 

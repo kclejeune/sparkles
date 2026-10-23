@@ -572,7 +572,7 @@ mod on {
         let mut chain = Vec::new();
         while matches!(
             n.kind,
-            Kind::Filter(_) | Kind::Extend(..) | Kind::LeftJoin { .. }
+            Kind::Filter(_) | Kind::Extend(..) | Kind::LeftJoin { .. } | Kind::KeyedLeftJoin { .. }
         ) {
             chain.push(n);
             n = &n.children[0];

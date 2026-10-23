@@ -1121,15 +1121,26 @@ fn spill_admitted(ctx: &Ctx, node: &Node, kind: QueryKind) -> bool {
 /// case: eager execution holds the whole product, and the cursor holds the product's
 /// smaller input, the key set of the NOT EXISTS and one row per group.
 fn memory_admitted(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
-    kind == QueryKind::Select && ctx.snap.delta.is_empty() && batches_admitted(options) && {
-        let room = admission_room(ctx);
-        let eager = largest_output_bytes(node);
-        eager.is_finite() && eager * 2.0 > room && streams_natively(ctx, node) && {
+    let eager = largest_output_bytes(node);
+    eager.is_finite() && eager * 2.0 > admission_room(ctx) && cursor_fits(ctx, node, kind, options)
+}
+
+/// Whether a cursor over `node` can run without spill: the query is a SELECT over an
+/// immutable snapshot, every operator streams natively, and the state the cursor keeps,
+/// with its batch headroom, is expected to fit in half of the memory the query may use.
+/// Automatic admission asks this when eager execution is expected not to fit, and the
+/// eager memory retry asks it when eager execution has failed, so both send the same
+/// plans to a cursor without spill (roadmap items 91 and 96).
+fn cursor_fits(ctx: &Ctx, node: &Node, kind: QueryKind, options: &CursorOptions) -> bool {
+    kind == QueryKind::Select
+        && ctx.snap.delta.is_empty()
+        && batches_admitted(options)
+        && streams_natively(ctx, node)
+        && {
             let state = cursor_state_bytes(ctx, node);
             let headroom = cursor_headroom(ctx, node, options) as f64;
-            state.is_finite() && state * 2.0 + headroom <= room
+            state.is_finite() && state * 2.0 + headroom <= admission_room(ctx)
         }
-    }
 }
 
 /// The memory automatic admission compares a plan's estimates with: what the query's
@@ -1172,8 +1183,11 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
         _ if binary::eligible(node) => {
             let probe = &node.children[binary::probe_side(node)];
             let build = &node.children[1 - binary::probe_side(node)];
-            // a join with no shared variable has no key, so it builds no hash index
-            if build.vars.iter().any(|v| probe.vars.contains(v)) {
+            // a join with no shared variable has no key, so it builds no hash index,
+            // except a keyed OPTIONAL, which indexes its equality column
+            if build.vars.iter().any(|v| probe.vars.contains(v))
+                || matches!(node.kind, Kind::KeyedLeftJoin { .. })
+            {
                 hashed(build, build.est)
             } else {
                 rows(build, build.est)
@@ -1458,9 +1472,11 @@ pub fn query_execution_with_plan(
             let levels = levels.max(prepared.plan_depth);
             // An eager SELECT that runs out of memory runs again once as a cursor that
             // may spill (X08 §6.8). Eager execution writes nothing before it finishes,
-            // so the failure always comes before any output.
+            // so the failure always comes before any output. Without spill it runs
+            // again when automatic admission would have streamed it had its estimates
+            // foreseen the failure: its operators all stream and their state fits.
+            // That test plans EXISTS patterns, so it waits for the failure.
             let retry = kind == QueryKind::Select
-                && options.spill.is_some()
                 && options.extensions.is_none()
                 && options.initial_bindings.is_empty()
                 && retryable(&prepared.node)
@@ -1492,8 +1508,19 @@ pub fn query_execution_with_plan(
                         if retry
                             && matches!(
                                 &failed.error,
-                                Error::BudgetExceeded(b) if b.kind == crate::BudgetKind::Memory
-                            ) =>
+                                Error::BudgetExceeded(b) if matches!(
+                                    b.kind,
+                                    crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
+                                )
+                            )
+                            && (options.spill.is_some()
+                                || fits_without_spill(
+                                    &retry_snapshot,
+                                    &parsed,
+                                    options,
+                                    cursor,
+                                    started,
+                                )) =>
                     {
                         return retry_as_cursor(retry_snapshot, query, options, cursor, started);
                     }
@@ -1512,6 +1539,33 @@ pub fn query_execution_with_plan(
     })
 }
 
+/// Whether a cursor over `parsed` could run without spill, as automatic admission asks
+/// of it through [`cursor_fits`]. The eager run that failed has released its memory, so
+/// the query is planned again against its whole budget.
+fn fits_without_spill(
+    snapshot: &Arc<Snapshot>,
+    parsed: &spargebra::Query,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    started: Instant,
+) -> bool {
+    let options = within_first_deadline(options, started);
+    super::prepare_query(snapshot.clone(), parsed, &options, None, None)
+        .is_ok_and(|p| cursor_fits(&p.ctx, &p.node, p.kind, cursor))
+}
+
+/// `options` with a relative timeout turned into the deadline of the run that started
+/// at `started`, so that what runs after an eager failure keeps the first run's time.
+fn within_first_deadline(options: &QueryOptions, started: Instant) -> QueryOptions {
+    let mut options = options.clone();
+    if let Some(timeout) = options.timeout {
+        let deadline = started + timeout;
+        options.deadline = Some(options.deadline.map_or(deadline, |d| d.min(deadline)));
+        options.timeout = None;
+    }
+    options
+}
+
 /// Run `query` again as a cursor after its eager run exceeded the memory budget, within
 /// the deadline the first run started under. The root of the cursor plan counts the
 /// retry as `eagerMemoryRetry`.
@@ -1525,12 +1579,7 @@ fn retry_as_cursor(
     if let Some(spill) = &options.spill {
         spill.count_eager_retry();
     }
-    let mut options = options.clone();
-    if let Some(timeout) = options.timeout {
-        let deadline = started + timeout;
-        options.deadline = Some(options.deadline.map_or(deadline, |d| d.min(deadline)));
-        options.timeout = None;
-    }
+    let options = within_first_deadline(options, started);
     let mut execution = query_cursor(snapshot, query, &options, cursor)?;
     if let QueryExecution::Select(cursor) = &mut execution {
         let counters = cursor
@@ -2110,6 +2159,7 @@ fn own_exprs(kind: &Kind) -> Vec<&Expr> {
         | Kind::CountFilterScan { filter: exprs, .. } => exprs.iter().collect(),
         Kind::Extend(_, expr) | Kind::Assign(_, expr) | Kind::Unfold { expr, .. } => vec![expr],
         Kind::LeftJoin { expr } => expr.iter().collect(),
+        Kind::KeyedLeftJoin { expr, .. } => vec![expr],
         Kind::OrderBy { keys, .. } => keys.iter().map(|(key, _)| key).collect(),
         Kind::Group { aggs, .. } => aggs
             .iter()
@@ -2220,6 +2270,7 @@ fn value_ordered(node: &Node) -> bool {
         | Kind::HalfJoin { .. }
         | Kind::Minus
         | Kind::LeftJoin { .. }
+        | Kind::KeyedLeftJoin { .. }
         | Kind::Lateral(_) => first(),
         Kind::Union => node.children.len() == 1 && first(),
         // A merge join keeps its left input's order, and a hash join its probe side's,

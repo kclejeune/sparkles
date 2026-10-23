@@ -163,6 +163,9 @@ pub struct Optimizations {
     /// OPTIONAL on one variable, with both sides sorted on it and always binding it,
     /// runs as a merge in the left side's order
     pub merge_left_join: bool,
+    /// an OPTIONAL whose sides share no variable and whose condition equates a variable
+    /// of each side pairs the rows by that equality instead of forming their product
+    pub keyed_left_join: bool,
     /// a FILTER conjunct over the variables of one triple pattern is tested on a sample
     /// of the pattern's rows, whose share that passes is the planner's estimate of the
     /// share of its input it keeps (instead of 30%)
@@ -215,7 +218,7 @@ pub struct Optimizations {
 }
 
 impl Optimizations {
-    pub const NAMES: [&str; 41] = [
+    pub const NAMES: [&str; 42] = [
         "range_pushdown",
         "incremental_group",
         "count_join_runs",
@@ -241,6 +244,7 @@ impl Optimizations {
         "flat_hash_join",
         "gallop_index_join",
         "merge_left_join",
+        "keyed_left_join",
         "sampled_filters",
         "characteristic_sets",
         "probed_keys",
@@ -286,6 +290,7 @@ impl Optimizations {
         flat_hash_join: true,
         gallop_index_join: true,
         merge_left_join: true,
+        keyed_left_join: true,
         sampled_filters: true,
         characteristic_sets: true,
         probed_keys: true,
@@ -331,6 +336,7 @@ impl Optimizations {
         flat_hash_join: false,
         gallop_index_join: false,
         merge_left_join: false,
+        keyed_left_join: false,
         sampled_filters: false,
         characteristic_sets: false,
         probed_keys: false,
@@ -376,6 +382,7 @@ impl Optimizations {
             "flat_hash_join" => &mut self.flat_hash_join,
             "gallop_index_join" => &mut self.gallop_index_join,
             "merge_left_join" => &mut self.merge_left_join,
+            "keyed_left_join" => &mut self.keyed_left_join,
             "sampled_filters" => &mut self.sampled_filters,
             "characteristic_sets" => &mut self.characteristic_sets,
             "probed_keys" => &mut self.probed_keys,
@@ -2129,6 +2136,85 @@ impl Ctx {
                 .get(id.payload())
                 .map_or(TermKind::None, key_kind),
         }
+    }
+
+    /// The order of two base-vocabulary simple literals (`xsd:string`) by their lexical
+    /// forms, compared on their vocabulary keys without decoding either term. A simple
+    /// literal's key is `"` lexical 0xFF, and UTF-8 byte order is code point order.
+    /// `None` when either id is another kind of term.
+    pub(super) fn simple_literal_cmp(&self, a: Id, b: Id) -> Option<std::cmp::Ordering> {
+        let v = &self.snap.generation.vocab;
+        let (x, y) = (a.payload(), b.payload());
+        // the literals come before the triple terms and the IRIs
+        if x >= v.first_triple() || y >= v.first_triple() {
+            return None;
+        }
+        let lexical = |k: &[u8]| -> Option<std::ops::Range<usize>> {
+            (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
+        };
+        if self.is_cursor() {
+            // A cursor charges the reconstruction of both keys, as its decoding does. A
+            // charge that fails fails the cursor, and the generic comparison follows.
+            let order = self.with_cursor_vocab_key(x, |kx| {
+                let rx = lexical(kx)?;
+                match self.with_cursor_vocab_key(y, |ky| {
+                    let ry = lexical(ky)?;
+                    Some(kx[rx.clone()].cmp(&ky[ry]))
+                }) {
+                    Ok(order) => order.flatten(),
+                    Err(error) => {
+                        self.fail_cursor(&error);
+                        None
+                    }
+                }
+            });
+            return match order {
+                Ok(order) => order.flatten(),
+                Err(error) => {
+                    self.fail_cursor(&error);
+                    None
+                }
+            };
+        }
+        v.get_with(x, |kx| {
+            let rx = lexical(kx)?;
+            v.get_with(y, |ky| {
+                let ry = lexical(ky)?;
+                Some(kx[rx.clone()].cmp(&ky[ry]))
+            })
+            .flatten()
+        })
+        .flatten()
+    }
+
+    /// For a base-vocabulary simple literal, the first base id whose key starts with its
+    /// lexical form, which is the first of the strings it is a proper prefix of, or its
+    /// own id when it is a prefix of none. `None` for any other id.
+    ///
+    /// The vocabulary sorts a string's key `"` lexical 0xFF after the keys of its
+    /// extensions, so id order is lexical order except for those. For simple literals
+    /// `a < b` by id, the lexical form of `a` is less than that of `b` exactly when `a`
+    /// is below `b`'s floor, since the keys between `b`'s floor and `b` all start with
+    /// `b`'s lexical form.
+    pub(super) fn string_floor(&self, id: Id) -> Option<u64> {
+        if id.tag() != Tag::Vocab {
+            return None;
+        }
+        let v = &self.snap.generation.vocab;
+        let p = id.payload();
+        if p >= v.first_triple() {
+            return None;
+        }
+        let key = v.get(p)?;
+        if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
+            return None;
+        }
+        let prefix = &key[..key.len() - 1];
+        // most strings extend none: the key before them does not start with them
+        if p == 0 || !v.get_with(p - 1, |k| k.starts_with(prefix))? {
+            return Some(p);
+        }
+        Some(v.prefix_range(prefix).0)
     }
 
     pub fn local_len(&self) -> u64 {
