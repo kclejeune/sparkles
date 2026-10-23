@@ -5232,6 +5232,9 @@ const STRING_ORDER_ROWS: usize = 4096;
 /// The rows whose values the first test of [`string_order_mask`] reads.
 const STRING_ORDER_SAMPLE: usize = 64;
 
+/// The most ids a worker's cache of string floors holds in [`string_order_mask`].
+const STRING_FLOOR_ENTRIES: usize = 1 << 20;
+
 /// `FILTER(?x < ?y)`, or `<=`, `>` or `>=`, over a table whose values of both variables
 /// are stored simple literals. Their order is read from their base-vocabulary ids and
 /// each string's floor ([`Ctx::string_floor`]), computed once per distinct id in a cache
@@ -5265,9 +5268,12 @@ fn string_order_mask(
     let threads = rayon::current_num_threads().max(1);
     let par = n > PAR_THRESHOLD && threads > 1;
     let workers = if par { threads } else { 1 };
-    // each worker's cache holds at most one entry per distinct id of its rows
-    let entries = n.saturating_mul(2).min(1 << 21) as u64;
-    let Ok(_cache) = ctx.charge(entries.saturating_mul(24).saturating_mul(workers as u64)) else {
+    // Each worker's cache holds at most `entries` ids and starts again when it is full.
+    // A table of 16-byte entries with their control bytes, at most 7/8 full, coexists
+    // with its old table while it grows.
+    let entries = n.saturating_mul(2).min(STRING_FLOOR_ENTRIES);
+    let table = ((entries.saturating_mul(8) / 7).next_power_of_two() as u64).saturating_mul(17);
+    let Ok(_cache) = ctx.charge(table.saturating_mul(3) / 2 * workers as u64) else {
         return Ok(None);
     };
     let map = t.var_map(ctx.nvars());
@@ -5281,6 +5287,9 @@ fn string_order_mask(
         ebv(expr, &row, ctx).unwrap_or(false)
     };
     let floor = |cache: &mut FxHashMap<Id, u64>, id: Id| -> Option<u64> {
+        if cache.len() >= entries && !cache.contains_key(&id) {
+            cache.clear();
+        }
         let f = *cache
             .entry(id)
             .or_insert_with(|| ctx.string_floor(id).unwrap_or(u64::MAX));

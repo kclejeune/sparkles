@@ -3,8 +3,9 @@
 //! separator after a lexical form is byte 0xFF, so its id order must not decide them.
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
-use sparkles_core::sparql::{QueryOptions, query};
+use sparkles_core::sparql::{CursorOptions, QueryOptions, query, select_cursor};
 use sparkles_core::store::{Store, StoreOptions};
+use sparkles_core::{BudgetKind, Error};
 
 const VALUES: [&str; 12] = [
     r#""""#,
@@ -188,5 +189,50 @@ fn large_tables_order_stored_strings_through_their_vocabulary_floors() {
             }
         }
         assert_eq!(got, expected, "{op}");
+    }
+}
+
+/// A cursor charges the keys it reads to compare two stored strings, as it charges
+/// their decoding. The budget holds the query without the comparison but not the two
+/// 128 KiB keys as well.
+#[test]
+fn cursor_comparisons_charge_the_keys_they_read() {
+    let s = Store::in_memory(StoreOptions::default());
+    let long = |c: char| c.to_string().repeat(128 << 10);
+    let data = format!(
+        "<urn:s:0> <urn:p> \"{}\" .\n<urn:s:1> <urn:q> \"{}\" .\n",
+        long('a'),
+        long('b')
+    );
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let options = QueryOptions {
+        max_memory_bytes: Some(384 << 10),
+        no_cache: true,
+        ..Default::default()
+    };
+    let run = |filter: &str| {
+        let q = format!("SELECT ?a WHERE {{ ?a <urn:p> ?x . ?b <urn:q> ?y FILTER({filter}) }}");
+        select_cursor(s.snapshot(), &q, &options, &CursorOptions::default()).and_then(
+            |mut cursor| {
+                let mut rows = 0;
+                while let Some(batch) = cursor.next_batch()? {
+                    rows += batch.len();
+                }
+                Ok(rows)
+            },
+        )
+    };
+    assert_eq!(run("true").unwrap(), 1);
+    for filter in ["?x < ?y", "STR(?x) < STR(?y)"] {
+        let outcome = run(filter);
+        assert!(
+            matches!(&outcome, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+            "{filter}: {outcome:?}"
+        );
     }
 }

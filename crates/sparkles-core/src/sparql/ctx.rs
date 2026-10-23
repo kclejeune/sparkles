@@ -2152,6 +2152,30 @@ impl Ctx {
         let lexical = |k: &[u8]| -> Option<std::ops::Range<usize>> {
             (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
         };
+        if self.is_cursor() {
+            // A cursor charges the reconstruction of both keys, as its decoding does. A
+            // charge that fails fails the cursor, and the generic comparison follows.
+            let order = self.with_cursor_vocab_key(x, |kx| {
+                let rx = lexical(kx)?;
+                match self.with_cursor_vocab_key(y, |ky| {
+                    let ry = lexical(ky)?;
+                    Some(kx[rx.clone()].cmp(&ky[ry]))
+                }) {
+                    Ok(order) => order.flatten(),
+                    Err(error) => {
+                        self.fail_cursor(&error);
+                        None
+                    }
+                }
+            });
+            return match order {
+                Ok(order) => order.flatten(),
+                Err(error) => {
+                    self.fail_cursor(&error);
+                    None
+                }
+            };
+        }
         v.get_with(x, |kx| {
             let rx = lexical(kx)?;
             v.get_with(y, |ky| {
