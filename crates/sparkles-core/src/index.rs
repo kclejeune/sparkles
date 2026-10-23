@@ -29,7 +29,7 @@ pub const BLOCK_ROWS: usize = 32 * 1024;
 /// Rows of a segment in the generations this build writes. The `.seg` header records the
 /// size, and a reader accepts any size from [`MIN_SEG_ROWS`] to [`MAX_SEG_ROWS`] that
 /// divides [`BLOCK_ROWS`].
-pub const SEG_ROWS: usize = 1024;
+pub const SEG_ROWS: usize = 2048;
 const MIN_SEG_ROWS: usize = 512;
 const MAX_SEG_ROWS: usize = 4096;
 const SEG_MAGIC: &[u8; 8] = b"SPKSEG01";
@@ -1258,6 +1258,21 @@ impl PermIndex {
         (s1 - s0 <= (n / SPARSE_SEGMENTS_DIV).max(1) && s1 - s0 < n).then_some((s0, s1))
     }
 
+    /// [`segment_span`](Self::segment_span), unless the cache holds block `b`'s columns
+    /// whole (judged by the first column of `mask`): a reader then uses them, as cheap as
+    /// a segment, instead of cutting segments from them on every request.
+    pub(crate) fn read_span(
+        &self,
+        cache: &BlockCache,
+        b: usize,
+        lo: &Key,
+        hi: &Key,
+        mask: ColMask,
+    ) -> Option<(usize, usize)> {
+        let span = self.segment_span(b, lo, hi)?;
+        (!cache.holds_whole(self, b, mask)).then_some(span)
+    }
+
     /// Whether segment `s` of block `b` is the block's last.
     #[inline]
     pub(crate) fn last_segment(&self, b: usize, s: usize) -> bool {
@@ -1348,7 +1363,7 @@ impl PermIndex {
         hi: &Key,
         mask: ColMask,
     ) -> bool {
-        match self.segment_span(b, lo, hi) {
+        match self.read_span(cache, b, lo, hi, mask) {
             Some((s0, s1)) => (s0..s1).all(|s| cache.has_segment(self, b, s, mask)),
             None => cache.has_cols(self, b, mask),
         }
@@ -1365,7 +1380,7 @@ impl PermIndex {
         hi: &Key,
         mask: ColMask,
     ) -> bool {
-        match self.segment_span(b, lo, hi) {
+        match self.read_span(cache, b, lo, hi, mask) {
             Some(span) => self.prefetch_segments(cache, b, span, mask),
             None => self.prefetch(cache, b, mask),
         }
@@ -1716,6 +1731,14 @@ impl BlockCache {
             (b as u32) << SEG_KEY_BITS | seg,
             self.ns << 8 | c as u32,
         )
+    }
+
+    /// Whether the cache holds the first column of `mask` of block `b` whole, one lookup
+    /// that tells a reader of a few rows to use the whole columns.
+    #[inline]
+    pub(crate) fn holds_whole(&self, idx: &PermIndex, b: usize, mask: ColMask) -> bool {
+        let c = (mask & ALL_COLS).trailing_zeros() as usize;
+        c < 4 && self.cache.peek(&self.key(idx, b, c, WHOLE)).is_some()
     }
 
     /// Whether the columns in `mask` of segment `s` of block `b` are in the cache, as the
@@ -2129,7 +2152,7 @@ impl PermIndex {
         // once, and a cold one is asked for before either is decoded
         let ends = if hi - 1 == lo { 1 } else { 2 };
         let mut cached: [Option<Block>; 2] = [None, None];
-        let spans = [lo, hi - 1].map(|e| self.segment_span(e, &lo_key, &hi_key));
+        let spans = [lo, hi - 1].map(|e| self.read_span(cache, e, &lo_key, &hi_key, bc));
         for ((slot, e), span) in cached.iter_mut().zip([lo, hi - 1]).zip(spans).take(ends) {
             if partial(e) {
                 if let Some(span) = span {
@@ -2283,7 +2306,7 @@ impl PermIndex {
             let m = &self.blocks[b];
             let mask = columns(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
-            if !whole && let Some(span) = self.segment_span(b, lo_key, hi_key) {
+            if !whole && let Some(span) = self.read_span(cache, b, lo_key, hi_key, mask) {
                 // a few rows of the block: the segments that can hold them, one by one
                 if !self.for_each_segment_rows(cache, b, span, lo_key, hi_key, mask, &mut f)? {
                     break;
@@ -2341,7 +2364,7 @@ impl PermIndex {
         if b >= self.blocks.len() || self.blocks[b].first > *key {
             return Ok(false);
         }
-        if let Some(span) = self.segment_span(b, key, key) {
+        if let Some(span) = self.read_span(cache, b, key, key, ALL_COLS) {
             let mut found = false;
             self.for_each_segment_rows(cache, b, span, key, key, ALL_COLS, |_, _, _| {
                 found = true;

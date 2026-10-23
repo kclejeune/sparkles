@@ -865,7 +865,7 @@ fn prefetch(ctx: &Ctx, perm: Perm, ranges: &Ranges, cols: ColMask, rule: &RowRul
                 ctx.check()?;
             }
             // a range of a few rows of the block: the segments the reader decodes
-            if let Some(span) = idx.segment_span(b, &lo, &hi) {
+            if let Some(span) = idx.read_span(&ctx.snap.cache, b, &lo, &hi, mask) {
                 if idx.prefetch_segments(&ctx.snap.cache, b, span, mask) && ctx.opt.parallel_decode
                 {
                     warm.get_or_insert_with(|| ctx.snap.cache.warm_columns(idx))
@@ -1171,7 +1171,16 @@ fn read_ranges_gallop(
             let part = match (&cur, next_seg) {
                 (Some((cb, 0, _)), _) if *cb == x => 0,
                 (_, Some(s)) => s + 1,
-                _ => idx.segment_span(x, &lo, &hi).map_or(0, |(s0, _)| s0 + 1),
+                // the held segment reaches the range's start: ranges come in key order, so
+                // the range starts in it, and keys close together need no search
+                (Some((cb, cp, held)), _)
+                    if *cb == x && *cp != 0 && lead_cmp(held, held.len() - 1, &lo, d).is_ge() =>
+                {
+                    *cp
+                }
+                _ => idx
+                    .read_span(&ctx.snap.cache, x, &lo, &hi, mask)
+                    .map_or(0, |(s0, _)| s0 + 1),
             };
             let from = match &cur {
                 Some((cb, cp, _)) if *cb == x && *cp == part => Some(row),

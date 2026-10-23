@@ -304,11 +304,14 @@ from the row counts of the blocks before it, so the file needs no offset table a
 in-memory index grows by one integer per block. The file is mapped with `MADV_RANDOM`
 and stays on disk.
 
-**Segment size.** The writer uses 1,024 rows. The `.seg` header records the size, so a
+**Segment size.** The writer uses 2,048 rows. The `.seg` header records the size, so a
 later build can write another size without a format change, and the reader accepts any
-size from 512 to 4,096 rows that divides the block. The size was chosen by a sweep of
-512, 1,024, 2,048 and 4,096 rows at 10.5M that measured index size and the decoded bytes
-of the cold point lookups, as the Outcome reports.
+size from 512 to 4,096 rows that divides the block. A sweep at 10.5M re-encoded every
+permutation and counted its bytes with the directory. Against the unsegmented layout,
+512 rows gave 110.6%, 1,024 rows 105.9%, 2,048 rows 103.3% and 4,096 rows 101.9%.
+Smaller frames compress worse, and each restarts its deltas and adds a directory entry.
+2,048 rows is the smallest size within the 5% size target of §6.4, and a point lookup
+then decodes 16 KiB per column instead of 256 KiB.
 
 **Decoder entry points.** `PermIndex::decode_segment(b, c, s)` decodes one frame into a
 column of at most `SEG_ROWS` values. `PermIndex::decode_col(b, c)` decodes every frame
@@ -320,6 +323,8 @@ decodes to the wrong number of values, is a corruption error and never a panic.
 the rows of block `b` in a key range. It reads whole columns when the generation is not
 segmented, when the range covers the whole block, when the cache already holds the
 columns whole, or when the range spans more than a quarter of the block's segments.
+The index-join reader keeps the segment it holds while the next range starts in it, so
+keys that lie close together cost no search of the directory.
 Otherwise it reads the segments whose first keys can hold the range, found by a binary
 search in the block's directory. The range scan (`for_each_key_range_masked`), the
 counts of edge blocks (`count_between`), the full-key test (`contains`), the index-join
@@ -332,12 +337,14 @@ moves from one segment to the next when a range continues past the end of a segm
 **Dense scans.** A whole block, and every reader that asks for whole blocks by number
 (sorted scans, the streaming scan cursor, sampling, the reasoner, exports), decodes the
 whole column from its frames. The work per value is unchanged, and the extra cost is
-one LZ4 frame start and one varint restart per 1,024 rows.
+one LZ4 frame start and one varint restart per 2,048 rows.
 
 **Cache.** A cached column is keyed by the permutation instance, the block, the column,
-the namespace and the segment. The segment takes six bits next to the column, where 0
-means the whole column, so a whole column and a segment never shadow each other. The
-weigher counts each entry's decoded bytes as before.
+the namespace and the segment. The segment takes the low seven bits of the block field,
+where 0 means the whole column, so a whole column and a segment never shadow each other.
+The weigher counts each entry's decoded bytes as before. A reader of a few rows uses a
+block's whole columns when the cache holds them, because cutting a segment out of them
+on every request costs more than reading them in place.
 
 **Format.** Generations written by this build have index format 3, registered in the
 format table of X12. The reader opens formats 2 and 3. A format 2 generation is read as
