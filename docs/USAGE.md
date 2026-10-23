@@ -4047,6 +4047,20 @@ to switch to main. The Settings tab has a GraphRAG section with the fields above
 review inbox lists the unreviewed reports. The routes are described in
 [API.md](API.md#graphrag).
 
+Once reports exist, Ask can answer questions about the whole dataset from them, such as
+"What are the main areas of work in this organisation?". The draft decides whether a
+question is about the whole dataset, and a question that names one entity is always
+answered with a query. A global answer shows its points and the reports they come from,
+each with the findings used and the facts those findings cite. **Answer from the data**
+asks the same question again with a query, and **Answer from summaries** does the
+opposite. `sparkles ask --mode global` and `"mode": "global"` in `POST /{ds}/ask` do the
+same from the command line and the API. A caller who may not read the reports gets an
+answer from the data and a note that the summaries are unavailable.
+
+Agents read the reports with the MCP tool `community_reports`, and `recall` with
+`"communities": true` adds the report of each seed's community after its facts. A
+project brief lists the best rated reports of the coarsest level.
+
 ## Sending notifications
 
 The server can tell a person when something needs them. It sends a notification to a

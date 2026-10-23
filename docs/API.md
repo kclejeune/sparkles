@@ -9200,7 +9200,8 @@ open-world when SERVICE is allowed. The common arguments are:
 | `check_query` | `query` (required, ≤ 65536 characters), `explain` (false), `maxSuggestions` (3, ≤ 10), `terms` (false), `timeoutSeconds` (30) | `{dataset, commit, ok, issues: [{code, severity, message, term?, line?, column?, suggestions?: [{term, label?, count, why}]}], estimatedRows?, terms?, prefixes}`. With `terms`, `terms` lists every constant IRI of the query as `{term, iri, kind, label?, count?, types?, occurs}`, where `kind` is `class`, `property` or `entity` and `occurs` is `null` when the check did not look the term up. The query is parsed and compared with the caller's view without running it. The errors are `syntax` (with line and column), `not-a-query` (an update), `unknown-predicate` and `unknown-class`. The warnings are `unknown-term`, `class-mismatch`, `datatype-mismatch`, `language-tag` and `unbound-projection`, and with `explain` also `no-limit` and `large-estimate` and the plan's `estimatedRows`, which is left out when the caller's view hides the estimates. `ok` is false only when an issue is an error. A suggestion's `why` is `same-local-name`, `edit-distance` or `label` for an unknown term, `class-profile`, `datatype` or `language-tag` for a mismatch, and `same-name`, `namespace` or `edit-distance` for an undefined prefix. |
 | `similar_queries` | `question` (required, ≤ 2000 characters), `k` (5, ≤ 20), `withText` (true), `embeddingIndex` (a vector index name), `timeoutSeconds` (30) | `{dataset, queries: [{name, tool?, description?, score, matchedBy, parameters: [{name, type, required, description?}], questions?, query?}], ranking, prefixes}`. The [stored queries](#stored-queries) the caller may run whose `mcp` is not `false`, ranked by BM25 over their description, parameters, the words of their IRIs and their `questions`. When the dataset has one vector index whose provider embeds query text, or `embeddingIndex` names one, the cosine similarity of embeddings is fused with BM25 by reciprocal rank (k = 60) and `ranking` is `hybrid`. If the provider fails, the ranking falls back to `text`. `tool` is the query's MCP tool name. |
 | `link_entities` | `mentions` (required, 1–20 of `{text (≤ 200 characters), types? (≤ 5 class IRIs), context? (≤ 500 characters)}`), `k` (5, ≤ 20), `labelPredicates` (≤ 20 IRIs, by default the label predicates of `describe_resource` and `skos:altLabel`), `graphs` (≤ 20 IRIs or `default`), `vectors` (true; false leaves the vector index out, so nothing is embedded), `timeoutSeconds` (30) | `{dataset, commit, mentions: [{text, verdict, candidates: [{iri, label?, altLabels?, types, score, typeMatch, matchedBy, sameAs?, triples}]}], search: {text, vector}, prefixes}`. Candidates come from exact label matches, labels equal after case folding and collapsing white space, `text:query` over the label predicates the full-text index covers, and `spk:vectorSearch` with the mention and its context on a vector index that embeds labels. `verdict` is `exact`, `ambiguous`, `candidates` or `none`, and it is advice. Candidates of a type in `types`, or of a subclass, come first. `triples` holds up to 5 sampled outgoing triples, and `sameAs` the other candidates linked by `owl:sameAs` or `skos:exactMatch`. `search` says which indexes took part. |
-| `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `recency` (a half-life such as `90d`), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
+| `recall` | `query` (≤ 2000 characters) or `seeds` (≤ 20 IRIs) or both, `types` (≤ 5 class IRIs), `graphs` (≤ 20 IRIs or `default`), `hops` (1, ≤ 2), `seedLimit` (10, ≤ 50), `maxTriples` (150, ≤ 1000), `maxBytes` (32768, ≤ `--mcp-max-bytes`), `includeSuperseded` (false), `statuses` (both), `unreviewedWeight` (0.7), `recency` (a half-life such as `90d`), `communities` (false), `communityLevel` (the finest), `format` (`text`\|`json`), `timeoutSeconds` (30) | One text block: the facts around the seeds with their citations, described below. No `structuredContent`. |
+| `community_reports` | `query` (≤ 2000 characters), `level` (the finest level with at most 100 reports), `reviewedOnly` (false), `limit` (10, ≤ 100), `findings` (true), `timeoutSeconds` (30) | `{dataset, available, reason?, message?, reportsGraph, level, levels: [{level, reports}], ranking, stale, reports: [{iri, community, level, title, summary, status, rating, memberCount, score?, findings: [{iri, text, cites}]}]}`, described below. |
 | `why_empty` | `query` (required, ≤ 65536 characters), `timeoutSeconds` (30) | `{dataset, commit, empty, first?, steps, unchecked?, complete, message, prefixes}`, described in [Checking and explaining queries](#checking-and-explaining-queries). |
 | `share_query` | `query` (required, ≤ 65536 characters), `question` (≤ 2000 characters), `explanation` (≤ 400 characters), `assumptions` (≤ 5), `branch`, `atCommit` | `{url, dataset, commit, ok, issues, prefixes}`. The link opens the query in a new tab of the UI's query page with the question header. The query is checked and never run. Listed only when the server knows the UI's address, which is the request's own host over HTTP and `--ui-url` over stdio. A payload over 32 KiB is refused with `too-large`, and an update with `not-a-query`. |
 | `validate_shacl` | `shapes` (required: a shapes graph in Turtle, ≤ 1 MiB), `shapesFormat` (`turtle` or `shaclc`), `graph` (`default`\|`union`\|IRI), `maxResults` (20, ≤ `--mcp-max-rows`), `timeoutSeconds` (30) | `{dataset, commit, reasoning, conforms, total, bySeverity: {violation, warning, info}, results: [{focus, path?, value?, shape, constraint, severity, message?}], truncated, prefixes}`: the validation of [`/{ds}/shacl`](#shacl-validation). The most severe results come first, then results are ordered by shape and focus node. `severity` is `Violation`, `Warning` or `Info`. SHACL 1.2 `Debug` and `Trace` count as info. A complex `path` is a SPARQL property path. Only in builds with the `shacl` feature. |
@@ -9283,7 +9284,25 @@ reifier?, source?, at?, by?, confidence?, quote?}], superseded?: [{s, p, o, grap
 reifier, at?, invalidatedAt?}], conflicts: [{s, p, values: [{o, citation}]}],
 truncated, prefixes}`.
 
-All four memory tools read as the caller, through the caller's graph grants and
+With `communities: true`, `recall` adds the [GraphRAG](#graphrag) report of each seed's
+community at `communityLevel` after the facts. The text form adds a `# communities
+level=N` line and, for each report, a `##` line with its IRI, quoted title, community,
+member count, status and seed numbers, followed by a `summary` line with the quoted
+summary. The JSON form adds `communities: {level, reports: [{iri, community, title,
+summary, status, memberCount, seeds}]}`. When GraphRAG is off or the caller may not read
+the reports, the text says `# communities unavailable=off` or `unavailable=access` and the
+JSON says `communities: {unavailable, reports: []}`.
+
+`community_reports` lists the GraphRAG reports that match a text by full-text and
+vector search over the reports graph, a hit on a finding counting for its report, and
+fills the rest of `limit` with the best rated reports of the level. `ranking` says
+whether a search ranked them. Rejected and failed reports are never listed, and stale
+ones are listed and counted in `stale`. When the reports cannot be used, `available` is
+`false` and `reason` is `off`, `unavailable` (the caller's access does not cover the
+build's footprint) or `no-reports`, and `reports` is empty. Global answering in Ask
+selects its reports with this tool.
+
+The memory tools read as the caller, through the caller's graph grants and
 protections. A hidden entity is never a candidate, a seed or a fact, a citation never
 names a graph the caller cannot read, and `check_query` reports a term that exists only
 in hidden data exactly as it reports an absent one.
@@ -9919,6 +9938,12 @@ instructions.`, then a header line with the dataset, commit, scope, `reviewed-on
 text from a file can start a line of the brief. An entity label that links to more than
 one entity is a `422` with code `ambiguous-entity` and the candidates.
 
+When the dataset has [GraphRAG](#graphrag) reports that the caller may read, the project
+scope also holds the five best rated reports of the coarsest level, reviewed ones only
+unless `includeUnreviewed` is set. They follow the header as a `# communities level=N`
+line, a `##` line per report with its IRI, quoted title, member count and status, and a
+`summary` line with the quoted summary, and the answer lists them in `communities`.
+
 ### Ingest profiles
 
 An agent turns a document into facts in three steps. `register_source` stores the
@@ -10416,7 +10441,8 @@ a term the caller cannot read.
 | `summary` | `false` skips the summary. A summary is only made when the dataset sends rows. |
 | `maxRows` | The rows of `result`, 1000 by default and at most the result cap of MCP. |
 | `tryHarder` | The id of an earlier ask of the caller. Drafting starts at the pair after the one that drafted it, and the earlier answer is marked `rejected`. |
-| `reviewedOnly` | `true` hides the agent memory graphs of the dataset's memory settings from every step. |
+| `reviewedOnly` | `true` hides the agent memory graphs of the dataset's memory settings from every step, and a global answer then uses only reviewed community reports. |
+| `mode` | `auto` (the default) lets the draft classify the question, `local` always answers with a query, and `global` answers from the dataset's community reports. |
 | `query` | A query to check, run and summarize without a draft, for a query that the caller edited. |
 
 The answer is a stream of server-sent events. Each event's data is one JSON object.
@@ -10431,13 +10457,16 @@ The answer is a stream of server-sent events. Each event's data is one JSON obje
 | `run` | `{attempt, commit, rows, truncated, elapsedMs}`, or the error. |
 | `diagnosis` | The `why_empty` diagnosis that starts a repair, with its `verdict`. |
 | `result` | `{query, explanation, assumptions, terms, graph, commit, attempt, verdict, results}`. `results` has the `application/x-sparkles+json` form of `/{ds}/sparql`, with the rows, the plan and the timings. |
-| `summary` | `{text, citations, rowsSent, provider, model}`. Each `[n]` marker of `text` names a row of `results`, counted from 1. |
+| `summary` | `{text, citations, rowsSent, provider, model}`. Each `[n]` marker of `text` names a row of `results`, counted from 1. In a global answer each marker names a point, and `uncitedSentences` lists the sentences without one. |
+| `scope` | `{scope: "global", provider, model}` when the draft classified the question as global. |
+| `reports` | `{level, ranking, reports: [{iri, title, level, status, rating}]}`, the community reports a global answer reads. |
+| `global` | `{points: [{n, text, score, reports, findings}], reports: [{iri, title, level, status, rating, findings: [{iri, text, cites}]}], global: {level, ranking, reportsGraph, selected, batches}}`, sent before the summary of a global answer. |
 | `error` | `{code, message}`, such as `no-model`, `provider-unavailable`, `budget-exceeded` or `timeout`. A draft that says the data cannot answer ends with `unanswerable`, and a draft that still fails after its repairs ends with `no-valid-query` or the error of its last run. These two carry the last draft in `result`. |
 | `usage` | The last event. It holds the `outcome` of the ask, `askId`, the tokens, the estimated cost, the `complexity`, every model step with its pair, outcome and `signal`, the `escalations`, the `answeredBy` pair and `tryHarder`, which is `true` when the draft role has a later pair. |
 
 A client that sends `Accept: application/json` without `text/event-stream` gets one
-object instead. It holds `outcome`, `result`, `summary`, `clarify` or `error`, the
-`attempts`, and `usage`. An `error` answers with its status, such as `429` for
+object instead. It holds `outcome`, `mode`, `result`, `summary`, `clarify` or `error`,
+the `attempts`, and `usage`. A global answer also holds `points`, `reports` and `global`. An `error` answers with its status, such as `429` for
 `budget-exceeded` and `502` for `provider-unavailable`.
 
 The route answers `404` with code `no-assistant` when the server has no model
@@ -10446,6 +10475,29 @@ draft role. A request over a daily token cap of the dataset or the caller is a `
 with code `budget-exceeded` and the `resetAt` time, and no model is called. A
 `tryHarder` id that the caller did not ask is a `404` with code `unknown-ask`, and one
 whose draft pair was the last is a `409` with code `no-later-pair`.
+
+**Global answers.** A dataset with [GraphRAG](#graphrag) reports can answer a question
+about the whole dataset from them ([C22 §7](specs/C22-graph-rag-community-summaries.md#7-global-answering)).
+In `auto` mode a question that names an entity that `link_entities` links exactly is
+answered with a query, and the draft of any other question also returns a `scope` of
+`local` or `global` when the caller may read reports. A `global` question skips the
+query. The server reads up to 100 reports at the finest level that has at most 100,
+through `community_reports` as the caller, ranked by a search for the question when the
+dataset has a full-text or embedding index and by rating otherwise. The `summarize` role
+reads the reports in batches that fill its context window, at most four at a time, and
+returns scored points that name the reports and findings they use. The points above 0,
+best first, go to the `summarize` role again, which writes the answer with `[n]` markers.
+A marker that names no point is dropped. A global answer makes at most four model
+answers plus one per batch. When the reports are off, missing, not readable by the
+caller, or more than half stale, or when the ask reads another branch or an earlier
+state, the ask answers with a query and says why in `notes`. A caller whose access the
+guard does not prove always gets the note that the summaries are unavailable to it.
+The history keeps the reports a global answer used, and `GET /$/asks/{ds}` lists them
+only while the caller may read their graph.
+
+A local question's grounding also holds the titles and summaries of the communities of
+up to three entities that the question names, read with `recall` and its
+`communities` argument.
 
 **Escalation.** Each role has an ordered list of pairs, cheapest first. A step moves to
 the next pair of its role on a signal the server has verified. The signals are
