@@ -757,7 +757,12 @@ client types list the new parameters.
   state as the graph reads it, so a change in a graph the view does not read is skipped. A
   step that lists only some of its changes, or that would pass the node cap, reads the
   graph again at its commit instead.
-- **The grouped time-lapse.** Each group keeps its net change since the start. A group the
+- **The grouped time-lapse.** When a time-lapse switches to grouping after drawing some
+  steps, one grouped diff from its start to the step before counts what those steps drew,
+  so their classes stay on the picture. A13 therefore makes five requests, still one at a
+  time. The node cap also counts the ends that a removal of an undrawn triple adds as
+  ghosts.
+  Each group keeps its net change since the start. A group the
   step changed is marked with the step's counts, and one that falls to nothing goes after
   its step unless **Keep ghosts** is on. The grouped picture draws at most 1,500 nodes,
   the largest groups first, and says how many groups it left out.

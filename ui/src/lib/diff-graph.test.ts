@@ -161,6 +161,16 @@ describe('the time-lapse', () => {
     expect(over.canvas).toBe(s.canvas);
   });
 
+  it('counts the ends a removal draws toward the node cap', () => {
+    const s = applyStep(emptyCanvas(), [q('+', 'a', 'p', 'b')], { maxNodes: 3 });
+    // removing a triple that is not drawn draws its two ends as ghosts
+    const over = applyStep(s.canvas, [q('-', 'c', 'p', 'd')], { maxNodes: 3, keepGhosts: true });
+    expect(over.overflow).toBe(true);
+    expect(over.canvas).toBe(s.canvas);
+    const fits = applyStep(s.canvas, [q('-', 'a', 'p', 'b')], { maxNodes: 3 });
+    expect(fits.overflow).toBe(false);
+  });
+
   it('steps commit by commit, or by bucket over long ranges', () => {
     expect(lapseSteps(0, 3)).toEqual([
       { from: 0, to: 1 },

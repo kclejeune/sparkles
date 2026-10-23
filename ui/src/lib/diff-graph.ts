@@ -122,10 +122,10 @@ export function applyStep(
     if (isGhost(e) && !opts.keepGhosts) continue;
     edges.set(id, e.change === 'added' ? { ...e, change: 'kept' } : e);
   }
-  // the nodes this step would add, to stop before the cap
+  // the nodes this step would add, to stop before the cap: an addition draws its ends, and
+  // so does a removal of a triple that is not drawn, as ghosts
   const fresh = new Set<string>();
   for (const q of quads) {
-    if (q.op !== '+') continue;
     const { sid, oid } = quadIds(q);
     for (const id of [sid, oid]) if (!nodes.has(id)) fresh.add(id);
   }

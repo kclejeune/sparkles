@@ -361,15 +361,20 @@
   let lapseGroups: Map<string, LiveGroup> | null = null;
   let wrap: HTMLDivElement | undefined = $state();
 
+  /** Bumped by every stop, so that a start still reading the catalog gives up. */
+  let lapseGen = 0;
+
   function stopLapse() {
     playing = false;
     clearTimeout(timer);
+    lapseGen++;
   }
 
   async function startLapse() {
     const f = fromSeq;
     const t = toSeq;
     if (f == null || t == null || t <= f) return;
+    const gen = ++lapseGen;
     if (stepIndex < 0 || stepIndex >= steps.length - 1) {
       // a range of more than 500 commits steps through the timeline's buckets
       let buckets: api.TimelineBucket[] | undefined;
@@ -378,11 +383,14 @@
           .commitTimeline(ds, { from: f + 1, to: t, buckets: 200 })
           .catch(() => null);
         buckets = tl?.buckets;
+        // a stop, a new range or leaving the view while the timeline was read
+        if (gen !== lapseGen) return;
       }
       steps = lapseSteps(f, t, buckets);
       // the catalog's counts say which steps are too large to draw, before asking for them
       if (t - f <= 500) {
         const page = await api.commits(ds, { before: t + 1, limit: t - f }).catch(() => null);
+        if (gen !== lapseGen) return;
         if (page) steps = withCounts(steps, page.commits);
       }
       stepCount = steps.length;
@@ -432,8 +440,11 @@
       let added = 0;
       let removed = 0;
       let commit: api.Commit | undefined;
+      // switching to groups after drawn steps first counts those steps by class
+      let seed = false;
       if (!lapseGroups && tooLarge(s)) {
         lapseGroups = new Map();
+        seed = i > 0;
         note = `Commit ${s.to} has ${fmtInt(s.changes ?? 0)} changes, more than the ${fmtInt(STEP_QUADS)} a step draws, so the time-lapse is grouped by class from here on.`;
       } else if (!lapseGroups) {
         const d = await api.diff(ds, {
@@ -450,6 +461,7 @@
         if (!r || r.overflow) {
           // a step too large to draw: from here on, by class
           lapseGroups = new Map();
+          seed = i > 0;
           note = `Commit ${s.to} has ${fmtInt(d.added + d.removed)} changes, more than ${!r ? `the ${fmtInt(STEP_QUADS)} a step draws` : `${fmtInt(MAX_CANVAS_NODES)} nodes hold`}, so the time-lapse is grouped by class from here on.`;
         } else {
           const t1 = performance.now();
@@ -470,6 +482,25 @@
           added = r.added;
           removed = r.removed;
         }
+      }
+      if (lapseGroups && seed) {
+        // the changes drawn so far, grouped, so that the classes they drew stay
+        if (inFlight === 0) {
+          requests++;
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          if (wrap) {
+            wrap.dataset.requests = String(requests);
+            wrap.dataset.maxInFlight = String(maxInFlight);
+          }
+        }
+        const before = await api.diffGroups(ds, {
+          from: `commit:${steps[0].from}`,
+          to: `commit:${s.from}`,
+          signal,
+        });
+        inFlight--;
+        lapseGroups = lapseGroupsStep(new Map(), before.groups, false).live;
       }
       if (lapseGroups) {
         if (inFlight === 0) {

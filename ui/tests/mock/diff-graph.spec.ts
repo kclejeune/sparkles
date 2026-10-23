@@ -173,15 +173,47 @@ test('A13: the time-lapse makes one request per step and groups the large one', 
   await expect(view(page).getByRole('button', { name: 'Play the time-lapse' })).toBeVisible();
   // bob was drawn by step 2
   expect(seen[0]).toMatch(/bob/);
-  // four steps, four diff requests, never two at once
-  expect(diffs).toHaveLength(4);
+  // four steps and one request that groups the steps drawn before the large one, never two
+  // at once
+  expect(diffs).toHaveLength(5);
   expect(most).toBe(1);
+  expect(diffs.at(-2)).toContain('group=class');
+  expect(diffs.at(-2)).toContain('from=commit%3A0');
+  expect(diffs.at(-2)).toContain('to=commit%3A3');
   expect(diffs.at(-1)).toContain('group=class');
   await expect.poll(() => labels(page)).toMatch(/Person \+600/);
+  // the names and Carol, drawn before the switch, stay as groups
+  expect(await labels(page)).toMatch(/xsd:string/);
+  expect(await labels(page)).toMatch(/IRIs without a class/);
   // the live region announces the step
   await expect(view(page).locator('[aria-live="polite"]')).toHaveText(
     'commit 4, 1,200 added, 0 removed',
   );
+});
+
+test('leaving the diff while the time-lapse reads the catalog starts no step', async ({ page }) => {
+  const diffs: string[] = [];
+  page.on('request', (r) => {
+    if (/\/chrono4\/diff\?/.test(r.url())) diffs.push(r.url());
+  });
+  await page.goto(diffUrl(4, 0));
+  await expect
+    .poll(async () => (await drawn(page)).nodes.length, { timeout: 30_000 })
+    .toBeGreaterThan(0);
+  // the commit catalog answers late
+  let caught = 0;
+  await page.route(/\/\$\/commits\/chrono4/, async (route) => {
+    caught++;
+    await new Promise((r) => setTimeout(r, 1500));
+    await route.continue().catch(() => {});
+  });
+  diffs.length = 0;
+  await view(page).getByRole('button', { name: 'Play the time-lapse' }).click();
+  await expect.poll(() => caught).toBe(1);
+  await page.getByRole('button', { name: 'Exit diff' }).click();
+  await expect(view(page)).toHaveCount(0);
+  await page.waitForTimeout(2500);
+  expect(diffs).toEqual([]);
 });
 
 test('A14: the overview compares commit 3 with commit 4', async ({ page }) => {
