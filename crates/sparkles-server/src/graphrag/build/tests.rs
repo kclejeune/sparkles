@@ -13,7 +13,7 @@ pub(crate) const ORG: &str = "urn:g:org";
 
 /// Two clusters of `n` people each, every pair of a cluster knowing each other, with
 /// one edge between the clusters and a few literals per person.
-fn data(n: usize) -> String {
+pub(crate) fn data(n: usize) -> String {
     let mut t = format!("<{ORG}> {{\n");
     for c in ["x", "y"] {
         for i in 0..n {
@@ -35,7 +35,7 @@ fn data(n: usize) -> String {
 
 /// The report a stub model writes: one finding that cites item 1 and the entity that
 /// item names.
-fn answer(r: &Received) -> String {
+pub(crate) fn answer(r: &Received) -> String {
     let prompt = mock::prompt_of(r);
     let first = prompt
         .lines()
@@ -128,7 +128,7 @@ pub(crate) async fn patch(app: &axum::Router, uri: &str, body: Value) -> StatusC
     res.status()
 }
 
-fn settings(extra: Value) -> GraphragSettings {
+pub(crate) fn settings(extra: Value) -> GraphragSettings {
     let mut v = json!({
         "enabled": true,
         "principal": "reports",
@@ -157,7 +157,7 @@ impl Fixture {
         );
     }
 
-    fn run(&self, settings: GraphragSettings, mode: Mode) -> Result<Outcome, RunError> {
+    pub(crate) fn run(&self, settings: GraphragSettings, mode: Mode) -> Result<Outcome, RunError> {
         let ds = self.st.datasets().get("org").cloned().unwrap();
         store_settings(&self.st, &ds, &settings);
         run(&Run {

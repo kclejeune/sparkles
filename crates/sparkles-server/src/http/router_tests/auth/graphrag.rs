@@ -580,3 +580,256 @@ async fn restricted_writers_cannot_review() {
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
     assert!(r.text().contains("restricted-writer"), "{}", r.text());
 }
+
+/// A community and its report in the reports graph, linked to the build's footprint,
+/// with GraphRAG enabled for the dataset (C22 Phase 2).
+#[cfg(feature = "mcp")]
+async fn with_community(s: &AuthServer) {
+    let fp = footprint_iri(s).await;
+    let ds = s.state.datasets().get("rag").cloned().unwrap();
+    let rdfs = "http://www.w3.org/2000/01/rdf-schema#label";
+    let trig = format!(
+        "<{REPORTS}> {{ <urn:c:1> a <{community}> ; <{level}> 0 ; <{count}> 2 ; <{member}> <http://ex/x> ; <{report}> <http://ex/r> ; <{disc}> <{fp}> . <http://ex/r> a <{rep}> ; <{status}> \"unreviewed\" ; <{rdfs}> \"Team\" ; <{summary}> \"the report\" ; <{finding}> <http://ex/r#f1> . <http://ex/r#f1> <{order}> 1 ; <{text}> \"x knows y\" . }}\n",
+        community = gr("Community"),
+        level = gr("level"),
+        count = gr("memberCount"),
+        member = gr("member"),
+        report = gr("report"),
+        disc = gr("disclosure"),
+        rep = gr("Report"),
+        status = gr("status"),
+        summary = gr("summary"),
+        finding = gr("finding"),
+        order = gr("order"),
+        text = gr("text"),
+    );
+    ds.store
+        .load(&[Source::from_bytes(
+            trig.into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    crate::settings::store_runtime(
+        &s.state,
+        &ds,
+        &crate::settings::GRAPHRAG,
+        &serde_json::json!({ "enabled": true, "principal": "tua", "projection": { "graphs": ["urn:g:*"] } }),
+    )
+    .unwrap();
+}
+
+/// `user`'s principal as a request has it, with the server's disclosure guard.
+#[cfg(feature = "mcp")]
+fn guarded(s: &AuthServer, user: &str) -> crate::auth::Principal {
+    s.auth()
+        .user_principal(user)
+        .unwrap()
+        .with_guard(s.state.graphrag_guard.clone(), s.state.access_epoch())
+}
+
+/// A tool call as `user`.
+#[cfg(feature = "mcp")]
+fn tool_as(s: &AuthServer, user: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
+    let call = crate::mcp::Call {
+        arrived: std::time::Instant::now(),
+        cancel: Default::default(),
+        request_id: "t".into(),
+        principal: guarded(s, user),
+        headers: None,
+        held: None,
+        grant: None,
+    };
+    let serde_json::Value::Object(mut m) = args else {
+        panic!("arguments are an object")
+    };
+    m.insert("dataset".into(), "rag".into());
+    let server = crate::mcp::McpServer::new(s.state.clone(), crate::mcp::McpConfig::default());
+    match server.run_now(name, m, &call).unwrap() {
+        crate::mcp::Outcome::Structured(v) => v,
+        crate::mcp::Outcome::Text(t) => {
+            serde_json::from_str(&t).unwrap_or(serde_json::Value::String(t))
+        }
+    }
+}
+
+/// `community_reports` and the communities of `recall` and the brief read through the
+/// guard: a caller it does not prove learns only that the reports are unavailable.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn report_consumers_follow_coverage() {
+    let s = server();
+    with_community(&s).await;
+    let s = std::sync::Arc::new(s);
+    let s2 = s.clone();
+    tokio::task::spawn_blocking(move || {
+        let s = s2;
+        for u in SEES {
+            let v = tool_as(&s, u, "community_reports", serde_json::json!({}));
+            assert_eq!(v["available"], true, "{u}: {v}");
+            assert_eq!(v["reports"][0]["title"], "Team", "{u}: {v}");
+            assert_eq!(v["reports"][0]["findings"][0]["text"], "x knows y", "{u}: {v}");
+            let r = tool_as(
+                &s,
+                u,
+                "recall",
+                serde_json::json!({ "seeds": ["http://ex/x"], "hops": 0, "communities": true, "format": "json" }),
+            );
+            assert_eq!(r["communities"]["reports"][0]["title"], "Team", "{u}: {r}");
+        }
+        for u in BLIND {
+            let v = tool_as(&s, u, "community_reports", serde_json::json!({}));
+            assert_eq!(v["available"], false, "{u}: {v}");
+            assert_eq!(v["reason"], "unavailable", "{u}: {v}");
+            assert_eq!(v["reports"], serde_json::json!([]), "{u}: {v}");
+            assert!(!v.to_string().contains("Team"), "{u}: {v}");
+            let r = tool_as(
+                &s,
+                u,
+                "recall",
+                serde_json::json!({ "seeds": ["http://ex/x"], "hops": 0, "communities": true, "format": "json" }),
+            );
+            assert_eq!(r["communities"]["unavailable"], "access", "{u}: {r}");
+            assert!(!r.to_string().contains("the report"), "{u}: {r}");
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// A5: a caller the guard does not prove gets a local answer and a note that the
+/// summaries are unavailable to it, even when it asks for a global answer.
+#[cfg(feature = "mcp")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a5_unproven_callers_answer_locally() {
+    use crate::models::mock::{self, MockModel};
+    let s = server();
+    with_community(&s).await;
+    let mock = MockModel::start(|r, _| {
+        let sys = r.body["messages"][0]["content"].as_str().unwrap_or("");
+        let text = if sys.contains("translate a person's question") {
+            let mut d = serde_json::json!({
+                "query": "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1",
+                "explanation": "Lists a subject.",
+                "assumptions": [],
+                "clarify": { "question": "", "choices": [] },
+                "graph": { "subject": "", "predicate": "", "object": "" }
+            });
+            if r.body.to_string().contains("ScopedDraft") {
+                d["scope"] = "global".into();
+            }
+            d.to_string()
+        } else if sys.contains("community reports about one dataset") {
+            serde_json::json!({ "points": [{ "text": "A team.", "score": 50, "reports": ["R1"], "findings": ["F1.1"] }] }).to_string()
+        } else {
+            serde_json::json!({ "text": "One subject [1].", "citations": [1] }).to_string()
+        };
+        (200, mock::openai(&text))
+    });
+    let pair = serde_json::json!({ "provider": "p", "model": "m" });
+    let cfg = serde_json::json!({
+        "providers": { "p": { "kind": "openai", "endpoint": mock.url(), "requestTimeoutSecs": 5,
+                              "allowedModels": ["m"], "structuredOutput": "json-schema" } },
+        "roles": { "draft": [pair], "summarize": [pair] }
+    });
+    s.state
+        .models
+        .store(Some(std::sync::Arc::new(crate::models::Models::new(
+            crate::models::ModelsConfig::parse(&cfg.to_string()).unwrap(),
+            Default::default(),
+            sparkles::outbound::OutboundPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        ))));
+    let s = std::sync::Arc::new(s);
+    let s2 = s.clone();
+    tokio::task::spawn_blocking(move || {
+        let s = s2;
+        let models = s.state.models().unwrap();
+        let server = crate::mcp::McpServer::new(s.state.clone(), crate::mcp::McpConfig::default());
+        for (u, mode) in [
+            ("tpart", crate::ask::AskMode::Global),
+            ("tub", crate::ask::AskMode::Auto),
+        ] {
+            let o = crate::ask::AskOptions {
+                dataset: "rag".into(),
+                question: "What are the main groups?".into(),
+                mode,
+                ..Default::default()
+            };
+            let p = guarded(&s, u);
+            let mut on = |_: &str, _: &serde_json::Value| {};
+            let out = crate::ask::ask(&server, &models, &p, &o, &mut on);
+            assert_eq!(out["mode"], "local", "{u}: {out}");
+            assert!(
+                out["notes"]
+                    .to_string()
+                    .contains("summaries are unavailable to you"),
+                "{u}: {out}"
+            );
+            assert!(!out.to_string().contains("the report"), "{u}: {out}");
+        }
+        // a proven caller gets a global answer from the same question
+        let o = crate::ask::AskOptions {
+            dataset: "rag".into(),
+            question: "What are the main groups?".into(),
+            mode: crate::ask::AskMode::Global,
+            ..Default::default()
+        };
+        let p = guarded(&s, "tua");
+        let mut on = |_: &str, _: &serde_json::Value| {};
+        let out = crate::ask::ask(&server, &models, &p, &o, &mut on);
+        assert_eq!(out["mode"], "global", "{out}");
+    })
+    .await
+    .unwrap();
+}
+
+/// C22 §6.6 in every build: a history entry lists the reports of a global answer only
+/// while the guard proves their graph for the reader, so a history written by a build
+/// with global answers stays filtered by one without them (round 4, finding 1).
+#[tokio::test]
+async fn history_lists_reports_only_while_proven() {
+    let s = server();
+    let ds = s.state.datasets().get("rag").cloned().unwrap();
+    let at = chrono::Utc::now().to_rfc3339();
+    let users: Vec<&str> = SEES.iter().chain(BLIND.iter()).copied().collect();
+    let records: Vec<crate::assistant::AskRecord> = users
+        .iter()
+        .map(|u| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("ask-{u}"),
+                "principal": s.auth().user_principal(u).unwrap().id(),
+                "at": at,
+                "question": "What are the main groups?",
+                "result": "answered",
+                "outcome": "none",
+                "routing": {},
+                "mode": "global",
+                "reports": ["http://ex/r"],
+                "reportsGraph": REPORTS,
+            }))
+            .unwrap()
+        })
+        .collect();
+    crate::assistant::store_history(&s.state, &ds, &records).unwrap();
+    for u in SEES {
+        let r = get(&s.app, u, "/$/asks/rag", "application/json").await;
+        assert_eq!(r.status, StatusCode::OK, "{u}");
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(
+            v["asks"][0]["reports"],
+            serde_json::json!(["http://ex/r"]),
+            "{u}: {v}"
+        );
+    }
+    for u in BLIND {
+        let r = get(&s.app, u, "/$/asks/rag", "application/json").await;
+        assert_eq!(r.status, StatusCode::OK, "{u}");
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["asks"].as_array().map(Vec::len), Some(1), "{u}: {v}");
+        assert!(v["asks"][0].get("reports").is_none(), "{u}: {v}");
+        assert!(v["asks"][0].get("reportsGraph").is_none(), "{u}: {v}");
+    }
+}

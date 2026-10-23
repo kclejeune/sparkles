@@ -4,6 +4,7 @@
 
 import type {
   AskClarify,
+  AskGlobal,
   AskEvent,
   AskGraph,
   AskRecord,
@@ -43,6 +44,10 @@ export type TabQuestion = {
   graph?: AskGraph | null;
   /** The feedback sent for the answer. */
   feedback?: Feedback;
+  /** Whether the answer came from the data or from community reports (C22 §2.4). */
+  mode?: 'local' | 'global';
+  /** What a global answer read. */
+  global?: AskGlobal;
 };
 
 /** The last check of a tab's query, kept with the text it checked. */
@@ -384,6 +389,11 @@ export function nextStep(e: AskEvent, o: { run: boolean; summary: boolean }): st
       return `Repairing (${Math.min(e.data.attempt ?? 1, 2)} of 2)`;
     case 'result':
       return o.run && o.summary && e.data.results ? 'Summarizing' : 'Finishing';
+    case 'scope':
+    case 'reports':
+      return 'Reading community reports';
+    case 'global':
+      return 'Summarizing';
     default:
       return null;
   }

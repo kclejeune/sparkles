@@ -12,6 +12,8 @@ pub mod budget;
 pub mod build;
 #[cfg(feature = "memory")]
 pub mod cli;
+#[cfg(all(test, feature = "mcp"))]
+mod consumers_tests;
 pub mod guard;
 pub mod hierarchy;
 #[cfg(feature = "mcp")]
@@ -19,6 +21,8 @@ pub mod http;
 pub mod identity;
 pub mod ledger;
 pub mod projection;
+#[cfg(feature = "mcp")]
+pub mod read;
 #[cfg(feature = "mcp")]
 pub mod report;
 #[cfg(feature = "mcp")]

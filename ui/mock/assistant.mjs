@@ -9,6 +9,8 @@
 //   diagnosis starts a repair, and the repair escalates to the large model.
 // - "connected" drafts a SELECT with graph variables.
 // - "provider" ends with `provider-unavailable`, and "budget" is refused with `429`.
+// - "main areas" (or `mode: "global"`) is answered from community reports (C22 §7),
+//   unless the request asks for `mode: "local"`.
 // - anything else drafts the members of the payments team.
 //
 // A request body with the mock-only field `hold: "summary"` stops before the summary
@@ -34,6 +36,58 @@ const history = {};
 const drafted = {};
 
 const who = (req) => mockPrincipal(req) ?? 'local';
+
+/** The community reports of a global answer (C22 §7.2). */
+const REPORT = 'urn:x-sparkles:graphrag:report:';
+const REPORTS = [
+  { iri: `${REPORT}pay`, title: 'The payments team', level: 1, status: 'reviewed', rating: 7 },
+  { iri: `${REPORT}plat`, title: 'The platform team', level: 1, status: 'unreviewed', rating: 5 },
+];
+const GLOBAL = {
+  points: [
+    {
+      n: 1,
+      text: 'The payments team ships the checkout redesign.',
+      score: 90,
+      reports: [REPORTS[0].iri],
+      findings: [`${REPORTS[0].iri}#f1`],
+    },
+    {
+      n: 2,
+      text: 'The platform team runs the build and the clusters.',
+      score: 70,
+      reports: [REPORTS[1].iri],
+      findings: [`${REPORTS[1].iri}#f1`],
+    },
+  ],
+  reports: [
+    {
+      ...REPORTS[0],
+      findings: [
+        {
+          iri: `${REPORTS[0].iri}#f1`,
+          text: 'Ana and Kai ship the checkout redesign.',
+          cites: [
+            '<<( <http://example.org/resource/ana> <http://example.org/ontology#memberOf> <http://example.org/resource/payments> )>>',
+          ],
+        },
+      ],
+    },
+    {
+      ...REPORTS[1],
+      findings: [
+        {
+          iri: `${REPORTS[1].iri}#f1`,
+          text: 'Lee and Mo run the build.',
+          cites: [
+            '<<( <http://example.org/resource/lee> <http://example.org/ontology#memberOf> <http://example.org/resource/platform> )>>',
+          ],
+        },
+      ],
+    },
+  ],
+  global: { level: 1, ranking: 'rating', selected: 2, batches: 1 },
+};
 
 function settingsOf(name) {
   const s = settings[name] ?? (name === 'org' ? { enabled: true, send: 'rows' } : {});
@@ -149,6 +203,53 @@ async function runAsk(req, res, ds, body, { sparklesResult }) {
     await emit('usage', usage);
     res.end();
   };
+  const global =
+    !body.query &&
+    body.mode !== 'local' &&
+    (body.mode === 'global' || /main areas/i.test(question));
+  if (global) {
+    if (body.mode !== 'global') {
+      await emit('ground', { examples: [], entities: [], classes: 2, predicates: 3 });
+      steps.push({ role: 'draft', ...SMALL, outcome: 'ok', latencyMs: 300 });
+      await emit('scope', { scope: 'global', ...SMALL });
+    }
+    await emit('reports', { level: 1, ranking: 'rating', reports: REPORTS });
+    steps.push({ role: 'summarize', ...SMALL, outcome: 'ok', latencyMs: 400 });
+    steps.push({ role: 'summarize', ...SMALL, outcome: 'ok', latencyMs: 300 });
+    await emit('global', GLOBAL);
+    await emit('summary', {
+      text: 'Most of the work is the checkout redesign of the payments team [1]. The platform team runs the build and the clusters [2]. Both ship shared releases.',
+      citations: [1, 2],
+      uncitedSentences: ['Both ship shared releases.'],
+      ...SMALL,
+    });
+    drafted[id] = pos;
+    if (s.historyDays !== 0 && question)
+      (history[ds.name] ??= []).push({
+        id,
+        principal: me,
+        at: new Date().toISOString(),
+        question,
+        result: 'answered',
+        outcome: 'none',
+        routing: { steps, escalations },
+        mode: 'global',
+        reports: REPORTS.map((r) => r.iri),
+      });
+    await emit('usage', {
+      outcome: 'answered',
+      askId: id,
+      inputTokens: 2400,
+      outputTokens: 160,
+      steps,
+      escalations,
+      draftPair: pos,
+      tryHarder: false,
+      answeredBy: { role: 'summarize', ...SMALL },
+    });
+    res.end();
+    return;
+  }
   if (!body.query) {
     await emit('ground', {
       examples: [],

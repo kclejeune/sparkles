@@ -3785,12 +3785,17 @@ export interface components {
                 at: string;
                 commit?: number;
                 id: string;
+                /** @enum {string} */
+                mode?: "local" | "global";
                 note?: string;
                 /** @enum {string} */
                 outcome: "none" | "accepted" | "edited" | "rejected";
                 principal: string;
                 query?: string;
                 question: string;
+                /** @description The reports a global answer used, listed only while their graph is proven for the caller. */
+                reports?: string[];
+                reportsGraph?: string;
                 /** @description The pipeline's outcome. */
                 result: string;
                 /** @description The complexity, steps, escalations, answering pair and tokens. */
@@ -3818,12 +3823,17 @@ export interface components {
             }[];
             /** @description The rows returned in `result`, 1000 by default. */
             maxRows?: number;
+            /**
+             * @description Answer from the data (`local`), from the community reports (`global`), or as the draft classifies the question (`auto`, the default).
+             * @enum {string}
+             */
+            mode?: "auto" | "local" | "global";
             /** @description A query to check, run and summarize without drafting, for **Summarize again** after an edit. */
             query?: string;
             /** @description At most 2000 characters. */
             question: string;
             reasoning?: boolean;
-            /** @description Hide the agent memory graphs of the dataset from the query. */
+            /** @description Hide the agent memory graphs of the dataset from the query, and use only reviewed community reports. */
             reviewedOnly?: boolean;
             /** @description Whether to run the checked query. `true` by default. */
             run?: boolean;
@@ -3846,10 +3856,31 @@ export interface components {
                 code: string;
                 message: string;
             };
+            /** @description In a global answer, the `level`, `ranking`, `reportsGraph`, the `selected` reports and the map `batches`. */
+            global?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description Whether the answer came from the data or from community reports.
+             * @enum {string}
+             */
+            mode?: "local" | "global";
             notes?: string[];
             /** @enum {string} */
             outcome: "answered" | "empty" | "checked" | "not-run" | "clarify" | "unanswerable" | "failed" | "error";
+            /** @description In a global answer, the points the reduce step read. The summary's citations number them. */
+            points?: {
+                findings: string[];
+                n: number;
+                reports: string[];
+                score: number;
+                text: string;
+            }[];
             question: string;
+            /** @description In a global answer, the reports it used. */
+            reports?: {
+                [key: string]: unknown;
+            }[];
             /** @description The checked query with `explanation`, `assumptions`, `terms`, `graph`, `commit`, `attempt`, `verdict` and `results` in the `application/x-sparkles+json` form. */
             result?: {
                 [key: string]: unknown;
@@ -3860,6 +3891,8 @@ export interface components {
                 provider?: string;
                 rowsSent?: number;
                 text: string;
+                uncited?: boolean;
+                uncitedSentences?: string[];
             };
             /** @description `askId`, the tokens and estimated cost, `complexity`, the `steps` with their pairs and signals, `escalations`, `draftPair`, `answeredBy` and `tryHarder`. */
             usage: {
@@ -4428,6 +4461,10 @@ export interface components {
                 [key: string]: unknown;
             }[];
             commit: number;
+            /** @description In a project brief, the best rated reports of the coarsest level that the caller may read. */
+            communities?: {
+                [key: string]: unknown;
+            }[];
             dataset: string;
             facts?: {
                 [key: string]: unknown;
@@ -7170,6 +7207,10 @@ export interface components {
             at?: number | string;
             /** @description Read the snapshot of this commit. */
             atCommit?: number;
+            /** @description Add the GraphRAG community report of each seed's community. */
+            communities?: boolean;
+            /** @description The level of those communities, 0 being the coarsest. The finest by default. */
+            communityLevel?: number;
             /**
              * @description Always `json` here.
              * @enum {string}
@@ -7212,6 +7253,24 @@ export interface components {
                 status?: "reviewed" | "unreviewed";
             }[];
             commit: number;
+            /** @description With `communities`, the report of each seed's community. */
+            communities?: {
+                level?: number;
+                reports: {
+                    community: string;
+                    iri: string;
+                    memberCount: number;
+                    seeds: number[];
+                    status: string;
+                    summary: string;
+                    title: string;
+                }[];
+                /**
+                 * @description Why no report is listed.
+                 * @enum {string}
+                 */
+                unavailable?: "off" | "access";
+            };
             conflicts: {
                 p: string;
                 s: string;

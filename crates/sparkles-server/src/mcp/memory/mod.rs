@@ -16,6 +16,7 @@
 mod assert;
 mod brief;
 mod check;
+mod communities;
 mod diagnose;
 pub(crate) mod inbox;
 pub(crate) mod ingest;
@@ -63,6 +64,13 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
+    /// The query options with the remaining time as their timeout.
+    pub fn timed(&self) -> Result<QueryOptions, Error> {
+        let mut opts = self.opts.clone();
+        opts.timeout = Some(remaining(self.deadline)?);
+        Ok(opts)
+    }
+
     /// The rows of a SELECT query with `bindings` substituted, under the remaining time.
     pub fn rows(
         &self,

@@ -1,12 +1,13 @@
 # C22: Community summaries for global questions (GraphRAG)
 
-> **Status:** Phase 1 implemented; its paid acceptance runs wait for approval
+> **Status:** Phase 1 implemented, Phase 2 partly implemented; the paid acceptance runs wait for approval
 >
 > **Phases:** Phase 1 is implemented. Phase 1 is the community build from F14's Leiden, the
 > summaries written by the server's model providers with citations to facts, their
 > storage as triples with provenance and review status, the build task and the settings.
 > Phase 2 adds global questions in Ask, community context in `recall` and the brief, and
-> the MCP tool. Phase 3 refreshes communities and summaries incrementally after commits.
+> the MCP tool, and is partly implemented. Phase 3 refreshes communities and summaries
+> incrementally after commits.
 >
 > **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime)
 > cover configuring the role, and [Community reports](../USAGE.md#community-reports-graphrag)
@@ -835,8 +836,37 @@ write access through the update endpoint. The HTTP routes and the Communities ta
 main only, and the tab tells a reader on another branch to switch to main. The metrics hold the
 figures of the runs and reviews since the server started. The byte bound's default
 allowances are unmeasured, and measuring them needs paid provider runs. Global Ask and
-memory integration remain Phase 2, and automatic refresh remains Phase 3.
+memory integration are the first part of Phase 2 below, and automatic refresh remains
+Phase 3.
 [ROADMAP](../ROADMAP.md) item 12 tracks this work.
+
+Phase 2 is partly implemented. Ask takes `mode` of `auto`, `local` or `global`. In
+`auto` mode a question that names an entity linked exactly stays local, and otherwise
+the draft returns a `scope` when the caller may read reports. A global answer reads its
+reports through the MCP tool `community_reports` as the caller, maps them in batches to
+scored points with the `summarize` role, at most four batches at a time, reduces the
+points to an answer with point markers, and keeps only markers that resolve through a
+point to findings. The response and the stream carry `points` and `reports`, and the
+history keeps the report identities and lists them only while their graph is proven for
+the reader. `recall` takes `communities` and `communityLevel`, the project brief adds the
+five best rated reports of the coarsest level within `maxChars`, and a local question's
+grounding names the communities of up to three entities it links exactly when every
+draft and repair pair may receive rows. The query page shows a global
+answer with its points and reports, and **Answer from the data** and **Answer from
+summaries** switch the mode. Tests with stub providers cover A5, A6, A7 and A9 and the
+guard on every new read path.
+
+These Phase 2 choices refine the text above. `maxStale` is fixed at half of the selected
+reports, and `maxReports` at 100, rather than settings, until the evaluation sets them.
+`community_reports` ranks by the dataset's full-text index and by every embedding index
+that may hold report text when they cover the reports graph, and by rating otherwise.
+Without `communityLevel`, `recall` gives each seed its finest community that has a
+report. Map batches are sized for the smallest context among the summarize pair and its
+fallbacks, so a large model that has a small fallback makes more, smaller calls, in
+exchange for a failover that never sends a batch its pair cannot read. A global answer reads main at its head,
+so an ask with `at` or another branch answers locally. The context of §7.3 is on, and the
+evaluation decides whether it stays on. Several configurations per dataset and the
+evaluation of §9 remain.
 
 The contracts that the first draft left open are settled in §14. Token budgets use
 conservative reservations before every HTTP attempt, and findings carry entity numbers
