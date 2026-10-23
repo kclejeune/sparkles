@@ -285,6 +285,40 @@ test('the list follows the time-lapse, and moving the range starts it again', as
   expect(asked[0]).toContain('from=commit:1');
 });
 
+test('the overview reads the profiles again when a time-lapse step fails', async ({ page }) => {
+  let grouped = 0;
+  let failedAt = -1;
+  await page.route(/group=class/, async (route) => {
+    // the second step fails as a grouping past the budget does
+    if (++grouped === 2) {
+      failedAt = profiles.length;
+      return route.fulfill({
+        status: 507,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'memory budget exceeded', budget: 'memory' }),
+      });
+    }
+    return route.continue();
+  });
+  const profiles: string[] = [];
+  page.on('request', (r) => {
+    if (r.url().includes('/profiles')) profiles.push(decodeURIComponent(r.url()));
+  });
+  await page.goto('/ui/explore?ds=chrono4');
+  await expect(page.getByRole('navigation', { name: 'Overview levels' })).toBeVisible();
+  await page.keyboard.press('Shift+H');
+  const slider = page.getByRole('region', { name: 'Overview history time slider' });
+  await slider.getByRole('combobox', { name: 'Play mode' }).selectOption('lapse');
+  await slider.getByRole('combobox', { name: 'Play speed' }).selectOption('4');
+  await slider.getByRole('button', { name: 'Play', exact: true }).click();
+  await expect(slider.getByRole('button', { name: 'Play', exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  // after the failure, the state the last good step drew is read exactly
+  expect(failedAt).toBeGreaterThanOrEqual(0);
+  await expect.poll(() => profiles.slice(failedAt).some((u) => /at=commit:\d/.test(u))).toBe(true);
+});
+
 test('a write receipt on the query page shows the write on the graph', async ({ page }) => {
   await page.goto('/ui/query');
   const editor = page.locator('.cm-content');

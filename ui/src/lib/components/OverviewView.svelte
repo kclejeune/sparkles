@@ -456,9 +456,15 @@
    * of the state it reached are read, so what stays on screen is exact.
    */
   $effect(() => {
-    // not while a read runs, nor when the slider has moved on and a read will follow
-    if (playing || !lapsed || !timeOpen || timeBusy || ovAt !== drawnAt) return;
-    untrack(() => {
+    // not while a read runs; a move of the slider starts its read in the same update, so the
+    // check waits for that to begin, and a failed read leaves the state drawn to reconcile
+    if (playing || !lapsed || !timeOpen || timeBusy) return;
+    untrack(() => queueMicrotask(reconcile));
+  });
+
+  function reconcile() {
+    if (playing || !lapsed || !timeOpen || timeBusy) return;
+    {
       timeCtl?.abort();
       timeCtl = new AbortController();
       const signal = timeCtl.signal;
@@ -469,8 +475,8 @@
         .catch((e) => {
           if (!(e instanceof DOMException && e.name === 'AbortError')) timeNote = errorText(e);
         });
-    });
-  });
+    }
+  }
 
   let timeKey = '';
   $effect(() => {
