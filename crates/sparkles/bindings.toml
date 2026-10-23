@@ -3,42 +3,42 @@
 
 ["algorithms.projections.delete"]
 python = "Dataset.algorithms.projections.delete"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.algorithms.projections.delete"
 
 ["algorithms.projections.get"]
 python = "Dataset.algorithms.projections.get"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.algorithms.projections.get"
 
 ["algorithms.projections.list"]
 python = "Dataset.algorithms.projections.list"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.algorithms.projections.list"
 
 ["algorithms.projections.put"]
 python = "Dataset.algorithms.projections.put"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.algorithms.projections.put"
 
 ["algorithms.query_text"]
 python = "Dataset.algorithms.query_text"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.algorithms.queryText"
 
 ["algorithms.run"]
 python = "Dataset.algorithms.run"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.algorithms.run"
 
 ["algorithms.run_write"]
 python = "Dataset.algorithms.run_write"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.algorithms.runWrite"
 
 ["algorithms.stats"]
 python = "Dataset.algorithms.stats"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.algorithms.stats"
 
 ["backup.policy.next_runs"]
@@ -443,7 +443,7 @@ node = "Dataset.clearGraph"
 
 ["graph.groups"]
 python = "Dataset.graph.groups"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.graph.groups"
 
 ["graphql.config.get"]

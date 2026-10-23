@@ -456,6 +456,13 @@ public class DatasetGraphSparkles internal constructor(
     }
 
     internal fun isPinned(): Boolean = pinned != null
+    /** The overview of the pinned commit, or of the live dataset at the request's own point. */
+    internal fun overview(request: org.apache.jena.atlas.json.JsonObject, opts: io.github.kclejeune.sparkles.jena.internal.ffi.GroupsOpts, operation: SparklesOperation): ByteArray {
+        val body = request.bytes()
+        val pin = pinned ?: return ffi { handle.ffi.graphGroups(body, opts, operation.native) }
+        require(!request.hasKey("at")) { "a dataset pinned to a commit reads that commit, so the request names no point" }
+        return ffi { pin.graphGroups(body, opts, operation.native) }
+    }
     internal fun pinnedReference(): String? = pinned?.let { "commit:${ffi { it.commitSeq() }}" }
 
     public fun snapshots(): SparklesSnapshots = SparklesSnapshots(this)
@@ -468,6 +475,7 @@ public class DatasetGraphSparkles internal constructor(
     public fun queries(): SparklesQueries = SparklesQueries(this)
     public fun schema(): SparklesSchema = SparklesSchema(this)
     public fun graphql(): SparklesGraphQl = SparklesGraphQl(this)
+    public fun graph(): SparklesGraphOverview = SparklesGraphOverview(this)
 
     /** Serialize one committed snapshot with bounded native byte batches. */
     public fun dump(output: OutputStream, lang: Lang) {
