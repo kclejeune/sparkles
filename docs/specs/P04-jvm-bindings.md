@@ -1857,8 +1857,11 @@ round. The time is still in the engine's write path.
 `ds.graph().groups` from [U06](U06-large-graph-rendering.md#outcome). The request is a
 `GroupsRequest` with a `GroupsWithin` that is `OfClass` or `OfGroup`, a `GroupsBy` that is
 `Auto`, `Members`, `Community` or `Property`, a `limit`, and an `at` that takes `commit:N`,
-`time:` or `snapshot:` points. A dataset pinned with `at(...)` reads its own commit when the
-request names none. `GroupsOptions` holds the options of a query that bear on the view and
+`time:` or `snapshot:` points. A call reads what the thread's other reads do, which is the head,
+the snapshot of its read transaction, the view of its write transaction with the changes so far,
+or the commit that a dataset pinned with `at(...)` holds. Only a call on the head can name a point
+in history in `at`. The default graph is the union of the named graphs when the dataset's setting
+or its context says so, as for a query. `GroupsOptions` holds the options of a query that bear on the view and
 the budgets, which are `defaultGraph`, `namedGraphs`, `includeInferred`, `maxRows`,
 `maxMemoryBytes`, `maxRowsProduced` and `noCache`. The timeout and the cancellation belong
 to the `SparklesOperation` of the third form, and its timeout is one deadline for all of
