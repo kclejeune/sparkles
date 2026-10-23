@@ -3,6 +3,7 @@
 // page's sections. The mock's `org` dataset has agent notes with C17 reifiers.
 
 import { expect, test } from '@playwright/test';
+import { expectNoSidewaysScroll, phone } from '../phone';
 
 const ANA = 'http://example.org/resource/ana';
 
@@ -69,4 +70,53 @@ test('the Memory page shows agents, sources, activity, branches and settings', a
   await search.getByRole('button', { name: 'Recall' }).click();
   await expect(search).toContainText('"Payments team"');
   await expect(search.getByRole('region', { name: /Facts about/ }).first()).toBeVisible();
+});
+
+// A phone keeps every card at its content height. The page is a scroll container as tall as
+// the content area, and its rows once shrank to fit that height, which squeezed the Search
+// memory card to a sliver and let the cards below overlap it. `foaf` has no agent facts (the
+// empty cards), `org` has them.
+test.describe('on a phone', () => {
+  test.use({ ...phone, viewport: { width: 390, height: 844 } });
+
+  for (const ds of ['foaf', 'org']) {
+    test(`the Memory page's cards keep their height and do not overlap (${ds})`, async ({
+      page,
+    }) => {
+      await page.goto(`/ui/memory?ds=${ds}`);
+      await expect(page.getByRole('region', { name: 'Search memory' })).toBeVisible();
+      await expect(page.getByRole('region', { name: 'Agents' })).toBeVisible();
+      await expect(page.locator('main .spinner')).toHaveCount(0);
+
+      const boxes = await page.evaluate(() =>
+        [...document.querySelectorAll('.page :is(.tabs, section.card)')].map((e) => {
+          const r = e.getBoundingClientRect();
+          return {
+            name: e.getAttribute('aria-label'),
+            top: r.top,
+            bottom: r.bottom,
+            // the full height of the content, whatever the box was squeezed to
+            content: e.scrollHeight,
+            height: r.height,
+          };
+        }),
+      );
+      expect(boxes.length).toBeGreaterThan(5);
+      for (const [i, b] of boxes.entries()) {
+        expect(b.height, `${b.name} is clipped`).toBeGreaterThanOrEqual(b.content - 1);
+        // one column at this width: a card starts below the bottom of the one before it
+        if (i > 0)
+          expect(b.top, `${b.name} overlaps ${boxes[i - 1].name}`).toBeGreaterThanOrEqual(
+            boxes[i - 1].bottom - 1,
+          );
+      }
+      // the search card sits fully above the Agents card
+      const [search, agents] = [
+        await page.getByRole('region', { name: 'Search memory' }).boundingBox(),
+        await page.getByRole('region', { name: 'Agents' }).boundingBox(),
+      ];
+      expect(search!.y + search!.height).toBeLessThanOrEqual(agents!.y + 1);
+      await expectNoSidewaysScroll(page, `the Memory page of ${ds}`);
+    });
+  }
 });

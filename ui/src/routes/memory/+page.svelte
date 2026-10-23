@@ -413,6 +413,11 @@
     display: grid;
     gap: 14px;
     align-content: start;
+    /* The page is a scroll container with the height of the content area. Without this,
+       its auto rows shrink to fit that height, and a card that scrolls sideways (its
+       automatic minimum height is 0) is squeezed to a sliver. Rows that keep their
+       content height make the page scroll instead. */
+    grid-auto-rows: max-content;
     min-width: 0;
     overflow: auto;
   }
