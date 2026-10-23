@@ -169,7 +169,7 @@
       import('graphology'),
       import('sigma'),
     ]);
-    if (!host) return;
+    if (!host || destroyed) return;
     graph = new GraphCtor({ type: 'directed', multi: false, allowSelfLoops: false });
     readColors();
     try {
@@ -231,9 +231,8 @@
       onfail?.(`WebGL is not available in this browser (${e instanceof Error ? e.message : e})`);
       return;
     }
-    for (const c of host.querySelectorAll('canvas')) {
-      c.addEventListener('webglcontextlost', onLost as EventListener, false);
-    }
+    watched = [...host.querySelectorAll('canvas')];
+    for (const c of watched) c.addEventListener('webglcontextlost', onLost as EventListener, false);
     renderer.on('clickNode', ({ node }) => {
       focusKey = node;
       onselect?.(node);
@@ -259,8 +258,24 @@
     sync();
   }
 
+  /** The canvases watched for a lost context. */
+  let watched: HTMLCanvasElement[] = [];
+  let destroyed = false;
+
+  /**
+   * Kill the renderer without counting it as a lost context: `kill` releases the WebGL
+   * contexts, which fires `webglcontextlost` on its canvases.
+   */
+  function release() {
+    for (const c of watched) c.removeEventListener('webglcontextlost', onLost as EventListener);
+    watched = [];
+    renderer?.kill();
+    renderer = undefined;
+  }
+
   function onLost(e: Event) {
     e.preventDefault();
+    if (destroyed) return;
     lost++;
     if (lost > 1) {
       onfail?.('WebGL is not available in this browser: the context was lost twice');
@@ -268,8 +283,8 @@
     }
     // restore once: a new renderer on the same graph
     setTimeout(() => {
-      renderer?.kill();
-      renderer = undefined;
+      if (destroyed) return;
+      release();
       ready = false;
       void mount();
     }, 50);
@@ -457,10 +472,13 @@
     const before = cam.getState();
     let state = { x: 0.5, y: 0.5, angle: 0, ratio: 1 };
     cam.setState(state);
+    // the mapping from graph to screen follows the positions only once they are drawn
+    r.refresh();
+    // the conversions use the matrix of the last frame unless given a camera state
     for (let i = 0; i < 4; i++) {
       let [left, right, top, bottom] = [Infinity, -Infinity, Infinity, -Infinity];
       g.forEachNode((key, attr) => {
-        const p = r.graphToViewport({ x: attr.x, y: attr.y });
+        const p = r.graphToViewport({ x: attr.x, y: attr.y }, { cameraState: state });
         const size = r.getNodeDisplayData(key)?.size ?? attr.size ?? 4;
         const text = typeof attr.label === 'string' ? attr.label : '';
         left = Math.min(left, p.x - size);
@@ -472,7 +490,10 @@
         (W - 2 * margin) / Math.max(1, right - left),
         (H - 2 * margin) / Math.max(1, bottom - top),
       );
-      const c = r.viewportToFramedGraph({ x: (left + right) / 2, y: (top + bottom) / 2 });
+      const c = r.viewportToFramedGraph(
+        { x: (left + right) / 2, y: (top + bottom) / 2 },
+        { cameraState: state },
+      );
       state = { ...state, x: c.x, y: c.y, ratio: state.ratio / scale };
       cam.setState(state);
     }
@@ -585,7 +606,8 @@
     media?.removeEventListener('change', readColors);
     stopLayout();
     worker?.terminate();
-    renderer?.kill();
+    destroyed = true;
+    release();
   });
 </script>
 
