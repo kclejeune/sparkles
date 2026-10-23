@@ -560,3 +560,46 @@ async fn diff_etags_differ_between_lifted_and_kept_protections() {
     assert!(!staff.text().contains("salary"), "{}", staff.text());
     assert_ne!(staff.header("etag"), etag);
 }
+
+/// A grouped diff (U01 Phase 4) is grouped in the masked states the caller reads: a
+/// protected class never names a group, and a protected resource's changes are those the
+/// plain diff shows.
+#[tokio::test]
+async fn grouped_diffs_keep_the_protections() {
+    let s = server();
+    let r = update_as(
+        &s.app,
+        "hr",
+        &b("tadmin"),
+        "INSERT DATA { <http://ex/alice> a <http://ex/Patient> . <http://ex/eve> <http://ex/name> \"Eve\" . \
+         <http://ex/eve> <http://ex/knows> <http://ex/bob> }",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let get = |u: &'static str, user: &'static str| {
+        let app = s.app.clone();
+        async move { call(&app, "GET", u, &[("authorization", &b(user))], "").await }
+    };
+    let r = get("/hr/diff?group=class", "tstaff").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let t = r.text();
+    assert!(!t.contains("Patient") && !t.contains("salary"), "{t}");
+    let d = r.json();
+    // the same counts as the plain diff under the same view
+    let plain = get("/hr/diff", "tstaff").await.json();
+    assert_eq!(d["added"], plain["added"], "{d} {plain}");
+    assert_eq!(d["removed"], plain["removed"], "{d} {plain}");
+    // bob, an in-patient, is hidden: eve's link to him is not grouped by his class
+    for g in d["groups"].as_array().unwrap() {
+        assert!(
+            g["object"]["class"]
+                .as_str()
+                .is_none_or(|c| !c.contains("Patient")),
+            "{d}"
+        );
+    }
+    // a doctor reads patients, and their classes
+    let r = get("/hr/diff?group=class", "tdoc").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.text().contains("http://ex/Patient"), "{}", r.text());
+}

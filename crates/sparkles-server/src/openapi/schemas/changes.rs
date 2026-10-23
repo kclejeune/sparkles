@@ -61,9 +61,37 @@ fn changes(put: &mut dyn FnMut(&str, J)) {
                     "logChanges": { "type": "integer", "description": "Changes read from the write-ahead logs. Left out for a caller limited to some graphs." },
                     "compared": { "type": "integer", "description": "Quads compared state against state. Left out for a caller limited to some graphs." },
                     "quads": { "type": "array", "items": sref("ChangedQuad"), "description": "With `quads=true`: removals first, then additions, up to `limit`." },
+                    "group": { "type": "string", "enum": ["class"], "description": "With `group=class`: the changes are counted in `groups` instead of listed." },
+                    "groupCount": { "type": "integer", "description": "With `group=class`: the groups found, of which `groups` lists up to `limit`." },
+                    "truncated": { "type": "boolean", "description": "With `group=class`: more groups were found than `groups` lists." },
+                    "groups": { "type": "array", "items": sref("DiffGroup"), "description": "With `group=class`: the largest groups first." },
                 }),
             ),
-            "The net change between two states: counts, and the quads with `quads=true`.",
+            "The net change between two states: counts, the quads with `quads=true`, or the counts by class with `group=class`.",
+            "diffs-between-commits",
+        ),
+    );
+    put(
+        "DiffGroup",
+        doc(
+            obj(
+                &["subjectClass", "predicate", "object", "added", "removed"],
+                json!({
+                    "subjectClass": { "type": ["string", "null"], "description": "The class of the subject, an IRI, read at the `to` state for an added quad and at the `from` state for a removed one. `null` for a subject without a class the caller can read." },
+                    "predicate": { "type": "string", "description": "The predicate IRI." },
+                    "object": {
+                        "description": "`{class}` for a resource by its class (`null` for a blank node without one; the object of `rdf:type` is the class it names), `{literal}` for a literal by its datatype IRI, `{iri: true}` for an IRI without a class.",
+                        "oneOf": [
+                            obj(&["class"], json!({ "class": { "type": ["string", "null"] } })),
+                            obj(&["literal"], json!({ "literal": string() })),
+                            obj(&["iri"], json!({ "iri": { "type": "boolean", "enum": [true] } })),
+                        ],
+                    },
+                    "added": int(),
+                    "removed": int(),
+                }),
+            ),
+            "The changes of a diff with one subject class, predicate and object class or kind.",
             "diffs-between-commits",
         ),
     );

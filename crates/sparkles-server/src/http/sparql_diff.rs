@@ -166,14 +166,14 @@ impl Deadline {
 /// releases it when a run ends, so this counts what the comparison keeps between runs: the
 /// table of the result being read, the hashes and the listed rows. Dropping it gives the
 /// grant back everything it still holds, whichever way the request ends.
-struct Charge {
+pub(super) struct Charge {
     grant: Option<Arc<PoolGrant>>,
     limit: Option<u64>,
     held: u64,
 }
 
 impl Charge {
-    fn new(opts: &sparkles::sparql::QueryOptions) -> Charge {
+    pub(super) fn new(opts: &sparkles::sparql::QueryOptions) -> Charge {
         Charge {
             grant: opts.grant.clone(),
             limit: opts.max_memory_bytes,
@@ -183,7 +183,7 @@ impl Charge {
 
     /// Account for `n` more bytes: `507` with `budget: "memory"` past the request's budget,
     /// and the pool's own refusal when it cannot give the bytes.
-    fn charge(&mut self, n: u64) -> Result<(), sparkles::Error> {
+    pub(super) fn charge(&mut self, n: u64) -> Result<(), sparkles::Error> {
         let total = self.held.saturating_add(n);
         if let Some(limit) = self.limit
             && total > limit

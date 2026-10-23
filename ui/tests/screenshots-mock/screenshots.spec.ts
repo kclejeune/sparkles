@@ -378,3 +378,28 @@ ORDER BY ?name`;
   await pane.getByRole('button', { name: 'Fit to view' }).click();
   await shoot(page, 'pattern');
 });
+
+test('diff-graph', async ({ page }) => {
+  // the last commit of main drawn as a graph of its own, with the triples around it
+  await page.goto(`/ui/explore?ds=${DATASET}&diff=head`);
+  const view = page.locator('.dg');
+  await expect(view.locator('.wrap[data-graph]')).toBeAttached({ timeout: 30_000 });
+  await page.keyboard.press('x');
+  await page.waitForTimeout(1500);
+  await shoot(page, 'diff-graph');
+});
+
+test('diff-lapse', async ({ page }) => {
+  // a time-lapse over main's history, caught on a step that removes a triple
+  await page.goto(`/ui/explore?ds=${DATASET}&diff=head&diffFrom=commit%3A0`);
+  const view = page.locator('.dg');
+  await expect(view.locator('.wrap[data-graph]')).toBeAttached({ timeout: 30_000 });
+  await view.getByRole('checkbox', { name: 'Keep ghosts' }).check();
+  await view.getByRole('combobox', { name: 'Steps a second' }).selectOption('2');
+  await view.getByRole('button', { name: 'Play the time-lapse' }).click();
+  await expect(view.getByRole('button', { name: 'Play the time-lapse' })).toBeVisible({
+    timeout: 60_000,
+  });
+  await page.waitForTimeout(1000);
+  await shoot(page, 'diff-lapse');
+});

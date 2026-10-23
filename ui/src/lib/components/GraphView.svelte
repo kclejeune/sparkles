@@ -53,6 +53,7 @@
     highlight = null,
     pathFocus = null,
     onmenu,
+    layoutNew = true,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -78,6 +79,12 @@
     pathFocus?: number | null;
     /** A node's context menu was asked for (right click or long press), at a point of the view. */
     onmenu?: (id: string, at: { x: number; y: number }) => void;
+    /**
+     * Run the layout when elements are added. A fast time-lapse turns it off: new nodes stay
+     * where they are seeded, next to a neighbour or inside the drawn area, so a step costs
+     * no layout.
+     */
+    layoutNew?: boolean;
   } = $props();
 
   let host: HTMLDivElement;
@@ -384,8 +391,14 @@
     const fresh = new Set<string>();
     let pathAdded = false;
     const stepping = !reduced();
+    const byEnd = new Map<string, GEdge>();
+    for (const e of wantEdges.values()) {
+      if (!byEnd.has(e.source)) byEnd.set(e.source, e);
+      if (!byEnd.has(e.target)) byEnd.set(e.target, e);
+    }
     const fade = motion() && !wasEmpty;
     motionOn = motion();
+    let area: { x1: number; y1: number; w: number; h: number } | undefined;
     cy.batch(() => {
       cy!.elements().forEach((el) => {
         const id = el.id();
@@ -404,18 +417,33 @@
             existing.removeClass('leaving');
             existing.removeStyle('opacity');
           }
-          existing.data({
-            label: sign(n.change) + n.label,
-            change: n.change ?? '',
-            kind: n.kind,
-            focus: !!n.focus,
-            expanded: !!n.expanded,
-            title: n.title,
-            color: n.color ?? '',
-            w: Math.min(190, n.label.length * 6 + 14),
-            paths: (n.paths ?? []).join(','),
-            onpath: !!n.paths?.length,
-          });
+          // only what changed: a data change restyles the element
+          const label = sign(n.change) + n.label;
+          const color = n.color ?? '';
+          const paths = (n.paths ?? []).join(',');
+          const d = existing.data();
+          if (
+            d.label !== label ||
+            d.change !== (n.change ?? '') ||
+            d.kind !== n.kind ||
+            d.focus !== !!n.focus ||
+            d.expanded !== !!n.expanded ||
+            d.title !== n.title ||
+            d.color !== color ||
+            d.paths !== paths
+          )
+            existing.data({
+              label,
+              change: n.change ?? '',
+              kind: n.kind,
+              focus: !!n.focus,
+              expanded: !!n.expanded,
+              title: n.title,
+              color,
+              w: Math.min(190, n.label.length * 6 + 14),
+              paths,
+              onpath: !!n.paths?.length,
+            });
         } else {
           const el = cy!.add(toEl.node(n));
           added++;
@@ -436,7 +464,7 @@
             continue;
           }
           // Seed position next to an existing neighbour so incremental layouts stay calm.
-          const neighbour = edges.find((e) => e.target === n.id || e.source === n.id);
+          const neighbour = byEnd.get(n.id);
           const other = neighbour
             ? cy!.getElementById(neighbour.source === n.id ? neighbour.target : neighbour.source)
             : null;
@@ -446,6 +474,11 @@
               x: p.x + (Math.random() - 0.5) * 120,
               y: p.y + (Math.random() - 0.5) * 120,
             });
+          } else if (!layoutNew && !wasEmpty) {
+            // no neighbour drawn yet: somewhere inside the drawn area
+            // the drawn area before this sync, measured once without labels
+            const b = (area ??= cy!.nodes().not(el).boundingBox({ includeLabels: false }));
+            el.position({ x: b.x1 + Math.random() * b.w, y: b.y1 + Math.random() * b.h });
           }
         }
       }
@@ -463,12 +496,14 @@
             have.removeClass('leaving');
             have.removeStyle('opacity');
           }
-          have.data({
-            change: e.change ?? '',
-            label: edgeLabel(e),
-            paths: (e.paths ?? []).join(','),
-            onpath: !!e.paths?.length,
-          });
+          const label = edgeLabel(e);
+          const paths = (e.paths ?? []).join(',');
+          if (
+            have.data('label') !== label ||
+            have.data('change') !== (e.change ?? '') ||
+            have.data('paths') !== paths
+          )
+            have.data({ change: e.change ?? '', label, paths, onpath: !!e.paths?.length });
         }
       }
     });
@@ -480,10 +515,11 @@
       });
     applyPathFocus();
     // Too many edge labels turn into noise: show them only on hover/selection.
-    cy.edges().toggleClass('quiet', cy.edges().length > 60);
+    const quiet = cy.edges().length > 60;
+    cy.edges(quiet ? ':not(.quiet)' : '.quiet').toggleClass('quiet', quiet);
     // Incremental layouts keep the user's arrangement, but when most of the graph is new
     // (a resource and then its neighbours) there is nothing to keep: lay it out afresh.
-    if (added) {
+    if (added && (layoutNew || wasEmpty)) {
       const randomize = wasEmpty || cy.nodes().length - added <= 2;
       // in the time slider the nodes that stay keep their places
       const keep =

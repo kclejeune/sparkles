@@ -1125,3 +1125,52 @@ datasets = {{ graphs = "read" }}
         assert_eq!(r.status, StatusCode::FORBIDDEN, "{name}: {}", r.text());
     }
 }
+
+/// A grouped diff (U01 Phase 4) counts the changes of the graphs the caller reads, and
+/// reads classes there too: a type triple in a graph the caller cannot read leaves its
+/// resource without a class instead of naming it.
+#[tokio::test]
+async fn grouped_diffs_read_classes_in_the_callers_graphs() {
+    let s = server();
+    let up = "PREFIX ex: <http://ex/> INSERT DATA { GRAPH <http://ex/b/1> { ex:x a ex:Secret } \
+              GRAPH <http://ex/a/1> { ex:x ex:p \"v\" . ex:x ex:q ex:a1 } }";
+    assert_eq!(
+        update_as(&s.app, "graphs", &b("gfull"), up).await.status,
+        StatusCode::OK
+    );
+    let get = |user: &'static str| {
+        let app = s.app.clone();
+        async move {
+            call(
+                &app,
+                "GET",
+                "/graphs/diff?group=class",
+                &[("authorization", &b(user))],
+                "",
+            )
+            .await
+        }
+    };
+    let r = get("gra").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(!r.text().contains("Secret"), "{}", r.text());
+    let d = r.json();
+    assert_eq!(d["added"], 2, "{d}");
+    assert!(d.get("logChanges").is_none(), "{d}");
+    for g in d["groups"].as_array().unwrap() {
+        assert!(g["subjectClass"].is_null(), "{d}");
+    }
+    let r = get("gfull").await;
+    let d = r.json();
+    assert_eq!(d["added"], 3, "{d}");
+    let secret = d["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["subjectClass"] == "http://ex/Secret")
+        .count();
+    assert_eq!(secret, 3, "{d}");
+    // a reader of none of the changed graphs gets no groups, and no class
+    let r = get("gep").await;
+    assert_ne!(r.status, StatusCode::OK, "{}", r.text());
+}

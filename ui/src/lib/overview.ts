@@ -14,7 +14,7 @@
  * the base level is then the answer for the whole dataset at one level of the hierarchy,
  * and the path opens communities into the level below and the finest into members.
  */
-import type { ClassProfile, GroupsAnswer } from './api';
+import type { ClassProfile, GroupedDiff, GroupsAnswer } from './api';
 import type { CommunityStatus } from './graphrag';
 import type { GNode } from './components/GraphView.svelte';
 
@@ -352,4 +352,136 @@ export function describe(
           ? 'group'
           : 'groups';
   return `${last.label} opened into ${fmt(n)} ${what}${a.truncated ? ', truncated' : ''}.`;
+}
+
+// --- the overview through time (spec U01, Phase 4) ---------------------------------------
+
+const RDF_TYPE_IRI = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+
+/** What a grouped diff changed in the class level: instances per class, triples per edge. */
+export type OvChanges = {
+  /** By class IRI: instances added and removed, from the `rdf:type` changes. */
+  classes: Map<string, { added: number; removed: number }>;
+  /** By edge key (`c:A\u0001c:B`): triples added and removed, and the net change per predicate. */
+  edges: Map<string, { added: number; removed: number; predicates: Map<string, number> }>;
+};
+
+/** The class-level changes of a grouped diff. Groups without both classes are left out. */
+export function overviewChanges(g: GroupedDiff): OvChanges {
+  const out: OvChanges = { classes: new Map(), edges: new Map() };
+  for (const x of g.groups) {
+    if (!('class' in x.object)) continue;
+    const oc = x.object.class;
+    if (x.predicate === RDF_TYPE_IRI) {
+      if (oc == null) continue;
+      const c = out.classes.get(oc) ?? { added: 0, removed: 0 };
+      c.added += x.added;
+      c.removed += x.removed;
+      out.classes.set(oc, c);
+      continue;
+    }
+    if (x.subjectClass == null || oc == null || oc === x.subjectClass) continue;
+    const key = `c:${x.subjectClass}\u0001c:${oc}`;
+    const e = out.edges.get(key) ?? { added: 0, removed: 0, predicates: new Map() };
+    e.added += x.added;
+    e.removed += x.removed;
+    e.predicates.set(x.predicate, (e.predicates.get(x.predicate) ?? 0) + x.added - x.removed);
+    out.edges.set(key, e);
+  }
+  return out;
+}
+
+/**
+ * The class level after a step's changes: class sizes move by their instances added and
+ * removed, and edges by their triples, so the time-lapse needs no new read of the profiles.
+ * A class or an edge that a step adds is drawn, and one that falls to nothing is left out.
+ * Nodes keep their keys, so their positions hold still.
+ */
+export function applyOverviewChanges(
+  g: OvGraph,
+  c: OvChanges,
+  label: (iri: string) => string = (i) => i,
+): OvGraph {
+  const nodes = g.nodes.map((n) => {
+    const d = n.kind === 'class' ? c.classes.get(n.cls) : undefined;
+    return d ? { ...n, size: Math.max(0, n.size + d.added - d.removed) } : n;
+  });
+  const have = new Set(nodes.map((n) => n.key));
+  for (const [cls, d] of c.classes) {
+    if (have.has(`c:${cls}`) || d.added - d.removed <= 0) continue;
+    nodes.push({
+      key: `c:${cls}`,
+      kind: 'class',
+      label: label(cls),
+      size: d.added - d.removed,
+      cls,
+      iri: cls,
+      openable: true,
+    });
+  }
+  const kept = nodes.filter((n) => n.size > 0 || n.kind !== 'class');
+  const drawn = new Set(kept.map((n) => n.key));
+  const edges = new Edges();
+  const known = new Set(g.edges.map((e) => e.key));
+  for (const e of g.edges) {
+    if (!drawn.has(e.source) || !drawn.has(e.target)) continue;
+    const d = c.edges.get(e.key);
+    const seen = new Set<string | null>();
+    for (const p of e.predicates) {
+      seen.add(p.iri);
+      const n = p.count + (p.iri && d ? (d.predicates.get(p.iri) ?? 0) : 0);
+      if (n > 0) edges.add(e.source, e.target, p.iri, n);
+    }
+    // a predicate the edge did not have yet
+    for (const [p, n] of d?.predicates ?? [])
+      if (!seen.has(p) && n > 0) edges.add(e.source, e.target, p, n);
+  }
+  for (const [key, d] of c.edges) {
+    const [s, t] = key.split('\u0001');
+    if (!drawn.has(s) || !drawn.has(t) || known.has(key)) continue;
+    for (const [p, n] of d.predicates) if (n > 0) edges.add(s, t, p, n);
+  }
+  return { nodes: kept, edges: edges.list() };
+}
+
+/**
+ * The class level of a comparison with what it removed entirely: a class whose last
+ * instances the range removed and an edge whose last triples it removed are added with no
+ * size, so that their `−` marks are drawn and listed. `present` holds the classes that still
+ * have instances, drawn or not, so that a class the filters or the cap leave out is not
+ * taken for a removed one.
+ */
+export function withRemoved(
+  g: OvGraph,
+  c: OvChanges,
+  label: (iri: string) => string = (i) => i,
+  present: ReadonlySet<string> = new Set(),
+): OvGraph {
+  const nodes = [...g.nodes];
+  const have = new Set(nodes.map((n) => n.key));
+  const hidden = (key: string) => !have.has(key) && present.has(key.slice(2));
+  const gone = (key: string) => {
+    if (have.has(key) || hidden(key)) return;
+    have.add(key);
+    const cls = key.slice(2);
+    nodes.push({ key, kind: 'class', label: label(cls), size: 0, cls, iri: cls, openable: false });
+  };
+  for (const [cls, d] of c.classes) if (d.removed > 0) gone(`c:${cls}`);
+  const edges = [...g.edges];
+  const known = new Set(edges.map((e) => e.key));
+  for (const [key, d] of c.edges) {
+    if (known.has(key) || d.removed === 0) continue;
+    const [source, target] = key.split('\u0001');
+    if (hidden(source) || hidden(target)) continue;
+    gone(source);
+    gone(target);
+    edges.push({
+      key,
+      source,
+      target,
+      count: 0,
+      predicates: [...d.predicates.keys()].map((iri) => ({ iri, count: 0 })),
+    });
+  }
+  return { nodes, edges };
 }

@@ -3732,6 +3732,52 @@ schema in the Thrift compact protocol. Its literals carry the base direction of
 directional language strings, which Jena's binary reader ignores. A patch always lists
 every change, so `limit` with a patch format is `400`.
 
+**Grouped by class.** `group=class` answers the diff's counts grouped by the class of the
+subject, the predicate, and the class or kind of the object, without the quads. The UI's
+diff graph and the Explore overview read it to draw a large diff as classes and to move
+the class level through time.
+
+```json
+{ "dataset": "ds", "datasetId": "3f1c9a2e-…",
+  "from": { "selector": "commit:3", "commit": { "seq": 3, … } },
+  "to": { "selector": "commit:4", "commit": { "seq": 4, … } },
+  "added": 1200, "removed": 0, "method": "log", "logChanges": 1200, "compared": 0,
+  "group": "class", "groupCount": 2, "truncated": false,
+  "groups": [
+    { "subjectClass": "http://ex/Person", "predicate": "http://ex/worksFor",
+      "object": { "class": "http://ex/Org" }, "added": 600, "removed": 0 },
+    { "subjectClass": "http://ex/Person",
+      "predicate": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+      "object": { "class": "http://ex/Person" }, "added": 600, "removed": 0 } ] }
+```
+
+The class of a resource is read at the `to` state for an added quad and at the `from` state
+for a removed one, from the `rdf:type` triples of every graph the caller may read. A
+resource with several classes counts under the one that most of the resources looked up in
+that state share, and on a tie under the smallest IRI. A resource without a class has
+`subjectClass: null`. The object is `{ "class": IRI }` for a resource with a class, and
+the object of an `rdf:type` change is the class it names. It is `{ "literal": datatype }`
+for a literal, `{ "iri": true }` for an IRI without a class, and `{ "class": null }` for a
+blank node without one. IRIs are given without angle brackets. Groups come largest first,
+`limit` caps them from 1 to 5,000 (5,000 by default), `groupCount` counts every group
+found, and `truncated` says that some were left out. `term=` applies as it does to the
+quads.
+
+The diff is read as it is without grouping, so the `--max-rows` budget applies. Each
+state is then read once for the classes. The distinct resources of the changes on that
+side are looked up together, by one seek each, or by one scan of the type triples when
+they are many next to them. The classes are looked up in the state as the caller's view
+reads it, with its graphs and its protections of triples, so a hidden `rdf:type` triple
+leaves its resource in the `null` group and never names the class. What the grouping holds,
+and the diff it groups, count against the request's memory budget (`--query-memory-mb`,
+lowered by `memory-mb`) and the server memory pool until the response is written. The
+memory budget also caps the changes the diff may hold, at about 96 bytes each, before the
+diff is built. A grouping past them answers `507` with `budget: "memory"` or
+`"server-memory"`, and `max-rows` lowers the rows budget too.
+The request's timeout covers the whole grouping, and a client that disconnects stops it.
+A grouped diff between two `commit:` selectors gets its own weak entity tag. `group=class`
+answers JSON only, and with `quads=true`, the diff lines or an RDF Patch it answers `400`.
+
 ### Comparing a query between two states
 
 `POST /{ds}/sparql/diff?from=SEL&to=SEL` runs one SELECT query at two states and returns

@@ -18,6 +18,13 @@
    * finest level, into their members. The selected or opened community goes to
    * `oncommunity`, so the page can show its report beside the canvas, and `marked`
    * entities, such as those a chosen finding is about, are ringed on the canvas.
+   *
+   * The overview moves through time (U01 Phase 4): `Shift+H` opens the time slider, which
+   * reads the class level at its commit, labels each class and edge with its change in
+   * compare mode, and plays a time-lapse that applies each step's grouped diff to the counts
+   * while the positions hold still.
+   * The history reads the classes only, so it is not offered while the communities are
+   * drawn.
    */
   import { onDestroy, onMount, untrack } from 'svelte';
   import { resolve } from '$app/paths';
@@ -27,7 +34,13 @@
   import { shortLabel } from '$lib/graph';
   import * as gr from '$lib/graphrag';
   import type { PrefixMap } from '$lib/rdf';
+  import { countsText, markOf, seqOf } from '$lib/diff-graph';
+  import { timeFailure } from '$lib/timeline';
   import {
+    applyOverviewChanges,
+    overviewChanges,
+    withRemoved,
+    type OvChanges,
     classLevel,
     communityLevel,
     describe,
@@ -46,6 +59,7 @@
   import GraphView, { type GEdge, type GNode } from './GraphView.svelte';
   import Icon from './Icon.svelte';
   import LargeGraphView, { type LEdge, type LNode } from './LargeGraphView.svelte';
+  import TimeSlider from './TimeSlider.svelte';
 
   let {
     ds,
@@ -122,15 +136,48 @@
   const offMain = $derived(communities && !!branch);
   const reportsReady = $derived(communities && !offMain && reports?.available === true);
 
+  // --- the overview through time (U01 Phase 4) ------------------------------------------
+
+  let timeOpen = $state(false);
+  let ovAt = $state('');
+  let ovFrom = $state('');
+  let ovCompare = $state(false);
+  let playMode = $state<'reread' | 'lapse'>('reread');
+  let playing = $state(false);
+  let timeBusy = $state(false);
+  let timeMs = $state(0);
+  let timeAnnounce = $state('');
+  let timeNote = $state('');
+  let slider: TimeSlider | undefined = $state();
+  /** The changes the labels show: of the compared range, or of the last time-lapse step. */
+  let marks = $state<OvChanges | null>(null);
+  /** The class level as the time-lapse has moved it, in place of the profiles'. */
+  let lapsed = $state<OvGraph | null>(null);
+  /** The state the picture shows, which a time-lapse step starts from. */
+  let drawnAt = '';
+  let timeCtl: AbortController | undefined;
+
+  /** The classes the profiles have instances of, drawn or filtered out. */
+  const presentClasses = $derived(
+    new Set((profiles ?? []).filter((p) => p.instances > 0).map((p) => p.class)),
+  );
+  const profileBase = $derived.by(() =>
+    profiles ? classLevel(profiles, { builtins, label }) : { nodes: [], edges: [], hidden: 0 },
+  );
   const base = $derived.by((): OvGraph & { hidden: number } => {
     if (communities) {
       return reportsReady && reports
         ? { ...communityLevel(reports, label), hidden: 0 }
         : { nodes: [], edges: [], hidden: 0 };
     }
-    return profiles
-      ? classLevel(profiles, { builtins, label })
-      : { nodes: [], edges: [], hidden: 0 };
+    if (lapsed) return { ...lapsed, hidden: profileBase.hidden };
+    // a comparison also draws the classes and edges it removed entirely, with their marks
+    if (ovCompare && marks)
+      return {
+        ...withRemoved(profileBase, marks, label, presentClasses),
+        hidden: profileBase.hidden,
+      };
+    return profileBase;
   });
   const picture: OvGraph = $derived(visible(base, path, label));
   const startLevel = $derived(reports?.within.reports?.level ?? 0);
@@ -201,8 +248,22 @@
   });
 
   function nodeLabel(n: OvNode) {
-    return n.kind === 'member' ? n.label : `${n.label} (${fmtCompact(n.size)})`;
+    if (n.kind === 'member') return n.label;
+    const c = n.kind === 'class' ? marks?.classes.get(n.cls) : undefined;
+    const change = c ? countsText(c.added, c.removed) : '';
+    return `${n.label} (${fmtCompact(n.size)})${change ? ` ${change}` : ''}`;
   }
+  function nodeMark(n: OvNode) {
+    const c = n.kind === 'class' ? marks?.classes.get(n.cls) : undefined;
+    return c ? markOf(c.added, c.removed) : undefined;
+  }
+  function edgeMark(key: string) {
+    const c = marks?.edges.get(key);
+    return c ? markOf(c.added, c.removed) : undefined;
+  }
+  let changeColors = $state({ added: '#1a7f37', removed: '#cf222e' });
+  const tint = (m: string | undefined, fallback: string) =>
+    m === 'added' ? changeColors.added : m === 'removed' ? changeColors.removed : fallback;
 
   const lnodes: LNode[] = $derived.by(() => {
     // a new level is placed around the node it opened from
@@ -215,7 +276,7 @@
         key: n.key,
         label: nodeLabel(n),
         size: nodeRadius(n.size, maxSize, n.kind),
-        color: drawn(colorOf(n)),
+        color: tint(nodeMark(n), drawn(colorOf(n))),
         x: p.x,
         y: p.y,
         fixed: !!known,
@@ -229,13 +290,15 @@
       source: e.source,
       target: e.target,
       size: 0.6 + (2.4 * Math.log1p(e.count)) / Math.log1p(max),
+      ...(edgeMark(e.key) ? { color: tint(edgeMark(e.key), '') } : {}),
     }));
   });
   const markedSet = $derived(new Set(markedKeys ?? []));
   const rows: ListRow[] = $derived(
     picture.nodes.map((n) => ({
       key: n.key,
-      label: n.label,
+      // a class row also names its change in the history; a community row only its title
+      label: communities ? n.label : nodeLabel(n),
       kind: n.kind,
       size: n.size,
       cls: communities ? (n.status ?? '') : label(n.cls),
@@ -247,16 +310,18 @@
   );
   // the Cytoscape fallback
   const gnodes: GNode[] = $derived(
-    picture.nodes.map((n) =>
-      fallbackNode(n, nodeLabel(n), drawn(colorOf(n)), markedSet.has(n.key)),
-    ),
+    picture.nodes.map((n) => ({
+      ...fallbackNode(n, nodeLabel(n), drawn(colorOf(n)), markedSet.has(n.key)),
+      change: nodeMark(n),
+    })),
   );
   const gedges: GEdge[] = $derived(
     picture.edges.map((e) => ({
       id: e.key,
       source: e.source,
       target: e.target,
-      label: `${e.predicates[0]?.iri ? label(e.predicates[0].iri) : ''}${e.predicates.length > 1 ? ` +${e.predicates.length - 1}` : ''} · ${fmtCompact(e.count)}`,
+      label: `${e.predicates[0]?.iri ? label(e.predicates[0].iri) : ''}${e.predicates.length > 1 ? ` +${e.predicates.length - 1}` : ''} · ${fmtCompact(e.count)}${marks?.edges.get(e.key) ? ` ${countsText(marks.edges.get(e.key)!.added, marks.edges.get(e.key)!.removed)}` : ''}`,
+      change: edgeMark(e.key),
     })),
   );
 
@@ -275,6 +340,10 @@
       rejected: v('--danger', statusColors.rejected),
       failed: v('--danger', statusColors.failed),
     };
+    changeColors = {
+      added: css.getPropertyValue('--added').trim() || changeColors.added,
+      removed: css.getPropertyValue('--removed').trim() || changeColors.removed,
+    };
   }
 
   function errorText(e: unknown): string {
@@ -287,19 +356,25 @@
     return e instanceof Error ? e.message : String(e);
   }
 
-  async function load() {
+  /** Read the class profiles at `at` and draw them; a failure is the caller's. */
+  async function readProfiles(at: string | undefined, signal: AbortSignal) {
+    const t = performance.now();
+    const p = await api.schemaProfiles(ds, { signal, ...(at ? { at } : {}) });
+    if (signal.aborted) throw new DOMException('superseded', 'AbortError');
+    profiles = p.classes;
+    if (mode === 'classes') baseCommit = p.snapshot.commit ?? null;
+    loadMs = performance.now() - t;
+    // a dataset of built-in classes only keeps them, others start without them
+    builtins = !p.classes.some((c) => !c.builtin && c.instances > 0);
+  }
+
+  async function load(at?: string) {
     controller?.abort();
     controller = new AbortController();
     loading = true;
     loadError = null;
-    const t = performance.now();
     try {
-      const p = await api.schemaProfiles(ds, { signal: controller.signal });
-      profiles = p.classes;
-      if (mode === 'classes') baseCommit = p.snapshot.commit ?? null;
-      loadMs = performance.now() - t;
-      // a dataset of built-in classes only keeps them, others start without them
-      builtins = !p.classes.some((c) => !c.builtin && c.instances > 0);
+      await readProfiles(at, controller.signal);
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return;
       loadError = errorText(e);
@@ -344,6 +419,8 @@
     by = 'auto';
     mode = m;
     onmode?.(m);
+    // the history reads the classes only
+    if (m === 'communities' && timeOpen) resetTime();
     if (m === 'communities') {
       if (reports) baseCommit = reports.commit;
       else void loadCommunities();
@@ -361,6 +438,12 @@
 
   /** Open a class or a group: the path keeps the levels above it. */
   async function open(key: string, how: GroupsBy = 'auto') {
+    // opening a class pauses the time-lapse; groups are read at the head
+    if (playing) slider?.pause();
+    if (timeOpen && (ovAt || ovCompare || lapsed) && !key.startsWith('m:')) {
+      await closeTime();
+      timeNote = 'Groups are read at the head, so the overview went back to it.';
+    }
     if (key.startsWith('m:')) {
       onresource(key.slice(2), byKey.get(key)?.label);
       return;
@@ -506,9 +589,146 @@
     if (key) void open(key, 'members');
   }
 
+  // --- reading through time ---------------------------------------------------------------
+
+  function closeTime() {
+    resetTime();
+    return load();
+  }
+
+  /** Close the history without reading the classes again. */
+  function resetTime() {
+    timeOpen = false;
+    playing = false;
+    ovAt = '';
+    ovFrom = '';
+    ovCompare = false;
+    marks = null;
+    lapsed = null;
+    timeCtl?.abort();
+    drawnAt = '';
+  }
+
+  /** Read the class level at the slider's state, or apply one time-lapse step to it. */
+  async function readTime() {
+    timeCtl?.abort();
+    timeCtl = new AbortController();
+    const signal = timeCtl.signal;
+    const at = ovAt;
+    const prev = drawnAt;
+    const a = seqOf(prev);
+    const b = seqOf(at);
+    timeBusy = true;
+    timeNote = '';
+    const t0 = performance.now();
+    try {
+      // the head is always after the state drawn
+      const forward = a != null && (b != null ? b > a : at === '');
+      if (playMode === 'lapse' && playing && !ovCompare && forward) {
+        // one step: the grouped diff applied to the counts, positions held
+        const g = await api.diffGroups(ds, {
+          from: `commit:${a}`,
+          to: b != null ? `commit:${b}` : undefined,
+          signal,
+        });
+        const c = overviewChanges(g);
+        lapsed = applyOverviewChanges(lapsed ?? profileBase, c, label);
+        marks = c;
+        timeAnnounce = `Commit ${g.to.commit.seq}: ${fmtInt(g.added)} added, ${fmtInt(g.removed)} removed`;
+        if (g.truncated)
+          timeNote = `The step has ${fmtInt(g.groupCount)} groups, of which the ${fmtInt(g.groups.length)} largest are counted.`;
+      } else {
+        path = [];
+        // a failed read rejects the move instead of drawing the state before it
+        await readProfiles(at || undefined, signal);
+        lapsed = null;
+        loadError = null;
+        marks = null;
+        if (ovCompare && ovFrom) {
+          const g = await api.diffGroups(ds, { from: ovFrom, to: at || undefined, signal });
+          if (signal.aborted) return;
+          marks = overviewChanges(g);
+          timeAnnounce = `Commit ${g.to.commit.seq}: ${fmtInt(g.added)} added, ${fmtInt(g.removed)} removed since commit ${g.from.commit.seq}`;
+        } else {
+          timeAnnounce = at
+            ? `Class overview at commit ${at.replace(/^commit:/, '')}`
+            : 'Class overview at the head';
+        }
+      }
+      if (signal.aborted) return;
+      drawnAt = at;
+      slider?.accept();
+      timeMs = performance.now() - t0;
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return;
+      const gone = timeFailure(e);
+      if (gone) {
+        slider?.reject({ seq: gone.seq, readable: gone.readable });
+        timeNote = `${gone.title}. ${gone.detail}`;
+      } else if (e instanceof ApiError && e.status === 507) {
+        slider?.fail();
+        timeNote = `${e.message}. The counts of this step could not be grouped within the budget.`;
+      } else {
+        slider?.fail();
+        timeNote = errorText(e);
+      }
+    } finally {
+      // a read that a newer one superseded leaves the busy state to it
+      if (timeCtl?.signal === signal) timeBusy = false;
+    }
+  }
+
+  /**
+   * The time-lapse moves the counts from each grouped diff, which cannot see links that a
+   * reclassified resource keeps or a type that two graphs hold. When it stops, the profiles
+   * of the state it reached are read, so what stays on screen is exact.
+   */
+  $effect(() => {
+    // not while a read runs; a move of the slider starts its read in the same update, so the
+    // check waits for that to begin, and a failed read leaves the state drawn to reconcile
+    if (playing || !lapsed || !timeOpen || timeBusy) return;
+    untrack(() => queueMicrotask(reconcile));
+  });
+
+  function reconcile() {
+    if (playing || !lapsed || !timeOpen || timeBusy) return;
+    {
+      timeCtl?.abort();
+      timeCtl = new AbortController();
+      const signal = timeCtl.signal;
+      void readProfiles(drawnAt || undefined, signal)
+        .then(() => {
+          if (!signal.aborted) lapsed = null;
+        })
+        .catch((e) => {
+          if (!(e instanceof DOMException && e.name === 'AbortError')) timeNote = errorText(e);
+        });
+    }
+  }
+
+  let timeKey = '';
+  $effect(() => {
+    if (!timeOpen) return;
+    const key = `${ovAt}|${ovCompare ? ovFrom : ''}`;
+    if (key === timeKey) return;
+    timeKey = key;
+    void readTime();
+  });
+
   function onKey(e: KeyboardEvent) {
     if ((e.target as HTMLElement)?.closest?.('input, textarea, select, [contenteditable]')) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+    // Shift+H: the overview through time
+    if ((e.key === 'H' || e.key === 'h') && e.shiftKey) {
+      if (communities) return;
+      e.preventDefault();
+      if (timeOpen) closeTime();
+      else {
+        timeKey = '|';
+        timeOpen = true;
+      }
+      return;
+    }
     if (e.key === 'l' || e.key === 'L') {
       e.preventDefault();
       listView = !listView;
@@ -668,6 +888,16 @@
         ><input type="checkbox" bind:checked={builtins} /> Built-in</label
       >
     {/if}
+    {#if !communities}
+      <button
+        class="btn sm"
+        aria-pressed={timeOpen}
+        aria-label="Overview history"
+        title="Move the overview through the commits (Shift+H)"
+        onclick={() => (timeOpen ? closeTime() : ((timeKey = '|'), (timeOpen = true)))}
+        ><Icon name="clock" size={13} /> <span class="hide-xs">History</span></button
+      >
+    {/if}
     <button
       class="btn sm"
       aria-pressed={listView}
@@ -684,8 +914,29 @@
       >
     {/if}
   </div>
-  {#if note || openError || failReason || changed || markNote || legend.length}
+  {#if timeOpen}
+    <div class="ov-time">
+      <TimeSlider
+        bind:this={slider}
+        {ds}
+        bind:at={ovAt}
+        bind:from={ovFrom}
+        bind:compare={ovCompare}
+        bind:playMode
+        bind:playing
+        lapse
+        busy={timeBusy || loading}
+        lastReadMs={timeMs}
+        announcement={timeAnnounce}
+        label="Overview history"
+        canFollow={false}
+        onclose={closeTime}
+      />
+    </div>
+  {/if}
+  {#if note || openError || failReason || changed || markNote || legend.length || timeNote}
     <div class="ov-notes small">
+      {#if timeNote}<p class="faint" role="status">{timeNote}</p>{/if}
       {#if openError}<p class="err" role="alert">{openError}</p>{/if}
       {#if changed}<p class="faint">
           The dataset changed since the overview was read, so its {communities
@@ -759,7 +1010,9 @@
       <div class="ov-empty">
         <Icon name="alert" size={20} />
         <p>The overview could not be read: {loadError}</p>
-        <button class="btn sm" onclick={load}><Icon name="refresh" size={13} /> Retry</button>
+        <button class="btn sm" onclick={() => load(ovAt || undefined)}
+          ><Icon name="refresh" size={13} /> Retry</button
+        >
       </div>
     {:else if !communities && profiles && !base.nodes.length && !path.length}
       <div class="ov-empty">
@@ -791,6 +1044,7 @@
           {selected}
           marked={markedKeys}
           label={communities ? 'GraphRAG communities' : 'Graph overview'}
+          still={!!lapsed}
           onselect={(k) => (selected = k)}
           onopen={(k) => open(k)}
           {onlayout}
@@ -861,6 +1115,10 @@
     height: 100%;
     min-height: 0;
     position: relative;
+  }
+  .ov-time {
+    flex: none;
+    min-width: 0;
   }
   .ov-bar {
     display: flex;

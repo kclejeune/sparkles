@@ -12,6 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import ox from 'oxigraph';
+import { groupDiff, PRIVATE_GRAPH } from './history.mjs';
 
 export const MAIN = 'main';
 
@@ -855,6 +856,12 @@ export function handleDiff(req, res, url, seg, ctx) {
     for (const [k, q] of qa) if (!qb.has(k)) net.set(k, { op: '-', quad: q });
     for (const [k, q] of qb) if (!qa.has(k)) net.set(k, { op: '+', quad: q });
   }
+  // a reader who is not an admin cannot read the private graph (a cookie principal)
+  const principal = /(?:^|;\s*)mock-principal=([^;]+)/.exec(String(req.headers.cookie ?? ''));
+  const limited = !!principal && decodeURIComponent(principal[1]) !== 'admin';
+  const hidden = (q) =>
+    limited && q.graph.termType === 'NamedNode' && q.graph.value === PRIVATE_GRAPH;
+  for (const [k, ch] of net) if (hidden(ch.quad)) net.delete(k);
   // `term=`: only the changes whose subject or object is one of the terms
   const terms = url.searchParams
     .getAll('term')
@@ -867,6 +874,27 @@ export function handleDiff(req, res, url, seg, ctx) {
   const at = (seq) => list.find((c) => c.seq === seq) ?? { seq, ref: `commit:${seq}` };
   const limit = Number(url.searchParams.get('limit') ?? 1000);
   const added = changes.filter((c) => c.op === '+').length;
+  if (url.searchParams.has('group')) {
+    if (url.searchParams.get('group') !== 'class' || url.searchParams.get('quads') === 'true')
+      return (ctx.fail(res, 400, 'group=class does not combine with quads=true'), true);
+    // a grouping past the budget, for the fallback of the diff graph
+    if (ds.name === 'chrono507')
+      return (
+        ctx.send(res, 507, { error: 'the memory budget is exceeded', budget: 'memory' }), true
+      );
+    ctx.send(res, 200, {
+      dataset: ds.name,
+      datasetId: ds.id,
+      from: { selector: String(from), commit: at(from) },
+      to: { selector: String(to), commit: at(to) },
+      added,
+      removed: changes.length - added,
+      method: 'log',
+      group: 'class',
+      ...groupDiff(ds, from, to, changes, hidden, Number(url.searchParams.get('limit') ?? 5000)),
+    });
+    return true;
+  }
   ctx.send(res, 200, {
     dataset: ds.name,
     datasetId: ds.id,

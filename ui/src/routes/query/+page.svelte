@@ -8,6 +8,7 @@
   import { auth } from '$lib/auth.svelte';
   import { branchOption, branchParam, MAIN, onBranch, onBranchLabel } from '$lib/branches';
   import { receiptSummary } from '$lib/commits';
+  import { diffGraphHref } from '$lib/diff-graph';
   import { atLabel, normalizeAt, validAt } from '$lib/history';
   import {
     CHANGE_FILTERS,
@@ -2542,6 +2543,10 @@
         lastReadMs={outcome?.elapsed ?? 0}
         paused={resultsFocused}
         announcement={announce}
+        onshowdiff={(from, to) => {
+          if (!ds) return;
+          goto(diffGraphHref(resolve('/explore'), ds, to, from, { branch: branch || null }));
+        }}
         onchange={onTimeChange}
         onclose={closeTime}
       />
@@ -2941,6 +2946,19 @@
                     >{receiptSummary(r)}</span
                   >
                   <span class="faint">{fmtInt(r.commit.quads)} quads after</span>
+                  <a
+                    class="btn ghost sm"
+                    title="Draw what this write changed as a graph"
+                    href={diffGraphHref(
+                      resolve('/explore'),
+                      outcome.ds,
+                      `commit:${r.commit.seq}`,
+                      `commit:${Math.max(r.commit.seq - 1, 0)}`,
+                      { branch: outcome.branch },
+                    )}
+                    onclick={() => app.setDataset(outcome.ds)}
+                    ><Icon name="graph" size={12} /> Show on graph</a
+                  >
                 </p>
               {:else}
                 <p class="faint">{receiptSummary(r)}.</p>

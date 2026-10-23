@@ -8,6 +8,7 @@
   import { auth } from '$lib/auth.svelte';
   import { branchOption, branchParam, MAIN, onBranch } from '$lib/branches';
   import { receiptSummary } from '$lib/commits';
+  import { diffGraphHref } from '$lib/diff-graph';
   import { normalizeAt, validAt } from '$lib/history';
   import { formatEditor } from '$lib/fmt-edit';
   import { formatAny } from '$lib/fmt-wasm';
@@ -1431,6 +1432,19 @@ ex:PersonShape a sh:NodeShape ;
                 uploadReceipt.commit.quads !== undefined
                   ? ` (${uploadReceipt.commit.quads.toLocaleString('en-US')} quads after)`
                   : ''}
+                {#if uploadReceipt.committed}
+                  <a
+                    class="btn ghost sm"
+                    title="Draw what this upload changed as a graph"
+                    href={diffGraphHref(
+                      resolve('/explore'),
+                      name,
+                      `commit:${uploadReceipt.commit.seq}`,
+                      `commit:${Math.max(uploadReceipt.commit.seq - 1, 0)}`,
+                      { branch },
+                    )}><Icon name="graph" size={12} /> Show on graph</a
+                  >
+                {/if}
               </p>
             {/if}
             <div class="row">
