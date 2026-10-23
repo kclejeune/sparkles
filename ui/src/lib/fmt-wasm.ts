@@ -28,7 +28,7 @@ export type FmtModule = {
   /** a `POST /$/lint` JSON body in, the endpoint's JSON answer out (modules built before
    * the linter have none) */
   lint?: (request: string) => string;
-  /** `{ text }` in, the pattern of the query out (spec U08 §3.2; modules built before the
+  /** `{ text, strict? }` in, the pattern of the query out (spec U08 §3.2; modules built before the
    * builder have none) */
   pattern?: (request: string) => string;
 };
@@ -142,11 +142,14 @@ export function localFormatter(load: (() => Promise<FmtModule>) | undefined) {
     }
   }
 
-  /** The pattern answer at once when the module is already loaded, else null. */
-  function patternNow(text: string): PatternAnswer | null {
+  /** The pattern answer at once when the module is already loaded, else null. `strict`
+   * adds the server parser's checks, for the text a canvas edit would make. */
+  function patternNow(text: string, strict = false): PatternAnswer | null {
     if (!loaded || broken || !loaded.pattern) return null;
     try {
-      return JSON.parse(loaded.pattern(JSON.stringify({ text }))) as PatternAnswer;
+      return JSON.parse(
+        loaded.pattern(JSON.stringify(strict ? { text, strict } : { text })),
+      ) as PatternAnswer;
     } catch (e) {
       broken = true;
       console.warn('The browser formatter failed; the Pattern pane is off from now on', e);
@@ -154,7 +157,14 @@ export function localFormatter(load: (() => Promise<FmtModule>) | undefined) {
     }
   }
 
-  return { formatLocal, formatAny, lintLocal, lintAny, patternLocal, patternNow };
+  return {
+    formatLocal,
+    formatAny,
+    lintLocal,
+    lintAny,
+    patternLocal,
+    patternNow,
+  };
 }
 
 // The bindings when the UI was built with them. `VITE_FMT_WASM=off` leaves them out (the

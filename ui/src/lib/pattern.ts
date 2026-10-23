@@ -61,14 +61,20 @@ export type Filter = {
   vars: string[];
   text: string;
   range: Range;
+  /** the `.` that follows it in its group */
+  dot?: Range | null;
 };
 
 export type Locked = {
   kind: string;
   vars: string[];
-  /** exactly the text at `range` */
+  /** exactly the text at `range`, which runs over a comment that ends its line */
   text: string;
   range: Range;
+  /** the end of its last token, before that comment */
+  end?: number;
+  /** the `.` that follows it in its group (a `triples` statement keeps its own inside) */
+  dot?: Range | null;
 };
 
 export type Group = {
@@ -79,12 +85,20 @@ export type Group = {
   items: Item[];
 };
 
-export type Item = Triple | Filter | (Group & { type: 'group' }) | (Locked & { type: 'locked' });
+export type Item =
+  | Triple
+  | Filter
+  | (Group & { type: 'group'; dot?: Range | null })
+  | (Locked & { type: 'locked' });
 
 export type PatternOk = {
   ok: true;
   form: 'select' | 'ask' | 'construct' | 'describe';
-  prologue: { prefixes: { prefix: string; iri: string; range: Range }[] };
+  /** the last BASE, against which IRIs and prefixes are already resolved */
+  prologue: {
+    base?: string | null;
+    prefixes: { prefix: string; iri: string; range: Range }[];
+  };
   /** the WHERE group; null for a DESCRIBE without one */
   root: Group | null;
   projection: {
@@ -120,7 +134,12 @@ export type Change = { from: number; to: number; insert: string };
 
 /** A triple with the groups around it: `path[0]` is the root, the last its own group.
  * `index` is its place in its group's items, `order` its place in `triplesOf`. */
-export type Placed = { triple: Triple; path: Group[]; index: number; order: number };
+export type Placed = {
+  triple: Triple;
+  path: Group[];
+  index: number;
+  order: number;
+};
 
 /** Every triple of the pattern in text order, with its groups. */
 export function triplesOf(p: PatternOk): Placed[] {
@@ -128,7 +147,12 @@ export function triplesOf(p: PatternOk): Placed[] {
   const walk = (g: Group, path: Group[]) => {
     g.items.forEach((item, index) => {
       if (item.type === 'triple')
-        out.push({ triple: item, path: [...path, g], index, order: out.length });
+        out.push({
+          triple: item,
+          path: [...path, g],
+          index,
+          order: out.length,
+        });
       else if (item.type === 'group') walk(item, [...path, g]);
     });
   };
@@ -149,16 +173,16 @@ export function lockedOf(p: PatternOk): Locked[] {
   return out;
 }
 
-/** Every filter of the pattern in text order, with whether it is inside an OPTIONAL. */
-export function filtersOf(p: PatternOk): { filter: Filter; optional: boolean }[] {
-  const out: { filter: Filter; optional: boolean }[] = [];
-  const walk = (g: Group, optional: boolean) => {
+/** Every filter of the pattern in text order, with its group. */
+export function filtersOf(p: PatternOk): { filter: Filter; group: Group }[] {
+  const out: { filter: Filter; group: Group }[] = [];
+  const walk = (g: Group) => {
     for (const item of g.items) {
-      if (item.type === 'filter') out.push({ filter: item, optional });
-      else if (item.type === 'group') walk(item, true);
+      if (item.type === 'filter') out.push({ filter: item, group: g });
+      else if (item.type === 'group') walk(item);
     }
   };
-  if (p.root) walk(p.root, false);
+  if (p.root) walk(p.root);
   return out;
 }
 
@@ -349,6 +373,8 @@ export function drawing(p: PatternOk): Drawing {
     return n;
   };
   const classes = new Map<string, string[]>();
+  // the edges between the same two nodes with the same predicate, for the edge ids
+  const seen = new Map<string, number>();
   for (const t of placed) {
     const { triple } = t;
     const { s, o } = keyOf.get(triple)!;
@@ -383,8 +409,11 @@ export function drawing(p: PatternOk): Drawing {
         : triple.p.kind === 'var'
           ? `?${triple.p.value}`
           : triple.p.text;
+    const occurrence = `${s}|${triple.p.text}|${o}`;
+    const n = seen.get(occurrence) ?? 0;
+    seen.set(occurrence, n + 1);
     edges.push({
-      id: `e:${s}|${triple.p.text}|${o}|${edges.filter((e) => e.source === s && e.target === o && e.label === label).length}`,
+      id: `e:${occurrence}|${n}`,
       source: s,
       target: o,
       label,
@@ -396,12 +425,15 @@ export function drawing(p: PatternOk): Drawing {
   }
   for (const [k, list] of classes) nodes.get(k)!.subtitle.push(...list);
   const varNode = (v: string) => nodes.get(`v:${v}`);
-  const blocks = lockedOf(p);
+  const inner = lockedOf(p);
+  // the blocks of the WHERE group, then FROM, a CONSTRUCT template and DESCRIBE's terms
+  const blocks = [...inner, ...p.locked];
   lockedKeys(blocks).forEach((id, i) => {
     const b = blocks[i];
     // a block that binds variables (a BIND, a subquery, VALUES …) gets nodes for them, so
-    // the reader sees where `?y` comes from; a MINUS binds nothing outside itself
-    if (b.kind !== 'MINUS')
+    // the reader sees where `?y` comes from; a MINUS binds nothing outside itself, and a
+    // clause outside the WHERE group only uses the variables drawn already
+    if (b.kind !== 'MINUS' && i < inner.length)
       for (const v of b.vars)
         if (!varNode(v))
           nodes.set(`v:${v}`, {
@@ -434,11 +466,15 @@ export function drawing(p: PatternOk): Drawing {
           at: b.range.from,
         });
   });
-  // filters: a chip on the node, or a locked chip joined to every variable it mentions
+  // filters: a chip on the node, or a chip node joined to every variable it mentions. A
+  // filter keeps its scope: it goes on a variable only when the variable sits in the same
+  // hull (or in none, for a filter of the root), else it is a node in its OPTIONAL's hull
   const chips = new Map<string, number>();
-  for (const { filter } of filtersOf(p)) {
+  for (const { filter, group } of filtersOf(p)) {
+    const optional = group.kind === 'optional';
+    const hull = optional ? hullOf.get(group) : undefined;
     const n = filter.expr ? varNode(filter.expr.var) : undefined;
-    if (filter.expr && n) {
+    if (filter.expr && n && !n.fromLocked && n.parent === hull && (hull || !optional)) {
       n.subtitle.push(chipText(filter.expr));
       continue;
     }
@@ -446,14 +482,21 @@ export function drawing(p: PatternOk): Drawing {
     const k = chips.get(h) ?? 0;
     chips.set(h, k + 1);
     const id = `c:${h}:${k}`;
+    const label = first(filter.text, 40);
     nodes.set(id, {
       id,
       kind: 'chip',
-      label: first(filter.text, 40),
+      label: optional && !hull ? `OPTIONAL · ${label}` : label,
       subtitle: [],
       title: filter.text,
       at: filter.range.from,
-      locked: { kind: 'FILTER', vars: filter.vars, text: filter.text, range: filter.range },
+      ...(hull ? { parent: hull } : {}),
+      locked: {
+        kind: 'FILTER',
+        vars: filter.vars,
+        text: filter.text,
+        range: filter.range,
+      },
     });
     for (const v of filter.vars)
       if (varNode(v))
@@ -467,10 +510,12 @@ export function drawing(p: PatternOk): Drawing {
           at: filter.range.from,
         });
   }
+  // an OPTIONAL whose nodes the required part binds has no hull: its edges stay dashed
+  const used = new Set([...nodes.values()].map((n) => n.parent));
   return {
     nodes: [...nodes.values()],
     edges,
-    hulls,
+    hulls: hulls.filter((h) => used.has(h.id)),
     parts: parts(
       // a variable only a locked block binds is drawn beside it, not as a part of its own
       [...nodes.values()].filter((n) => n.kind !== 'locked' && n.kind !== 'chip' && !n.fromLocked),
@@ -530,9 +575,24 @@ export function describe(el: { node: PNode } | { edge: PEdge }, d: Drawing): str
 /**
  * A variable renamed in the editor (§4.4): when exactly one variable key disappeared and
  * one appeared, and the two have the same incident edges (by predicate and the keys of
- * the other ends), the old key and the new one.
+ * the other ends), every key that moves: the variable's, and those of the literals it is
+ * the subject of, whose keys hold the subject's (`l:v:x|…`). Null when there is no rename.
  */
-export function renamed(before: Drawing, after: Drawing): [string, string] | null {
+export function renamed(before: Drawing, after: Drawing): [string, string][] | null {
+  const r = renamedVar(before, after);
+  if (!r) return null;
+  const [o, n] = r;
+  const out: [string, string][] = [[o, n]];
+  const have = new Set(after.nodes.map((x) => x.id));
+  for (const x of before.nodes)
+    if (x.id.startsWith(`l:${o}|`)) {
+      const moved = `l:${n}|${x.id.slice(o.length + 3)}`;
+      if (have.has(moved)) out.push([x.id, moved]);
+    }
+  return out;
+}
+
+function renamedVar(before: Drawing, after: Drawing): [string, string] | null {
   const vars = (d: Drawing) => new Set(d.nodes.filter((n) => n.kind === 'var').map((n) => n.id));
   const a = vars(before);
   const b = vars(after);
@@ -548,7 +608,9 @@ export function renamed(before: Drawing, after: Drawing): [string, string] | nul
       )
       .sort()
       .join('\n');
-  const same = (x: string) => (x === o ? n : x);
+  // a literal's key holds its subject's
+  const same = (x: string) =>
+    x === o ? n : x.startsWith(`l:${o}|`) ? `l:${n}|${x.slice(o.length + 3)}` : x;
   return sig(before, o, same) === sig(after, n, (x) => x) ? [o, n] : null;
 }
 
@@ -647,12 +709,16 @@ function insertItem(
   let at: number;
   if (after) {
     let end = itemRange(after).to;
-    // the `.` that may follow an element that is not a triple statement
-    const dot = after.type === 'triple' ? null : /^[ \t]*\./.exec(text.slice(end));
-    if (dot) end += dot[0].length;
-    // a statement that ends without its `.`, followed by a triple statement
-    const stmtEnd = after.type === 'triple' && !text.slice(0, end).trimEnd().endsWith('.');
-    if (stmtEnd && isTriple) changes.push({ from: end, to: end, insert: ' .' });
+    if (after.type === 'triple' || (after.type === 'locked' && after.kind === 'triples')) {
+      // a statement that ends without its `.` (which it holds), before a triple statement;
+      // a locked statement's range runs over a trailing comment, so its `.` goes at `end`
+      const last = after.type === 'locked' ? (after.end ?? end) : end;
+      const dotted = text.slice(after.range.from, last).trimEnd().endsWith('.');
+      if (!dotted && isTriple) changes.push({ from: last, to: last, insert: ' .' });
+    } else if (after.dot) {
+      // the `.` that follows another element, maybe after a comment or a line break
+      end = after.dot.to;
+    }
     at = lineTail(text, end);
   } else {
     at = lineTail(text, g.inner.from);
@@ -689,7 +755,10 @@ export function removalRange(text: string, placed: Placed): Range {
     // one object of a `,` list
     const k = entry.indexOf(triple);
     if (k < entry.length - 1)
-      return { from: triple.objectRange.from, to: entry[k + 1].objectRange.from };
+      return {
+        from: triple.objectRange.from,
+        to: entry[k + 1].objectRange.from,
+      };
     return { from: entry[k - 1].oRange.to, to: triple.objectRange.to };
   }
   // one entry of a `;` list
@@ -701,7 +770,10 @@ export function removalRange(text: string, placed: Placed): Range {
   }
   // the last entry: from the end of the one before (before its `;`)
   const prev = siblings.filter((t) => t.entry === entries[k - 1]);
-  return { from: prev[prev.length - 1].objectRange.to, to: triple.entryRange.to };
+  return {
+    from: prev[prev.length - 1].objectRange.to,
+    to: triple.entryRange.to,
+  };
 }
 
 /** The text of a triple pattern as a statement on its own. */
@@ -713,32 +785,42 @@ export type AddTriple = {
   s: string;
   p: string;
   o: string;
-  /** a PREFIX line to add first, for a prefixed name the query does not declare */
-  declare?: { prefix: string; iri: string };
+  /** PREFIX lines to add first, for prefixed names the query does not declare */
+  declare?: { prefix: string; iri: string }[];
 };
 
-/** The edit that deletes a triple, or toggles OPTIONAL on it (by its index in `triplesOf`). */
-export type TripleEdit = { kind: 'delete' | 'optional'; triple: number };
+/** The edit that deletes a triple, or toggles OPTIONAL on it. The triple is named by the
+ * id of its edge, which is resolved against the drawing of the text being edited, so an
+ * edit never lands on another triple when the text moved since the selection. */
+export type TripleEdit = { kind: 'delete' | 'optional'; edge: string };
 
 export type Edit = AddTriple | TripleEdit;
 
 /** Why an edit cannot be made. */
 export class EditError extends Error {}
 
+const IRIREF = String.raw`<[^<>"{}|^${'`'}\\\s]*>`;
+const PNAME = String.raw`(?:[\p{L}][\p{L}\p{N}_.-]*)?:[\p{L}\p{N}_:%-]*`;
+const TAG = String.raw`(@[a-zA-Z]+(-[a-zA-Z0-9]+)*|\^\^(${IRIREF}|${PNAME}))?`;
+const IRI_RE = new RegExp(`^${IRIREF}$`);
+const PNAME_RE = new RegExp(`^${PNAME}$`, 'u');
+const DQ_RE = new RegExp(String.raw`^"([^"\\\n\r]|\\.)*"${TAG}$`, 'u');
+const SQ_RE = new RegExp(String.raw`^'([^'\\\n\r]|\\.)*'${TAG}$`, 'u');
+
 /** A term as it is written in a triple, checked: a variable, an IRI, a prefixed name, a
- * labelled blank node, `a` for a predicate, or a literal for an object. */
+ * labelled blank node, `a` for a predicate, or a literal for an object, whose datatype is
+ * exactly one IRI or prefixed name. */
 export function checkTerm(text: string, role: 's' | 'p' | 'o'): string {
   const t = text.trim();
   const ok =
     /^[?$][\p{L}\p{N}_]+$/u.test(t) ||
-    /^<[^<>"{}|^`\\\s]*>$/.test(t) ||
-    /^[\p{L}][\p{L}\p{N}_.-]*:[\p{L}\p{N}_:%-]*$/u.test(t) ||
-    /^:[\p{L}\p{N}_:%-]*$/u.test(t) ||
+    IRI_RE.test(t) ||
+    PNAME_RE.test(t) ||
     (role !== 'p' && /^_:[\p{L}\p{N}_]+$/u.test(t)) ||
     (role === 'p' && t === 'a') ||
     (role === 'o' &&
-      (/^"([^"\\\n]|\\.)*"(@[a-zA-Z]+(-[a-zA-Z0-9]+)*|\^\^\S+)?$/.test(t) ||
-        /^'([^'\\\n]|\\.)*'(@[a-zA-Z]+(-[a-zA-Z0-9]+)*|\^\^\S+)?$/.test(t) ||
+      (DQ_RE.test(t) ||
+        SQ_RE.test(t) ||
         /^[+-]?(\d+\.?\d*([eE][+-]?\d+)?|\.\d+([eE][+-]?\d+)?)$/.test(t) ||
         t === 'true' ||
         t === 'false'));
@@ -749,12 +831,53 @@ export function checkTerm(text: string, role: 's' | 'p' | 'o'): string {
   return t;
 }
 
-const asTerm = (t: string, kind: Term['kind'] = 'iri'): Term => ({
-  kind: /^[?$]/.test(t) ? 'var' : t.startsWith('_:') ? 'bnode' : kind,
-  text: t,
-  value: /^[?$]/.test(t) ? t.slice(1) : t.startsWith('_:') ? t.slice(2) : t,
-  range: { from: 0, to: 0 },
-});
+type Prefixes = { prefix: string; iri: string }[];
+
+/** The prefix of a prefixed name, or null for another term. */
+const prefixOf = (t: string): string | null =>
+  !/^[?$_<"'+\-.\d]/.test(t) && PNAME_RE.test(t) ? t.slice(0, t.indexOf(':')) : null;
+
+/** An IRI resolved against the query's BASE, as the parser resolves it. */
+function resolveIri(iri: string, base: string | null | undefined): string {
+  if (!base || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(iri)) return iri;
+  try {
+    return new URL(iri, base).href;
+  } catch {
+    return iri;
+  }
+}
+
+/**
+ * A checked term as the parse gives it: a variable's name, a blank node's label, a full
+ * IRI (a prefixed name expanded under the query's prefixes and then `extra`, an IRI
+ * resolved against BASE, `a` as rdf:type), or a literal as written.
+ */
+export function resolveTerm(t: string, p: PatternOk, extra: Prefixes = []): Term {
+  const range = { from: 0, to: 0 };
+  if (/^[?$]/.test(t)) return { kind: 'var', text: t, value: t.slice(1), range };
+  if (t.startsWith('_:')) return { kind: 'bnode', text: t, value: t.slice(2), range };
+  if (t === 'a') return { kind: 'iri', text: t, value: RDF_TYPE, range };
+  if (t.startsWith('<'))
+    return {
+      kind: 'iri',
+      text: t,
+      value: resolveIri(t.slice(1, -1), p.prologue.base),
+      range,
+    };
+  const prefix = prefixOf(t);
+  if (prefix !== null) {
+    // a later declaration of the same prefix wins, as in the parser
+    const ns = [...p.prologue.prefixes, ...extra].filter((x) => x.prefix === prefix).pop();
+    const local = t.slice(prefix.length + 1);
+    return {
+      kind: 'iri',
+      text: t,
+      value: (ns?.iri ?? `${prefix}:`) + local,
+      range,
+    };
+  }
+  return { kind: 'literal', text: t, value: t, range };
+}
 
 /**
  * The changes an edit makes to `text`, whose pattern is `p`:
@@ -774,8 +897,19 @@ export function edit(text: string, p: PatternOk, e: Edit): Change[] {
     const s = checkTerm(e.s, 's');
     const pr = checkTerm(e.p, 'p');
     const o = checkTerm(e.o, 'o');
-    const subject = asTerm(s);
-    const binds = bindsOf(subject, asTerm(pr), asTerm(o, 'literal'));
+    const declare = declarations(p, e);
+    // a prefixed name needs its prefix declared by the query or by the edit
+    for (const t of [s, pr, o]) {
+      const prefix = prefixOf(t);
+      if (
+        prefix !== null &&
+        !p.prologue.prefixes.some((x) => x.prefix === prefix) &&
+        !declare.some((x) => x.prefix === prefix)
+      )
+        throw new EditError(`The prefix "${prefix}:" is not declared`);
+    }
+    const subject = resolveTerm(s, p, declare);
+    const binds = bindsOf(subject, resolveTerm(pr, p, declare), resolveTerm(o, p, declare));
     // the group of the subject's patterns
     const key = termKey(subject);
     const home = triplesOf(p).find(
@@ -783,16 +917,12 @@ export function edit(text: string, p: PatternOk, e: Edit): Change[] {
     );
     const g = home ? home.path[home.path.length - 1] : p.root;
     const changes = insertItem(text, g, anchor(g, binds), statement(s, pr, o), true);
-    if (e.declare) {
-      const { prefix, iri } = e.declare;
-      if (!p.prologue.prefixes.some((x) => x.prefix === prefix))
-        changes.push({ from: 0, to: 0, insert: `PREFIX ${prefix}: <${iri}>\n` });
-    }
+    for (const { prefix, iri } of declare)
+      changes.push({ from: 0, to: 0, insert: `PREFIX ${prefix}: <${iri}>\n` });
     return changes;
   }
-  const all = triplesOf(p);
-  const placed = all[e.triple];
-  if (!placed) throw new EditError('no such triple');
+  const placed = resolveEdit(p, e.edge);
+  if (!placed) throw new EditError('The pattern changed, select the edge again');
   const { triple, path } = placed;
   const g = path[path.length - 1];
   const removal = removalRange(text, placed);
@@ -817,42 +947,123 @@ export function edit(text: string, p: PatternOk, e: Edit): Change[] {
   const after = anchor(parent, binds, skip);
   const changes = insertItem(text, parent, after, words, true);
   if (empty) {
-    const r = optionalRemoval(text, g.range);
-    return merge({ from: r.from, to: r.to, insert: '' }, changes);
+    const dot = optItem.type === 'group' ? optItem.dot : null;
+    return merge(optionalRemoval(text, optItem.range, dot), changes);
   }
   return merge(del, changes);
 }
 
-/** The range an OPTIONAL's removal deletes: with its line when alone on it, and the `.`
- * after it in its group. */
-function optionalRemoval(text: string, r: Range): Range {
-  let to = r.to;
-  const dot = /^[ \t]*\./.exec(text.slice(to));
-  if (dot) to += dot[0].length;
-  to = lineTail(text, to);
+/** The PREFIX lines an add makes: its declarations the query lacks, each prefix once. */
+function declarations(p: PatternOk, e: AddTriple): Prefixes {
+  const out: Prefixes = [];
+  for (const d of e.declare ?? [])
+    if (
+      !p.prologue.prefixes.some((x) => x.prefix === d.prefix) &&
+      !out.some((x) => x.prefix === d.prefix)
+    )
+      out.push(d);
+  return out;
+}
+
+/** The triple whose edge has this id in the drawing of `p`. */
+export function resolveEdit(p: PatternOk, edge: string): Placed | undefined {
+  return drawing(p).edges.find((x) => x.id === edge)?.triple;
+}
+
+/** The deletions that remove an OPTIONAL: its range, with its line when alone on it and no
+ * `.` follows on that line, and the `.` after it in its group as a deletion of its own,
+ * which keeps a comment or line break between the two. */
+function optionalRemoval(text: string, r: Range, dot: Range | null | undefined): Change[] {
+  const out: Change[] = [];
+  const to = lineTail(text, r.to);
   const start = blankBefore(text, r.from);
-  if (start !== null && /^[ \t]*(\r?\n|$)/.test(text.slice(to))) return { from: start, to };
-  return { from: r.from, to };
+  const dotOnLine = !!dot && !/[\r\n]/.test(text.slice(r.to, dot.from));
+  if (dotOnLine) {
+    // `OPTIONAL { … } .` with its line, or just the two
+    const end = lineTail(text, dot!.to);
+    if (start !== null && /^[ \t]*(\r?\n|$)/.test(text.slice(end)))
+      out.push({ from: start, to: end, insert: '' });
+    else out.push({ from: r.from, to: dot!.to, insert: '' });
+    return out;
+  }
+  if (start !== null && /^[ \t]*(\r?\n|$)/.test(text.slice(to)))
+    out.push({ from: start, to, insert: '' });
+  else out.push({ from: r.from, to: r.to, insert: '' });
+  if (dot) out.push({ from: dot.from, to: dot.to, insert: '' });
+  return out;
 }
 
 /**
- * A deletion and insertions as one list of non-overlapping changes: an insertion inside
- * the deleted range moves to its end, where the deleted text was.
+ * Deletions and insertions as one list of non-overlapping changes: an insertion inside a
+ * deleted range moves to its end, where the deleted text was.
  */
-function merge(del: Change, inserts: Change[]): Change[] {
+function merge(dels: Change | Change[], inserts: Change[]): Change[] {
+  const list = Array.isArray(dels) ? dels : [dels];
   return [
-    del,
-    ...inserts.map((c) =>
-      c.from > del.from && c.from < del.to ? { ...c, from: del.to, to: del.to } : c,
-    ),
+    ...list,
+    ...inserts.map((c) => {
+      const d = list.find((d) => c.from > d.from && c.from < d.to);
+      return d ? { ...c, from: d.to, to: d.to } : c;
+    }),
   ];
+}
+
+/** A triple as the parse gives it, for comparing two parses (R3). */
+function signature(s: Term, p: { kind: string; value: string; text: string }, o: Term): string {
+  const pred = p.kind === 'path' ? `path:${p.text}` : `${p.kind}:${p.value}`;
+  const obj = o.kind === 'literal' ? `l:${o.value}` : termKey(o);
+  return `${termKey(s)} ${pred} ${obj}`;
+}
+
+/**
+ * Whether the parse after an edit agrees with the edit (R3): after `add` exactly one more
+ * triple, with the edit's terms; after `delete` exactly that triple fewer; after
+ * `optional` the same triples with that one moved in or out of an OPTIONAL. The pane
+ * refuses an edit whose result does not agree.
+ */
+export function agrees(before: PatternOk, e: Edit, after: PatternOk): boolean {
+  const bag = (q: PatternOk) => {
+    const m = new Map<string, number>();
+    for (const t of triplesOf(q)) {
+      const k = `${signature(t.triple.s, t.triple.p, t.triple.o)}|${t.path.length > 1}`;
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return m;
+  };
+  const a = bag(before);
+  const b = bag(after);
+  const diff = (x: Map<string, number>, y: Map<string, number>) => {
+    const out: string[] = [];
+    for (const [k, n] of x) for (let i = y.get(k) ?? 0; i < n; i++) out.push(k);
+    return out;
+  };
+  const added = diff(b, a);
+  const removed = diff(a, b);
+  if (e.kind === 'add') {
+    const declare = declarations(before, e);
+    const t = (x: string) => resolveTerm(x.trim(), before, declare);
+    const want = signature(t(e.s), t(e.p), t(e.o));
+    return removed.length === 0 && added.length === 1 && added[0].startsWith(`${want}|`);
+  }
+  const placed = resolveEdit(before, e.edge);
+  if (!placed) return false;
+  const sig = signature(placed.triple.s, placed.triple.p, placed.triple.o);
+  const opt = placed.path.length > 1;
+  if (e.kind === 'delete')
+    return added.length === 0 && removed.length === 1 && removed[0] === `${sig}|${opt}`;
+  return (
+    removed.length === 1 &&
+    added.length === 1 &&
+    removed[0] === `${sig}|${opt}` &&
+    added[0] === `${sig}|${!opt}`
+  );
 }
 
 /** What an edit is announced as: "Added ?person ex:worksFor ?org, 3 nodes, 2 edges". */
 export function announcement(e: Edit, p: PatternOk, after: Drawing): string {
   const counts = `${after.nodes.filter((n) => n.kind !== 'chip').length} nodes, ${after.edges.filter((x) => x.style !== 'dotted').length} edges`;
-  if (e.kind === 'add') return `Added ${e.s} ${e.p} ${e.o}, ${counts}`;
-  const t = triplesOf(p)[e.triple]?.triple;
+  if (e.kind === 'add') return `Added ${e.s.trim()} ${e.p.trim()} ${e.o.trim()}, ${counts}`;
+  const t = resolveEdit(p, e.edge)?.triple;
   const words = t ? `${t.s.text} ${t.p.text} ${t.o.text}` : 'the triple';
   if (e.kind === 'delete') return `Deleted ${words}, ${counts}`;
   return `Toggled optional on ${words}, ${counts}`;

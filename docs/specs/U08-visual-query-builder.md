@@ -525,7 +525,14 @@ prefixed names expanded, a blank node label or a literal as written. `root` is n
 a `DESCRIBE` without a `WHERE` group, `projection` is null for the other forms and has a
 `locked` flag, and an error answer has a `code`, which is `syntax`, `update` for an
 update request, or `bad-request`. A locked block's range runs to the end of a comment on
-the line of its last token, so A2's block keeps `# year`.
+the line of its last token, so A2's block keeps `# year`, and its `end` is the end of
+that last token. A filter, a locked block and an `OPTIONAL` have a `dot`, the range of the
+`.` that follows them in their group wherever it stands, even after a comment or a line
+break. A triples statement holds its own `.`. The reader honours `BASE` in source order,
+resolving IRIs and the namespaces of `PREFIX` lines against it, and the answer gives the
+last one as `prologue.base`. A request with `strict: true` also runs the server's parser
+on the text and answers `code: "syntax"` when it refuses, which catches what the lossless
+parser accepts, such as a `BIND` to a variable already in scope.
 
 **Classification.** It follows §4.1, with these choices where the table left room. A
 statement with any part outside the subset is one locked block of kind `triples`, so a
@@ -546,12 +553,27 @@ mention.
 and `PatternPane.svelte` parses, draws and edits. The editor exposes `applyPattern`,
 which dispatches an edit as one transaction with the user event `input.pattern` and an
 isolated history entry, and `undo` and `redo`, which the pane calls for `Mod+Z` and
-`Mod+Shift+Z`. A canvas edit is checked by parsing its result before it is applied, so it
-never lands in text that does not parse. New nodes are placed by an fcose run with every
-known node fixed, after which the known nodes are put back exactly where they were. A
-variable that only a locked block mentions gets a node beside it, except for a `MINUS`,
-which binds nothing outside itself, and such a node does not count as a disconnected
-part. The mock UI tests format through the mock's endpoint with `VITE_FMT_WASM=off`, so
+`Mod+Shift+Z`. The pane handles those keys and `Escape` anywhere inside it apart from the
+fields of the add form, so they work in the list and in an element's panel as on the
+canvas. An edit names its triple by the id of its edge, which is resolved again against
+the text as it is when the edit is made, so typing between a selection and its edit never
+moves the edit to another triple. When the edge is gone the pane refuses with "The
+pattern changed, select the edge again". Before a canvas edit is applied, the pane parses
+its result with `strict: true` and checks R3 on that parse. An added triple must be the
+only new one and carry the terms that were typed. A deleted triple must be the only one
+gone, and an optional toggle must move just that triple in or out of an `OPTIONAL`. A
+prefixed name whose prefix neither the query nor the dataset declares is refused before
+that, and a typed term is resolved under the query's prefixes and `BASE` to find the
+group that holds its patterns. New nodes are placed by an fcose run with every known node
+fixed, after which the known nodes are put back exactly where they were. A variable that
+only a locked block mentions gets a node beside it, except for a `MINUS`, which binds
+nothing outside itself, and such a node does not count as a disconnected part. `FROM`
+clauses, a `CONSTRUCT` template and the terms of `DESCRIBE` are locked nodes too, joined
+to the variables they use. An `OPTIONAL` whose nodes are all bound outside it has no hull,
+and its edges stay dashed. A filter keeps its scope. It is a chip on its variable only
+when the variable sits in the filter's own hull, or in none for a filter of the root, and
+is otherwise a chip node inside the hull. The query page keeps a pane per editor tab, so
+each tab keeps its own drawing and layout. The mock UI tests format through the mock's endpoint with `VITE_FMT_WASM=off`, so
 the pane loads the module on its own glob, `VITE_PATTERN_WASM=off` leaves it out, and
 `mise run ui:e2e:mock` builds it first.
 
@@ -581,7 +603,8 @@ checking R2, that the locked blocks stay byte-identical and that the only deleti
 range the edit names, and R3, that the parse agrees with the edit. The layout map's tests
 cover storage bounds, restore and renames. `ui/tests/mock/pattern.spec.ts` covers A1, A2,
 A6 to A9, A11, locked blocks through a sequence of canvas edits, the error states of
-§2.7, the result's Pattern tab, and the 390 px layout.
+§2.7, the result's Pattern tab, and the 390 px layout. Each of the 14 findings of the
+first review has a regression test in one of these suites.
 
 **Measurements.** `ui/tests/mock/pattern-perf.spec.ts` runs A10 when `PATTERN_PERF=1`
 is set. On the development laptop, under a load average of about 20 from other builds

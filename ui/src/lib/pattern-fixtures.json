@@ -23,6 +23,7 @@
         "vars": ["person", "org"]
       },
       "prologue": {
+        "base": null,
         "prefixes": [
           {
             "iri": "http://example.org/",
@@ -266,6 +267,150 @@
     },
     "text": "PREFIX ex: <http://example.org/>\nSELECT ?person ?org WHERE {\n  ?person a ex:Person ; ex:worksFor ?org .\n  ?org a ex:Org ; ex:locatedIn ex:lyon .\n}\nLIMIT 1000\n"
   },
+  "base": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 17,
+          "to": 25
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": "http://x/",
+        "prefixes": []
+      },
+      "root": {
+        "inner": {
+          "from": 27,
+          "to": 69
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 36,
+              "to": 42
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 40,
+                "to": 42
+              },
+              "text": "?o",
+              "value": "o"
+            },
+            "oRange": {
+              "from": 40,
+              "to": 42
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 40,
+              "to": 42
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<p>",
+              "value": "http://x/p"
+            },
+            "pRange": {
+              "from": 36,
+              "to": 39
+            },
+            "range": {
+              "from": 28,
+              "to": 44
+            },
+            "s": {
+              "kind": "iri",
+              "range": {
+                "from": 28,
+                "to": 35
+              },
+              "text": "<thing>",
+              "value": "http://x/thing"
+            },
+            "sRange": {
+              "from": 28,
+              "to": 35
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 48,
+              "to": 68
+            },
+            "o": {
+              "kind": "iri",
+              "range": {
+                "from": 52,
+                "to": 68
+              },
+              "text": "<http://x/thing>",
+              "value": "http://x/thing"
+            },
+            "oRange": {
+              "from": 52,
+              "to": 68
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 52,
+              "to": 68
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<q>",
+              "value": "http://x/q"
+            },
+            "pRange": {
+              "from": 48,
+              "to": 51
+            },
+            "range": {
+              "from": 45,
+              "to": 68
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 45,
+                "to": 47
+              },
+              "text": "?o",
+              "value": "o"
+            },
+            "sRange": {
+              "from": 45,
+              "to": 47
+            },
+            "stmt": 1,
+            "type": "triple"
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 26,
+          "to": 70
+        }
+      }
+    },
+    "text": "BASE <http://x/>\nSELECT * { <thing> <p> ?o . ?o <q> <http://x/thing> }"
+  },
   "bind": {
     "answer": {
       "form": "select",
@@ -283,6 +428,7 @@
         "vars": []
       },
       "prologue": {
+        "base": null,
         "prefixes": [
           {
             "iri": "http://example.org/",
@@ -355,6 +501,8 @@
             "type": "triple"
           },
           {
+            "dot": null,
+            "end": 98,
             "kind": "BIND",
             "range": {
               "from": 75,
@@ -419,6 +567,7 @@
             "type": "triple"
           },
           {
+            "dot": null,
             "expr": {
               "args": ["\"A\""],
               "op": "strstarts",
@@ -452,6 +601,110 @@
     },
     "text": "SELECT * WHERE { ?s ?p }"
   },
+  "construct": {
+    "answer": {
+      "form": "construct",
+      "locked": [
+        {
+          "dot": null,
+          "end": 32,
+          "kind": "CONSTRUCT",
+          "range": {
+            "from": 10,
+            "to": 32
+          },
+          "text": "{ ?s <http://x/q> ?o }",
+          "vars": ["s", "o"]
+        },
+        {
+          "dot": null,
+          "end": 48,
+          "kind": "FROM",
+          "range": {
+            "from": 33,
+            "to": 48
+          },
+          "text": "FROM <http://g>",
+          "vars": []
+        }
+      ],
+      "modifiers": [],
+      "ok": true,
+      "projection": null,
+      "prologue": {
+        "base": null,
+        "prefixes": []
+      },
+      "root": {
+        "inner": {
+          "from": 56,
+          "to": 76
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 60,
+              "to": 75
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 73,
+                "to": 75
+              },
+              "text": "?o",
+              "value": "o"
+            },
+            "oRange": {
+              "from": 73,
+              "to": 75
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 73,
+              "to": 75
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<http://x/p>",
+              "value": "http://x/p"
+            },
+            "pRange": {
+              "from": 60,
+              "to": 72
+            },
+            "range": {
+              "from": 57,
+              "to": 75
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 57,
+                "to": 59
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 57,
+              "to": 59
+            },
+            "stmt": 0,
+            "type": "triple"
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 55,
+          "to": 77
+        }
+      }
+    },
+    "text": "CONSTRUCT { ?s <http://x/q> ?o } FROM <http://g> WHERE { ?s <http://x/p> ?o }"
+  },
   "crlf": {
     "answer": {
       "form": "select",
@@ -469,6 +722,7 @@
         "vars": []
       },
       "prologue": {
+        "base": null,
         "prefixes": []
       },
       "root": {
@@ -595,6 +849,213 @@
     },
     "text": "SELECT * {\r\n  ?s <http://x/p> ?o .\r\n  ?o <http://x/q> ?r .\r\n}\r\n"
   },
+  "describe": {
+    "answer": {
+      "form": "describe",
+      "locked": [
+        {
+          "dot": null,
+          "end": 21,
+          "kind": "DESCRIBE",
+          "range": {
+            "from": 0,
+            "to": 21
+          },
+          "text": "DESCRIBE <http://x/a>",
+          "vars": []
+        }
+      ],
+      "modifiers": [],
+      "ok": true,
+      "projection": null,
+      "prologue": {
+        "base": null,
+        "prefixes": []
+      },
+      "root": null
+    },
+    "text": "DESCRIBE <http://x/a>"
+  },
+  "dot-comment": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 0,
+          "to": 8
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": []
+      },
+      "root": {
+        "inner": {
+          "from": 10,
+          "to": 94
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 16,
+              "to": 29
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 27,
+                "to": 29
+              },
+              "text": "?v",
+              "value": "v"
+            },
+            "oRange": {
+              "from": 27,
+              "to": 29
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 27,
+              "to": 29
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<http://p>",
+              "value": "http://p"
+            },
+            "pRange": {
+              "from": 16,
+              "to": 26
+            },
+            "range": {
+              "from": 13,
+              "to": 31
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 13,
+                "to": 15
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 13,
+              "to": 15
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "dot": {
+              "from": 73,
+              "to": 74
+            },
+            "inner": {
+              "from": 44,
+              "to": 62
+            },
+            "items": [
+              {
+                "entry": 0,
+                "entryRange": {
+                  "from": 48,
+                  "to": 61
+                },
+                "o": {
+                  "kind": "var",
+                  "range": {
+                    "from": 59,
+                    "to": 61
+                  },
+                  "text": "?o",
+                  "value": "o"
+                },
+                "oRange": {
+                  "from": 59,
+                  "to": 61
+                },
+                "object": 0,
+                "objectRange": {
+                  "from": 59,
+                  "to": 61
+                },
+                "p": {
+                  "kind": "iri",
+                  "path": null,
+                  "text": "<http://p>",
+                  "value": "http://p"
+                },
+                "pRange": {
+                  "from": 48,
+                  "to": 58
+                },
+                "range": {
+                  "from": 45,
+                  "to": 61
+                },
+                "s": {
+                  "kind": "var",
+                  "range": {
+                    "from": 45,
+                    "to": 47
+                  },
+                  "text": "?s",
+                  "value": "s"
+                },
+                "sRange": {
+                  "from": 45,
+                  "to": 47
+                },
+                "stmt": 1,
+                "type": "triple"
+              }
+            ],
+            "kind": "optional",
+            "range": {
+              "from": 34,
+              "to": 63
+            },
+            "type": "group"
+          },
+          {
+            "dot": {
+              "from": 92,
+              "to": 93
+            },
+            "expr": {
+              "args": ["1"],
+              "op": ">",
+              "var": "v"
+            },
+            "range": {
+              "from": 75,
+              "to": 89
+            },
+            "text": "FILTER(?v > 1)",
+            "type": "filter",
+            "vars": ["v"]
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 9,
+          "to": 95
+        }
+      }
+    },
+    "text": "SELECT * {\n  ?s <http://p> ?v .\n  OPTIONAL { ?s <http://p> ?o } # note\n  . FILTER(?v > 1)\n  .\n}\n"
+  },
   "empty": {
     "answer": {
       "form": "select",
@@ -612,6 +1073,7 @@
         "vars": []
       },
       "prologue": {
+        "base": null,
         "prefixes": []
       },
       "root": {
@@ -646,6 +1108,7 @@
         "vars": []
       },
       "prologue": {
+        "base": null,
         "prefixes": [
           {
             "iri": "http://example.org/",
@@ -943,6 +1406,294 @@
     },
     "text": "PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:p ?a, ?b , ?c ;\n     ex:q ?d ;\n     ex:r ?e .\n}\n"
   },
+  "literal": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 0,
+          "to": 8
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": []
+      },
+      "root": {
+        "inner": {
+          "from": 10,
+          "to": 63
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 19,
+              "to": 40
+            },
+            "o": {
+              "kind": "literal",
+              "range": {
+                "from": 33,
+                "to": 38
+              },
+              "text": "\"Ana\"",
+              "value": "\"Ana\""
+            },
+            "oRange": {
+              "from": 33,
+              "to": 38
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 33,
+              "to": 38
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<http://name>",
+              "value": "http://name"
+            },
+            "pRange": {
+              "from": 19,
+              "to": 32
+            },
+            "range": {
+              "from": 11,
+              "to": 62
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 11,
+                "to": 18
+              },
+              "text": "?person",
+              "value": "person"
+            },
+            "sRange": {
+              "from": 11,
+              "to": 18
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "entry": 1,
+            "entryRange": {
+              "from": 41,
+              "to": 62
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 56,
+                "to": 62
+              },
+              "text": "?other",
+              "value": "other"
+            },
+            "oRange": {
+              "from": 56,
+              "to": 62
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 56,
+              "to": 62
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<http://knows>",
+              "value": "http://knows"
+            },
+            "pRange": {
+              "from": 41,
+              "to": 55
+            },
+            "range": {
+              "from": 11,
+              "to": 62
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 11,
+                "to": 18
+              },
+              "text": "?person",
+              "value": "person"
+            },
+            "sRange": {
+              "from": 11,
+              "to": 18
+            },
+            "stmt": 0,
+            "type": "triple"
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 9,
+          "to": 64
+        }
+      }
+    },
+    "text": "SELECT * { ?person <http://name> \"Ana\" ; <http://knows> ?other }"
+  },
+  "literal-renamed": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 0,
+          "to": 8
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": []
+      },
+      "root": {
+        "inner": {
+          "from": 10,
+          "to": 64
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 20,
+              "to": 41
+            },
+            "o": {
+              "kind": "literal",
+              "range": {
+                "from": 34,
+                "to": 39
+              },
+              "text": "\"Ana\"",
+              "value": "\"Ana\""
+            },
+            "oRange": {
+              "from": 34,
+              "to": 39
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 34,
+              "to": 39
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<http://name>",
+              "value": "http://name"
+            },
+            "pRange": {
+              "from": 20,
+              "to": 33
+            },
+            "range": {
+              "from": 11,
+              "to": 63
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 11,
+                "to": 19
+              },
+              "text": "?someone",
+              "value": "someone"
+            },
+            "sRange": {
+              "from": 11,
+              "to": 19
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "entry": 1,
+            "entryRange": {
+              "from": 42,
+              "to": 63
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 57,
+                "to": 63
+              },
+              "text": "?other",
+              "value": "other"
+            },
+            "oRange": {
+              "from": 57,
+              "to": 63
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 57,
+              "to": 63
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<http://knows>",
+              "value": "http://knows"
+            },
+            "pRange": {
+              "from": 42,
+              "to": 56
+            },
+            "range": {
+              "from": 11,
+              "to": 63
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 11,
+                "to": 19
+              },
+              "text": "?someone",
+              "value": "someone"
+            },
+            "sRange": {
+              "from": 11,
+              "to": 19
+            },
+            "stmt": 0,
+            "type": "triple"
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 9,
+          "to": 65
+        }
+      }
+    },
+    "text": "SELECT * { ?someone <http://name> \"Ana\" ; <http://knows> ?other }"
+  },
   "locked-after": {
     "answer": {
       "form": "select",
@@ -960,6 +1711,7 @@
         "vars": []
       },
       "prologue": {
+        "base": null,
         "prefixes": [
           {
             "iri": "http://example.org/",
@@ -1032,6 +1784,8 @@
             "type": "triple"
           },
           {
+            "dot": null,
+            "end": 85,
             "kind": "BIND",
             "range": {
               "from": 67,
@@ -1042,6 +1796,8 @@
             "vars": ["b", "c"]
           },
           {
+            "dot": null,
+            "end": 108,
             "kind": "MINUS",
             "range": {
               "from": 88,
@@ -1061,6 +1817,54 @@
     },
     "text": "PREFIX ex: <http://example.org/>\nSELECT * WHERE {\n  ?a ex:p ?b .\n  BIND(?b + 1 AS ?c)\n  MINUS { ?a ex:q ?d }\n}\n"
   },
+  "locked-stmt": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 0,
+          "to": 8
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": []
+      },
+      "root": {
+        "inner": {
+          "from": 10,
+          "to": 48
+        },
+        "items": [
+          {
+            "dot": null,
+            "end": 43,
+            "kind": "triples",
+            "range": {
+              "from": 13,
+              "to": 47
+            },
+            "text": "?s <http://p> [ <http://q> 1 ] # c",
+            "type": "locked",
+            "vars": ["s"]
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 9,
+          "to": 49
+        }
+      }
+    },
+    "text": "SELECT * {\n  ?s <http://p> [ <http://q> 1 ] # c\n}\n"
+  },
   "no-dot": {
     "answer": {
       "form": "select",
@@ -1078,6 +1882,7 @@
         "vars": []
       },
       "prologue": {
+        "base": null,
         "prefixes": []
       },
       "root": {
@@ -1167,6 +1972,7 @@
         "vars": []
       },
       "prologue": {
+        "base": null,
         "prefixes": []
       },
       "root": {
@@ -1256,6 +2062,7 @@
         "vars": []
       },
       "prologue": {
+        "base": null,
         "prefixes": [
           {
             "iri": "http://example.org/",
@@ -1328,6 +2135,10 @@
             "type": "triple"
           },
           {
+            "dot": {
+              "from": 108,
+              "to": 109
+            },
             "inner": {
               "from": 82,
               "to": 106
@@ -1396,6 +2207,7 @@
             "type": "group"
           },
           {
+            "dot": null,
             "inner": {
               "from": 122,
               "to": 155
@@ -1526,6 +2338,897 @@
       }
     },
     "text": "PREFIX ex: <http://example.org/>\nSELECT * WHERE {\n  ?org ex:name ?n .\n  OPTIONAL { ?org ex:locatedIn ?c . } .\n  OPTIONAL { ?org ex:size ?z . ?z ex:unit ?u }\n}\n"
+  },
+  "optional-filter": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 0,
+          "to": 8
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": []
+      },
+      "root": {
+        "inner": {
+          "from": 10,
+          "to": 107
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 14,
+              "to": 27
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 25,
+                "to": 27
+              },
+              "text": "?o",
+              "value": "o"
+            },
+            "oRange": {
+              "from": 25,
+              "to": 27
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 25,
+              "to": 27
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<http://p>",
+              "value": "http://p"
+            },
+            "pRange": {
+              "from": 14,
+              "to": 24
+            },
+            "range": {
+              "from": 11,
+              "to": 29
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 11,
+                "to": 13
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 11,
+              "to": 13
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "dot": null,
+            "inner": {
+              "from": 40,
+              "to": 90
+            },
+            "items": [
+              {
+                "entry": 0,
+                "entryRange": {
+                  "from": 44,
+                  "to": 57
+                },
+                "o": {
+                  "kind": "var",
+                  "range": {
+                    "from": 55,
+                    "to": 57
+                  },
+                  "text": "?x",
+                  "value": "x"
+                },
+                "oRange": {
+                  "from": 55,
+                  "to": 57
+                },
+                "object": 0,
+                "objectRange": {
+                  "from": 55,
+                  "to": 57
+                },
+                "p": {
+                  "kind": "iri",
+                  "path": null,
+                  "text": "<http://q>",
+                  "value": "http://q"
+                },
+                "pRange": {
+                  "from": 44,
+                  "to": 54
+                },
+                "range": {
+                  "from": 41,
+                  "to": 59
+                },
+                "s": {
+                  "kind": "var",
+                  "range": {
+                    "from": 41,
+                    "to": 43
+                  },
+                  "text": "?s",
+                  "value": "s"
+                },
+                "sRange": {
+                  "from": 41,
+                  "to": 43
+                },
+                "stmt": 1,
+                "type": "triple"
+              },
+              {
+                "dot": null,
+                "expr": {
+                  "args": ["2"],
+                  "op": ">",
+                  "var": "o"
+                },
+                "range": {
+                  "from": 60,
+                  "to": 74
+                },
+                "text": "FILTER(?o > 2)",
+                "type": "filter",
+                "vars": ["o"]
+              },
+              {
+                "dot": null,
+                "expr": {
+                  "args": ["3"],
+                  "op": ">",
+                  "var": "x"
+                },
+                "range": {
+                  "from": 75,
+                  "to": 89
+                },
+                "text": "FILTER(?x > 3)",
+                "type": "filter",
+                "vars": ["x"]
+              }
+            ],
+            "kind": "optional",
+            "range": {
+              "from": 30,
+              "to": 91
+            },
+            "type": "group"
+          },
+          {
+            "dot": null,
+            "expr": {
+              "args": ["9"],
+              "op": "<",
+              "var": "o"
+            },
+            "range": {
+              "from": 92,
+              "to": 106
+            },
+            "text": "FILTER(?o < 9)",
+            "type": "filter",
+            "vars": ["o"]
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 9,
+          "to": 108
+        }
+      }
+    },
+    "text": "SELECT * { ?s <http://p> ?o . OPTIONAL { ?s <http://q> ?x . FILTER(?o > 2) FILTER(?x > 3) } FILTER(?o < 9) }"
+  },
+  "optional-iri": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 33,
+          "to": 41
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": [
+          {
+            "iri": "http://example.org/",
+            "prefix": "ex",
+            "range": {
+              "from": 0,
+              "to": 32
+            }
+          }
+        ]
+      },
+      "root": {
+        "inner": {
+          "from": 43,
+          "to": 87
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 49,
+              "to": 56
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 54,
+                "to": 56
+              },
+              "text": "?o",
+              "value": "o"
+            },
+            "oRange": {
+              "from": 54,
+              "to": 56
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 54,
+              "to": 56
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "ex:p",
+              "value": "http://example.org/p"
+            },
+            "pRange": {
+              "from": 49,
+              "to": 53
+            },
+            "range": {
+              "from": 46,
+              "to": 58
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 46,
+                "to": 48
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 46,
+              "to": 48
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "dot": null,
+            "inner": {
+              "from": 71,
+              "to": 85
+            },
+            "items": [
+              {
+                "entry": 0,
+                "entryRange": {
+                  "from": 77,
+                  "to": 84
+                },
+                "o": {
+                  "kind": "var",
+                  "range": {
+                    "from": 82,
+                    "to": 84
+                  },
+                  "text": "?x",
+                  "value": "x"
+                },
+                "oRange": {
+                  "from": 82,
+                  "to": 84
+                },
+                "object": 0,
+                "objectRange": {
+                  "from": 82,
+                  "to": 84
+                },
+                "p": {
+                  "kind": "iri",
+                  "path": null,
+                  "text": "ex:q",
+                  "value": "http://example.org/q"
+                },
+                "pRange": {
+                  "from": 77,
+                  "to": 81
+                },
+                "range": {
+                  "from": 72,
+                  "to": 84
+                },
+                "s": {
+                  "kind": "iri",
+                  "range": {
+                    "from": 72,
+                    "to": 76
+                  },
+                  "text": "ex:a",
+                  "value": "http://example.org/a"
+                },
+                "sRange": {
+                  "from": 72,
+                  "to": 76
+                },
+                "stmt": 1,
+                "type": "triple"
+              }
+            ],
+            "kind": "optional",
+            "range": {
+              "from": 61,
+              "to": 86
+            },
+            "type": "group"
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 42,
+          "to": 88
+        }
+      }
+    },
+    "text": "PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:p ?o .\n  OPTIONAL { ex:a ex:q ?x }\n}\n"
+  },
+  "shared-hull": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 0,
+          "to": 8
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": []
+      },
+      "root": {
+        "inner": {
+          "from": 10,
+          "to": 60
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 14,
+              "to": 27
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 25,
+                "to": 27
+              },
+              "text": "?o",
+              "value": "o"
+            },
+            "oRange": {
+              "from": 25,
+              "to": 27
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 25,
+              "to": 27
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "<http://p>",
+              "value": "http://p"
+            },
+            "pRange": {
+              "from": 14,
+              "to": 24
+            },
+            "range": {
+              "from": 11,
+              "to": 29
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 11,
+                "to": 13
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 11,
+              "to": 13
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "dot": null,
+            "inner": {
+              "from": 40,
+              "to": 58
+            },
+            "items": [
+              {
+                "entry": 0,
+                "entryRange": {
+                  "from": 44,
+                  "to": 57
+                },
+                "o": {
+                  "kind": "var",
+                  "range": {
+                    "from": 55,
+                    "to": 57
+                  },
+                  "text": "?o",
+                  "value": "o"
+                },
+                "oRange": {
+                  "from": 55,
+                  "to": 57
+                },
+                "object": 0,
+                "objectRange": {
+                  "from": 55,
+                  "to": 57
+                },
+                "p": {
+                  "kind": "iri",
+                  "path": null,
+                  "text": "<http://q>",
+                  "value": "http://q"
+                },
+                "pRange": {
+                  "from": 44,
+                  "to": 54
+                },
+                "range": {
+                  "from": 41,
+                  "to": 57
+                },
+                "s": {
+                  "kind": "var",
+                  "range": {
+                    "from": 41,
+                    "to": 43
+                  },
+                  "text": "?s",
+                  "value": "s"
+                },
+                "sRange": {
+                  "from": 41,
+                  "to": 43
+                },
+                "stmt": 1,
+                "type": "triple"
+              }
+            ],
+            "kind": "optional",
+            "range": {
+              "from": 30,
+              "to": 59
+            },
+            "type": "group"
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 9,
+          "to": 61
+        }
+      }
+    },
+    "text": "SELECT * { ?s <http://p> ?o . OPTIONAL { ?s <http://q> ?o } }"
+  },
+  "two": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 33,
+          "to": 41
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": [
+          {
+            "iri": "http://example.org/",
+            "prefix": "ex",
+            "range": {
+              "from": 0,
+              "to": 32
+            }
+          }
+        ]
+      },
+      "root": {
+        "inner": {
+          "from": 43,
+          "to": 74
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 49,
+              "to": 56
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 54,
+                "to": 56
+              },
+              "text": "?a",
+              "value": "a"
+            },
+            "oRange": {
+              "from": 54,
+              "to": 56
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 54,
+              "to": 56
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "ex:p",
+              "value": "http://example.org/p"
+            },
+            "pRange": {
+              "from": 49,
+              "to": 53
+            },
+            "range": {
+              "from": 46,
+              "to": 58
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 46,
+                "to": 48
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 46,
+              "to": 48
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 64,
+              "to": 71
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 69,
+                "to": 71
+              },
+              "text": "?b",
+              "value": "b"
+            },
+            "oRange": {
+              "from": 69,
+              "to": 71
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 69,
+              "to": 71
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "ex:q",
+              "value": "http://example.org/q"
+            },
+            "pRange": {
+              "from": 64,
+              "to": 68
+            },
+            "range": {
+              "from": 61,
+              "to": 73
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 61,
+                "to": 63
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 61,
+              "to": 63
+            },
+            "stmt": 1,
+            "type": "triple"
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 42,
+          "to": 75
+        }
+      }
+    },
+    "text": "PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:p ?a .\n  ?s ex:q ?b .\n}\n"
+  },
+  "two-moved": {
+    "answer": {
+      "form": "select",
+      "locked": [],
+      "modifiers": [],
+      "ok": true,
+      "projection": {
+        "distinct": false,
+        "locked": false,
+        "range": {
+          "from": 33,
+          "to": 41
+        },
+        "star": true,
+        "vars": []
+      },
+      "prologue": {
+        "base": null,
+        "prefixes": [
+          {
+            "iri": "http://example.org/",
+            "prefix": "ex",
+            "range": {
+              "from": 0,
+              "to": 32
+            }
+          }
+        ]
+      },
+      "root": {
+        "inner": {
+          "from": 43,
+          "to": 89
+        },
+        "items": [
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 49,
+              "to": 56
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 54,
+                "to": 56
+              },
+              "text": "?z",
+              "value": "z"
+            },
+            "oRange": {
+              "from": 54,
+              "to": 56
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 54,
+              "to": 56
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "ex:z",
+              "value": "http://example.org/z"
+            },
+            "pRange": {
+              "from": 49,
+              "to": 53
+            },
+            "range": {
+              "from": 46,
+              "to": 58
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 46,
+                "to": 48
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 46,
+              "to": 48
+            },
+            "stmt": 0,
+            "type": "triple"
+          },
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 64,
+              "to": 71
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 69,
+                "to": 71
+              },
+              "text": "?a",
+              "value": "a"
+            },
+            "oRange": {
+              "from": 69,
+              "to": 71
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 69,
+              "to": 71
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "ex:p",
+              "value": "http://example.org/p"
+            },
+            "pRange": {
+              "from": 64,
+              "to": 68
+            },
+            "range": {
+              "from": 61,
+              "to": 73
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 61,
+                "to": 63
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 61,
+              "to": 63
+            },
+            "stmt": 1,
+            "type": "triple"
+          },
+          {
+            "entry": 0,
+            "entryRange": {
+              "from": 79,
+              "to": 86
+            },
+            "o": {
+              "kind": "var",
+              "range": {
+                "from": 84,
+                "to": 86
+              },
+              "text": "?b",
+              "value": "b"
+            },
+            "oRange": {
+              "from": 84,
+              "to": 86
+            },
+            "object": 0,
+            "objectRange": {
+              "from": 84,
+              "to": 86
+            },
+            "p": {
+              "kind": "iri",
+              "path": null,
+              "text": "ex:q",
+              "value": "http://example.org/q"
+            },
+            "pRange": {
+              "from": 79,
+              "to": 83
+            },
+            "range": {
+              "from": 76,
+              "to": 88
+            },
+            "s": {
+              "kind": "var",
+              "range": {
+                "from": 76,
+                "to": 78
+              },
+              "text": "?s",
+              "value": "s"
+            },
+            "sRange": {
+              "from": 76,
+              "to": 78
+            },
+            "stmt": 2,
+            "type": "triple"
+          }
+        ],
+        "kind": "group",
+        "range": {
+          "from": 42,
+          "to": 90
+        }
+      }
+    },
+    "text": "PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:z ?z .\n  ?s ex:p ?a .\n  ?s ex:q ?b .\n}\n"
   },
   "update": {
     "answer": {

@@ -410,6 +410,61 @@ fn errors_and_updates() {
 }
 
 #[test]
+fn base_resolves_iris_and_namespaces() {
+    let q =
+        "BASE <http://x/>\nPREFIX r: <rel/>\nSELECT * { <thing> <p> ?o . <http://x/thing> r:q ?o }";
+    let p = ok(q);
+    assert_eq!(p.base.as_deref(), Some("http://x/"));
+    assert_eq!(p.prefixes[0].iri, "http://x/rel/");
+    let ts = triples(items(&p));
+    assert_eq!(ts[0].s.value, "http://x/thing");
+    assert_eq!(ts[0].s.value, ts[1].s.value);
+    assert_eq!(ts[0].p.value, "http://x/p");
+    assert_eq!(ts[1].p.value, "http://x/rel/q");
+    // a later BASE resolves against the one before
+    let p = ok("BASE <http://x/a/> BASE <b/> SELECT * { <c> ?p ?o }");
+    assert_eq!(triples(items(&p))[0].s.value, "http://x/a/b/c");
+}
+
+#[test]
+fn separator_dots_and_token_ends() {
+    let q = "SELECT * { OPTIONAL { ?s <http://p> ?o } # note\n . FILTER(?o > 1) . BIND(1 AS ?x) # one\n . ?s <http://p> [ <http://q> 1 ] # c\n }";
+    let p = ok(q);
+    let its = items(&p);
+    let Item::Group(g) = &its[0] else { panic!() };
+    assert_eq!(at(q, g.dot.as_ref().unwrap()), ".");
+    assert!(g.dot.as_ref().unwrap().start > q.find("# note").unwrap());
+    let Item::Filter(f) = &its[1] else { panic!() };
+    assert_eq!(at(q, f.dot.as_ref().unwrap()), ".");
+    let Item::Locked(b) = &its[2] else { panic!() };
+    assert_eq!(b.text, "BIND(1 AS ?x) # one");
+    assert_eq!(&q[b.range.start..b.end], "BIND(1 AS ?x)");
+    assert!(b.dot.is_some());
+    let Item::Locked(t) = &its[3] else { panic!() };
+    assert_eq!(t.kind, "triples");
+    assert_eq!(&q[t.range.start..t.end], "?s <http://p> [ <http://q> 1 ]");
+    assert_eq!(t.text, "?s <http://p> [ <http://q> 1 ] # c");
+    assert!(t.dot.is_none());
+}
+
+#[test]
+fn the_strict_check_adds_the_server_parser() {
+    use sparkles_fmt::pattern::check;
+    assert_eq!(check("SELECT * { ?s ?p ?o }"), Ok(()));
+    // the lossless parser takes what fails only on scoping
+    let scope = "SELECT * { ?s ?p ?o BIND(1 AS ?o) }";
+    assert!(pattern(scope).is_ok());
+    assert!(matches!(check(scope), Err(PatternError::Syntax { .. })));
+    assert!(matches!(
+        check("SELECT * {"),
+        Err(PatternError::Syntax { .. })
+    ));
+    assert_eq!(check("CLEAR ALL"), Err(PatternError::Update));
+    // undeclared prefixes pass: the query page declares them on Run
+    assert_eq!(check("SELECT * { ?s ex:p ?o }"), Ok(()));
+}
+
+#[test]
 fn unicode_ranges_are_bytes() {
     let q = "SELECT * { ?s <http://x/p> \"é😀\" . ?s <http://x/q> ?o }";
     let p = ok(q);

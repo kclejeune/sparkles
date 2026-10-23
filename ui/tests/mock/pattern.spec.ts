@@ -304,7 +304,9 @@ test('the Pattern tab draws the query that ran, read-only, and Edit opens it in 
   await page.getByRole('button', { name: /^Run\b/ }).click();
   const results = page.getByRole('region', { name: 'Results' });
   await results.getByRole('tab', { name: /Pattern/ }).click();
-  const ran = results.getByRole('region', { name: 'Pattern of the query that ran' });
+  const ran = results.getByRole('region', {
+    name: 'Pattern of the query that ran',
+  });
   await expect(ran).toHaveAttribute('data-state', 'ok');
   await expect(ran.getByText('read-only')).toBeVisible();
   await expect
@@ -322,8 +324,123 @@ test('the Pattern tab draws the query that ran, read-only, and Edit opens it in 
     .toBe('SELECT ?s ?o WHERE { ?s <http://example.org/p> ?o } LIMIT 5');
 });
 
+// the regressions of the first review (target/audits/u08-phase1/plan.md)
+
+test('an open panel keeps its triple when typing moves the text', async ({ page }) => {
+  await openPane(
+    page,
+    'PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:p ?a .\n  ?s ex:q ?b .\n}',
+  );
+  const c = canvas(page);
+  await expect.poll(() => settled(c)).toBeGreaterThan(0);
+  await c.focus();
+  for (let i = 0; i < 3; i++) await page.keyboard.press('Tab');
+  await expect(pane(page).getByTestId('pattern-focus')).toHaveText('edge ex:q from ?s to ?b');
+  await page.keyboard.press('Enter');
+  const panel = pane(page).getByRole('dialog', { name: 'Pattern element' });
+  await expect(panel).toContainText('?s ex:q ?b');
+  // a triple typed before it in the editor
+  await editor(page).locator('.cm-line').nth(1).click();
+  await page.keyboard.press('End');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type('?s ex:z ?z .');
+  await expect(panel).toContainText('?s ex:q ?b');
+  await panel.getByRole('button', { name: /Delete/ }).click();
+  await expect.poll(() => textOf(page)).not.toContain('ex:q');
+  const now = await textOf(page);
+  expect(now).toContain('?s ex:p ?a .');
+  expect(now).toContain('?s ex:z ?z .');
+});
+
+test('each editor tab keeps its own positions', async ({ page }) => {
+  await openPane(page, A3);
+  const c = canvas(page);
+  await expect.poll(() => settled(c)).toBeGreaterThan(0);
+  const tabs = page.locator('.qtab-btn');
+  // move ?person in the first tab
+  await c.focus();
+  for (let i = 0; i < 5; i++) await page.keyboard.press('Shift+ArrowRight');
+  await expect.poll(async () => (await positions(c))['v:person']?.[0]).toBeDefined();
+  const first = (await positions(c))['v:person'];
+  // the same query in a second tab, ?person moved the other way
+  await page.getByRole('button', { name: 'New query tab' }).click();
+  await setText(page, A3);
+  await expect(pane(page)).toHaveAttribute('data-state', 'ok');
+  await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);
+  await canvas(page).focus();
+  for (let i = 0; i < 10; i++) await page.keyboard.press('Shift+ArrowLeft');
+  const second = (await positions(canvas(page)))['v:person'];
+  expect(Math.abs(second[0] - first[0])).toBeGreaterThan(100);
+  // back and forth: each tab draws its own picture
+  await tabs.nth(0).click();
+  await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);
+  await expect
+    .poll(async () => (await positions(canvas(page)))['v:person']?.[0])
+    .toBeCloseTo(first[0], 0);
+  await tabs.nth(1).click();
+  await expect.poll(() => settled(canvas(page))).toBeGreaterThan(0);
+  await expect
+    .poll(async () => (await positions(canvas(page)))['v:person']?.[0])
+    .toBeCloseTo(second[0], 0);
+});
+
+test('undo, redo and Escape work in the list and from the panel', async ({ page }) => {
+  await openPane(page, A3);
+  await pane(page).getByRole('button', { name: 'List' }).click();
+  const optional = pane(page)
+    .locator('li')
+    .filter({ hasText: 'edge ex:locatedIn' })
+    .getByRole('button', { name: 'Optional' });
+  await optional.click();
+  await expect.poll(() => textOf(page)).toContain('OPTIONAL {');
+  // the list button still has focus: Mod+Z there undoes the edit
+  await pane(page).locator('li button').first().focus();
+  await page.keyboard.press('ControlOrMeta+Z');
+  await expect.poll(() => textOf(page)).toBe(A3);
+  await page.keyboard.press('ControlOrMeta+Shift+Z');
+  await expect.poll(() => textOf(page)).toContain('OPTIONAL {');
+  await page.keyboard.press('ControlOrMeta+Z');
+  await expect.poll(() => textOf(page)).toBe(A3);
+  // Escape from a button of the panel closes it
+  await pane(page).getByRole('button', { name: 'Canvas' }).click();
+  await canvas(page).focus();
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Enter');
+  const panel = pane(page).getByRole('dialog', { name: 'Pattern element' });
+  await panel.getByRole('button', { name: 'Optional' }).focus();
+  await page.keyboard.press('Escape');
+  await expect(panel).toHaveCount(0);
+  // typing in the add form keeps the field's own undo
+  await pane(page).getByRole('button', { name: 'Triple' }).click();
+  await pane(page).getByLabel('Subject').fill('?x');
+  await pane(page).getByLabel('Subject').press('ControlOrMeta+Z');
+  await expect.poll(() => textOf(page)).toBe(A3);
+});
+
+test('a prefix nobody declares is refused, and DESCRIBE draws its locked terms', async ({
+  page,
+}) => {
+  await openPane(page, 'SELECT * { ?s <http://x/p> ?o }');
+  await pane(page).getByRole('button', { name: 'Triple' }).click();
+  await pane(page).getByLabel('Subject').fill('?o');
+  await pane(page).getByLabel('Predicate').fill('missing:p');
+  await pane(page).getByLabel('Object').fill('?z');
+  await pane(page).getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(pane(page).getByRole('alert')).toHaveText('The prefix "missing:" is not declared');
+  expect(await textOf(page)).toBe('SELECT * { ?s <http://x/p> ?o }');
+  await setText(page, 'DESCRIBE <http://x/a>');
+  await expect
+    .poll(async () => (await graph(canvas(page))).locked)
+    .toEqual(['DESCRIBE <http://x/a>']);
+  await expect(pane(page)).not.toContainText('Add a node to start');
+});
+
 test.describe('at 390 px', () => {
-  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  test.use({
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+    isMobile: true,
+  });
 
   test('the editor and the pane are two tabs, edits work with taps, and nothing scrolls sideways', async ({
     page,

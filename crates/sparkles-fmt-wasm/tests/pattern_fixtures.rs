@@ -36,6 +36,52 @@ const QUERIES: &[(&str, &str)] = &[
     ("empty", "SELECT * WHERE {\n}\n"),
     ("update", "INSERT DATA { <http://x/a> <http://x/b> 1 }"),
     ("broken", "SELECT * WHERE { ?s ?p }"),
+    // the regressions of the first review (target/audits/u08-phase1)
+    (
+        "two",
+        "PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:p ?a .\n  ?s ex:q ?b .\n}\n",
+    ),
+    (
+        "two-moved",
+        "PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:z ?z .\n  ?s ex:p ?a .\n  ?s ex:q ?b .\n}\n",
+    ),
+    (
+        "optional-iri",
+        "PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:p ?o .\n  OPTIONAL { ex:a ex:q ?x }\n}\n",
+    ),
+    (
+        "locked-stmt",
+        "SELECT * {\n  ?s <http://p> [ <http://q> 1 ] # c\n}\n",
+    ),
+    (
+        "dot-comment",
+        "SELECT * {\n  ?s <http://p> ?v .\n  OPTIONAL { ?s <http://p> ?o } # note\n  . FILTER(?v > 1)\n  .\n}\n",
+    ),
+    ("describe", "DESCRIBE <http://x/a>"),
+    (
+        "construct",
+        "CONSTRUCT { ?s <http://x/q> ?o } FROM <http://g> WHERE { ?s <http://x/p> ?o }",
+    ),
+    (
+        "base",
+        "BASE <http://x/>\nSELECT * { <thing> <p> ?o . ?o <q> <http://x/thing> }",
+    ),
+    (
+        "shared-hull",
+        "SELECT * { ?s <http://p> ?o . OPTIONAL { ?s <http://q> ?o } }",
+    ),
+    (
+        "optional-filter",
+        "SELECT * { ?s <http://p> ?o . OPTIONAL { ?s <http://q> ?x . FILTER(?o > 2) FILTER(?x > 3) } FILTER(?o < 9) }",
+    ),
+    (
+        "literal",
+        "SELECT * { ?person <http://name> \"Ana\" ; <http://knows> ?other }",
+    ),
+    (
+        "literal-renamed",
+        "SELECT * { ?someone <http://name> \"Ana\" ; <http://knows> ?other }",
+    ),
 ];
 
 #[test]

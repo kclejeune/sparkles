@@ -2536,18 +2536,21 @@
     {/if}
     {#if patternShown}
       <div class="pattern-cell">
-        <PatternPane
-          bind:this={pattern}
-          text={active.query}
-          tab={active.id}
-          phone={isPhone}
-          prefixes={app.prefixes(ds)}
-          onedit={(changes) => editor?.applyPattern(changes)}
-          onundo={() => editor?.undo()}
-          onredo={() => editor?.redo()}
-          onescape={() => (isPhone ? (phoneTab = 'text') : editor?.focus())}
-          onclose={() => (patternOpen = false)}
-        />
+        <!-- a pane per tab, so each keeps its own drawing and layout -->
+        {#key active.id}
+          <PatternPane
+            bind:this={pattern}
+            text={active.query}
+            tab={active.id}
+            phone={isPhone}
+            prefixes={app.prefixes(ds)}
+            onedit={(changes) => editor?.applyPattern(changes)}
+            onundo={() => editor?.undo()}
+            onredo={() => editor?.redo()}
+            onescape={() => (isPhone ? (phoneTab = 'text') : editor?.focus())}
+            onclose={() => (patternOpen = false)}
+          />
+        {/key}
       </div>
     {/if}
   </div>

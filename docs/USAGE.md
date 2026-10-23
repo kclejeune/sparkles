@@ -1516,11 +1516,14 @@ change their text.
 The pane makes three edits. **+ Triple** (`N`) adds a triple pattern written as a
 subject, a predicate and an object. It goes into the group that holds the subject's
 patterns, after the last part of it the pane edits, and also after any locked block that
-follows and uses a variable the new triple binds. A prefixed name whose prefix the query does not declare, but the dataset does,
-adds its `PREFIX` line. Selecting an edge offers **Optional**, which moves the triple into
+follows and uses a variable the new triple binds. A prefixed name whose prefix the query
+does not declare, but the dataset does, adds its `PREFIX` line, and one that neither
+declares is refused. Selecting an edge offers **Optional**, which moves the triple into
 `OPTIONAL { … }` or back out of it, and **Delete**, which removes it from its statement.
 Each edit changes only the text it must, as one change to the editor, so `Ctrl+Z` (`⌘Z`
-on a Mac) in the editor or in the pane undoes it in one step, the same as typing.
+on a Mac) in the editor or anywhere in the pane undoes it in one step, the same as typing.
+The pane makes an edit only when the server would accept the result and the result holds
+exactly the change asked for.
 
 The pane redraws 150 ms after typing stops. Text that does not parse leaves the last
 drawing on screen, dimmed, with the line and column of the error, and the pane makes no

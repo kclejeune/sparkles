@@ -72,6 +72,8 @@ pub struct Number {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pattern {
     pub form: Form,
+    /// the last `BASE` of the prologue, resolved against the ones before it
+    pub base: Option<String>,
     pub prefixes: Vec<Prefix>,
     /// the `WHERE` group; `None` only for a `DESCRIBE` without one
     pub root: Option<Group>,
@@ -111,6 +113,8 @@ pub struct Group {
     pub range: Range<usize>,
     pub inner: Range<usize>,
     pub items: Vec<Item>,
+    /// the `.` token that follows an `OPTIONAL` in its group, if any
+    pub dot: Option<Range<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,6 +252,8 @@ pub struct Filter {
     pub vars: Vec<String>,
     pub text: String,
     pub range: Range<usize>,
+    /// the `.` token that follows the filter in its group, if any
+    pub dot: Option<Range<usize>>,
 }
 
 /// A part of the query the canvas never writes into: its kind (`BIND`, `MINUS`,
@@ -260,6 +266,11 @@ pub struct Locked {
     pub vars: Vec<String>,
     pub text: String,
     pub range: Range<usize>,
+    /// the end of the block's last token, before a trailing comment
+    pub end: usize,
+    /// the `.` token that follows the block in its group, if any (a triples statement
+    /// holds its own)
+    pub dot: Option<Range<usize>>,
 }
 
 /// Why there is no pattern.
@@ -325,9 +336,44 @@ pub fn pattern(text: &str) -> Result<Pattern, PatternError> {
     Ok(Reader::new(&tree).query())
 }
 
+/// Whether the server's parser accepts `text` as a query, with the checks the lossless
+/// parser leaves out, such as the scope of variables. A prefix the query uses without
+/// declaring it passes, as the query page declares it when it runs the query. The
+/// builder checks every canvas edit with this before it applies one.
+pub fn check(text: &str) -> Result<(), PatternError> {
+    let tokens = lex(text, LexMode::Sparql);
+    let r = crate::sparql::nesting(text, &tokens)
+        .and_then(|()| crate::check::sparql_reference(text, &tokens));
+    match r {
+        Ok(r) if r.unit == Unit::Update => Err(PatternError::Update),
+        Ok(_) => Ok(()),
+        Err(FormatError::Syntax {
+            message,
+            line,
+            column,
+            ..
+        })
+        | Err(FormatError::Unsupported {
+            message,
+            line,
+            column,
+        }) => Err(PatternError::Syntax {
+            message,
+            line,
+            column,
+        }),
+        Err(other) => Err(PatternError::Syntax {
+            message: other.to_string(),
+            line: 1,
+            column: 1,
+        }),
+    }
+}
+
 struct Reader<'t, 's> {
     tree: &'t Tree<'s>,
     prefixes: HashMap<String, String>,
+    base: Option<String>,
     stmt: usize,
 }
 
@@ -336,6 +382,7 @@ impl<'t, 's> Reader<'t, 's> {
         Reader {
             tree,
             prefixes: HashMap::new(),
+            base: None,
             stmt: 0,
         }
     }
@@ -349,15 +396,22 @@ impl<'t, 's> Reader<'t, 's> {
             match t.kind(n) {
                 K::Prologue => {
                     for d in t.child_nodes(n) {
+                        let toks = self.tokens(d);
+                        if t.kind(d) == K::BaseDecl {
+                            // in source order, each against the one before
+                            if let Some(iri) = toks.get(1) {
+                                self.base = Some(self.resolve(&iri_inner(t.token_text(*iri))));
+                            }
+                            continue;
+                        }
                         if t.kind(d) != K::PrefixDecl {
                             continue;
                         }
-                        let toks = self.tokens(d);
                         let (Some(ns), Some(iri)) = (toks.get(1), toks.get(2)) else {
                             continue;
                         };
                         let label = t.token_text(*ns);
-                        let iri = iri_inner(t.token_text(*iri));
+                        let iri = self.resolve(&iri_inner(t.token_text(*iri)));
                         self.prefixes.insert(label.to_string(), iri.clone());
                         prefixes.push(Prefix {
                             prefix: label.trim_end_matches(':').to_string(),
@@ -378,6 +432,7 @@ impl<'t, 's> Reader<'t, 's> {
         };
         let mut p = Pattern {
             form,
+            base: self.base.clone(),
             prefixes,
             root: None,
             projection: None,
@@ -431,6 +486,18 @@ impl<'t, 's> Reader<'t, 's> {
             }
         }
         p
+    }
+
+    /// An IRI resolved against the `BASE` in effect (as written when there is none, or it
+    /// does not resolve).
+    fn resolve(&self, iri: &str) -> String {
+        match &self.base {
+            Some(base) => oxiri::Iri::parse(base.as_str())
+                .ok()
+                .and_then(|b| b.resolve(iri).ok())
+                .map_or_else(|| iri.to_string(), |r| r.into_inner()),
+            None => iri.to_string(),
+        }
     }
 
     /// The significant tokens of `n`'s subtree, in order.
@@ -516,7 +583,9 @@ impl<'t, 's> Reader<'t, 's> {
             kind: kind.to_string(),
             vars,
             text: self.tree.src[range.clone()].to_string(),
+            end: self.tree.range(n).end,
             range,
+            dot: None,
         }
     }
 
@@ -565,15 +634,29 @@ impl<'t, 's> Reader<'t, 's> {
             (Some(&a), Some(&b)) if toks.len() >= 2 => t.token(a).end()..t.token(b).start as usize,
             _ => range.clone(),
         };
-        let mut items = Vec::new();
-        for c in t.child_nodes(g) {
-            self.item(c, kind, &mut items);
+        let mut items: Vec<Item> = Vec::new();
+        for e in t.children(g) {
+            match *e {
+                Element::Node(c) => self.item(c, kind, &mut items),
+                // the `.` after an element that is not a triples statement
+                Element::Token(tok) if t.token_kind(tok) == TokenKind::Dot => {
+                    let r = t.token(tok).range();
+                    match items.last_mut() {
+                        Some(Item::Group(x)) if x.dot.is_none() => x.dot = Some(r),
+                        Some(Item::Filter(x)) if x.dot.is_none() => x.dot = Some(r),
+                        Some(Item::Locked(x)) if x.dot.is_none() => x.dot = Some(r),
+                        _ => {}
+                    }
+                }
+                Element::Token(_) => {}
+            }
         }
         Group {
             kind,
             range,
             inner,
             items,
+            dot: None,
         }
     }
 
@@ -600,6 +683,7 @@ impl<'t, 's> Reader<'t, 's> {
                     vars: self.vars(c),
                     text: t.src[range.clone()].to_string(),
                     range,
+                    dot: None,
                 })
             }
             K::Optional => {
@@ -670,6 +754,7 @@ impl<'t, 's> Reader<'t, 's> {
         let mut probe = Reader {
             tree: t,
             prefixes: self.prefixes.clone(),
+            base: self.base.clone(),
             stmt: 0,
         };
         t.child_nodes(g).all(|c| match t.kind(c) {
@@ -791,7 +876,7 @@ impl<'t, 's> Reader<'t, 's> {
     /// The full IRI of an IRI token or prefixed name.
     fn iri(&self, text: &str, kind: TokenKind) -> String {
         match kind {
-            TokenKind::IriRef => iri_inner(text),
+            TokenKind::IriRef => self.resolve(&iri_inner(text)),
             _ => {
                 let colon = text.find(':').map_or(0, |i| i + 1);
                 let (ns, local) = text.split_at(colon);

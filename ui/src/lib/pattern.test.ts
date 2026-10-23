@@ -3,6 +3,7 @@ import { Store } from 'oxigraph';
 import { describe, expect, it } from 'vitest';
 import fixtures from './pattern-fixtures.json';
 import {
+  agrees,
   applyChanges,
   checkTerm,
   compact,
@@ -16,6 +17,8 @@ import {
   overCaps,
   removalRange,
   renamed,
+  resolveEdit,
+  resolveTerm,
   textOrder,
   triplesOf,
   type Change,
@@ -39,6 +42,13 @@ function parses(text: string): boolean {
     return false;
   }
 }
+
+/** The id of the edge of the triple at `i` in `triplesOf`. */
+const edgeAt = (p: PatternOk, i: number) => {
+  const e = drawing(p).edges.find((x) => x.triple?.order === i);
+  if (!e) throw new Error(`no edge for triple ${i}`);
+  return e.id;
+};
 
 const run = (name: Name, e: Edit) => {
   const { text, p } = fx(name);
@@ -117,13 +127,68 @@ describe('the drawing', () => {
     const before = drawing(p);
     // the same pattern with ?org called ?company: build the answer by renaming terms
     const swap = JSON.parse(JSON.stringify(p).replaceAll('"value":"org"', '"value":"company"'));
-    expect(renamed(before, drawing(swap))).toEqual(['v:org', 'v:company']);
+    expect(renamed(before, drawing(swap))).toEqual([['v:org', 'v:company']]);
     // two renames at once are not guessed
     const both = JSON.parse(
       JSON.stringify(swap).replaceAll('"value":"person"', '"value":"someone"'),
     );
     expect(renamed(before, drawing(both))).toBeNull();
     expect(text).toContain('?org');
+  });
+
+  it('draws the locked clauses outside the WHERE group', () => {
+    const d = drawing(fx('describe').p);
+    expect(d.nodes.map((n) => n.label)).toEqual(['locked · DESCRIBE']);
+    const c = drawing(fx('construct').p);
+    const kinds = c.nodes.filter((n) => n.kind === 'locked').map((n) => n.locked!.kind);
+    expect(kinds.sort()).toEqual(['CONSTRUCT', 'FROM']);
+    const template = c.nodes.find((n) => n.locked?.kind === 'CONSTRUCT')!;
+    expect(
+      c.edges
+        .filter((e) => e.source === template.id)
+        .map((e) => e.target)
+        .sort(),
+    ).toEqual(['v:o', 'v:s']);
+    expect(c.parts).toBe(1);
+  });
+
+  it('draws no hull without a node of its own', () => {
+    const d = drawing(fx('shared-hull').p);
+    expect(d.hulls).toEqual([]);
+    expect(d.edges.filter((e) => e.optional).map((e) => e.label)).toEqual(['<http://q>']);
+    expect(describeEl({ edge: d.edges[1] }, d)).toBe('edge <http://q> from ?s to ?o, optional');
+  });
+
+  it('keeps a filter in its OPTIONAL’s scope', () => {
+    const d = drawing(fx('optional-filter').p);
+    // the root filter on a required variable is its chip
+    expect(d.nodes.find((n) => n.id === 'v:o')!.subtitle).toEqual(['< 9']);
+    // the optional's filter on a variable of its hull is a chip there
+    expect(d.nodes.find((n) => n.id === 'v:x')!.subtitle).toEqual(['> 3']);
+    // the optional's filter on a required variable is a node inside the hull
+    const chip = d.nodes.find((n) => n.kind === 'chip')!;
+    expect([chip.title, chip.parent]).toEqual(['FILTER(?o > 2)', 'h:0']);
+  });
+
+  it('moves a renamed subject’s literals with it', () => {
+    const before = drawing(fx('literal').p);
+    const after = drawing(fx('literal-renamed').p);
+    expect(renamed(before, after)).toEqual([
+      ['v:person', 'v:someone'],
+      ['l:v:person|http://name|0', 'l:v:someone|http://name|0'],
+    ]);
+  });
+
+  it('draws 20,000 triples in linear time', () => {
+    const { p } = fx('one-line');
+    const t0 = p.root!.items[0];
+    const items = Array.from({ length: 20000 }, (_, i) => ({ ...t0, stmt: i }));
+    const big = { ...p, root: { ...p.root!, items } } as PatternOk;
+    const start = performance.now();
+    const d = drawing(big);
+    expect(d.edges).toHaveLength(20000);
+    expect(new Set(d.edges.map((e) => e.id)).size).toBe(20000);
+    expect(performance.now() - start).toBeLessThan(1000);
   });
 
   it('counts disconnected parts and the caps', () => {
@@ -137,7 +202,7 @@ describe('edits as splices', () => {
   it('A6: marking ex:locatedIn optional is exactly this change', () => {
     const { p } = fx('a3');
     const i = triplesOf(p).findIndex((t) => t.triple.p.text === 'ex:locatedIn');
-    const { out } = run('a3', { kind: 'optional', triple: i });
+    const { out } = run('a3', { kind: 'optional', edge: edgeAt(p, i) });
     expect(out).toBe(
       'PREFIX ex: <http://example.org/>\nSELECT ?person ?org WHERE {\n  ?person a ex:Person ; ex:worksFor ?org .\n  ?org a ex:Org .\n  OPTIONAL { ?org ex:locatedIn ex:lyon . }\n}\nLIMIT 1000\n',
     );
@@ -145,34 +210,64 @@ describe('edits as splices', () => {
   });
 
   it('adds a triple after the last triple of its subject’s group', () => {
-    const { out } = run('a3', { kind: 'add', s: '?person', p: 'ex:age', o: '?age' });
+    const { out } = run('a3', {
+      kind: 'add',
+      s: '?person',
+      p: 'ex:age',
+      o: '?age',
+    });
     expect(out).toBe(
       'PREFIX ex: <http://example.org/>\nSELECT ?person ?org WHERE {\n  ?person a ex:Person ; ex:worksFor ?org .\n  ?org a ex:Org ; ex:locatedIn ex:lyon .\n  ?person ex:age ?age .\n}\nLIMIT 1000\n',
     );
   });
 
   it('places a new triple after a locked block that uses a variable it binds (§4.2)', () => {
-    const { out } = run('locked-after', { kind: 'add', s: '?c', p: 'ex:z', o: '?w' });
+    const { out } = run('locked-after', {
+      kind: 'add',
+      s: '?c',
+      p: 'ex:z',
+      o: '?w',
+    });
     expect(out).toBe(
       'PREFIX ex: <http://example.org/>\nSELECT * WHERE {\n  ?a ex:p ?b .\n  BIND(?b + 1 AS ?c)\n  ?c ex:z ?w .\n  MINUS { ?a ex:q ?d }\n}\n',
     );
     // a triple that binds nothing the blocks use goes before them
-    const { out: before } = run('locked-after', { kind: 'add', s: '?x', p: 'ex:z', o: '1' });
+    const { out: before } = run('locked-after', {
+      kind: 'add',
+      s: '?x',
+      p: 'ex:z',
+      o: '1',
+    });
     expect(before).toContain('?a ex:p ?b .\n  ?x ex:z 1 .\n  BIND');
     expect(parses(out) && parses(before)).toBe(true);
   });
 
   it('adds a `.` to a statement without one and keeps a trailing comment on its line', () => {
-    const { out } = run('no-dot', { kind: 'add', s: '?o', p: '<http://x/q>', o: '?r' });
+    const { out } = run('no-dot', {
+      kind: 'add',
+      s: '?o',
+      p: '<http://x/q>',
+      o: '?r',
+    });
     expect(out).toBe('SELECT * {\n  ?s <http://x/p> ?o . # last\n  ?o <http://x/q> ?r .\n}\n');
     expect(parses(out)).toBe(true);
   });
 
   it('adds to a query on one line and to an empty group', () => {
-    const { out } = run('one-line', { kind: 'add', s: '?o', p: 'a', o: '<http://x/C>' });
+    const { out } = run('one-line', {
+      kind: 'add',
+      s: '?o',
+      p: 'a',
+      o: '<http://x/C>',
+    });
     expect(out).toBe('SELECT * { ?s <http://x/p> ?o .\n  ?o a <http://x/C> .\n }');
     expect(parses(out)).toBe(true);
-    const { out: empty } = run('empty', { kind: 'add', s: '?s', p: '?p', o: '?o' });
+    const { out: empty } = run('empty', {
+      kind: 'add',
+      s: '?s',
+      p: '?p',
+      o: '?o',
+    });
     expect(empty).toBe('SELECT * WHERE {\n  ?s ?p ?o .\n}\n');
   });
 
@@ -182,7 +277,7 @@ describe('edits as splices', () => {
       s: '?o',
       p: 'foaf:name',
       o: '?n',
-      declare: { prefix: 'foaf', iri: 'http://xmlns.com/foaf/0.1/' },
+      declare: [{ prefix: 'foaf', iri: 'http://xmlns.com/foaf/0.1/' }],
     });
     expect(out.startsWith('PREFIX foaf: <http://xmlns.com/foaf/0.1/>\nSELECT')).toBe(true);
     const { out: again } = run('a3', {
@@ -190,7 +285,7 @@ describe('edits as splices', () => {
       s: '?o',
       p: 'ex:name',
       o: '?n',
-      declare: { prefix: 'ex', iri: 'http://example.org/' },
+      declare: [{ prefix: 'ex', iri: 'http://example.org/' }],
     });
     expect(again.match(/PREFIX/g)).toHaveLength(1);
   });
@@ -199,7 +294,7 @@ describe('edits as splices', () => {
     const { text, p } = fx('lists');
     const idx = (o: string) => triplesOf(p).findIndex((t) => t.triple.o.text === o);
     const del = (o: string) =>
-      applyChanges(text, edit(text, p, { kind: 'delete', triple: idx(o) }));
+      applyChanges(text, edit(text, p, { kind: 'delete', edge: edgeAt(p, idx(o)) }));
     expect(del('?a')).toBe(
       'PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:p ?b , ?c ;\n     ex:q ?d ;\n     ex:r ?e .\n}\n',
     );
@@ -215,19 +310,28 @@ describe('edits as splices', () => {
     for (const o of ['?a', '?b', '?c', '?d', '?e']) expect(parses(del(o)), o).toBe(true);
     // a statement of one triple goes with its line, CRLF included
     const crlf = fx('crlf');
-    const out = applyChanges(crlf.text, edit(crlf.text, crlf.p, { kind: 'delete', triple: 0 }));
+    const out = applyChanges(
+      crlf.text,
+      edit(crlf.text, crlf.p, { kind: 'delete', edge: edgeAt(crlf.p, 0) }),
+    );
     expect(out).toBe('SELECT * {\r\n  ?o <http://x/q> ?r .\r\n}\r\n');
   });
 
   it('moves a triple out of an OPTIONAL, deleting the OPTIONAL when it empties', () => {
     const { text, p } = fx('optional');
     const idx = (o: string) => triplesOf(p).findIndex((t) => t.triple.o.text === o);
-    const lone = applyChanges(text, edit(text, p, { kind: 'optional', triple: idx('?c') }));
+    const lone = applyChanges(
+      text,
+      edit(text, p, { kind: 'optional', edge: edgeAt(p, idx('?c')) }),
+    );
     // after the last editable item of the group, which is the other OPTIONAL
     expect(lone).toBe(
       'PREFIX ex: <http://example.org/>\nSELECT * WHERE {\n  ?org ex:name ?n .\n  OPTIONAL { ?org ex:size ?z . ?z ex:unit ?u }\n  ?org ex:locatedIn ?c .\n}\n',
     );
-    const shared = applyChanges(text, edit(text, p, { kind: 'optional', triple: idx('?u') }));
+    const shared = applyChanges(
+      text,
+      edit(text, p, { kind: 'optional', edge: edgeAt(p, idx('?u')) }),
+    );
     expect(shared).toBe(
       'PREFIX ex: <http://example.org/>\nSELECT * WHERE {\n  ?org ex:name ?n .\n  OPTIONAL { ?org ex:locatedIn ?c . } .\n  OPTIONAL { ?org ex:size ?z .  }\n  ?z ex:unit ?u .\n}\n',
     );
@@ -238,11 +342,133 @@ describe('edits as splices', () => {
     const { text, p } = fx('bind');
     const placed = triplesOf(p);
     for (let i = 0; i < placed.length; i++) {
+      if (!drawing(p).edges.some((x) => x.triple?.order === i)) continue;
       const r = removalRange(text, placed[i]);
-      const changes = edit(text, p, { kind: 'delete', triple: i });
+      const changes = edit(text, p, { kind: 'delete', edge: edgeAt(p, i) });
       expect(changes).toEqual([{ from: r.from, to: r.to, insert: '' }]);
       expect(r.from).toBeGreaterThanOrEqual(placed[i].triple.range.from - 3);
     }
+  });
+
+  it('names a triple by its edge, so a moved text still edits the selected one', () => {
+    const before = fx('two');
+    const target = drawing(before.p).edges.find((x) => x.label === 'ex:q')!.id;
+    // a triple typed before it: the old index would name ex:p now
+    const moved = fx('two-moved');
+    const out = applyChanges(
+      moved.text,
+      edit(moved.text, moved.p, { kind: 'delete', edge: target }),
+    );
+    expect(out).toBe(
+      'PREFIX ex: <http://example.org/>\nSELECT * {\n  ?s ex:z ?z .\n  ?s ex:p ?a .\n}\n',
+    );
+    expect(resolveEdit(moved.p, target)!.triple.p.text).toBe('ex:q');
+  });
+
+  it('refuses a prefix neither the query nor the dataset declares', () => {
+    const { text, p } = fx('one-line');
+    expect(() => edit(text, p, { kind: 'add', s: '?s', p: 'missing:p', o: '?o' })).toThrow(
+      'The prefix "missing:" is not declared',
+    );
+    // two undeclared prefixes the dataset knows give two PREFIX lines
+    const out = applyChanges(
+      text,
+      edit(text, p, {
+        kind: 'add',
+        s: 'a:x',
+        p: 'b:y',
+        o: '?o',
+        declare: [
+          { prefix: 'a', iri: 'http://a/' },
+          { prefix: 'b', iri: 'http://b/' },
+          { prefix: 'a', iri: 'http://a/' },
+        ],
+      }),
+    );
+    expect(out.match(/PREFIX/g)).toHaveLength(2);
+    expect(parses(out)).toBe(true);
+  });
+
+  it('resolves a prefixed or relative subject to find its group', () => {
+    const { text, p } = fx('optional-iri');
+    const out = applyChanges(text, edit(text, p, { kind: 'add', s: 'ex:a', p: 'ex:r', o: '?c' }));
+    expect(out).toContain('OPTIONAL { ex:a ex:q ?x .\n');
+    expect(out).toContain('ex:a ex:r ?c .');
+    expect(out.indexOf('ex:a ex:r ?c')).toBeLessThan(out.lastIndexOf('}\n}'));
+    const full = applyChanges(
+      text,
+      edit(text, p, {
+        kind: 'add',
+        s: '<http://example.org/a>',
+        p: 'ex:r',
+        o: '?c',
+      }),
+    );
+    expect(full.indexOf('<http://example.org/a> ex:r ?c')).toBeLessThan(full.indexOf('}\n}'));
+    expect(parses(out) && parses(full)).toBe(true);
+    const base = fx('base');
+    expect(resolveTerm('<thing>', base.p).value).toBe('http://x/thing');
+    expect(resolveTerm('a', base.p).value).toBe('http://www.w3.org/1999/02/22-rdf-syntax-ns#type');
+    // BASE gives one node for `<thing>` and `<http://x/thing>`
+    expect(drawing(base.p).parts).toBe(1);
+  });
+
+  it('takes a datatype of exactly one IRI or prefixed name', () => {
+    expect(checkTerm('"x"^^<http://t>', 'o')).toBe('"x"^^<http://t>');
+    expect(checkTerm('"1"^^xsd:int', 'o')).toBe('"1"^^xsd:int');
+    expect(() => checkTerm('"x"^^<http://t>.?x<http://p>?y', 'o')).toThrow(EditError);
+    expect(() => checkTerm('"x"^^xsd:int ?y', 'o')).toThrow(EditError);
+    expect(() => checkTerm('<http://a> <http://b>', 's')).toThrow(EditError);
+  });
+
+  it('R3: the gate refuses a result that does not agree with the edit', () => {
+    const { text, p } = fx('two');
+    const add: Edit = { kind: 'add', s: '?s', p: 'ex:r', o: '?c' };
+    const after = fx('two-moved').p;
+    // a different triple than the one asked for
+    expect(agrees(p, add, after)).toBe(false);
+    expect(agrees(p, { ...add, p: 'ex:z', o: '?z' }, after)).toBe(true);
+    // deleting a triple must remove exactly it
+    const del: Edit = { kind: 'delete', edge: drawing(after).edges[0].id };
+    expect(agrees(after, del, p)).toBe(true);
+    expect(agrees(after, { kind: 'delete', edge: drawing(after).edges[1].id }, p)).toBe(false);
+    expect(agrees(p, { kind: 'optional', edge: drawing(p).edges[0].id }, p)).toBe(false);
+    expect(text).toContain('ex:q');
+  });
+
+  it('adds a `.` after a locked statement, before its comment', () => {
+    const { out } = run('locked-stmt', {
+      kind: 'add',
+      s: '?s',
+      p: '<http://r>',
+      o: '?x',
+    });
+    expect(out).toBe(
+      'SELECT * {\n  ?s <http://p> [ <http://q> 1 ] . # c\n  ?s <http://r> ?x .\n}\n',
+    );
+    expect(parses(out)).toBe(true);
+  });
+
+  it('finds separator dots after comments and line breaks', () => {
+    const { text, p } = fx('dot-comment');
+    const opt = drawing(p).edges.find((x) => x.optional)!.id;
+    const out = applyChanges(text, edit(text, p, { kind: 'optional', edge: opt }));
+    expect(out).toBe(
+      // the OPTIONAL goes with its line and trailing comment, its `.` on the next line alone
+      'SELECT * {\n  ?s <http://p> ?v .\n   FILTER(?v > 1)\n  .\n  ?s <http://p> ?o .\n}\n',
+    );
+    expect(parses(out)).toBe(true);
+    // a triple after the FILTER goes after its `.` on the next line
+    const { out: added } = run('dot-comment', {
+      kind: 'add',
+      s: '?v',
+      p: '<http://q>',
+      o: '?w',
+    });
+    expect(added).toBe(
+      'SELECT * {\n  ?s <http://p> ?v .\n  OPTIONAL { ?s <http://p> ?o } # note\n  . FILTER(?v > 1)\n  .\n  ?v <http://q> ?w .\n}\n',
+    );
+    expect(parses(added)).toBe(true);
   });
 
   it('refuses terms it would not write', () => {
@@ -255,7 +481,9 @@ describe('edits as splices', () => {
     expect(checkTerm('ex:a', 's')).toBe('ex:a');
     expect(checkTerm('<http://x/a>', 'p')).toBe('<http://x/a>');
     const { text, p } = fx('a3');
-    expect(() => edit(text, p, { kind: 'delete', triple: 99 })).toThrow(EditError);
+    expect(() => edit(text, p, { kind: 'delete', edge: 'e:gone' })).toThrow(
+      'The pattern changed, select the edge again',
+    );
     const describe_ = fixtures.update.answer as PatternAnswer;
     expect(describe_.ok).toBe(false);
   });
@@ -294,6 +522,15 @@ describe.skipIf(!existsSync(built))('the built module', async () => {
   const pattern = (text: string) =>
     JSON.parse(bindings.pattern(JSON.stringify({ text }))) as PatternAnswer;
 
+  it('refuses through `strict` what the server parser refuses', () => {
+    const strict = (text: string) =>
+      JSON.parse(bindings.pattern(JSON.stringify({ text, strict: true }))) as PatternAnswer;
+    const scope = 'SELECT * { ?s ?p ?o BIND(1 AS ?o) }';
+    expect(pattern(scope).ok).toBe(true);
+    expect(strict(scope).ok).toBe(false);
+    expect(strict('SELECT * { ?s ?p ?o }').ok).toBe(true);
+  });
+
   it('answers the fixtures', () => {
     for (const [name, f] of Object.entries(fixtures))
       expect(pattern(f.text), name).toEqual(f.answer);
@@ -310,13 +547,17 @@ describe.skipIf(!existsSync(built))('the built module', async () => {
       for (let step = 0; step < 20; step++) {
         const p = pattern(text) as PatternOk;
         expect(p.ok, text).toBe(true);
-        const n = triplesOf(p).length;
+        const edges = drawing(p).edges.filter((x) => x.triple);
         const roll = r();
         let e: Edit;
-        if (n === 0 || roll < 0.45) {
+        if (edges.length === 0 || roll < 0.45) {
           const s = pick(terms.filter((t) => !t.startsWith('"')));
           e = { kind: 'add', s, p: pick(preds), o: pick(terms) };
-        } else e = { kind: roll < 0.7 ? 'delete' : 'optional', triple: Math.floor(r() * n) };
+        } else
+          e = {
+            kind: roll < 0.7 ? 'delete' : 'optional',
+            edge: pick(edges).id,
+          };
         let changes: Change[];
         try {
           changes = edit(text, p, e);
@@ -332,10 +573,12 @@ describe.skipIf(!existsSync(built))('the built module', async () => {
         // the action names: the triple's, or the OPTIONAL it empties
         expect(lockedOf(after).map((b) => b.text)).toEqual(lockedBefore);
         const deletions = changes.filter((c) => c.to > c.from);
-        expect(deletions.length).toBe(e.kind === 'add' ? 0 : 1);
+        // an emptied OPTIONAL's `.` on another line is a deletion of its own
+        expect(deletions.length).toBe(e.kind === 'add' ? 0 : deletions.length > 1 ? 2 : 1);
         expect(changes.every((c) => c.to === c.from || c.insert === '')).toBe(true);
+        expect(agrees(p, e, after), `${JSON.stringify(e)}\n${next}`).toBe(true);
         if (e.kind !== 'add') {
-          const placed = triplesOf(p)[e.triple];
+          const placed = resolveEdit(p, e.edge)!;
           const d = deletions[0];
           const named = removalRange(text, placed);
           const g = placed.path[placed.path.length - 1];
@@ -355,13 +598,13 @@ describe.skipIf(!existsSync(built))('the built module', async () => {
           expect(count(now)).toBe(count(before) + 1);
         } else if (e.kind === 'delete') {
           expect(now.length).toBe(before.length - 1);
-          const gone = triplesOf(p)[e.triple].triple;
+          const gone = resolveEdit(p, e.edge)!.triple;
           const word = `${gone.s.text} ${gone.p.text} ${gone.o.text}`;
           const count = (xs: string[]) => xs.filter((x) => x.replace(/ \?$/, '') === word).length;
           expect(count(now)).toBe(count(before) - 1);
         } else {
           expect(now.length).toBe(before.length);
-          const t = triplesOf(p)[e.triple];
+          const t = resolveEdit(p, e.edge)!;
           const word = `${t.triple.s.text} ${t.triple.p.text} ${t.triple.o.text}`;
           const flipped = t.path.length > 1 ? word : `${word} ?`;
           expect(now).toContain(flipped);

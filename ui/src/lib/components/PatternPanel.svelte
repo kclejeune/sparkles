@@ -25,13 +25,15 @@
     readonly?: boolean;
     /** a bottom sheet on a phone */
     sheet?: boolean;
-    ondelete?: (triple: number) => void;
-    onoptional?: (triple: number) => void;
+    /** the edit, by the id of the triple's edge */
+    ondelete?: (edge: string) => void;
+    onoptional?: (edge: string) => void;
     onclose: () => void;
   } = $props();
 
   const lineOf = (offset: number) => text.slice(0, offset).split('\n').length;
   const triple = $derived('edge' in el ? el.edge.triple : undefined);
+  const edgeId = $derived('edge' in el ? el.edge.id : '');
   const locked = $derived('node' in el ? el.node.locked : undefined);
 </script>
 
@@ -51,12 +53,12 @@
       <button
         class="btn sm"
         disabled={readonly}
-        onclick={() => onoptional?.(triple.order)}
+        onclick={() => onoptional?.(edgeId)}
         aria-pressed={triple.path.length > 1}
       >
         {triple.path.length > 1 ? 'Required' : 'Optional'}
       </button>
-      <button class="btn sm danger" disabled={readonly} onclick={() => ondelete?.(triple.order)}>
+      <button class="btn sm danger" disabled={readonly} onclick={() => ondelete?.(edgeId)}>
         <Icon name="trash" size={13} /> Delete
       </button>
     </div>

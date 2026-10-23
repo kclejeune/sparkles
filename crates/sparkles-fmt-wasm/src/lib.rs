@@ -129,7 +129,8 @@ fn run_lint(request: &str) -> Result<J, J> {
     }
 }
 
-/// The pattern of a query for the visual query builder (spec U08 §3.2): `{ text }` in,
+/// The pattern of a query for the visual query builder (spec U08 §3.2): `{ text, strict? }`
+/// in (`strict` adds the server parser's checks, for the text of a canvas edit),
 /// and out either `{ ok: true, form, prologue, root, projection, limit, offset,
 /// modifiers, locked }` or `{ ok: false, error, line, column }` (`code: "update"` for an
 /// update request, `"bad-request"` for a request that is not `{ text }`). Every range is
@@ -149,7 +150,18 @@ fn run_pattern(request: &str) -> Result<J, J> {
         .get("text")
         .and_then(J::as_str)
         .ok_or_else(|| fail("bad-request", "expected `text`, the query", 0, 0))?;
-    match sparkles_fmt::pattern::pattern(text) {
+    let strict = match body.get("strict") {
+        None | Some(J::Null) => false,
+        Some(J::Bool(b)) => *b,
+        Some(_) => return Err(fail("bad-request", "`strict` must be true or false", 0, 0)),
+    };
+    let answer = sparkles_fmt::pattern::pattern(text);
+    // the server's own checks too, for the text of a canvas edit
+    let answer = match answer {
+        Ok(p) if strict => sparkles_fmt::pattern::check(text).map(|()| p),
+        other => other,
+    };
+    match answer {
         Ok(p) => Ok(pattern_json(text, &p)),
         Err(PatternError::Update) => Err(fail(
             "update",
@@ -213,6 +225,7 @@ fn pattern_json(text: &str, p: &Pattern) -> J {
         "ok": true,
         "form": p.form.name(),
         "prologue": {
+            "base": p.base,
             "prefixes": p.prefixes.iter().map(|x| json!({
                 "prefix": x.prefix, "iri": x.iri, "range": u.range(&x.range),
             })).collect::<Vec<J>>(),
@@ -268,10 +281,12 @@ fn item_json(u: &Units, i: &Item) -> J {
             "vars": f.vars,
             "text": f.text,
             "range": u.range(&f.range),
+            "dot": f.dot.as_ref().map(|d| u.range(d)),
         }),
         Item::Group(g) => {
             let mut j = group_json(u, g);
             j["type"] = json!("group");
+            j["dot"] = json!(g.dot.as_ref().map(|d| u.range(d)));
             j
         }
         Item::Locked(l) => {
@@ -301,7 +316,10 @@ fn path_json(p: &Path) -> J {
 }
 
 fn locked_json(u: &Units, l: &Locked) -> J {
-    json!({ "kind": l.kind, "vars": l.vars, "text": l.text, "range": u.range(&l.range) })
+    json!({
+        "kind": l.kind, "vars": l.vars, "text": l.text, "range": u.range(&l.range),
+        "end": u.at(l.end), "dot": l.dot.as_ref().map(|d| u.range(d)),
+    })
 }
 
 /// A finding as `POST /$/lint` writes it: lines and columns as `sparkles lint` prints
@@ -639,6 +657,21 @@ mod tests {
         );
         let r = call_pattern(json!({ "text": "DELETE WHERE { ?s ?p ?o }" }));
         assert_eq!(r["code"], "update");
+        // the lossless parser takes a scope error; the strict check does not
+        let scope = "SELECT * { ?s ?p ?o BIND(1 AS ?o) }";
+        assert_eq!(call_pattern(json!({ "text": scope }))["ok"], true);
+        let r = call_pattern(json!({ "text": scope, "strict": true }));
+        assert_eq!(
+            (r["ok"].as_bool(), r["code"].as_str()),
+            (Some(false), Some("syntax"))
+        );
+        // an undeclared prefix passes, as Run declares it
+        let r = call_pattern(json!({ "text": "SELECT * { ?s ex:p ?o }", "strict": true }));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(
+            call_pattern(json!({ "text": "ASK {}", "strict": 1 }))["code"],
+            "bad-request"
+        );
         assert_eq!(call_pattern(json!({ "nope": 1 }))["code"], "bad-request");
         assert_eq!(pattern("{"), pattern("{"));
         assert!(pattern("{").contains("bad-request"));

@@ -16,6 +16,7 @@
   import { onDestroy, onMount, tick } from 'svelte';
   import { LocalUnavailable, patternLocal, patternNow } from '$lib/fmt-wasm';
   import {
+    agrees,
     announcement,
     applyChanges,
     describe,
@@ -106,9 +107,15 @@
     error = null;
     const next = drawingOf(a);
     if (tab && drawn) {
-      // a variable renamed in the editor keeps its place
-      const r = renamed(drawn, next);
-      if (r) layouts.rename(tab, r[0], r[1]);
+      // a variable renamed in the editor keeps its place, with its literals
+      for (const [from, to] of renamed(drawn, next) ?? []) layouts.rename(tab, from, to);
+    }
+    // the open panel follows its element by id, or closes when it is gone
+    if (selected) {
+      const id = 'node' in selected ? selected.node.id : selected.edge.id;
+      const node = next.nodes.find((n) => n.id === id);
+      const edge = node ? undefined : next.edges.find((x) => x.id === id);
+      selected = node ? { node } : edge ? { edge } : null;
     }
     const map = tab ? layouts.get(tab, text) : (layouts.stored(text) ?? {});
     layout = kept(
@@ -170,28 +177,27 @@
       if (!now?.ok) return;
       show(text, now, 0);
     }
+    const refuse = (why: string) => {
+      live = why;
+      if (e.kind === 'add') addError = why;
+    };
     let changes: Change[];
     try {
       changes = editOf(drawnText, answer, e);
     } catch (err) {
-      if (err instanceof EditError) {
-        live = err.message;
-        if (e.kind === 'add') addError = err.message;
-        return;
-      }
+      if (err instanceof EditError) return refuse(err.message);
       throw err;
     }
-    // a canvas edit never lands in broken text
+    // a canvas edit never lands in text the server would refuse, and the parse of the
+    // result must be the pattern the edit describes (R3)
     const next = applyChanges(drawnText, changes);
-    const check = patternNow(next);
-    if (check && !check.ok) {
-      const why = `That edit would not parse: ${check.error}`;
-      live = why;
-      if (e.kind === 'add') addError = why;
-      return;
-    }
+    const check = patternNow(next, true);
+    if (!check) return refuse('The browser module is not ready, so the edit was not made');
+    if (!check.ok) return refuse(`That edit would not parse: ${check.error}`);
+    if (!agrees(answer, e, check))
+      return refuse('That edit would change more of the pattern than it names, so it was not made');
     onedit!(changes);
-    if (check?.ok) live = announcement(e, answer, drawingOf(check));
+    live = announcement(e, answer, drawingOf(check));
     selected = null;
     if (e.kind === 'add') {
       addS = addP = addO = '';
@@ -201,17 +207,21 @@
 
   function addTriple(ev: SubmitEvent) {
     ev.preventDefault();
-    // a prefixed name the query does not declare, declared for the dataset
+    // prefixed names the query does not declare, declared for the dataset
     const declared = new Set(answer?.prologue.prefixes.map((p) => p.prefix));
-    const pn = [addS, addP, addO]
-      .map((t) => /^([A-Za-z][\w.-]*):/.exec(t.trim())?.[1])
-      .find((p) => p && !declared.has(p) && prefixes[p]);
+    const declare = [
+      ...new Set(
+        [addS, addP, addO]
+          .map((t) => /^([\p{L}][\p{L}\p{N}_.-]*)?:/u.exec(t.trim())?.[1] ?? null)
+          .filter((p): p is string => p !== null && !declared.has(p) && !!prefixes[p]),
+      ),
+    ].map((prefix) => ({ prefix, iri: prefixes[prefix] }));
     apply({
       kind: 'add',
       s: addS,
       p: addP,
       o: addO,
-      ...(pn ? { declare: { prefix: pn, iri: prefixes[pn] } } : {}),
+      ...(declare.length ? { declare } : {}),
     });
   }
 
@@ -221,33 +231,38 @@
     root?.querySelector<HTMLInputElement>('input[name="pattern-s"]')?.focus();
   }
 
-  function key(e: KeyboardEvent, el: Focusable | null) {
+  /** Undo, redo and Escape anywhere in the pane but its text inputs, the canvas, the list
+   * and the panel alike. */
+  function paneKey(e: KeyboardEvent) {
+    const t = e.target as HTMLElement | null;
+    if (t?.closest('input, textarea, select, [contenteditable="true"]')) return;
     const mod = e.ctrlKey || e.metaKey;
-    if (mod && (e.key === 'z' || e.key === 'Z')) {
+    if (mod && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
       e.preventDefault();
       if (e.shiftKey) onredo?.();
       else onundo?.();
-      return;
-    }
-    if (mod && e.key === 'y') {
+    } else if (mod && !e.altKey && (e.key === 'y' || e.key === 'Y')) {
       e.preventDefault();
       onredo?.();
-      return;
+    } else if (e.key === 'Escape' && !mod) {
+      e.preventDefault();
+      if (selected) {
+        selected = null;
+        canvas?.focus();
+      } else onescape?.();
     }
-    if (e.key === 'Escape') {
+  }
+
+  /** The canvas's own keys on the focused element; the pane's keys bubble to `paneKey`. */
+  function key(e: KeyboardEvent, el: Focusable | null) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const edge = el && 'edge' in el && el.edge.triple ? el.edge.id : undefined;
+    if ((e.key === 'Delete' || e.key === 'Backspace') && edge) {
       e.preventDefault();
-      if (selected) selected = null;
-      else onescape?.();
-      return;
-    }
-    if (mod || e.altKey) return;
-    const triple = el && 'edge' in el ? el.edge.triple : undefined;
-    if ((e.key === 'Delete' || e.key === 'Backspace') && triple) {
+      apply({ kind: 'delete', edge });
+    } else if ((e.key === 'o' || e.key === 'O') && edge) {
       e.preventDefault();
-      apply({ kind: 'delete', triple: triple.order });
-    } else if ((e.key === 'o' || e.key === 'O') && triple) {
-      e.preventDefault();
-      apply({ kind: 'optional', triple: triple.order });
+      apply({ kind: 'optional', edge });
     } else if ((e.key === 'n' || e.key === 'N') && canEdit) {
       e.preventDefault();
       void openAdd();
@@ -286,10 +301,13 @@
   });
 </script>
 
+<!-- the pane's shortcuts reach it from every control inside; see paneKey -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <section
   class="ppane"
   class:phone
   bind:this={root}
+  onkeydown={paneKey}
   aria-label={readonly ? 'Pattern of the query that ran' : 'Pattern'}
   data-parse-ms={timing.parseMs.toFixed(2)}
   data-draw-ms={timing.drawMs.toFixed(2)}
@@ -426,8 +444,8 @@
               text={drawnText}
               readonly={!canEdit}
               sheet={phone}
-              ondelete={(i) => apply({ kind: 'delete', triple: i })}
-              onoptional={(i) => apply({ kind: 'optional', triple: i })}
+              ondelete={(edge) => apply({ kind: 'delete', edge })}
+              onoptional={(edge) => apply({ kind: 'optional', edge })}
               onclose={() => (selected = null)}
             />
           {/if}
@@ -436,19 +454,18 @@
         <ol class="plist" aria-label="Pattern elements in text order">
           {#each rows as row, i (i)}
             {@const triple = 'edge' in row ? row.edge.triple : undefined}
+            {@const edge = 'edge' in row ? row.edge.id : ''}
             <li class:locked={'node' in row && !!row.node.locked}>
               <span class="desc">{describe(row, drawn)}</span>
               {#if triple && canEdit}
-                <button
-                  class="btn sm"
-                  onclick={() => apply({ kind: 'optional', triple: triple.order })}
+                <button class="btn sm" onclick={() => apply({ kind: 'optional', edge })}
                   >{triple.path.length > 1 ? 'Required' : 'Optional'}</button
                 >
                 <button
                   class="btn sm danger"
                   aria-label="Delete {triple.triple.s.text} {triple.triple.p.text} {triple.triple.o
                     .text}"
-                  onclick={() => apply({ kind: 'delete', triple: triple.order })}
+                  onclick={() => apply({ kind: 'delete', edge })}
                   ><Icon name="trash" size={12} /></button
                 >
               {/if}
