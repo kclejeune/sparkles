@@ -1134,6 +1134,146 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/graphrag/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the state of the community reports
+         * @description The settings in force, the reports by status, the communities by level and the last build. A caller for whom the reports graph is not proven gets `available: false` and nothing derived from the reports. A dataset admin also gets the budget and the accounting anomalies.
+         */
+        get: operations["getGraphrag"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graphrag/{ds}/build": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Build the community reports
+         * @description Starts a task of kind `graphrag` that writes a report for every community. Without `confirm` the task records its estimate in its `detail` and waits for `POST /$/graphrag/{ds}/confirm`. Needs `admin` on the dataset, and GraphRAG enabled in its settings.
+         */
+        post: operations["buildGraphrag"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graphrag/{ds}/communities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the communities
+         * @description The communities of the reports graph with their reports' titles, statuses and ratings, read through the caller's view.
+         */
+        get: operations["listCommunities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graphrag/{ds}/community": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a community and its report
+         * @description A community with its members, its children and its report with findings and citations, read through the caller's view. A community the caller may not read is a `404`.
+         */
+        get: operations["getCommunity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graphrag/{ds}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Answer a build's estimate
+         * @description Confirms or refuses the estimate of a task that waits for it. Needs `admin` on the dataset.
+         */
+        post: operations["confirmGraphrag"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graphrag/{ds}/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Refresh the community reports
+         * @description Starts a task of kind `graphrag` that rewrites the reports of communities that changed. Without `confirm` the task records its estimate in its `detail` and waits for `POST /$/graphrag/{ds}/confirm`. Needs `admin` on the dataset, and GraphRAG enabled in its settings.
+         */
+        post: operations["refreshGraphrag"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graphrag/{ds}/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Review a community report
+         * @description Sets a report's status to `reviewed` or `rejected`, or supersedes it with a person's edit of its title or summary. Needs `write` on the dataset and a reports graph the caller may read.
+         */
+        post: operations["reviewCommunityReport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/history/{ds}": {
         parameters: {
             query?: never;
@@ -4473,6 +4613,7 @@ export interface components {
              * @example merge
              * @example revert
              * @example cherry-pick
+             * @example graphrag
              * @example unknown
              */
             kind: string;
@@ -5455,6 +5596,133 @@ export interface components {
             };
             /** @enum {string} */
             state: "ready" | "building" | "failed" | "over-budget";
+        };
+        /** @description A build or a refresh of a dataset's community reports. */
+        GraphragBuildRequest: {
+            /** @description Start without waiting for a confirmation of the estimate. The default is `false`, and the task then waits for `POST /$/graphrag/{ds}/confirm`. */
+            confirm?: boolean;
+        };
+        /** @description The communities of the reports graph, by level and then by rating. */
+        GraphragCommunities: {
+            available: boolean;
+            communities: {
+                iri: string;
+                level?: number;
+                memberCount?: number;
+                parent?: string | null;
+                report?: {
+                    iri: string;
+                    rating?: number;
+                    /** @enum {string} */
+                    status?: "unreviewed" | "reviewed" | "rejected" | "stale" | "failed";
+                    title?: string;
+                } | null;
+            }[];
+            reportsGraph?: string;
+        };
+        /** @description A community with its members, children and report. */
+        GraphragCommunity: {
+            children?: {
+                iri: string;
+                title?: string | null;
+            }[];
+            factCount?: number;
+            iri: string;
+            level?: number;
+            memberCount?: number;
+            /** @description Up to 500 members. */
+            members?: {
+                iri: string;
+                label?: string | null;
+            }[];
+            parent?: string | null;
+            report?: {
+                activity?: {
+                    inputTokens?: number;
+                    model?: string;
+                    outputTokens?: number;
+                    startedAt?: string;
+                };
+                droppedCitations?: number | null;
+                droppedUnsupported?: number | null;
+                failure?: string | null;
+                findings?: {
+                    about?: string[];
+                    /** @description Cited facts as N-Triples triple terms, reifiers, and cited child findings. */
+                    cites?: string[];
+                    text: string;
+                    unmatchedNames?: string[];
+                }[];
+                iri: string;
+                rating?: number | null;
+                revisionOf?: string | null;
+                sourceCommit?: number | null;
+                /** @enum {string} */
+                status?: "unreviewed" | "reviewed" | "rejected" | "stale" | "failed";
+                summary?: string | null;
+                title?: string | null;
+            };
+        };
+        /** @description The answer to a build's estimate. */
+        GraphragConfirmRequest: {
+            /** @description `true` (the default) starts the run, and `false` ends it without sending anything. */
+            confirm?: boolean;
+            /** @description The id of the waiting task. */
+            task: string;
+        };
+        /** @description A review of a community report. */
+        GraphragReviewRequest: {
+            /** @description The report's IRI. */
+            report: string;
+            /** @enum {string} */
+            status?: "reviewed" | "rejected";
+            summary?: string;
+            /** @description A new title. With `title` or `summary` the edit is a new report with status `reviewed` that supersedes this one. */
+            title?: string;
+        };
+        GraphragReviewResult: {
+            commit?: number | null;
+            report: string;
+            /** @enum {string} */
+            status: "unreviewed" | "reviewed" | "rejected" | "stale" | "failed";
+        };
+        /** @description The state of a dataset's community reports. */
+        GraphragStatus: {
+            /** @description For a dataset admin only. */
+            anomalies?: {
+                [key: string]: unknown;
+            }[];
+            /** @description Whether the caller may read the reports graph. When it is `false`, the answer holds nothing derived from the reports. */
+            available: boolean;
+            /** @description For a dataset admin only. */
+            budget?: {
+                tokensPerBuild?: number;
+                tokensPerDay?: number;
+                usedToday?: number;
+            };
+            dataset: string;
+            enabled: boolean;
+            lastBuild?: {
+                branch?: string;
+                /** Format: date-time */
+                finishedAt?: string;
+                /** @description The communities the last run left for a later one. */
+                pending?: number;
+                sourceCommit?: number;
+                tokens?: number;
+            };
+            levels?: {
+                communities: number;
+                level: number;
+            }[];
+            reason?: string;
+            /** @enum {string} */
+            refresh?: "manual" | "auto";
+            /** @description The current reports by status. */
+            reports?: {
+                [key: string]: number;
+            };
+            reportsGraph: string;
         };
         /** @description The recorded changes that match a history query, in N-Triples syntax. */
         HistoryChanges: {
@@ -7491,7 +7759,7 @@ export interface components {
             /** @description The entity tag of the runtime layer, as in the `ETag` header. */
             etag: string;
             /** @enum {string} */
-            kind: "assistant" | "memory" | "ingest" | "prefixes";
+            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag";
             /** @description The fields the settings file locks. */
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
@@ -7939,6 +8207,7 @@ export interface components {
              * @example backup-verify
              * @example backup-gc
              * @example backup-policy
+             * @example graphrag
              */
             kind: string;
             message?: string;
@@ -8771,8 +9040,8 @@ export interface components {
         ifMatch: string;
         /** @description Entity tags, or `*`. */
         ifNoneMatch: string;
-        /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
-        kind: "assistant" | "memory" | "ingest" | "models" | "notifications";
+        /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+        kind: "assistant" | "memory" | "ingest" | "graphrag" | "models" | "notifications";
         /** @description The page size. */
         limit: number;
         /** @description A lower budget of the serialized result, in MiB. */
@@ -11523,6 +11792,222 @@ export interface operations {
                     };
                 };
             };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getGraphrag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphragStatus"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    buildGraphrag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["GraphragBuildRequest"];
+            };
+        };
+        responses: {
+            /** @description The task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCommunities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The communities. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphragCommunities"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getCommunity: {
+        parameters: {
+            query?: {
+                /** @description The community's IRI. */
+                iri?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The community. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphragCommunity"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    confirmGraphrag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphragConfirmRequest"];
+            };
+        };
+        responses: {
+            /** @description The answer was recorded. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    refreshGraphrag: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["GraphragBuildRequest"];
+            };
+        };
+        responses: {
+            /** @description The task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            503: components["responses"]["Unavailable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    reviewCommunityReport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphragReviewRequest"];
+            };
+        };
+        responses: {
+            /** @description The review. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphragReviewResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
@@ -14361,7 +14846,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -14391,7 +14876,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -14432,7 +14917,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -14465,7 +14950,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -14552,7 +15037,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -14584,7 +15069,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -14627,7 +15112,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -14662,7 +15147,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory` or `ingest` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;

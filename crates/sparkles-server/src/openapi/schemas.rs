@@ -309,7 +309,7 @@ pub(super) fn schemas() -> Map<String, J> {
             &["id", "kind", "dataset", "state", "startedAt", "cancellable"],
             json!({
                 "id": { "type": "string" },
-                "kind": { "type": "string", "examples": ["compact", "backup", "reason", "load", "clone", "text-rebuild", "geo-index", "backup-create", "backup-restore", "backup-verify", "backup-gc", "backup-policy"] },
+                "kind": { "type": "string", "examples": ["compact", "backup", "reason", "load", "clone", "text-rebuild", "geo-index", "backup-create", "backup-restore", "backup-verify", "backup-gc", "backup-policy", "graphrag"] },
                 "dataset": { "type": "string", "description": "Empty for a server-wide task." },
                 "target": { "type": "string" },
                 "state": string_enum(&["queued", "running", "done", "failed", "cancelled"]),

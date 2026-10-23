@@ -109,6 +109,15 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/ingest/{ds}/{task}/approve", &["POST"]),
     // assistant settings and the caller's own ask history (C18 §3.5, §6.4)
     ("/$/assistant/{ds}", &["GET", "PUT"]),
+    // GraphRAG community reports (C22 §2.2, §2.3): the routes decide coverage of the
+    // reports graph with the guard of every other read path
+    ("/$/graphrag/{ds}", &["GET"]),
+    ("/$/graphrag/{ds}/build", &["POST"]),
+    ("/$/graphrag/{ds}/refresh", &["POST"]),
+    ("/$/graphrag/{ds}/confirm", &["POST"]),
+    ("/$/graphrag/{ds}/communities", &["GET"]),
+    ("/$/graphrag/{ds}/community", &["GET"]),
+    ("/$/graphrag/{ds}/review", &["POST"]),
     // layered dataset settings (C19 §6)
     ("/$/settings", &["GET"]),
     ("/$/settings/{ds}", &["GET"]),
@@ -341,6 +350,14 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ingest/{ds}/{task}/approve" => Dataset(Read),
         "/$/assistant/{ds}" if get => Dataset(Read),
         "/$/assistant/{ds}" => Dataset(Admin),
+        "/$/graphrag/{ds}" | "/$/graphrag/{ds}/communities" | "/$/graphrag/{ds}/community" => {
+            Dataset(Read)
+        }
+        // a build sends the dataset to a provider and spends the dataset's budget
+        "/$/graphrag/{ds}/build" | "/$/graphrag/{ds}/refresh" | "/$/graphrag/{ds}/confirm" => {
+            Dataset(Admin)
+        }
+        "/$/graphrag/{ds}/review" => Dataset(Write),
         // the settings file and the model configuration are the operator's
         "/$/settings" => Server(ServerPerm::ServerAdmin),
         "/$/settings/{ds}" => Dataset(Read),

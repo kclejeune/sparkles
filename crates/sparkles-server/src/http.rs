@@ -312,6 +312,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     // consolidation and retention of agent memory (C18 §8.3, §8.4)
     #[cfg(feature = "mcp")]
     let app = app.merge(crate::ingest::maintain::routes());
+    #[cfg(feature = "mcp")]
+    let app = app.merge(crate::graphrag::http::routes());
     // the MCP endpoint (`serve --mcp`)
     #[cfg(feature = "mcp")]
     let app = match crate::mcp::http::route(&state) {

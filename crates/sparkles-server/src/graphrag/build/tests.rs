@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode, header};
 use sparkles::io::{RdfFormat, Source};
 use tower::ServiceExt;
 
-const ORG: &str = "urn:g:org";
+pub(crate) const ORG: &str = "urn:g:org";
 
 /// Two clusters of `n` people each, every pair of a cluster knowing each other, with
 /// one edge between the clusters and a few literals per person.
@@ -59,13 +59,13 @@ fn answer(r: &Received) -> String {
     .to_string()
 }
 
-struct Fixture {
-    st: Arc<AppState>,
-    app: axum::Router,
-    mock: MockModel,
+pub(crate) struct Fixture {
+    pub(crate) st: Arc<AppState>,
+    pub(crate) app: axum::Router,
+    pub(crate) mock: MockModel,
 }
 
-fn fixture(n: usize) -> Fixture {
+pub(crate) fn fixture(n: usize) -> Fixture {
     let mock = MockModel::start(|r, _| (200, mock::openai(&answer(r))));
     let mut st = AppState::standalone(Default::default(), Duration::from_secs(30));
     let cfg = json!({
@@ -94,7 +94,7 @@ fn fixture(n: usize) -> Fixture {
     Fixture { st, app, mock }
 }
 
-async fn patch(app: &axum::Router, uri: &str, body: Value) -> StatusCode {
+pub(crate) async fn patch(app: &axum::Router, uri: &str, body: Value) -> StatusCode {
     let res = app
         .clone()
         .oneshot(
@@ -127,7 +127,7 @@ fn settings(extra: Value) -> GraphragSettings {
 }
 
 impl Fixture {
-    async fn allow_rows(&self) {
+    pub(crate) async fn allow_rows(&self) {
         assert_eq!(
             patch(
                 &self.app,
@@ -153,7 +153,7 @@ impl Fixture {
         })
     }
 
-    fn rows(&self, q: &str) -> Vec<Vec<String>> {
+    pub(crate) fn rows(&self, q: &str) -> Vec<Vec<String>> {
         let ds = self.st.datasets().get("org").cloned().unwrap();
         let mut v: Vec<Vec<String>> =
             sparql::query(ds.store.snapshot(), q, &QueryOptions::default())
@@ -170,7 +170,7 @@ impl Fixture {
         v
     }
 
-    fn reports(&self) -> Vec<Vec<String>> {
+    pub(crate) fn reports(&self) -> Vec<Vec<String>> {
         self.rows(&format!(
             "SELECT ?c ?r ?s WHERE {{ GRAPH <urn:x-sparkles:graphrag:reports> {{ ?c a <{}> ; <{}> ?r . ?r <{}> ?s }} }}",
             super::super::guard::gr("Community"),

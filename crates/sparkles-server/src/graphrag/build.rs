@@ -1122,6 +1122,9 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
             delete.extend(prep.gone.iter().cloned());
             delete.extend(prep.orphans.iter().cloned());
         }
+        // builds and reviews of one dataset commit one at a time
+        let lock = r.st.graphrag.lock(&r.ds.name);
+        let _held = lock.lock();
         // the principal's view must still be the one the run read (§6.2)
         let now = r.admit().map(|(_, _, p)| p)?;
         let again = r.footprint(&now, prep.snap.commit, &prep.projection_graphs)?;
@@ -1195,4 +1198,4 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

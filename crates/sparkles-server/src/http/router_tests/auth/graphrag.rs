@@ -444,3 +444,63 @@ async fn long_polls_end_when_access_changes() {
     assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
     assert_eq!(r.err()["code"], "access-changed");
 }
+
+/// The GraphRAG routes decide with the same guard: a caller for whom the reports graph
+/// is not proven learns nothing derived from it (§6.4).
+#[tokio::test]
+async fn graphrag_routes_follow_coverage() {
+    let s = server();
+    for u in SEES {
+        let r = get(&s.app, u, "/$/graphrag/rag", "application/json").await;
+        assert_eq!(r.status, StatusCode::OK, "{u}: {}", r.text());
+        let v: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
+        assert_eq!(v["available"], true, "{u}: {v}");
+        assert!(v["reports"].is_object(), "{u}: {v}");
+        // only a dataset admin sees the budget and the anomalies
+        assert_eq!(v["budget"].is_object(), u == "tadmin", "{u}: {v}");
+    }
+    for u in BLIND {
+        let r = get(&s.app, u, "/$/graphrag/rag", "application/json").await;
+        let v: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
+        assert_eq!(v["available"], false, "{u}: {v}");
+        assert!(
+            v.get("reports").is_none() && v.get("levels").is_none(),
+            "{u}: {v}"
+        );
+        let r = get(&s.app, u, "/$/graphrag/rag/communities", "application/json").await;
+        let v: serde_json::Value = serde_json::from_str(&r.text()).unwrap();
+        assert_eq!(v["available"], false, "{u}: {v}");
+        let uri = format!("/$/graphrag/rag/community?iri={}", enc("http://ex/r"));
+        let r = get(&s.app, u, &uri, "application/json").await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{u}");
+        let r = call(
+            &s.app,
+            "POST",
+            "/$/graphrag/rag/review",
+            &[
+                ("authorization", &b(u)),
+                ("content-type", "application/json"),
+            ],
+            r#"{"report":"http://ex/r","status":"reviewed"}"#,
+        )
+        .await;
+        assert!(
+            r.status == StatusCode::NOT_FOUND || r.status == StatusCode::FORBIDDEN,
+            "{u}: {}",
+            r.status
+        );
+    }
+    // a build needs dataset admin
+    let r = call(
+        &s.app,
+        "POST",
+        "/$/graphrag/rag/build",
+        &[
+            ("authorization", &b("tua")),
+            ("content-type", "application/json"),
+        ],
+        "{}",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}

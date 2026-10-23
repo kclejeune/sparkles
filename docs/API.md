@@ -10571,6 +10571,53 @@ configuration names endpoints and keys. The `GET` answer adds `status`, which sa
 whether asking works (`ask`), why not (`reason`), the draft pairs, whether a summary is
 possible, and the history days in force. A `status` member in a `PUT` is ignored.
 
+### GraphRAG
+
+A dataset's GraphRAG settings are the `graphrag` kind of [Settings](#settings), kept in
+`<db>/graphrag.json`. A build reads the dataset as the settings' `principal`, groups the
+projection's resources into the Leiden hierarchy, and has the `community` model role
+write one report per community. The reports are triples in the reports graph, which is
+`urn:x-sparkles:graphrag:reports` by default and must be named under
+`urn:x-sparkles:graphrag:`. Spec C22 describes the build, the checks and the storage.
+
+`POST /$/graphrag/{ds}/build` and `POST /$/graphrag/{ds}/refresh` need `admin` on the
+dataset and start a task of kind `graphrag` in `/$/tasks`. A build writes a report for
+every community. A refresh keeps a report whose members did not change and whose facts
+changed by less than `refresh.minChangedFraction`, and rewrites the others. A rewritten
+report supersedes the old one with `prov:wasRevisionOf`. Without `"confirm": true` the
+task stores its estimate in its `detail` and waits for
+`POST /$/graphrag/{ds}/confirm` with `{"task": "<id>"}`, or with `"confirm": false` to
+end it without sending anything. Only one GraphRAG task of a dataset runs at a time,
+and a second one is a `409`. A task can be cancelled between model calls with
+`DELETE /$/tasks/{id}`. The task's result counts the reports written, kept and failed,
+and the communities left `pending` when the budget or an accounting anomaly stopped the
+run.
+
+```json
+{ "mode": "build", "sourceCommit": 41, "communities": 12, "written": 12, "kept": 0,
+  "failed": 0, "pending": 0, "tokens": 48211, "requests": 12, "commits": [42, 43] }
+```
+
+`GET /$/graphrag/{ds}` needs `read` and reports the settings in force, the current
+reports by status, the communities per level and the last build. A dataset admin also
+gets the budget used today and the accounting anomalies. A caller for whom the reports
+graph is not proven, because its access does not cover everything the build read, gets
+`"available": false` and nothing derived from the reports.
+
+`GET /$/graphrag/{ds}/communities` lists the communities with the title, status and
+rating of each one's report, and `GET /$/graphrag/{ds}/community?iri=` shows one
+community with its members, its children and its report with findings and citations.
+Both read through the caller's view, and a community the caller may not read is a
+`404`.
+
+`POST /$/graphrag/{ds}/review` needs `write` on the dataset and a reports graph the
+caller may read. The body `{"report": "<iri>", "status": "reviewed"}` sets a report's
+status to `reviewed` or `rejected`. A body with `title` or `summary` is an edit. The
+edit is a new report with status `reviewed` that copies the old report's findings and
+citations, supersedes it with `prov:wasRevisionOf`, and is committed with the caller as
+its author. Builds and reviews write commits of kind `graphrag`, whose messages hold no
+report text.
+
 ### Settings
 
 A dataset's `assistant`, `memory`, `ingest` and `prefixes` settings are settings kinds. The

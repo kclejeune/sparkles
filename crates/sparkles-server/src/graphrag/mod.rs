@@ -12,6 +12,8 @@ pub mod budget;
 pub mod build;
 pub mod guard;
 pub mod hierarchy;
+#[cfg(feature = "mcp")]
+pub mod http;
 pub mod identity;
 pub mod ledger;
 pub mod projection;
