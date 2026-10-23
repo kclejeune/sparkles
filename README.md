@@ -190,8 +190,9 @@ package on most of the same queries, and slower on some small lookups.
 
 Sparkles uses more memory than QLever at its peaks in exchange for this speed, mostly for
 a 1 GiB decoded-block cache per dataset that can be made smaller. On SP²Bench and LUBM it
-is fastest on most queries but loses some by large factors, and its default memory budget
-refuses four SP²Bench queries.
+is fastest on most queries but loses some by large factors. Its default memory budget
+refused four SP²Bench queries in the reference run, and later corrections answer two of
+them.
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every measurement, the cost of each memory
 tradeoff and every case where Sparkles loses.
 

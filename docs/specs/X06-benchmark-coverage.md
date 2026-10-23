@@ -1019,5 +1019,18 @@ mixed domains retain the ordinary kernel. No equality is replaced by RDF-term
 unification, and input expressions, OPTIONAL, SERVICE and extension operators are
 outside this admission. Products that fit their existing budgets stay ordinary.
 Explicit streaming retains its existing operators. The fixture establishes
-removed intermediate rows without a latency claim. Full-scale `q5a` acceptance
-and the separate `q4` and `q6` failures remain open.
+removed intermediate rows without a latency claim. The separate `q4` and `q6`
+failures remain open.
+
+The 10M acceptance ran on forge on 2026-10-23 with the original 10,000,091-triple
+input and unchanged defaults. These were an 8 GiB query budget, a 200M-row limit, a
+60 s deadline, automatic execution, the result cache off and spill off. The server
+ran on one CPU with one Rayon thread. `q5a` returned 385,208 rows in 4.23 to 4.25 s
+over three runs. Each answer matched an independent oracle, up to blank-node
+relabeling. The pruned product emitted 1,137,394 rows, which equals the oracle's
+count before DISTINCT, and query memory peaked at 166 MB. The previous build refused
+the query because its 924,047,440,470-row product exceeded the row limit. The guards
+`q8`, `q12b` and repeated automatic `q12a` gave the same answers and times on both
+builds. These are diagnostic timings without the forge trim protocol, so the
+reference numbers wait for item 1's refresh. The product itself runs on one thread,
+and it takes about 3.4 s of the 3.8 s execution.

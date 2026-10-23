@@ -87,9 +87,11 @@ On larger and standard workloads:
   materializes in 17.3 s, Sparkles is fastest on 11 of 14 queries. QLever is 3.7× faster
   on `q2`, and Fluree has lower means on `q1` and `q3`, where Sparkles has the lower
   medians.
-* **SP²Bench at 10M triples.** Sparkles answers 13 of 17 queries and is fastest on 11. Its
-  default query memory budget refuses `q4`, `q5a`, `q6` and `q12a`, and Jena is 181× faster
-  on `q8` and Oxigraph about 5,000× on `q12b`.
+* **SP²Bench at 10M triples.** In the reference run Sparkles answers 13 of 17 queries and
+  is fastest on 11. Its default query memory budget refuses `q4`, `q5a`, `q6` and `q12a`,
+  and Jena is 181× faster on `q8` and Oxigraph about 5,000× on `q12b`. A later diagnostic
+  run answers `q5a` and `q12a` and takes 9 ms on `q8` and 7 ms on `q12b`, pending the
+  refreshed reference run.
 * **BSBM Explore at 10M triples.** Sparkles has the lowest pooled median on eight of
   eleven templates. Fluree is 2.9× faster on q5, and Oxigraph is faster on q7 and q8.
 * **BSBM BI at 10M triples.** QLever is 12.6× faster on q2 and 1.37× on q3, whose
@@ -362,8 +364,13 @@ excludes the optimizer's work.
 The `q12a` follow-up selects the existing ASK cursor for a bounded pure
 variable-equality filter over an over-budget Cartesian candidate estimate. It
 preserves the query's limits and can stop after a qualifying binding. This does
-not replace the historical error or timing cells above. Its 10M acceptance remains
-open, along with the `q4`, `q5a` and `q6` default-budget failures.
+not replace the historical error or timing cells above.
+
+A diagnostic run on forge on 2026-10-23, without the trim protocol, checked the later
+corrections at 10M under the default budgets. String equality pruning lets `q5a`
+return its 385,208 rows in 4.2 s, with answers that match an independent oracle.
+`q12a` answered in 0.07 s, `q8` in 9 ms and `q12b` in 7 ms. The table keeps the
+earlier reference run until item 1 repeats it. `q4` and `q6` are still refused.
 
 Sparkles loads the data in 4.12 s, against 8.90 s for Fluree, 9.70 s for QLever, 20.49 s
 for Oxigraph and 44.88 s for TDB2. Its index takes 307 MiB on disk, against QLever's
@@ -2342,11 +2349,11 @@ than 10%. Fluree's warm advantage on `star-lookup` at 1.05M is within 10%.
 
 | Case | Reference advantage | Qualification |
 |---|---|---|
-| SP²Bench `q8` and `q12b`, 10M | Jena 181× on `q8`, Oxigraph about 5,000× and Jena about 2,900× on `q12b` | Sparkles' plan produces 555,607,405 rows for the one-row ASK of `q12b`. |
+| SP²Bench `q8` and `q12b`, 10M | Jena 181× on `q8`, Oxigraph about 5,000× and Jena about 2,900× on `q12b` | The reference plan produced 555,607,405 rows for the one-row ASK of `q12b`. A later diagnostic run with the UNION correction answers `q8` in 9 ms and `q12b` in 7 ms. |
 | WatDiv `L3-1`, 10.97M | Fluree 1.21× | Sparkles has the lowest mean on all 20 template aggregates and 84 of 88 instances. This individual instance is 21% slower in the refreshed run. |
 | BSBM Explore `q5`, `q7` and `q8`, 10M | Fluree 2.9× on `q5`, Oxigraph 1.2× on `q7` and 1.4× on `q8` | Pooled medians cover three instances per template. Wrong answers are excluded from the ranking. |
 | BSBM BI `q2` and `q3`, 10M | QLever 12.6× on `q2` and 1.37× on `q3` | The three fixed-instance answer checks agree. The generated driver mix still fails on a Sparkles budget refusal. |
-| SP²Bench `q4`, `q5a`, `q6` and `q12a`, 10M | Jena answers `q6` and `q12a`, and Oxigraph `q12a` | Sparkles' default query memory budget refuses all four. No engine finished `q4` or `q5a`. |
+| SP²Bench `q4`, `q5a`, `q6` and `q12a`, 10M | Jena answers `q6` and `q12a`, and Oxigraph `q12a` | The reference run refused all four. A later diagnostic run answers `q5a` in 4.2 s and `q12a` in 0.07 s, and `q4` and `q6` are still refused. |
 | LUBM(100) `q2` | QLever 3.7× | Sparkles is fastest on 11 of 14 queries. |
 | LUBM(100) `q1` and `q3` means | Fluree 1.19× and 1.22× | Sparkles' medians are lower, so the means reflect slow outliers. |
 | Single-triple update latency in the suite | Oxigraph 1.51× and QLever 1.39× at 1.05M, Oxigraph 1.59×, QLever 1.35× and Fluree 1.15× at 10.5M | Sparkles takes 5.3 and 5.4 ms per request including curl, and synchronizes each acknowledgment. Oxigraph does not synchronize its WAL, and QLever keeps updates in memory. |

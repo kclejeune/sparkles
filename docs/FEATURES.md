@@ -357,9 +357,10 @@ that work by priority and links each item to its design spec.
   need native latency acceptance. Spatial and embedding acceptance also remain open. [Roadmap](ROADMAP.md) item 86 and
   [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates).
 * **SP²Bench query budgets.** The selective UNION rewrite covers `q8` and `q12b`.
-  The remaining budget work includes `q4` memory use, the large candidate products
-  before equality filters in `q5a` and `q6`. The bounded automatic ASK policy covers
-  `q12a`; published reference acceptance remains open. [Roadmap](ROADMAP.md) item 91.
+  The bounded automatic ASK policy covers `q12a`, and string equality pruning lets
+  `q5a` answer at 10M within the default budgets. The remaining budget work is `q4`
+  memory use and the candidate product before the equality filter in `q6`. Reference
+  timings at 10M wait for the benchmark refresh. [Roadmap](ROADMAP.md) item 91.
 * **Inference.** Inference is forward materialization, plus Jena's RDFS on read. There
   are no other on-the-fly rules and no backward (LP) rules. Derived facts still use
   the ordinary inferred graph. A separate derived-fact layer and canonical
