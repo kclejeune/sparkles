@@ -400,7 +400,7 @@ a disclosure footprint that the build records, and a common guard applies it to 
 read path. No report is published before both exist. Ask and `recall` use reports only
 for callers who may read them, and otherwise answer locally and say so. A dataset whose
 readers have different views could define several GraphRAG configurations, each with
-its own principal and reports graph. That is deferred to roadmap item 99, and §13 holds
+its own principal and reports graph. That is deferred to roadmap item 100, and §13 holds
 the design.
 
 The model sees the facts of the principal's view. C18 §3.5's `sendByProvider` applies:
@@ -669,7 +669,7 @@ and CLI, the Communities tab, the inbox kind, and manual refresh.
 
 **Phase 2.** Global answering in Ask with classification and the mode switch, community
 context in `recall` and the brief, `community_reports`, and the evaluation. Several
-configurations per dataset moved to roadmap item 99.
+configurations per dataset moved to roadmap item 100.
 
 **Phase 3.** Automatic refresh from the change feed, then from an F13 view.
 
@@ -747,7 +747,7 @@ configurations per dataset moved to roadmap item 99.
    time would serve datasets that never build. The default chosen is a local answer.
 3. **Multilingual reports.** One `language` per configuration. Reports in several
    languages would multiply cost.
-4. **Several configurations per dataset.** Deferred to roadmap item 99, since no
+4. **Several configurations per dataset.** Deferred to roadmap item 100, since no
    deployment needs it yet and it changes the state format. The proposed design keeps
    today's single object valid and also accepts `{configurations: [{name, ...}]}`, each
    entry with its own principal, projection and reports graph. The routes take
@@ -876,7 +876,7 @@ fallbacks, so a large model that has a small fallback makes more, smaller calls,
 exchange for a failover that never sends a batch its pair cannot read. A global answer reads main at its head,
 so an ask with `at` or another branch answers locally. The context of §7.3 is on, and the
 evaluation decides whether it stays on. The evaluation of §9 remains, and several
-configurations per dataset are deferred to roadmap item 99 with the design in §13.
+configurations per dataset are deferred to roadmap item 100 with the design in §13.
 
 The contracts that the first draft left open are settled in §14. Token budgets use
 conservative reservations before every HTTP attempt, and findings carry entity numbers
