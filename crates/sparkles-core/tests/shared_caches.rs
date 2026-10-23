@@ -59,9 +59,14 @@ fn datasets_share_one_block_cache_and_count_their_own_bytes() {
     assert_eq!(usage[&a.cache().namespace()].bytes, ab);
     // each view counts its own lookups
     assert!(a.cache().misses() > 0 && b.cache().misses() > 0);
-    let before = a.cache().hits();
-    run(&a, Q);
-    assert!(a.cache().hits() > before);
+    // two lookups in the same block: the first decodes it, the second finds it cached.
+    // Rerunning Q would find its answer in the result cache, and planning takes the
+    // predicates' counts from the statistics, so neither would read a block.
+    let (ha, hb) = (a.cache().hits(), b.cache().hits());
+    assert_eq!(run(&a, "SELECT ?o WHERE { <urn:s5> <urn:p> ?o }"), 1);
+    assert_eq!(run(&a, "SELECT ?o WHERE { <urn:s6> <urn:p> ?o }"), 1);
+    assert!(a.cache().hits() > ha);
+    assert_eq!(b.cache().hits(), hb);
 }
 
 #[test]

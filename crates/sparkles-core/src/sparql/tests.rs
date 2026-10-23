@@ -2071,3 +2071,21 @@ fn union_default_graph_per_request() {
         assert_eq!(st.inserted, 4);
     }
 }
+
+/// Planning a pattern that binds only its predicate takes the predicate's count from the
+/// statistics, so it decodes no block on a cold cache (spec X07, the remaining cold
+/// gaps). Before, the count decoded both end blocks of the predicate's range.
+#[test]
+fn planning_a_predicate_pattern_decodes_no_block() {
+    let s = store();
+    let snap = s.snapshot();
+    let before = snap.cache.misses();
+    let (_, plan) = explain(
+        snap.clone(),
+        "SELECT ?s ?n WHERE { ?s <http://xmlns.com/foaf/0.1/name> ?n }",
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.estimated_rows, 4.0, "{plan:?}");
+    assert_eq!(snap.cache.misses(), before, "planning decoded a block");
+}

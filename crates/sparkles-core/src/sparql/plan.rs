@@ -2313,6 +2313,9 @@ impl<'a> Planner<'a> {
             let dedup = gvar.is_none() && gf.multi() && perm != Perm::Gspo;
             let mut est = if prefix.is_empty() {
                 snap.len() as f64
+            } else if let Some(n) = snap.predicate_count(perm, &prefix) {
+                // the same exact count, without decoding the predicate's end blocks
+                n as f64
             } else {
                 snap.count(perm, &prefix)? as f64
             };

@@ -269,9 +269,12 @@ that work by priority and links each item to its design spec.
   built. [Roadmap](ROADMAP.md) item 12.
 
 * **Cold sparse reads.** The constant, scan and result-term prefetch paths and I/O
-  profiling are implemented. Corrected-source warm instruction and read-hint gates,
-  same-host cold targets and the dense-read policy checks remain open. A segmented
-  block layout is deferred until measurements justify it. [Roadmap](ROADMAP.md) item 4.
+  profiling are implemented and pass the warm instruction, warm read-hint and concurrent
+  policy gates. Cold `values-star` and `path-plus` remain slower than Oxigraph at 1.05M
+  and 10.5M, and `star-lookup` at 10.5M. The 1.01B dense-read gate and window sweep are
+  not measured. Planning takes a predicate's row count from the statistics instead of
+  decoding blocks. The remaining cold time of the point lookups is spent decoding whole
+  columns, so a segmented block layout is the next step. [Roadmap](ROADMAP.md) item 4.
 
 * **Weighted betweenness.** Betweenness requires finite, strictly positive stored edge
   weights. Zero-weight shortest-path counting needs defined cycle semantics and a

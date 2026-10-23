@@ -1,7 +1,8 @@
 # X07: Cold sparse reads
 
-> **Status:** implemented in part (Phases 1 and 2). Phases 3 and 4 are not built. Phase 3
-> is deferred until a forge run shows that the remaining cold time is block decoding.
+> **Status:** implemented in part (Phases 1 and 2). Phases 3 and 4 are not built. The
+> measurements of 2026-10-23 attribute the remaining cold time of the point lookups to block
+> decoding, so Phase 3 is the next step.
 >
 > **Phases:** Phase 1 is per-query I/O accounting and a profile of the cold losses.
 > Phase 2 adds batched resolution of a query's constants, first-scan prefetch, a read
@@ -423,7 +424,8 @@ Phase 1 breakdown attributes the remainder to block reads or decoding.
 
 ## Outcome
 
-Phases 1 and 2 are built. Phase 3 and Phase 4 are not.
+Phases 1 and 2 are built. Phase 3 and Phase 4 are not. The [Phase 3 decision](#phase-3-decision)
+records why Phase 3 is the next step.
 
 ### What was built
 
@@ -480,9 +482,9 @@ further candidates, while the normal reader still consumes the requested columns
 is an admission estimate rather than a reservation against other cache users or eviction.
 Focused regressions cover cancellation within one pool wave, an expired deadline with no
 decodes, a final cancellation check, oversized requests, selectivity, duplicates, partial
-tails, cached columns and read-through caches. Remaining source-review repairs and the
-warm, cold and no-profile performance gates are pending on corrected integrated source.
-These correctness checks establish no new performance result or Phase 3 clearance.
+tails, cached columns and read-through caches. These correctness checks establish no
+performance result. The [corrected-source measurements](#corrected-source-measurements)
+below cover the integrated code.
 
 Read-ahead now keeps actual advised compressed-byte coverage separately from examined
 cached blocks. Eager and both cursor consumers use current-block fallback advice if a
@@ -492,8 +494,7 @@ target. It permits at most one next-block extension with a bridged gap of at mos
 A separate examined-span cap bounds traversal through cached or empty spans without
 claiming they were hinted. Repeated calls at one position add no window. The bound is
 on requested coverage rather than physical device I/O. Default, disabled and small-window
-configuration tests retain the same scan-answer assertions. Corrected-source
-performance gates remain pending.
+configuration tests retain the same scan-answer assertions.
 
 Coverage lookup uses the sorted intervals to stop at the first future interval beyond
 the required start. It retains complete-span containment and consumed-prefix pruning.
@@ -512,8 +513,7 @@ hints, disabled automatic look-ahead, advice issued before the profile, partial 
 invalid IDs and early callback or reservation errors. A Linux test evicts only a private
 file's offset pages and independently checks a middle page with `mincore` before lookup.
 The profile then reports that page absent before the read and resident afterward.
-Corrected-source cold, warm and no-profile performance gates remain pending. These
-checks establish no speed result.
+These checks establish no speed result.
 
 Profile lifetime transitions now share the page and event state lock. The first start
 initializes that state before publishing profiling as enabled. The last drop disables
@@ -709,65 +709,175 @@ code added to both, the execution ratios became 1.04 and 0.94. A ratio of this s
 microseconds therefore follows code placement rather than added work, and the wall time
 of both queries stays within 1.5% of the base.
 
-### Remaining measurements
+### Corrected-source measurements
 
-Roadmap item 4, §9 and A5 retain the slowdown investigation. The flag ablation that this
-section once proposed does not recreate the base, so it is replaced by an instruction
-count per request. Build the base and the corrected tip in release mode and load the
-1.05M store once for each. Start `sparkles --result-cache-mb 0 serve --timeout 600`
-pinned to one core, send 200 warm-up requests, then measure `instructions:u` with
-`perf stat` over 2,000 further requests and divide. Repeat for `employee-docs`,
-`star-lookup`, `values-star`, `path-plus` and the five shortest queries, and count
-`madvise` calls over one warm pass of every query. The pass condition is `employee-docs`
-within 2% of the base instructions, no query more than 5% above, and no `madvise` call per
-warm query. The timing screen on Namespace and then on forge follows only after that.
-The comparisons need source, binary, input and driver hashes, exact flags, valid answers,
-balanced samples, cold preparation and raw distributions. Historical comparisons against
-`899fb251` remain separate from these corrected-source measurements.
+These measurements of 2026-10-23 compare the engine of main at `b7b6f760` (B) with the
+same source without X07 (A). Later main commits up to `6699f27d` do not touch the read
+path. X07 reached main through two merges. `d370602e` brought the isolated branch
+`20f01c82..8ba362aa`, and `cd54765b` brought the five warm follow-ups. A reverts both
+merges on top of `b7b6f760` and keeps the later work that edited nearby lines, such as the
+`Col` column type and the `decode_ahead` and `grow_input` flags. Of the 5,407 code lines
+that differ between A and B, 5,393 occur in the two X07 patches, and the other 14 are type
+names, a later test fix inside `ioacct.rs`, an array length and formatting. A full revert
+was used because the four flags and window 0 leave X07 paths active, and because a new
+runtime switch would itself be new engine code.
 
-The refresh of 2026-10-18 to 2026-10-19 ran the suite's cold mode on forge with the release
-binary of commit 81478fbe, three restarts per query. Sparkles was fastest on 21 of 28 cold
-queries at 1.05M and on 24 of 28 at 10.5M. Its cold medians were 6.5 and 4.3 ms for
-`path-plus` and 14.9 and 20.2 ms for `star-lookup`. Oxigraph's cold `path-plus` took 2.2
-and 1.6 ms, and its `star-lookup` 15.4 ms at 10.5M. BENCHMARKS.md lists the cold losses. These are refresh figures of one
-build, not comparisons of base and final builds.
+**Warm instructions.** On atlas (Intel i5-13500, the CPU model of forge), each build
+served its own 1.05M store with `sparkles --result-cache-mb 0 serve --timeout 600` pinned
+to one core, and `perf stat -e instructions:u` counted the server over 2,000 requests
+after 200 warm-ups. The rounds ran A, B, B, A, and two rounds of one build agreed within
+0.05%. `scripts/x07-warm-insns.py` runs this protocol.
 
-The quiet forge runs remain pending for the same-host cold targets at 1.05M and 10.5M,
-the warm per-query gates, the 1.01B dense-policy gate A5, concurrent policies A6 and the
-1, 4 and 16 MiB window sweep. The 5% phase performance threshold and the 2% A2 counter-cost
-threshold remain separate from the 10% batch push threshold. The historical observations
-above do not clear these gates on corrected integrated source or establish that the
-slowdown is fixed.
+| Query | B against A | Query | B against A |
+|---|---:|---|---:|
+| `employee-docs` | 1.000 | `count-all` | 1.003 |
+| `star-lookup` | 0.999 | `distinct-obj` | 1.005 |
+| `values-star` | 1.001 | `types-grouped` | 1.002 |
+| `path-plus` | 1.003 | `predicate-counts` | 0.999 |
+| `subquery-agg` | 1.013 | `range-topk` | 1.048 |
+
+The other 18 queries of the suite, at 200 or 20 requests, ran at 0.991 to 1.022 of A.
+`employee-docs` is within the 2% gate, and every query is within 5%, with `range-topk`
+closest to the limit. All answers were identical.
+
+**Warm read hints.** A second server ran under `strace -e trace=madvise`, and each call
+was attributed to a query by its time. B made no read hint in the warm pass of 23 of the
+28 queries. `contains`, `lang-filter`, `regex-iri`, `order-by-full` and `export-500k`
+issue `MADV_WILLNEED` on every warm pass in both builds, as many in B as in A or fewer.
+They come from the vocabulary look-ahead of dense passes (`vocab::Ahead::at`), which
+predates X07 and is deliberate prefetch. The gate measures the warm overhead that X07
+adds, so it counts only hints that X07 adds, and it passes.
+
+**Cold preparation.** Each cold sample evicts every file of the store from the page cache
+with `posix_fadvise(POSIX_FADV_DONTNEED)` and starts a fresh server, which needs no root.
+`fincore` showed no resident page of the store after an eviction. The filesystem was
+trimmed with `fstrim` before the stores were loaded. On forge and atlas, sudo
+authenticates through the forwarded SSH agent, so `fstrim` and `drop_caches` work only
+from a session that forwards the agent, and fail from a detached job.
+
+**Cold A/B on forge.** `bench-regressions.py --cold` took 7 samples per round, in rounds
+A, B, B, A, and 8 more interleaved rounds for the six closest queries. No query of the
+28 is more than 5% slower in B at either size. The largest ratio is `path-plus` at 1.041
+at 10.5M, with overlapping ranges. X07 makes `star-lookup` 41% faster and
+`employee-docs` 30% faster at 10.5M, and 14% and 25% faster at 1.05M.
+
+| Cold, forge, median ms | 1.05M A | 1.05M B | 10.5M A | 10.5M B |
+|---|---:|---:|---:|---:|
+| `star-lookup` | 20.8 | 17.8 | 37.4 | 22.2 |
+| `employee-docs` | 16.5 | 12.4 | 26.3 | 18.4 |
+| `values-star` | 11.6 | 10.6 | 11.3 | 10.1 |
+| `path-plus` | 7.9 | 8.0 | 6.3 | 6.6 |
+
+**Targets.** `bench.sh --mode cold` (median of 3) measured B and Oxigraph 0.5.11 in the
+same run on forge. Fluree was not re-measured.
+
+| Query, cold | 1.05M B | 1.05M Oxigraph | 10.5M B | 10.5M Oxigraph |
+|---|---:|---:|---:|---:|
+| `star-lookup` | 13.2 | 14.9 | 18.8 | 15.4 |
+| `values-star` | 9.2 | 6.3 | 8.9 | 5.7 |
+| `employee-docs` | 12.0 | 15.3 | 15.1 | 14.1 |
+| `path-plus` | 6.5 | 3.8 | 5.7 | 2.2 |
+
+`star-lookup` at 1.05M meets its target, and `employee-docs` at 10.5M is within 1.1 times
+the Oxigraph of the same run. `values-star` misses at both sizes (1.45 and 1.56 times
+Oxigraph), `path-plus` misses at both (1.69 and 2.65 times), and `star-lookup` misses at
+10.5M (1.22 times). `employee-docs` at 1.05M is faster than Oxigraph but its target came
+from Fluree's earlier figure, which was not re-measured.
+
+**A6.** Sixteen concurrent cold point lookups at 10.5M took a median of 13.1 ms alone and
+10.9 ms next to a running `export-500k` in B, so the export did not slow them. No call
+changed the mapping advice after the server was ready. `scripts/x07-concurrent-cold.py`
+runs this check. A6 holds.
+
+**Window sweep.** At 10.5M, 1, 4 and 16 MiB windows gave medians within the noise of each
+other on eleven sparse and dense queries. For example `star-lookup` took 22.0, 21.0 and
+22.6 ms and `export-500k` 128.4, 128.9 and 126.1 ms.
+
+The 1.01B dense gate A5 and the 1.01B window sweep remain open, because no 1.01B store
+was available on forge or atlas. The full counter-cost gate A2 is not isolated by this
+pair, which measures all of X07 together.
+
+### Remaining cold gaps
+
+A cold sample starts a fresh server on an evicted store, and the measurements of
+2026-10-23 found that it costs about as much as a fresh server on a store whose pages are
+all resident. On forge at 10.5M, `star-lookup` took a median of 17.9 ms cold and 14.4 ms
+fresh, and `path-plus` 5.3 ms and 4.9 ms. The page cache misses therefore explain little
+of the gap to Oxigraph, and the cost is CPU time in a process that has not yet run a
+query. `profile=io` on atlas splits a fresh request at 10.5M as follows.
+
+| Query, fresh | Server total ms | Plan ms | Execution ms | Columns decoded | Decoded MiB | Decode CPU ms | Rows read |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `star-lookup` | 14.8 | 1.6 | 11.9 | 136 | 34 | 64.9 | 102 |
+| `employee-docs` | 12.7 | 1.3 | 9.8 | 92 | 23 | 41.4 | 28 |
+| `values-star` | 5.5 | 2.0 | 2.7 | 8 | 2 | 3.8 | 22 |
+| `path-plus` | 2.9 | 0.3 | 2.3 | 4 | 1 | 2.1 | 0 |
+
+The decode CPU time is summed over the decode pool, so it can exceed the execution time.
+Each lookup decodes whole 32,768-row columns of 256 KiB, so `star-lookup` decodes 34 MiB to
+read 102 rows. A `perf` profile of the decode threads on forge put about 37% of their time
+in the kernel clearing fresh pages for the decoded columns, about 37% in the varint
+decoder and about 12% in LZ4. Turning off transparent huge pages for mimalloc made no
+clear difference.
+
+Planning decoded blocks too. The planner took the row count of a predicate's pattern from
+the two edge blocks of its range, and on a cold process those were decoded to plan the
+query. Commit `69714b13` takes the count of a pattern with only its predicate bound from
+the predicate statistics of the generation, adjusted by the uncompacted delta, and falls
+back to the block count when the statistics do not describe the same base. A test shows
+that planning such a pattern decodes no block. In four interleaved rounds of 5 samples
+each on forge, with curl as the client, it moved the cold medians at 10.5M as follows.
+
+| Cold, forge, 10.5M, median ms | Before | After |
+|---|---:|---:|
+| `star-lookup` | 20.3 | 17.9 |
+| `employee-docs` | 16.0 | 14.1 |
+| `values-star` | 9.1 | 8.2 |
+| `path-plus` | 5.5 | 5.3 |
+
+These figures use a different client from the `bench.sh` columns above and compare only
+with each other. The warm protocol of `scripts/x07-warm-insns.py` on atlas, at 1.05M in
+rounds before, after, after, before, put `employee-docs` at 0.990 of the instructions
+before the change and every query of the suite between 0.975 and 1.024. Starting the decode pool before the server listens was tried as well, in
+the same protocol against the build with the statistics change. It moved no query by more
+than the spread of the rounds, and it was not kept.
+
+The probes that estimate joins from a VALUES table still decode up to two blocks per group
+at planning time when the cache does not hold them, which is most of the 2 ms that
+`values-star` spends planning. That budget is a deliberate tradeoff of plan quality
+against plan time, and it was left unchanged. The rest of a fresh request, about 2 ms
+between the server's total and the client's time for `path-plus`, is spent outside query
+execution, in the handoff of a query that the server does not yet know to be quick to a
+blocking thread and in the transfer. Changing that policy belongs to the execution work of
+roadmap item 7 and was not attempted here.
 
 ### Phase 3 decision
 
-Phase 3 was not started. The breakdown attributes `path-plus` and `star-lookup` to
-column decoding, and segments would cut `path-plus` decoding by a large factor. Three
-things are open, and the first two are cheaper than a new block format.
+Phase 3 should start, as its own change. The rule of §10 was that it starts if decoding,
+without page faults, and the index wait are together larger than the gap to the target.
+For `star-lookup` at 10.5M the execution time is 11.9 ms, almost all of it decoding, and
+the gap to the target was 1.5 ms before the statistics change. Without the 37% spent
+clearing pages, decoding still accounts for several times the gap. The same holds for
+`employee-docs`, which decodes 23 MiB to read 28 rows. Segments of 1,024 rows would decode
+about one thirty-second of each block for these lookups, which shrinks the decoder time
+and the page clearing together.
 
-* The request time is larger than the execution time. For `star-lookup` at 10.5M the
-  server reports 12 ms of 25 ms median, and the rest is not split into transfer, client
-  and kernel time. A decode-bound claim needs that split on forge.
-* Decoding takes about 116 µs per 32,768-row column, which is slow for a delta decode,
-  and the decode CPU time doubles on the pool (30.5 against 16.7 ms). Both fit the cost of
-  page faults on the freshly allocated 256 KiB output of each column, which the decode
-  timer includes and concurrent faults make worse. The profile already reports major
-  and minor faults. A warm decode of the same columns remains needed to distinguish
-  fault cost from decoder CPU time before choosing buffer reuse or segmentation.
-* `path-plus` spends about 1.5 ms outside execution, so segments alone cannot reach the
-  2.1 ms target.
-
-The recommendation is a forge run of the four queries at 1.05M and 10.5M with
-`profile=io`, with base and final builds, then a decision. Phase 3 starts if decode, not
-including page faults, and the index wait are together larger than the gap to the target.
+Segments do not close every gap. `path-plus` decodes 1 MiB in about 2 ms, and segments
+could remove most of that, but its target of 2.1 ms is below the fixed cost of a first
+request outside execution. `values-star` also needs cheaper planning probes. Phase 3 is
+also an on-disk format change, so it needs a new index format version, a clean refusal by
+older builds, fixtures for the stores written before it, and its own index-size, load-time
+and warm-decode gates from §6.4. For those reasons it was not folded into this change.
 
 ### Not done
 
-Phase 3 and Phase 4, the 1.01B gates (A5 and the forge targets), a per-query set of
+Phase 3 and Phase 4, the 1.01B gates (A5 and its window sweep), the cold targets of
+`values-star`, `path-plus` and 10.5M `star-lookup`, cheaper join probes at planning time
+on a cold process, a per-query set of
 hinted blocks in the context to avoid a second hint of a block, I/O priority for
 read-ahead, and a `FILTER` constant collector beyond the common comparison nodes.
 `bench-regressions.py` gained `--io` on 2026-10-18 under roadmap item 1, which keeps each
-sample's server times and I/O profile for the forge run of the Phase 3 decision. The
+sample's server times and I/O profile. The
 Namespace screen still reports no I/O counters, and its primary metric excludes the plan time and serialization time in which
 the prefetch work runs. The profile reads `getrusage(RUSAGE_SELF)` for process-wide
 faults, and a per-operator `RUSAGE_THREAD` breakdown is not built. `/$/stats` has no I/O
