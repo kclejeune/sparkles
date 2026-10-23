@@ -1166,3 +1166,16 @@ After the rebase onto item 96, a review of the shared rule found that the retry'
 the cursor ran before every automatic eager run and planned each EXISTS pattern, which
 slowed successful queries with many EXISTS filters. The test now runs only after an eager
 memory failure, on a fresh plan that keeps the first run's deadline.
+
+A forge A/B after the merge, over four interleaved rounds at 10M with a 16 GiB server cap
+and `--max-result-mb 4096`, found that the fix for the first review's uncharged keys had
+cost the cursor most of its comparison gain. Streamed `q4` took 53.8 s on the merged
+build, 60.2 s on main before it and 25.7 s on the lane build before that fix, while eager
+`q4` took 15.9 s, 35.9 s and 16.2 s. Each key of a cursor comparison had its own scratch
+charge, and that charge took the query ledger about six times per comparison. The
+comparison now reserves its keys within the cursor's decoding envelope, which covers a
+key of the largest size seen so far on every worker, is charged once when it grows and
+is released when the cursor ends. On atlas at 1M with four threads, an approximate
+measurement on a shared host, streamed `q4` execution fell from about 2.7 s to 1.4 s,
+eager execution stayed at about 0.4 s, and the answers stayed the same. A test counts the
+ledger operations of 2,000 cursor comparisons against a filter that compares nothing.
