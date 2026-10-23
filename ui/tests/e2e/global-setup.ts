@@ -35,6 +35,10 @@ import {
   DECLARED_KEY,
   MODELS,
   PASSWORD,
+  PATTERN_DATA,
+  PATTERN_DATASET,
+  PATTERN_PREDICATE,
+  READER,
   SETTINGS,
   USER,
 } from './data';
@@ -152,6 +156,26 @@ export default async function globalSetup(_config: FullConfig) {
 name = "${USER}"
 password = "${hashed.stdout.trim()}"
 datasets = { ${DATASET} = "write" }
+roles = ["pattern-writer"]
+
+[[users]]
+name = "${READER}"
+password = "${hashed.stdout.trim()}"
+roles = ["pattern-reader"]
+
+[[roles.pattern-writer.grants]]
+dataset = "${PATTERN_DATASET}"
+level = "write"
+lifts = ["work"]
+
+[[roles.pattern-reader.grants]]
+dataset = "${PATTERN_DATASET}"
+level = "read"
+
+[[protections]]
+name = "work"
+dataset = "${PATTERN_DATASET}"
+predicates = ["${PATTERN_PREDICATE}"]
 
 [[tokens]]
 name = "e2e-setup"
@@ -193,6 +217,23 @@ server = ["server-admin"]
     await check(
       await fetch(`${url}/$/text/${DATASET}`, { method: 'PUT', headers: auth }),
       'enabling full-text search',
+    );
+    // the Pattern pane's dataset, whose ex:worksFor the reader does not see
+    await check(
+      await fetch(`${url}/$/datasets`, {
+        method: 'POST',
+        headers: { ...auth, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dbName: PATTERN_DATASET, dbType: 'mem' }),
+      }),
+      'creating the Pattern dataset',
+    );
+    await check(
+      await fetch(`${url}/${PATTERN_DATASET}/data`, {
+        method: 'POST',
+        headers: { ...auth, 'Content-Type': 'text/turtle' },
+        body: PATTERN_DATA,
+      }),
+      'loading the Pattern dataset',
     );
     for (let i = 0; ; i++) {
       const s = await (await fetch(`${url}/$/text/${DATASET}`, { headers: auth })).json();

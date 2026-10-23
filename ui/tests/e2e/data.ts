@@ -6,6 +6,19 @@ export const PASSWORD = 'correct horse battery staple';
 
 export const EX = 'http://example.org/e2e/';
 
+/**
+ * The dataset of the Pattern pane's tests (spec U08 A13): `ex:worksFor` is protected, so
+ * the limited reader `READER` reads the dataset without it, while `USER` lifts it.
+ */
+export const PATTERN_DATASET = 'pattern-e2e';
+export const READER = 'reader';
+export const PATTERN_PREDICATE = 'http://example.org/worksFor';
+export const PATTERN_DATA = `@prefix ex: <http://example.org/> .
+ex:alice a ex:Person ; ex:worksFor ex:acme ; ex:name "Alice" .
+ex:bob a ex:Person ; ex:worksFor ex:acme ; ex:name "Bob" .
+ex:acme a ex:Org ; ex:locatedIn ex:lyon ; ex:name "Acme" .
+`;
+
 /** The dataset the server without auth is started with (`--mem`), so it is declared. */
 export const DECLARED_DATASET = 'declared-e2e';
 
