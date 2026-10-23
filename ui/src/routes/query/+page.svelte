@@ -98,7 +98,7 @@
   import LensMenu from '$components/LensMenu.svelte';
   import LensLegend from '$components/LensLegend.svelte';
   import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
-  import { Lenses } from '$lib/lenses.svelte';
+  import { Lenses, resultState } from '$lib/lenses.svelte';
 
   /**
    * A query tab; `stored` names the saved query it was opened from, and `ask` holds the
@@ -1762,12 +1762,11 @@
     const o = outcome;
     if (!o || o.view !== 'graph' || o.status !== 'done' || !o.result) return;
     const info = app.datasets.find((d) => d.name === o.ds);
-    const at = o.result.at;
     lenses.setInput({
       ds: onBranch(o.ds, o.branch),
       branch: o.branch,
       // the lenses read the state the result was read at, the head's commit included
-      at: at?.commit != null ? `commit:${at.commit}` : undefined,
+      at: resultState(o.result),
       epoch: o.startedAt,
       nodes: drawnGraph.nodes.map((n) => ({ id: n.id, term: n.term })),
       edges: drawnGraph.edges

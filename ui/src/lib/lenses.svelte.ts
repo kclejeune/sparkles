@@ -103,6 +103,19 @@ export type LensInput = {
   short: (iri: string) => string;
 };
 
+/**
+ * The state a query result was read at, for its lenses: the commit an At selector resolved
+ * to, or the head's commit the result's metadata names, so that the lenses read the same
+ * state even after the head moves.
+ */
+export function resultState(r: {
+  at?: { commit: number | null } | null;
+  meta?: { commit?: number | null } | null;
+}): string | undefined {
+  const c = r.at?.commit ?? r.meta?.commit;
+  return c != null ? `commit:${c}` : undefined;
+}
+
 export type LensColumn = { channel: Channel; title: string; cells: Map<string, string> };
 
 export type ChannelStatus = { busy: boolean; ms?: number; error?: string; note?: string };
@@ -179,7 +192,14 @@ export class Lenses {
   #inferredRead: {
     input: LensInput;
     promise: Promise<{ inferred: Set<string>; unchecked: Set<string> }>;
+    ctl: AbortController;
   } | null = null;
+
+  /** Stop the shared inferred-edge read, such as when it is superseded or nothing needs it. */
+  #dropInferred() {
+    this.#inferredRead?.ctl.abort();
+    this.#inferredRead = null;
+  }
   #dsKey = '';
 
   /** What the canvas draws now. Lenses whose data it changes run again. */
@@ -191,6 +211,7 @@ export class Lenses {
       if (dsKey !== this.#dsKey) {
         this.#dsKey = dsKey;
         this.#caches.clear();
+        this.#dropInferred();
         this.#edgeChosen = false;
         this.properties = [];
         this.#propsKey = '';
@@ -209,6 +230,8 @@ export class Lenses {
             this.results[ch] = null;
             this.status[ch] = { busy: false };
           }
+      if (this.choice.badge.lens !== 'inferred' && this.choice.edge.lens !== 'inferred')
+        this.#dropInferred();
       this.blocked =
         input.nodes.length > MAX_LENS_NODES
           ? `Lenses apply to at most ${MAX_LENS_NODES.toLocaleString('en-US')} drawn nodes, and this graph has ${input.nodes.length.toLocaleString('en-US')}.`
@@ -218,7 +241,7 @@ export class Lenses {
       if (prev && prev.epoch !== input.epoch) {
         // values read before the redraw may be of an older head
         this.#caches.clear();
-        this.#inferredRead = null;
+        this.#dropInferred();
       }
       this.#schedule(stateChanged);
     });
@@ -233,6 +256,8 @@ export class Lenses {
     this.results[channel] = null;
     this.status[channel] = { busy: false };
     this.#ctl[channel]?.abort();
+    if (this.choice.badge.lens !== 'inferred' && this.choice.edge.lens !== 'inferred')
+      this.#dropInferred();
     this.#runSoon(channel, 0);
   }
 
@@ -269,6 +294,7 @@ export class Lenses {
 
   destroy() {
     clearTimeout(this.#timer);
+    this.#dropInferred();
     for (const c of Object.values(this.#ctl)) c?.abort();
   }
 
@@ -435,11 +461,15 @@ export class Lenses {
         );
         // one read serves both the badge and the edge lens
         let read = this.#inferredRead;
-        if (!read || read.input !== input) {
-          const p = readInferred({ ...ctx, signal: undefined }, input.edges, cache, input.verify);
-          read = this.#inferredRead = { input, promise: p };
+        if (!read || read.input !== input || read.ctl.signal.aborted) {
+          // its own lifetime: either lens may stop waiting while the other still needs it
+          this.#dropInferred();
+          const ctl = new AbortController();
+          const p = readInferred({ ...ctx, signal: ctl.signal }, input.edges, cache, input.verify);
+          const r = { input, promise: p, ctl };
+          read = this.#inferredRead = r;
           p.catch(() => {
-            if (this.#inferredRead === read) this.#inferredRead = null;
+            if (this.#inferredRead === r) this.#inferredRead = null;
           });
         }
         const { inferred, unchecked } = await read.promise;

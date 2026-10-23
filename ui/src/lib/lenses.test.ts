@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { QueryOptions, Term } from './api';
-import { Lenses, type LensInput } from './lenses.svelte';
+import { Lenses, resultState, type LensInput } from './lenses.svelte';
 import type { LensEdge, LensNode, SelectFn } from './lens-sources';
 
 const EX = 'http://example.org/';
@@ -87,5 +87,36 @@ describe('Lenses', () => {
     await l.loadProperties();
     expect(l.properties.map((p) => p.iri)).toEqual([`${EX}cost`]);
     l.destroy();
+  });
+
+  it('stops a shared inferred-edge read when the canvas goes (re-review 2)', async () => {
+    const signals: AbortSignal[] = [];
+    const l = new Lenses();
+    l.delay = 0;
+    l.select = (async (_ds: string, _q: string, opts: QueryOptions) => {
+      signals.push(opts.signal!);
+      await new Promise((r) => setTimeout(r, 200));
+      return [];
+    }) as SelectFn;
+    const edges: LensEdge[] = Array.from({ length: 1000 }, (_, i) => ({
+      id: `e${i}`,
+      source: 'a',
+      target: `n${i}`,
+      triple: [iri(`${EX}a`), iri(`${EX}p`), iri(`${EX}n${i}`)],
+    }));
+    l.setInput(input({ edges, reasoning: true }));
+    l.set('badge', { lens: 'inferred' });
+    await settle();
+    expect(signals.length).toBeGreaterThan(0);
+    l.destroy();
+    expect(signals.every((s) => s?.aborted)).toBe(true);
+  });
+});
+
+describe('resultState', () => {
+  it('reads a result at its commit, whether or not an At selector named it (re-review 1)', () => {
+    expect(resultState({ meta: { commit: 7 } })).toBe('commit:7');
+    expect(resultState({ at: { commit: 3 }, meta: { commit: 7 } })).toBe('commit:3');
+    expect(resultState({ meta: {} })).toBeUndefined();
   });
 });
