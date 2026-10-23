@@ -136,7 +136,7 @@ design is written and there is no code for it.
 | [U08](U08-visual-query-builder.md) | A canvas beside the query editor that draws any query's pattern and edits basic graph patterns, filters, optional parts, simple paths and later `UNION`, `GRAPH` and `VALUES` as splices of the text, with locked blocks for the rest, predicates from the schema and a layout that survives edits | specified |
 | [U09](U09-path-finder.md) | Shortest, all shortest and k shortest paths between two entities, drawn and animated in Explore, with excluded predicates and a hub degree limit added to F07's path search | specified |
 | [U10](U10-canvas-lenses.md) | Size, colour, badge and edge-style lenses on the graph views, inferred edges drawn dashed, PageRank, centrality and community lenses from view-only F14 runs cached on the server, and the derivation tree of an inferred edge from a search over the materialized closure | specified |
-| [U11](U11-linked-views.md) | Arcs between located entities on the map, facet histograms computed on the server whose brushes filter the canvas and add filters to the query, and an embedding map of a vector index whose lasso becomes a `VALUES` block, all sharing one selection | specified |
+| [U11](U11-linked-views.md) | Arcs between located entities on the map, facet histograms computed on the server whose brushes filter the canvas and add filters to the query, and an embedding map of a vector index whose lasso becomes a `VALUES` block, all sharing one selection | implemented in part (Phase 1) |
 
 ### How the graph-interaction features are grouped
 

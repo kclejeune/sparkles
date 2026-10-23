@@ -1,20 +1,22 @@
 # U11: Linked views beside the graph
 
-> **Status:** specified
+> **Status:** partly implemented
 >
-> **Phases:** None shipped. Phase 1 draws the relations between located entities as arcs
-> in the map view, for the Explore graph and for query results. Phase 2 adds facet
-> histograms of literal properties beside the canvas, where brushing a range filters the
-> canvas and can add the matching `FILTER` to the query, after a server route that
-> computes the histograms. Phase 3 adds an embedding map, a two-dimensional projection of
-> a vector index coloured by class or community, where a lasso selection becomes a
-> `VALUES` block, after a server route that computes the projection. All three share one
-> selection with the graph canvas.
+> **Phases:** Phase 1 shipped on 2026-10-23. It draws the relations between located
+> entities as arcs in the map view, for the Explore graph and for query results, with
+> aggregation, clustering and one selection shared by the graph canvas and the maps.
+> Phase 2 adds facet histograms of literal properties beside the canvas, where brushing a
+> range filters the canvas and can add the matching `FILTER` to the query, after a server
+> route that computes the histograms. Phase 3 adds an embedding map, a two-dimensional
+> projection of a vector index coloured by class or community, where a lasso selection
+> becomes a `VALUES` block, after a server route that computes the projection. Phases 2
+> and 3 are not built.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [Usage: Arcs on the map](../USAGE.md#arcs-on-the-map) ·
+> [Features](../FEATURES.md#web-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how Phase 1 landed.
 
 This design was written from the Sparkles code and specs: GeoSPARQL and the UI's maps
 ([G01](G01-geosparql.md)), vector search and indexes ([F04](F04-vector-search.md)), local
@@ -395,4 +397,100 @@ it says "The embedding map shows the head".
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 107.
+Phase 1 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 107, with no server
+change. Phases 2 and 3 are not built and stay under item 107.
+
+**Selection.** `ui/src/lib/selection.svelte.ts` holds one selection of entity terms, keyed
+by their SPARQL form, with the name of the view that made it. It keeps at most 20,000
+entities, keeps the first ones given when a larger set arrives, and counts the rest so that
+the selection bar can say so. The map and Explore's graph canvas read and write it. A click,
+or `Enter` on a focused marker, selects the entities the marker or arc stands for. `Shift`
+adds them and `Alt` removes them. A click on a node of the canvas selects that node. The
+selection bar under the toolbar names the count and the source and has **Clear** and, in
+Explore, **Open as graph**, which draws up to 1,500 selected entities as nodes and expands
+the first 25 of them. `Escape` clears the selection from any view that has no dialog or
+field open. The canvas dims the nodes outside the selection and the edges that do not join
+two selected nodes, and the map dims its markers and arcs and draws the selected ones again
+in the accent colour. **Use in query** is not offered, because it needs the inline `VALUES`
+of U08 Phase 3. The query page's graph views do not read the selection, so a selection made
+on a result's map ends when the Map tab closes.
+
+**Arcs.** `ui/src/lib/arcs.ts` is a pure module that the maps feed with places and links.
+An arc is the great circle between two positions, raised toward the left of its direction by
+12 percent of its length, and by 7 percent more for each further predicate between the same
+two markers, so that the arcs of the two directions stay apart. An arc that crosses the
+antimeridian is cut there into two parts that end on it at one latitude. The arrowhead sits
+the marker's radius and 8 px before the end of the arc, so that the marker does not cover it.
+Places within 20 px of the seed of a cluster at the current zoom merge into one marker, in
+the order the places were given, so that the same input always gives the same markers. The
+links between places of one marker are counted on the marker and not drawn. The remaining
+links merge by marker pair, direction, predicate and change into one arc whose width is
+`1.6 + 2.2 log2(count)` pixels up to 14, with the count as its label, or the caption of its
+single link when a result names a labelling column. Colours come from an eight-colour
+palette by predicate, and arcs added or removed between two states of the time slider use
+the same tokens as map features, green and a plus sign, red, dashed and a minus sign. The
+layout is recomputed when the map stops moving, because it depends on the zoom.
+
+**Places.** `ui/src/lib/locate.ts` finds the position of an entity with the routes of the
+map card, an own geometry literal, a geometry reached through `geo:hasGeometry` or
+`geo:hasDefaultGeometry`, or WGS84 latitude and longitude. One query with a `VALUES` block
+asks for 200 entities, four requests run at once, and the first literal that can be drawn
+stands for an entity with several. A line or a polygon stands at its centroid, weighted by
+length or area with holes taken out. The queries run through `api.select` on the dataset and
+branch of the page, at the `at` of the slider or of the result, and under the caller's
+view, so an entity whose geometry the caller may not read is simply not located and is
+listed under the map. The map never asks for relations. Explore's arcs are the edges the
+graph already holds, and a result's arcs are its own rows.
+
+**Maps.** Explore has **Graph** and **Map** beside its toolbar's other buttons, and
+`Shift+M` toggles them. A result with two geometry columns, or with two entity columns, has
+**Points** and **Arcs** on its Map tab, with **From**, **To** and **Label** columns. A
+result with entity columns and no geometry column gets the tab only when a lookup of its
+first 200 entities finds a geometry, so a result of plain resources does not grow a useless
+tab. The bundled basemap has no glyphs, so counts, labels and arrowheads are canvas images
+that MapLibre asks for by name when a layer needs one. Tab walks the markers in view,
+largest first, `Enter` selects one and a list of the markers and arcs in view below the map
+is the alternative for a screen reader and for taps. At 390 px the controls are 44 px
+targets, the map takes the page's width and the page scrolls to the details below it.
+
+**Caps.** A map draws 20,000 places and 20,000 links. A result of more rows reads the first
+20,000, and a map of more places keeps the first 20,000 and leaves out the links that end in
+the others. Both say so under the map.
+
+**Tests.** The Vitest suites for `arcs.ts`, `selection.svelte.ts`, `locate.ts`,
+`result-arcs.ts` and the centroid and lookup query of `geo.ts` cover great circles, the
+antimeridian split, the bow in both directions, clustering at several zooms, aggregation,
+the caps, the cap and counts of the selection, batching and failure of lookups. The
+Playwright suite `ui/tests/mock/arcs.spec.ts` runs A1, A2 and the keyboard and phone parts
+of A10 against the mock's `flows` dataset, with the empty state, a caller who cannot read
+the people's geometries, a past state, a branch and the 390 px layout. The mock runs real
+SPARQL through Oxigraph, but not Sparkles' engine, so A1 against a real server is not
+automated.
+
+**Measurements.** `ui/tests/mock/arcs-perf.spec.ts` draws 20,000 distinct arcs between 300
+places from one query and pans the map for 90 frames. Headless Chromium draws with WebGL in
+software, so the frame times are an upper bound for a machine with a GPU. The run below
+was repeated three times on a 16 thread laptop that was also building other work, with a load
+average between 20 and 40, and the table gives the median of the three means.
+
+| View | Arcs drawn | Layout | Mean frame while panning |
+|---|---|---|---|
+| World, 27 clusters | 425 | 8 to 16 ms | 42 ms, about 24 frames per second. |
+| Zoom 3.5, 300 clusters | 20,000 | 160 to 210 ms | 144 ms, about 7 frames per second. |
+| Zoom 8, 300 clusters | 20,000 | 120 to 185 ms | 16.6 ms, 60 frames per second. |
+
+The slow case is 20,000 distinct arcs drawn at once under software rendering, which a result
+seldom reaches because arcs between the same two clusters merge into one. A result with a
+few hundred distinct cluster pairs pans at the world row. The layout figure is the time to
+cluster the places and aggregate the links after a zoom, and it is the same work on a machine
+with a GPU.
+
+**Limits.** The explicit frame-rate gate of this spec, A9, belongs to the embedding map of
+Phase 3. The frame times above were measured in software rendering on a busy machine and
+are not a published figure. The layout of 20,000 distinct arcs runs on the main thread and
+takes about 100 to 220 ms, which is felt as a pause after a zoom, and moving it to a worker
+is a later option. Explore's map reads the dataset and not a branch, because Explore itself
+has no branch selector. In compare mode with a branch, the nodes that only the other branch
+had are listed as not located. Colours are read from the theme when a map opens, so
+a change of theme shows at the next map. Markers at one position stay merged at
+every zoom, and there is no spiral that opens them.

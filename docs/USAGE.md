@@ -33,6 +33,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Loading CSV and TSV](#loading-csv-and-tsv)
 * [Branches and merges](#branches-and-merges)
 * [The Explore overview](#the-explore-overview)
+* [Arcs on the map](#arcs-on-the-map)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
 * [Formatting](#formatting)
@@ -1492,6 +1493,50 @@ default only when the dataset has no other classes.
 The query page's graph view uses the same WebGL view for results of more than 2,000
 nodes. **Max nodes** then offers 10,000, 50,000 and 100,000, and **Renderer** switches
 between the canvas and WebGL views.
+
+## Arcs on the map
+
+The maps draw relations as well as places. In Explore, the **Map** button beside **Graph**
+in the graph toolbar, or `Shift+M`, shows the drawn graph on a map. Each drawn entity that
+has a geometry becomes a marker at its point, or at the centre of its line or polygon. Each
+drawn edge between two located entities becomes an arc. An arc is a great circle, bowed a
+little to the left of its direction so that the arcs of both directions between two places
+stay apart, and it ends in an arrowhead at its target. An arc that crosses the antimeridian
+is cut there and drawn on both sides.
+
+The map finds the entities by querying for their geometries, 200 at a time with four
+requests in flight. The queries run in your own view, at the state the graph slider reads,
+so an entity whose geometry you may not read is not located. Entities without a geometry
+are listed under the map as not located, and their edges are not drawn. The map draws only
+the edges the graph already shows and asks for no relations of its own.
+
+Arcs are coloured by predicate, with a checkbox and a legend entry for each, and **Width by**
+chooses between the count and one width. Markers closer than 20 px merge into one marker
+that shows how many places it holds, and the links between two places of one marker are
+counted on the marker instead of drawn. The arcs of one predicate and direction between the
+same two markers merge into one arc whose width and label give the count. Zooming in splits
+the markers and their arcs again. When you compare two states with the graph slider, added
+arcs are green and removed arcs are red and dashed, and their labels start with a plus or a
+minus sign.
+
+On the query page, a result with two columns of geometry literals, or with two columns of
+entities that have geometries, offers **Arcs** on its Map tab. Each row is an arc from the
+first column to the second, and **Label** chooses a third column to write on the arc. A
+result with two entity columns and no geometry column gets the Map tab when a lookup of its
+first 200 entities finds a geometry. The lookups run on the result's branch and at the past
+state the result was read at. Picking a row in the list beside the map highlights its arc.
+
+A click on a marker or an arc selects the entities it stands for, and the selection bar
+names the count and the source, with **Clear** and, in Explore, **Open as graph**, which
+draws the selected entities as the graph. The selection dims everything else on the map,
+and Explore's graph canvas dims the nodes outside it too. `Escape` clears it. With the map
+focused, `Tab` moves through the markers in view, the largest first, `Enter` selects one,
+and `Shift+Enter` adds it to the selection. **List of places and links in view** below the
+map lists the same markers and arcs with their counts, for a screen reader and for taps. At
+a phone's width the controls grow to 44 px and the map takes the page's width.
+
+A map draws at most 20,000 places and 20,000 links before merging, and says when a result
+had more. [U11](specs/U11-linked-views.md#outcome) records the measurements.
 
 ## The time slider
 
