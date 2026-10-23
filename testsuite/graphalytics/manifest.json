@@ -1,0 +1,85 @@
+{
+  "format": {
+    "kind": "sparkles-graphalytics-reference",
+    "version": 1
+  },
+  "source": {
+    "repository": "https://github.com/ldbc/ldbc_graphalytics",
+    "commit": "7b8bde76cf7aab5e90b25ecd4b38829e2f98b292",
+    "license": "Apache-2.0"
+  },
+  "cases": [
+    {
+      "name": "example-directed",
+      "directed": true,
+      "edge_columns": 3,
+      "bfs_source": 1,
+      "pagerank": {
+        "iterations": 2,
+        "damping": 0.85
+      },
+      "expected": {
+        "bfs": {
+          "path": "upstream/example-directed-BFS",
+          "sha256": "40e1e63e6bb69b13ed4fd5033e953e24e6740a1cd9bc6d3c1c4875dc066ffdbd"
+        },
+        "pr": {
+          "path": "upstream/example-directed-PR",
+          "sha256": "b8e210fa7d77bc5855b2f16c87607850d7b1f082bff33d72ecd4f68f74faf113"
+        },
+        "wcc": {
+          "path": "upstream/example-directed-WCC",
+          "sha256": "f50ece1702d808407e491f2fba7b59fa573ef72829f0c222a3e614067355c00b"
+        }
+      },
+      "vertices": {
+        "path": "upstream/example-directed.v",
+        "sha256": "bf794518e35d7f1ce3a50b3058c4191bb9401e568fc645d77e10b0f404cf1f22"
+      },
+      "edges": {
+        "path": "upstream/example-directed.e",
+        "sha256": "fc051f181a2172429db5c63d70eb38d6b8f7fda83379bddbf9d34eb115b6de29"
+      },
+      "properties": {
+        "path": "upstream/example-directed.properties",
+        "sha256": "b1d662a6089d698375cb22129814a310badedc1ab857feb3b0d67061d90fe2c4"
+      }
+    },
+    {
+      "name": "example-undirected",
+      "directed": false,
+      "edge_columns": 3,
+      "bfs_source": 2,
+      "pagerank": {
+        "iterations": 2,
+        "damping": 0.85
+      },
+      "expected": {
+        "bfs": {
+          "path": "upstream/example-undirected-BFS",
+          "sha256": "c73f35e82013aa44f0998bd5d1731e4794af17c8aead88522c7690e7cd408714"
+        },
+        "pr": {
+          "path": "upstream/example-undirected-PR",
+          "sha256": "5b875a71230dc992a285af81fb9d125d565640f58b2f127506ca6939bd772823"
+        },
+        "wcc": {
+          "path": "upstream/example-undirected-WCC",
+          "sha256": "ee1cd81c6c1d86766778ced06619a260d94a8e99634b434fde681f63ade5bacc"
+        }
+      },
+      "vertices": {
+        "path": "upstream/example-undirected.v",
+        "sha256": "fed60183fd736aca1fcf8a81cafafaec4b5ded217b2eea09f76dc28841242e94"
+      },
+      "edges": {
+        "path": "upstream/example-undirected.e",
+        "sha256": "09dc162ebd7e638ac50b6d3bab8ef8fc3b53f5ea24caaa0519ccdf8d17d84c16"
+      },
+      "properties": {
+        "path": "upstream/example-undirected.properties",
+        "sha256": "5e5fe6a9e22136e934b9c8484cf47daee883851b1cecd471d4ac8524c34a462a"
+      }
+    }
+  ]
+}

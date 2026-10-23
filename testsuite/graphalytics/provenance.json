@@ -1,0 +1,72 @@
+{
+  "format": {
+    "kind": "sparkles-graphalytics-fixture-provenance",
+    "version": 1
+  },
+  "repository": "https://github.com/ldbc/ldbc_graphalytics",
+  "commit": "7b8bde76cf7aab5e90b25ecd4b38829e2f98b292",
+  "license": "Apache-2.0",
+  "files": [
+    {
+      "path": "upstream/example-directed.v",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-directed.v",
+      "sha256": "bf794518e35d7f1ce3a50b3058c4191bb9401e568fc645d77e10b0f404cf1f22"
+    },
+    {
+      "path": "upstream/example-directed.e",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-directed.e",
+      "sha256": "fc051f181a2172429db5c63d70eb38d6b8f7fda83379bddbf9d34eb115b6de29"
+    },
+    {
+      "path": "upstream/example-directed-BFS",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-directed-BFS",
+      "sha256": "40e1e63e6bb69b13ed4fd5033e953e24e6740a1cd9bc6d3c1c4875dc066ffdbd"
+    },
+    {
+      "path": "upstream/example-directed-PR",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-directed-PR",
+      "sha256": "b8e210fa7d77bc5855b2f16c87607850d7b1f082bff33d72ecd4f68f74faf113"
+    },
+    {
+      "path": "upstream/example-directed-WCC",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-directed-WCC",
+      "sha256": "f50ece1702d808407e491f2fba7b59fa573ef72829f0c222a3e614067355c00b"
+    },
+    {
+      "path": "upstream/example-directed.properties",
+      "source_path": "config-template/graphs/example-directed.properties",
+      "sha256": "b1d662a6089d698375cb22129814a310badedc1ab857feb3b0d67061d90fe2c4"
+    },
+    {
+      "path": "upstream/example-undirected.v",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-undirected.v",
+      "sha256": "fed60183fd736aca1fcf8a81cafafaec4b5ded217b2eea09f76dc28841242e94"
+    },
+    {
+      "path": "upstream/example-undirected.e",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-undirected.e",
+      "sha256": "09dc162ebd7e638ac50b6d3bab8ef8fc3b53f5ea24caaa0519ccdf8d17d84c16"
+    },
+    {
+      "path": "upstream/example-undirected-BFS",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-undirected-BFS",
+      "sha256": "c73f35e82013aa44f0998bd5d1731e4794af17c8aead88522c7690e7cd408714"
+    },
+    {
+      "path": "upstream/example-undirected-PR",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-undirected-PR",
+      "sha256": "5b875a71230dc992a285af81fb9d125d565640f58b2f127506ca6939bd772823"
+    },
+    {
+      "path": "upstream/example-undirected-WCC",
+      "source_path": "graphalytics-validation/src/main/resources/validation-graphs/example/example-undirected-WCC",
+      "sha256": "ee1cd81c6c1d86766778ced06619a260d94a8e99634b434fde681f63ade5bacc"
+    },
+    {
+      "path": "upstream/example-undirected.properties",
+      "source_path": "config-template/graphs/example-undirected.properties",
+      "sha256": "5e5fe6a9e22136e934b9c8484cf47daee883851b1cecd471d4ac8524c34a462a"
+    }
+  ],
+  "modified": false
+}
