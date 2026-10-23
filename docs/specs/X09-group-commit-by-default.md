@@ -1319,13 +1319,47 @@ took 1 ms more. Both wall differences are steps of 1 ms that the server time doe
 and they are open. So the screen's `two-hop-count` and `star-lookup` slowdowns did not
 reproduce on Intel, and no query changed by more than the 5% that the host resolves.
 
+The background full-text checkpoint was revised on 2026-10-23. The periodic tick
+captures its directory and commit generation under the live writer lock, then
+synchronizes files and directories after releasing that lock. A lease keeps the
+directory paths stable. Completion updates scheduling only for the same directory
+and generation. Concurrent document changes and metadata publication retain the
+recovery marker, and a failed parent-directory synchronization remains pending for
+retry. Explicit close and rebuild keep their durability ordering. The disk format
+and WAL ordering are unchanged.
+
+Index replacement drains the old merge workers. Successful reconfiguration and
+disable also wait for old checkpoint leases, including leases held by stale or
+already-closed writers, before their paths can be reused. Streaming file I/O keeps
+the number of open handles bounded. Replacement may wait for merge workers and a
+checkpoint, and atomic metadata publication takes a completion-state lock. These
+costs buy stable paths and prevent a retired owner from synchronizing or removing
+a replacement's files.
+
+The publication-progress regression failed before the change and passed after it.
+Real-directory and Store tests cover concurrent checkpoints, metadata publication,
+marker failures, late writes, retained old owners, reconfiguration and reopen
+answers. The background crash-image fixture drives the actual periodic tick and
+requires a new transaction to start and acknowledge within the same successful
+file synchronization. A bounded handshake forces that interleaving. A delayed
+receipt from an earlier transaction cannot satisfy it. The explicit and background
+syscall histories replay against receipts, annotations, the durable head and
+text/RDF equality. Ten histories and 2,496 replayed crash images passed. This
+fixture is a durability test, not a native latency measurement. The older kill and
+log-writes tables above continue to describe their recorded sources.
+
+This change removes the background file-synchronization wait from the live writer
+lock. Tantivy publication can still occur inside a group leader's fence, and WAL
+and vocabulary synchronization can still delay writes. It does not establish the
+50 ms load-quality rule or the serial, throughput, reader and memory gates of
+section 17.9.
+
 **Open under item 86.** Complete forge acceptance under section 17.9 remains open,
 including text and spatial query latency under a four-writer load, a spatial dataset
 with geometries and an embedding index whose worker runs. Partial full-text pilots
-have run. The current background text checkpoint holds the publication mutex while
-synchronizing files, so removing that wait must preserve checkpoint, replacement and
-close durability. Until the full gates pass the item stays partly done, or the user
-amends a gate as for Phase 3. Three smaller items wait for that
+have run. The revised background checkpoint has targeted concurrency and durability
+coverage, while its native performance acceptance remains open. Until the full
+gates pass the item stays partly done, or the user amends a gate as for Phase 3. Three smaller items wait for that
 work. Staged documents could count their bytes in the queue's limit,
 since a queue of long literals now holds more than 4 MiB of them. The leader applies a
 prefix's text changes, a Tantivy commit included when the batch is full, while its fence
