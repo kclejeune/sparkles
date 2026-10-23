@@ -1,15 +1,16 @@
 # C22: Community summaries for global questions (GraphRAG)
 
-> **Status:** specified, with the model role foundation implemented
+> **Status:** Phase 1 implemented; its paid acceptance runs wait for approval
 >
-> **Phases:** None shipped. Phase 1 is the community build from F14's Leiden, the
+> **Phases:** Phase 1 is implemented. Phase 1 is the community build from F14's Leiden, the
 > summaries written by the server's model providers with citations to facts, their
 > storage as triples with provenance and review status, the build task and the settings.
 > Phase 2 adds global questions in Ask, community context in `recall` and the brief, and
 > the MCP tool. Phase 3 refreshes communities and summaries incrementally after commits.
 >
 > **User docs:** [Model settings](../USAGE.md#changing-models-and-keys-at-runtime)
-> cover configuring the role. Community reports are not built.
+> cover configuring the role, and [Community reports](../USAGE.md#community-reports-graphrag)
+> cover building and reviewing them.
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end will record how it lands.
@@ -793,28 +794,44 @@ order and inherits the resolved `summarize` list when neither layer explicitly
 configures `community`. An explicit empty list disables the role. Configuration,
 server/dataset precedence and UI guidance have focused regression tests.
 
-No phase is complete. The foundation adds no model calls, report storage, build task or
-route. The first Phase 1 parts that need no publication are in the server: the
-versioned `graphrag` settings type, the bounded and versioned build state, the hierarchy
-adapter of §3.1 with its stable identities, and the admission of §3.5, which reserves
-every model attempt from an exact local tokenizer, the provider's counting endpoint or
-the byte bound. The daily ledger and the anomalies persist in a small versioned file in
-the dataset's GraphRAG directory, written before each request can be sent. The
-`graphrag` kind is registered with C19's settings, so `/$/settings` validates and keeps
-it, and no build reads it. The projection reader reads as the build's principal and
-checks each provider's send level. The report inputs and the checks of §3.4 are in
-place with the prose heuristic. The disclosure guard of §6 is in the common access
-path. Every restricted view hides the guarded namespace until the request binds it to
-the snapshot it reads, and the footprints in that snapshot then prove the graphs they
-cover. A policy reload ends open change feed streams. Router tests cover the paths of §6.6 for SPARQL, time travel, the
-Graph Store, the schema report and the change feed. Nothing writes a reports graph yet,
-so the guard has no effect on current data. None of these parts is wired into a build
-or a route, and local mock providers test the model parts. The byte bound's default
-allowances are unmeasured. Measuring them against real providers needs paid or provider
-runs, which wait for the user's approval. Phase 1 still needs the whole-build estimate,
-report storage with provenance, the build task and routes, the CLI, the Communities
-tab, the inbox kind and manual refresh. Global Ask and memory integration remain Phase 2, and
-automatic refresh remains Phase 3. [ROADMAP](../ROADMAP.md) item 12 tracks this work.
+Phase 1 is implemented, and its acceptance runs against paid providers wait for the
+user's approval. A build reads the projection as the settings' principal, which must be
+allowed to query the dataset on the run's branch. It computes the Leiden hierarchy with
+stable identities, writes one report per community through the `community` role with
+the checks of §3.4, and stores communities, reports, findings, citations and their
+provenance as triples in commits of kind `graphrag`. A cited fact carries its reifier
+when it has one. Every commit adds the run's footprint, and every community and report
+links it, so the guard of §6 decides each snapshot from its own data. A report is
+removed once no community links it and no linked report cites it, so a kept parent's
+citations of a replaced child stay resolvable.
+
+`POST /$/graphrag/{ds}/build` and `/refresh` run as tasks of kind `graphrag`. The task
+reports the estimate and waits for `POST /$/graphrag/{ds}/confirm` unless the caller
+confirmed beforehand. The run checks its settings, its providers, their send levels and
+the principal's view again after the confirmation, before each model request and before
+each commit, and it fails without committing when a review changed a report link while
+it ran. All branches of a dataset share its daily ledger. An accounting anomaly stops
+the run like the budget does, the remaining communities stay pending, and a later
+refresh writes them. `GET /$/graphrag/{ds}`, `/communities` and `/community` read
+through the caller's view and say only that the reports are unavailable to a caller for
+whom the graph is not proven. `POST /$/graphrag/{ds}/review` sets a status or saves an
+edit as a reviewed revision. The review inbox lists unreviewed reports and the
+anomalies, the metrics of §8 count reports, tokens, pending communities and anomalies,
+and `sparkles graphrag` builds, refreshes and reads reports on a server or with `--loc`.
+The UI's dataset page has a Communities tab with the tree, a community's members and
+report, the estimate to confirm and the review actions, and its Settings tab has the
+`graphrag` fields. Tests with stub providers cover A1 to A4, A8 and A10 to A16.
+
+These choices differ from or refine the text above. Manual refresh compares the fact
+digests each report was written from with the facts it reads now, rather than reading
+the change feed, which Phase 3 adds. The baseline of a kept report stays until the
+report is rewritten, so small changes add up. A folded member's facts go into its
+parent's input and its parent's change measure. Only an unrestricted writer can review
+a report, since §6.2 lets only such a writer write a guarded graph. The metrics hold the
+figures of the runs and reviews since the server started. The byte bound's default
+allowances are unmeasured, and measuring them needs paid provider runs. Global Ask and
+memory integration remain Phase 2, and automatic refresh remains Phase 3.
+[ROADMAP](../ROADMAP.md) item 12 tracks this work.
 
 The contracts that the first draft left open are settled in §14. Token budgets use
 conservative reservations before every HTTP attempt, and findings carry entity numbers

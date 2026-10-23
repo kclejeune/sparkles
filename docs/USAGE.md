@@ -4036,7 +4036,15 @@ model configuration from `--model-config`, as `serve` does.
 sparkles graphrag --loc ./org-db --dataset org --model-config models.json build --confirm
 ```
 
-The routes are described in [API.md](API.md#graphrag).
+The dataset page's **Communities** tab shows the state of the reports, a **Build** and
+a **Refresh** button for dataset admins, and the estimate to confirm before a run sends
+anything. The hierarchy is a tree, coarsest level first. Choosing a community shows its
+members, its report with findings and citations, and the review actions **Reviewed**,
+**Reject** and **Edit**. An edit is saved as a new reviewed report that supersedes the
+old one. Reviewing needs write access to the dataset without graph or triple
+restrictions. The Settings tab has a GraphRAG section with the fields above, and the
+review inbox lists the unreviewed reports. The routes are described in
+[API.md](API.md#graphrag).
 
 ## Sending notifications
 
