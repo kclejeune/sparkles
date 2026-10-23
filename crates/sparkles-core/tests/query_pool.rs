@@ -398,10 +398,13 @@ fn algorithm_concurrent_contexts_keep_separate_or_shared_grant_ownership() {
             peaks[id] = used;
         }
         assert!(peaks.iter().all(|p| *p > 0));
+        // A finished result keeps its own estimate, at most its query's peak, on the
+        // grant it ran under (X08-P1-retained-results).
         if shared {
-            assert_eq!(a.used(), peaks.iter().sum::<u64>());
+            assert!(a.used() > 0 && a.used() <= peaks.iter().sum::<u64>());
         } else {
-            assert_eq!((a.used(), b.used()), (peaks[0], peaks[1]));
+            assert!(a.used() > 0 && a.used() <= peaks[0]);
+            assert!(b.used() > 0 && b.used() <= peaks[1]);
         }
         drop(results.remove(0));
         assert!(b.used() > 0);

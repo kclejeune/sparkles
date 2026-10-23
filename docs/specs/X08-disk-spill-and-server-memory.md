@@ -1066,10 +1066,11 @@ higher of its live bytes and that estimate, lowers every other account to its li
 and returns the excess to each account's own grant outside the ledger's lock. A cursor
 ledger keeps no eager contribution and a ledger with a running algorithm call keeps its
 contribution, so both are left alone. A later charge on the context grows its
-contribution again as before. A contribution within 1 MiB of the retained estimate is
-left alone, so a small query keeps its lock-free fast account and takes no ledger. A
-larger one is handed to the ledger first, which makes the shrink and any concurrent
-charge take the same lock.
+contribution again as before. A fast account whose contribution is within 1 MiB of the
+retained estimate is left alone, so a small query keeps its lock-free account and takes
+no ledger. A larger one is handed to the ledger first, which makes the shrink and any
+concurrent charge take the same lock. A context that already has a ledger, such as one
+that called a graph algorithm, always shrinks.
 
 The computed terms and cached values were never charged in eager execution, and the peak
 estimate covered them only by accident. Counting them keeps them covered after the
