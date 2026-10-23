@@ -1339,6 +1339,12 @@ impl PermIndex {
         }
     }
 
+    /// Whether readers read block `b` whole from now on.
+    #[cfg(test)]
+    pub(crate) fn is_dense(&self, b: usize) -> bool {
+        self.segs.as_ref().is_some_and(|d| d.dense(b))
+    }
+
     /// The segments of block `b` a request may read one by one before it reads the block
     /// whole (see [`mark_dense`](Self::mark_dense)).
     pub(crate) fn dense_limit(&self, b: usize) -> usize {
