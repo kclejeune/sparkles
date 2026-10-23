@@ -134,19 +134,32 @@ def test_the_timeout_covers_all_of_the_queries() -> None:
         f"<{EX}s{i}> a <{EX}T> ; <{EX}region> <{EX}r{i % 12}> ; <{EX}knows> <{EX}s{(i * 7) % 200000}> ."
         for i in range(200000)
     )
-    # separate copies, so that the result cache of one has nothing to serve another
-    warmup, measured, bounded = Dataset(), Dataset(), Dataset()
-    for ds in (warmup, measured, bounded):
-        ds.load(rows, "turtle")
     request = {"class": EX + "T"}
     by = {"property": EX + "region"}
 
+    def fresh() -> Dataset:
+        # a copy of its own, so that the result cache of another has nothing to serve it
+        ds = Dataset()
+        ds.load(rows, "turtle")
+        return ds
+
     # a first call pays one-time costs, which would make the measured time too long
-    warmup.graph.groups(request, by=by)
-    start = time.perf_counter()
-    answer = measured.graph.groups(request, by=by)
-    whole = time.perf_counter() - start
-    assert len(answer["groups"]) == 12
-    assert whole > 0.04, f"the answer took {whole} s, too fast to bound"
-    with pytest.raises(QueryTimeoutError):
-        bounded.graph.groups(request, by=by, timeout=whole / 2)
+    fresh().graph.groups(request, by=by)
+
+    # The timeout is half of the shortest time that a whole answer took. The time of one
+    # call varies by a factor of two or more on a busy machine, so a bounded call can be
+    # faster than half of one measured time and finish in time. A timeout that does not
+    # bound the answer fires in none of the attempts, so one attempt that fires is enough.
+    shortest = float("inf")
+    for _ in range(6):
+        measured = fresh()
+        start = time.perf_counter()
+        answer = measured.graph.groups(request, by=by)
+        shortest = min(shortest, time.perf_counter() - start)
+        assert len(answer["groups"]) == 12
+        assert shortest > 0.04, f"the answer took {shortest} s, too fast to bound"
+        try:
+            fresh().graph.groups(request, by=by, timeout=shortest / 2)
+        except QueryTimeoutError:
+            return
+    pytest.fail(f"no call timed out at {shortest / 2} s, half of the shortest whole answer")
