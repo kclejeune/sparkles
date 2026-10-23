@@ -78,9 +78,9 @@ const QUERIES: &[(&str, bool)] = &[
     ("SELECT DISTINCT ?p WHERE { ?s a ex:Film . ?s ?p ?o }", true),
     ("SELECT DISTINCT ?p WHERE { ?s ?p ?o }", true),
     ("SELECT DISTINCT ?p WHERE { ex:f9 ?p ?o }", false),
-    ("SELECT ?s WHERE { ?s spk:hasPredicate ex:p3 }", true),
+    ("SELECT ?s WHERE { ?s spk:hasPredicate ex:p3 }", false),
     ("SELECT ?p WHERE { ex:f7 spk:hasPredicate ?p }", true),
-    ("ASK { ex:f7 spk:hasPredicate ex:p1 }", true),
+    ("ASK { ex:f7 spk:hasPredicate ex:p1 }", false),
     (
         "SELECT ?s ?p WHERE { ?s a ex:Film . ?s ql:has-predicate ?p } ORDER BY ?s ?p",
         true,

@@ -2197,21 +2197,18 @@ impl<'a> Planner<'a> {
             PT::C(id) => PathEnd::Const(id),
             PT::V(v) => PathEnd::Var(v),
         };
+        // A constant predicate reads its own PSO range, the subjects that have it, which
+        // costs less than walking every subject's pattern.
         if vars.len() == [s, p].iter().filter(|x| matches!(x, PT::V(_))).count()
+            && matches!(p, PT::V(_))
             && !matches!(g, ActiveGraph::Var(_))
             && let Some((gf, None)) = self.graph_filter(g)
             && let Some(uses) = usable(self.ctx, &gf)
         {
             let stats = &self.ctx.snap.generation.stats;
-            let est = match (s, p) {
-                (PT::C(_), PT::C(_)) => 1.0,
-                (PT::C(_), PT::V(_)) => (stats.distinct_predicates as f64).clamp(1.0, 16.0),
-                (PT::V(_), PT::C(q)) => self
-                    .ctx
-                    .snap
-                    .predicate_stat(q.0)
-                    .map_or(0.0, |st| st.distinct_subjects as f64),
-                (PT::V(_), PT::V(_)) => stats
+            let est = match s {
+                PT::C(_) => (stats.distinct_predicates as f64).clamp(1.0, 16.0),
+                PT::V(_) => stats
                     .predicates
                     .iter()
                     .map(|st| st.distinct_subjects as f64)
