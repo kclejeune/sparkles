@@ -517,7 +517,7 @@ fn diff_of(
 ) -> sparkles::Result<Diff> {
     if cross {
         let from = from.unwrap_or(At::Head);
-        return Ok(main.store.branch_diff(fb, &from, tb, &to, o)?);
+        return main.store.branch_diff(fb, &from, tb, &to, o);
     }
     // without `from`: the commit before `to`
     let from = match from {
