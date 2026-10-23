@@ -443,7 +443,7 @@ node = "Dataset.clearGraph"
 
 ["graph.groups"]
 python = "Dataset.graph.groups"
-jvm = "planned: a typed handle after the Python and Node.js ones"
+jvm = "DatasetGraphSparkles.graph().groups"
 node = "Dataset.graph.groups"
 
 ["graphql.config.get"]

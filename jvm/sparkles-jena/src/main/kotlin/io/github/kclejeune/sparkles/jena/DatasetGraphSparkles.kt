@@ -456,6 +456,15 @@ public class DatasetGraphSparkles internal constructor(
     }
 
     internal fun isPinned(): Boolean = pinned != null
+    /**
+     * The overview of what this thread reads: its transaction, the pinned commit, or the head
+     * at the request's own point. Only a read of the head can name a point in history.
+     */
+    internal fun overview(request: org.apache.jena.atlas.json.JsonObject, opts: io.github.kclejeune.sparkles.jena.internal.ffi.GroupsOpts, operation: SparklesOperation): ByteArray {
+        val src = source()
+        require(src is Source.Head || !request.hasKey("at")) { "a request that names a point in history runs on the live dataset outside a transaction" }
+        return src.groups(request.bytes(), opts, operation.native)
+    }
     internal fun pinnedReference(): String? = pinned?.let { "commit:${ffi { it.commitSeq() }}" }
 
     public fun snapshots(): SparklesSnapshots = SparklesSnapshots(this)
@@ -468,6 +477,7 @@ public class DatasetGraphSparkles internal constructor(
     public fun queries(): SparklesQueries = SparklesQueries(this)
     public fun schema(): SparklesSchema = SparklesSchema(this)
     public fun graphql(): SparklesGraphQl = SparklesGraphQl(this)
+    public fun graph(): SparklesGraphOverview = SparklesGraphOverview(this)
 
     /** Serialize one committed snapshot with bounded native byte batches. */
     public fun dump(output: OutputStream, lang: Lang) {

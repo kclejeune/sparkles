@@ -1,6 +1,6 @@
 //! Structured administration documents are encoded once per request, rather than per
 //! nested field. The Java surface uses Jena's JSON trees and typed outer records.
-use crate::{ErrorKind, FfiDataset, FfiError, FfiOperation, FfiResult};
+use crate::{ErrorKind, FfiDataset, FfiError, FfiOperation, FfiReadTxn, FfiResult, FfiWriteTxn};
 use std::sync::Arc;
 pub(crate) fn encode<T: serde::Serialize>(value: &T) -> FfiResult<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| FfiError::new(ErrorKind::Invalid, e.to_string()))
@@ -24,6 +24,53 @@ pub struct SchemaRequest {
     pub at: Option<String>,
     pub limit: u32,
     pub cursor: Option<String>,
+}
+/// The view and the budgets of a graph overview call, which are those of a query that bear
+/// on the overview's own queries. The timeout and the cancellation come from the call's
+/// operation.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GroupsOpts {
+    pub union_default_graph: Option<bool>,
+    pub default_graph: Vec<String>,
+    pub named_graphs: Vec<String>,
+    pub include_inferred: bool,
+    pub max_rows: Option<u64>,
+    pub max_memory_bytes: Option<u64>,
+    pub max_rows_produced: Option<u64>,
+    pub no_cache: bool,
+}
+/// The overview request and the options of its queries. The dataset's defaults apply as they
+/// do to its queries, but only a call that asks for the inferred graph reads it.
+fn groups_args(
+    ds: &sparkles::Dataset,
+    request: &[u8],
+    opts: GroupsOpts,
+    operation: &FfiOperation,
+) -> FfiResult<(
+    sparkles::overview::GroupsRequest,
+    sparkles::sparql::QueryOptions,
+)> {
+    let req = sparkles::overview::GroupsRequest::from_json(&decode(request)?)?;
+    let mut q = sparkles::sparql::QueryOptions {
+        union_default_graph: opts.union_default_graph,
+        default_graph_uris: opts.default_graph,
+        named_graph_uris: opts.named_graphs,
+        max_rows: opts.max_rows.map(|m| m as usize),
+        max_memory_bytes: opts.max_memory_bytes,
+        max_rows_produced: opts.max_rows_produced,
+        cancel: Some(operation.control.cancel.flag()),
+        deadline: operation.control.deadline,
+        no_cache: opts.no_cache,
+        ..Default::default()
+    };
+    if opts.include_inferred {
+        q.default_graph_extra = vec![crate::query::INFERRED_GRAPH.to_string()];
+    }
+    let mut q = ds.with_query_defaults(&q).into_owned();
+    if !opts.include_inferred {
+        q.default_graph_extra.clear();
+    }
+    Ok((req, q))
 }
 fn schema_request(
     req: SchemaRequest,
@@ -105,6 +152,18 @@ impl FfiDataset {
                 .map(|(name, term)| (name, term.to_string()))
                 .collect(),
         })
+    }
+    /// The answer of `ds.graph().groups` for a request in JSON. Every query of the overview
+    /// shares the deadline of `operation`, which is one deadline for the whole call.
+    pub fn graph_groups(
+        &self,
+        request: Vec<u8>,
+        opts: GroupsOpts,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        operation.control.check()?;
+        let (req, q) = groups_args(&self.inner.ds, &request, opts, &operation)?;
+        encode(&self.inner.ds.graph().groups(&req, &q)?)
     }
     pub fn schema_report(
         &self,
@@ -341,5 +400,35 @@ impl FfiDataset {
                 "built without graphql",
             ))
         }
+    }
+}
+#[uniffi::export]
+impl FfiReadTxn {
+    /// As `FfiDataset::graph_groups`, over the snapshot of this transaction. The request's
+    /// `at` is not read, because the snapshot is the point in history.
+    pub fn graph_groups(
+        &self,
+        request: Vec<u8>,
+        opts: GroupsOpts,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        operation.control.check()?;
+        let (req, q) = groups_args(&self.ds.ds, &request, opts, &operation)?;
+        encode(&sparkles::overview::groups_at(self.snap.clone(), &req, &q)?)
+    }
+}
+#[uniffi::export]
+impl FfiWriteTxn {
+    /// As `FfiDataset::graph_groups`, over the transaction's view, which holds its changes.
+    /// The request's `at` is not read.
+    pub fn graph_groups(
+        &self,
+        request: Vec<u8>,
+        opts: GroupsOpts,
+        operation: Arc<FfiOperation>,
+    ) -> FfiResult<Vec<u8>> {
+        operation.control.check()?;
+        let (req, q) = groups_args(&self.ds.ds, &request, opts, &operation)?;
+        encode(&sparkles::overview::groups_at(self.view()?, &req, &q)?)
     }
 }

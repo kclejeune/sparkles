@@ -6,6 +6,8 @@ import io.github.kclejeune.sparkles.jena.internal.ffi.FfiQuery
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiReadTxn
 import io.github.kclejeune.sparkles.jena.internal.ffi.FfiWriteTxn
 import io.github.kclejeune.sparkles.jena.internal.ffi.FindResult
+import io.github.kclejeune.sparkles.jena.internal.ffi.FfiOperation
+import io.github.kclejeune.sparkles.jena.internal.ffi.GroupsOpts
 import io.github.kclejeune.sparkles.jena.internal.ffi.QueryOpts
 import io.github.kclejeune.sparkles.jena.internal.ffi.SparklesJni
 import org.apache.jena.graph.Node
@@ -26,6 +28,9 @@ internal sealed interface Source {
     fun graphNames(): ByteArray
     fun prepareQuery(text: String, opts: QueryOpts): FfiQuery
 
+    /** The graph overview of what this source reads. A source other than the head ignores the request's `at`. */
+    fun groups(request: ByteArray, opts: GroupsOpts, operation: FfiOperation): ByteArray
+
     // The head and read transactions make their small, frequent calls through JNI (SparklesJni).
     class Head(private val ds: FfiDataset) : Source {
         override fun find(pattern: ByteArray, firstRows: Int) = ffi { SparklesJni.find(ds, pattern, firstRows) }
@@ -33,6 +38,7 @@ internal sealed interface Source {
         override fun contains(pattern: ByteArray) = ffi { SparklesJni.contains(ds, pattern) }
         override fun graphNames() = ffi { ds.graphNames() }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { SparklesJni.prepareQuery(ds, text, opts) }
+        override fun groups(request: ByteArray, opts: GroupsOpts, operation: FfiOperation) = ffi { ds.graphGroups(request, opts, operation) }
     }
 
     class Read(private val t: FfiReadTxn) : Source {
@@ -41,6 +47,7 @@ internal sealed interface Source {
         override fun contains(pattern: ByteArray) = ffi { SparklesJni.contains(t, pattern) }
         override fun graphNames() = ffi { t.graphNames() }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { SparklesJni.prepareQuery(t, text, opts) }
+        override fun groups(request: ByteArray, opts: GroupsOpts, operation: FfiOperation) = ffi { t.graphGroups(request, opts, operation) }
     }
 
     class Write(private val t: FfiWriteTxn) : Source {
@@ -49,6 +56,7 @@ internal sealed interface Source {
         override fun contains(pattern: ByteArray) = ffi { t.contains(pattern) }
         override fun graphNames() = ffi { t.graphNames() }
         override fun prepareQuery(text: String, opts: QueryOpts) = ffi { t.prepareQuery(text, opts) }
+        override fun groups(request: ByteArray, opts: GroupsOpts, operation: FfiOperation) = ffi { t.graphGroups(request, opts, operation) }
     }
 }
 
