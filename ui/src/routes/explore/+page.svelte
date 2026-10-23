@@ -44,6 +44,8 @@
   import TimeSlider from '$components/TimeSlider.svelte';
   import MemoryTab from '$components/MemoryTab.svelte';
   import OverviewView from '$components/OverviewView.svelte';
+  import DiffGraph from '$components/DiffGraph.svelte';
+  import { quadIds, seqOf, stepAnnouncement, STEP_QUADS } from '$lib/diff-graph';
   import TextSearchView from '$components/TextSearchView.svelte';
 
   type ENode = {
@@ -136,6 +138,51 @@
   const urlAt = page.url.searchParams.get('at');
   const urlFrom = page.url.searchParams.get('from');
   const urlAgainst = page.url.searchParams.get('against');
+  // --- the diff graph (docs/specs/U01-time-slider.md, Phase 4) -------------------------
+
+  type DiffView = { to: string; from: string; branch: string; group: boolean };
+  const diffOfUrl = (u: URL): DiffView | null => {
+    const to = u.searchParams.get('diff');
+    if (!to) return null;
+    return {
+      to,
+      from: u.searchParams.get('diffFrom') ?? '',
+      branch: u.searchParams.get('diffBranch') ?? '',
+      group: u.searchParams.get('group') === 'class',
+    };
+  };
+  /** The diff drawn as a graph, in place of the resource graph and the overview. */
+  let diffView = $state<DiffView | null>(diffOfUrl(page.url));
+  /** Bumped when the address names another diff, so that the view reads it again. */
+  let diffKey = $state(0);
+  $effect(() => {
+    const d = diffOfUrl(page.url);
+    untrack(() => {
+      const same =
+        (!d && !diffView) ||
+        (d &&
+          diffView &&
+          d.to === diffView.to &&
+          d.from === diffView.from &&
+          d.branch === diffView.branch &&
+          d.group === diffView.group);
+      if (same) return;
+      // a move inside the diff graph keeps it; another address reads the new diff
+      diffView = d;
+      diffKey++;
+      if (d) tab = 'graph';
+    });
+  });
+  function openDiff(to: string, from: string) {
+    diffView = { to, from, branch: '', group: false };
+    diffKey++;
+    syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
+  }
+  function exitDiff() {
+    diffView = null;
+    syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
+  }
+
   /** The History strip of the selected resource. */
   let stripOpen = $state(
     !!(urlAt || urlFrom || urlAgainst) && urlTab !== 'schema' && urlTab !== 'search',
@@ -597,13 +644,120 @@
     }
   }
 
-  // the graph follows the graph slider
+  // --- the time-lapse on the graph (U01 Phase 4) ---------------------------------------
+
+  /** Play re-reads the graph at each commit, or applies each step's changes to it. */
+  let graphPlayMode = $state<'reread' | 'lapse'>('reread');
+  let graphPlaying = $state(false);
+
+  /**
+   * One time-lapse step from `fromAt` to `toAt`: the changes that touch drawn resources (the
+   * `term` filter, up to 1,000 of them) are applied to the graph. An added triple draws its
+   * edge and a new end next to its neighbour, so the picture grows as the data did. A removed
+   * one leaves a ghost for this step, and a node left without edges goes with it.
+   */
+  async function lapseGraph(fromAt: string, toAt: string) {
+    const name = ds;
+    if (!name || !focusId) return;
+    const owns = graphRuns.claim('graph');
+    const signal = graphRuns.signal('graph');
+    graphReading = true;
+    graphNote = '';
+    const t0 = performance.now();
+    try {
+      const iris = Object.values(nodes)
+        .filter((n) => n.term.type === 'uri')
+        .map((n) => n.iri)
+        .slice(0, 1000);
+      const d = await api.diff(name, {
+        from: fromAt,
+        to: toAt,
+        terms: iris,
+        quads: true,
+        limit: STEP_QUADS,
+        signal,
+      });
+      if (!owns()) return;
+      const addedNodes = new Set<string>();
+      const addedEdges = new Set<string>();
+      const ghostEdges: Record<string, EEdge> = {};
+      const ghostNodes: Record<string, ENode> = {};
+      let added = 0;
+      let removed = 0;
+      for (const q of d.quads ?? []) {
+        const { s, o, p, sid, oid, edge, lit } = quadIds(q);
+        if (q.op === '+') {
+          if (!nodes[sid] && !nodes[oid]) continue;
+          if (Object.keys(nodes).length >= MAX_NODES) continue;
+          if (!nodes[sid]) {
+            ensureNode(s, undefined, sid);
+            addedNodes.add(sid);
+          }
+          if (!nodes[oid]) {
+            ensureNode(o, undefined, oid);
+            addedNodes.add(oid);
+          }
+          if (!edges[edge]) {
+            addEdge(sid, p, oid, lit);
+            addedEdges.add(edge);
+            added++;
+          }
+          continue;
+        }
+        const e = edges[edge];
+        if (e) {
+          ghostEdges[edge] = e;
+          delete edges[edge];
+          removed++;
+        }
+      }
+      const incident = new Set(Object.values(edges).flatMap((e) => [e.source, e.target]));
+      for (const [id, n] of Object.entries(nodes)) {
+        if (id === focusId || incident.has(id)) continue;
+        ghostNodes[id] = n;
+        delete nodes[id];
+      }
+      changes = { addedNodes, addedEdges, ghostNodes, ghostEdges };
+      graphSlider?.accept();
+      graphReadMs = performance.now() - t0;
+      const a = seqOf(fromAt) ?? 0;
+      graphAnnounce = stepAnnouncement({ from: a, to: d.to.commit.seq }, added, removed);
+      const listed = d.quads?.length ?? 0;
+      if (listed < d.added + d.removed)
+        graphNote = `The step changed ${fmtInt(d.added + d.removed)} triples of the drawn resources, and the first ${fmtInt(listed)} are drawn.`;
+    } catch (e) {
+      if (!owns() || isAbort(e)) return;
+      const gone = timeFailure(e);
+      if (gone) {
+        toasts.push('error', gone.title, gone.detail);
+        graphSlider?.reject({ seq: gone.seq, readable: gone.readable });
+        drawnKey = timeKey();
+        return;
+      }
+      graphSlider?.fail();
+      toasts.error('Could not read the changes of that commit', e);
+    } finally {
+      if (owns()) graphReading = false;
+    }
+  }
+
+  // the graph follows the graph slider: a time-lapse step applies its changes, any other
+  // move reads the graph again
   $effect(() => {
     const key = timeKey();
     untrack(() => {
       if (key === drawnKey) return;
+      const prev = drawnKey;
       drawnKey = key;
-      if (focusId) void rereadGraph();
+      if (!focusId) return;
+      const before = prev === 'head' ? null : prev.split('|')[0];
+      const a = seqOf(before);
+      const b = seqOf(exAt);
+      // the head is always after the state drawn
+      const forward = a != null && (b != null ? b > a : exAt === '');
+      if (graphPlayMode === 'lapse' && graphPlaying && !exCompare && forward)
+        void lapseGraph(`commit:${a}`, b != null ? `commit:${b}` : 'head');
+      else void rereadGraph();
     });
   });
 
@@ -627,6 +781,12 @@
     if (tab !== 'graph') p.set('tab', tab);
     if (tab === 'search' && textQuery.trim()) p.set('q', textQuery.trim());
     if (iri && sideTab === 'memory') p.set('view', 'memory');
+    if (diffView && tab === 'graph') {
+      p.set('diff', diffView.to);
+      if (diffView.from) p.set('diffFrom', diffView.from);
+      if (diffView.branch) p.set('diffBranch', diffView.branch);
+      if (diffView.group) p.set('group', 'class');
+    }
     const timed =
       tab === 'schema'
         ? schemaTimeOpen
@@ -1250,6 +1410,28 @@
         onopen={(iri, label) => focusOn(iri, label)}
       />
     {/key}
+  {:else if tab === 'graph' && diffView}
+    <div class="diff-host">
+      {#key `${ds}|${diffKey}`}
+        <DiffGraph
+          ds={diffView.branch ? `${ds}@${diffView.branch}` : ds}
+          from={diffView.from}
+          to={diffView.to}
+          group={diffView.group}
+          {prefixes}
+          onexit={exitDiff}
+          onchange={(c) => {
+            if (!diffView) return;
+            diffView = { ...diffView, from: c.from, to: c.to, group: c.group };
+            syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
+          }}
+          onopen={(iri) => {
+            diffView = null;
+            void focusOn(iri);
+          }}
+        />
+      {/key}
+    </div>
   {:else if tab === 'graph'}
     <div class="split" class:overview={nodeCount === 0 && !graphTimeOpen}>
       <div class="canvas">
@@ -1294,6 +1476,10 @@
               bind:against={exAgainst}
               label="Graph history"
               canFollow={false}
+              lapse
+              bind:playMode={graphPlayMode}
+              bind:playing={graphPlaying}
+              onshowdiff={(from, to) => openDiff(to, from)}
               onchange={() => syncUrl(selected?.term.type === 'uri' ? selected.iri : null)}
               onclose={() => {
                 closeGraphTime();
@@ -2167,6 +2353,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .diff-host {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
   .split {
     flex: 1;

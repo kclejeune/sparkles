@@ -11,7 +11,13 @@
     /** Kept in place while the layout runs (it was laid out before). */
     fixed?: boolean;
   };
-  export type LEdge = { key: string; source: string; target: string; size?: number };
+  export type LEdge = {
+    key: string;
+    source: string;
+    target: string;
+    size?: number;
+    color?: string;
+  };
 </script>
 
 <script lang="ts">
@@ -39,6 +45,7 @@
     onfail,
     iterations = 300,
     label = 'Graph',
+    still = false,
   }: {
     nodes: LNode[];
     edges: LEdge[];
@@ -51,6 +58,11 @@
     onfail?: (reason: string) => void;
     iterations?: number;
     label?: string;
+    /**
+     * Update sizes, colours and labels in place without a new layout, so the picture
+     * holds still while a time-lapse changes its counts (U01 Phase 4).
+     */
+    still?: boolean;
   } = $props();
 
   let host: HTMLDivElement;
@@ -416,6 +428,7 @@
       graph.addEdgeWithKey(e.key, e.source, e.target, {
         size: e.size ?? 1,
         weight: e.size ?? 1,
+        ...(e.color ? { color: e.color } : {}),
       });
     }
     renderer.setSetting('defaultEdgeType', edgeType());
@@ -427,12 +440,40 @@
     startLayout(true);
   }
 
+  /** The props' sizes, colours and labels on the drawn graph, positions kept and no layout. */
+  function update() {
+    if (!graph || !renderer) return;
+    const g = graph;
+    const want = new Set(nodes.map((n) => n.key));
+    g.forEachNode((k) => {
+      if (!want.has(k)) g.dropNode(k);
+    });
+    for (const n of nodes) {
+      const a = { label: n.label, size: n.size, color: n.color };
+      if (g.hasNode(n.key)) g.mergeNodeAttributes(n.key, a);
+      else g.addNode(n.key, { ...a, x: n.x, y: n.y, fixed: true });
+    }
+    const wantE = new Set(edges.map((e) => e.key));
+    g.forEachEdge((k) => {
+      if (!wantE.has(k)) g.dropEdge(k);
+    });
+    for (const e of edges) {
+      if (e.source === e.target || !g.hasNode(e.source) || !g.hasNode(e.target)) continue;
+      const a = { size: e.size ?? 1, weight: e.size ?? 1, ...(e.color ? { color: e.color } : {}) };
+      if (g.hasEdge(e.key)) g.mergeEdgeAttributes(e.key, a);
+      else if (!g.hasEdge(e.source, e.target)) g.addEdgeWithKey(e.key, e.source, e.target, a);
+    }
+    setFocusSet();
+    renderer.refresh();
+  }
+
   // the props change as a whole (a new level), so one rebuild per change. The rebuild
-  // reads other state, such as the selection, which must not start another one.
+  // reads other state, such as the selection, which must not start another one. While the
+  // picture holds still, the drawn graph is updated in place instead.
   $effect(() => {
     void nodes;
     void edges;
-    if (ready) untrack(sync);
+    if (ready) untrack(() => (still && graph && graph.order > 0 ? update() : sync()));
   });
 
   $effect(() => {

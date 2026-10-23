@@ -40,6 +40,7 @@
     onexpand,
     emptyText = 'Nothing to draw',
     animate = false,
+    layoutNew = true,
   }: {
     nodes: GNode[];
     edges: GEdge[];
@@ -52,6 +53,12 @@
      * are (the time slider). Off with `prefers-reduced-motion`, then changes appear at once.
      */
     animate?: boolean;
+    /**
+     * Run the layout when elements are added. A fast time-lapse turns it off: new nodes stay
+     * where they are seeded, next to a neighbour or inside the drawn area, so a step costs
+     * no layout.
+     */
+    layoutNew?: boolean;
   } = $props();
 
   let host: HTMLDivElement;
@@ -321,8 +328,14 @@
     );
     let added = 0;
     const fresh = new Set<string>();
+    const byEnd = new Map<string, GEdge>();
+    for (const e of wantEdges.values()) {
+      if (!byEnd.has(e.source)) byEnd.set(e.source, e);
+      if (!byEnd.has(e.target)) byEnd.set(e.target, e);
+    }
     const fade = motion() && !wasEmpty;
     motionOn = motion();
+    let area: { x1: number; y1: number; w: number; h: number } | undefined;
     cy.batch(() => {
       cy!.elements().forEach((el) => {
         const id = el.id();
@@ -341,22 +354,33 @@
             existing.removeClass('leaving');
             existing.removeStyle('opacity');
           }
-          existing.data({
-            label: sign(n.change) + n.label,
-            change: n.change ?? '',
-            kind: n.kind,
-            focus: !!n.focus,
-            expanded: !!n.expanded,
-            title: n.title,
-            w: Math.min(190, n.label.length * 6 + 14),
-          });
+          // only what changed: a data change restyles the element
+          const label = sign(n.change) + n.label;
+          const d = existing.data();
+          if (
+            d.label !== label ||
+            d.change !== (n.change ?? '') ||
+            d.kind !== n.kind ||
+            d.focus !== !!n.focus ||
+            d.expanded !== !!n.expanded ||
+            d.title !== n.title
+          )
+            existing.data({
+              label,
+              change: n.change ?? '',
+              kind: n.kind,
+              focus: !!n.focus,
+              expanded: !!n.expanded,
+              title: n.title,
+              w: Math.min(190, n.label.length * 6 + 14),
+            });
         } else {
           const el = cy!.add(toEl.node(n));
           added++;
           fresh.add(n.id);
           if (fade) fadeIn(el);
           // Seed position next to an existing neighbour so incremental layouts stay calm.
-          const neighbour = edges.find((e) => e.target === n.id || e.source === n.id);
+          const neighbour = byEnd.get(n.id);
           const other = neighbour
             ? cy!.getElementById(neighbour.source === n.id ? neighbour.target : neighbour.source)
             : null;
@@ -366,6 +390,11 @@
               x: p.x + (Math.random() - 0.5) * 120,
               y: p.y + (Math.random() - 0.5) * 120,
             });
+          } else if (!layoutNew && !wasEmpty) {
+            // no neighbour drawn yet: somewhere inside the drawn area
+            // the drawn area before this sync, measured once without labels
+            const b = (area ??= cy!.nodes().not(el).boundingBox({ includeLabels: false }));
+            el.position({ x: b.x1 + Math.random() * b.w, y: b.y1 + Math.random() * b.h });
           }
         }
       }
@@ -380,7 +409,9 @@
             have.removeClass('leaving');
             have.removeStyle('opacity');
           }
-          have.data({ change: e.change ?? '', label: sign(e.change) + e.label });
+          const label = sign(e.change) + e.label;
+          if (have.data('label') !== label || have.data('change') !== (e.change ?? ''))
+            have.data({ change: e.change ?? '', label });
         }
       }
     });
@@ -391,10 +422,11 @@
         edges: [...wantEdges.values()].map((e) => [e.label, e.change ?? '']),
       });
     // Too many edge labels turn into noise: show them only on hover/selection.
-    cy.edges().toggleClass('quiet', cy.edges().length > 60);
+    const quiet = cy.edges().length > 60;
+    cy.edges(quiet ? ':not(.quiet)' : '.quiet').toggleClass('quiet', quiet);
     // Incremental layouts keep the user's arrangement, but when most of the graph is new
     // (a resource and then its neighbours) there is nothing to keep: lay it out afresh.
-    if (added) {
+    if (added && (layoutNew || wasEmpty)) {
       const randomize = wasEmpty || cy.nodes().length - added <= 2;
       // in the time slider the nodes that stay keep their places
       const keep = animate

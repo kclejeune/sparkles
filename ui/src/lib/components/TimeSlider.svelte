@@ -75,6 +75,10 @@
     label = 'History',
     refreshKey = 0,
     canFollow = true,
+    lapse = false,
+    playMode = $bindable('reread'),
+    playing = $bindable(false),
+    onshowdiff,
     onchange,
     onclose,
   }: {
@@ -113,6 +117,16 @@
     /** Bump to reload the commits. */
     refreshKey?: number;
     canFollow?: boolean;
+    /**
+     * The view can play a time-lapse, which applies each step's changes instead of reading
+     * the view again (U01 Phase 4). The play menu then offers both.
+     */
+    lapse?: boolean;
+    playMode?: 'reread' | 'lapse';
+    /** Play is running. */
+    playing?: boolean;
+    /** **Show on graph** in compare mode: the diff between the two handles as a graph. */
+    onshowdiff?: (from: string, to: string) => void;
     onchange?: (c: TimeChange) => void;
     onclose?: () => void;
   } = $props();
@@ -139,7 +153,6 @@
   let rightSeq = $state(0);
   let leftSeq = $state(0);
   let dragging = $state<'left' | 'right' | 'band' | null>(null);
-  let playing = $state(false);
   let speed = $state<1 | 2 | 4>(1);
   let follow = $state(false);
   let followNote = $state<string | null>(null);
@@ -450,6 +463,11 @@
     good = { right: rightSeq, left: leftSeq, compare, at, from };
   }
 
+  /** Pause Play, for example when the person opens something in the view. */
+  export function pause() {
+    playing = false;
+  }
+
   /** Read the commits again. */
   export function reload() {
     return load();
@@ -731,6 +749,17 @@
       <option value="2">2×</option>
       <option value="4">4×</option>
     </select>
+    {#if lapse}
+      <select
+        class="select sm"
+        aria-label="Play mode"
+        title="Read the view again at each commit, or apply each commit's changes (a time-lapse)"
+        bind:value={playMode}
+      >
+        <option value="reread">Re-read</option>
+        <option value="lapse">Time-lapse</option>
+      </select>
+    {/if}
     <button
       class="btn sm"
       aria-pressed={compare}
@@ -949,6 +978,14 @@
       {:else if compare}
         <span class="mono"><span class="from-tag">from</span> {caption(leftStop)}</span>
         <span class="mono"><span class="to-tag">to</span> {caption(rightStop)}</span>
+        {#if onshowdiff}
+          <button
+            class="btn ghost sm"
+            title="Draw the changes between the two handles as a graph"
+            onclick={() => onshowdiff(`commit:${leftSeq}`, `commit:${rightSeq}`)}
+            ><Icon name="graph" size={12} /> Show on graph</button
+          >
+        {/if}
       {:else}
         <span class="mono">{caption(rightStop)}</span>
       {/if}

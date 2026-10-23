@@ -80,6 +80,91 @@ function stateStore(commit) {
   return st;
 }
 
+/** The graph a reader who is not an admin cannot read, for the limited reader of U01's A16. */
+export const PRIVATE_GRAPH = 'http://example.org/private';
+
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+
+/** The state after commit `seq` of `ds` as a store (the head is the live store), or null. */
+function storeAt(ds, seq) {
+  const list = allCommits(ds);
+  const head = list.at(-1)?.seq ?? 0;
+  if (seq === head) return ds.store;
+  const c = list.find((x) => x.seq === seq);
+  return c && statesOf.has(c) ? stateStore(c) : null;
+}
+
+/**
+ * `GET /{ds}/diff?group=class` (U01 Phase 4): the changes counted by the class of the
+ * subject, the predicate and the class or kind of the object. Classes are read at the `to`
+ * state for an addition and at the `from` state for a removal, in the graphs the caller
+ * reads; a resource with several classes counts under the one most of the side's resources
+ * share, the smallest IRI first.
+ */
+export function groupDiff(ds, from, to, changes, hidden, limit = 5000) {
+  const classes = (seq, op) => {
+    const st = storeAt(ds, seq);
+    const res = new Map();
+    if (!st) return res;
+    const terms = new Map();
+    for (const ch of changes.filter((c) => c.op === op)) {
+      terms.set(String(ch.quad.subject), ch.quad.subject);
+      if (ch.quad.predicate.value !== RDF_TYPE && ch.quad.object.termType !== 'Literal')
+        terms.set(String(ch.quad.object), ch.quad.object);
+    }
+    const found = new Map();
+    for (const [k, t] of terms) {
+      if (t.termType !== 'NamedNode' && t.termType !== 'BlankNode') continue;
+      const cs = new Set(
+        st
+          .match(t, ox.namedNode(RDF_TYPE), null)
+          .filter((q) => !hidden(q) && q.object.termType === 'NamedNode')
+          .map((q) => q.object.value),
+      );
+      if (cs.size) found.set(k, [...cs]);
+    }
+    const freq = new Map();
+    for (const cs of found.values()) for (const c of cs) freq.set(c, (freq.get(c) ?? 0) + 1);
+    for (const [k, cs] of found) {
+      cs.sort((a, b) => freq.get(b) - freq.get(a) || (a < b ? -1 : 1));
+      res.set(k, cs[0]);
+    }
+    return res;
+  };
+  const removedAt = classes(from, '-');
+  const addedAt = classes(to, '+');
+  const groups = new Map();
+  for (const ch of changes) {
+    const cl = ch.op === '+' ? addedAt : removedAt;
+    const q = ch.quad;
+    const o = q.object;
+    const object =
+      o.termType === 'Literal'
+        ? { literal: o.datatype.value }
+        : q.predicate.value === RDF_TYPE && o.termType === 'NamedNode'
+          ? { class: o.value }
+          : cl.has(String(o))
+            ? { class: cl.get(String(o)) }
+            : o.termType === 'NamedNode'
+              ? { iri: true }
+              : { class: null };
+    const subjectClass = cl.get(String(q.subject)) ?? null;
+    const key = JSON.stringify([subjectClass, q.predicate.value, object]);
+    const g = groups.get(key) ?? {
+      subjectClass,
+      predicate: q.predicate.value,
+      object,
+      added: 0,
+      removed: 0,
+    };
+    if (ch.op === '+') g.added++;
+    else g.removed++;
+    groups.set(key, g);
+  }
+  const list = [...groups.values()].sort((a, b) => b.added + b.removed - (a.added + a.removed));
+  return { groupCount: list.length, truncated: list.length > limit, groups: list.slice(0, limit) };
+}
+
 /**
  * `GET /$/commits/{ds}/timeline`: the commits in buckets of consecutive numbers, with the
  * quad counts and the readable ranges.

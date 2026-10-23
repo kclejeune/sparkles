@@ -29,6 +29,7 @@
   import { fmtInt, fmtRelative } from '$lib/format';
   import { diffSummary, readable } from '$lib/history';
   import { LatestRun } from '$lib/supersede';
+  import { diffGraphHref } from '$lib/diff-graph';
   import DiffLines from './DiffLines.svelte';
   import Icon from './Icon.svelte';
 
@@ -166,6 +167,23 @@
     } finally {
       if (owns()) diffLoading = false;
     }
+  }
+
+  /** Draw what commit `c` changed as a graph in Explore (U01 Phase 4). */
+  function showOnGraph(e: MouseEvent, c: GraphCommit) {
+    e.preventDefault();
+    app.setDataset(name);
+    goto(
+      diffGraphHref(
+        resolve('/explore'),
+        name,
+        `commit:${c.seq}`,
+        `commit:${Math.max(c.seq - 1, 0)}`,
+        {
+          branch: c.branch,
+        },
+      ),
+    );
   }
 
   function queryAt(e: MouseEvent, c: GraphCommit) {
@@ -352,6 +370,14 @@
             >
           {/if}
           <span class="spacer"></span>
+          {#if c.seq > 0}
+            <a
+              class="btn ghost sm"
+              href={resolve('/explore')}
+              title="Draw what this commit changed as a graph"
+              onclick={(e) => showOnGraph(e, c)}><Icon name="graph" size={12} /> Show on graph</a
+            >
+          {/if}
           {#if readable(c)}
             <a class="btn ghost sm" href={resolve('/query')} onclick={(e) => queryAt(e, c)}
               ><Icon name="query" size={12} /> Query at commit {c.seq}</a
