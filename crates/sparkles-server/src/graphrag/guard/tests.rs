@@ -210,179 +210,165 @@ fn capture_refuses_what_it_cannot_describe() {
     assert!(matches!(e, CaptureError::Unrepresentable(_)));
 }
 
-fn guard_for(dir: Option<&Path>) -> Guard {
-    let id = uuid::Uuid::from_u128(1);
-    let root = dir.map(Path::to_path_buf);
-    Guard::new(Box::new(move |name| {
-        (name == "ds").then(|| (id, root.clone()))
-    }))
+use sparkles::io::{RdfFormat, Source};
+use sparkles::store::{Store, StoreOptions};
+
+fn store(trig: &str) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    s.load(&[Source::from_bytes(
+        trig.as_bytes().to_vec(),
+        RdfFormat::TriG,
+        None,
+    )])
+    .unwrap();
+    s
 }
 
-fn entry(fp: Footprint) -> Entry {
-    Entry {
-        graph: REPORTS.into(),
-        footprint: fp,
+/// A quad as TriG.
+fn nq(q: &oxrdf::Quad) -> String {
+    format!(
+        "{} {{ {} {} {} . }}\n",
+        q.graph_name, q.subject, q.predicate, q.object
+    )
+}
+
+/// The TriG of a reports graph whose report links to `fp`, with `fp` stored.
+fn with_footprint(fp: &Footprint) -> String {
+    let mut out = format!(
+        "<{REPORTS}> {{ <http://ex/r> <{}> <{}> . <http://ex/r> <http://ex/summary> \"s\" . }}\n",
+        gr("disclosure"),
+        fp.iri()
+    );
+    for q in fp.quads(REPORTS) {
+        out.push_str(&nq(&q));
     }
+    out
+}
+
+fn reader(read: &[&str]) -> GraphAccess {
+    GraphAccess::graphs(graphs(read), Graphs::none())
 }
 
 #[test]
-fn restricted_views_lose_unproven_guarded_graphs() {
-    let reader = GraphAccess::graphs(Graphs::All.without_iri("urn:g:z"), Graphs::none());
-    // without a guard, or with no footprint, the graph is hidden
-    let v = apply(reader.clone(), "ds", None);
-    assert!(!v.read.allows_iri(REPORTS));
-    assert!(v.read.allows_iri(A));
-    let g = guard_for(None);
-    assert!(
-        !apply(reader.clone(), "ds", Some(&g))
-            .read
-            .allows_iri(REPORTS)
-    );
-    // a footprint the reader covers exempts it
+fn footprints_are_named_by_their_digest_and_versioned() {
     let c = caller("reports", &[]);
-    g.install(
-        "ds",
-        vec![entry(footprint(
-            Some(&view(&[A], &[], c.clone())),
-            &[A],
-            &c,
-        ))],
-    )
-    .unwrap();
-    assert!(
-        apply(reader.clone(), "ds@main", Some(&g))
-            .read
-            .allows_iri(REPORTS)
-    );
-    // other guarded graphs stay hidden
-    assert!(
-        !apply(reader.clone(), "ds", Some(&g))
-            .read
-            .allows_iri("urn:x-sparkles:graphrag:other")
-    );
-    // a second footprint the reader does not cover hides it again
-    g.install(
-        "ds",
-        vec![entry(footprint(
-            Some(&view(&["urn:g:z"], &[], c.clone())),
-            &["urn:g:z"],
-            &c,
-        ))],
-    )
-    .unwrap();
-    assert!(
-        !apply(reader.clone(), "ds", Some(&g))
-            .read
-            .allows_iri(REPORTS)
-    );
-    // an unrestricted view is left as it is
-    let all = GraphAccess::graphs(Graphs::All, Graphs::All);
-    assert_eq!(apply(all.clone(), "ds", None), all);
+    let fp = footprint(None, &[A], &c);
+    assert!(fp.iri().starts_with(FOOTPRINT_PREFIX));
+    assert_eq!(fp.iri().len(), FOOTPRINT_PREFIX.len() + 64);
+    assert_eq!(Footprint::parse(&fp.to_json()).unwrap(), fp);
+    let newer = fp.to_json().replacen("\"version\":1", "\"version\":2", 1);
+    assert!(Footprint::parse(&newer).unwrap_err().contains("version 2"));
+    assert!(Footprint::parse("{}").is_err());
 }
 
 #[test]
-fn registries_are_durable_add_only_and_versioned() {
-    let dir = tempfile::tempdir().unwrap();
-    let g = guard_for(Some(dir.path()));
+fn a_snapshot_proves_what_its_footprints_cover() {
     let c = caller("reports", &[]);
     let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
-    g.install("ds", vec![entry(fp.clone())]).unwrap();
-    g.install("ds", vec![entry(fp.clone())]).unwrap();
-    let r = Registry::load(dir.path()).unwrap();
-    assert_eq!(r.entries.len(), 1, "an entry is kept once");
-    let reader = GraphAccess::graphs(graphs(&[A, REPORTS]), Graphs::none());
-    assert!(
-        apply(reader.clone(), "ds", Some(&g))
-            .read
-            .allows_iri(REPORTS)
+    let s = store(&with_footprint(&fp));
+    let g = Guard::new();
+    let idx = g.index(&s.snapshot());
+    assert_eq!(
+        idx.proven(&reader(&[A, REPORTS])),
+        vec![REPORTS.to_string()]
     );
-    // a fresh guard reads the file
-    let g2 = guard_for(Some(dir.path()));
+    assert!(idx.proven(&reader(&[B, REPORTS])).is_empty(), "denied");
+    // the disclosure graph is never proven
     assert!(
-        apply(reader.clone(), "ds", Some(&g2))
-            .read
-            .allows_iri(REPORTS)
+        !idx.proven(&reader(&[A, REPORTS]))
+            .contains(&DISCLOSURE_GRAPH.to_string())
     );
-    // an unknown version makes every guarded graph unproven, and refuses installs
-    std::fs::write(path_in(dir.path()), br#"{"version": 2, "entries": []}"#).unwrap();
-    assert!(matches!(
-        Registry::load(dir.path()),
-        Err(RegistryError::UnknownVersion(2))
+}
+
+#[test]
+fn reports_without_a_valid_footprint_are_unproven() {
+    let c = caller("reports", &[]);
+    let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
+    let r = reader(&[A, REPORTS]);
+    let g = Guard::new();
+    // a report linking to a footprint the snapshot lacks
+    let s = store(&format!(
+        "<{REPORTS}> {{ <http://ex/r> <{}> <{}> . }}",
+        gr("disclosure"),
+        fp.iri()
     ));
-    assert!(
-        !apply(reader.clone(), "ds", Some(&g))
-            .read
-            .allows_iri(REPORTS)
+    assert!(g.index(&s.snapshot()).proven(&r).is_empty());
+    // a footprint whose JSON does not match its name
+    let mut other = fp.clone();
+    other.source_commit = 99;
+    let forged = with_footprint(&fp).replace(
+        &fp.to_json().replace('"', "\\\""),
+        &other.to_json().replace('"', "\\\""),
     );
-    assert!(g.install("ds", vec![entry(fp.clone())]).is_err());
-    // a damaged file as well
-    std::fs::write(path_in(dir.path()), b"{not json").unwrap();
-    assert!(!apply(reader, "ds", Some(&g2)).read.allows_iri(REPORTS));
+    assert_ne!(forged, with_footprint(&fp));
+    assert!(g.index(&store(&forged).snapshot()).proven(&r).is_empty());
+    // a footprint of a newer version
+    let newer = with_footprint(&fp).replacen("\\\"version\\\":1", "\\\"version\\\":2", 1);
+    assert_ne!(newer, with_footprint(&fp));
+    assert!(g.index(&store(&newer).snapshot()).proven(&r).is_empty());
+    // a second footprint the reader does not cover
+    let wide = footprint(Some(&view(&[A, B], &[], c.clone())), &[A, B], &c);
+    let mut two = with_footprint(&fp);
+    for q in wide.quads(REPORTS) {
+        two.push_str(&nq(&q));
+    }
+    assert!(g.index(&store(&two).snapshot()).proven(&r).is_empty());
+    assert_eq!(
+        g.index(&store(&two).snapshot())
+            .proven(&reader(&[A, B, REPORTS])),
+        vec![REPORTS.to_string()]
+    );
 }
 
 #[test]
-fn entries_outside_the_namespace_are_corrupt() {
-    let r = br#"{"version": 1, "entries": [{"graph": "urn:other", "footprint": {"version": 1, "dataset": "d", "branch": "main", "sourceCommit": 1, "principal": "p", "caller": {}, "endpoint": "query", "graphs": []}}]}"#;
-    assert!(matches!(Registry::parse(r), Err(RegistryError::Corrupt(_))));
-}
-
-#[test]
-fn installs_bump_the_epoch() {
-    let g = guard_for(None);
-    let before = g.epoch();
+fn guarded_graphs_stay_hidden_until_bound() {
     let c = caller("reports", &[]);
-    g.install("ds", vec![entry(footprint(None, &[A], &c))])
+    let fp = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
+    let g = Arc::new(Guard::new());
+    let r = reader(&[A, REPORTS]);
+    let v = Arc::new(apply(r.clone(), Some(&g)));
+    assert!(!v.read.allows_iri(REPORTS), "unbound");
+    assert!(v.read.allows_iri(A));
+    // bound to a snapshot without the footprint: hidden
+    let empty = store("<urn:g:a> { <http://ex/x> <http://ex/p> 1 . }");
+    assert!(!v.bound(&empty.snapshot()).read.allows_iri(REPORTS));
+    // the same view, bound to a later snapshot with the footprint: proven
+    let s = store(&with_footprint(&fp));
+    let b = v.bound(&s.snapshot());
+    assert!(b.read.allows_iri(REPORTS));
+    assert!(
+        !b.write.allows_iri(REPORTS),
+        "never written through a restricted view"
+    );
+    // without a guard nothing is proven
+    let none = Arc::new(apply(r, None));
+    assert!(!none.bound(&s.snapshot()).read.allows_iri(REPORTS));
+    // an unrestricted view is left as it is
+    let all = GraphAccess::graphs(Graphs::All, Graphs::All);
+    assert_eq!(apply(all.clone(), Some(&g)), all);
+}
+
+/// A view resolved before a report and its footprint were committed is decided against
+/// the snapshot it reads, so it never reads the new report under the old decision.
+#[test]
+fn a_view_resolved_before_a_commit_sees_the_new_footprint() {
+    let c = caller("reports", &[]);
+    let old = footprint(Some(&view(&[A], &[], c.clone())), &[A], &c);
+    let s = store(&with_footprint(&old));
+    let g = Arc::new(Guard::new());
+    let v = Arc::new(apply(reader(&[A, REPORTS]), Some(&g)));
+    assert!(v.bound(&s.snapshot()).read.allows_iri(REPORTS));
+    // a build that also read B commits its report and footprint
+    let new = footprint(Some(&view(&[A, B], &[], c.clone())), &[A, B], &c);
+    let mut more = format!(
+        "<{REPORTS}> {{ <http://ex/r2> <{}> <{}> . }}\n",
+        gr("disclosure"),
+        new.iri()
+    );
+    for q in new.quads(REPORTS) {
+        more.push_str(&nq(&q));
+    }
+    s.load(&[Source::from_bytes(more.into_bytes(), RdfFormat::TriG, None)])
         .unwrap();
-    assert!(g.epoch() > before);
-}
-
-fn numbered(n: u64) -> Entry {
-    let c = caller("reports", &[]);
-    let mut fp = footprint(None, &[A], &c);
-    fp.source_commit = n;
-    entry(fp)
-}
-
-/// Concurrent installs into one persistent registry keep every entry.
-#[test]
-fn concurrent_installs_lose_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let g = Arc::new(guard_for(Some(dir.path())));
-    let threads: Vec<_> = (0..8u64)
-        .map(|t| {
-            let g = g.clone();
-            std::thread::spawn(move || {
-                for i in 0..10 {
-                    g.install("ds", vec![numbered(t * 100 + i)]).unwrap();
-                }
-            })
-        })
-        .collect();
-    for t in threads {
-        t.join().unwrap();
-    }
-    assert_eq!(Registry::load(dir.path()).unwrap().entries.len(), 80);
-    assert_eq!(g.footprints("ds"), Some(80));
-}
-
-/// A first read of an in-memory dataset racing an install never replaces the installed
-/// registry with an empty one.
-#[test]
-fn first_reads_keep_concurrent_installs() {
-    for round in 0..200u64 {
-        let g = Arc::new(guard_for(None));
-        let reader = {
-            let g = g.clone();
-            std::thread::spawn(move || {
-                for _ in 0..20 {
-                    g.footprints("ds");
-                }
-            })
-        };
-        g.install("ds", vec![numbered(round)]).unwrap();
-        reader.join().unwrap();
-        assert_eq!(g.footprints("ds"), Some(1), "round {round}");
-        g.install("ds", vec![numbered(round + 1_000)]).unwrap();
-        assert_eq!(g.footprints("ds"), Some(2), "round {round}");
-    }
+    assert!(!v.bound(&s.snapshot()).read.allows_iri(REPORTS));
 }

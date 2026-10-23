@@ -319,7 +319,7 @@ impl Drop for Leaving<'_> {
 pub struct AppState {
     pub data_dir: PathBuf,
     pub catalog: sparkles::Catalog,
-    /// the disclosure registries of the datasets' reports graphs (spec C22 §6)
+    /// the disclosure guard of reports graphs (spec C22 §6)
     pub graphrag_guard: Arc<crate::graphrag::guard::Guard>,
     /// HTTP routing state and observers, keyed by dataset name. Only map lookups and
     /// changes happen under this lock, never catalog work or file system work.
@@ -596,24 +596,13 @@ impl Limits {
 
 /// The disclosure guard of a catalog's datasets, which finds a dataset's directory
 /// through the catalog.
-fn guard_for(catalog: &sparkles::Catalog) -> Arc<crate::graphrag::guard::Guard> {
-    let catalog = catalog.clone();
-    Arc::new(crate::graphrag::guard::Guard::new(Box::new(move |name| {
-        catalog
-            .get(name)
-            .map(|d| (d.dataset_id(), d.store().root().map(Path::to_path_buf)))
-    })))
-}
-
 impl AppState {
-    /// Moves whenever the access policy is reloaded or a disclosure registry gains an
-    /// entry (spec C22 §6.3). Both counters only grow, so their sum moves when either does.
+    /// Moves whenever the access policy is reloaded (spec C22 §6.3).
     pub fn access_epoch(&self) -> u64 {
         #[cfg(feature = "auth")]
-        let policy = self.auth.as_ref().map_or(0, |a| a.epoch());
+        return self.auth.as_ref().map_or(0, |a| a.epoch());
         #[cfg(not(feature = "auth"))]
-        let policy = 0;
-        self.graphrag_guard.epoch() + policy
+        0
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -639,7 +628,7 @@ impl AppState {
         let catalog = sparkles::Catalog::open(data_dir, options)?;
         let state = AppState {
             data_dir: data_dir.to_path_buf(),
-            graphrag_guard: guard_for(&catalog),
+            graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
             catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),
@@ -705,7 +694,7 @@ impl AppState {
         let catalog = sparkles::Catalog::memory(store_opts.clone().into());
         AppState {
             data_dir: PathBuf::new(),
-            graphrag_guard: guard_for(&catalog),
+            graphrag_guard: Arc::new(crate::graphrag::guard::Guard::new()),
             catalog,
             admission: Default::default(),
             routing: Mutex::new(BTreeMap::new()),

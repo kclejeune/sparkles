@@ -224,8 +224,10 @@ fn classes_of(types: &[(u64, u64)], x: u64) -> &[(u64, u64)] {
 
 /// Compute the profiles of the classes of `snap`.
 pub fn profiles(snap: &Arc<Snapshot>, opts: &ProfileOptions) -> Result<ClassProfiles, SchemaError> {
+    let rebound = super::bind_view(snap, &opts.schema);
+    let schema = rebound.as_ref().unwrap_or(&opts.schema);
     // a view that hides triples is profiled without them
-    let masked = match &opts.schema.graphs {
+    let masked = match &schema.graphs {
         Some(a) => a.masked(snap)?,
         None => snap.clone(),
     };
@@ -234,7 +236,7 @@ pub fn profiles(snap: &Arc<Snapshot>, opts: &ProfileOptions) -> Result<ClassProf
         declared_graph: None,
         subject_classes: false,
         term_totals: false,
-        ..opts.schema.clone()
+        ..schema.clone()
     };
     let budget = Budget {
         deadline: so.deadline,

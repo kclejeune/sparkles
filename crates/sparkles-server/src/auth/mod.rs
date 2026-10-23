@@ -852,8 +852,7 @@ impl Principal {
         };
         // reports graphs are readable only when the guard proves the view covers what
         // their builds read; an unrestricted view has nothing to prove
-        let view =
-            view.map(|v| crate::graphrag::guard::apply(v, &qualified, self.guard.as_deref()));
+        let view = view.map(|v| crate::graphrag::guard::apply(v, self.guard.as_ref()));
         let Some(hidden) = &self.hidden else {
             return view.map(Arc::new);
         };

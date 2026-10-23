@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::auth::Endpoint;
-use crate::graphrag::guard::{CaptureInput, Entry, capture};
+use crate::graphrag::guard::{CaptureInput, DISCLOSURE_GRAPH, capture, gr};
 
 const REPORTS: &str = "urn:x-sparkles:graphrag:reports";
 const REPORTS_ENC: &str = "urn%3Ax-sparkles%3Agraphrag%3Areports";
@@ -104,7 +104,8 @@ fn all_graphs() -> String {
 }
 
 /// A server whose reports graph has the footprint of a build that read graphs a, b and
-/// c as tua.
+/// c as tua. Commit 1 loads the data without a footprint, and commit 2 adds the
+/// footprint and the report's link to it.
 fn server() -> AuthServer {
     server_with(true)
 }
@@ -140,17 +141,34 @@ fn server_with(pattern: bool) -> AuthServer {
         reports: &[REPORTS.to_string()],
     })
     .unwrap();
-    s.state
-        .graphrag_guard
-        .install(
-            "rag",
-            vec![Entry {
-                graph: REPORTS.into(),
-                footprint,
-            }],
-        )
+    let mut trig = format!(
+        "<{REPORTS}> {{ <http://ex/r> <{}> <{}> . }}\n",
+        gr("disclosure"),
+        footprint.iri()
+    );
+    for q in footprint.quads(REPORTS) {
+        trig.push_str(&format!(
+            "{} {{ {} {} {} . }}\n",
+            q.graph_name, q.subject, q.predicate, q.object
+        ));
+    }
+    ds.store
+        .load(&[Source::from_bytes(
+            trig.into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
         .unwrap();
     s
+}
+
+/// The footprint IRI the fixture's report links to.
+async fn footprint_iri(s: &AuthServer) -> String {
+    let text = format!(
+        "SELECT ?f {{ GRAPH <{REPORTS}> {{ <http://ex/r> <{}> ?f }} }}",
+        gr("disclosure")
+    );
+    column(&s.app, "tadmin", &q(&text)).await[0].clone()
 }
 
 fn enc(s: &str) -> String {
@@ -190,16 +208,19 @@ async fn sparql_reads_follow_coverage() {
     let in_reports = format!("SELECT ?o {{ GRAPH <{REPORTS}> {{ ?s ?p ?o }} }}");
     let listed = "SELECT DISTINCT ?g { GRAPH ?g { ?s ?p ?o } }";
     let count = "SELECT (COUNT(*) AS ?n) { GRAPH ?g { ?s ?p ?o } }";
+    let fp = footprint_iri(&s).await;
     for u in SEES {
         assert_eq!(
             column(&s.app, u, &q(&in_reports)).await,
-            ["http://ex/x", "the report"],
+            ["http://ex/x", "the report", fp.as_str()],
             "{u}"
         );
-        assert!(
-            column(&s.app, u, &q(listed))
-                .await
-                .contains(&REPORTS.to_string()),
+        let graphs = column(&s.app, u, &q(listed)).await;
+        assert!(graphs.contains(&REPORTS.to_string()), "{u}");
+        // only unrestricted readers see the footprints
+        assert_eq!(
+            graphs.contains(&DISCLOSURE_GRAPH.to_string()),
+            u == "tadmin",
             "{u}"
         );
     }
@@ -212,17 +233,19 @@ async fn sparql_reads_follow_coverage() {
             "{u}"
         );
     }
-    // counts leave the hidden graph out: tub misses the reports, tua also misses the
-    // secret triple of the protection, which tua owns
+    // counts leave the hidden graphs out: tadmin also counts the two footprint
+    // triples, tub misses the reports and the secret triple of x, which tua owns
     let n = |v: Vec<String>| v[0].parse::<u64>().unwrap();
-    assert_eq!(n(column(&s.app, "tadmin", &q(count)).await), 7);
-    assert_eq!(n(column(&s.app, "tua", &q(count)).await), 7);
+    assert_eq!(n(column(&s.app, "tadmin", &q(count)).await), 10);
+    assert_eq!(n(column(&s.app, "tua", &q(count)).await), 8);
     assert_eq!(n(column(&s.app, "tub", &q(count)).await), 4);
-    assert_eq!(n(column(&s.app, "tlift", &q(count)).await), 7);
-    // a past state is read under the same guard
-    let at = format!("/rag/sparql?at=1&query={}", enc(&in_reports));
-    assert_eq!(column(&s.app, "tua", &at).await.len(), 2);
-    assert!(column(&s.app, "tub", &at).await.is_empty());
+    assert_eq!(n(column(&s.app, "tlift", &q(count)).await), 8);
+    // a past state is decided against its own footprints: commit 1 has none
+    let at = |c: u32| format!("/rag/sparql?at={c}&query={}", enc(&in_reports));
+    assert!(column(&s.app, "tua", &at(1)).await.is_empty());
+    assert_eq!(column(&s.app, "tadmin", &at(1)).await.len(), 2);
+    assert_eq!(column(&s.app, "tua", &at(2)).await.len(), 3);
+    assert!(column(&s.app, "tub", &at(2)).await.is_empty());
 }
 
 #[tokio::test]
@@ -235,6 +258,7 @@ async fn graph_store_and_schema_follow_coverage() {
         assert!(r.text().contains("the report"), "{u}");
         let all = get(&s.app, u, "/rag/data", "application/trig").await;
         assert!(all.text().contains("the report"), "{u}");
+        assert_eq!(all.text().contains(DISCLOSURE_GRAPH), u == "tadmin", "{u}");
     }
     for u in BLIND {
         let r = get(&s.app, u, &one, "application/n-triples").await;
@@ -252,7 +276,7 @@ async fn graph_store_and_schema_follow_coverage() {
     let schema = "/$/schema/rag?graph=union";
     assert_eq!(
         triples(get(&s.app, "tlift", schema, "application/json").await),
-        7
+        8
     );
     assert_eq!(
         triples(get(&s.app, "tub", schema, "application/json").await),
@@ -268,8 +292,10 @@ async fn graph_store_and_schema_follow_coverage() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
+/// The change feed shows changes between commits, which no single snapshot's
+/// footprints cover, so it never shows a restricted reader a guarded graph (§6.5).
 #[tokio::test]
-async fn the_change_feed_follows_coverage() {
+async fn the_change_feed_hides_guarded_graphs_from_restricted_readers() {
     let s = server_with(false);
     let up = format!(
         "INSERT DATA {{ GRAPH <{REPORTS}> {{ <http://ex/r2> <http://ex/summary> \"later\" }} }}"
@@ -280,13 +306,11 @@ async fn the_change_feed_follows_coverage() {
     );
     for (u, sees) in [
         ("tadmin", true),
-        ("tua", true),
-        ("tub", true),
-        ("tlift", true),
-        ("tpart", false),
+        ("tua", false),
+        ("tlift", false),
         ("tnarrow", false),
     ] {
-        let r = get(&s.app, u, "/rag/changes?after=1", "application/json").await;
+        let r = get(&s.app, u, "/rag/changes?after=2", "application/json").await;
         assert_eq!(r.status, StatusCode::OK, "{u}: {}", r.text());
         let f = r.json();
         assert_eq!(f["commits"][0]["added"], u64::from(sees), "{u}: {f}");
@@ -296,6 +320,16 @@ async fn the_change_feed_follows_coverage() {
             "{u}"
         );
     }
+    // the reports are read at a commit instead
+    let q = format!("ASK {{ GRAPH <{REPORTS}> {{ <http://ex/r2> ?p ?o }} }}");
+    let r = get(
+        &s.app,
+        "tlift",
+        &self::q(&q),
+        "application/sparql-results+json",
+    )
+    .await;
+    assert_eq!(r.json()["boolean"], true);
 }
 
 /// A15: the principal loses a graph its build read after the build. Coverage follows the
@@ -317,8 +351,8 @@ async fn a_revoked_grant_hides_the_reports_graph() {
     assert!(ask(get(&s.app, "tlift", &in_reports, json).await));
 }
 
-/// A change feed stream opened before a policy reload or a registry install ends with
-/// `access-changed` before it reads another commit (§6.3).
+/// A change feed stream opened before a policy reload ends with `access-changed` before
+/// it reads another commit (§6.3).
 #[tokio::test]
 async fn streams_end_when_access_changes() {
     use futures_util::StreamExt;
@@ -328,7 +362,7 @@ async fn streams_end_when_access_changes() {
             .app
             .clone()
             .oneshot(
-                axum::extract::Request::get("/rag/changes?after=1")
+                axum::extract::Request::get("/rag/changes?after=2")
                     .header("accept", "text/event-stream")
                     .header("authorization", b("tlift"))
                     .extension(ConnectInfo(default_peer()))
@@ -380,30 +414,6 @@ async fn streams_end_when_access_changes() {
     let (event, data) = next(&mut body, &mut buf).await;
     assert_eq!(event, "error", "{data}");
     assert!(data.contains("access-changed"), "{data}");
-    // a registry install
-    let mut body = open(&s).await;
-    let mut buf = String::new();
-    assert_eq!(next(&mut body, &mut buf).await.0, "commit");
-    let root = s
-        .state
-        .datasets()
-        .get("rag")
-        .unwrap()
-        .store
-        .root()
-        .unwrap()
-        .to_path_buf();
-    let entry = crate::graphrag::guard::Registry::load(&root)
-        .unwrap()
-        .entries[0]
-        .clone();
-    let mut other = entry.clone();
-    other.footprint.source_commit += 1;
-    s.state.graphrag_guard.install("rag", vec![other]).unwrap();
-    // the second commit of the page read before the install is dropped
-    let (event, data) = next(&mut body, &mut buf).await;
-    assert_eq!(event, "error", "{data}");
-    assert!(data.contains("access-changed"), "{data}");
 }
 
 /// A long poll that waited across a policy reload answers `access-changed` instead of
@@ -416,7 +426,7 @@ async fn long_polls_end_when_access_changes() {
         get(
             &app,
             "tlift",
-            "/rag/changes?after=1&wait=10",
+            "/rag/changes?after=2&wait=10",
             "application/json",
         )
         .await

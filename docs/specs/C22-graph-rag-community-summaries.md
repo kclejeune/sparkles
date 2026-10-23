@@ -434,22 +434,29 @@ it, and not only the facts one prompt cited. A footprint whose protections canno
 written in this form, such as one that would need a graph named by a blank node, makes
 the build refuse to start.
 
-The footprints of a dataset are kept in a versioned registry file in the dataset's
-directory. A reader that finds a version it does not know, a file it cannot parse or an
-entry that fails its checks treats every guarded graph as having no valid footprint.
+Footprints are stored in the dataset, in the guarded graph
+`urn:x-sparkles:graphrag:disclosure`. A footprint is a resource
+`urn:x-sparkles:graphrag:footprint:{sha256}`, named by the SHA-256 of its canonical
+JSON, with `gr:footprint` holding that JSON as a literal and `gr:covers` naming the
+reports graph it covers. Every report links to the footprint of the build that wrote it
+with `gr:disclosure`. No footprint proves the disclosure graph itself, so only
+unrestricted readers see it, because protection definitions are not shown to callers.
+A footprint whose version is unknown, whose JSON does not parse or fails its checks, or
+whose name does not match its digest counts as invalid.
 
-**Installation.** The build writes the footprint to the registry and makes it durable,
-with a write to a new file, a flush and a rename, before the commit that adds the first
-report triple. A crash between the two leaves a footprint without reports, which only
-restricts. Before that commit the build compares the principal's resolved view, the
-settings and the policy with the footprint captured at its start. Any difference stops
-the build before it publishes, and a new build captures a new footprint.
+**Installation.** The commit that adds a build's first report triple to a reports graph
+also adds the build's footprint, so no snapshot holds a report without the footprint
+that covers it. Before that commit the build compares the principal's resolved view,
+the settings and the policy with the footprint captured at its start. Any difference
+stops the build before it publishes, and a new build captures a new footprint.
 
-**Retention.** Entries are only added. Replacing a build, rewriting a report, deleting a
-configuration or shrinking the principal's grants removes no entry, so the guard never
-weakens for reports that older commits or other branches still hold. Removing an entry
-is a declassification, which this spec does not define. A later design must make it an
-explicit operation of a dataset administrator.
+**Retention.** A footprint stays in the snapshot while any report in its graph links to
+it. The commit that removes the last such report removes the footprint too, so a
+footprint lives exactly as long as the content it covers. Older commits, branches and
+backups keep the footprints of the reports they hold, because the footprints are part of
+the same data. Removing a footprint that a report still links to makes the graph
+unproven, so only an unrestricted writer can weaken the guard, and only by removing the
+reports as well.
 
 ### 6.3 Coverage
 
@@ -483,10 +490,26 @@ Rule 1 holds at any commit because such a reader may read the build's commit its
 Rules 2 and 3 hold because the protections the reader shares with the footprint give
 the same answers as they gave the principal at the build's commit.
 
-A decision is made when a request resolves its view, from the policy and the registry in
-force at that moment, as views are today. A policy reload or a new registry entry
-therefore applies to the next request. A long-lived read, such as the change feed
-stream, ends when either changes, and the client reconnects under the new decision.
+A decision is made against the footprints in the snapshot the request reads, never
+against a view decided earlier. A request resolves its view from the policy when it is
+authenticated, and the guarded graphs of that view stay undecided until the request
+binds the view to its snapshot. A path that reads a view it has not bound sees no
+guarded graph. A guarded graph is proven for a snapshot only when the snapshot holds at
+least one footprint that covers it, every such footprint is valid and proven, and every
+footprint that a report in the graph links to is among them. A policy reload applies to
+the next request, and a long-lived read such as the change feed stream ends when the
+policy changes.
+
+*Design refinement, 2026-10-23.* The first form of this section decided coverage when
+the request resolved its view, from a registry file of footprints. A request takes its
+snapshot after that, so a build could install a footprint and commit a report between
+the two. The request then read the new report under a decision that had not seen its
+footprint. Three repairs were weighed. A recheck of the decision in every read path fails
+open the first time a path is added without it. A grace period, in which the build waits
+for older requests to finish before it commits, has no bound while streaming responses
+are open. Footprints stored in the snapshot itself make every point-in-time read, branch,
+backup and restore consistent by construction, and an unbound view fails closed, so this
+form was chosen.
 
 ### 6.4 The guard
 
@@ -509,18 +532,17 @@ permission of the metrics endpoint.
 
 ### 6.5 History, branches and restores
 
-The registry belongs to the dataset, not to a branch or a commit. Point-in-time reads,
-snapshots and every branch see the same guarded graphs and the same footprints, and a
-branch created from a commit with reports inherits their guard with nothing to copy.
-Because entries are never removed implicitly, a report still held at an old commit
-keeps its footprint after the head rebuilds or drops it. A build on a branch records its
-branch and commit in its footprint and adds to the same registry.
+Footprints are data in the dataset, so a point-in-time read, a snapshot or a read on a
+branch decides against the footprints of the commit it reads. A branch created from a
+commit with reports holds their footprints with nothing to copy, and a build on a branch
+records its branch and commit in its footprint. A backup, a restore, a clone and a
+replica carry the footprints with the reports, and one that dropped the disclosure graph
+leaves its reports readable only by unrestricted readers.
 
-A backup includes the registry, copied after the store snapshot, so the copy holds every
-entry for the reports the snapshot holds. A restore installs the backup's registry
-together with its data, and keeps any entry of the replaced registry, since dropping one
-would be a declassification. A restore, a clone or a replica without a registry leaves
-the reports readable only by unrestricted readers. Offline access to the database files
+The change feed, `/{ds}/diff`, `/{ds}/history` and the timeline show changes between
+commits, which no single snapshot's footprints cover. These paths never bind the guard,
+so a restricted reader sees no change to a guarded graph there, and reads reports at a
+commit through SPARQL or the Graph Store instead. Offline access to the database files
 stays under the operator's authority, as for every other graph.
 
 ### 6.6 Read paths
@@ -554,7 +576,8 @@ an unproven reader gets no report triple and no metadata, together with a positi
 for each admitted rule. They cover the principal losing a graph after a build, callers
 with the same roles and different `?user` or `?group` bindings, a hidden input graph,
 a lifted protection, a policy change during a build, a branch, an old snapshot, a
-missing or unknown registry, and the schema and count paths.
+missing or unknown footprint in the snapshot, a report committed while a request's view
+was already resolved, and the schema and count paths.
 
 ## 7. Global answering
 
@@ -750,6 +773,11 @@ the facts sent, with the drop and retry policy of §3.4. A heuristic over the pr
 the review status cover the free text, and the spec describes the heuristic as one and
 not as proof.
 
+**2026-10-23, footprints in the snapshot.** The orchestrator replaced the registry
+file of §6.2 with footprints stored in the dataset, after a review found that a request
+could read a report committed after its view was decided. §6.2, §6.3 and §6.5 changed,
+and §6.3 records the race and the reason for the choice.
+
 **2026-10-23, the disclosure guard.** §6 gained the design of the disclosure footprint
 and the common read guard that reports need before they become visible. The first draft
 compared readers with the build principal's current grants through a C12 graph rule,
@@ -776,9 +804,9 @@ the dataset's GraphRAG directory, written before each request can be sent. The
 it, and no build reads it. The projection reader reads as the build's principal and
 checks each provider's send level. The report inputs and the checks of §3.4 are in
 place with the prose heuristic. The disclosure guard of §6 is in the common access
-path. Every restricted view hides the guarded namespace unless the dataset's versioned
-footprint registry proves coverage, and a policy reload or a registry install ends open
-change feed streams. Router tests cover the paths of §6.6 for SPARQL, time travel, the
+path. Every restricted view hides the guarded namespace until the request binds it to
+the snapshot it reads, and the footprints in that snapshot then prove the graphs they
+cover. A policy reload ends open change feed streams. Router tests cover the paths of §6.6 for SPARQL, time travel, the
 Graph Store, the schema report and the change feed. Nothing writes a reports graph yet,
 so the guard has no effect on current data. None of these parts is wired into a build
 or a route, and local mock providers test the model parts. The byte bound's default

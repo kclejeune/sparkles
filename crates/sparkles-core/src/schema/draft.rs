@@ -1211,13 +1211,14 @@ fn decide(path: String, instances: u64, acc: &Acc, cx: &Ctx) -> PropertyDraft {
 
 /// Draft SHACL shapes and a ShEx schema from `snap`.
 pub fn draft_shapes(snap: &Arc<Snapshot>, opts: &DraftOptions) -> Result<ShapesDraft, SchemaError> {
+    let rebound = super::bind_view(snap, &opts.schema);
+    let so = rebound.as_ref().unwrap_or(&opts.schema);
     // a view that hides triples drafts from the triples it sees
-    let masked = match &opts.schema.graphs {
+    let masked = match &so.graphs {
         Some(a) => a.masked(snap)?,
         None => snap.clone(),
     };
     let snap: &Snapshot = &masked;
-    let so = &opts.schema;
     let budget = Budget {
         deadline: so.deadline,
         cancel: so.cancel.as_deref(),

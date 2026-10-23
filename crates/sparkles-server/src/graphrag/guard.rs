@@ -1,10 +1,12 @@
 //! The disclosure guard of reports graphs (spec C22 §6).
 //!
 //! Every graph under [`GUARDED_PREFIX`] is guarded. A build records a [`Footprint`] of
-//! what it read, and a dataset's footprints are kept in a versioned [`Registry`] in
-//! `<db>/graphrag/disclosure.json`, to which entries are only ever added. When a request
-//! resolves its view, [`apply`] removes every guarded graph that [`covers`] does not
-//! prove for the reader, so every read path treats it as a graph that does not exist.
+//! what it read and commits it to [`DISCLOSURE_GRAPH`] together with its first report,
+//! and each report links to its footprint. [`apply`] leaves a restricted view's guarded
+//! graphs undecided, and binding the view to the snapshot a request reads admits those
+//! that the snapshot's footprints prove for the reader, so a decision never misses a
+//! footprint committed after the view was resolved. A path that does not bind sees no
+//! guarded graph.
 //!
 //! Coverage compares definitions and caller attributes, never data:
 //!
@@ -19,48 +21,21 @@
 //! and fails closed. A guarded graph with no valid footprint is proven only by rule 1.
 
 use super::settings::GUARDED_PREFIX;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sparkles::access::{Caller, GraphAccess, Graphs, Protection, Rule};
+use sparkles::access::{Caller, Decider, GraphAccess, Graphs, GuardDecision, Protection, Rule};
+use sparkles::id::Id;
+use sparkles::index::Perm;
+use sparkles::store::Snapshot;
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The registry format this server reads and writes.
-pub const REGISTRY_VERSION: u32 = 1;
 /// The footprint format this server reads and writes.
 pub const FOOTPRINT_VERSION: u32 = 1;
 /// The pattern that names every guarded graph.
 pub fn guarded_pattern() -> String {
     format!("{GUARDED_PREFIX}*")
 }
-/// The most entries a registry may hold.
-pub const MAX_ENTRIES: usize = 10_000;
-/// The largest registry file read, in bytes.
-pub const MAX_REGISTRY_BYTES: u64 = 64 << 20;
-
-/// The file of a database directory.
-pub fn path_in(db: &Path) -> PathBuf {
-    db.join("graphrag").join("disclosure.json")
-}
-
-/// Serializes registry installs in the process.
-static INSTALLS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-/// Create `dir` inside the database directory `db` and flush `db`, so that a file
-/// written in `dir` survives a power loss. `db` is flushed on every call, since an
-/// earlier call may have created `dir` and then failed to flush.
-pub(crate) fn create_dir_durably(db: &Path, dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    std::fs::File::open(db)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = db;
-    Ok(())
-}
-
 /// A graph set as the footprint keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "kind")]
@@ -373,195 +348,247 @@ pub fn covers(reader: Option<&GraphAccess>, fp: &Footprint) -> Decision {
     Decision::Proven
 }
 
-/// One footprint for one guarded graph.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Entry {
-    pub graph: String,
-    pub footprint: Footprint,
+/// The guarded graph that holds every footprint of a dataset (§6.2). No footprint
+/// proves it, so only unrestricted readers see it.
+pub const DISCLOSURE_GRAPH: &str = "urn:x-sparkles:graphrag:disclosure";
+/// The vocabulary of reports and footprints.
+pub const GR: &str = "urn:x-sparkles:graphrag#";
+/// The prefix of a footprint's IRI, followed by the SHA-256 of its JSON in hex.
+pub const FOOTPRINT_PREFIX: &str = "urn:x-sparkles:graphrag:footprint:";
+/// The largest footprint literal read, in bytes.
+pub const MAX_FOOTPRINT_BYTES: usize = 4 << 20;
+
+/// An IRI of the vocabulary.
+pub fn gr(name: &str) -> String {
+    format!("{GR}{name}")
 }
 
-/// `graphrag/disclosure.json`: the footprints of a dataset, only ever added to.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Registry {
-    pub version: u32,
-    #[serde(default)]
-    pub entries: Vec<Entry>,
-}
-
-impl Default for Registry {
-    fn default() -> Registry {
-        Registry {
-            version: REGISTRY_VERSION,
-            entries: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum RegistryError {
-    UnknownVersion(u64),
-    Corrupt(String),
-    Bound(&'static str),
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for RegistryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RegistryError::UnknownVersion(v) => write!(
-                f,
-                "the disclosure registry has format version {v}, and this server reads version {REGISTRY_VERSION}"
-            ),
-            RegistryError::Corrupt(m) => write!(f, "the disclosure registry cannot be read: {m}"),
-            RegistryError::Bound(m) => write!(f, "the disclosure registry is too large: {m}"),
-            RegistryError::Io(e) => write!(f, "the disclosure registry: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for RegistryError {}
-
-impl From<std::io::Error> for RegistryError {
-    fn from(e: std::io::Error) -> RegistryError {
-        RegistryError::Io(e)
-    }
-}
-
-impl Registry {
-    fn check(&self) -> Result<(), RegistryError> {
-        if self.version != REGISTRY_VERSION {
-            return Err(RegistryError::UnknownVersion(self.version.into()));
-        }
-        if self.entries.len() > MAX_ENTRIES {
-            return Err(RegistryError::Bound("entries"));
-        }
-        for e in &self.entries {
-            if !super::settings::is_guarded(&e.graph) {
-                return Err(RegistryError::Corrupt(format!(
-                    "the entry for {} is outside the guarded namespace",
-                    e.graph
-                )));
-            }
-            if e.footprint.version != FOOTPRINT_VERSION {
-                return Err(RegistryError::UnknownVersion(e.footprint.version.into()));
-            }
-        }
-        Ok(())
+impl Footprint {
+    /// The footprint's JSON, as it is stored.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("serializable")
     }
 
-    /// Parse a registry, refusing an unknown version before any other member.
-    pub fn parse(bytes: &[u8]) -> Result<Registry, RegistryError> {
+    /// The IRI that names the footprint: the SHA-256 of its JSON.
+    pub fn iri(&self) -> String {
+        iri_of(&self.to_json())
+    }
+
+    /// Parse a stored footprint, refusing a version this server does not read before
+    /// any other member, and a JSON longer than [`MAX_FOOTPRINT_BYTES`].
+    pub fn parse(json: &str) -> Result<Footprint, String> {
         #[derive(Deserialize)]
         struct Probe {
             version: Option<serde_json::Value>,
         }
-        let p: Probe =
-            serde_json::from_slice(bytes).map_err(|e| RegistryError::Corrupt(e.to_string()))?;
+        if json.len() > MAX_FOOTPRINT_BYTES {
+            return Err("the footprint is too large".into());
+        }
+        let p: Probe = serde_json::from_str(json).map_err(|e| e.to_string())?;
         match p.version.as_ref().and_then(|v| v.as_u64()) {
-            Some(v) if v == u64::from(REGISTRY_VERSION) => {}
-            Some(v) => return Err(RegistryError::UnknownVersion(v)),
-            None => return Err(RegistryError::Corrupt("the version is missing".into())),
+            Some(v) if v == u64::from(FOOTPRINT_VERSION) => {}
+            Some(v) => {
+                return Err(format!(
+                    "the footprint has format version {v}, and this server reads version {FOOTPRINT_VERSION}"
+                ));
+            }
+            None => return Err("the footprint has no version".into()),
         }
-        let r: Registry =
-            serde_json::from_slice(bytes).map_err(|e| RegistryError::Corrupt(e.to_string()))?;
-        r.check()?;
-        Ok(r)
+        serde_json::from_str(json).map_err(|e| e.to_string())
     }
 
-    /// The registry of a database directory, empty when there is none.
-    pub fn load(db: &Path) -> Result<Registry, RegistryError> {
-        let path = path_in(db);
-        match std::fs::metadata(&path) {
-            Ok(m) if m.len() > MAX_REGISTRY_BYTES => Err(RegistryError::Bound("bytes")),
-            Ok(_) => Registry::parse(&std::fs::read(&path)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Registry::default()),
-            Err(e) => Err(e.into()),
-        }
+    /// The quads that store the footprint for `reports_graph` in [`DISCLOSURE_GRAPH`].
+    pub fn quads(&self, reports_graph: &str) -> Vec<oxrdf::Quad> {
+        let json = self.to_json();
+        let s = oxrdf::NamedNode::new_unchecked(iri_of(&json));
+        let g = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(DISCLOSURE_GRAPH));
+        vec![
+            oxrdf::Quad::new(
+                s.clone(),
+                oxrdf::NamedNode::new_unchecked(gr("footprint")),
+                oxrdf::Literal::new_simple_literal(json),
+                g.clone(),
+            ),
+            oxrdf::Quad::new(
+                s,
+                oxrdf::NamedNode::new_unchecked(gr("covers")),
+                oxrdf::NamedNode::new_unchecked(reports_graph),
+                g,
+            ),
+        ]
     }
+}
 
-    /// Add entries and write the registry durably: a new file, a flush and a rename.
-    /// The registry on disk is read again first, so an entry written by another build
-    /// is kept, and an unreadable registry refuses the install.
-    /// Installs are serialized in the process, so two cannot both read the old registry
-    /// and lose each other's entries.
-    pub fn install(db: &Path, entries: Vec<Entry>) -> Result<Registry, RegistryError> {
-        let _serial = INSTALLS.lock();
-        let mut r = Registry::load(db)?;
-        for e in entries {
-            if !r.entries.contains(&e) {
-                r.entries.push(e);
+fn iri_of(json: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(json.as_bytes());
+    let mut out = String::with_capacity(FOOTPRINT_PREFIX.len() + 64);
+    out.push_str(FOOTPRINT_PREFIX);
+    for b in d {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// What one snapshot holds for one guarded graph.
+#[derive(Clone, Debug, Default)]
+pub struct GraphFootprints {
+    /// the footprints that cover the graph, `None` for one that is invalid
+    pub footprints: Vec<Option<Arc<Footprint>>>,
+    /// a report in the graph links to a footprint that does not cover it
+    pub missing: bool,
+}
+
+/// The footprints a snapshot holds, by guarded graph.
+#[derive(Clone, Debug, Default)]
+pub struct Index {
+    pub graphs: HashMap<String, GraphFootprints>,
+}
+
+impl Index {
+    /// The guarded graphs that `view` may read at this snapshot (§6.3).
+    pub fn proven(&self, view: &GraphAccess) -> Vec<String> {
+        self.graphs
+            .iter()
+            .filter(|(g, f)| {
+                g.as_str() != DISCLOSURE_GRAPH
+                    && !f.missing
+                    && !f.footprints.is_empty()
+                    && f.footprints.iter().all(|fp| {
+                        fp.as_ref()
+                            .is_some_and(|fp| covers(Some(view), fp) == Decision::Proven)
+                    })
+            })
+            .map(|(g, _)| g.clone())
+            .collect()
+    }
+}
+
+/// The IRI of a term, when it is one.
+fn iri(t: Option<oxrdf::Term>) -> Option<String> {
+    match t {
+        Some(oxrdf::Term::NamedNode(n)) => Some(n.into_string()),
+        _ => None,
+    }
+}
+
+/// The `[s, p, o, g]` quads with predicate `p`.
+fn with_predicate(snap: &Snapshot, p: &str) -> sparkles::Result<Vec<[Id; 4]>> {
+    let Some(pid) = snap.lookup_iri(p) else {
+        return Ok(Vec::new());
+    };
+    Ok(snap
+        .scan_keys(Perm::Pso, &[pid.0])?
+        .iter()
+        .map(|k| Perm::Pso.to_quad(k))
+        .collect())
+}
+
+/// Read the footprints of `snap`. `parse` turns a footprint's IRI and JSON into the
+/// footprint, `None` when it is invalid. A snapshot that cannot be read gives an index
+/// in which every graph that links to a footprint is missing one.
+fn read_index(
+    snap: &Snapshot,
+    parse: &dyn Fn(&str, &str) -> Option<Arc<Footprint>>,
+) -> sparkles::Result<Index> {
+    let mut index = Index::default();
+    let dg = snap.lookup_iri(DISCLOSURE_GRAPH);
+    // footprint IRI -> the graphs it covers, and its JSON literals
+    let mut covers: HashMap<Id, Vec<String>> = HashMap::new();
+    let mut json: HashMap<Id, Vec<String>> = HashMap::new();
+    if let Some(dg) = dg {
+        for [s, _, o, g] in with_predicate(snap, &gr("covers"))? {
+            if g == dg
+                && let Some(o) = iri(snap.term(o)).filter(|o| super::settings::is_guarded(o))
+            {
+                covers.entry(s).or_default().push(o);
             }
         }
-        r.check()?;
-        let bytes = serde_json::to_vec(&r).expect("serializable");
-        if bytes.len() as u64 > MAX_REGISTRY_BYTES {
-            return Err(RegistryError::Bound("bytes"));
+        for [s, _, o, g] in with_predicate(snap, &gr("footprint"))? {
+            if g == dg {
+                let lit = match snap.term(o) {
+                    Some(oxrdf::Term::Literal(l)) => l.value().to_string(),
+                    _ => String::new(),
+                };
+                json.entry(s).or_default().push(lit);
+            }
         }
-        let path = path_in(db);
-        let dir = path.parent().expect("the registry has a directory");
-        create_dir_durably(db, dir)?;
-        let tmp = dir.join("disclosure.json.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &path)?;
-        #[cfg(unix)]
-        std::fs::File::open(dir)?.sync_all()?;
-        Ok(r)
     }
-
-    /// The footprints of each guarded graph.
-    fn by_graph(&self) -> HashMap<String, Vec<Footprint>> {
-        let mut m: HashMap<String, Vec<Footprint>> = HashMap::new();
-        for e in &self.entries {
-            m.entry(e.graph.clone())
+    let mut covered: std::collections::HashSet<(String, String)> = Default::default();
+    for (s, graphs) in &covers {
+        let fp = match (iri(snap.term(*s)), json.get(s).map(Vec::as_slice)) {
+            (Some(name), Some([one])) => {
+                let fp = parse(&name, one);
+                if fp.is_some() {
+                    for g in graphs {
+                        covered.insert((name.clone(), g.clone()));
+                    }
+                }
+                fp
+            }
+            // no literal, or several
+            _ => None,
+        };
+        for g in graphs {
+            index
+                .graphs
+                .entry(g.clone())
                 .or_default()
-                .push(e.footprint.clone());
+                .footprints
+                .push(fp.clone());
         }
-        m
+    }
+    for [_, _, o, g] in with_predicate(snap, &gr("disclosure"))? {
+        if Some(g) == dg {
+            continue;
+        }
+        let Some(graph) = iri(snap.term(g)).filter(|g| super::settings::is_guarded(g)) else {
+            continue;
+        };
+        let linked = iri(snap.term(o)).unwrap_or_default();
+        if !covered.contains(&(linked, graph.clone())) {
+            index.graphs.entry(graph).or_default().missing = true;
+        }
+    }
+    Ok(index)
+}
+
+/// What identifies a committed snapshot's content, for the index cache: its store's
+/// result cache, which each store owns, and the generation and commit that key that
+/// cache. The entry holds the result cache, so its address is not reused while cached.
+struct CacheKey {
+    store: Arc<sparkles::sparql::cache::ResultCache>,
+    generation: u64,
+    commit: u64,
+}
+
+impl CacheKey {
+    fn of(snap: &Snapshot) -> Option<CacheKey> {
+        (snap.cacheable && snap.mask.is_none()).then(|| CacheKey {
+            store: snap.results.clone(),
+            generation: snap.generation.uid,
+            commit: snap.commit,
+        })
+    }
+
+    fn same(&self, o: &CacheKey) -> bool {
+        Arc::ptr_eq(&self.store, &o.store)
+            && self.generation == o.generation
+            && self.commit == o.commit
     }
 }
 
-/// What the guard knows of one dataset.
-#[derive(Clone, Debug)]
-enum Known {
-    /// the footprints of each guarded graph
-    Valid(Arc<HashMap<String, Vec<Footprint>>>),
-    /// the registry could not be read: no guarded graph has a valid footprint
-    Invalid,
-}
+/// The indexes kept.
+const CACHED_INDEXES: usize = 16;
+/// The parsed footprints kept.
+const CACHED_FOOTPRINTS: usize = 4096;
 
-/// A dataset as the guard's resolver finds it: its identity, and its directory when it
-/// is persistent.
-pub type Resolved = (uuid::Uuid, Option<PathBuf>);
-
-/// Finds a dataset by name.
-pub type Resolver = Box<dyn Fn(&str) -> Option<Resolved> + Send + Sync>;
-
-/// The registry file's length and modification time, which tell a changed file apart.
-/// The registry file's size, modification time and, on Unix, inode. Every install
-/// renames a new file into place, so the inode changes even within one clock tick.
-type Stamp = Option<(u64, std::time::SystemTime, u64)>;
-
-struct Cached {
-    id: uuid::Uuid,
-    stamp: Stamp,
-    known: Known,
-}
-
-/// The registries of a server's datasets. A registry is read from its dataset's
-/// directory when first needed and read again when its file changes or the dataset is
-/// replaced. An in-memory dataset keeps its registry here only.
+/// The server's disclosure guard: the footprints of recent snapshots and parsed
+/// footprints, shared by every request's decision.
+#[derive(Default)]
 pub struct Guard {
-    resolve: Resolver,
-    cache: RwLock<HashMap<String, Cached>>,
-    /// bumped whenever a registry gains an entry; a long-lived read made before ends
-    /// when it sees a new value (§6.3), together with the policy's own epoch
-    epoch: AtomicU64,
+    indexes: Mutex<Vec<(CacheKey, Arc<Index>)>>,
+    parsed: Mutex<HashMap<String, Option<Arc<Footprint>>>>,
 }
 
 impl std::fmt::Debug for Guard {
@@ -570,183 +597,99 @@ impl std::fmt::Debug for Guard {
     }
 }
 
-fn stamp(db: &Path) -> Result<Stamp, std::io::Error> {
-    match std::fs::metadata(path_in(db)) {
-        Ok(m) => {
-            #[cfg(unix)]
-            let ino = std::os::unix::fs::MetadataExt::ino(&m);
-            #[cfg(not(unix))]
-            let ino = 0;
-            Ok(Some((m.len(), m.modified()?, ino)))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 impl Guard {
-    pub fn new(resolve: Resolver) -> Guard {
-        Guard {
-            resolve,
-            cache: RwLock::new(HashMap::new()),
-            epoch: AtomicU64::new(0),
-        }
+    pub fn new() -> Guard {
+        Guard::default()
     }
 
-    /// The footprints the guard knows for `ds`, `None` when its registry is invalid.
-    #[cfg(test)]
-    fn footprints(&self, ds: &str) -> Option<usize> {
-        match self.known(ds) {
-            Known::Valid(m) => Some(m.values().map(Vec::len).sum()),
-            Known::Invalid => None,
+    /// A footprint named `name` with JSON `json`, `None` when it is invalid. Parsed
+    /// footprints are kept by the digest of their JSON, so a name is checked against
+    /// the JSON every time.
+    fn parse(&self, name: &str, json: &str) -> Option<Arc<Footprint>> {
+        let digest = iri_of(json);
+        if digest != name {
+            tracing::warn!(target: "sparkles::graphrag", "the footprint {name} does not match its digest");
+            return None;
         }
-    }
-
-    /// The number of registry installs this guard has made.
-    pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::SeqCst)
-    }
-
-    /// What the guard knows of `ds` now.
-    fn known(&self, ds: &str) -> Known {
-        let Some((id, root)) = (self.resolve)(ds) else {
-            return Known::Valid(Arc::default());
-        };
-        let current = match &root {
-            None => None,
-            Some(db) => match stamp(db) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(target: "sparkles::graphrag", "dataset {ds}: the disclosure registry cannot be read: {e}");
-                    return Known::Invalid;
-                }
-            },
-        };
-        if let Some(c) = self.cache.read().get(ds)
-            && c.id == id
-            && (root.is_none() || c.stamp == current)
-        {
-            return c.known.clone();
+        if let Some(fp) = self.parsed.lock().get(&digest) {
+            return fp.clone();
         }
-        let known = match &root {
-            // a new in-memory dataset has no footprint until a build installs one
-            None => Known::Valid(Arc::default()),
-            Some(db) => match Registry::load(db) {
-                Ok(r) => Known::Valid(Arc::new(r.by_graph())),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "sparkles::graphrag",
-                        "dataset {ds}: {e}; its reports are readable only by unrestricted readers"
-                    );
-                    Known::Invalid
-                }
-            },
-        };
-        let mut cache = self.cache.write();
-        // an install may have published a newer registry since the read above: an
-        // in-memory dataset's entry is never replaced by its initial empty registry
-        if root.is_none()
-            && let Some(c) = cache.get(ds)
-            && c.id == id
-        {
-            return c.known.clone();
-        }
-        cache.insert(
-            ds.to_string(),
-            Cached {
-                id,
-                stamp: current,
-                known: known.clone(),
-            },
-        );
-        known
-    }
-
-    /// Add footprints to a dataset's registry, durably for a persistent dataset, before
-    /// any report they cover is committed. Decisions made after it use them.
-    pub fn install(&self, ds: &str, entries: Vec<Entry>) -> Result<(), RegistryError> {
-        let Some((id, root)) = (self.resolve)(ds) else {
-            return Err(RegistryError::Corrupt(format!("no dataset named {ds}")));
-        };
-        match root {
-            Some(db) => {
-                Registry::install(&db, entries)?;
-                // a reader that loaded the old file keeps its old stamp, so the next
-                // decision reads the new file
-                self.cache.write().remove(ds);
+        let fp = match Footprint::parse(json) {
+            Ok(fp) => Some(Arc::new(fp)),
+            Err(e) => {
+                tracing::warn!(target: "sparkles::graphrag", "the footprint {name} is invalid: {e}");
+                None
             }
-            None => {
-                let mut cache = self.cache.write();
-                let mut r = Registry::default();
-                if let Some(c) = cache.get(ds).filter(|c| c.id == id)
-                    && let Known::Valid(m) = &c.known
-                {
-                    for (g, fps) in m.iter() {
-                        for f in fps {
-                            r.entries.push(Entry {
-                                graph: g.clone(),
-                                footprint: f.clone(),
-                            });
-                        }
-                    }
-                }
-                for e in entries {
-                    if !r.entries.contains(&e) {
-                        r.entries.push(e);
-                    }
-                }
-                r.check()?;
-                cache.insert(
-                    ds.to_string(),
-                    Cached {
-                        id,
-                        stamp: None,
-                        known: Known::Valid(Arc::new(r.by_graph())),
-                    },
-                );
-            }
+        };
+        let mut parsed = self.parsed.lock();
+        if parsed.len() >= CACHED_FOOTPRINTS {
+            parsed.clear();
         }
-        self.epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        parsed.insert(digest, fp.clone());
+        fp
     }
 
-    /// The guarded graphs proven for a reader of `ds`.
-    fn proven(&self, ds: &str, view: &GraphAccess) -> Vec<String> {
-        let Known::Valid(m) = self.known(ds) else {
-            return Vec::new();
+    /// The footprints of `snap`.
+    pub fn index(&self, snap: &Snapshot) -> Arc<Index> {
+        let key = CacheKey::of(snap);
+        if let Some(k) = &key
+            && let Some((_, i)) = self.indexes.lock().iter().find(|(c, _)| c.same(k))
+        {
+            return i.clone();
+        }
+        let index = match read_index(snap, &|n, j| self.parse(n, j)) {
+            Ok(i) => Arc::new(i),
+            Err(e) => {
+                // nothing is proven from a snapshot that cannot be read
+                tracing::warn!(target: "sparkles::graphrag", "the footprints cannot be read: {e}");
+                return Arc::new(Index::default());
+            }
         };
-        let mut out: Vec<String> = m
-            .iter()
-            .filter(|(_, fps)| {
-                !fps.is_empty()
-                    && fps
-                        .iter()
-                        .all(|f| covers(Some(view), f) == Decision::Proven)
-            })
-            .map(|(g, _)| g.clone())
-            .collect();
-        out.sort();
-        out
+        if let Some(k) = key {
+            let mut c = self.indexes.lock();
+            if c.len() >= CACHED_INDEXES {
+                c.remove(0);
+            }
+            c.push((k, index.clone()));
+        }
+        index
     }
 }
 
-/// The dataset part of a name qualified with a branch (`ds@branch`).
-fn base(ds: &str) -> &str {
-    ds.split_once('@').map_or(ds, |(d, _)| d)
+/// One reader's decision of the guarded graphs, made against the snapshot it reads.
+struct Decide {
+    guard: Arc<Guard>,
+    view: GraphAccess,
 }
 
-/// Apply the guard to a resolved view of `ds`: `None` for a reader without a view,
-/// which is unrestricted. A restricted view loses every guarded graph not proven for
-/// it. Without a guard (`None`), no guarded graph is proven.
-pub fn apply(view: GraphAccess, ds: &str, guard: Option<&Guard>) -> GraphAccess {
+impl GuardDecision for Decide {
+    fn exempt(&self, snap: &Arc<Snapshot>) -> Vec<String> {
+        self.guard.index(snap).proven(&self.view)
+    }
+}
+
+/// Guard a restricted view (§6.4). Its guarded graphs stay hidden until the view is
+/// bound to the snapshot a request reads, and are then proven against that snapshot's
+/// footprints. Writes never reach a guarded graph through a restricted view. An
+/// unrestricted view is returned as it is, and without a guard nothing is proven.
+pub fn apply(view: GraphAccess, guard: Option<&Arc<Guard>>) -> GraphAccess {
     if unrestricted(Some(&view)) {
         return view;
     }
-    let exempt = guard.map_or_else(Vec::new, |g| g.proven(base(ds), &view));
     let pattern = guarded_pattern();
+    let read = match guard {
+        Some(g) => view.read.guarded_by(
+            &pattern,
+            Decider(Arc::new(Decide {
+                guard: g.clone(),
+                view: view.clone(),
+            })),
+        ),
+        None => view.read.guarded(&pattern, &[]),
+    };
     GraphAccess {
-        read: view.read.guarded(&pattern, &exempt),
-        write: view.write.guarded(&pattern, &exempt),
+        read,
+        write: view.write.guarded(&pattern, &[]),
         triples: view.triples,
     }
 }

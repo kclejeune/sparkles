@@ -22,6 +22,18 @@ pub const MAX_ANOMALIES: usize = 32;
 /// The largest ledger file read, in bytes.
 pub const MAX_LEDGER_BYTES: u64 = 1 << 20;
 
+/// Create `dir` inside the database directory `db` and flush `db`, so that a file
+/// written in `dir` survives a power loss. `db` is flushed on every call, since an
+/// earlier call may have created `dir` and then failed to flush.
+pub(crate) fn create_dir_durably(db: &Path, dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    std::fs::File::open(db)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = db;
+    Ok(())
+}
+
 /// The file of a database directory.
 pub fn path_in(db: &Path) -> PathBuf {
     db.join("graphrag").join("ledger.json")
@@ -89,7 +101,7 @@ impl LedgerFile {
     pub fn save(&self, db: &Path) -> std::io::Result<()> {
         let path = path_in(db);
         let dir = path.parent().expect("the ledger has a directory");
-        super::guard::create_dir_durably(db, dir)?;
+        create_dir_durably(db, dir)?;
         let tmp = dir.join("ledger.json.tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;

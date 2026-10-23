@@ -1318,8 +1318,20 @@ struct Reuse<'a> {
     changed: FxHashSet<u64>,
 }
 
+/// `opts` with its view's undecided guards decided against `snap`, when it has any.
+pub(crate) fn bind_view(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Option<SchemaOptions> {
+    let a = opts.graphs.as_ref()?;
+    let bound = a.bound(snap);
+    (!Arc::ptr_eq(a, &bound)).then(|| SchemaOptions {
+        graphs: Some(bound),
+        ..opts.clone()
+    })
+}
+
 /// Compute the schema report of `snap`.
 pub fn discover(snap: &Arc<Snapshot>, opts: &SchemaOptions) -> Result<SchemaReport, SchemaError> {
+    let rebound = bind_view(snap, opts);
+    let opts = rebound.as_ref().unwrap_or(opts);
     // a view that hides triples is reported without them
     let masked = match &opts.graphs {
         Some(a) => a.masked(snap)?,

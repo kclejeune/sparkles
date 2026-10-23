@@ -287,6 +287,16 @@ impl GraphragSettings {
                 "reportsGraph must be an IRI under {GUARDED_PREFIX}, the namespace the disclosure guard protects"
             ));
         }
+        if self.reports_graph == super::guard::DISCLOSURE_GRAPH
+            || self
+                .reports_graph
+                .starts_with(super::guard::FOOTPRINT_PREFIX)
+        {
+            return Err(format!(
+                "reportsGraph may not be {}, which holds the disclosure footprints",
+                super::guard::DISCLOSURE_GRAPH
+            ));
+        }
         if self
             .reports_graph
             .chars()
