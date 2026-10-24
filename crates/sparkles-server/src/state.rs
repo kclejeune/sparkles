@@ -176,6 +176,8 @@ pub const DEFAULT_REASON_CACHE_TRIPLES: usize = sparkles::reasoning::DEFAULT_CLO
 /// Default of `serve --reason-max-inferred`, the reasoner's own default of 50 million
 /// derived triples (`sparkles_reasoner::DEFAULT_MAX_INFERRED`).
 pub const DEFAULT_REASON_MAX_INFERRED: usize = 50_000_000;
+/// The facts one query may derive with query-time reasoning by default (spec F17 §8).
+pub const DEFAULT_REASON_MAX_DERIVED: usize = 1_000_000;
 
 /// A background task. Its JSON form also carries Fuseki's names for its fields
 /// (`taskId`, `task`, `started`, `finished`, `success`; see [`Task::serialize`]).
@@ -398,6 +400,9 @@ pub struct AppState {
     /// (`serve --reason-max-inferred`, 0 on the command line for no limit, which is
     /// `usize::MAX` here); a request may ask for less with `maxInferred`
     pub reason_max_inferred: usize,
+    /// the facts a query's query-time reasoning may derive (`serve --reason-max-derived`,
+    /// 0 on the command line for no limit); a request may ask for less with `maxDerived`
+    pub reason_max_derived: usize,
     /// automatic compaction (`serve --auto-compact-*`) and what is known of each
     /// dataset's compactions
     pub compaction: crate::compaction::AutoCompact,
@@ -677,6 +682,7 @@ impl AppState {
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             reason_max_inferred: DEFAULT_REASON_MAX_INFERRED,
+            reason_max_derived: DEFAULT_REASON_MAX_DERIVED,
             compaction: Default::default(),
             #[cfg(feature = "backup")]
             backup: None,
@@ -737,6 +743,7 @@ impl AppState {
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
             reason_max_inferred: DEFAULT_REASON_MAX_INFERRED,
+            reason_max_derived: DEFAULT_REASON_MAX_DERIVED,
             compaction: Default::default(),
             #[cfg(feature = "backup")]
             backup: None,
