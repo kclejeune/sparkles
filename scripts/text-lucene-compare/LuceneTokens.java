@@ -1,6 +1,8 @@
 // Prints the tokens that a Lucene analyzer makes of each line of standard input, one
 // line of output per line of input. Tokens are separated by spaces, and a token whose
 // position does not follow the last one's is preceded by +N: with its position increment.
+// Each token is written as Lucene indexes it, as UTF-8 with U+FFFD for an unpaired
+// surrogate.
 // It runs on the classpath of Fuseki's fuseki-server.jar, which bundles Lucene.
 //
 //   java -cp fuseki-server.jar:. LuceneTokens org.apache.lucene.analysis.fr.FrenchAnalyzer
@@ -12,6 +14,7 @@ import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
 import org.apache.lucene.analysis.tokenattributes.PositionIncrementAttribute;
+import org.apache.lucene.util.BytesRef;
 
 public class LuceneTokens {
   public static void main(String[] args) throws Exception {
@@ -29,7 +32,7 @@ public class LuceneTokens {
         while (ts.incrementToken()) {
           if (sb.length() > 0) sb.append(' ');
           if (inc.getPositionIncrement() != 1) sb.append('+').append(inc.getPositionIncrement()).append(':');
-          sb.append(term);
+          sb.append(new BytesRef(term).utf8ToString());
         }
         ts.end();
       }

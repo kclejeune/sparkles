@@ -1104,11 +1104,15 @@ pub fn install(name: &str, bytes: &[u8]) -> Result<String> {
     let path = path_of(name);
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    // a temporary file of its own, so that concurrent installs each rename a whole file
-    let mut tmp = tempfile::Builder::new()
-        .prefix(&format!(".{name}."))
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
+    // a temporary file of its own, so that concurrent installs each rename a whole file,
+    // created with the permissions of a new file (0666 under the umask), since a server
+    // may run under another account than the one that installs
+    let prefix = format!(".{name}.");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let mut tmp = builder.tempfile_in(parent)?;
     std::io::Write::write_all(&mut tmp, bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(&path).map_err(|e| Error::from(e.error))?;

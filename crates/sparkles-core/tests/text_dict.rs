@@ -145,4 +145,14 @@ fn concurrent_installs_leave_a_whole_dictionary() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(names, ["zh-dict.sdict"]);
+    // the installed file has the permissions of any new file, so that a server running
+    // under another account can read it
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let plain = tmp.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        assert_eq!(mode(&dict::path_of("zh-dict")), mode(&plain));
+    }
 }
