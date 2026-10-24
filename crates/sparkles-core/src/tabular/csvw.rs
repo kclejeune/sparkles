@@ -14,6 +14,29 @@ pub struct Metadata {
     pub tables: Vec<TableDesc>,
     /// Properties that were accepted and ignored, or not checked.
     pub warnings: Vec<String>,
+    /// The table group's `@id`, notes and common properties, for standard mode.
+    pub group: Described,
+}
+
+/// What standard mode writes about a table group or a table besides its rows: its
+/// `@id`, its `notes` and its common properties (spec F19 §6.1).
+#[derive(Clone, Debug, Default)]
+pub struct Described {
+    pub id: Option<String>,
+    pub notes: Vec<J>,
+    /// common properties, by their name as written (`dc:title`, or an absolute IRI)
+    pub common: Vec<(String, J)>,
+}
+
+/// A schema's foreign key (spec F19 §6.3).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ForeignKey {
+    pub columns: Vec<String>,
+    /// the referenced table's `url`, as written
+    pub resource: Option<String>,
+    /// the referenced schema's URL, as written
+    pub schema_reference: Option<String>,
+    pub ref_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -28,6 +51,12 @@ pub struct TableDesc {
     pub props: Props,
     pub dialect: DialectDesc,
     pub suppress: bool,
+    /// The schema's `primaryKey` column names.
+    pub primary_key: Vec<String>,
+    pub foreign_keys: Vec<ForeignKey>,
+    /// the schema's `@id`, which a foreign key's `schemaReference` names
+    pub schema_id: Option<String>,
+    pub described: Described,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -85,7 +114,7 @@ impl Props {
 }
 
 /// Dialect properties as given. `None` is "not set here".
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DialectDesc {
     pub delimiter: Option<u8>,
     pub quote: Option<Option<u8>>,
@@ -143,6 +172,83 @@ const QUIET: &[&str] = &[
     "primaryKey",
     "foreignKeys",
 ];
+
+/// The `@id`, `notes` and common properties of an object.
+fn described(o: &Map<String, J>) -> Described {
+    Described {
+        id: o.get("@id").and_then(J::as_str).map(str::to_string),
+        notes: match o.get("notes") {
+            Some(J::Array(a)) => a.clone(),
+            Some(v) => vec![v.clone()],
+            None => Vec::new(),
+        },
+        common: o
+            .iter()
+            .filter(|(k, _)| {
+                k.contains(':') && !k.starts_with("urn:x-sparkles:") && !k.starts_with('@')
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    }
+}
+
+/// A column reference: one name or an array of names.
+fn column_names(v: &J, what: &str) -> Result<Vec<String>, String> {
+    match v {
+        J::String(s) => Ok(vec![s.clone()]),
+        J::Array(a) if !a.is_empty() => a
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{what} must name columns by strings"))
+            })
+            .collect(),
+        _ => Err(format!("{what} must be a column name or an array of them")),
+    }
+}
+
+fn foreign_keys(v: &J) -> Result<Vec<ForeignKey>, String> {
+    let a = v.as_array().ok_or("foreignKeys must be an array")?;
+    let mut out = Vec::new();
+    for fk in a {
+        let o = fk.as_object().ok_or("each foreign key must be an object")?;
+        let columns = column_names(
+            o.get("columnReference")
+                .ok_or("a foreign key needs a columnReference")?,
+            "a foreign key's columnReference",
+        )?;
+        let r = o
+            .get("reference")
+            .and_then(J::as_object)
+            .ok_or("a foreign key needs a reference object")?;
+        let ref_columns = column_names(
+            r.get("columnReference")
+                .ok_or("a foreign key's reference needs a columnReference")?,
+            "a reference's columnReference",
+        )?;
+        if ref_columns.len() != columns.len() {
+            return Err("a foreign key and its reference name different numbers of columns".into());
+        }
+        let resource = r.get("resource").and_then(J::as_str).map(str::to_string);
+        let schema_reference = r
+            .get("schemaReference")
+            .and_then(J::as_str)
+            .map(str::to_string);
+        if resource.is_some() == schema_reference.is_some() {
+            return Err(
+                "a foreign key's reference needs one of resource and schemaReference".into(),
+            );
+        }
+        out.push(ForeignKey {
+            columns,
+            resource,
+            schema_reference,
+            ref_columns,
+        });
+    }
+    Ok(out)
+}
 
 struct Ctx {
     base: Option<oxiri::Iri<String>>,
@@ -272,6 +378,11 @@ pub fn parse(text: &str, location: Option<&str>) -> Result<Metadata, String> {
     Ok(Metadata {
         tables,
         warnings: cx.warnings,
+        group: if o.contains_key("tables") {
+            described(o)
+        } else {
+            Described::default()
+        },
     })
 }
 
@@ -323,11 +434,21 @@ fn table(
     let suppress = bool_prop(o, "suppressOutput")?.unwrap_or(false);
     let mut columns = Vec::new();
     let mut schema_props = Props::default();
+    let mut primary_key = Vec::new();
+    let mut fks = Vec::new();
+    let mut schema_id = None;
     match o.get("tableSchema") {
         None => {}
         Some(J::Object(s)) => {
             cx.unknown(s, "schema", &["columns", "@context"]);
             schema_props = props(s, cx)?;
+            if let Some(pk) = s.get("primaryKey") {
+                primary_key = column_names(pk, "primaryKey")?;
+            }
+            if let Some(f) = s.get("foreignKeys") {
+                fks = foreign_keys(f)?;
+            }
+            schema_id = s.get("@id").and_then(J::as_str).map(str::to_string);
             if let Some(cs) = s.get("columns") {
                 let cs = cs.as_array().ok_or("columns must be an array")?;
                 let mut seen_virtual = false;
@@ -364,6 +485,10 @@ fn table(
         props: schema_props.over(&table_props),
         dialect,
         suppress,
+        primary_key,
+        foreign_keys: fks,
+        schema_id,
+        described: described(o),
     })
 }
 

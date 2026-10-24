@@ -16,6 +16,7 @@
 //! ([`server`]). The runtime values of model secrets live in `<dataDir>/secrets`
 //! ([`secrets`]).
 
+pub mod connections;
 pub mod forms;
 pub mod http;
 pub mod merge;
@@ -222,8 +223,23 @@ pub static NOTIFICATIONS: Kind = Kind {
     check: crate::notify::config::check,
 };
 
+/// The server-wide `connections` kind (spec F19 §4.4): the database connections that
+/// mappings read, declared in the settings file's `server.connections` and kept at
+/// runtime in `<dataDir>/connections.json`.
+pub static CONNECTIONS: Kind = Kind {
+    name: "connections",
+    scope: Scope::Server,
+    file: connections::CONNECTIONS_FILE,
+    members: connections::MEMBERS,
+    removable: &["connections"],
+    shared: false,
+    defaults: connections::defaults,
+    normalize: connections::normalize,
+    check: connections::check,
+};
+
 /// Every server-wide kind (§11).
-pub static SERVER_KINDS: [&Kind; 2] = [&MODELS, &NOTIFICATIONS];
+pub static SERVER_KINDS: [&Kind; 3] = [&MODELS, &NOTIFICATIONS, &CONNECTIONS];
 
 pub fn kind(name: &str) -> Option<&'static Kind> {
     KINDS.iter().copied().find(|k| k.name == name)
@@ -313,7 +329,7 @@ pub struct Declared {
 
 /// The names that `server.locked` may start with: the server-wide kinds and the
 /// secrets of the model configuration and the notification channels.
-const SERVER_LOCK_ROOTS: &[&str] = &["models", "notifications", "secrets"];
+const SERVER_LOCK_ROOTS: &[&str] = &["models", "notifications", "connections", "secrets"];
 
 impl Declared {
     /// Read a settings file: its form, the members it may hold, and every effective
@@ -521,16 +537,19 @@ fn parse_server(v: &Value) -> Result<ServerEntry, String> {
     let mut out = Vec::new();
     let mut values = BTreeMap::new();
     for (k, v) in m {
-        if k == NOTIFICATIONS.name {
+        if let Some(kind) = [&NOTIFICATIONS, &CONNECTIONS]
+            .into_iter()
+            .find(|kind| kind.name == k)
+        {
             if !v.is_object() {
                 return Err(format!("{k}: an object"));
             }
-            values.insert(NOTIFICATIONS.name, v.clone());
+            values.insert(kind.name, v.clone());
             continue;
         }
         if k != "locked" {
             return Err(format!(
-                "unknown member {k:?}: server holds locked and notifications"
+                "unknown member {k:?}: server holds locked, notifications and connections"
             ));
         }
         let list = v

@@ -722,6 +722,7 @@ pub fn run(a: ConvertArgs) -> Result<()> {
         template: a.template.clone(),
         base: a.base.clone(),
         key: a.key.clone(),
+        ..Default::default()
     };
     if (csv.mapping.is_some() || csv.template.is_some() || csv.key.is_some())
         && !inputs.iter().any(|i| i.table.is_some())

@@ -73,6 +73,7 @@ pub fn check_lock(root: &str, p: &[String]) -> Result<(), String> {
             crate::models::check_secret_name(&p[0])
         }
         "notifications" => crate::notify::config::check_lock(p),
+        "connections" => super::connections::check_lock(p),
         _ => {
             let top = p[0].as_str();
             if !MODELS.members.contains(&top) {

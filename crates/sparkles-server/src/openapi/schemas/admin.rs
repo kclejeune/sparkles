@@ -285,6 +285,96 @@ fn queries(put: &mut dyn FnMut(&str, J)) {
             "stored-queries",
         ),
     );
+    let mapping_version = obj(
+        &["version", "created", "digest"],
+        json!({
+            "version": int(),
+            "parent": int(),
+            "created": string(),
+            "author": string(),
+            "message": string(),
+            "datasetCommit": { "type": "integer", "description": "The dataset's head when the version was saved." },
+            "digest": { "type": "string", "description": "Hex SHA-256 over the parent's digest and the definition." },
+        }),
+    );
+    let mapping = json!({
+        "name": string(),
+        "dataset": string(),
+        "kind": string_enum(&["rml", "yarrrml", "csvw", "template"]),
+        "description": string(),
+        "text": { "type": "string", "description": "The mapping text. Listings leave it out." },
+        "version": mapping_version.clone(),
+        "summary": obj(&["kind", "triplesMaps", "files", "connections", "warnings"], json!({
+            "kind": string(),
+            "vocabulary": { "type": "string", "description": "R2RML, RML (rml.io), RML-Core or YARRRML." },
+            "triplesMaps": int(),
+            "files": strings(),
+            "connections": { "type": "array", "items": string(), "description": "The connections it reads. An empty name is an R2RML mapping's default connection." },
+            "graphs": { "type": ["array", "null"], "items": string(), "description": "The graphs its graph maps name, `default` for the default graph, or null when one is not constant." },
+            "warnings": strings(),
+        })),
+        "lastRun": obj(&["time", "version", "mode", "quads", "rows"], json!({
+            "time": string(),
+            "version": int(),
+            "mode": string_enum(&["add", "replace"]),
+            "commit": int(),
+            "quads": int(),
+            "rows": int(),
+            "warnings": strings(),
+            "author": string(),
+        })),
+        "changed": { "type": "boolean", "description": "On a PUT: whether a new version was stored." },
+    });
+    put(
+        "StoredMapping",
+        doc(
+            obj(&["name", "kind", "version"], mapping.clone()),
+            "A stored mapping, with the summary of its check and its last run.",
+            "stored-mappings",
+        ),
+    );
+    put(
+        "StoredMappingList",
+        doc(
+            obj(
+                &["dataset", "mappings"],
+                json!({ "dataset": string(), "mappings": array(obj(&["name", "kind", "version"], mapping)), "warning": string() }),
+            ),
+            "A dataset's stored mappings, without their text.",
+            "stored-mappings",
+        ),
+    );
+    put(
+        "StoredMappingVersions",
+        doc(
+            obj(
+                &["dataset", "name", "versions"],
+                json!({ "dataset": string(), "name": string(), "versions": array(mapping_version) }),
+            ),
+            "The kept versions of a stored mapping, newest first.",
+            "stored-mappings",
+        ),
+    );
+    put(
+        "MappingRun",
+        doc(
+            obj(
+                &["mapping", "version", "mode", "rows", "quads", "warnings"],
+                json!({
+                    "mapping": string(),
+                    "version": int(),
+                    "mode": string_enum(&["add", "replace"]),
+                    "rows": int(),
+                    "quads": { "type": "integer", "description": "The quads the mapping made, before the load removed duplicates." },
+                    "count": { "type": "integer", "description": "The quads the commit added." },
+                    "warnings": strings(),
+                    "reports": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                }),
+            ),
+            "What a stored mapping's run made and committed.",
+            "stored-mappings",
+        ),
+    );
 }
 
 // ------------------------------------------------------------------ views --

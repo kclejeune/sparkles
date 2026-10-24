@@ -1,7 +1,10 @@
 //! CONSTRUCT templates in the style of Tarql: the table's rows are a `VALUES` block at
 //! the start of the WHERE clause, and the template's triples are written for each
 //! solution. Rows are evaluated in batches with the engine's SPARQL evaluator against an
-//! empty dataset (spec C05 §5).
+//! empty dataset (spec C05 §5), or, with a lookup, against a snapshot of the target
+//! dataset (spec F19 §7.2). Tarql's `tarql:expandPrefix` and `tarql:expandPrefixedName`
+//! are available, and a file may hold several CONSTRUCT queries, which run over the
+//! same batches (spec F19 §7.1).
 
 use crate::error::{Error, Result};
 use crate::sparql::QueryOptions;
@@ -12,16 +15,77 @@ use spargebra::algebra::GraphPattern;
 use spargebra::term::GroundTerm;
 use std::sync::Arc;
 
-/// A parsed and checked CONSTRUCT template.
+/// Tarql's namespace.
+pub const TARQL: &str = "http://tarql.github.io/tarql#";
+
+/// A parsed and checked CONSTRUCT template: one or more queries.
 pub struct Template {
-    query: Query,
+    queries: Vec<Query>,
     prefixes: Vec<(String, String)>,
+}
+
+/// The target dataset a template reads (spec F19 §7.2): a snapshot of its head when the
+/// conversion starts, read under the caller's view, its declared prefixes, and the
+/// commit of the snapshot.
+#[derive(Clone)]
+pub struct Lookup {
+    pub snapshot: Arc<Snapshot>,
+    pub prefixes: Vec<(String, String)>,
+    pub commit: u64,
+    /// The graphs the caller may read, when its grants cover some graphs only. The
+    /// template's WHERE clause reads no other graph.
+    pub graphs: Option<Arc<crate::access::GraphAccess>>,
+}
+
+/// The texts of the queries of a file: one, or several CONSTRUCT queries one after
+/// another, each with the file's prologue.
+fn split_queries(text: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(?i)\bCONSTRUCT\b").expect("a regex"));
+    let starts: Vec<usize> = re
+        .find_iter(text)
+        .map(|m| m.start())
+        .filter(|&i| {
+            // a later query starts after the closing brace of the one before
+            text[..i].trim_end().ends_with('}')
+        })
+        .collect();
+    if starts.is_empty() {
+        return vec![text.to_string()];
+    }
+    let first = re.find(text).map_or(0, |m| m.start());
+    let prologue = &text[..first];
+    let mut out = Vec::new();
+    let mut from = 0;
+    for &s in &starts {
+        // the first segment holds the prologue already
+        if from == 0 {
+            out.push(text[..s].to_string());
+        } else {
+            out.push(format!("{prologue}\n{}", &text[from..s]));
+        }
+        from = s;
+    }
+    out.push(format!("{prologue}\n{}", &text[from..]));
+    out
 }
 
 impl Template {
     /// Parse a template. Refuses anything that is not a CONSTRUCT, dataset clauses,
     /// top-level modifiers and aggregates, and SERVICE.
     pub fn parse(text: &str, base: Option<&str>) -> Result<Template> {
+        let parts = split_queries(text);
+        let mut queries = Vec::with_capacity(parts.len());
+        for part in &parts {
+            queries.push(Self::parse_one(part, base)?);
+        }
+        Ok(Template {
+            queries,
+            prefixes: declared_prefixes(text),
+        })
+    }
+
+    fn parse_one(text: &str, base: Option<&str>) -> Result<Query> {
         let query = crate::sparql::parse_query(text, base, &[])?;
         let refuse = |what: &str| {
             Err(Error::invalid(format!(
@@ -65,10 +129,16 @@ impl Template {
                 "a CSV template cannot use SERVICE: an import does not reach other endpoints",
             ));
         }
-        Ok(Template {
-            query,
-            prefixes: declared_prefixes(text),
-        })
+        Ok(query)
+    }
+
+    /// The number of CONSTRUCT queries of the template.
+    pub fn len(&self) -> usize {
+        self.queries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queries.is_empty()
     }
 
     /// The `PREFIX` declarations of the query text, for Turtle output.
@@ -76,9 +146,9 @@ impl Template {
         &self.prefixes
     }
 
-    /// The query with `values` at the start of its WHERE clause.
-    fn with_values(&self, values: GraphPattern) -> Query {
-        match &self.query {
+    /// Query `i` with `values` at the start of its WHERE clause.
+    fn with_values(&self, i: usize, values: GraphPattern) -> Query {
+        match &self.queries[i] {
             Query::Construct {
                 template,
                 graph_templates,
@@ -126,16 +196,88 @@ pub(crate) struct Runner<'a> {
     part: usize,
 }
 
+/// The namespace of `prefix` among the template's prefixes, then the dataset's.
+fn namespace<'p>(prefixes: &'p [(String, String)], prefix: &str) -> Option<&'p str> {
+    prefixes
+        .iter()
+        .find(|(p, _)| p == prefix)
+        .map(|(_, ns)| ns.as_str())
+}
+
+/// `tarql:expandPrefix` and `tarql:expandPrefixedName` over `prefixes`.
+fn tarql_functions(
+    prefixes: Vec<(String, String)>,
+) -> Arc<crate::sparql::extensions::ExtensionRegistry> {
+    use crate::sparql::extensions::{ExtensionRegistry, ScalarDescriptor, ScalarError, Volatility};
+    use oxrdf::{Literal, NamedNode};
+    let prefixes = Arc::new(prefixes);
+    let mut b = ExtensionRegistry::builder();
+    let p1 = prefixes.clone();
+    let mut expand = ScalarDescriptor::new(
+        format!("{TARQL}expandPrefix"),
+        1..=1,
+        move |_: &crate::sparql::extensions::ScalarContext<'_>, args: &[Term]| match &args[0] {
+            Term::Literal(l) => namespace(&p1, l.value())
+                .map(|ns| Term::Literal(Literal::new_simple_literal(ns)))
+                .ok_or(ScalarError::Expression),
+            _ => Err(ScalarError::Expression),
+        },
+    )
+    .expect("a valid descriptor");
+    expand.volatility = Volatility::Immutable;
+    expand.description = Some("the namespace of a prefix, as a string".into());
+    let p2 = prefixes;
+    let mut name = ScalarDescriptor::new(
+        format!("{TARQL}expandPrefixedName"),
+        1..=1,
+        move |_: &crate::sparql::extensions::ScalarContext<'_>, args: &[Term]| match &args[0] {
+            Term::Literal(l) => {
+                let (p, local) = l.value().split_once(':').ok_or(ScalarError::Expression)?;
+                let ns = namespace(&p2, p).ok_or(ScalarError::Expression)?;
+                NamedNode::new(format!("{ns}{local}"))
+                    .map(Term::NamedNode)
+                    .map_err(|_| ScalarError::Expression)
+            }
+            _ => Err(ScalarError::Expression),
+        },
+    )
+    .expect("a valid descriptor");
+    name.volatility = Volatility::Immutable;
+    name.description = Some("the IRI of a prefixed name".into());
+    b.register_scalar(expand).expect("a new IRI");
+    b.register_scalar(name).expect("a new IRI");
+    b.build()
+}
+
 impl<'a> Runner<'a> {
-    pub fn new(template: &'a Template, opts: &QueryOptions, part: usize) -> Runner<'a> {
+    pub fn new(
+        template: &'a Template,
+        opts: &QueryOptions,
+        part: usize,
+        lookup: Option<&Lookup>,
+    ) -> Runner<'a> {
         let mut opts = opts.clone();
         opts.allow_service = false;
         opts.forbid_service = true;
         opts.no_cache = true;
         opts.initial_bindings.clear();
+        // the template's prefixes first, then the dataset's (C20)
+        let mut prefixes = template.prefixes.clone();
+        if let Some(l) = lookup {
+            opts.graphs = l.graphs.clone();
+            for (p, ns) in &l.prefixes {
+                if !prefixes.iter().any(|(q, _)| q == p) {
+                    prefixes.push((p.clone(), ns.clone()));
+                }
+            }
+        }
+        opts.extensions = Some(tarql_functions(prefixes));
         Runner {
             template,
-            snap: Store::in_memory(Default::default()).snapshot(),
+            snap: match lookup {
+                Some(l) => l.snapshot.clone(),
+                None => Store::in_memory(Default::default()).snapshot(),
+            },
             opts,
             batch: 0,
             part,
@@ -151,17 +293,22 @@ impl<'a> Runner<'a> {
         sink: &mut dyn FnMut(Triple) -> Result<()>,
     ) -> Result<u64> {
         self.batch += 1;
-        let q = self.template.with_values(GraphPattern::Values {
+        let values = GraphPattern::Values {
             variables: vars.to_vec(),
             bindings: rows,
-        });
-        let r = crate::sparql::execute_query(self.snap.clone(), &q, &self.opts, 0.0)?;
-        let (p, b) = (self.part, self.batch);
-        let relabel = |n: &BlankNode| BlankNode::new_unchecked(format!("t{p}b{b}x{}", n.as_str()));
+        };
         let mut n = 0;
-        for t in r.triples {
-            sink(relabel_triple(t, &relabel))?;
-            n += 1;
+        for i in 0..self.template.queries.len() {
+            let q = self.template.with_values(i, values.clone());
+            let r = crate::sparql::execute_query(self.snap.clone(), &q, &self.opts, 0.0)?;
+            let (p, b) = (self.part, self.batch);
+            // the queries of one file share no blank nodes
+            let relabel =
+                |x: &BlankNode| BlankNode::new_unchecked(format!("t{p}b{b}q{i}x{}", x.as_str()));
+            for t in r.triples {
+                sink(relabel_triple(t, &relabel))?;
+                n += 1;
+            }
         }
         Ok(n)
     }

@@ -324,7 +324,7 @@ const APPEND_FILES: [&str; 2] = ["wal.log", "delta.vocab"];
 
 /// Meta files at the root, besides `CURRENT`, `dataset.json` and `prefixes.json`, that a
 /// backup holds when present.
-const OPTIONAL_META: [&str; 13] = [
+const OPTIONAL_META: [&str; 14] = [
     crate::annotations::FILE,
     super::REMOVED_PREFIXES_FILE,
     "text.json",
@@ -336,6 +336,7 @@ const OPTIONAL_META: [&str; 13] = [
     crate::guard::config::SHEX_SCHEMA_SHEXC_FILE,
     crate::guard::config::SHEX_SCHEMA_SHEXJ_FILE,
     crate::stored::FILE,
+    crate::stored_mappings::FILE,
     crate::algo::catalog::FILE,
     // the GraphQL configuration (crate sparkles-graphql)
     "graphql.json",

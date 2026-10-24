@@ -131,6 +131,8 @@ pub struct DatasetState {
     pub name: Option<String>,
     /// the stored queries (`queries.json`)
     pub queries: crate::stored::Catalog,
+    /// the stored mappings (`mappings.json`)
+    pub mappings: crate::stored_mappings::Catalog,
     /// the named projections of graph algorithms (`algo.json`)
     pub algo: Arc<crate::algo::catalog::Catalog>,
     /// the GraphQL configuration (`graphql.json`)
@@ -297,6 +299,13 @@ impl Dataset {
                 shown()
             );
         }
+        let mappings = crate::stored_mappings::Catalog::open_or_broken(store.root());
+        if let Some(e) = mappings.broken() {
+            tracing::error!(
+                "stored mappings of {}: {e}; they cannot be changed until it is fixed",
+                shown()
+            );
+        }
         let algo = Arc::new(crate::algo::catalog::Catalog::open_or_broken(store.root()));
         if let Some(e) = algo.broken() {
             tracing::error!(
@@ -335,6 +344,7 @@ impl Dataset {
                 pool: opts.pool,
                 name: opts.name,
                 queries,
+                mappings,
                 algo,
                 #[cfg(feature = "graphql")]
                 graphql,

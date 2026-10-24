@@ -645,3 +645,7 @@ The items this spec left out are now designed in
   uploads. See F19 §2.2 and §8.
 - **CSV in the Graph Store protocol** (§7, §8). `PUT` and `POST` on `/{ds}/data` take
   `text/csv` with `mapping=NAME` or `base`. See F19 §2.3.
+
+These follow-ups shipped on 2026-10-24 with F19 Phase 1, except the PostgreSQL source,
+which is roadmap item 230. The [F19 Outcome](F19-mappings-and-virtual-graphs.md#outcome)
+records what landed and the decisions made.
