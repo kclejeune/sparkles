@@ -1355,6 +1355,72 @@ before Phase 2 starts.
     users and grants kept in step across peers (open question 10), and how does a
     joining replica get the keys of an encrypted dataset (question 17)?
 
+### Recommended direction for question 22
+
+The maintainer accepted this direction on 2026-10-24. Item 280 turns it into the design of
+§2 and §7 and settles the points left open below.
+
+* **Identity.** Peers authenticate each other with mutual TLS. Each node generates its own
+  key pair, and its private key never leaves it. A cluster CA issues each node a
+  certificate that names the node and the cluster, and that certificate replaces the
+  replication bearer token between peers. Certificates last about a day, and a node renews
+  its own with its current certificate, so rotation needs no operator. Removing a node
+  stops its renewals, and a short revocation list covers the hours its last certificate
+  has left.
+* **Three ways to provision a node.** All three end with the same certificate and the
+  same mutual TLS.
+  * Static files stay supported. An operator, the NixOS module or cert-manager writes the
+    CA certificate, the node's certificate and its key, and the node reloads them when
+    they change. This suits deployments managed from Git.
+  * A join token is the default for clusters that run their own CA, as kubeadm, k3s,
+    Consul and CockroachDB do it. `sparkles cluster token create --ttl 1h --role replica`
+    prints a single-use token that holds a secret and the SHA-256 hash of the cluster CA
+    certificate. The joining node runs `sparkles serve --join URL --join-token TOKEN`
+    against any member, and the bootstrap exchange below gives it a certificate. The
+    server stores only a hash of the secret, spends the token on first use and records an
+    audit event. An optional manual approval mode holds each join until an admin accepts
+    it.
+  * Platform identity fits Kubernetes. A node proves who it is with a projected service
+    account token that the cluster checks through the TokenReview API, or cert-manager,
+    Vault or SPIFFE issues its certificate directly. This replaces the join token and
+    keeps mutual TLS.
+* **Bootstrap exchange.** The first node creates the cluster CA locally with
+  `sparkles cluster init`, so nothing crosses the network. A joining node has no
+  certificate yet, so its first connection is TLS that authenticates only the server. The
+  node accepts the server's chain only if it ends at a CA certificate whose hash matches
+  the hash in the token, which is how kubeadm's `discovery-token-ca-cert-hash` stops a
+  node from joining an impostor. The node then generates its key pair and sends a
+  certificate signing request with a proof of the token secret. The proof is an HMAC over
+  the request and the TLS exporter value of RFC 9266, so a proof taken from one
+  connection cannot be replayed on another. The server checks the proof, spends the
+  token, and returns the signed certificate with the CA chain. Every later connection is
+  mutual TLS. With platform identity the service account token takes the place of the
+  proof, and the CA bundle comes from the platform, such as a ConfigMap.
+* **Cluster state.** The member list, roles, users, tokens, grants, shared settings, the
+  CA certificate and wrapped dataset keys need one store that every peer reads. It can be
+  a small system dataset that replicates through the commit stream like any other, which
+  also answers open question 10, or a dedicated store such as etcd, which the lease may
+  already use. Item 280 chooses between them. Discovery comes from this state, so a joining
+  node needs only one seed address and no gossip protocol is required. The leader lease
+  stays in the external store of §8 Phase 3.
+* **The CA key across failover.** With the built-in CA, the CA key is encrypted to each
+  peer that can be promoted and reaches only those peers. Read replicas that are never
+  promoted do not receive it. Production deployments can use an external CA, such as
+  cert-manager or Vault, so that no Sparkles node holds a signing key.
+* **Keys of encrypted datasets.** Encryption follows the envelope model of
+  [F11](F11-encryption-at-rest.md). With a KMS or Vault (item 65), each node authenticates
+  to the KMS with its own identity and Sparkles moves no key material. With the built-in
+  setup, each dataset key is wrapped with HPKE (RFC 9180) to the public key of every
+  authorized node and kept in the cluster state. The primary wraps the key for a node
+  when its join is approved, and removing a node deletes its wrapped copy, with an
+  optional key rotation so the node cannot read later data. A replica must decrypt to
+  answer queries, so membership for a dataset and holding its key are the same thing.
+* **Libraries.** rustls provides TLS and the exporter, rcgen generates certificates and
+  signing requests, and an HPKE crate wraps keys. No new cryptography is written.
+* **Phasing.** Phase 2 ships static configuration with mutual TLS from files. A Phase 2b
+  adds join tokens and the built-in CA with automatic renewal. Phase 3 adds the cluster
+  state store, key wrapping and Kubernetes identity next to lease failover.
+
 ## 12. Sources
 
 * **Sparkles repository, read for this spec:**
