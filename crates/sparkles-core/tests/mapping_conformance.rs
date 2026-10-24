@@ -44,6 +44,7 @@ fn lit(props: &[(String, Term)], p: &str) -> Option<String> {
     })
 }
 
+#[cfg(feature = "mapping-sqlite")]
 fn obj<'a>(props: &'a [(String, Term)], p: &str) -> Option<&'a Term> {
     props.iter().find(|(q, _)| q == p).map(|(_, o)| o)
 }
