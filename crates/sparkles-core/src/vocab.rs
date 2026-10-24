@@ -580,6 +580,24 @@ impl Vocab {
         b: usize,
         wanted: u32,
         key: &mut Vec<u8>,
+        f: impl FnMut(usize, &[u8]) -> bool,
+    ) {
+        if self.fsst.is_some() {
+            self.decode_block_as::<P, true>(b, wanted, key, f)
+        } else {
+            self.decode_block_as::<P, false>(b, wanted, key, f)
+        }
+    }
+
+    /// [`Vocab::decode_block`] for an FSST-coded vocabulary when `F` and a front-coded
+    /// one otherwise. Each hot loop is compiled once per codec, so the front-coded loops
+    /// carry no test for FSST codes.
+    #[inline(always)]
+    fn decode_block_as<const P: bool, const F: bool>(
+        &self,
+        b: usize,
+        wanted: u32,
+        key: &mut Vec<u8>,
         mut f: impl FnMut(usize, &[u8]) -> bool,
     ) {
         key.clear();
@@ -596,38 +614,59 @@ impl Vocab {
             return;
         }
         let last = 31 - wanted.leading_zeros() as usize;
-        if self.fsst.is_none() || wanted == (2u32 << last) - 1 {
+        if !F || wanted == (2u32 << last) - 1 {
             // Every key up to the last is decoded whole when each is wanted, and when
             // the suffixes are plain, whose copies cost less than planning which bytes
             // to skip: on `star-join` at 10.5M the plan added 3.7% to the instructions.
             for i in 0..=last {
-                let e = self.entry(data, &mut pos, i == 0);
+                let e = self.entry::<F>(data, &mut pos, i == 0);
                 key.truncate(e.shared);
-                self.push_suffix(data, e, (start + i) as u64, usize::MAX, key, false);
+                self.push_suffix::<F>(data, e, (start + i) as u64, usize::MAX, key, false);
                 if wanted >> i & 1 == 1 && !f(i, key) {
                     return;
                 }
             }
             return;
         }
+        self.decode_planned(data, pos, start, last, wanted, key, &mut f);
+    }
+
+    /// The rest of [`Vocab::decode_block`] for an FSST-coded block whose wanted keys
+    /// leave gaps, out of line so that the straight decode stays small.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn decode_planned(
+        &self,
+        data: &[u8],
+        mut pos: usize,
+        start: usize,
+        last: usize,
+        wanted: u32,
+        key: &mut Vec<u8>,
+        f: &mut dyn FnMut(usize, &[u8]) -> bool,
+    ) {
         let mut es = [Entry::default(); FC_BLOCK];
         for (i, e) in es.iter_mut().enumerate().take(last + 1) {
-            *e = self.entry(data, &mut pos, i == 0);
+            *e = self.entry::<true>(data, &mut pos, i == 0);
         }
         let need = needs(&es, last, wanted);
         for i in 0..=last {
-            self.step(data, es[i], (start + i) as u64, need[i], key, false);
+            self.step::<true>(data, es[i], (start + i) as u64, need[i], key, false);
             if wanted >> i & 1 == 1 && !f(i, key) {
                 return;
             }
         }
     }
 
-    /// [`needs`] for an FSST-coded vocabulary, and every key whole for a front-coded
-    /// one, whose plain suffixes cost less to copy than to plan around.
+    /// [`needs`] for an FSST-coded vocabulary (`F`), and every key whole for a
+    /// front-coded one, whose plain suffixes cost less to copy than to plan around.
     #[inline(always)]
-    fn needs(&self, es: &[Entry; FC_BLOCK], last: usize, wanted: u32) -> [usize; FC_BLOCK] {
-        if self.fsst.is_some() {
+    fn needs_as<const F: bool>(
+        es: &[Entry; FC_BLOCK],
+        last: usize,
+        wanted: u32,
+    ) -> [usize; FC_BLOCK] {
+        if F {
             needs(es, last, wanted)
         } else {
             [usize::MAX; FC_BLOCK]
@@ -635,11 +674,12 @@ impl Vocab {
     }
 
     /// The entry at `pos` (advanced past it), the first of its block when `first`.
+    /// `F` says whether the vocabulary is FSST-coded.
     #[inline(always)]
-    fn entry(&self, data: &[u8], pos: &mut usize, first: bool) -> Entry {
+    fn entry<const F: bool>(&self, data: &[u8], pos: &mut usize, first: bool) -> Entry {
         let shared = read_varint(data, pos) as usize;
         let word = read_varint(data, pos) as usize;
-        let (len, coded) = if self.fsst.is_some() && !first {
+        let (len, coded) = if F && !first {
             (word >> 1, word & 1 == 1)
         } else {
             (word, false)
@@ -667,7 +707,7 @@ impl Vocab {
     /// all of it when it is shorter. With `exact`, the caller has reserved the room and
     /// the buffer does not grow (see [`fsst::Table::decode_upto`]).
     #[inline(always)]
-    fn push_suffix(
+    fn push_suffix<const F: bool>(
         &self,
         data: &[u8],
         e: Entry,
@@ -676,11 +716,13 @@ impl Vocab {
         key: &mut Vec<u8>,
         exact: bool,
     ) {
-        match &self.fsst {
-            Some(t) if e.coded => t
-                .table(id)
-                .decode_at(data, e.start, e.len, max, key, !exact),
-            _ => key.extend_from_slice(&data[e.start..e.start + e.len.min(max)]),
+        if F && e.coded
+            && let Some(t) = &self.fsst
+        {
+            t.table(id)
+                .decode_at(data, e.start, e.len, max, key, !exact)
+        } else {
+            key.extend_from_slice(&data[e.start..e.start + e.len.min(max)])
         }
     }
 
@@ -689,12 +731,20 @@ impl Vocab {
     /// `usize::MAX`. `key` must hold at least `need.min(e.shared)` bytes, which
     /// [`Vocab::needs`] ensures.
     #[inline(always)]
-    fn step(&self, data: &[u8], e: Entry, id: u64, need: usize, key: &mut Vec<u8>, exact: bool) {
+    fn step<const F: bool>(
+        &self,
+        data: &[u8],
+        e: Entry,
+        id: u64,
+        need: usize,
+        key: &mut Vec<u8>,
+        exact: bool,
+    ) {
         if need <= e.shared {
             key.truncate(need);
         } else {
             key.truncate(e.shared);
-            self.push_suffix(data, e, id, need - e.shared, key, exact);
+            self.push_suffix::<F>(data, e, id, need - e.shared, key, exact);
         }
     }
 
@@ -743,6 +793,21 @@ impl Vocab {
     pub(crate) fn get_sorted_checked<E>(
         &self,
         ids: &[u64],
+        reserve: impl FnMut(usize) -> std::result::Result<(), E>,
+        f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        if self.fsst.is_some() {
+            self.get_sorted_checked_as::<true, E>(ids, reserve, f)
+        } else {
+            self.get_sorted_checked_as::<false, E>(ids, reserve, f)
+        }
+    }
+
+    /// [`Vocab::get_sorted_checked`] for an FSST-coded vocabulary when `F`.
+    #[inline(always)]
+    fn get_sorted_checked_as<const F: bool, E>(
+        &self,
+        ids: &[u64],
         mut reserve: impl FnMut(usize) -> std::result::Result<(), E>,
         mut f: impl FnMut(u64, &[u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), E> {
@@ -773,9 +838,9 @@ impl Vocab {
             self.touch_block(b);
             let mut es = [Entry::default(); FC_BLOCK];
             for (at, e) in es.iter_mut().enumerate().take(last + 1) {
-                *e = self.entry(data, &mut pos, at == 0);
+                *e = self.entry::<F>(data, &mut pos, at == 0);
             }
-            let need = self.needs(&es, last, mask);
+            let need = Self::needs_as::<F>(&es, last, mask);
             key.clear();
             for at in 0..=last {
                 let id = (b * FC_BLOCK + at) as u64;
@@ -796,7 +861,7 @@ impl Vocab {
                         key.reserve_exact(total - key.len());
                     }
                 }
-                self.step(data, e, id, nd, &mut key, true);
+                self.step::<F>(data, e, id, nd, &mut key, true);
                 if mask >> at & 1 == 1 {
                     f(id, &key)?;
                 }
@@ -1137,7 +1202,11 @@ impl Vocab {
         if lo == 0 {
             return Err(0);
         }
-        self.find_in_block::<P>(lo - 1, key)
+        if self.fsst.is_some() {
+            self.find_in_block::<P, true>(lo - 1, key)
+        } else {
+            self.find_in_block::<P, false>(lo - 1, key)
+        }
     }
 
     /// Find `probe` in block `b`, whose first key is not above it: `Ok(id)` when it is
@@ -1152,7 +1221,7 @@ impl Vocab {
     /// compared, and only that suffix is decoded. This relies on the writer storing the
     /// longest shared prefix, which [`VocabWriter`] does and `sparkles check` verifies.
     #[inline(always)]
-    fn find_in_block<const P: bool>(
+    fn find_in_block<const P: bool, const F: bool>(
         &self,
         b: usize,
         probe: &[u8],
@@ -1166,7 +1235,7 @@ impl Vocab {
             self.touch_block(b);
         }
         let lcp = |a: &[u8], b: &[u8]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
-        let e = self.entry(data, &mut pos, true);
+        let e = self.entry::<F>(data, &mut pos, true);
         let first = &data[e.start..e.start + e.len];
         match first.cmp(probe) {
             std::cmp::Ordering::Less => {}
@@ -1177,21 +1246,19 @@ impl Vocab {
         let mut scratch = Vec::new();
         for i in 1..n {
             let id = (start + i) as u64;
-            let e = self.entry(data, &mut pos, false);
+            let e = self.entry::<F>(data, &mut pos, false);
             if e.shared < c {
                 return Err(id);
             }
             if e.shared > c {
                 continue;
             }
-            let suffix: &[u8] = match &self.fsst {
-                Some(t) if e.coded => {
-                    scratch.clear();
-                    t.table(id)
-                        .decode_into(&data[e.start..e.start + e.len], &mut scratch);
-                    &scratch
-                }
-                _ => &data[e.start..e.start + e.len],
+            let suffix: &[u8] = if F && e.coded {
+                scratch.clear();
+                self.push_suffix::<F>(data, e, id, usize::MAX, &mut scratch, false);
+                &scratch
+            } else {
+                &data[e.start..e.start + e.len]
             };
             let rest = &probe[c..];
             match suffix.cmp(rest) {
@@ -1210,6 +1277,22 @@ impl Vocab {
         b: usize,
         wanted: u32,
         reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
+        f: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
+    ) -> crate::error::Result<()> {
+        if self.fsst.is_some() {
+            self.scan_block_checked_as::<true>(b, wanted, reserve, f)
+        } else {
+            self.scan_block_checked_as::<false>(b, wanted, reserve, f)
+        }
+    }
+
+    /// [`Vocab::scan_block_checked`] for an FSST-coded vocabulary when `F`.
+    #[inline(always)]
+    fn scan_block_checked_as<const F: bool>(
+        &self,
+        b: usize,
+        wanted: u32,
+        reserve: &mut impl FnMut(usize) -> crate::error::Result<()>,
         mut f: impl FnMut(usize, &[u8]) -> crate::error::Result<bool>,
     ) -> crate::error::Result<()> {
         let data = self.data.as_slice();
@@ -1222,9 +1305,9 @@ impl Vocab {
         let last = 31 - wanted.leading_zeros() as usize;
         let mut es = [Entry::default(); FC_BLOCK];
         for (i, e) in es.iter_mut().enumerate().take(last + 1) {
-            *e = self.entry(data, &mut pos, i == 0);
+            *e = self.entry::<F>(data, &mut pos, i == 0);
         }
-        let need = self.needs(&es, last, wanted);
+        let need = Self::needs_as::<F>(&es, last, wanted);
         let mut key = Vec::new();
         for i in 0..=last {
             let id = (b * FC_BLOCK + i) as u64;
@@ -1256,7 +1339,7 @@ impl Vocab {
                     ));
                 }
             }
-            self.step(data, e, id, nd, &mut key, true);
+            self.step::<F>(data, e, id, nd, &mut key, true);
             if wanted >> i & 1 == 1 && !f(i, &key)? {
                 break;
             }
