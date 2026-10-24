@@ -638,4 +638,6 @@ set, such as another class or a change to the drawn entities when they are the s
 clears the brushes, and on the query page the brushes end when another tab of the result
 opens, while the selection they made stays. **Apply to query** on the query page cannot
 keep the counts of a query with `LIMIT`, `OFFSET`, `GROUP BY` or `HAVING`, so it refuses
-those queries rather than wrapping them in a subquery.
+those queries rather than wrapping them in a subquery. The library call
+`ds.graph().facets` has no Python, Node.js or JVM binding, and `bindings.toml` marks the
+three as planned.

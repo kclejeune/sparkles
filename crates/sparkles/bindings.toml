@@ -441,6 +441,11 @@ python = "Dataset.clear_graph"
 jvm = "DatasetGraphSparkles.getGraph(graph).clear"
 node = "Dataset.clearGraph"
 
+["graph.facets"]
+python = "planned: Dataset.graph.facets, after the facet panel's request settles"
+jvm = "planned: DatasetGraphSparkles.graph().facets, after the Python and Node.js ones"
+node = "planned: Dataset.graph.facets, after the facet panel's request settles"
+
 ["graph.groups"]
 python = "Dataset.graph.groups"
 jvm = "DatasetGraphSparkles.graph().groups"
