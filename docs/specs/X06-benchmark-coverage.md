@@ -930,6 +930,8 @@ so its pinned Java 21 is used, while BSBM keeps its separate Java 17 driver.
 See [ROADMAP](../ROADMAP.md) item 1.
 
 
+<a id="sp2bench-planner-follow-up-2026-10-21"></a>
+
 ### SP²Bench planner follow-up (2026-10-21)
 
 Roadmap item 91 traced the `q8` and `q12b` losses to a selective author pattern
