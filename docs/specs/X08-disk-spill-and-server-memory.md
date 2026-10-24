@@ -401,7 +401,9 @@ column with a seed per recursion level:
 SPARQL compatibility needs care with unbound values. The join keys on the column with
 the fewest unbound build rows, as now. Build rows with an unbound key are compatible with
 every probe row, so they stay in memory and are joined against every partition's probe
-rows. If they do not fit, the join fails with its budget error. Probe rows with an
+rows. If they do not fit, the join fails with its budget error. Item 94 replaced this:
+they now go to a file of their own once they fill a quarter of a chunk, as the item 94
+Outcome below describes. Probe rows with an
 unbound key must meet every build row. They go to a separate file, which is joined
 against each build partition in turn after the partition's own probe file, with a matched
 bitmap for OPTIONAL and anti joins. Every probe row therefore sees all its candidate
@@ -1838,3 +1840,43 @@ Completed native hash joins release their hash index, input buffers and spill re
 when they reach EOF. Their plans keep final spill counters and completion metadata,
 and already returned batches keep their own storage. This does not resolve the known
 large spill-pass count when a grouping consumes ordered spilled join output.
+
+### Spilled join amplification, item 94 (2026-10-24)
+
+The acceptance runs of item 93 left three ways in which a spill wrote far more than its
+input. Each now writes about what its input takes.
+
+A spilled hash join kept the build rows that leave its key unbound in memory and added
+them to the first chunk of every partition's job. Their rows counted against every
+chunk, so once they were more than a chunk every job was partitioned again up to the
+last level and joined in chunks, and once they outgrew memory the join failed with its
+budget error. They now stay in memory only while they fill a quarter of a chunk. Past
+that they go to a file of their own, fed whole frames like the partition files. The file
+never counts toward partitioning again and is never copied into a deeper level. An inner
+join meets it in one job that reads every probe file against it in chunks, and the
+output spooler of an ordered join ends a run at each change of probe file. The other
+joins decide a probe row from all its candidates at once, so each of their jobs reads
+the file as further chunks after its own build rows. Item 210 covers reading it once for
+those joins as well. The regression test runs every join mode with one build row in two
+and one in ten unbound under 768 KiB and 192 KiB, with ordered and unordered probe input.
+Before the fix both of its larger configurations failed their budget. Now every
+configuration stays at one level, matches eager execution and keeps the probe order. A
+second test checks that one-row input batches write at most 1.5 times what batches of
+512 rows write.
+
+Counting a merge join multiplies the lengths of its equal-key runs, but it built each
+run as it does for output, and a run longer than a quarter of the query's room went to a
+spill file only to be counted. The count now passes over a run and keeps its length. Two
+runs of 4,000 rows counted under 128 KiB wrote 7,151 bytes before and write nothing now.
+
+Spilled groupings and DISTINCT chose a row's partition from a mix of its FxHash with the
+depth's seed. Rows whose FxHash values are equal stayed in one partition at every depth,
+so each pass rewrote every row it did not keep and the bytes grew with the square of the
+input. FxHash adds each word to its state and multiplies by a constant, so such rows are
+easy to build. The partition hash now mixes every key column into a state that starts
+from the depth's seed. A DISTINCT of 120,000 rows with one FxHash value under 1 MiB wrote
+11.5 MB before, against 2.4 MB for ordinary rows of the same size, and now writes 2.4 MB
+like them.
+
+Spill file formats are unchanged, since only the routing of rows changed.
+
