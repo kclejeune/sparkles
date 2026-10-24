@@ -244,7 +244,7 @@ graphs and maps, with arcs for the relations between located entities and facet 
 merges, a time slider over past commits with commit diffs drawn as graphs, the Ask bar, and agent memory. The screenshots
 below start with time travel over commits, branches and merges, GraphRAG communities, the
 Ask bar and agent memory, path finding, inference on the canvas, maps of relations,
-validation on the graph, facets that brush the graph, and the visual query builder.
+validation on the graph, graph algorithms as lenses, and facets that brush the graph.
 
 <table>
   <tr>
@@ -288,12 +288,12 @@ validation on the graph, facets that brush the graph, and the visual query build
     <td>SHACL results on the graph, with a suggested fix previewed</td>
   </tr>
   <tr>
+    <td><img src="docs/images/explore-algo-lenses.png" alt="The resource explorer with algorithm lenses, sizing nodes by PageRank over the drawn graph and colouring them by Leiden communities, with the legend giving the score ranges and each community's size"></td>
     <td><img src="docs/images/explore-facets.png" alt="The resource explorer with the Facets panel beside a person's graph, brushing an age range on a histogram and one employer on a bar list, so that the other facets count the 41 people under both brushes and the drawn people outside them are dimmed"></td>
-    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
   </tr>
   <tr>
+    <td>Lenses that size nodes by PageRank and colour them by community</td>
     <td>Facet histograms whose brushes filter the graph</td>
-    <td>A query's pattern drawn beside its text</td>
   </tr>
 </table>
 
@@ -356,6 +356,14 @@ validation on the graph, facets that brush the graph, and the visual query build
   <tr>
     <td>The schema browser</td>
     <td>The k shortest paths between two people</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
+    <td></td>
+  </tr>
+  <tr>
+    <td>A query's pattern drawn beside its text</td>
+    <td></td>
   </tr>
 </table>
 

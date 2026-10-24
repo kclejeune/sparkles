@@ -36,6 +36,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Arcs on the map](#arcs-on-the-map)
 * [Facets and Use in query](#facets-and-use-in-query)
 * [Lenses on the graph](#lenses-on-the-graph)
+  * [Algorithm lenses](#algorithm-lenses)
 * [The validation overlay](#the-validation-overlay)
 * [The time slider](#the-time-slider)
 * [Automatic compaction](#automatic-compaction)
@@ -1783,6 +1784,51 @@ signed-in user's view, and a grown graph reads only its new nodes. Nothing they 
 saved. Lenses apply to at most 20,000 drawn nodes. On the query page, the edges of a
 `CONSTRUCT` result are also read with reasoning, so that a constructed triple that is not
 in the data is not taken for an inferred one.
+
+In compare mode on the time slider, a size lens whose values come from the dataset shows
+each node's value at the right handle and its change since the left handle in the tooltip
+and the list.
+
+### Algorithm lenses
+
+The size channel also offers PageRank, betweenness, BFS depth from a node, k-core and
+triangles, and the colour channel WCC components, label propagation, Louvain and Leiden
+communities. These lenses run the [graph algorithms](#graph-algorithms) without writing
+anything back.
+
+![Explore with nodes sized by PageRank and coloured by Leiden communities](images/explore-algo-lenses.png)
+
+Each algorithm lens has a **scope**.
+
+* **drawn graph** runs over the drawn nodes and the edges among them, as one
+  `SERVICE algo:` query. It is the default, takes at most 1,500 drawn nodes, and runs
+  again once the graph has been still for a second.
+* **projection** runs over the whole dataset, on the drawn edges' predicates, one of them,
+  or a stored projection, and the drawn nodes show their values in that larger graph. The
+  run goes on in the background with a progress bar and **Cancel**, and the server keeps
+  its result, so changing the drawing reads the kept result instead of running again.
+
+The menu also shows the parameters a person would change, such as damping and iterations
+for PageRank or resolution and seed for Leiden, and a changed value runs the lens again.
+Louvain and Leiden show their last level unless another is picked, and BFS asks for the
+node to start from. The lens's row shows the run's summary, such as the iterations and
+whether PageRank converged, or the modularity of the communities.
+
+Community colours stay with their communities. When a new run, such as Leiden with another
+seed, finds a community that holds half or more of an earlier community's members, it keeps
+that community's colour. The legend gives each community's size, such as "community 12, 41
+drawn of 3,980" for a projection run.
+
+When the dataset has [GraphRAG reports](API.md#graphrag) that you may read, the colour
+channel offers **GraphRAG community**, with a level picker, and each legend entry links to
+the community's report in the Communities tab. The lens is absent on a branch and at a past
+state, and the menu says why.
+
+A projection run waits while the time slider plays, with the note "paused while playing",
+and runs when play stops. Above 20,000 drawn nodes only a size lens with projection scope
+runs, and it shows the top 1,000 drawn nodes by value, with the rest at the smallest size.
+A server older than the view-only runs leaves projection scope disabled with the reason,
+and drawn-graph scope still works.
 
 ## The validation overlay
 

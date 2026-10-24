@@ -357,6 +357,10 @@ fn algorithms(put: &mut dyn FnMut(&str, J)) {
                         "description": "The name of a stored projection, or a definition.",
                     },
                     "params": any_object("The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`."),
+                    "nodes": { "type": "array", "items": string(), "maxItems": 20000, "description": "View-only runs. The IRIs of the nodes whose rows the answer holds. The whole result is computed, and each community or component row also carries `communitySize`, its size in the whole projection." },
+                    "keep": { "type": "boolean", "description": "View-only runs. Keep the whole result in the server's cache of view-only results, keyed by branch, commit, the caller's view and the request without `nodes`, `keep`, `async` and `top`." },
+                    "async": { "type": "boolean", "description": "View-only runs with `keep`. Run as an `algo-view` task and answer `202`, or join the task of a run with the same key." },
+                    "top": { "type": "integer", "minimum": 1, "maximum": 20000, "description": "View-only runs. Only the rows with the highest values of the first numeric output, such as `score`." },
                     "write": closed(
                         &["graph", "predicates"],
                         json!({
@@ -369,7 +373,7 @@ fn algorithms(put: &mut dyn FnMut(&str, J)) {
                     ),
                 }),
             ),
-            "A run of one algorithm. With `write` the results are written to a graph in batched commits.",
+            "A run of one algorithm. With `write` the results are written to a graph in batched commits. Without it, `nodes`, `keep`, `async` and `top` make it a view-only run.",
             "graph-algorithms",
         ),
     );

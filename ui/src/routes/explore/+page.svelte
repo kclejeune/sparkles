@@ -734,6 +734,9 @@
       reasoning: hasReasoning,
       label: (id) => nodes[id]?.label ?? id,
       short: (iri) => shortLabel(iri, prefixes),
+      // the left handle of a comparison in time, not one against another branch (§4.3)
+      compareAt: graphTimeOpen && exCompare && exFrom && !exAgainst ? exFrom : undefined,
+      playing: graphPlaying,
     });
   });
   // the validation lens of the badge channel (U07 §11.2): the overlay validates, and the
@@ -2350,6 +2353,7 @@
               {/if}
               <LensLegend
                 results={lenses.results}
+                {ds}
                 selected={lensMarked ? lensPick : null}
                 onselect={(key) => (lensPick = key)}
               />

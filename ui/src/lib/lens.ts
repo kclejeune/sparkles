@@ -24,6 +24,8 @@ export type LegendEntry = {
   swatch?: number;
   /** The size step of a size entry, `NO_VALUE` for nodes without a value. */
   step?: number;
+  /** The GraphRAG community of the entry, whose report the legend links to. */
+  community?: string;
 };
 
 export type LensResult = {
@@ -42,6 +44,8 @@ export type LensResult = {
   text: Map<string, string>;
   legend: LegendEntry[];
   summary?: string;
+  /** The levels of a hierarchical run, for its level picker. */
+  levels?: number[];
   computedAt: { at: string; branch: string };
 };
 
@@ -185,15 +189,108 @@ export function categoryOrder(
   return { order, index };
 }
 
+/** The communities of a colour lens's last run and their palette indexes (§2.3). */
+export type ColourMemory = { members: Map<string, Set<string>>; index: Map<string, number> };
+
+/**
+ * Palette indexes that stay stable across runs (§2.3). Communities take colours in order of
+ * their size in the drawn graph, and a community whose members overlap half or more of an
+ * earlier community's members keeps that one's colour, each earlier colour going to one
+ * community at most. The rest take the free colours in order, then "other".
+ */
+export function stableIndex(
+  values: Map<string, string | null>,
+  prev: ColourMemory | null | undefined,
+  label: (v: string) => string = (v) => v,
+): Map<string, number> {
+  const { order, index: fresh } = categoryOrder(values, label);
+  if (!prev || !prev.members.size) return fresh;
+  const before = new Map<string, string>();
+  for (const [cat, ids] of prev.members) for (const id of ids) before.set(id, cat);
+  const members = new Map<string, string[]>();
+  for (const [id, v] of values) {
+    if (v == null) continue;
+    const l = members.get(v);
+    if (l) l.push(id);
+    else members.set(v, [id]);
+  }
+  const out = new Map<string, number>();
+  const used = new Set<number>();
+  const claimed = new Set<string>();
+  for (const cat of order) {
+    const overlap = new Map<string, number>();
+    for (const id of members.get(cat) ?? []) {
+      const p = before.get(id);
+      if (p != null && !claimed.has(p)) overlap.set(p, (overlap.get(p) ?? 0) + 1);
+    }
+    // the largest overlap among the earlier communities this one may take the colour of:
+    // it holds at least half of them, and their colour is still free
+    let best: [string, number] | null = null;
+    for (const [p, n] of overlap) {
+      const idx = prev.index.get(p);
+      const size = prev.members.get(p)?.size ?? 0;
+      if (idx == null || idx >= OTHER || used.has(idx) || n * 2 < size) continue;
+      if (!best || n > best[1] || (n === best[1] && p < best[0])) best = [p, n];
+    }
+    if (!best) continue;
+    const idx = prev.index.get(best[0])!;
+    out.set(cat, idx);
+    used.add(idx);
+    claimed.add(best[0]);
+  }
+  let next = 0;
+  for (const cat of order) {
+    if (out.has(cat)) continue;
+    while (next < OTHER && used.has(next)) next++;
+    if (next < OTHER) {
+      out.set(cat, next);
+      used.add(next);
+    } else out.set(cat, OTHER);
+  }
+  return out;
+}
+
+/** What a colour lens's run leaves for the next run's {@link stableIndex}. */
+export function colourMemory(r: LensResult): ColourMemory {
+  const members = new Map<string, Set<string>>();
+  const index = new Map<string, number>();
+  for (const [id, v] of r.values) {
+    if (typeof v !== 'string') continue;
+    let m = members.get(v);
+    if (!m) members.set(v, (m = new Set()));
+    m.add(id);
+    const c = r.codes.get(id);
+    if (c != null) index.set(v, c);
+  }
+  return { members, index };
+}
+
 /** A colour lens over categories (§2.1): twelve qualitative colours by size, then "other". */
 export function colourResult(
   c: Common & {
     values: Map<string, string | null>;
     label?: (v: string) => string;
+    /** The palette index of each category, such as {@link stableIndex} gives. */
+    index?: Map<string, number>;
+    /** A legend entry's text, such as "community 12, 41 drawn of 3,980". */
+    entry?: (v: string, drawn: number) => string;
+    /** What the categories are called in the summary, "categories" by default. */
+    noun?: [string, string];
   },
 ): LensResult {
   const label = c.label ?? ((v: string) => v);
-  const { order, index } = categoryOrder(c.values, label);
+  const ordered = categoryOrder(c.values, label);
+  const index = c.index ?? ordered.index;
+  // in palette order, so that a kept colour keeps its place in the legend too
+  const order = c.index
+    ? [...ordered.order].sort(
+        (a, b) =>
+          (index.get(a) ?? OTHER) - (index.get(b) ?? OTHER) ||
+          ordered.index.get(a)! - ordered.index.get(b)!,
+      )
+    : ordered.order;
+  const entry = c.entry ?? ((v: string) => label(v));
+  const [one, many] = c.noun ?? ['category', 'categories'];
   const codes = new Map<string, number>();
   const text = new Map<string, string>();
   const byCat = new Map<string, string[]>();
@@ -210,19 +307,20 @@ export function colourResult(
     if (list) list.push(id);
     else byCat.set(v, [id]);
   }
-  const legend: LegendEntry[] = order.slice(0, PALETTE_SIZE).map((v, i) => ({
+  const coloured = order.filter((v) => (index.get(v) ?? OTHER) < OTHER);
+  const legend: LegendEntry[] = coloured.map((v) => ({
     key: `cat-${v}`,
-    text: label(v),
+    text: entry(v, byCat.get(v)!.length),
     count: byCat.get(v)!.length,
     ids: byCat.get(v)!,
-    swatch: i,
+    swatch: index.get(v)!,
   }));
-  const rest = order.slice(PALETTE_SIZE);
+  const rest = order.filter((v) => (index.get(v) ?? OTHER) >= OTHER);
   if (rest.length) {
     const ids = rest.flatMap((v) => byCat.get(v)!);
     legend.push({
       key: 'other',
-      text: `other, ${rest.length} ${rest.length === 1 ? 'category' : 'categories'}`,
+      text: `other, ${rest.length} ${rest.length === 1 ? one : many}`,
       count: ids.length,
       ids,
       swatch: OTHER,
@@ -238,7 +336,7 @@ export function colourResult(
     codes,
     text,
     legend,
-    summary: `${order.length} ${order.length === 1 ? 'category' : 'categories'}`,
+    summary: `${order.length} ${order.length === 1 ? one : many}`,
     computedAt: c.computedAt,
   };
 }

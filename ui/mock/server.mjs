@@ -41,6 +41,7 @@ import { handleAsk, isAdmin, ORG_MEMORY, ORG_PREFIXES, orgTrig, whoamiFor } from
 import { handleAssistant } from './assistant.mjs';
 import { handleFacets } from './facets.mjs';
 import { handleGraphrag } from './graphrag.mjs';
+import { handleAlgo, rewriteService } from './algo.mjs';
 import { handleExplain, timedOutPlan } from './explain.mjs';
 import { handleReview, INGEST_BRANCH } from './review.mjs';
 import { geoQuery, handleGeo } from './geo.mjs';
@@ -1331,7 +1332,7 @@ function pickFormat(accept, candidates) {
 }
 
 async function handleQuery(req, res, ds, p) {
-  const query = p.get('query');
+  let query = p.get('query');
   if (!query) return fail(res, 400, 'Missing query parameter');
   // a past state (`at=`): the same query over the store of that commit
   let readSeq = headCommit(ds).seq;
@@ -1342,6 +1343,12 @@ async function handleQuery(req, res, ds, p) {
     readSeq = at.seq;
     atHeaders = at.headers;
     if (at.store) ds = pastView(ds, at.store);
+  }
+  // a `SERVICE algo:` call over the drawn nodes, answered from computed rows (mock/algo.mjs)
+  try {
+    query = rewriteService(ds.store, query, queryOptions(ds, p)) ?? query;
+  } catch (e) {
+    return fail(res, 400, String(e?.message ?? e));
   }
   if (handleSearchQuery(req, res, ds, p, query)) return;
   if (handlePathSearch(req, res, ds, query, readSeq, atHeaders)) return;
@@ -2380,6 +2387,20 @@ const server = http.createServer(async (req, res) => {
     if (await handleFacets(req, res, seg, { datasets, send, fail, readBody })) return;
     // GraphRAG community reports (mock/graphrag.mjs)
     if (await handleGraphrag(req, res, url, seg, { datasets, send, fail, readBody })) return;
+    // graph algorithms and their view-only runs (mock/algo.mjs)
+    if (
+      await handleAlgo(req, res, url, seg, {
+        datasets,
+        send,
+        fail,
+        readBody,
+        tasks,
+        nextTaskId: () => String(taskSeq++),
+        headSeq: (d) => headCommit(d).seq,
+        queryOptions: (d) => queryOptions(d, new URLSearchParams()),
+      })
+    )
+      return;
     // asking the server, the assistant settings and the history (mock/assistant.mjs)
     if (
       await handleAssistant(req, res, url, seg, {

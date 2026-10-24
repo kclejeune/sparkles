@@ -6,14 +6,19 @@
    * 390 px it is a strip above the graph that shows the active encodings in one line and
    * opens on a tap.
    */
+  import { base } from '$app/paths';
   import { CHANNELS, NO_VALUE, OTHER, sizeFactor, type LegendEntry, type Results } from '$lib/lens';
+  import { reportHref } from '$lib/graphrag';
 
   let {
     results,
+    ds = '',
     selected = null,
     onselect,
   }: {
     results: Results;
+    /** The dataset, for the links of GraphRAG communities to their reports. */
+    ds?: string;
     /** The key of the entry whose nodes are selected. */
     selected?: string | null;
     onselect?: (key: string | null, ids: string[]) => void;
@@ -98,6 +103,13 @@
                   {/if}
                   <span class="n faint">{e.count.toLocaleString('en-US')}</span>
                 </button>
+                {#if e.community && ds}
+                  <a
+                    class="report"
+                    href={reportHref(`${base}/datasets/${encodeURIComponent(ds)}`, e.community)}
+                    title="Open this community's report in the Communities tab">report</a
+                  >
+                {/if}
               </li>
             {/each}
           </ul>
@@ -157,6 +169,15 @@
     list-style: none;
     margin: 0;
     padding: 0;
+  }
+  li {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .report {
+    font-size: var(--fs-xs);
+    flex: none;
   }
   .entry {
     display: flex;

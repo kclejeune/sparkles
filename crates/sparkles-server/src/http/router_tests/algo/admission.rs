@@ -578,9 +578,13 @@ async fn body_aware_parse_grant_restore_lookup_order_and_denials() {
         )
         .await
         .status,
-        StatusCode::BAD_REQUEST
+        // a run may read a branch (U10 §6), and this one does not exist
+        StatusCode::NOT_FOUND
     );
-    assert!(p.events.lock().is_empty());
+    // authorized first, and refused at the dataset's lookup before any run
+    let events = p.events.lock().clone();
+    assert!(!events.contains(&"projection"), "{events:?}");
+    assert!(!events.contains(&"task-id"), "{events:?}");
 }
 
 #[tokio::test]

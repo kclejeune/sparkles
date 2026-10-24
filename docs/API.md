@@ -227,6 +227,8 @@ validators (`sparkles_shacl`, `sparkles_shex`).
 | `sparkles_embedding_backlog` | gauge. Subjects (per graph) waiting to be embedded, the status's `backlog`. | `dataset`, `index` |
 | `sparkles_embedding_lag_commits` | gauge. Commits since the newest one whose text is all embedded, which is `headSeq − appliedSeq` of the status. | `dataset`, `index` |
 | `sparkles_graphql_groups` | histogram (1 … 64). The fetch groups, which are SPARQL queries, that each GraphQL request ran. | `dataset` |
+| `sparkles_algo_view_cache_entries`, `sparkles_algo_view_cache_bytes` | gauge. The results kept by [view-only algorithm runs](#view-only-runs) and their estimated bytes, which the server memory pool also holds. | |
+| `sparkles_algo_view_cache_hits_total`, `sparkles_algo_view_cache_misses_total`, `sparkles_algo_view_cache_joins_total`, `sparkles_algo_view_cache_refused_total` | counter. View-only requests answered from a kept result, requests that ran the algorithm, background requests that joined a run in progress, and results not kept because they were larger than the cache or the pool had no room. | |
 | `sparkles_graphrag_reports` | gauge. A dataset's current [community reports](#graphrag) by status, as of the last build or review since the server started. | `dataset`, `status` = `unreviewed` \| `reviewed` \| `rejected` \| `stale` \| `failed` |
 | `sparkles_graphrag_tokens_total` | counter. Tokens counted against a dataset's GraphRAG budgets since the server started. | `dataset`, `phase` = `build` \| `refresh` |
 | `sparkles_graphrag_stale_communities` | gauge. The communities the last GraphRAG run left pending for a later one. | `dataset` |
@@ -660,7 +662,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/describe/{ds}`           | *Extension.* Restores the DESCRIBE defaults. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. The caller that started a background view-only algorithm run (`algo-view`) may also cancel it. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results and its cached remote SERVICE results ([SERVICE options](#service-options-loop-bulk-and-cache)). Returns `{ "cleared": number /* entries */, "bytes": number, "serviceCleared": number, "serviceBytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's effective prefixes, which are the well-known ones, the prefixes the settings file declares and the dataset's own, as the [prefixes kind](#prefixes) computes them. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. Declared and well-known prefixes are not listed here, and `?prefix=` and `?uri=` look only at the stored ones. |
@@ -736,7 +738,8 @@ type DatasetQuota = {
 type Task = {
   id: string;
   kind: "compact" | "backup" | "reason" | "load" | "clone" | "text-rebuild" | "geo-index"
-      | "backup-create" | "backup-restore" | "backup-verify" | "backup-gc" | "backup-policy";
+      | "backup-create" | "backup-restore" | "backup-verify" | "backup-gc" | "backup-policy"
+      | "algo-run" | "algo-view" | …;
   dataset: string;          // "" for a server-wide task (listed for server admins only)
   target?: string;          // the dataset a clone creates; for backup tasks see Backup repositories
   state: "queued" | "running" | "done" | "failed" | "cancelled";
@@ -5998,6 +6001,86 @@ A replace run commits its first batch before the others, so a reader sees a grap
 part of the new results until the run ends. Use `atomic` for a graph that must change at
 once, at the price of one large commit.
 
+### View-only runs
+
+A request without `write` may add four members that make it a view-only run, which the
+graph canvas uses for its algorithm lenses.
+
+```json
+{
+  "algorithm": "pageRank",
+  "projection": "people",
+  "nodes": ["http://example.org/alice", "http://example.org/bob"],
+  "keep": true,
+  "async": true
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `nodes` | Up to 20,000 IRIs. The whole result is computed, and the answer holds only the rows of these nodes. A node that the caller's projection does not contain gets no row and no error. |
+| `keep` | Keep the whole result in the server's cache of view-only results, so that a later request for other nodes reads it instead of running again. |
+| `async` | With `keep`, run as a task of kind `algo-view` and answer `202` with the task. |
+| `top` | Up to 20,000. Only the rows with the highest values of the first numeric output, such as `score` or `core`, highest first. With `nodes`, the highest of the listed nodes. |
+
+The answer is SPARQL JSON results whatever the `Accept` header asks for. A community or
+component row also binds `communitySize`, the size of its community or component in the
+whole projection, counted per level for `louvain` and `leiden`. Two members follow the
+results. `summary` holds the statistics of the run, as `summary=true` returns them, and
+`run` holds the commit it computed at, whether the cache answered (`cached`), the rows of
+the whole result, the rows returned, `truncated` when the server's row limit cut the
+answer, and `definition`, a hash of the request that every answer of the same definition
+shares. A client that reads one run in several requests compares `commit` and `definition`
+to know that its answers come from one run, since a named projection can change between
+them without a commit. The answer is written one row at a time, and its buffer counts
+against the memory budget, so an answer over the result-byte limit is refused as soon as
+it passes the limit.
+
+The run reads under the caller's view at the state that the request's `at` parameter and
+`branch` parameter select, with the query timeout and memory budget. The budget parameters
+`memory-mb`, `max-rows`, `max-rows-produced`, `spill-mb` and `max-result-mb` lower the
+server's budgets as they do on a query. The decoded rows of the result count against the
+memory budget and the request's grant of the memory pool as they are decoded, so a large
+result answers `507` with `budget: "memory"` before it grows past them. An answer whose
+JSON is larger than the result-byte limit answers `507` with `budget: "result-bytes"`,
+whether it was computed or read from the cache. Any run without
+`write` may read a branch, while a run with `write` answers `400` on a branch, since its
+run record and the named projections belong to main. A run on a branch does not find
+main's named projections, so it gives its projection inline. The cache key is the
+dataset's branch, the commit, the caller's read view with its triple protections, the
+`default-graph-uri` and `named-graph-uri` parameters, the dataset's inferred overlay and
+RDFS on read, and the query text that the request without `nodes`, `keep`, `async` and
+`top` stands for, with the definition of a named projection. The query text has every
+prefixed name expanded with the dataset's prefixes as they are when the request arrives,
+so a changed prefix, which makes no commit, is a different key. A caller therefore
+never reads a result computed for a wider view. The cache keeps at most 8 results and
+512 MiB of their estimated size, and never more than half of the server memory pool, so the
+other half always stays for the admission of queries. It drops the oldest first. Each kept
+result holds a grant of the server memory pool of its size, rounded up to the pool's 4 MiB
+granules, for as long as the cache keeps it or a request still reads it, so kept results
+reduce the memory left for queries. A result larger than half the pool is answered but not
+kept, and so is a result for which the pool has no room even after the older results are
+dropped. A result keeps decoded
+terms, so it takes about 100 to 150 bytes per node and output rather than the 16 bytes of a
+bare score, in exchange for answering a later request without dictionary lookups.
+
+A background run is followed with `GET /$/tasks/{id}` and its task needs only `read`. A
+request for the same key while the task runs joins it, and its answer is the same task with
+`joined: true`. The callers that started or joined a run can follow its task even when their
+view of the dataset is restricted, and the caller that started it, or a dataset admin, can
+cancel it with `DELETE /$/tasks/{id}`. Both rights hold only while the caller can still read
+the dataset through the same view it had when it started or joined the run. The task of a
+run on a branch names the dataset as `ds@branch`, so access to it is checked on that
+branch. A run checks its cancellation and deadline again while it decodes its rows, and a
+run cancelled after it computed keeps nothing. A caller whose
+grants change loses sight of the task. The task has the deadline of an update, none unless
+the request gives a `timeout` or the server runs with `--update-timeout`, and takes its
+initial grant of the memory pool when it starts. F14's algorithms do not report their
+iterations, so the task's progress moves by phase, from waiting through computing to
+keeping the result. When the task ends, its `detail` holds the algorithm, the commit, the
+rows, the summary and `kept`, and the same request then answers from the cache with `200`.
+`/metrics` counts the cache's hits, misses, joins and refusals.
+
 ### Named projections
 
 | Route | Needs | Meaning |
@@ -8563,7 +8646,8 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/ui/*`, `/$/ping`, `/$/ready`, `/$/openapi.json`, `/$/openapi.yaml` | GET | Nothing. Without `metrics`, `/$/ready` lists only readable datasets. |
 | `/$/whoami`, `/$/auth/config`, `/$/auth/login`, `/$/auth/oidc/*` (including the back-channel logout), `/$/auth/device`, `/$/auth/token` | | Nothing. Invalid credentials are still `401`. |
 | `/$/server`, `/$/datasets` (GET), `/$/tasks`, `/$/tasks/{id}`, `/$/stats`, `/$/backups-list`, `/$/validate/*`, `/$/auth/logout`, `/$/format` (POST), `/$/lint` (POST), `/$/geo/convert` (POST) | | Any caller. `/$/format` and `/$/lint` admit nobody under `--format-endpoint off`, and only signed-in callers under `authenticated`. Listings show readable datasets only, and server-wide tasks only to `server-admin`. `/$/stats` covers the datasets the caller may read, and `/$/backups-list` the files of the datasets it administers. Cancelling a task (DELETE) needs `admin` on its dataset. |
-| `/$/algo/{ds}/run` | POST | Read-only runs need `read` through `query`. Runs with `write` need `write` through `update`. The body selects the policy before dataset access. |
+| `/$/algo/{ds}/run` | POST | Read-only runs need `read` through `query`, and so do view-only runs, including background ones. Runs with `write` need `write` through `update`. The body selects the policy before dataset access. |
+| `/$/graphrag/{ds}/memberships` | POST | `read` through `query`, with the reports graph proven for the caller. |
 | `/$/algo/{ds}/projections[/{name}]` | GET | `read` through `info`. |
 | `/$/graph/{ds}/groups` | POST | `read` through `query`. |
 | `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
@@ -10943,6 +11027,15 @@ rating of each one's report, and `GET /$/graphrag/{ds}/community?iri=` shows one
 community with its members, its children and its report with findings and citations.
 Both read through the caller's view, and a community the caller may not read is a
 `404`.
+
+`POST /$/graphrag/{ds}/memberships` takes `{"nodes": ["<iri>", …], "level": 0}` with at
+most 20,000 IRIs and answers which communities hold each node, at the given level or at
+every level when `level` is left out. Each row of `memberships` names a node, its
+community and the community's level, and `communities` gives each named community's
+level, member count and report title. The graph canvas uses it to colour nodes by
+community. It needs `read` through the query endpoint and reads through the caller's
+view on main only. A request on a branch, or from a caller for whom the reports graph is
+not proven, gets `"available": false` with no memberships.
 
 `POST /$/graphrag/{ds}/review` needs `write` on the dataset without graph or triple
 restrictions, because only an unrestricted writer may write a reports graph. A caller

@@ -123,7 +123,8 @@ export function chooseBranch(path, seg, url) {
   if (seg[0] === '$' && name && name !== MAIN) {
     const route = seg[1];
     const clone = route === 'datasets' && seg[3] === 'clone';
-    if (!clone && !BRANCH_ROUTES.has(route))
+    const algoRun = route === 'algo' && seg[3] === 'run';
+    if (!clone && !algoRun && !BRANCH_ROUTES.has(route))
       return { error: [400, { error: `${path} does not take a branch`, code: 'invalid-branch' }] };
   }
   return { name: name === MAIN ? null : name, path, seg };

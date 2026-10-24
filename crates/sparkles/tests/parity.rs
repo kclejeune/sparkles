@@ -792,6 +792,7 @@ fn entries() -> Vec<(&'static str, Entry)> {
         server_only!("confirmGraphrag", Tasks),
         server_only!("listCommunities", Process),
         server_only!("getCommunity", Process),
+        server_only!("listCommunityMemberships", Process),
         server_only!("reviewCommunityReport", Process),
         // C19: the layered settings come from the server's settings file
         server_only!("getSettingsStatus", Process),

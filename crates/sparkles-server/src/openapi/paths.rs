@@ -1129,7 +1129,7 @@ fn algorithms(p: &mut Paths) {
             "Graph algorithms",
             "Run a graph algorithm",
         )
-        .doc("Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.")
+        .doc("Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. A request with `nodes`, `keep`, `async` or `top` is a view-only run, which answers in SPARQL JSON with the rows of the listed nodes, `communitySize` for community and component rows, the run's `summary` and a `run` member that names the commit and whether the cache answered. With `keep` the whole result is kept in a cache of at most 8 results and 512 MiB charged to the server memory pool, and with `async` as well the run is an `algo-view` task that needs only read, which a request for the same key joins and the caller that started it may cancel. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.")
         .see("graph-algorithms")
         .params(&["format", "timeout", "nocache", "execution"])
         .query("summary", json!({ "type": "boolean" }), "Return only the summary of the run.")
@@ -1140,7 +1140,7 @@ fn algorithms(p: &mut Paths) {
             Some(json!({ "application/sparql-results+json": { "schema": { "type": "object" } } })),
             json!({}),
         )
-        .resp("202", "A run with `write`, started as a task.", Some(json!({ "application/json": { "schema": sref("Task") } })))
+        .resp("202", "A run with `write`, or a view-only run with `keep` and `async`, started as a task. A view-only answer has `joined: true` when it joined a run already in progress.", Some(json!({ "application/json": { "schema": sref("Task") } })))
         .errors(&[400, 409, 413, 429, 503, 507]),
     );
     p.add(
@@ -2847,6 +2847,14 @@ fn assist(p: &mut Paths) {
             .see("graphrag")
             .json("200", "The community.", "GraphragCommunity")
             .errors(&[400, 404]),
+    );
+    p.add(
+        op(POST, "/$/graphrag/{ds}/memberships", "listCommunityMemberships", "Datasets", "Read the communities of nodes")
+            .doc("The communities of the reports graph that hold each listed node, at the given level or at every level, with each community's member count and report title. Read on main only and through the caller's view. A caller for whom the reports graph is not proven, or a request on a branch, gets `available: false`.")
+            .see("graphrag")
+            .json_body(true, "GraphragMembershipsRequest")
+            .json("200", "The memberships.", "GraphragMemberships")
+            .errors(&[400, 404, 413]),
     );
     p.add(
         op(POST, "/$/graphrag/{ds}/review", "reviewCommunityReport", "Datasets", "Review a community report")

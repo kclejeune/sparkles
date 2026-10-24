@@ -4988,7 +4988,17 @@ fn with_inferences(mut r: Response, ds: &Dataset, included: bool, seq: u64) -> R
 
 /// Whether `p` may see task `t`: read on its dataset or the dataset it creates;
 /// `server-admin` for a server-scoped task (no dataset).
-fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
+/// The figures of the cache of view-only algorithm runs, for `/metrics`.
+pub(crate) fn algo_view_metrics(out: &mut String) {
+    algo::view::metrics(out);
+}
+
+fn task_visible(st: &AppState, p: &Principal, t: &crate::state::Task) -> bool {
+    // a background view-only run is followed by the callers that started or joined it,
+    // whose view may be restricted
+    if t.kind == algo::view::TASK && algo::view::follows(st, &t.id, &t.dataset, p) {
+        return true;
+    }
     if t.dataset.is_empty() {
         return p.has(crate::auth::ServerPerm::ServerAdmin);
     }
@@ -5062,7 +5072,7 @@ async fn list_tasks(State(st): St, Extension(p): Extension<Principal>) -> Json<J
         .tasks
         .lock()
         .iter()
-        .filter(|t| task_visible(&p, t))
+        .filter(|t| task_visible(&st, &p, t))
         .map(|t| task_for(&p, t))
         .collect();
     Json(serde_json::to_value(tasks).unwrap())
@@ -5076,13 +5086,14 @@ async fn get_task(
     st.tasks
         .lock()
         .iter()
-        .find(|t| t.id == id && task_visible(&p, t))
+        .find(|t| t.id == id && task_visible(&st, &p, t))
         .map(|t| Json(serde_json::to_value(task_for(&p, t)).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
 }
 
 /// `DELETE /$/tasks/{id}`: cancel a task. Needs `admin` on the task's dataset
-/// (`server-admin` for a server-scoped task). `202` with the task when it accepted,
+/// (`server-admin` for a server-scoped task), or for a background view-only algorithm
+/// run, to be the caller that started it. `202` with the task when it accepted,
 /// `409 not-cancellable` when it does not accept cancellation or has finished.
 async fn cancel_task(
     State(st): St,
@@ -5093,7 +5104,7 @@ async fn cancel_task(
         .tasks
         .lock()
         .iter()
-        .find(|t| t.id == id && task_visible(&p, t))
+        .find(|t| t.id == id && task_visible(&st, &p, t))
         .cloned()
     else {
         return Err(err(StatusCode::NOT_FOUND, "no such task"));
@@ -5102,6 +5113,8 @@ async fn cancel_task(
         p.has(crate::auth::ServerPerm::ServerAdmin)
     } else {
         p.can(&t.dataset, Level::Admin)
+            // the caller that started a background view-only run may cancel it
+            || (t.kind == algo::view::TASK && algo::view::started(&st, &t.id, &t.dataset, &p))
     };
     if !allowed {
         let msg = if t.dataset.is_empty() {

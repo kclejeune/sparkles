@@ -1132,7 +1132,7 @@
       },
       "AlgoRequest": {
         "additionalProperties": false,
-        "description": "A run of one algorithm. With `write` the results are written to a graph in batched commits.",
+        "description": "A run of one algorithm. With `write` the results are written to a graph in batched commits. Without it, `nodes`, `keep`, `async` and `top` make it a view-only run.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
         },
@@ -1157,6 +1157,22 @@
             ],
             "type": "string"
           },
+          "async": {
+            "description": "View-only runs with `keep`. Run as an `algo-view` task and answer `202`, or join the task of a run with the same key.",
+            "type": "boolean"
+          },
+          "keep": {
+            "description": "View-only runs. Keep the whole result in the server's cache of view-only results, keyed by branch, commit, the caller's view and the request without `nodes`, `keep`, `async` and `top`.",
+            "type": "boolean"
+          },
+          "nodes": {
+            "description": "View-only runs. The IRIs of the nodes whose rows the answer holds. The whole result is computed, and each community or component row also carries `communitySize`, its size in the whole projection.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20000,
+            "type": "array"
+          },
           "params": {
             "additionalProperties": true,
             "description": "The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`.",
@@ -1172,6 +1188,12 @@
                 "$ref": "#/components/schemas/AlgoProjectionDefinition"
               }
             ]
+          },
+          "top": {
+            "description": "View-only runs. Only the rows with the highest values of the first numeric output, such as `score`.",
+            "maximum": 20000,
+            "minimum": 1,
+            "type": "integer"
           },
           "write": {
             "additionalProperties": false,
@@ -8134,6 +8156,103 @@
         "required": [
           "reportsGraph",
           "available"
+        ],
+        "type": "object"
+      },
+      "GraphragMemberships": {
+        "description": "The communities that hold the listed nodes, with each community's member count and report title.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "communities": {
+            "items": {
+              "properties": {
+                "iri": {
+                  "type": "string"
+                },
+                "level": {
+                  "type": "integer"
+                },
+                "memberCount": {
+                  "type": "integer"
+                },
+                "title": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "iri"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "memberships": {
+            "items": {
+              "properties": {
+                "community": {
+                  "type": "string"
+                },
+                "level": {
+                  "type": "integer"
+                },
+                "node": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "node",
+                "community"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "reportsGraph": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "available",
+          "memberships",
+          "communities"
+        ],
+        "type": "object"
+      },
+      "GraphragMembershipsRequest": {
+        "additionalProperties": false,
+        "description": "The nodes whose communities to read, at one level or at every level.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "properties": {
+          "level": {
+            "type": "integer"
+          },
+          "nodes": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20000,
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes"
         ],
         "type": "object"
       },
@@ -18948,7 +19067,7 @@
     },
     "/$/algo/{ds}/run": {
       "post": {
-        "description": "Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.",
+        "description": "Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. A request with `nodes`, `keep`, `async` or `top` is a view-only run, which answers in SPARQL JSON with the rows of the listed nodes, `communitySize` for community and component rows, the run's `summary` and a `run` member that names the commit and whether the cache answered. With `keep` the whole result is kept in a cache of at most 8 results and 512 MiB charged to the server memory pool, and with `async` as well the run is an `algo-view` task that needs only read, which a request for the same key joins and the caller that started it may cancel. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.",
         "externalDocs": {
           "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graph-algorithms"
         },
@@ -19009,7 +19128,7 @@
                 }
               }
             },
-            "description": "A run with `write`, started as a task."
+            "description": "A run with `write`, or a view-only run with `keep` and `async`, started as a task. A view-only answer has `joined: true` when it joined a run already in progress."
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -25041,6 +25160,84 @@
           "Datasets"
         ],
         "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/graphrag/{ds}/memberships": {
+      "post": {
+        "description": "The communities of the reports graph that hold each listed node, at the given level or at every level, with each community's member count and report title. Read on main only and through the caller's view. A caller for whom the reports graph is not proven, or a request on a branch, gets `available: false`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#graphrag"
+        },
+        "operationId": "listCommunityMemberships",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GraphragMembershipsRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphragMemberships"
+                }
+              }
+            },
+            "description": "The memberships."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Read the communities of nodes",
+        "tags": [
+          "Datasets"
+        ],
+        "x-sparkles-permission": "read"
       }
     },
     "/$/graphrag/{ds}/refresh": {

@@ -5,6 +5,7 @@ import {
   announcement,
   badgeResult,
   categoryOrder,
+  colourMemory,
   colourResult,
   describe as describeLens,
   encode,
@@ -18,6 +19,7 @@ import {
   sizeFactor,
   sizeResult,
   sizeStep,
+  stableIndex,
 } from './lens';
 
 const at = { at: 'head', branch: 'main' };
@@ -252,5 +254,89 @@ describe('the lens palette', () => {
   it('has twelve different colours in each theme', () => {
     for (const b of blocks)
       expect(new Set(LENS_TOKENS.map((t) => b[t])).size).toBe(PALETTE_SIZE + 1);
+  });
+});
+
+describe('stable community colours (§2.3)', () => {
+  const vals = (o: Record<string, string>) => new Map<string, string | null>(Object.entries(o));
+
+  it('keeps the colour of a community that overlaps half or more of an earlier one', () => {
+    const first = colourResult({
+      lens: 'leiden',
+      name: 'Leiden',
+      values: vals({ a: 'x', b: 'x', c: 'x', d: 'y', e: 'y', f: 'z' }),
+      computedAt: at,
+    });
+    const before = colourMemory(first);
+    expect(before.index.get('x')).toBe(0);
+    expect(before.index.get('y')).toBe(1);
+    // the next run renames the communities, and its biggest one is the old y
+    const next = vals({ a: '7', b: '7', d: '3', e: '3', g: '3', f: '9' });
+    const index = stableIndex(next, before);
+    // '3' is the largest now but keeps y's colour, '7' keeps two of x's three members
+    expect(index.get('3')).toBe(1);
+    expect(index.get('7')).toBe(0);
+    expect(index.get('9')).toBe(2);
+    const r = colourResult({ lens: 'leiden', name: 'Leiden', values: next, index, computedAt: at });
+    // the legend lists the colours in palette order
+    expect(r.legend.map((e) => e.swatch)).toEqual([0, 1, 2]);
+    expect(r.codes.get('d')).toBe(1);
+  });
+
+  it('gives a new colour to a community below half the overlap, and each old colour once', () => {
+    const before = {
+      members: new Map([['x', new Set(['a', 'b', 'c', 'd'])]]),
+      index: new Map([['x', 0]]),
+    };
+    // one member of four is below half: a fresh colour
+    expect(stableIndex(vals({ a: 'p', e: 'p', f: 'p' }), before).get('p')).toBe(0);
+    // two communities each with half of x: the larger takes it, the other a free colour
+    const i = stableIndex(vals({ a: 'p', b: 'p', z: 'p', c: 'q', d: 'q' }), before);
+    expect(i.get('p')).toBe(0);
+    expect(i.get('q')).toBe(1);
+  });
+
+  it('picks the largest overlap among the earlier communities that qualify', () => {
+    const xs = Array.from({ length: 10 }, (_, i) => `x${i}`);
+    const ys = ['y0', 'y1', 'y2'];
+    const before = {
+      members: new Map([
+        ['X', new Set(xs)],
+        ['Y', new Set(ys)],
+      ]),
+      index: new Map([
+        ['X', 0],
+        ['Y', 1],
+      ]),
+    };
+    const o: Record<string, string> = {};
+    // n holds four of X's ten, below half, and all three of Y
+    for (const id of [...xs.slice(0, 4), ...ys]) o[id] = 'n';
+    for (const id of xs.slice(4)) o[id] = 'm';
+    // a larger new community that would take a freed colour first
+    for (let i = 0; i < 8; i++) o[`new${i}`] = 'l';
+    const index = stableIndex(vals(o), before);
+    expect(index.get('n')).toBe(1);
+    expect(index.get('m')).toBe(0);
+    expect(index.get('l')).toBe(2);
+  });
+
+  it('sends communities beyond the palette to "other"', () => {
+    const o: Record<string, string> = {};
+    for (let i = 0; i < 15; i++) o[`n${i}`] = `c${i}`;
+    const index = stableIndex(vals(o), null);
+    expect([...index.values()].filter((v) => v === OTHER)).toHaveLength(3);
+    const r = colourResult({
+      lens: 'wcc',
+      name: 'WCC',
+      values: vals(o),
+      index,
+      noun: ['component', 'components'],
+      entry: (v, n) => `component ${v}, ${n} node`,
+      computedAt: at,
+    });
+    expect(r.legend.at(-1)?.text).toBe('other, 3 components');
+    expect(r.legend[0].text).toMatch(/^component c\d+, 1 node$/);
+    expect(r.summary).toBe('15 components');
   });
 });

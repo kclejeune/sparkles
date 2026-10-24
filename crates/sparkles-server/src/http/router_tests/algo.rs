@@ -223,3 +223,4 @@ async fn a_run_that_writes_has_the_update_timeout() {
 }
 
 mod admission;
+mod view;

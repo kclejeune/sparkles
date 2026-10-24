@@ -2330,6 +2330,8 @@
       branch: o.branch,
       // the lenses read the state the result was read at, the head's commit included
       at: resultState(o.result),
+      // only a result read with an At selector shows a past state
+      past: !!o.result.at,
       epoch: o.startedAt,
       nodes: drawnGraph.nodes.map((n) => ({ id: n.id, term: n.term })),
       edges: drawnGraph.edges
@@ -3792,6 +3794,7 @@
                   {/if}
                   <LensLegend
                     results={lenses.results}
+                    ds={outcome?.ds ?? ''}
                     selected={lensMarked ? lensPick : null}
                     onselect={(key) => (lensPick = key)}
                   />

@@ -674,6 +674,36 @@ GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT 1`,
   await shoot(page, 'explore-lenses');
 });
 
+test('explore-algo-lenses', async ({ page, request }) => {
+  // algorithm lenses over the drawn graph: nodes sized by PageRank and coloured by Leiden
+  // communities, with the menu's parameters and the legend's community sizes
+  const rows = await request.post('/foaf/sparql', {
+    headers: {
+      'Content-Type': 'application/sparql-query',
+      Accept: 'application/sparql-results+json',
+    },
+    data: `PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?p (COUNT(?o) AS ?n) WHERE { ?p foaf:knows ?o FILTER(STRSTARTS(STR(?p), "http://example.org/resource/")) }
+GROUP BY ?p ORDER BY DESC(?n) ?p LIMIT 1`,
+  });
+  const person = (await rows.json()).results.bindings[0].p.value as string;
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'foaf'));
+  await page.goto(`/ui/explore?ds=foaf&iri=${encodeURIComponent(person)}`);
+  await expect(page.locator('.wrap[data-graph]')).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await menu.getByRole('combobox', { name: 'Size' }).selectOption('pageRank');
+  await menu.getByRole('combobox', { name: 'Colour' }).selectOption('leiden');
+  await expect(page.getByTestId('lens-status-size')).toContainText('iteration', {
+    timeout: 30_000,
+  });
+  await expect(page.getByTestId('lens-status-colour')).toContainText('communit', {
+    timeout: 30_000,
+  });
+  await page.getByRole('button', { name: 'Fit to view' }).click();
+  await shoot(page, 'explore-algo-lenses');
+});
+
 test('pattern-edit', async ({ page }) => {
   // building on the canvas: + Edge from ?person, with the predicate picker ranked by the
   // profile of ex:Person, and a waiting class node beside the drawing
