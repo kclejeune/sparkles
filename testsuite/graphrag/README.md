@@ -35,11 +35,13 @@ compares every pair of answers in both orders on comprehensiveness, diversity, e
 and directness, without citation markers, and the report gives each pair's win rate with a
 95% bootstrap interval over questions and the share of judgements that agree when the order
 is swapped. The phase also measures the classification of §7.1 on the global questions and
-a fixed sample of answerable demo questions in `auto` mode, where an Ask that fails counts
-as failed rather than as either mode. It checks the citations of every global answer. Each
+a fixed sample of answerable demo questions in `auto` mode, where an Ask that never chose a
+scope, because it stopped at a mention clarification or an error, counts as unclassified. It checks the citations of every global answer. Each
 sentence takes the markers that follow it, the findings of its points are resolved through
 child findings to the facts they cite, every cited fact is looked up in the projection,
-and the judge rates each claim against that evidence. A reply that does not give exactly
+and the judge rates each claim against that evidence, with a missing fact marked as not in
+the data. A claim is valid when the judge finds it supported and every fact behind it
+exists. A reply that does not give exactly
 one verdict per claim is asked once more and otherwise counted as incomplete. The phase
 also records latency and build tokens, and it refuses a questions file without a global
 question before any paid request. The demo graph is

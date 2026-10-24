@@ -178,11 +178,17 @@ class Answers(unittest.TestCase):
             ],
         )
 
-    def test_a_failed_ask_is_neither_global_nor_local(self):
-        self.assertEqual(harness.mode_of({"mode": "global", "returncode": 0}), "global")
-        self.assertEqual(harness.mode_of({"mode": "local", "returncode": 0}), "local")
-        self.assertEqual(harness.mode_of({"outcome": "error", "returncode": 2}), "failed")
-        self.assertEqual(harness.mode_of({"mode": "local", "returncode": 2}), "failed")
+    def test_an_ask_that_chose_no_scope_is_unclassified(self):
+        def mode(**kw):
+            return harness.mode_of(dict({"returncode": 0, "outcome": "answered"}, **kw))
+
+        self.assertEqual(mode(mode="global"), "global")
+        self.assertEqual(mode(mode="local"), "local")
+        # A query that failed its repairs still came from a draft that chose local.
+        self.assertEqual(mode(mode="local", outcome="failed"), "local")
+        self.assertEqual(mode(mode="local", outcome="clarify"), "unclassified")
+        self.assertEqual(mode(outcome="error", returncode=2), "unclassified")
+        self.assertEqual(mode(mode="local", returncode=2), "unclassified")
 
     def test_every_marker_must_reach_cited_findings(self):
         out = {
@@ -265,7 +271,7 @@ class DryRun(unittest.TestCase):
             ev = summary["phases"]["evaluate"]
             self.assertEqual(ev["questions"], 1)
             self.assertEqual(ev["levelsUsed"]["global-coarse"], [0])
-            self.assertEqual(ev["classification"]["failed"], 0)
+            self.assertEqual(ev["classification"]["unclassified"], 0)
             self.assertTrue(ev["citations"]["global-fine"]["citedFacts"] > 0)
             self.assertEqual(len(ev["winRates"]), 6)
             self.assertEqual(summary["ledger"]["unresolvedNanodollars"], 0)
