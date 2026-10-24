@@ -36,9 +36,10 @@ and the SPARQL algebra come from the Oxigraph project's crates.
 * **Fuseki compatibility.** The server speaks the SPARQL 1.1 Protocol, the Graph Store
   Protocol and Fuseki's `/$/` admin API, and converts Fuseki configurations. See
   [Server](docs/FEATURES.md#server-fuseki-equivalent).
-* **Branches and time travel.** Any query can read a past commit, any two commits can be
-  diffed, and branches can be created from any commit and merged with conflict review.
-  See [Storage](docs/FEATURES.md#storage-tdb2-equivalent).
+* **Branches and time travel.** Queries can read any commit that compaction has retained,
+  two retained commits can be diffed, and a branch can start from one and merge back with
+  conflict review. Full-text search reads only the head. See
+  [Storage](docs/FEATURES.md#storage-tdb2-equivalent).
 * **Vector and full-text search.** BM25 full-text search compatible with jena-text, HNSW
   vector indexes with embeddings computed on write, hybrid ranking, path search and graph
   algorithms all run inside SPARQL. See [Search](docs/FEATURES.md#search).
