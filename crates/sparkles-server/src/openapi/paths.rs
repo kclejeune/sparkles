@@ -900,6 +900,52 @@ fn schema(p: &mut Paths) {
     );
     p.add(
         op(
+            POST,
+            "/$/graph/{ds}/facets",
+            "getGraphFacets",
+            "Schema",
+            "Facet histograms of a set",
+        )
+        .doc("Counts the entities of a set by ranges of round width of a property's numbers or of the years of its dates, or by its 12 most frequent values, with the entities that have no value. The set is a class, up to 20,000 IRIs, or the distinct values of a variable of a `SELECT` query, and a set above 1,000,000 entities is refused with `507`. Each brush in `filters` keeps the entities with a value in its range or among its values, and each facet counts the set filtered by every brush but its own, so the facets filter each other. `matching` counts the set under every brush. A facet over a budget carries an `error` while the others stay. `candidates: true` also lists the properties of a sample of the set, ranked by the share that has a value. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query.")
+        .see("facets")
+        .param("timeout")
+        .param("reasoning")
+        .body(
+            true,
+            "The set, its facets and the brushes.",
+            json!({ "application/json": { "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["within"],
+                "properties": {
+                    "within": { "type": "object", "description": "`{\"class\": IRI}`, `{\"nodes\": [IRI, …]}` with up to 20,000 IRIs, or `{\"query\": SELECT, \"variable\": name}`." },
+                    "facets": { "type": "array", "maxItems": 6, "items": { "type": "object", "description": "`{\"property\": IRI, \"bins\"?: 2–40, \"top\"?: 1–12, \"kind\"?: \"numeric\" | \"date\" | \"values\", \"edges\"?: [number, …], \"bars\"?: [term, …]}`. `edges` and `bars` hand back the ranges or values of an earlier answer." } },
+                    "filters": { "type": "array", "maxItems": 6, "items": { "type": "object", "description": "`{\"property\": IRI, \"range\": [from, to], \"kind\"?: \"numeric\" | \"date\"}`, where a date range is in whole years and `to` is excluded, or `{\"property\": IRI, \"values\": [term, …]}` with terms in the SPARQL JSON results form." } },
+                    "candidates": { "type": "boolean", "description": "Also list the properties of the set." },
+                    "at": { "type": "string", "description": "A commit, time or named snapshot." }
+                }
+            } } }),
+        )
+        .resp(
+            "200",
+            "The counts of each facet.",
+            Some(json!({ "application/json": { "schema": {
+                "type": "object",
+                "required": ["commit", "size", "matching", "facets", "truncated"],
+                "properties": {
+                    "commit": { "type": "integer" },
+                    "size": { "type": "integer", "description": "Entities in the set." },
+                    "matching": { "type": "integer", "description": "Entities of the set under every brush." },
+                    "facets": { "type": "array", "items": { "type": "object", "description": "`property`, `kind`, `missing`, and `bins` of `{from, to, count}` for a range facet or `values` of `{value, count, label?}` and `other` for a bar list, or `error` with its `budget` and `message`." } },
+                    "candidates": { "type": "array", "items": { "type": "object", "description": "`{property, share, kind}`." } },
+                    "truncated": { "type": "boolean", "description": "The candidates come from a sample of the set or were cut to 40." }
+                }
+            } } })),
+        )
+        .errors(&[400, 403, 404, 408, 503, 507]),
+    );
+    p.add(
+        op(
             GET,
             "/$/schema/{ds}/diff",
             "getSchemaDiff",

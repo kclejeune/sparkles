@@ -130,6 +130,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/profiles", get(schema::profiles))
         .route("/$/schema/{ds}/diff", get(schema::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
+        .route("/$/graph/{ds}/facets", post(graph::facets))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(

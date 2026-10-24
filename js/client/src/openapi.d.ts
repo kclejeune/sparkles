@@ -1055,6 +1055,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/graph/{ds}/facets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Facet histograms of a set
+         * @description Counts the entities of a set by ranges of round width of a property's numbers or of the years of its dates, or by its 12 most frequent values, with the entities that have no value. The set is a class, up to 20,000 IRIs, or the distinct values of a variable of a `SELECT` query, and a set above 1,000,000 entities is refused with `507`. Each brush in `filters` keeps the entities with a value in its range or among its values, and each facet counts the set filtered by every brush but its own, so the facets filter each other. `matching` counts the set under every brush. A facet over a budget carries an `error` while the others stay. `candidates: true` also lists the properties of a sample of the set, ranked by the share that has a value. Every count comes from queries run under the caller's view, timeout and memory budget, so it needs read through the query endpoint and fails with `507` like a query.
+         */
+        post: operations["getGraphFacets"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/graph/{ds}/groups": {
         parameters: {
             query?: never;
@@ -11667,6 +11687,66 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getGraphFacets: {
+        parameters: {
+            query?: {
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
+                reasoning?: components["parameters"]["reasoning"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The set, its facets and the brushes. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description A commit, time or named snapshot. */
+                    at?: string;
+                    /** @description Also list the properties of the set. */
+                    candidates?: boolean;
+                    facets?: Record<string, never>[];
+                    filters?: Record<string, never>[];
+                    /** @description `{"class": IRI}`, `{"nodes": [IRI, …]}` with up to 20,000 IRIs, or `{"query": SELECT, "variable": name}`. */
+                    within: Record<string, never>;
+                };
+            };
+        };
+        responses: {
+            /** @description The counts of each facet. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        candidates?: Record<string, never>[];
+                        commit: number;
+                        facets: Record<string, never>[];
+                        /** @description Entities of the set under every brush. */
+                        matching: number;
+                        /** @description Entities in the set. */
+                        size: number;
+                        /** @description The candidates come from a sample of the set or were cut to 40. */
+                        truncated: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

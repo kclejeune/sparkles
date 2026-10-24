@@ -637,6 +637,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/schema/{ds}/profiles`    | *Extension.* `ClassProfiles`: the predicates the instances of each class use, and those that point at them. See [Class profiles](#class-profiles). |
 | GET    | `/$/schema/{ds}/diff`        | *Extension.* `SchemaDiff`: the classes and predicates added, removed and changed between two states. See [Schema diffs](#schema-diffs). |
 | POST   | `/$/graph/{ds}/groups`       | *Extension.* `GroupsAnswer`: the groups or members of a class or of a group, with the edges between them, for the Explore overview. See [Graph overview](#graph-overview). |
+| POST   | `/$/graph/{ds}/facets`       | *Extension.* `FacetsAnswer`: the facet histograms of a class, a list of IRIs or a query's values, with brushes that filter each other. See [Facets](#facets). |
 | POST   | `/$/compact/{ds}`            | Merges the delta (updates) into a freshly built, sorted base index. Writes go on during the build, and the writer lock is held only for the switch. Returns a cancellable `Task`. `409` while a compaction of the dataset is queued or running. The old generation is removed once no reader or retained history needs it, which is what Fuseki's `?deleteOld=true` asks for. `deleteOld` with no value or `true` is accepted, and `deleteOld=false` is a `400`. |
 | GET    | `/$/compaction/{ds}`         | *Extension.* `CompactionStatus`: the dataset's automatic compaction, its settings and what it sees. See [Automatic compaction](#automatic-compaction). |
 | PUT    | `/$/compaction/{ds}`         | *Extension.* Replaces the dataset's own compaction settings with the JSON object's. Returns `CompactionStatus`. |
@@ -1308,6 +1309,81 @@ and a `reason`, with no groups, no counts and nothing that tells whether reports
 caller with coverage gets `unavailable: "none"` when the graph holds no communities. The
 grouping reads main, where reports are built, so `?branch=` naming another branch is a
 `400`, and `at` reads the reports as they were at that point of main.
+
+### Facets
+
+The design is in [U11 §3.2](specs/U11-linked-views.md#32-phase-2-prerequisite-a-facets-route).
+
+`POST /$/graph/{ds}/facets` counts the entities of a set by the values of up to six of
+their properties, for the facet panels of Explore and the query page. The Rust library
+gives the same answer through `ds.graph().facets`.
+
+```ts
+type Term = { type: "uri" | "literal"; value: string; datatype?: string; "xml:lang"?: string };
+type FacetsRequest = {
+  within: { class: string }                          // the instances of a class
+        | { nodes: string[] }                        // 1 to 20,000 IRIs
+        | { query: string; variable: string };       // the distinct values of a SELECT's variable
+  facets?: { property: string;
+             bins?: number;                          // 2 to 40, 20 by default
+             top?: number;                           // 1 to 12, 12 by default
+             kind?: "numeric" | "date" | "values";   // told from a sample of the values when absent
+             edges?: number[];                       // the ranges of an earlier answer
+             bars?: Term[] }[];                      // the values of an earlier answer
+  filters?: ({ property: string; range: [number, number]; kind?: "numeric" | "date" }
+           | { property: string; values: Term[] })[]; // at most 6 brushes
+  candidates?: boolean;                              // also list the properties of the set
+  at?: string;                                       // a commit, time or named snapshot
+};
+type FacetsAnswer = {
+  commit: number;
+  size: number;                                      // entities in the set
+  matching: number;                                  // entities kept by every brush
+  facets: { property: string; kind?: "numeric" | "date" | "values";
+            bins?: { from: number; to: number; count: number }[];
+            values?: { value: Term; count: number; label?: string }[];
+            other?: number; missing?: number;
+            error?: { budget: string; message: string } }[];
+  candidates?: { property: string; share: number; kind: "numeric" | "date" | "values" }[];
+  truncated: boolean;
+};
+```
+
+A facet whose sampled values are nine in ten numbers counts the entities by ranges of
+round width of the numbers, and one whose values are nine in ten dates counts them by
+ranges of whole years. A bin runs from `from` up to but not including `to`, so the last
+bin's `to` lies above the largest value. Any other facet lists its `top` most frequent
+values, IRIs with their labels, and `other` counts the entities whose values are all
+outside that list. `missing` counts the entities without a value of the facet's kind, so
+an entity whose value the caller may not read counts as missing. An entity with several
+values counts once in each bin or value it has. The ranges and the list come from the
+whole set, so they stay the same while other facets are brushed. A request can hand back
+the `edges` or `bars` of an earlier answer, with the facet's `kind`, which keeps the bins
+and skips the queries that find them.
+
+A brush keeps the entities with a value in its range, or among its values. Each facet
+counts the set kept by every brush except its own, so the facets filter each other and a
+brushed facet still shows what a wider brush would add. `matching` counts the set under
+every brush. A brush on a numeric facet is applied as `FILTER(?v >= from && ?v < to)`, a
+brush on a date facet as `FILTER(YEAR(?v) >= from && YEAR(?v) < to)` and a brush of values
+as `FILTER(?v IN (…))`. The UI's **Apply to query** writes the same text, so the applied
+query's `COUNT(DISTINCT ?x)` equals `matching`.
+
+A `query` set must be a `SELECT` without `FROM` or `FROM NAMED` that projects the
+variable, and it runs inside each count as a subquery, under the request's prefixes and
+base. `candidates` lists the properties of the first 1,000 entities of the set, ranked by
+the share of them that has a value, without the label properties, the class of a class
+set, and properties whose values are nearly all different. `truncated` says that the
+list came from a sample smaller than the set or was cut to 40.
+
+Every count comes from SPARQL queries run under the caller's view, as for the
+[graph overview](#graph-overview), so a caller limited to some graphs or under protections
+counts only what its own queries would read. The route needs `read` through the `query`
+endpoint, takes `timeout` and `reasoning`, and names its branch with `?branch=`. A set
+above 1,000,000 entities answers `507` with the `rows` budget. A facet whose queries
+exceed a budget carries an `error` with the budget's name while the other facets stay,
+and an exceeded budget while the set is counted answers `507` as a query does. Answers
+share the graph overview's cache, keyed by branch, commit, view and request.
 
 ### Schema diffs
 
