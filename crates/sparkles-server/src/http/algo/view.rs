@@ -322,52 +322,32 @@ impl Kept {
         if self.sizes.is_some() {
             vars.push("communitySize".into());
         }
-        let over = |n: usize| -> sparkles::Result<()> {
-            match limit {
-                Some(limit) if n as u64 > limit => {
-                    Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
-                        kind: sparkles::BudgetKind::ResultBytes,
-                        limit,
-                        requested: n as u64,
-                    }))
-                }
-                _ => Ok(()),
-            }
+        let mut w = Charged {
+            out: Vec::new(),
+            held,
+            charged: 0,
+            limit,
+            err: None,
         };
-        let json = |e: serde_json::Error| sparkles::Error::invalid(e.to_string());
-        let mut out: Vec<u8> = Vec::new();
-        let mut charged = 0usize;
-        // every part is written apart first, and the answer grows only after its room is
-        // charged
-        let mut append =
-            |out: &mut Vec<u8>, part: &[u8], held: &mut Held| -> sparkles::Result<()> {
-                over(out.len() + part.len())?;
-                if out.capacity() - out.len() < part.len() {
-                    let want = (out.len() + part.len()).max(out.capacity() * 2);
-                    held.charge((want - charged) as u64)?;
-                    out.reserve_exact(want - out.len());
-                    charged = out.capacity().max(want);
-                }
-                out.extend_from_slice(part);
-                Ok(())
-            };
-        let mut part: Vec<u8> = Vec::new();
-        part.extend_from_slice(b"{\"head\":{\"vars\":");
-        serde_json::to_writer(&mut part, &vars).map_err(json)?;
-        part.extend_from_slice(b"},\"results\":{\"bindings\":[");
-        append(&mut out, &part, held)?;
+        w.write_json_raw(b"{\"head\":{\"vars\":")?;
+        w.write_json(&vars)?;
+        w.write_json_raw(b"},\"results\":{\"bindings\":[")?;
         for (k, &i) in picked.iter().enumerate() {
-            part.clear();
             if k > 0 {
-                part.push(b',');
+                w.write_json_raw(b",")?;
             }
-            serde_json::to_writer(&mut part, &self.binding(i)).map_err(json)?;
-            append(&mut out, &part, held)?;
+            // the binding copies the row's terms for as long as it is written
+            let row = row_bytes(&self.rows[i as usize]) * 2;
+            w.held.charge(row)?;
+            let b = self.binding(i);
+            let r = w.write_json(&b);
+            drop(b);
+            w.held.release(row);
+            r?;
         }
-        part.clear();
-        part.extend_from_slice(b"]},\"summary\":");
-        serde_json::to_writer(&mut part, &self.summary).map_err(json)?;
-        part.extend_from_slice(b",\"run\":");
+        w.write_json_raw(b"]},\"summary\":")?;
+        w.write_json(&self.summary)?;
+        w.write_json_raw(b",\"run\":")?;
         let run = json!({
             "commit": self.commit,
             "cached": cached,
@@ -376,9 +356,9 @@ impl Kept {
             "truncated": truncated,
             "definition": format!("{:016x}", self.definition),
         });
-        serde_json::to_writer(&mut part, &run).map_err(json)?;
-        part.push(b'}');
-        append(&mut out, &part, held)?;
+        w.write_json(&run)?;
+        w.write_json_raw(b"}")?;
+        let out = w.out;
         Ok(out)
     }
 
@@ -441,6 +421,15 @@ impl Held {
         Ok(())
     }
 
+    /// Account for `n` fewer bytes.
+    fn release(&mut self, n: u64) {
+        let n = n.min(self.held);
+        if let Some(g) = &self.grant {
+            g.release(n);
+        }
+        self.held -= n;
+    }
+
     /// Make the bytes held `n`, charging or giving back the difference.
     fn settle(&mut self, n: u64) -> sparkles::Result<()> {
         if n > self.held {
@@ -461,6 +450,73 @@ impl Drop for Held {
         if let Some(g) = &self.grant {
             g.release(self.held);
         }
+    }
+}
+
+/// The buffer of an answer, which grows only after its room is charged to `held`, and
+/// refuses to pass `limit` bytes. Serialization writes straight into it, without a
+/// scratch buffer.
+struct Charged<'a> {
+    out: Vec<u8>,
+    held: &'a mut Held,
+    /// the capacity charged so far
+    charged: usize,
+    limit: Option<u64>,
+    /// the refusal that stopped a write
+    err: Option<sparkles::Error>,
+}
+
+impl Charged<'_> {
+    fn write_json<T: serde::Serialize + ?Sized>(&mut self, v: &T) -> sparkles::Result<()> {
+        match serde_json::to_writer(&mut *self, v) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self
+                .err
+                .take()
+                .unwrap_or_else(|| sparkles::Error::invalid(e.to_string()))),
+        }
+    }
+
+    fn write_json_raw(&mut self, b: &[u8]) -> sparkles::Result<()> {
+        use std::io::Write as _;
+        match self.write_all(b) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self
+                .err
+                .take()
+                .unwrap_or_else(|| sparkles::Error::invalid(e.to_string()))),
+        }
+    }
+}
+
+impl std::io::Write for Charged<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let want = self.out.len() + buf.len();
+        if let Some(limit) = self.limit
+            && want as u64 > limit
+        {
+            self.err = Some(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                kind: sparkles::BudgetKind::ResultBytes,
+                limit,
+                requested: want as u64,
+            }));
+            return Err(std::io::Error::other("result limit"));
+        }
+        if want > self.out.capacity() {
+            let to = want.max(self.out.capacity() * 2).max(4096);
+            if let Err(e) = self.held.charge((to - self.charged) as u64) {
+                self.err = Some(e);
+                return Err(std::io::Error::other("memory budget"));
+            }
+            self.out.reserve_exact(to - self.out.len());
+            self.charged = to;
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1438,5 +1494,36 @@ mod tests {
                 out.capacity()
             );
         }
+    }
+
+    #[test]
+    fn a_large_binding_counts_against_the_memory_budget() {
+        // one node with an 8 MiB IRI: its binding and the buffer both count
+        let long = format!("http://ex/{}", "a".repeat(8 << 20));
+        let vars = vec!["node".into(), "score".into()];
+        let rows = vec![vec![Some(NamedNode::new_unchecked(long).into()), dbl(1.0)]];
+        let k = Kept::new(vars, rows, None, 1);
+        let mut held = Held {
+            grant: None,
+            limit: Some(20 << 20),
+            held: 0,
+        };
+        let e = k
+            .write_answer(&ViewOpts::default(), true, usize::MAX, None, &mut held)
+            .unwrap_err();
+        assert!(
+            matches!(&e, sparkles::Error::BudgetExceeded(b) if b.kind == sparkles::BudgetKind::Memory),
+            "{e}"
+        );
+        // with room for it, the answer is written
+        let mut held = Held {
+            grant: None,
+            limit: Some(64 << 20),
+            held: 0,
+        };
+        let out = k
+            .write_answer(&ViewOpts::default(), true, usize::MAX, None, &mut held)
+            .unwrap();
+        assert!(held.held >= out.capacity() as u64);
     }
 }
