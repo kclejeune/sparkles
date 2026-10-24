@@ -466,16 +466,22 @@ button in Explore and the page `/datasets/{name}/edit`.
 * A save plans its update on the head before it waits for the writer lock. When another
   commit moved a changed field's values to other graphs or changed the graph new values go
   to, without changing the values, the save plans again on the new head, up to three
-  times. A check plans on the state its dry run starts from, and is a dry run from the
+  times. A new instance's IRI is checked again under the writer lock, so a save refuses an
+  IRI that another commit began to describe while it waited. A check plans on the state its dry run starts from, and is a dry run from the
   moment it opens, so a failed check leaves no terms behind.
 * The check validates the resource, the IRIs a change adds or removes, and up to 500 nodes
-  that reach one of them through one or two triples. With a guard on, the preview's guard
+  one or two triples away from one of them in either direction, so shapes with inverse
+  steps are covered. With a guard on, the preview's guard
   verdict covers every other node. Without one, a shape that reaches the resource through
   a longer path is not validated by the check.
 * The model, the check and the save stop when the request is cancelled or its deadline
-  passes, also while they read values.
+  passes, also while they read values, and a model never answers with fields left empty
+  by such a stop.
 * The check and save routes are admitted on any branch the caller can see, as the branch
   routes are, and the handler checks write on the branch the body or the query names.
+* A new instance's type counts as a change, so its form can be saved with no values.
+  The entity picker of a field with several `sh:class` constraints offers only instances
+  of all of them.
 * A date-time keeps its timezone when edited, and a new `xsd:dateTimeStamp` takes the
   browser's offset for that date. Patterns with the `x` or `q` flag are checked only by the
   server. The fields are disabled while a save and its reload run.

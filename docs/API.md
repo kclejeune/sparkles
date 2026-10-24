@@ -7495,8 +7495,8 @@ checks write on the branch the body or the query names.
 `check` runs the change as a write preview (see [Write previews](#write-previews)) and then
 validates the nodes the change touches against the form's shapes, whether or not the
 dataset has a guard. The nodes it validates are the resource, the IRIs added or removed,
-and up to 500 nodes that reach one of them through one or two triples, whose shapes can
-read the change along a path. The check plans the change on the state its dry run starts
+and up to 500 nodes one or two triples away from one of them in either direction, whose
+shapes can read the change along a path. The check plans the change on the state its dry run starts
 from. The validation holds the dataset's writer lock and stops after 10
 seconds. The answer is the preview, the validation and the fields whose stored values
 already differ from `expect`, which a save would refuse with a conflict. A check of a

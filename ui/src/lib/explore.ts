@@ -69,14 +69,13 @@ LIMIT 25`,
 
 /**
  * The query of an instance search for a form's entity picker (U02 Phase 2): resources
- * whose label holds `text`, limited to instances of `classes` (or their subclasses) when
- * there are some. With `fullText`, the dataset's full-text index finds the labels and
+ * whose label holds `text`, limited to the instances of every class of `classes` (or of
+ * its subclasses) when there are some. With `fullText`, the dataset's full-text index finds the labels and
  * ranks the hits.
  */
 export function instanceSearchQuery(text: string, classes: string[], fullText: boolean): string {
-  const typed = classes.length
-    ? `  ?s rdf:type/rdfs:subClassOf* ?class .\n  VALUES ?class { ${classes.map(sparqlIri).join(' ')} }\n`
-    : '';
+  // a value of a field with several sh:class constraints is an instance of each of them
+  const typed = classes.map((c) => `  ?s rdf:type/rdfs:subClassOf* ${sparqlIri(c)} .\n`).join('');
   if (fullText) {
     const q = sparqlString(escapeTextQuery(text.trim()));
     return `${P}PREFIX text: <${TEXT_NS}>

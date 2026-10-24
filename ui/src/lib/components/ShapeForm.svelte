@@ -192,7 +192,8 @@
   });
   const problemCount = $derived(Object.values(problems).reduce((n, p) => n + p.length, 0));
   const changes = $derived(model ? changeSet(model, current) : { changes: [], expect: {} });
-  const nChanges = $derived(changeCount(changes));
+  /** A new instance's save writes its type even when no field has a value. */
+  const nChanges = $derived(changeCount(changes) + (cls ? 1 : 0));
   const changeKey = $derived(JSON.stringify(changes));
   const checkCurrent = $derived(!!check && check.key === changeKey);
   const results = $derived(checkCurrent ? (check?.answer.validation.results ?? []) : []);

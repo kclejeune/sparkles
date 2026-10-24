@@ -247,6 +247,8 @@ test('New instance in the schema tab makes a resource with a minted IRI', async 
   await add.click();
   const form = page.getByRole('region', { name: /^New ex:Person|^New http/ });
   await expect(form.getByRole('group', { name: 'Identity' })).toBeVisible({ timeout: 30_000 });
+  // the instance's type is a change of its own, so an empty form can be saved
+  await expect(form.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
   await form.getByRole('textbox', { name: 'Name', exact: true }).fill('Lucía Moreno');
   await form.getByRole('combobox', { name: 'Works for' }).fill(`<${W}andes>`);
   await page.getByRole('option', { name: /Use/ }).click();

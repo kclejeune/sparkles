@@ -570,3 +570,70 @@ fn a_cancelled_model_request_is_refused() {
     let e = ds.forms().model(&req, &opts).unwrap_err();
     assert!(matches!(e, sparkles::Error::Cancelled), "{e}");
 }
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_new_instance_whose_iri_is_taken_while_it_waits_is_refused() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (ds, settings) = dataset();
+    let focus = settings.mint_iri();
+    let other = ds.clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let (f, taken) = (fired.clone(), focus.clone());
+    ds.store().set_failpoint(
+        "writer-acquiring",
+        Some(Arc::new(move |_| {
+            if !f.swap(true, Ordering::SeqCst) {
+                other
+                    .update(&format!("INSERT DATA {{ <{taken}> <{EX}other> \"x\" }}"))
+                    .unwrap();
+            }
+        })),
+    );
+    let mut c = change("name", vec![], vec![lit("Carol")], vec![]);
+    c.focus = focus.clone();
+    c.class = Some(ex("Person"));
+    c.settings = settings;
+    let saved = ds.forms().save(&c, &Default::default());
+    ds.store().set_failpoint("writer-acquiring", None);
+    assert!(fired.load(Ordering::SeqCst));
+    let e = saved
+        .err()
+        .expect("the save went ahead on a resource that exists");
+    assert!(e.to_string().contains("already describes"), "{e}");
+    assert!(!ds.ask(&format!("ASK {{ <{focus}> a ?c }}")).unwrap());
+}
+
+#[test]
+fn a_check_validates_nodes_that_read_the_focus_along_an_inverse_path() {
+    let (ds, settings) = dataset();
+    ds.load_str_into(
+        r#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/> .
+ex:LinkedShape a sh:NodeShape ; sh:targetNode ex:target ;
+  sh:property [ sh:path ( [ sh:inversePath ex:link ] ex:name ) ; sh:minLength 3 ] ."#,
+        sparkles::io::RdfFormat::Turtle,
+        "urn:shapes",
+    )
+    .unwrap();
+    ds.update(&format!(
+        "INSERT DATA {{ <{EX}alice> <{EX}link> <{EX}target> }}"
+    ))
+    .unwrap();
+    let mut c = change(
+        "name",
+        vec![lit("Alice Lima")],
+        vec![lit("x")],
+        vec![lit("Alice Lima")],
+    );
+    c.settings = settings;
+    let check = ds.forms().check(&c, &Default::default()).unwrap();
+    let results = check.results.unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|r| r["focusNode"]["value"] == ex("target")),
+        "{results:?}"
+    );
+}

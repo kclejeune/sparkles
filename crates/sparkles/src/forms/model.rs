@@ -281,6 +281,7 @@ pub enum FormSaved {
 /// let name = oxrdf::Literal::new_simple_literal("A");
 /// let change = FormChange {
 ///     focus: "http://ex/a".into(),
+///     class: None,
 ///     changes: vec![FieldChange {
 ///         field: model.fields[0].id.clone(),
 ///         remove: vec![name.clone().into()],
@@ -335,7 +336,7 @@ impl Forms {
         )?;
         built.lang = req.lang.clone();
         let writable = req.writable && req.at.is_none();
-        Ok(built.model(writable, &store.branch_name()))
+        built.model(writable, &store.branch_name())
     }
 
     /// Preview a change as a dry run, and validate the nodes it touches at the state it
@@ -425,7 +426,16 @@ impl Forms {
             let access = opts.graphs.clone();
             let (settings, target) = (change.settings.clone(), built.target.clone());
             let lim = limits.clone();
+            let new_instance = built.new_class.is_some();
             let differ = Arc::new(move |snap: &Arc<Snapshot>| {
+                // a new instance's IRI must still describe nothing when the write starts
+                if new_instance {
+                    let mut read = Reader::new(snap, access.as_deref())?;
+                    read.limits = lim.clone();
+                    if describes(&read, &focus)? {
+                        return Err(used_iri(&focus));
+                    }
+                }
                 let (c, mut stale) = conflicts_at(snap, access.as_deref(), &focus, &checks, &lim)?;
                 if c.is_empty() && !stale {
                     // new values go to a graph that depends on the state
@@ -797,8 +807,10 @@ impl Built {
         }
     }
 
-    fn model(&self, writable: bool, branch: &str) -> FormModel {
-        let read = self.read().expect("a reader over the snapshot built");
+    /// The model. A read that the request's cancellation or deadline stops fails the
+    /// whole model, rather than leaving fields empty.
+    fn model(&self, writable: bool, branch: &str) -> Result<FormModel> {
+        let read = self.read()?;
         let lang = self.lang.as_deref();
         let mut groups: Vec<FormGroup> = Vec::new();
         let mut fields = Vec::new();
@@ -831,13 +843,13 @@ impl Built {
                 }
                 iri
             });
-            let mut values = read.values(&self.focus, &f.path).unwrap_or_default();
+            let mut values = read.values(&self.focus, &f.path)?;
             let truncated = values.len() > MAX_FIELD_VALUES;
             values.truncate(MAX_FIELD_VALUES);
             for v in &mut values {
                 v.read_only = !self.writable_graph(v.graph.as_deref());
                 if let Term::NamedNode(n) = &v.term {
-                    v.label = read.label(n, lang);
+                    v.label = read.label(n, lang)?;
                 }
             }
             let reason = if !writable {
@@ -856,14 +868,16 @@ impl Built {
                 None
             };
             let predicate = f.path.predicate().map(|p| p.as_str().to_string());
-            let label = pick_lang(&f.names, lang)
-                .map(|l| l.value().to_string())
-                .or_else(|| f.path.predicate().and_then(|p| read.label(p, lang)))
-                .unwrap_or_else(|| match &f.path {
-                    FieldPath::Predicate(p) => self.short(p.as_str()),
-                    FieldPath::Inverse(p) => format!("^{}", self.short(p.as_str())),
-                    FieldPath::Complex(p) => p.to_sparql(),
-                });
+            let named = pick_lang(&f.names, lang).map(|l| l.value().to_string());
+            let named = match (named, f.path.predicate()) {
+                (None, Some(p)) => read.label(p, lang)?,
+                (n, _) => n,
+            };
+            let label = named.unwrap_or_else(|| match &f.path {
+                FieldPath::Predicate(p) => self.short(p.as_str()),
+                FieldPath::Inverse(p) => format!("^{}", self.short(p.as_str())),
+                FieldPath::Complex(p) => p.to_sparql(),
+            });
             fields.push(Field {
                 id: f.id(),
                 path: match &f.path {
@@ -908,8 +922,7 @@ impl Built {
                 .then_with(|| a.label.cmp(&b.label))
         });
         let other = read
-            .others(&self.focus, &covered)
-            .unwrap_or_default()
+            .others(&self.focus, &covered)?
             .into_iter()
             .map(|(p, mut values)| {
                 for v in &mut values {
@@ -921,7 +934,7 @@ impl Built {
                 }
             })
             .collect();
-        FormModel {
+        Ok(FormModel {
             form_format: FORM_FORMAT,
             focus: match &self.focus {
                 Term::NamedNode(n) if self.new_class.is_none() => Some(n.as_str().to_string()),
@@ -946,7 +959,7 @@ impl Built {
             other,
             graph: self.target.clone(),
             closed: self.layout.closed,
-        }
+        })
     }
 
     fn group(&self, g: &FieldGroup, lang: Option<&str>) -> FormGroup {
@@ -1058,15 +1071,8 @@ impl Built {
         let mut ins: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
         if let Some(c) = &self.new_class {
             // a new instance takes an IRI nothing describes yet
-            let used = match read.snap().lookup_term(&self.focus) {
-                None => false,
-                Some(id) => !read.scan(Perm::Spo, &[id.0], 1)?.is_empty(),
-            };
-            if used {
-                return Err(Error::invalid(format!(
-                    "focus: {} already describes a resource; a new instance needs a new IRI",
-                    self.focus
-                )));
+            if describes(&read, &self.focus)? {
+                return Err(used_iri(&self.focus));
             }
             if !self.writable_graph(self.target.as_deref()) {
                 return Err(Error::NotPermitted(format!(
@@ -1312,9 +1318,23 @@ fn conflicts_at(
     Ok((out, stale))
 }
 
-/// The nodes a check validates: those the change touches, and the nodes that reach one
-/// of them through one or two triples in `post`, whose shapes can read the touched
-/// nodes along a path. At most [`MAX_DEPENDENTS`] are added.
+/// Whether `focus` is the subject of a triple the reader sees.
+fn describes(read: &Reader<'_>, focus: &Term) -> Result<bool> {
+    Ok(match read.snap().lookup_term(focus) {
+        None => false,
+        Some(id) => !read.scan(Perm::Spo, &[id.0], 1)?.is_empty(),
+    })
+}
+
+fn used_iri(focus: &Term) -> Error {
+    Error::invalid(format!(
+        "focus: {focus} already describes a resource; a new instance needs a new IRI"
+    ))
+}
+
+/// The nodes a check validates: those the change touches, and the nodes one or two
+/// triples away from one of them in `post`, in either direction, whose shapes can read
+/// the touched nodes along a path. At most [`MAX_DEPENDENTS`] are added.
 fn dependents(post: &Arc<Snapshot>, touched: &[Term], limits: &Limits) -> Result<Vec<Term>> {
     let mut read = Reader::new(post, None)?;
     read.limits = limits.clone();
@@ -1325,17 +1345,25 @@ fn dependents(post: &Arc<Snapshot>, touched: &[Term], limits: &Limits) -> Result
     let mut added = 0usize;
     'hops: for _ in 0..2 {
         let mut next = Vec::new();
-        for o in std::mem::take(&mut frontier) {
-            for q in read.scan(Perm::Osp, &[o.0], MAX_DEPENDENTS + 1)? {
-                if read.graph(q[3]).is_none() || !seen.insert(q[0]) {
+        for n in std::mem::take(&mut frontier) {
+            // a shape reads a node along a path from either end: the subjects of the
+            // triples into it and, for inverse steps, the objects of the triples out of it
+            let into = read.scan(Perm::Osp, &[n.0], MAX_DEPENDENTS + 1)?;
+            let out_of = read.scan(Perm::Spo, &[n.0], MAX_DEPENDENTS + 1)?;
+            let ends = into
+                .into_iter()
+                .map(|q| (q[0], q[3]))
+                .chain(out_of.into_iter().map(|q| (q[2], q[3])));
+            for (id, g) in ends {
+                if read.graph(g).is_none() || !seen.insert(id) {
                     continue;
                 }
-                let Some(t) = post.term(q[0]) else { continue };
+                let Some(t) = post.term(id) else { continue };
                 if matches!(t, Term::Literal(_)) {
                     continue;
                 }
                 out.push(t);
-                next.push(q[0]);
+                next.push(id);
                 added += 1;
                 if added >= MAX_DEPENDENTS {
                     break 'hops;
@@ -1596,15 +1624,16 @@ impl<'a> Reader<'a> {
     }
 
     /// A label of an IRI in the readable graphs, in `lang` when it has one.
-    fn label(&self, n: &NamedNode, lang: Option<&str>) -> Option<String> {
-        let s = self.snap.lookup_iri(n.as_str())?;
+    fn label(&self, n: &NamedNode, lang: Option<&str>) -> Result<Option<String>> {
+        let Some(s) = self.snap.lookup_iri(n.as_str()) else {
+            return Ok(None);
+        };
         for lp in LABELS {
             let Some(p) = self.snap.lookup_iri(lp) else {
                 continue;
             };
             let lits: Vec<Literal> = self
-                .scan(Perm::Spo, &[s.0, p.0], 50)
-                .ok()?
+                .scan(Perm::Spo, &[s.0, p.0], 50)?
                 .into_iter()
                 .filter(|q| self.graph(q[3]).is_some())
                 .filter_map(|q| match self.snap.term(q[2]) {
@@ -1613,10 +1642,10 @@ impl<'a> Reader<'a> {
                 })
                 .collect();
             if let Some(l) = pick_lang(&lits, lang) {
-                return Some(l.value().to_string());
+                return Ok(Some(l.value().to_string()));
             }
         }
-        None
+        Ok(None)
     }
 
     /// The outgoing values of `focus` whose predicates no field covers, `rdf:type` aside.
@@ -1657,5 +1686,43 @@ impl<'a> Reader<'a> {
             });
         }
         Ok(by.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_model_whose_request_is_cancelled_while_it_reads_fails() {
+        let ds = Dataset::memory();
+        ds.update(
+            r#"PREFIX ex: <http://ex/> PREFIX sh: <http://www.w3.org/ns/shacl#>
+            INSERT DATA {
+              GRAPH <urn:shapes> { ex:S a sh:NodeShape ; sh:targetClass ex:P ;
+                sh:property [ sh:path ex:name ] }
+              ex:a a ex:P ; ex:name "A" }"#,
+        )
+        .unwrap();
+        let settings = FormSettings {
+            shapes: ShapesSource::Graphs,
+            graphs: vec!["urn:shapes".into()],
+            ..Default::default()
+        };
+        let forms = ds.forms();
+        let mut built = forms
+            .build(
+                &ds.store().snapshot(),
+                "http://ex/a",
+                &settings,
+                &QueryOptions::default(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(built.model(true, "main").is_ok());
+        // the request is cancelled after the shapes were read: the values are not
+        built.limits.cancel = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        assert!(matches!(built.model(true, "main"), Err(Error::Cancelled)));
     }
 }
