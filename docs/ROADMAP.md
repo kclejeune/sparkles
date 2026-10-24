@@ -191,9 +191,9 @@ spec sections.
 | 226 | **The cost of the change ring on commits.** While a view or live query is subscribed, each commit copies its changes into a ring, which adds about 4% to a single-quad commit on atlas. It needs a pinned forge measurement and a cheaper copy. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
 | 240 | **Buffered output of streamed answers.** The cursor writers of streamed SELECT and graph answers still write a few bytes at a time through the response writer and are compiled with the server. Give them the engine-side buffer that eager answers use, with the same count of the rows the client received. | [Benchmarking](BENCHMARKING.md#release-build-settings) | S |
 | 241 | **Front coding on three warm DBpedia queries.** Since item 108, `pat-film-predicates` and `pat-film-predicate-list` take about 4% longer with front coding and `top-linked` 1.4% longer, in all 16 pinned rounds on forge. Count their instructions on both builds and remove the cost, or show that it comes from code placement. | [X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads) | S |
-| 242 | **`two-hop-count` after the result buffer.** With eager answers buffered in the engine, `two-hop-count` at 10.5M took 1.4% more server time on forge in all eight rounds, at 28.1 ms, while it ran the same instructions within 0.01%. Check it in pinned rounds after the next change to the engine, and find the code whose placement moved if it stays. | [Benchmarking](BENCHMARKING.md#release-build-settings) | S |
 | 243 | **Cheaper row accounting in the result buffer.** The buffer checks the row count at every write so that an answer cut partway reports the rows the client received. Serializers write one character at a time, so the check costs 7% of the instructions of `optional-chain` and 14% of its client time on forge, 150.8 ms against 132.0 ms. A row log that the serializers fill themselves measured no cheaper. Find a way to record row ends that costs nothing per write. | [Benchmarks](BENCHMARKS.md#the-cost-of-result-serialization) | S |
 | 265 | **Forge numbers for views on inferred data.** The cost of a view's round on a dataset with RDFS on read or materialized inferences, the cost of a commit that skips it, and the commit path without views were screened on Namespace only. `inferred_pass_against_query` and `commit_path_without_views` in `incr_bench.rs` need a pinned forge run before BENCHMARKS gives their numbers. | [F13](specs/F13-incremental-views-and-provenance.md#outcome) | S |
+| 306 | **Tiny queries after the combined feature changes.** In 16 pinned forge rounds, `count-all` server time rose from 5.3 to 6.0 µs and `distinct-obj` from 3.6 to 4.2 µs, while client time stayed within 1.2%. Bisect the changes between `142cd28f` and `8798c2db`, distinguish instruction cost from code placement, and remove the cost. | [Benchmarks](BENCHMARKS.md#the-cost-of-result-serialization) | S |
 
 ### Spill performance investigation
 
@@ -351,6 +351,7 @@ linked spec Outcome records how they landed.
 - **180.** Plan pattern references only for a shown plan. [U04](specs/U04-live-query-profiling.md#phase-4-2026-10-23) Phase 4
 - **181.** Compiler provenance in the Namespace query screen. [Benchmarking](BENCHMARKING.md#namespace-query-screens)
 - **182.** `subquery-agg` after the U02 forms, U11 Phase 3 and item 94 merges, which forge measured unchanged. [Benchmarking](BENCHMARKING.md#namespace-query-screens)
+- **242.** `two-hop-count` after the result buffer, which forge measured at 0.998 of the build before the buffer in 24 pinned rounds. [Benchmarks](BENCHMARKS.md#the-cost-of-result-serialization)
 
 ## Keeping this current
 

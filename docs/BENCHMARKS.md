@@ -1334,15 +1334,23 @@ the client in 150.8 ms against 220.4 ms, and every round was faster. `star-looku
 0.496 ms of client time against 0.526 ms, and `count-all`, `types-grouped` and
 `values-star` stay within 1.2%. A screen of all queries on forge, at 8
 rounds of 20 requests, found client time 19% lower for `order-by-full`, 30% lower for
-`star-join` and 5% lower for `distinct-join`. `two-hop-count` took 1.4% more server
-time in every round while it ran the same instructions, which roadmap item 242 follows
-up.
+`star-join` and 5% lower for `distinct-join`. `two-hop-count` keeps its speed. In 24
+pinned A,B,B,A rounds with 40 requests per server process on forge, its server time was
+27.63 ms against 27.68 ms for the build before the buffer, and its client time was
+28.32 ms against 28.37 ms,
+with the ranges of round medians overlapping.
 
 The buffer remembers where each row ends, so an answer that stops partway reports the rows
 whose bytes the response writer took. That accounting costs 7% of the instructions of
 `optional-chain`, 3.7% of those of `star-lookup` and 2% of those of `values-star` against
 a buffer that counts rows only when it is written out, and on forge `optional-chain` took
 150.8 ms of client time against 132.0 ms without it. Roadmap item 243 follows this up.
+
+A pinned forge comparison of the combined feature changes, with 16 A,B,B,A rounds and
+100 requests per server process, found `count-all` server time 12.5% higher at 6.0 µs
+against 5.3 µs and `distinct-obj` 14.5% higher at 4.2 µs against 3.6 µs. Every round was slower for both
+queries. Client time stayed within 1.2%, at about 0.30 ms. Item 306 tracks isolating and
+removing the server-time cost.
 
 ### The cost of the query memory pool
 
