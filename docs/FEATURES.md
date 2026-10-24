@@ -428,7 +428,7 @@ check them against the W3C suites and Jena's own answers.
 
 ### Incremental views and live queries
 
-* Incremental views and live queries ([API.md](API.md#incremental-views), spec [F13](specs/F13-incremental-views-and-provenance.md) Phase 1). A `table` view keeps a SELECT or CONSTRUCT query's result current after every commit, through a circuit of Z-set operators compiled from the query that joins each commit's net changes against the store's own indexes. Basic graph patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS`, `VALUES`, `DISTINCT`, subqueries and `GROUP BY` with `COUNT`, `SUM` and `AVG` are maintained, and other operators are evaluated again as `recompute` nodes. A commit that misses a view's patterns skips it. Queries read a view with `SERVICE view:read`, and `GET /{ds}/live` streams a query's result and then its changes as server-sent events, resuming after a commit with `Last-Event-ID`. Views and live queries with the same query and access share one circuit. View state is checkpointed and recovered from the change log, views read as their principal, and `Dataset::views`, `Dataset::live`, `sparkles views`, `sparkles query --live` and Python's `Dataset.views` and `Dataset.live` expose them.
+* Incremental views and live queries ([API.md](API.md#incremental-views), spec [F13](specs/F13-incremental-views-and-provenance.md) Phase 1). A `table` view keeps a SELECT or CONSTRUCT query's result current after every commit, through a circuit of Z-set operators compiled from the query that joins each commit's net changes against the store's own indexes. Basic graph patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS`, `VALUES`, `DISTINCT`, subqueries and `GROUP BY` with `COUNT`, `SUM` and `AVG` are maintained, and other operators are evaluated again as `recompute` nodes. A commit that misses a view's patterns skips it. Queries read a view with `SERVICE view:read`, and `GET /{ds}/live` streams a query's result and then its changes as server-sent events, resuming after a commit with `Last-Event-ID`. Views and live queries with the same query and access share one circuit. On a dataset with RDFS on read or materialized inferences in the default graph, a view or live query evaluates its whole query again with them at each commit that touches it, so it answers as the one-off query does, and the view's state reports `evaluation: recompute`. Turning either setting on or off switches existing views and live queries between the two modes without detaching them. View state is checkpointed and recovered from the change log, views read as their principal, and `Dataset::views`, `Dataset::live`, `sparkles views`, `sparkles query --live` and Python's `Dataset.views` and `Dataset.live` expose them.
 
 ## Search
 
@@ -1467,8 +1467,9 @@ links each item to its design spec.
   or JVM API, no UI, no views per branch, no ordered windows and no provenance per fact.
   Roadmap item 17.
 * Backups and clones do not carry view definitions. Roadmap item 220.
-* A dataset whose materialized inferences join the default graph refuses views and live
-  queries. Roadmap item 221.
+* Views and live queries on a dataset with RDFS on read or materialized inferences
+  evaluate the whole query again at each commit that touches them, rather than
+  maintaining it incrementally. Roadmap item 221.
 * A caller reads a view only with full access or the principal's exact access. Roadmap
   item 222.
 * View passes run on one thread per dataset, and the live query limits count per

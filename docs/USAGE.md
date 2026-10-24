@@ -1240,6 +1240,12 @@ shows the plan a query would have without defining it. The same commands work on
 server with `--server URL --dataset NAME`, where `put`, `delete` and `rebuild` need
 `admin` on the dataset.
 
+On a dataset with RDFS on read or materialized inferences, a view evaluates its whole
+query again with them at each commit that touches it, so its rows match the one-off
+query. `list` and `get` then show `recompute` and the reason. Turning RDFS on read or the
+inferences on or off later switches the existing views and live queries between the two
+modes, and they stay attached.
+
 `sparkles query --live` follows a query on a server. It prints the result, then a block
 for each commit that changes it, with `+` before the rows the commit added and `-` before
 the rows it removed. `--results json` prints one JSON object per event instead.

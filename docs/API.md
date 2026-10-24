@@ -2903,9 +2903,13 @@ directory as `views/{name}/view.json`, and the state is checkpointed beside them
 Unknown members are refused. A query outside the incremental fragment is refused with
 `400 not-incremental` and names the construct: `NOW`, `RAND`, `UUID`, `STRUUID`, `BNODE`,
 any `SERVICE`, full-text, vector and spatial search, `DESCRIBE`, and a `GRAPH` block in a
-CONSTRUCT template. A dataset with RDFS on read, or whose materialized inferences join
-the default graph, refuses every view and live query the same way, because a view reads
-the stored quads. Views and live queries never read the graphs that a disclosure guard
+CONSTRUCT template. On a dataset with RDFS on read, or whose materialized inferences
+join the default graph, a view or live query evaluates its whole query again with them,
+as a one-off query with the dataset's defaults runs. It runs at each commit that changes
+a pattern of the query rewritten for the current schema, the inferred graph, or a schema
+triple in the schema's graph. Turning either setting on or off switches the existing
+views and live queries between the two modes. A view stays attached, and a live query
+receives the difference as a diff or a `reset`. Views and live queries never read the graphs that a disclosure guard
 protects. `ORDER BY` without `LIMIT` does not change a view's rows and is
 ignored. Operators that the circuit cannot maintain run as
 `recompute` nodes, which evaluate their subtree again at each commit that touches it and
@@ -2917,7 +2921,7 @@ operator `incremental` or `recompute`, with the reason.
 | Method | Path | Needs | Description |
 |---|---|---|---|
 | GET | `/$/views/{ds}` | `read` | `{dataset, views: [...]}`, each view with its definition and state but without its plan. |
-| GET | `/$/views/{ds}/{name}` | `read` | The view with its state, its columns, its rows counted with multiplicity, `stateBytes`, the passes run and skipped, `passMs`, `recomputeMs` and its plan. A caller who may not read the view's rows gets neither `rows` nor `stateBytes`, here or in the list. |
+| GET | `/$/views/{ds}/{name}` | `read` | The view with its state, its columns, its rows counted with multiplicity, `stateBytes`, the passes run and skipped, `passMs`, `recomputeMs`, `evaluation` and its plan. A caller who may not read the view's rows gets neither `rows` nor `stateBytes`, here or in the list. |
 | PUT | `/$/views/{ds}/{name}` | `admin` | Defines or replaces the view and starts its first evaluation as a `view-build` task. `201` for a new view, `200` otherwise, with the plan and `task`. |
 | DELETE | `/$/views/{ds}/{name}` | `admin` | Removes the view and its state (`204`). |
 | POST | `/$/views/{ds}/{name}/rebuild` | `admin` | Evaluates the view again from scratch as a task and lifts a suspension (`202`). |
@@ -2926,7 +2930,10 @@ A view's `state` is `building` while it is evaluated, `current` at the head comm
 `behind` with `commits` while its pass runs after a commit, `suspended` with a `reason`
 such as `over-budget` or `pass-timeout`, or `failed` with an `error`. A pass that runs
 longer than `--view-pass-timeout`, 30 seconds by default, suspends its view. The views of
-a dataset share `--views-memory` when it is set.
+a dataset share `--views-memory` when it is set. `evaluation` is `recompute` when every
+relevant commit evaluates the whole query again, with the reason in `evaluationReason`,
+such as `RDFS on read`, `materialized inferences` or `protections that depend on the
+data`. It is `incremental` otherwise.
 
 **Reading a view.** A query reads a view's rows with the local service `view:read`.
 
