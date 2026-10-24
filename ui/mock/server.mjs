@@ -2649,6 +2649,14 @@ const server = http.createServer(async (req, res) => {
                   `invalid text configuration: predicates: expected "all" or a list of IRIs, got ${JSON.stringify(preds)}`,
                 );
               const created = makeDataset(dbName, dbType);
+              // mock only: the demo history (a bulk load and many updates whose states are
+              // no longer retained), for tests of the slider's hatched stretch that must
+              // not depend on what other tests did to the seeded `foaf` dataset
+              if (p.get('seedHistory') === true || p.get('seedHistory') === 'true') {
+                created.store.load(buildTurtle(), { format: 'text/turtle' });
+                created.baseQuads = created.store.size;
+                seedHistory(created);
+              }
               if (textCfg)
                 created.text = {
                   predicates: preds,
