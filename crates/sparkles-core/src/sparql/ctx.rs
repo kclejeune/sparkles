@@ -524,6 +524,8 @@ pub struct Ctx {
     pub service_depth: u32,
     /// the dataset's named projections (see [`crate::algo::catalog`])
     pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
+    /// the dataset's views, for `SERVICE view:read`
+    pub views: Option<Arc<dyn super::viewsvc::ViewSource>>,
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
@@ -874,6 +876,7 @@ impl Ctx {
             local_endpoints: None,
             service_depth: 0,
             algo_projections: None,
+            views: None,
             rdfs: None,
             opt: Optimizations::default(),
             io_start: crate::ioacct::profiling()

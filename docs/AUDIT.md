@@ -34,10 +34,10 @@ Sparkles preserves these Jena behaviours:
 * **XSD value space.** The numeric tower (integer ⊂ decimal ⊂ float ⊂ double, plus the
   derived integer types), dateTime, date, time, durations, booleans and strings. ORDER BY
   orders values as `ValueSpace` does.
-* **RIOT.** Turtle, N-Triples, N-Quads, TriG, RDF/XML and JSON-LD 1.1. Jena's own
-  RDF/JSON, Thrift, Protobuf and TriX were out of scope for v1 (§5). The server, `load`
-  and `convert` have since added them. Streaming `StreamRDF` sinks. The JSON,
-  XML, CSV and TSV result formats.
+* **RIOT.** Sparkles reads and writes Turtle, N-Triples, N-Quads, TriG, RDF/XML and
+  JSON-LD 1.1. The server, `load` and `convert` also handle Jena's own RDF/JSON, Thrift,
+  Protobuf and TriX, which the v1 scope left out (§5). Parsing streams into sinks as
+  `StreamRDF` does, and results come in the JSON, XML, CSV and TSV formats.
 * **ARQ.** Full SPARQL 1.1 Query and Update, property paths, aggregates, subqueries,
   VALUES, SERVICE, EXISTS, the function library (XPath `fn:`, `math:`, `afn:`) and property
   functions. The optimizer transforms, such as filter placement, filter equality
@@ -139,9 +139,9 @@ The original v1 scope left out JavaScript scripting functions, jena-ontapi's obj
 jena-text's Lucene index format and assembler configuration, backward-chaining (LP) rules
 and Shiro authentication. Sparkles implements `text:query` itself and has its own
 authentication ([C09](specs/C09-dataset-access-control.md)). RDF Thrift, RDF Protobuf,
-TriX, RDF/JSON, RDF Patch and GeoSPARQL were initially outside that scope and have since
-been implemented, with limits.
+TriX, RDF/JSON, RDF Patch and GeoSPARQL were also outside that scope, and Sparkles
+implements them with limits.
 
 The current [format and feature limits](FEATURES.md#known-gaps) and
 [GeoSPARQL divergences](COMPARISON.md#geosparql) are maintained in the product guides.
-The original choices and later outcomes remain in the corresponding design specs.
+The design specs record each original choice and its outcome.

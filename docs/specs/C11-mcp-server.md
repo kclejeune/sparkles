@@ -14,7 +14,7 @@
 >
 > **User docs:** [API: MCP server](../API.md#mcp-server) ·
 > [Usage: MCP server](../USAGE.md#mcp-server-llm-agents) ·
-> [Features](../FEATURES.md#agents-and-questions-in-plain-language)
+> [Features](../FEATURES.md#ai-and-agents)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.
@@ -1688,7 +1688,7 @@ limit of 64 watchers. Updates go out as `notifications/resources/updated` on the
 session's stream. A request without a session has no stream to deliver to, so it
 gets the protocol's error for an unsupported method.
 
-**OAuth for the MCP endpoint** (item 67, Tier 6, release work, [ROADMAP](../ROADMAP.md)).
+**OAuth for the MCP endpoint** (item 67, Tier 2, [ROADMAP](../ROADMAP.md)).
 Deviation 3 of Phase 2 records that protected-resource metadata, audience validation and
 scope challenges were not built. Part of it has since landed: OIDC access tokens are
 accepted as bearer credentials on every route, `/$/mcp` included, when their audience

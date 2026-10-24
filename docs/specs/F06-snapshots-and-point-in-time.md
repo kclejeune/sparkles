@@ -15,7 +15,7 @@
 > **User docs:** [API: Point-in-time reads and snapshots](../API.md#point-in-time-reads-and-snapshots) ·
 > [API: History queries](../API.md#history-queries) ·
 > [Usage: History, snapshots and clones](../USAGE.md#history-snapshots-and-clones) ·
-> [Features](../FEATURES.md#storage-tdb2-equivalent) ·
+> [Features](../FEATURES.md#versioning-and-history) ·
 > [Benchmarks: Point-in-time reads](../BENCHMARKS.md#point-in-time-reads-105m-triples)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section

@@ -707,3 +707,256 @@ fn bad_lookups_and_unknown_extensions() {
         m.warnings
     );
 }
+
+/// F19 A7: C05's T3 file in standard mode.
+#[test]
+fn standard_mode_describes_the_group_table_and_rows() {
+    let mut o = csvw(
+        &META.replace(
+            "\"url\": \"people.csv\",",
+            "\"url\": \"people.csv\", \"dc:title\": \"People\", \"notes\": [\"checked\"],",
+        ),
+        "people.csv",
+    );
+    o.standard = true;
+    let got = run("ID,Name,Born,Tags,Employer\n7,Ann,03/04/1990,a;b,n/a\n", &o).unwrap();
+    let cw = "http://www.w3.org/ns/csvw#";
+    let rdf_type = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
+    for want in [
+        format!("_:tg {rdf_type} <{cw}TableGroup>"),
+        format!("_:tg <{cw}table> _:t0"),
+        format!("_:t0 {rdf_type} <{cw}Table>"),
+        format!("_:t0 <{cw}url> <file:///data/people.csv>"),
+        "_:t0 <http://purl.org/dc/terms/title> \"People\"".to_string(),
+        format!("_:t0 <{cw}note> \"checked\""),
+        format!("_:t0 <{cw}row> _:t0row2"),
+        format!("_:t0row2 {rdf_type} <{cw}Row>"),
+        format!("_:t0row2 <{cw}rownum> \"1\"^^<{XSD}integer>"),
+        format!("_:t0row2 <{cw}url> <file:///data/people.csv#row=2>"),
+        format!("_:t0row2 <{cw}describes> <http://example.org/person/7>"),
+    ] {
+        assert!(got.contains(&want), "missing {want}\n{got:#?}");
+    }
+    // the minimal-mode triples are still there, once each
+    assert_eq!(
+        got.iter()
+            .filter(|t| t.contains("<http://schema.org/keywords>"))
+            .count(),
+        2
+    );
+    // a common property that needs JSON-LD processing fails
+    let mut o = csvw(
+        &META.replace(
+            "\"url\": \"people.csv\",",
+            "\"url\": \"people.csv\", \"dc:creator\": {\"@type\": \"x\", \"name\": \"y\"},",
+        ),
+        "people.csv",
+    );
+    o.standard = true;
+    let e = run("ID,Name,Born,Tags,Employer\n7,Ann,03/04/1990,a;b,n/a\n", &o).unwrap_err();
+    assert!(e.to_string().contains("JSON-LD processing"), "{e}");
+    // templates have no standard mode
+    let mut t = template("CONSTRUCT { ?s ?p ?o } WHERE {}", None);
+    t.standard = true;
+    assert!(run("a\n1\n", &t).is_err());
+}
+
+const GROUP: &str = r#"{
+  "@context": "http://www.w3.org/ns/csvw",
+  "tables": [
+    { "url": "customer.csv",
+      "tableSchema": { "aboutUrl": "http://ex.org/customer/{id}", "primaryKey": "id",
+        "columns": [{ "name": "id", "datatype": "integer" }, { "name": "name" }] } },
+    { "url": "orders.csv",
+      "tableSchema": { "aboutUrl": "http://ex.org/order/{id}", "primaryKey": "id",
+        "foreignKeys": [{ "columnReference": "customer",
+                          "reference": { "resource": "customer.csv", "columnReference": "id" } }],
+        "columns": [{ "name": "id" }, { "name": "customer", "datatype": "integer" }] } }
+  ]
+}"#;
+
+/// F19 A8: primary and foreign keys.
+#[test]
+fn primary_and_foreign_keys_are_checked() {
+    let meta = Arc::new(csvw::parse(GROUP, Some("file:///data/meta.json")).unwrap());
+    assert_eq!(key_order(&meta, &[1, 0]).unwrap(), vec![0, 1]);
+    assert!(
+        key_order(&meta, &[1])
+            .unwrap_err()
+            .to_string()
+            .contains("not part of this load")
+    );
+    let opts = |table: usize, reg: &Arc<KeyRegistry>| {
+        let mut o = Options::new(
+            Mapping::Csvw(meta.clone()),
+            if table == 0 {
+                "customer.csv"
+            } else {
+                "orders.csv"
+            },
+        );
+        o.table = Some(table);
+        o.keys = Some(reg.clone());
+        o
+    };
+    // a duplicate primary key names both rows
+    let reg = Arc::new(KeyRegistry::new(None));
+    let e = run("id,name\n7,Ann\n7,Bob\n", &opts(0, &reg))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("rows 2 and 3 have the same primary key (id = \"7\")"),
+        "{e}"
+    );
+    let e = run("id,name\n,Ann\n", &opts(0, &reg))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("a primary key cell is empty"), "{e}");
+    // a foreign key with no referenced value names its row, column and value
+    let reg = Arc::new(KeyRegistry::new(None));
+    run("id,name\n1,Ann\n2,Bob\n", &opts(0, &reg)).unwrap();
+    run("id,customer\n10,1\n11,\n12,2\n", &opts(1, &reg)).unwrap();
+    let e = run("id,customer\n10,1\n13,3\n", &opts(1, &reg))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("orders.csv: row 3, column 2 (customer): the value \"3\" is not among the values of column id of table customer.csv"),
+        "{e}"
+    );
+    // the referenced table must come first
+    let reg = Arc::new(KeyRegistry::new(None));
+    let e = run("id,customer\n10,1\n", &opts(1, &reg))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("must be converted first"), "{e}");
+    // the key values are charged to the budget
+    let reg = Arc::new(KeyRegistry::new(Some(100)));
+    let e = run("id,name\n1,Ann\n2,Bob\n3,Cy\n", &opts(0, &reg))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("memory budget"), "{e}");
+    // a cycle fails
+    let cyc = GROUP.replacen(
+        "\"primaryKey\": \"id\",\n        \"columns\"",
+        "\"primaryKey\": \"id\", \"foreignKeys\": [{ \"columnReference\": \"id\", \"reference\": { \"resource\": \"orders.csv\", \"columnReference\": \"customer\" } }],\n        \"columns\"",
+        1,
+    );
+    let m = csvw::parse(&cyc, None).unwrap();
+    assert!(
+        key_order(&m, &[0, 1])
+            .unwrap_err()
+            .to_string()
+            .contains("cycle")
+    );
+}
+
+/// F19 A9 and §7.1: Tarql's functions, `apf:strSplit`, and several CONSTRUCT queries.
+#[test]
+fn tarql_functions_and_str_split_work_in_templates() {
+    let q = r#"PREFIX ex: <http://ex.org/>
+PREFIX tarql: <http://tarql.github.io/tarql#>
+PREFIX apf: <http://jena.apache.org/ARQ/property#>
+CONSTRUCT { ?c ex:code ?code . ?c ex:named ?n }
+WHERE { BIND(IRI(CONCAT(tarql:expandPrefix("ex"), ?code)) AS ?c)
+        BIND(tarql:expandPrefixedName(?qname) AS ?n) }
+CONSTRUCT { ?c ex:tag ?t }
+WHERE { BIND(IRI(CONCAT(tarql:expandPrefix("ex"), ?code)) AS ?c) ?t apf:strSplit (?tags ";") }"#;
+    let t = Template::parse(q, None).unwrap();
+    assert_eq!(t.len(), 2);
+    let got = run("code,qname,tags\nNO,ex:Norway,a;b\n", &template(q, None)).unwrap();
+    assert_eq!(
+        got,
+        [
+            "<http://ex.org/NO> <http://ex.org/code> \"NO\"",
+            "<http://ex.org/NO> <http://ex.org/named> <http://ex.org/Norway>",
+            "<http://ex.org/NO> <http://ex.org/tag> \"a\"",
+            "<http://ex.org/NO> <http://ex.org/tag> \"b\"",
+        ]
+    );
+}
+
+/// F19 A9 and §7.2: a template that reads the target dataset.
+#[test]
+fn templates_read_the_target_dataset_with_a_lookup() {
+    use crate::store::{Store, StoreOptions};
+    let store = Store::in_memory(StoreOptions::default());
+    store
+        .load(&[crate::io::Source::from_bytes(
+            b"<http://ex.org/country/no> <http://ex.org/isoCode> \"NO\" .\n".to_vec(),
+            oxrdfio::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    let q = "PREFIX ex: <http://ex.org/>
+        CONSTRUCT { ?p ex:country ?country } WHERE {
+          BIND(IRI(CONCAT(\"http://ex.org/p/\", ?id)) AS ?p)
+          ?country ex:isoCode ?code }";
+    let mut o = template(q, None);
+    // without a lookup the template sees an empty dataset
+    assert!(run("id,code\n7,NO\n", &o).unwrap().is_empty());
+    let head = store.head_commit().seq;
+    o.lookup = Some(template::Lookup {
+        snapshot: store.snapshot(),
+        prefixes: vec![("x".into(), "http://ex.org/x/".into())],
+        commit: head,
+        graphs: None,
+    });
+    let got = run("id,code\n7,NO\n8,SE\n", &o).unwrap();
+    assert_eq!(
+        got,
+        ["<http://ex.org/p/7> <http://ex.org/country> <http://ex.org/country/no>"]
+    );
+    let mut stats = Stats::default();
+    convert(
+        Cursor::new(b"id,code\n7,NO\n".to_vec()),
+        &o,
+        &mut |_| Ok(()),
+    )
+    .map(|s| stats = s)
+    .unwrap();
+    assert_eq!(stats.lookup_commit, Some(head));
+    // the dataset's declared prefixes reach tarql:expandPrefix
+    let q = "PREFIX tarql: <http://tarql.github.io/tarql#>
+        CONSTRUCT { ?s <http://ex.org/p> 1 } WHERE { BIND(IRI(CONCAT(tarql:expandPrefix(\"x\"), ?id)) AS ?s) }";
+    let mut o2 = template(q, None);
+    o2.lookup = o.lookup.clone();
+    assert_eq!(
+        run("id\n7\n", &o2).unwrap(),
+        ["<http://ex.org/x/7> <http://ex.org/p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
+    );
+}
+
+/// Review round 1: a referenced value that repeats is charged once.
+#[test]
+fn repeated_referenced_values_are_charged_once() {
+    // orders reference customer.name, which repeats and is not the primary key
+    let g = GROUP
+        .replace(
+            "\"primaryKey\": \"id\",\n        \"columns\": [{ \"name\": \"id\", \"datatype\": \"integer\" }, { \"name\": \"name\" }]",
+            "\"columns\": [{ \"name\": \"id\", \"datatype\": \"integer\" }, { \"name\": \"name\" }]",
+        )
+        .replace(
+            "\"columnReference\": \"customer\",\n                          \"reference\": { \"resource\": \"customer.csv\", \"columnReference\": \"id\" }",
+            "\"columnReference\": \"customer\",\n                          \"reference\": { \"resource\": \"customer.csv\", \"columnReference\": \"name\" }",
+        )
+        .replace("{ \"name\": \"customer\", \"datatype\": \"integer\" }", "{ \"name\": \"customer\" }");
+    assert!(g.contains("\"columnReference\": \"name\""), "{g}");
+    let meta = Arc::new(csvw::parse(&g, Some("file:///data/meta.json")).unwrap());
+    let mut o = Options::new(Mapping::Csvw(meta), "customer.csv");
+    o.table = Some(0);
+    let reg = Arc::new(KeyRegistry::new(Some(200)));
+    o.keys = Some(reg);
+    run("id,name\n1,Ann\n2,Ann\n3,Ann\n4,Ann\n5,Ann\n", &o).unwrap();
+}
+
+/// Review round 1: every CONSTRUCT query after the first gets the shared prologue.
+#[test]
+fn three_constructs_share_the_prologue() {
+    let q = "PREFIX ex: <http://ex.org/>
+CONSTRUCT { ?s ex:a ?v } WHERE { BIND(IRI(CONCAT(\"http://ex.org/\", ?v)) AS ?s) }
+CONSTRUCT { ?s ex:b ?v } WHERE { BIND(IRI(CONCAT(\"http://ex.org/\", ?v)) AS ?s) }
+CONSTRUCT { ?s ex:c ?v } WHERE { BIND(IRI(CONCAT(\"http://ex.org/\", ?v)) AS ?s) }";
+    let t = Template::parse(q, None).unwrap();
+    assert_eq!(t.len(), 3);
+    assert_eq!(run("v\nx\n", &template(q, None)).unwrap().len(), 3);
+}

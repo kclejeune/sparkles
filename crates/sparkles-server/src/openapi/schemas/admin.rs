@@ -32,6 +32,7 @@ fn last_build(count: &str) -> J {
 pub(super) fn put_all(put: &mut dyn FnMut(&str, J)) {
     history(put);
     queries(put);
+    views(put);
     algorithms(put);
     indexes(put);
     reasoning(put);
@@ -282,6 +283,177 @@ fn queries(put: &mut dyn FnMut(&str, J)) {
             ),
             "A dataset's stored queries, without their text.",
             "stored-queries",
+        ),
+    );
+    let mapping_version = obj(
+        &["version", "created", "digest"],
+        json!({
+            "version": int(),
+            "parent": int(),
+            "created": string(),
+            "author": string(),
+            "message": string(),
+            "datasetCommit": { "type": "integer", "description": "The dataset's head when the version was saved." },
+            "digest": { "type": "string", "description": "Hex SHA-256 over the parent's digest and the definition." },
+        }),
+    );
+    let mapping = json!({
+        "name": string(),
+        "dataset": string(),
+        "kind": string_enum(&["rml", "yarrrml", "csvw", "template"]),
+        "description": string(),
+        "text": { "type": "string", "description": "The mapping text. Listings leave it out." },
+        "version": mapping_version.clone(),
+        "summary": obj(&["kind", "triplesMaps", "files", "connections", "warnings"], json!({
+            "kind": string(),
+            "vocabulary": { "type": "string", "description": "R2RML, RML (rml.io), RML-Core or YARRRML." },
+            "triplesMaps": int(),
+            "files": strings(),
+            "connections": { "type": "array", "items": string(), "description": "The connections it reads. An empty name is an R2RML mapping's default connection." },
+            "graphs": { "type": ["array", "null"], "items": string(), "description": "The graphs its graph maps name, `default` for the default graph, or null when one is not constant." },
+            "warnings": strings(),
+        })),
+        "lastRun": obj(&["time", "version", "mode", "quads", "rows"], json!({
+            "time": string(),
+            "version": int(),
+            "mode": string_enum(&["add", "replace"]),
+            "commit": int(),
+            "quads": int(),
+            "rows": int(),
+            "warnings": strings(),
+            "author": string(),
+        })),
+        "changed": { "type": "boolean", "description": "On a PUT: whether a new version was stored." },
+    });
+    put(
+        "StoredMapping",
+        doc(
+            obj(&["name", "kind", "version"], mapping.clone()),
+            "A stored mapping, with the summary of its check and its last run.",
+            "stored-mappings",
+        ),
+    );
+    put(
+        "StoredMappingList",
+        doc(
+            obj(
+                &["dataset", "mappings"],
+                json!({ "dataset": string(), "mappings": array(obj(&["name", "kind", "version"], mapping)), "warning": string() }),
+            ),
+            "A dataset's stored mappings, without their text.",
+            "stored-mappings",
+        ),
+    );
+    put(
+        "StoredMappingVersions",
+        doc(
+            obj(
+                &["dataset", "name", "versions"],
+                json!({ "dataset": string(), "name": string(), "versions": array(mapping_version) }),
+            ),
+            "The kept versions of a stored mapping, newest first.",
+            "stored-mappings",
+        ),
+    );
+    put(
+        "MappingRun",
+        doc(
+            obj(
+                &["mapping", "version", "mode", "rows", "quads", "warnings"],
+                json!({
+                    "mapping": string(),
+                    "version": int(),
+                    "mode": string_enum(&["add", "replace"]),
+                    "rows": int(),
+                    "quads": { "type": "integer", "description": "The quads the mapping made, before the load removed duplicates." },
+                    "count": { "type": "integer", "description": "The quads the commit added." },
+                    "warnings": strings(),
+                    "reports": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                }),
+            ),
+            "What a stored mapping's run made and committed.",
+            "stored-mappings",
+        ),
+    );
+}
+
+// ------------------------------------------------------------------ views --
+
+fn views(put: &mut dyn FnMut(&str, J)) {
+    let definition = json!({
+        "query": with_desc(string(), "A SELECT or CONSTRUCT query; the dataset's prefixes apply."),
+        "storedQuery": with_desc(string(), "A stored query by name, in place of `query`."),
+        "mode": string_enum(&["table", "graph"]),
+        "graph": string(),
+        "principal": with_desc(string(), "The user whose view of the dataset the query reads; the definer by default."),
+        "provenance": string_enum(&["none", "count", "why", "lineage"]),
+        "maintenance": string_enum(&["async", "commit"]),
+        "branches": array(string()),
+        "memoryBytes": { "type": "integer", "minimum": 1, "description": "The budget of the view's state." },
+        "keepCommits": { "type": "integer", "minimum": 0 },
+    });
+    put(
+        "ViewDefinition",
+        doc(
+            obj(&[], definition.clone()),
+            "A view's definition. Phase 1 takes `table` views maintained `async` on `main`, without provenance and with `keepCommits` 0.",
+            "incremental-views",
+        ),
+    );
+    let plan = json!({
+        "type": "object",
+        "additionalProperties": true,
+        "description": "The view's plan: each node has its `operator`, its `mode` (`incremental` or `recompute`), its `vars`, a `detail` that gives a recompute node's reason, and its `children`.",
+    });
+    let members = json!({
+        "name": string(),
+        "dataset": string(),
+        "definition": sref("ViewDefinition"),
+        "state": string_enum(&["building", "current", "behind", "suspended", "failed"]),
+        "commits": { "type": "integer", "description": "With `behind`: the commits it lags." },
+        "reason": with_desc(string(), "With `suspended`: why."),
+        "error": with_desc(string(), "With `failed`: why."),
+        "commit": { "type": "integer", "description": "The commit its rows reflect." },
+        "columns": array(string()),
+        "rows": { "type": "integer", "description": "Its rows, multiplicities counted." },
+        "stateBytes": { "type": "integer" },
+        "passes": { "type": "integer" },
+        "skipped": { "type": "integer", "description": "Passes its footprint skipped." },
+        "passMs": { "type": "number" },
+        "recomputeMs": { "type": "number", "description": "Time spent in its recompute nodes." },
+        "plan": plan,
+        "task": with_desc(string(), "On a PUT: the task of the first evaluation."),
+    });
+    put(
+        "View",
+        doc(
+            obj(&["name", "definition", "state"], members.clone()),
+            "A view with its state.",
+            "incremental-views",
+        ),
+    );
+    let mut brief = members;
+    brief.as_object_mut().expect("an object").remove("plan");
+    put(
+        "ViewList",
+        doc(
+            obj(
+                &["dataset", "views"],
+                json!({ "dataset": string(), "views": array(obj(&["name", "state"], brief)) }),
+            ),
+            "A dataset's views without their plans.",
+            "incremental-views",
+        ),
+    );
+    put(
+        "ViewTask",
+        doc(
+            obj(
+                &["dataset", "name", "task"],
+                json!({ "dataset": string(), "name": string(), "task": string() }),
+            ),
+            "A view's rebuild and the task that runs it.",
+            "incremental-views",
         ),
     );
 }

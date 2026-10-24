@@ -9,7 +9,7 @@
 >
 > **User docs:** [API: Automatic compaction](../API.md#automatic-compaction) ·
 > [Usage: Automatic compaction](../USAGE.md#automatic-compaction) ·
-> [Features](../FEATURES.md#storage-tdb2-equivalent) ·
+> [Features](../FEATURES.md#storage-and-indexes) ·
 > [Benchmarks: Automatic compaction](../BENCHMARKS.md#automatic-compaction-105m-triples) ·
 > [Benchmarks: Partial compaction](../BENCHMARKS.md#partial-compaction-and-the-spatial-index)
 >

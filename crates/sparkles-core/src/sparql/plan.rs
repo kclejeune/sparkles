@@ -487,6 +487,8 @@ pub enum Kind {
     PathSearch(Box<super::pathsearch::PathSearchSpec>),
     /// the recorded changes of the dataset (`SERVICE hist:changes`)
     HistoryChanges(Box<super::history_svc::HistorySpec>),
+    /// the rows of a `table` view (`SERVICE view:read`)
+    ViewRead(Box<super::viewsvc::ViewSpec>),
     /// a graph algorithm on a projection of the dataset (`SERVICE algo:pageRank`, …);
     /// child 0, if the call has a variable source, is the rest of the group, and the last
     /// child is the nested pattern of edges, if any
@@ -641,6 +643,7 @@ impl Node {
             Kind::SpatialRelate(_) => "SpatialRelate",
             Kind::PathSearch(_) => "PathSearch",
             Kind::HistoryChanges(_) => "HistoryChanges",
+            Kind::ViewRead(_) => "ViewRead",
             Kind::AlgoCall(_) => "AlgoCall",
             Kind::PatternCount(_) => "PatternCount",
             Kind::PatternScan(_) => "PatternScan",
@@ -1338,6 +1341,10 @@ impl<'a> Planner<'a> {
                     })
                     .collect();
                 let n = group(child, keys, aggs, self.ctx);
+                Ok(self.apply_filters(n, filters))
+            }
+            GP::Service { inner, name, .. } if super::viewsvc::is_read(name) => {
+                let n = super::viewsvc::view_leaf(self, inner)?;
                 Ok(self.apply_filters(n, filters))
             }
             GP::Service { inner, name, .. } if super::history_svc::is_changes(name) => {

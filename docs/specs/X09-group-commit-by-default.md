@@ -1419,6 +1419,96 @@ disabled or when the count is kept after a raced locked attempt. The forge accep
 2026-10-23 below saw write stalls that match the period of the locked attempt, but it did
 not trace the ticks, and roadmap item 110 confirms the cause.
 
+**Bounded locked checkpoint.** Roadmap item 110 traced the ticks on `forge` on 2026-10-24
+and confirmed the cause. Each background checkpoint now logs at debug level, under the
+target `sparkles::text::checkpoint`, how long it held the live writer lock before its file
+synchronization, how long the synchronization took, how long it kept text publication out
+in all, and whether it cleared the marker. In a mixed full-text run at 1.05M with a build
+of e411a772 and this trace, every unlocked checkpoint was raced, because each reader's
+search seals the open batch and commits it to the index's files, and every fourth tick
+then held the live writer lock for a median of 74 ms and at most 166 ms, about every
+5.3 s. Each of these locked ticks synchronized every file of the index again, a median of
+76 ms in the unlocked ticks as well. All 16 write stalls of the ordinary process lay inside
+a locked tick, with a median of 127 ms and a maximum of 177 ms as the writers saw them, and
+none lay elsewhere.
+
+The checkpoint now synchronizes only the files finished or replaced since a pass last
+synchronized them, and the locked attempt follows an unlocked pass instead of replacing it.
+The directory records the name of each file as Tantivy finishes it and of each metadata
+file when its atomic replacement has been renamed into place. A pass takes the recorded
+names, synchronizes those files and then the index directory, and puts the names back if
+any synchronization fails or the pass panics. A directory opened with its marker present may hold files that
+an earlier process wrote and never synchronized, so the first pass after such an open
+synchronizes every file in it, as every pass did before. After three raced ticks, the next
+tick runs its unlocked pass first, and when a write races that pass too, it repeats the
+unlocked pass for the files written during the one before, up to four times, until none
+are left. Each repetition has only the files of a shorter interval to synchronize, so it
+takes a fraction of the time of the one before, and a repetition that no write races
+clears the marker without the tick ever holding the lock for its I/O. Otherwise the tick
+then takes the live writer lock and runs a last pass, which finds only the segments and
+metadata of the commits that the readers sealed during the last repetition, so it holds the
+lock for a few file synchronizations rather than for all of them. The count of raced
+ticks starts again after such a tick whatever its outcome, as before.
+
+A pass synchronizes its files from up to eight threads. On `forge` each synchronization of a
+newly written file took about 1.5 ms on its own, because each forced its own journal commit,
+and the segments that the readers' searches commit are merged away within seconds, so nearly
+every file in the directory was new at each tick and synchronizing only the new files did
+not shorten the unlocked pass. Synchronizations issued together share journal commits. With
+one thread the locked pass still held the lock for a median of 24 ms, and with eight threads
+the unlocked pass fell from 77 ms to 28 or 32 ms, the repetitions caught up, and no tick of
+the same run needed the lock for its I/O. The first error any thread meets fails the pass,
+which puts all of its names back, and a helper thread that cannot be started leaves its
+share to the others. Synchronization order among a pass's files does not
+matter for the invariant, because the marker goes only after every one of them and the
+directory have been synchronized.
+
+[BENCHMARKS.md](../BENCHMARKS.md#bounded-full-text-checkpoint-on-forge) has the traced runs
+of each step. Over two processes of each setting at a fixed 500 transactions/s, the shipped
+build had no write stall over 25 ms where the trace of e411a772 had 73, its longest write
+took 19.5 ms against 171.4 ms, and its maximum schedule lag was 31.0 and 37.9 ms ordinary
+and 10.1 and 10.7 ms grouped, within the 50 ms rule, against 159.6 to 165.6 ms. The reader p99
+was 3.8% higher on average, within the spread of these runs, and item 170 follows it up.
+
+The crash argument is the invariant of `text/lazydir.rs`, that `meta.json` never refers to
+unsynchronized data unless the marker exists, and the change keeps it. The marker is
+removed only when no write was counted and no atomic replacement was in flight between a
+pass's snapshot of the write count and its check, as before. Every write the snapshot
+counts recorded its name in the same critical section that counted it, so the name was
+either taken by this pass or by an earlier pass that synchronized it successfully. Tantivy
+never changes a finished file, so a file synchronized by an earlier pass is still durable.
+A metadata replacement records its name only after its rename, so a pass that synchronized
+the old file under that name, while the replacement was in flight, saw the in-flight count
+and kept the marker, and the next pass synchronizes the new file. A file deleted since it
+was recorded is skipped, because no metadata that a later checkpoint can declare clean
+refers to it. The index directory is synchronized whenever a file was created, renamed or
+removed since the last time, so the names of the synchronized files are durable before the
+marker goes. Nothing changes in the WAL ordering. A checkpoint writes no index content and
+changes no payload, the payload in `meta.json` still comes from a commit made under the
+live writer lock from fenced commits only, and the marker removal and its parent directory
+synchronization are unchanged. No format changed, so no version moved.
+
+The tests cover each step. `a_raced_pass_keeps_its_progress` requires the next pass after a
+raced one to synchronize only the file written during it, and
+`replaced_metadata_is_synchronized_again` requires a metadata replacement that finishes
+during a pass, or is in flight across it, to be synchronized by the next pass. That test
+fails when the name is recorded when the replacement starts. `a_failed_pass_puts_its_files_back`,
+`a_pass_failing_after_another_threads_sync_puts_both_files_back`,
+`a_panicking_pass_puts_its_files_back`, `a_pass_without_helper_threads_synchronizes_every_file`
+and `a_directory_opened_with_its_marker_synchronizes_every_file` cover a failed pass, a
+failure after another thread's synchronization, a panic, a helper that cannot start and a
+reopen after a crash. `a_locked_pass_first_catches_up_without_live` requires the
+repetition to run without the lock and to clear the marker when nothing races it.
+`steady_publication_cannot_starve_the_background_checkpoint` races every unlocked pass and
+every repetition with a publication, and requires the fourth tick to end in one pass that
+holds live and clears the marker, and the count to start again when a merge's write races
+that pass. The background crash fixture
+of `tests/power_loss.rs` runs a reader that searches throughout, so its commits race the
+unlocked passes. It stops the index's segment merges, which write without the lock and
+could race every locked pass, and its writers go on past their commits until a locked pass
+has cleared the marker, so every recorded run contains such a removal. It then replays the
+crash images against the receipts and the recovered text.
+
 This change removes the background file-synchronization wait from the live writer
 lock. Tantivy publication can still occur inside a group leader's fence, and WAL
 and vocabulary synchronization can still delay writes. It does not establish the
@@ -1440,13 +1530,14 @@ amended gates without a rerun. The results are the following.
 |---|---|
 | Serial commits, p50 and p90 no more than 5% slower | 35 of 36 checks met. The miss is the p90 of spatial literal inserts at 10.5M, with a paired ratio of 1.077. |
 | Four writers, at least the required gain | Met in all six cells. The paired ratios and the requirements are 1.50 and 1.41 for full-text at 1.05M, 1.68 and 1.48 at 10.5M, 1.52 and 1.45 for spatial at 1.05M, 1.59 and 1.41 at 10.5M, and 2.38 and 1.43 and 2.06 and 1.46 for embedding. |
-| Text query p50 and p99 during four writers | Ratios of 0.987 and 1.000 at 1.05M and 0.997 and 0.982 at 10.5M. Not established, because the schedule lag requirement failed for both settings. |
-| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established, because the schedule lag requirement failed for the ordinary writer at both sizes and for one grouped process at 10.5M. |
+| Text query p50 and p99 during four writers | Ratios of 0.987 and 1.000 at 1.05M and 0.997 and 0.982 at 10.5M. Not established, because the schedule lag requirement failed for both settings. Met in the rerun after item 110, described below. |
+| Spatial query p50 and p99 during four writers | Ratios of 0.964 and 0.925 at 1.05M and 1.002 and 1.044 at 10.5M. Not established, because the schedule lag requirement failed for the ordinary writer at both sizes and for one grouped process at 10.5M. The rerun after item 110 met it at 10.5M and not at 1.05M. |
 | Peak resident memory within 64 MiB | Met in all ten cells. The largest certified difference was 19.6 MiB, for embedding at 1.05M. |
 
 Every gate is therefore met except the p90 of spatial serial inserts at 10.5M and the two
-reader gates, which are not established. The text mixed cells also need a rerun once the
-stall below is bounded.
+reader gates, which are not established. The rerun of the mixed cells after item 110,
+described below, established the text reader gate at both sizes and the spatial one at
+10.5M.
 
 The serial and throughput misses of the first judgement follow the drive more than the
 engine. The server's own counters show the mean time of a commit synchronization at about
@@ -1470,8 +1561,8 @@ requirement, so the cells pass because each one mixes drive states.
 
 Every mixed process in the text cells stopped all four writers together for a median of 70
 to 150 ms about every 5.4 s, with grouping and without. That is the period of the locked
-fallback of the background checkpoint, and the run recorded no ticks, so the cause is probable
-and not confirmed. The longest stall of most processes was 150 to 190 ms, and the extremes
+fallback of the background checkpoint, and the run recorded no ticks, so the cause was probable
+and not confirmed until item 110 traced it. The longest stall of most processes was 150 to 190 ms, and the extremes
 were 575 ms for a grouped process and 584 ms for an ordinary one. It fails the 50 ms schedule
 lag of the load-quality rule in both settings, so no text reader comparison can be
 certified. Grouping did not cause it, and the ordinary path shows the same cadence and larger
@@ -1491,24 +1582,56 @@ campaign, which is why section 17.9 names the breakpoint as chosen afterwards an
 sensitivities. It asked for the Fisher and sign tests above, and for a follow-up item for
 each measured slowdown that the amended gates let through.
 
+**Reader gates after item 110.** Item 110 reran the text and spatial mixed cells on `forge`
+on 2026-10-24 with a release binary of its branch at a0718d43, the bounded checkpoint with
+parallel synchronization, built on `forge` before timing. The fix that review round 3 asked
+for later changed only the paths of a failed or panicking pass. Each cell ran five blocks of an
+ordinary, a grouped, a grouped and an ordinary process, as before, and the offered rate was
+60% of the slowest unpaced process instead of 80%, through the new `--rate-fraction` option
+of `scripts/bench-indexed-commit.py`. Every process met the memory and achieved rate
+requirements and checked its acknowledgements and index answers live and after a cold
+reopen. The table gives the paired ratios of grouped to ordinary.
+
+| Cell | Rate (tx/s) | Max schedule lag, ordinary and grouped (ms) | Reader p50 ratio | Reader p99 ratio | Gate |
+|---|---:|---|---:|---:|---|
+| Text at 1.05M | 414 | 6.3 to 30.1 and 4.2 to 12.1 | 1.001 | 0.993 | Met. |
+| Text at 10.5M | 354 | 3.7 to 6.4 and 2.2 to 10.1 | 0.987 | 1.008 | Met. |
+| Spatial at 1.05M | 583 | 136.1 to 271.7 and 8.0 to 11.7 | 0.947 | 0.813 | Not established, because every ordinary process missed the 50 ms lag. |
+| Spatial at 10.5M | 444 | 3.5 to 12.3 and 4.0 to 8.8 | 0.999 | 0.988 | Met. |
+
+No text process stalled. The ordinary lag of the text cell fell from 153 to 182 ms at 1.05M
+in the campaign of 2026-10-23 to 6.3 to 30.1 ms, and from 156 to 584 ms at 10.5M to 3.7 to
+6.4 ms. The grouped readers' paired p50 ratio of 1.001 at 1.05M and p99 ratio of 1.008 at
+10.5M are within the 10% gate and the spread of the runs, and [ROADMAP](../ROADMAP.md) item
+170 follows them up. The ordinary spatial processes at 1.05M had no slow
+request either, with a longest write of 16.6 to 26.8 ms. In 36 to 56 of their 86 seconds,
+however, their write p90 was about 7 ms, the time of four commit synchronizations queued
+behind each other, and in the other seconds it was about 2 ms. No grouped process had such a
+second. The calibration measured 972 transactions/s unpaced for the ordinary writer, an
+average over the drive's fast and slow states. In the slow state four ordinary writers
+complete about four commits every 7 ms, or 570 transactions/s, which is less than the
+offered 583. The miss is therefore the capacity of the ordinary path in the drive's slow
+state against a calibration that averages both states, and not a stall in the engine.
+[ROADMAP](../ROADMAP.md) item 171 makes the calibration account for it.
+
 **Open under item 86.** Item 86 stays partly done. The p90 of spatial serial inserts at 10.5M
-missed its amended gate, the reader gates are not established, and the text mixed cells need
-a rerun. The follow-ups are [ROADMAP](../ROADMAP.md) items 110 to 112, which the standing
-rule that every accepted regression gets its own item produced. Item 110 bounds the write
-stall of the locked checkpoint, confirms it by tracing the ticks and ends by rerunning the
-reader gates of the text and spatial cells with more headroom in the mixed rate. Item 111
-investigates the spatial serial slowdowns at 10.5M, which are the missed p90, an accepted p50
-at 1.025 and an accepted IRI p90 at 1.032, an engine overhead of 0.240 against 0.213 ms and a
-reader p99 ratio of 1.044. Item 112 investigates the cost of a fence for indexed datasets,
-whose synchronization takes 1.4 to 1.5 ms against about 1.0 ms for one ordinary commit and
-which carries only 1.9 to 2.0 commits with four writers, so that the gain of 1.50 to 1.68 for
-full-text and spatial datasets stays near the original bar of 1.5. A later campaign should
-quiet the drive and probe its flush time before each process, randomize the order and leave
-more headroom in the mixed rate. Three smaller items wait for that work. Staged documents
-could count their bytes in the queue's limit, since a queue of long literals now holds more
-than 4 MiB of them. The leader applies a prefix's text changes, a Tantivy commit included
-when the batch is full, while its fence is still active, which delays the next fence and is
-question 4 of section 17.10. The forge runs showed no text stall that this causes beyond the
-locked checkpoint's, but they do not rule it out, since the mixed cells cannot be certified.
-The model test has no write transaction that searches text, so the wait of a search on a
-speculative head has only unit tests.
+missed its amended gate, and the spatial reader gate at 1.05M is not established. The
+follow-ups are [ROADMAP](../ROADMAP.md) items 111, 112 and 171, which the standing rule that
+every accepted regression gets its own item produced. Item 110 bounded the write stall of the
+locked checkpoint and established the text reader gate at both sizes and the spatial one at
+10.5M. Item 111 investigates the spatial serial slowdowns at 10.5M, which are the missed
+p90, an accepted p50 at 1.025 and an accepted IRI p90 at 1.032, an engine overhead of 0.240
+against 0.213 ms and a reader p99 ratio of 1.044. Item 112 investigates the cost of a fence
+for indexed datasets, whose synchronization takes 1.4 to 1.5 ms against about 1.0 ms for one
+ordinary commit and which carries only 1.9 to 2.0 commits with four writers, so that the gain
+of 1.50 to 1.68 for full-text and spatial datasets stays near the original bar of 1.5. Item
+171 reruns the spatial mixed cell at 1.05M with a rate that the ordinary writer sustains in
+the drive's slow state. A later campaign should quiet the drive, probe its flush time before
+each process and randomize the order. Three smaller items wait for that work. Staged
+documents could count their bytes in the queue's limit, since a queue of long literals now
+holds more than 4 MiB of them. The leader applies a prefix's text changes, a Tantivy commit
+included when the batch is full, while its fence is still active, which delays the next fence
+and is question 4 of section 17.10. The rerun after item 110 had no text process above the
+50 ms lag at either size, so this delay stays within the load-quality rule there. The model
+test has no write transaction that searches text, so the wait of a search on a speculative
+head has only unit tests.

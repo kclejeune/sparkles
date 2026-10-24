@@ -543,7 +543,7 @@ real server. A3 to A11 need Phases 2 and 3.
 Phase 2 shipped the cached view-only algorithm runs of §3.2, the algorithm lenses of §2.3
 with drawn-graph and projection scope, stable community colours, the GraphRAG community
 lens, the pause while playing and the compare-mode deltas of §4.3, and the top 1,000 of §5
-above 20,000 drawn nodes. Phase 3 remains [ROADMAP](../ROADMAP.md) item 105.
+above 20,000 drawn nodes. Phase 3 follows below.
 
 **What was built on the server.** `crates/sparkles-server/src/http/algo/view.rs` takes the
 `nodes`, `keep`, `async` and `top` members out of a run request before the rest parses as

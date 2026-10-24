@@ -3,7 +3,7 @@
 [ARCHITECTURE.md](../ARCHITECTURE.md#query-execution-and-where-optimizations-live)
 explains the query pipeline and the role of these mechanisms. This reference records
 operator applicability, cost-model choices and local implementation measurements.
-The timings below describe those measurements, not a current performance guarantee;
+The timings below describe those measurements and are not a performance guarantee.
 [BENCHMARKS.md](../BENCHMARKS.md) owns the published engine comparisons and methodology.
 
 The switches are defined in
@@ -13,6 +13,7 @@ operator or its cost model changes.
 
 * [Optimizations adopted from QLever](#optimizations-adopted-from-qlever)
 * [Further scan and filter optimizations](#further-scan-and-filter-optimizations)
+* [Cold reads](#cold-reads)
 
 ## Optimizations adopted from QLever
 
@@ -25,7 +26,7 @@ operator or its cost model changes.
 * **Permutation files.** Blocks store each column separately (delta, zig-zag varint,
   LZ4). Each block's first and last key stay in RAM, which allows block skipping on
   bound prefixes and exact counts with at most two block decodes.
-* **Segmented blocks.** Since index format 3 a column is a run of LZ4 frames of 2,048
+* **Segmented blocks.** A column is a run of LZ4 frames of 2,048
   rows each, whose deltas restart at every frame, and `<perm>.seg` holds each frame's
   first key and length (X07 §6.5). A reader of a few rows of a block, such as an index
   join's probe, a short range scan or the count of an edge block, decodes only the frames
@@ -113,7 +114,7 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   the block is read, in pieces of 8192 rows so that a short scan still uses every thread.
   Otherwise the runs are read in order with the delta merged in. At 10.5M triples,
   counting the `foaf:name` values that contain "Ada" tests 1.02M names and takes about
-  4 ms in the server, against 14 ms when the name column was materialized first.
+  4 ms in the server, against 14 ms when the name column is materialized first.
 * **Filters on the runs of a scan** (`filter_scan_runs`). A FILTER directly over a scan
   sorted on a variable it tests evaluates the conjuncts that read only that variable once
   per value, then copies out of the index blocks only the rows of the values that pass,
@@ -144,7 +145,7 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   are all among the other side's. For patterns on one subject this holds only when every
   subject with the rarer predicate has the others. In WatDiv, where users have most
   predicates independently of each other, it overestimated a star of six patterns
-  tenfold. A bulk load or compaction now counts the characteristic sets of the subjects,
+  tenfold. A bulk load or compaction therefore counts the characteristic sets of the subjects,
   after Neumann and Moerkotte: each set of predicates some subject has exactly, with its
   subjects and the triples of each predicate. The classes a subject has by `rdf:type`
   count as predicates of their own, since a class usually decides which predicates its
@@ -195,7 +196,8 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   exactly, instead of by every row of the scan. On English DBpedia, `?s a dbo:Band ;
   rdfs:label ?l FILTER(REGEX(?l, "^The B"))` then reads the 23,812 labels in the range
   and merges them with the bands, instead of looking up the label of each of the 36,745
-  bands. It went from 18.8 to 3.8 ms warm and from 1,040 to 90 ms cold.
+  bands. It takes 3.8 ms warm and 90 ms cold, against 18.8 ms and 1,040 ms with
+  per-band label lookups.
 * **Pure expressions per distinct value** (`expr_cache`). A FILTER conjunct, BIND, ORDER BY
   key or aggregate argument that reads one variable and gives the same result for the same
   term is evaluated once per distinct id of that variable. Rows look up the result, errors
@@ -288,8 +290,9 @@ Each of these can be switched off per query (`QueryOptions::optimizations`) or p
   is kept alone. At 10.5M triples, `optional-count` runs in 6 ms instead of 15 ms on a
   warm store. EXPLAIN notes `[merge on ?p]`. Other OPTIONALs keep the hash join, which
   puts the unmatched left rows last.
-* **Keyed left joins** (`keyed_left_join`). An OPTIONAL whose two sides share no
-  variable used to join every left row with every right row before its FILTER ran. When
+* **Keyed left joins** (`keyed_left_join`). Without this path, an OPTIONAL whose two
+  sides share no variable joins every left row with every right row before its FILTER
+  runs. When
   the FILTER has a conjunct `?a = ?b` with one variable from each side, the join pairs
   the rows through that equality instead. An IRI or a blank node equals only itself, so
   a left row whose value is one meets only the right rows with the same id. A left row

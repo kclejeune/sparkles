@@ -21,6 +21,7 @@ mod handles;
 mod indexes;
 mod interrupt;
 mod io;
+mod mappings;
 mod overview;
 mod queries;
 mod query_cursor;
@@ -34,6 +35,7 @@ mod txn;
 mod utilities;
 mod validate;
 mod validation;
+mod views;
 
 use pyo3::prelude::*;
 use pyo3::types::PyFrozenSet;
@@ -71,7 +73,9 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     indexes::register(m)?;
     reasoning::register(m)?;
     querybuilder::register(m)?;
+    mappings::register(m)?;
     queries::register(m)?;
+    views::register(m)?;
     algorithms::register(m)?;
     overview::register(m)?;
     forms::register(m)?;

@@ -7,7 +7,7 @@
 >
 > **User docs:** [API: Protections of triples](../API.md#protections-of-triples) ·
 > [Usage: Hiding some triples from some users](../USAGE.md#hiding-some-triples-from-some-users) ·
-> [Features](../FEATURES.md#server-fuseki-equivalent)
+> [Features](../FEATURES.md#access-control-and-security)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

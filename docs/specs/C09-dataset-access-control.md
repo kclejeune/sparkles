@@ -11,7 +11,7 @@
 > decided with it. Phase 3, graph-level ACLs and endpoint permissions,
 > shipped as [C12](C12-graph-access-control.md).
 >
-> **User docs:** [API: Authentication and access control](../API.md#authentication-and-access-control) · [API: Rate limiting](../API.md#rate-limiting) · [Features](../FEATURES.md#server-fuseki-equivalent)
+> **User docs:** [API: Authentication and access control](../API.md#authentication-and-access-control) · [API: Rate limiting](../API.md#rate-limiting) · [Features](../FEATURES.md#access-control-and-security)
 >
 > This is the design as written before implementation; the [Outcome](#outcome) section at the end
 > records how it landed.

@@ -552,5 +552,5 @@ accepts a tree only when every premise is asserted, an axiom or derived at a sma
 depth. §3.1's objection to the kept closure concerns reading first derivations from its
 row order, and the search does not depend on that order. `whyNot` answers `501` from
 that engine. When Phase 1 lands, its demand engine replaces the search behind the same
-route, and the tests compare the two on the same closures. Whether to build the search
-before F17 is U10's open question 1, and roadmap item 105 carries it.
+route, and the tests compare the two on the same closures. U10 Phase 3 builds the search
+before F17, as U10's open question 1 proposed.

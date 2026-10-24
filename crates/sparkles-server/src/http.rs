@@ -47,10 +47,15 @@ mod hist;
 pub(crate) mod history;
 mod inline;
 pub(crate) use sparkles::jena_formats;
+mod gsp_csv;
 #[cfg(feature = "fmt")]
 mod lint;
+mod live;
+mod mappings;
 mod patch;
 mod queries;
+mod views;
+pub(crate) use views::start as start_views;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
 pub(crate) mod sd;
@@ -195,7 +200,33 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .delete(queries::delete_query),
         )
         .route("/$/queries/{ds}/{name}/versions", get(queries::versions))
+        .route("/$/mappings/{ds}", get(mappings::list))
+        .route(
+            "/$/mappings/{ds}/{name}",
+            get(mappings::get_mapping)
+                .put(mappings::put_mapping)
+                .delete(mappings::delete_mapping),
+        )
+        .route("/$/mappings/{ds}/{name}/versions", get(mappings::versions))
+        .route(
+            "/{ds}/mappings/{name}/run",
+            post(mappings::run).layer(DefaultBodyLimit::max(
+                state
+                    .limits
+                    .max_upload_bytes
+                    .map_or(usize::MAX, |b| b as usize),
+            )),
+        )
         .route("/{ds}/queries/{name}", get(queries::run).post(queries::run))
+        .route("/$/views/{ds}", get(views::list))
+        .route(
+            "/$/views/{ds}/{name}",
+            get(views::get_view)
+                .put(views::put_view)
+                .delete(views::delete_view),
+        )
+        .route("/$/views/{ds}/{name}/rebuild", post(views::rebuild))
+        .route("/{ds}/live", get(live::live))
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/timeline", get(timeline::timeline))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
@@ -512,7 +543,10 @@ impl ApiError {
         }
         // only a refusal that a retry can pass says when to retry: a request larger than
         // the whole pool answers 507 without it
-        if budget == Some(BudgetKind::ServerMemory) && self.0 == StatusCode::SERVICE_UNAVAILABLE {
+        let behind = body.get("code").and_then(J::as_str) == Some("view-behind");
+        if (budget == Some(BudgetKind::ServerMemory) || behind)
+            && self.0 == StatusCode::SERVICE_UNAVAILABLE
+        {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
@@ -750,6 +784,7 @@ impl From<Error> for ApiError {
             Error::Branch(b) => {
                 StatusCode::from_u16(b.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
+            Error::Component(c) if c.component == "views" => views::status(&c.code),
             // query-time reasoning past a limit, or with rules it cannot evaluate
             Error::Component(c)
                 if c.component == "reasoner"
@@ -769,6 +804,9 @@ impl From<Error> for ApiError {
             Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
             Error::Patch(p) => json!({ "error": msg, "code": p.kind.code() }),
             Error::Branch(b) => branches::error_body(&b),
+            Error::Component(c) if c.component == "views" => {
+                json!({ "error": c.message, "code": c.code })
+            }
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }
@@ -3362,6 +3400,25 @@ async fn gsp_on(
             };
             Ok(report.attach(resp))
         }
+        // a CSV or TSV table, mapped into the graph (F19 §2.3)
+        Method::PUT | Method::POST | Method::DELETE
+            if gsp_csv::is_table(&content_type(&headers)).is_some() =>
+        {
+            let kind = gsp_csv::is_table(&content_type(&headers)).expect("checked");
+            gsp_csv::write(
+                st.clone(),
+                ds,
+                &p,
+                method,
+                params,
+                headers,
+                body,
+                target,
+                view,
+                kind,
+            )
+            .await
+        }
         Method::PUT | Method::POST => {
             if st.read_only {
                 return Err(err(StatusCode::FORBIDDEN, "server is read-only"));
@@ -3557,6 +3614,12 @@ async fn upload(
         .get::<Principal>()
         .and_then(|p| p.view(&name, crate::auth::Endpoint::Upload));
     let restricted = wopts.opts.graphs.is_some();
+    // `If-Match` names the head the upload expects, as on a Graph Store write: a
+    // template that read the dataset (`lookup=true`) then commits only on that state
+    wopts.opts.precondition =
+        conditional::write_precondition(&headers, ds.store.dataset_id(), &Target::Dataset);
+    // a template's lookups read what the caller may read
+    let lookup_grants = wopts.opts.graphs.clone();
     let dry = wopts
         .opts
         .dry_run
@@ -3674,6 +3737,8 @@ async fn upload(
     if files.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "no files in upload"));
     }
+    mappings.resolve(&params, &ds)?;
+    let lookup_view = lookup_param(&params)?.then_some(lookup_grants.clone());
     let (wopts, timeout) = wopts.start();
     // the admitted grant, read on the request's task before the blocking thread
     let grant = crate::server_memory::current_grant();
@@ -3707,8 +3772,20 @@ async fn upload(
                 *f = out;
             }
         }
-        // CSV and TSV files are converted into N-Triples
-        let tables = tabular::convert(&mut files, &mappings, &params, &st, &wopts, grant.as_ref())?;
+        // CSV and TSV files, and the files a mapping reads, are converted
+        let lookup = match lookup_view {
+            Some(view) => Some(tabular_lookup(&ds, view)?),
+            None => None,
+        };
+        let cx = tabular::Ctx {
+            st: &st,
+            wopts: &wopts,
+            grant: grant.as_ref(),
+            lookup,
+            only_graph: g.clone(),
+            dir: tmp.path(),
+        };
+        let tables = tabular::convert(&mut files, &mappings, &params, &cx)?;
         let sources = files
             .iter()
             .map(|p| {
@@ -3750,6 +3827,45 @@ async fn upload(
     })
     .await
     .map_err(|e| with_timeout(e, timeout))
+}
+
+/// `lookup=true`: a template reads the dataset (spec F19 §7.2).
+pub(super) fn lookup_param(params: &Params) -> ApiResult<bool> {
+    match params.get("lookup") {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(v) => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("lookup {v:?}: use true or false"),
+        )),
+    }
+}
+
+/// The snapshot a template's lookups read: the head when the conversion starts, under
+/// the caller's view when its grants cover some graphs only.
+pub(super) fn tabular_lookup(
+    ds: &Dataset,
+    view: Option<Arc<sparkles::access::GraphAccess>>,
+) -> ApiResult<sparkles::tabular::template::Lookup> {
+    let snap = ds.store.snapshot();
+    let commit = snap.commit;
+    let (snapshot, graphs) = match view {
+        Some(v) => {
+            let bound = v.bound(&snap);
+            let masked = bound.masked(&snap)?;
+            // the masked snapshot hides protected triples, and the grants keep the
+            // template out of the graphs the caller may not read
+            let graphs = (!bound.reads_all()).then_some(bound);
+            (masked, graphs)
+        }
+        None => (snap, None),
+    };
+    Ok(sparkles::tabular::template::Lookup {
+        snapshot,
+        prefixes: ds.store.prefixes().into_iter().collect(),
+        commit,
+        graphs,
+    })
 }
 
 // ------------------------------------------------------------------- admin ------

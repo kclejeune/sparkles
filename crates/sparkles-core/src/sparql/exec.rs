@@ -1391,6 +1391,7 @@ fn run_node(
             output_lease = t.lease;
             t.table
         }
+        Kind::ViewRead(spec) => super::viewsvc::run(ctx, spec, &n.vars)?,
         Kind::HistoryChanges(spec) => {
             let input = match n.children.len() {
                 0 => None,
