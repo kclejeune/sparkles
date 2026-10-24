@@ -584,13 +584,23 @@ read did not apply.
   out, since the `eq-rep-*` rules, whose predicate is a variable, would otherwise answer
   every demand.
 * **Negation.** The pattern a `noValue` reads, with its constants bound, is a demand of a
-  lower stage evaluated to its fixpoint first. A program whose stages do not end is not
+  lower stage evaluated to its fixpoint first. A negated `rdf:type` pattern with a
+  constant class asks for that class alone, as a positive one does. The schema pass runs
+  its lower stages first too, and they derive instance facts in full, so a schema rule's
+  `noValue` reads a complete pattern. A program whose stages do not end is not
   stratified and fails with `422` and `reasoning-rules`.
+* **Lists.** A builtin or head action that reads an RDF list is not evaluated again when
+  the list's facts grow. When rules give `rdf:first` or `rdf:rest` facts with that
+  constant predicate, a lower stage therefore derives every such list before the stage
+  that reads it. The facts a `listForAll` reads are asked for behind the copy's guard,
+  unless an atom of the rule already matches them as in `cls-int1`.
 * **Evaluation.** `crates/sparkles-reasoner/src/query.rs` evaluates the program with the
   semi-naive engine over the base tier of the caller's input graphs, under the query's
-  deadline, cancellation and memory budget. Each derivation adds its magic facts and
-  continues from them. The program is made at the first derivation that misses the table
-  cache.
+  deadline, cancellation and memory budget, and the schema joins of specialization stop
+  with the query too. Each derivation adds its magic facts and continues from them. The
+  program is made at the first derivation that misses the table cache. The facts a query
+  copies into its view are charged to its memory budget at 448 bytes each, seven index
+  keys with their node overhead, also when they come from cached tables.
 * **Tables.** `crates/sparkles-reasoner/src/tables.rs` caches what a demand derived,
   keyed by the generation, the commit, the mask of a view that hides triples, the input
   graphs, the rules' digest, the demand with its constants and a hash of its seeds. Local
@@ -601,7 +611,11 @@ read did not apply.
   `--reasoning`, `--profile`, `--rules` and `--max-derived`, and `serve` takes
   `--reason-max-derived`. `Dataset::query_reasoner` gives the library's provider for
   `QueryOptions::reasoning`. EXPLAIN shows a `Reason` node over the plan with a `Derive`
-  node per pattern.
+  node per pattern. A DESCRIBE under `reasoning=demand` fails with `501` and the code
+  `unsupported`, since the description reads facts outside the WHERE pattern that no
+  demand asks for. Item 193 covers it.
+* **Access.** `owl:imports` are followed only through graphs the caller can read, so a
+  denied graph adds no schema and its imports appear in no warning.
 
 **Decisions where this spec left the choice open.**
 
@@ -626,6 +640,12 @@ read did not apply.
    read without derivation, then the fewest stored facts.
 7. The table cache is process-wide with its own budget of 256 MiB rather than the
    dataset's result cache budget of §6.1. Item 192 covers this.
+8. Lists that rules derive are complete in a lower stage, which derives every list the
+   rules give rather than the lists a query reaches. This costs a derivation of all such
+   lists for each query that reads one and keeps the answers equal to a fixpoint. Lists
+   that only the equality rules rename are read with what they hold so far.
+9. DESCRIBE is refused rather than answered from the asserted facts, so a description is
+   never silently incomplete.
 
 **Measurements.** Development measurements on an nsc instance (16 vCPUs of an AMD EPYC
 host, 32 GiB) on 2026-10-24 at `d80c0ce7`, with the server alone on it. Each query ran
@@ -719,9 +739,22 @@ in small. A6 holds in `budget_stops_a_runaway_rule`, A7 in the server test
 `tables_are_cached_per_snapshot`, and A10 in `rdfs_on_read_does_not_apply_under_demand`.
 A4, A5, A8 and A9's second part belong to Phase 2.
 
+**Review.** The Codex review of the phase found eight problems, each fixed with a
+regression test in `crates/sparkles-reasoner/tests/demand.rs` that failed before the
+fix. Imports were resolved before the caller's graph filter, which exposed the imports of
+denied graphs in warnings (`imports_follow_the_graph_view`). The linear rewriting dropped
+stored facts of the recursive predicate (`linear_recursion_reads_stored_facts`). The
+schema pass skipped its lower stages (`schema_negation_reads_complete_lower_stages`).
+Facts copied from cached tables bypassed the memory budget
+(`cached_tables_are_charged_to_the_memory_budget`). Specialization ignored the deadline
+(`specialization_stops_at_the_deadline`). List builtins asked for no derived lists
+(`list_builtins_ask_for_derived_lists`). Negated type demands lost their class and
+reported a false cycle (`negative_type_demands_keep_the_class`). DESCRIBE answered
+without derived facts (`describe_is_refused_under_demand`).
+
 **Limitations.** Schema facts that follow only from derived instance facts can be missing
 from a query that reads them, as decision 3 describes, and `owl:sameAs` that rules derive
 between schema terms does not reach the schema (item 191). Equality is not kept as
 canonical representatives, so an entity with many aliases still costs a fact per alias and
 property in the equality stage. `MAX_SEEDS` and the specialization caps are not tuned by
-measurement.
+measurement. DESCRIBE is refused under `reasoning=demand` (item 193).

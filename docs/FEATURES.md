@@ -436,12 +436,13 @@ that work by priority and links each item to its design spec.
   queries that read millions of facts take tens to over a hundred times as long. A query that reads
   schema facts uses the rules unspecialized, and schema facts that follow only from
   derived instance facts, such as the `rdfs:Class` typing of a class whose instances are
-  all derived, may be missing from its answers. Derived facts still use
+  all derived, may be missing from its answers. DESCRIBE is refused under derivation on
+  demand. Derived facts still use
   the ordinary inferred graph. A separate derived-fact layer and canonical
   `owl:sameAs` representatives are not built. Incremental maintenance does not cover rules with `noValue`,
   `now` or new blank nodes, or RDF lists that change under OWL 2 RL. Those runs, and the
   first run after a compaction without retained history, compute everything again.
-  Inconsistency checks cover a fixed subset of OWL 2 RL. Over a kept closure, changes of 100 triples at 16 threads take 1.6 to 2.3 times their time before the closure dropped the explicit facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. [Roadmap](ROADMAP.md) items 9, 17, 19, 53, 113, 190, 191, 192.
+  Inconsistency checks cover a fixed subset of OWL 2 RL. Over a kept closure, changes of 100 triples at 16 threads take 1.6 to 2.3 times their time before the closure dropped the explicit facts, and undos at 1 thread take 1.3 to 1.8 times, on LUBM-style data. [Roadmap](ROADMAP.md) items 9, 17, 19, 53, 113, 190, 191, 192, 193.
 * **SPARQL extensions.** Sparkles has ARQ's query language and function library apart
   from JavaScript functions, `afn:context`, the Leviathan `lfn:` library, the `JSON`
   query form and evaluation of `shortest(…)` paths, which ARQ does not evaluate either.

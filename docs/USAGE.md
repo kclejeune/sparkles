@@ -677,7 +677,8 @@ the query needs from the rules of `--profile`, the last materialization's profil
 default, or of a Jena rule file given with `--rules`, whose backward rules answer this
 way, and leaves the inferred graph out. `--max-derived` caps the facts it derives, and
 `--explain` shows a `Derive` node for each pattern
-([Query-time reasoning](API.md#query-time-reasoning)). `--reasoning false` reads the
+([Query-time reasoning](API.md#query-time-reasoning)). A DESCRIBE is refused with
+`--reasoning demand`. `--reasoning false` reads the
 asserted data alone.
 
 When a persistent dataset opens and its configured text index is missing or damaged,

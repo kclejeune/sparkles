@@ -6979,6 +6979,11 @@ beyond the schema, where a materialization derives 10.9 million.
   says so.
 * `reasoning=auto`, the cost-based choice between the inferred graph and derivation,
   answers `400` until F17 Phase 2.
+* A DESCRIBE with `reasoning=demand` fails with `501` and the code `unsupported`, since
+  the description reads facts that no pattern asks for. CONSTRUCT with the description's
+  patterns gives the derived facts.
+* The facts copied into a query's view are charged to its memory budget, also when they
+  come from cached tables.
 
 Under OWL 2 RL, the rules are first specialized to the dataset's schema: the schema's
 facts are derived once per snapshot, and each rule that joins a schema fact with an
