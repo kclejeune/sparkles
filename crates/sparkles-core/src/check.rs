@@ -984,6 +984,22 @@ impl Checker<'_> {
                                     .offset(at)
                                     .id(id.to_string()),
                                 );
+                            } else if i > 0
+                                && shared < prev.len()
+                                && shared < key.len()
+                                && key[shared] == prev[shared]
+                            {
+                                // a lookup compares keys by their shared prefixes and
+                                // needs the longest one (`Vocab::find_in_block`)
+                                issues.push(
+                                    Issue::error(format!(
+                                        "term {id} stores a shorter shared prefix than it has with term {}",
+                                        id - 1
+                                    ))
+                                    .block(b)
+                                    .offset(at)
+                                    .id(id.to_string()),
+                                );
                             }
                             if first.is_none() {
                                 first = Some(key.clone());

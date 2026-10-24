@@ -9501,6 +9501,8 @@ export interface components {
         kind: "assistant" | "memory" | "ingest" | "graphrag" | "forms" | "models" | "notifications";
         /** @description The page size. */
         limit: number;
+        /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+        maxDerived: number;
         /** @description A lower budget of the serialized result, in MiB. */
         maxResultMb: number;
         /** @description A lower budget of intermediate rows. */
@@ -9519,8 +9521,12 @@ export interface components {
         policy: string;
         /** @description `io` adds an `io` object to the metadata of the `application/x-sparkles+json` result, with what the query read from the index and vocabulary files and the time spent doing so. The counters are process-wide, so concurrent queries add to them. Overlapping profiles share at most 65,536 first-admitted pages; pagesTruncated reports cap omissions, not completeness. Page counts describe the retained sample, and broughtIn is its diagnostic nonnegative resident-count delta rather than physical I/O. Numeric mapped loads are observed independently of advice, including hints-off and previously hinted reads. The counters cover the whole process, so the parameter needs the `metrics` permission and answers `403` without it. Any other value answers `400`. */
         profile: "io";
+        /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+        queryReasoning: "true" | "false" | "materialized" | "demand";
         /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
         reasoning: boolean;
+        /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+        reasoningProfile: "rdfs" | "rdfs-simple" | "owl-rl";
         /** @description Add a commit receipt to the body. */
         receipt: boolean;
         /** @description A commit: `42`, `commit:42` or `head`. */
@@ -17282,8 +17288,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -17443,8 +17453,12 @@ export interface operations {
                 "named-graph-uri"?: components["parameters"]["namedGraphUri"];
                 /** @description The response format, in place of `Accept`. Fuseki's `output` and `results` are the same parameter. */
                 format?: components["parameters"]["format"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The most rows serialized. Eager native metadata reports the full total; streaming stops production at the prefix and reports a null total unless exhausted. */
@@ -19215,8 +19229,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -19286,8 +19304,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -19594,8 +19616,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
@@ -19665,8 +19691,12 @@ export interface operations {
                 format?: components["parameters"]["format"];
                 /** @description Seconds. Capped at the server's `--max-timeout`. */
                 timeout?: components["parameters"]["timeout"];
-                /** @description Include materialized inferences. The default is true when the dataset has any. False also turns RDFS on read off. */
-                reasoning?: components["parameters"]["reasoning"];
+                /** @description `true` or `materialized` reads materialized inferences, the default when the dataset has any. `demand` derives the facts the query needs from the dataset's rules as it runs, without the inferred graph (spec F17). `false` reads the asserted data alone and also turns RDFS on read off. */
+                reasoning?: components["parameters"]["queryReasoning"];
+                /** @description The rules of `reasoning=demand`. The default is the profile of the last materialization. */
+                reasoningProfile?: components["parameters"]["reasoningProfile"];
+                /** @description The most facts `reasoning=demand` may derive for the query, magic facts aside. It never exceeds the server's `--reason-max-derived`. */
+                maxDerived?: components["parameters"]["maxDerived"];
                 /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
                 at?: components["parameters"]["at"];
                 /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */

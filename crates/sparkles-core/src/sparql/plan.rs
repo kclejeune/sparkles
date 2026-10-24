@@ -2648,7 +2648,7 @@ impl<'a> Planner<'a> {
         // unknown constants → empty
         if t.t
             .iter()
-            .any(|x| matches!(x, PT::C(id) if id.tag() == Tag::Local))
+            .any(|x| matches!(x, PT::C(id) if self.ctx.unknown_const(*id)))
         {
             return Ok(vec![Node::empty(vars_of(t))]);
         }
@@ -3364,15 +3364,15 @@ impl<'a> Planner<'a> {
         let mut children = Vec::new();
         let mut edge_vars = None;
         let simple = match simple {
-            Some((id, _)) if id.tag() == Tag::Local && min == 1 => {
+            Some((id, _)) if self.ctx.unknown_const(id) && min == 1 => {
                 return Ok(Node::empty(left.vars.clone()));
             }
             // a predicate that is not in the store: only the zero-length path matches
-            Some((id, _)) if id.tag() == Tag::Local && count.is_some() => {
+            Some((id, _)) if self.ctx.unknown_const(id) && count.is_some() => {
                 count = Some((0, Some(0)));
                 Some((0, false))
             }
-            Some((id, rev)) if id.tag() != Tag::Local => Some((id.0, rev)),
+            Some((id, rev)) if id.tag() != Tag::Local || self.ctx.local_facts => Some((id.0, rev)),
             _ => {
                 let (a, b) = (self.ctx.fresh_var(), self.ctx.fresh_var());
                 let mut items = Vec::new();

@@ -1715,6 +1715,37 @@ queries that decode many strings, such as `export-500k`, `contains` and `lang-fi
 the default. Cold queries ran 2% to 3% faster on average, because fewer vocabulary pages
 are read, but cold `export-500k` still took 1.11 times as long.
 
+Roadmap item 108 made FSST reads faster without changing the files
+([X11](specs/X11-index-compression-and-predicate-patterns.md#item-108-faster-fsst-reads)).
+Forge compared the release binary of `e411a772` with the branch at `c2518d7b` on
+2026-10-24, with both binaries on the same stores in interleaved rounds. Warm 10.5M cells
+are medians of four runs of 15 requests, warm DBpedia cells of two runs of 10, and cold
+cells of two runs of five cold samples.
+
+| Measurement | Main, front | Main, FSST | Branch, front | Branch, FSST |
+|---|---:|---:|---:|---:|
+| Warm `export-500k` at 10.5M | 106.6 ms | 118.1 ms | 105.6 ms | 115.7 ms |
+| Warm `contains` at 10.5M | 13.08 ms | 14.11 ms | 12.77 ms | 13.31 ms |
+| Warm `lang-filter` at 10.5M | 9.24 ms | 9.99 ms | 9.30 ms | 9.69 ms |
+| Warm `star-join` at 10.5M | 29.07 ms | 29.18 ms | 28.86 ms | 30.40 ms |
+| Warm `export-1m` on DBpedia | 357.0 ms | 959.3 ms | 347.7 ms | 366.4 ms |
+| Warm geometric mean at 10.5M | 1 | 1.000 | 0.992 | 1.004 |
+| Warm geometric mean on DBpedia | 1 | 1.062 | 1.019 | 1.041 |
+| Cold `export-500k` at 10.5M | 131.7 ms | | 131.4 ms | 134.1 ms |
+| Cold geometric mean at 10.5M | 1 | | 0.999 | 0.999 |
+| Cold geometric mean on DBpedia | 1 | | 0.968 | 0.958 |
+
+The DBpedia export took 2.69 times as long with main's FSST as with front coding, and it
+takes 1.05 times as long with the branch's. The branch's front coding measured 1.019 on
+DBpedia because of queries under 1 ms in a single round, and perf on atlas counted the same
+or fewer instructions for it on each of the nine DBpedia queries that moved most, and
+roadmap item 161 confirms this with a pinned forge rerun. Cold `export-500k` now meets the gate, at 1.02
+times front coding, but cold `entity-summary-1` on DBpedia took 1.17 times as long as with
+front coding, above the cold limit of 15%. Warm `contains`, `lang-filter` and the export at 10.5M still run 4% to
+10% slower than front coding, and DBpedia's `abstract-contains` and `label-regex` 12%
+slower, so FSST stays an option. `star-join` runs 4% slower with the branch's FSST than
+with main's, and roadmap item 160 follows up on it and on cold `entity-summary-1`.
+
 ## Loading and index builds
 
 Sparkles builds its index in one parallel pass. Parsing and vocabulary merging run on all
@@ -2213,6 +2244,75 @@ calibration needs more headroom than 20% when the synchronization time varies th
 The embedding cell has no reader gate, and its worker called a deterministic local provider.
 The amended gates were written after this campaign, so the next forge run is the first to
 judge them without having seen its data.
+
+### Bounded full-text checkpoint on forge
+
+[Roadmap](ROADMAP.md) item 110 traced the background checkpoint of the full-text index on
+`forge` on 2026-10-24 with `scripts/bench-indexed-commit.py`, under the host's bench and
+heavy locks. Each run was the mixed scenario of the full-text cell at 1.05M, with one block
+of an ordinary, two grouped and an ordinary process at a fixed 500 transactions/s and two
+readers, and with the debug target `sparkles::text::checkpoint` passed to the server. Every
+release binary was built on `forge` before timing. Build A is e411a772 with only the trace
+added. Build B synchronizes only the files written since the last pass and follows a raced
+unlocked pass with a locked one at once. Build C first repeats the unlocked pass until at
+most 16 files are left. Build D, the one that shipped, repeats it until none are left and
+synchronizes a pass's files from eight threads. The table pools the two processes of each
+setting. A stall is a run of writes slower than 25 ms that starts within 1 s of the last.
+
+| Build | Setting | Locked passes | Lock held p50 (ms) | Lock held max (ms) | Unlocked pass p50 (ms) | Stalls | Longest write (ms) | Max schedule lag (ms) | Write p99 (ms) | Reader p99 (ms) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| A | ordinary | 38 | 61.7 | 166.3 | 69.5 | 37 | 171.4 | 165.6, 162.3 | 9.87, 10.43 | 7.17, 7.33 |
+| A | grouped | 38 | 101.0 | 164.8 | 83.6 | 36 | 167.8 | 162.5, 159.6 | 6.76, 7.28 | 7.41, 6.88 |
+| B | ordinary | 37 | 24.2 | 48.4 | 77.3 | 24 | 88.3 | 81.5, 61.4 | 9.92, 9.90 | 7.40, 7.31 |
+| B | grouped | 36 | 35.4 | 54.0 | 80.4 | 32 | 71.3 | 63.4, 57.6 | 6.97, 7.06 | 7.42, 7.80 |
+| C | ordinary | 36 | 23.7 | 44.1 | 76.8 | 23 | 60.0 | 61.6, 52.0 | 9.77, 10.02 | 7.43, 7.28 |
+| C | grouped | 36 | 24.5 | 56.6 | 77.1 | 29 | 116.5 | 55.9, 110.0 | 6.69, 7.86 | 7.34, 7.32 |
+| D | ordinary | 0 | none | none | 27.7 | 0 | 19.5 | 31.0, 37.9 | 10.04, 9.41 | 7.69, 7.48 |
+| D | grouped | 0 | none | none | 31.8 | 0 | 18.6 | 10.1, 10.7 | 6.83, 6.70 | 7.51, 7.19 |
+
+The trace of build A confirms the cause. Every unlocked checkpoint was raced, every fourth
+tick held the live writer lock through a synchronization of every index file, about every
+5.3 s, and 106 of the 111 stalls of the six traced processes of build A lay inside such a
+tick. Synchronizing only the new files did not shorten the unlocked pass, because the
+segments that the readers' searches commit are merged away within seconds, so nearly every
+file in the directory is new at each tick. It did shorten the locked pass to the files of
+the unlocked pass before it. Each synchronization of a new file cost about 1.5 ms on its
+own, because each forced a journal commit, and the locked pass still held the lock for a
+median of 24 ms. Synchronizing eight files at once lets ext4 commit them together, which
+brought the unlocked pass from 77 to 28 or 32 ms. The repetitions then caught up, 76 of 111
+of them cleared the marker, and no tick of build D needed the lock for its I/O. The longest
+write fell from about 170 ms to under 20 ms in both settings, and build D met the 50 ms
+schedule lag in all four processes. Its reader p99 was 7.47 ms on average against 7.20 ms
+for build A, 3.8% higher over four processes each, which is within the spread of these
+runs but is followed up as [roadmap](ROADMAP.md) item 170, since eight synchronizing
+threads could compete with readers for the drive.
+
+### Indexed mixed cells after item 110 on forge
+
+The text and spatial mixed cells of [X09 section 17.9](specs/X09-group-commit-by-default.md#179-performance-gates)
+ran again on `forge` on 2026-10-24 with build D of the section above, under the host's bench
+and heavy locks. Each cell ran five blocks of an ordinary, a grouped, a grouped and an
+ordinary process, four writers and two readers, at 60% of the slowest unpaced process
+instead of 80%, through `--rate-fraction 0.6`. The medians pool the ten processes of each
+setting, and the ratios are the paired medians of grouped to ordinary that
+`scripts/bench-indexed-report.py` prints.
+
+| Cell | Rate (tx/s) | Reader p50, ordinary and grouped (ms) | Reader p99, ordinary and grouped (ms) | Paired p50 and p99 ratios | Max schedule lag, ordinary and grouped (ms) | Gate |
+|---|---:|---|---|---|---|---|
+| Text at 1.05M | 414 | 4.85, 4.84 | 7.94, 7.72 | 1.001, 0.993 | 6.3–30.1, 4.2–12.1 | Met. |
+| Text at 10.5M | 354 | 4.87, 4.83 | 8.00, 8.10 | 0.987, 1.008 | 3.7–6.4, 2.2–10.1 | Met. |
+| Spatial at 1.05M | 583 | 1.04, 0.98 | 1.66, 1.35 | 0.947, 0.813 | 136.1–271.7, 8.0–11.7 | Not established. |
+| Spatial at 10.5M | 444 | 1.03, 1.02 | 1.48, 1.45 | 0.999, 0.988 | 3.5–12.3, 4.0–8.8 | Met. |
+
+No text process stalled. The ordinary lag of the text cell fell from 153 to 182 ms at 1.05M
+on 2026-10-23 to 6.3 to 30.1 ms, and from 156 to 584 ms at 10.5M to 3.7 to 6.4 ms. The
+grouped readers' paired p50 ratio of 1.001 at 1.05M and p99 ratio of 1.008 at 10.5M are
+within the gate and the spread of the runs, and [roadmap](ROADMAP.md) item 170 follows them up. The ordinary spatial processes at 1.05M had no slow
+request, but in 36 to 56 of their 86 seconds four queued commit synchronizations took about
+7 ms, so they sustained about 570 transactions/s against the offered 583. The unpaced
+calibration averaged the drive's fast and slow states, and [roadmap](ROADMAP.md) item 171
+corrects it. The grouped spatial processes stayed under 12 ms of lag. Memory and the achieved
+rate passed in every cell.
 
 ### Reader tail of group commit on forge
 

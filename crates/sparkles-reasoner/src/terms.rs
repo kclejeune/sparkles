@@ -212,6 +212,15 @@ impl Terms {
         self.id_charged(t, true)
     }
 
+    /// The id of the IRI or literal with vocabulary key `key`: in the store, else a
+    /// (new) local id, failing without a new term when it does not fit the budget.
+    pub fn try_id_for_key(&self, key: &[u8]) -> Result<u64, MemoryExceeded> {
+        if let Some(id) = self.snap.lookup_key(key) {
+            return Ok(id.0);
+        }
+        self.local_keyed(key.to_vec(), LocalTerm::Key(Vec::new()), true)
+    }
+
     fn id_charged(&self, t: &Term, strict: bool) -> Result<u64, MemoryExceeded> {
         if let Some(id) = id::inline_id(t) {
             return Ok(id.0);

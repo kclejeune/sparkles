@@ -949,6 +949,37 @@ impl Snapshot {
         self.perm(Perm::Spo).contains(&self.cache, &k)
     }
 
+    /// This snapshot with `quads` added, as a view for one query (spec F17 §3.2): the
+    /// facts query-time reasoning derived. The view is not cacheable, so the result cache
+    /// neither reads nor fills entries for it, and its counts start empty. With `absent`,
+    /// the caller knows that none of the quads is in the base index unless the delta
+    /// deleted it there, so no base probe is made. Ids tagged local are the query's own
+    /// terms, which only the query that made them reads.
+    pub fn with_overlay(&self, quads: &[[Id; 4]], absent: bool) -> Result<Snapshot> {
+        let mut delta = self.delta.clone();
+        let spo = Perm::Spo.index();
+        for q in quads {
+            let k = Perm::Spo.to_key(q);
+            if delta.ins[spo].contains(&k) {
+                continue;
+            }
+            if delta.del[spo].contains(&k) {
+                apply(&mut delta, q, true, true);
+                continue;
+            }
+            if !absent && self.perm(Perm::Spo).contains(&self.cache, &k)? {
+                continue;
+            }
+            apply(&mut delta, q, true, false);
+        }
+        Ok(Snapshot {
+            delta,
+            counts: Default::default(),
+            cacheable: false,
+            ..self.clone()
+        })
+    }
+
     /// Distinct values of the first key column (e.g. graph names from GSPO), by skipping.
     fn distinct_first_checked(
         &self,
@@ -3614,6 +3645,26 @@ impl Store {
         self.text
             .load_full()
             .is_some_and(|ti| ti.checkpoint_background_for_test())
+    }
+
+    /// Test hook: stop the full-text index's segment merges.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn stop_text_merges_for_test(&self) {
+        if let Some(ti) = self.text.load_full() {
+            ti.stop_merges_for_test();
+        }
+    }
+
+    /// Test hook: the background full-text checkpoint passes that held the live writer
+    /// lock, those of them that cleared the index's marker, and the background passes of
+    /// any kind that cleared it.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn text_background_checkpoints_for_test(&self) -> [u64; 3] {
+        self.text
+            .load_full()
+            .map_or([0; 3], |ti| ti.background_checkpoints_for_test())
     }
 
     /// Test hook: pause (or resume) the full-text index's background tick, so staged
