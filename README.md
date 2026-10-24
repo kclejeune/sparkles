@@ -1,15 +1,17 @@
 # Sparkles ✨
 
-A fast RDF, SPARQL and OWL database in Rust, compatible with Apache Jena and Fuseki.
+Sparkles is a fast RDF, SPARQL and OWL database in Rust, compatible with Apache Jena and
+Fuseki.
 
-Sparkles implements the protocols, semantics and operational model of
+It implements the protocols, semantics and operational model of
 [Apache Jena](https://jena.apache.org/) and Fuseki on the index and execution architecture
 of [QLever](https://github.com/ad-freiburg/qlever). Applications that talk to Fuseki keep
 working, Java and Kotlin programs keep using Jena's APIs through a `DatasetGraph` backed by
 Sparkles, and queries run on sorted, compressed indexes with a cost-based, column-at-a-time
 executor. Sparkles adds MVCC transactions, durable commits, online compaction and a history
-that can be queried, diffed and branched. The engine is a library, and the server, the CLI,
-the web UI and the Python, JVM and Node.js bindings are all built on it.
+that can be queried, diffed and branched. The engine is a library, and the server, the CLI
+and the Python, JVM and Node.js bindings are built on it. The RDF term model, the parsers
+and the SPARQL algebra come from the Oxigraph project's crates.
 
 > [!WARNING]
 > Sparkles is experimental. There are no releases, and the on-disk format, HTTP API, CLI
