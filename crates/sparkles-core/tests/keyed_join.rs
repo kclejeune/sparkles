@@ -316,3 +316,33 @@ fn application_callbacks_in_the_filter_keep_the_product() {
     );
     assert!(operators(&r.plan, "KeyedJoin").is_empty());
 }
+
+/// SP2Bench q12a's shape: two large parts linked by an equality of names. A cursor
+/// reads both alternately and stops at the first matching pair. The answers agree
+/// with the product's, whether a pair exists or not.
+#[test]
+fn ask_over_a_large_keyed_join_reads_both_sides_alternately() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..3000 {
+        data += &format!("ex:a{i} ex:creator ex:p{i} . ex:p{i} ex:name \"Person {i}\" .\n");
+        // the inproceedings' authors are other people, except one shared name
+        let j = i + 5000;
+        data += &format!("ex:b{i} ex:author ex:q{j} . ex:q{j} ex:label \"Person {j}\" .\n");
+    }
+    data += "ex:q9 ex:label \"Person 2999\" . ex:bq ex:author ex:q9 .\n";
+    load(&store, data);
+    for (extra, expected) in [("", true), ("&& ?n1 != \"Person 2999\"", false)] {
+        let text = format!(
+            "PREFIX ex: <http://example.org/> ASK {{ ?a ex:creator ?p1 . ?p1 ex:name ?n1 . \
+             ?b ex:author ?p2 . ?p2 ex:label ?n2 FILTER(?n1 = ?n2 {extra}) }}"
+        );
+        for keyed in [true, false] {
+            let r = query(store.snapshot(), &text, &options(100_000_000, keyed)).unwrap();
+            assert_eq!(r.boolean, expected, "{extra}, keyed {keyed}");
+        }
+        let r = query(store.snapshot(), &text, &options(100_000_000, true)).unwrap();
+        let keyed_ops = operators(&r.plan, "KeyedJoin");
+        assert_eq!(keyed_ops.len(), 1, "{extra}");
+    }
+}

@@ -363,11 +363,14 @@ pub enum Kind {
     /// The inner join of two parts of a group that share no variable, linked by a FILTER
     /// conjunct `?left = ?right` over a variable of each. The candidate pairs are those of
     /// [`Kind::KeyedLeftJoin`], and `expr`, the conjunction of the FILTERs that need both
-    /// sides, is tested on them, so the result is the filtered product's.
+    /// sides, is tested on them, so the result is the filtered product's. With `ripple`,
+    /// set for an ASK that a cursor answers, both inputs are read alternately so that the
+    /// first matching pair ends the query early (see `cursor::ripple`).
     KeyedJoin {
         expr: Expr,
         left: VarId,
         right: VarId,
+        ripple: bool,
     },
     Minus,
     /// ARQ's SEMIJOIN (`anti`: ANTIJOIN): the rows of child 0 compatible with a row of
@@ -4091,6 +4094,7 @@ fn keyed_inner_join(l: Node, r: Node, expr: Expr, (a, b): (VarId, VarId), ctx: &
             expr,
             left: a,
             right: b,
+            ripple: false,
         },
         vars,
         certain,

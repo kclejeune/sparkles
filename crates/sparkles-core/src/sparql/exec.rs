@@ -1150,7 +1150,9 @@ fn run_node(
             let r = child(1, infos)?;
             keyed_left_join(ctx, &l, &r, expr, (*left, *right), &mut note)?
         }
-        Kind::KeyedJoin { expr, left, right } => {
+        Kind::KeyedJoin {
+            expr, left, right, ..
+        } => {
             let l = child(0, infos)?;
             let r = child(1, infos)?;
             keyed_join(ctx, &l, &r, expr, (*left, *right), false, &mut note)?

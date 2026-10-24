@@ -29,6 +29,7 @@ mod group;
 mod joinspill;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 mod merge;
+mod ripple;
 mod topk;
 mod walk;
 
@@ -946,6 +947,16 @@ fn filtered_ask_admitted(ctx: &Ctx, node: &Node) -> bool {
         }
         filtered = &filtered.children[0];
     }
+    // A keyed join reads its inputs alternately under ASK (see `ripple`), so the first
+    // matching pair ends both. Small inputs are joined eagerly at less fixed cost.
+    if let Kind::KeyedJoin { .. } = filtered.kind {
+        return filtered.children.len() == 2
+            && filtered
+                .children
+                .iter()
+                .any(|c| c.est.is_finite() && c.est >= AUTO_SCAN_ROWS)
+            && native(filtered);
+    }
     let Kind::Filter(expressions) = &filtered.kind else {
         return false;
     };
@@ -1045,6 +1056,11 @@ fn orient_filtered_ask(node: &mut Node) {
             break;
         }
         filtered = &mut filtered.children[0];
+    }
+    if let Kind::KeyedJoin { ripple, .. } = &mut filtered.kind {
+        // the first matching pair answers the ASK
+        *ripple = filtered.children.len() == 2;
+        return;
     }
     if !matches!(filtered.kind, Kind::Filter(_)) {
         return;
@@ -2084,6 +2100,7 @@ enum State {
     Merge(Box<merge::Merge>),
     Distinct(distinct::Distinct),
     Binary(Box<binary::Binary>),
+    Ripple(Box<ripple::Ripple>),
     Group(Box<group::Group>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
@@ -2625,7 +2642,10 @@ impl Operator {
         if incremental_binary && !needed && ctx.spill.is_some() {
             order.clear();
         }
-        let binary = incremental_binary
+        let ripple = (incremental_binary && ripple::eligible(&node))
+            .then(|| ripple::Ripple::new(ctx, &node))
+            .transpose()?;
+        let binary = (incremental_binary && ripple.is_none())
             .then(|| binary::Binary::new(ctx, &node, !order.is_empty() || probe_value_ordered))
             .transpose()?;
         if binary.is_some()
@@ -2676,6 +2696,8 @@ impl Operator {
             State::Merge(Box::new(merge))
         } else if let Some(binary) = binary {
             State::Binary(Box::new(binary))
+        } else if let Some(ripple) = ripple {
+            State::Ripple(Box::new(ripple))
         } else if let Some(group) = group {
             State::Group(Box::new(group))
         } else if filter::eligible(&node, &children) {
@@ -3134,6 +3156,13 @@ impl Operator {
                     }
                     if batch.is_none() {
                         binary.release_working_sets();
+                    }
+                    batch
+                }
+                State::Ripple(ripple) => {
+                    let batch = ripple.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if batch.is_none() {
+                        ripple.release_working_sets();
                     }
                     batch
                 }
