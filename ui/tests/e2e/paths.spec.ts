@@ -68,13 +68,16 @@ test('A4: the k shortest paths from Alice to Lyon are listed in order of length'
   );
   expect(lengths.length).toBeGreaterThan(1);
   expect(lengths).toEqual([...lengths].sort((a, b) => a - b));
-  // the graph carries path 1's number and draws it first
+  // the graph carries path 1's number; the edge's label is prefixed once Explore has read
+  // the dataset's prefixes, which can come after the edge is drawn
   await expect
     .poll(async () => {
       const raw = await page.locator('.wrap[data-graph]').getAttribute('data-graph');
-      return (JSON.parse(raw ?? '{"edges":[]}') as { edges: [string][] }).edges.map(([l]) => l);
+      return (JSON.parse(raw ?? '{"edges":[]}') as { edges: [string][] }).edges.some(([l]) =>
+        /^(ex:)?worksFor · 1$/.test(l),
+      );
     })
-    .toContain('ex:worksFor · 1');
+    .toBe(true);
 });
 
 anonymous(
