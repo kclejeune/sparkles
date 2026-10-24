@@ -112,7 +112,14 @@ async function edgeOn(page: Page, from: string, to: string) {
         while (el && !('_cyreg' in el)) el = el.parentElement;
         const cy = (el as unknown as { _cyreg: { cy: { edges(): Edge[] } } })._cyreg.cy;
         const e = [...cy.edges()].find(
-          (x) => x.source().data('label') === from && x.target().data('label') === to,
+          // a label is a local name or a prefixed name, as the server's prefixes give it
+          (x) => {
+            const l = (n: Node, want: string) => {
+              const v = String(n.data('label'));
+              return v === want || v.endsWith(`:${want}`);
+            };
+            return l(x.source(), from) && l(x.target(), to);
+          },
         )!;
         const p = e.renderedMidpoint();
         const box = el!.getBoundingClientRect();
@@ -128,7 +135,9 @@ open(
     await setUp(request, 'why-open', {});
     await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), 'why-open');
     await page.goto(`/ui/explore?ds=why-open&iri=${encodeURIComponent(`${EX}alice`)}`);
-    await expect.poll(async () => (await drawn(page)).nodes.map(([l]) => l)).toContain('Employee');
+    await expect
+      .poll(async () => (await drawn(page)).nodes.some(([l]) => /(^|:)Employee$/.test(l)))
+      .toBe(true);
     await expect
       .poll(async () => (await drawn(page)).edges.some(([, , i]) => i === 'inferred'))
       .toBe(true);
