@@ -54,7 +54,7 @@ export interface paths {
         put?: never;
         /**
          * Run a graph algorithm
-         * @description Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.
+         * @description Without `write` the run is the SPARQL query its request stands for, answered as `/{ds}/sparql` answers (`Accept`, `timeout`, `execution` and the budget overrides apply), one row per node, node pair or node and level. `summary=true` returns only the statistics of the run. A request with `nodes`, `keep`, `async` or `top` is a view-only run, which answers in SPARQL JSON with the rows of the listed nodes, `communitySize` for community and component rows, the run's `summary` and a `run` member that names the commit and whether the cache answered. With `keep` the whole result is kept in a cache of at most 8 results and 512 MiB charged to the server memory pool, and with `async` as well the run is an `algo-view` task that needs only read, which a request for the same key joins and the caller that started it may cancel. With `write` the run is a task that computes at the head commit and writes the rows in batched commits, with a run record in the graph. Read-only runs need read through the query endpoint and use Query rate/concurrency limits. Write-back runs need write through the update endpoint and use Update HTTP admission through the 202 response body. Background work uses the existing task queue and algorithm-thread admission, not an HTTP permit. A task can be cancelled with `DELETE /$/tasks/{id}`.
          */
         post: operations["runAlgorithm"];
         delete?: never;
@@ -1228,6 +1228,26 @@ export interface paths {
          * @description Confirms or refuses the estimate of a task that waits for it. Needs `admin` on the dataset.
          */
         post: operations["confirmGraphrag"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/graphrag/{ds}/memberships": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read the communities of nodes
+         * @description The communities of the reports graph that hold each listed node, at the given level or at every level, with each community's member count and report title. Read on main only and through the caller's view. A caller for whom the reports graph is not proven, or a request on a branch, gets `available: false`.
+         */
+        post: operations["listCommunityMemberships"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3749,16 +3769,24 @@ export interface components {
             /** @description Why `algo.json` could not be read. The list is then empty and refuses changes. */
             warning?: string;
         };
-        /** @description A run of one algorithm. With `write` the results are written to a graph in batched commits. */
+        /** @description A run of one algorithm. With `write` the results are written to a graph in batched commits. Without it, `nodes`, `keep`, `async` and `top` make it a view-only run. */
         AlgoRequest: {
             /** @enum {string} */
             algorithm: "pageRank" | "betweenness" | "wcc" | "scc" | "labelPropagation" | "louvain" | "leiden" | "nodeSimilarity" | "triangleCount" | "clustering" | "kCore" | "bfs" | "sssp" | "fastRP" | "node2vec";
+            /** @description View-only runs with `keep`. Run as an `algo-view` task and answer `202`, or join the task of a run with the same key. */
+            async?: boolean;
+            /** @description View-only runs. Keep the whole result in the server's cache of view-only results, keyed by branch, commit, the caller's view and the request without `nodes`, `keep`, `async` and `top`. */
+            keep?: boolean;
+            /** @description View-only runs. The IRIs of the nodes whose rows the answer holds. The whole result is computed, and each community or component row also carries `communitySize`, its size in the whole projection. */
+            nodes?: string[];
             /** @description The parameters of the algorithm, named as in `algo:` without the prefix, such as `maxIterations`, `seed` or `topK`. */
             params?: {
                 [key: string]: unknown;
             };
             /** @description The name of a stored projection, or a definition. */
             projection?: string | components["schemas"]["AlgoProjectionDefinition"];
+            /** @description View-only runs. Only the rows with the highest values of the first numeric output, such as `score`. */
+            top?: number;
             write?: {
                 atomic?: boolean;
                 batchSize?: number;
@@ -5755,6 +5783,28 @@ export interface components {
             reportsGraph: string;
             truncated?: boolean;
             unreviewed?: number;
+        };
+        /** @description The communities that hold the listed nodes, with each community's member count and report title. */
+        GraphragMemberships: {
+            available: boolean;
+            communities: {
+                iri: string;
+                level?: number;
+                memberCount?: number;
+                title?: string | null;
+            }[];
+            memberships: {
+                community: string;
+                level?: number;
+                node: string;
+            }[];
+            reason?: string;
+            reportsGraph?: string;
+        };
+        /** @description The nodes whose communities to read, at one level or at every level. */
+        GraphragMembershipsRequest: {
+            level?: number;
+            nodes: string[];
         };
         /** @description A review of a community report. */
         GraphragReviewRequest: {
@@ -9421,7 +9471,7 @@ export interface operations {
                     "application/sparql-results+json": Record<string, never>;
                 };
             };
-            /** @description A run with `write`, started as a task. */
+            /** @description A run with `write`, or a view-only run with `keep` and `async`, started as a task. A view-only answer has `joined: true` when it joined a run already in progress. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -12079,6 +12129,39 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listCommunityMemberships: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GraphragMembershipsRequest"];
+            };
+        };
+        responses: {
+            /** @description The memberships. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphragMemberships"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["PayloadTooLarge"];
             default: components["responses"]["Error"];
         };
     };

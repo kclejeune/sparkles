@@ -1858,6 +1858,7 @@ pub fn render_prometheus(st: &AppState) -> String {
     crate::vector::metrics(st, &mut o);
     crate::http::history::metrics(st, &mut o);
     crate::http::branches::metrics(st, &mut o);
+    crate::http::algo_view_metrics(&mut o);
     crate::assistant::metrics(st, &mut o);
     crate::notify::metrics(st, &mut o);
     #[cfg(feature = "mcp")]

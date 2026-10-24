@@ -117,6 +117,7 @@ pub const ROUTES: &[(&str, &[&str])] = &[
     ("/$/graphrag/{ds}/confirm", &["POST"]),
     ("/$/graphrag/{ds}/communities", &["GET"]),
     ("/$/graphrag/{ds}/community", &["GET"]),
+    ("/$/graphrag/{ds}/memberships", &["POST"]),
     ("/$/graphrag/{ds}/review", &["POST"]),
     // layered dataset settings (C19 §6)
     ("/$/settings", &["GET"]),
@@ -350,9 +351,10 @@ pub fn need(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) -> Opt
         | "/$/ingest/{ds}/{task}/approve" => Dataset(Read),
         "/$/assistant/{ds}" if get => Dataset(Read),
         "/$/assistant/{ds}" => Dataset(Admin),
-        "/$/graphrag/{ds}" | "/$/graphrag/{ds}/communities" | "/$/graphrag/{ds}/community" => {
-            Dataset(Read)
-        }
+        "/$/graphrag/{ds}"
+        | "/$/graphrag/{ds}/communities"
+        | "/$/graphrag/{ds}/community"
+        | "/$/graphrag/{ds}/memberships" => Dataset(Read),
         // a build sends the dataset to a provider and spends the dataset's budget
         "/$/graphrag/{ds}/build" | "/$/graphrag/{ds}/refresh" | "/$/graphrag/{ds}/confirm" => {
             Dataset(Admin)

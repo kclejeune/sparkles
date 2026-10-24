@@ -1818,6 +1818,46 @@ fn graphrag(put: &mut dyn FnMut(&str, J)) {
         ),
     );
     put(
+        "GraphragMembershipsRequest",
+        doc(
+            closed(
+                &["nodes"],
+                json!({
+                    "nodes": { "type": "array", "items": string(), "maxItems": 20000 },
+                    "level": int(),
+                }),
+            ),
+            "The nodes whose communities to read, at one level or at every level.",
+            "graphrag",
+        ),
+    );
+    put(
+        "GraphragMemberships",
+        doc(
+            obj(
+                &["available", "memberships", "communities"],
+                json!({
+                    "available": boolean(),
+                    "reason": string(),
+                    "reportsGraph": string(),
+                    "memberships": array(obj(&["node", "community"], json!({
+                        "node": string(),
+                        "community": string(),
+                        "level": int(),
+                    }))),
+                    "communities": array(obj(&["iri"], json!({
+                        "iri": string(),
+                        "level": int(),
+                        "memberCount": int(),
+                        "title": or_null(string()),
+                    }))),
+                }),
+            ),
+            "The communities that hold the listed nodes, with each community's member count and report title.",
+            "graphrag",
+        ),
+    );
+    put(
         "GraphragCommunity",
         doc(
             obj(

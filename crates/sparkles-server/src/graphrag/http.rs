@@ -6,6 +6,8 @@
 //! - `GET /$/graphrag/{ds}` reports the state.
 //! - `GET /$/graphrag/{ds}/communities` lists the communities, and
 //!   `GET /$/graphrag/{ds}/community?iri=` shows one with its report.
+//! - `POST /$/graphrag/{ds}/memberships` answers which communities hold the listed nodes,
+//!   for the community colour lens of the graph canvas (spec U10 §2.3).
 //! - `POST /$/graphrag/{ds}/review` sets a report's status, or replaces its title and
 //!   summary with a person's edit.
 //!
@@ -18,7 +20,7 @@ use super::guard::gr;
 use super::settings::GraphragSettings;
 use super::store::{self, Status};
 use crate::auth::{Endpoint, Level, Principal};
-use crate::http::{AdminBody, ApiResult, blocking, dataset, err, err_code};
+use crate::http::{AdminBody, ApiResult, QueryBody, blocking, dataset, err, err_code};
 use crate::state::{AppState, Dataset};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -40,6 +42,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/$/graphrag/{ds}/confirm", post(post_confirm))
         .route("/$/graphrag/{ds}/communities", get(get_communities))
         .route("/$/graphrag/{ds}/community", get(get_community))
+        .route("/$/graphrag/{ds}/memberships", post(post_memberships))
         .route("/$/graphrag/{ds}/review", post(post_review))
 }
 
@@ -453,6 +456,115 @@ async fn get_community(
             out["report"] = report_json(&ds, &opts, &graph, &rep)?;
         }
         Ok(out)
+    })
+    .await?;
+    Ok(Json(v).into_response())
+}
+
+/// Nodes a memberships request may list.
+const MAX_MEMBERSHIP_NODES: usize = 20_000;
+/// Nodes in one membership query.
+const MEMBERSHIP_BATCH: usize = 1_000;
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipsRequest {
+    nodes: Vec<String>,
+    level: Option<u64>,
+}
+
+/// `POST /$/graphrag/{ds}/memberships`: the communities of the reports graph that hold
+/// each listed node, at one level or at every level, with each community's member count
+/// and report title. Read on main only and through the caller's view, under the coverage
+/// rule of §6.3, so a caller for whom the graph is not proven gets `available: false`.
+async fn post_memberships(
+    State(st): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Extension(p): Extension<Principal>,
+    QueryBody(b): QueryBody,
+) -> ApiResult<Response> {
+    let ds = dataset(&st, &name)?;
+    let req: MembershipsRequest = body(&b)?;
+    if req.nodes.len() > MAX_MEMBERSHIP_NODES {
+        return Err(bad(format!(
+            "nodes lists {} terms; at most {MAX_MEMBERSHIP_NODES} are allowed",
+            req.nodes.len()
+        )));
+    }
+    let mut nodes = Vec::with_capacity(req.nodes.len());
+    for n in &req.nodes {
+        let n = n
+            .strip_prefix('<')
+            .and_then(|n| n.strip_suffix('>'))
+            .unwrap_or(n);
+        nodes.push(
+            oxrdf::NamedNode::new(n).map_err(|_| bad(format!("'{n}' in nodes is not an IRI")))?,
+        );
+    }
+    let branch = ds.store.branch_name();
+    if branch != "main" {
+        return Ok(Json(json!({
+            "available": false,
+            "reason": format!("GraphRAG communities are read on main, where their reports are built, and this request reads the branch '{branch}'"),
+            "memberships": [],
+            "communities": [],
+        }))
+        .into_response());
+    }
+    let st2 = st.clone();
+    let v = blocking(move || {
+        let graph = settings_of(&st2, &ds).reports_graph;
+        if !proven(&ds, &p, &graph) {
+            return Ok(json!({ "available": false, "memberships": [], "communities": [] }));
+        }
+        let opts = caller_options(&ds, &p);
+        let level = req
+            .level
+            .map(|l| format!("FILTER(?l = {l})"))
+            .unwrap_or_default();
+        let mut memberships = Vec::new();
+        let mut communities: BTreeMap<String, ()> = BTreeMap::new();
+        for chunk in nodes.chunks(MEMBERSHIP_BATCH) {
+            let values: String = chunk.iter().map(|n| format!("{n} ")).collect();
+            let q = format!(
+                "SELECT ?m ?c ?l WHERE {{ VALUES ?m {{ {values}}} GRAPH <{graph}> {{ ?c <{member}> ?m ; <{lvl}> ?l . }} {level} }}",
+                member = gr("member"),
+                lvl = gr("level"),
+            );
+            for r in rows(&ds, &opts, &q)? {
+                let (Some(m), Some(c)) = (iri(&r[0]), iri(&r[1])) else {
+                    continue;
+                };
+                communities.insert(c.clone(), ());
+                memberships.push(json!({ "node": m, "community": c, "level": int(&r[2]) }));
+            }
+        }
+        let mut list = Vec::new();
+        let keys: Vec<String> = communities.into_keys().collect();
+        for chunk in keys.chunks(MEMBERSHIP_BATCH) {
+            let values: String = chunk.iter().map(|c| format!("<{c}> ")).collect();
+            let q = format!(
+                "SELECT ?c ?l ?n ?title WHERE {{ VALUES ?c {{ {values}}} GRAPH <{graph}> {{ ?c <{lvl}> ?l ; <{count}> ?n . OPTIONAL {{ ?c <{report}> ?r . ?r <{label}> ?title }} }} }}",
+                lvl = gr("level"),
+                count = gr("memberCount"),
+                report = gr("report"),
+                label = store::RDFS_LABEL,
+            );
+            for r in rows(&ds, &opts, &q)? {
+                list.push(json!({
+                    "iri": iri(&r[0]),
+                    "level": int(&r[1]),
+                    "memberCount": int(&r[2]),
+                    "title": lit(&r[3]),
+                }));
+            }
+        }
+        Ok(json!({
+            "available": true,
+            "reportsGraph": graph,
+            "memberships": memberships,
+            "communities": list,
+        }))
     })
     .await?;
     Ok(Json(v).into_response())

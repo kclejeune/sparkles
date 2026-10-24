@@ -37,7 +37,7 @@ use sparkles::overview::GroupsRequest;
 /// The RDFS on read the queries use, for the cache key: a setting can change without a
 /// commit. A fixed schema is named by a hash of its content, a graph source by its graph,
 /// whose content the commit already names.
-fn rdfs_key(rdfs: Option<&sparkles::sparql::rdfs::RdfsOnRead>) -> String {
+pub(in crate::http) fn rdfs_key(rdfs: Option<&sparkles::sparql::rdfs::RdfsOnRead>) -> String {
     use sparkles::sparql::rdfs::RdfsSchema;
     use std::hash::{Hash, Hasher};
     match rdfs.map(|r| &r.source) {
