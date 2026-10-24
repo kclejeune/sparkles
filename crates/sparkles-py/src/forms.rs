@@ -15,10 +15,11 @@ mod imp {
     use oxrdf::Term;
     use pyo3::types::PyMapping;
     use serde_json::{Value as J, json};
+    use sparkles::Error;
     use sparkles::commit::AnnotatedCommit;
     use sparkles::forms::{FieldChange, FormChange, FormCheck, FormRequest, FormSettings};
     use sparkles::overview::rdf_term_from_json;
-    use sparkles::preview::Preview;
+    use sparkles::preview::{Outcome, Preview};
     use sparkles::sparql::QueryOptions;
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -53,8 +54,12 @@ mod imp {
             let d = Duration::try_from_secs_f64(t).map_err(|_| {
                 pyo3::exceptions::PyValueError::new_err("timeout must be finite and nonnegative")
             })?;
+            // the engine adds the timeout to the current time, so one that overflows is refused here
+            let deadline = Instant::now()
+                .checked_add(d)
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("timeout is too large"))?;
             opts.timeout = Some(d);
-            opts.write.deadline = Instant::now().checked_add(d);
+            opts.write.deadline = Some(deadline);
         }
         opts.cancel = Some(flag.clone());
         opts.write.cancel = Some(flag.clone());
@@ -316,6 +321,46 @@ mod imp {
                 v["kind"] = json!(p.kind.name());
             }
             doc["validation"] = v;
+        }
+        let st = &p.storage;
+        let mut storage = json!({
+            "status": if st.refused.is_some() { "refused" } else { "fits" },
+        });
+        for (k, v) in [
+            ("limit", st.limit),
+            ("used", st.used),
+            ("projected", st.projected),
+        ] {
+            if let Some(v) = v {
+                storage[k] = json!(v);
+            }
+        }
+        match &st.refused {
+            Some(Error::BudgetExceeded(b)) => {
+                storage["budget"] = json!(b.kind);
+                storage["error"] = json!(b.to_string());
+            }
+            Some(e) => {
+                storage["code"] = json!("storage-full");
+                storage["error"] = json!(e.to_string());
+            }
+            None => {}
+        }
+        doc["storage"] = storage;
+        match outcome {
+            Outcome::PreconditionFailed => {
+                doc["code"] = json!("precondition-failed");
+            }
+            Outcome::StorageRefused => {
+                if let Some(Error::BudgetExceeded(b)) = &st.refused {
+                    doc["budget"] = json!(b.kind);
+                    doc["limit"] = json!(b.limit);
+                    doc["requested"] = json!(b.requested);
+                } else {
+                    doc["code"] = json!("storage-full");
+                }
+            }
+            Outcome::Rejected | Outcome::Commit | Outcome::NoChange => {}
         }
         if let Some(e) = p.error() {
             doc["error"] = json!(e);

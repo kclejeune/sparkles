@@ -227,6 +227,40 @@ def test_a_protected_branch_refuses_a_check_and_a_save(ds: Dataset) -> None:
     assert names(ds) == ["Alice Lima"]
 
 
+def test_a_directional_literal_goes_back_as_it_was_listed(ds: Dataset) -> None:
+    ds.update(f'INSERT DATA {{ <{EX}alice> <{EX}name> "marhaba"@ar--rtl }}')
+    m = ds.forms.model(EX + "alice", settings=SETTINGS)
+    loaded = [v["term"] for v in field(m, "Name")["values"]]
+    assert {"type": "literal", "value": "marhaba", "xml:lang": "ar", "its:dir": "rtl"} in loaded
+    # the model's own values are the expected values, so no conflict is found
+    c = ds.forms.check(change(NAME, [], [lit("Zed")], loaded), settings=SETTINGS)
+    assert c["conflicts"] == []
+    added = {"type": "literal", "value": "shalom", "xml:lang": "he", "its:dir": "rtl"}
+    ds.forms.save(change(NAME, [], [added], loaded), settings=SETTINGS)
+    assert ds.ask(f'ASK {{ <{EX}alice> <{EX}name> "shalom"@he--rtl }}')
+    with pytest.raises(InvalidInputError, match="its:dir"):
+        ds.forms.check(change(NAME, [], [{**added, "its:dir": "up"}], []), settings=SETTINGS)
+
+
+def test_a_check_reports_the_storage_a_quota_refuses(tmp_path) -> None:
+    ds = Dataset(str(tmp_path / "db"))
+    ds.update(DATA)
+    ds.load(SHAPES, "turtle", to_graph="urn:shapes")
+    c = change(NAME, [lit("Alice Lima")], [lit("Alicia " * 100)], [lit("Alice Lima")])
+    ok = ds.forms.check(c, settings=SETTINGS)["preview"]
+    assert ok["outcome"] == "commit"
+    assert ok["storage"]["status"] == "fits"
+    ds.settings.quota.set(max_bytes=1)
+    p = ds.forms.check(c, settings=SETTINGS)["preview"]
+    assert p["outcome"] == "storage-refused"
+    assert p["wouldCommit"] is True
+    assert p["storage"]["status"] == "refused"
+    assert p["storage"]["limit"] == 1
+    assert p["error"] == p["storage"]["error"]
+    assert p["budget"] == p["storage"]["budget"]
+    ds.close()
+
+
 def test_a_guard_rejects_what_the_check_flagged() -> None:
     ds = Dataset()
     ds.update(DATA)
@@ -327,7 +361,15 @@ def test_a_cancelled_token_stops_each_call(ds: Dataset) -> None:
 
 
 def test_a_bad_timeout_and_cancel_are_refused(ds: Dataset) -> None:
-    with pytest.raises(ValueError):
-        ds.forms.model(EX + "alice", settings=SETTINGS, timeout=-1.0)
+    c = change(NAME, [lit("Alice Lima")], [lit("Alicia")], [lit("Alice Lima")])
+    for timeout in (-1.0, float("nan"), float("inf"), 1e19, 1e300):
+        with pytest.raises(ValueError):
+            ds.forms.model(EX + "alice", settings=SETTINGS, timeout=timeout)
+        with pytest.raises(ValueError):
+            ds.forms.check(c, settings=SETTINGS, timeout=timeout)
+        with pytest.raises(ValueError):
+            ds.forms.save(c, settings=SETTINGS, timeout=timeout)
+    # the request thread is still alive
+    assert ds.forms.model(EX + "alice", settings=SETTINGS, timeout=60)["editable"] is True
     with pytest.raises(TypeError):
         ds.forms.model(EX + "alice", settings=SETTINGS, cancel=object())  # type: ignore[arg-type]
