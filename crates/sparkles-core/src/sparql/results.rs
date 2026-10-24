@@ -258,13 +258,35 @@ pub(crate) struct Buffered<'a> {
 
 impl Buffered<'_> {
     /// Note the rows counted since the last look, which end where `buf` ends now.
-    #[inline]
+    #[inline(always)]
     fn note(&mut self) {
         let rows = self.staged.get();
         if rows != self.rows {
-            self.rows = rows;
-            self.marks.push((self.buf.len(), rows));
+            self.mark(rows);
         }
+    }
+
+    /// [`Write::write`] of `b` when it does not fit in what is left of `buf`.
+    #[inline(never)]
+    fn write_full(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.drain()?;
+        if b.len() >= OUTPUT_BUFFER {
+            // no row ends inside one write, so this piece ends none
+            let r = self.inner.write_all(b);
+            self.failed |= r.is_err();
+            r?;
+        } else {
+            self.buf.extend_from_slice(b);
+        }
+        Ok(b.len())
+    }
+
+    /// The rows up to `rows` end where `buf` ends now. Kept out of line so that the
+    /// serializers' many small writes inline only the check.
+    #[inline(never)]
+    fn mark(&mut self, rows: u64) {
+        self.rows = rows;
+        self.marks.push((self.buf.len(), rows));
     }
 
     /// Write the collected bytes on. Each row counts in `sent` as soon as the caller's
@@ -306,24 +328,17 @@ impl Buffered<'_> {
 }
 
 impl Write for Buffered<'_> {
-    #[inline]
+    #[inline(always)]
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
         self.note();
         if b.len() > OUTPUT_BUFFER - self.buf.len() {
-            self.drain()?;
-            if b.len() >= OUTPUT_BUFFER {
-                // no row ends inside one write, so this piece ends none
-                let r = self.inner.write_all(b);
-                self.failed |= r.is_err();
-                r?;
-                return Ok(b.len());
-            }
+            return self.write_full(b);
         }
         self.buf.extend_from_slice(b);
         Ok(b.len())
     }
 
-    #[inline]
+    #[inline(always)]
     fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
         self.write(b).map(|_| ())
     }
