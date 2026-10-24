@@ -13,7 +13,7 @@ crate's normal tests (`damaged_files_never_panic`).
 
 ## Running
 
-Needs a nightly toolchain and cargo-fuzz, installed for the user:
+The target needs a nightly toolchain and cargo-fuzz, installed for the user:
 
 ```sh
 rustup toolchain install nightly --profile minimal
