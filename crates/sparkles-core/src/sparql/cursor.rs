@@ -4083,6 +4083,7 @@ mod tests {
             graph: super::super::plan::GraphFilter::All,
             graph_col: 3,
             dedup: false,
+            src: None,
         };
         let index = ctx.snap.perm(Perm::Spo);
         ctx.snap.cache.get_cols(index, 1, 2).unwrap();

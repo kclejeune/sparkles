@@ -308,3 +308,30 @@ async fn rejected_inferences_fail_the_reason_task() {
     );
     assert_eq!(st.get("v").unwrap().store.snapshot().commit, head);
 }
+
+/// The validation overlay writes its suggested fixes to the graph the guard validates,
+/// which is the union of the graphs when the server serves the union as the default graph.
+#[tokio::test]
+async fn status_reports_the_union_default_graph() {
+    for union in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = StoreOptions {
+            union_default_graph: union,
+            ..StoreOptions::default()
+        };
+        let st = Arc::new(AppState::new(dir.path(), opts, Duration::from_secs(30)).unwrap());
+        st.create("v", DbType::Persistent).unwrap();
+        let app = router(st.clone());
+        // the overlay's shapes-graph and editor sources need it without a guard too
+        let none = send(&app, req("GET", "/$/validation/v", "", ""))
+            .await
+            .json();
+        assert_eq!(none["config"], J::Null, "{none}");
+        assert_eq!(none["unionDefaultGraph"], json!(union), "{none}");
+        assert_eq!(enable(&app, "warn").await.status, StatusCode::OK);
+        let got = send(&app, req("GET", "/$/validation/v", "", ""))
+            .await
+            .json();
+        assert_eq!(got["unionDefaultGraph"], json!(union), "{got}");
+    }
+}

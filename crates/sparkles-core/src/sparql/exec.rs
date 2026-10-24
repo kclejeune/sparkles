@@ -104,6 +104,153 @@ pub struct PlanInfo {
     /// have any, so it is boxed to keep the plan of a node that simply ran small: every
     /// operator builds one and returns it up the tree.
     pub fidelity: Option<Box<PlanFidelity>>,
+    /// The parts of the query the node reads (see [`PlanRefs`]). Only nodes that read
+    /// triple patterns, filter or join have any, so it is boxed like `fidelity`.
+    pub refs: Option<Box<PlanRefs>>,
+}
+
+/// What a plan node reads of the query's text, so that a client can draw the plan on
+/// the query's pattern (spec U04 §11.3). Every term here is written in the query, so it
+/// tells a caller nothing the query did not.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlanRefs {
+    /// The triple patterns and paths the node reads, in query order.
+    pub patterns: Vec<std::sync::Arc<PlanPattern>>,
+    /// The query variables a filter reads.
+    pub filter_vars: Vec<String>,
+    /// The query variables a join joins on.
+    pub join_vars: Vec<String>,
+}
+
+/// A triple pattern or path of the query, as a plan node names it (spec U04 §11.3).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct PlanPattern {
+    /// The subject as an N-Triples term, `?name` for a variable of the query, or `?_` for
+    /// a blank node or a variable the planner made.
+    pub s: String,
+    /// The predicate, or a path written as [`path_text`] writes it.
+    pub p: String,
+    pub o: String,
+    /// The graph term of the `GRAPH` around it, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+    /// Its index among the equal patterns of the query, from 0.
+    pub occurrence: u32,
+}
+
+/// A property path in the form the plan's `patterns` write it: IRIs in angle brackets,
+/// `/` and `|` between the steps and choices of a flattened sequence or alternative,
+/// `^`, `*`, `+`, `?` and `{n}`, `{n,m}` or `{n,}` around a step in parentheses unless it
+/// is one IRI or a negated set, `!(…)` with `|` for a negated set, and ARQ's `distinct(…)`,
+/// `multi(…)` and `shortest(…)`. There are no spaces.
+pub fn path_text(p: &spargebra::algebra::PropertyPathExpression) -> String {
+    use spargebra::algebra::PropertyPathExpression as PP;
+    fn atom(p: &PP) -> bool {
+        matches!(p, PP::NamedNode(_) | PP::NegatedPropertySet(_))
+    }
+    fn wrapped(p: &PP, out: &mut String) {
+        if atom(p) {
+            write(p, out);
+        } else {
+            out.push('(');
+            write(p, out);
+            out.push(')');
+        }
+    }
+    fn seq<'a>(p: &'a PP, out: &mut Vec<&'a PP>) {
+        match p {
+            PP::Sequence(a, b) => {
+                seq(a, out);
+                seq(b, out);
+            }
+            p => out.push(p),
+        }
+    }
+    fn alt<'a>(p: &'a PP, out: &mut Vec<&'a PP>) {
+        match p {
+            PP::Alternative(a, b) => {
+                alt(a, out);
+                alt(b, out);
+            }
+            p => out.push(p),
+        }
+    }
+    fn write(p: &PP, out: &mut String) {
+        match p {
+            PP::NamedNode(n) => {
+                out.push('<');
+                out.push_str(n.as_str());
+                out.push('>');
+            }
+            PP::Reverse(x) => {
+                out.push('^');
+                wrapped(x, out);
+            }
+            PP::Sequence(..) | PP::Alternative(..) => {
+                let mut items = Vec::new();
+                let sep = if matches!(p, PP::Sequence(..)) {
+                    seq(p, &mut items);
+                    '/'
+                } else {
+                    alt(p, &mut items);
+                    '|'
+                };
+                for (i, x) in items.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(sep);
+                    }
+                    // a step that is itself a choice, or a choice that is a sequence
+                    if matches!(x, PP::Sequence(..) | PP::Alternative(..)) {
+                        out.push('(');
+                        write(x, out);
+                        out.push(')');
+                    } else {
+                        write(x, out);
+                    }
+                }
+            }
+            PP::ZeroOrMore(x) | PP::OneOrMore(x) | PP::ZeroOrOne(x) => {
+                wrapped(x, out);
+                out.push(match p {
+                    PP::ZeroOrMore(_) => '*',
+                    PP::OneOrMore(_) => '+',
+                    _ => '?',
+                });
+            }
+            PP::NegatedPropertySet(items) => {
+                out.push_str("!(");
+                for (i, n) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push('|');
+                    }
+                    out.push('<');
+                    out.push_str(n.as_str());
+                    out.push('>');
+                }
+                out.push(')');
+            }
+            PP::Range { path, min, max } => {
+                wrapped(path, out);
+                out.push_str(&match max {
+                    Some(m) if m == min => format!("{{{min}}}"),
+                    Some(m) => format!("{{{min},{m}}}"),
+                    None => format!("{{{min},}}"),
+                });
+            }
+            PP::Distinct(x) | PP::Multi(x) | PP::Shortest(x) => {
+                out.push_str(match p {
+                    PP::Distinct(_) => "distinct(",
+                    PP::Multi(_) => "multi(",
+                    _ => "shortest(",
+                });
+                write(x, out);
+                out.push(')');
+            }
+        }
+    }
+    let mut out = String::new();
+    write(p, &mut out);
+    out
 }
 
 /// What a plan node says beyond its counts (spec C18 §6.6.5).
@@ -265,6 +412,18 @@ impl PlanInfo {
         if f.estimate_guessed {
             m.serialize_entry("estimateGuessed", &true)?;
         }
+        if let Some(r) = &self.refs {
+            if !r.patterns.is_empty() {
+                let patterns: Vec<&PlanPattern> = r.patterns.iter().map(|p| &**p).collect();
+                m.serialize_entry("patterns", &patterns)?;
+            }
+            if !r.filter_vars.is_empty() {
+                m.serialize_entry("filterVars", &r.filter_vars)?;
+            }
+            if !r.join_vars.is_empty() {
+                m.serialize_entry("joinVars", &r.join_vars)?;
+            }
+        }
         Ok(())
     }
 
@@ -403,6 +562,111 @@ fn node_fidelity(ctx: &Ctx, n: &Node) -> Option<Box<PlanFidelity>> {
     }
 }
 
+/// What `n` reads of the query's text (spec U04 §11.3): the patterns of a scan, an index
+/// join or a path, the variables of a filter and those a join joins on. Most nodes read
+/// none of it.
+#[inline]
+fn node_refs(ctx: &Ctx, n: &Node) -> Option<Box<PlanRefs>> {
+    #[cold]
+    #[inline(never)]
+    fn of(ctx: &Ctx, n: &Node) -> Option<Box<PlanRefs>> {
+        let mut patterns = Vec::new();
+        let mut scan = |s: &ScanSpec| {
+            if let Some(p) = &s.src
+                && !patterns.contains(p)
+            {
+                patterns.push(p.clone());
+            }
+        };
+        let mut filter_vars = Vec::new();
+        let mut join_vars = Vec::new();
+        let shared = |a: &Node, b: &Node| -> Vec<VarId> {
+            a.vars
+                .iter()
+                .copied()
+                .filter(|v| b.vars.contains(v))
+                .collect()
+        };
+        match &n.kind {
+            Kind::Scan(s) | Kind::RangeScan(s, _) => scan(s),
+            Kind::CountScan { spec, .. }
+            | Kind::CountDistinctScan { spec, .. }
+            | Kind::GroupCountScan { spec, .. } => scan(spec),
+            Kind::CountFilterScan { spec, filter, .. } => {
+                scan(spec);
+                filter.iter().for_each(|e| e.vars(&mut filter_vars));
+            }
+            Kind::OrderedTopK(t) => scan(&t.scan),
+            Kind::SpatialScan(t) => scan(&t.scan),
+            Kind::IndexJoin(j) => {
+                j.probes.iter().for_each(|p| scan(&p.scan));
+                join_vars.push(j.key);
+            }
+            Kind::Path { spec, .. } => {
+                if let Some(p) = &spec.src {
+                    patterns.push(p.clone());
+                }
+            }
+            Kind::Filter(exprs) => exprs.iter().for_each(|e| e.vars(&mut filter_vars)),
+            Kind::Join { keys, .. } => join_vars.extend_from_slice(keys),
+            Kind::PatternCount(spec) => {
+                if let Some(p) = &spec.src {
+                    patterns.push(p.clone());
+                }
+            }
+            Kind::PatternScan(spec) => {
+                if let Some(p) = &spec.src {
+                    patterns.push(p.clone());
+                }
+            }
+            // the variable a count join holds is the count's: the key is what its two
+            // inputs share
+            Kind::CountJoin { .. }
+            | Kind::CountJoinRuns { .. }
+            | Kind::LeftJoin { .. }
+            | Kind::KeyedLeftJoin { .. }
+            | Kind::Minus
+            | Kind::HalfJoin { .. }
+                if n.children.len() == 2 =>
+            {
+                join_vars = shared(&n.children[0], &n.children[1]);
+            }
+            _ => {}
+        }
+        filter_vars.sort_unstable();
+        filter_vars.dedup();
+        let refs = PlanRefs {
+            patterns,
+            filter_vars: names(ctx, &filter_vars),
+            join_vars: names(ctx, &join_vars),
+        };
+        (refs != PlanRefs::default()).then(|| Box::new(refs))
+    }
+    match &n.kind {
+        Kind::Scan(_)
+        | Kind::RangeScan(..)
+        | Kind::CountScan { .. }
+        | Kind::CountDistinctScan { .. }
+        | Kind::GroupCountScan { .. }
+        | Kind::CountFilterScan { .. }
+        | Kind::OrderedTopK(_)
+        | Kind::SpatialScan(_)
+        | Kind::IndexJoin(_)
+        | Kind::Path { .. }
+        | Kind::Filter(_)
+        | Kind::Join { .. }
+        | Kind::CountJoin { .. }
+        | Kind::CountJoinRuns { .. }
+        | Kind::LeftJoin { .. }
+        | Kind::KeyedLeftJoin { .. }
+        | Kind::Minus
+        | Kind::HalfJoin { .. }
+        | Kind::PatternCount(_)
+        | Kind::PatternScan(_) => of(ctx, n),
+        _ => None,
+    }
+}
+
 fn names(ctx: &Ctx, vars: &[VarId]) -> Vec<String> {
     let all = ctx.var_names.read();
     vars.iter()
@@ -449,6 +713,7 @@ pub(super) fn describe_node(ctx: &Ctx, n: &Node) -> PlanInfo {
         estimated_cost: n.cost.round(),
         actual_rows: -1,
         fidelity: node_fidelity(ctx, n),
+        refs: node_refs(ctx, n),
         ..Default::default()
     }
 }
@@ -1238,6 +1503,7 @@ fn run_node(
     ctx.produced(table.len())?;
     let info = PlanInfo {
         fidelity: node_fidelity(ctx, n),
+        refs: node_refs(ctx, n),
         operator: n.operator().to_string(),
         description: match note {
             Some(x) => format!("{} {x}", n.desc),

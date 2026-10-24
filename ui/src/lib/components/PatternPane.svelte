@@ -37,7 +37,19 @@
   // The panel of an element holds its edits, and the strip under the canvas holds the
   // projection, DISTINCT, LIMIT, OFFSET and **Count matches**.
   import { onDestroy, onMount, tick, untrack } from 'svelte';
-  import type { ClassProfile } from '$lib/api';
+  import type { ClassProfile, CursorPlan, PlanNode } from '$lib/api';
+  import {
+    badge,
+    filterLabel,
+    label as planLabel,
+    misestimate,
+    LEGEND,
+    overlay as overlayOf,
+    spoken,
+    under,
+    width as planWidth,
+    type Overlay,
+  } from '$lib/plan-pattern';
   import { LocalUnavailable, patternLocal, patternNow } from '$lib/fmt-wasm';
   import {
     announcement,
@@ -100,7 +112,7 @@
   import type { PrefixMap } from '$lib/rdf';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
-  import PatternCanvas, { type Focusable } from './PatternCanvas.svelte';
+  import PatternCanvas, { type CanvasOverlay, type Focusable } from './PatternCanvas.svelte';
   import PatternPanel from './PatternPanel.svelte';
   import PatternPicker from './PatternPicker.svelte';
 
@@ -119,6 +131,15 @@
     onescape,
     onclose,
     debounce = 150,
+    plan = null,
+    planText = null,
+    planExecuted = true,
+    planHeader = null,
+    planSelected = null,
+    onplanselect,
+    onshowplan,
+    planSwitch = null,
+    onopen,
   }: {
     text: string;
     /** the editor tab whose layout the pane keeps; null for a result's pattern */
@@ -141,6 +162,24 @@
     onescape?: () => void;
     onclose?: () => void;
     debounce?: number;
+    /** the plan to draw on the pattern (spec U04 §11), when **Plan on pattern** is on */
+    plan?: PlanNode | CursorPlan | null;
+    /** the query text the plan is of: the overlay shows only while the pane draws it */
+    planText?: string | null;
+    /** the plan ran, so it has actual rows and times */
+    planExecuted?: boolean;
+    /** the commit and branch the plan's numbers describe */
+    planHeader?: string | null;
+    /** the operator selected in the plan tree, whose elements light up */
+    planSelected?: string | null;
+    /** an element was chosen whose operator the plan tree should select */
+    onplanselect?: (id: string) => void;
+    /** show this operator in the plan tree (the phone's sheet) */
+    onshowplan?: (id: string) => void;
+    /** the shared **Plan on pattern** switch, shown in the header when a plan exists */
+    planSwitch?: { on: boolean; set: (on: boolean) => void } | null;
+    /** a result's pattern: put the query in the editor and open the Pattern pane there */
+    onopen?: () => void;
   } = $props();
 
   /** What an empty editor is edited as: the first edit writes the whole query. */
@@ -202,6 +241,197 @@
   let profiles: ProfileCache | null = null;
   /** The classes `datatypes()` reads at most, far under the cache's bound. */
   const DATATYPE_CLASSES = 20;
+
+  // ------------------------------------------------- the plan on the pattern (U04 §11) ----
+
+  /** Show each operator's own time in place of its rows (`T`). */
+  let planTime = $state(false);
+  /** Time shows only for a plan that ran: an estimate has no times to show. */
+  const showTime = $derived(planTime && planExecuted);
+  /** the element under the pointer or the focus, for a join badge's highlight */
+  let hovered = $state<string | null>(null);
+  /** the operator of the join badge `J` moved to, of the hovered node */
+  let activeJoin = $state<string | null>(null);
+  /** the join badge the selection was made on, which outlives the focus */
+  let selectedJoin = $state<string | null>(null);
+  let notDrawnOpen = $state(false);
+
+  /** The plan matched with the drawing, when the pane draws the text the plan is of. */
+  const planMatch = $derived.by<Overlay | null>(() => {
+    if (!plan || planText == null || !answer || !drawn || error || planText !== drawnText)
+      return null;
+    try {
+      return overlayOf(answer, drawn, plan, planExecuted);
+    } catch {
+      return null;
+    }
+  });
+  /** A plan is given but the text differs from the one that ran (A19). */
+  const planStale = $derived(!!plan && planText != null && !!drawn && planText !== drawnText);
+
+  /** The elements an operator's subtree reads: edges, their ends, chips, classes and joins. */
+  function elementsUnder(m: Overlay, opId: string): string[] {
+    const out = new Set<string>();
+    for (const [id, st] of m.edges)
+      if (st.ops.some((o) => under(o.id, opId))) {
+        out.add(id);
+        const e = drawn?.edges.find((x) => x.id === id);
+        if (e) {
+          out.add(e.source);
+          out.add(e.target);
+        }
+      }
+    for (const [id, list] of m.classes)
+      if (list.some((st) => st.ops.some((o) => under(o.id, opId)))) out.add(id);
+    for (const j of m.joins)
+      if (under(j.op.id, opId)) for (const v of j.drawnVars) out.add(`v:${v}`);
+    for (const [key, f] of m.filters)
+      if (under(f.op.id, opId))
+        for (const n of shown?.nodes ?? []) if (n.filters?.includes(key)) out.add(n.id);
+    for (const [id, st] of m.locked) if (under(st.op.id, opId)) out.add(id);
+    return [...out];
+  }
+
+  /** The operator an element of the canvas stands for: an edge's, a badge's, a chip's. */
+  function opOf(m: Overlay, el: Focusable, join0: string | null = activeJoin): string | null {
+    if ('edge' in el) return m.edges.get(el.edge.id)?.op.id ?? null;
+    const n = el.node;
+    const joins = m.joins.filter((j) => j.drawnVars.some((v) => n.id === `v:${v}`));
+    const join = joins.find((j) => j.op.id === join0) ?? joins[0];
+    if (join) return join.op.id;
+    for (const key of n.filters ?? []) {
+      const f = m.filters.get(key);
+      if (f) return f.op.id;
+    }
+    return m.locked.get(n.id)?.op.id ?? m.classes.get(n.id)?.[0]?.op.id ?? null;
+  }
+
+  const canvasOverlay = $derived.by<CanvasOverlay | null>(() => {
+    const m = planMatch;
+    if (!m || !shown) return null;
+    const planTime = showTime;
+    const o = { time: planTime, phone };
+    const edges: CanvasOverlay['edges'] = {};
+    for (const [id, st] of m.edges) {
+      const shared = st.shared ? (phone ? ' ⋈' : ' · shared') : '';
+      edges[id] = {
+        text: planLabel(st, o) + shared,
+        width: planWidth(m.executed && st.rows >= 0 ? st.rows : st.est),
+        warn: !planTime && !!st.ratio,
+        hot: planTime && m.hot === st.op.id,
+        spoken:
+          spoken(st, planTime) +
+          (st.shared
+            ? `, read by ${st.op.node.operator} with ${st.shared} other ${st.shared === 1 ? 'edge' : 'edges'}`
+            : '') +
+          (st.ops.length > 1 ? `, read by ${st.ops.length} operators` : ''),
+      };
+    }
+    const nodes: CanvasOverlay['nodes'] = {};
+    const add = (id: string, line: string, warn: boolean, hot: boolean, said: string) => {
+      const n = (nodes[id] ??= { lines: [], warn: false, hot: false, spoken: '' });
+      n.lines.push(hot ? `${line} ●` : line);
+      n.warn ||= warn;
+      n.hot ||= hot;
+      n.spoken = n.spoken ? `${n.spoken}, ${said}` : said;
+    };
+    for (const [id, list] of m.classes)
+      for (const st of list)
+        add(
+          id,
+          `a ${planLabel(st, o)}`,
+          !planTime && !!st.ratio,
+          planTime && m.hot === st.op.id,
+          `class ${spoken(st, planTime)}`,
+        );
+    for (const [key, f] of m.filters) {
+      const n = shown.nodes.find((x) => x.filters?.includes(key));
+      if (!n) continue;
+      const text = filterLabel(f, o);
+      if (text)
+        add(
+          n.id,
+          `filter ${text}`,
+          false,
+          planTime && m.hot === f.op.id,
+          f.passed >= 0 ? `filter passed ${f.passed} of ${f.reached} rows` : `filter ${text}`,
+        );
+    }
+    for (const [id, st] of m.locked)
+      add(
+        id,
+        `${st.op.node.operator} · ${planLabel(st, o)}`,
+        !planTime && !!st.ratio,
+        planTime && m.hot === st.op.id,
+        `${st.op.node.operator}, ${spoken(st, planTime)}`,
+      );
+    const joins: CanvasOverlay['joins'] = [];
+    for (const j of m.joins) {
+      for (const v of j.drawnVars) {
+        const id = `v:${v}`;
+        const warn = !planTime && misestimate(j.op.node, m.executed) != null;
+        const said =
+          `join ${j.n}, ${j.op.node.operator} on ?${v}` +
+          (m.executed && j.op.node.actualRows >= 0 ? `, ${j.op.node.actualRows} rows` : '');
+        add(
+          id,
+          badge(j, o, m.executed) + (warn ? ' ⚠' : ''),
+          warn,
+          planTime && m.hot === j.op.id,
+          said,
+        );
+        joins.push({ node: id, op: j.op.id, spoken: said });
+      }
+    }
+    return { edges, nodes, joins };
+  });
+
+  /** What lights up: the edges below a hovered or focused join badge, else the elements of
+   * the operator selected in the plan tree. */
+  const planLit = $derived.by<string[] | null>(() => {
+    const m = planMatch;
+    if (!m) return null;
+    const onNode = hovered
+      ? m.joins.filter((j) => j.drawnVars.some((v) => `v:${v}` === hovered))
+      : [];
+    // the badge `J` is on, else every join on the node under the pointer
+    const active = onNode.filter((j) => j.op.id === activeJoin);
+    const hoverJoins = active.length ? active : onNode;
+    if (hoverJoins.length)
+      return [...new Set(hoverJoins.flatMap((j) => elementsUnder(m, j.op.id)))];
+    if (planSelected) {
+      const els = elementsUnder(m, planSelected);
+      return els.length ? els : null;
+    }
+    return null;
+  });
+
+  /** What the panel of the selected element shows of the plan. */
+  const planInfo = $derived.by(() => {
+    const m = planMatch;
+    if (!m || !selected) return null;
+    const id = opOf(m, selected, selectedJoin);
+    const op = id ? m.ops.find((o) => o.id === id) : undefined;
+    if (!op) return null;
+    const n = op.node;
+    const lines: string[] = [];
+    if (n.estimatedRows >= 0)
+      lines.push(`Estimated ${n.estimatedRows.toLocaleString('en-US')} rows`);
+    if (m.executed && n.actualRows >= 0)
+      lines.push(`Actual ${n.actualRows.toLocaleString('en-US')} rows`);
+    if (m.executed) lines.push(`Own time ${op.self.toFixed(op.self < 1 ? 2 : 1)} ms`);
+    const st = 'edge' in selected ? m.edges.get(selected.edge.id) : undefined;
+    if (st?.ratio)
+      lines.push(
+        `⚠ ${st.ratio}: ${st.rows > st.est ? 'more than ten times' : 'under a tenth of'} the estimate`,
+      );
+    if (st?.shared)
+      lines.push(
+        `${n.operator} also reads ${st.shared} other ${st.shared === 1 ? 'edge' : 'edges'} of this pattern`,
+      );
+    if (st && st.ops.length > 1) lines.push(`${st.ops.length} operators read this edge`);
+    return { id: op.id, operator: n.operator, description: n.description, lines };
+  });
 
   const canEdit = $derived(!readonly && !!answer && !error && !!onedit);
   const over = $derived(!!answer && !!drawn && overCaps(answer, drawn));
@@ -771,7 +1001,13 @@
       return;
     }
     selected = el;
+    selectedJoin = el && 'node' in el ? activeJoin : null;
     intent = null;
+    const m = planMatch;
+    if (m && el) {
+      const id = opOf(m, el);
+      if (id) onplanselect?.(id);
+    }
   }
 
   function startTapEdge() {
@@ -877,6 +1113,19 @@
 
   /** The canvas's own keys on the focused element; the pane's keys bubble to `paneKey`. */
   function key(e: KeyboardEvent, el: Focusable | null) {
+    if (
+      planMatch &&
+      planExecuted &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !e.altKey &&
+      (e.key === 't' || e.key === 'T')
+    ) {
+      e.preventDefault();
+      planTime = !planTime;
+      live = planTime ? 'Showing each operator’s own time' : 'Showing rows';
+      return;
+    }
     if (e.ctrlKey || e.metaKey || e.altKey || !canEdit) return;
     const edge = el && 'edge' in el && el.edge.triple ? el.edge.id : undefined;
     const node = el && 'node' in el ? el.node : undefined;
@@ -1054,7 +1303,24 @@
   <header class="phead">
     {#if !phone}<strong>Pattern</strong>{/if}
     {#if readonly}<span class="badge">read-only</span>{/if}
+    {#if planSwitch}
+      <label class="switch" title="Draw the plan's rows on the pattern">
+        <input
+          type="checkbox"
+          checked={planSwitch.on}
+          onchange={(e) => planSwitch?.set(e.currentTarget.checked)}
+        />
+        Plan on pattern
+      </label>
+    {/if}
     <span class="spacer"></span>
+    {#if onopen}
+      <button
+        class="btn sm"
+        title="Put this query in the editor and open the Pattern pane"
+        onclick={onopen}>Edit</button
+      >
+    {/if}
     {#if canEdit}
       <button class="btn sm" onclick={openNode} title="Add a node (N)">
         <Icon name="plus" size={13} /> Node
@@ -1173,6 +1439,76 @@
     </form>
   {/if}
 
+  {#if planMatch && mode === 'canvas'}
+    <div class="planbar" role="group" aria-label="Plan on pattern" data-testid="plan-bar">
+      <span class="ptitle"
+        ><Icon name="plan" size={12} /> Plan{planExecuted ? '' : ' estimate'}{planHeader
+          ? ` · ${planHeader}`
+          : ''}</span
+      >
+      <div class="seg" role="group" aria-label="Numbers on the pattern">
+        <button class="btn sm" aria-pressed={!showTime} onclick={() => (planTime = false)}
+          >Rows</button
+        >
+        <button
+          class="btn sm"
+          aria-pressed={showTime}
+          disabled={!planExecuted}
+          title="Each operator's own time (T)"
+          onclick={() => (planTime = true)}>Time</button
+        >
+      </div>
+      {#if planMatch.hiddenEstimates}
+        <span class="faint small">Estimates are hidden from your view.</span>
+      {:else if !phone}
+        <span class="faint small legend" title={LEGEND}>⚠ over ten times off</span>
+      {/if}
+      {#if planMatch.unmatched.length}
+        <button
+          class="btn sm ghost"
+          aria-expanded={notDrawnOpen}
+          onclick={() => (notDrawnOpen = !notDrawnOpen)}
+          data-testid="plan-not-drawn"
+          >{planMatch.unmatched.length} operator{planMatch.unmatched.length === 1 ? '' : 's'} not drawn</button
+        >
+      {/if}
+    </div>
+    {#if notDrawnOpen && planMatch.unmatched.length}
+      <ul class="notdrawn" aria-label="Operators not drawn">
+        {#each planMatch.unmatched as u, i (i)}
+          <li>
+            <button
+              class="linkish"
+              onclick={() => {
+                onplanselect?.(u.op.id);
+                onshowplan?.(u.op.id);
+              }}
+              ><strong>{u.op.node.operator}</strong>
+              <span class="mono">{u.pattern.s} {u.pattern.p} {u.pattern.o}</span>
+              <span class="faint"
+                >{planLabel(
+                  {
+                    op: u.op,
+                    est: u.op.node.estimatedRows,
+                    rows: planExecuted ? u.op.node.actualRows : -1,
+                    timeMs: u.op.node.timeMs,
+                    self: u.op.self,
+                    ratio: null,
+                  },
+                  { time: showTime, phone },
+                )}</span
+              ></button
+            >
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  {:else if planStale && !readonly}
+    <p class="notice" role="status" data-testid="plan-stale">
+      The plan is of the query that ran, and the text has changed since, so it is not drawn here.
+    </p>
+  {/if}
+
   <div class="pbody">
     {#if unavailable}
       <div class="state">
@@ -1232,6 +1568,10 @@
             {onselect}
             {onlayout}
             onkey={key}
+            overlay={canvasOverlay}
+            lit={planLit}
+            onhover={(id) => (hovered = id)}
+            onjoin={(op) => (activeJoin = op)}
           />
           {#if selected}
             <PatternPanel
@@ -1253,6 +1593,8 @@
               {short}
               note={schemaNote}
               {datatypes}
+              {planInfo}
+              {onshowplan}
               onedit={(e) => apply(withDeclare(e))}
               onrename={rename}
               onedge={(id) => openEdge(id)}
@@ -1270,8 +1612,12 @@
           {#each rows as row, i (i)}
             {@const triple = 'edge' in row ? row.edge.triple : undefined}
             {@const edge = 'edge' in row ? row.edge.id : ''}
+            {@const said =
+              'edge' in row
+                ? canvasOverlay?.edges[row.edge.id]?.spoken
+                : canvasOverlay?.nodes[row.node.id]?.spoken}
             <li class:locked={'node' in row && !!row.node.locked}>
-              <span class="desc">{describe(row, shown)}</span>
+              <span class="desc">{describe(row, shown)}{said ? `, ${said}` : ''}</span>
               {#if triple && canEdit}
                 <button class="btn sm" onclick={() => apply({ kind: 'optional', edge })}
                   >{triple.path.length > 1 ? 'Required' : 'Optional'}</button
@@ -1609,5 +1955,49 @@
     overflow: hidden;
     clip: rect(0 0 0 0);
     white-space: nowrap;
+  }
+  .switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-2);
+    cursor: pointer;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .planbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 4px 10px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-2);
+    font-size: 12px;
+  }
+  .planbar .ptitle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-weight: 600;
+  }
+  .notdrawn {
+    margin: 0;
+    padding: 4px 10px 6px 26px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    max-height: 140px;
+    overflow: auto;
+  }
+  .notdrawn .linkish {
+    background: none;
+    border: 0;
+    padding: 2px 0;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    display: inline-flex;
+    gap: 6px;
+    flex-wrap: wrap;
   }
 </style>

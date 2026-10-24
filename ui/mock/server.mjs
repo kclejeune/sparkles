@@ -30,6 +30,8 @@ import {
   handleDiff,
   recordChanges,
   initBranches,
+  overlayResults,
+  overlaySummary,
   resolveBranch,
 } from './branches.mjs';
 import { handleDescribe } from './describe.mjs';
@@ -660,8 +662,43 @@ function extractPatterns(q) {
 
 const isVar = (t) => /^[?$]/.test(t);
 
+const MOCK_PREFIXES = {
+  rdf: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+  rdfs: 'http://www.w3.org/2000/01/rdf-schema#',
+  xsd: 'http://www.w3.org/2001/XMLSchema#',
+  foaf: 'http://xmlns.com/foaf/0.1/',
+};
+
+/**
+ * A term of a pattern as the server's plans write it in `patterns` (U04 §11.3): a full
+ * IRI in angle brackets, `?name` for a variable, `?_` for a blank node, a number as a typed
+ * literal. A string literal reaches here as `"…"` (stripNoise hides its text), so its
+ * pattern matches nothing on the canvas and is listed as not drawn.
+ */
+function ntTerm(t, prefixes) {
+  if (t === 'a') return '<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>';
+  if (/^[?$]/.test(t)) return `?${t.slice(1)}`;
+  if (t.startsWith('<')) return t;
+  if (t.startsWith('_:') || t === '[]') return '?_';
+  if (/^[+-]?\d+$/.test(t)) return `"${t}"^^<http://www.w3.org/2001/XMLSchema#integer>`;
+  const i = t.indexOf(':');
+  if (i >= 0 && !t.startsWith('"')) {
+    const base = prefixes[t.slice(0, i)];
+    if (base) return `<${base}${t.slice(i + 1)}>`;
+  }
+  return t;
+}
+
+function queryPrefixes(query) {
+  const out = { ...MOCK_PREFIXES };
+  for (const m of query.matchAll(/PREFIX\s+([\w-]*):\s*<([^>]*)>/gi)) out[m[1]] = m[2];
+  return out;
+}
+
 function plan(query, totalRows, execMs, executed) {
   const pats = extractPatterns(query);
+  const prefixes = queryPrefixes(query);
+  const seenPattern = new Map();
   const scale = executed ? 1 : -1;
   const n = (x) => (executed ? Math.max(0, Math.round(x)) : -1);
   let budget = Math.max(execMs, 0.05);
@@ -677,6 +714,15 @@ function plan(query, totalRows, execMs, executed) {
             : 'SPO';
     const est = !isVar(s) ? 8 : !isVar(o) ? 40 : !isVar(p) ? 400 : 5000;
     const rows = Math.max(totalRows, 1) * (1 + ((i * 37) % 5));
+    const nt = [s, p, o].map((t) => ntTerm(t, prefixes));
+    const key = nt.join(' ');
+    const occurrence = seenPattern.get(key) ?? 0;
+    seenPattern.set(key, occurrence + 1);
+    // foaf:knows and ex:memberOf are the mock's misestimates: many more pairs than its
+    // statistics expect
+    const knows =
+      nt[1] === '<http://xmlns.com/foaf/0.1/knows>' ||
+      nt[1] === '<http://example.org/ontology#memberOf>';
     return {
       operator: 'IndexScan',
       description: `${perm} ${s} ${p} ${o}`,
@@ -686,10 +732,11 @@ function plan(query, totalRows, execMs, executed) {
       ].filter(isVar),
       estimatedRows: est,
       estimatedCost: est,
-      actualRows: n(Math.min(rows, est * 3)),
+      actualRows: n(knows ? est * 30 + i : Math.min(rows, est * 3)),
       timeMs: executed ? +(budget * 0.12 * (1 + (i % 3))).toFixed(3) : 0,
       cached: i === 1 && executed,
       children: [],
+      patterns: [{ s: nt[0], p: nt[1], o: nt[2], occurrence }],
     };
   });
   let node =
@@ -723,6 +770,7 @@ function plan(query, totalRows, execMs, executed) {
       timeMs: executed ? +(node.timeMs + right.timeMs + budget * 0.08).toFixed(3) : 0,
       cached: false,
       children: [node, right],
+      ...(shared.length ? { joinVars: shared.map((c) => c.slice(1)) } : {}),
     };
   }
   const wrap = (operator, description, factor = 1) => {
@@ -741,7 +789,13 @@ function plan(query, totalRows, execMs, executed) {
   };
   const q = stripNoise(query);
   const filter = /FILTER\s*\(([^)]*)\)/i.exec(q);
-  if (filter) wrap('Filter', filter[1].trim().slice(0, 80), 1);
+  if (filter) {
+    // the filter passes a tenth of the rows that reach it
+    const reached = node.actualRows;
+    wrap('Filter', filter[1].trim().slice(0, 80), 1);
+    node.filterVars = [...new Set((filter[1].match(/[?$]\w+/g) ?? []).map((v) => v.slice(1)))];
+    if (executed && reached > 0) node.actualRows = Math.max(1, Math.round(reached / 10));
+  }
   if (/\bGROUP\s+BY\b/i.test(q)) wrap('GroupBy', /GROUP\s+BY\s+([^\n}]*)/i.exec(q)[1].trim(), 1);
   const order = /ORDER\s+BY\s+([^\n}]*?)(?:LIMIT|OFFSET|$)/i.exec(q);
   if (order) wrap('Sort', order[1].trim());
@@ -1443,6 +1497,78 @@ function sparklesResult(ds, query, cap = Infinity) {
       datasetId: ds.id,
     },
   };
+}
+
+/**
+ * `POST /{ds}/shacl?shapes=guard` with `target` nodes in a form body: the guard's results
+ * for those nodes (the validation overlay of U07 §11). Other forms are not mocked.
+ */
+function handleOverlayShacl(res, ds, p) {
+  if (p.get('shapes') !== 'guard') return fail(res, 501, 'Only shapes=guard is mocked');
+  if (!ds.guard) return fail(res, 404, `/${ds.name} has no write-time validation`);
+  const form = new URLSearchParams(
+    String(p.get('__ct') ?? '').startsWith('application/x-www-form-urlencoded')
+      ? p.get('__body').toString('utf8')
+      : '',
+  );
+  const targets = form.getAll('target').map((t) => t.replace(/^<|>$/g, ''));
+  const results = overlayResults(ds, ds.store, targets) ?? [];
+  send(res, 200, { conforms: !results.length, results });
+}
+
+/** A dry run of an update (C15): the changes and the guard's summary, then rolled back. */
+function handleDryRun(res, ds, p) {
+  const update = p.get('update');
+  if (!update) return fail(res, 400, 'Missing update parameter');
+  const before = ds.store.match();
+  const dump = ds.store.dump({ format: 'application/n-quads' });
+  try {
+    ds.store.update(update);
+  } catch (e) {
+    return send(res, 400, parseErr(e));
+  }
+  const after = ds.store.match();
+  const key = (q) => String(q);
+  const had = new Set(before.map(key));
+  const has = new Set(after.map(key));
+  const quad = (op) => (q) => ({
+    op,
+    subject: q.subject.toString(),
+    predicate: q.predicate.toString(),
+    object: q.object.toString(),
+    graph: q.graph.termType === 'DefaultGraph' ? null : q.graph.toString(),
+  });
+  const removed = before.filter((q) => !has.has(key(q))).map(quad('-'));
+  const added = after.filter((q) => !had.has(key(q))).map(quad('+'));
+  const validation = overlaySummary(ds, ds.store);
+  for (const q of ds.store.match()) ds.store.delete(q);
+  ds.store.load(dump, { format: 'application/n-quads' });
+  const head = headCommit(ds).seq;
+  const changes = [...removed, ...added];
+  const limit = Number(p.get('changes') ?? 0);
+  const wouldCommit = changes.length > 0;
+  const rejected = !!validation && ds.guard.mode === 'reject' && validation.blocking > 0;
+  const body = {
+    dryRun: true,
+    dataset: ds.name,
+    committed: false,
+    wouldCommit,
+    outcome: rejected ? 'rejected' : wouldCommit ? 'commit' : 'no-change',
+    head,
+    commit: { seq: wouldCommit ? head + 1 : head, inserted: added.length, deleted: removed.length },
+    ...(limit
+      ? {
+          changes: {
+            total: changes.length,
+            limit,
+            truncated: changes.length > limit,
+            quads: changes.slice(0, limit),
+          },
+        }
+      : {}),
+    ...(validation ? { validation } : {}),
+  };
+  send(res, rejected ? 422 : 200, body, 'application/json', { 'Sparkles-Dry-Run': 'true' });
 }
 
 function handleUpdate(req, res, ds, p) {
@@ -2871,7 +2997,10 @@ const server = http.createServer(async (req, res) => {
       if (p.has('update')) return handleUpdate(req, res, ds, p);
       return handleQuery(req, res, ds, p);
     }
+    if (op === 'update' && ['true', ''].includes(String(p.get('dryRun') ?? 'x')))
+      return handleDryRun(res, ds, p);
     if (op === 'update') return handleUpdate(req, res, ds, p);
+    if (op === 'shacl') return handleOverlayShacl(res, ds, p);
     if (op === 'explain') {
       const query = p.get('query');
       if (!query) return fail(res, 400, 'Missing query parameter');

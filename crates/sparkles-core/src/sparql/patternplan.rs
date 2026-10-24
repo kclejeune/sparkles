@@ -107,6 +107,8 @@ pub struct PatternCountSpec {
     pub subject: Option<VarId>,
     pub pred: VarId,
     pub counts: Vec<(VarId, Measure)>,
+    /// the query's `?s ?p ?o`, for the plan's `patterns`
+    pub src: Option<std::sync::Arc<super::exec::PlanPattern>>,
 }
 
 /// `spk:hasPredicate` read from the patterns.
@@ -115,6 +117,8 @@ pub struct PatternScanSpec {
     pub uses: PatternUse,
     pub s: PathEnd,
     pub p: PathEnd,
+    /// the query's `?s spk:hasPredicate ?p`, for the plan's `patterns`
+    pub src: Option<std::sync::Arc<super::exec::PlanPattern>>,
 }
 
 /// The shape of a GROUP BY that the patterns can answer.
@@ -125,6 +129,8 @@ pub(super) struct CountShape {
     /// the object variable the rewrite drops, which must not be substituted
     pub o: Option<Variable>,
     pub counts: Vec<(Variable, Measure)>,
+    /// the triple the patterns answer, for the plan's `patterns`
+    pub triple: TriplePattern,
 }
 
 /// Recognize `GROUP BY ?p` over `inner` with `aggregates` as a pattern count.
@@ -227,7 +233,13 @@ pub(super) fn count_shape(
             return None;
         }
     }
-    Some(CountShape { rest, s, o, counts })
+    Some(CountShape {
+        rest,
+        s,
+        o,
+        counts,
+        triple: patterns[i].clone(),
+    })
 }
 
 /// (predicate, count), in predicate order.

@@ -61,7 +61,10 @@
   import LensMenu from '$components/LensMenu.svelte';
   import LensLegend from '$components/LensLegend.svelte';
   import { describe as lensDescribe, entryIds, OTHER } from '$lib/lens';
-  import { Lenses } from '$lib/lenses.svelte';
+  import { Lenses, type LensColumn } from '$lib/lenses.svelte';
+  import ValidationOverlay from '$components/ValidationOverlay.svelte';
+  import { MARK, type Badge, type VResult } from '$lib/validation-overlay';
+  import { load as loadPref, save as savePref } from '$lib/storage';
 
   type ENode = {
     id: string;
@@ -185,9 +188,51 @@
     changes = null;
     selection.clear();
     lensPick = null;
+    vShown = new Set();
     graphEpoch++;
   }
   let graphView: GraphView | undefined = $state();
+
+  // --- the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11) ---
+  /** On, off, or `null` for the default: on when the dataset has a write-time guard. */
+  let vChoice = $state<boolean | null>(
+    loadPref<boolean | null>('sparkles.explore.validation', null),
+  );
+  let vLive = $state(false);
+  let vBadges = $state(new Map<string, Badge>());
+  let vMarked = $state<{ nodes: string[]; edges: string[] } | null>(null);
+  let vPlaying = $state(false);
+  /** The elements Show triples drew, which stay drawn while the paths are drawn alone. */
+  let vShown = $state(new Set<string>());
+  let overlay: ValidationOverlay | undefined = $state();
+  function toggleValidation() {
+    vChoice = !(vChoice ?? vLive);
+    savePref('sparkles.explore.validation', vChoice);
+    if (!vChoice) vMarked = null;
+  }
+  /** Show triples: draw the result's focus node, path edge and value, and mark them. */
+  function showResultTriples(r: VResult) {
+    const sid = termKey(r.focus);
+    // a node the path finder drew joins the graph, so that its triples can be drawn
+    const drawnNode = gNodes.find((n) => n.id === sid && n.change !== 'removed');
+    if (!nodes[sid] && drawnNode) ensureNode(r.focus, drawnNode.label);
+    const out = { nodes: nodes[sid] ? [sid] : [], edges: [] as string[] };
+    const shown = () => {
+      // paths alone hide the explored graph, but not the triples of a result
+      vShown = new Set([...vShown, ...out.nodes, ...out.edges]);
+      return out;
+    };
+    if (!r.path || !r.value || !nodes[sid]) return shown();
+    const lit = r.value.type === 'literal';
+    if (lit) showLiterals = true;
+    const oid = lit ? `lit:${sid}|${r.path}|${termKey(r.value)}` : termKey(r.value);
+    ensureNode(r.value, undefined, oid);
+    const [s, o] = r.inverse ? [oid, sid] : [sid, oid];
+    addEdge(s, r.path, o, lit);
+    out.nodes.push(oid);
+    out.edges.push(`${s}|${r.path}|${o}`);
+    return shown();
+  }
   // the reads of a view that goes away stop with it
   onDestroy(() => {
     selection.clear();
@@ -380,6 +425,7 @@
 
   function closeGraphTime() {
     graphTimeOpen = false;
+    vPlaying = false;
     resetTime();
   }
 
@@ -424,7 +470,7 @@
     if (!pathOverlay) return [...real, ...ghosts];
     // the path finder's overlay: on the drawn nodes, plus the nodes it adds
     const on = new Map(pathOverlay.nodes.map((n) => [n.key, n]));
-    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const drawn = pathsAlone ? real.filter((n) => vShown.has(n.id)) : [...real, ...ghosts];
     const have = new Set(drawn.map((n) => n.id));
     const marked = drawn.map((n) => (on.has(n.id) ? { ...n, paths: on.get(n.id)!.paths } : n));
     const extra = pathOverlay.nodes
@@ -461,7 +507,7 @@
       .map((e) => ({ ...e, change: 'removed' as const }));
     if (!pathOverlay) return [...real, ...ghosts];
     const on = new Map(pathOverlay.edges.map((e) => [e.id, e]));
-    const drawn = pathsAlone ? [] : [...real, ...ghosts];
+    const drawn = pathsAlone ? real.filter((e) => vShown.has(e.id)) : [...real, ...ghosts];
     const have = new Set(drawn.map((e) => e.id));
     const marked = drawn.map((e) => (on.has(e.id) ? { ...e, paths: on.get(e.id)!.paths } : e));
     const extra = pathOverlay.edges
@@ -481,6 +527,24 @@
     return [...marked, ...extra];
   });
   const nodeCount = $derived(Object.keys(nodes).length);
+
+  // --- the validation overlay's drawn nodes and list column ---
+  // the nodes the canvas draws, path finder nodes included and ghosts left out
+  const vItems = $derived(
+    gNodes.flatMap((n) =>
+      n.term && n.change !== 'removed' ? [{ id: n.id, term: n.term, label: n.label }] : [],
+    ),
+  );
+  /** The list view's Validation column (U07 §11.2). */
+  const vColumn = $derived<LensColumn | null>(
+    vLive && vChoice !== false && vBadges.size
+      ? {
+          channel: 'badge',
+          title: 'Validation',
+          cells: new Map([...vBadges].map(([id, b]) => [id, `${MARK[b.worst]} ${b.words}`])),
+        }
+      : null,
+  );
 
   // --- the path finder (docs/specs/U09-path-finder.md) ----------------------------------
 
@@ -1967,12 +2031,44 @@
                 onclick={() => (graphTimeOpen ? closeGraphTime() : openGraphTime())}
                 ><Icon name="clock" size={13} /> History</button
               >
+              <button
+                class="btn sm"
+                aria-pressed={vChoice ?? vLive}
+                title="Badge the SHACL and ShEx results of the drawn nodes (V opens a node's results, Shift+V moves to the next)"
+                onclick={toggleValidation}><Icon name="check" size={13} /> Validation</button
+              >
               <button class="btn sm ghost" onclick={clearGraph}
                 ><Icon name="trash" size={13} /> Clear</button
               >
             {/if}
           </div>
           <SelectionBar onopengraph={openSelectionAsGraph} />
+          {#if ds && vItems.length && vChoice !== false}
+            <ValidationOverlay
+              bind:this={overlay}
+              {ds}
+              items={vItems}
+              {prefixes}
+              auto={vChoice === null}
+              at={mapAt}
+              branch={overviewBranch ?? ''}
+              paused={vPlaying}
+              head={app.datasets.find((d) => d.name === ds)?.head ?? null}
+              {selectedId}
+              onselect={(id) => {
+                select(id);
+                graphView?.center(id);
+              }}
+              onshowtriples={showResultTriples}
+              onopenquery={(text) => {
+                app.pendingQuery = { query: text, title: 'Suggested fix' };
+                goto(resolve('/query'));
+              }}
+              bind:live={vLive}
+              bind:badges={vBadges}
+              bind:marked={vMarked}
+            />
+          {/if}
         {/if}
         {#if graphTimeOpen && ds}
           <div class="graph-time">
@@ -1994,6 +2090,7 @@
               bind:playMode={graphPlayMode}
               bind:playing={graphPlaying}
               onshowdiff={(from, to) => openDiff(to, from)}
+              onplaying={(on) => (vPlaying = on)}
               onchange={() => syncUrl(selected?.term.type === 'uri' ? selected.iri : null)}
               onclose={() => {
                 closeGraphTime();
@@ -2052,7 +2149,7 @@
                   rows={listRows}
                   plain
                   label="Drawn nodes"
-                  lensColumns={lenses.columns}
+                  lensColumns={vColumn ? [...lenses.columns, vColumn] : lenses.columns}
                   selected={selectedId}
                   onselect={select}
                   openLabel="Focus"
@@ -2076,6 +2173,9 @@
                     (menu = nodes[id]?.term.type === 'uri' ? { id, ...at } : null)}
                   lens={lenses.encoding}
                   marked={lensMarked}
+                  validation={vLive && vChoice !== false
+                    ? { badges: vBadges, marked: vMarked, onbadge: (id) => overlay?.open(id) }
+                    : null}
                 />
                 {#if menu}
                   <div
@@ -3032,6 +3132,7 @@
     grid-template-columns: minmax(0, 1fr) 380px;
   }
   .canvas {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-height: 0;

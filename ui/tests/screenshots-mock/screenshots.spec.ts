@@ -385,6 +385,56 @@ ORDER BY ?region`;
   await shoot(page, 'pattern');
 });
 
+test('plan-pattern', async ({ page }) => {
+  // the plan drawn on the pattern of the query that ran (U04 §11): estimated and actual
+  // rows on each edge, ex:memberOf marked as a misestimate, the joins as numbered badges
+  // and the filter's rows on its chip, with the plan tree beside it
+  const query = `PREFIX ex: <http://example.org/ontology#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?name ?teamName WHERE {
+  ?person a ex:Person ;
+          foaf:name ?name ;
+          ex:memberOf ?team .
+  ?team rdfs:label ?teamName .
+  FILTER(STRLEN(?name) > 3)
+}`;
+  await page.addInitScript(
+    ([q]) => {
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'Teams', query: q }], active: 't1' }),
+      );
+      localStorage.removeItem('sparkles.patternLayouts');
+      localStorage.setItem('sparkles.patternPane', JSON.stringify({ open: false }));
+      localStorage.setItem('sparkles.planOnPattern', 'true');
+    },
+    [query],
+  );
+  await page.goto(`/ui/query?ds=${DATASET}`);
+  await expect(page.locator('.cm-content')).toContainText('SELECT', { timeout: 30_000 });
+  // a shorter editor, so the drawing and the tree have room
+  const top = (await page.locator('.cm-editor').boundingBox())!.y;
+  const split = (await page.getByRole('separator', { name: 'Resize editor' }).boundingBox())!;
+  await page.mouse.move(split.x + split.width / 2, split.y + split.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(split.x + split.width / 2, top + 250, { steps: 5 });
+  await page.mouse.up();
+  await page.getByRole('button', { name: /^Run/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await results.getByRole('tab', { name: /Pattern/ }).click();
+  const ran = results.getByRole('region', { name: 'Pattern of the query that ran' });
+  const canvas = ran.locator('.pcanvas');
+  await expect(canvas).toHaveAttribute('data-overlay', /memberOf/, { timeout: 30_000 });
+  await expect
+    .poll(async () => Number(await canvas.getAttribute('data-settled')))
+    .toBeGreaterThan(0);
+  await ran.getByRole('button', { name: 'Fit to view' }).click();
+  await page.mouse.move(0, 0);
+  await shoot(page, 'plan-pattern');
+});
+
 test('diff-graph', async ({ page, request }) => {
   // a commit of `world` that adds and removes triples, drawn as a graph of its own
   await update(
@@ -548,4 +598,46 @@ SELECT ?person ?name WHERE {
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   await page.waitForTimeout(500);
   await page.screenshot({ path: join(OUT, 'pattern-edit.png'), animations: 'disabled' });
+});
+
+// the validation overlay (docs/specs/U07-data-quality-and-schema-diagram.md §11): a team
+// whose SHACL guard wants a name for every person and a valid email address
+const Q = 'http://example.org/quality/';
+
+test('validation-overlay', async ({ page, request }) => {
+  const made = await request.post('/$/datasets', { data: { dbName: 'team', dbType: 'mem' } });
+  expect(made.ok() || made.status() === 409).toBe(true);
+  const u = await request.post('/team/update', {
+    headers: { 'Content-Type': 'application/sparql-update' },
+    data: `PREFIX q: <${Q}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA {
+      q:acme a q:Organization ; rdfs:label "Acme Robotics" .
+      q:lea a q:Person ; q:name "Léa Martin" ; q:email "lea@acme.example" ; q:worksFor q:acme .
+      q:omar a q:Person ; q:name "Omar Haddad" ; q:email "omar@acme" ; q:worksFor q:acme .
+      q:p17 a q:Person ; q:email "p17@acme.example" ; q:worksFor q:acme .
+      q:p18 a q:Person ; q:worksFor q:acme .
+      q:sara a q:Person ; q:name "Sara Lind" ; q:email "sara@acme.example" ; q:worksFor q:acme . }`,
+  });
+  expect(u.ok()).toBe(true);
+  const shapes = `@prefix sh: <http://www.w3.org/ns/shacl#> . @prefix q: <${Q}> .
+q:PersonShape a sh:NodeShape ; sh:targetClass q:Person ;
+  sh:property [ sh:path q:name ; sh:minCount 1 ] ;
+  sh:property [ sh:path q:email ; sh:pattern "^[^@]+@[^@]+[.][^@]+$" ; sh:message "not an email address" ] .`;
+  const g = await request.put('/$/validation/team', {
+    data: { mode: 'warn', shapes: { inline: shapes } },
+  });
+  expect(g.ok()).toBe(true);
+  await page.goto(`/ui/explore?ds=team&iri=${encodeURIComponent(`${Q}acme`)}`);
+  await expect(page.getByRole('button', { name: /p17, 1 violation/ })).toBeVisible({
+    timeout: 30_000,
+  });
+  await page.getByRole('button', { name: /omar, 1 violation/i }).click();
+  const panel = page.getByRole('dialog', { name: /Validation results of/ });
+  await panel.getByRole('button', { name: 'Show triples' }).click();
+  await page.getByRole('button', { name: /p17, 1 violation/ }).click();
+  await panel.getByRole('button', { name: 'Suggest fix' }).click();
+  const editor = panel.getByRole('textbox', { name: 'Suggested update' });
+  await editor.fill((await editor.inputValue()).replace('?value .', '"Priya Shah" .'));
+  await panel.getByRole('button', { name: 'Preview' }).click();
+  await expect(panel).toContainText('The guard would resolve this result.');
+  await shoot(page, 'validation-overlay');
 });

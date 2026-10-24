@@ -91,10 +91,14 @@ mod handlers {
     use sparkles::handles::GuardOutcome;
 
     fn status_json(ds: &Dataset) -> J {
-        match ds.dataset.validation().guard().get() {
+        let mut j = match ds.dataset.validation().guard().get() {
             Some(g) => g.json(),
             None => none_json(),
-        }
+        };
+        // a guard over `default`, and the overlay's other sources, validate the union of
+        // the graphs when the server serves the union as the default graph
+        j["unionDefaultGraph"] = J::Bool(ds.store.snapshot().union_default_graph);
+        j
     }
 
     /// The language a `PUT` body asks for: `language`, or SHACL without one.

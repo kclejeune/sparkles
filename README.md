@@ -243,7 +243,8 @@ The web UI is embedded in the server. It has a query editor with results as tabl
 graphs and maps, with arcs for the relations between located entities, a visual query builder that draws each query and edits it as text, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
 merges, a time slider over past commits with commit diffs drawn as graphs, the Ask bar, and agent memory. The screenshots
 below start with time travel over commits, branches and merges, GraphRAG communities, the
-Ask bar and agent memory, path finding, inference on the canvas and maps of relations.
+Ask bar and agent memory, path finding, inference on the canvas, maps of relations and
+validation on the graph.
 
 <table>
   <tr>
@@ -251,7 +252,7 @@ Ask bar and agent memory, path finding, inference on the canvas and maps of rela
     <td><img src="docs/images/diff-graph.png" alt="The diff graph of one commit, drawing a new employee, a new job title and a move to Los Angeles in green and the removed job title, home city and acquaintance as dashed red ghosts"></td>
   </tr>
   <tr>
-    <td>A query's results compared between two commits</td>
+    <td>Time travel: a query's results compared between two commits</td>
     <td>A commit's changes drawn as a graph</td>
   </tr>
   <tr>
@@ -280,11 +281,11 @@ Ask bar and agent memory, path finding, inference on the canvas and maps of rela
   </tr>
   <tr>
     <td><img src="docs/images/map-arcs.png" alt="The resource explorer showing a freight company's graph as a world map, with arcs from its head office in Dubai to its offices, partners and employees on six continents, coloured by predicate"></td>
-    <td><img src="docs/images/branches.png" alt="A dataset page listing its branches above a commit history graph that includes a merge"></td>
+    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, a bad email address and its edge marked, and a results panel previewing an update that adds a missing name"></td>
   </tr>
   <tr>
     <td>A graph's relations drawn as arcs on a map</td>
-    <td>Branches and their commit graph</td>
+    <td>SHACL results on the graph, with a suggested fix previewed</td>
   </tr>
 </table>
 
@@ -293,20 +294,28 @@ Ask bar and agent memory, path finding, inference on the canvas and maps of rela
 
 <table>
   <tr>
+    <td><img src="docs/images/branches.png" alt="A dataset page listing its branches above a commit history graph that includes a merge"></td>
     <td><img src="docs/images/diff-lapse.png" alt="A time-lapse over four commits with ghosts kept, showing the changes of each commit added in green and removed ones as dashed ghosts, with a running total of changes since the start"></td>
-    <td><img src="docs/images/time-slider-graph.png" alt="The resource explorer with the time slider in compare mode, drawing a new edge in green and a removed one as a dashed ghost"></td>
   </tr>
   <tr>
+    <td>Branches and their commit graph</td>
     <td>A time-lapse that applies one commit's diff per step</td>
-    <td>A graph compared between two commits</td>
   </tr>
   <tr>
+    <td><img src="docs/images/time-slider-graph.png" alt="The resource explorer with the time slider in compare mode, drawing a new edge in green and a removed one as a dashed ghost"></td>
     <td><img src="docs/images/handoff.png" alt="A query handed over by an agent, open in the query editor with its question, assumptions, the terms it uses and a clean check"></td>
-    <td><img src="docs/images/ask-steps.png" alt="The Ask bar while it works, showing Summarizing after the query results have arrived"></td>
   </tr>
   <tr>
+    <td>A graph compared between two commits</td>
     <td>A query an agent handed over for review</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/ask-steps.png" alt="The Ask bar while it works, showing Summarizing after the query results have arrived"></td>
+    <td><img src="docs/images/plan-pattern.png" alt="The Pattern tab of a query that ran with Plan on pattern, each edge labelled with its estimated and actual rows, ex:memberOf marked as a misestimate, numbered join badges on the variables and the plan tree beside it"></td>
+  </tr>
+  <tr>
     <td>An answer in progress, at the summary step</td>
+    <td>A query's plan drawn on its pattern, with misestimates marked</td>
   </tr>
   <tr>
     <td><img src="docs/images/result-arcs.png" alt="A query result drawn as labelled great-circle arcs for 37 freight routes between cities on six continents, beside the list of rows"></td>

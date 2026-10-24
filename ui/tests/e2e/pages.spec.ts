@@ -23,7 +23,7 @@ SELECT ?person ?name WHERE { ?person a ex:Person ; rdfs:label ?name } ORDER BY ?
 
 test('the explorer finds a resource by label and shows its properties', async ({ page }) => {
   await page.goto(`/ui/explore?ds=${DATASET}`);
-  await page.getByRole('combobox').fill('lovelace');
+  await page.getByRole('combobox', { name: /Find a resource/ }).fill('lovelace');
   await page.getByRole('option', { name: /Ada Lovelace/ }).click();
 
   const side = page.getByRole('complementary', { name: 'Resource details' });

@@ -77,7 +77,7 @@
       <tr>
         <th scope="col">Name</th>
         {#if !plain}<th scope="col" class="num">Size</th>{/if}
-        {#each lensColumns as c (c.channel)}
+        {#each lensColumns as c (`${c.channel}:${c.title}`)}
           <th scope="col" class="lens-col" data-lens={c.channel}>{c.title}</th>
         {/each}
         <th scope="col" class="hide-sm">Kind</th>
@@ -106,7 +106,7 @@
             </button>
           </td>
           {#if !plain}<td class="num">{r.kind === 'member' ? '' : fmtInt(r.size)}</td>{/if}
-          {#each lensColumns as c (c.channel)}
+          {#each lensColumns as c (`${c.channel}:${c.title}`)}
             <td class="lens-col" data-lens={c.channel}>{c.cells.get(r.key) ?? ''}</td>
           {/each}
           <td class="hide-sm faint">{r.kind}</td>

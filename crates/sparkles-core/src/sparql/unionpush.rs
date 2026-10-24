@@ -380,6 +380,7 @@ mod tests {
                 graph: GraphFilter::Default,
                 graph_col: perm.col_of(crate::index::G),
                 dedup: false,
+                src: None,
             };
             Node::leaf(Kind::Scan(spec), vars, 100.0, String::new())
         }

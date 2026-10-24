@@ -3727,6 +3727,7 @@ fn protocol(p: &mut Paths) {
     let mut shapes = Map::new();
     media(&RDF[..6], &mut shapes);
     shapes.insert("text/shaclc".into(), text());
+    shapes.insert("application/x-www-form-urlencoded".into(), text());
     let mut report = Map::new();
     media(&RDF[..6], &mut report);
     report.insert(
@@ -3735,12 +3736,13 @@ fn protocol(p: &mut Paths) {
     );
     p.add(
         op(POST, "/{ds}/shacl", "shacl", "Validation", "Validate with SHACL")
-            .doc("Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms.")
+            .doc("Validates a data graph of the dataset against the shapes graph in the body, as Fuseki's `/{ds}/shacl` does. The report answers `200` whether or not the data conforms. With `shapes=guard` or `shapes=<graph IRI>` the shapes come from the write-time guard or from a graph of the dataset, and the body is empty or a form of further parameters. A named source with any other body is a `400`.")
             .see("shacl-validation")
             .param("graphSel")
-            .query("target", s(), "Validate one node, an IRI or prefixed name.")
+            .query("target", json!({ "type": "array", "items": { "type": "string" }, "maxItems": 1000 }), "Validate these nodes against the shapes whose targets select them. Each is an IRI, a prefixed name or a blank node label, and the parameter may repeat up to 1,000 times.")
+            .query("shapes", s(), "`guard` for the write-time guard's shapes on its data graph, or the IRI of a shapes graph of the dataset.")
             .params(&["reasoning", "timeout", "at", "format"])
-            .body(true, "The shapes graph.", J::Object(shapes))
+            .body(false, "The shapes graph, or with `shapes` an empty body or a form of parameters.", J::Object(shapes))
             .resp("200", "The validation report.", Some(J::Object(report)))
             .errors(&[400, 408, 507]),
     );
@@ -3753,15 +3755,17 @@ fn protocol(p: &mut Paths) {
             .query("shape", s(), "A shape label; `START` by default.")
             .query("schema-format", json!({ "type": "string", "enum": ["shexc", "shexj", "shexr"] }), "The schema's syntax when the media type does not say.")
             .query("base", s(), "The base IRI of the schema.")
-            .params(&["graphSel", "reasoning", "timeout", "format"])
+            .query("schema", json!({ "type": "string", "enum": ["guard"] }), "`guard` validates against the write-time guard's schema on its data graph. The body is then empty or a form of parameters, and the shape map names up to 1,000 nodes, where `START` takes the shapes the guard's shape map gives each node.")
+            .params(&["graphSel", "reasoning", "timeout", "at", "format"])
             .body(
-                true,
-                "The schema, or a JSON envelope.",
+                false,
+                "The schema, or a JSON envelope, or with `schema=guard` an empty body or a form of parameters.",
                 json!({
                     "text/shex": text(),
                     "application/shex+json": { "schema": { "type": "object" } },
                     "application/json": { "schema": { "anyOf": [sref("ShexRequest"), { "type": "object", "description": "A ShExJ schema." }] } },
                     "text/turtle": text(),
+                    "application/x-www-form-urlencoded": text(),
                 }),
             )
             .resp(

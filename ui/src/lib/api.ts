@@ -404,6 +404,12 @@ export type PlanNode = {
   pushedFilters?: string[];
   /** The estimate is a constant guess (`SERVICE`). */
   estimateGuessed?: boolean;
+  /** The triple patterns and paths of the query the node reads, in query order (U04 §11.3). */
+  patterns?: { s: string; p: string; o: string; graph?: string; occurrence: number }[];
+  /** On a filter, the query variables its expression reads. */
+  filterVars?: string[];
+  /** On a join, the query variables it joins on. */
+  joinVars?: string[];
   /** From a streamed plan: whether the operator materializes its input, and why. */
   materializes?: boolean;
   reason?: string | null;
@@ -2968,6 +2974,8 @@ export type ValidationConfig = {
 export type WriteValidation = {
   language: 'shacl' | 'shex';
   config: ValidationConfig;
+  /** Whether the server serves the union of the graphs as the default graph */
+  unionDefaultGraph?: boolean;
   status: WriteValidationStatus;
 };
 
@@ -2992,6 +3000,24 @@ export async function writeValidation(
     cache: 'no-store',
   });
   return body && body.config ? (body as WriteValidation) : null;
+}
+
+/**
+ * `GET /$/validation/{ds}` with the server's union-default flag, which the answer carries
+ * with a configuration and without one.
+ */
+export async function writeValidationState(
+  ds: string,
+  signal?: AbortSignal,
+): Promise<{ validation: WriteValidation | null; unionDefaultGraph: boolean }> {
+  const body = await json<(WriteValidation | { config: null }) & { unionDefaultGraph?: boolean }>(
+    `/$/validation/${enc(ds)}`,
+    { signal, cache: 'no-store' },
+  );
+  return {
+    validation: body && body.config ? (body as WriteValidation) : null,
+    unionDefaultGraph: !!body?.unionDefaultGraph,
+  };
 }
 
 /**

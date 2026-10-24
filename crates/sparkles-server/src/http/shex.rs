@@ -71,6 +71,8 @@ mod enabled {
         pub base: Option<String>,
         /// the syntax of a schema body (`schema-format`)
         pub schema_format: Option<SchemaFormat>,
+        /// `schema=guard`: the write-time guard's schema instead of a body
+        pub guard: bool,
     }
 
     fn flag(params: &Params, name: &str) -> ApiResult<bool> {
@@ -140,7 +142,23 @@ mod enabled {
                 ))
             })?),
         };
+        let guard = match params.get("schema") {
+            None => false,
+            Some("guard") => true,
+            Some(v) => return Err(bad(format!("invalid schema '{v}' (guard)"))),
+        };
+        if guard && params.has("graph") {
+            return Err(bad(
+                "schema=guard validates the guard's data graph: leave out graph".into(),
+            ));
+        }
+        if guard && (schema_format.is_some() || base.is_some()) {
+            return Err(bad(
+                "schema=guard takes the guard's schema: leave out schema-format and base".into(),
+            ));
+        }
         Ok(ShexParams {
+            guard,
             schema_format,
             graph,
             use_inferred: params.get("reasoning").is_none_or(|v| v != "false"),
@@ -324,8 +342,46 @@ mod enabled {
         QueryBody(body): QueryBody,
     ) -> ApiResult {
         let ds = dataset(&st, &name)?;
-        let query = Params::from_query(&uri);
+        let mut query = Params::from_query(&uri);
+        let ct = content_type(&headers);
+        let mut body = body;
+        // `schema=guard`: the body holds no schema, at most a form of parameters
+        if query.get("schema").is_some() {
+            if ct == "application/x-www-form-urlencoded" {
+                query.extend_form(&body);
+                body = Default::default();
+            } else if !body.iter().all(u8::is_ascii_whitespace) {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "give the schema in the body or name it with schema=, not both",
+                ));
+            }
+        }
         let p = params(&st, &query, &headers)?;
+        let at = super::super::history::at_param(&query)?;
+        let guard = if p.guard {
+            match ds.validation.read().clone() {
+                Some(crate::write_validation::Validation::Shex(g)) => Some(g),
+                #[cfg(feature = "shacl")]
+                Some(crate::write_validation::Validation::Shacl(_)) => {
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "the write-time guard of /{} validates SHACL: use /{}/shacl?shapes=guard",
+                            ds.name, ds.name
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(err(
+                        StatusCode::NOT_FOUND,
+                        format!("/{} has no write-time validation", ds.name),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         // SPARQL selectors: the request's row and memory budgets (SERVICE is refused
         // when the map is parsed, and the caller's permissions apply all the same)
         let mut selector_query = query_options(&st, &ds, &query);
@@ -335,7 +391,6 @@ mod enabled {
             &ds.name,
             crate::auth::Endpoint::Shex,
         );
-        let ct = content_type(&headers);
         let has_inferred = ds.reasoning.read().is_some();
         // a client that disconnects stops the validation at its next check
         let (cancel, _cancel_on_drop) = cancel_on_drop();
@@ -362,6 +417,28 @@ mod enabled {
         let files = st.file_loads.clone();
         let limits = st.shex_import_limits;
         blocking(move || {
+            let past = sparkles::sparql::QueryOptions {
+                timeout: Some(p.timeout),
+                cancel: Some(cancel.clone()),
+                ..Default::default()
+            };
+            let (snap, resolved) = super::super::history::snapshot_for(&ds, at.as_ref(), &past)?;
+            if let Some(g) = &guard {
+                return guard_validation(GuardRun {
+                    guard: g,
+                    snap,
+                    resolved,
+                    uri: &uri,
+                    ds: &ds,
+                    p: &p,
+                    cancel,
+                    max_results,
+                    max_pairs,
+                    too_large: &too_large,
+                    max_bytes,
+                    selector_query,
+                });
+            }
             let req = read_request(&ct, &body, &p)?;
             // one resolver, and one outbound request budget, per validation
             let budget = sparkles::outbound::RequestBudget::new(&policy);
@@ -395,7 +472,6 @@ mod enabled {
                 }
                 MapText::Json(m) => ShapeMap::from_json(m).map_err(|e| syntax("shape map", &e))?,
             };
-            let snap = ds.store.snapshot();
             if let GraphParam::Named(iri) = &p.graph
                 && !graph_exists(&snap, iri)
             {
@@ -453,6 +529,7 @@ mod enabled {
             }
             let resp = ([(header::CONTENT_TYPE, p.format.media_type())], buf).into_response();
             let resp = with_commit(resp, &ds, snap.commit);
+            let resp = super::super::history::history_headers(resp, resolved.as_ref(), &uri);
             Ok(with_inferences(
                 resp,
                 &ds,
@@ -461,6 +538,121 @@ mod enabled {
             ))
         })
         .await
+    }
+
+    /// A validation under `schema=guard`, with what it needs.
+    struct GuardRun<'a> {
+        guard: &'a std::sync::Arc<sparkles_shex::guard::ShexGuard>,
+        snap: std::sync::Arc<sparkles::store::Snapshot>,
+        resolved: Option<sparkles::history::Resolved>,
+        uri: &'a Uri,
+        ds: &'a std::sync::Arc<crate::state::Dataset>,
+        p: &'a ShexParams,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        max_results: Option<usize>,
+        max_pairs: usize,
+        too_large: &'a dyn Fn(u64) -> ApiError,
+        max_bytes: Option<u64>,
+        selector_query: sparkles::sparql::QueryOptions,
+    }
+
+    /// `schema=guard` (spec U07 §11.3): the guard's schema on the guard's data graph, for
+    /// the nodes of the request's shape map. Each association names a node; one with
+    /// `START` takes the shapes the guard's shape map gives that node, and one with a
+    /// label keeps it.
+    fn guard_validation(r: GuardRun<'_>) -> ApiResult {
+        let bad = |m: String| err(StatusCode::BAD_REQUEST, m);
+        let (schema, guard_map, opts) = r.guard.validation_inputs(&r.snap);
+        let text = match (&r.p.map, &r.p.node) {
+            (Some(m), _) => m.clone(),
+            (None, Some(n)) => format!("{n}@{}", r.p.shape.as_deref().unwrap_or("START")),
+            (None, None) => return Err(bad(NO_MAP.into())),
+        };
+        let asked = ShapeMap::parse(&text, schema.prefixes(), schema.base())
+            .map_err(|e| syntax("shape map", &e))?;
+        if asked.0.len() > super::super::MAX_FOCUS_NODES {
+            return Err(bad(format!(
+                "too many associations: {} (at most {})",
+                asked.0.len(),
+                super::super::MAX_FOCUS_NODES
+            )));
+        }
+        let mut start = Vec::new();
+        let mut map = ShapeMap::default();
+        for a in asked.0 {
+            let sparkles_shex::NodeSelector::Term(t) = &a.node else {
+                return Err(bad(
+                    "under schema=guard each association of the shape map names a node".into(),
+                ));
+            };
+            match a.shape {
+                sparkles_shex::ShapeLabel::Start => start.push(t.clone()),
+                _ => map.0.push(a),
+            }
+        }
+        let resp = |buf: String, commit: u64, inferences: bool| -> ApiResult {
+            let resp = ([(header::CONTENT_TYPE, r.p.format.media_type())], buf).into_response();
+            let resp = with_commit(resp, r.ds, commit);
+            let resp = super::super::history::history_headers(resp, r.resolved.as_ref(), r.uri);
+            Ok(with_inferences(resp, r.ds, inferences, commit))
+        };
+        let Some(base) = opts else {
+            // none of the guard's data graphs exists: nothing to validate
+            let empty = sparkles_shex::ResultMap {
+                conforms: true,
+                ..Default::default()
+            };
+            return resp(
+                write_report(&empty, r.p.format, r.p.stats),
+                r.snap.commit,
+                false,
+            );
+        };
+        let inferences = base.extra_graphs.iter().any(|g| g == INFERRED_GRAPH);
+        if !start.is_empty() {
+            let data = sparkles::validation::DataGraph::new(
+                r.snap.clone(),
+                base.data_graph.as_deref(),
+                &base.extra_graphs,
+                &base.exclude_graphs,
+            )
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            let found = sparkles_shex::shapemap::focus_map(&guard_map, &start, &data)
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            map.0.extend(found.0);
+        }
+        let opts = ValidateOptions {
+            pool: crate::validation_common::validation_pool(),
+            timeout: Some(r.p.timeout),
+            cancel: Some(r.cancel),
+            max_results: r.max_results,
+            max_pairs: Some(r.max_pairs),
+            only_nonconformant: r.p.only_nonconformant,
+            semact_trace: r.p.semact_trace,
+            selector_query: Some(r.selector_query),
+            ..base
+        };
+        let results = sparkles_shex::validate(&r.snap, &schema, &map, &opts).map_err(|e| {
+            if let Some(t) = e.downcast_ref::<TooManyResults>() {
+                return (r.too_large)(
+                    (t.limit as u64 + 1) * crate::validation_common::MIN_RESULT_BYTES,
+                );
+            }
+            if let Some(s) = e.downcast_ref::<SchemaError>() {
+                return schema_error(s);
+            }
+            let msg = format!("{e:#}");
+            match e.downcast::<Error>() {
+                Ok(e) => ApiError::from(e),
+                Err(_) => err(StatusCode::BAD_REQUEST, msg),
+            }
+        })?;
+        let buf = write_report(&results, r.p.format, r.p.stats);
+        drop(results);
+        if r.max_bytes.is_some_and(|m| buf.len() as u64 > m) {
+            return Err((r.too_large)(buf.len() as u64));
+        }
+        resp(buf, r.snap.commit, inferences)
     }
 }
 
