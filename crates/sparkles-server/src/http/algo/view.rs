@@ -337,23 +337,37 @@ impl Kept {
         let json = |e: serde_json::Error| sparkles::Error::invalid(e.to_string());
         let mut out: Vec<u8> = Vec::new();
         let mut charged = 0usize;
-        out.extend_from_slice(b"{\"head\":{\"vars\":");
-        serde_json::to_writer(&mut out, &vars).map_err(json)?;
-        out.extend_from_slice(b"},\"results\":{\"bindings\":[");
+        // every part is written apart first, and the answer grows only after its room is
+        // charged
+        let mut append =
+            |out: &mut Vec<u8>, part: &[u8], held: &mut Held| -> sparkles::Result<()> {
+                over(out.len() + part.len())?;
+                if out.capacity() - out.len() < part.len() {
+                    let want = (out.len() + part.len()).max(out.capacity() * 2);
+                    held.charge((want - charged) as u64)?;
+                    out.reserve_exact(want - out.len());
+                    charged = out.capacity().max(want);
+                }
+                out.extend_from_slice(part);
+                Ok(())
+            };
+        let mut part: Vec<u8> = Vec::new();
+        part.extend_from_slice(b"{\"head\":{\"vars\":");
+        serde_json::to_writer(&mut part, &vars).map_err(json)?;
+        part.extend_from_slice(b"},\"results\":{\"bindings\":[");
+        append(&mut out, &part, held)?;
         for (k, &i) in picked.iter().enumerate() {
+            part.clear();
             if k > 0 {
-                out.push(b',');
+                part.push(b',');
             }
-            serde_json::to_writer(&mut out, &self.binding(i)).map_err(json)?;
-            over(out.len())?;
-            if out.capacity() > charged {
-                held.charge((out.capacity() - charged) as u64)?;
-                charged = out.capacity();
-            }
+            serde_json::to_writer(&mut part, &self.binding(i)).map_err(json)?;
+            append(&mut out, &part, held)?;
         }
-        out.extend_from_slice(b"]},\"summary\":");
-        serde_json::to_writer(&mut out, &self.summary).map_err(json)?;
-        out.extend_from_slice(b",\"run\":");
+        part.clear();
+        part.extend_from_slice(b"]},\"summary\":");
+        serde_json::to_writer(&mut part, &self.summary).map_err(json)?;
+        part.extend_from_slice(b",\"run\":");
         let run = json!({
             "commit": self.commit,
             "cached": cached,
@@ -362,9 +376,9 @@ impl Kept {
             "truncated": truncated,
             "definition": format!("{:016x}", self.definition),
         });
-        serde_json::to_writer(&mut out, &run).map_err(json)?;
-        out.push(b'}');
-        over(out.len())?;
+        serde_json::to_writer(&mut part, &run).map_err(json)?;
+        part.push(b'}');
+        append(&mut out, &part, held)?;
         Ok(out)
     }
 
@@ -1403,5 +1417,26 @@ mod tests {
         // the buffer stopped near the limit, and what it held was charged
         assert!(held.held < 64 << 10, "{}", held.held);
         assert!(held.held > 0);
+    }
+
+    #[test]
+    fn the_whole_answer_buffer_is_charged() {
+        for n in [0usize, 1, 3, 17, 64, 200, 777] {
+            let vars = vec!["node".into(), "score".into()];
+            let rows: Vec<_> = (0..n)
+                .map(|i| vec![iri(&format!("n{i}")), dbl(i as f64)])
+                .collect();
+            let k = Kept::new(vars, rows, Some(json!({"iterations": 3})), 1);
+            let mut held = Held::unbounded();
+            let out = k
+                .write_answer(&ViewOpts::default(), true, usize::MAX, None, &mut held)
+                .unwrap();
+            assert!(
+                held.held >= out.capacity() as u64,
+                "{n} rows: {} charged for a buffer of {}",
+                held.held,
+                out.capacity()
+            );
+        }
     }
 }

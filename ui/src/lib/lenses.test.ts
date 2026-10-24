@@ -351,6 +351,78 @@ describe('algorithm lenses (Phase 2)', () => {
     l.destroy();
   });
 
+  const graphragFetch = (status: () => Promise<Response>) =>
+    vi.fn(async (url: string) => {
+      const u = String(url);
+      const json = (b: unknown) =>
+        new Response(JSON.stringify(b), { headers: { 'Content-Type': 'application/json' } });
+      if (u.includes('/memberships'))
+        return json({
+          available: true,
+          memberships: [{ node: `${EX}a`, community: `${EX}c1` }],
+          communities: [{ iri: `${EX}c1`, memberCount: 3, title: 'Team' }],
+        });
+      if (u.includes('/projections')) return json({ projections: [] });
+      if (/\/\$\/graphrag\/ds$/.test(new URL(u, 'http://x').pathname)) return status();
+      return new Response('{}', { status: 404 });
+    });
+  const okStatus = () =>
+    Promise.resolve(
+      new Response(JSON.stringify({ enabled: true, available: true, levels: [{ level: 0 }] }), {
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+  it('waits for an options read in flight when the menu asks again (merge re-review)', async () => {
+    let release: () => void = () => {};
+    let deferNext = false;
+    vi.stubGlobal(
+      'fetch',
+      graphragFetch(() => {
+        if (!deferNext) return okStatus();
+        return new Promise<Response>((r) => {
+          release = () => void okStatus().then(r);
+        });
+      }),
+    );
+    const { l } = lenses(() => []);
+    l.setInput(input({ nodes: people, at: 'commit:2', past: true }));
+    await l.loadAlgoOptions();
+    l.set('colour', { lens: 'graphrag' });
+    await settleLong();
+    expect(l.status.colour.error).toMatch(/past state/);
+    // back at the head the options are read again, slowly, and the menu asks meanwhile
+    deferNext = true;
+    l.setInput(input({ nodes: people }));
+    void l.loadAlgoOptions();
+    await settleLong();
+    release();
+    await settleLong();
+    expect(l.status.colour.error).toBeUndefined();
+    expect(l.results.colour?.legend[0].text).toMatch(/^Team/);
+    l.destroy();
+  });
+
+  it('reads the options again after a failed read when the state changes (merge re-review)', async () => {
+    let reads = 0;
+    vi.stubGlobal(
+      'fetch',
+      graphragFetch(() => {
+        reads++;
+        return reads === 1 ? Promise.resolve(new Response('{}', { status: 500 })) : okStatus();
+      }),
+    );
+    const { l } = lenses(() => []);
+    l.setInput(input({ nodes: people }));
+    await l.loadAlgoOptions();
+    expect(l.algo.graphrag).toBeNull();
+    l.setInput(input({ nodes: people, epoch: 2 }));
+    await settleLong();
+    expect(reads).toBe(2);
+    expect(l.algo.graphrag).toEqual({ levels: [0] });
+    l.destroy();
+  });
+
   it('refuses the GraphRAG lens at a past state although its options were read at the head (§6)', async () => {
     const fetches = vi.fn(async () => new Response('{}', { status: 500 }));
     vi.stubGlobal('fetch', fetches);

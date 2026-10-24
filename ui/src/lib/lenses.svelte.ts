@@ -357,6 +357,7 @@ export class Lenses {
         this.#propsKey = '';
         this.#colours = null;
         this.#algoKey = '';
+        this.#algoWanted = false;
         this.algo = { projections: [], projectionOff: null, graphrag: null, graphragOff: null };
         // a default of the last dataset is not this one's
         for (const ch of this.#suggested) this.#clear(ch);
@@ -395,7 +396,7 @@ export class Lenses {
         this.#dropInferred();
       }
       // what the algorithm lenses offer depends on the state shown: read it again once read
-      if (this.#algoKey && stateChanged) void this.loadAlgoOptions();
+      if (this.#algoWanted && stateChanged) void this.loadAlgoOptions();
       this.#schedule(stateChanged);
     });
   }
@@ -513,7 +514,14 @@ export class Lenses {
    * when the state shown or the drawing's epoch changes, and after a read that failed.
    */
   loadAlgoOptions(): Promise<void> {
-    const p = this.#loadAlgoOptions();
+    this.#algoWanted = true;
+    const input = this.#input;
+    if (!input) return Promise.resolve();
+    const key = this.#algoKeyOf(input);
+    // a read of the same state in flight is the one to wait for
+    if (key === this.#algoKey) return this.#algoLoading ?? Promise.resolve();
+    this.#algoKey = key;
+    const p = this.#loadAlgoOptions(input, key);
     this.#algoLoading = p;
     void p.finally(() => {
       if (this.#algoLoading === p) this.#algoLoading = null;
@@ -523,15 +531,17 @@ export class Lenses {
 
   /** The read of the algorithm options in flight, which the GraphRAG lens waits for. */
   #algoLoading: Promise<void> | null = null;
+  /** Whether the options were asked for, so that a change of state reads them again. */
+  #algoWanted = false;
 
-  async #loadAlgoOptions() {
-    const input = this.#input;
-    if (!input) return;
+  #algoKeyOf(input: LensInput): string {
+    const past = input.past ?? !!input.at;
+    return `${input.ds}|${input.branch ?? ''}|${past}|${input.epoch ?? ''}`;
+  }
+
+  async #loadAlgoOptions(input: LensInput, key: string) {
     const main = !input.branch || input.branch === 'main';
     const past = input.past ?? !!input.at;
-    const key = `${input.ds}|${input.branch ?? ''}|${past}|${input.epoch ?? ''}`;
-    if (key === this.#algoKey) return;
-    this.#algoKey = key;
     let failed = false;
     const [read, gr] = await Promise.all([
       main ? readProjections(input.ds) : Promise.resolve([]),
