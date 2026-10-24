@@ -2853,7 +2853,7 @@ fn run_limited(
 }
 
 /// Scan with an optional row limit; returns `(table, truncated)`.
-fn scan_limited(
+pub(super) fn scan_limited(
     ctx: &Ctx,
     spec: &ScanSpec,
     vars: &[VarId],

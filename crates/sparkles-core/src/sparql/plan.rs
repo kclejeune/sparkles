@@ -698,6 +698,9 @@ struct PathItem {
 }
 
 pub(super) const FILTER_SELECTIVITY: f64 = 0.3;
+/// A pattern with one variable estimated at this many rows or fewer is read at planning
+/// time, and bound to its value when it has one row (see `Planner::point_value`).
+const POINT_ROWS: f64 = 4.0;
 const DP_LIMIT: usize = 12;
 
 pub struct Planner<'a> {
@@ -2951,6 +2954,34 @@ impl<'a> Planner<'a> {
             i += 1;
         }
 
+        // Point patterns: a triple pattern with a single variable of which the store holds
+        // exactly one row binds that variable to a constant for the rest of the group, as
+        // the filter-equality substitution above does. Its FILTERs then test the constant,
+        // so they can narrow scans of the group's other patterns.
+        if self.ctx.opt.point_patterns {
+            let mut i = 0;
+            while i < triples.len() {
+                let point =
+                    self.point_value(&triples[i], i, &triples, &filters, &nodes, &paths, &unpacks)?;
+                let Some((v, c)) = point else {
+                    i += 1;
+                    continue;
+                };
+                triples.remove(i);
+                for t in &mut triples {
+                    for x in &mut t.t {
+                        if *x == PT::V(v) {
+                            *x = PT::C(c);
+                        }
+                    }
+                }
+                for f in &mut filters {
+                    substitute(f, v, c);
+                }
+                binds.push((v, c));
+            }
+        }
+
         let mut leaves: Vec<Vec<Node>> = Vec::new();
         for t in &triples {
             leaves.push(self.scan_options(t)?);
@@ -3068,6 +3099,66 @@ impl<'a> Planner<'a> {
             result = n;
         }
         Ok(result)
+    }
+
+    /// The constant that the point pattern `triples[i]` binds its variable to, read from
+    /// the snapshot, when the pattern has one variable in one position, the store holds
+    /// exactly one row of it, and the variable appears in another pattern or a FILTER of
+    /// the group and nowhere a constant cannot take its place.
+    #[allow(clippy::too_many_arguments)]
+    fn point_value(
+        &self,
+        t: &Triple,
+        i: usize,
+        triples: &[Triple],
+        filters: &[Expr],
+        nodes: &[Node],
+        paths: &[PathItem],
+        unpacks: &[UnpackItem],
+    ) -> Result<Option<(VarId, Id)>> {
+        if matches!(t.graph, ActiveGraph::Var(_)) {
+            return Ok(None);
+        }
+        let mut vars = t.t.iter().filter_map(|x| match x {
+            PT::V(v) => Some(*v),
+            PT::C(_) => None,
+        });
+        let (Some(v), None) = (vars.next(), vars.next()) else {
+            return Ok(None);
+        };
+        let used = triples
+            .iter()
+            .enumerate()
+            .any(|(j, o)| j != i && o.t.contains(&PT::V(v)))
+            || filters.iter().any(|f| f.var_set().contains(&v));
+        if !used
+            || filters.iter().any(Expr::has_exists)
+            || nodes.iter().any(|n| n.vars.contains(&v))
+            || paths.iter().any(|p| p.s == PT::V(v) || p.o == PT::V(v))
+            || unpacks
+                .iter()
+                .any(|u| u.t == v || u.parts.contains(&PT::V(v)))
+            || triples
+                .iter()
+                .any(|o| matches!(o.graph, ActiveGraph::Var(g) if g == v))
+        {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_options(t)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let Kind::Scan(spec) = &scan.kind else {
+            return Ok(None);
+        };
+        // an estimate of a few rows comes before the read, which costs a seek
+        if !(scan.est <= POINT_ROWS) || !spec.eqs.is_empty() {
+            return Ok(None);
+        }
+        let (rows, _) = super::exec::scan_limited(self.ctx, spec, &scan.vars, Some(2))?;
+        Ok(match (rows.len(), rows.col_of(v)) {
+            (1, Some(c)) => Some((v, rows.cols[c][0])).filter(|(_, id)| !id.is_undef()),
+            _ => None,
+        })
     }
 
     /// DP / greedy join ordering over connected components (QLever QueryPlanner).
@@ -4253,6 +4344,20 @@ pub(super) fn range_atom(e: &Expr, v: VarId, ctx: &Ctx) -> Option<(RangeOp, supe
             Expr::Const(id) => ctx.value(*id),
             Expr::Neg(x) => arith(NumOp::Sub, &Value::Integer(0.into()), &constant(x, ctx)?).ok(),
             Expr::Pos(x) => constant(x, ctx).filter(|c| c.is_numeric()),
+            Expr::Arith(x, y, op) => {
+                use super::expr::ArithOp;
+                let op = match op {
+                    ArithOp::Add => NumOp::Add,
+                    ArithOp::Sub => NumOp::Sub,
+                    ArithOp::Mul => NumOp::Mul,
+                    ArithOp::Div => NumOp::Div,
+                };
+                let (x, y) = (constant(x, ctx)?, constant(y, ctx)?);
+                if !(x.is_numeric() && y.is_numeric()) {
+                    return None;
+                }
+                arith(op, &x, &y).ok()
+            }
             _ => None,
         }
     }
