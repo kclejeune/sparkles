@@ -768,7 +768,9 @@ list and builds another was refused as unstratified
 before its charge was admitted, which now reserves first, and that the retry without
 list stages accepted a `noValue` on a cycle through a list
 (`negation_through_lists_is_refused`). A fourth review found that this check merged all
-classes of `rdf:type`, which it now keeps apart (`negation_check_keeps_classes_apart`).
+classes of `rdf:type`, which it now keeps apart (`negation_check_keeps_classes_apart`),
+and a fifth that it left out the facts a `listForAll` tests
+(`negation_through_list_for_all_is_refused`).
 
 **Limitations.** Schema facts that follow only from derived instance facts can be missing
 from a query that reads them, as decision 3 describes, and `owl:sameAs` that rules derive

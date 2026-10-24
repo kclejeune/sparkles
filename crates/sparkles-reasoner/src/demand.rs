@@ -1268,9 +1268,9 @@ pub(crate) fn transform(
 
 /// Whether a `noValue` of `rules` reads a pattern that depends on the head of its own
 /// rule, over the dependencies of predicates, with `rdf:type` split by its constant class:
-/// those of body atoms, of `noValue` patterns, and the `rdf:first` and `rdf:rest` of the
-/// lists that builtins and head actions read. A variable predicate stands for every
-/// predicate, and a variable class for every class.
+/// those of body atoms, of `noValue` patterns, of the facts a `listForAll` tests, and the
+/// `rdf:first` and `rdf:rest` of the lists that builtins and head actions read. A
+/// variable predicate stands for every predicate, and a variable class for every class.
 fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
     // the nodes that read or give every predicate, and every class; the others are
     // constant predicates and classes
@@ -1333,6 +1333,14 @@ fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
         if reads_lists(r) {
             for p in [terms.rdf_first, terms.rdf_rest] {
                 deps.push((node(Slot::Const(p), Slot::Any, false), false));
+            }
+        }
+        // the facts a listForAll tests (third Codex re-review of F17-P1)
+        for b in &r.builtins {
+            for read in list_reads(b.kind, &b.args, None) {
+                if let Read::Facts(_, p) = read {
+                    deps.push((node(p, Slot::Any, false), false));
+                }
             }
         }
         for &h in &heads {

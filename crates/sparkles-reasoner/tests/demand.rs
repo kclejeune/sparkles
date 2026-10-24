@@ -794,3 +794,26 @@ fn negation_check_keeps_classes_apart() {
         vec!["<http://ex.org/a>"]
     );
 }
+
+/// Fourth Codex re-review of F17-P1: the facts a `listForAll` over a variable list
+/// tests are dependencies of the check for a noValue on a cycle.
+#[test]
+fn negation_through_list_for_all_is_refused() {
+    let s = store(
+        "ex:a ex:p ex:c . ex:a ex:requires ex:LS .
+         ex:LS rdf:first ex:Upper ; rdf:rest rdf:nil .",
+    );
+    let rules = Profile::Rules(
+        "@prefix ex: <http://ex.org/>.
+         [u: (?x ex:p ?y), noValue(ex:a, rdf:type, ex:Lower) -> (ex:a rdf:type ex:Upper)]
+         [lo: (?z ex:p ?y), listMember(ex:L1, ?x) -> (?x rdf:type ex:Lower)]
+         [mk: (?x ex:requires ?ls), listForAll(?ls, ?x, rdf:type) -> (ex:L1 rdf:first ?x), (ex:L1 rdf:rest rdf:nil)]"
+            .into(),
+    );
+    let qr = reasoner(&rules);
+    match query(s.snapshot(), "SELECT ?x { ?x a ex:Upper }", &demand(&qr)) {
+        Err(sparkles_core::Error::Component(c)) => assert_eq!(c.code, "reasoning-rules"),
+        Err(e) => panic!("{e}"),
+        Ok(r) => panic!("answered {:?}", rows(&r)),
+    }
+}
