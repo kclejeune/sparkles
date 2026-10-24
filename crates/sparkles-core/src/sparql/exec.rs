@@ -564,7 +564,8 @@ fn node_fidelity(ctx: &Ctx, n: &Node) -> Option<Box<PlanFidelity>> {
 
 /// What `n` reads of the query's text (spec U04 §11.3): the patterns of a scan, an index
 /// join or a path, the variables of a filter and those a join joins on. Most nodes read
-/// none of it.
+/// none of it, and no node names it when the plan names no patterns
+/// ([`Ctx::plan_patterns`]).
 #[inline]
 fn node_refs(ctx: &Ctx, n: &Node) -> Option<Box<PlanRefs>> {
     #[cold]
@@ -641,6 +642,9 @@ fn node_refs(ctx: &Ctx, n: &Node) -> Option<Box<PlanRefs>> {
             join_vars: names(ctx, &join_vars),
         };
         (refs != PlanRefs::default()).then(|| Box::new(refs))
+    }
+    if !ctx.plan_patterns {
+        return None;
     }
     match &n.kind {
         Kind::Scan(_)
@@ -8438,6 +8442,8 @@ fn fetch_local(
     opts.work = Some(ctx.rows_produced.clone());
     opts.outbound_budget = Some(ctx.outbound_budget.clone());
     opts.service_depth = ctx.service_depth + 1;
+    // the call's plan is dropped below, so it names no patterns (item 180)
+    opts.no_plan_patterns = true;
     ctx.check()?;
     let r = super::query(snap, query, &opts)?;
     let vars: std::sync::Arc<[oxrdf::Variable]> = r

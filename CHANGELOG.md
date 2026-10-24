@@ -4,6 +4,24 @@
 
 ### Changed
 
+Eager results are now serialized into an 8 KiB buffer of the engine's own and written to
+the response in pieces of that size, where the serializers used to write a few bytes at a
+time through the response writer's checks. On forge the 300,191 rows of `optional-chain`
+at 10.5M reach the client in 150.8 ms instead of 220.4 ms, `order-by-full` and `star-join`
+take 19% and 30% less client time, and a plain SPARQL JSON answer of a small query takes
+up to a third fewer instructions. The serializers are now compiled
+with the engine, so their speed no longer moves with unrelated changes to the server. The
+rows reported for an answer that stops partway are still the rows the client received.
+
+The query route no longer names the query's patterns in the plan of an answer that does
+not show the plan, which is every format but the Sparkles format, and an in-process
+SERVICE call no longer names them in its dropped plan. The explain routes, MCP and the
+library keep them. A plain SPARQL JSON request of a small query runs up to 5.8 thousand
+fewer instructions.
+
+`scripts/nsc-bench.sh` now records the compilers of each binary and refuses to compare
+two binaries built with different ones unless `--allow-mixed-compilers` is given.
+
 The first run of a query text that the server does not remember now runs on the thread
 that received it under the request's timeout when the server has been idle for 10 ms,
 instead of on the blocking pool. On forge that took about 1.8 ms off a fresh server's

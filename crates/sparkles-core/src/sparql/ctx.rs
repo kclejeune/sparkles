@@ -515,6 +515,9 @@ pub struct Ctx {
     pub outbound_budget: Arc<crate::outbound::RequestBudget>,
     /// consult / fill the store's result cache
     pub use_cache: bool,
+    /// name the query's patterns and variables in the plan (see
+    /// [`QueryOptions::no_plan_patterns`](super::QueryOptions::no_plan_patterns))
+    pub plan_patterns: bool,
     /// the caller's scope in the cache of remote SERVICE results (see
     /// [`QueryOptions::service_scope`](super::QueryOptions::service_scope))
     pub service_scope: Arc<str>,
@@ -872,6 +875,7 @@ impl Ctx {
             outbound: Default::default(),
             outbound_budget: crate::outbound::RequestBudget::new(&Default::default()),
             use_cache: true,
+            plan_patterns: true,
             service_scope: Arc::from(""),
             local_endpoints: None,
             service_depth: 0,

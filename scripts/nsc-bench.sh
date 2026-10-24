@@ -18,8 +18,14 @@
 # binary, then runs ROUNDS rounds of A, B, B, A, each in a fresh server process pinned to
 # one CPU with the client pinned to another. OUT/summary.md gets the per-query medians, the
 # per-round ratios, the spread between server processes and the geometric mean, and
-# OUT/manifest.txt the binaries' commits and SHA-256, the instance, the phase times and the
-# billed vCPU-minutes.
+# OUT/manifest.txt the binaries' commits and SHA-256, the compilers each was built with,
+# the instance, the phase times and the billed vCPU-minutes.
+#
+# The compilers come from each binary's .comment section, which names rustc, the linker
+# and the C and C++ compilers that built its native dependencies, such as mimalloc. Two
+# binaries whose compilers differ are refused, since that difference alone moves every
+# query, unless --allow-mixed-compilers is given. A cached revision keeps the compilers of
+# the shell that built it, so build in `nix develop` and remove a stale cache entry.
 #
 # Options:
 #   --people N          dataset size in people, about 10.5 triples each (default 100000,
@@ -40,6 +46,8 @@
 #   --machine-type T    Namespace machine type (default linux/amd64:8x16)
 #   --duration D        instance lifetime cap, as nsc takes it (default 2h)
 #   --out DIR           results directory (default target/nsc-bench/<UTC time>)
+#   --allow-mixed-compilers
+#                       compare binaries built with different compilers anyway
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -60,6 +68,7 @@ CARGO_ARGS=
 MACHINE=linux/amd64:8x16
 DURATION=2h
 OUT=
+MIXED=0
 POLL=${POLL:-20}
 REMOTE=/root/nsc-bench
 
@@ -88,6 +97,11 @@ while [ $# -gt 0 ]; do
       shift
       continue
       ;;
+    --allow-mixed-compilers)
+      MIXED=1
+      shift
+      continue
+      ;;
     --serve-args) SERVE_ARGS=$2 ;;
     --execution) EXECUTION=$2 ;;
     --cargo-args) CARGO_ARGS=$2 ;;
@@ -106,7 +120,7 @@ while [ $# -gt 0 ]; do
   shift 2
 done
 [ ${#ARGS[@]} -eq 2 ] || usage 1
-for t in nsc zstd python3 cargo; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
+for t in nsc zstd python3 cargo readelf; do command -v "$t" > /dev/null || die "$t is not on PATH"; done
 OUT=$(realpath -m "${OUT:-$ROOT/target/nsc-bench/$(date -u +%Y%m%dT%H%M%SZ)}")
 mkdir -p "$OUT/stage/queries" "$OUT/logs" "$CACHE"/{bin,data,src}
 STAGE=$OUT/stage
@@ -117,7 +131,12 @@ now() { date +%s.%N; }
 secs() { awk "BEGIN {printf \"%.1f\", $2 - $1}"; }
 
 # ------------------------------------------------------------------------- binaries
-# binary <rev|path> <A|B>: stages bin-<A|B>.zst and notes its source and SHA-256
+# compilers <binary>: the distinct entries of its .comment section, joined by "; "
+compilers() {
+  readelf -p .comment "$1" 2> /dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | sort -u | paste -sd ';' - | sed 's/;/; /g'
+}
+declare -A COMPILERS
+# binary <rev|path> <A|B>: stages bin-<A|B>.zst and notes its source, SHA-256 and compilers
 binary() {
   local ref=$1 v=$2 bin sha src
   if [ -f "$ref" ]; then
@@ -142,6 +161,14 @@ binary() {
       # shellcheck disable=SC2086 # CARGO_ARGS is a list of flags
       (cd "$CACHE/src/$sha" && CARGO_TARGET_DIR=$CACHE/target cargo build --release -p sparkles-server $CARGO_ARGS) \
         > "$OUT/logs/build-$v.log" 2>&1 || die "build of $ref failed, see $OUT/logs/build-$v.log"
+      # the shell's compilers, beside the binary's own record of them in .comment
+      {
+        echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "cargo args: $CARGO_ARGS"
+        echo "cc: $(cc --version 2> /dev/null | head -1)"
+        echo "c++: $(c++ --version 2> /dev/null | head -1)"
+        (cd "$CACHE/src/$sha" && rustc -V)
+      } > "$CACHE/bin/$sha/build.txt"
       cp "$CACHE/target/release/sparkles" "$bin.tmp"
       mv "$bin.tmp" "$bin"
       rm -rf "${CACHE:?}/src/$sha"
@@ -151,6 +178,8 @@ binary() {
   fi
   note "$v: $src"
   note "$v sha256: $(sha256sum "$bin" | cut -d' ' -f1)"
+  COMPILERS[$v]=$(compilers "$bin")
+  note "$v compilers: ${COMPILERS[$v]:-unknown}"
   # a dynamically linked binary runs under the instance's own glibc loader
   if ldd "$bin" > /dev/null 2>&1; then echo "DYNAMIC_$v=1" >> "$STAGE/run.env"; else echo "DYNAMIC_$v=0" >> "$STAGE/run.env"; fi
   zstd -q -T0 -3 -f "$bin" -o "$STAGE/bin-$v.zst"
@@ -158,6 +187,13 @@ binary() {
 : > "$STAGE/run.env"
 binary "${ARGS[0]}" A
 binary "${ARGS[1]}" B
+if [ -z "${COMPILERS[A]}" ] || [ -z "${COMPILERS[B]}" ] || [ "${COMPILERS[A]}" != "${COMPILERS[B]}" ]; then
+  if [ "$MIXED" = 1 ]; then
+    note "warning: the compilers differ or are unknown, compared anyway (--allow-mixed-compilers)"
+  else
+    die "A and B were not built with the same known compilers (see $MANIFEST). Rebuild both in \`nix develop\`, after removing a stale $CACHE/bin/<commit>, or pass --allow-mixed-compilers"
+  fi
+fi
 
 # ----------------------------------------------------------------------- data, queries
 DATA=$CACHE/data/people-$PEOPLE.nt.zst

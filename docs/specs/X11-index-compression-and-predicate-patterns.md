@@ -721,8 +721,12 @@ where main's FSST measured 1.000 and 1.062. The branch's front coding measured 0
 1.019 against main's. On DBpedia the difference comes from queries under 1 ms in a single
 round, and perf on atlas counted the same or fewer instructions for the branch's front
 coding on each of the nine DBpedia queries that moved most, so the front-coded path does
-no more work than before. Roadmap item 161 confirms this with a pinned forge rerun of
-several rounds.
+no more work than before. A rerun on forge in 16 pinned rounds, eight per build, found
+the front-coded queries of the warm DBpedia suite at a geometric mean of 1.004 against
+main's, and every query under 1 ms within 1% except `category-people-1`, whose round
+medians overlap. Three longer queries stayed slower in every round. `pat-film-predicates`
+and `pat-film-predicate-list` take 3.6% and 4.2% longer at about 6.7 ms, and `top-linked`
+takes 1.4% longer at 90.6 ms. Roadmap item 241 follows them up.
 
 Cold, the branch's FSST meets the gate on its geometric means and on the export, but not
 on every query. Its geometric means against main's front coding are 0.999 at 10.5M and

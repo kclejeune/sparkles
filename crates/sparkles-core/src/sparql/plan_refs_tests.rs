@@ -465,3 +465,104 @@ fn nodes_that_read_no_pattern_carry_none_of_the_members() {
         }
     }
 }
+
+#[test]
+fn a_caller_that_shows_no_plan_gets_no_members_and_the_same_answer() {
+    let s = people();
+    let q = "SELECT * WHERE { ?p ex:team ?t . ?p ex:name ?n . ?t ex:partOf+ ?u \
+             OPTIONAL { ?p ex:age ?a } FILTER(STRLEN(?n) > 2 && ?u != ?t) }";
+    let named = query(s.snapshot(), q, &opts()).unwrap();
+    let plain = QueryOptions {
+        no_plan_patterns: true,
+        ..opts()
+    };
+    let bare = query(s.snapshot(), q, &plain).unwrap();
+    let j = serde_json::to_value(&bare.plan).unwrap();
+    for n in nodes(&j) {
+        assert!(n.get("patterns").is_none(), "{n}");
+        assert!(n.get("filterVars").is_none(), "{n}");
+        assert!(n.get("joinVars").is_none(), "{n}");
+    }
+    let shown = serde_json::to_value(&named.plan).unwrap();
+    assert!(!texts(&shown).is_empty(), "{shown:#}");
+    assert!(
+        nodes(&shown).iter().any(|n| n["filterVars"].is_array()),
+        "{shown:#}"
+    );
+    assert!(
+        nodes(&shown).iter().any(|n| n["joinVars"].is_array()),
+        "{shown:#}"
+    );
+    // the operators and the answer are those of the plan that names its patterns
+    let ops = |j: &Value| -> Vec<String> {
+        nodes(j)
+            .iter()
+            .map(|n| n["operator"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ops(&j), ops(&shown));
+    assert_eq!(bare.len(), named.len());
+    assert!(!bare.is_empty());
+    // a cursor of a caller that shows no plan names nothing either
+    let QueryExecution::Select(mut c) =
+        query_cursor(s.snapshot(), q, &plain, &Default::default()).unwrap()
+    else {
+        panic!("a SELECT cursor");
+    };
+    while c.next_batch().unwrap().is_some() {}
+    let cj = serde_json::to_value(c.plan()).unwrap();
+    for n in nodes(&cj) {
+        assert!(n.get("patterns").is_none(), "{n}");
+    }
+}
+
+/// One store that answers SERVICE calls to `http://local/sparql` in process.
+struct Local(Arc<crate::store::Snapshot>);
+
+impl std::fmt::Debug for Local {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Local")
+    }
+}
+
+impl LocalEndpoints for Local {
+    fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>> {
+        (iri == "http://local/sparql").then(|| {
+            Ok(LocalTarget {
+                snap: self.0.clone(),
+                options: QueryOptions::default(),
+                hold: None,
+            })
+        })
+    }
+}
+
+#[test]
+fn an_in_process_service_call_names_no_patterns() {
+    let s = people();
+    let q = "SELECT * WHERE { SERVICE <http://local/sparql> { ?p <http://ex.org/team> ?t } }";
+    let local = QueryOptions {
+        no_plan_patterns: true,
+        local_endpoints: Some(Arc::new(Local(s.snapshot()))),
+        allow_service: true,
+        ..opts()
+    };
+    plan::PATTERNS_NAMED.with(|n| n.set(0));
+    let r = query(s.snapshot(), q, &local).unwrap();
+    assert_eq!(r.len(), 60);
+    // the call's plan is dropped, so neither query names a pattern
+    assert_eq!(plan::PATTERNS_NAMED.with(|n| n.get()), 0);
+    // without the outer opt-out the call still names nothing, since its plan is dropped
+    let shown = QueryOptions {
+        no_plan_patterns: false,
+        ..local
+    };
+    let r = query(s.snapshot(), q, &shown).unwrap();
+    assert_eq!(r.len(), 60);
+    let outer = serde_json::to_value(&r.plan).unwrap();
+    assert_eq!(
+        plan::PATTERNS_NAMED.with(|n| n.get()),
+        texts(&outer).len(),
+        "{outer:#}"
+    );
+}

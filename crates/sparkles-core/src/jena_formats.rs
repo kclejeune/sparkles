@@ -1490,19 +1490,28 @@ impl<W: Write> RdfWriter<W> {
         self.w.write_all(msg)
     }
 
-    pub fn finish(mut self) -> io::Result<W> {
+    pub fn finish(self) -> io::Result<W> {
+        self.finish_counted(|_| {})
+    }
+
+    /// [`finish`](Self::finish), calling `done` with the number of triples of each
+    /// RDF/JSON subject once its bytes are written, so that a caller can count the
+    /// triples that a writer failing partway, or on its flush, took.
+    pub fn finish_counted(mut self, mut done: impl FnMut(u64)) -> io::Result<W> {
         if self.fmt == JenaFormat::RdfJson {
-            let doc: serde_json::Map<String, serde_json::Value> = std::mem::take(&mut self.json)
-                .into_iter()
-                .map(|(s, preds)| {
-                    let preds: serde_json::Map<String, serde_json::Value> = preds
-                        .into_iter()
-                        .map(|(p, os)| (p, serde_json::Value::Array(os)))
-                        .collect();
-                    (s, serde_json::Value::Object(preds))
-                })
-                .collect();
-            serde_json::to_writer(&mut self.w, &doc).map_err(io::Error::other)?;
+            // the bytes of `serde_json::to_writer` on the whole map, one subject at a time
+            self.w.write_all(b"{")?;
+            for (i, (s, preds)) in std::mem::take(&mut self.json).into_iter().enumerate() {
+                if i > 0 {
+                    self.w.write_all(b",")?;
+                }
+                serde_json::to_writer(&mut self.w, &s).map_err(io::Error::other)?;
+                self.w.write_all(b":")?;
+                let n = preds.values().map(|os| os.len() as u64).sum();
+                serde_json::to_writer(&mut self.w, &preds).map_err(io::Error::other)?;
+                done(n);
+            }
+            self.w.write_all(b"}")?;
         }
         if self.fmt == JenaFormat::TriX {
             self.trix.finish(&mut self.w)?;
