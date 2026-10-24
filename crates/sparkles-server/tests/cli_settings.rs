@@ -37,9 +37,14 @@ impl Server {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let s = Server { child, port };
+        let mut s = Server { child, port };
         let t0 = Instant::now();
         while s.call("GET", "/$/ping", None).0 != 200 {
+            // a server that could not bind the port leaves it to whatever holds it
+            assert!(
+                s.child.try_wait().unwrap().is_none(),
+                "the server exited before it answered on port {port}"
+            );
             assert!(
                 t0.elapsed() < Duration::from_secs(30),
                 "server did not start"
@@ -53,6 +58,15 @@ impl Server {
         let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
             return (0, J::Null);
         };
+        // While nothing listens on the port, the kernel may pick the port itself as the
+        // ephemeral source, and the socket connects to itself: the read below would then
+        // return the request and wait forever for an end that never comes.
+        if c.local_addr().ok() == c.peer_addr().ok() {
+            return (0, J::Null);
+        }
+        // a server that accepts and never answers fails the test instead of hanging it
+        let _ = c.set_read_timeout(Some(Duration::from_secs(60)));
+        let _ = c.set_write_timeout(Some(Duration::from_secs(60)));
         let body = body.map(|b| b.to_string()).unwrap_or_default();
         let _ = write!(
             c,
@@ -252,11 +266,49 @@ fn cli(s: &Server, home: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]
         .unwrap()
         .write_all(stdin.as_bytes())
         .unwrap();
-    let o = child.wait_with_output().unwrap();
+    // the pipes are read on threads, so that a command that never ends is killed after a
+    // minute and the test fails with what it printed instead of hanging
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let t0 = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if t0.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout, stderr) = (out.join().unwrap(), err.join().unwrap());
+    let Some(status) = status else {
+        panic!("sparkles {args:?} did not finish in 60 s\nstdout: {stdout}\nstderr: {stderr}");
+    };
     Out {
-        code: o.status.code(),
-        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        code: status.code(),
+        stdout,
+        stderr,
     }
 }
 

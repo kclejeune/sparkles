@@ -861,6 +861,11 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// Whether the evaluation stops. The flags are read once in 1024 calls, and a flag
+    /// seen set stops the evaluation for good, so that every enclosing loop of a join
+    /// returns at its next candidate. Without that, each outer candidate ran up to 1024
+    /// more inner candidates before the next read, and a cancelled join went on for a
+    /// large share of its full length.
     fn aborted(&mut self) -> bool {
         if self.stop {
             return true;
@@ -870,6 +875,7 @@ impl<'a> Eval<'a> {
             if self.abort.load(Ordering::Relaxed)
                 || self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
             {
+                self.stop = true;
                 return true;
             }
             // a passed deadline stops every enclosing scan at once, not one 1,024 steps on

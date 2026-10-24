@@ -67,6 +67,15 @@ impl Server {
         let Ok(mut c) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
             return (0, J::Null);
         };
+        // While nothing listens on the port, the kernel may pick the port itself as the
+        // ephemeral source, and the socket connects to itself: the read below would then
+        // return the request and wait forever for an end that never comes.
+        if c.local_addr().ok() == c.peer_addr().ok() {
+            return (0, J::Null);
+        }
+        // a server that accepts and never answers fails the test instead of hanging it
+        let _ = c.set_read_timeout(Some(Duration::from_secs(60)));
+        let _ = c.set_write_timeout(Some(Duration::from_secs(60)));
         let body = body.map(|b| b.to_string()).unwrap_or_default();
         let _ = write!(
             c,
