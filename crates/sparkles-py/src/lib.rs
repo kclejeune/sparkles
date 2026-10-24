@@ -34,6 +34,7 @@ mod txn;
 mod utilities;
 mod validate;
 mod validation;
+mod views;
 
 use pyo3::prelude::*;
 use pyo3::types::PyFrozenSet;
@@ -72,6 +73,7 @@ fn _sparkles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     reasoning::register(m)?;
     querybuilder::register(m)?;
     queries::register(m)?;
+    views::register(m)?;
     algorithms::register(m)?;
     overview::register(m)?;
     forms::register(m)?;

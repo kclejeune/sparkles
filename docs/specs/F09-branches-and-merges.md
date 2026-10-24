@@ -20,7 +20,7 @@
 >
 > **User docs:** [API: Branches and merges](../API.md#branches-and-merges) ·
 > [Usage: Branches and merges](../USAGE.md#branches-and-merges) ·
-> [Features](../FEATURES.md#storage-tdb2-equivalent)
+> [Features](../FEATURES.md#versioning-and-history)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section
 > at the end records how it landed.

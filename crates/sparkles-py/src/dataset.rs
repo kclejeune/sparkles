@@ -1413,6 +1413,31 @@ impl PyDataset {
     }
 
     #[getter]
+    fn views(slf: Py<Self>) -> crate::views::PyViews {
+        crate::views::PyViews { owner: slf }
+    }
+
+    /// Subscribe to a SELECT, ASK or CONSTRUCT query: iterate the result for the
+    /// snapshot and then a diff after each commit that changes it.
+    #[pyo3(signature=(query, *, after=None))]
+    fn live(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        after: Option<u64>,
+    ) -> PyResult<crate::views::PyLiveQuery> {
+        let ds = self.ds(py)?;
+        let o = sparkles::incr::LiveOptions {
+            after,
+            ..Default::default()
+        };
+        let live = py.detach(|| ds.live(query, &o)).py(py)?;
+        Ok(crate::views::PyLiveQuery {
+            live: std::sync::Mutex::new(Some(std::sync::Arc::new(live))),
+        })
+    }
+
+    #[getter]
     fn schema(slf: Py<Self>) -> crate::schema::PySchema {
         crate::schema::PySchema { owner: slf }
     }

@@ -48,8 +48,11 @@ mod inline;
 pub(crate) use sparkles::jena_formats;
 #[cfg(feature = "fmt")]
 mod lint;
+mod live;
 mod patch;
 mod queries;
+mod views;
+pub(crate) use views::start as start_views;
 pub(crate) mod schema;
 pub(crate) use schema::constraints::ShapesRequest;
 pub(crate) mod sd;
@@ -194,6 +197,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/$/queries/{ds}/{name}/versions", get(queries::versions))
         .route("/{ds}/queries/{name}", get(queries::run).post(queries::run))
+        .route("/$/views/{ds}", get(views::list))
+        .route(
+            "/$/views/{ds}/{name}",
+            get(views::get_view)
+                .put(views::put_view)
+                .delete(views::delete_view),
+        )
+        .route("/$/views/{ds}/{name}/rebuild", post(views::rebuild))
+        .route("/{ds}/live", get(live::live))
         .route("/$/commits/{ds}", get(list_commits))
         .route("/$/commits/{ds}/timeline", get(timeline::timeline))
         .route("/$/commits/{ds}/{reference}", get(get_commit))
@@ -510,7 +522,10 @@ impl ApiError {
         }
         // only a refusal that a retry can pass says when to retry: a request larger than
         // the whole pool answers 507 without it
-        if budget == Some(BudgetKind::ServerMemory) && self.0 == StatusCode::SERVICE_UNAVAILABLE {
+        let behind = body.get("code").and_then(J::as_str) == Some("view-behind");
+        if (budget == Some(BudgetKind::ServerMemory) || behind)
+            && self.0 == StatusCode::SERVICE_UNAVAILABLE
+        {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
         }
@@ -748,6 +763,7 @@ impl From<Error> for ApiError {
             Error::Branch(b) => {
                 StatusCode::from_u16(b.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
+            Error::Component(c) if c.component == "views" => views::status(&c.code),
             // query-time reasoning past a limit, or with rules it cannot evaluate
             Error::Component(c)
                 if c.component == "reasoner"
@@ -767,6 +783,9 @@ impl From<Error> for ApiError {
             Error::PreconditionFailed(_) => json!({ "error": msg, "code": "precondition-failed" }),
             Error::Patch(p) => json!({ "error": msg, "code": p.kind.code() }),
             Error::Branch(b) => branches::error_body(&b),
+            Error::Component(c) if c.component == "views" => {
+                json!({ "error": c.message, "code": c.code })
+            }
             Error::Conflict(_) if msg.starts_with("history-limit") => {
                 json!({ "error": msg, "code": "history-limit" })
             }

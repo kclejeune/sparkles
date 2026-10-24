@@ -1,9 +1,9 @@
 # Fuzzing the formatter
 
-[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets for `sparkles-fmt`. This
-directory is a Cargo workspace of its own (with its own `Cargo.lock`): `libfuzzer-sys`
-and the nightly toolchain stay out of the repository's workspace, its lockfile, its
-third-party license notices and the Nix build, and `mise run ci` never builds it.
+This directory holds the [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets
+for `sparkles-fmt`. It is a Cargo workspace of its own, with its own `Cargo.lock`, so that
+`libfuzzer-sys` and the nightly toolchain stay out of the repository's workspace, its
+lockfile, its third-party license notices and the Nix build. `mise run ci` never builds it.
 
 | Target | Languages | Also checks |
 |---|---|---|
@@ -12,9 +12,9 @@ third-party license notices and the Nix build, and `mise run ci` never builds it
 | `fmt_lines` | N-Triples, N-Quads (header variant bit) | streamed output (any bytes, any chunk size, spilled sorted runs) equals the in-memory output |
 | `fmt_jsonld` | JSON-LD | |
 
-Each input is a five-byte options header followed by the text; an all-zero header is the
-default options (see `decode` in `src/invariants.rs` for the bits). Every target checks
-the formatter's own promises:
+Each input is a five-byte options header followed by the text. An all-zero header gives
+the default options, and `decode` in `src/invariants.rs` defines the bits. Every target
+checks the formatter's own promises:
 
 - it never panics;
 - it either refuses with a syntax error positioned inside the input, or prints output
@@ -22,16 +22,16 @@ the formatter's own promises:
   strict JSON), keeps every comment, and formats to itself under the same options;
 - a cursor maps to a character boundary of the output.
 
-Two refusals are deliberate and pass: nesting deeper than the formatter takes (256
-levels of brackets, so that nothing overflows the stack), and SPARQL that only
-spargebra's leniency accepts: tokens it reads as two where the grammar's longest match
-makes one (`PREFIXex:` as `PREFIX ex:`, `CONSTRUCTWHERE`, `?o .2 ?s` as `?o . 2 ?s`;
-see `lenient_reading`). Any other refusal (`unsupported-syntax`, `unsafe-format`,
-`unstable-format`) is a finding.
+Two refusals are deliberate and pass. The first is nesting deeper than the formatter
+takes, which is 256 levels of brackets, so that nothing overflows the stack. The second
+is SPARQL that only spargebra's leniency accepts, where it reads two tokens and the
+grammar's longest match makes one, as in `PREFIXex:`, `CONSTRUCTWHERE` and `?o .2 ?s`.
+`lenient_reading` lists these cases. Any other refusal, such as `unsupported-syntax`,
+`unsafe-format` or `unstable-format`, is a finding.
 
 ## Running
 
-Needs a nightly toolchain and cargo-fuzz, installed for the user (not by `mise`):
+The targets need a nightly toolchain and cargo-fuzz, installed for the user rather than by `mise`:
 
 ```sh
 rustup toolchain install nightly --profile minimal
@@ -52,7 +52,7 @@ The first run builds the seed corpora (`seed.sh`) in `corpus/<target>/` from the
 inputs and, when the variables are set, the suites the tests use: `SPARKLES_W3C_DIR`
 (SPARQL, the RDF suite next to it, Jena's RIOT JSON-LD files and the JSON results),
 `SPARKLES_RDF_TESTS_DIR`, `SPARKLES_SHACL_TESTS` and `SPARKLES_JSONLD_TESTS`. The suites
-are read where they are checked out; no third-party file is copied into the repository.
+are read where they are checked out, and no third-party file is copied into the repository.
 `corpus/`, `artifacts/` and `target/` are git-ignored.
 
 To replay or shrink a finding (from this directory):

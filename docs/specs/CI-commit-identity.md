@@ -12,7 +12,7 @@
 > **User docs:** [API: Commits](../API.md#commits) ·
 > [API: Entity tags and conditional requests](../API.md#entity-tags-and-conditional-requests) ·
 > [API: Change feed](../API.md#change-feed) ·
-> [Features](../FEATURES.md#storage-tdb2-equivalent)
+> [Features](../FEATURES.md#versioning-and-history)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
 > the end records how it landed.

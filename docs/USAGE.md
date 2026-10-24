@@ -1,14 +1,18 @@
 # Usage
 
-This guide covers operating the `sparkles` binary. It describes running the server, the
-command-line tools, automatic compaction, the formatter and linter, backups, outbound
-requests, path search, integrity checks, the MCP server, embedding the library, the
-Python package, the JVM library for Apache Jena, the JavaScript packages, the Rust
-client, Docker, Kubernetes, deploying on NixOS and the Home Manager module.
-[API.md](API.md) specifies the HTTP API. [DEVELOPMENT.md](DEVELOPMENT.md) covers building from source and testing.
+This guide covers running and operating Sparkles. Its sections are grouped by task. The
+first group covers the server, the command-line tools, maintenance, backups and outbound
+requests. The next ones cover branches, path search, graph algorithms and embeddings,
+then the web UI, then the MCP server, agent memory and the model-backed features. The
+last two groups cover embedding the library, the Python, JVM, JavaScript and Rust
+clients, and deployment with Docker, Kubernetes, NixOS and Home Manager.
+[API.md](API.md) specifies the HTTP API, and [DEVELOPMENT.md](DEVELOPMENT.md) covers
+building from source and testing.
 
 Sparkles is experimental. The on-disk format, HTTP API and CLI may change between commits
 without a migration path, so keep backups of anything you cannot regenerate.
+
+**Running and operating the server**
 
 * [Running the server](#running-the-server)
   * [Network exposure](#network-exposure)
@@ -31,26 +35,39 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [DESCRIBE modes](#describe-modes)
   * [GraphQL](#graphql)
   * [Loading CSV and TSV](#loading-csv-and-tsv)
+* [Formatting](#formatting)
+* [Linting](#linting)
+* [Automatic compaction](#automatic-compaction)
+* [Backup repositories](#backup-repositories)
+* [Checking a database](#checking-a-database)
+* [Upgrading databases](#upgrading-databases)
+* [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
+  * [Correlated, bulk and cached SERVICE](#correlated-bulk-and-cached-service)
+* [Sending notifications](#sending-notifications)
+
+**Working with the data**
+
 * [Branches and merges](#branches-and-merges)
+* [Finding paths](#finding-paths)
+* [Graph algorithms](#graph-algorithms)
+* [Embeddings computed on write](#embeddings-computed-on-write)
+* [Local embedding models](#local-embedding-models)
+
+**The web UI**
+
 * [The Explore overview](#the-explore-overview)
 * [Arcs on the map](#arcs-on-the-map)
 * [Facets and Use in query](#facets-and-use-in-query)
 * [The embedding map](#the-embedding-map)
+* [The Pattern pane](#the-pattern-pane)
 * [Lenses on the graph](#lenses-on-the-graph)
   * [Algorithm lenses](#algorithm-lenses)
 * [The validation overlay](#the-validation-overlay)
+* [Editing forms](#editing-forms)
 * [The time slider](#the-time-slider)
-* [Automatic compaction](#automatic-compaction)
-* [Formatting](#formatting)
-* [Linting](#linting)
-* [Backup repositories](#backup-repositories)
-* [Outbound requests (SERVICE and LOAD)](#outbound-requests-service-and-load)
-  * [Correlated, bulk and cached SERVICE](#correlated-bulk-and-cached-service)
-* [Finding paths](#finding-paths)
-* [Graph algorithms](#graph-algorithms)
-* [Embeddings computed on write](#embeddings-computed-on-write)
-* [Checking a database](#checking-a-database)
-* [Upgrading databases](#upgrading-databases)
+
+**Agents and models**
+
 * [MCP server (LLM agents)](#mcp-server-llm-agents)
   * [Handing a query to the web UI](#handing-a-query-to-the-web-ui)
   * [Agent memory grants](#agent-memory-grants)
@@ -60,7 +77,10 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Escalation](#escalation)
   * [The Ask bar](#the-ask-bar)
   * [Measuring models](#measuring-models)
-* [Sending notifications](#sending-notifications)
+* [Community reports (GraphRAG)](#community-reports-graphrag)
+
+**Libraries and clients**
+
 * [Embedding the library](#embedding-the-library)
 * [Python](#python)
 * [JVM (Apache Jena)](#jvm-apache-jena)
@@ -73,6 +93,9 @@ without a migration path, so keep backups of anything you cannot regenerate.
   * [Differences from TDB2](#differences-from-tdb2)
 * [JavaScript and TypeScript](#javascript-and-typescript)
 * [Rust client](#rust-client)
+
+**Deployment**
+
 * [Docker](#docker)
 * [Kubernetes (Helm)](#kubernetes-helm)
 * [Deploying on NixOS](#deploying-on-nixos)
@@ -484,7 +507,7 @@ happens to materialized inferences, and the limits.
 | `--service-bulk-size N` | `10` | Inputs per request of `SERVICE <loop:bulk:…>` (see [Correlated and cached SERVICE](#correlated-bulk-and-cached-service)). |
 | `--service-bulk-max N` | `100` | The most inputs per request of any bulk SERVICE. `bulk+n` is capped to it. |
 | `--service-cache-mb N` | `64` (`small`: `16`) | The cache of remote results that `SERVICE <cache:…>` uses, for the whole server. `0` turns it off. A global flag. |
-| `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. Each dataset used to have a cache of this size. A global flag. |
+| `--cache-mb N` | `1024` (`small`: `256`) | The block cache, for the whole server. A global flag. |
 | `--result-cache-mb N` | `256` (`small`: `64`) | The query result cache, for the whole server. `0` turns it off. A global flag. |
 | `--history-cache-mb N` | `512` (`small`: `128`) | Materialized past states for point-in-time reads, for the whole server. A global flag. |
 | `--memory-profile NAME` | `default` | `default` or `small`. A profile sets the defaults of the cache, query budget and pool flags above, and a flag given on the command line overrides it. A global flag. |
@@ -558,12 +581,12 @@ queries that each stay within `--query-memory-mb` cannot add up to more than the
 A request that finds the pool full waits up to `--query-admission-wait` seconds and then
 receives `503` with `Retry-After`. The pool costs a few atomic operations per request and
 nothing per row while a query stays inside its grant. The default pool is half of the
-available memory less the caches, so a server that ran many large queries at once may now
-see `503` where it used to run them until the host ran out of memory. Every request
+available memory less the caches, so many large concurrent queries receive `503` rather
+than running until the host runs out of memory. Every request
 reserves 16 MiB when it starts, so on a small host the pool is the 256 MiB floor, and
 concurrent queries beyond the sixteenth wait and then receive `503` with `Retry-After`.
-Set `--total-query-memory-mb 0` to turn the pool off, which restores the earlier
-behaviour. A SERVICE call from a query to its own server counts as a request of its own,
+Set `--total-query-memory-mb 0` to turn the pool off.
+A SERVICE call from a query to its own server counts as a request of its own,
 so it can wait while its caller holds memory and then answer `503`. The mechanism is
 described in [API.md](API.md#query-memory-pool).
 
@@ -1195,6 +1218,44 @@ every stored query as a tool named `<dataset>__<query>`, and the UI's query page
 them with a form for their parameters. [API.md](API.md#stored-queries) describes the
 definitions, the parameter types and the versions.
 
+### Incremental views
+
+A view keeps the result of a SELECT or CONSTRUCT query current after every commit. A
+commit updates the view by the rows its changes affect, so a dashboard query over a large
+dataset costs little to keep current. A live query sends a client the same changes as
+they happen.
+
+```sh
+sparkles views put --loc db team-sizes \
+    'PREFIX org: <http://www.w3.org/ns/org#> SELECT ?team (COUNT(?p) AS ?n) WHERE { ?p org:memberOf ?team } GROUP BY ?team'
+sparkles views list --loc db
+sparkles views get --loc db team-sizes
+sparkles views explain --loc db 'SELECT ?p ?q WHERE { ?p <http://xmlns.com/foaf/0.1/knows>+ ?q }'
+sparkles query --loc db 'PREFIX view: <urn:x-sparkles:view#> SELECT * WHERE { SERVICE view:read { [] view:name "team-sizes" ; view:bind ?team, ?n } }'
+```
+
+`put` defines the view and waits for its first evaluation, and `get` shows its state, its
+size and its plan, with each operator marked `incremental` or `recompute`. `explain`
+shows the plan a query would have without defining it. The same commands work on a
+server with `--server URL --dataset NAME`, where `put`, `delete` and `rebuild` need
+`admin` on the dataset.
+
+`sparkles query --live` follows a query on a server. It prints the result, then a block
+for each commit that changes it, with `+` before the rows the commit added and `-` before
+the rows it removed. `--results json` prints one JSON object per event instead.
+
+```sh
+sparkles query --live --server http://localhost:3030 --dataset books \
+    'SELECT ?book WHERE { ?book a <http://ex.org/Book> }'
+curl -N 'localhost:3030/books/live?query=SELECT%20%3Fb%20WHERE%20%7B%20%3Fb%20a%20%3Chttp%3A%2F%2Fex.org%2FBook%3E%20%7D'
+```
+
+`serve --max-live-queries` and `--max-live-queries-per-principal` limit the live queries
+of a dataset, 1,000 and 20 by default. `--view-pass-timeout` suspends a view whose pass
+runs longer, 30 seconds by default, and `--views-memory` bounds the state of a dataset's
+views together. [API.md](API.md#incremental-views) describes the definitions, the
+states, `SERVICE view:read` and the events of a live query.
+
 ### DESCRIBE modes
 
 A DESCRIBE query returns the concise bounded description of each resource by default.
@@ -1334,6 +1395,817 @@ input given as the output is refused.
 triples. On a server, `POST /{ds}/upload` takes tables too
 ([API](API.md#csv-and-tsv-uploads)).
 
+## Formatting
+
+`sparkles fmt` formats SPARQL queries and updates (`.rq`, `.ru`, `.sparql`), Turtle
+(`.ttl`, `.turtle`), TriG (`.trig`), N-Triples (`.nt`), N-Quads (`.nq`) and JSON-LD
+(`.jsonld`). It follows Prettier's modes and exit codes. It exits 0 when everything is
+formatted or was written, and 1 when `--check` or `-l` found a file that would change.
+It exits 2 on any error: a syntax error, a refused output, an unreadable file or a bad
+option. It processes every file, so one run reports every problem, and it formats files
+in parallel (`--threads N`).
+
+```sh
+sparkles fmt q.rq                    # print the formatted query (stdin to stdout without a path)
+sparkles fmt --write queries/        # rewrite in place: temporary file, fsync, rename; unchanged files keep their mtime
+sparkles fmt --check queries/        # [warn] per unformatted file on stderr; --diff adds unified diffs on stdout
+sparkles fmt -l queries/             # names of the files that would change
+sparkles fmt --stdin-filepath queries/q.rq < q.rq   # stdin named for detection, config and ignore files
+sparkles fmt --sort data.nq          # N-Triples / N-Quads sorted (external sort past --sort-memory)
+sparkles fmt --canonicalize data.nq  # RDFC-1.0 canonical form (drops comments)
+```
+
+- **Files.** Directories are walked recursively for the extensions above. The walk
+  applies `.gitignore`, `.git/info/exclude` and the global gitignore. It includes hidden
+  files but never enters `.git`, `node_modules` or `target`. A file named on the command
+  line is formatted whatever its extension. `--language` names its language; otherwise
+  the extension does. With an unknown extension, the content decides, and it is never
+  detected as N-Triples, because N-Triples is also valid Turtle. Walks skip `.n3`, `.shc`
+  and `.json` files, which need `--language` when named. RDF/XML and compressed files are
+  refused.
+- **Ignore file.** `.sparklesfmtignore` in the current directory, in gitignore syntax, or
+  `--ignore-path FILE` (repeatable). It applies to walks and to named files. A named file
+  that it matches is skipped silently. An ignored `--stdin-filepath` passes stdin through
+  unchanged.
+- **Config.** `.sparklesfmt.toml` or `sparklesfmt.toml`, found by walking up from each
+  file's directory. The nearest one wins, and files are not merged. Flags override it.
+  `--config FILE` uses one file for every input, and `--no-config` uses the defaults. An
+  unknown key or a bad value is an error that names the key and the file.
+
+  ```toml
+  line-width = 100               # 40..=400
+  indent-width = 2               # 1..=8
+  prefix-groups = []             # e.g. [["rdf", "rdfs", "xsd", "owl"]]; --prefix-group rdf,rdfs,xsd,owl
+  type-shorthand = true          # rdf:type → a (and a entries first)
+  compact-iris = true            # full IRI → prefixed name
+  quote-style = "double"         # "double" | "preserve"
+  operator-position = "leading"  # "leading" | "trailing": where a broken || or && chain puts its operator
+  align-values = false           # SPARQL: pad multi-variable VALUES rows into columns
+  prune-prefixes = false         # SPARQL, Turtle, TriG: drop prefix declarations nothing uses
+  directive-style = "sparql"     # Turtle, TriG: "sparql" (PREFIX, GRAPH) | "turtle" (@prefix, no GRAPH)
+  turtle-layout = "diff"         # Turtle, TriG: "diff" | "conventional"
+  sort = false                   # Turtle, TriG, JSON-LD terms, N-Triples, N-Quads
+  ```
+
+  Every key has a flag of the same name (`--no-type-shorthand`, `--quote-style preserve`, …).
+- **Messages.** Errors read `path:LINE:COL: error: …`, with 1-based lines and columns
+  counted in characters. A refused output reads
+  `path: error: formatter refused its own output (algebra differs); input left unchanged; please report`.
+- **Size.** A document is formatted in memory up to `--max-bytes` (default `256MiB`).
+  Sizes take a `KiB`, `MiB`, `GiB` or `TiB` suffix. A larger file is an error, with two
+  exceptions:
+  - N-Triples and N-Quads always stream. A file or stdin of any size is formatted in one
+    pass in bounded memory. With `--diff`, they are formatted in memory.
+  - Turtle and TriG over `--max-bytes` stream statement by statement unless sorted.
+    `--max-bytes` then bounds the largest statement. With `prune-prefixes`, the input is
+    read twice, and stdin is kept in a temporary file.
+
+  Sorting N-Triples and N-Quads spills sorted runs to the temporary directory past
+  `--sort-memory` (default `1GiB`). `--canonicalize` holds at most
+  `--max-canonicalize-quads` quads (default 20,000,000).
+
+`sparkles lsp` serves the same formatting to editors over the Language Server Protocol,
+with syntax errors and the formatter's warnings as diagnostics. [editors.md](editors.md)
+has the editor setups. `POST /$/format` is the HTTP form ([API.md](API.md#formatting)).
+The UI formats in the page when it is built with the formatter's WebAssembly module.
+
+## Linting
+
+`sparkles lint` finds mistakes and doubtful constructs in SPARQL queries and updates
+(`.rq`, `.ru`, `.sparql`) and in Turtle (`.ttl`) and TriG (`.trig`) documents. It walks
+directories and reads ignore files and config files as `sparkles fmt` does. The design is
+in [spec X04](specs/X04-linter.md).
+
+```sh
+sparkles lint queries/ shapes/            # path:line:column: severity [rule] message
+sparkles lint --fix queries/              # apply the safe fixes in place
+sparkles lint --strict --format json .    # warnings fail too; a JSON report
+sparkles lint --rule cartesian-product=error --rule single-use-variable=off q.rq
+sparkles lint --stdin-filepath q.rq < q.rq
+sparkles lint --list-rules                # every rule with its default severity
+```
+
+The exit status is 0 when no finding is an error, 1 when one is (or a warning is under
+`--strict`), and 2 when a file, flag or config file cannot be used. With `--fix` and
+stdin, the fixed text goes to stdout and the remaining findings go to stderr.
+
+| Rule | Default | What it finds |
+|---|---|---|
+| `syntax` | error | The document does not parse. This rule cannot be turned off. |
+| `undefined-prefix` | error | A prefixed name whose prefix is not declared before it. |
+| `unused-prefix` | warning | A prefix declaration nothing uses. `--fix` removes it. |
+| `unused-variable` | warning | A variable bound by `BIND` or `VALUES` that nothing reads. |
+| `single-use-variable` | hint | A variable that occurs once in a pattern and is not projected. It is a wildcard or a typo. |
+| `unbound-variable` | warning | A variable that is projected, filtered, ordered or used in a template but never bound. |
+| `cartesian-product` | warning | A pattern that shares no variable with the patterns before it in its group. |
+| `select-star-group-by` | error | `SELECT *` in a query that groups. |
+| `ungrouped-variable` | error | A projected variable that is neither grouped nor aggregated. |
+| `filter-scope` | warning | A FILTER in a nested group that tests a variable bound only outside the group, so it removes every row. |
+| `filter-equality` | hint | `FILTER(?v = <iri>)` where the IRI could go in the triple pattern. |
+| `iri-space` | warning | An IRI, an `IRI("…")` argument or an `xsd:anyURI` that holds whitespace. |
+| `language-tag-case` | warning | A language tag not written as BCP 47 recommends (`en-US`). `--fix` rewrites it. |
+| `deprecated-language-tag` | warning | A deprecated language tag or subtag, with its replacement. |
+| `suspicious-datatype` | warning | An invalid lexical form, an unknown XML Schema datatype, a misspelled XML Schema namespace, or `rdf:langString` as a datatype. |
+| `redundant-datatype` | info | `"…"^^xsd:string`, which is the plain string. `--fix` drops the datatype. |
+| `deprecated-syntax` | warning | Jena's old `jena.hpl.hp.com` function namespaces, or `owl:DataRange`. |
+
+The SPARQL rules look at variables in their scope. A subquery's variables are its own,
+and `MINUS` and `EXISTS` patterns bind nothing outside themselves. A variable whose name
+starts with `_` is exempt from the two unused-variable rules. A safe fix never changes
+what the document means. `--fix` checks this, and it writes nothing when the fixed text
+does not parse to the same algebra, graph or dataset.
+
+The `[lint]` table of `.sparklesfmt.toml` sets the rules' severities for the files under
+it, and `--rule` overrides it. The formatter ignores the table.
+
+```toml
+[lint]
+unused-prefix = "error"
+single-use-variable = "off"
+```
+
+`sparkles lsp` publishes the same findings in editors and offers the safe fixes as quick
+fixes ([editors.md](editors.md)). The same file's `[prefixes]` and `[lsp]` tables give
+`sparkles lsp` the prefixes it completes and declares, and the formatter and the lint only
+check them ([editors.md](editors.md#prefixes)). The UI's query editor lints while you type, and its
+Format menu fixes the safe findings. `POST /$/lint` is the HTTP form
+([API.md](API.md#linting)).
+
+## Automatic compaction
+
+A server compacts each dataset in the background when its delta of updates grows large,
+and writes go on while it does. By default a dataset is compacted when its delta reaches
+10,000 quads plus 5% of its base index, or a million quads, or 512 MiB of memory, or when
+its write-ahead log passes 1 GiB. A delta of at least 10,000 quads is also compacted
+after 5 minutes without a commit, and any change is compacted within a day. The build
+runs on a quarter of the cores at a lower priority, and at most one automatic compaction
+runs on the server at a time. [API.md](API.md#automatic-compaction) describes when a due
+compaction waits and the status at `/$/compaction/{ds}`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--no-auto-compact` | | Turn automatic compaction off for every dataset. |
+| `--auto-compact-min-quads N` | `10000` | The floor. The quad-count and idle triggers need a delta at least this large. |
+| `--auto-compact-ratio R` | `0.05` | Compact when the delta reaches the floor plus this share of the base index's quads. |
+| `--auto-compact-max-quads N` | `1000000` | Compact at this delta size, whatever the base; `0` means no limit. |
+| `--auto-compact-max-delta-mb N` | `512` | Compact when the delta takes about this much memory; `0` means no limit. |
+| `--auto-compact-max-wal-mb N` | `1024` | Compact when the write-ahead log passes this size; `0` means no limit. |
+| `--auto-compact-idle S` | `300` | Compact a delta of at least the floor after this many seconds without a commit; `0` turns it off. |
+| `--auto-compact-max-age S` | `86400` | Compact when the oldest change not yet compacted is this old; `0` turns it off. |
+| `--auto-compact-min-interval S` | `60` | Seconds between the end of a compaction and the start of the next automatic one. |
+| `--auto-compact-threads N` | a quarter of the cores | Threads of an automatic compaction's build. On Linux they run at nice 10. |
+| `--auto-compact-io-mb N` | `0` | The average rate, in MiB per second, at which an automatic compaction may write its new index; `0` means no limit. |
+| `--auto-compact-max-running N` | `1` | Automatic compactions that may run on the server at once. |
+| `--auto-compact-partial MODE` | `auto` | Whether a compaction, automatic or not, may rewrite only the index blocks its delta touches: `auto`, `off` or `always`. |
+
+A dataset can override every setting but the threads, the rate and the running limit.
+The settings are stored in `compaction.json` in its directory:
+
+```sh
+sparkles compaction --loc db                                  # the policy, the delta and the verdict
+sparkles compaction --loc db --set deltaRatio=0.02 --set idleSeconds=60
+sparkles compaction --loc db --set enabled=false              # off for this dataset
+sparkles compaction --loc db --default                        # back to the server's settings
+sparkles compaction --server URL --dataset db --set maxAgeSeconds=0
+curl -X PUT 'localhost:3030/$/compaction/db' -H 'Content-Type: application/json' -d '{"deltaRatio": 0.02}'
+```
+
+A database that no server holds is never compacted on its own. `sparkles compact --loc db
+--if-due` compacts it only when its policy says so, which suits a cron job.
+
+A compaction whose delta uses only terms the dataset already has rewrites only the index
+blocks that the delta touches and copies the others. Numbers, dates, booleans and blank
+nodes never add terms, and neither do links between existing resources. A delta that adds
+a term, such as a new IRI or string, rebuilds the whole index. The `partial` setting
+chooses: `auto` compacts partially when the delta adds no term and that is estimated to
+be quicker than a rebuild, `off` always rebuilds, and `always` compacts partially whenever
+the delta adds no term. `sparkles compact --partial off` rebuilds once, which also drops terms that no quad
+uses any more. The compaction's task message and `last` in its status say which it was.
+
+```sh
+sparkles compaction --loc db --set partial=off     # always rebuild this dataset's index
+sparkles compact --loc db --partial always         # one partial compaction, if no term was added
+```
+
+Each compaction makes the next incremental backup upload the whole new generation, and a
+retention window keeps the old generation until its commits age out. Raise the ratio or
+the minimum interval for datasets where that costs too much.
+
+## Backup repositories
+
+Backup repositories (see [API.md](API.md#backup-repositories)) also work offline, on a
+stopped database. A server's own datasets are backed up through its HTTP API or UI, or by
+its policies.
+
+In-memory datasets (`--mem`, or `dbType=mem`) are backed up by the server too. They have
+no files on disk, so each backup first writes the dataset's current state to a temporary
+index generation in `<data>/tmp`. That needs about as much free disk space as the
+compacted dataset, on top of the `--min-free-disk-mb` reserve. The copy is removed when
+the upload ends. A backup taken this way restores as a new persistent dataset, with the
+same content, prefixes, validation and index settings. Each server start gives an
+in-memory dataset a new id, and retention keeps `min_count` backups per id. A policy for
+such datasets should therefore set `expire_after` with `min_count = 0` (see
+[API.md](API.md#lifecycle-policies)).
+
+`--repo` takes either a name from the backup config file or a URL. The config file is
+`--backup-config FILE` or `$SPARKLES_BACKUP_CONFIG`, and defaults to
+`$XDG_CONFIG_HOME/sparkles/backup.toml`. A URL is `file:///srv/backups/r`,
+`s3://bucket/prefix?region=…&endpoint=…&path_style=true&allow_http=true` or `memory://`.
+Credentials never go in URLs. They come from the environment or a credentials file.
+
+Only `repo add` and `backup create` initialize an empty location. The other commands
+attach to an existing repository. Manifests are cached in
+`$XDG_CACHE_HOME/sparkles/backup/`, and progress goes to stderr. Ctrl-C cancels, and a
+second Ctrl-C quits. The commands that print a result take `--format json` (or
+`--json`). The exit code is 0 on success, 1 on errors, and 2 on warnings only, such as
+orphaned blobs in `repo verify`.
+
+```sh
+sparkles repo add local --path /srv/backups/r    # edits the config file (mode 0600), initializes, tests
+sparkles repo add s3 --s3 kg-backups --prefix prod --region eu-central-1 --credentials env
+#   --endpoint URL --path-style --allow-http (MinIO, R2, …); --credentials default | env |
+#   env:KEY_VAR,SECRET_VAR[,TOKEN_VAR] | file:PATH; --readonly; --no-init (attach only)
+sparkles repo add lab --s3 lab --endpoint http://127.0.0.1:9000 --path-style --allow-http \
+  --credentials-name minio --credentials env:MINIO_ACCESS_KEY,MINIO_SECRET_KEY
+#   keeps the source as [credentials.minio], which the repository names (without
+#   --credentials: uses the one defined); a server reading the file can then name it too
+sparkles repo list | show local | test local | remove local   # remove leaves the contents alone
+sparkles repo verify local --level data          # every backup, plus orphaned blobs
+sparkles repo gc local --dry-run --grace 24h     # delete blobs no backup references
+sparkles repo locks local [--break ID]
+sparkles backup create  --loc db --repo local [--name N] [--note T] [--dataset NAME]  # refused while a server has db open
+sparkles backup create  --loc db --branch dev --repo local  # standalone capture of dev
+sparkles backup list    --repo file:///srv/backups/r [--dataset ds | --dataset-id UUID] [--policy P]
+sparkles backup show    --repo local b2
+sparkles backup verify  --repo local b2 --level restore   # exists | data | restore; exit 1 on failure
+sparkles backup restore --repo local b2 --to /srv/dr/ds [--replace]
+sparkles backup restore --repo local b2 --data /srv/sparkles [--as ds]  # into a stopped server
+sparkles backup delete  --repo local b1          # blobs go at the next gc
+sparkles backup policy list | show P | history P # policies of the config file
+sparkles backup policy run P --data /srv/sparkles --backup-config backup.toml [--json]
+sparkles backup policy preview '30 2 * * *' --tz Europe/Berlin [--count 5]
+```
+
+`restore --identity auto|new|keep` picks the dataset id. `auto` keeps the id unless a
+dataset in the target data directory already has it. `--check quick|full|none` picks the
+integrity check that runs before the restored database is published. `sparkles serve`
+holds a lock on `<data>/sparkles-server.lock`, which allows one server per data
+directory, and `restore --data` refuses while a server holds it.
+
+`backup policy run` opens the data directory of a stopped server and takes the same
+directory lock. It runs the named policy from the TOML file against the repositories
+that file configures. It backs up the selected datasets, applies retention and runs
+garbage collection when the policy asks for it. A policy whose schedule is disabled can
+still be run this way. Datasets that have not changed since their last backup can be
+skipped. JSON output lists the result for each dataset, and the exit status is nonzero
+when a backup or retention step fails. Ctrl-C cancels the run and keeps the backups
+that already finished.
+
+A backup captures one branch, and both the default and scheduled policies capture
+`main`. A branch that still shares its upstream's index is written out as standalone
+files, and the branch itself is left unchanged. The manifest records the dataset and
+branch the backup came from. Restoring a branch backup with `--identity auto` or `new`
+gives it a fresh dataset id and records the captured branch as its origin. `keep` is
+refused. The restored dataset keeps its blank-node labels but is not attached to the
+source's branch history.
+
+A server started with `sparkles serve --backup-config FILE` serves the file's
+repositories and policies through its API, read-only. It also accepts repositories
+registered through its API and UI (`POST /$/repositories`), within the operator's limits
+from that file:
+
+* Their credentials can only name a source defined in the file. The caller cannot choose
+  environment variables, files or the instance's default chain.
+* Their S3 endpoints go through the [outbound policy](#outbound-requests-service-and-load),
+  so a MinIO on localhost needs `--outbound-allow 127.0.0.1` or
+  `--outbound-allow-private`. They never go through a proxy from the environment
+  (`HTTPS_PROXY`). The config file's repositories and the CLI's do use that proxy.
+* `fs` repositories must stay out of the data directory and the config files'
+  directories. When `[api] fs_roots` is set, they must lie under it:
+
+```toml
+[credentials.minio]              # named by {"source": "named", "name": "minio"}
+source = "env"
+access_key_id_var = "MINIO_ACCESS_KEY"
+secret_access_key_var = "MINIO_SECRET_KEY"
+
+[api]
+fs_roots = ["/srv/backups"]
+```
+
+To register an S3 repository through the API, first define its credential source in the
+file. Write it by hand, or run
+`sparkles repo add … --credentials-name minio --credentials …` on the same file. Start the
+server with the file, or send it SIGHUP. Then `POST /$/repositories` with
+`"credentials": {"source": "named", "name": "minio"}`.
+
+### Encrypted repositories
+
+Build the CLI with `--features backup-encryption` to enable encrypted repositories.
+The feature is off in the default build. It requires Linux or Android, because it keeps
+keys in protected memory. Plaintext repositories behave as before. The CLI and a server
+started with `serve --backup-config FILE` support the same local key providers. The
+HTTP API refuses encryption settings when it registers or updates a repository, so only
+the operator controls keys and the references to them.
+
+Store keys outside datasets, catalogs and the backup repository. A key file must be a
+regular file owned by the user that runs Sparkles or by root, with no group or other
+permissions. Each local key is exactly 32 raw bytes, 64 hexadecimal characters, or the
+canonical base64 encoding of 32 bytes. The hex and base64 forms may have ASCII
+whitespace around them. Raw input made only of printable ASCII is refused, because a
+typed 32-character password would otherwise become the key. If an existing key is such
+text, give the same bytes in hex instead, for example with `xxd -p -c 64 key`, and the
+existing slots keep opening. A passphrase file holds 1 to 4096 bytes, used exactly as
+written, so a final newline is part of the passphrase. Provider output is limited to
+4096 bytes. Configuration and flags hold references to keys, never the keys themselves.
+
+```sh
+sparkles repo add secure --path /srv/backups/secure --encrypt \
+  --key-file /run/keys/backup-online --key-file /run/keys/backup-recovery
+sparkles backup create --loc db --repo secure --name b1
+sparkles repo key list --repo secure --json
+sparkles repo key add --repo secure --passphrase-file /run/keys/recovery-phrase --key-label offline
+sparkles repo key rotate-master --repo secure
+sparkles repo key remove --repo secure --slot UUID
+sparkles repo key retire --repo secure --epoch 1
+```
+
+Creating an encrypted repository requires two independent keys unless
+`--single-key-ok` accepts one. Keep a recovery key offline. `repo key add` wraps a key
+into every readable epoch without adding its reference to the online configuration,
+and it requires `--key-label`. Running the same addition again with the same label and
+key finishes an interrupted addition without creating a duplicate. `repo key remove`
+refuses to remove the last available wrap of an epoch. Rotation starts a new
+master-key epoch for new backups, and older backups stay readable. An epoch can be
+retired only when no remaining manifest or blob refers to it, so delete obsolete
+backups and run garbage collection first. Once that check succeeds, retirement goes
+ahead even when offline recovery keys are not available.
+
+Creation and `repo key add` also accept `--key-env VARIABLE`, `--key-credential NAME`
+(from `$CREDENTIALS_DIRECTORY`), or
+`--key-command-argv '["/absolute/provider","argument"]'`. Sparkles runs the command's
+argv as given, without a shell. The timeout is 10 seconds by default and
+`--key-command-timeout` sets it between 1 and 300 seconds. The command gets no stdin,
+and its stderr is discarded. On a timeout or cancellation, Sparkles kills the
+provider's process group and reaps the provider.
+A provider starts with an empty environment plus `PATH`, `HOME`, `LANG`,
+`XDG_RUNTIME_DIR` and `CREDENTIALS_DIRECTORY` when Sparkles has them, so it never sees
+other repositories' `--key-env` keys or cloud credentials. A provider that needs
+another non-secret setting can take it through `/usr/bin/env NAME=value` in its argv.
+Variables named by `--key-env` stay in the Sparkles process environment after they are
+read. Put secrets in the provider's input source, never in its argv. Credential names are
+simple identifiers and their files must remain inside the credential directory.
+
+Rotation is protected against rollback. The marker records which key epoch is active,
+and that record is authenticated by the active master key. Each host also remembers
+the newest epoch it has seen for each repository, in memory and in
+`.key-epoch.json` inside the repository's cache directory. After a rotation, a bucket
+writer who holds the old key cannot make Sparkles seal new backups with it again. If a
+whole repository is deliberately restored from an older copy of its bucket, delete that
+file and restart before opening it. Repositories created by earlier builds keep
+opening, and their marker gains the authentication tag on the next `repo key
+rotate-master` or `repo key retire`. Earlier builds cannot open a repository after that
+step or after `repo key add`, because new key slots use a newer format. Rollback of
+individual backups is not detected: a bucket writer can put back an older backup under
+its name.
+
+A local key can move between file, environment, credential and command providers
+without changing its bytes or adding a slot. The slot still records the original
+source, but only the key bytes decide whether it opens.
+
+Other repository commands can override the configured references with
+`--repository-key-file`, `--repository-key-env`, `--repository-credential`,
+`--repository-passphrase-file` or `--repository-key-command-argv`.
+`--repository-key-command-timeout` sets the command's timeout. Passphrase recovery also needs the original
+slot label, because it identifies the stored Argon2 salt:
+
+```sh
+sparkles backup restore --repo file:///srv/backups/secure b1 --to /srv/recovered \
+  --repository-passphrase-file /run/keys/recovery-phrase --repository-key-label offline
+```
+
+`backup policy run` also works with a configured encrypted repository. After it takes
+the stopped catalog's lock, it reads the credentials and key providers of the policy's
+repository and of no other. The repository key override flags are refused for policy
+runs. Key files must stay outside the catalog and the configured repository
+directories, and a key file stored inside another Sparkles dataset is also refused. An
+offline run does not see datasets that a server attached only for its session. Ctrl-C
+cancels retention and garbage collection as it cancels backups, and completed backups
+are kept.
+
+The Rust TOML API keeps key references in `ConfiguredRepository`, which
+`RepoToml::configured` and `ConfigFile::configured_repositories` return.
+`RepoToml::to_config` and `ConfigFile::repository_configs` return `Result` and
+refuse encrypted tables, so an encrypted repository cannot be turned into a plaintext
+one by accident. `repo list` and `repo show` print key references and the public
+metadata of key slots, never resolved keys or passphrases. Sparkles has no support for
+cloud KMS, Vault or encrypting the database directory.
+
+### Encrypted repositories in the server
+
+With `backup-encryption` enabled, `serve --backup-config FILE` also opens the encrypted
+repositories that the operator defines in that file. Persistent repositories can use
+the same key file, environment variable, systemd credential, passphrase file and
+command providers, all given as references. An encrypted `type = "memory"` repository
+is refused, because it cannot keep its identity and data across a reload or restart.
+The server reads the keys when it first needs a repository, including the background
+checks at startup and after SIGHUP, and then caches the opened repository in protected
+memory. The listener starts without waiting for those checks. Backups, restores,
+verification, garbage collection and scheduled policies all use the cached repository.
+Secret files must stay outside the server's data directory and the repository
+directories. The API refuses an `encryption` field when it registers or updates a
+repository, so key references and key management stay with the operator.
+
+On SIGHUP, the server validates the new configuration before it changes the registry.
+It then drops every opened encrypted repository, even when its key references are the
+same, so send SIGHUP after replacing the contents of a key file or credential. A missing
+or wrong key makes the repository unavailable or locked, and the server never opens a
+plaintext repository in its place. A reload that keeps a repository at the same
+location still checks its registered UUID. Cancelling a backup or scheduled-policy task
+interrupts provider commands and the wait for another task that is opening the same
+repository. Opening the storage backend keeps its own deadlines, and the server checks
+for cancellation before it caches the result. Operations that had already started can
+finish with the repository they opened. Later operations open it with the new
+configuration, and an open that started before the reload is never returned or cached
+for the new entry.
+
+The Rust registry methods `load` and `replace_config` still accept only plaintext
+repositories. A server integration that needs the trusted encryption references uses
+`load_configured` and `replace_configured`. API views and the registry the API persists
+leave those references out.
+
+## Checking a database
+
+`sparkles check --loc db` verifies a database directory without modifying it. It takes
+no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
+run next to a server that holds the database. `--data DIR` checks every database in a
+server's data directory. It leaves out directories whose names start with a dot, which
+hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each
+check prints one line, `ok`, `warning` or `error`, and lists the file, offset, block,
+row, commit or id of every problem below it. `--format json` prints the same report as
+JSON. The exit status is 0 when everything is clean, 1 when any check found an error,
+and 2 when there are warnings only.
+
+| Check | What it verifies |
+|---|---|
+| `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
+| `generation` | `meta.json` and `stats.json` parse and agree on the quad count, and this release reads the index format. |
+| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. An FSST-coded vocabulary's tables in `vocab.fsst` read with their checksum, and in full mode every coded suffix uses only codes its table holds. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
+| `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. The summary names its format, `framed` or `legacy`, and the zero bytes preallocated after its last chunk. A torn tail is a warning. |
+| `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
+| `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
+| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave, and one with zero records before its commit record. Zero bytes after the last commit are preallocated space, reported in the summary. Commit numbers continue from the generation's base commit, and ids resolve. The summary names the log's version: 1 for a log that starts with a header record, 0 for one written before the header existed. A header with a version this release does not read is an error. |
+| `catalog` | `commits.bin` has valid record checksums, continuous records and the right dataset id, and agrees with the WAL. A lagging catalog, or damage that open can rebuild from the WAL, is a warning. Lost history before the generation is an error. |
+| `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
+| `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
+| `patterns` | `patterns.bin` has a valid layout, and in full mode its checksum matches and every subject's pattern, the subjects of each pattern and the predicate totals match SPO. A pattern file of a version this release does not read is a warning, because queries then read the permutations. A missing file that `meta.json` records is a warning too. |
+| `reasoning` | `reasoning.json` parses and names an existing commit. |
+
+Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
+that queries would read wrongly. Warnings are states that open handles by itself. A
+server that writes during the check can cause transient warnings, because an in-flight
+transaction looks like a torn tail, but never errors.
+
+`--quick` reads metadata only. It reads block metadata instead of every block, the first
+key of each vocabulary block, and whether segment files exist instead of their
+checksums. On the 10.5M-quad benchmark database, a full check takes about 0.3 s and a
+quick one 20 ms (16 cores, warm page cache). The same check is a library call:
+`sparkles::check::check(root, &CheckOptions::default())` returns a serializable
+`CheckReport`.
+
+## Upgrading databases
+
+Every file Sparkles keeps records the version of its format, and a release reads the
+versions of the release before it. The registry of file kinds and versions is
+`crates/sparkles-core/src/formats.rs`. `GET /$/server` lists it in its `formats` member,
+and `sparkles migrate --check` prints it with each database's versions. Before 1.0, release
+0.N opens the databases and backups that 0.N and 0.(N-1) wrote. From 1.0, a release opens
+those of its own major version and of the last minor release before it.
+
+Most changes need no step. A release reads the older version, and it writes the new one
+the next time it writes the file or, for a generation's index, at the next compaction.
+A full-text, spatial or vector index in a version the release does not read is rebuilt
+in the background. When a format changes in a way the new release cannot read, the
+release ships an upgrade step and refuses the old files with a message that names
+`sparkles migrate`. A database outside the window is refused with the release that wrote
+it, which `writtenBy` in `dataset.json` records. Dump it with `sparkles dump` from that
+release and load the dump with `sparkles load`.
+
+```sh
+sparkles migrate --data /srv/sparkles --check            # every database of a stopped server
+sparkles migrate --data /srv/sparkles --dataset books    # upgrade one dataset
+sparkles migrate --loc db --keep-old                     # one database, keeping the old files
+sparkles migrate --loc db --check --format json
+```
+
+`sparkles migrate` works offline. With `--data` it takes the catalog lock, so it fails
+while a server holds the data directory, and it upgrades the persistent datasets that
+`config.json` registers, or those that `--dataset` names.
+
+`--check` plans without changing anything. It lists each database's `dataset.json`
+versions, the version of every generation's index, log and update vocabulary, whether
+the release opens the database, and the steps an upgrade would run. It does not finish
+or undo an earlier run, which it reports as `interrupted`. The exit status is 1 when a
+database is outside the window or has an interrupted run, which a server refuses until
+`sparkles migrate` runs without `--check`, and 0 otherwise. The JSON report gives both
+answers, `inWindow` for the formats and `opens` for whether this release opens the
+database now. A generation whose `meta.json` has no usable version is listed as refused,
+and the report goes on with the other generations and databases.
+
+The window covers the root of a database and every branch, and a newer settings file of
+a dataset or of one of its branches puts the database outside it. The informational files
+`origin.json` and `restore.json` are the exception, because a store ignores a newer one
+with a warning. Startup checks the dataset metadata and settings of every active and
+retained branch before it rewrites the root's metadata, and it reads the same branch
+directories as migration planning. Both leave out unpublished `.create-*` directories and
+`.deleting` tombstones, which planning leaves unchanged and which startup's branch
+recovery removes once these checks pass. An incompatible branch refuses its dataset
+before any cleanup, and the other datasets stay available.
+
+The command makes the database path absolute before it changes anything. If the path
+contains `..`, the command resolves the existing parent through the filesystem and keeps
+the final database name. This keeps a valid `db/../db` path usable during the swap and
+follows the physical meaning of symlink parents. If an interrupted run made such a path
+unresolvable, recover through the database's stable parent path. Paths without `..`
+still support a missing database and new nested directories.
+
+Without `--check`, the command copies each database that has steps to run into a
+sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
+the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
+free space as the database. It keeps the mode and the owner of every file and directory,
+and a file that a step rewrites keeps those of the file it replaces. The command must
+therefore run as the user that owns the database or as root, and it refuses to start
+otherwise. It also refuses a database directory that its owner cannot write, and a
+database named through a symlink, which the swap would replace with a directory. Run it
+on the directory the link points to. The dataset id, the commit numbers, the commit catalog, the branches and the
+snapshots stay as they were. `--keep-old` keeps the database as it was in
+`.pre-migrate-<version>-<name>`, and without it that directory is removed. The command
+refuses to start while that directory exists, so it never deletes an earlier kept copy.
+A dataset delete does not remove a kept copy either. The command also refuses a database
+that holds a symlink or another entry that is not a regular file or directory, because
+the copy would leave it out. Replace the entry with the files it points to and run again.
+
+The command takes the lock file `.migrate.lock-<name>` next to the database, which a
+second `sparkles migrate` and a `--check` of the same database respect. It also takes
+the database's own lock, which a server or any other process that has the database open
+holds, so it fails with a locked error while a server runs on the database. The lock
+file stays in place after the command finishes. A server, or any other open of the
+database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
+has run on it again, so a stopped run never leads to an empty database. After it checks
+for a pending migration, startup verifies that its locked file still belongs to the
+current database directory. If a migration replaced that directory while startup was
+taking its lock, the open refuses with a locked error and can be retried.
+
+Until the copy has passed its check and carries a durable mark that says so, any error
+removes the copy and leaves the database as it was. That covers a step that fails, a
+check that finds errors or fails to run, and a mark that cannot be written. If the
+command stops before the swap, the next run removes the copy, and the database is
+unchanged. If it stops between the two renames, the next run renames the checked copy
+into place. A copy without the mark of a passed check is never renamed into place, and
+the command reports it and leaves both directories alone.
+
+The mark is versioned and records the exact old sibling directory and whether to keep
+it. Recovery uses that recorded directory even when another release finishes the run, so
+it preserves unrelated kept copies. An unknown or damaged mark, or one with a known field
+given twice, refuses recovery without changing the copies. A bare legacy `keep-old` or
+`remove-old` mark also refuses automatic recovery, because it does not name the original
+old directory. In those cases inspect the sibling copies, then recover through a known
+original location or restore by hand.
+
+A backup restore refuses to replace a database while a migration is pending, including
+when the database directory is missing between the two renames. An offline restore also
+checks that its lock belongs to the current database directory before it publishes, and
+refuses a stale lock with `dataset-busy`, leaving both directories intact.
+
+The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
+format, which the first write to it would also do. A server opens such a database
+without the step.
+
+A server that finds a dataset in a version it does not read leaves that dataset closed,
+logs why, and serves the others. That covers an index or a log in a newer version, a
+`dataset.json` that needs a later reader, and a settings file such as `describe.json`,
+`rdfs.json` or `assistant.json` with a newer `format`, which a store checks at open before
+it writes any file. The dataset stays registered, and `GET /$/server` lists it under
+`refusedDatasets`. A caller sees the refused datasets it may read, and a server
+administrator sees all of them and alone gets the full reason, which names paths. The
+other callers get a fixed sentence. A refused dataset cannot be deleted or renamed through
+the API while it is closed. Stop the server and run `sparkles migrate`, or edit
+`config.json`. After `sparkles migrate`, or after the database is replaced, the next start
+opens it.
+
+## Outbound requests (SERVICE and LOAD)
+
+`SERVICE <url>` and `LOAD <http…>` make the server open connections, so they follow a
+network policy. With authentication on, they also need the `federate` permission. The
+local `sparkles query` and `sparkles update` follow the same policy with a different
+default, described below. The policy works as follows:
+
+* Only `http` and `https` URLs are allowed.
+* The host is resolved once, and the connection goes to exactly the addresses that were
+  checked, so DNS rebinding cannot swap in another address. If any address that a name
+  resolves to is refused, the name is refused.
+* By default, only public addresses are contacted. The policy refuses loopback
+  (`127.0.0.0/8`, `::1`), private (`10/8`, `172.16/12`, `192.168/16`), shared
+  (`100.64.0.0/10`), link-local (`169.254.0.0/16`, which holds the `169.254.169.254`
+  metadata service, and `fe80::/10`), unique-local (`fc00::/7`), multicast, broadcast,
+  unspecified, documentation, benchmarking and reserved ranges. It also refuses the
+  IPv4-mapped, IPv4-compatible, NAT64 and 6to4 IPv6 forms of those.
+* Every redirect hop is checked the same way, for at most 5 hops.
+* Each request has a 10 s connect timeout and a total timeout (`--outbound-timeout`,
+  default 60 s) that never runs past the query's own timeout. Its response has a ceiling
+  (`--outbound-max-mb`, default 256), counted as the body streams in and, for a
+  compressed `LOAD`, after decompression.
+* One budget covers all the SERVICE calls and LOADs of a query or update, so that many
+  requests cannot add up to more than a few large ones. It limits the bytes they receive
+  (`--outbound-request-max-mb`, by default 4 × `--outbound-max-mb`), and a compressed
+  `LOAD` counts its decompressed bytes. It also limits the time they take, summed
+  (`--outbound-request-timeout`, by default 4 × `--outbound-timeout`). Past the byte
+  limit, the request fails with `507` (`"budget": "outbound-bytes"`) and an update
+  commits nothing. Past the time limit, the next call gets only the time that is left and
+  then fails like a timeout.
+* A `LOAD` is parsed as its response streams in. It is not buffered first.
+
+A refused destination fails with `403` before any connection is made. `SILENT` hides
+neither that refusal nor a spent budget. It hides failures of the remote side, such as
+timeouts. Proxy environment variables (`HTTP_PROXY`, …) are ignored for these requests.
+
+Error messages name the URL and its host. They do not say what the host resolved to, and
+they do not include the connection's own error. A refused name answers
+`… is refused by the outbound policy`, and a failed connection answers `cannot connect`.
+The server logs the details under the target `sparkles::outbound`: the resolved address,
+its kind and the OS error. An operator can see why a request failed, but a caller cannot
+use the errors to map internal names to addresses.
+
+`--outbound-allow-private` opens loopback, private, shared and unique-local addresses,
+for example to reach a local Fuseki during development:
+
+```sh
+sparkles serve --data ./data --outbound-allow-private
+# SELECT * { SERVICE <http://localhost:3030/ds/sparql> { ?s ?p ?o } }
+```
+
+Link-local addresses, including the metadata service, stay refused. In production,
+prefer an allowlist. With `--outbound-allow` (repeatable), only the listed destinations
+are contacted. An entry is one of:
+
+* A host name (`--outbound-allow sparql.example.org`), or `*.example.org` for the
+  subdomains of a name. The name is contacted at public addresses, and at private ones
+  too with `--outbound-allow-private`.
+* An address or CIDR network (`--outbound-allow 10.20.0.0/16`). Any address in it is
+  contacted, including private and link-local ones.
+
+Listing a name vouches for the name, not for the addresses it resolves to. To reach a
+name that resolves to a private or link-local address, list that address or network as
+well (`--outbound-allow fuseki.internal --outbound-allow 10.20.0.0/16`). A hijacked or
+mistyped DNS record then cannot open the metadata service. `sparkles mcp` takes the same
+flags. Library users set `QueryOptions::outbound`
+(`sparkles::outbound::OutboundPolicy`), which has the same defaults. Embedding requests
+([Embeddings computed on write](#embeddings-computed-on-write)) follow the server's policy
+too, and library users set theirs with `sparkles::vector::embed::set_environment`. The default refusal
+of non-public addresses is the constant `BLOCK_PRIVATE_BY_DEFAULT`.
+
+**Local commands.** `sparkles query` and `sparkles update` without `--server` run on the
+operator's own machine. They therefore allow loopback, private, shared and unique-local
+destinations by default, as `--outbound-allow-private` does for a server. A SERVICE call
+to a local Fuseki or a `LOAD` from an intranet host needs no flag. Link-local addresses,
+including the metadata service, stay refused. The local commands take the same
+`--outbound-*` flags. `--outbound-block-private` restores the strict default of `serve`
+and `mcp`, for example for a query from an untrusted source:
+
+```sh
+sparkles query --data local.ttl 'SELECT * { SERVICE <http://localhost:3030/ds/sparql> { ?s ?p ?o } }'
+sparkles query --data local.ttl --outbound-block-private --query untrusted.rq
+```
+
+With `--server`, the request runs on that server under its own policy, and these flags
+do not apply.
+
+**Local files.** `LOAD <file:…>` over HTTP needs `serve --load-dir DIR`, and
+`server-admin` when authentication is on. The file must be a regular file under `DIR`
+once `..` and symbolic links are resolved. A link inside `DIR` may point elsewhere inside
+it. Without the flag, the server refuses file loads with `403`. `DIR` may not hold the
+data directory. The local `sparkles update` reads any file its user can read. Library
+users set `QueryOptions::file_loads` to `FileLoads::Anywhere` (the default),
+`FileLoads::under(dir)` or `FileLoads::Disabled`.
+
+### Correlated, bulk and cached SERVICE
+
+A SERVICE that depends on the solutions before it runs once per solution with `loop:` in
+front of its IRI, as Jena's service enhancer does. `bulk+n:` sends `n` solutions in one
+request, and `cache:` keeps each solution's remote result for the next query:
+
+```sparql
+SELECT ?film ?label WHERE {
+  ?film a :Film ; :wikidata ?item .
+  SERVICE <loop:bulk+50:cache:https://query.wikidata.org/sparql> {
+    SELECT ?label { ?item rdfs:label ?label FILTER(lang(?label) = "en") } LIMIT 1
+  }
+}
+```
+
+Without `loop:`, the endpoint evaluates the sub-select once over all of its items, and
+every film gets the same label. With `loop:` and no `bulk`, it gets one request per film.
+With `bulk+50`, 1,000 films take 20 requests, and with `cache:` a second run takes none.
+The requests follow the outbound policy and its budgets like any SERVICE call.
+
+The cache is shared by the datasets, holds `--service-cache-mb` (64) in all, and keeps each
+caller's entries apart. `cache+clear:` refreshes the entries a query reads, and
+`POST /$/cache/clear/{ds}` drops them all. `SERVICE <loop:> { … }` and
+`SERVICE <urn:x-arq:self> { … }` read the dataset itself without a request. The options
+and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cache).
+
+## Sending notifications
+
+The server can tell a person when something needs them. It sends a notification to a
+webhook or an ntfy topic when agent memory has waited for review too long, when a
+backup policy run fails, and when a model provider's daily token budget is used up.
+Notifications are off until the configuration turns them on.
+
+The configuration is the server-wide settings kind `notifications`. An operator declares
+it in the settings file under `server.notifications`, and a server administrator changes
+it at runtime unless the settings file locks a field, as for the model configuration.
+A channel never holds a credential. It names a secret, which comes from
+`--model-secret NAME=file:PATH` or from a value stored with `sparkles secrets set`.
+
+```json
+{
+  "server": {
+    "notifications": {
+      "enabled": true,
+      "baseUrl": "https://sparkles.example.org",
+      "channels": {
+        "phone": { "type": "ntfy", "topic": "sparkles-ops", "token": { "secret": "ntfy-token" } },
+        "ops": { "type": "webhook", "url": "https://hooks.example.org/sparkles", "signingSecret": { "secret": "hook-signing" } }
+      },
+      "routes": { "memory.review.pending": ["phone"], "backup.*": ["phone", "ops"], "*": ["ops"] }
+    },
+    "locked": ["notifications.channels.phone"]
+  }
+}
+```
+
+```sh
+sparkles serve --loc data/org --settings settings.json \
+  --model-secret ntfy-token=file:/run/secrets/ntfy-token \
+  --model-secret hook-signing=file:/run/secrets/hook-signing
+sparkles notify test phone
+sparkles notify status
+```
+
+`sparkles notify test CHANNEL` sends a test notification to one channel at once, even
+while notifications are off, and prints the HTTP status the channel answered or the
+error. `sparkles notify status` prints each channel with its last success and its last
+failure, the routes, and the conditions that were notified. The same configuration can
+be changed from the command line:
+
+```sh
+sparkles settings set --global notifications.enabled=true \
+  'notifications.routes.*=["ops"]'
+sparkles secrets set hook-signing < hook-signing.key
+```
+
+A webhook receives the notification as a JSON body. With `signingSecret`, the request
+carries the `webhook-id`, `webhook-timestamp` and `webhook-signature` headers of
+Standard Webhooks, and the libraries of that specification verify them. A webhook URL
+that holds a token, as many chat services' incoming webhooks do, goes into a secret
+with `"urlSecret": {"secret": NAME}` in place of `url`. An ntfy channel publishes to
+`https://ntfy.sh` unless `server` names another ntfy server. A topic on the public
+server can be read by anyone who guesses its name, so use an access token with a
+reserved topic, or a server of your own.
+
+Each dataset decides how long its memory review may wait. The event fires when the
+oldest open review branch, such as a scheduled consolidation's, is older than
+`notifyAfter`, and then at most once per `repeatEvery` until no review branch is open:
+
+```sh
+sparkles settings set org memory.review.notifyAfter=2d memory.review.repeatEvery=1d
+```
+
+A backup policy that fails notifies once, then at most once per the kind's
+`repeatEvery` (one day by default) until a run of the policy succeeds. A spent model
+budget notifies once per provider and day. Requests to the channels go through the
+outbound policy, so a channel on a private address needs `--outbound-allow-private`.
+A failed delivery is retried with backoff, five attempts by default.
+[API.md](API.md#notifications) lists every member, the events and their data, and the
+metrics.
+
+On NixOS the settings file comes from `services.sparkles.settings` and the secrets from
+`services.sparkles.models.secrets`, which also serves the model providers' keys:
+
+```nix
+services.sparkles = {
+  settings.server.notifications = {
+    enabled = true;
+    baseUrl = "https://sparkles.example.org";
+    channels.phone = { type = "ntfy"; topic = "sparkles-ops"; token.secret = "ntfy-token"; };
+    routes."*" = [ "phone" ];
+  };
+  settings.server.locked = [ "notifications.channels.phone" ];
+  settings.datasets.org.memory.review.notifyAfter = "2d";
+  models.secrets.ntfy-token.file = config.sops.secrets."ntfy-token".path;
+};
+```
+
 ## Branches and merges
 
 A branch lets a change take several steps, or several people, before it reaches the data
@@ -1468,6 +2340,417 @@ A branch costs almost nothing while it stays linked. Its memory then holds the u
 delta at the starting commit, and its first compaction builds a full index, about what a
 clone costs. `--max-branches` (64) limits the branches of a dataset, and the dataset's
 storage quota covers every branch.
+
+## Finding paths
+
+A property path tells whether two nodes are connected. A path search returns the
+connections themselves, one row per edge or per path, through the local service
+`SERVICE path:search`. The parameters are in [API.md](API.md#path-search), and the design
+is in [F07](specs/F07-path-search.md).
+
+The shortest chain of `foaf:knows` between two people, edge by edge:
+
+```sh
+sparkles query --loc ./db '
+PREFIX path: <urn:x-sparkles:path#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?i ?s ?o WHERE {
+  SERVICE path:search {
+    [] path:source <http://example.org/person/0> ;
+       path:target <http://example.org/person/999999> ;
+       path:predicate foaf:knows ;
+       path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o .
+  }
+} ORDER BY ?i'
+```
+
+The ends can come from the rest of the query. This finds the distance from each of two
+people to everyone who works for one organization:
+
+```sparql
+SELECT ?a ?b ?len WHERE {
+  VALUES ?a { <http://example.org/person/1> <http://example.org/person/2> }
+  ?b <http://example.org/worksFor> <http://example.org/org/7> .
+  SERVICE path:search {
+    [] path:source ?a ; path:target ?b ; path:predicate foaf:knows ; path:length ?len .
+  }
+}
+```
+
+`path:algorithm path:allShortest` returns every shortest path, `path:kShortest` with
+`path:k 5` the five shortest, and `path:all` with `path:maxLength 4` every path of up to
+four edges. `path:direction path:both` ignores the direction of the triples. Name the
+predicates when you can, because a search without them follows every triple, including
+`rdf:type`. A search stops with an error when it visits more than 10 million nodes. Raise
+the limit with `path:maxVisited`, or narrow the search with `path:maxLength` or
+predicates.
+
+When the predicates to follow are not known in advance, name the ones to skip instead.
+`path:excludePredicate rdf:type, owl:sameAs` follows every other triple. A node with
+thousands of edges, such as a country or a popular class, connects almost everything
+through itself, so a path through it says little. `path:maxDegree 1000` keeps paths from
+passing through a node with more than 1,000 edges in the search's direction, while the
+source and the target may have any number. EXPLAIN ANALYZE reports the nodes skipped this
+way as `skippedHubs`.
+
+A predicate can be followed in its own direction. A family tree stored with
+`ex:parent` from child to parent and `ex:sibling` both ways is searched from an
+ancestor down to a person with `path:predicate (ex:parent path:backward), (ex:sibling
+path:both)`. When the edges are not single triples, a nested pattern can give them.
+`path:start` and `path:end` name its variables of each edge's ends, and this search
+follows co-authorship, two people who wrote the same paper:
+
+```sparql
+SELECT ?len WHERE {
+  SERVICE path:search {
+    [] path:source <http://example.org/person/1> ; path:target <http://example.org/person/2> ;
+       path:start ?x ; path:end ?y ; path:length ?len .
+    ?x <http://example.org/authorOf> ?doc . ?y <http://example.org/authorOf> ?doc .
+    FILTER(?x != ?y)
+  }
+}
+```
+
+The pattern is evaluated once, before the search, so it suits edges that a predicate
+list cannot describe rather than large graphs that predicates can.
+
+Paths are computed per query and nothing is indexed ahead of time. On the 10.5M-triple
+benchmark data, the shortest path between two people 17 edges apart takes about 3 ms,
+where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
+runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
+
+### Finding paths in Explore
+
+Explore's **Paths** button, or `Shift+P`, opens a panel beside the graph that runs these
+searches. **From** and **To** search the dataset as Explore's search box does, and they
+also take a pasted IRI, a prefixed name or a quoted literal. A right click or a long press
+on a node offers **Paths from here** and **Paths to here**, and so do the buttons of the
+side panel, and the panel then fills **From** with the node selected before. **Mode**
+chooses the shortest path, every shortest path up to 50 or the k shortest paths, with k
+from 2 to 20.
+
+**Filters** sets the length, up to 8 edges, the direction, the hub limit and the
+predicates. By default a search goes both ways, skips nodes with more than 1,000 edges and
+follows every predicate except those of the dataset's `paths` setting, which are
+`rdf:type` and `owl:sameAs` unless an administrator changes them. **only** follows the
+listed predicates instead, and the predicate box suggests those of the schema.
+
+The paths are drawn over the graph one edge at a time, in order of length, with each
+edge labelled by the paths that use it. With reduced motion they appear at once. The list
+under the form describes each path in words, and the keys `1` to `9` show one path, `A`
+shows them all and `Escape` shows them all again before it closes the panel. A shown path
+dims the elements off it, separately from the [shared selection](#arcs-on-the-map), which
+keeps its own dimming, and an element that two of them dim, or a lens legend entry and one
+of them, is dimmer still. Under the inferred-edge [lens](#lenses-on-the-graph) an inferred
+edge on a path keeps its dash and takes the path's colour. The paths are drawn on the graph and not on the map, so opening the
+panel switches Explore's canvas back to the graph, and **Map** and `Shift+M` wait until the
+panel closes. **Open in editor** opens the query in
+the query page, **Add to graph** keeps the paths' nodes in the explored graph, and **Clear**
+removes the overlay. The search reads the commit of `main` that Explore shows. When it reaches
+its limit of a million visited nodes or ten seconds, the panel says so and suggests a
+shorter length, a lower hub limit or fewer predicates. At phone width the panel is a sheet
+at the bottom of the screen that folds to its handle.
+
+**Weight** in the filters orders the paths by a number on the reifiers of their edges
+instead of by their length. When the list is first opened, it asks the dataset for the
+properties that reifiers carry with numeric values of zero or more, most used first, and
+offers up to 20 of them. With a weight chosen, the search adds up that property along each
+path, as `path:weight` does, and an edge without a reifier or without the property weighs
+1. Each path in the list then shows its cost after its length, and the announcement names
+the cheapest cost. The default, **none, count edges**, counts the edges as before.
+
+### Finding paths on the query page
+
+The same panel opens over a query's graph results, from the **Paths** button of the graph
+toolbar or `Shift+P` while the graph has the focus. A right click or a long press on a node
+of the canvas offers **Paths from here** and **Paths to here**, and in the WebGL view the
+selected node fills **From**. The search reads the state the result was read at, on the
+result's branch, and the header names it. The paths are drawn on the result's own nodes and
+edges where the result has them, with each edge labelled by the paths that use it, and the
+nodes and edges a path needs that the result lacks are added for as long as the paths are
+shown. The WebGL view colours and thickens the path edges, labels the path nodes and draws
+the path numbers at the edges' midpoints, without the step-by-step animation, and it keeps
+its layout and its view while paths are shown and cleared. The keys `1` to `9`, `A` and
+`Escape` work as in Explore, with the focus in the list or on the graph. **Open in editor**
+opens the paths' query in a new tab of the query page, at the result's state. **Add to
+graph** is not offered, because a result graph is the query's answer and not a graph to
+build on. Closing the panel, or running a query again, removes the paths and the nodes
+they added.
+
+## Graph algorithms
+
+PageRank, betweenness, components, communities, node similarity, triangle counts,
+k-cores, breadth-first and shortest-path distances, and two kinds of node embeddings run
+inside the server on a projection of the graph. A query reaches them through
+`SERVICE algo:<name>`, and `sparkles algo` and `POST /$/algo/{ds}/run` run them without
+writing a query. The parameters and outputs of each algorithm are in
+[API.md](API.md#graph-algorithms), and the design is in
+[F14](specs/F14-graph-algorithms.md).
+
+FastRP reads `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
+Neo4j GDS. The list has one weight for each propagation over the graph, and
+`nodeSelfInfluence` weights the random starting vectors. The default propagates three
+times and weights the second and third rounds. Earlier builds propagated twice by default,
+so embeddings written by them differ from new ones and a default call costs about a third
+more. Only the meaning of the parameters matches GDS. The random vectors and the final
+normalization are Sparkles's own, so the numbers differ. A list with no non-zero weight
+and a zero `nodeSelfInfluence` is refused, as is a dimension above 16384, the largest of
+a vector index.
+
+Weighted betweenness accepts only finite, strictly positive weights in the stored
+`f32` representation. A zero, negative or nonfinite weight refuses the whole call,
+including a SERVICE value that rounds to zero or infinity during conversion. A
+refused call returns no score rows. Unweighted betweenness uses unit edges, SSSP
+accepts zero weights, and PageRank keeps its nonnegative weight domain.
+[Roadmap item 79](ROADMAP.md) tracks nonnegative weighted betweenness semantics.
+
+Some finite positive graphs are also refused during computation. If a competitive
+edge cannot increase the distance at `f64` precision, or a computed distance is
+nonfinite, the invocation fails with `Invalid` and publishes no score rows, success
+statistics or write-back commits. A tiny edge that cannot improve or tie its target
+does not trigger this refusal. Accepted distances and path counts remain approximate,
+and sampling checks only the selected source searches.
+[Roadmap item 80](ROADMAP.md) tracks positive-weight numerical robustness.
+
+The ten most central people of a social graph:
+
+```sh
+sparkles query --loc ./db '
+PREFIX algo: <urn:x-sparkles:algo#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?person ?rank WHERE {
+  SERVICE algo:pageRank { [] algo:predicate foaf:knows ; algo:node ?person ; algo:score ?rank }
+} ORDER BY DESC(?rank) LIMIT 10'
+```
+
+The same run from the command line, and a community detection that is written back to a
+graph in commits of 50,000 triples:
+
+```sh
+sparkles algo run --loc ./db pageRank --predicate http://xmlns.com/foaf/0.1/knows --param maxIterations=30
+sparkles algo run --loc ./db leiden --predicate http://xmlns.com/foaf/0.1/knows --direction undirected \
+  --param seed=7 --write-graph http://example.org/analytics \
+  --write community=http://example.org/community --write level=http://example.org/level --batch-size 50000
+```
+
+`--summary` prints the statistics of the run instead of its rows, and `--request FILE`
+takes the whole request as JSON, as the HTTP route does. A write-back run records itself
+in the output graph with the commit it computed at, so a reader knows which state the
+numbers describe. It commits in batches so that a large result does not hold the writer
+lock for long.
+
+A write-back run is an update, so the server's query timeout does not apply to it. It has
+no deadline unless the request has a `timeout` or the server runs with
+`--update-timeout`. Without a deadline, a run that waits for `--algo-threads` waits until
+a thread is free or the run is cancelled. Thread admission has no queue order, so a run
+that asks for several threads can wait while one-thread calls keep taking the free slots.
+On a server with a query memory pool, the task holds its initial grant of the pool while
+it waits for threads, because it takes the grant when it starts. A dataset has at most
+one write-back task at a time, so the grants held this way add up to one initial grant
+for each dataset. The wait has no deadline, so those grants stay held until the threads
+are free or the task is cancelled, and queries can answer `503` meanwhile if the pool is
+otherwise full.
+The run keeps the algorithm's result as term identifiers and decodes the terms of one
+batch at a time, so the decoded terms of a large result never sit in memory together.
+The identifiers of the whole result stay in memory until the run ends, up to
+`--max-rows` rows. The plan of the write-back also keeps an index of the rows that have a
+node, ordered by node, which takes 8 bytes for each row. A run under a memory pool charges
+that index to its grant before it builds it, and gives it back when the run ends. The
+index is the price of writing each node's rows together without decoding the result up
+front. On a server with a query memory pool, a run takes its initial grant
+when its task starts and waits for it up to `--query-admission-wait`, as a request
+does.
+
+Query and task cancellation both reach computation, result preparation and writer
+admission. A supplied timeout and task deadline share the earlier absolute bound from
+operation entry through completion, including built-in SHACL and ShEx validation. History
+SERVICE calls retain the same controls at the native change-log scan checks. Rust history
+queries accept composed cancellation flags as well as a single flag and an absolute
+deadline. Checks are cooperative and do not preempt history indexing, reads or flushing.
+Committed batches remain after cancellation. A partial run attempts to record its final
+status without waiting for another writer, with one separate 100 ms cooperative cleanup
+budget. The record can remain unfinished when that attempt fails. This budget does not
+interrupt a durability call. A cancel or deadline that arrives after the last batch is
+committed does not fail the run, because its record already says `complete`.
+
+Define a projection once under a name when several queries use it:
+
+```sh
+sparkles algo projections put --loc ./db people --predicate http://xmlns.com/foaf/0.1/knows --direction undirected
+sparkles algo projections list --loc ./db
+```
+
+A query then writes `algo:projection "people"` instead of the predicates. The server
+keeps built projections in memory (`--algo-cache-mb`), so a second call on unchanged
+data skips the build. `--algo-threads` and `--algo-max-threads-per-call` bound the CPU
+that algorithms take, and a call that is over its memory budget fails with a message that
+names the parameter that would make it fit.
+
+An algorithm checks cancellation and the deadline in its loops over nodes, edges and
+heap entries, with at most 128K units of work between two checks. A unit is a node, an
+edge of a row or a heap entry. The one exception is a single row of a node of high
+degree, whose edges most loops read without a check. A sort runs as one step that
+cannot be interrupted. Triangle counting sorts all node indexes by degree, which takes
+time proportional to `n log n` for `n` nodes. Triangle counting, clustering, community
+detection and label propagation also sort one row, the neighbouring communities of one
+community or the labels around one node, and the degree of that row or community bounds
+each of those sorts. Building a projection sorts all of its edge keys. A cancel or
+deadline that arrives inside a sort takes effect when the sort ends.
+
+The Rust library, Python and Node.js reach the same runs and projections through the
+dataset's `algorithms` handle. A request is the JSON of the HTTP route as a dict or an
+object:
+
+```python
+ds.algorithms.projections.put("people", {"predicates": ["http://xmlns.com/foaf/0.1/knows"]})
+rows = list(ds.algorithms.run({"algorithm": "pageRank", "projection": "people"}))
+ds.algorithms.run_write({"algorithm": "leiden", "projection": "people",
+                         "write": {"graph": "http://example.org/analytics",
+                                   "predicates": {"community": "http://example.org/community"}}})
+```
+
+In Node.js the calls are `ds.algorithms.run(request)` and `ds.algorithms.runWrite(request)`
+with the same `projections` methods. The JVM binding reaches algorithms only
+through `SERVICE algo:…` queries.
+
+For a clustering request with `params: {"graphalytics": true}`, the Rust, Python and
+Node.js handles return `node` and `coefficient`. The default direction is forward,
+and an explicit projection or predicate direction takes precedence. Summary requests
+remain available. A write mapping for `triangles` is refused before computation,
+while ordinary clustering continues to expose triangle counts.
+
+## Embeddings computed on write
+
+A vector index can compute its vectors from the dataset's text through an embeddings
+endpoint that speaks OpenAI's `POST /v1/embeddings` protocol. That covers OpenAI and most
+hosted providers, and also local models served by Ollama, vLLM, LM Studio, llama.cpp's
+server or Text Embeddings Inference. A build with the `embed-local` feature can also run
+a model in the server process, as [Local embedding models](#local-embedding-models)
+describes. The design is in
+[F08](specs/F08-embeddings-on-write.md), and the fields and endpoints are in
+[API.md](API.md#embeddings-on-write).
+
+With Ollama on the same machine:
+
+```sh
+ollama pull nomic-embed-text
+sparkles serve --data ./data --outbound-allow 127.0.0.1/32 --outbound-allow api.openai.com
+curl -X PUT http://localhost:3030/$/vector/ds/docs -H 'Content-Type: application/json' -d '{
+  "predicate": "http://example.org/embedding", "dimension": 768,
+  "embedding": {
+    "url": "http://127.0.0.1:11434/v1/embeddings", "model": "nomic-embed-text",
+    "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"],
+    "inputPrefix": "search_document: ", "queryPrefix": "search_query: "
+  }
+}'
+```
+
+The server refuses loopback and private destinations by default, also for embeddings,
+so a local provider needs `--outbound-allow` with its address, or
+`--outbound-allow-private`. An allowlist limits SERVICE and `LOAD` to the same
+destinations, which is why the example lists the hosted endpoint too.
+
+With OpenAI, the key comes from a secret the operator defines. The configuration names
+the secret, never the key:
+
+```sh
+OPENAI_API_KEY=sk-… sparkles serve --data ./data --embedding-secret openai=env:OPENAI_API_KEY
+# "embedding": { "url": "https://api.openai.com/v1/embeddings", "model": "text-embedding-3-small",
+#                "apiKey": {"secret": "openai"}, "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"] }
+```
+
+`file:PATH` reads the key from a file, such as a systemd credential, each time a request
+is made, so a rotated key takes effect without a restart.
+
+After that, writes are embedded in the background. A write commits at once and its
+vectors follow in a commit of kind `embed`. The index's card on the dataset page shows
+the worker's state, the backlog and the last error, and has a "Re-embed" action.
+`sparkles vector status` prints the same as JSON. A search can pass text instead of a
+vector:
+
+```sparql
+PREFIX spk: <urn:x-sparkles:>  PREFIX ex: <http://example.org/>
+SELECT ?s ?score WHERE { (?s ?score) spk:vectorSearch (ex:embedding "rivers of southern France" 10) }
+```
+
+**What leaves the machine.** The text of the selected literals, and the texts that
+searches pass, go to the configured endpoint, with the model name and, when set, the API
+key. Nothing else is sent, and nothing is sent for an index without an `embedding`
+object. `--no-embedding` stops all of it on a server. Search texts are sent by any
+caller who may read the dataset, which a `queryText: false` index refuses.
+
+**Local commands.** `sparkles update --loc` and the other local commands do not embed.
+The next server start, or `sparkles vector embed --loc db`, catches their writes up, and
+sends nothing for text that was already embedded. The local commands use the local
+outbound policy, which allows private addresses, and take `--embedding-secret` for keys
+named by a secret. The Python package does the same with
+`Dataset.indexes.vector.embed_until_idle()`.
+
+## Local embedding models
+
+A server built with the `embed-local` cargo feature runs sentence-embedding models
+itself, with no Ollama or other service next to it. The flake's packages have the
+feature, and so do the Docker images. A plain `cargo build` leaves it out, so build with it:
+
+```sh
+cargo build --release -p sparkles-server --features embed-local
+```
+
+Without the feature, the server still reads the configuration below and reports each
+local model with `runtime: false`.
+
+The models come from a model store, a directory of pinned snapshots that
+`sparkles models` fills from the Hugging Face Hub. Each snapshot is named by its
+repository and a full commit id, and every file is checked against its hash:
+
+```sh
+sparkles models pull sentence-transformers/all-MiniLM-L6-v2@1110a243fdf4706b3f48f1d95db1a4f5529b4d41 --data ./data
+sparkles models list --data ./data
+sparkles models verify --data ./data
+```
+
+`--data DIR` uses `DIR/models`, the server's default store. `--dir` names any other
+directory, and so does `$SPARKLES_MODELS_DIR`. A branch or tag such as `main` is refused
+unless `--allow-unpinned` is given, and then the commit it points to is recorded. A
+snapshot already in the store is not downloaded again. `--manifest FILE` pulls a list
+of `{"repo", "revision", "files"}` entries, and `files` limits a snapshot to the files
+named. `sparkles models rm REPO@REVISION` deletes a snapshot.
+
+The model configuration then names the model under a provider of the `local` kind, and a
+vector index names that provider instead of a URL:
+
+```sh
+cat > models.json <<'EOF'
+{ "providers": { "embed": { "kind": "local", "models": {
+    "minilm": { "repo": "sentence-transformers/all-MiniLM-L6-v2",
+                "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41" } } } } }
+EOF
+sparkles serve --data ./data --model-config models.json
+curl -X PUT http://localhost:3030/$/vector/ds/docs -H 'Content-Type: application/json' -d '{
+  "predicate": "http://example.org/embedding", "dimension": 384,
+  "embedding": { "provider": "embed", "model": "minilm",
+                 "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"] }
+}'
+```
+
+The server reads the store at `<data>/models` unless `--models-dir` names another one,
+which may be read-only. It makes no download of its own unless it runs with
+`--models-download on`, which fetches a missing pinned snapshot in the background
+through the outbound policy. Both `sparkles models pull` and the server read a Hub
+mirror's address from `$SPARKLES_HUB_ENDPOINT` and a token for gated repositories
+from `$HF_TOKEN`, and `pull` also takes `--hub-token-file`. The weights load at the first text and are dropped after
+ten idle minutes (`idleUnloadSecs`). Each model runs on its own pool of two threads by
+default (`threads`), at a lower priority than queries, so embedding a large backlog
+slows searches little. `GET /$/models` and the index's card show whether a model is
+absent, present, loaded or unloaded, and how much memory its weights take.
+
+The architectures are BERT (all-MiniLM, BGE), XLM-RoBERTa (multilingual-e5), NomicBERT
+(nomic-embed-text) and Qwen3 (Qwen3-Embedding), with safetensors weights.
+`"dtype": "bf16"` halves the memory of NomicBERT and Qwen3 models. A provider of the
+`openai` or `ollama` kind works the same way in an index's `embedding`, with the
+provider's endpoint and key, so an index need not repeat them. The fields are in
+[API.md](API.md#model-providers) and the design is in
+[F12](specs/F12-local-embeddings.md).
 
 ## The Explore overview
 
@@ -2098,1136 +3381,6 @@ communities closes it.
 
 At 390 px the diff graph's options fold into a sheet, the play controls stay in a bar at
 the bottom, and the change list opens as a second tab beside the graph.
-
-## Automatic compaction
-
-A server compacts each dataset in the background when its delta of updates grows large,
-and writes go on while it does. By default a dataset is compacted when its delta reaches
-10,000 quads plus 5% of its base index, or a million quads, or 512 MiB of memory, or when
-its write-ahead log passes 1 GiB. A delta of at least 10,000 quads is also compacted
-after 5 minutes without a commit, and any change is compacted within a day. The build
-runs on a quarter of the cores at a lower priority, and at most one automatic compaction
-runs on the server at a time. [API.md](API.md#automatic-compaction) describes when a due
-compaction waits and the status at `/$/compaction/{ds}`.
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--no-auto-compact` | | Turn automatic compaction off for every dataset. |
-| `--auto-compact-min-quads N` | `10000` | The floor. The quad-count and idle triggers need a delta at least this large. |
-| `--auto-compact-ratio R` | `0.05` | Compact when the delta reaches the floor plus this share of the base index's quads. |
-| `--auto-compact-max-quads N` | `1000000` | Compact at this delta size, whatever the base; `0` means no limit. |
-| `--auto-compact-max-delta-mb N` | `512` | Compact when the delta takes about this much memory; `0` means no limit. |
-| `--auto-compact-max-wal-mb N` | `1024` | Compact when the write-ahead log passes this size; `0` means no limit. |
-| `--auto-compact-idle S` | `300` | Compact a delta of at least the floor after this many seconds without a commit; `0` turns it off. |
-| `--auto-compact-max-age S` | `86400` | Compact when the oldest change not yet compacted is this old; `0` turns it off. |
-| `--auto-compact-min-interval S` | `60` | Seconds between the end of a compaction and the start of the next automatic one. |
-| `--auto-compact-threads N` | a quarter of the cores | Threads of an automatic compaction's build. On Linux they run at nice 10. |
-| `--auto-compact-io-mb N` | `0` | The average rate, in MiB per second, at which an automatic compaction may write its new index; `0` means no limit. |
-| `--auto-compact-max-running N` | `1` | Automatic compactions that may run on the server at once. |
-| `--auto-compact-partial MODE` | `auto` | Whether a compaction, automatic or not, may rewrite only the index blocks its delta touches: `auto`, `off` or `always`. |
-
-A dataset can override every setting but the threads, the rate and the running limit.
-The settings are stored in `compaction.json` in its directory:
-
-```sh
-sparkles compaction --loc db                                  # the policy, the delta and the verdict
-sparkles compaction --loc db --set deltaRatio=0.02 --set idleSeconds=60
-sparkles compaction --loc db --set enabled=false              # off for this dataset
-sparkles compaction --loc db --default                        # back to the server's settings
-sparkles compaction --server URL --dataset db --set maxAgeSeconds=0
-curl -X PUT 'localhost:3030/$/compaction/db' -H 'Content-Type: application/json' -d '{"deltaRatio": 0.02}'
-```
-
-A database that no server holds is never compacted on its own. `sparkles compact --loc db
---if-due` compacts it only when its policy says so, which suits a cron job.
-
-A compaction whose delta uses only terms the dataset already has rewrites only the index
-blocks that the delta touches and copies the others. Numbers, dates, booleans and blank
-nodes never add terms, and neither do links between existing resources. A delta that adds
-a term, such as a new IRI or string, rebuilds the whole index. The `partial` setting
-chooses: `auto` compacts partially when the delta adds no term and that is estimated to
-be quicker than a rebuild, `off` always rebuilds, and `always` compacts partially whenever
-the delta adds no term. `sparkles compact --partial off` rebuilds once, which also drops terms that no quad
-uses any more. The compaction's task message and `last` in its status say which it was.
-
-```sh
-sparkles compaction --loc db --set partial=off     # always rebuild this dataset's index
-sparkles compact --loc db --partial always         # one partial compaction, if no term was added
-```
-
-Each compaction makes the next incremental backup upload the whole new generation, and a
-retention window keeps the old generation until its commits age out. Raise the ratio or
-the minimum interval for datasets where that costs too much.
-
-## Formatting
-
-`sparkles fmt` formats SPARQL queries and updates (`.rq`, `.ru`, `.sparql`), Turtle
-(`.ttl`, `.turtle`), TriG (`.trig`), N-Triples (`.nt`), N-Quads (`.nq`) and JSON-LD
-(`.jsonld`). It follows Prettier's modes and exit codes. It exits 0 when everything is
-formatted or was written, and 1 when `--check` or `-l` found a file that would change.
-It exits 2 on any error: a syntax error, a refused output, an unreadable file or a bad
-option. It processes every file, so one run reports every problem, and it formats files
-in parallel (`--threads N`).
-
-```sh
-sparkles fmt q.rq                    # print the formatted query (stdin to stdout without a path)
-sparkles fmt --write queries/        # rewrite in place: temporary file, fsync, rename; unchanged files keep their mtime
-sparkles fmt --check queries/        # [warn] per unformatted file on stderr; --diff adds unified diffs on stdout
-sparkles fmt -l queries/             # names of the files that would change
-sparkles fmt --stdin-filepath queries/q.rq < q.rq   # stdin named for detection, config and ignore files
-sparkles fmt --sort data.nq          # N-Triples / N-Quads sorted (external sort past --sort-memory)
-sparkles fmt --canonicalize data.nq  # RDFC-1.0 canonical form (drops comments)
-```
-
-- **Files.** Directories are walked recursively for the extensions above. The walk
-  applies `.gitignore`, `.git/info/exclude` and the global gitignore. It includes hidden
-  files but never enters `.git`, `node_modules` or `target`. A file named on the command
-  line is formatted whatever its extension. `--language` names its language; otherwise
-  the extension does. With an unknown extension, the content decides, and it is never
-  detected as N-Triples, because N-Triples is also valid Turtle. Walks skip `.n3`, `.shc`
-  and `.json` files, which need `--language` when named. RDF/XML and compressed files are
-  refused.
-- **Ignore file.** `.sparklesfmtignore` in the current directory, in gitignore syntax, or
-  `--ignore-path FILE` (repeatable). It applies to walks and to named files. A named file
-  that it matches is skipped silently. An ignored `--stdin-filepath` passes stdin through
-  unchanged.
-- **Config.** `.sparklesfmt.toml` or `sparklesfmt.toml`, found by walking up from each
-  file's directory. The nearest one wins, and files are not merged. Flags override it.
-  `--config FILE` uses one file for every input, and `--no-config` uses the defaults. An
-  unknown key or a bad value is an error that names the key and the file.
-
-  ```toml
-  line-width = 100               # 40..=400
-  indent-width = 2               # 1..=8
-  prefix-groups = []             # e.g. [["rdf", "rdfs", "xsd", "owl"]]; --prefix-group rdf,rdfs,xsd,owl
-  type-shorthand = true          # rdf:type → a (and a entries first)
-  compact-iris = true            # full IRI → prefixed name
-  quote-style = "double"         # "double" | "preserve"
-  operator-position = "leading"  # "leading" | "trailing": where a broken || or && chain puts its operator
-  align-values = false           # SPARQL: pad multi-variable VALUES rows into columns
-  prune-prefixes = false         # SPARQL, Turtle, TriG: drop prefix declarations nothing uses
-  directive-style = "sparql"     # Turtle, TriG: "sparql" (PREFIX, GRAPH) | "turtle" (@prefix, no GRAPH)
-  turtle-layout = "diff"         # Turtle, TriG: "diff" | "conventional"
-  sort = false                   # Turtle, TriG, JSON-LD terms, N-Triples, N-Quads
-  ```
-
-  Every key has a flag of the same name (`--no-type-shorthand`, `--quote-style preserve`, …).
-- **Messages.** Errors read `path:LINE:COL: error: …`, with 1-based lines and columns
-  counted in characters. A refused output reads
-  `path: error: formatter refused its own output (algebra differs); input left unchanged; please report`.
-- **Size.** A document is formatted in memory up to `--max-bytes` (default `256MiB`).
-  Sizes take a `KiB`, `MiB`, `GiB` or `TiB` suffix. A larger file is an error, with two
-  exceptions:
-  - N-Triples and N-Quads always stream. A file or stdin of any size is formatted in one
-    pass in bounded memory. With `--diff`, they are formatted in memory.
-  - Turtle and TriG over `--max-bytes` stream statement by statement unless sorted.
-    `--max-bytes` then bounds the largest statement. With `prune-prefixes`, the input is
-    read twice, and stdin is kept in a temporary file.
-
-  Sorting N-Triples and N-Quads spills sorted runs to the temporary directory past
-  `--sort-memory` (default `1GiB`). `--canonicalize` holds at most
-  `--max-canonicalize-quads` quads (default 20,000,000).
-
-`sparkles lsp` serves the same formatting to editors over the Language Server Protocol,
-with syntax errors and the formatter's warnings as diagnostics. [editors.md](editors.md)
-has the editor setups. `POST /$/format` is the HTTP form ([API.md](API.md#formatting)).
-The UI formats in the page when it is built with the formatter's WebAssembly module.
-
-## Linting
-
-`sparkles lint` finds mistakes and doubtful constructs in SPARQL queries and updates
-(`.rq`, `.ru`, `.sparql`) and in Turtle (`.ttl`) and TriG (`.trig`) documents. It walks
-directories and reads ignore files and config files as `sparkles fmt` does. The design is
-in [spec X04](specs/X04-linter.md).
-
-```sh
-sparkles lint queries/ shapes/            # path:line:column: severity [rule] message
-sparkles lint --fix queries/              # apply the safe fixes in place
-sparkles lint --strict --format json .    # warnings fail too; a JSON report
-sparkles lint --rule cartesian-product=error --rule single-use-variable=off q.rq
-sparkles lint --stdin-filepath q.rq < q.rq
-sparkles lint --list-rules                # every rule with its default severity
-```
-
-The exit status is 0 when no finding is an error, 1 when one is (or a warning is under
-`--strict`), and 2 when a file, flag or config file cannot be used. With `--fix` and
-stdin, the fixed text goes to stdout and the remaining findings go to stderr.
-
-| Rule | Default | What it finds |
-|---|---|---|
-| `syntax` | error | The document does not parse. This rule cannot be turned off. |
-| `undefined-prefix` | error | A prefixed name whose prefix is not declared before it. |
-| `unused-prefix` | warning | A prefix declaration nothing uses. `--fix` removes it. |
-| `unused-variable` | warning | A variable bound by `BIND` or `VALUES` that nothing reads. |
-| `single-use-variable` | hint | A variable that occurs once in a pattern and is not projected. It is a wildcard or a typo. |
-| `unbound-variable` | warning | A variable that is projected, filtered, ordered or used in a template but never bound. |
-| `cartesian-product` | warning | A pattern that shares no variable with the patterns before it in its group. |
-| `select-star-group-by` | error | `SELECT *` in a query that groups. |
-| `ungrouped-variable` | error | A projected variable that is neither grouped nor aggregated. |
-| `filter-scope` | warning | A FILTER in a nested group that tests a variable bound only outside the group, so it removes every row. |
-| `filter-equality` | hint | `FILTER(?v = <iri>)` where the IRI could go in the triple pattern. |
-| `iri-space` | warning | An IRI, an `IRI("…")` argument or an `xsd:anyURI` that holds whitespace. |
-| `language-tag-case` | warning | A language tag not written as BCP 47 recommends (`en-US`). `--fix` rewrites it. |
-| `deprecated-language-tag` | warning | A deprecated language tag or subtag, with its replacement. |
-| `suspicious-datatype` | warning | An invalid lexical form, an unknown XML Schema datatype, a misspelled XML Schema namespace, or `rdf:langString` as a datatype. |
-| `redundant-datatype` | info | `"…"^^xsd:string`, which is the plain string. `--fix` drops the datatype. |
-| `deprecated-syntax` | warning | Jena's old `jena.hpl.hp.com` function namespaces, or `owl:DataRange`. |
-
-The SPARQL rules look at variables in their scope. A subquery's variables are its own,
-and `MINUS` and `EXISTS` patterns bind nothing outside themselves. A variable whose name
-starts with `_` is exempt from the two unused-variable rules. A safe fix never changes
-what the document means. `--fix` checks this, and it writes nothing when the fixed text
-does not parse to the same algebra, graph or dataset.
-
-The `[lint]` table of `.sparklesfmt.toml` sets the rules' severities for the files under
-it, and `--rule` overrides it. The formatter ignores the table.
-
-```toml
-[lint]
-unused-prefix = "error"
-single-use-variable = "off"
-```
-
-`sparkles lsp` publishes the same findings in editors and offers the safe fixes as quick
-fixes ([editors.md](editors.md)). The same file's `[prefixes]` and `[lsp]` tables give
-`sparkles lsp` the prefixes it completes and declares, and the formatter and the lint only
-check them ([editors.md](editors.md#prefixes)). The UI's query editor lints while you type, and its
-Format menu fixes the safe findings. `POST /$/lint` is the HTTP form
-([API.md](API.md#linting)).
-
-## Backup repositories
-
-Backup repositories (see [API.md](API.md#backup-repositories)) also work offline, on a
-stopped database. A server's own datasets are backed up through its HTTP API or UI, or by
-its policies.
-
-In-memory datasets (`--mem`, or `dbType=mem`) are backed up by the server too. They have
-no files on disk, so each backup first writes the dataset's current state to a temporary
-index generation in `<data>/tmp`. That needs about as much free disk space as the
-compacted dataset, on top of the `--min-free-disk-mb` reserve. The copy is removed when
-the upload ends. A backup taken this way restores as a new persistent dataset, with the
-same content, prefixes, validation and index settings. Each server start gives an
-in-memory dataset a new id, and retention keeps `min_count` backups per id. A policy for
-such datasets should therefore set `expire_after` with `min_count = 0` (see
-[API.md](API.md#lifecycle-policies)).
-
-`--repo` takes either a name from the backup config file or a URL. The config file is
-`--backup-config FILE` or `$SPARKLES_BACKUP_CONFIG`, and defaults to
-`$XDG_CONFIG_HOME/sparkles/backup.toml`. A URL is `file:///srv/backups/r`,
-`s3://bucket/prefix?region=…&endpoint=…&path_style=true&allow_http=true` or `memory://`.
-Credentials never go in URLs. They come from the environment or a credentials file.
-
-Only `repo add` and `backup create` initialize an empty location. The other commands
-attach to an existing repository. Manifests are cached in
-`$XDG_CACHE_HOME/sparkles/backup/`, and progress goes to stderr. Ctrl-C cancels, and a
-second Ctrl-C quits. The commands that print a result take `--format json` (or
-`--json`). The exit code is 0 on success, 1 on errors, and 2 on warnings only, such as
-orphaned blobs in `repo verify`.
-
-```sh
-sparkles repo add local --path /srv/backups/r    # edits the config file (mode 0600), initializes, tests
-sparkles repo add s3 --s3 kg-backups --prefix prod --region eu-central-1 --credentials env
-#   --endpoint URL --path-style --allow-http (MinIO, R2, …); --credentials default | env |
-#   env:KEY_VAR,SECRET_VAR[,TOKEN_VAR] | file:PATH; --readonly; --no-init (attach only)
-sparkles repo add lab --s3 lab --endpoint http://127.0.0.1:9000 --path-style --allow-http \
-  --credentials-name minio --credentials env:MINIO_ACCESS_KEY,MINIO_SECRET_KEY
-#   keeps the source as [credentials.minio], which the repository names (without
-#   --credentials: uses the one defined); a server reading the file can then name it too
-sparkles repo list | show local | test local | remove local   # remove leaves the contents alone
-sparkles repo verify local --level data          # every backup, plus orphaned blobs
-sparkles repo gc local --dry-run --grace 24h     # delete blobs no backup references
-sparkles repo locks local [--break ID]
-sparkles backup create  --loc db --repo local [--name N] [--note T] [--dataset NAME]  # refused while a server has db open
-sparkles backup create  --loc db --branch dev --repo local  # standalone capture of dev
-sparkles backup list    --repo file:///srv/backups/r [--dataset ds | --dataset-id UUID] [--policy P]
-sparkles backup show    --repo local b2
-sparkles backup verify  --repo local b2 --level restore   # exists | data | restore; exit 1 on failure
-sparkles backup restore --repo local b2 --to /srv/dr/ds [--replace]
-sparkles backup restore --repo local b2 --data /srv/sparkles [--as ds]  # into a stopped server
-sparkles backup delete  --repo local b1          # blobs go at the next gc
-sparkles backup policy list | show P | history P # policies of the config file
-sparkles backup policy run P --data /srv/sparkles --backup-config backup.toml [--json]
-sparkles backup policy preview '30 2 * * *' --tz Europe/Berlin [--count 5]
-```
-
-`restore --identity auto|new|keep` picks the dataset id. `auto` keeps the id unless a
-dataset in the target data directory already has it. `--check quick|full|none` picks the
-integrity check that runs before the restored database is published. `sparkles serve`
-holds a lock on `<data>/sparkles-server.lock`, which allows one server per data
-directory, and `restore --data` refuses while a server holds it.
-
-`backup policy run` opens the data directory of a stopped server and takes the same
-directory lock. It runs the named policy from the TOML file against the repositories
-that file configures. It backs up the selected datasets, applies retention and runs
-garbage collection when the policy asks for it. A policy whose schedule is disabled can
-still be run this way. Datasets that have not changed since their last backup can be
-skipped. JSON output lists the result for each dataset, and the exit status is nonzero
-when a backup or retention step fails. Ctrl-C cancels the run and keeps the backups
-that already finished.
-
-A backup captures one branch, and both the default and scheduled policies capture
-`main`. A branch that still shares its upstream's index is written out as standalone
-files, and the branch itself is left unchanged. The manifest records the dataset and
-branch the backup came from. Restoring a branch backup with `--identity auto` or `new`
-gives it a fresh dataset id and records the captured branch as its origin. `keep` is
-refused. The restored dataset keeps its blank-node labels but is not attached to the
-source's branch history.
-
-A server started with `sparkles serve --backup-config FILE` serves the file's
-repositories and policies through its API, read-only. It also accepts repositories
-registered through its API and UI (`POST /$/repositories`), within the operator's limits
-from that file:
-
-* Their credentials can only name a source defined in the file. The caller cannot choose
-  environment variables, files or the instance's default chain.
-* Their S3 endpoints go through the [outbound policy](#outbound-requests-service-and-load),
-  so a MinIO on localhost needs `--outbound-allow 127.0.0.1` or
-  `--outbound-allow-private`. They never go through a proxy from the environment
-  (`HTTPS_PROXY`). The config file's repositories and the CLI's do use that proxy.
-* `fs` repositories must stay out of the data directory and the config files'
-  directories. When `[api] fs_roots` is set, they must lie under it:
-
-```toml
-[credentials.minio]              # named by {"source": "named", "name": "minio"}
-source = "env"
-access_key_id_var = "MINIO_ACCESS_KEY"
-secret_access_key_var = "MINIO_SECRET_KEY"
-
-[api]
-fs_roots = ["/srv/backups"]
-```
-
-To register an S3 repository through the API, first define its credential source in the
-file. Write it by hand, or run
-`sparkles repo add … --credentials-name minio --credentials …` on the same file. Start the
-server with the file, or send it SIGHUP. Then `POST /$/repositories` with
-`"credentials": {"source": "named", "name": "minio"}`.
-
-### Encrypted repositories
-
-Build the CLI with `--features backup-encryption` to enable encrypted repositories.
-The feature is off in the default build. It requires Linux or Android, because it keeps
-keys in protected memory. Plaintext repositories behave as before. The CLI and a server
-started with `serve --backup-config FILE` support the same local key providers. The
-HTTP API refuses encryption settings when it registers or updates a repository, so only
-the operator controls keys and the references to them.
-
-Store keys outside datasets, catalogs and the backup repository. A key file must be a
-regular file owned by the user that runs Sparkles or by root, with no group or other
-permissions. Each local key is exactly 32 raw bytes, 64 hexadecimal characters, or the
-canonical base64 encoding of 32 bytes. The hex and base64 forms may have ASCII
-whitespace around them. Raw input made only of printable ASCII is refused, because a
-typed 32-character password would otherwise become the key. If an existing key is such
-text, give the same bytes in hex instead, for example with `xxd -p -c 64 key`, and the
-existing slots keep opening. A passphrase file holds 1 to 4096 bytes, used exactly as
-written, so a final newline is part of the passphrase. Provider output is limited to
-4096 bytes. Configuration and flags hold references to keys, never the keys themselves.
-
-```sh
-sparkles repo add secure --path /srv/backups/secure --encrypt \
-  --key-file /run/keys/backup-online --key-file /run/keys/backup-recovery
-sparkles backup create --loc db --repo secure --name b1
-sparkles repo key list --repo secure --json
-sparkles repo key add --repo secure --passphrase-file /run/keys/recovery-phrase --key-label offline
-sparkles repo key rotate-master --repo secure
-sparkles repo key remove --repo secure --slot UUID
-sparkles repo key retire --repo secure --epoch 1
-```
-
-Creating an encrypted repository requires two independent keys unless
-`--single-key-ok` accepts one. Keep a recovery key offline. `repo key add` wraps a key
-into every readable epoch without adding its reference to the online configuration,
-and it requires `--key-label`. Running the same addition again with the same label and
-key finishes an interrupted addition without creating a duplicate. `repo key remove`
-refuses to remove the last available wrap of an epoch. Rotation starts a new
-master-key epoch for new backups, and older backups stay readable. An epoch can be
-retired only when no remaining manifest or blob refers to it, so delete obsolete
-backups and run garbage collection first. Once that check succeeds, retirement goes
-ahead even when offline recovery keys are not available.
-
-Creation and `repo key add` also accept `--key-env VARIABLE`, `--key-credential NAME`
-(from `$CREDENTIALS_DIRECTORY`), or
-`--key-command-argv '["/absolute/provider","argument"]'`. Sparkles runs the command's
-argv as given, without a shell. The timeout is 10 seconds by default and
-`--key-command-timeout` sets it between 1 and 300 seconds. The command gets no stdin,
-and its stderr is discarded. On a timeout or cancellation, Sparkles kills the
-provider's process group and reaps the provider.
-A provider starts with an empty environment plus `PATH`, `HOME`, `LANG`,
-`XDG_RUNTIME_DIR` and `CREDENTIALS_DIRECTORY` when Sparkles has them, so it never sees
-other repositories' `--key-env` keys or cloud credentials. A provider that needs
-another non-secret setting can take it through `/usr/bin/env NAME=value` in its argv.
-Variables named by `--key-env` stay in the Sparkles process environment after they are
-read. Put secrets in the provider's input source, never in its argv. Credential names are
-simple identifiers and their files must remain inside the credential directory.
-
-Rotation is protected against rollback. The marker records which key epoch is active,
-and that record is authenticated by the active master key. Each host also remembers
-the newest epoch it has seen for each repository, in memory and in
-`.key-epoch.json` inside the repository's cache directory. After a rotation, a bucket
-writer who holds the old key cannot make Sparkles seal new backups with it again. If a
-whole repository is deliberately restored from an older copy of its bucket, delete that
-file and restart before opening it. Repositories created by earlier builds keep
-opening, and their marker gains the authentication tag on the next `repo key
-rotate-master` or `repo key retire`. Earlier builds cannot open a repository after that
-step or after `repo key add`, because new key slots use a newer format. Rollback of
-individual backups is not detected: a bucket writer can put back an older backup under
-its name.
-
-A local key can move between file, environment, credential and command providers
-without changing its bytes or adding a slot. The slot still records the original
-source, but only the key bytes decide whether it opens.
-
-Other repository commands can override the configured references with
-`--repository-key-file`, `--repository-key-env`, `--repository-credential`,
-`--repository-passphrase-file` or `--repository-key-command-argv`.
-`--repository-key-command-timeout` sets the command's timeout. Passphrase recovery also needs the original
-slot label, because it identifies the stored Argon2 salt:
-
-```sh
-sparkles backup restore --repo file:///srv/backups/secure b1 --to /srv/recovered \
-  --repository-passphrase-file /run/keys/recovery-phrase --repository-key-label offline
-```
-
-`backup policy run` also works with a configured encrypted repository. After it takes
-the stopped catalog's lock, it reads the credentials and key providers of the policy's
-repository and of no other. The repository key override flags are refused for policy
-runs. Key files must stay outside the catalog and the configured repository
-directories, and a key file stored inside another Sparkles dataset is also refused. An
-offline run does not see datasets that a server attached only for its session. Ctrl-C
-cancels retention and garbage collection as it cancels backups, and completed backups
-are kept.
-
-The Rust TOML API keeps key references in `ConfiguredRepository`, which
-`RepoToml::configured` and `ConfigFile::configured_repositories` return.
-`RepoToml::to_config` and `ConfigFile::repository_configs` now return `Result` and
-refuse encrypted tables, so an encrypted repository cannot be turned into a plaintext
-one by accident. `repo list` and `repo show` print key references and the public
-metadata of key slots, never resolved keys or passphrases. Sparkles has no support for
-cloud KMS, Vault or encrypting the database directory.
-
-### Encrypted repositories in the server
-
-With `backup-encryption` enabled, `serve --backup-config FILE` also opens the encrypted
-repositories that the operator defines in that file. Persistent repositories can use
-the same key file, environment variable, systemd credential, passphrase file and
-command providers, all given as references. An encrypted `type = "memory"` repository
-is refused, because it cannot keep its identity and data across a reload or restart.
-The server reads the keys when it first needs a repository, including the background
-checks at startup and after SIGHUP, and then caches the opened repository in protected
-memory. The listener starts without waiting for those checks. Backups, restores,
-verification, garbage collection and scheduled policies all use the cached repository.
-Secret files must stay outside the server's data directory and the repository
-directories. The API refuses an `encryption` field when it registers or updates a
-repository, so key references and key management stay with the operator.
-
-On SIGHUP, the server validates the new configuration before it changes the registry.
-It then drops every opened encrypted repository, even when its key references are the
-same, so send SIGHUP after replacing the contents of a key file or credential. A missing
-or wrong key makes the repository unavailable or locked, and the server never opens a
-plaintext repository in its place. A reload that keeps a repository at the same
-location still checks its registered UUID. Cancelling a backup or scheduled-policy task
-interrupts provider commands and the wait for another task that is opening the same
-repository. Opening the storage backend keeps its own deadlines, and the server checks
-for cancellation before it caches the result. Operations that had already started can
-finish with the repository they opened. Later operations open it with the new
-configuration, and an open that started before the reload is never returned or cached
-for the new entry.
-
-The Rust registry methods `load` and `replace_config` still accept only plaintext
-repositories. A server integration that needs the trusted encryption references uses
-`load_configured` and `replace_configured`. API views and the registry the API persists
-leave those references out.
-
-## Outbound requests (SERVICE and LOAD)
-
-`SERVICE <url>` and `LOAD <http…>` make the server open connections, so they follow a
-network policy. With authentication on, they also need the `federate` permission. The
-local `sparkles query` and `sparkles update` follow the same policy with a different
-default, described below. The policy works as follows:
-
-* Only `http` and `https` URLs are allowed.
-* The host is resolved once, and the connection goes to exactly the addresses that were
-  checked, so DNS rebinding cannot swap in another address. If any address that a name
-  resolves to is refused, the name is refused.
-* By default, only public addresses are contacted. The policy refuses loopback
-  (`127.0.0.0/8`, `::1`), private (`10/8`, `172.16/12`, `192.168/16`), shared
-  (`100.64.0.0/10`), link-local (`169.254.0.0/16`, which holds the `169.254.169.254`
-  metadata service, and `fe80::/10`), unique-local (`fc00::/7`), multicast, broadcast,
-  unspecified, documentation, benchmarking and reserved ranges. It also refuses the
-  IPv4-mapped, IPv4-compatible, NAT64 and 6to4 IPv6 forms of those.
-* Every redirect hop is checked the same way, for at most 5 hops.
-* Each request has a 10 s connect timeout and a total timeout (`--outbound-timeout`,
-  default 60 s) that never runs past the query's own timeout. Its response has a ceiling
-  (`--outbound-max-mb`, default 256), counted as the body streams in and, for a
-  compressed `LOAD`, after decompression.
-* One budget covers all the SERVICE calls and LOADs of a query or update, so that many
-  requests cannot add up to more than a few large ones. It limits the bytes they receive
-  (`--outbound-request-max-mb`, by default 4 × `--outbound-max-mb`), and a compressed
-  `LOAD` counts its decompressed bytes. It also limits the time they take, summed
-  (`--outbound-request-timeout`, by default 4 × `--outbound-timeout`). Past the byte
-  limit, the request fails with `507` (`"budget": "outbound-bytes"`) and an update
-  commits nothing. Past the time limit, the next call gets only the time that is left and
-  then fails like a timeout.
-* A `LOAD` is parsed as its response streams in. It is not buffered first.
-
-A refused destination fails with `403` before any connection is made. `SILENT` hides
-neither that refusal nor a spent budget. It hides failures of the remote side, such as
-timeouts. Proxy environment variables (`HTTP_PROXY`, …) are ignored for these requests.
-
-Error messages name the URL and its host. They do not say what the host resolved to, and
-they do not include the connection's own error. A refused name answers
-`… is refused by the outbound policy`, and a failed connection answers `cannot connect`.
-The server logs the details under the target `sparkles::outbound`: the resolved address,
-its kind and the OS error. An operator can see why a request failed, but a caller cannot
-use the errors to map internal names to addresses.
-
-`--outbound-allow-private` opens loopback, private, shared and unique-local addresses,
-for example to reach a local Fuseki during development:
-
-```sh
-sparkles serve --data ./data --outbound-allow-private
-# SELECT * { SERVICE <http://localhost:3030/ds/sparql> { ?s ?p ?o } }
-```
-
-Link-local addresses, including the metadata service, stay refused. In production,
-prefer an allowlist. With `--outbound-allow` (repeatable), only the listed destinations
-are contacted. An entry is one of:
-
-* A host name (`--outbound-allow sparql.example.org`), or `*.example.org` for the
-  subdomains of a name. The name is contacted at public addresses, and at private ones
-  too with `--outbound-allow-private`.
-* An address or CIDR network (`--outbound-allow 10.20.0.0/16`). Any address in it is
-  contacted, including private and link-local ones.
-
-Listing a name vouches for the name, not for the addresses it resolves to. To reach a
-name that resolves to a private or link-local address, list that address or network as
-well (`--outbound-allow fuseki.internal --outbound-allow 10.20.0.0/16`). A hijacked or
-mistyped DNS record then cannot open the metadata service. `sparkles mcp` takes the same
-flags. Library users set `QueryOptions::outbound`
-(`sparkles::outbound::OutboundPolicy`), which has the same defaults. Embedding requests
-([Embeddings computed on write](#embeddings-computed-on-write)) follow the server's policy
-too, and library users set theirs with `sparkles::vector::embed::set_environment`. The default refusal
-of non-public addresses is the constant `BLOCK_PRIVATE_BY_DEFAULT`.
-
-**Local commands.** `sparkles query` and `sparkles update` without `--server` run on the
-operator's own machine. They therefore allow loopback, private, shared and unique-local
-destinations by default, as `--outbound-allow-private` does for a server. A SERVICE call
-to a local Fuseki or a `LOAD` from an intranet host needs no flag. Link-local addresses,
-including the metadata service, stay refused. The local commands take the same
-`--outbound-*` flags. `--outbound-block-private` restores the strict default of `serve`
-and `mcp`, for example for a query from an untrusted source:
-
-```sh
-sparkles query --data local.ttl 'SELECT * { SERVICE <http://localhost:3030/ds/sparql> { ?s ?p ?o } }'
-sparkles query --data local.ttl --outbound-block-private --query untrusted.rq
-```
-
-With `--server`, the request runs on that server under its own policy, and these flags
-do not apply.
-
-**Local files.** `LOAD <file:…>` over HTTP needs `serve --load-dir DIR`, and
-`server-admin` when authentication is on. The file must be a regular file under `DIR`
-once `..` and symbolic links are resolved. A link inside `DIR` may point elsewhere inside
-it. Without the flag, the server refuses file loads with `403`. `DIR` may not hold the
-data directory. The local `sparkles update` reads any file its user can read. Library
-users set `QueryOptions::file_loads` to `FileLoads::Anywhere` (the default),
-`FileLoads::under(dir)` or `FileLoads::Disabled`.
-
-### Correlated, bulk and cached SERVICE
-
-A SERVICE that depends on the solutions before it runs once per solution with `loop:` in
-front of its IRI, as Jena's service enhancer does. `bulk+n:` sends `n` solutions in one
-request, and `cache:` keeps each solution's remote result for the next query:
-
-```sparql
-SELECT ?film ?label WHERE {
-  ?film a :Film ; :wikidata ?item .
-  SERVICE <loop:bulk+50:cache:https://query.wikidata.org/sparql> {
-    SELECT ?label { ?item rdfs:label ?label FILTER(lang(?label) = "en") } LIMIT 1
-  }
-}
-```
-
-Without `loop:`, the endpoint evaluates the sub-select once over all of its items, and
-every film gets the same label. With `loop:` and no `bulk`, it gets one request per film.
-With `bulk+50`, 1,000 films take 20 requests, and with `cache:` a second run takes none.
-The requests follow the outbound policy and its budgets like any SERVICE call.
-
-The cache is shared by the datasets, holds `--service-cache-mb` (64) in all, and keeps each
-caller's entries apart. `cache+clear:` refreshes the entries a query reads, and
-`POST /$/cache/clear/{ds}` drops them all. `SERVICE <loop:> { … }` and
-`SERVICE <urn:x-arq:self> { … }` read the dataset itself without a request. The options
-and the request shapes are in [API.md](API.md#service-options-loop-bulk-and-cache).
-
-## Finding paths
-
-A property path tells whether two nodes are connected. A path search returns the
-connections themselves, one row per edge or per path, through the local service
-`SERVICE path:search`. The parameters are in [API.md](API.md#path-search), and the design
-is in [F07](specs/F07-path-search.md).
-
-The shortest chain of `foaf:knows` between two people, edge by edge:
-
-```sh
-sparkles query --loc ./db '
-PREFIX path: <urn:x-sparkles:path#>
-PREFIX foaf: <http://xmlns.com/foaf/0.1/>
-SELECT ?i ?s ?o WHERE {
-  SERVICE path:search {
-    [] path:source <http://example.org/person/0> ;
-       path:target <http://example.org/person/999999> ;
-       path:predicate foaf:knows ;
-       path:edgeIndex ?i ; path:edgeSubject ?s ; path:edgeObject ?o .
-  }
-} ORDER BY ?i'
-```
-
-The ends can come from the rest of the query. This finds the distance from each of two
-people to everyone who works for one organization:
-
-```sparql
-SELECT ?a ?b ?len WHERE {
-  VALUES ?a { <http://example.org/person/1> <http://example.org/person/2> }
-  ?b <http://example.org/worksFor> <http://example.org/org/7> .
-  SERVICE path:search {
-    [] path:source ?a ; path:target ?b ; path:predicate foaf:knows ; path:length ?len .
-  }
-}
-```
-
-`path:algorithm path:allShortest` returns every shortest path, `path:kShortest` with
-`path:k 5` the five shortest, and `path:all` with `path:maxLength 4` every path of up to
-four edges. `path:direction path:both` ignores the direction of the triples. Name the
-predicates when you can, because a search without them follows every triple, including
-`rdf:type`. A search stops with an error when it visits more than 10 million nodes. Raise
-the limit with `path:maxVisited`, or narrow the search with `path:maxLength` or
-predicates.
-
-When the predicates to follow are not known in advance, name the ones to skip instead.
-`path:excludePredicate rdf:type, owl:sameAs` follows every other triple. A node with
-thousands of edges, such as a country or a popular class, connects almost everything
-through itself, so a path through it says little. `path:maxDegree 1000` keeps paths from
-passing through a node with more than 1,000 edges in the search's direction, while the
-source and the target may have any number. EXPLAIN ANALYZE reports the nodes skipped this
-way as `skippedHubs`.
-
-A predicate can be followed in its own direction. A family tree stored with
-`ex:parent` from child to parent and `ex:sibling` both ways is searched from an
-ancestor down to a person with `path:predicate (ex:parent path:backward), (ex:sibling
-path:both)`. When the edges are not single triples, a nested pattern can give them.
-`path:start` and `path:end` name its variables of each edge's ends, and this search
-follows co-authorship, two people who wrote the same paper:
-
-```sparql
-SELECT ?len WHERE {
-  SERVICE path:search {
-    [] path:source <http://example.org/person/1> ; path:target <http://example.org/person/2> ;
-       path:start ?x ; path:end ?y ; path:length ?len .
-    ?x <http://example.org/authorOf> ?doc . ?y <http://example.org/authorOf> ?doc .
-    FILTER(?x != ?y)
-  }
-}
-```
-
-The pattern is evaluated once, before the search, so it suits edges that a predicate
-list cannot describe rather than large graphs that predicates can.
-
-Paths are computed per query and nothing is indexed ahead of time. On the 10.5M-triple
-benchmark data, the shortest path between two people 17 edges apart takes about 3 ms,
-where `ASK { … foaf:knows+ … }` for the same pair takes about 125 ms, because the search
-runs from both ends at once ([BENCHMARKS.md](BENCHMARKS.md#path-search)).
-
-### Finding paths in Explore
-
-Explore's **Paths** button, or `Shift+P`, opens a panel beside the graph that runs these
-searches. **From** and **To** search the dataset as Explore's search box does, and they
-also take a pasted IRI, a prefixed name or a quoted literal. A right click or a long press
-on a node offers **Paths from here** and **Paths to here**, and so do the buttons of the
-side panel, and the panel then fills **From** with the node selected before. **Mode**
-chooses the shortest path, every shortest path up to 50 or the k shortest paths, with k
-from 2 to 20.
-
-**Filters** sets the length, up to 8 edges, the direction, the hub limit and the
-predicates. By default a search goes both ways, skips nodes with more than 1,000 edges and
-follows every predicate except those of the dataset's `paths` setting, which are
-`rdf:type` and `owl:sameAs` unless an administrator changes them. **only** follows the
-listed predicates instead, and the predicate box suggests those of the schema.
-
-The paths are drawn over the graph one edge at a time, in order of length, with each
-edge labelled by the paths that use it. With reduced motion they appear at once. The list
-under the form describes each path in words, and the keys `1` to `9` show one path, `A`
-shows them all and `Escape` shows them all again before it closes the panel. A shown path
-dims the elements off it, separately from the [shared selection](#arcs-on-the-map), which
-keeps its own dimming, and an element that two of them dim, or a lens legend entry and one
-of them, is dimmer still. Under the inferred-edge [lens](#lenses-on-the-graph) an inferred
-edge on a path keeps its dash and takes the path's colour. The paths are drawn on the graph and not on the map, so opening the
-panel switches Explore's canvas back to the graph, and **Map** and `Shift+M` wait until the
-panel closes. **Open in editor** opens the query in
-the query page, **Add to graph** keeps the paths' nodes in the explored graph, and **Clear**
-removes the overlay. The search reads the commit of `main` that Explore shows. When it reaches
-its limit of a million visited nodes or ten seconds, the panel says so and suggests a
-shorter length, a lower hub limit or fewer predicates. At phone width the panel is a sheet
-at the bottom of the screen that folds to its handle.
-
-**Weight** in the filters orders the paths by a number on the reifiers of their edges
-instead of by their length. When the list is first opened, it asks the dataset for the
-properties that reifiers carry with numeric values of zero or more, most used first, and
-offers up to 20 of them. With a weight chosen, the search adds up that property along each
-path, as `path:weight` does, and an edge without a reifier or without the property weighs
-1. Each path in the list then shows its cost after its length, and the announcement names
-the cheapest cost. The default, **none, count edges**, counts the edges as before.
-
-### Finding paths on the query page
-
-The same panel opens over a query's graph results, from the **Paths** button of the graph
-toolbar or `Shift+P` while the graph has the focus. A right click or a long press on a node
-of the canvas offers **Paths from here** and **Paths to here**, and in the WebGL view the
-selected node fills **From**. The search reads the state the result was read at, on the
-result's branch, and the header names it. The paths are drawn on the result's own nodes and
-edges where the result has them, with each edge labelled by the paths that use it, and the
-nodes and edges a path needs that the result lacks are added for as long as the paths are
-shown. The WebGL view colours and thickens the path edges, labels the path nodes and draws
-the path numbers at the edges' midpoints, without the step-by-step animation, and it keeps
-its layout and its view while paths are shown and cleared. The keys `1` to `9`, `A` and
-`Escape` work as in Explore, with the focus in the list or on the graph. **Open in editor**
-opens the paths' query in a new tab of the query page, at the result's state. **Add to
-graph** is not offered, because a result graph is the query's answer and not a graph to
-build on. Closing the panel, or running a query again, removes the paths and the nodes
-they added.
-
-## Graph algorithms
-
-PageRank, betweenness, components, communities, node similarity, triangle counts,
-k-cores, breadth-first and shortest-path distances, and two kinds of node embeddings run
-inside the server on a projection of the graph. A query reaches them through
-`SERVICE algo:<name>`, and `sparkles algo` and `POST /$/algo/{ds}/run` run them without
-writing a query. The parameters and outputs of each algorithm are in
-[API.md](API.md#graph-algorithms), and the design is in
-[F14](specs/F14-graph-algorithms.md).
-
-FastRP reads `iterationWeights` and `nodeSelfInfluence` with the meaning they have in
-Neo4j GDS. The list has one weight for each propagation over the graph, and
-`nodeSelfInfluence` weights the random starting vectors. The default propagates three
-times and weights the second and third rounds. Earlier builds propagated twice by default,
-so embeddings written by them differ from new ones and a default call costs about a third
-more. Only the meaning of the parameters matches GDS. The random vectors and the final
-normalization are Sparkles's own, so the numbers differ. A list with no non-zero weight
-and a zero `nodeSelfInfluence` is refused, as is a dimension above 16384, the largest of
-a vector index.
-
-Weighted betweenness accepts only finite, strictly positive weights in the stored
-`f32` representation. A zero, negative or nonfinite weight refuses the whole call,
-including a SERVICE value that rounds to zero or infinity during conversion. A
-refused call returns no score rows. Unweighted betweenness still uses unit edges, SSSP
-still accepts zero weights, and PageRank retains its nonnegative weight domain.
-[Roadmap item 79](ROADMAP.md) tracks nonnegative weighted betweenness semantics.
-
-Some finite positive graphs are also refused during computation. If a competitive
-edge cannot increase the distance at `f64` precision, or a computed distance is
-nonfinite, the invocation fails with `Invalid` and publishes no score rows, success
-statistics or write-back commits. A tiny edge that cannot improve or tie its target
-does not trigger this refusal. Accepted distances and path counts remain approximate,
-and sampling checks only the selected source searches.
-[Roadmap item 80](ROADMAP.md) tracks positive-weight numerical robustness.
-
-The ten most central people of a social graph:
-
-```sh
-sparkles query --loc ./db '
-PREFIX algo: <urn:x-sparkles:algo#>
-PREFIX foaf: <http://xmlns.com/foaf/0.1/>
-SELECT ?person ?rank WHERE {
-  SERVICE algo:pageRank { [] algo:predicate foaf:knows ; algo:node ?person ; algo:score ?rank }
-} ORDER BY DESC(?rank) LIMIT 10'
-```
-
-The same run from the command line, and a community detection that is written back to a
-graph in commits of 50,000 triples:
-
-```sh
-sparkles algo run --loc ./db pageRank --predicate http://xmlns.com/foaf/0.1/knows --param maxIterations=30
-sparkles algo run --loc ./db leiden --predicate http://xmlns.com/foaf/0.1/knows --direction undirected \
-  --param seed=7 --write-graph http://example.org/analytics \
-  --write community=http://example.org/community --write level=http://example.org/level --batch-size 50000
-```
-
-`--summary` prints the statistics of the run instead of its rows, and `--request FILE`
-takes the whole request as JSON, as the HTTP route does. A write-back run records itself
-in the output graph with the commit it computed at, so a reader knows which state the
-numbers describe. It commits in batches so that a large result does not hold the writer
-lock for long.
-
-A write-back run is an update, so the server's query timeout does not apply to it. It has
-no deadline unless the request has a `timeout` or the server runs with
-`--update-timeout`. Without a deadline, a run that waits for `--algo-threads` waits until
-a thread is free or the run is cancelled. Thread admission has no queue order, so a run
-that asks for several threads can wait while one-thread calls keep taking the free slots.
-On a server with a query memory pool, the task holds its initial grant of the pool while
-it waits for threads, because it takes the grant when it starts. A dataset has at most
-one write-back task at a time, so the grants held this way add up to one initial grant
-for each dataset. The wait has no deadline, so those grants stay held until the threads
-are free or the task is cancelled, and queries can answer `503` meanwhile if the pool is
-otherwise full.
-The run keeps the algorithm's result as term identifiers and decodes the terms of one
-batch at a time, so the decoded terms of a large result never sit in memory together.
-The identifiers of the whole result stay in memory until the run ends, up to
-`--max-rows` rows. The plan of the write-back also keeps an index of the rows that have a
-node, ordered by node, which takes 8 bytes for each row. A run under a memory pool charges
-that index to its grant before it builds it, and gives it back when the run ends. The
-index is the price of writing each node's rows together without decoding the result up
-front. On a server with a query memory pool, a run takes its initial grant
-when its task starts and waits for it up to `--query-admission-wait`, as a request
-does.
-
-Query and task cancellation both reach computation, result preparation and writer
-admission. A supplied timeout and task deadline share the earlier absolute bound from
-operation entry through completion, including built-in SHACL and ShEx validation. History
-SERVICE calls retain the same controls at the native change-log scan checks. Rust history
-queries accept composed cancellation flags as well as a single flag and an absolute
-deadline. Checks are cooperative and do not preempt history indexing, reads or flushing.
-Committed batches remain after cancellation. A partial run attempts to record its final
-status without waiting for another writer, with one separate 100 ms cooperative cleanup
-budget. The record can remain unfinished when that attempt fails. This budget does not
-interrupt a durability call. A cancel or deadline that arrives after the last batch is
-committed does not fail the run, because its record already says `complete`.
-
-Define a projection once under a name when several queries use it:
-
-```sh
-sparkles algo projections put --loc ./db people --predicate http://xmlns.com/foaf/0.1/knows --direction undirected
-sparkles algo projections list --loc ./db
-```
-
-A query then writes `algo:projection "people"` instead of the predicates. The server
-keeps built projections in memory (`--algo-cache-mb`), so a second call on unchanged
-data skips the build. `--algo-threads` and `--algo-max-threads-per-call` bound the CPU
-that algorithms take, and a call that is over its memory budget fails with a message that
-names the parameter that would make it fit.
-
-An algorithm checks cancellation and the deadline in its loops over nodes, edges and
-heap entries, with at most 128K units of work between two checks. A unit is a node, an
-edge of a row or a heap entry. The one exception is a single row of a node of high
-degree, whose edges most loops read without a check. A sort runs as one step that
-cannot be interrupted. Triangle counting sorts all node indexes by degree, which takes
-time proportional to `n log n` for `n` nodes. Triangle counting, clustering, community
-detection and label propagation also sort one row, the neighbouring communities of one
-community or the labels around one node, and the degree of that row or community bounds
-each of those sorts. Building a projection sorts all of its edge keys. A cancel or
-deadline that arrives inside a sort takes effect when the sort ends.
-
-The Rust library, Python and Node.js reach the same runs and projections through the
-dataset's `algorithms` handle. A request is the JSON of the HTTP route as a dict or an
-object:
-
-```python
-ds.algorithms.projections.put("people", {"predicates": ["http://xmlns.com/foaf/0.1/knows"]})
-rows = list(ds.algorithms.run({"algorithm": "pageRank", "projection": "people"}))
-ds.algorithms.run_write({"algorithm": "leiden", "projection": "people",
-                         "write": {"graph": "http://example.org/analytics",
-                                   "predicates": {"community": "http://example.org/community"}}})
-```
-
-In Node.js the calls are `ds.algorithms.run(request)` and `ds.algorithms.runWrite(request)`
-with the same `projections` methods. The JVM binding reaches algorithms only
-through `SERVICE algo:…` queries.
-
-For a clustering request with `params: {"graphalytics": true}`, the Rust, Python and
-Node.js handles return `node` and `coefficient`. The default direction is forward,
-and an explicit projection or predicate direction takes precedence. Summary requests
-remain available. A write mapping for `triangles` is refused before computation,
-while ordinary clustering continues to expose triangle counts.
-
-## Embeddings computed on write
-
-A vector index can compute its vectors from the dataset's text through an embeddings
-endpoint that speaks OpenAI's `POST /v1/embeddings` protocol. That covers OpenAI and most
-hosted providers, and also local models served by Ollama, vLLM, LM Studio, llama.cpp's
-server or Text Embeddings Inference. A build with the `embed-local` feature can also run
-a model in the server process, as [Local embedding models](#local-embedding-models)
-describes. The design is in
-[F08](specs/F08-embeddings-on-write.md), and the fields and endpoints are in
-[API.md](API.md#embeddings-on-write).
-
-With Ollama on the same machine:
-
-```sh
-ollama pull nomic-embed-text
-sparkles serve --data ./data --outbound-allow 127.0.0.1/32 --outbound-allow api.openai.com
-curl -X PUT http://localhost:3030/$/vector/ds/docs -H 'Content-Type: application/json' -d '{
-  "predicate": "http://example.org/embedding", "dimension": 768,
-  "embedding": {
-    "url": "http://127.0.0.1:11434/v1/embeddings", "model": "nomic-embed-text",
-    "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"],
-    "inputPrefix": "search_document: ", "queryPrefix": "search_query: "
-  }
-}'
-```
-
-The server refuses loopback and private destinations by default, also for embeddings,
-so a local provider needs `--outbound-allow` with its address, or
-`--outbound-allow-private`. An allowlist limits SERVICE and `LOAD` to the same
-destinations, which is why the example lists the hosted endpoint too.
-
-With OpenAI, the key comes from a secret the operator defines. The configuration names
-the secret, never the key:
-
-```sh
-OPENAI_API_KEY=sk-… sparkles serve --data ./data --embedding-secret openai=env:OPENAI_API_KEY
-# "embedding": { "url": "https://api.openai.com/v1/embeddings", "model": "text-embedding-3-small",
-#                "apiKey": {"secret": "openai"}, "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"] }
-```
-
-`file:PATH` reads the key from a file, such as a systemd credential, each time a request
-is made, so a rotated key takes effect without a restart.
-
-After that, writes are embedded in the background. A write commits at once and its
-vectors follow in a commit of kind `embed`. The index's card on the dataset page shows
-the worker's state, the backlog and the last error, and has a "Re-embed" action.
-`sparkles vector status` prints the same as JSON. A search can pass text instead of a
-vector:
-
-```sparql
-PREFIX spk: <urn:x-sparkles:>  PREFIX ex: <http://example.org/>
-SELECT ?s ?score WHERE { (?s ?score) spk:vectorSearch (ex:embedding "rivers of southern France" 10) }
-```
-
-**What leaves the machine.** The text of the selected literals, and the texts that
-searches pass, go to the configured endpoint, with the model name and, when set, the API
-key. Nothing else is sent, and nothing is sent for an index without an `embedding`
-object. `--no-embedding` stops all of it on a server. Search texts are sent by any
-caller who may read the dataset, which a `queryText: false` index refuses.
-
-**Local commands.** `sparkles update --loc` and the other local commands do not embed.
-The next server start, or `sparkles vector embed --loc db`, catches their writes up, and
-sends nothing for text that was already embedded. The local commands use the local
-outbound policy, which allows private addresses, and take `--embedding-secret` for keys
-named by a secret. The Python package does the same with
-`Dataset.indexes.vector.embed_until_idle()`.
-
-## Local embedding models
-
-A server built with the `embed-local` cargo feature runs sentence-embedding models
-itself, with no Ollama or other service next to it. The flake's packages have the
-feature, and so do the Docker images. A plain `cargo build` leaves it out, so build with it:
-
-```sh
-cargo build --release -p sparkles-server --features embed-local
-```
-
-Without the feature, the server still reads the configuration below and reports each
-local model with `runtime: false`.
-
-The models come from a model store, a directory of pinned snapshots that
-`sparkles models` fills from the Hugging Face Hub. Each snapshot is named by its
-repository and a full commit id, and every file is checked against its hash:
-
-```sh
-sparkles models pull sentence-transformers/all-MiniLM-L6-v2@1110a243fdf4706b3f48f1d95db1a4f5529b4d41 --data ./data
-sparkles models list --data ./data
-sparkles models verify --data ./data
-```
-
-`--data DIR` uses `DIR/models`, the server's default store. `--dir` names any other
-directory, and so does `$SPARKLES_MODELS_DIR`. A branch or tag such as `main` is refused
-unless `--allow-unpinned` is given, and then the commit it points to is recorded. A
-snapshot already in the store is not downloaded again. `--manifest FILE` pulls a list
-of `{"repo", "revision", "files"}` entries, and `files` limits a snapshot to the files
-named. `sparkles models rm REPO@REVISION` deletes a snapshot.
-
-The model configuration then names the model under a provider of the `local` kind, and a
-vector index names that provider instead of a URL:
-
-```sh
-cat > models.json <<'EOF'
-{ "providers": { "embed": { "kind": "local", "models": {
-    "minilm": { "repo": "sentence-transformers/all-MiniLM-L6-v2",
-                "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41" } } } } }
-EOF
-sparkles serve --data ./data --model-config models.json
-curl -X PUT http://localhost:3030/$/vector/ds/docs -H 'Content-Type: application/json' -d '{
-  "predicate": "http://example.org/embedding", "dimension": 384,
-  "embedding": { "provider": "embed", "model": "minilm",
-                 "predicates": ["http://www.w3.org/2000/01/rdf-schema#label"] }
-}'
-```
-
-The server reads the store at `<data>/models` unless `--models-dir` names another one,
-which may be read-only. It makes no download of its own unless it runs with
-`--models-download on`, which fetches a missing pinned snapshot in the background
-through the outbound policy. Both `sparkles models pull` and the server read a Hub
-mirror's address from `$SPARKLES_HUB_ENDPOINT` and a token for gated repositories
-from `$HF_TOKEN`, and `pull` also takes `--hub-token-file`. The weights load at the first text and are dropped after
-ten idle minutes (`idleUnloadSecs`). Each model runs on its own pool of two threads by
-default (`threads`), at a lower priority than queries, so embedding a large backlog
-slows searches little. `GET /$/models` and the index's card show whether a model is
-absent, present, loaded or unloaded, and how much memory its weights take.
-
-The architectures are BERT (all-MiniLM, BGE), XLM-RoBERTa (multilingual-e5), NomicBERT
-(nomic-embed-text) and Qwen3 (Qwen3-Embedding), with safetensors weights.
-`"dtype": "bf16"` halves the memory of NomicBERT and Qwen3 models. A provider of the
-`openai` or `ollama` kind works the same way in an index's `embedding`, with the
-provider's endpoint and key, so an index need not repeat them. The fields are in
-[API.md](API.md#model-providers) and the design is in
-[F12](specs/F12-local-embeddings.md).
-
-## Checking a database
-
-`sparkles check --loc db` verifies a database directory without modifying it. It takes
-no lock, truncates no WAL, repairs no catalog and rebuilds no full-text index, so it can
-run next to a server that holds the database. `--data DIR` checks every database in a
-server's data directory. It leaves out directories whose names start with a dot, which
-hold unfinished clones and the copies that `sparkles migrate` builds or keeps. Each
-check prints one line, `ok`, `warning` or `error`, and lists the file, offset, block,
-row, commit or id of every problem below it. `--format json` prints the same report as
-JSON. The exit status is 0 when everything is clean, 1 when any check found an error,
-and 2 when there are warnings only.
-
-| Check | What it verifies |
-|---|---|
-| `layout` | `CURRENT` names an existing generation. `dataset.json`, the generation's `commit.json` (with the same dataset id) and `prefixes.json` parse. Leftovers of interrupted work are warnings: `*.tmp`, `text.new`/`text.old`, an old or unfinished `gen-NNNN`, or a set-aside catalog. |
-| `generation` | `meta.json` and `stats.json` parse and agree on the quad count, and this release reads the index format. |
-| `vocabulary` | The front-coded vocabulary decodes, its keys strictly increase, and its size matches `meta.json`. An FSST-coded vocabulary's tables in `vocab.fsst` read with their checksum, and in full mode every coded suffix uses only codes its table holds. Every vocabulary id in the permutations is below that size. Every entry of the sparse index `vocab.idx` names the offset and first key of its block. An index that does not read as one for this vocabulary is a warning, because the server ignores it. |
-| `delta-vocabulary` | The update vocabulary is well formed and holds no duplicate. The summary names its format, `framed` or `legacy`, and the zero bytes preallocated after its last chunk. A torn tail is a warning. |
-| `perm.spo` … `perm.gspo` | Block metadata is contiguous, sorted and fits the file, and the row count matches `meta.json`. Every block decodes to its row count, and its first and last keys match the metadata. Keys strictly increase within and across blocks, and every id is valid for its position. |
-| `permutations` | The 7 permutations hold the same number of rows and, compared by an order-independent hash, the same quads. |
-| `wal` | Records are well formed, and every commit record's checksum matches. A damaged final transaction is a warning, because open truncates it. So is a final transaction that names update-vocabulary terms the file lacks, which a crash during its commit can leave, and one with zero records before its commit record. Zero bytes after the last commit are preallocated space, reported in the summary. Commit numbers continue from the generation's base commit, and ids resolve. The summary names the log's version: 1 for a log that starts with a header record, 0 for one written before the header existed. A header with a version this release does not read is an error. |
-| `catalog` | `commits.bin` has valid record checksums, continuous records and the right dataset id, and agrees with the WAL. A lagging catalog, or damage that open can rebuild from the WAL, is a warning. Lost history before the generation is an error. |
-| `text` | `text.json` parses. The index opens read-only, and every committed segment file exists and matches its checksum. The index's commit is compared with the WAL. An index that is behind is a warning, because open catches it up or rebuilds it. |
-| `geo` | `geo.json` parses and is a valid configuration. The current generation's index files (`geo/rtree.spkg`, `geo/column.spkg`) have a valid header and footer, belong to this generation and configuration, and match their index checksums. In full mode, the data checksums are checked too. A damaged file is a warning, because open rebuilds it. |
-| `patterns` | `patterns.bin` has a valid layout, and in full mode its checksum matches and every subject's pattern, the subjects of each pattern and the predicate totals match SPO. A pattern file of a version this release does not read is a warning, because queries then read the permutations. A missing file that `meta.json` records is a warning too. |
-| `reasoning` | `reasoning.json` parses and names an existing commit. |
-
-Errors are states that `Store::open` refuses, that lose acknowledged data or history, or
-that queries would read wrongly. Warnings are states that open handles by itself. A
-server that writes during the check can cause transient warnings, because an in-flight
-transaction looks like a torn tail, but never errors.
-
-`--quick` reads metadata only. It reads block metadata instead of every block, the first
-key of each vocabulary block, and whether segment files exist instead of their
-checksums. On the 10.5M-quad benchmark database, a full check takes about 0.3 s and a
-quick one 20 ms (16 cores, warm page cache). The same check is a library call:
-`sparkles::check::check(root, &CheckOptions::default())` returns a serializable
-`CheckReport`.
-
-## Upgrading databases
-
-Every file Sparkles keeps records the version of its format, and a release reads the
-versions of the release before it. The registry of file kinds and versions is
-`crates/sparkles-core/src/formats.rs`. `GET /$/server` lists it in its `formats` member,
-and `sparkles migrate --check` prints it with each database's versions. Before 1.0, release
-0.N opens the databases and backups that 0.N and 0.(N-1) wrote. From 1.0, a release opens
-those of its own major version and of the last minor release before it.
-
-Most changes need no step. A release reads the older version, and it writes the new one
-the next time it writes the file or, for a generation's index, at the next compaction.
-A full-text, spatial or vector index in a version the release does not read is rebuilt
-in the background. When a format changes in a way the new release cannot read, the
-release ships an upgrade step and refuses the old files with a message that names
-`sparkles migrate`. A database outside the window is refused with the release that wrote
-it, which `writtenBy` in `dataset.json` records. Dump it with `sparkles dump` from that
-release and load the dump with `sparkles load`.
-
-```sh
-sparkles migrate --data /srv/sparkles --check            # every database of a stopped server
-sparkles migrate --data /srv/sparkles --dataset books    # upgrade one dataset
-sparkles migrate --loc db --keep-old                     # one database, keeping the old files
-sparkles migrate --loc db --check --format json
-```
-
-`sparkles migrate` works offline. With `--data` it takes the catalog lock, so it fails
-while a server holds the data directory, and it upgrades the persistent datasets that
-`config.json` registers, or those that `--dataset` names.
-
-`--check` plans without changing anything. It lists each database's `dataset.json`
-versions, the version of every generation's index, log and update vocabulary, whether
-the release opens the database, and the steps an upgrade would run. It does not finish
-or undo an earlier run, which it reports as `interrupted`. The exit status is 1 when a
-database is outside the window or has an interrupted run, which a server refuses until
-`sparkles migrate` runs without `--check`, and 0 otherwise. The JSON report gives both
-answers, `inWindow` for the formats and `opens` for whether this release opens the
-database now. A generation whose `meta.json` has no usable version is listed as refused,
-and the report goes on with the other generations and databases.
-
-The window covers the root of a database and every branch, and a newer settings file of
-a dataset or of one of its branches puts the database outside it. The informational files
-`origin.json` and `restore.json` are the exception, because a store ignores a newer one
-with a warning. Startup checks the dataset metadata and settings of every active and
-retained branch before it rewrites the root's metadata, and it reads the same branch
-directories as migration planning. Both leave out unpublished `.create-*` directories and
-`.deleting` tombstones, which planning leaves unchanged and which startup's branch
-recovery removes once these checks pass. An incompatible branch refuses its dataset
-before any cleanup, and the other datasets stay available.
-
-The command makes the database path absolute before it changes anything. If the path
-contains `..`, the command resolves the existing parent through the filesystem and keeps
-the final database name. This keeps a valid `db/../db` path usable during the swap and
-follows the physical meaning of symlink parents. If an interrupted run made such a path
-unresolvable, recover through the database's stable parent path. Paths without `..`
-still support a missing database and new nested directories.
-
-Without `--check`, the command copies each database that has steps to run into a
-sibling directory named `.migrate-<name>` and runs the steps on the copy. It then checks
-the copy as `sparkles check` does and swaps it in with two renames. The copy needs as much
-free space as the database. It keeps the mode and the owner of every file and directory,
-and a file that a step rewrites keeps those of the file it replaces. The command must
-therefore run as the user that owns the database or as root, and it refuses to start
-otherwise. It also refuses a database directory that its owner cannot write, and a
-database named through a symlink, which the swap would replace with a directory. Run it
-on the directory the link points to. The dataset id, the commit numbers, the commit catalog, the branches and the
-snapshots stay as they were. `--keep-old` keeps the database as it was in
-`.pre-migrate-<version>-<name>`, and without it that directory is removed. The command
-refuses to start while that directory exists, so it never deletes an earlier kept copy.
-A dataset delete does not remove a kept copy either. The command also refuses a database
-that holds a symlink or another entry that is not a regular file or directory, because
-the copy would leave it out. Replace the entry with the files it points to and run again.
-
-The command takes the lock file `.migrate.lock-<name>` next to the database, which a
-second `sparkles migrate` and a `--check` of the same database respect. It also takes
-the database's own lock, which a server or any other process that has the database open
-holds, so it fails with a locked error while a server runs on the database. The lock
-file stays in place after the command finishes. A server, or any other open of the
-database, refuses a database with a pending `.migrate-<name>` until `sparkles migrate`
-has run on it again, so a stopped run never leads to an empty database. After it checks
-for a pending migration, startup verifies that its locked file still belongs to the
-current database directory. If a migration replaced that directory while startup was
-taking its lock, the open refuses with a locked error and can be retried.
-
-Until the copy has passed its check and carries a durable mark that says so, any error
-removes the copy and leaves the database as it was. That covers a step that fails, a
-check that finds errors or fails to run, and a mark that cannot be written. If the
-command stops before the swap, the next run removes the copy, and the database is
-unchanged. If it stops between the two renames, the next run renames the checked copy
-into place. A copy without the mark of a passed check is never renamed into place, and
-the command reports it and leaves both directories alone.
-
-The mark is versioned and records the exact old sibling directory and whether to keep
-it. Recovery uses that recorded directory even when another release finishes the run, so
-it preserves unrelated kept copies. An unknown or damaged mark, or one with a known field
-given twice, refuses recovery without changing the copies. A bare legacy `keep-old` or
-`remove-old` mark also refuses automatic recovery, because it does not name the original
-old directory. In those cases inspect the sibling copies, then recover through a known
-original location or restore by hand.
-
-A backup restore refuses to replace a database while a migration is pending, including
-when the database directory is missing between the two renames. An offline restore also
-checks that its lock belongs to the current database directory before it publishes, and
-refuses a stale lock with `dataset-busy`, leaving both directories intact.
-
-The only step today rewrites a legacy update vocabulary (`delta.vocab`) in the framed
-format, which the first write to it would also do. A server opens such a database
-without the step.
-
-A server that finds a dataset in a version it does not read leaves that dataset closed,
-logs why, and serves the others. That covers an index or a log in a newer version, a
-`dataset.json` that needs a later reader, and a settings file such as `describe.json`,
-`rdfs.json` or `assistant.json` with a newer `format`, which a store checks at open before
-it writes any file. The dataset stays registered, and `GET /$/server` lists it under
-`refusedDatasets`. A caller sees the refused datasets it may read, and a server
-administrator sees all of them and alone gets the full reason, which names paths. The
-other callers get a fixed sentence. A refused dataset cannot be deleted or renamed through
-the API while it is closed. Stop the server and run `sparkles migrate`, or edit
-`config.json`. After `sparkles migrate`, or after the database is replaced, the next start
-opens it.
 
 ## MCP server (LLM agents)
 
@@ -4685,98 +4838,6 @@ answer from the data and a note that the summaries are unavailable.
 Agents read the reports with the MCP tool `community_reports`, and `recall` with
 `"communities": true` adds the report of each seed's community after its facts. A
 project brief lists the best rated reports of the coarsest level.
-
-## Sending notifications
-
-The server can tell a person when something needs them. It sends a notification to a
-webhook or an ntfy topic when agent memory has waited for review too long, when a
-backup policy run fails, and when a model provider's daily token budget is used up.
-Notifications are off until the configuration turns them on.
-
-The configuration is the server-wide settings kind `notifications`. An operator declares
-it in the settings file under `server.notifications`, and a server administrator changes
-it at runtime unless the settings file locks a field, as for the model configuration.
-A channel never holds a credential. It names a secret, which comes from
-`--model-secret NAME=file:PATH` or from a value stored with `sparkles secrets set`.
-
-```json
-{
-  "server": {
-    "notifications": {
-      "enabled": true,
-      "baseUrl": "https://sparkles.example.org",
-      "channels": {
-        "phone": { "type": "ntfy", "topic": "sparkles-ops", "token": { "secret": "ntfy-token" } },
-        "ops": { "type": "webhook", "url": "https://hooks.example.org/sparkles", "signingSecret": { "secret": "hook-signing" } }
-      },
-      "routes": { "memory.review.pending": ["phone"], "backup.*": ["phone", "ops"], "*": ["ops"] }
-    },
-    "locked": ["notifications.channels.phone"]
-  }
-}
-```
-
-```sh
-sparkles serve --loc data/org --settings settings.json \
-  --model-secret ntfy-token=file:/run/secrets/ntfy-token \
-  --model-secret hook-signing=file:/run/secrets/hook-signing
-sparkles notify test phone
-sparkles notify status
-```
-
-`sparkles notify test CHANNEL` sends a test notification to one channel at once, even
-while notifications are off, and prints the HTTP status the channel answered or the
-error. `sparkles notify status` prints each channel with its last success and its last
-failure, the routes, and the conditions that were notified. The same configuration can
-be changed from the command line:
-
-```sh
-sparkles settings set --global notifications.enabled=true \
-  'notifications.routes.*=["ops"]'
-sparkles secrets set hook-signing < hook-signing.key
-```
-
-A webhook receives the notification as a JSON body. With `signingSecret`, the request
-carries the `webhook-id`, `webhook-timestamp` and `webhook-signature` headers of
-Standard Webhooks, and the libraries of that specification verify them. A webhook URL
-that holds a token, as many chat services' incoming webhooks do, goes into a secret
-with `"urlSecret": {"secret": NAME}` in place of `url`. An ntfy channel publishes to
-`https://ntfy.sh` unless `server` names another ntfy server. A topic on the public
-server can be read by anyone who guesses its name, so use an access token with a
-reserved topic, or a server of your own.
-
-Each dataset decides how long its memory review may wait. The event fires when the
-oldest open review branch, such as a scheduled consolidation's, is older than
-`notifyAfter`, and then at most once per `repeatEvery` until no review branch is open:
-
-```sh
-sparkles settings set org memory.review.notifyAfter=2d memory.review.repeatEvery=1d
-```
-
-A backup policy that fails notifies once, then at most once per the kind's
-`repeatEvery` (one day by default) until a run of the policy succeeds. A spent model
-budget notifies once per provider and day. Requests to the channels go through the
-outbound policy, so a channel on a private address needs `--outbound-allow-private`.
-A failed delivery is retried with backoff, five attempts by default.
-[API.md](API.md#notifications) lists every member, the events and their data, and the
-metrics.
-
-On NixOS the settings file comes from `services.sparkles.settings` and the secrets from
-`services.sparkles.models.secrets`, which also serves the model providers' keys:
-
-```nix
-services.sparkles = {
-  settings.server.notifications = {
-    enabled = true;
-    baseUrl = "https://sparkles.example.org";
-    channels.phone = { type = "ntfy"; topic = "sparkles-ops"; token.secret = "ntfy-token"; };
-    routes."*" = [ "phone" ];
-  };
-  settings.server.locked = [ "notifications.channels.phone" ];
-  settings.datasets.org.memory.review.notifyAfter = "2d";
-  models.secrets.ntfy-token.file = config.sops.secrets."ntfy-token".path;
-};
-```
 
 ## Embedding the library
 

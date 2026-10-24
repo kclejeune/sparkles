@@ -53,6 +53,7 @@ pub mod update;
 pub mod value;
 mod valuespush;
 mod vectortopk;
+pub mod viewsvc;
 mod zipper;
 
 use crate::error::{Error, Result};
@@ -174,6 +175,8 @@ pub struct QueryOptions {
     /// The named projections of the dataset, for `algo:projection` in a graph algorithm
     /// call (see [`crate::algo::catalog`]).
     pub algo_projections: Option<Arc<crate::algo::catalog::Catalog>>,
+    /// The dataset's views, which `SERVICE view:read` reads (see [`viewsvc`]).
+    pub views: Option<Arc<dyn viewsvc::ViewSource>>,
     /// The outbound budget the request spends (`None`: a new one from
     /// [`outbound`](Self::outbound)), shared by several requests that count as one.
     pub outbound_budget: Option<Arc<crate::outbound::RequestBudget>>,
@@ -544,6 +547,7 @@ fn make_ctx(
     ctx.use_cache = !opts.no_cache;
     ctx.plan_patterns = !opts.no_plan_patterns;
     ctx.algo_projections = opts.algo_projections.clone();
+    ctx.views = opts.views.clone();
     ctx.extensions = opts.extensions.clone();
     if let Some(s) = &opts.service_scope {
         ctx.service_scope = s.clone();

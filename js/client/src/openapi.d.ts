@@ -3144,6 +3144,71 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/views/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List views
+         * @description The dataset's incremental views with their state: `building`, `current`, `behind` with the commits it lags, `suspended` with a reason, or `failed`.
+         */
+        get: operations["listViews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/views/{ds}/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a view */
+        get: operations["getView"];
+        /**
+         * Define a view
+         * @description Compiles the query, keeps the definition and starts the first evaluation as a task in `/$/tasks`. Needs `admin` on the dataset. A query outside the incremental fragment is refused with `400 not-incremental`, and Phase 2 options with `400 unsupported-option`.
+         */
+        put: operations["putView"];
+        post?: never;
+        /**
+         * Delete a view
+         * @description Removes the view and its state. Needs `admin` on the dataset.
+         */
+        delete: operations["deleteView"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/views/{ds}/{name}/rebuild": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rebuild a view
+         * @description Evaluates the view again from scratch as a task, and lifts a suspension. Needs `admin` on the dataset.
+         */
+        post: operations["rebuildView"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/whoami": {
         parameters: {
             query?: never;
@@ -3448,6 +3513,26 @@ export interface paths {
          * @description The recorded changes of a range of commits, read from the change log, which outlives compactions. Each change is an addition or a removal of a quad with its commit's number, time, kind, author and message. `subject`, `predicate` and `object` take N-Triples terms or bare IRIs and may repeat.
          */
         get: operations["historyChanges"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/{ds}/live": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Live query
+         * @description A SELECT, ASK or CONSTRUCT query that a view could be, as server-sent events: `snapshot` pages of the result, then a `diff` after each commit that changes it, `reset` when the server evaluated the query again, and `error` when the stream ends. Each event's id is a commit.
+         */
+        get: operations["liveQuery"];
         put?: never;
         post?: never;
         delete?: never;
@@ -8972,6 +9057,95 @@ export interface components {
              * @enum {string}
              */
             level: "exists" | "data" | "restore";
+        };
+        /** @description A view with its state. */
+        View: {
+            columns?: string[];
+            /** @description The commit its rows reflect. */
+            commit?: number;
+            /** @description With `behind`: the commits it lags. */
+            commits?: number;
+            dataset?: string;
+            definition: components["schemas"]["ViewDefinition"];
+            /** @description With `failed`: why. */
+            error?: string;
+            name: string;
+            passMs?: number;
+            passes?: number;
+            /** @description The view's plan: each node has its `operator`, its `mode` (`incremental` or `recompute`), its `vars`, a `detail` that gives a recompute node's reason, and its `children`. */
+            plan?: {
+                [key: string]: unknown;
+            };
+            /** @description With `suspended`: why. */
+            reason?: string;
+            /** @description Time spent in its recompute nodes. */
+            recomputeMs?: number;
+            /** @description Its rows, multiplicities counted. */
+            rows?: number;
+            /** @description Passes its footprint skipped. */
+            skipped?: number;
+            /** @enum {string} */
+            state: "building" | "current" | "behind" | "suspended" | "failed";
+            stateBytes?: number;
+            /** @description On a PUT: the task of the first evaluation. */
+            task?: string;
+        };
+        /** @description A view's definition. Phase 1 takes `table` views maintained `async` on `main`, without provenance and with `keepCommits` 0. */
+        ViewDefinition: {
+            branches?: string[];
+            graph?: string;
+            keepCommits?: number;
+            /** @enum {string} */
+            maintenance?: "async" | "commit";
+            /** @description The budget of the view's state. */
+            memoryBytes?: number;
+            /** @enum {string} */
+            mode?: "table" | "graph";
+            /** @description The user whose view of the dataset the query reads; the definer by default. */
+            principal?: string;
+            /** @enum {string} */
+            provenance?: "none" | "count" | "why" | "lineage";
+            /** @description A SELECT or CONSTRUCT query; the dataset's prefixes apply. */
+            query?: string;
+            /** @description A stored query by name, in place of `query`. */
+            storedQuery?: string;
+        };
+        /** @description A dataset's views without their plans. */
+        ViewList: {
+            dataset: string;
+            views: {
+                columns?: string[];
+                /** @description The commit its rows reflect. */
+                commit?: number;
+                /** @description With `behind`: the commits it lags. */
+                commits?: number;
+                dataset?: string;
+                definition?: components["schemas"]["ViewDefinition"];
+                /** @description With `failed`: why. */
+                error?: string;
+                name: string;
+                passMs?: number;
+                passes?: number;
+                /** @description With `suspended`: why. */
+                reason?: string;
+                /** @description Time spent in its recompute nodes. */
+                recomputeMs?: number;
+                /** @description Its rows, multiplicities counted. */
+                rows?: number;
+                /** @description Passes its footprint skipped. */
+                skipped?: number;
+                /** @enum {string} */
+                state: "building" | "current" | "behind" | "suspended" | "failed";
+                stateBytes?: number;
+                /** @description On a PUT: the task of the first evaluation. */
+                task?: string;
+            }[];
+        };
+        /** @description A view's rebuild and the task that runs it. */
+        ViewTask: {
+            dataset: string;
+            name: string;
+            task: string;
         };
         Whoami: {
             authEnabled: boolean;
@@ -16925,6 +17099,161 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    listViews: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The views without their plans. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ViewList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getView: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The view with its state and its plan, each operator marked `incremental` or `recompute`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["View"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    putView: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ViewDefinition"];
+            };
+        };
+        responses: {
+            /** @description Replaced. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["View"];
+                };
+            };
+            /** @description Created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["View"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    deleteView: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    rebuildView: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The rebuild's task. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ViewTask"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     whoami: {
         parameters: {
             query?: never;
@@ -18388,6 +18717,45 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             501: components["responses"]["NotImplemented"];
+            default: components["responses"]["Error"];
+        };
+    };
+    liveQuery: {
+        parameters: {
+            query?: {
+                /** @description The query. */
+                query?: string;
+                /** @description Resume after this commit (`commit:N`): the first event is the change since it, or a `reset`. */
+                after?: string;
+                /** @description Merge the diffs of commits that arrive within this many milliseconds. */
+                coalesceMs?: number;
+            };
+            header?: {
+                /** @description Resume after this commit. */
+                "Last-Event-ID"?: string;
+            };
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The events. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
             default: components["responses"]["Error"];
         };
     };

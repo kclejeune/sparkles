@@ -1194,3 +1194,38 @@ async fn grouped_diffs_read_classes_in_the_callers_graphs() {
     let r = get("gep").await;
     assert_ne!(r.status, StatusCode::OK, "{}", r.text());
 }
+
+/// A view's row count is data: a caller whose grants do not cover the view sees its
+/// definition and state without it.
+#[tokio::test]
+async fn view_metadata_hides_counts_from_narrower_callers() {
+    let s = server();
+    let body = serde_json::json!({ "query": "SELECT ?s WHERE { GRAPH ?g { ?s ?p ?o } }" });
+    let r = call(
+        &s.app,
+        "PUT",
+        "/$/views/graphs/all",
+        &[
+            ("authorization", &b("alice")),
+            ("content-type", "application/json"),
+        ],
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let ds = s.state.get("graphs").unwrap();
+    ds.dataset
+        .views()
+        .wait_built("all", Duration::from_secs(30))
+        .unwrap();
+    for (user, sees) in [("gfull", true), ("gra", false)] {
+        let r = get_as(&s.app, "/$/views/graphs/all", Some(&b(user))).await;
+        assert_eq!(r.status, StatusCode::OK, "{user}: {}", r.text());
+        let j = r.json();
+        assert_eq!(j.get("rows").is_some(), sees, "{user}: {j}");
+        assert_eq!(j.get("stateBytes").is_some(), sees, "{user}: {j}");
+        let r = get_as(&s.app, "/$/views/graphs", Some(&b(user))).await;
+        assert_eq!(r.status, StatusCode::OK, "{user}: {}", r.text());
+        assert_eq!(r.json()["views"][0].get("rows").is_some(), sees, "{user}");
+    }
+}

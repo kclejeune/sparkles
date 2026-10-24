@@ -25,6 +25,7 @@ mod commit_stats;
 mod compaction;
 #[cfg(test)]
 mod compaction_tests;
+mod deltas;
 mod describe;
 mod diff;
 mod diff_groups;
@@ -87,6 +88,7 @@ pub use compaction::{
     CompactionSettings, REBUILD_BUCKETS, RELINK_CATCHING_UP, RELINK_READING, RELINK_WRITING,
     RebuildHistogram, RebuildReason, SETTING_NAMES, Trigger, TriggerKind,
 };
+pub use deltas::{CommitDelta, DeltaPage, DeltaSubscription};
 pub use describe::DESCRIBE_FILE;
 pub use diff::{Diff, DiffMethod, DiffOp, DiffOptions, StateMark, key_id};
 pub use diff_groups::{CHANGE_BYTES, ClassGroup, ClassGroups, MAX_GROUPS, ObjectGroup};
@@ -1436,6 +1438,8 @@ pub struct Store {
     vector: Arc<vector::VectorRegistry>,
     /// embeddings computed on write: the work of the indexes that name a provider
     embed: Arc<crate::vector::embed::Embedder>,
+    /// the id-level changes of recent commits, kept while incremental views read them
+    deltas: deltas::Ring,
     /// pins, retention, generations and materialized past states (persistent stores)
     history: Option<Arc<Mutex<crate::history::HistoryState>>>,
     /// pins and the retention window of an in-memory store, as kept snapshots
@@ -1722,6 +1726,7 @@ impl Store {
             geo: Default::default(),
             vector: Default::default(),
             embed: Default::default(),
+            deltas: Default::default(),
             history: None,
             mem_history: Some(Mutex::new(Default::default())),
             changelog,
@@ -2156,6 +2161,7 @@ impl Store {
             geo: Default::default(),
             vector: Default::default(),
             embed: Default::default(),
+            deltas: Default::default(),
             history: Some(Arc::new(Mutex::new({
                 let mut history = history;
                 history.use_budget(match &opts.shared {
@@ -3639,6 +3645,26 @@ impl Store {
         self.text
             .load_full()
             .is_some_and(|ti| ti.checkpoint_background_for_test())
+    }
+
+    /// Test hook: stop the full-text index's segment merges.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn stop_text_merges_for_test(&self) {
+        if let Some(ti) = self.text.load_full() {
+            ti.stop_merges_for_test();
+        }
+    }
+
+    /// Test hook: the background full-text checkpoint passes that held the live writer
+    /// lock, those of them that cleared the index's marker, and the background passes of
+    /// any kind that cleared it.
+    #[cfg(all(feature = "text", feature = "failpoints"))]
+    #[doc(hidden)]
+    pub fn text_background_checkpoints_for_test(&self) -> [u64; 3] {
+        self.text
+            .load_full()
+            .map_or([0; 3], |ti| ti.background_checkpoints_for_test())
     }
 
     /// Test hook: pause (or resume) the full-text index's background tick, so staged
@@ -6301,6 +6327,8 @@ impl WriteTxn<'_> {
         self.store.maintain_geo(&mut snap, &self.base, &self.log);
         self.store.remember_past(c.seq);
         let snap = Arc::new(snap);
+        // before the publication: a view runtime woken by it finds the changes
+        self.store.deltas.noted(c.seq, gen_, &self.log);
         self.store.current.store(snap.clone());
         self.store.commits.send_replace(c.seq);
         // after the publication: a worker that takes these pairs reads this state

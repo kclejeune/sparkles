@@ -18652,6 +18652,270 @@
         },
         "type": "object"
       },
+      "View": {
+        "description": "A view with its state.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "properties": {
+          "columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "commit": {
+            "description": "The commit its rows reflect.",
+            "type": "integer"
+          },
+          "commits": {
+            "description": "With `behind`: the commits it lags.",
+            "type": "integer"
+          },
+          "dataset": {
+            "type": "string"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/ViewDefinition"
+          },
+          "error": {
+            "description": "With `failed`: why.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "passMs": {
+            "type": "number"
+          },
+          "passes": {
+            "type": "integer"
+          },
+          "plan": {
+            "additionalProperties": true,
+            "description": "The view's plan: each node has its `operator`, its `mode` (`incremental` or `recompute`), its `vars`, a `detail` that gives a recompute node's reason, and its `children`.",
+            "type": "object"
+          },
+          "reason": {
+            "description": "With `suspended`: why.",
+            "type": "string"
+          },
+          "recomputeMs": {
+            "description": "Time spent in its recompute nodes.",
+            "type": "number"
+          },
+          "rows": {
+            "description": "Its rows, multiplicities counted.",
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Passes its footprint skipped.",
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "building",
+              "current",
+              "behind",
+              "suspended",
+              "failed"
+            ],
+            "type": "string"
+          },
+          "stateBytes": {
+            "type": "integer"
+          },
+          "task": {
+            "description": "On a PUT: the task of the first evaluation.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "definition",
+          "state"
+        ],
+        "type": "object"
+      },
+      "ViewDefinition": {
+        "description": "A view's definition. Phase 1 takes `table` views maintained `async` on `main`, without provenance and with `keepCommits` 0.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "properties": {
+          "branches": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "graph": {
+            "type": "string"
+          },
+          "keepCommits": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maintenance": {
+            "enum": [
+              "async",
+              "commit"
+            ],
+            "type": "string"
+          },
+          "memoryBytes": {
+            "description": "The budget of the view's state.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "table",
+              "graph"
+            ],
+            "type": "string"
+          },
+          "principal": {
+            "description": "The user whose view of the dataset the query reads; the definer by default.",
+            "type": "string"
+          },
+          "provenance": {
+            "enum": [
+              "none",
+              "count",
+              "why",
+              "lineage"
+            ],
+            "type": "string"
+          },
+          "query": {
+            "description": "A SELECT or CONSTRUCT query; the dataset's prefixes apply.",
+            "type": "string"
+          },
+          "storedQuery": {
+            "description": "A stored query by name, in place of `query`.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ViewList": {
+        "description": "A dataset's views without their plans.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "views": {
+            "items": {
+              "properties": {
+                "columns": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "commit": {
+                  "description": "The commit its rows reflect.",
+                  "type": "integer"
+                },
+                "commits": {
+                  "description": "With `behind`: the commits it lags.",
+                  "type": "integer"
+                },
+                "dataset": {
+                  "type": "string"
+                },
+                "definition": {
+                  "$ref": "#/components/schemas/ViewDefinition"
+                },
+                "error": {
+                  "description": "With `failed`: why.",
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "passMs": {
+                  "type": "number"
+                },
+                "passes": {
+                  "type": "integer"
+                },
+                "reason": {
+                  "description": "With `suspended`: why.",
+                  "type": "string"
+                },
+                "recomputeMs": {
+                  "description": "Time spent in its recompute nodes.",
+                  "type": "number"
+                },
+                "rows": {
+                  "description": "Its rows, multiplicities counted.",
+                  "type": "integer"
+                },
+                "skipped": {
+                  "description": "Passes its footprint skipped.",
+                  "type": "integer"
+                },
+                "state": {
+                  "enum": [
+                    "building",
+                    "current",
+                    "behind",
+                    "suspended",
+                    "failed"
+                  ],
+                  "type": "string"
+                },
+                "stateBytes": {
+                  "type": "integer"
+                },
+                "task": {
+                  "description": "On a PUT: the task of the first evaluation.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "state"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset",
+          "views"
+        ],
+        "type": "object"
+      },
+      "ViewTask": {
+        "description": "A view's rebuild and the task that runs it.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "properties": {
+          "dataset": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "dataset",
+          "name",
+          "task"
+        ],
+        "type": "object"
+      },
       "Whoami": {
         "properties": {
           "authEnabled": {
@@ -35122,6 +35386,299 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/views/{ds}": {
+      "get": {
+        "description": "The dataset's incremental views with their state: `building`, `current`, `behind` with the commits it lags, `suspended` with a reason, or `failed`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "operationId": "listViews",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ViewList"
+                }
+              }
+            },
+            "description": "The views without their plans."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "List views",
+        "tags": [
+          "Views"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/views/{ds}/{name}": {
+      "delete": {
+        "description": "Removes the view and its state. Needs `admin` on the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "operationId": "deleteView",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Delete a view",
+        "tags": [
+          "Views"
+        ],
+        "x-sparkles-permission": "admin"
+      },
+      "get": {
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "operationId": "getView",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/View"
+                }
+              }
+            },
+            "description": "The view with its state and its plan, each operator marked `incremental` or `recompute`."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Get a view",
+        "tags": [
+          "Views"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "put": {
+        "description": "Compiles the query, keeps the definition and starts the first evaluation as a task in `/$/tasks`. Needs `admin` on the dataset. A query outside the incremental fragment is refused with `400 not-incremental`, and Phase 2 options with `400 unsupported-option`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "operationId": "putView",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ViewDefinition"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/View"
+                }
+              }
+            },
+            "description": "Replaced."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/View"
+                }
+              }
+            },
+            "description": "Created."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Define a view",
+        "tags": [
+          "Views"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
+    "/$/views/{ds}/{name}/rebuild": {
+      "post": {
+        "description": "Evaluates the view again from scratch as a task, and lifts a suspension. Needs `admin` on the dataset.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+        },
+        "operationId": "rebuildView",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ViewTask"
+                }
+              }
+            },
+            "description": "The rebuild's task."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Rebuild a view",
+        "tags": [
+          "Views"
+        ],
+        "x-sparkles-permission": "admin"
+      }
+    },
     "/$/whoami": {
       "get": {
         "description": "Answers `401` only for invalid credentials.",
@@ -38342,6 +38899,89 @@
         "summary": "History query",
         "tags": [
           "History"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/{ds}/live": {
+      "get": {
+        "description": "A SELECT, ASK or CONSTRUCT query that a view could be, as server-sent events: `snapshot` pages of the result, then a `diff` after each commit that changes it, `reset` when the server evaluated the query again, and `error` when the stream ends. Each event's id is a commit.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#live-queries"
+        },
+        "operationId": "liveQuery",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The query.",
+            "in": "query",
+            "name": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Resume after this commit (`commit:N`): the first event is the change since it, or a `reset`.",
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Merge the diffs of commits that arrive within this many milliseconds.",
+            "in": "query",
+            "name": "coalesceMs",
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Resume after this commit.",
+            "in": "header",
+            "name": "Last-Event-ID",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The events."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Live query",
+        "tags": [
+          "Views"
         ],
         "x-sparkles-permission": "read"
       }
@@ -42198,6 +42838,13 @@
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#stored-queries"
       },
       "name": "Stored queries"
+    },
+    {
+      "description": "Incremental views kept current after every commit, and live queries.",
+      "externalDocs": {
+        "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#incremental-views"
+      },
+      "name": "Views"
     },
     {
       "description": "PageRank, communities, similarity and embeddings on projections of a dataset.",
