@@ -23,6 +23,7 @@
     VALUES_CAP,
     valuesQuery,
     type Category,
+    type Points,
     type Projection,
     type Pt,
   } from '$lib/embedding';
@@ -30,7 +31,7 @@
   import { fmtInt, fmtMs } from '$lib/format';
   import { OTHER } from '$lib/lens';
   import { displayIri } from '$lib/rdf';
-  import { selection } from '$lib/selection.svelte';
+  import { selection, SELECTION_CAP } from '$lib/selection.svelte';
   import { LatestRun } from '$lib/supersede';
   import { fmtScore, resolvePredicate, vectorSearch } from '$lib/vectors';
   import EmbeddingMap from '$components/EmbeddingMap.svelte';
@@ -54,7 +55,7 @@
 
   // --- the dataset's indexes -----------------------------------------------------------
   let vstatus = $state<api.VectorStatus | null>(null);
-  let statusError = $state<string | null>(null);
+  let statusError = $state<{ title: string; hint?: string; forbidden?: boolean } | null>(null);
   const statusRuns = new LatestRun();
   let indexName = $state(params.get('index') ?? '');
   let method = $state<Method>(params.get('method') === 'neighbours' ? 'neighbours' : 'pca');
@@ -76,7 +77,7 @@
       vstatus = none
         ? { budgetBytes: 0, usedBytes: 0, generation: '', indexes: [], predicates: [] }
         : null;
-      statusError = none ? null : api.errorMessage(e);
+      statusError = none ? null : failure(e);
     }
   }
 
@@ -99,7 +100,8 @@
   const chosen = $derived(indexes.find((i) => i.name === indexName));
 
   // --- the projection ------------------------------------------------------------------
-  let proj = $state<Projection | null>(null);
+  // raw: the columns are large and replaced whole, so they need no deep proxies
+  let proj = $state.raw<Projection | null>(null);
   /** The whole projection's bounds, which frame the camera across region answers. */
   let bounds = $state<[number, number, number, number] | null>(null);
   let loading = $state(false);
@@ -328,10 +330,15 @@
 
   type Shape = { kind: 'lasso'; poly: Pt[] } | { kind: 'box'; a: Pt; b: Pt };
 
-  function applySelection(keys: string[], how: 'set' | 'add' | 'remove') {
-    if (how === 'add') selection.add(keys, SOURCE);
-    else if (how === 'remove') selection.remove(keys);
-    else selection.set(keys, SOURCE, { keepEmpty: true });
+  /**
+   * Change the shared selection. A selection above its cap keeps the entities nearest the
+   * centre of what was drawn, so the selection keeps its core.
+   */
+  function applySelection(keys: string[], how: 'set' | 'add' | 'remove', from: Points) {
+    const list = keys.length > SELECTION_CAP ? byDistance(keys, from).ordered : keys;
+    if (how === 'add') selection.add(list, SOURCE);
+    else if (how === 'remove') selection.remove(list);
+    else selection.set(list, SOURCE, { keepEmpty: true });
   }
 
   /**
@@ -344,6 +351,7 @@
     applySelection(
       found.map((i) => keyOf(p.points.entities[i])),
       how,
+      p.points,
     );
     if (!p.head.region.sampled || !ds || !indexName) return;
     const pts = shape.kind === 'lasso' ? shape.poly : [shape.a, shape.b];
@@ -360,8 +368,7 @@
           ? lassoed(full.points, shape.poly)
           : boxed(full.points, shape.a, shape.b);
       const keys = inside.map((i) => keyOf(full.points.entities[i]));
-      if (how === 'set') selection.set(keys, SOURCE, { keepEmpty: true });
-      else applySelection(keys, how);
+      applySelection(keys, how, full.points);
       if (full.head.region.sampled)
         toasts.push(
           'info',
@@ -546,7 +553,10 @@
   {#if !ds}
     <div class="empty">Pick a dataset.</div>
   {:else if statusError}
-    <div class="error-box">{statusError}</div>
+    <div class="error-box" data-state={statusError.forbidden ? 'forbidden' : 'error'}>
+      <strong>{statusError.title}</strong>
+      {#if statusError.hint}<p>{statusError.hint}</p>{/if}
+    </div>
   {:else if vstatus && !indexes.length}
     <div class="empty" data-state="no-index">
       This dataset has no vector index to map. <a href={datasetHref}

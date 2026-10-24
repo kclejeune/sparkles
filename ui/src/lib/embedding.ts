@@ -200,11 +200,14 @@ export function byDistance(
   }
   cx /= placed.length;
   cy /= placed.length;
-  const d = (k: string) => {
+  const dist = new Map<string, number>();
+  for (const k of placed) {
     const i = at.get(k)!;
-    return (points.x[i] - cx) ** 2 + (points.y[i] - cy) ** 2;
-  };
-  const ordered = [...placed].sort((a, b) => d(a) - d(b) || (a < b ? -1 : a > b ? 1 : 0));
+    dist.set(k, (points.x[i] - cx) ** 2 + (points.y[i] - cy) ** 2);
+  }
+  const ordered = [...placed].sort(
+    (a, b) => dist.get(a)! - dist.get(b)! || (a < b ? -1 : a > b ? 1 : 0),
+  );
   return { ordered: [...ordered, ...selected.filter((k) => !at.has(k))], centre: { x: cx, y: cy } };
 }
 

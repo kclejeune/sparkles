@@ -208,7 +208,24 @@ test('A caller limited to some graphs is told the map needs the whole dataset', 
   );
 });
 
-test('The dataset page and the Similar page link to the map', async ({ page }) => {
+test('Explore, the Similar page and the dataset page link to the map', async ({ page }) => {
+  await page.goto(
+    `/ui/explore?ds=foaf&iri=${encodeURIComponent('http://example.org/resource/Frances_Allen')}`,
+  );
+  await expect(page.getByText(/\d+ nodes, \d+ edges/)).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Embedding map' })).toHaveAttribute(
+    'href',
+    /\/ui\/embedding\?ds=foaf&index=embedding/,
+  );
+  // scratch has no vector index
+  await page.goto('/ui/explore?ds=scratch');
+  await expect(page.getByRole('link', { name: 'Embedding map' })).toHaveCount(0);
+  await page.goto('/ui/datasets/foaf');
+  await expect(
+    page
+      .getByRole('article', { name: 'Vector index embedding' })
+      .getByRole('link', { name: 'Embedding map' }),
+  ).toHaveAttribute('href', /\/ui\/embedding\?ds=foaf&index=embedding/);
   await page.goto('/ui/similar?ds=foaf&index=embedding');
   await page.getByRole('link', { name: 'Embedding map' }).click();
   await expect(page).toHaveURL(/\/ui\/embedding\?ds=foaf&index=embedding/);

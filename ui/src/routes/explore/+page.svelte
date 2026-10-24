@@ -1883,6 +1883,25 @@
     });
   });
 
+  // the first vector index of the dataset, for the link to its embedding map; a caller
+  // whose access covers part of the dataset gets 403 here and sees no link
+  let mapIndex = $state<string | null>(null);
+  $effect(() => {
+    const name = ds;
+    mapIndex = null;
+    if (!name) return;
+    let live = true;
+    api
+      .vectorStatus(name)
+      .then((s) => {
+        if (live && name === ds) mapIndex = s.indexes[0]?.name ?? null;
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  });
+
   // `?selection=1` (Open as graph on another page, such as the embedding map) draws the
   // shared selection once the dataset is open
   let selectionOpened = false;
@@ -2144,6 +2163,15 @@
                   onclick={() => setCanvasMode('map')}><Icon name="map" size={13} /> Map</button
                 >
               </div>
+              {#if mapIndex && ds}
+                <a
+                  class="btn sm"
+                  title="The entities of the vector index {mapIndex} projected to two dimensions"
+                  href="{resolve('/embedding')}?ds={encodeURIComponent(
+                    ds,
+                  )}&index={encodeURIComponent(mapIndex)}">Embedding map</a
+                >
+              {/if}
               {#if canvasMode === 'graph'}
                 <LensMenu
                   {lenses}

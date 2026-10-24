@@ -20,7 +20,8 @@ const NONE = 0xffffffff;
 const IN_REQUEST = 2000;
 
 const WORLD = 'http://example.org/world/';
-export const WORLD_SHIPMENTS = 6000;
+/** `MOCK_SHIPMENTS` changes the count, for measuring the map at its 50,000-point cap. */
+export const WORLD_SHIPMENTS = Number(process.env.MOCK_SHIPMENTS ?? 6000);
 const CARGO = [
   'Electronics',
   'Textiles',

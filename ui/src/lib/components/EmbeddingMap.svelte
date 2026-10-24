@@ -111,14 +111,17 @@
     graph.clear();
     const n = points.x.length;
     const size = n > 20000 ? 1.5 : n > 2000 ? 2.5 : 4;
-    for (let i = 0; i < n; i++)
+    for (let i = 0; i < n; i++) {
+      const color = colourOf(i);
       graph.addNode(String(i), {
         x: points.x[i],
         y: points.y[i],
         size,
-        color: colourOf(i),
+        color,
+        faded: fade(color),
         label: '',
       });
+    }
   }
 
   /** viewport = a × graph + b, for the density shading, the lasso and the tests */
@@ -145,34 +148,41 @@
     const t = transform();
     if (t) wrap.dataset.transform = [t.ax, t.bx, t.ay, t.by].map((v) => v.toFixed(4)).join(',');
     if (!density || !densityBox || !t) return;
+    const img = shading();
+    if (!img) return;
+    // the grid drawn in one call, mapped from the points' coordinates to the viewport
+    const [x0, y0, x1, y1] = densityBox;
+    ctx.setTransform(dpr * t.ax, 0, 0, dpr * t.ay, dpr * t.bx, dpr * t.by);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(img, x0, y0, x1 - x0, y1 - y0);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  /** The density grid as an image of one pixel per cell, made again when the grid changes. */
+  let shaded: { of: Uint32Array; colour: string; img: HTMLCanvasElement } | null = null;
+  function shading(): HTMLCanvasElement | null {
+    if (!density) return null;
+    if (shaded && shaded.of === density && shaded.colour === spark) return shaded.img;
     const size = Math.round(Math.sqrt(density.length));
     let max = 0;
     for (const c of density) max = Math.max(max, c);
-    if (!max) return;
-    const [x0, y0, x1, y1] = densityBox;
-    const cw = (x1 - x0) / size;
-    const ch = (y1 - y0) / size;
-    ctx.fillStyle = spark;
+    if (!max || !size) return null;
+    const img = document.createElement('canvas');
+    img.width = size;
+    img.height = size;
+    const g = img.getContext('2d');
+    if (!g) return null;
+    g.fillStyle = spark;
     const lmax = Math.log1p(max);
     for (let r = 0; r < size; r++)
       for (let c = 0; c < size; c++) {
         const n = density[r * size + c];
         if (!n) continue;
-        const gx = x0 + c * cw;
-        const gy = y0 + r * ch;
-        const vx0 = t.ax * gx + t.bx;
-        const vy0 = t.ay * gy + t.by;
-        const vx1 = t.ax * (gx + cw) + t.bx;
-        const vy1 = t.ay * (gy + ch) + t.by;
-        ctx.globalAlpha = 0.05 + 0.35 * (Math.log1p(n) / lmax);
-        ctx.fillRect(
-          Math.min(vx0, vx1),
-          Math.min(vy0, vy1),
-          Math.abs(vx1 - vx0) + 0.5,
-          Math.abs(vy1 - vy0) + 0.5,
-        );
+        g.globalAlpha = 0.05 + 0.35 * (Math.log1p(n) / lmax);
+        g.fillRect(c, r, 1, 1);
       }
-    ctx.globalAlpha = 1;
+    shaded = { of: density, colour: spark, img };
+    return img;
   }
 
   function drawOver() {
@@ -249,7 +259,7 @@
           const sel = selected;
           if (sel && !sel.has(Number(key))) {
             // the point's own colour, faded, so the map keeps its shape around a selection
-            res.color = fade(data.color as string);
+            res.color = data.faded as string;
             res.zIndex = 0;
           } else if (sel) res.zIndex = 1;
           return res;
@@ -325,7 +335,10 @@
     void colourIndex;
     untrack(() => {
       if (!graph || !renderer) return;
-      graph.forEachNode((k) => graph!.setNodeAttribute(k, 'color', colourOf(Number(k))));
+      graph.forEachNode((k) => {
+        const color = colourOf(Number(k));
+        graph!.mergeNodeAttributes(k, { color, faded: fade(color) });
+      });
       renderer.refresh({ skipIndexation: true });
     });
   });

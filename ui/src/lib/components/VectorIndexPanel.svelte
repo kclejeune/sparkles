@@ -625,7 +625,7 @@
               <a class="btn sm" href={searchHref(ix.name)}
                 ><Icon name="search" size={13} /> Search</a
               >
-              <a class="btn sm" href={mapHref(ix.name)}>Map</a>
+              <a class="btn sm" href={mapHref(ix.name)}>Embedding map</a>
               <span class="spacer"></span>
               {#if canAdmin}
                 <button
