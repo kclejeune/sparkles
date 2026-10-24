@@ -626,15 +626,29 @@ impl Gen<'_> {
                 // size of the product is checked
                 let mut values: Vec<Vec<Cell<'_>>> = Vec::new();
                 let mut product = 1usize;
+                let mut scratch = Vec::new();
                 for p in parts {
                     if let CPart::Ref(i) = p {
+                        if product > MAX_ROW_VALUES {
+                            // past the bound only a NULL matters: nothing is kept
+                            scratch.clear();
+                            row.get(*i, &mut scratch)?;
+                            if scratch.is_empty() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         let mut cells = Vec::new();
                         row.get(*i, &mut cells)?;
                         if cells.is_empty() {
                             return Ok(());
                         }
                         product = product.saturating_mul(cells.len());
-                        values.push(cells);
+                        if product > MAX_ROW_VALUES {
+                            values = Vec::new();
+                        } else {
+                            values.push(cells);
+                        }
                     }
                 }
                 if product > MAX_ROW_VALUES {

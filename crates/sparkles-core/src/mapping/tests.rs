@@ -738,6 +738,19 @@ fn a_template_product_past_the_cap_fails() {
             .unwrap()
             .is_empty()
     );
+    // many references past the bound keep no values while the rest are checked
+    let wide = format!(
+        r#"{RML}<http://ex.org/m> a rml:TriplesMap ;
+          rml:logicalSource [ rml:source "a.json" ; rml:referenceFormulation rml:JSONPath ; rml:iterator "$" ] ;
+          rml:subjectMap [ rml:template "http://ex.org/{}" ] ;
+          rml:predicateObjectMap [ rml:predicate ex:p ; rml:objectMap [ rml:constant "x" ] ] ."#,
+        "{a[*]}".repeat(1000)
+    );
+    let many = format!("{{\"a\":[{}]}}", arr(10_000));
+    let e = run_text(MappingKind::Rml, &wide, &[("a.json", &many)])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("more than 100000 values"), "{e}");
     let ok = format!("{{\"a\":[{}],\"b\":[{}]}}", arr(300), arr(300));
     assert_eq!(
         run_text(MappingKind::Rml, &m, &[("a.json", &ok)])
