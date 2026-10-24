@@ -129,6 +129,14 @@ pub(super) async fn admit_run(State(st): St, req: Request, next: Next) -> Respon
     {
         return denied;
     }
+    // a run that reads may read a branch; one that writes keeps to main, where its run
+    // record and its named projections live
+    if request.write.is_some()
+        && super::branches::current().is_some_and(|b| b != sparkles::branch::MAIN)
+    {
+        return bad("a run that writes its results runs on main; leave out the branch")
+            .into_response();
+    }
     if request.write.is_some() && st.read_only {
         return err(StatusCode::FORBIDDEN, "server is read-only").into_response();
     }

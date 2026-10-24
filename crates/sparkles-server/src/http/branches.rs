@@ -390,7 +390,9 @@ pub(crate) async fn select(
         if PICK_ROUTES.contains(&seg) {
             return next.run(req).await;
         }
-        if branch != MAIN && !clone && !ADMIN_BRANCH_ROUTES.contains(&seg) {
+        // an algorithm run reads a branch; its handler refuses a write-back run there
+        let algo_run = seg == "algo" && path.ends_with("/run");
+        if branch != MAIN && !clone && !algo_run && !ADMIN_BRANCH_ROUTES.contains(&seg) {
             return bad_branch(format!("{path} does not take a branch"));
         }
         if seg == "branches" || seg == "merge" {

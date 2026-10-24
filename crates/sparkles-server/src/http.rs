@@ -4962,10 +4962,10 @@ pub(crate) fn algo_view_metrics(out: &mut String) {
     algo::view::metrics(out);
 }
 
-fn task_visible(p: &Principal, t: &crate::state::Task) -> bool {
+fn task_visible(st: &AppState, p: &Principal, t: &crate::state::Task) -> bool {
     // a background view-only run is followed by the callers that started or joined it,
     // whose view may be restricted
-    if t.kind == algo::view::TASK && algo::view::follows(&t.id, p) {
+    if t.kind == algo::view::TASK && algo::view::follows(st, &t.id, p) {
         return true;
     }
     if t.dataset.is_empty() {
@@ -5041,7 +5041,7 @@ async fn list_tasks(State(st): St, Extension(p): Extension<Principal>) -> Json<J
         .tasks
         .lock()
         .iter()
-        .filter(|t| task_visible(&p, t))
+        .filter(|t| task_visible(&st, &p, t))
         .map(|t| task_for(&p, t))
         .collect();
     Json(serde_json::to_value(tasks).unwrap())
@@ -5055,7 +5055,7 @@ async fn get_task(
     st.tasks
         .lock()
         .iter()
-        .find(|t| t.id == id && task_visible(&p, t))
+        .find(|t| t.id == id && task_visible(&st, &p, t))
         .map(|t| Json(serde_json::to_value(task_for(&p, t)).unwrap()))
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such task"))
 }
@@ -5073,7 +5073,7 @@ async fn cancel_task(
         .tasks
         .lock()
         .iter()
-        .find(|t| t.id == id && task_visible(&p, t))
+        .find(|t| t.id == id && task_visible(&st, &p, t))
         .cloned()
     else {
         return Err(err(StatusCode::NOT_FOUND, "no such task"));
@@ -5083,7 +5083,7 @@ async fn cancel_task(
     } else {
         p.can(&t.dataset, Level::Admin)
             // the caller that started a background view-only run may cancel it
-            || (t.kind == algo::view::TASK && algo::view::started(&t.id, &p))
+            || (t.kind == algo::view::TASK && algo::view::started(&st, &t.id, &p))
     };
     if !allowed {
         let msg = if t.dataset.is_empty() {

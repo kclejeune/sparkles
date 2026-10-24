@@ -497,7 +497,13 @@ fn who(p: &Principal) -> String {
     format!("{:?}\u{1f}{}", p.kind, p.name)
 }
 
-fn add_caller(id: &str, p: &Principal) {
+/// A task's key among every server's: task ids count per server.
+fn task_key(st: &AppState, id: &str) -> String {
+    format!("{:p}/{id}", st)
+}
+
+fn add_caller(st: &AppState, id: &str, p: &Principal) {
+    let id = &task_key(st, id);
     let me = who(p);
     let mut c = CALLERS.lock();
     if let Some((_, v)) = c.iter_mut().find(|(t, _)| t == id) {
@@ -513,21 +519,23 @@ fn add_caller(id: &str, p: &Principal) {
 }
 
 /// Whether `p` started or joined the background run of task `id`.
-pub(crate) fn follows(id: &str, p: &Principal) -> bool {
+pub(crate) fn follows(st: &AppState, id: &str, p: &Principal) -> bool {
+    let id = task_key(st, id);
     let me = who(p);
     CALLERS
         .lock()
         .iter()
-        .any(|(t, v)| t == id && v.contains(&me))
+        .any(|(t, v)| *t == id && v.contains(&me))
 }
 
 /// Whether `p` started the background run of task `id`.
-pub(crate) fn started(id: &str, p: &Principal) -> bool {
+pub(crate) fn started(st: &AppState, id: &str, p: &Principal) -> bool {
+    let id = task_key(st, id);
     let me = who(p);
     CALLERS
         .lock()
         .iter()
-        .any(|(t, v)| t == id && v.first() == Some(&me))
+        .any(|(t, v)| *t == id && v.first() == Some(&me))
 }
 
 /// Datasets whose background runs wait before they compute, so that tests can join and
@@ -655,7 +663,7 @@ async fn background(
             && let Some(task) = st.tasks.lock().iter().find(|t| t.id == *id).cloned()
         {
             JOINS.fetch_add(1, Ordering::Relaxed);
-            add_caller(id, &p);
+            add_caller(&st, id, &p);
             return Ok(task_answer(&task, true));
         }
         // a result kept between the check above and taking the lock
@@ -674,7 +682,7 @@ async fn background(
         });
         let id = st.next_task_id();
         running.push((key.clone(), id.clone()));
-        add_caller(&id, &p);
+        add_caller(&st, &id, &p);
         let state = st.clone();
         let d = ds.clone();
         let task = st.start_task_opts(id, TASK, &ds.name, None, true, move |h| {

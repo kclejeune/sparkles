@@ -5951,7 +5951,10 @@ the whole result, the rows returned, and `truncated` when the server's row limit
 answer.
 
 The run reads under the caller's view at the state that the request's `at` parameter and
-dataset name select, with the query timeout and memory budget. The cache key is the
+`branch` parameter select, with the query timeout and memory budget. Any run without
+`write` may read a branch, while a run with `write` answers `400` on a branch, since its
+run record and the named projections belong to main. A branch has its own named
+projections, which are empty unless they were created there. The cache key is the
 dataset's branch, the commit, the caller's read view with its triple protections, the
 `default-graph-uri` and `named-graph-uri` parameters, the dataset's inferred overlay and
 RDFS on read, and the request without `nodes`, `keep`, `async` and `top`, with the

@@ -5,12 +5,16 @@ use super::*;
 use crate::http::algo::view;
 use serde_json::json;
 
+/// The run route of `ds`, which may carry a query string such as `g?branch=dev`.
+fn run_path(ds: &str) -> String {
+    match ds.split_once('?') {
+        Some((d, q)) => format!("/$/algo/{d}/run?{q}"),
+        None => format!("/$/algo/{ds}/run"),
+    }
+}
+
 async fn run(s: &Server, ds: &str, body: &J) -> (StatusCode, J) {
-    let r = send(
-        &s.app,
-        json_req("POST", &format!("/$/algo/{ds}/run"), &body.to_string()),
-    )
-    .await;
+    let r = send(&s.app, json_req("POST", &run_path(ds), &body.to_string())).await;
     (r.status, r.json())
 }
 
@@ -217,4 +221,52 @@ async fn background_runs_are_joined_cancelled_and_kept() {
     assert_eq!(st, StatusCode::OK, "{j}");
     assert_eq!(j["run"]["cached"], true);
     assert_eq!(j["results"]["bindings"][0]["communitySize"]["value"], "2");
+}
+
+#[tokio::test]
+async fn a_branch_has_its_own_kept_results_and_refuses_write_back() {
+    let s = algo_server();
+    let r = send(
+        &s.app,
+        json_req("POST", "/$/branches/g", r#"{"name": "dev"}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = send(
+        &s.app,
+        Request::post("/g@dev/update")
+            .header(header::CONTENT_TYPE, "application/sparql-update")
+            .body(Body::from(
+                "INSERT DATA { <http://ex/d> <http://ex/p> <http://ex/a> }",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "nodes": ["http://ex/d"],
+        "keep": true,
+    });
+    let (st, main) = run(&s, "g", &body).await;
+    assert_eq!(st, StatusCode::OK, "{main}");
+    assert_eq!(
+        main["results"]["bindings"][0]["communitySize"]["value"],
+        "2"
+    );
+    let (st, dev) = run(&s, "g?branch=dev", &body).await;
+    assert_eq!(st, StatusCode::OK, "{dev}");
+    assert_eq!(dev["run"]["cached"], false, "{dev}");
+    assert_eq!(dev["results"]["bindings"][0]["communitySize"]["value"], "5");
+    let (_, dev) = run(&s, "g?branch=dev", &body).await;
+    assert_eq!(dev["run"]["cached"], true);
+    let (st, j) = run(
+        &s,
+        "g?branch=dev",
+        &json!({"algorithm": "pageRank", "projection": {"predicates": ["http://ex/p"]},
+                "write": {"graph": "http://ex/out", "predicates": {"score": "http://ex/rank"}}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{j}");
 }
