@@ -10,27 +10,22 @@
 //!   `surface,left id,right id,cost,` and nine features (four parts of speech, two
 //!   inflection fields, the base form and two readings), `matrix.def` with the cost of
 //!   each pair of adjacent ids, and `char.def` and `unk.def` for the words the lexicon
-//!   lacks. As in Kuromoji's search mode, a word of more than two Han characters, or of
-//!   more than seven other characters, costs more for each character over that, so
-//!   compounds split into their parts. Particles, auxiliary verbs, conjunctions and
-//!   symbols are dropped by their part of speech, inflected words are replaced by their
-//!   base form, and a long Katakana word loses a final `ー`, as Kuromoji's analyzer does.
+//!   lacks. Its text is segmented as Kuromoji's `JapaneseAnalyzer` segments and filters
+//!   it, in search mode ([`morph`]).
 //! * `ko-dict` reads a MeCab dictionary laid out as mecab-ko-dic, whose features are the
 //!   part of speech, a semantic class, the final consonant, the reading, the type, the
-//!   first and last parts of speech and the expression. Endings, particles, symbols and
-//!   the other parts of speech that Nori's analyzer drops by default are dropped, and a
-//!   compound or an inflected word is replaced by its parts, as Nori does by default.
-//!   The Hangul words of a sentence are segmented together across the spaces between
-//!   them, and an ending, particle, copula or suffix costs more after a space, as in
-//!   Nori.
+//!   first and last parts of speech and the expression. Its text is segmented as Nori's
+//!   `KoreanAnalyzer` segments and filters it ([`morph`]).
 //! * `zh-dict` reads a word list with frequencies, one `word frequency [tag]` per line,
 //!   as jieba's `dict.txt` is laid out. A word costs the negative logarithm of its share
-//!   of all occurrences, and a character the list lacks costs as a word seen once.
+//!   of all occurrences, and a character the list lacks costs as a word seen once. Only
+//!   runs of adjacent Han, Hiragana, Katakana and Hangul words, as Lucene's tokenizer
+//!   finds them ([`super::standard`]), are segmented, after their widths are folded as
+//!   Lucene's CJK width filter folds them. Other words pass through whole.
 //!
-//! Only runs of adjacent Han, Hiragana, Katakana and Hangul words, as Lucene's tokenizer
-//! finds them ([`super::standard`]), are segmented, with Korean runs joined across
-//! whitespace. Other words pass through whole.
-//! Widths are folded first, as Lucene's CJK width filter folds them.
+//! MeCab sources are read as Lucene's dictionary builders read them, in EUC-JP for
+//! IPADIC and UTF-8 for mecab-ko-dic. The seven JIS X 0208 characters that the WHATWG
+//! decoder maps as Windows does are mapped back to the characters Java's decoder gives.
 //!
 //! A dictionary is compiled from its source files into one file, `<name>.sdict`, whose
 //! format starts with a magic number and a version. A reader refuses a version it does
@@ -46,11 +41,21 @@ use std::sync::{Arc, Mutex, RwLock};
 use tantivy::tokenizer::{Token, Tokenizer};
 use tantivy_fst::raw::Fst;
 
+#[rustfmt::skip]
+mod java_tables;
+mod morph;
+
 /// The version of the compiled dictionary format.
 pub const FORMAT_VERSION: u32 = 1;
 const MAGIC: &[u8; 8] = b"SPKSDICT";
 /// A string id that stands for no string.
 const NONE: u32 = u32::MAX;
+/// The kinds of a mecab-ko-dic word: a plain one, a compound, an inflected word and a
+/// preanalyzed one.
+const KIND_MORPHEME: u8 = 0;
+const KIND_COMPOUND: u8 = 1;
+const KIND_INFLECT: u8 = 2;
+const KIND_PREANALYSIS: u8 = 3;
 /// MeCab's longest group of unknown characters.
 const MAX_GROUP: usize = 24;
 
@@ -96,13 +101,17 @@ struct Entry {
     left: u16,
     right: u16,
     cost: i16,
-    /// the part of speech as one string (string id)
+    /// the part of speech as one string (string id): IPADIC's four levels joined by
+    /// `-`, or the first part of speech of a mecab-ko-dic word, as Nori reads them
     pos: u32,
-    /// the base form of an inflected Japanese word, or the morphemes of an inflected or
-    /// preanalyzed Korean word (`surface/POS/*` joined by `+`), or NONE
+    /// the base form of an inflected Japanese word, or the Hangul reading of a Korean
+    /// word written otherwise, or NONE
     base: u32,
-    /// a Korean compound's parts, `surface/POS/*` joined by `+`, or NONE
+    /// the parts of a Korean compound or the morphemes of an inflected or preanalyzed
+    /// word, `form/POS/*` joined by `+`, or NONE
     parts: u32,
+    /// the kind of a Korean word (`KIND_*`)
+    kind: u8,
 }
 
 /// A character category of `char.def`.
@@ -191,13 +200,33 @@ fn read_text(path: &Path) -> Result<String> {
                     path.display()
                 )));
             }
-            Ok(s.into_owned())
+            // the decoder follows the WHATWG table, which maps seven JIS X 0208
+            // characters as Windows does; Java, whose decoder built Lucene's
+            // dictionaries, keeps the JIS ones
+            Ok(s.chars()
+                .map(|c| match c {
+                    '\u{2015}' => '\u{2014}',
+                    '\u{FF5E}' => '\u{301C}',
+                    '\u{2225}' => '\u{2016}',
+                    '\u{FF0D}' => '\u{2212}',
+                    '\u{FFE0}' => '\u{00A2}',
+                    '\u{FFE1}' => '\u{00A3}',
+                    '\u{FFE2}' => '\u{00AC}',
+                    c => c,
+                })
+                .collect())
         }
     }
 }
 
 /// An entry of a lexicon or `unk.def` line from its fields after the surface.
-fn entry_of(f: &[String], layout: Layout, strings: &mut Interner, at: &str) -> Result<Entry> {
+fn entry_of(
+    surface: &str,
+    f: &[String],
+    layout: Layout,
+    strings: &mut Interner,
+    at: &str,
+) -> Result<Entry> {
     let num = |i: usize| -> Result<i64> {
         f.get(i)
             .and_then(|v| v.trim().parse::<i64>().ok())
@@ -209,6 +238,7 @@ fn entry_of(f: &[String], layout: Layout, strings: &mut Interner, at: &str) -> R
     }
     let cost = cost.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
     let feat = |i: usize| f.get(3 + i).map(String::as_str).unwrap_or("*");
+    let mut kind = KIND_MORPHEME;
     let (pos, base, parts) = match layout {
         Layout::Ipadic => {
             let pos: Vec<&str> = (0..4).map(feat).filter(|p| *p != "*").collect();
@@ -220,18 +250,30 @@ fn entry_of(f: &[String], layout: Layout, strings: &mut Interner, at: &str) -> R
             )
         }
         Layout::KoDic => {
-            let expr = |strings: &mut Interner| {
-                if feat(7) == "*" {
-                    NONE
-                } else {
-                    strings.id(feat(7))
-                }
+            // as Nori's dictionary builder reads the features
+            kind = match feat(4).to_ascii_lowercase().as_str() {
+                "compound" => KIND_COMPOUND,
+                "inflect" => KIND_INFLECT,
+                "preanalysis" => KIND_PREANALYSIS,
+                _ => KIND_MORPHEME,
             };
-            match feat(4) {
-                "Compound" => (strings.id(feat(0)), NONE, expr(strings)),
-                "Inflect" | "Preanalysis" => (strings.id(feat(0)), expr(strings), NONE),
-                _ => (strings.id(feat(0)), NONE, NONE),
-            }
+            let left_pos = if kind == KIND_MORPHEME || kind == KIND_COMPOUND || feat(5) == "*" {
+                feat(0)
+            } else {
+                feat(5)
+            };
+            let reading = feat(3);
+            let base = if kind == KIND_MORPHEME && reading != "*" && reading != surface {
+                strings.id(reading)
+            } else {
+                NONE
+            };
+            let parts = if kind != KIND_MORPHEME && feat(7) != "*" {
+                strings.id(feat(7))
+            } else {
+                NONE
+            };
+            (strings.id(left_pos), base, parts)
         }
         Layout::Frequency => (NONE, NONE, NONE),
     };
@@ -242,6 +284,7 @@ fn entry_of(f: &[String], layout: Layout, strings: &mut Interner, at: &str) -> R
         pos,
         base,
         parts,
+        kind,
     })
 }
 
@@ -273,7 +316,7 @@ fn parse_mecab(dir: &Path, layout: Layout) -> Result<Parts> {
             if f.len() < 4 || f[0].is_empty() {
                 return Err(bad(format!("{at}: expected surface,left,right,cost,…")));
             }
-            let e = entry_of(&f[1..], layout, &mut strings, &at)?;
+            let e = entry_of(&f[0], &f[1..], layout, &mut strings, &at)?;
             words.entry(f[0].clone()).or_default().push(e);
         }
     }
@@ -320,7 +363,7 @@ fn parse_mecab(dir: &Path, layout: Layout) -> Result<Parts> {
         let Some(c) = categories.iter().position(|c| c.name == f[0]) else {
             return Err(bad(format!("{at}: unknown category {:?}", f[0])));
         };
-        unk[c].push(entry_of(&f[1..], layout, &mut strings, &at)?);
+        unk[c].push(entry_of(&f[0], &f[1..], layout, &mut strings, &at)?);
     }
     let check = |e: &Entry| (e.right as usize) < r && (e.left as usize) < l;
     if !words
@@ -465,6 +508,7 @@ fn parse_frequency(file: &Path) -> Result<Parts> {
                     pos: NONE,
                     base: NONE,
                     parts: NONE,
+                    kind: KIND_MORPHEME,
                 }],
             )
         })
@@ -483,6 +527,7 @@ fn parse_frequency(file: &Path) -> Result<Parts> {
         pos: NONE,
         base: NONE,
         parts: NONE,
+        kind: KIND_MORPHEME,
     }]];
     Ok(assemble(
         Interner::new(),
@@ -523,6 +568,7 @@ fn encode(p: &Parts, layout: Layout) -> Result<Vec<u8>> {
         out.extend_from_slice(&e.pos.to_le_bytes());
         out.extend_from_slice(&e.base.to_le_bytes());
         out.extend_from_slice(&e.parts.to_le_bytes());
+        out.push(e.kind);
     };
     u32s(&mut out, p.entries.len() as u32);
     for e in &p.entries {
@@ -632,6 +678,10 @@ pub struct Dictionary {
     /// the ranges above it, last match wins
     astral: Vec<(u32, u32, u32, u8)>,
     unknown: Vec<(u32, u32)>,
+    /// the categories whose characters Kuromoji counts as Han (`KANJI`, `KANJINUMERIC`)
+    kanji: Vec<u8>,
+    /// the `SYMBOL` category
+    symbol: Option<u8>,
     /// the SHA-256 of the compiled file, hex
     pub sha256: String,
 }
@@ -661,7 +711,7 @@ impl Dictionary {
         for _ in 0..n {
             strings.push(r.string()?);
         }
-        let n = r.count(18)?;
+        let n = r.count(19)?;
         let mut entries = Vec::with_capacity(n);
         for _ in 0..n {
             entries.push(Entry {
@@ -671,6 +721,7 @@ impl Dictionary {
                 pos: r.u32()?,
                 base: r.u32()?,
                 parts: r.u32()?,
+                kind: r.u8()?,
             });
         }
         let n = r.count(8)?;
@@ -726,7 +777,8 @@ impl Dictionary {
         }
         // every id the segmenter follows must be in range
         let ok = entries.iter().all(|e| {
-            (e.right as usize) < size_r
+            e.kind <= KIND_PREANALYSIS
+                && (e.right as usize) < size_r
                 && (e.left as usize) < size_l
                 && [e.pos, e.base, e.parts]
                     .iter()
@@ -738,7 +790,19 @@ impl Dictionary {
         if !ok {
             return Err(bad("an entry refers past the end of a table"));
         }
+        let kanji = categories
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.name == "KANJI" || c.name == "KANJINUMERIC")
+            .map(|(i, _)| i as u8)
+            .collect();
+        let symbol = categories
+            .iter()
+            .position(|c| c.name == "SYMBOL")
+            .map(|i| i as u8);
         Ok(Dictionary {
+            symbol,
+            kanji,
             layout,
             strings,
             entries,
@@ -776,6 +840,30 @@ impl Dictionary {
             .unwrap_or(self.bmp[0])
     }
 
+    /// The category of `c` as Lucene's dictionary builder keeps it: the first category of
+    /// the last `char.def` line that names it, and above U+FFFF the category of its high
+    /// surrogate, since Lucene reads UTF-16 code units.
+    fn lucene_class(&self, c: char) -> u8 {
+        let u = c as u32;
+        let unit = if u > 0xFFFF {
+            0xD800 + ((u - 0x10000) >> 10)
+        } else {
+            u
+        };
+        // Lucene's builders make the Katakana middle dot a symbol
+        if unit == 0x30FB
+            && let Some(symbol) = self.symbol
+        {
+            return symbol;
+        }
+        self.bmp[unit as usize].1
+    }
+
+    /// A part of speech by its string id.
+    fn tag(&self, id: u32) -> &str {
+        &self.strings[id as usize]
+    }
+
     fn connect(&self, right: u16, left: u16) -> i32 {
         self.costs[right as usize * self.size_l + left as usize] as i32
     }
@@ -801,10 +889,9 @@ impl Dictionary {
         }
     }
 
-    /// Cuts `text`, a run of CJK characters, into words: the byte range and entry of
-    /// each, in order. `spaced[i]`, when given, says that whitespace came before
-    /// character `i` in the source, which makes some words cost more there.
-    fn segment(&self, text: &str, spaced: &[bool]) -> Vec<(usize, usize, u32)> {
+    /// Cuts `text`, a run of CJK characters, into words by a word list's frequencies:
+    /// the byte range and entry of each, in order.
+    fn segment(&self, text: &str) -> Vec<(usize, usize, u32)> {
         let chars: Vec<(usize, char)> = text.char_indices().collect();
         let n = chars.len();
         if n == 0 {
@@ -841,10 +928,6 @@ impl Dictionary {
             self.unknown_words(&chars, i, !cands.is_empty(), &mut cands);
             for (end, e) in cands {
                 let entry = &self.entries[e as usize];
-                let mut penalty = self.penalty(&chars[i..end]);
-                if spaced.get(i) == Some(&true) {
-                    penalty += self.space_penalty(entry);
-                }
                 let mut best: Option<(i64, usize)> = None;
                 for (k, p) in nodes[i].iter().enumerate() {
                     let right = if p.entry == NONE {
@@ -861,7 +944,7 @@ impl Dictionary {
                 nodes[end].push(Node {
                     start: i,
                     entry: e,
-                    total: c + entry.cost as i64 + penalty,
+                    total: c + entry.cost as i64,
                     back: k,
                 });
             }
@@ -888,65 +971,6 @@ impl Dictionary {
         }
         out.reverse();
         out
-    }
-
-    /// Kuromoji's search mode: a long word of Han characters, or a longer one of others,
-    /// costs more, so that compounds split.
-    fn penalty(&self, word: &[(usize, char)]) -> i64 {
-        if self.layout != Layout::Ipadic {
-            return 0;
-        }
-        let len = word.len() as i64;
-        if len > 2 {
-            if word.iter().all(|(_, c)| super::standard::is_han(*c as u32)) {
-                return (len - 2) * 3000;
-            }
-            if len > 7 {
-                return (len - 7) * 1700;
-            }
-        }
-        0
-    }
-
-    /// Nori's cost of a word after whitespace when it can only follow another word:
-    /// an ending, a particle, a copula or a suffix.
-    fn space_penalty(&self, entry: &Entry) -> i64 {
-        if self.layout != Layout::KoDic || entry.pos == NONE {
-            return 0;
-        }
-        let pos = self.strings[entry.pos as usize].as_str();
-        let first = pos.split('+').next().unwrap_or(pos);
-        if first.starts_with('E')
-            || first.starts_with('J')
-            || matches!(first, "VCP" | "XSA" | "XSN" | "XSV")
-        {
-            3000
-        } else {
-            0
-        }
-    }
-
-    /// The words of `text` with its whitespace taken out, so that the lattice runs
-    /// across it as Nori's does: (byte range in `text`, entry).
-    fn segment_spaced(&self, text: &str) -> Vec<(usize, usize, u32)> {
-        let mut compact = String::with_capacity(text.len());
-        // per byte of `compact`, its byte in `text`
-        let mut at: Vec<usize> = Vec::with_capacity(text.len());
-        let mut spaced = Vec::new();
-        let mut space = false;
-        for (i, c) in text.char_indices() {
-            if c.is_whitespace() {
-                space = true;
-                continue;
-            }
-            compact.push(c);
-            at.extend(i..i + c.len_utf8());
-            spaced.push(std::mem::take(&mut space));
-        }
-        self.segment(&compact, &spaced)
-            .into_iter()
-            .map(|(a, b, e)| (at[a], at[b - 1] + 1, e))
-            .collect()
     }
 
     /// The unknown words that start at character `i`, as MeCab makes them from
@@ -991,148 +1015,17 @@ impl Dictionary {
         }
     }
 
-    /// The words of a CJK run as tokens: (byte range, text), after the analyzer's
-    /// part-of-speech filter, base forms and Korean compounds.
+    /// The words of a CJK run: (byte range, text).
     fn words_of(&self, text: &str) -> Vec<(usize, usize, String)> {
-        let mut out = Vec::new();
-        let words = if self.layout == Layout::KoDic {
-            self.segment_spaced(text)
-        } else {
-            self.segment(text, &[])
-        };
-        for (from, to, e) in words {
-            let entry = &self.entries[e as usize];
-            let surface = &text[from..to];
-            let pos = (entry.pos != NONE).then(|| self.strings[entry.pos as usize].as_str());
-            match self.layout {
-                Layout::Ipadic => {
-                    if pos.is_some_and(ja_stop) {
-                        continue;
-                    }
-                    let word = if entry.base != NONE {
-                        self.strings[entry.base as usize].clone()
-                    } else {
-                        surface.to_string()
-                    };
-                    out.push((from, to, katakana_stem(word)));
-                }
-                Layout::KoDic => {
-                    if entry.parts != NONE
-                        && let Some(parts) = compound_parts(&self.strings[entry.parts as usize])
-                        && parts.iter().map(|(s, _)| *s).collect::<String>() == surface
-                    {
-                        let mut at = from;
-                        for (s, p) in parts {
-                            let end = at + s.len();
-                            if !ko_stop(p) {
-                                out.push((at, end, s.to_string()));
-                            }
-                            at = end;
-                        }
-                        continue;
-                    }
-                    // an inflected word: each morpheme over the whole word, as Nori
-                    // gives them
-                    if entry.base != NONE
-                        && let Some(parts) = compound_parts(&self.strings[entry.base as usize])
-                    {
-                        for (s, p) in parts {
-                            if !ko_stop(p) {
-                                out.push((from, to, s.to_string()));
-                            }
-                        }
-                        continue;
-                    }
-                    if pos.is_some_and(ko_stop) {
-                        continue;
-                    }
-                    out.push((from, to, surface.to_string()));
-                }
-                Layout::Frequency => out.push((from, to, surface.to_string())),
-            }
-        }
-        out
+        self.segment(text)
+            .into_iter()
+            .map(|(from, to, _)| (from, to, text[from..to].to_string()))
+            .collect()
     }
 }
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// The parts of speech Kuromoji's analyzer drops by default: conjunctions, particles,
-/// auxiliary verbs, symbols other than letters, interjections of other kinds, fillers
-/// and non-verbal sounds.
-fn ja_stop(pos: &str) -> bool {
-    pos == "接続詞"
-        || pos.starts_with("助詞")
-        || pos == "助動詞"
-        || matches!(
-            pos,
-            "記号"
-                | "記号-一般"
-                | "記号-読点"
-                | "記号-句点"
-                | "記号-空白"
-                | "記号-括弧開"
-                | "記号-括弧閉"
-        )
-        || pos == "その他-間投"
-        || pos == "フィラー"
-        || pos == "非言語音"
-}
-
-/// The parts of speech Nori's analyzer drops by default: endings, interjections,
-/// particles, adverbs and determiners, symbols, affixes and unknown or non-Korean ones.
-/// A tag joined from several (`VV+EC`) is judged by its first.
-fn ko_stop(pos: &str) -> bool {
-    let first = pos.split('+').next().unwrap_or(pos);
-    first.starts_with('E')
-        || first.starts_with('J')
-        || matches!(
-            first,
-            "IC" | "MAG"
-                | "MAJ"
-                | "MM"
-                | "SP"
-                | "SSC"
-                | "SSO"
-                | "SC"
-                | "SE"
-                | "XPN"
-                | "XSA"
-                | "XSN"
-                | "XSV"
-                | "UNA"
-                | "NA"
-                | "VSV"
-        )
-}
-
-/// A Katakana word of four characters or more without a final `ー`, as Kuromoji's
-/// Katakana stem filter makes it.
-fn katakana_stem(word: String) -> String {
-    let n = word.chars().count();
-    if n >= 4
-        && word.ends_with('ー')
-        && word
-            .chars()
-            .all(|c| matches!(c as u32, 0x30A0..=0x30FF | 0x31F0..=0x31FF))
-    {
-        let mut w = word;
-        w.pop();
-        return w;
-    }
-    word
-}
-
-/// A mecab-ko-dic expression `a/NNG/*+b/NNG/*` as (surface, part of speech) pairs.
-fn compound_parts(expr: &str) -> Option<Vec<(&str, &str)>> {
-    expr.split('+')
-        .map(|p| {
-            let mut f = p.split('/');
-            Some((f.next()?, f.next()?))
-        })
-        .collect()
 }
 
 // ------------------------------------------------------------------- installed files
@@ -1220,9 +1113,15 @@ impl Tokenizer for DictTokenizer {
     }
 }
 
-/// The tokens of `text`: its words as Lucene's tokenizer finds them, with each run of
-/// adjacent CJK words segmented by the dictionary.
+/// The tokens of `text`: Kuromoji's or Nori's words, or for a word list the words as
+/// Lucene's tokenizer finds them, with each run of adjacent CJK words segmented by the
+/// list's frequencies.
 fn tokens(dict: &Dictionary, text: &str) -> Vec<Token> {
+    match dict.layout {
+        Layout::Ipadic => return morph::japanese(dict, text),
+        Layout::KoDic => return morph::korean(dict, text),
+        Layout::Frequency => {}
+    }
     use super::standard::{Kind, typed_tokens};
     let mut out: Vec<Token> = Vec::new();
     let push = |out: &mut Vec<Token>, text: String, from: usize, to: usize| {
@@ -1241,28 +1140,13 @@ fn tokens(dict: &Dictionary, text: &str) -> Vec<Token> {
         let Some((from, to)) = run.take() else {
             return;
         };
-        // fold widths, a voiced mark joining the kana before it, and keep the source
-        // range of each folded character
-        let mut chars: Vec<(char, usize, usize)> = Vec::new();
-        for (i, c) in text[from..to].char_indices() {
-            let f = super::cjk::fold(c);
-            let end = from + i + c.len_utf8();
-            if matches!(f as u32, 0x3099 | 0x309A)
-                && let Some(last) = chars.last_mut()
-                && let Some(v) = super::cjk::voiced(last.0, f)
-            {
-                last.0 = v;
-                last.2 = end;
-                continue;
-            }
-            chars.push((f, from + i, end));
-        }
+        // fold widths, keeping the source range of each folded character
         let mut folded = String::new();
         // per byte of `folded`, the source range of its character
         let mut origin: Vec<(usize, usize)> = Vec::new();
-        for (c, s, e) in chars {
+        for (c, s, e) in super::cjk::fold_chars(&text[from..to]) {
             folded.push(c);
-            origin.extend(std::iter::repeat_n((s, e), c.len_utf8()));
+            origin.extend(std::iter::repeat_n((from + s, from + e), c.len_utf8()));
         }
         for (a, b, word) in dict.words_of(&folded) {
             push(out, word, origin[a].0, origin[b - 1].1);
@@ -1279,13 +1163,8 @@ fn tokens(dict: &Dictionary, text: &str) -> Vec<Token> {
             );
             continue;
         }
-        let joins = |to: usize| {
-            to == t.offset_from
-                || (dict.layout == Layout::KoDic
-                    && text[to..t.offset_from].chars().all(char::is_whitespace))
-        };
         match run {
-            Some((f, to)) if joins(to) => run = Some((f, t.offset_to)),
+            Some((f, to)) if to == t.offset_from => run = Some((f, t.offset_to)),
             _ => {
                 flush(&mut out, &mut run);
                 run = Some((t.offset_from, t.offset_to));
@@ -1387,11 +1266,14 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_ipadic(tmp.path());
         let d = Dictionary::from_bytes(&compile(tmp.path(), Layout::Ipadic).unwrap()).unwrap();
-        // particles go, and the inflected verb becomes its base form
-        assert_eq!(
-            texts(&d, "東京都に住んでいる"),
-            ["東京", "都", "住む", "いる"]
-        );
+        // particles go and leave a gap, the inflected verb becomes its base form, and
+        // いる is one of Kuromoji's stop words
+        assert_eq!(texts(&d, "東京都に住んでいる"), ["東京", "都", "住む"]);
+        let positions: Vec<usize> = tokens(&d, "東京都に住んでいる")
+            .iter()
+            .map(|t| t.position)
+            .collect();
+        assert_eq!(positions, [0, 1, 3]);
         // the search mode penalty splits the four-character compound
         assert_eq!(texts(&d, "東京都庁"), ["東京", "都庁"]);
         // an unknown Katakana run is one word, without its final ー
@@ -1432,22 +1314,6 @@ pub(crate) mod tests {
             ["서울", "썸", "남"]
         );
         assert_eq!((t[1].offset_from, t[2].offset_to), (11, 17));
-    }
-
-    #[test]
-    fn korean_words_after_a_space_cost_more_when_they_follow_another() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_kodic(tmp.path());
-        let d = Dictionary::from_bytes(&compile(tmp.path(), Layout::KoDic).unwrap()).unwrap();
-        let entry = |pos: &str| {
-            *d.entries
-                .iter()
-                .find(|e| e.pos != NONE && d.strings[e.pos as usize] == pos)
-                .unwrap()
-        };
-        assert_eq!(d.space_penalty(&entry("JX")), 3000);
-        assert_eq!(d.space_penalty(&entry("VCP+EF")), 3000);
-        assert_eq!(d.space_penalty(&entry("NNP")), 0);
     }
 
     #[test]

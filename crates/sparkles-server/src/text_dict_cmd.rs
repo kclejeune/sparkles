@@ -89,6 +89,9 @@ struct Pinned {
     license_member: Option<&'static str>,
     license_url: Option<(&'static str, &'static str)>,
     license: &'static str,
+    /// lexicon lines added to the source, as Lucene adds them to the dictionary it
+    /// bundles
+    extra: &'static [&'static str],
 }
 
 const PINNED: [Pinned; 3] = [
@@ -100,15 +103,19 @@ const PINNED: [Pinned; 3] = [
         license_member: Some("COPYING"),
         license_url: None,
         license: "IPADIC 2.7.0 (NAIST and ICOT terms, permissive with notice)",
+        // Lucene's Kuromoji adds the era name of 2019
+        extra: &["令和,1288,1288,5904,名詞,固有名詞,一般,*,*,*,令和,レイワ,レイワ"],
     },
     Pinned {
         name: "ko-dict",
-        url: "https://bitbucket.org/eunjeon/mecab-ko-dic/downloads/mecab-ko-dic-2.1.1-20180720.tar.gz",
-        sha256: "fd62d3d6d8fa85145528065fabad4d7cb20f6b2201e71be4081a4e9701a5b330",
+        // the version Lucene's Nori bundles
+        url: "https://bitbucket.org/eunjeon/mecab-ko-dic/downloads/mecab-ko-dic-2.0.3-20170922.tar.gz",
+        sha256: "c929f0f457ea58b97d0dc79f6504b1cd9e5c011817b17b3fc2031cc7ea2bcbb5",
         archive: true,
         license_member: Some("COPYING"),
         license_url: None,
-        license: "mecab-ko-dic 2.1.1 (Apache-2.0)",
+        license: "mecab-ko-dic 2.0.3 (Apache-2.0)",
+        extra: &[],
     },
     Pinned {
         name: "zh-dict",
@@ -121,6 +128,7 @@ const PINNED: [Pinned; 3] = [
             "18ba0984839f85853b29fadaf992f7dba8fd0ca0fbeae34de2b8735222dc7a37",
         )),
         license: "jieba 0.42.1 word list (MIT)",
+        extra: &[],
     },
 ];
 
@@ -149,6 +157,12 @@ pub fn run(args: TextDictArgs) -> Result<()> {
             let work = tempfile::tempdir()?;
             let (from, license) = if p.archive {
                 let license = extract(&source, work.path(), p.license_member)?;
+                if !p.extra.is_empty() {
+                    std::fs::write(
+                        work.path().join("sparkles-extra.csv"),
+                        p.extra.join("\n") + "\n",
+                    )?;
+                }
                 (work.path().to_path_buf(), license)
             } else {
                 let f = work.path().join("source.txt");

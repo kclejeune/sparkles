@@ -24,6 +24,9 @@
 //! matches of the same length the earlier rule's wins, as in JFlex. Lucene's scanner
 //! reads at most 255 UTF-16 code units of a word, so a longer word is cut where the
 //! longest match within those units ends, and the rest is scanned as new text.
+//!
+//! The rules follow `StandardTokenizerImpl.jflex` of Lucene 9.11.1 (Apache-2.0,
+//! Copyright The Apache Software Foundation).
 
 use super::standard_tables::RANGES;
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
@@ -135,11 +138,6 @@ fn props(c: char) -> u16 {
         Ok(i) => RANGES[i].2,
         Err(_) => 0,
     }
-}
-
-/// Whether a character is of the Han script.
-pub(super) fn is_han(u: u32) -> bool {
-    char::from_u32(u).is_some_and(|c| props(c) & SCRIPT == HAN)
 }
 
 /// The kind of a word, as Lucene's tokenizer types its tokens: the CJK bigram filter of

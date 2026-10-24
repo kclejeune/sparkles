@@ -1227,6 +1227,9 @@ mod imp {
         fn width(s: &str) -> Option<String> {
             Some(super::cjk::fold_word(s))
         }
+        fn width_legacy(s: &str) -> Option<String> {
+            Some(super::cjk::fold_legacy(s))
+        }
         let raw = || TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default()).dynamic();
         let java = || raw().filter_dynamic(MapFilter(f::lowercase));
         match analyzer {
@@ -1235,15 +1238,15 @@ mod imp {
                 .filter_dynamic(AsciiFoldingFilter)
                 .build(),
             Some(Analyzer::Cjk) => raw()
-                .filter_dynamic(MapFilter(width))
+                .filter_dynamic(MapFilter(width_legacy))
                 .filter_dynamic(LowerCaser)
                 .build(),
-            Some(Analyzer::CjkLucene | Analyzer::JaDict | Analyzer::ZhDict | Analyzer::KoDict) => {
-                raw()
-                    .filter_dynamic(MapFilter(width))
-                    .filter_dynamic(MapFilter(f::lowercase))
-                    .build()
-            }
+            // Nori folds no widths
+            Some(Analyzer::KoDict) => java().build(),
+            Some(Analyzer::CjkLucene | Analyzer::JaDict | Analyzer::ZhDict) => raw()
+                .filter_dynamic(MapFilter(width))
+                .filter_dynamic(MapFilter(f::lowercase))
+                .build(),
             // Lucene's French and Italian analyzers normalize elisions too
             Some(Analyzer::FrenchLight) => {
                 java().filter_dynamic(MapFilter(f::french_elision)).build()
@@ -4505,6 +4508,19 @@ mod imp {
         }
 
         fn tokens(a: Analyzer, text: &str) -> Vec<(usize, String)> {
+            #[cfg(feature = "text-cjk-dict")]
+            let mut an = if a.needs_dictionary() {
+                // the installed dictionary, whichever it is
+                let mut config = TextConfig::default();
+                config.dictionaries.insert(
+                    a.name().to_string(),
+                    super::super::dict::load(a.name()).unwrap().sha256.clone(),
+                );
+                dictionary_analyzer(a, &config).unwrap()
+            } else {
+                language_analyzer(a)
+            };
+            #[cfg(not(feature = "text-cjk-dict"))]
             let mut an = language_analyzer(a);
             let mut st = an.token_stream(text);
             let mut out = Vec::new();
@@ -4587,6 +4603,41 @@ mod imp {
                 }
             }
             assert!(checked > 0, "no fixtures in {}", dir.display());
+            assert!(
+                failures.is_empty(),
+                "{} of {checked} lines differ:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        }
+
+        /// `ja-dict` and `ko-dict` against the tokens Kuromoji and Nori 9.11 made of the
+        /// same lines (`tests/data/lucene-dict-analyzers/`, made by
+        /// `scripts/text-lucene-compare/tokens.sh`). It needs the dictionaries that
+        /// `sparkles text-dict fetch` installs, in `$SPARKLES_TEXT_DICTS`.
+        #[cfg(feature = "text-cjk-dict")]
+        #[test]
+        #[ignore]
+        fn dictionary_analyzers_agree_with_lucene() {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/lucene-dict-analyzers");
+            let mut failures = Vec::new();
+            let mut checked = 0;
+            for a in [Analyzer::JaDict, Analyzer::KoDict] {
+                let read =
+                    |ext| std::fs::read_to_string(dir.join(format!("{}.{ext}", a.name()))).unwrap();
+                let (input, expected) = (read("in"), read("out"));
+                let got = analyzed_lines(a, &input);
+                for ((line, e), g) in input.lines().zip(expected.lines()).zip(got.lines()) {
+                    checked += 1;
+                    if e != g {
+                        failures.push(format!(
+                            "{}: {line:?}: lucene {e:?}, sparkles {g:?}",
+                            a.name()
+                        ));
+                    }
+                }
+            }
             assert!(
                 failures.is_empty(),
                 "{} of {checked} lines differ:\n{}",

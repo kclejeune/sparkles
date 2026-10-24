@@ -84,12 +84,68 @@ impl Tokenizer for CjkLuceneTokenizer {
     }
 }
 
-/// A word with its widths folded, a voiced mark joined to the kana before it.
+/// A word with its widths folded and a half-width voiced mark joined to the kana before
+/// it, as Lucene's `CJKWidthFilter` folds a token.
 pub(super) fn fold_word(word: &str) -> String {
+    fold_chars(word).into_iter().map(|(c, _, _)| c).collect()
+}
+
+/// The characters of `text` with their widths folded and each half-width voiced mark
+/// joined to the kana before it where the two combine, as Lucene's `CJKWidthCharFilter`
+/// and `CJKWidthFilter` fold them, each with the byte range of `text` it comes from.
+pub(super) fn fold_chars(text: &str) -> Vec<(char, usize, usize)> {
+    let mut out: Vec<(char, usize, usize)> = Vec::with_capacity(text.len());
+    for (i, c) in text.char_indices() {
+        let end = i + c.len_utf8();
+        if matches!(c as u32, 0xFF9E | 0xFF9F)
+            && let Some(last) = out.last_mut()
+            && let Some(v) = combine(last.0, c)
+        {
+            last.0 = v;
+            last.2 = end;
+            continue;
+        }
+        out.push((fold(c), i, end));
+    }
+    out
+}
+
+/// What Lucene adds to a Katakana from U+30A6 to U+30FD to voice it, and to make it
+/// semi-voiced (its `KANA_COMBINE_VOICED` and `KANA_COMBINE_SEMI_VOICED`).
+const COMBINE_VOICED: [u8; 88] = [
+    78, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1,
+    0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+];
+const COMBINE_SEMI_VOICED: [u8; 88] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// The Katakana `prev` voiced by the half-width mark `mark` (U+FF9E, or U+FF9F for the
+/// semi-voiced mark), if the two combine.
+fn combine(prev: char, mark: char) -> Option<char> {
+    let u = prev as u32;
+    if !(0x30A6..=0x30FD).contains(&u) {
+        return None;
+    }
+    let i = (u - 0x30A6) as usize;
+    let add = if mark == '\u{FF9F}' {
+        COMBINE_SEMI_VOICED[i]
+    } else {
+        COMBINE_VOICED[i]
+    };
+    (add != 0).then(|| char::from_u32(u + add as u32)).flatten()
+}
+
+/// A word folded as the `cjk` analyzer folds its text: widths, and any voiced mark
+/// joined to the kana before it.
+pub(super) fn fold_legacy(word: &str) -> String {
     let mut out: Vec<char> = Vec::with_capacity(word.len());
     for c in word.chars() {
         let f = fold(c);
-        if matches!(c as u32, 0xFF9E | 0xFF9F)
+        if matches!(f as u32, 0x3099 | 0x309A)
             && let Some(last) = out.last_mut()
             && let Some(v) = voiced(*last, f)
         {
