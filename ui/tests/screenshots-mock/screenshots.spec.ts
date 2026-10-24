@@ -340,6 +340,51 @@ test('explore-facets', async ({ page }) => {
   await shoot(page, 'explore-facets');
 });
 
+test('embedding-map', async ({ page, request }) => {
+  // the 6,000 invented shipments of `world` projected by the server and coloured by cargo
+  // class, with a lasso around one lobe of the largest class in the shared selection
+  await page.goto('/ui/embedding?ds=world&index=shipments');
+  const map = page.locator('.emap[data-ready="true"]');
+  await expect(map).toHaveAttribute('data-points', '6000', { timeout: 30_000 });
+  await expect(page.getByTestId('progress')).toHaveCount(0);
+  await page.waitForTimeout(500);
+  const r = await request.get('/$/vector/world/shipments/projection');
+  const points: { x: number; y: number; class?: number }[] = (await r.json()).points;
+  const [ax, bx, ay, by] = (await map.getAttribute('data-transform'))!.split(',').map(Number);
+  const box = (await map.boundingBox())!;
+  // the densest cell of class 0 at a coarse grid, in viewport pixels
+  const cells = new Map<string, { n: number; x: number; y: number }>();
+  for (const p of points) {
+    if (p.class !== 0) continue;
+    const vx = box.x + ax * p.x + bx;
+    const vy = box.y + ay * p.y + by;
+    const key = `${Math.floor(vx / 80)},${Math.floor(vy / 80)}`;
+    const c = cells.get(key) ?? { n: 0, x: 0, y: 0 };
+    c.n++;
+    c.x += vx;
+    c.y += vy;
+    cells.set(key, c);
+  }
+  const best = [...cells.values()].sort((a, b) => b.n - a.n)[0];
+  const cx = best.x / best.n;
+  const cy = best.y / best.n;
+  await page.getByRole('radio', { name: 'Lasso' }).click();
+  await page.mouse.move(cx + 70, cy);
+  await page.mouse.down();
+  for (let k = 1; k <= 24; k++) {
+    const a = (k / 24) * Math.PI * 2;
+    await page.mouse.move(
+      cx + 70 * Math.cos(a) * (1 + 0.15 * Math.sin(3 * a)),
+      cy + 55 * Math.sin(a),
+    );
+  }
+  await page.mouse.up();
+  await expect(page.getByRole('region', { name: 'Selection' })).toContainText(
+    'selected by the embedding map',
+  );
+  await shoot(page, 'embedding-map');
+});
+
 test('query-facets', async ({ page }) => {
   // the query page's facets of a variable, with the brushes Apply to query writes
   await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
@@ -780,6 +825,66 @@ INSERT DATA {
   await shoot(page, 'explore-why');
 });
 
+test('explore-why-stale', async ({ page, request }) => {
+  // a derivation from stale inferences: the note above the tree, and Next on the second
+  // of two derivations whose top rules differ
+  const ds = 'staff-history';
+  const r = await request.post('/$/datasets', { data: { dbName: ds, dbType: 'persistent' } });
+  expect(r.ok() || r.status() === 409).toBe(true);
+  if (r.ok()) {
+    const u = await request.post(`/${ds}/update`, {
+      headers: { 'Content-Type': 'application/sparql-update' },
+      data: `PREFIX ex: <http://example.org/ontology#>
+PREFIX res: <http://example.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA {
+  ex:Manager rdfs:subClassOf ex:Employee . ex:reportsTo rdfs:range ex:Employee .
+  res:alice a ex:Manager ; rdfs:label "Alice Ng" .
+  res:bob ex:reportsTo res:alice ; rdfs:label "Bob Diaz" .
+  res:carol ex:reportsTo res:alice ; rdfs:label "Carol Ito" .
+}`,
+    });
+    expect(u.ok()).toBe(true);
+    const t = await request.post(`/$/reason/${ds}`, { form: { profile: 'rdfs' } });
+    expect(t.ok()).toBe(true);
+    await expect
+      .poll(async () => (await (await request.get(`/$/reason/${ds}`)).json()).profile, {
+        timeout: 20_000,
+      })
+      .toBe('rdfs');
+    // two commits after the run leave the inferences stale
+    for (const who of ['dan', 'erin']) {
+      const w = await request.post(`/${ds}/update`, {
+        headers: { 'Content-Type': 'application/sparql-update' },
+        data: `INSERT DATA { <http://example.org/resource/${who}> <http://www.w3.org/2000/01/rdf-schema#label> "${who}" }`,
+      });
+      expect(w.ok()).toBe(true);
+    }
+  }
+  await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), ds);
+  await page.goto(
+    `/ui/explore?ds=${ds}&iri=${encodeURIComponent('http://example.org/resource/alice')}`,
+  );
+  const graph = page.locator('.wrap[data-graph]');
+  await expect(graph).toBeVisible({ timeout: 30_000 });
+  await expect
+    .poll(async () => {
+      const g = JSON.parse((await graph.getAttribute('data-graph')) ?? '{"nodes":[]}');
+      return (g.nodes as [string][]).map(([l]) => l);
+    })
+    .toEqual(expect.arrayContaining(['Alice Ng', 'Employee']));
+  const why = page.getByRole('button', { name: /Why is rdf:type inferred\?/ }).first();
+  await why.click();
+  const panel = page.getByTestId('why-panel');
+  await expect(panel.getByRole('tree')).toBeVisible();
+  await expect(panel.getByRole('note')).toContainText('stale');
+  await panel.getByRole('button', { name: 'Next' }).click();
+  await expect(panel).toContainText('2 of 2 derivations');
+  await page.getByRole('button', { name: 'Fit to view' }).click();
+  await settle(page, graph);
+  await shoot(page, 'explore-why-stale');
+});
+
 test('pattern-edit', async ({ page }) => {
   // building on the canvas: + Edge from ?person, with the predicate picker ranked by the
   // profile of ex:Person, and a waiting class node beside the drawing
@@ -877,4 +982,56 @@ q:PersonShape a sh:NodeShape ; sh:targetClass q:Person ;
   await panel.getByRole('button', { name: 'Preview' }).click();
   await expect(panel).toContainText('The guard would resolve this result.');
   await shoot(page, 'validation-overlay');
+});
+
+test('forms', async ({ page }) => {
+  // the editing form of a person of `world` in the explorer's panel, generated from the
+  // shapes (mock/forms.mjs): a mistyped email that the browser checks at once, and a
+  // previewed move to a city in Works for, which the server's check reports under the field
+  await page.goto(`/ui/explore?ds=world&iri=${encodeURIComponent(`${WORLD}priya-nair`)}`);
+  const edit = page.getByRole('button', { name: 'Edit', exact: true });
+  await expect(edit).toBeVisible({ timeout: 30_000 });
+  await edit.click();
+  const form = page.getByRole('region', { name: /^Edit Priya Nair/ });
+  await form.getByLabel('Email', { exact: true }).fill('priya.nair@meridian');
+  await form.getByRole('button', { name: 'Clear Lives in' }).click();
+  await form.getByRole('combobox', { name: 'Lives in' }).fill(`<${WORLD}delhi>`);
+  await page.getByRole('option', { name: /Use/ }).click();
+  await form.getByRole('button', { name: 'Clear Works for' }).click();
+  await form.getByRole('combobox', { name: 'Works for' }).fill(`<${WORLD}mumbai>`);
+  await page.getByRole('option', { name: /Use/ }).click();
+  await form.getByRole('button', { name: 'Preview' }).click();
+  await expect(form.locator(`[data-field="<${WORLD}worksFor>"]`)).toContainText('server check');
+  await form
+    .locator(`[data-field="<${WORLD}worksFor>"]`)
+    .evaluate((e) => e.scrollIntoView({ block: 'center' }));
+  await shoot(page, 'forms');
+});
+
+test('forms-branch', async ({ page, request }) => {
+  // the form on its own page after a save while main is protected: the save went to the
+  // editor's session branch, which the banner links to the merge page
+  const p = await request.patch('/$/branches/world/main', { data: { protected: true } });
+  expect(p.ok()).toBe(true);
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  try {
+    await page.goto(`/ui/datasets/world/edit?iri=${encodeURIComponent(`${WORLD}wei-lin-tan`)}`);
+    const form = page.getByRole('region', { name: /^Edit / });
+    await expect(form.getByRole('note').filter({ hasText: /main is protected/ })).toBeVisible({
+      timeout: 30_000,
+    });
+    await form.getByLabel('Email', { exact: true }).fill('weilin.tan@meridian.example');
+    await form.getByRole('radio', { name: 'Active' }).check();
+    await form
+      .getByLabel('Message', { exact: true })
+      .fill('Add the email and status of Wei Lin Tan');
+    await form.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(form.getByRole('status').filter({ hasText: 'Editing on branch' })).toBeVisible();
+    await form.getByLabel('Age', { exact: true }).fill('17');
+    // the save's toast goes before the picture
+    await expect(page.getByText(/^Saved commit/)).toHaveCount(0, { timeout: 15_000 });
+    await shoot(page, 'forms-branch');
+  } finally {
+    await request.patch('/$/branches/world/main', { data: { protected: false } });
+  }
 });

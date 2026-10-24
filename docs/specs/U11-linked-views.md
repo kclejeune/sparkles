@@ -1,6 +1,6 @@
 # U11: Linked views beside the graph
 
-> **Status:** partly implemented
+> **Status:** implemented
 >
 > **Phases:** Phase 1 shipped on 2026-10-23. It draws the relations between located
 > entities as arcs in the map view, for the Explore graph and for query results, with
@@ -8,17 +8,19 @@
 > Phase 2 shipped on 2026-10-24. It adds the facets route and facet histograms of the
 > properties of a set beside the canvas, where brushing a range filters the canvas and
 > **Apply to query** adds the matching `FILTER` to the query, and **Use in query**, which
-> writes a selection as a `VALUES` block. Phase 3 adds an embedding map, a two-dimensional
-> projection of a vector index coloured by class or community, where a lasso selection
-> becomes a `VALUES` block, after a server route that computes the projection. Phase 3 is
-> not built.
+> writes a selection as a `VALUES` block. Phase 3 shipped on 2026-10-24. It adds the
+> projection routes of a vector index and the embedding map, a two-dimensional projection
+> coloured by class or by a predicate, where a lasso or a box selects entities that
+> **Use in query** writes as a `VALUES` block.
 >
 > **User docs:** [Usage: Arcs on the map](../USAGE.md#arcs-on-the-map) ·
 > [Usage: Facets and Use in query](../USAGE.md#facets-and-use-in-query) ·
-> [API: Facets](../API.md#facets) · [Features](../FEATURES.md#web-ui)
+> [Usage: The embedding map](../USAGE.md#the-embedding-map) ·
+> [API: Facets](../API.md#facets) · [API: Embedding map](../API.md#embedding-map) ·
+> [Features](../FEATURES.md#web-ui)
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end records how Phases 1 and 2 landed.
+> the end records how the three phases landed.
 
 This design was written from the Sparkles code and specs: GeoSPARQL and the UI's maps
 ([G01](G01-geosparql.md)), vector search and indexes ([F04](F04-vector-search.md)), local
@@ -400,8 +402,8 @@ it says "The embedding map shows the head".
 ## Outcome
 
 Phase 1 shipped on 2026-10-23 under [ROADMAP](../ROADMAP.md) item 107, with no server
-change. Phase 2 shipped on 2026-10-24 and its section below describes it. Phase 3 is not
-built and stays under item 107.
+change. Phases 2 and 3 shipped on 2026-10-24, and their sections below describe them. Items
+140 to 142 hold what remains.
 
 **Selection.** `ui/src/lib/selection.svelte.ts` holds one selection of entity terms, keyed
 by their SPARQL form, with the name of the view that made it. It keeps at most 20,000
@@ -640,4 +642,155 @@ opens, while the selection they made stays. **Apply to query** on the query page
 keep the counts of a query with `LIMIT`, `OFFSET`, `GROUP BY` or `HAVING`, so it refuses
 those queries rather than wrapping them in a subquery. The library call
 `ds.graph().facets` is bound in Python as `Dataset.graph.facets`, and `bindings.toml`
+marks the Node.js and JVM bindings as planned.
+
+### Phase 3
+
+**The routes.** `POST /$/vector/{ds}/{name}/projection` computes a projection of an index
+and keeps it, and `GET` on the same path answers the kept one. The core is
+`crates/sparkles-core/src/vector/projection.rs`, reached through
+`Store::vector_projection` and the library call `ds.indexes().vector().projection`, and the
+server part is `crates/sparkles-server/src/projection.rs`. PCA learns its two axes from at
+most 100,000 vectors by randomized subspace iteration, a block of eight directions refined
+over eight rounds and then diagonalised by Jacobi rotations, and projects every vector onto
+them. Under the cosine metric the vectors are normalised first. An entity with several
+vectors sits at the mean of their projections. A PCA of up to a million vectors runs in the
+request with the request's timeout, and a larger one runs as a `vector-projection` task
+that the 202 answer names with a `Location` header. The neighbour layout always runs as a
+task. It starts from the PCA positions and runs a force layout over the bottom layer of the
+index's HNSW graph, with springs along the links and a repulsion from the mass of the cells
+of a grid, for 100 rounds by default. It is a simplified ForceAtlas2 that needs no new
+dependency, and it gives the same positions for the same seed. Its edges include the links
+of nodes that the live layer added to the graph after its build, as far as the snapshot
+holds their rows, so an entity inserted since is pulled toward its neighbours as well. A
+task can be cancelled by anyone with `read` on the whole dataset, which is who can start
+one, and a request's projection stops when its client goes away. An index created before
+its predicate had any vector finds the predicate in the snapshot, so the vectors inserted
+since are projected. The choice between the request and a task counts the vectors inserted
+since the index's base as well as the base rows.
+
+**The answer.** `GET` returns the method, the commit and generation, `stale`, the counts,
+the bounds, the variance the two PCA axes explain, a 256 by 256 density grid of every entity
+in the region as base64 `Uint32` counts, the classes with their counts, and up to 50,000
+points. A `bbox` parameter answers one region and `limit` lowers the cap. When a region holds
+more entities than the cap, the answer keeps those of lowest priority, a hash of each subject
+fixed when the projection is built, so the sample is even, it stays the same between
+requests, and a zoomed region keeps the points the whole view showed. `colour=` names a
+predicate whose first object per entity is returned as an index into a list of values with
+their counts. `Accept: application/x-sparkles-points` returns a binary answer that starts
+with the magic `SPKPTS`, a zero byte and the format version 1, then the length and text of a
+JSON header, the entities joined by newlines and padded to four bytes, `Float32` x and y
+pairs, `Uint32` class indexes and, with `colour=`, `Uint32` value indexes, where
+`0xFFFFFFFF` means none. The UI refuses any other version and says to update it. A class is
+the first `rdf:type` of an entity in the store's order.
+
+**Keeping projections.** The server keeps at most four projections and 1 GiB of them, the
+least recently used dropped first. The query memory pool pays for the computation before
+it allocates. The store computes an upper bound of the working memory from the same
+snapshot and build that the computation then reads, counting the rows, the sample, the
+PCA's blocks and its accumulators, which it keeps to one per thread by splitting the
+sample into one part per thread, the points and, for the neighbour layout, the copy of the
+live layer and the edges, and passes it to an admission callback. The layout copies only
+the live nodes of pairs the snapshot inserted, so a live layer that grew after the
+admission cannot make the copy larger than what was admitted. In the
+request the callback charges the request's admission grant, and the charge lives in the
+blocking worker, so it stays paid for while a computation whose client went away runs to
+its next cancellation check. A task waits in the pool's queue for a grant of its own,
+since it may start before the request that started it lets go of its admission grant, and
+hands that grant to the kept projection, which gives back all of it but the projection's
+own bytes. The bytes are charged and not only granted, because the pool clamps a grant to
+its capacity, so a computation larger than the pool answers `507` before it reads a
+vector. A kept projection
+and its grant are one shared value, so a reader still answering from a projection that was
+just replaced keeps its memory paid for until it is done. A projection is keyed by the
+dataset, the branch, the index and the method, and it also records the predicate,
+dimension and metric of the build it read, so an index replaced under the same name
+forgets it. PCA copies no part of the live layer, which only the neighbour layout reads. A projection takes 24
+bytes per entity, not the 12 the spec estimated, because each point keeps its subject's id
+and its sampling priority beside its coordinates and class, so ten million entities take
+about 230 MiB. That is memory spent so that a region and its sample are answered without a
+second pass over the index. A kept projection also holds the store snapshot it was built
+from, so its class and colour lookups read the state it projected, and that snapshot keeps
+one older generation alive until the projection is replaced or dropped. `stale` is true once
+the dataset has any commit after the projection's, which is more cautious than the index's
+own commit and costs a recompute after writes that leave the vectors alone. `/metrics`
+reports `sparkles_vector_projections` and `sparkles_vector_projection_bytes`. Both routes
+need `read` and are on the `whole_dataset` list, so a caller whose access covers part of the
+dataset gets `403`. The rate limiter counts them as queries.
+
+**The map.** `/ui/embedding?ds=…&index=…&method=…&colour=…` is
+`ui/src/routes/embedding/+page.svelte`, and `ui/src/lib/components/EmbeddingMap.svelte`
+draws the points with WebGL through sigma, as `LargeGraphView` does, over a canvas of the
+density shading and under a canvas that draws the lasso or the box. `ui/src/lib/embedding.ts`
+reads the binary format and holds the shape tests, the legend, the numeric ranges and the
+order of a large selection. The page computes a PCA when no projection is kept, follows a
+task with a progress bar and **Cancel** while the last projection stays dimmed, and offers
+**Recompute** with a **Stale** badge. The camera's frame is the whole projection's bounds, so
+a region's answer replaces the sample without moving the view. Zooming below 80 percent of
+the bounds of a sampled projection fetches the region in view with a margin of a quarter on
+each side, and zooming back out fetches the whole projection again. A lasso in a sampled view
+selects at once from the drawn points and then fetches the shape's bounding box and selects
+every entity inside the shape. A selection above 20,000 entities keeps those nearest the
+centre of what was drawn. The colour is the class by default, or a predicate's values, with
+the eight largest categories in the legend and the rest as "other", and numbers with more
+than eight distinct values in up to five ranges of equal count. Points outside an active
+selection are drawn in their own colour mixed most of the way into the background, so the
+map keeps its shape. Hovering a point waits 400 ms and then shows its label, class and five
+nearest neighbours from `spk:vectorSearch`, and a click opens it in Explore. **Use in query**
+opens a new query of the selected entities and their labels, the 1,000 nearest the
+selection's centre, and **Open as graph** opens Explore with `selection=1`, which draws the
+shared selection. **List** shows the first 200 points in view with a checkbox each. `L` and
+`B` toggle the lasso and the box. At 390 px the pointer modes give way to a **Lasso** toggle.
+The dataset page's index cards, Explore's graph toolbar and the Similar page link to the map,
+and Explore and the Similar page leave the link out when the vector status answers `403`.
+When the query page reads a past state, the map says that it shows the head.
+
+**Decisions where the spec left room.** The spec's `{entity, x, y, class?}` points carry a
+`colour?` index as well, and the class list rides in the header rather than per point.
+Colouring by a written-back community predicate works through `colour=`, but a kept Leiden
+run of the lens menu is not a predicate and is not offered, item 140. **Use in query** opens a
+new query with `?entity` rather than editing a query, because the map has no query of its own.
+`Shift+M` does not open the embedding map, item 140.
+
+**Tests.** `crates/sparkles-core/src/vector/projection.rs` checks the PCA axes against the
+exact eigenvectors of a fixed sample and the Jacobi step. The router tests in
+`crates/sparkles-server/src/projection_tests.rs` build three clusters in 16 dimensions and
+check that PCA separates the classes (A6), the density grid, regions, limits and colours, the
+binary answer against the JSON one, staleness after a commit, the neighbour task's
+determinism, the cap of four projections with `/metrics`, the request checks, a branch's
+projection, a replaced index, an index created before its vectors, and the memory pool's
+refusals and grants, including the PCA workspace of one vector of 16,384 dimensions.
+`crates/sparkles-core/tests/projection_memory.rs` measures the PCA's peak memory with a
+counting allocator on 16 threads against the bound it is admitted with, and a unit test
+checks that the layout's edges include the live nodes the snapshot holds.
+`router_tests::auth::tasks` checks that a reader may cancel a projection task.
+`router_tests::auth::overview` checks the `403` of the `whole_dataset` rule. The Python
+binding is checked in `test_admin.py`. The Vitest suite `embedding.test.ts` covers the binary
+format and its version refusal, the lasso and the box, the order by distance, the legend, the
+numeric ranges, the density grid and the `VALUES` text. The Playwright suite
+`ui/tests/mock/embedding.spec.ts` runs A7 with `Shift` and `Alt`, **Open as graph**, a task
+with progress and **Cancel**, the legend and the list, staleness and **Recompute**, the states
+without an index and without access, the entry links, and the page at 390 px, against
+`ui/mock/projection.mjs`, which computes a real PCA of `foaf`'s vectors and invents 6,000
+shipments for `world`. `ui/tests/e2e/embedding.spec.ts` runs A6 on 10,000 vectors and A8
+against a real server.
+
+**A9.** The frame times were measured in headless Chromium, whose WebGL is SwiftShader in
+software, against the mock with `MOCK_SHIPMENTS=50000`, on a 16 thread laptop with a load
+average between 16 and 33 from other work, so they are an upper bound and not a published
+figure. With 50,000 points and the density shading, a drag pans at about 1 to 2 frames per
+second, and a CPU profile puts nearly all of each frame in the browser's native rendering
+rather than in the page's code, so the gate of 30 frames per second needs the GPU run of item
+141. A box over 20,000 of the 50,000 points updates the selection, including one redraw, in 91
+to 126 ms over three runs after the first. Two changes found by profiling brought that down
+from 560 to 800 ms. The projection is held in a raw state, not a deeply reactive one, so
+reading its columns does not go through proxies, and the order by distance computes each
+distance once rather than in every comparison. The density grid is drawn once into an image
+of one pixel per cell and scaled onto the map in one call per frame, and the faded colour of
+each point is computed when the point is added rather than in every redraw.
+
+**Limits.** A9's frame rate was measured only in software rendering, and its GPU run is item
+141. Projections are not written to disk and are not
+served to callers with partial access, which are open questions 1 and 2 and item 142. The
+library call is bound in Python as `Dataset.indexes.vector.projection`, and `bindings.toml`
 marks the Node.js and JVM bindings as planned.

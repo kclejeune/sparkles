@@ -420,6 +420,7 @@ pub(super) fn add_all(p: &mut Paths) {
     datasets(p);
     fuseki(p);
     schema(p);
+    forms(p);
     admin(p);
     queries(p);
     algorithms(p);
@@ -434,6 +435,111 @@ pub(super) fn add_all(p: &mut Paths) {
     auth(p);
     protocol(p);
     openapi(p);
+}
+
+/// Editing forms generated from SHACL shapes (U02).
+fn forms(p: &mut Paths) {
+    let term = json!({ "type": "object", "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`." });
+    let change = json!({ "application/json": { "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["changes"],
+        "properties": {
+            "focus": { "type": "string", "description": "The IRI of the resource. Give either `focus` or `class`." },
+            "class": { "type": "string", "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`." },
+            "branch": { "type": "string", "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch." },
+            "shapes": { "type": "string", "enum": ["guard", "graphs", "drafted"], "description": "The shapes the form was built from, when not the setting's." },
+            "changes": { "type": "array", "items": { "type": "object", "required": ["field"], "properties": {
+                "field": { "type": "string", "description": "The field's id, its path in SPARQL syntax." },
+                "remove": { "type": "array", "items": term },
+                "add": { "type": "array", "items": term }
+            } } },
+            "expect": { "type": "object", "additionalProperties": { "type": "array", "items": term }, "description": "The values the form loaded, by field id, for every changed field." },
+            "message": { "type": "string", "description": "The commit message." }
+        }
+    } } });
+    p.add(
+        op(GET, "/$/forms/{ds}", "getForm", "Validation", "The form of a resource")
+            .doc("The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. Reads follow the caller's query endpoint grants and writeability its update endpoint grants on the branch saves go to. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.")
+            .see("editing-forms")
+            .query("focus", s(), "The IRI of the resource. Give either `focus` or `class`.")
+            .query("class", s(), "The class of a new instance.")
+            .query("shapes", json!({ "type": "string", "enum": ["guard", "graphs", "drafted"] }), "Where the shapes come from, when not the dataset's `forms` setting.")
+            .query("lang", s(), "The language labels are picked in, then English, then untagged.")
+            .params(&["branch", "at", "timeout"])
+            .resp(
+                "200",
+                "The form model.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["formFormat", "focus", "types", "commit", "branch", "editable", "shapes", "groups", "fields", "other", "graph", "closed", "save"],
+                    "properties": {
+                        "formFormat": { "type": "integer", "enum": [1] },
+                        "focus": { "type": ["string", "null"] },
+                        "types": { "type": "array", "items": { "type": "string" } },
+                        "commit": { "type": "integer" },
+                        "branch": { "type": "string" },
+                        "editable": { "type": "boolean", "description": "The caller may save changes through this form." },
+                        "shapes": { "type": "object", "description": "`{source, nodeShapes, missing?, unknownHints}`." },
+                        "groups": { "type": "array", "items": { "type": "object", "description": "`{iri, label, order}`." } },
+                        "fields": { "type": "array", "items": { "type": "object", "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?}`." } },
+                        "other": { "type": "array", "items": { "type": "object", "description": "`{predicate, values}`." } },
+                        "graph": { "type": ["string", "null"], "description": "The graph new values go into, `null` for the default graph." },
+                        "closed": { "type": "boolean" },
+                        "save": { "type": "object", "description": "`{to, branch, exists, mainProtected}`: `to` is `main` or `branch`." },
+                        "guard": { "type": ["object", "null"], "description": "`{language, mode}` of the write guard." }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408, 501]),
+    );
+    p.add(
+        op(POST, "/$/forms/{ds}/check", "checkForm", "Validation", "Check a form's changes")
+            .doc("Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.")
+            .see("editing-forms")
+            .body(true, "The changes.", change.clone())
+            .resp(
+                "200",
+                "The preview and the validation.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["branch", "preview", "update", "conflicts", "validation"],
+                    "properties": {
+                        "branch": { "type": "string" },
+                        "preview": { "type": "object", "description": "The dry run, as a write preview answers it." },
+                        "update": { "type": "string" },
+                        "conflicts": { "type": "array", "items": { "type": "object" }, "description": "`{id, now}` of each changed field whose stored values differ from `expect`." },
+                        "validation": { "type": "object", "description": "`{checked, withheld, timedOut, conforms, results}`." }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408]),
+    );
+    p.add(
+        op(POST, "/$/forms/{ds}/save", "saveForm", "Validation", "Save a form's changes")
+            .doc("Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.")
+            .see("editing-forms")
+            .body(true, "The changes.", change)
+            .resp(
+                "200",
+                "The commit receipt.",
+                Some(json!({ "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["committed", "commit", "branch", "branchCreated"],
+                    "properties": {
+                        "committed": { "type": "boolean" },
+                        "commit": { "type": "object" },
+                        "branch": { "type": "string" },
+                        "branchCreated": { "type": "boolean" },
+                        "focus": { "type": "string", "description": "The resource saved, which for a new instance is the IRI minted for it." },
+                        "dataset": { "type": "string" },
+                        "datasetId": { "type": "string" },
+                        "validation": { "type": "object" }
+                    }
+                } } })),
+            )
+            .errors(&[400, 403, 404, 408, 409, 422, 507]),
+    );
 }
 
 fn server(p: &mut Paths) {
@@ -2254,6 +2360,81 @@ fn format_and_mcp(p: &mut Paths) {
         answer.insert(m.into(), text());
     }
     p.add(
+        op(
+            POST,
+            "/$/vector/{ds}/{name}/projection",
+            "computeVectorProjection",
+            "Search",
+            "Compute a projection of a vector index",
+        )
+        .doc("Computes a two-dimensional projection of the index's entities at the head and keeps it in memory for `GET`. `pca` projects every vector on the two leading principal components of a sample, and an entity with several vectors sits at the mean of their projections. It runs in the request for an index of up to 1,000,000 vectors and as a task above that. `neighbours` lays out the index's HNSW neighbour graph from the PCA positions and always runs as a task. The server keeps four projections, 1 GiB in all, charged to the query memory pool, and refuses one it cannot hold with `507`. A caller whose access covers part of the dataset gets `403`.")
+        .see("embedding-map")
+        .query("method", json!({ "type": "string", "enum": ["pca", "neighbours"], "default": "pca" }), "How the vectors are placed.")
+        .param("timeout")
+        .body(
+            false,
+            "The sample, seed and layout steps.",
+            json!({ "application/json": { "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "sample": { "type": "integer", "minimum": 1, "maximum": 100000, "description": "Vectors the PCA learns from." },
+                    "seed": { "type": "integer", "minimum": 0, "description": "The seed of the first directions, the sampling priorities and the layout." },
+                    "iterations": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Steps of the neighbour layout." }
+                }
+            } } }),
+        )
+        .json_inline("200", "The projection, without its points.", projection_summary())
+        .task()
+        .errors(&[400, 403, 404, 408, 503, 507]),
+    );
+    p.add(
+        op(
+            GET,
+            "/$/vector/{ds}/{name}/projection",
+            "getVectorProjection",
+            "Search",
+            "Read a kept projection of a vector index",
+        )
+        .doc("Returns the kept projection's method, commit, bounds, a density grid of 256 by 256 cells, its classes, and up to 50,000 points as `{entity, x, y, class?, colour?}`. `bbox` returns the points inside a region and its density, at most `limit`, those of lowest sampling priority when there are more, so zooming in keeps the points already shown. `colour` names a predicate whose first value per point is returned as an index into `colour.values`. `Accept: application/x-sparkles-points` returns the binary points format of the embedding map guide. A projection read at an older commit than the head has `stale: true`.")
+        .see("embedding-map")
+        .query("method", json!({ "type": "string", "enum": ["pca", "neighbours"] }), "The projection's method. The most recent of any method when absent.")
+        .query("bbox", json!({ "type": "string" }), "`minX,minY,maxX,maxY`.")
+        .query("limit", json!({ "type": "integer", "minimum": 0, "maximum": 50000, "default": 50000 }), "The most points to return.")
+        .query("colour", json!({ "type": "string" }), "A predicate IRI whose values colour the points.")
+        .resp(
+            "200",
+            "The projection and its points.",
+            Some(json!({
+                "application/json": { "schema": {
+                    "type": "object",
+                    "required": ["index", "method", "commit", "stale", "entities", "bounds", "region", "density", "classes", "points"],
+                    "properties": {
+                        "index": { "type": "string" },
+                        "method": { "type": "string" },
+                        "commit": { "type": "integer" },
+                        "generation": { "type": "string" },
+                        "stale": { "type": "boolean", "description": "The head has moved since the projection was computed." },
+                        "vectors": { "type": "integer" },
+                        "dimension": { "type": "integer" },
+                        "entities": { "type": "integer", "description": "Points in the whole projection." },
+                        "bounds": { "type": "array", "items": { "type": "number" }, "description": "`[minX, minY, maxX, maxY]`." },
+                        "explained": { "type": "array", "items": { "type": "number" }, "description": "The share of the sample's variance on each component." },
+                        "builtMs": { "type": "number" },
+                        "bytes": { "type": "integer" },
+                        "region": { "type": "object", "description": "`{bbox, total, shown, sampled}`: the points inside the region and how many are returned." },
+                        "density": { "type": "object", "description": "`{size, bbox, max, counts}`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y." },
+                        "classes": { "type": "array", "items": { "type": "object", "description": "`{iri, count}`." } },
+                        "colour": { "type": "object", "description": "`{predicate, values}`, where `values` holds `{value, count}` with a term in the SPARQL JSON results form." },
+                        "points": { "type": "array", "items": { "type": "object", "description": "`{entity, x, y, class?, colour?}`, where `class` and `colour` index `classes` and `colour.values`." } }
+                    }
+                } },
+                "application/x-sparkles-points": { "schema": { "type": "string", "format": "binary" } }
+            })),
+        )
+        .errors(&[400, 403, 404]),
+    );
+    p.add(
         o.query("prefixGroup", s(), "One prefix group, comma-separated (repeatable).")
             .body(true, "The text, as a JSON `FormatRequest` or a raw body.", J::Object(body))
             .resp_h(
@@ -3935,4 +4116,26 @@ fn openapi(p: &mut Paths) {
         )
         .resp("304", "Not modified.", None),
     );
+}
+
+/// The facts of a projection, as `POST /$/vector/{ds}/{name}/projection` answers them.
+fn projection_summary() -> J {
+    json!({
+        "type": "object",
+        "required": ["index", "method", "commit", "stale", "entities", "bounds"],
+        "properties": {
+            "index": { "type": "string" },
+            "method": { "type": "string", "enum": ["pca", "neighbours"] },
+            "commit": { "type": "integer" },
+            "generation": { "type": "string" },
+            "stale": { "type": "boolean" },
+            "vectors": { "type": "integer" },
+            "dimension": { "type": "integer" },
+            "entities": { "type": "integer" },
+            "bounds": { "type": "array", "items": { "type": "number" } },
+            "explained": { "type": "array", "items": { "type": "number" } },
+            "builtMs": { "type": "number" },
+            "bytes": { "type": "integer" }
+        }
+    })
 }

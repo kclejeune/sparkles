@@ -10,6 +10,8 @@
 // has been searched. Builds take about three seconds. With `MOCK_ROLE=dataset-admin` the
 // caller is an admin of `foaf` and a reader of `scratch`, as in mock/backups.mjs.
 
+import { WORLD_SHIPMENTS } from './projection.mjs';
+
 const VECTOR_DT = 'urn:x-sparkles:vector';
 const EX = 'http://example.org/ontology#';
 const ROLE = process.env.MOCK_ROLE ?? 'server-admin';
@@ -64,6 +66,9 @@ export function touchPacked(ds, predicate) {
 }
 
 function counts(ds, cfg) {
+  // `world`'s invented shipments have no vectors in the store (mock/projection.mjs)
+  if (cfg.synthetic)
+    return { ok: cfg.synthetic, skipped: { malformed: 0, wrongDimension: 0, zeroNorm: 0 } };
   const rows = vectorRows(ds, cfg.predicate);
   let ok = 0;
   const skipped = { malformed: 0, wrongDimension: 0, zeroNorm: 0 };
@@ -194,8 +199,26 @@ function build(ds, name, ctx, message) {
   return task;
 }
 
-/** Give `foaf` its index (called once the datasets are loaded). */
+/** Give `foaf` and `world` their indexes (called once the datasets are loaded). */
 export function seedVectors(datasets) {
+  const world = datasets.get('world');
+  if (world) {
+    const config = {
+      predicate: 'http://example.org/world/manifestEmbedding',
+      dimension: 64,
+      metric: 'cosine',
+      model: 'mock-manifest-64',
+      hnsw: { m: 16, efConstruction: 128, efSearch: 128 },
+      exactThreshold: 10000,
+      synthetic: WORLD_SHIPMENTS,
+    };
+    indexes(world).set('shipments', {
+      config,
+      building: null,
+      baseRows: WORLD_SHIPMENTS,
+      lastBuild: null,
+    });
+  }
   const foaf = datasets.get('foaf');
   if (!foaf) return;
   const config = {

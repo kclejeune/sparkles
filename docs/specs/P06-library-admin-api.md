@@ -220,6 +220,7 @@ after this spec, or `server-only` with the reason in §6.
 | `getWriteValidation`, `setWriteValidation`, `deleteWriteValidation` | Partial. The guards are in `sparkles-shacl` and `sparkles-shex`. Installing them and their status are in the server, and the Python binding has its own copy. | `write_validation`, `set_write_validation` | `ds.validation().guard()` |
 | `shacl` | `sparkles_shacl::validate` | `validate_shacl` | `ds.validation().shacl` |
 | `shex` | `sparkles_shex::validate` | `validate_shex` | `ds.validation().shex` |
+| `getForm`, `checkForm`, `saveForm` | `sparkles::forms`, from [U02](U02-shape-driven-forms.md) | No | `ds.forms()` with `model`, `check` and `save`. The Python, Node.js and JVM bindings are planned. |
 
 ### 2.8 Backups
 

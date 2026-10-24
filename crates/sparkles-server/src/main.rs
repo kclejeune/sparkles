@@ -61,6 +61,7 @@ mod outbound;
 mod patch_cmd;
 #[cfg(feature = "auth")]
 mod ping_cmd;
+mod projection;
 mod queries_cmd;
 mod quota_cmd;
 mod ratelimit;

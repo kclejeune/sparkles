@@ -5934,7 +5934,8 @@ impl WriteTxn<'_> {
             return Err(Error::WriterBusy);
         }
         // a commit with a merge record (a merge, or a commit a merge replays) passes
-        if (self.is_dirty() || self.force) && self.merge.is_none() {
+        let as_new_branch = self.opts.preview_as_new_branch && self.opts.dry_run.is_some();
+        if (self.is_dirty() || self.force) && self.merge.is_none() && !as_new_branch {
             self.store.check_protected(self.kind)?;
         }
         self.check_requested_all()

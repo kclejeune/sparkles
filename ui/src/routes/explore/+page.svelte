@@ -68,6 +68,8 @@
   import ValidationOverlay from '$components/ValidationOverlay.svelte';
   import WhyPanel from '$components/WhyPanel.svelte';
   import type { WhyTriple } from '$lib/why';
+  import ShapeForm from '$components/ShapeForm.svelte';
+  import { getForm } from '$lib/forms-api';
   import ValidationSource from '$components/ValidationSource.svelte';
   import { type Badge, type GuardProbe, type VResult } from '$lib/validation-overlay';
   import { load as loadPref, save as savePref } from '$lib/storage';
@@ -502,6 +504,53 @@
     const id = selectedId;
     if (id) untrack(() => void loadDetails(id));
   });
+
+  // --- editing forms (U02) ---------------------------------------------------------
+  /** Whether a shape describes a resource and the caller may save its form, by IRI. */
+  let editable = $state<Record<string, boolean>>({});
+  /** The properties panel shows the form of the selected resource. */
+  let editing = $state(false);
+  $effect(() => {
+    // only the selection, the dataset and the slider: the graph changes as it grows
+    const id = selectedId;
+    const name = ds;
+    const past = timeActive;
+    const n = untrack(() => (id ? nodes[id] : null));
+    untrack(() => (editing = false));
+    if (!n || n.term.type !== 'uri' || !name || past) return;
+    const iri = n.iri;
+    if (untrack(() => editable[`${name}|${iri}`]) !== undefined) return;
+    const c = new AbortController();
+    getForm(name, iri, { signal: c.signal }).then(
+      (m) => (editable[`${name}|${iri}`] = m.editable && m.fields.some((f) => f.editable)),
+      () => {},
+    );
+    return () => c.abort();
+  });
+
+  /** Whether a shape would describe a new instance of a class the caller may save, by class. */
+  let creatable = $state<Record<string, boolean>>({});
+  $effect(() => {
+    const c = selectedClass;
+    const name = ds;
+    if (!c || !name) return;
+    if (untrack(() => creatable[`${name}|${c}`]) !== undefined) return;
+    const ctl = new AbortController();
+    getForm(name, '', { class: c, signal: ctl.signal }).then(
+      (m) => (creatable[`${name}|${c}`] = m.editable && m.fields.some((f) => f.editable)),
+      () => {},
+    );
+    return () => ctl.abort();
+  });
+
+  /** After a save: read the resource's properties again. */
+  function formSaved(id: string) {
+    const keep = Object.fromEntries(
+      Object.entries(detailCache).filter(([k]) => !k.startsWith(`${id}|`)),
+    );
+    detailCache = keep;
+    void loadDetails(id);
+  }
 
   // --- graph model -----------------------------------------------------------
 
@@ -1940,6 +1989,34 @@
     });
   });
 
+  // the first vector index of the dataset, for the link to its embedding map; a caller
+  // whose access covers part of the dataset gets 403 here and sees no link
+  let mapIndex = $state<string | null>(null);
+  $effect(() => {
+    const name = ds;
+    mapIndex = null;
+    if (!name) return;
+    let live = true;
+    api
+      .vectorStatus(name)
+      .then((s) => {
+        if (live && name === ds) mapIndex = s.indexes[0]?.name ?? null;
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  });
+
+  // `?selection=1` (Open as graph on another page, such as the embedding map) draws the
+  // shared selection once the dataset is open
+  let selectionOpened = false;
+  $effect(() => {
+    if (selectionOpened || !ds || page.url.searchParams.get('selection') !== '1') return;
+    selectionOpened = true;
+    untrack(() => void openSelectionAsGraph([...selection.ids]));
+  });
+
   function setTab(t: Tab) {
     tab = t;
     syncUrl(focusId && nodes[focusId] ? nodes[focusId].iri : null);
@@ -2198,6 +2275,15 @@
                   onclick={() => setCanvasMode('map')}><Icon name="map" size={13} /> Map</button
                 >
               </div>
+              {#if mapIndex && ds}
+                <a
+                  class="btn sm"
+                  title="The entities of the vector index {mapIndex} projected to two dimensions"
+                  href="{resolve('/embedding')}?ds={encodeURIComponent(
+                    ds,
+                  )}&index={encodeURIComponent(mapIndex)}">Embedding map</a
+                >
+              {/if}
               {#if canvasMode === 'graph'}
                 <LensMenu
                   {lenses}
@@ -2542,6 +2628,17 @@
                   <button class="btn sm" onclick={() => describeInQuery(n.iri)}
                     ><Icon name="query" size={13} /> Describe</button
                   >
+                  {#if ds && editable[`${ds}|${n.iri}`] && !timeActive}
+                    <button
+                      class="btn sm"
+                      aria-pressed={editing}
+                      title="Edit this resource in a form generated from its shapes"
+                      onclick={() => {
+                        editing = !editing;
+                        sideTab = 'props';
+                      }}><Icon name="pencil" size={13} /> Edit</button
+                    >
+                  {/if}
                   <button
                     class="btn sm"
                     title="Find paths from this resource (Shift+P)"
@@ -2632,6 +2729,20 @@
             {:else if n.term.type !== 'uri'}
               <div class="side-body faint">
                 Blank nodes can only be explored through their neighbours.
+              </div>
+            {:else if editing && sideTab === 'props' && ds && !timeActive}
+              <div class="side-body scroll">
+                {#key n.iri}
+                  <ShapeForm
+                    {ds}
+                    iri={n.iri}
+                    {prefixes}
+                    title={n.label}
+                    oncancel={() => (editing = false)}
+                    onsaved={() => formSaved(n.id)}
+                    ondraft={() => (draftOpen = true)}
+                  />
+                {/key}
               </div>
             {:else if sideTab === 'memory' && ds}
               <div class="side-body scroll">
@@ -3126,6 +3237,16 @@
               <button class="btn sm" onclick={() => focusOn(cls.iri, cls.label)}
                 ><Icon name="graph" size={13} /> Class as graph</button
               >
+              {#if ds && creatable[`${ds}|${cls.iri}`]}
+                <a
+                  class="btn sm"
+                  href="{resolve('/datasets/[name]/edit', { name: ds })}?class={encodeURIComponent(
+                    cls.iri,
+                  )}"
+                  title="Make a resource of this class in a form generated from its shapes"
+                  ><Icon name="plus" size={13} /> New instance</a
+                >
+              {/if}
             </div>
           </div>
           <div class="side-body scroll">

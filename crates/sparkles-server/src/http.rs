@@ -35,6 +35,10 @@ mod dry_run;
 mod explain;
 #[cfg(feature = "fmt")]
 mod format;
+#[cfg(feature = "shacl")]
+mod forms;
+#[cfg(feature = "shacl")]
+use forms::{check as forms_check, model as forms_model, save as forms_save};
 pub(crate) mod fuseki;
 mod graph;
 #[cfg(feature = "graphql")]
@@ -132,6 +136,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/$/schema/{ds}/diff", get(schema::diff))
         .route("/$/graph/{ds}/groups", post(graph::groups))
         .route("/$/graph/{ds}/facets", post(graph::facets))
+        .route("/$/forms/{ds}", get(forms_model))
+        .route("/$/forms/{ds}/check", post(forms_check))
+        .route("/$/forms/{ds}/save", post(forms_save))
         .route("/$/compact/{ds}", post(compact))
         .route("/$/backup/{ds}", post(backup))
         .route(
@@ -455,6 +462,15 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
+    /// The error's message, for a task that reports it.
+    pub(crate) fn message(&self) -> String {
+        self.1
+            .get("error")
+            .and_then(J::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.1.to_string())
+    }
+
     fn respond(self) -> Response {
         // engine errors with an outcome of their own have their own status codes (see
         // `From<Error>`): 408 timeout, 503 cancelled, 507 with a `budget` field
@@ -846,7 +862,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 pub(crate) struct Params(Vec<(String, String)>);
 
 impl Params {
-    fn from_query(uri: &Uri) -> Params {
+    pub(crate) fn from_query(uri: &Uri) -> Params {
         Params(
             uri.query()
                 .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
@@ -1086,7 +1102,7 @@ fn timeout_secs(params: &Params) -> Option<Duration> {
 
 /// The `timeout` parameter of a query, capped at `--max-timeout`, else the server's
 /// default.
-fn timeout_param(st: &AppState, params: &Params) -> Duration {
+pub(crate) fn timeout_param(st: &AppState, params: &Params) -> Duration {
     timeout_secs(params)
         .map(|t| st.limits.cap_timeout(t, Some(st.default_timeout)))
         .unwrap_or(st.default_timeout)
@@ -1102,7 +1118,7 @@ fn update_timeout(st: &AppState, params: &Params) -> Option<Duration> {
 
 /// A cancellation flag and the guard that sets it when dropped: kept in a handler's
 /// future, it stops the engine work of a request whose client disconnected.
-fn cancel_on_drop() -> (Arc<AtomicBool>, CancelOnDrop) {
+pub(crate) fn cancel_on_drop() -> (Arc<AtomicBool>, CancelOnDrop) {
     let cancel = Arc::new(AtomicBool::new(false));
     (cancel.clone(), CancelOnDrop(cancel))
 }
@@ -1152,7 +1168,7 @@ impl WriteDeadline {
 }
 
 /// A `408` names the timeout that applied (`timeoutSeconds`).
-fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiError {
+pub(crate) fn with_timeout(mut e: ApiError, timeout: Option<Duration>) -> ApiError {
     if e.0 == StatusCode::REQUEST_TIMEOUT
         && let (Some(t), Some(o)) = (timeout, e.1.as_object_mut())
     {
@@ -5114,9 +5130,14 @@ async fn cancel_task(
     let allowed = if t.dataset.is_empty() {
         p.has(crate::auth::ServerPerm::ServerAdmin)
     } else {
+        // a projection may be cancelled by anyone who could have started it: `read` on
+        // the whole dataset
         p.can(&t.dataset, Level::Admin)
             // the caller that started a background view-only run may cancel it
             || (t.kind == algo::view::TASK && algo::view::started(&st, &t.id, &t.dataset, &p))
+            || (t.kind == crate::projection::TASK
+                && p.can(&t.dataset, Level::Read)
+                && !p.restricted(&t.dataset))
     };
     if !allowed {
         let msg = if t.dataset.is_empty() {
@@ -5433,6 +5454,24 @@ fn shacl_target(
 }
 
 #[cfg(not(feature = "shacl"))]
+async fn forms_model() -> ApiResult {
+    Err(err(
+        StatusCode::NOT_IMPLEMENTED,
+        "built without the `shacl` feature",
+    ))
+}
+
+#[cfg(not(feature = "shacl"))]
+async fn forms_check() -> ApiResult {
+    forms_model().await
+}
+
+#[cfg(not(feature = "shacl"))]
+async fn forms_save() -> ApiResult {
+    forms_model().await
+}
+
+#[cfg(not(feature = "shacl"))]
 async fn shacl() -> ApiResult {
     Err(err(
         StatusCode::NOT_IMPLEMENTED,
@@ -5448,6 +5487,8 @@ mod compress_tests;
 mod diff_tests;
 #[cfg(test)]
 mod dry_run_tests;
+#[cfg(all(test, feature = "shacl"))]
+mod forms_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]

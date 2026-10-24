@@ -35,6 +35,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [The Explore overview](#the-explore-overview)
 * [Arcs on the map](#arcs-on-the-map)
 * [Facets and Use in query](#facets-and-use-in-query)
+* [The embedding map](#the-embedding-map)
 * [Lenses on the graph](#lenses-on-the-graph)
   * [Algorithm lenses](#algorithm-lenses)
 * [The validation overlay](#the-validation-overlay)
@@ -1613,6 +1614,49 @@ that holds the most selected entities. In Explore it opens a new query with the 
 entities and their labels. A block holds at most 1,000 entities, the first ones selected,
 and a note says how many were left out.
 
+## The embedding map
+
+The embedding map draws the entities of a vector index as points on a plane, so that
+entities with alike vectors sit close together. **Embedding map** on an index's card on the
+dataset page, in Explore's graph toolbar and on the Similar page opens it at
+`/ui/embedding?ds=…&index=…`. The server computes the projection the first time the map is
+opened and keeps it in memory, so later visits draw at once.
+
+**Layout** chooses how the points are placed. **PCA** projects every vector onto the two
+directions along which the index's vectors vary most, and the line above the map says how
+much of the variance those two directions explain. It runs in the request for an index of up
+to a million vectors. **Neighbours** starts from the PCA positions and lays out the index's
+own neighbour graph with a force layout, which pulls alike entities together and separates
+clusters better. It runs as a task, and the map shows a progress bar with **Cancel** while
+the last projection stays dimmed beneath it. An entity with several vectors sits at the mean
+of their positions.
+
+**Colour by** colours the points by their class, which is the first `rdf:type` of each
+entity, or by the first value of a predicate you type, such as a community predicate that a
+graph algorithm wrote back. Numbers with more than eight distinct values are coloured in up
+to five ranges of equal count. The legend names the eight largest categories with their
+counts and puts the rest under "other".
+
+A plain drag pans and the wheel zooms, and **Fit**, **+** and **−** do the same from
+buttons. **Lasso** (`L`) and **Box** (`B`) make a drag draw a shape instead, and the points
+inside it become the shared selection. `Shift` adds to the selection and `Alt` takes the
+shape's points out of it. Hovering a point shows its label, its class and its five nearest
+neighbours in the index, and a click opens it in Explore. **Use in query** in the selection
+bar opens a new query with the selected entities in a `VALUES` block and their labels. A
+block holds at most 1,000 entities, the ones nearest the selection's centre, and a note says
+how many were left out. **Open as graph** draws the selection in Explore. **List** shows the
+points in view as a table, with a checkbox per row that selects the entity.
+
+An index of more than 50,000 entities is drawn as a density shading of every entity with a
+sample of 50,000 on top. Zooming into a region fetches that region's entities, again at most
+50,000, and a lasso in a sampled view selects every entity inside it, not only the drawn
+ones. When the data changes after the projection was built, the line above the map shows
+**Stale** and **Recompute** builds a new one. The map always shows the head of the dataset,
+because vector indexes answer only at the head. A caller whose access covers only part of
+the dataset gets no map, since the projection places entities whose triples that caller
+cannot read. At a phone's width the pointer modes give way to a **Lasso** toggle, so that a
+plain drag still pans.
+
 ## The Pattern pane
 
 The query page can draw the graph pattern of the query in the editor. **Pattern** in the
@@ -1917,6 +1961,69 @@ full validation, and the overlay says so when such a result appears. A caller wh
 grants cover only some graphs of the dataset cannot validate it, and the overlay shows
 "Validation needs access to every graph". A validation over the server's result budget
 shows the error and no badges.
+
+## Editing forms
+
+A dataset's SHACL shapes double as editing forms
+([U02](specs/U02-shape-driven-forms.md)). When a node shape targets the resource selected
+in Explore and the caller may save, the side panel shows **Edit**, which turns the
+properties into a form. `/ui/datasets/{name}/edit?iri=…&branch=…` opens the same form on
+a page of its own, for links from other tools. The shapes come from the dataset's
+write-time SHACL guard by default ([Write-time validation](API.md#write-time-validation)),
+and the dataset's `forms` setting can name shapes graphs instead or draft shapes from the
+data. Forms from drafted shapes say that the shapes are not enforced.
+
+The form merges the property shapes of every node shape that applies, groups the fields by
+`sh:group`, orders them by `sh:order` and labels them by `sh:name`, with `sh:description`
+as help. A required field says so in words. Each field's input follows its constraints:
+radio buttons or a select for `sh:in`, a checkbox or a three-way select for booleans, date
+inputs, number inputs with the type's step and the shape's bounds, a text input with a
+language for `rdf:langString`, a text area for long strings, an entity picker for
+`sh:class` and IRIs, and a term input for a field without constraints. A known
+`dash:editor` such as `dash:TextAreaEditor` replaces the choice, and a known `dash:viewer`
+such as `dash:LabelViewer` or `dash:URIViewer` chooses how a read-only value is shown. The
+entity picker searches the instances of the field's `sh:class` by label, through the
+full-text index when the dataset has one. Triples of the resource that no shape describes
+are listed under **Other properties**, read-only. A field the caller's grants hide is
+absent, and one marked `dash:readOnly`, protected from the caller's writes or with a
+complex path is read-only with the reason beside it. A value stored in a graph the caller
+cannot write is shown read-only inside an editable field. Date-time values keep their
+timezone when edited, and a new `xsd:dateTimeStamp` takes the browser's offset.
+
+A class that a node shape targets gets **New instance** in the schema tab, which opens an
+empty form at `/ui/datasets/{name}/edit?class=…`. The first save mints the resource's IRI
+from the `forms` setting's `newIri`, a `urn:uuid:` IRI by default, writes its `rdf:type`
+with the values, and opens the form of the new resource.
+
+The browser checks values as they are typed: XSD lexical forms, patterns with their flags,
+lengths, numeric and date ranges, allowed values, counts, `sh:languageIn` and
+`sh:uniqueLang`. A problem shows under its field, and the bar at the bottom counts problems
+and changes. **Preview** sends the change to the server, which runs it as a dry run and
+validates the touched resources against every constraint of the shapes, including
+`sh:class`, `sh:node` and SHACL-SPARQL. Its results appear under their fields, and the
+preview lists the triples the save would remove and add. **Save** commits the change as one
+commit with the message typed beside it. With a guard in `reject` mode, Save checks first
+and writes nothing when the guard would reject the change. Otherwise a save with problems
+asks once more with **Save with problems**. After a failed save, an error summary at the
+top of the form lists every problem, and each entry moves the focus to its field. The
+fields are disabled while a save and the reload after it run, so nothing typed meanwhile
+is lost.
+
+Saves go to `main` when the caller may write it and it is not protected. When `main` is
+protected, or the `forms` setting's `saveTo` is `branch`, the first save creates the
+editor's branch `edits.{user}.{yyyymmdd}` from `main`'s head, and the form then edits that
+branch. Its banner counts the branch's commits and links to the merge page with
+**Review and merge**. The branch menu in the form's header opens the form on another
+branch.
+
+A save sends the values the form loaded for each field it changes. When another commit
+changed one of those fields meanwhile, the form lists the value it loaded, the value now
+stored and the person's own, and **Keep mine** or **Take the stored values** settles each
+field before saving again. Changes to other fields never conflict.
+
+The `forms` settings kind sets the shapes source, the shapes graphs, where saves go, the
+branch name template, the graph that new values go to and how new instances get IRIs
+([API](API.md#the-forms-settings-kind)). The dataset page's **Settings** tab edits it.
 
 ## The time slider
 

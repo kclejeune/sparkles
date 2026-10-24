@@ -133,6 +133,9 @@ pub fn classify(
             || admin.starts_with("schema/")
             || admin == "graph/{ds}/groups"
             || admin == "graph/{ds}/facets"
+            || admin == "forms/{ds}"
+            || admin == "forms/{ds}/check"
+            || admin == "vector/{ds}/{name}/projection"
             || admin.starts_with("stats/")
             || admin == "reason/{ds}/diagnostics"
             || admin == "reason/{ds}/explain"
@@ -140,6 +143,9 @@ pub fn classify(
             || admin == "commits/{ds}/timeline"
         {
             return Some(Class::Query);
+        }
+        if admin == "forms/{ds}/save" {
+            return Some(Class::Update);
         }
         return (!read && *method != Method::OPTIONS).then_some(Class::Admin);
     }

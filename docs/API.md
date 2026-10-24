@@ -664,7 +664,7 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | DELETE | `/$/describe/{ds}`           | *Extension.* Restores the DESCRIBE defaults. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
-| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, or a reasoning run. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, or `server-admin` for a server-wide task. The caller that started a background view-only algorithm run (`algo-view`) may also cancel it. |
+| DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, a reasoning run or a vector projection. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, `read` on the whole dataset for a `vector-projection`, or `server-admin` for a server-wide task. The caller that started a background view-only algorithm run (`algo-view`) may also cancel it. |
 | POST   | `/$/cache/clear/{ds}`        | *Extension (no Fuseki equivalent).* Drops the dataset's cached query results and its cached remote SERVICE results ([SERVICE options](#service-options-loop-bulk-and-cache)). Returns `{ "cleared": number /* entries */, "bytes": number, "serviceCleared": number, "serviceBytes": number }`. |
 | GET    | `/$/prefixes/{ds}`           | `{ "prefixes": { "rdf": "http://…#", … } }`: the dataset's effective prefixes, which are the well-known ones, the prefixes the settings file declares and the dataset's own, as the [prefixes kind](#prefixes) computes them. |
 | GET    | `/{ds}/prefixes`             | Modelled on Fuseki's prefixes service. `?prefix=p` returns `{ prefix, uri }`, or `404` if `p` is unbound. `?uri=u` returns `{ uri, prefixes: [...] }`. With neither, the response is `{ prefixes: {...} }` with the stored prefixes only. Declared and well-known prefixes are not listed here, and `?prefix=` and `?uri=` look only at the stored ones. |
@@ -5278,6 +5278,8 @@ exactly.
 | DELETE | `/$/vector/{ds}/{name}` | Drops the index and its files, with `204`. |
 | POST | `/$/vector/{ds}/{name}/rebuild` | Builds the index again from RDF. Returns `202` and a task. |
 | POST | `/$/vector/{ds}/{name}/recall?samples=100&k=10&ef=` | Measures recall@k against the exact search, with stored vectors as queries. Returns `{ k, samples, ef, recall, hnswMs, exactMs }`. `recall` is `null` when no vector was sampled, for example while the index has no graph to search. |
+| POST | `/$/vector/{ds}/{name}/projection?method=pca` | Computes a two-dimensional projection of the index and keeps it. See [Embedding map](#embedding-map). |
+| GET | `/$/vector/{ds}/{name}/projection?bbox=&limit=&colour=` | The kept projection with its density grid, classes and up to 50,000 points. |
 
 A `VectorIndexStatus` is
 `{ name, predicate, dimension, metric, model?, state, progress?, message?, generation, rows, overlay: { inserts, deletes, indexed, pending, overBudget }, skipped: { malformed, wrongDimension, zeroNorm }, memory: { segmentBytes, hnswBytes, residency }, hnsw, exactThreshold, files?, lastBuild?, embedding? }`.
@@ -5304,6 +5306,85 @@ sparkles vector status  --loc DB [--name NAME]
 
 Each command takes `--server URL --dataset NAME` instead of `--loc`. `create` and
 `rebuild` wait for the build.
+
+### Embedding map
+
+`POST /$/vector/{ds}/{name}/projection` computes a two-dimensional projection of an
+index's entities at the head of the branch, and `GET` on the same path reads it. The UI's
+embedding map draws it.
+
+```sh
+curl -X POST 'http://localhost:3030/$/vector/wiki/abstracts/projection?method=pca'
+curl 'http://localhost:3030/$/vector/wiki/abstracts/projection?limit=1000'
+```
+
+`method=pca`, the default, finds the two leading principal components of a sample of up
+to 100,000 vectors and projects every vector on them. Under the cosine metric the vectors
+are normalized first. An entity with several vectors under the predicate sits at the mean
+of their projections. A PCA of an index of up to 1,000,000 vectors runs in the request
+under its `timeout`, and a larger one runs as a task. `method=neighbours` starts from the
+PCA positions and lays out the index's HNSW neighbour graph, moving each entity toward its
+neighbours and away from crowded regions. It always runs as a cancellable task of kind
+`vector-projection`, and the `POST` answers `202` with the task. Anyone with `read` on the
+whole dataset may cancel it with `DELETE /$/tasks/{id}`, since anyone who can start one
+can. The projection reads the index's base rows and the vectors inserted since, and the
+layout also follows the links of nodes that were added to the graph after its build. The
+optional body is
+`{ "sample": n, "seed": n, "iterations": n }`, where `iterations` counts the layout's
+steps, 100 by default. The same seed gives the same projection.
+
+The `POST` that runs in the request answers the projection's facts,
+`{ index, method, commit, generation, stale, vectors, dimension, entities, bounds,
+explained, builtMs, bytes }`. `vectors` counts the projected vectors and `entities` the
+points, and `explained` is the share of the sample's variance on each component.
+
+`GET` answers those facts with:
+
+| Member | Meaning |
+|---|---|
+| `points` | Up to `limit` points, 50,000 by default and at most, as `{ entity, x, y, class?, colour? }`. |
+| `region` | `{ bbox, total, shown, sampled }` for the points inside `bbox`, or all of them. |
+| `density` | `{ size: 256, bbox, max, counts }`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y. |
+| `classes` | `{ iri, count }` per class. A point's `class` indexes this list. |
+| `colour` | With `colour=IRI`, `{ predicate, values }`, where `values` holds `{ value, count }` and a point's `colour` indexes it. |
+
+Each entity has a fixed sampling priority from the seed. A region with more points than
+`limit` returns those of lowest priority, so a smaller region shows every point that a
+larger one showed inside it, and more. A point's class is its first `rdf:type`, and its
+colour value is the first object of the `colour` predicate.
+
+`Accept: application/x-sparkles-points` returns the same answer in binary. The body starts
+with the eight bytes `SPKPTS\0\x01`, where the last byte is the format's version, and a
+reader refuses any other. A little-endian `Uint32` gives the length of the header, which is
+the JSON answer without `points` and with `count`, `termsBytes` and `hasColour`. The
+entities follow as `termsBytes` bytes of UTF-8 separated by line feeds, then zero bytes to a
+multiple of four. Then come `count` pairs of `Float32` x and y, `count` `Uint32` class
+indexes, and with `colour=` `count` `Uint32` colour indexes. `0xFFFFFFFF` means no class or
+no value.
+
+The server keeps four projections, 1 GiB in all, keyed by dataset, branch, index and
+method, and drops the least recently used first. A projection takes 24 bytes per entity,
+so ten million entities take 240 MB. The query memory pool pays for the computation before
+it allocates, from a bound of its working memory taken from the snapshot it reads. In the
+request the request's own grant is charged, and a task waits in the pool's queue for a
+grant of its own. A computation that needs more than the whole pool is refused with `507`,
+and one that finds the memory in use past the admission wait gets `503`, or a failed task.
+A kept projection then holds a grant for its own bytes until it is dropped and its last
+reader is done, and a projection the pool or the limit cannot hold is refused with
+`507`. An index replaced under the same name with another predicate, dimension or
+metric forgets its projections. A
+kept projection holds the snapshot it read, so after a compaction the replaced generation's
+files stay open until the projection is replaced or dropped. Projections are not written to
+disk, and a restart forgets them. A projection read at an older commit than the head has
+`stale: true` until a new one is computed. `GET` answers `404` until a `POST` computed one.
+`/metrics` reports `sparkles_vector_projections` and `sparkles_vector_projection_bytes`.
+
+Both routes need `read`, and they answer `403` to a caller whose grants or protections
+cover part of the dataset, as the vector status routes do, because a point reveals that an
+entity exists and what it is like. The library computes a projection with
+`ds.indexes().vector().projection(name, &ProjectionConfig, &Control)`, and Python with
+`ds.indexes.vector.projection(name, method="pca", sample=…, seed=…)`, which returns every
+point.
 
 ### Embeddings on write
 
@@ -7553,6 +7634,228 @@ SHACLC cannot express, such as a named property shape, `sh:minCount 0` or a labe
 shape, is not written at all, and the error names those triples. The Rust API is
 `sparkles_shacl::compact::{parse, write}` and `sparkles_shacl::ShapesSyntax`.
 
+## Editing forms
+
+The design and its rationale are in
+[U02 Editing forms generated from SHACL shapes](specs/U02-shape-driven-forms.md).
+
+The form routes turn a dataset's SHACL shapes into an editing form for one resource. The
+server reads the shapes, chooses the node shapes that target the resource, merges their
+property shapes into fields and reads the resource's values under the caller's grants. A
+form's changes go back as terms, and the server writes them as one update of
+`DELETE DATA` and `INSERT DATA`, so a client never writes SPARQL text for a save. The routes
+need the `shacl` cargo feature, which is on by default, and return `501` without it.
+
+| Route | Permission | Use |
+|---|---|---|
+| `GET /$/forms/{ds}?focus=IRI` | `read` | The form model of a resource, or with `class=IRI` the empty form of a new instance. |
+| `POST /$/forms/{ds}/check` | `write` | A dry run of a change and its validation against the form's shapes. |
+| `POST /$/forms/{ds}/save` | `write` | The commit of a change, unless another commit changed its fields. |
+
+### The form model
+
+`GET /$/forms/{ds}` takes these parameters.
+
+* **`focus`** is the IRI of the resource, bare or in angle brackets.
+* **`class`** asks for the form of a new instance of that class instead, built from the
+  node shapes that target the class or one of its superclasses, with no values and a
+  `focus` of `null`. A request names `focus` or `class`, and a `class` form takes no `at`.
+* **`shapes`** is `guard`, `graphs` or `drafted` and overrides the `forms` setting's
+  source. `guard` reads the shapes of the dataset's write-time SHACL guard, `graphs` reads
+  the shapes graphs the setting names, and `drafted` drafts shapes from the data as the
+  schema report does. A dataset without a SHACL guard answers with no fields and
+  `shapes.missing` set, rather than an error.
+* **`branch`** opens the form on a branch, as on other routes. **`at`** opens the form at
+  a past state, as the history routes take it, and such a form is never editable.
+* **`lang`** is the language whose `sh:name` and `sh:description` the labels prefer. The
+  server falls back to English, then to untagged text, then to the predicate's
+  `rdfs:label` and similar labels in the data, and then to its prefixed name.
+
+The answer is the model. Its `ETag` and `Sparkles-Commit` headers name the commit read.
+
+```ts
+type FormModel = {
+  formFormat: 1;
+  focus: string | null;
+  types: string[];                  // the focus node's rdf:type values
+  commit: number;                   // the commit read
+  branch: string;
+  editable: boolean;                // whether the caller may save this form
+  shapes: {
+    source: "guard" | "graphs" | "drafted";
+    nodeShapes: string[];           // the node shapes that target the focus
+    missing?: string;               // why there are no shapes
+    unknownHints: string[];         // DASH editors and viewers the server does not know
+  };
+  groups: { iri: string | null; label: string; order: number | null }[];
+  fields: FormField[];
+  other: { predicate: string; values: FormValue[] }[];  // triples no field covers
+  graph: string | null;             // where new values go, null for the default graph
+  closed: boolean;                  // a shape is sh:closed, so other properties violate it
+  save: { to: "main" | "branch"; branch: string; exists: boolean; mainProtected: boolean };
+  guard: { language: "shacl" | "shex"; mode: "reject" | "warn" | "off" } | null;
+};
+type FormField = {
+  id: string;                       // the path in SPARQL syntax, such as <http://ex/name>
+  path: string;                     // the predicate IRI, or the SPARQL path of a complex path
+  inverse: boolean;
+  editable: boolean;
+  reason?: "readOnly" | "protected" | "graph" | "complex-path" | "too-many" | "state";
+  label: string;
+  description?: string;
+  group: string | null;             // the sh:PropertyGroup IRI
+  order: number | null;
+  widget: string;                   // radio, select, checkbox, boolean-select, date, datetime,
+                                    // number, text-lang, textarea, text, entity, nested, term
+  editor?: string;                  // dash:editor
+  viewer?: string;                  // dash:viewer
+  constraints: Constraints;         // the merged constraints of every shape on this path
+  sources: string[];                // the shapes that constrain this path
+  values: FormValue[];
+  truncated?: boolean;              // more than 200 values, so the field is read-only
+};
+type FormValue = { term: Term; graph: string | null; label?: string; readOnly?: boolean };
+```
+
+A field's `id` is its path written in SPARQL syntax, so two node shapes that constrain the
+same path give one field with the stricter of each constraint. `constraints` holds the
+constraints the browser can check, which are `minCount`, `maxCount`, `datatype`,
+`nodeKind`, `class`, `in`, `hasValue`, the four range bounds, `minLength`, `maxLength`,
+`pattern` with its `flags`, `languageIn`, `uniqueLang`, `singleLine` and `defaultValue`.
+`node` lists the shapes of `sh:node`, and `server` names the other components the check
+evaluates, such as `sh:qualifiedValueShape` or a SHACL-SPARQL constraint.
+
+A predicate path and an inverse path are editable. Sequence, alternative and repetition
+paths are read-only with `reason: "complex-path"` and show no values. A field is also
+read-only when its shape has `dash:readOnly true`, when a protection of the caller's grants
+keeps the predicate from writes (`protected`), when new values would go to a graph the
+caller cannot write (`graph`), when it holds more than 200 values (`too-many`), and when
+the whole form cannot be saved (`state`). Fields whose predicate a protection hides from
+reads are left out, as are the values in graphs the caller cannot read and the values of
+the inferred graph. What the caller may write follows its grants on the update endpoint of
+the branch saves go to, and what it reads follows the query endpoint. A value in a graph
+the caller cannot write has `readOnly: true`. Only protections that name predicates and
+graphs alone make a field `protected`, and a protection scoped by classes or a pattern is
+enforced by the save itself. Shapes read from shapes graphs leave out the triples that the
+caller's protections hide. A focus that no shape targets answers `200` with no fields.
+
+### Checks and saves
+
+`check` and `save` take the same JSON body.
+
+```ts
+type FormChangeBody = {
+  focus?: string;                   // the IRI of the resource
+  class?: string;                   // or the class of a new instance, instead of focus
+  branch?: string;                  // the branch the form was opened on, main by default
+  shapes?: "guard" | "graphs" | "drafted";
+  changes: { field: string; remove?: Term[]; add?: Term[] }[];
+  expect: { [field: string]: Term[] };  // the values the form loaded, for every changed field
+  message?: string;                 // the commit message
+};
+```
+
+The server checks each change before it writes anything. A field that is not in the form,
+a blank node, or a literal on an inverse path is a `400`, because the change could not
+name its triple. A change to a
+read-only field is a `403`. A change of more than 1,000 terms is a `400`. A removed value is
+deleted from every graph that holds it, and an added value goes to the model's `graph`.
+`expect` must name every changed field. It may be empty for a field that had no values.
+A change with `class` makes a new instance. The server mints its IRI from the setting's
+`newIri`, refuses an IRI that already describes a resource, and adds its `rdf:type`.
+The middleware admits a check or a save on any branch the caller can see, and the handler
+checks write on the branch the body or the query names.
+
+`check` runs the change as a write preview (see [Write previews](#write-previews)) and then
+validates the nodes the change touches against the form's shapes, whether or not the
+dataset has a guard. The nodes it validates are the resource, the IRIs added or removed,
+and up to 500 nodes one or two triples away from one of them in either direction, whose
+shapes can read the change along a path. The check plans the change on the state its dry run starts
+from. The validation holds the dataset's writer lock and stops after 10
+seconds. The answer is the preview, the validation and the fields whose stored values
+already differ from `expect`, which a save would refuse with a conflict. A check of a
+session branch that does not exist yet previews its first commit on `main`'s head, and
+`main`'s protection does not refuse that preview.
+
+```ts
+type FormCheckAnswer = {
+  branch: string;
+  preview: WritePreview;            // as POST /{ds}/update?dryRun=true answers
+  update: string;                   // the SPARQL Update the save would run
+  conflicts: { id: string; now: Term[] }[];  // fields another commit changed, as save's 409 lists them
+  validation: {
+    checked: boolean;
+    withheld: boolean;              // the caller's grants hide part of the dataset
+    timedOut: boolean;
+    conforms: boolean | null;
+    results: (ShaclResult & { field: string | null })[] | null;
+  };
+};
+```
+
+Each result carries the `field` it belongs to, which is the field whose path is the
+result's `sh:resultPath` on the focus node, or `null` for a result on another node. A
+caller whose grants limit the graphs or triples it reads gets `withheld: true` and no
+results, as the validation routes withhold reports from such callers.
+
+`save` compares `expect` with the stored values of the changed fields while it holds the
+writer lock. When one differs, it answers `409` with code `form-conflict` and the current
+values, and writes nothing. When the values are the same but another commit moved one of
+them to another graph while the save waited, the save plans its update again on the new
+head, up to three times.
+
+```json
+{
+  "error": "another commit changed these fields since the form loaded them",
+  "code": "form-conflict",
+  "branch": "edits.ana.20261024",
+  "fields": [{ "id": "<http://example.org/email>", "now": [{ "type": "literal", "value": "a@b.org" }] }]
+}
+```
+
+Otherwise the change is committed as one commit of kind `update`, with the caller as author
+and `message` as its message, and the write-time guard runs as it does for any write. The
+answer is the commit receipt of `POST /{ds}/update` plus `dataset`, `focus`, `branch` and
+`branchCreated`, where `focus` is the IRI minted for a new instance. A rejected write answers as an update does, such as `422` with the guard's
+report.
+
+### Where saves go
+
+A form opened on a branch other than `main` saves there. A form opened on `main` saves to
+`main` or to a session branch, as the `forms` setting's `saveTo` decides.
+
+* **`auto`** is the default. It saves to `main` unless `main` is protected, and to the
+  session branch then.
+* **`main`** always saves to `main`, which a protected `main` refuses with
+  `403 branch-protected`.
+* **`branch`** always saves to the session branch.
+
+The session branch is named by `branchTemplate`, `edits.{user}.{date}` by default, where
+`{user}` is the caller's name and `{date}` is the day in UTC as `yyyymmdd`. The first save
+creates it from `main`'s head, which needs the right to write branches and grants that do
+not limit the caller to some graphs or triples. Later saves on the same day reuse it. Its
+changes reach `main` through the merge routes. A check of a session branch that does not
+exist yet runs on `main`'s head, where the branch would start.
+
+### The `forms` settings kind
+
+`forms` is a settings kind (see [Settings](#settings)), read from the dataset's `main` and
+kept in `<db>/forms.json`. Its fields are these.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `shapes` | `guard` | Where the shapes come from, which is `guard`, `graphs` or `drafted`. |
+| `graphs` | `[]` | The shapes graphs that `shapes: "graphs"` reads. |
+| `saveTo` | `auto` | Where saves of a form on `main` go, which is `auto`, `main` or `branch`. |
+| `branchTemplate` | `edits.{user}.{date}` | The name of the session branch. It must hold `{user}`. |
+| `targetGraph` | `type` | The graph new values go to. `type` is the graph of the focus node's `rdf:type` triple, `default` the default graph, and an IRI that graph. |
+| `newIri` | `urn:uuid` | How new instances get IRIs, either `urn:uuid` or a template that holds `{uuid}`. Phase 2 of the forms uses it. |
+
+```sh
+curl -X PATCH 'localhost:3030/$/settings/people/forms' \
+  -H 'content-type: application/json' -d '{"saveTo": "branch"}'
+```
+
 ## ShEx validation
 
 The design and its rationale are in [G02 ShEx 2.1 validation](specs/G02-shex.md).
@@ -8763,7 +9066,7 @@ without the permission is a `403` before any connection or file is opened, even 
 | `/$/algo/{ds}/projections/{name}` | PUT, DELETE | Dataset `admin`. |
 | `/$/metrics` | GET | `metrics` |
 | `/$/datasets` | POST | `server-admin` |
-| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` needs `read` too. |
+| `/$/datasets/{ds}`, `/$/stats/{ds}`, `/$/schema/{ds}…`, `/$/queries/{ds}…` (GET), `/$/prefixes/{ds}`, `/$/commits/{ds}…`, `/$/ready/{ds}`, `/$/reason/{ds}` (GET), `/$/reason/{ds}/diagnostics`, `/$/text/{ds}` (GET), `/$/geo/{ds}` (GET), `/$/vector/{ds}`, `/$/vector/{ds}/{name}` (GET), `/$/snapshots/{ds}…` (GET), `/$/history/{ds}` (GET), `/$/validation/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/describe/{ds}` (GET), `/$/quota/{ds}` (GET), `/$/compaction/{ds}` (GET), `/$/graphql/{ds}…` (GET), `/{ds}/prefixes` (GET) | GET | `read`. `POST /$/vector/{ds}/{name}/recall` and both methods of `/$/vector/{ds}/{name}/projection` need `read` too. |
 | `/$/datasets/{ds}` (DELETE), `/$/datasets/{ds}/clone`, `/$/compact/{ds}`, `/$/backup/{ds}`, `/$/cache/clear/{ds}`, `/$/reason/{ds}` (POST, DELETE), `/$/reason/{ds}/auto`, `/$/text/{ds}` (PUT, DELETE), `/$/text/{ds}/rebuild`, `/$/geo/{ds}` (PUT, DELETE), `/$/geo/{ds}/rebuild`, `/$/vector/{ds}/{name}` (PUT, DELETE), `/$/vector/{ds}/{name}/rebuild`, `/$/vector/{ds}/{name}/reembed`, `/$/snapshots/{ds}` (POST), `/$/snapshots/{ds}/{name}` (DELETE), `/$/history/{ds}` (PUT), `/$/validation/{ds}`, `/$/rdfs/{ds}`, `/$/describe/{ds}`, `/$/compaction/{ds}` and `/$/graphql/{ds}` (PUT, DELETE), `/$/queries/{ds}/{name}` (PUT, DELETE) | | `admin` |
 | `/$/backups/{ds}`, `/$/backups/{ds}/{repo}/{backup}` | GET | `read`. A backup of another dataset is `404`. |
 | `/$/backups/{ds}` (POST), `/$/backups/{ds}/{repo}/{backup}` (DELETE), `…/restore`, `…/verify` | | `admin`. A restore also needs it on its target name. |
@@ -8893,7 +9196,7 @@ because those come from statistics of every graph.
 Routes that report on the whole dataset answer `403` with
 `"… covers every graph of /wiki, and your access is limited to some graphs or triples"`. These are
 `/$/stats/{ds}`, `/$/reason/{ds}` (GET) and its diagnostics, `/$/text/{ds}`,
-`/$/geo/{ds}` and `/$/vector/{ds}…` status and recall, `/$/backups/{ds}…` (GET),
+`/$/geo/{ds}` and `/$/vector/{ds}…` status, recall and projections, `/$/backups/{ds}…` (GET),
 `/$/history/{ds}` (GET), `/$/rdfs/{ds}` (GET), `/$/quota/{ds}` (GET),
 `/$/compaction/{ds}` (GET), `/{ds}/shacl`, `/{ds}/shex` and changes to `/{ds}/prefixes`.
 Other
@@ -11168,16 +11471,16 @@ figures of the runs and reviews since the server started.
 
 ### Settings
 
-A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag` and `paths` settings
-are settings kinds. The effective value of a kind is computed from four layers, and a
+A dataset's `assistant`, `memory`, `ingest`, `prefixes`, `graphrag`, `paths` and `forms`
+settings are settings kinds. The effective value of a kind is computed from four layers, and a
 later layer overrides an earlier one.
 
 1. The built-in defaults of the kind.
 2. The `defaults` of the settings file of `serve --settings`.
 3. The settings file's entry for the dataset, by name.
 4. The runtime layer, which holds the fields changed through the API. It is kept in the
-   dataset's file (`assistant.json`, `memory.json`, `paths.json`, or the settings members of
-   `ingest.json`), or in the process for an in-memory dataset.
+   dataset's file (`assistant.json`, `memory.json`, `paths.json`, `forms.json`, or the
+   settings members of `ingest.json`), or in the process for an in-memory dataset.
 
 Layers merge as in RFC 7396. Objects merge member by member, and arrays and scalars
 replace the earlier value. A field is a path of members written with dots, such as

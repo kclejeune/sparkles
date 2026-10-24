@@ -16,6 +16,7 @@
 //! ([`server`]). The runtime values of model secrets live in `<dataDir>/secrets`
 //! ([`secrets`]).
 
+pub mod forms;
 pub mod http;
 pub mod merge;
 pub mod paths;
@@ -188,8 +189,23 @@ pub static PATHS: Kind = Kind {
     check: check_as::<paths::PathSettings>,
 };
 
+/// The editing forms of spec U02.
+pub static FORMS: Kind = Kind {
+    name: "forms",
+    scope: Scope::Dataset,
+    file: forms::FORMS_FILE,
+    members: forms::MEMBERS,
+    removable: &[],
+    shared: false,
+    defaults: defaults_of::<forms::FormSettings>,
+    normalize: normalize_as::<forms::FormSettings>,
+    check: check_as::<forms::FormSettings>,
+};
+
 /// Every dataset-wide kind, in the order the answers list them.
-pub static KINDS: [&Kind; 6] = [&ASSISTANT, &MEMORY, &INGEST, &PREFIXES, &GRAPHRAG, &PATHS];
+pub static KINDS: [&Kind; 7] = [
+    &ASSISTANT, &MEMORY, &INGEST, &PREFIXES, &GRAPHRAG, &PATHS, &FORMS,
+];
 
 /// The server-wide `notifications` kind (spec C21 §5): channels, routes and delivery,
 /// declared in the settings file's `server.notifications` and kept at runtime in

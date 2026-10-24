@@ -652,11 +652,13 @@ pub mod hnsw;
 mod index;
 pub mod live;
 pub mod persist;
+pub mod projection;
 mod search;
 
 pub use config::{HnswConfig, SearchMode, VectorConfigFile, VectorIndexConfig, VectorIndexStatus};
 pub(crate) use index::{BuildCtl, Carry, Outcome, build_index};
 pub use index::{Built, GenerationVectors, PackedStatus, PredicateVectors, Segment, check_files};
+pub use projection::{Projection, ProjectionConfig, ProjectionMethod};
 pub(crate) use search::overlay_counts;
 pub use search::{Hit, Search, SearchInfo, search};
 

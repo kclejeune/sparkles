@@ -14,6 +14,8 @@ mod branches;
 mod cli_grants;
 #[cfg(feature = "reasoning")]
 mod explain;
+#[cfg(feature = "shacl")]
+mod forms;
 #[cfg(feature = "graphql")]
 mod graphql;
 mod graphrag;

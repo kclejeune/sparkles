@@ -431,6 +431,21 @@ python = "skip: formatter and linter remain CLI tools"
 jvm = "SparklesHelpers.lint"
 node = "lint"
 
+["forms.check"]
+python = "planned: Dataset.forms.check, after the form editor settles"
+jvm = "planned: DatasetGraphSparkles.forms().check, after the Python and Node.js ones"
+node = "planned: Dataset.forms.check, after the form editor settles"
+
+["forms.model"]
+python = "planned: Dataset.forms.model, after the form editor settles"
+jvm = "planned: DatasetGraphSparkles.forms().model, after the Python and Node.js ones"
+node = "planned: Dataset.forms.model, after the form editor settles"
+
+["forms.save"]
+python = "planned: Dataset.forms.save, after the form editor settles"
+jvm = "planned: DatasetGraphSparkles.forms().save, after the Python and Node.js ones"
+node = "planned: Dataset.forms.save, after the form editor settles"
+
 ["geo.convert"]
 python = "convert_geometries"
 jvm = "SparklesHelpers.convertGeometries"
@@ -610,6 +625,11 @@ node = "Dataset.indexes.vector.put"
 python = "Dataset.indexes.vector.rebuild"
 jvm = "DatasetGraphSparkles.indexes().vector().rebuild"
 node = "Dataset.indexes.vector.rebuild"
+
+["indexes.vector.projection"]
+python = "Dataset.indexes.vector.projection"
+jvm = "planned: a typed handle after the Python and Node.js ones"
+node = "planned: Dataset.indexes.vector.projection, after the Python one"
 
 ["indexes.vector.recall"]
 python = "Dataset.indexes.vector.recall"

@@ -387,3 +387,41 @@ async fn facets_count_only_what_the_caller_reads() {
     let r = facets(&app, "oinfo", body).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
 }
+
+/// The projection routes (U11 A8) answer `403` to a caller whose access covers part of
+/// the dataset, before they look for the index, as the vector status route does, since a
+/// point reveals that an entity exists. Every user of this fixture reads through a view,
+/// because the dataset has protections. Without authentication the routes reach the
+/// index lookup (`projection_tests`).
+#[tokio::test]
+async fn projections_need_access_to_the_whole_dataset() {
+    let (_dir, app) = server();
+    for user in ["oga", "olift", "ofull"] {
+        let status = call(
+            &app,
+            "GET",
+            "/$/vector/ov",
+            &[("authorization", &b(user))],
+            "",
+        )
+        .await;
+        assert_eq!(status.status, StatusCode::FORBIDDEN, "{}", status.text());
+        for method in ["POST", "GET"] {
+            let r = call(
+                &app,
+                method,
+                "/$/vector/ov/v/projection",
+                &[("authorization", &b(user))],
+                "",
+            )
+            .await;
+            assert_eq!(
+                r.status,
+                StatusCode::FORBIDDEN,
+                "{method} as {user}: {}",
+                r.text()
+            );
+            assert!(r.text().contains("covers every graph"), "{}", r.text());
+        }
+    }
+}

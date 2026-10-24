@@ -234,7 +234,7 @@
         }
       },
       "kind": {
-        "description": "The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server.",
+        "description": "The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server.",
         "in": "path",
         "name": "kind",
         "required": true,
@@ -244,6 +244,7 @@
             "memory",
             "ingest",
             "graphrag",
+            "forms",
             "models",
             "notifications"
           ],
@@ -15420,7 +15421,8 @@
               "ingest",
               "prefixes",
               "graphrag",
-              "paths"
+              "paths",
+              "forms"
             ],
             "type": "string"
           },
@@ -23985,6 +23987,565 @@
           "Formatting"
         ],
         "x-sparkles-permission": "any caller"
+      }
+    },
+    "/$/forms/{ds}": {
+      "get": {
+        "description": "The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. Reads follow the caller's query endpoint grants and writeability its update endpoint grants on the branch saves go to. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
+        },
+        "operationId": "getForm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "description": "The IRI of the resource. Give either `focus` or `class`.",
+            "in": "query",
+            "name": "focus",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The class of a new instance.",
+            "in": "query",
+            "name": "class",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Where the shapes come from, when not the dataset's `forms` setting.",
+            "in": "query",
+            "name": "shapes",
+            "schema": {
+              "enum": [
+                "guard",
+                "graphs",
+                "drafted"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "The language labels are picked in, then English, then untagged.",
+            "in": "query",
+            "name": "lang",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/branch"
+          },
+          {
+            "$ref": "#/components/parameters/at"
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "branch": {
+                      "type": "string"
+                    },
+                    "closed": {
+                      "type": "boolean"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "editable": {
+                      "description": "The caller may save changes through this form.",
+                      "type": "boolean"
+                    },
+                    "fields": {
+                      "items": {
+                        "description": "`{id, path, inverse, editable, reason?, label, description?, group, order, widget, editor?, viewer?, constraints, sources, values}`, where each value is `{term, graph, label?, readOnly?}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "focus": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "formFormat": {
+                      "enum": [
+                        1
+                      ],
+                      "type": "integer"
+                    },
+                    "graph": {
+                      "description": "The graph new values go into, `null` for the default graph.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "groups": {
+                      "items": {
+                        "description": "`{iri, label, order}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "guard": {
+                      "description": "`{language, mode}` of the write guard.",
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "other": {
+                      "items": {
+                        "description": "`{predicate, values}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "save": {
+                      "description": "`{to, branch, exists, mainProtected}`: `to` is `main` or `branch`.",
+                      "type": "object"
+                    },
+                    "shapes": {
+                      "description": "`{source, nodeShapes, missing?, unknownHints}`.",
+                      "type": "object"
+                    },
+                    "types": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "formFormat",
+                    "focus",
+                    "types",
+                    "commit",
+                    "branch",
+                    "editable",
+                    "shapes",
+                    "groups",
+                    "fields",
+                    "other",
+                    "graph",
+                    "closed",
+                    "save"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The form model."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "501": {
+            "$ref": "#/components/responses/NotImplemented"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "The form of a resource",
+        "tags": [
+          "Validation"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/forms/{ds}/check": {
+      "post": {
+        "description": "Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
+        },
+        "operationId": "checkForm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "branch": {
+                    "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch.",
+                    "type": "string"
+                  },
+                  "changes": {
+                    "items": {
+                      "properties": {
+                        "add": {
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "field": {
+                          "description": "The field's id, its path in SPARQL syntax.",
+                          "type": "string"
+                        },
+                        "remove": {
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "field"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "class": {
+                    "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`.",
+                    "type": "string"
+                  },
+                  "expect": {
+                    "additionalProperties": {
+                      "items": {
+                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "description": "The values the form loaded, by field id, for every changed field.",
+                    "type": "object"
+                  },
+                  "focus": {
+                    "description": "The IRI of the resource. Give either `focus` or `class`.",
+                    "type": "string"
+                  },
+                  "message": {
+                    "description": "The commit message.",
+                    "type": "string"
+                  },
+                  "shapes": {
+                    "description": "The shapes the form was built from, when not the setting's.",
+                    "enum": [
+                      "guard",
+                      "graphs",
+                      "drafted"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "changes"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The changes.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "branch": {
+                      "type": "string"
+                    },
+                    "conflicts": {
+                      "description": "`{id, now}` of each changed field whose stored values differ from `expect`.",
+                      "items": {
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "preview": {
+                      "description": "The dry run, as a write preview answers it.",
+                      "type": "object"
+                    },
+                    "update": {
+                      "type": "string"
+                    },
+                    "validation": {
+                      "description": "`{checked, withheld, timedOut, conforms, results}`.",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "branch",
+                    "preview",
+                    "update",
+                    "conflicts",
+                    "validation"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The preview and the validation."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Check a form's changes",
+        "tags": [
+          "Validation"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
+    "/$/forms/{ds}/save": {
+      "post": {
+        "description": "Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#editing-forms"
+        },
+        "operationId": "saveForm",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "branch": {
+                    "description": "The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch.",
+                    "type": "string"
+                  },
+                  "changes": {
+                    "items": {
+                      "properties": {
+                        "add": {
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "field": {
+                          "description": "The field's id, its path in SPARQL syntax.",
+                          "type": "string"
+                        },
+                        "remove": {
+                          "items": {
+                            "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "field"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "class": {
+                    "description": "The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`.",
+                    "type": "string"
+                  },
+                  "expect": {
+                    "additionalProperties": {
+                      "items": {
+                        "description": "A term in the SPARQL JSON results form: `{\"type\": \"uri\", \"value\": …}` or `{\"type\": \"literal\", \"value\": …, \"datatype\"?: …, \"xml:lang\"?: …}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "description": "The values the form loaded, by field id, for every changed field.",
+                    "type": "object"
+                  },
+                  "focus": {
+                    "description": "The IRI of the resource. Give either `focus` or `class`.",
+                    "type": "string"
+                  },
+                  "message": {
+                    "description": "The commit message.",
+                    "type": "string"
+                  },
+                  "shapes": {
+                    "description": "The shapes the form was built from, when not the setting's.",
+                    "enum": [
+                      "guard",
+                      "graphs",
+                      "drafted"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "changes"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "description": "The changes.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "branch": {
+                      "type": "string"
+                    },
+                    "branchCreated": {
+                      "type": "boolean"
+                    },
+                    "commit": {
+                      "type": "object"
+                    },
+                    "committed": {
+                      "type": "boolean"
+                    },
+                    "dataset": {
+                      "type": "string"
+                    },
+                    "datasetId": {
+                      "type": "string"
+                    },
+                    "focus": {
+                      "description": "The resource saved, which for a new instance is the IRI minted for it.",
+                      "type": "string"
+                    },
+                    "validation": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "committed",
+                    "commit",
+                    "branch",
+                    "branchCreated"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The commit receipt."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Save a form's changes",
+        "tags": [
+          "Validation"
+        ],
+        "x-sparkles-permission": "read"
       }
     },
     "/$/geo/convert": {
@@ -34170,6 +34731,366 @@
         "x-sparkles-permission": "admin"
       }
     },
+    "/$/vector/{ds}/{name}/projection": {
+      "get": {
+        "description": "Returns the kept projection's method, commit, bounds, a density grid of 256 by 256 cells, its classes, and up to 50,000 points as `{entity, x, y, class?, colour?}`. `bbox` returns the points inside a region and its density, at most `limit`, those of lowest sampling priority when there are more, so zooming in keeps the points already shown. `colour` names a predicate whose first value per point is returned as an index into `colour.values`. `Accept: application/x-sparkles-points` returns the binary points format of the embedding map guide. A projection read at an older commit than the head has `stale: true`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#embedding-map"
+        },
+        "operationId": "getVectorProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "The projection's method. The most recent of any method when absent.",
+            "in": "query",
+            "name": "method",
+            "schema": {
+              "enum": [
+                "pca",
+                "neighbours"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "`minX,minY,maxX,maxY`.",
+            "in": "query",
+            "name": "bbox",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most points to return.",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "default": 50000,
+              "maximum": 50000,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "A predicate IRI whose values colour the points.",
+            "in": "query",
+            "name": "colour",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "bounds": {
+                      "description": "`[minX, minY, maxX, maxY]`.",
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "builtMs": {
+                      "type": "number"
+                    },
+                    "bytes": {
+                      "type": "integer"
+                    },
+                    "classes": {
+                      "items": {
+                        "description": "`{iri, count}`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "colour": {
+                      "description": "`{predicate, values}`, where `values` holds `{value, count}` with a term in the SPARQL JSON results form.",
+                      "type": "object"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "density": {
+                      "description": "`{size, bbox, max, counts}`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y.",
+                      "type": "object"
+                    },
+                    "dimension": {
+                      "type": "integer"
+                    },
+                    "entities": {
+                      "description": "Points in the whole projection.",
+                      "type": "integer"
+                    },
+                    "explained": {
+                      "description": "The share of the sample's variance on each component.",
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "index": {
+                      "type": "string"
+                    },
+                    "method": {
+                      "type": "string"
+                    },
+                    "points": {
+                      "items": {
+                        "description": "`{entity, x, y, class?, colour?}`, where `class` and `colour` index `classes` and `colour.values`.",
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "region": {
+                      "description": "`{bbox, total, shown, sampled}`: the points inside the region and how many are returned.",
+                      "type": "object"
+                    },
+                    "stale": {
+                      "description": "The head has moved since the projection was computed.",
+                      "type": "boolean"
+                    },
+                    "vectors": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "method",
+                    "commit",
+                    "stale",
+                    "entities",
+                    "bounds",
+                    "region",
+                    "density",
+                    "classes",
+                    "points"
+                  ],
+                  "type": "object"
+                }
+              },
+              "application/x-sparkles-points": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The projection and its points."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read a kept projection of a vector index",
+        "tags": [
+          "Search"
+        ],
+        "x-sparkles-permission": "read"
+      },
+      "post": {
+        "description": "Computes a two-dimensional projection of the index's entities at the head and keeps it in memory for `GET`. `pca` projects every vector on the two leading principal components of a sample, and an entity with several vectors sits at the mean of their projections. It runs in the request for an index of up to 1,000,000 vectors and as a task above that. `neighbours` lays out the index's HNSW neighbour graph from the PCA positions and always runs as a task. The server keeps four projections, 1 GiB in all, charged to the query memory pool, and refuses one it cannot hold with `507`. A caller whose access covers part of the dataset gets `403`.",
+        "externalDocs": {
+          "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#embedding-map"
+        },
+        "operationId": "computeVectorProjection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ds"
+          },
+          {
+            "$ref": "#/components/parameters/name"
+          },
+          {
+            "description": "How the vectors are placed.",
+            "in": "query",
+            "name": "method",
+            "schema": {
+              "default": "pca",
+              "enum": [
+                "pca",
+                "neighbours"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/timeout"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "iterations": {
+                    "description": "Steps of the neighbour layout.",
+                    "maximum": 1000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "sample": {
+                    "description": "Vectors the PCA learns from.",
+                    "maximum": 100000,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "seed": {
+                    "description": "The seed of the first directions, the sampling priorities and the layout.",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "description": "The sample, seed and layout steps.",
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "bounds": {
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "builtMs": {
+                      "type": "number"
+                    },
+                    "bytes": {
+                      "type": "integer"
+                    },
+                    "commit": {
+                      "type": "integer"
+                    },
+                    "dimension": {
+                      "type": "integer"
+                    },
+                    "entities": {
+                      "type": "integer"
+                    },
+                    "explained": {
+                      "items": {
+                        "type": "number"
+                      },
+                      "type": "array"
+                    },
+                    "generation": {
+                      "type": "string"
+                    },
+                    "index": {
+                      "type": "string"
+                    },
+                    "method": {
+                      "enum": [
+                        "pca",
+                        "neighbours"
+                      ],
+                      "type": "string"
+                    },
+                    "stale": {
+                      "type": "boolean"
+                    },
+                    "vectors": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "method",
+                    "commit",
+                    "stale",
+                    "entities",
+                    "bounds"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The projection, without its points."
+          },
+          "202": {
+            "$ref": "#/components/responses/TaskStarted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/Timeout"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "basicAuth": []
+          },
+          {
+            "apiToken": []
+          },
+          {
+            "oidcAccessToken": []
+          },
+          {
+            "csrfToken": [],
+            "sessionCookie": []
+          },
+          {
+            "cloudflareAccess": []
+          }
+        ],
+        "summary": "Compute a projection of a vector index",
+        "tags": [
+          "Search"
+        ],
+        "x-sparkles-permission": "read"
+      }
+    },
     "/$/vector/{ds}/{name}/rebuild": {
       "post": {
         "externalDocs": {
@@ -41469,7 +42390,7 @@
       "name": "Reasoning"
     },
     {
-      "description": "SHACL and ShEx validation, and write-time validation.",
+      "description": "SHACL and ShEx validation, write-time validation and editing forms generated from shapes.",
       "externalDocs": {
         "url": "https://github.com/kclejeune/sparkles/blob/main/docs/API.md#write-time-validation"
       },

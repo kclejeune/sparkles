@@ -378,6 +378,21 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("measureVectorRecall", "indexes.vector.recall", |ds| {
             ds.indexes().vector().recall("v", &Default::default());
         }),
+        op!(
+            "computeVectorProjection",
+            "indexes.vector.projection",
+            |ds| {
+                ds.indexes()
+                    .vector()
+                    .projection("v", &Default::default(), &Control::none());
+            }
+        ),
+        // the server keeps the last projections it computed; the library returns each one
+        op!("getVectorProjection", "indexes.vector.projection", |ds| {
+            ds.indexes()
+                .vector()
+                .projection("v", &Default::default(), &Control::none());
+        }),
         op!("getGeoIndex", "indexes.geo.status", |ds| {
             ds.indexes().geo().status();
         }),
@@ -566,6 +581,16 @@ fn entries() -> Vec<(&'static str, Entry)> {
         }),
         op_if!("shex", "shex", "validation.shex", |ds| {
             ds.validation().shex(&any(), &any(), &any());
+        }),
+        // -------------------------------------------------------- editing forms (U02)
+        op_if!("shacl", "getForm", "forms.model", |ds| {
+            ds.forms().model(&any(), &any());
+        }),
+        op_if!("shacl", "checkForm", "forms.check", |ds| {
+            ds.forms().check(&any(), &any());
+        }),
+        op_if!("shacl", "saveForm", "forms.save", |ds| {
+            ds.forms().save(&any(), &any());
         }),
         // ------------------------------------------------------------------ backups
         op!("backupNquads", "dataset.backup", |ds| {

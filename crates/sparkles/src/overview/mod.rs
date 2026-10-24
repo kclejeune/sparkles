@@ -29,7 +29,7 @@ mod reports;
 pub use facets::{
     Brush, DEFAULT_BINS, FacetSet, FacetSpec, FacetsRequest, Kind as FacetKind, MAX_BINS,
     MAX_FACETS, MAX_FILTERS, MAX_NODES as MAX_FACET_NODES, MAX_SET, MAX_TOP, brush_condition,
-    facets_at, number_text, round_edges,
+    facets_at, number_text, rdf_term_from_json, round_edges,
 };
 pub use groups::{DEFAULT_BUCKETS, MAX_BUCKETS, MAX_EDGES, MAX_LIMIT};
 pub use ids::MAX_DEPTH;

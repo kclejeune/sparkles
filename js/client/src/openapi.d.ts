@@ -999,6 +999,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/$/forms/{ds}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The form of a resource
+         * @description The fields that the property shapes of the node shapes targeting `focus` describe, laid out by `sh:group` and `sh:order` and labelled by `sh:name`, with the resource's values read under the caller's view, the widget of each field, the constraints the browser checks and the triples no property shape covers. Fields the caller's protections hide from reads are absent, and fields it cannot write are read-only with a `reason`. Reads follow the caller's query endpoint grants and writeability its update endpoint grants on the branch saves go to. A focus no shape targets answers `200` with no fields. With `class` instead of `focus`, the form is that of a new instance of the class, with the fields of the node shapes whose class targets select it and no values, and `focus` is `null`. `save` says where a save goes, and `guard` gives the write guard's mode.
+         */
+        get: operations["getForm"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/forms/{ds}/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check a form's changes
+         * @description Turns the changes into one update of `DELETE DATA` and `INSERT DATA`, runs it as a dry run and validates the nodes it touches at the state it would make against the form's shapes, whether or not the dataset has a guard. The answer is `200` with the write preview, the update, the fields another commit changed since the form loaded them (`conflicts`, which a save would refuse), and the validation results, each with the `field` it belongs to or `null`. A check of a session branch that does not exist yet previews its first commit on `main`'s head, which `main`'s protection does not refuse. A caller whose view hides part of the data gets no validation (`withheld`), as the validation routes refuse such callers. It needs write on the branch, through the update endpoint.
+         */
+        post: operations["checkForm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/forms/{ds}/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Save a form's changes
+         * @description Commits the changes as one update with the message, when the stored values of every changed field are still those `expect` names, compared under the writer lock. Otherwise it answers `409` with code `form-conflict` and the fields with their stored values `now`. The write guard runs as for any write. A save of a form opened on `main` while the `forms` setting sends saves to a branch creates the caller's session branch from `main`'s head when it does not exist.
+         */
+        post: operations["saveForm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/$/geo/convert": {
         parameters: {
             query?: never;
@@ -3021,6 +3081,30 @@ export interface paths {
         post?: never;
         /** Drop a vector index */
         delete: operations["deleteVectorIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/$/vector/{ds}/{name}/projection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a kept projection of a vector index
+         * @description Returns the kept projection's method, commit, bounds, a density grid of 256 by 256 cells, its classes, and up to 50,000 points as `{entity, x, y, class?, colour?}`. `bbox` returns the points inside a region and its density, at most `limit`, those of lowest sampling priority when there are more, so zooming in keeps the points already shown. `colour` names a predicate whose first value per point is returned as an index into `colour.values`. `Accept: application/x-sparkles-points` returns the binary points format of the embedding map guide. A projection read at an older commit than the head has `stale: true`.
+         */
+        get: operations["getVectorProjection"];
+        put?: never;
+        /**
+         * Compute a projection of a vector index
+         * @description Computes a two-dimensional projection of the index's entities at the head and keeps it in memory for `GET`. `pca` projects every vector on the two leading principal components of a sample, and an entity with several vectors sits at the mean of their projections. It runs in the request for an index of up to 1,000,000 vectors and as a task above that. `neighbours` lays out the index's HNSW neighbour graph from the PCA positions and always runs as a task. The server keeps four projections, 1 GiB in all, charged to the query memory pool, and refuses one it cannot hold with `507`. A caller whose access covers part of the dataset gets `403`.
+         */
+        post: operations["computeVectorProjection"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -8015,7 +8099,7 @@ export interface components {
             /** @description The entity tag of the runtime layer, as in the `ETag` header. */
             etag: string;
             /** @enum {string} */
-            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths";
+            kind: "assistant" | "memory" | "ingest" | "prefixes" | "graphrag" | "paths" | "forms";
             /** @description The fields the settings file locks. */
             locked: string[];
             /** @description Locked fields whose runtime value is kept in the file but ignored. */
@@ -9298,8 +9382,8 @@ export interface components {
         ifMatch: string;
         /** @description Entity tags, or `*`. */
         ifNoneMatch: string;
-        /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
-        kind: "assistant" | "memory" | "ingest" | "graphrag" | "models" | "notifications";
+        /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
+        kind: "assistant" | "memory" | "ingest" | "graphrag" | "forms" | "models" | "notifications";
         /** @description The page size. */
         limit: number;
         /** @description A lower budget of the serialized result, in MiB. */
@@ -11668,6 +11752,210 @@ export interface operations {
             413: components["responses"]["PayloadTooLarge"];
             415: components["responses"]["UnsupportedMediaType"];
             422: components["responses"]["Unprocessable"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getForm: {
+        parameters: {
+            query?: {
+                /** @description The IRI of the resource. Give either `focus` or `class`. */
+                focus?: string;
+                /** @description The class of a new instance. */
+                class?: string;
+                /** @description Where the shapes come from, when not the dataset's `forms` setting. */
+                shapes?: "guard" | "graphs" | "drafted";
+                /** @description The language labels are picked in, then English, then untagged. */
+                lang?: string;
+                /** @description The branch to work on (default `main`). The path form `/{ds}@{branch}/…` chooses one too; the two must agree. */
+                branch?: components["parameters"]["branch"];
+                /** @description The state to read: `head`, `42`, `commit:42`, `time:<RFC 3339>` or `snapshot:NAME`. */
+                at?: components["parameters"]["at"];
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The form model. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch: string;
+                        closed: boolean;
+                        commit: number;
+                        /** @description The caller may save changes through this form. */
+                        editable: boolean;
+                        fields: Record<string, never>[];
+                        focus: string | null;
+                        /** @enum {integer} */
+                        formFormat: 1;
+                        /** @description The graph new values go into, `null` for the default graph. */
+                        graph: string | null;
+                        groups: Record<string, never>[];
+                        /** @description `{language, mode}` of the write guard. */
+                        guard?: Record<string, never> | null;
+                        other: Record<string, never>[];
+                        /** @description `{to, branch, exists, mainProtected}`: `to` is `main` or `branch`. */
+                        save: Record<string, never>;
+                        /** @description `{source, nodeShapes, missing?, unknownHints}`. */
+                        shapes: Record<string, never>;
+                        types: string[];
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            501: components["responses"]["NotImplemented"];
+            default: components["responses"]["Error"];
+        };
+    };
+    checkForm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The changes. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch. */
+                    branch?: string;
+                    changes: {
+                        add?: Record<string, never>[];
+                        /** @description The field's id, its path in SPARQL syntax. */
+                        field: string;
+                        remove?: Record<string, never>[];
+                    }[];
+                    /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
+                    class?: string;
+                    /** @description The values the form loaded, by field id, for every changed field. */
+                    expect?: {
+                        [key: string]: Record<string, never>[];
+                    };
+                    /** @description The IRI of the resource. Give either `focus` or `class`. */
+                    focus?: string;
+                    /** @description The commit message. */
+                    message?: string;
+                    /**
+                     * @description The shapes the form was built from, when not the setting's.
+                     * @enum {string}
+                     */
+                    shapes?: "guard" | "graphs" | "drafted";
+                };
+            };
+        };
+        responses: {
+            /** @description The preview and the validation. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch: string;
+                        /** @description `{id, now}` of each changed field whose stored values differ from `expect`. */
+                        conflicts: Record<string, never>[];
+                        /** @description The dry run, as a write preview answers it. */
+                        preview: Record<string, never>;
+                        update: string;
+                        /** @description `{checked, withheld, timedOut, conforms, results}`. */
+                        validation: Record<string, never>;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            default: components["responses"]["Error"];
+        };
+    };
+    saveForm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+            };
+            cookie?: never;
+        };
+        /** @description The changes. */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The branch the form was opened on. A form opened on `main` saves where the dataset's `forms` setting says, which may be the caller's session branch. */
+                    branch?: string;
+                    changes: {
+                        add?: Record<string, never>[];
+                        /** @description The field's id, its path in SPARQL syntax. */
+                        field: string;
+                        remove?: Record<string, never>[];
+                    }[];
+                    /** @description The class of a new instance, whose IRI the server mints from the `forms` setting's `newIri`. The change also adds the instance's `rdf:type`. */
+                    class?: string;
+                    /** @description The values the form loaded, by field id, for every changed field. */
+                    expect?: {
+                        [key: string]: Record<string, never>[];
+                    };
+                    /** @description The IRI of the resource. Give either `focus` or `class`. */
+                    focus?: string;
+                    /** @description The commit message. */
+                    message?: string;
+                    /**
+                     * @description The shapes the form was built from, when not the setting's.
+                     * @enum {string}
+                     */
+                    shapes?: "guard" | "graphs" | "drafted";
+                };
+            };
+        };
+        responses: {
+            /** @description The commit receipt. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch: string;
+                        branchCreated: boolean;
+                        commit: Record<string, never>;
+                        committed: boolean;
+                        dataset?: string;
+                        datasetId?: string;
+                        /** @description The resource saved, which for a new instance is the IRI minted for it. */
+                        focus?: string;
+                        validation?: Record<string, never>;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };
@@ -15238,7 +15526,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15268,7 +15556,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15309,7 +15597,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15342,7 +15630,7 @@ export interface operations {
                 "If-Match"?: string;
             };
             path: {
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15429,7 +15717,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15461,7 +15749,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15504,7 +15792,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -15539,7 +15827,7 @@ export interface operations {
             path: {
                 /** @description The dataset name. */
                 ds: components["parameters"]["ds"];
-                /** @description The settings kind: `assistant`, `memory`, `ingest` or `graphrag` of a dataset, or `models` or `notifications` of the server. */
+                /** @description The settings kind: `assistant`, `memory`, `ingest`, `graphrag` or `forms` of a dataset, or `models` or `notifications` of the server. */
                 kind: components["parameters"]["kind"];
             };
             cookie?: never;
@@ -16503,6 +16791,136 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getVectorProjection: {
+        parameters: {
+            query?: {
+                /** @description The projection's method. The most recent of any method when absent. */
+                method?: "pca" | "neighbours";
+                /** @description `minX,minY,maxX,maxY`. */
+                bbox?: string;
+                /** @description The most points to return. */
+                limit?: number;
+                /** @description A predicate IRI whose values colour the points. */
+                colour?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The projection and its points. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description `[minX, minY, maxX, maxY]`. */
+                        bounds: number[];
+                        builtMs?: number;
+                        bytes?: number;
+                        classes: Record<string, never>[];
+                        /** @description `{predicate, values}`, where `values` holds `{value, count}` with a term in the SPARQL JSON results form. */
+                        colour?: Record<string, never>;
+                        commit: number;
+                        /** @description `{size, bbox, max, counts}`, where `counts` is base64 of little-endian `Uint32` cell counts, row by row from the minimum y. */
+                        density: Record<string, never>;
+                        dimension?: number;
+                        /** @description Points in the whole projection. */
+                        entities: number;
+                        /** @description The share of the sample's variance on each component. */
+                        explained?: number[];
+                        generation?: string;
+                        index: string;
+                        method: string;
+                        points: Record<string, never>[];
+                        /** @description `{bbox, total, shown, sampled}`: the points inside the region and how many are returned. */
+                        region: Record<string, never>;
+                        /** @description The head has moved since the projection was computed. */
+                        stale: boolean;
+                        vectors?: number;
+                    };
+                    "application/x-sparkles-points": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    computeVectorProjection: {
+        parameters: {
+            query?: {
+                /** @description How the vectors are placed. */
+                method?: "pca" | "neighbours";
+                /** @description Seconds. Capped at the server's `--max-timeout`. */
+                timeout?: components["parameters"]["timeout"];
+            };
+            header?: never;
+            path: {
+                /** @description The dataset name. */
+                ds: components["parameters"]["ds"];
+                /** @description The name of the stored query, snapshot, vector index, branch, ingest profile or model secret. */
+                name: components["parameters"]["name"];
+            };
+            cookie?: never;
+        };
+        /** @description The sample, seed and layout steps. */
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /** @description Steps of the neighbour layout. */
+                    iterations?: number;
+                    /** @description Vectors the PCA learns from. */
+                    sample?: number;
+                    /** @description The seed of the first directions, the sampling priorities and the layout. */
+                    seed?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description The projection, without its points. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        bounds: number[];
+                        builtMs?: number;
+                        bytes?: number;
+                        commit: number;
+                        dimension?: number;
+                        entities: number;
+                        explained?: number[];
+                        generation?: string;
+                        index: string;
+                        /** @enum {string} */
+                        method: "pca" | "neighbours";
+                        stale: boolean;
+                        vectors?: number;
+                    };
+                };
+            };
+            202: components["responses"]["TaskStarted"];
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            408: components["responses"]["Timeout"];
+            503: components["responses"]["Unavailable"];
+            507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };
     };

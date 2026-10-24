@@ -4,6 +4,7 @@
 use super::*;
 use crate::http::router_tests::tasks::{spin, wait_done};
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 fn ids(r: &R) -> Vec<String> {
     r.json()
@@ -36,6 +37,35 @@ async fn cancel_needs_admin_on_the_task_dataset() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
     // carol administers wiki
     let r = delete_as(&s.app, &uri, &b("carol")).await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    assert_eq!(wait_done(&s.state, &id).await.state, "cancelled");
+}
+
+/// A projection task (U11 §3.3) may be cancelled by anyone who could start it: `read` on
+/// the whole dataset, not `admin`.
+#[tokio::test]
+async fn a_projection_task_is_cancelled_by_its_readers() {
+    let s = auth_server();
+    let id = s.state.next_task_id();
+    s.state.start_task_opts(
+        id.clone(),
+        crate::projection::TASK,
+        "wiki",
+        None,
+        true,
+        move |h| {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(30) {
+                if h.is_cancelled() {
+                    return Err(sparkles::Error::Cancelled.into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok("stopped".into())
+        },
+    );
+    let uri = format!("/$/tasks/{id}");
+    let r = delete_as(&s.app, &uri, &b("bob")).await;
     assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
     assert_eq!(wait_done(&s.state, &id).await.state, "cancelled");
 }
