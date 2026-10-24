@@ -549,7 +549,8 @@ pub fn endpoint(route: &str, method: &Method, uri: &Uri, headers: &HeaderMap) ->
         | "/{ds}/geo"
         | "/{ds}/queries/{name}"
         | "/$/graph/{ds}/groups"
-        | "/$/graph/{ds}/facets" => Endpoint::Query,
+        | "/$/graph/{ds}/facets"
+        | "/$/graphrag/{ds}/memberships" => Endpoint::Query,
         "/{ds}/graphql" | "/{ds}/graphql/schema" => Endpoint::Graphql,
         "/{ds}/update" | "/{ds}/facts" => Endpoint::Update,
         "/{ds}/sources" if get => Endpoint::Query,

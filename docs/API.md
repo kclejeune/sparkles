@@ -6028,8 +6028,13 @@ component row also binds `communitySize`, the size of its community or component
 whole projection, counted per level for `louvain` and `leiden`. Two members follow the
 results. `summary` holds the statistics of the run, as `summary=true` returns them, and
 `run` holds the commit it computed at, whether the cache answered (`cached`), the rows of
-the whole result, the rows returned, and `truncated` when the server's row limit cut the
-answer.
+the whole result, the rows returned, `truncated` when the server's row limit cut the
+answer, and `definition`, a hash of the request that every answer of the same definition
+shares. A client that reads one run in several requests compares `commit` and `definition`
+to know that its answers come from one run, since a named projection can change between
+them without a commit. The answer is written one row at a time, and its buffer counts
+against the memory budget, so an answer over the result-byte limit is refused as soon as
+it passes the limit.
 
 The run reads under the caller's view at the state that the request's `at` parameter and
 `branch` parameter select, with the query timeout and memory budget. The budget parameters
@@ -6064,7 +6069,10 @@ request for the same key while the task runs joins it, and its answer is the sam
 `joined: true`. The callers that started or joined a run can follow its task even when their
 view of the dataset is restricted, and the caller that started it, or a dataset admin, can
 cancel it with `DELETE /$/tasks/{id}`. Both rights hold only while the caller can still read
-the dataset through the same view it had when it started or joined the run. A caller whose
+the dataset through the same view it had when it started or joined the run. The task of a
+run on a branch names the dataset as `ds@branch`, so access to it is checked on that
+branch. A run checks its cancellation and deadline again while it decodes its rows, and a
+run cancelled after it computed keeps nothing. A caller whose
 grants change loses sight of the task. The task has the deadline of an update, none unless
 the request gives a `timeout` or the server runs with `--update-timeout`, and takes its
 initial grant of the memory pool when it starts. F14's algorithms do not report their

@@ -392,7 +392,14 @@ pub(crate) async fn select(
         }
         // an algorithm run reads a branch; its handler refuses a write-back run there
         let algo_run = seg == "algo" && path.ends_with("/run");
-        if branch != MAIN && !clone && !algo_run && !ADMIN_BRANCH_ROUTES.contains(&seg) {
+        // the memberships route answers `available: false` off main itself
+        let memberships = seg == "graphrag" && path.ends_with("/memberships");
+        if branch != MAIN
+            && !clone
+            && !algo_run
+            && !memberships
+            && !ADMIN_BRANCH_ROUTES.contains(&seg)
+        {
             return bad_branch(format!("{path} does not take a branch"));
         }
         if seg == "branches" || seg == "merge" {

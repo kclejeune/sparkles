@@ -509,21 +509,43 @@ export class Lenses {
 
   /**
    * Read what the algorithm lenses can offer: the stored projections and the GraphRAG
-   * communities, on main, and the GraphRAG lens at the head only (§6).
+   * communities, on main, and the GraphRAG lens at the head only (§6). They are read again
+   * when the state shown or the drawing's epoch changes, and after a read that failed.
    */
-  async loadAlgoOptions() {
+  loadAlgoOptions(): Promise<void> {
+    const p = this.#loadAlgoOptions();
+    this.#algoLoading = p;
+    void p.finally(() => {
+      if (this.#algoLoading === p) this.#algoLoading = null;
+    });
+    return p;
+  }
+
+  /** The read of the algorithm options in flight, which the GraphRAG lens waits for. */
+  #algoLoading: Promise<void> | null = null;
+
+  async #loadAlgoOptions() {
     const input = this.#input;
     if (!input) return;
     const main = !input.branch || input.branch === 'main';
     const past = input.past ?? !!input.at;
-    const key = `${input.ds}|${input.branch ?? ''}|${past}`;
+    const key = `${input.ds}|${input.branch ?? ''}|${past}|${input.epoch ?? ''}`;
     if (key === this.#algoKey) return;
     this.#algoKey = key;
-    const [projections, gr] = await Promise.all([
+    let failed = false;
+    const [read, gr] = await Promise.all([
       main ? readProjections(input.ds) : Promise.resolve([]),
-      main ? graphragStatus(input.ds).catch(() => null) : Promise.resolve(null),
+      main
+        ? graphragStatus(input.ds).catch(() => {
+            failed = true;
+            return null;
+          })
+        : Promise.resolve(null),
     ]);
     if (this.#algoKey !== key) return;
+    // a failed read is not remembered: the next one asks again
+    if (read === null || failed) this.#algoKey = '';
+    const projections = read ?? [];
     const levels = (gr?.levels ?? []).map((l) => l.level).sort((a, b) => a - b);
     const has = !!gr?.enabled && levels.length > 0;
     this.algo = {
@@ -880,6 +902,8 @@ export class Lenses {
         });
       }
       case 'graphrag': {
+        // the options as read for the state shown now, once a read in flight has ended
+        if (this.#algoLoading) await this.#algoLoading;
         // checked against the graph as it is now, not when the options were last read (§6)
         if (input.branch && input.branch !== 'main')
           throw new Error('GraphRAG communities are built on main, and this graph shows a branch.');

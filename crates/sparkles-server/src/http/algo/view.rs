@@ -159,6 +159,9 @@ pub(crate) struct Kept {
     /// the pool memory the result holds while the cache keeps it, or a reader still has
     /// it after the cache dropped it
     grant: OnceLock<PoolGrant>,
+    /// a hash of the request's part of the cache key: answers of one run share it, so a
+    /// reader can tell when a named projection changed between its reads
+    definition: u64,
 }
 
 /// The heap of one decoded cell, estimated.
@@ -231,13 +234,14 @@ impl Kept {
             commit,
             bytes,
             grant: OnceLock::new(),
+            definition: 0,
         }
     }
 
-    /// The answer for `view`: the rows of its nodes (or all, up to `max_rows`), the
-    /// highest `top` of them by the first numeric output, with the size of each row's
-    /// group in the whole projection.
-    fn answer(&self, view: &ViewOpts, cached: bool, max_rows: usize) -> J {
+    /// The rows of the answer for `view`: those of its nodes (or all), the highest `top`
+    /// of them by the first numeric output, cut to `max_rows`, and whether the cut
+    /// dropped any.
+    fn pick(&self, view: &ViewOpts, max_rows: usize) -> (Vec<u32>, bool) {
         let mut picked: Vec<u32> = match &view.nodes {
             Some(nodes) => {
                 let mut seen = HashSet::new();
@@ -271,50 +275,107 @@ impl Kept {
         }
         let truncated = picked.len() > max_rows;
         picked.truncate(max_rows);
+        (picked, truncated)
+    }
+
+    /// The binding of row `i`, with the size of its group in the whole projection.
+    fn binding(&self, i: u32) -> J {
+        let row = &self.rows[i as usize];
+        let mut b = serde_json::Map::new();
+        for (v, t) in self.vars.iter().zip(row) {
+            if let Some(t) = t {
+                b.insert(v.clone(), sparkles::sparql::results::term_json(t));
+            }
+        }
+        if let Some((gc, lc, m)) = &self.sizes
+            && let Some(g) = &row[*gc]
+        {
+            let level = lc.and_then(|l| row[l].clone());
+            if let Some(n) = m.get(&(level, g.clone())) {
+                b.insert(
+                    "communitySize".into(),
+                    json!({
+                        "type": "literal",
+                        "value": n.to_string(),
+                        "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+                    }),
+                );
+            }
+        }
+        J::Object(b)
+    }
+
+    /// The answer for `view` as JSON, written one binding at a time: `507` with
+    /// `budget: "result-bytes"` as soon as it passes `limit`, and its buffer charged to
+    /// `held` as it grows, so a large answer is refused before it is all built.
+    fn write_answer(
+        &self,
+        view: &ViewOpts,
+        cached: bool,
+        max_rows: usize,
+        limit: Option<u64>,
+        held: &mut Held,
+    ) -> sparkles::Result<Vec<u8>> {
+        let (picked, truncated) = self.pick(view, max_rows);
+        held.charge(picked.capacity() as u64 * 4)?;
         let mut vars = self.vars.clone();
         if self.sizes.is_some() {
             vars.push("communitySize".into());
         }
-        let bindings: Vec<J> = picked
-            .iter()
-            .map(|&i| {
-                let row = &self.rows[i as usize];
-                let mut b = serde_json::Map::new();
-                for (v, t) in self.vars.iter().zip(row) {
-                    if let Some(t) = t {
-                        b.insert(v.clone(), sparkles::sparql::results::term_json(t));
-                    }
+        let over = |n: usize| -> sparkles::Result<()> {
+            match limit {
+                Some(limit) if n as u64 > limit => {
+                    Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
+                        kind: sparkles::BudgetKind::ResultBytes,
+                        limit,
+                        requested: n as u64,
+                    }))
                 }
-                if let Some((gc, lc, m)) = &self.sizes
-                    && let Some(g) = &row[*gc]
-                {
-                    let level = lc.and_then(|l| row[l].clone());
-                    if let Some(n) = m.get(&(level, g.clone())) {
-                        b.insert(
-                            "communitySize".into(),
-                            json!({
-                                "type": "literal",
-                                "value": n.to_string(),
-                                "datatype": "http://www.w3.org/2001/XMLSchema#integer",
-                            }),
-                        );
-                    }
-                }
-                J::Object(b)
-            })
-            .collect();
-        json!({
-            "head": { "vars": vars },
-            "results": { "bindings": bindings },
-            "summary": self.summary,
-            "run": {
-                "commit": self.commit,
-                "cached": cached,
-                "rows": self.rows.len(),
-                "returned": bindings.len(),
-                "truncated": truncated,
-            },
-        })
+                _ => Ok(()),
+            }
+        };
+        let json = |e: serde_json::Error| sparkles::Error::invalid(e.to_string());
+        let mut out: Vec<u8> = Vec::new();
+        let mut charged = 0usize;
+        out.extend_from_slice(b"{\"head\":{\"vars\":");
+        serde_json::to_writer(&mut out, &vars).map_err(json)?;
+        out.extend_from_slice(b"},\"results\":{\"bindings\":[");
+        for (k, &i) in picked.iter().enumerate() {
+            if k > 0 {
+                out.push(b',');
+            }
+            serde_json::to_writer(&mut out, &self.binding(i)).map_err(json)?;
+            over(out.len())?;
+            if out.capacity() > charged {
+                held.charge((out.capacity() - charged) as u64)?;
+                charged = out.capacity();
+            }
+        }
+        out.extend_from_slice(b"]},\"summary\":");
+        serde_json::to_writer(&mut out, &self.summary).map_err(json)?;
+        out.extend_from_slice(b",\"run\":");
+        let run = json!({
+            "commit": self.commit,
+            "cached": cached,
+            "rows": self.rows.len(),
+            "returned": picked.len(),
+            "truncated": truncated,
+            "definition": format!("{:016x}", self.definition),
+        });
+        serde_json::to_writer(&mut out, &run).map_err(json)?;
+        out.push(b'}');
+        over(out.len())?;
+        Ok(out)
+    }
+
+    /// The answer for `view` as a JSON value, for tests.
+    #[cfg(test)]
+    fn answer(&self, view: &ViewOpts, cached: bool, max_rows: usize) -> J {
+        let mut held = Held::unbounded();
+        let out = self
+            .write_answer(view, cached, max_rows, None, &mut held)
+            .expect("an unbounded answer");
+        serde_json::from_slice(&out).expect("valid JSON")
     }
 }
 
@@ -328,6 +389,16 @@ pub(crate) struct Held {
 }
 
 impl Held {
+    /// A charge with no grant and no limit.
+    #[cfg(test)]
+    fn unbounded() -> Held {
+        Held {
+            grant: None,
+            limit: None,
+            held: 0,
+        }
+    }
+
     pub(crate) fn new(opts: &QueryOptions) -> Held {
         Held {
             grant: opts.grant.clone(),
@@ -385,14 +456,22 @@ const CHARGE_EVERY: usize = 1024;
 /// Run the query `q` at `snap` under `opts` and keep every row. The decoded rows are
 /// charged to `held` as they are decoded, before they can grow past the request's
 /// budget or the pool, and the index and group sizes before they are built.
+///
+/// The request's cancellation and deadline are checked again while the rows are decoded
+/// and before the result is indexed, since the query has returned by then.
 fn compute(
     snap: Arc<Snapshot>,
     q: &str,
     opts: &QueryOptions,
     held: &mut Held,
+    definition: u64,
 ) -> sparkles::Result<Kept> {
     let commit = snap.commit;
+    let deadline = opts
+        .deadline
+        .or_else(|| opts.timeout.map(|t| Instant::now() + t));
     let r = sparkles::sparql::query(snap, q, opts)?;
+    let control = || controlled(opts, deadline);
     let mut vars = r.vars.clone();
     // the summary is the last column, the same literal in every row: decoded once
     let summary_col = (vars.last().map(String::as_str) == Some("summary")).then(|| {
@@ -417,13 +496,32 @@ fn compute(
         if rows.len().is_multiple_of(CHARGE_EVERY) {
             held.charge(pending)?;
             pending = 0;
+            control()?;
         }
     }
     held.charge(pending)?;
     drop(r);
-    let kept = Kept::new(vars, rows, summary, commit);
+    control()?;
+    let mut kept = Kept::new(vars, rows, summary, commit);
+    kept.definition = definition;
     held.settle(kept.bytes)?;
+    control()?;
     Ok(kept)
+}
+
+/// `Cancelled` once the request is cancelled, and `Timeout` past its deadline.
+fn controlled(opts: &QueryOptions, deadline: Option<Instant>) -> sparkles::Result<()> {
+    if opts
+        .cancel
+        .as_ref()
+        .is_some_and(|c| c.load(Ordering::Relaxed))
+    {
+        return Err(sparkles::Error::Cancelled);
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(sparkles::Error::Timeout);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- the cache ------
@@ -686,16 +784,27 @@ pub(crate) fn started(st: &AppState, id: &str, ds: &str, p: &Principal) -> bool 
     caller_pos(st, id, ds, p) == Some(0)
 }
 
-/// The tasks of the runs in progress, for tests.
+/// The tasks of the runs in progress on the dataset branch `branch`, for tests (task ids
+/// repeat across the servers of a test run).
 #[cfg(test)]
-pub(crate) fn running_ids() -> Vec<String> {
-    RUNNING.lock().iter().map(|(_, id)| id.clone()).collect()
+pub(crate) fn running_ids(branch: uuid::Uuid) -> Vec<String> {
+    RUNNING
+        .lock()
+        .iter()
+        .filter(|(k, _)| k.branch == branch)
+        .map(|(_, id)| id.clone())
+        .collect()
 }
 
 /// Datasets whose background runs wait before they compute, so that tests can join and
 /// cancel them while they run.
 #[cfg(test)]
 pub(crate) static PAUSED: Mutex<Vec<String>> = parking_lot::const_mutex(Vec::new());
+
+/// Datasets whose background runs wait after they computed and before they keep the
+/// result, so that tests can cancel them there.
+#[cfg(test)]
+pub(crate) static PAUSED_KEEP: Mutex<Vec<String>> = parking_lot::const_mutex(Vec::new());
 
 /// Removes a run from [`RUNNING`] when its task ends, however it ends.
 struct Running(Key, String);
@@ -748,30 +857,31 @@ fn key(ds: &Dataset, commit: u64, opts: &QueryOptions, request: String) -> Key {
     }
 }
 
-/// The answer as a response, `507` with `budget: "result-bytes"` when its JSON is larger
-/// than `limit`.
-fn respond(answer: J, limit: Option<u64>) -> ApiResult {
-    let body = serde_json::to_vec(&answer).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not write the answer: {e}"),
-        )
-    })?;
-    if let Some(limit) = limit
-        && body.len() as u64 > limit
-    {
-        return Err(sparkles::Error::BudgetExceeded(sparkles::Budget {
-            kind: sparkles::BudgetKind::ResultBytes,
-            limit,
-            requested: body.len() as u64,
-        })
-        .into());
-    }
+/// A written answer as a response.
+fn respond(body: Vec<u8>) -> ApiResult {
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
         .into_response())
+}
+
+/// The dataset as grants name it: `ds`, or `ds@branch` off main.
+fn qualified_name(ds: &Dataset) -> String {
+    let b = ds.branch_name();
+    if b == sparkles::branch::MAIN {
+        ds.name.clone()
+    } else {
+        crate::auth::on_branch(&ds.name, &b)
+    }
+}
+
+/// A stable hash of a request key, for [`Kept::definition`].
+fn definition_of(request: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    request.hash(&mut h);
+    h.finish()
 }
 
 /// A view-only run: answered at once, or with `async` started (or joined) as a task.
@@ -808,16 +918,17 @@ pub(crate) async fn run(
     blocking(move || {
         let started = Instant::now();
         let (snap, _) = super::super::history::snapshot_for(&ds, at.as_ref(), &opts)?;
+        let definition = definition_of(&request);
         let key = key(&ds, snap.commit, &opts, request);
+        // the decoded rows and the answer's buffer stay charged until it is written
+        let mut held = Held::new(&opts);
         if let Some(kept) = get(&key) {
             HITS.fetch_add(1, Ordering::Relaxed);
-            return respond(kept.answer(&view, true, max_rows), limit);
+            return respond(kept.write_answer(&view, true, max_rows, limit, &mut held)?);
         }
         MISSES.fetch_add(1, Ordering::Relaxed);
-        // the decoded rows stay charged until the answer is written
-        let mut held = Held::new(&opts);
         let kept = Arc::new(
-            compute(snap, &q, &opts, &mut held)
+            compute(snap, &q, &opts, &mut held, definition)
                 .map_err(|e| super::super::with_timeout(e.into(), timeout))?,
         );
         tracing::debug!(
@@ -829,7 +940,7 @@ pub(crate) async fn run(
         if view.keep {
             keep_answered(st.catalog.pool(), key, kept.clone(), &mut held);
         }
-        let out = respond(kept.answer(&view, false, max_rows), limit);
+        let out = respond(kept.write_answer(&view, false, max_rows, limit, &mut held)?);
         drop(held);
         out
     })
@@ -901,10 +1012,14 @@ async fn background(
     opts.grant = None;
     blocking(move || {
         let (snap, _) = super::super::history::snapshot_for(&ds, at.as_ref(), &opts)?;
+        let definition = definition_of(&request);
         let key = key(&ds, snap.commit, &opts, request);
+        // the task and its callers name the branch, so that access to it is checked there
+        let qname = qualified_name(&ds);
         if let Some(kept) = get(&key) {
             HITS.fetch_add(1, Ordering::Relaxed);
-            return respond(kept.answer(&view, true, max_rows), limit);
+            let mut held = Held::new(&opts);
+            return respond(kept.write_answer(&view, true, max_rows, limit, &mut held)?);
         }
         let mut running = RUNNING.lock();
         // a run that was cancelled is not joined: it is ending, and a new one starts
@@ -924,13 +1039,14 @@ async fn background(
         if let Some(task) = live {
             let id = &task.id;
             JOINS.fetch_add(1, Ordering::Relaxed);
-            add_caller(&st, id, &ds.name, &p);
+            add_caller(&st, id, &qname, &p);
             return Ok(task_answer(&task, true));
         }
         // a result kept between the check above and taking the lock
         if let Some(kept) = get(&key) {
             HITS.fetch_add(1, Ordering::Relaxed);
-            return respond(kept.answer(&view, true, max_rows), limit);
+            let mut held = Held::new(&opts);
+            return respond(kept.write_answer(&view, true, max_rows, limit, &mut held)?);
         }
         super::super::task_start_check(&st, None, &ds.name)?;
         MISSES.fetch_add(1, Ordering::Relaxed);
@@ -946,11 +1062,11 @@ async fn background(
         // made before the task is queued, so that a task cancelled before it starts,
         // whose closure is dropped without running, still leaves the list
         let cleanup = Running(key.clone(), id.clone());
-        add_caller(&st, &id, &ds.name, &p);
+        add_caller(&st, &id, &qname, &p);
         let state = st.clone();
         #[cfg(test)]
         let d = ds.clone();
-        let task = st.start_task_opts(id, TASK, &ds.name, None, true, move |h| {
+        let task = st.start_task_opts(id, TASK, &qname, None, true, move |h| {
             let _running = cleanup;
             let mut opts = opts;
             opts.cancel = Some(h.cancel_flag());
@@ -969,14 +1085,22 @@ async fn background(
             // F14's algorithms report no iterations, so progress is by phase
             h.progress(0.05, "computing");
             let mut held = Held::new(&opts);
-            let kept = Arc::new(compute(snap, &q, &opts, &mut held)?);
+            let kept = Arc::new(compute(snap, &q, &opts, &mut held, definition)?);
             h.progress(0.95, "keeping the result");
+            #[cfg(test)]
+            while PAUSED_KEEP.lock().contains(&d.name) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             let rows = kept.rows.len();
             let commit = kept.commit;
             let summary = kept.summary.clone();
             // the run's own grant goes back before the cache asks the pool for the result's
             drop(held);
             opts.grant = None;
+            // a run cancelled while it decoded keeps nothing
+            if h.cancel_flag().load(Ordering::Relaxed) {
+                return Err(sparkles::Error::Cancelled.into());
+            }
             let stored = put(state.catalog.pool(), key, kept);
             h.set_detail(json!({
                 "algorithm": req.algorithm,
@@ -984,6 +1108,7 @@ async fn background(
                 "rows": rows,
                 "kept": stored,
                 "summary": summary,
+                "definition": format!("{definition:016x}"),
             }));
             Ok(if stored {
                 format!("{}: kept a view-only run at commit {commit}", req.algorithm)
@@ -1252,5 +1377,31 @@ mod tests {
         ));
         assert_eq!(held.held, 40 << 20);
         assert!(request.granted() >= 40 << 20, "{}", request.granted());
+    }
+
+    #[test]
+    fn an_answer_stops_at_the_result_limit_before_it_is_all_written() {
+        let vars = vec!["node".into(), "score".into()];
+        let rows: Vec<_> = (0..10_000)
+            .map(|i| vec![iri(&format!("n{i}")), dbl(i as f64)])
+            .collect();
+        let k = Kept::new(vars, rows, None, 1);
+        let mut held = Held::unbounded();
+        let e = k
+            .write_answer(
+                &ViewOpts::default(),
+                true,
+                usize::MAX,
+                Some(4096),
+                &mut held,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&e, sparkles::Error::BudgetExceeded(b) if b.kind == sparkles::BudgetKind::ResultBytes),
+            "{e}"
+        );
+        // the buffer stopped near the limit, and what it held was charged
+        assert!(held.held < 64 << 10, "{}", held.held);
+        assert!(held.held > 0);
     }
 }

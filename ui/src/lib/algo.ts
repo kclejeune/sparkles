@@ -296,7 +296,14 @@ type RunAnswer = {
   head: { vars: string[] };
   results: { bindings: Row[] };
   summary?: Record<string, unknown> | null;
-  run?: { commit: number; cached: boolean; rows: number; truncated?: boolean };
+  run?: {
+    commit: number;
+    cached: boolean;
+    rows: number;
+    truncated?: boolean;
+    /** a hash of the run's request, the same for every answer of one definition */
+    definition?: string;
+  };
 };
 
 /** The answer of `POST /$/algo/{ds}/run`: `202` with a task, or the rows. */
@@ -400,6 +407,9 @@ export async function runProjection(
     if (ctx.signal?.aborted) throw aborted(ctx.signal);
   };
   let first = await ask(chunks[0], true);
+  // what every read must come from: the run's commit, and the definition of its request,
+  // which a stored projection changes without a commit
+  let definition: string | undefined;
   // the commit every read must come from, once the run has one
   let commit: number | undefined;
   if ('task' in first) {
@@ -417,23 +427,22 @@ export async function runProjection(
           ? 'The run was cancelled.'
           : `The run failed: ${t.message ?? 'no message'}`,
       );
-    const detail = t.detail as { kept?: boolean; commit?: number } | undefined;
+    const detail = t.detail as { kept?: boolean; commit?: number; definition?: string } | undefined;
     if (detail?.kept === false)
       throw new Error(
         'The run finished, but the server had no memory to keep its result. Narrow the projection, or try again later.',
       );
     commit = detail?.commit;
-    // read the kept result at the run's commit, not at a head that may have moved on
-    first = await ask(
-      chunks[0],
-      false,
-      ctx.at ?? (commit != null ? `commit:${commit}` : undefined),
-    );
+    definition = detail?.definition;
+    // read the kept result at the run's commit: a selector such as `head` may resolve to a
+    // newer commit by now
+    first = await ask(chunks[0], false, commit != null ? `commit:${commit}` : ctx.at);
     if ('task' in first) throw new Error('The kept result went away before it could be read.');
   }
   const answers: RunAnswer[] = [first.answer];
   commit ??= first.answer.run?.commit;
-  const pinned = ctx.at ?? (commit != null ? `commit:${commit}` : undefined);
+  definition ??= first.answer.run?.definition;
+  const pinned = commit != null ? `commit:${commit}` : ctx.at;
   for (const c of chunks.slice(1)) {
     check();
     const a = await ask(c, false, pinned);
@@ -444,6 +453,10 @@ export async function runProjection(
     if (commit != null && a.run?.commit != null && a.run.commit !== commit)
       throw new Error(
         `The dataset changed while the lens read the run: commit ${a.run.commit} instead of ${commit}.`,
+      );
+    if (definition != null && a.run?.definition != null && a.run.definition !== definition)
+      throw new Error(
+        'The projection changed while the lens read the run. Choose the lens again to run it on the new definition.',
       );
     if (a.run?.truncated)
       throw new Error(
@@ -476,8 +489,11 @@ export async function cancelRun(id: string): Promise<boolean> {
   }
 }
 
-/** The dataset's named projections, for the projection picker. Empty when they cannot be read. */
-export async function projections(ds: string, signal?: AbortSignal): Promise<string[]> {
+/**
+ * The dataset's named projections, for the projection picker. `null` when they cannot be
+ * read, so that the caller can ask again later.
+ */
+export async function projections(ds: string, signal?: AbortSignal): Promise<string[] | null> {
   try {
     const j = await api.json<{ projections?: { name: string }[] }>(
       `/$/algo/${encodeURIComponent(ds)}/projections`,
@@ -485,7 +501,7 @@ export async function projections(ds: string, signal?: AbortSignal): Promise<str
     );
     return (j?.projections ?? []).map((p) => p.name).sort();
   } catch {
-    return [];
+    return null;
   }
 }
 

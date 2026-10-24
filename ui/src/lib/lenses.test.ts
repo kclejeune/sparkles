@@ -303,6 +303,54 @@ describe('algorithm lenses (Phase 2)', () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
+  it('runs the GraphRAG lens again with fresh options after a past state (merge review)', async () => {
+    let statusReads = 0;
+    let projReads = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        const u = String(url);
+        const json = (b: unknown) =>
+          new Response(JSON.stringify(b), { headers: { 'Content-Type': 'application/json' } });
+        if (u.includes('/memberships'))
+          return json({
+            available: true,
+            memberships: [{ node: `${EX}a`, community: `${EX}c1` }],
+            communities: [{ iri: `${EX}c1`, memberCount: 3, title: 'Team' }],
+          });
+        if (u.includes('/projections')) {
+          projReads++;
+          return json({ projections: [] });
+        }
+        if (/\/\$\/graphrag\/ds$/.test(new URL(u, 'http://x').pathname)) {
+          statusReads++;
+          return json({ enabled: true, available: true, levels: [{ level: 0 }] });
+        }
+        return new Response('{}', { status: 404 });
+      }),
+    );
+    const { l } = lenses(() => []);
+    l.setInput(input({ nodes: people }));
+    await l.loadAlgoOptions();
+    l.set('colour', { lens: 'graphrag' });
+    await settleLong();
+    expect(l.results.colour?.legend[0].text).toMatch(/^Team/);
+    l.setInput(input({ nodes: people, at: 'commit:2', past: true }));
+    await settleLong();
+    expect(l.status.colour.error).toMatch(/past state/);
+    // back at the head, the lens waits for the options read again and shows the communities
+    l.setInput(input({ nodes: people }));
+    await settleLong();
+    expect(l.status.colour.error).toBeUndefined();
+    expect(l.results.colour?.legend[0].text).toMatch(/^Team/);
+    // a redraw of the dataset (a new epoch) reads the options again
+    const before = statusReads + projReads;
+    l.setInput(input({ nodes: people, epoch: 7 }));
+    await settleLong();
+    expect(statusReads + projReads).toBeGreaterThan(before);
+    l.destroy();
+  });
+
   it('refuses the GraphRAG lens at a past state although its options were read at the head (§6)', async () => {
     const fetches = vi.fn(async () => new Response('{}', { status: 500 }));
     vi.stubGlobal('fetch', fetches);

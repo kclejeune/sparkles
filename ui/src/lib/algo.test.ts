@@ -240,6 +240,42 @@ describe('projection runs (§3.2)', () => {
     );
   });
 
+  it('reads at the run commit even when the lens asked for the head (merge review)', async () => {
+    const paths: string[] = [];
+    const ctx: ProjectionContext = {
+      ds: 'ds',
+      at: 'head',
+      poll: 1,
+      post: async (path, body) => {
+        paths.push(path);
+        const b = body as { nodes: string[]; async?: boolean };
+        if (b.async) return { task: { id: '1', state: 'running' } as unknown as Task };
+        return answer(b.nodes, true);
+      },
+      getTask: async () =>
+        ({ id: '1', state: 'done', detail: { kept: true, commit: 7 } }) as unknown as Task,
+    };
+    await runProjection(ctx, ALGOS.pageRank, { name: 'p' }, [`${EX}a`], {});
+    expect(paths).toEqual(['/$/algo/ds/run?at=head', '/$/algo/ds/run?at=commit%3A7']);
+  });
+
+  it('refuses chunks of another projection definition (merge review)', async () => {
+    const iris = Array.from({ length: 25_000 }, (_, i) => `${EX}n${i}`);
+    const ctx: ProjectionContext = {
+      ds: 'ds',
+      post: async (_p, body) => {
+        const b = body as { nodes: string[] };
+        const a = answer(b.nodes.slice(0, 1), true);
+        (a.answer.run as { definition?: string }).definition =
+          b.nodes[0] === `${EX}n0` ? 'aaaa' : 'bbbb';
+        return a;
+      },
+    };
+    await expect(runProjection(ctx, ALGOS.pageRank, { name: 'p' }, iris, {})).rejects.toThrow(
+      'projection changed',
+    );
+  });
+
   it('stops following the task once the lens is cancelled', async () => {
     const stop = new AbortController();
     let polls = 0;

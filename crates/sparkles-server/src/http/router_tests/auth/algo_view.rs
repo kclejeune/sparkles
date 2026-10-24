@@ -27,6 +27,27 @@ password = "{afull}"
 datasets = {{ av = "read" }}
 
 [[users]]
+name = "aadmin"
+password = "{aadmin}"
+datasets = {{ av = "admin" }}
+
+[[users]]
+name = "amain"
+password = "{amain}"
+[[users.grants]]
+dataset = "av"
+level = "read"
+branches = ["main"]
+
+[[users]]
+name = "adev"
+password = "{adev}"
+[[users.grants]]
+dataset = "av"
+level = "read"
+branches = ["dev"]
+
+[[users]]
 name = "aga"
 password = "{aga}"
 [[users.grants]]
@@ -45,6 +66,9 @@ graphs = ["http://ex/ga"]
         afull = h("afull-pw"),
         aga = h("aga-pw"),
         aga2 = h("aga2-pw"),
+        aadmin = h("aadmin-pw"),
+        adev = h("adev-pw"),
+        amain = h("amain-pw"),
     )
 }
 
@@ -226,4 +250,63 @@ async fn followers_lose_the_task_when_their_access_changes() {
     crate::http::algo::view::PAUSED.lock().retain(|d| d != "av");
     let done = crate::http::router_tests::tasks::wait_done(&st, &id).await;
     assert_eq!(done.state, "done", "{:?}", done.message);
+}
+
+#[tokio::test]
+async fn a_branch_run_is_followed_on_its_branch() {
+    let (_dir, st, app) = server();
+    let r = call(
+        &app,
+        "POST",
+        "/$/branches/av",
+        &[
+            ("authorization", &b("aadmin")),
+            ("content-type", "application/json"),
+        ],
+        r#"{"name": "dev"}"#,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "nodes": ["http://ex/a"],
+        "keep": true,
+        "async": true,
+    });
+    let r = call(
+        &app,
+        "POST",
+        "/$/algo/av/run?branch=dev",
+        &[
+            ("authorization", &b("adev")),
+            ("content-type", "application/json"),
+        ],
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(r.json()["dataset"], "av@dev", "{}", r.text());
+    let uri = format!("/$/tasks/{id}");
+    // the reader of the branch follows it, and a reader of main only does not see it
+    let r = get_as(&app, &uri, Some(&b("adev"))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = get_as(&app, &uri, Some(&b("amain"))).await;
+    assert_ne!(r.status, StatusCode::OK, "{}", r.text());
+    let done = crate::http::router_tests::tasks::wait_done(&st, &id).await;
+    assert_eq!(done.state, "done", "{:?}", done.message);
+}
+
+#[tokio::test]
+async fn memberships_take_a_grant_through_the_query_endpoint() {
+    assert_eq!(
+        crate::auth::routes::endpoint(
+            "/$/graphrag/{ds}/memberships",
+            &axum::http::Method::POST,
+            &"/$/graphrag/av/memberships".parse().unwrap(),
+            &axum::http::HeaderMap::new(),
+        ),
+        Some(crate::auth::Endpoint::Query)
+    );
 }

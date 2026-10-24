@@ -297,7 +297,8 @@ async fn a_queued_run_cancelled_before_it_starts_leaves_the_running_list() {
     assert_eq!(st, StatusCode::ACCEPTED, "{t}");
     assert_eq!(t["state"], task_state::QUEUED, "{t}");
     let id = t["id"].as_str().unwrap().to_string();
-    assert!(view::running_ids().contains(&id));
+    let branch = s.state.get("g").unwrap().store.branch_id();
+    assert!(view::running_ids(branch).contains(&id));
     let r = send(
         &s.app,
         Request::delete(format!("/$/tasks/{id}"))
@@ -307,7 +308,7 @@ async fn a_queued_run_cancelled_before_it_starts_leaves_the_running_list() {
     .await;
     assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
     assert!(
-        !view::running_ids().contains(&id),
+        !view::running_ids(branch).contains(&id),
         "a cancelled queued run still holds its running entry"
     );
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -508,4 +509,103 @@ async fn a_background_run_hands_its_bytes_to_the_cache() {
         pool.granted(),
         pool.capacity()
     );
+}
+
+#[tokio::test]
+async fn a_run_cancelled_after_it_computed_keeps_nothing() {
+    let s = algo_server();
+    s.state.create("late", DbType::Mem).unwrap();
+    s.state
+        .get("late")
+        .unwrap()
+        .store
+        .load(&[Source::from_bytes(
+            GRAPH.as_bytes().to_vec(),
+            oxrdfio::RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    view::PAUSED_KEEP.lock().push("late".into());
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "nodes": ["http://ex/a"],
+        "keep": true,
+        "async": true,
+    });
+    let (st, t) = run(&s, "late", &body).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{t}");
+    let id = t["id"].as_str().unwrap().to_string();
+    // wait until it has computed and waits to keep the result
+    let t0 = std::time::Instant::now();
+    loop {
+        let p = s
+            .state
+            .tasks
+            .lock()
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.progress);
+        if p.is_some_and(|p| p >= 0.95) || t0.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let r = send(
+        &s.app,
+        Request::delete(format!("/$/tasks/{id}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    view::PAUSED_KEEP.lock().retain(|d| d != "late");
+    let done = super::super::tasks::wait_done(&s.state, &id).await;
+    assert_eq!(done.state, task_state::CANCELLED, "{:?}", done.message);
+    let mut sync = body.clone();
+    sync["async"] = json!(false);
+    let (_, j) = run(&s, "late", &sync).await;
+    assert_eq!(j["run"]["cached"], false, "{j}");
+}
+
+#[tokio::test]
+async fn answers_of_one_definition_share_its_hash() {
+    let s = algo_server();
+    let body = json!({
+        "algorithm": "wcc",
+        "projection": {"predicates": ["http://ex/p"]},
+        "nodes": ["http://ex/a"],
+        "keep": true,
+    });
+    let (_, a) = run(&s, "g", &body).await;
+    let mut other = body.clone();
+    other["nodes"] = json!(["http://ex/d"]);
+    let (_, b) = run(&s, "g", &other).await;
+    assert_eq!(a["run"]["definition"], b["run"]["definition"]);
+    let mut changed = body.clone();
+    changed["projection"] = json!({"predicates": ["http://ex/q"]});
+    let (_, c) = run(&s, "g", &changed).await;
+    assert_ne!(a["run"]["definition"], c["run"]["definition"]);
+}
+
+#[tokio::test]
+async fn memberships_on_a_branch_say_they_are_not_available() {
+    let s = algo_server();
+    let r = send(
+        &s.app,
+        json_req("POST", "/$/branches/g", r#"{"name": "dev"}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let r = send(
+        &s.app,
+        json_req(
+            "POST",
+            "/$/graphrag/g/memberships?branch=dev",
+            r#"{"nodes": ["http://ex/a"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["available"], false, "{}", r.text());
 }
