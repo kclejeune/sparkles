@@ -6278,7 +6278,8 @@ described under "Edges from a pattern" below.
   `ex:a ex:road ex:b {| ex:km 12 |}` writes. The smallest value counts when there are
   several. A weight that is not a non-negative number fails the query. The shortest
   modes then use Dijkstra's algorithm and `path:kShortest` uses Yen's algorithm with
-  Dijkstra's. Lengths still count edges.
+  Dijkstra's. The cheapest path of one pair and Yen's spur searches run from both ends.
+  Lengths still count edges.
 * **Graphs and access.** The search reads the active graph, as a triple pattern would.
   Under `GRAPH ?g` each named graph is searched on its own and `?g` is bound to it. A
   path never uses a triple that the caller's grants or protections hide, and a hidden

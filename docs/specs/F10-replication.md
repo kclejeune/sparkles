@@ -1311,6 +1311,228 @@ less time on the replica than making them took on the primary. The numbers go to
 14. **Graph terms on prefix rows.** Accepted and not narrowing, as in Jena. Should Sparkles
     refuse them instead, since it cannot honour them?
 
+The questions below came after the spec, as later features added derived state and
+deployment options that it does not cover. Roadmap item 280 answers them in this spec
+before Phase 2 starts.
+
+15. **Derived state on a replica.** For each kind of derived state, does a replica follow
+    the primary's result or rebuild it locally? This covers incremental views
+    ([F13](F13-incremental-views-and-provenance.md)), projections, algorithm views
+    ([F14](F14-graph-algorithms.md)), materialized inference
+    ([F16](F16-materialization-at-scale.md)), query-time reasoning settings
+    ([F17](F17-query-time-reasoning.md)), mappings and virtual graphs
+    ([F19](F19-mappings-and-virtual-graphs.md)), and full-text analyzer dictionaries.
+    §4.5 and §4.6 answer this only for the full-text, vector and spatial indexes.
+16. **Branches.** Open question 1 waited for the branches spec, which is now
+    [F09](F09-branches-and-merges.md). Does a replica follow every branch, a chosen set,
+    or only the main lineage, and how do branch commits appear in the commit stream?
+17. **Encryption at rest.** How do captures, the commit stream and archive segments carry
+    data from an encrypted dataset ([F11](F11-encryption-at-rest.md)), and which keys does
+    a replica need?
+18. **Fencing and data-loss guarantees of automated failover.** Phase 3 elects the primary
+    through an external lease, as Patroni does for PostgreSQL. The old primary refuses
+    writes before its lease expires, which assumes bounded clock drift. With
+    `--sync-replicas`, a commit is acknowledged as degraded after a timeout, so no lost
+    writes holds only in strict mode. The spec should give a table of failure modes, such
+    as a partition, a paused process, clock drift and a lost lease store, with the
+    guarantee in each.
+19. **Kubernetes deployment.** The Helm chart runs a single-replica StatefulSet. How do
+    roles, readiness, promotion and the lease map onto the chart?
+20. **Scope.** Replication gives read scaling and high availability. Writes and data size
+    still scale only with one node. Should the spec state sharding as a non-goal, or name
+    where it would go?
+21. **Estimate.** Phase 2 was estimated at about two weeks before the features in
+    question 15 existed. What is the estimate now?
+22. **Joining a peer and its credentials.** A replica joins today by static
+    configuration: an operator writes the primary's URL, a CA file and a bearer token
+    from a replication-only grant (§4.8), and the primary learns of the follower from its
+    first request. There is no enrollment step, no discovery of peers and no way to
+    rotate a token without editing both servers. With lease-based failover any replica
+    can become the primary, so every peer needs a token that the others accept and
+    credentials for the lease store. Should peers enroll with a one-time join token,
+    authenticate each other with mutual TLS (item 63), or use the identity of the
+    platform, such as a Kubernetes service account? How are tokens rotated, how are
+    users and grants kept in step across peers (open question 10), and how does a
+    joining replica get the keys of an encrypted dataset (question 17)?
+
+23. **High availability as a whole.** Questions 18 and 22 cover fencing and identity, but
+    the spec has no single account of how a cluster survives a node failure. It should
+    state recovery time and data-loss targets for the default and strict settings,
+    how many nodes a deployment needs (the lease store's quorum, such as three etcd
+    members, separate from the Sparkles nodes), whether the lease and the primary are
+    per server or per dataset, and how clients reach the new primary, through a
+    Kubernetes Service that selects the leader, a load balancer health check, or write
+    forwarding from replicas. It should also say how a dead node is replaced, by joining
+    a new one and bootstrapping it from a backup, and what happens when the lease store
+    itself is lost, where writes should stop rather than risk two primaries.
+
+### Recommended direction for question 22
+
+The maintainer accepted this direction on 2026-10-24. Item 280 turns it into the design of
+§2 and §7 and settles the points left open below.
+
+* **Identity.** Peers authenticate each other with mutual TLS. Each node generates its own
+  key pair, and its private key never leaves it. A cluster CA issues each node a
+  certificate that names the node and the cluster, and that certificate replaces the
+  replication bearer token between peers. Certificates last about a day, and a node renews
+  its own with its current certificate, so rotation needs no operator. Removing a node
+  stops its renewals, and a short revocation list covers the hours its last certificate
+  has left.
+* **Three ways to provision a node.** All three end with the same certificate and the
+  same mutual TLS.
+  * Static files stay supported. An operator, the NixOS module or cert-manager writes the
+    CA certificate, the node's certificate and its key, and the node reloads them when
+    they change. This suits deployments managed from Git.
+  * A join token is the default for clusters that run their own CA, as kubeadm, k3s,
+    Consul and CockroachDB do it. `sparkles cluster token create --ttl 1h --role replica`
+    prints a single-use token that holds a secret and the SHA-256 hash of the cluster CA
+    certificate. The joining node runs `sparkles serve --join URL --join-token TOKEN`
+    against any member, and the bootstrap exchange below gives it a certificate. The
+    server stores only a hash of the secret, spends the token on first use and records an
+    audit event. An optional manual approval mode holds each join until an admin accepts
+    it.
+  * Platform identity fits Kubernetes. A node proves who it is with a projected service
+    account token that the cluster checks through the TokenReview API, or cert-manager,
+    Vault or SPIFFE issues its certificate directly. This replaces the join token and
+    keeps mutual TLS.
+* **Bootstrap exchange.** The first node creates the cluster CA locally with
+  `sparkles cluster init`, so nothing crosses the network. A joining node has no
+  certificate yet, so its first connection is TLS that authenticates only the server. The
+  node accepts the server's chain only if it ends at a CA certificate whose hash matches
+  the hash in the token, which is how kubeadm's `discovery-token-ca-cert-hash` stops a
+  node from joining an impostor. The node then generates its key pair and sends a
+  certificate signing request with a proof of the token secret. The proof is an HMAC over
+  the request and the TLS exporter value of RFC 9266, so a proof taken from one
+  connection cannot be replayed on another. The server checks the proof, spends the
+  token, and returns the signed certificate with the CA chain. Every later connection is
+  mutual TLS. With platform identity the service account token takes the place of the
+  proof, and the CA bundle comes from the platform, such as a ConfigMap.
+* **Cluster state.** The member list, roles, users, tokens, grants, shared settings, the
+  CA certificate and wrapped dataset keys need one store that every peer reads. It can be
+  a small system dataset that replicates through the commit stream like any other, which
+  also answers open question 10, or a dedicated store such as etcd, which the lease may
+  already use. Item 280 chooses between them. Discovery comes from this state, so a joining
+  node needs only one seed address and no gossip protocol is required. The leader lease
+  stays in the external store of §8 Phase 3.
+* **The CA key across failover.** With the built-in CA, the CA key is encrypted to each
+  peer that can be promoted and reaches only those peers. Read replicas that are never
+  promoted do not receive it. Production deployments can use an external CA, such as
+  cert-manager or Vault, so that no Sparkles node holds a signing key.
+* **Keys of encrypted datasets.** Encryption follows the envelope model of
+  [F11](F11-encryption-at-rest.md). With a KMS or Vault (item 65), each node authenticates
+  to the KMS with its own identity and Sparkles moves no key material. With the built-in
+  setup, each dataset key is wrapped with HPKE (RFC 9180) to the public key of every
+  authorized node and kept in the cluster state. The primary wraps the key for a node
+  when its join is approved, and removing a node deletes its wrapped copy, with an
+  optional key rotation so the node cannot read later data. A replica must decrypt to
+  answer queries, so membership for a dataset and holding its key are the same thing.
+* **Libraries.** rustls provides TLS and the exporter, rcgen generates certificates and
+  signing requests, and an HPKE crate wraps keys. No new cryptography is written.
+* **Phasing.** Phase 2 ships static configuration with mutual TLS from files. A Phase 2b
+  adds join tokens and the built-in CA with automatic renewal. Phase 3 adds the cluster
+  state store, key wrapping and Kubernetes identity next to lease failover.
+
+### Proposed direction for questions 18 and 23
+
+This is a proposal for item 280 to confirm or change. It follows Patroni's design for
+PostgreSQL where the problems are the same, and adds fencing tokens so that a stale
+primary cannot have a write acknowledged.
+
+* **Leadership scope.** One lease per cluster names the primary server, which takes the
+  writes of every dataset. The maintainer chose this on 2026-10-24. Per-dataset leases
+  would spread write load across servers, but they multiply leases, fencing and client
+  routing, so they wait for a measured need.
+* **Topology.** The recommended cluster is three Sparkles nodes: the primary, one
+  synchronous replica and one asynchronous replica. The lease lives in a store that has
+  its own quorum, which is the Kubernetes API, a three-member etcd or a Consul cluster.
+  Two Sparkles nodes work with an external lease store but cannot keep both no data loss
+  and write availability through a failure.
+* **Synchronous quorum.** `--sync-replicas 1` with two replicas acknowledges a commit when
+  either replica has applied it, as PostgreSQL's `ANY 1` does. One node can then fail
+  without losing an acknowledged commit and without blocking writes.
+* **Fencing tokens.** Each lease acquisition has an epoch that only grows, taken from the
+  lease store's revision. The primary writes its epoch into every commit's WAL record and
+  stream page. A replica refuses commits from an epoch older than the newest it has seen,
+  and acknowledges only commits of the current epoch. A primary that paused and woke
+  after losing its lease therefore cannot get a strict synchronous commit acknowledged,
+  whatever its clock says. The primary also fences itself. It stops taking writes when
+  its renewal deadline passes on its monotonic clock, before the lease's TTL can expire
+  in the store, which assumes only that clock rates drift by a bounded amount.
+* **Timing and targets.** The defaults are a 10-second lease, renewal every 3 seconds and
+  self-fencing at 7 seconds. Writes return 10 to 20 seconds after the primary fails,
+  which is detection plus a bounded catch-up. In strict synchronous mode no acknowledged
+  commit is lost. In asynchronous mode the loss is at most the lag of the promoted
+  replica.
+* **Choosing the new primary.** A replica can take the lease only when it is healthy,
+  its lag is under `failover_max_lag`, and it is not marked `nofailover`, as Patroni's
+  `maximum_lag_on_failover` and tags work. A synchronous replica is preferred, then the
+  highest applied commit, then a configured priority. It takes the lease, applies the
+  rest of what it received and then accepts writes under the new epoch.
+* **Client routing.** Health endpoints serve load balancers. `GET /$/health/primary`
+  answers 200 only on the primary that holds the lease, and `GET /$/health/replica`
+  answers 200 on a replica within its lag limits, as Patroni's REST API does for HAProxy.
+  On Kubernetes the leader labels its pod with `sparkles.io/role=primary`, one Service
+  selects that label for writes and another selects every ready pod for reads. Write
+  forwarding from a replica stays optional, because the replica must forward the
+  caller's identity over mutual TLS. `minCommit` keeps reading your own writes across the
+  switch.
+* **Planned switchover.** `sparkles cluster switchover --to NODE` stops writes on the
+  primary, waits until the target has applied the head, and hands it the lease. It loses
+  nothing and pauses writes for a few seconds. Rolling upgrades use it after upgrading
+  the replicas first, which the logical stream allows because replicas may run a newer
+  version.
+* **A former primary.** When it starts and sees a newer epoch in the lease store, it
+  becomes a replica. If it holds commits after the fork, they were never acknowledged in
+  strict synchronous mode, so it re-seeds automatically and keeps the old directory for
+  salvage, as `pg_rewind` does for PostgreSQL. In asynchronous mode those commits may
+  have been acknowledged, so it stops in `diverged` and waits for an operator, as §2.7
+  describes.
+* **Replacing a node.** A new node joins with a join token or as a recreated StatefulSet
+  pod, bootstraps from the newest backup and catches up from the archive of §8 Phase 3 or
+  from the primary's holds.
+* **Losing the lease store.** No primary can renew, so the primary fences itself and
+  writes stop, while every node keeps serving reads. A failsafe mode could keep writes
+  going through such an outage. It is an open choice, described under the options below.
+* **Observability.** The epoch, lease holder, renewal age and failover count are metrics,
+  and every promotion, demotion, switchover and fence is an audit event.
+* **Testing.** NixOS VM tests inject faults in the manner of Jepsen. They partition the
+  network, pause the primary with SIGSTOP, skew clocks, and stop the lease store, while a
+  client records its writes. A checker then proves that no acknowledged write was lost
+  in strict mode, and that no two primaries accepted writes in the same epoch.
+
+The maintainer has not settled the following choices. Item 280 lays out the tradeoffs of
+each and asks before Phase 3 is designed in full.
+
+* **The default synchronous mode.** The maintainer leans toward strict, and the decision
+  waits until Phase 3.
+  * Strict by default never acknowledges a commit that no replica has applied, so a
+    failover loses nothing that a client was told succeeded. Writes block, and fail at
+    the timeout, when no synchronous replica is reachable, so a three-node cluster stops
+    writing if both replicas are down.
+  * Degrading by default acknowledges a commit after the timeout with
+    `Sparkles-Replication: degraded`, so writes continue with one node, but a failover
+    during the degraded period can lose those commits. This matches PostgreSQL with
+    `synchronous_standby_names` cleared by hand, and Patroni's
+    `synchronous_mode` without `synchronous_mode_strict`.
+  * Asynchronous by default has the lowest write latency and the largest loss window, and
+    leaves synchronous replication to deployments that ask for it.
+* **Failsafe mode when the lease store is lost.**
+  * Without it, losing the lease store stops writes cluster-wide until the store returns,
+    even though every Sparkles node is healthy. The store is then as critical as the
+    primary, which pushes operators toward a highly available store such as the
+    Kubernetes API or a three-member etcd.
+  * With it, a primary that cannot renew asks every member it knows of, over mutual TLS,
+    to confirm it as primary, and keeps writing while all of them answer within the
+    renewal interval. A member that confirms promises not to take the lease, or follow
+    anyone else, until the store returns. If any member does not answer, the primary
+    fences itself as it would without the mode. Patroni's `failsafe_mode` works this way.
+    It is safe only when the member list is complete and current, which ties it to
+    the cluster state of question 22, and it adds a second path to leadership that the
+    fault-injection tests must cover.
+  * A middle option keeps the mode off by default and enables it only where the lease
+    store is known to be less available than the Sparkles nodes, such as a single etcd
+    member.
+
 ## 12. Sources
 
 * **Sparkles repository, read for this spec:**

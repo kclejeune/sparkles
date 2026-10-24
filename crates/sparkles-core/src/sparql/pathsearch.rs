@@ -27,7 +27,8 @@
 //!
 //! The searches: bidirectional breadth-first search for one unweighted pair, one
 //! breadth-first search per source (or per target) for several or unbound ends,
-//! Dijkstra's algorithm with weights, Yen's algorithm for the k shortest paths, and a
+//! Dijkstra's algorithm with weights, from both ends for the cheapest path of one pair and
+//! for the spur searches of Yen's algorithm for the k shortest paths, and a
 //! depth-first enumeration pruned by the distance to the targets for all paths.
 
 use super::ctx::{Charge, Ctx};
@@ -1112,6 +1113,108 @@ impl Tree {
 /// An `f64` ordered by `total_cmp`, for the heaps.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OrdF64(f64);
+
+/// A sum of non-negative weights kept as a double-double: the rounded sum and the error
+/// of rounding it, from Knuth's TwoSum. A search from both ends adds a path's weights from
+/// each end, and plain floating point can round the two orders apart enough to rank a
+/// dearer path first when the weights differ greatly in size. With about 106 bits the
+/// orders agree unless two costs differ by less than about 2^-106 of their size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Cost {
+    hi: f64,
+    lo: f64,
+}
+
+impl Cost {
+    const ZERO: Cost = Cost { hi: 0.0, lo: 0.0 };
+
+    fn of(w: f64) -> Cost {
+        Cost { hi: w, lo: 0.0 }
+    }
+
+    const INFINITE: Cost = Cost {
+        hi: f64::INFINITY,
+        lo: 0.0,
+    };
+
+    fn add(self, o: Cost) -> Cost {
+        if self.hi.is_infinite() || o.hi.is_infinite() {
+            return Cost::INFINITE;
+        }
+        if (self.hi + o.hi).is_finite() {
+            return self.sum(o);
+        }
+        // the rounded parts reach past the largest double, but the rounding errors can
+        // bring the sum back under it. Halving is exact, so the halves are added without
+        // overflow and the sum doubled, which overflows only when the sum itself rounds
+        // past the largest double.
+        let half = |c: Cost| Cost {
+            hi: c.hi * 0.5,
+            lo: c.lo * 0.5,
+        };
+        let h = half(self).sum(half(o));
+        let hi = h.hi * 2.0;
+        if !hi.is_finite() {
+            return Cost::INFINITE;
+        }
+        Cost { hi, lo: h.lo * 2.0 }
+    }
+
+    /// TwoSum of the rounded parts, the rounding errors added to the error, and Fast2Sum
+    /// to renormalize.
+    fn sum(self, o: Cost) -> Cost {
+        let (a, b) = (self.hi, o.hi);
+        // s + e is exactly a + b
+        let s = a + b;
+        let bb = s - a;
+        let e = (a - (s - bb)) + (b - bb) + self.lo + o.lo;
+        // |s| ≥ |e|
+        let hi = s + e;
+        if !hi.is_finite() {
+            return Cost::INFINITE;
+        }
+        Cost {
+            hi,
+            lo: e - (hi - s),
+        }
+    }
+}
+
+impl Eq for Cost {}
+
+impl PartialOrd for Cost {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for Cost {
+    fn cmp(&self, o: &Self) -> Ordering {
+        self.hi.total_cmp(&o.hi).then(self.lo.total_cmp(&o.lo))
+    }
+}
+
+/// A path from `s` with every cycle cut out, so each node appears once. Two halves of a
+/// bidirectional search can share a node only through edges of weight zero, so the cut
+/// path costs the same.
+fn without_loops(s: u64, edges: Vec<Edge>) -> Vec<Edge> {
+    let mut out: Vec<Edge> = Vec::with_capacity(edges.len());
+    // the position in `out` after which each node is reached
+    let mut at: FxHashMap<u64, usize> = FxHashMap::default();
+    at.insert(s, 0);
+    for e in edges {
+        if let Some(&i) = at.get(&e.to) {
+            for d in out.drain(i..) {
+                at.remove(&d.to);
+            }
+            at.insert(e.to, i);
+            continue;
+        }
+        out.push(e);
+        at.insert(e.to, out.len());
+    }
+    out
+}
 impl Eq for OrdF64 {}
 impl PartialOrd for OrdF64 {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
@@ -2200,6 +2303,140 @@ impl<'a> Engine<'a> {
         Ok((tree, dist))
     }
 
+    /// The cheapest path from `s` to `t`, two different real nodes, by Dijkstra's
+    /// algorithm from both ends (ROADMAP item 150). The forward search settles nodes by
+    /// their cost from `s` and the backward search by their cost to `t`, and the side with
+    /// the smaller queue goes next. Every edge either side relaxes onto a node the other
+    /// side has reached gives a path, and the cheapest one so far is kept. The search
+    /// stops once the two queues' least costs add up to at least that path's cost, since
+    /// no path through an unsettled node can be cheaper, so on a graph where most paths
+    /// are short each side settles only the nodes near its end. A meeting node must be
+    /// one a path may pass through: not a hub and not a literal, unless it is an end.
+    /// `banned` nodes and edges are skipped on both sides, for Yen's spur searches.
+    fn dijkstra_pair(
+        &self,
+        s: u64,
+        t: u64,
+        banned_nodes: Option<&FxHashSet<u64>>,
+        banned_edges: Option<&FxHashSet<Edge>>,
+    ) -> Result<Option<(Vec<Edge>, f64)>> {
+        debug_assert!(s != t && s != VIRT && t != VIRT);
+        self.set_roots(&[s, t]);
+        let mut trees = [Tree::new(s, true), Tree::new(t, false)];
+        // the costs are double-doubles, so both ends add a path's weights alike
+        let mut dist: [FxHashMap<u64, Cost>; 2] = Default::default();
+        let mut settled: [FxHashSet<u64>; 2] = Default::default();
+        let mut heaps: [BinaryHeap<Reverse<(Cost, u64)>>; 2] = Default::default();
+        for (i, r) in [s, t].into_iter().enumerate() {
+            dist[i].insert(r, Cost::ZERO);
+            heaps[i].push(Reverse((Cost::ZERO, r)));
+        }
+        // the cheapest path found so far, by its cost and the node where the sides meet
+        let mut best: Option<(Cost, u64)> = None;
+        let mut n = 0u64;
+        loop {
+            for i in 0..2 {
+                while let Some(&Reverse((_, u))) = heaps[i].peek() {
+                    if !settled[i].contains(&u) {
+                        break;
+                    }
+                    heaps[i].pop();
+                }
+            }
+            let (Some(&Reverse((df, _))), Some(&Reverse((db, _)))) =
+                (heaps[0].peek(), heaps[1].peek())
+            else {
+                // one side has settled everything it can reach
+                break;
+            };
+            if best.is_some_and(|(mu, _)| df.add(db) >= mu) {
+                break;
+            }
+            let side = usize::from(heaps[0].len() > heaps[1].len());
+            let forward = side == 0;
+            let Reverse((d, u)) = heaps[side].pop().unwrap();
+            settled[side].insert(u);
+            if u != trees[side].root {
+                trees[side].order.push((u, 0));
+            }
+            self.visit(1)?;
+            n += 1;
+            if n.is_multiple_of(4096) {
+                self.ctx.check()?;
+            }
+            // a plain search expands each node once; Yen's spur searches revisit them
+            let steps: Rc<[Step]> = if banned_nodes.is_some() {
+                self.neighbours(u, forward)?
+            } else {
+                let mut out = Vec::new();
+                self.expand(&[u], forward, &mut out)?;
+                out.into_iter().map(|(_, s)| s).collect()
+            };
+            for st in steps.iter() {
+                let y = st.node;
+                if settled[side].contains(&y) || banned_nodes.is_some_and(|b| b.contains(&y)) {
+                    continue;
+                }
+                let e = if forward {
+                    Edge {
+                        from: u,
+                        to: y,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                } else {
+                    Edge {
+                        from: y,
+                        to: u,
+                        p: st.p,
+                        rev: st.rev,
+                    }
+                };
+                if banned_edges.is_some_and(|b| b.contains(&e)) {
+                    continue;
+                }
+                let nd = d.add(Cost::of(self.weight(&e)?));
+                if dist[side].get(&y).is_some_and(|&c| nd >= c) {
+                    continue;
+                }
+                dist[side].insert(y, nd);
+                trees[side].first.insert(
+                    y,
+                    (
+                        Parent {
+                            node: u,
+                            p: st.p,
+                            rev: st.rev,
+                        },
+                        0,
+                    ),
+                );
+                heaps[side].push(Reverse((nd, y)));
+                if let Some(&o) = dist[1 - side].get(&y)
+                    && best.is_none_or(|(mu, _)| nd.add(o) < mu)
+                    && (y == s || y == t || !(self.sink(y, true) || self.blocked(y)?))
+                {
+                    best = Some((nd.add(o), y));
+                }
+            }
+        }
+        let Some((_, m)) = best else {
+            return Ok(None);
+        };
+        // the parents of a node only ever get cheaper, so the two halves through the
+        // meeting node cost at most the path found, which no path beats
+        let check = || self.ctx.check();
+        let (Some(a), Some(z)) = (
+            trees[0].paths(m, false, 1, None, &check)?.pop(),
+            trees[1].paths(m, false, 1, None, &check)?.pop(),
+        ) else {
+            return Ok(None);
+        };
+        let path = without_loops(s, a.into_iter().chain(z).collect());
+        let cost = self.path_cost(&path)?;
+        Ok(Some((path, cost)))
+    }
+
     /// The shortest path from `from` to `to` (forward) that avoids the banned nodes and
     /// edges, of at most `budget` edges without weights: Yen's spur search.
     fn spur(
@@ -2211,7 +2448,11 @@ impl<'a> Engine<'a> {
         banned_edges: &FxHashSet<Edge>,
         budget: Option<u32>,
     ) -> Result<Option<(Vec<Edge>, f64)>> {
+        if self.spec.weighted() && to != VIRT && from != to {
+            return self.dijkstra_pair(from, to, Some(banned_nodes), Some(banned_edges));
+        }
         if self.spec.weighted() {
+            // a spur that closes a cycle searches from one end
             let close = to == VIRT;
             let targets: FxHashSet<u64> = [if close { virt } else { to }].into_iter().collect();
             let (tree, dist) = self.dijkstra(
@@ -2246,13 +2487,27 @@ impl<'a> Engine<'a> {
             }))
     }
 
+    /// A path's cost as a double-double, added from its start, so that equal paths always
+    /// get equal costs and costs that differ in the low bits rank apart. `real` maps the
+    /// virtual end of a cycle back to its node for the weight lookup.
+    fn exact_cost(&self, edges: &[Edge], real: impl Fn(u64) -> u64) -> Result<Cost> {
+        if !self.spec.weighted() {
+            return Ok(Cost::of(edges.len() as f64));
+        }
+        let mut c = Cost::ZERO;
+        for e in edges {
+            c = c.add(Cost::of(self.weight(&e.map(&real))?));
+        }
+        Ok(c)
+    }
+
     /// Simple paths in nondecreasing cost by Yen's algorithm; `accept` sees each one
     /// and returns whether to go on.
     fn yen(
         &self,
         s: u64,
         t: u64,
-        mut accept: impl FnMut(&[Edge], f64) -> Result<bool>,
+        mut accept: impl FnMut(&[Edge], Cost) -> Result<bool>,
     ) -> Result<()> {
         let tt = if s == t { VIRT } else { t };
         let real = |x: u64| if x == VIRT { s } else { x };
@@ -2260,15 +2515,19 @@ impl<'a> Engine<'a> {
         let none_n = FxHashSet::default();
         let none_e = FxHashSet::default();
         let budget = if self.spec.weighted() { None } else { max };
-        let Some(first) = self.spur(s, tt, s, &none_n, &none_e, budget)? else {
+        let Some((first, _)) = self.spur(s, tt, s, &none_n, &none_e, budget)? else {
             return Ok(());
         };
-        let mut a: Vec<(Vec<Edge>, f64)> = vec![first];
+        // candidates are ranked by their whole cost in double-double, never by the
+        // spur's rounded cost plus the root's, so that two equally cheap candidates
+        // cannot rank apart by the order their weights were added in
+        let first_cost = self.exact_cost(&first, real)?;
+        let mut a: Vec<(Vec<Edge>, Cost)> = vec![(first, first_cost)];
         let mut seen: FxHashSet<Vec<Edge>> = FxHashSet::default();
         seen.insert(a[0].0.clone());
         // candidates by (cost, length, discovery)
-        let mut heap: BinaryHeap<Reverse<(OrdF64, usize, u64)>> = BinaryHeap::new();
-        let mut cands: FxHashMap<u64, (Vec<Edge>, f64)> = FxHashMap::default();
+        let mut heap: BinaryHeap<Reverse<(Cost, usize, u64)>> = BinaryHeap::new();
+        let mut cands: FxHashMap<u64, (Vec<Edge>, Cost)> = FxHashMap::default();
         let mut seq = 0u64;
         loop {
             let (cur, cost) = a.last().cloned().unwrap();
@@ -2277,15 +2536,7 @@ impl<'a> Engine<'a> {
                 return Ok(());
             }
             let nodes: Vec<u64> = std::iter::once(s).chain(cur.iter().map(|e| e.to)).collect();
-            let mut root_cost = 0.0;
             for i in 0..cur.len() {
-                if i > 0 {
-                    root_cost += if self.spec.weighted() {
-                        self.weight(&cur[i - 1].map(real))?
-                    } else {
-                        1.0
-                    };
-                }
                 let root = &cur[..i];
                 let mut banned_edges = FxHashSet::default();
                 for (p, _) in &a {
@@ -2299,15 +2550,16 @@ impl<'a> Engine<'a> {
                     Some(m) => Some(m - i as u32),
                     None => None,
                 };
-                if let Some((sp, c)) =
+                if let Some((sp, _)) =
                     self.spur(nodes[i], tt, s, &banned_nodes, &banned_edges, budget)?
                 {
                     let mut path = root.to_vec();
                     path.extend(sp);
                     if seen.insert(path.clone()) {
                         let len = path.len();
-                        cands.insert(seq, (path, root_cost + c));
-                        heap.push(Reverse((OrdF64(root_cost + c), len, seq)));
+                        let c = self.exact_cost(&path, real)?;
+                        cands.insert(seq, (path, c));
+                        heap.push(Reverse((c, len, seq)));
                         seq += 1;
                         self.charge.add(len as u64 * 32)?;
                     }
@@ -2586,7 +2838,7 @@ pub fn run(
                         }
                         continue;
                     }
-                    let mut best: Option<f64> = None;
+                    let mut best: Option<Cost> = None;
                     let mut out = Vec::new();
                     eng.yen(s, t, |p, c| {
                         if p.len() as u32 > spec.max_len.unwrap() || (p.len() as u32) < spec.min_len
@@ -2623,6 +2875,19 @@ pub fn run(
                         }
                     }
                     continue;
+                }
+                // one cheapest path between two different nodes: from both ends
+                if single && weighted && !all {
+                    let t = *targets.set.first().unwrap();
+                    if t != s {
+                        eng.begin();
+                        if let Some((p, _)) = eng.dijkstra_pair(s, t, None, None)?
+                            && !add(&mut found, s, t, p, None, true)?
+                        {
+                            break 'sources;
+                        }
+                        continue;
+                    }
                 }
                 eng.begin();
                 let close = targets.any || tset.contains(&s);
@@ -2969,6 +3234,52 @@ mod tree_tests {
         }
         t.order = (1..=len).map(|i| (i, 0)).collect();
         t
+    }
+
+    #[test]
+    fn costs_add_up_alike_from_either_end() {
+        let w = [1.0, 1.0, 1.0, 1e16];
+        let fwd = w.iter().fold(Cost::ZERO, |c, &x| c.add(Cost::of(x)));
+        let bwd = w.iter().rev().fold(Cost::ZERO, |c, &x| c.add(Cost::of(x)));
+        assert_eq!(fwd, bwd);
+        // the unit weights are kept, so this path is dearer than 1e16 + 2
+        assert!(fwd > Cost::of(1e16).add(Cost::of(2.0)));
+        // halves met in the middle add up to the whole
+        let half = Cost::of(1.0).add(Cost::of(1.0));
+        assert_eq!(half.add(Cost::of(1.0).add(Cost::of(1e16))), fwd);
+        assert_eq!(Cost::of(f64::MAX).add(Cost::of(f64::MAX)), Cost::INFINITE);
+        // the rounded parts overflow, the whole does not
+        let u = 2f64.powi(969);
+        let near = Cost {
+            hi: f64::MAX,
+            lo: -u,
+        };
+        assert_eq!(
+            near.add(Cost::of(2.0 * u)),
+            Cost {
+                hi: f64::MAX,
+                lo: u
+            }
+        );
+        assert_eq!(Cost::INFINITE.add(Cost::of(1.0)), Cost::INFINITE);
+    }
+
+    #[test]
+    fn halves_that_share_a_node_are_cut_to_a_simple_path() {
+        let e = |from, to| Edge {
+            from,
+            to,
+            p: 9,
+            rev: false,
+        };
+        // 1 → 2 → 3 → 2 → 4, where the halves met at 3 over zero-weight edges
+        let cut = without_loops(1, vec![e(1, 2), e(2, 3), e(3, 2), e(2, 4)]);
+        assert_eq!(cut, vec![e(1, 2), e(2, 4)]);
+        // a loop back through the source
+        let cut = without_loops(1, vec![e(1, 2), e(2, 1), e(1, 5)]);
+        assert_eq!(cut, vec![e(1, 5)]);
+        let plain = vec![e(1, 2), e(2, 3)];
+        assert_eq!(without_loops(1, plain.clone()), plain);
     }
 
     #[test]
