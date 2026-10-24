@@ -296,6 +296,13 @@ that work by priority and links each item to its design spec.
   dataset on its main branch. The frame rate of arcs was measured only in software
   rendering. [Roadmap](ROADMAP.md) item 107.
 
+* **Weighted path search speed.** A search weighted by `path:weight` runs Dijkstra's
+  algorithm from the source alone. On the 10.5M-triple benchmark data a weighted pair
+  search takes 0.68 s where the unweighted one takes 1.2 ms, and the five cheapest paths
+  exceed the default limit of 10 million visited nodes. The path finder's weighted
+  searches on large graphs stop at its limit of a million visits.
+  [Roadmap](ROADMAP.md) item 150.
+
 * **Community summaries.** A dataset has one GraphRAG configuration, so readers with
   different views cannot each have reports built from their own view. The evaluation
   of global answering against local answers and text retrieval has not run, and an

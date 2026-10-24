@@ -378,6 +378,14 @@ in place, so its layout and camera stay where they were. The keys of §2.3 work 
 focus on the graph as well as in the list, and **Open in editor** opens the query in a new
 tab of the same page, since the query page is already open.
 
+**Phase 3 measurements.** A Namespace screen found the path searches unchanged, with a
+geometric mean of 0.93 for the new build over the old one and no query above the noise,
+since the engine did not change. It also timed the weighted searches the panel now sends.
+A weighted pair search takes 0.68 s on the 10.5M-triple data against 1.2 ms unweighted,
+and the five cheapest paths stop at the default limit of 10 million visited nodes.
+[BENCHMARKS](../BENCHMARKS.md#weighted-paths-for-the-path-finder-2026-10-24) has the table,
+and ROADMAP item 150 makes weighted searches bidirectional.
+
 **Phase 3 decisions.** The spec left these open, and each was decided here. The weight
 picker offers reifier properties only, with no free IRI field, since a weight that no
 reifier carries makes every edge weigh 1. The WebGL view does not animate the paths,
