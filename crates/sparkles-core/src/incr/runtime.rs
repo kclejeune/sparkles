@@ -877,11 +877,14 @@ impl Runtime {
             reg.cells.len()
         );
         reg.inference = now.clone();
-        // every event of the old mode carries a commit at most `seen`
-        self.switched
-            .store(self.seen.load(Ordering::Acquire), Ordering::Release);
+        // every event of the old mode carries a commit at most `seen`, or at most the
+        // commit of a circuit whose pass was in flight, which the state lock waits for
+        let mut boundary = self.seen.load(Ordering::Acquire);
+        self.switched.fetch_max(boundary, Ordering::AcqRel);
         for cell in reg.cells.values() {
             let mut st = cell.state.lock();
+            boundary = boundary.max(st.circuit.applied);
+            self.switched.fetch_max(boundary, Ordering::AcqRel);
             let fresh = st.fresh(now.clone());
             let mut c = match fresh {
                 Ok(c) => c,
@@ -2069,5 +2072,54 @@ fn diff_event(
 impl ViewSource for Runtime {
     fn read_view(&self, r: &ViewRead<'_>) -> Result<ViewRows> {
         self.read(r)
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+    use crate::store::StoreOptions;
+
+    struct Rdfs(Mutex<Option<Inference>>);
+    impl Host for Rdfs {
+        fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+            Ok(None)
+        }
+        fn stored_query(&self, _: &str) -> Result<String> {
+            Err(Error::NotFound("none".into()))
+        }
+        fn inference(&self) -> Option<Inference> {
+            self.0.lock().clone()
+        }
+    }
+
+    /// The boundary of a switch covers the commit of a pass that finished while the
+    /// switch waited for its circuit's lock, before the pass reported it.
+    #[test]
+    fn the_switch_boundary_covers_a_pass_in_flight() {
+        use crate::sparql::rdfs::{RdfsOnRead, SchemaSource};
+        let s = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        let host = Arc::new(Rdfs(Mutex::new(None)));
+        rt.set_host(host.clone());
+        let _l = rt
+            .live(
+                &s,
+                "SELECT ?s WHERE { ?s ?p ?o }",
+                None,
+                &LiveOptions::default(),
+            )
+            .unwrap();
+        // a pass moved the circuit to commit 7 and has not reported it yet
+        let cell = rt.reg.lock().cells.values().next().unwrap().clone();
+        cell.state.lock().circuit.applied = 7;
+        assert!(rt.seen.load(Ordering::Acquire) < 7);
+        *host.0.lock() = Inference::new(
+            Some(Arc::new(RdfsOnRead::new(SchemaSource::Graph(None)))),
+            Vec::new(),
+        );
+        let mut reg = rt.reg.lock();
+        rt.sync_inference(&mut reg, host.as_ref());
+        assert_eq!(rt.switched.load(Ordering::Acquire), 7);
     }
 }

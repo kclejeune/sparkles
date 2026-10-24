@@ -2109,26 +2109,12 @@ On a dataset with RDFS on read or materialized inferences, a view evaluates its 
 again with them, and item 221 tracks maintaining it incrementally. The test
 `inferred_pass_against_query` in the same file adds a small schema to the data and, for the
 materialized case, an inferred `rdf:type` per person. It then makes 100 commits that touch
-each view and 100 that do not. The runs used a release build on an ephemeral Namespace
-instance with 8 vCPUs and 16 GB, so the numbers are approximate. The query column is the
-median of 5 one-off evaluations with the same inference options and the cache off, and the
-round columns time the round after each touching commit.
-
-| View | People | Query ms | Round median ms | Round p95 ms | Round / query | Unrelated commit ms |
-|---|---:|---:|---:|---:|---:|---:|
-| RDFS, COUNT by team over a superproperty | 200,000 | 12.2 | 9.2 | 10.2 | 0.75 | 0.033 |
-| RDFS, COUNT of a class reached by a domain | 200,000 | 3.6 | 3.5 | 3.6 | 0.97 | 0.039 |
-| Materialized, COUNT by team | 200,000 | 1.4 | 1.4 | 1.5 | 1.02 | 0.010 |
-| RDFS, COUNT by team over a superproperty | 1,000,000 | 170.2 | 159.0 | 167.3 | 0.93 | 0.049 |
-| RDFS, COUNT of a class reached by a domain | 1,000,000 | 18.7 | 18.5 | 18.8 | 0.99 | 0.057 |
-| Materialized, COUNT by team | 1,000,000 | 6.8 | 6.9 | 7.0 | 1.02 | 0.013 |
-
-A touching commit costs about one evaluation of the query, as expected of a recompute
-node. A commit outside the footprint of the rewritten query costs under 0.06 ms. A view
-of the materialized class counts ran only on the 35 commits that changed the inferred
-graph and skipped the other 165. The commit path of a dataset without views is unchanged,
-at a median of 0.043 to 0.045 ms per commit on main and on this change alike, over three
-interleaved repetitions of `commit_path_without_views`.
+each view and 100 that do not, and compares the round after a touching commit with a
+one-off evaluation of the query. A screen on an 8-vCPU Namespace instance found that such
+a round costs about one evaluation of the query, between 0.75 and 1.02 times its median at
+200,000 and 1,000,000 people. A commit outside the footprint of the rewritten query skipped
+the view. The screen is not a published measurement, and item 265 tracks running the test
+and the commit path without views on forge.
 
 ## Bindings
 
