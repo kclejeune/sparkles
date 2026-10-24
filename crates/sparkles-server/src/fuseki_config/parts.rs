@@ -12,11 +12,46 @@ use oxrdf::{NamedOrBlankNode, Term};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-/// The language tags Sparkles has a stemming analyzer for.
-const STEMMED: [&str; 20] = [
-    "ar", "da", "de", "el", "en", "es", "fi", "fr", "hu", "it", "nl", "no", "nb", "nn", "pt", "ro",
-    "ru", "sv", "ta", "tr",
+/// The language tags of jena-text's localized analyzers that Sparkles has an analyzer
+/// for, each with the Sparkles analyzer closest to Lucene's: the ones that follow
+/// Lucene's where Sparkles has them, and the Snowball ones for the rest.
+const LOCALIZED: [(&str, &str); 23] = [
+    ("ar", "arabic"),
+    ("da", "danish"),
+    ("de", "german-light"),
+    ("el", "greek"),
+    ("en", "english-lucene"),
+    ("es", "spanish-light"),
+    ("fi", "finnish"),
+    ("fr", "french-light"),
+    ("hu", "hungarian"),
+    ("it", "italian-light"),
+    ("ja", "cjk-lucene"),
+    ("ko", "cjk-lucene"),
+    ("nb", "norwegian"),
+    ("nl", "dutch-lucene"),
+    ("nn", "norwegian"),
+    ("no", "norwegian"),
+    ("pt", "portuguese-light"),
+    ("ro", "romanian"),
+    ("ru", "russian-lucene"),
+    ("sv", "swedish-lucene"),
+    ("ta", "tamil"),
+    ("tr", "turkish"),
+    ("zh", "cjk-lucene"),
 ];
+
+/// The tags `text:multilingualSupport` analyzes in jena-text that Sparkles can analyze
+/// too.
+const MULTILINGUAL: [&str; 20] = [
+    "ar", "da", "de", "el", "en", "es", "fi", "fr", "hu", "it", "ja", "ko", "nl", "no", "pt", "ro",
+    "ru", "sv", "tr", "zh",
+];
+
+/// The analyzer of a tag in [`LOCALIZED`].
+fn localized_analyzer(tag: &str) -> Option<&'static str> {
+    LOCALIZED.iter().find(|(t, _)| *t == tag).map(|(_, a)| *a)
+}
 
 const REASONERS: &str = "http://jena.hpl.hp.com/2003/";
 
@@ -88,7 +123,8 @@ impl Converter<'_> {
                         all_languages = true;
                         self.report.converted(
                             place,
-                            "text:multilingualSupport: every language Sparkles stems (\"languages\": \"all\")",
+                            "text:multilingualSupport: \"languages\" maps each language jena-text \
+                             analyzes and Sparkles can to the analyzer closest to Lucene's",
                         );
                     }
                 }
@@ -234,11 +270,14 @@ impl Converter<'_> {
         }
         let mut cfg = json!({ "predicates": predicates });
         if all_languages {
-            cfg["languages"] = json!("all");
-        } else if !languages.is_empty() {
-            languages.sort();
-            languages.dedup();
-            cfg["languages"] = json!(languages);
+            languages.extend(MULTILINGUAL.iter().map(|t| t.to_string()));
+        }
+        if !languages.is_empty() {
+            let map: serde_json::Map<String, Value> = languages
+                .iter()
+                .filter_map(|t| localized_analyzer(t).map(|a| (t.clone(), json!(a))))
+                .collect();
+            cfg["languages"] = Value::Object(map);
         }
         Some(cfg)
     }
@@ -255,7 +294,7 @@ impl Converter<'_> {
             .and_then(lexical)?
             .to_ascii_lowercase();
         let primary = lang.split('-').next().unwrap_or("").to_string();
-        STEMMED.contains(&primary.as_str()).then_some(primary)
+        localized_analyzer(&primary).map(|_| primary)
     }
 
     fn analyzer_name(&self, g: &ConfigGraph, a: &Term) -> String {
