@@ -1522,7 +1522,10 @@ links each item to its design spec.
   such as Greek and Arabic, have no counterpart. Roadmap item 251.
 * `zh-dict` segments Chinese by jieba's word frequencies, so its tokens differ from those
   of Lucene's SmartChineseAnalyzer. Kuromoji's normal and extended modes and the user
-  dictionaries of Kuromoji and Nori have no counterpart. Roadmap item 250.
+  dictionaries of Kuromoji and Nori have no counterpart. Where a run of more than 1,024
+  UTF-16 units of unknown characters reaches that limit inside a surrogate pair, `ja-dict`
+  and `ko-dict` cut it before the pair while Lucene cuts inside it, which can shift later
+  positions. Roadmap item 250.
 * Full-text documents have one field. Roadmap item 35.
 * Enabling or reconfiguring a full-text index builds it while writes wait. A write
   transaction cannot search the full-text index after it changes data, because the index
