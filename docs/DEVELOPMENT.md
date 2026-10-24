@@ -74,6 +74,7 @@ mise run serve        # build, then serve ./data on :3030
 mise run fmt          # cargo fmt + oxfmt        (fmt:check for CI)
 mise run lint         # clippy -D warnings + svelte-check
 mise run lint:features # clippy -D warnings over feature combinations (in ci)
+mise run test:features # the server's tests with default features off and one feature set on (in ci, not ci:fast)
 mise run lint:doc-paths # every crates/sparkles… path cited in the docs exists (in ci)
 mise run fmt:wasm     # clippy for the formatter's wasm32 build (in ci)
 mise run fmt:fuzz     # fuzz the formatter with cargo-fuzz (needs nightly and cargo-fuzz; not in ci)
@@ -145,6 +146,7 @@ while exclusion still holds.
 mise run ci            # formatting, clippy, all workspace tests, UI, Python, JVM and JavaScript tests, license notices
 mise run ci:fast       # formatting, cited doc paths, workspace clippy and the Rust tests
 mise run lint:features # clippy over feature combinations (in ci)
+mise run test:features # the server's tests with one optional feature set at a time (in ci, not ci:fast)
 mise run test:w3c      # W3C SPARQL 1.0 / 1.1 query / 1.1 update / 1.2 suites, with a summary
 mise run test:shacl    # W3C SHACL Core and SHACL-SPARQL suites, SHACL 1.2 list tests, SHACLC pairs
 mise run test:shex     # shexTest: syntax, negative syntax and structure, representation, ShExR, validation
@@ -159,8 +161,8 @@ it writes each task's output to `target/ci/logs/<task>.log`. While it runs,
 their times. Every task runs to the end, and the final summary repeats the last lines of
 each failed task's log. `--fail-fast` stops after the first failure, `--jobs N` runs more
 tasks at once, and naming tasks runs only those, as in `mise run ci lint test`. Only
-one run at a time can use a checkout. `test` and `node:test` take turns whatever the
-`--jobs` value, because each links `target/debug/sparkles` with other features. The
+one run at a time can use a checkout. `test`, `test:features` and `node:test` take turns
+whatever the `--jobs` value, because each links `target/debug/sparkles` with other features. The
 binary of `test` has the formatter's fault injection, which its refused-output tests
 need, and a concurrent `node:test` used to replace it with a build without it.
 
@@ -282,6 +284,23 @@ Code that only some features use is gated on those features, and this task catch
 code and missing gates. Every combination shares the workspace target directory. The
 first run builds the dependencies once per feature set. After that, a change costs a
 minute or two.
+
+`mise run test:features` (`scripts/test-features.sh`) runs the server's unit and
+integration tests with the default features off and one optional feature set on, for
+each of `none`, `auth`, `mcp`, `memory`, `graphql` and `shacl`. The ordinary test run
+builds the server with its default features only, so a test that asserts a route or
+command that exists only with some feature passes there and fails under another build.
+This task is the test counterpart of `lint:features`. The script runs every set even
+after one fails, prints a line for each with its result and time, and exits non-zero if
+any set failed. Names on the command line choose the sets, and a set with several
+features is a comma-separated list, as in `scripts/test-features.sh none mcp,shacl`.
+Each set writes its output to `target/test-features/<set>.log`. The sets share the
+workspace target directory, so the dependencies compile once, and `CARGO_BUILD_JOBS`
+limits the compile jobs as it does for any cargo run. A test of a route that exists only
+with a feature carries a `#[cfg(feature = "...")]` gate for that feature, and a test
+file that needs a feature has the gate on the whole file. `mise run ci` runs this task
+and `mise run ci:fast` leaves it out, because every set compiles the server crate again.
+On the build host a set takes one to two minutes when the dependencies are warm, and the first run of a set takes several minutes more.
 
 `mise run lint:doc-paths` (`scripts/check-doc-paths.py`) checks that every
 `crates/sparkles…` path cited in the README, `docs/*.md`, `docs/specs` and the comments of
@@ -565,6 +584,7 @@ rather than to save runner minutes. `actionlint` checks the workflow files.
 | Build tests | `cargo nextest archive` builds every test binary once and uploads the archive. The doctests run here too. |
 | Test | Five jobs run the archive. Four take a quarter of the tests each (`--partition slice:N/4`), and one runs the `timing` group of `.config/nextest.toml`, which needs a machine to itself. |
 | Jena clients | Jena's own HTTP clients against the server binary from the archive (`mise run test:jena-clients`). |
+| Features | Six jobs run `scripts/test-features.sh` for one feature set each, with the default features off. They build apart from the archive and have a cache each. |
 
 The transcript import integration test reserves all test slots while it runs in its
 shard. It sends a 5 MiB transcript through the real server, whose query deadline stays

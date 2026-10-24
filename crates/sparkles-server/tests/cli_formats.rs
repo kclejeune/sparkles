@@ -6,6 +6,10 @@
 //! branch included), a write and a compaction succeed, the catalog opens, and the
 //! backups restore to the same data. A fixture changed to carry a newer index format is
 //! refused with a message that says so.
+//!
+//! The fixtures' queries use full-text and GeoSPARQL functions and their backups restore
+//! through `sparkles backup`, so the file needs those three features.
+#![cfg(all(feature = "text", feature = "geo", feature = "backup"))]
 
 use serde_json::Value as J;
 use std::path::{Path, PathBuf};
