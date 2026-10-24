@@ -1,18 +1,19 @@
 # F13: Incremental views, live queries and fact provenance
 
-> **Status:** specified
+> **Status:** Phase 1 shipped
 >
-> **Phases:** None shipped. Phase 1 is the incremental core over the commit stream,
+> **Phases:** Phase 1 shipped on 2026-10-24. Phase 1 is the incremental core over the commit stream,
 > materialized views read as tables, live SELECT queries over server-sent events, the
 > library API, the CLI and the fallback to re-evaluation. Phase 2 adds views written to
 > named graphs, WebSocket, MCP, the bindings and the UI, views per branch, top-k views,
 > and protections that depend on the data. Phase 3 adds per-fact provenance, recursion
 > for property paths and rules, and GraphQL subscriptions on the core.
 >
-> **User docs:** none, because nothing is built.
+> **User docs:** [API.md](../API.md#incremental-views), [API.md](../API.md#live-queries)
+> and [USAGE.md](../USAGE.md#incremental-views).
 >
 > This is the design as written before implementation. The [Outcome](#outcome) section at
-> the end will record how it lands.
+> the end records how Phase 1 landed.
 
 This design was written from the published work on incremental view maintenance and
 dataflow: Gupta, Mumick and Subrahmanian, "Maintaining views incrementally" (SIGMOD
@@ -725,4 +726,105 @@ of F16's derived-fact layer if F16 chooses it.
 
 ## Outcome
 
-Not built. See [ROADMAP](../ROADMAP.md) item 17.
+**Phase 1 delivered on 2026-10-24.** Phases 2 and 3 are not built, and
+[ROADMAP](../ROADMAP.md) item 17 tracks them.
+
+- `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
+  `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
+  operators in `ops/`, and `circuit.rs` runs a circuit's passes. `footprint.rs` resolves
+  a circuit's (graph, predicate, constant) entries against a snapshot. `persist.rs`
+  writes checkpoints, `views.rs` reads and writes `view.json`, `live.rs` holds the
+  subscriptions and `runtime.rs` runs a dataset's passes.
+- `Store::commit_deltas` returns each commit's net changes as ids. While someone
+  subscribes (`Store::subscribe_deltas`), the commit path copies each commit's changes
+  into a ring of at most 4,096 commits and 4M changes before it publishes the commit.
+  Without a subscriber the commit path does one atomic load. Commits the ring does not
+  hold are read from the change feed, whose keys are mapped to ids, and a change whose
+  term the current generation lacks makes the commit `complete: false`.
+- A pass reads the net changes from a circuit's commit to the head as one set, so a run
+  of commits costs one pass. A circuit whose footprint misses every changed quad is
+  skipped. More than 1,000,000 net changes, or changes that are not all known, evaluate
+  the circuit again, and the difference reaches live queries as a diff or, above
+  `resetRows`, as a `reset`.
+- `table` views live under `<root>/views/{name}/view.json` (`formats::SETTINGS`,
+  version 1). `SERVICE view:read` is planned in `sparql/viewsvc.rs` before remote
+  SERVICE planning. `/$/views/{ds}`, `/$/views/{ds}/{name}`, `…/rebuild` and
+  `GET /{ds}/live` are in the route table, the rate limiter and the OpenAPI description.
+  `Dataset::views()` and `Dataset::live` are the library API, `sparkles views` and
+  `sparkles query --live` the CLI, and `Dataset.views` and `Dataset.live` the Python API.
+- Checkpoints are `views/{name}/main/state-{commit}.bin` (`formats::VIEW_STATE`, version
+  1), written every 60 seconds while a view changes and at a clean close. A file of
+  another format is left in place and the view is built from the data, which a test
+  checks.
+- The metrics are `sparkles_view_lag_commits`, `sparkles_view_state_bytes`,
+  `sparkles_view_pass_seconds`, `sparkles_view_recompute_seconds_total`,
+  `sparkles_view_passes_skipped_total`, `sparkles_live_queries` and
+  `sparkles_live_events_total`.
+
+**Decisions where the design left a choice.**
+
+- Circuits are compiled from the spargebra algebra, not from `sparql::plan::Node`. The
+  planner fuses and reorders operators for one evaluation, and a circuit needs the
+  algebra's operators one to one. A join of patterns is a delta rule over the store's
+  permutations: the change of pattern `i` joins the patterns before it at the new
+  snapshot and those after it at the old one. The old snapshot is built from the new one
+  by reversing the net changes in its delta (`Snapshot::before_changes`), so no history
+  is read.
+- Operators that the circuit does not maintain become `recompute` nodes with their own
+  footprint. These are paths with `*`, `+` or `?` (paths without them are expanded into
+  joins and unions of at most 16 alternatives), `LIMIT` and `OFFSET`, a dataset clause,
+  the aggregates other than `COUNT`, `SUM` and `AVG`, correlated `EXISTS`, `LATERAL` and
+  ARQ's other extensions, triple terms, property functions, and `MINUS`, aggregates,
+  `DISTINCT`, `VALUES` and subqueries under `GRAPH ?g`. `ORDER BY` without `LIMIT` does not change a view's rows and is ignored.
+- `SUM` and `AVG` keep exact integer and decimal sums, and value counts for floats and
+  doubles, whose sums depend on order.
+- A CONSTRUCT template's blank nodes are minted as `_:v` and a hex hash of the template's
+  label and the solution's terms, so a solution that returns gives the same node.
+- Views and live queries with the same normalized query text and the same access
+  fingerprint share one circuit. The parser's random names of aggregate variables are
+  renamed in the text, so one query parsed twice gives one circuit and one checkpoint
+  fingerprint.
+- Protections that depend on the data make the whole query one `recompute` node over the
+  masked snapshot, as §6.2 allows for Phase 1. Graph grants and protections by predicate
+  filter the changes quad by quad.
+- A caller reads a view when it reads every quad of the dataset or has the same access
+  fingerprint as the view's principal. Comparing grant sets for containment and the
+  `view:{name}` grant that declassifies a view are left to item 222.
+- A view's principal is a configured user, resolved through the server's policy when
+  the view is attached and again after each policy reload. A definer whose grants cover
+  every graph defines a view without a principal by default, which reads every quad.
+  Other definers are the default principal, and must then be users.
+- Recovery loads the newest checkpoint into the head's id space and applies the commits
+  after it from `Store::commit_deltas`, which reads the change log or, without it,
+  history. A6 holds. A7 holds only when neither covers the gap, for example after a
+  compaction with the change log off. The view is then `building` until the pass that
+  evaluates it again ends.
+- A live query resumed after commit N gets the merged diffs the circuit kept since N
+  (256 commits and 1M rows at most). Otherwise the query is evaluated at the snapshot
+  before the changes since N and compared with the current result, and when those
+  changes are not known the client gets a `reset`.
+- Each dataset has one runtime and one worker thread, which runs a round after each
+  commit and each change to the views. `--view-threads` and parallel join deltas
+  (§8.3) are left to item 223. The worker starts on first use in the library and when the
+  server opens the dataset, so a view never attaches before the server's policy can
+  resolve its principal.
+- `--max-live-queries` and `--max-live-queries-per-principal` count per dataset, not per
+  server.
+- An SSE row is `{"values": [...]}` with one SPARQL JSON term or `null` per variable, and
+  `count` when it is not 1. ASK streams `{commit, value}`. A stream ends with an
+  `access-changed` error on a policy reload, and the client reconnects under the new
+  grants.
+- `sparkles query --live` needs `--server`, since a local database sees no other
+  writer's commits. It prints text blocks, or JSON lines with `--results json`.
+
+**Deviations.**
+
+- Views read the stored quads. RDFS on read refuses views and live queries as §4.5 says,
+  but the inferred graph that a materialization adds to the default graph is not part of
+  a view's default graph. Item 221 tracks it.
+- Backups and clones do not carry view definitions, because the backup layout has no
+  path for nested settings files. Item 220 tracks it.
+- PUT starts a `view-build` task that waits for the first evaluation on the worker,
+  rather than running the evaluation in the task.
+
+**Measurements.** See [BENCHMARKS](../BENCHMARKS.md#incremental-views).

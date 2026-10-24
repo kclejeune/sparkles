@@ -2439,6 +2439,69 @@ An incremental backup stores only the appended tail of the update log and the fi
 changed, so its size follows the writes since the last backup. S3, cold caches and
 databases larger than memory were not measured.
 
+### Incremental views
+
+`crates/sparkles-core/tests/incr_bench.rs` measures Phase 1 of
+[F13](specs/F13-incremental-views-and-provenance.md) on synthetic data in which each
+person belongs to a team, has an age and knows two other people, and half the teams have a
+label. The runs used a release build on atlas, an Intel Core i5-13500 with 20 threads,
+with no other work on the host. The SNB, BSBM and fan-out benchmarks of the spec's §11 are
+not built, and item 225 tracks them.
+
+Each row below defines one view over an in-memory store, then makes 200 commits of one or
+two quads each and times the round that brings the view up to date. A round includes
+reading the changes, building the snapshot before them and the circuit's own work. The
+query column is the median of 5 evaluations of the same query with the cache off.
+
+| View | People | Query ms | Pass median ms | Pass p95 ms | Query / pass | State MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| `team-sizes`, COUNT by team | 200,000 | 0.4 | 0.012 | 0.020 | 35 | 0.2 |
+| `team-ages`, SUM and AVG by team over a join | 200,000 | 5.1 | 0.020 | 0.032 | 259 | 0.4 |
+| `colleagues-known`, a three-pattern join | 200,000 | 9.8 | 0.193 | 0.313 | 51 | 0.0 |
+| `labelled`, OPTIONAL label | 200,000 | 1.7 | 0.010 | 0.018 | 167 | 22.9 |
+| `teams`, DISTINCT | 200,000 | 0.6 | 0.007 | 0.016 | 89 | 0.1 |
+| `team-sizes` | 1,000,000 | 0.5 | 0.035 | 0.042 | 15 | 0.8 |
+| `team-ages` | 1,000,000 | 27.1 | 0.096 | 0.115 | 282 | 1.8 |
+| `colleagues-known` | 1,000,000 | 78.2 | 0.230 | 0.588 | 340 | 0.0 |
+| `labelled` | 1,000,000 | 9.5 | 0.011 | 0.019 | 838 | 114.7 |
+| `teams` | 1,000,000 | 4.0 | 0.008 | 0.017 | 492 | 0.5 |
+
+The spec's target is a pass at least 100 times cheaper than evaluating the query again.
+At a million people, four of the five views meet it. `team-sizes` misses it at both sizes
+because the query engine answers a grouped COUNT over one pattern from the index in under
+a millisecond. At 200,000 people, the join view and the two cheap queries miss it as well,
+because the queries take only a few milliseconds there. `colleagues-known` stores no join
+state, so each change probes the indexes, and its pass is the slowest. The `labelled`
+view keeps its output rows, which is 115 MiB for 1M rows.
+
+The commit path was measured on a persistent store of 50,000 people with single-quad
+commits and the group commit off. Each figure is the median of 3,000 commits, in 3 rounds.
+
+| Case | Commit median ms | Commit p99 ms |
+|---|---:|---:|
+| `main` at 26deb06e | 0.329–0.336 | 0.415–0.454 after the first round |
+| This change, nothing subscribed | 0.321–0.335 | 0.472–0.504 |
+| This change, one live query subscribed | 0.345–0.346 | 0.511–0.548 |
+
+With nothing subscribed, a commit only checks an atomic counter, and the times match
+`main`. While a view or live query is subscribed, each commit also copies its changes into
+the ring that passes read, which added about 4% in this run. Item 226 tracks measuring it
+on forge and reducing it.
+
+With 0, 10 and 100 views defined and a worker thread keeping them current, 2,000 commits
+gave the following times. Each view had its own circuit.
+
+| Views | Commit median ms | Commit p99 ms | Commits per second | Catch-up after the last commit ms |
+|---:|---:|---:|---:|---:|
+| 0 | 0.324 | 1.908 | 1,609 | 0 |
+| 10 | 0.229 | 0.355 | 4,175 | 64 |
+| 100 | 0.230 | 0.370 | 4,128 | 5,352 |
+
+The writer does not wait for passes, so the commit time does not grow with the number of
+views. The run with no views came first and paid for a cold page cache. With 100 views, the
+single worker thread falls behind the writer and needs 5.4 seconds after the last commit to
+catch up. Item 223 tracks passes on several threads.
+
 ## Bindings
 
 The bindings embed the engine in a JVM, Python or Node.js process. The comparison of
