@@ -554,9 +554,17 @@ impl Vocab {
         }
     }
 
+    /// The first capacity of a key buffer. An FSST suffix decodes without branches only
+    /// with 64 bytes of room past the key (`fsst::Table::decode_at`), so a buffer of 64
+    /// bytes would be reallocated on its second key, once per lookup of a single key.
+    #[inline(always)]
+    fn scratch_capacity(&self) -> usize {
+        if self.fsst.is_some() { 192 } else { 64 }
+    }
+
     /// Decode a whole block, invoking `f(index_in_block, key)`; stops when `f` returns false.
     fn scan_block(&self, b: usize, f: impl FnMut(usize, &[u8]) -> bool) {
-        let mut key = Vec::with_capacity(64);
+        let mut key = Vec::with_capacity(self.scratch_capacity());
         if ioacct::profiling() {
             self.decode_block::<true>(b, ALL_KEYS, &mut key, f)
         } else {
@@ -735,7 +743,7 @@ impl Vocab {
         let want = (id as usize) % FC_BLOCK;
         let mut out = None;
         // Single-key callers own this fresh buffer throughout their scan.
-        let mut key = Vec::with_capacity(64);
+        let mut key = Vec::with_capacity(self.scratch_capacity());
         self.decode_block::<P>(b, 1 << want, &mut key, |_, k| {
             out = Some(f(k));
             false
@@ -886,7 +894,7 @@ impl Vocab {
         }
         // Empty and entirely out-of-range passes need no reconstruction storage.
         let mut key = if ids.first().is_some_and(|&id| id < self.len) {
-            Vec::with_capacity(64)
+            Vec::with_capacity(self.scratch_capacity())
         } else {
             Vec::new()
         };
