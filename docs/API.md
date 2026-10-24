@@ -5953,8 +5953,8 @@ answer.
 The run reads under the caller's view at the state that the request's `at` parameter and
 `branch` parameter select, with the query timeout and memory budget. Any run without
 `write` may read a branch, while a run with `write` answers `400` on a branch, since its
-run record and the named projections belong to main. A branch has its own named
-projections, which are empty unless they were created there. The cache key is the
+run record and the named projections belong to main. A run on a branch does not find
+main's named projections, so it gives its projection inline. The cache key is the
 dataset's branch, the commit, the caller's read view with its triple protections, the
 `default-graph-uri` and `named-graph-uri` parameters, the dataset's inferred overlay and
 RDFS on read, and the request without `nodes`, `keep`, `async` and `top`, with the
