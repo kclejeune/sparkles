@@ -35,7 +35,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// The facts one query may derive by default, magic facts included (spec F17 §8).
+/// The facts one query may derive by default (spec F17 §8). Magic facts do not count:
+/// they are charged to the query's memory budget.
 pub const DEFAULT_MAX_DERIVED: usize = 1_000_000;
 
 /// The code of an error for a derivation that passed a limit.

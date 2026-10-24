@@ -500,6 +500,7 @@ happens to materialized inferences, and the limits.
 | `--reason-cache-triples N` | `10000000` | The largest closure of a materialization that a dataset keeps in memory, so that the next re-run or automatic run updates it incrementally. The limit counts the closure's derived triples, which take about 135 bytes each, and the input graphs are read from the store's indexes. With `0`, a run reads the closure back from a persistent dataset, and an in-memory dataset runs in full. |
 | `--reason-threads N` | half the cores | The threads that materializations evaluate rules on. All runs share this pool, so a run leaves the other cores to queries and writes. A request's `threads` field can ask for fewer. Runs are admitted in arrival order while their threads fit the pool, so a run that asks for fewer threads waits until they are free, and runs that use the whole pool run together. With `0`, runs use the pool that queries also use, which has a thread per core. |
 | `--reason-max-inferred N` | `50000000` | The derived triples a materialization may produce before it fails. Every run of the server has this limit, including automatic runs, and a request's `maxInferred` can ask for a lower one. A run that passes the limit fails with the rule that produced the most candidates and commits nothing. With `0`, runs have no limit, and only `ReasonOptions::max_memory` or the memory of the host stops a runaway rule. |
+| `--reason-max-derived N` | `1000000` | The facts one query may derive with `reasoning=demand`, not counting the magic facts of the demand transformation. A request's `maxDerived` can ask for fewer. A query that passes the limit fails with `422` and the code `reasoning-budget` ([API](API.md#query-time-reasoning)). With `0`, queries have no limit, and the query's timeout and memory budget stop a runaway derivation. |
 
 `sparkles serve --help` lists the other options. They include `--read-only`,
 `--union-default-graph`, `--auto-reason`, `--auth-config`, `--unix-socket`,
@@ -590,6 +591,7 @@ sparkles load    --loc db people.csv --base http://ex.org/p/ --key id   # CSV an
 sparkles query   --loc db 'SELECT ...'        # --results text|json|xml|csv|tsv, --explain, --time
 sparkles query   --data file.ttl --query q.rq # query files in memory (arq --data)
 sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
+sparkles query   --loc db --reasoning demand --profile owl-rl 'SELECT ...'   # derive on demand (--rules FILE, --max-derived N)
 sparkles query   --loc db --describe scbd 'DESCRIBE <http://ex.org/a>'   # cbd|scbd|outgoing, --describe-labels
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles patch   --loc db changes.rdfp        # apply RDF Patch files, one commit per file
@@ -670,7 +672,13 @@ parser is chosen and its limits.
 follows the database's `rdfs.json`, the materialized inferences of `sparkles infer` are
 part of the default graph while `reasoning.json` records them, and DESCRIBE follows
 `describe.json`. `--rdfs` or `--rdfs-graph` sets RDFS on read for the one query instead.
-`sparkles queries run` follows the same settings.
+`sparkles queries run` follows the same settings. `--reasoning demand` derives the facts
+the query needs from the rules of `--profile`, the last materialization's profile by
+default, or of a Jena rule file given with `--rules`, whose backward rules answer this
+way, and leaves the inferred graph out. `--max-derived` caps the facts it derives, and
+`--explain` shows a `Derive` node for each pattern
+([Query-time reasoning](API.md#query-time-reasoning)). `--reasoning false` reads the
+asserted data alone.
 
 When a persistent dataset opens and its configured text index is missing or damaged,
 Sparkles rebuilds the index in the background. RDF queries and writes keep working,

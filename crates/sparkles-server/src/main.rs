@@ -1221,7 +1221,7 @@ enum Cmd {
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_INFERRED)]
         reason_max_inferred: usize,
         /// The facts one query's query-time reasoning (`reasoning=demand`) may derive,
-        /// magic facts included; a request may ask for fewer with `maxDerived` (0: no limit)
+        /// magic facts aside; a request may ask for fewer with `maxDerived` (0: no limit)
         #[arg(long, value_name = "N", default_value_t = state::DEFAULT_REASON_MAX_DERIVED)]
         reason_max_derived: usize,
         /// Compress responses for clients that accept it: auto or off
@@ -1604,7 +1604,7 @@ enum Cmd {
         /// A Jena rule file for `--reasoning demand`, backward rules included
         #[arg(long, value_name = "FILE")]
         rules: Option<PathBuf>,
-        /// The facts `--reasoning demand` may derive for the query, magic facts included
+        /// The facts `--reasoning demand` may derive for the query, magic facts aside
         /// (default 1,000,000; 0: no limit)
         #[arg(long, value_name = "N")]
         max_derived: Option<usize>,
