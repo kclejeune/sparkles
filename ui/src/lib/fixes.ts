@@ -365,12 +365,14 @@ export function suggestFix(r: VResult, ctx: FixContext = {}): string | null {
 }
 
 /**
- * The tokens `hasPlaceholder` reads, in source order: IRIs, literals in their short and
- * long forms, comments to the end of the line, and variables. Matching them in one pass
- * keeps a quote inside an IRI or a `#` inside a literal from starting another token.
+ * The tokens `hasPlaceholder` reads, in source order: IRIs with their `\u` and `\U`
+ * escapes, literals in their short and long forms, a backslash escape outside them (as in
+ * the prefixed name `ex:a\#b`), comments to the end of the line, and variables. Matching
+ * them in one pass keeps a quote inside an IRI or an escaped `#` in a name from starting
+ * another token.
  */
 const TOKENS =
-  /<[^<>"{}|^`\\\s]*>|"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|#[^\n]*|[?$]([A-Za-z_]\w*)/g;
+  /<(?:[^<>"{}|^`\\\s]|\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8})*>|"""(?:(?:"|"")?(?:[^"\\]|\\[\s\S]))*"""|'''(?:(?:'|'')?(?:[^'\\]|\\[\s\S]))*'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|\\[\s\S]|#[^\n]*|[?$]([A-Za-z_]\w*)/g;
 
 /**
  * Whether a suggestion still holds a placeholder the person must fill in: one of the

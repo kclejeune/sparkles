@@ -265,6 +265,20 @@ describe('review round 1', () => {
     expect(hasPlaceholder('# say "hi\nINSERT DATA { <urn:a> <urn:p> ?value }')).toBe(true);
   });
 
+  it('keeps escaped names and escaped IRIs opaque', () => {
+    const pn =
+      'PREFIX ex: <urn:> DELETE { ex:a\\#b ex:p ex:old } INSERT { ex:a\\#b ex:p ?allowed } WHERE { ex:a\\#b ex:p ex:old }';
+    expect(hasPlaceholder(pn)).toBe(true);
+    expect(hasPlaceholder("INSERT DATA { ex:O\\'Brien ex:p ?value }")).toBe(true);
+    expect(hasPlaceholder('INSERT DATA { <urn:\\u0061#b> <urn:p> ?value }')).toBe(true);
+    expect(hasPlaceholder('INSERT DATA { <urn:\\u0061> <urn:p> "?value" }')).toBe(false);
+    expect(hasPlaceholder('INSERT DATA { ex:a\\?value ex:p "x" }')).toBe(false);
+    expect(hasPlaceholder("INSERT DATA { <urn:a> <urn:p> '''a\\''' ?value ''' }")).toBe(false);
+    expect(
+      hasPlaceholder("INSERT DATA { <urn:a> <urn:p> '''it''s''' . <urn:a> <urn:q> ?value }"),
+    ).toBe(true);
+  });
+
   it('writes the graph the triples live in', () => {
     const min = shacl('MinCountConstraintComponent', { messages: ['minCount[1]: x'] });
     const named = suggestFix(min, { graph: EX + 'g1' })!;
