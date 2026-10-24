@@ -300,6 +300,7 @@ limits the compile jobs as it does for any cargo run. A test of a route that exi
 with a feature carries a `#[cfg(feature = "...")]` gate for that feature, and a test
 file that needs a feature has the gate on the whole file. `mise run ci` runs this task
 and `mise run ci:fast` leaves it out, because every set compiles the server crate again.
+On the build host a set takes one to two minutes when the dependencies are warm, and the first run of a set takes several minutes more.
 
 `mise run lint:doc-paths` (`scripts/check-doc-paths.py`) checks that every
 `crates/sparkles…` path cited in the README, `docs/*.md`, `docs/specs` and the comments of
