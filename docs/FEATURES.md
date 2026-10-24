@@ -364,7 +364,9 @@ that work by priority and links each item to its design spec.
   still fail at their budget. Completed hash joins release their working memory
   at EOF. Grouping above an ordered spilled join remains a performance follow-up.
   A build without a usable shared key keeps its real memory budget when spill is
-  enabled. Ordered join output consolidates as it is produced, with at most 128
+  enabled. Build rows that leave a spilled join's key unbound go to a file of their own
+  once they fill a quarter of a chunk, so they no longer make every partition partition
+  again or fail the join's budget. Ordered join output consolidates as it is produced, with at most 128
   finished output files and one active writer. A spilled join that must keep its
   order writes its output once more to merge it. In the initial implementation's
   measurements, this made one join under 4 MiB 8.9 times slower than the same cursor

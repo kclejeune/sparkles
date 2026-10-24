@@ -202,19 +202,16 @@ impl Distinct {
 
     /// Write the rows of `buffer` marked in `passed` to the partitions of later passes.
     fn pass_on(&mut self, ctx: &Ctx, buffer: &Buffer, passed: &[usize]) -> Result<()> {
-        use std::hash::{Hash, Hasher};
         let query = self.query.clone().expect("a spilling DISTINCT");
         let table = &buffer.table;
         let _gather = ctx.charge(passed.len() as u64 * (table.cols.len() as u64 * 8 + 8) + 256)?;
-        let seed = self.depth.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5bd1_e995;
         let mut parts: Vec<Vec<usize>> = vec![Vec::new(); PARTITIONS];
         let width = table.width() - usize::from(self.numbered);
         for &row in passed {
-            let mut hasher = rustc_hash::FxHasher::default();
-            for column in &table.cols[..width] {
-                column[row].hash(&mut hasher);
-            }
-            let hash = super::joinspill::mix(hasher.finish() ^ seed);
+            let hash = super::joinspill::row_hash(
+                self.depth,
+                table.cols[..width].iter().map(|column| column[row]),
+            );
             parts[(hash >> 60) as usize % PARTITIONS].push(row);
         }
         if self.writers.is_empty() {
