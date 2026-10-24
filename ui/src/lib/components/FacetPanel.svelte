@@ -573,9 +573,15 @@
               {/each}
             </div>
             <div class="axis faint">
-              <span>{edgeText(f, lo)}</span>
-              <span class="small">{f.missing ? `${fmtInt(f.missing)} without` : ''}</span>
-              <span>{edgeText(f, hi)}</span>
+              <span>{edgeText(f, 0)}</span>
+              <span class="small brushtext"
+                >{cur
+                  ? `${binLabel(f, cur[0]).split('–')[0]}–${binLabel(f, cur[1]).split('–').at(-1)}`
+                  : ''}{cur && f.missing ? ' · ' : ''}{f.missing
+                  ? `${fmtInt(f.missing)} without`
+                  : ''}</span
+              >
+              <span>{edgeText(f, f.bins.length)}</span>
             </div>
             {#if tables[f.property]}
               <table class="bins">
@@ -812,6 +818,9 @@
     font-size: var(--fs-xs);
     font-variant-numeric: tabular-nums;
     margin-top: 2px;
+  }
+  .brushtext {
+    color: var(--text);
   }
   table.bins {
     width: 100%;

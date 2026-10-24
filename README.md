@@ -240,11 +240,11 @@ orders every item by difficulty and impact and links each to its design spec.
 ## Web UI
 
 The web UI is embedded in the server. It has a query editor with results as tables,
-graphs and maps, with arcs for the relations between located entities, a visual query builder that draws each query and edits it as text, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
+graphs and maps, with arcs for the relations between located entities and facet histograms that brush them, a visual query builder that draws each query and edits it as text, a resource explorer that finds and draws paths between entities, schema and validation views, branch history and
 merges, a time slider over past commits with commit diffs drawn as graphs, the Ask bar, and agent memory. The screenshots
 below start with time travel over commits, branches and merges, GraphRAG communities, the
-Ask bar and agent memory, path finding, inference on the canvas, maps of relations and
-validation on the graph.
+Ask bar and agent memory, path finding, inference on the canvas, maps of relations,
+validation on the graph, facets that brush the graph, and the visual query builder.
 
 <table>
   <tr>
@@ -287,6 +287,14 @@ validation on the graph.
     <td>A graph's relations drawn as arcs on a map</td>
     <td>SHACL results on the graph, with a suggested fix previewed</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/explore-facets.png" alt="The resource explorer with the Facets panel beside a person's graph, brushing an age range on a histogram and one employer on a bar list, so that the other facets count the 41 people under both brushes and the drawn people outside them are dimmed"></td>
+    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
+  </tr>
+  <tr>
+    <td>Facet histograms whose brushes filter the graph</td>
+    <td>A query's pattern drawn beside its text</td>
+  </tr>
 </table>
 
 <details>
@@ -326,11 +334,11 @@ validation on the graph.
     <td>GeoSPARQL results on a map</td>
   </tr>
   <tr>
-    <td><img src="docs/images/pattern.png" alt="The query editor with the Pattern pane beside it, drawing the query's variables as nodes joined by its triple patterns, an optional part in a dashed hull, a filter as a chip under its variable and a BIND as a locked block, with the projection checkboxes, the count of matches and seven result rows"></td>
+    <td><img src="docs/images/query-facets.png" alt="The query page's Facets tab counting the values of ?person in every solution, with a brush on the years people joined and the editor above holding the triple and FILTER that Apply to query added"></td>
     <td><img src="docs/images/pattern-edit.png" alt="The Pattern pane adding an edge from ?person, with the predicate picker listing the predicates that instances of ex:Person use, with their counts"></td>
   </tr>
   <tr>
-    <td>A query's pattern drawn beside its text</td>
+    <td>A brush on a result's facets written into the query</td>
     <td>A query built on the canvas from the schema</td>
   </tr>
   <tr>

@@ -34,6 +34,7 @@ without a migration path, so keep backups of anything you cannot regenerate.
 * [Branches and merges](#branches-and-merges)
 * [The Explore overview](#the-explore-overview)
 * [Arcs on the map](#arcs-on-the-map)
+* [Facets and Use in query](#facets-and-use-in-query)
 * [Lenses on the graph](#lenses-on-the-graph)
 * [The validation overlay](#the-validation-overlay)
 * [The time slider](#the-time-slider)
@@ -1550,9 +1551,11 @@ The lookups run on the result's branch and at the state the result was read at. 
 compare two states, the entities that only removed rows use are looked up at the earlier one. Picking a row in the list beside the map highlights its arc.
 
 A click on a marker or an arc selects the entities it stands for, and the selection bar
-names the count and the source, with **Clear** and, in Explore, **Open as graph**, which
-draws the selected entities as the graph. The selection dims everything else on the map,
-and Explore's graph canvas dims the nodes outside it too. `Escape` clears it. With the map
+names the count and the source, with **Clear**, **Use in query** and, in Explore, **Open
+as graph**, which draws the selected entities as the graph. The selection dims everything
+else on the map, and the graph canvas dims the nodes outside it too, in Explore and on the
+query page, where the selection lasts across the result's views until the next run.
+`Escape` clears it. With the map
 focused, `Tab` moves through the markers in view, the largest first, `Enter` selects one,
 and `Shift+Enter` adds it to the selection. **List of places and links in view** below the
 map lists the same markers and arcs with their counts, for a screen reader and for taps. At
@@ -1560,6 +1563,50 @@ a phone's width the controls grow to 44 px and the map takes the page's width.
 
 A map draws at most 20,000 places and 20,000 links before merging, and says when a result
 had more. [U11](specs/U11-linked-views.md#outcome) records the measurements.
+
+## Facets and Use in query
+
+**Facets** beside the graph show how the values of the entities' properties are spread, and
+brushing a facet narrows the graph to the entities in the brush. In Explore, the **Facets**
+button in the graph toolbar, or `Shift+F`, opens the panel beside the properties panel. It
+counts the instances of the selected entity's class, or the drawn entities when that
+entity has no single class, and **Count** switches between the two when both apply. The
+counts come from the server for every entity of the set, not only the drawn ones.
+
+The panel opens with the three properties that the most entities of the set have, and
+**+ facet** adds others, up to six. A property whose values are numbers or dates becomes a
+histogram of up to 40 bins of round width, with dates counted by year. Any other property
+becomes a list of its 12 most frequent values, with how many entities have other values or
+none. Dragging across a histogram brushes a range, and so does moving one of the two
+handles under it. A click on a value of a list adds it to the brush or takes it out. Every
+other facet then counts only the entities in the brush, while the brushed facet keeps its
+own counts, so you can see what a wider brush would add. Faint bars behind a histogram show
+its counts before any other facet was brushed. The line at the bottom says how many of the
+set every brush keeps, and the drawn entities outside the brushes are dimmed through the
+selection, which then reads "selected by the facets". **Apply to query** opens a new query
+for the set with a triple and a `FILTER` per brush.
+
+On the query page, a `SELECT` result has a **Facets** tab. It counts the values of a
+variable of the query in every solution, not only the rows on screen, and **Count the
+values of** chooses the variable. **Apply to query** adds to the editor's query, for each
+brush, a triple that binds the property to a new variable and a `FILTER` over it, such as
+`?person ex:age ?age .` and `FILTER(?age >= 30 && ?age < 45)`, and leaves the rest of the
+text as it was. The filter is the one the server applied, so the query's distinct count of
+the variable equals the panel's count. `Mod+Z` undoes the edit.
+
+With a histogram focused, the arrow keys move a cursor over the bins, `Shift` with an arrow
+brushes from where the cursor was, `Enter` brushes the bin under the cursor, and `Escape`
+clears the brush. The handles are sliders that the arrow keys move by a bin, and they read
+out the brush and its count. **Table** lists the bins with their counts, and `Space` toggles
+the focused value of a list. At a phone's width the facets sit below the graph, and the
+values and handles are 44 px targets.
+
+**Use in query** in the selection bar writes the selected entities into the query as a
+`VALUES` block at the start of the `WHERE` group. On the query page it edits the query in the
+editor and binds the variable chosen beside the button, which starts as the result column
+that holds the most selected entities. In Explore it opens a new query with the selected
+entities and their labels. A block holds at most 1,000 entities, the first ones selected,
+and a note says how many were left out.
 
 ## The Pattern pane
 

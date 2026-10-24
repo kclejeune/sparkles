@@ -312,6 +312,74 @@ SELECT ?label ?from ?to WHERE {
   await shoot(page, 'result-arcs');
 });
 
+test('explore-facets', async ({ page }) => {
+  // the facets of the people of `world` beside the graph of the chief executive, with a
+  // brush on their ages and their employer, which dims the drawn people outside it
+  await page.goto(
+    `/ui/explore?ds=world&iri=${encodeURIComponent(`${WORLD}amira-haddad`)}&facets=1`,
+  );
+  const panel = page.getByTestId('facet-panel');
+  await expect(panel.getByTestId('facet')).toHaveCount(3, { timeout: 30_000 });
+  const facet = (local: string) =>
+    panel.locator(`[data-testid="facet"][data-property="${WORLD}${local}"]`);
+  await expect(facet('age').locator('.bin').first()).toBeVisible();
+  await facet('worksFor')
+    .getByRole('button', { name: /Meridian Logistics/ })
+    .click();
+  await facet('age')
+    .getByRole('group', { name: /age histogram/ })
+    .focus();
+  await page.keyboard.press('Home');
+  for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowRight');
+  for (let i = 0; i < 6; i++) await page.keyboard.press('Shift+ArrowRight');
+  await expect(panel.getByTestId('facet-count')).toContainText(/of 41 match/);
+  await expect(page.getByRole('region', { name: 'Selection' })).toContainText(
+    'selected by the facets',
+  );
+  await shoot(page, 'explore-facets');
+});
+
+test('query-facets', async ({ page }) => {
+  // the query page's facets of a variable, with the brushes Apply to query writes
+  await page.addInitScript(() => localStorage.setItem('sparkles.dataset', 'world'));
+  const query = `PREFIX ex: <${WORLD}>
+SELECT ?person ?city WHERE {
+  ?person a ex:Person ;
+    ex:livesIn ?city .
+}
+ORDER BY ?person`;
+  await page.addInitScript(
+    ([q]) =>
+      localStorage.setItem(
+        'sparkles.queryTabs',
+        JSON.stringify({ tabs: [{ id: 't1', title: 'People', query: q }], active: 't1' }),
+      ),
+    [query],
+  );
+  await page.goto('/ui/query?ds=world');
+  await page.getByRole('button', { name: /^Run/ }).click();
+  const results = page.getByRole('region', { name: 'Results' });
+  await expect(results.getByRole('grid')).toBeVisible({ timeout: 30_000 });
+  await results.getByRole('tab', { name: 'Facets' }).click();
+  const panel = page.getByTestId('facet-panel');
+  await expect(panel.getByTestId('facet')).toHaveCount(3, { timeout: 30_000 });
+  const facet = (local: string) =>
+    panel.locator(`[data-testid="facet"][data-property="${WORLD}${local}"]`);
+  await expect(facet('joined').locator('.bin').first()).toBeVisible();
+  await facet('joined')
+    .getByRole('group', { name: /joined histogram/ })
+    .focus();
+  await page.keyboard.press('End');
+  for (let i = 0; i < 4; i++) await page.keyboard.press('Shift+ArrowLeft');
+  await expect(panel.getByTestId('facet-count')).toContainText(/of 41 match/);
+  await panel.getByRole('button', { name: 'Apply to query' }).click();
+  await expect(page.locator('.cm-content')).toContainText('FILTER(YEAR(?joined)');
+  // the toast that confirms the edit would cover the facets
+  await page.getByRole('button', { name: 'Dismiss' }).click();
+  await page.waitForTimeout(400);
+  await shoot(page, 'query-facets');
+});
+
 test('explore-communities', async ({ page }) => {
   // the overview of `world` grouped by its GraphRAG communities (mock/world.mjs), with the
   // report of the head office, which links every region, beside it
