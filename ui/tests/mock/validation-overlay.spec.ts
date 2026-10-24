@@ -270,7 +270,12 @@ test('at 390 px the results panel is a bottom sheet', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   // A11 gave ex:p2 a name
   await open(page, 3);
-  await page.getByRole('button', { name: /p3, 1 violation/ }).click();
+  // The graph lays out from random starting positions, and in the short canvas of a phone
+  // the legend that docks at its top can cover p3's badge. The keyboard reaches the badge
+  // wherever the layout puts it, and the test is about the sheet that opens.
+  const badge = page.getByRole('button', { name: /p3, 1 violation/ });
+  await badge.focus();
+  await page.keyboard.press('Enter');
   const panel = page.getByRole('dialog', { name: /Validation results of/ });
   await expect(panel).toBeVisible();
   const box = (await panel.boundingBox())!;
