@@ -23,7 +23,7 @@
 use crate::budget::{
     Budget, Held, MemoryExceeded, Meter, table_bytes, table_capacity, table_grown,
 };
-use crate::facts::{Base, Memo, ProbeFilter};
+use crate::facts::{Base, Memo, Probe, ProbeFilter};
 use hashbrown::HashTable;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -243,6 +243,18 @@ impl<'a> Cands<'a> {
             Cands::Range(a, _) => a + i as u32,
         }
     }
+    /// The first `n` candidates and the rest.
+    pub fn split_at(self, n: usize) -> (Cands<'a>, Cands<'a>) {
+        let n = n.min(self.len());
+        match self {
+            Cands::Slice(s) => {
+                let (a, b) = s.split_at(n);
+                (Cands::Slice(a), Cands::Slice(b))
+            }
+            Cands::Range(a, b) => (Cands::Range(a, a + n as u32), Cands::Range(a + n as u32, b)),
+        }
+    }
+
     pub fn chunks(self, n: usize) -> Vec<Cands<'a>> {
         let n = n.max(1);
         match self {
@@ -658,8 +670,9 @@ impl Graph {
         let (triples, off) = (&self.triples, self.offset);
         let budget_ref = &*budget;
         // per shard: the first occurrence of each triple that is new, in position order,
-        // and those of them the base tier may hold, with the bytes charged for them
-        type Dedup = Result<(Vec<u64>, Vec<u64>, usize), MemoryExceeded>;
+        // those of them the base tier may hold, those whose predicate and object decide
+        // it, and the bytes charged for them
+        type Dedup = Result<(Vec<u64>, Vec<u64>, Vec<u64>, usize), MemoryExceeded>;
         let deduped: Vec<Dedup> = self
             .index
             .par_iter()
@@ -669,9 +682,9 @@ impl Graph {
                 let mut m = Meter::new(budget_ref, true);
                 let c: usize = buckets_ref.iter().map(|b| b[s].len()).sum();
                 // the batch's table, sized for every candidate of the shard, and the
-                // buffers of the kept ones
+                // buffers of the kept ones and of the two kinds of probes
                 let batch_bytes = table_bytes(table_capacity(c), size_of::<u64>());
-                m.add(batch_bytes + 2 * c * size_of::<u64>())?;
+                m.add(batch_bytes + 3 * c * size_of::<u64>())?;
                 let mut batch: HashTable<u64> = HashTable::with_capacity(c);
                 let mut kept: Vec<u64> = Vec::with_capacity(c);
                 for b in buckets_ref {
@@ -697,35 +710,38 @@ impl Graph {
                 }
                 drop(batch);
                 m.sub(batch_bytes);
-                let maybe = match &base {
-                    Some(b) => {
-                        // the probe filter's tables: an entry per kept candidate at most
-                        let filter = 2 * table_bytes(table_capacity(kept.len()), 24);
-                        m.add(filter)?;
-                        let mut f = ProbeFilter::default();
-                        let maybe: Vec<u64> = kept
-                            .iter()
-                            .copied()
-                            .filter(|&h| b.may_contain(&get(h), &mut f))
-                            .collect();
-                        drop(f);
-                        m.sub(filter);
-                        maybe
+                let (mut maybe, mut pairs) = (Vec::new(), Vec::new());
+                if let Some(b) = &base {
+                    // the probe filter's table: an entry per kept candidate at most
+                    let filter = table_bytes(table_capacity(kept.len()), 24);
+                    m.add(filter)?;
+                    maybe.reserve_exact(kept.len());
+                    pairs.reserve_exact(kept.len());
+                    let mut f = ProbeFilter::default();
+                    for &h in &kept {
+                        match b.classify(&get(h), &mut f) {
+                            Probe::No => {}
+                            Probe::Maybe => maybe.push(h),
+                            Probe::Pair => pairs.push(h),
+                        }
                     }
-                    None => Vec::new(),
-                };
-                Ok((kept, maybe, m.into_bytes()))
+                    drop(f);
+                    m.sub(filter);
+                }
+                Ok((kept, maybe, pairs, m.into_bytes()))
             })
             .collect();
         let mut kept: Vec<Vec<u64>> = Vec::with_capacity(SHARDS);
         let mut maybe: Vec<Vec<u64>> = Vec::with_capacity(SHARDS);
+        let mut pairs: Vec<Vec<u64>> = Vec::with_capacity(SHARDS);
         let mut first_err = None;
         for d in deduped {
             match d {
-                Ok((k, mb, bytes)) => {
+                Ok((k, mb, pr, bytes)) => {
                     work.adopt(bytes);
                     kept.push(k);
                     maybe.push(mb);
+                    pairs.push(pr);
                 }
                 Err(e) => {
                     first_err.get_or_insert(e);
@@ -736,30 +752,57 @@ impl Graph {
             return Err(e.into());
         }
         drop(buckets);
+        // the candidates whose predicate has few objects in the store are probed when the
+        // store has their predicate and object, which is counted once per distinct pair
+        // of the merge, in parallel
+        if let Some(b) = &base {
+            let n: usize = pairs.iter().map(Vec::len).sum();
+            if n > 0 {
+                work.try_grow(n * (size_of::<(u64, u64)>() + 1))?;
+                // allocated at the size charged: a collect from the flattened shards would
+                // grow by doubling
+                let mut list: Vec<(u64, u64)> = Vec::with_capacity(n);
+                list.extend(pairs.iter().flatten().map(|&h| {
+                    let t = get(h);
+                    (t[1], t[2])
+                }));
+                list.par_sort_unstable();
+                list.dedup();
+                let any: Vec<bool> = list.par_iter().map(|&(p, o)| b.po_any(p, o)).collect();
+                for (mb, pr) in maybe.iter_mut().zip(&pairs) {
+                    for &h in pr {
+                        let t = get(h);
+                        if list.binary_search(&(t[1], t[2])).is_ok_and(|i| any[i]) {
+                            mb.push(h);
+                        }
+                    }
+                }
+            }
+        }
+        drop(pairs);
         // the new triples that are in the base tier: probed in key order, a contiguous
         // range of keys per task, so that each task reads few blocks
         if let Some(base) = &base {
             let probes: usize = maybe.iter().map(Vec::len).sum();
-            // the probe list, the found names and those of them by shard
-            work.try_grow(probes * (size_of::<(Triple, u64)>() + 4 * size_of::<u64>()))?;
-            let mut probe: Vec<(Triple, u64)> =
-                maybe.iter().flatten().map(|&h| (get(h), h)).collect();
+            // the probe list, its triples and answers, the found names and those of them
+            // by shard
+            work.try_grow(
+                probes * (size_of::<(Triple, u64)>() + size_of::<Triple>() + 4 * size_of::<u64>()),
+            )?;
+            let mut probe: Vec<(Triple, u64)> = Vec::with_capacity(probes);
+            probe.extend(maybe.iter().flatten().map(|&h| (get(h), h)));
             drop(maybe);
             probe.par_sort_unstable();
-            let size = probe.len().div_ceil(threads * 4).max(1024);
-            let found: Vec<anyhow::Result<Vec<u64>>> = probe
-                .par_chunks(size)
-                .map(|c| {
-                    let ts: Vec<Triple> = c.iter().map(|x| x.0).collect();
-                    let f = base.contains_sorted(&ts)?;
-                    Ok(c.iter().zip(f).filter(|x| x.1).map(|x| x.0.1).collect())
-                })
+            let ts: Vec<Triple> = probe.iter().map(|x| x.0).collect();
+            let found = base.contains_sorted(&ts)?;
+            drop(ts);
+            let mut gone: Vec<u64> = probe
+                .iter()
+                .zip(found)
+                .filter(|x| x.1)
+                .map(|x| x.0.1)
                 .collect();
             drop(probe);
-            let mut gone: Vec<u64> = Vec::new();
-            for f in found {
-                gone.extend(f?);
-            }
             if !gone.is_empty() {
                 gone.sort_unstable();
                 let mut by_shard: Vec<Vec<u64>> = vec![Vec::new(); SHARDS];

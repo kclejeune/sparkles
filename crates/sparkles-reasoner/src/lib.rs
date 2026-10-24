@@ -1301,7 +1301,7 @@ fn update_closure(
         .chain(&ch.inferred_added)
         .chain(&ch.inferred_removed)
         .chain(&touched);
-    let written = write_changes(txn, snap, &closure, candidates, &budget)?;
+    let written = write_changes(exec, txn, snap, &closure, candidates, &budget)?;
     let changes = Changes {
         base_added: ch.base_added.len() as u64,
         base_removed: ch.base_removed.len() as u64,
@@ -1334,9 +1334,18 @@ fn update_closure(
     })
 }
 
+/// Candidates of [`write_changes`] from which their probes of the inferred graph run in
+/// parallel.
+const PAR_PROBES: usize = 256;
+
 /// Bring the inferred graph in line with the closure for the triples that may have
 /// changed: a triple belongs there when it is live, derived (not explicit) and valid RDF.
+///
+/// Whether the inferred graph holds each candidate is read from the snapshot on the
+/// run's threads while the transaction has written nothing, since the transaction then
+/// reads the snapshot, and one candidate at a time otherwise.
 fn write_changes<'a>(
+    exec: &pool::Exec,
     txn: &mut sparkles_core::store::WriteTxn<'_>,
     snap: &Snapshot,
     c: &incremental::Closure,
@@ -1350,7 +1359,8 @@ fn write_changes<'a>(
     let context = || " (writing the inferred graph)".to_string();
     let mut held = Held::new(budget);
     let mut seen: FxHashSet<[u64; 3]> = FxHashSet::default();
-    let mut insert: Vec<[u64; 3]> = Vec::new();
+    // the distinct candidates, with whether the inferred graph should hold them
+    let mut cands: Vec<([u64; 3], bool)> = Vec::new();
     for t in candidates {
         if !seen.contains(t) {
             room_for_key(&mut held, seen.capacity(), seen.len(), fact)
@@ -1366,12 +1376,56 @@ fn write_changes<'a>(
             .position(t)
             .is_some_and(|r| !c.flagged(r) || defaults.is_some_and(|d| d.contains(t)))
             && c.terms.valid(t);
-        let local = t.iter().any(|&x| Id(x).tag() == Tag::Local);
-        let have = match graph {
-            Some(g) if !local => txn.contains(&[Id(t[0]), Id(t[1]), Id(t[2]), g])?,
-            _ => false,
-        };
-        if want && !have {
+        if cands.len() == cands.capacity() {
+            let old = cands.capacity();
+            let new = (old * 2).max(4);
+            held.try_grow(new * size_of::<([u64; 3], bool)>())
+                .map_err(|e| e.with_context(context()))?;
+            cands.reserve_exact(new - cands.len());
+            held.shrink(old * size_of::<([u64; 3], bool)>());
+        }
+        cands.push((*t, want));
+    }
+    drop(seen);
+    let quad = |t: &[u64; 3], g: Id| [Id(t[0]), Id(t[1]), Id(t[2]), g];
+    let stored = |t: &[u64; 3]| t.iter().all(|&x| Id(x).tag() != Tag::Local);
+    held.try_grow(cands.len())
+        .map_err(|e| e.with_context(context()))?;
+    let have: Vec<bool> = match graph {
+        None => vec![false; cands.len()],
+        Some(g) if !txn.is_dirty() && cands.len() >= PAR_PROBES => {
+            use rayon::prelude::*;
+            let parts: Vec<anyhow::Result<Vec<bool>>> = exec.install(|| {
+                let chunk = cands
+                    .len()
+                    .div_ceil(rayon::current_num_threads() * 4)
+                    .max(PAR_PROBES / 4);
+                cands
+                    .par_chunks(chunk)
+                    .map(|ch| {
+                        ch.iter()
+                            .map(|(t, _)| Ok(stored(t) && snap.contains(&quad(t, g))?))
+                            .collect()
+                    })
+                    .collect()
+            });
+            let mut have = Vec::with_capacity(cands.len());
+            for p in parts {
+                have.extend(p?);
+            }
+            have
+        }
+        Some(g) => {
+            let mut have = Vec::with_capacity(cands.len());
+            for (t, _) in &cands {
+                have.push(stored(t) && txn.contains(&quad(t, g))?);
+            }
+            have
+        }
+    };
+    let mut insert: Vec<[u64; 3]> = Vec::new();
+    for ((t, want), have) in cands.iter().zip(have) {
+        if *want && !have {
             if insert.len() == insert.capacity() {
                 // the new buffer is charged before it is allocated, and the old one is
                 // released once it holds the facts
@@ -1385,10 +1439,11 @@ fn write_changes<'a>(
             insert.push(*t);
         } else if !want && have {
             let g = graph.expect("present");
-            txn.delete([Id(t[0]), Id(t[1]), Id(t[2]), g])?;
+            txn.delete(quad(t, g))?;
             w.removed += 1;
         }
     }
+    drop(cands);
     let before = match graph {
         Some(g) => snap.count(Perm::Gspo, &[g.0])?,
         None => 0,
@@ -1398,7 +1453,6 @@ fn write_changes<'a>(
             Some(g) => g,
             None => txn.intern(&Term::NamedNode(NamedNode::new_unchecked(INFERRED_GRAPH)))?,
         };
-        drop(seen);
         held.try_grow(insert.len() * size_of::<[Id; 4]>())
             .map_err(|e| e.with_context(context()))?;
         let mut quads = Vec::with_capacity(insert.len());

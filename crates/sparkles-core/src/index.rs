@@ -1290,7 +1290,7 @@ impl PermIndex {
 
     /// The rows `[from, to)` of block `b` that segment `s` holds.
     #[inline]
-    pub(crate) fn segment_rows(&self, b: usize, s: usize) -> (usize, usize) {
+    pub fn segment_rows(&self, b: usize, s: usize) -> (usize, usize) {
         let n = self.segs.as_ref().map_or(BLOCK_ROWS, |d| d.seg_rows);
         let rows = self.blocks[b].rows as usize;
         ((s * n).min(rows), ((s + 1) * n).min(rows))
@@ -1302,7 +1302,7 @@ impl PermIndex {
     /// than a quarter of the block's segments, or readers have already decoded a quarter
     /// of them one by one (spec X07 §6.5). A prefetch and the reader after it agree, since
     /// only a prefetch or a decode changes the answer.
-    pub(crate) fn segment_span(&self, b: usize, lo: &Key, hi: &Key) -> Option<(usize, usize)> {
+    pub fn segment_span(&self, b: usize, lo: &Key, hi: &Key) -> Option<(usize, usize)> {
         let d = self.segs.as_ref()?;
         let m = &self.blocks[b];
         if (m.first >= *lo && m.last <= *hi) || d.dense(b) {
@@ -1319,7 +1319,7 @@ impl PermIndex {
     /// [`segment_span`](Self::segment_span), unless the cache holds block `b`'s columns
     /// whole (judged by the first column of `mask`): a reader then uses them, as cheap as
     /// a segment, instead of cutting segments from them on every request.
-    pub(crate) fn read_span(
+    pub fn read_span(
         &self,
         cache: &BlockCache,
         b: usize,
@@ -1357,9 +1357,15 @@ impl PermIndex {
         self.segs.as_ref().is_none_or(|d| s + 1 >= d.count(b))
     }
 
+    /// The number of segments of block `b`, or `None` when the permutation is not
+    /// segmented.
+    pub fn segment_count(&self, b: usize) -> Option<usize> {
+        self.segs.as_ref().map(|d| d.count(b))
+    }
+
     /// The first key of segment `s` of block `b` (the block's first key when the
     /// permutation is not segmented).
-    pub(crate) fn segment_first(&self, b: usize, s: usize) -> Key {
+    pub fn segment_first(&self, b: usize, s: usize) -> Key {
         match &self.segs {
             Some(d) => d.first_key(b, s),
             None => self.blocks[b].first,
@@ -1872,19 +1878,21 @@ impl BlockCache {
         let mut decoded = false;
         let mut hinted = !hint;
         let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
+        // hits are counted once per call, as in `get_cols_hinted`
+        let mut hits = 0;
         for (c, col) in cols.iter_mut().enumerate() {
             if mask & (1 << c) == 0 {
                 continue;
             }
             let key = self.key(idx, b, c, s as u32 + 1);
             if let Some(v) = self.cache.get(&key) {
-                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                hits += 1;
                 *col = v;
                 continue;
             }
             if let Some(whole) = self.cache.get(&self.key(idx, b, c, WHOLE)) {
                 // cut once and kept, so that later requests find the segment
-                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                hits += 1;
                 let v = Col::from(whole[r0..r1].to_vec());
                 if self.fill {
                     self.cache.insert(key, v.clone());
@@ -1905,13 +1913,20 @@ impl BlockCache {
                 hinted = true;
                 idx.hint_segment(b, s, mask & !((1 << c) - 1));
             }
-            let v = idx.decode_segment(b, c, s, false)?;
+            let v = match idx.decode_segment(b, c, s, false) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.count_hits(hits);
+                    return Err(e);
+                }
+            };
             if self.fill {
                 self.cache.insert(key, v.clone());
             }
             *col = v;
             decoded = true;
         }
+        self.count_hits(hits);
         if decoded
             && count
             && let Some(d) = &idx.segs
@@ -1922,6 +1937,13 @@ impl BlockCache {
             cols,
             rows: r1 - r0,
         })
+    }
+
+    #[inline]
+    fn count_hits(&self, n: u64) {
+        if n > 0 {
+            self.hits.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// A cache of its own, of at most `bytes`.
@@ -1988,6 +2010,9 @@ impl BlockCache {
         hint: bool,
     ) -> Result<Block> {
         let mut cols: [Col; 4] = std::array::from_fn(|_| empty_col());
+        // hits are counted once per call: parallel readers of warm blocks contend on the
+        // counter's cache line
+        let mut hits = 0;
         for (c, col) in cols.iter_mut().enumerate() {
             if mask & (1 << c) == 0 {
                 continue;
@@ -1995,7 +2020,7 @@ impl BlockCache {
             let key = self.key(idx, b, c, WHOLE);
             *col = match self.cache.get(&key) {
                 Some(v) => {
-                    self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    hits += 1;
                     v
                 }
                 None => {
@@ -2005,7 +2030,14 @@ impl BlockCache {
                     if let Some(hook) = &self.decode_hook {
                         hook();
                     }
-                    let v = idx.decode_col_hinted(b, c, hint)?;
+                    let v = idx.decode_col_hinted(b, c, hint);
+                    let v = match v {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.count_hits(hits);
+                            return Err(e);
+                        }
+                    };
                     if self.fill {
                         self.cache.insert(key, v.clone());
                     }
@@ -2013,6 +2045,7 @@ impl BlockCache {
                 }
             };
         }
+        self.count_hits(hits);
         Ok(Block {
             cols,
             rows: idx.blocks[b].rows as usize,

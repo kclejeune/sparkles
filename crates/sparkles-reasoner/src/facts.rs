@@ -39,12 +39,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// object before a probe of the base tier.
 const FEW_OBJECTS: u64 = 4096;
 
-/// What [`Base::may_contain`] learned: by predicate, whether the store has it and has
-/// few distinct objects for it, and by predicate and object, whether the store has them.
+/// What [`Base::classify`] learned: by predicate, whether the store has it and has few
+/// distinct objects for it.
 #[derive(Default)]
 pub(crate) struct ProbeFilter {
     p: FxHashMap<u64, (bool, bool)>,
-    po: FxHashMap<(u64, u64), bool>,
+}
+
+/// What a probe of a triple in the base tier needs (see [`Base::classify`]).
+pub(crate) enum Probe {
+    /// none, since the tier certainly lacks it
+    No,
+    /// a probe
+    Maybe,
+    /// a probe when the store has its predicate and object
+    Pair,
 }
 
 /// A contiguous key range of one permutation, a share of a scan, in the pass of one
@@ -58,10 +67,11 @@ pub(crate) struct BaseRange {
     pass: usize,
 }
 
-/// The blocks a reader used last.
+/// The blocks a reader used last, and the segments of blocks it read a few rows of.
 #[derive(Default)]
 pub(crate) struct Memo {
-    slots: Vec<(u64, usize, Block)>,
+    /// (permutation instance, block, segment plus one or [`WHOLE`], the rows)
+    slots: Vec<(u64, usize, usize, Block)>,
     next: usize,
     /// scans made through this memo, not yet added to the tier's count
     pub scans: u64,
@@ -69,26 +79,80 @@ pub(crate) struct Memo {
 
 const MEMO_SLOTS: usize = 8;
 
+/// The fewest sorted triples a task of [`Base::contains_sorted`] searches.
+const SORTED_RUN: usize = 64;
+
+/// The segment field of a memo slot that holds a whole block.
+const WHOLE: usize = 0;
+
+/// Where the rows of a block in a key range are: the whole block, or segments `[s0, s1)`
+/// of it, read one by one with [`Memo::segment`].
+enum Rows<'a> {
+    Whole(&'a Block),
+    Segments(usize, usize),
+}
+
 impl Memo {
-    fn block(&mut self, snap: &Snapshot, idx: &PermIndex, b: usize) -> anyhow::Result<&Block> {
-        if let Some(i) = self
-            .slots
+    fn slot(&self, uid: u64, b: usize, s: usize) -> Option<usize> {
+        self.slots
             .iter()
-            .position(|(u, x, _)| *u == idx.uid && *x == b)
-        {
-            return Ok(&self.slots[i].2);
-        }
-        let blk = snap.cache.get_cols(idx, b, ALL_COLS)?;
+            .position(|(u, x, y, _)| *u == uid && *x == b && *y == s)
+    }
+
+    fn keep(&mut self, uid: u64, b: usize, s: usize, blk: Block) -> &Block {
         let i = if self.slots.len() < MEMO_SLOTS {
-            self.slots.push((idx.uid, b, blk));
+            self.slots.push((uid, b, s, blk));
             self.slots.len() - 1
         } else {
             let i = self.next;
             self.next = (self.next + 1) % MEMO_SLOTS;
-            self.slots[i] = (idx.uid, b, blk);
+            self.slots[i] = (uid, b, s, blk);
             i
         };
-        Ok(&self.slots[i].2)
+        &self.slots[i].3
+    }
+
+    fn block(&mut self, snap: &Snapshot, idx: &PermIndex, b: usize) -> anyhow::Result<&Block> {
+        if let Some(i) = self.slot(idx.uid, b, WHOLE) {
+            return Ok(&self.slots[i].3);
+        }
+        let blk = snap.cache.get_cols(idx, b, ALL_COLS)?;
+        Ok(self.keep(idx.uid, b, WHOLE, blk))
+    }
+
+    /// Segment `s` of block `b`, as a block of its rows.
+    fn segment(
+        &mut self,
+        snap: &Snapshot,
+        idx: &PermIndex,
+        b: usize,
+        s: usize,
+    ) -> anyhow::Result<&Block> {
+        if let Some(i) = self.slot(idx.uid, b, s + 1) {
+            return Ok(&self.slots[i].3);
+        }
+        let blk = snap.cache.get_segment(idx, b, s, ALL_COLS, true)?;
+        Ok(self.keep(idx.uid, b, s + 1, blk))
+    }
+
+    /// The rows of block `b` with keys in `[lo, hi]`: the whole block when this memo or
+    /// the store's cache holds it, or the range covers much of it, and otherwise the few
+    /// segments that can hold them. A first read of a few rows then decodes a segment of
+    /// the block instead of all of it.
+    fn rows(
+        &mut self,
+        snap: &Snapshot,
+        idx: &PermIndex,
+        b: usize,
+        lo: &Key,
+        hi: &Key,
+    ) -> anyhow::Result<Rows<'_>> {
+        if self.slot(idx.uid, b, WHOLE).is_none()
+            && let Some((s0, s1)) = idx.read_span(&snap.cache, b, lo, hi, ALL_COLS)
+        {
+            return Ok(Rows::Segments(s0, s1));
+        }
+        self.block(snap, idx, b).map(Rows::Whole)
     }
 }
 
@@ -516,22 +580,48 @@ impl Base {
         } else {
             let idx = snap.perm(perm);
             let (b0, b1) = idx.key_block_range(&lo, &hi);
-            for b in b0..b1 {
-                let m = &idx.blocks[b];
-                let whole = m.first >= lo && m.last <= hi;
-                let blk = memo.block(snap, idx, b)?;
+            let mut rows_of = |blk: &Block, whole: bool, f: &mut dyn FnMut(Triple) -> bool| {
                 let (s, e) = if whole {
                     (0, blk.len())
                 } else {
                     blk.key_range(&lo, &hi)
                 };
                 let cols = &blk.cols;
-                if !(s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], &mut f)) {
-                    break;
+                (s..e).all(|i| row([cols[0][i], cols[1][i], cols[2][i], cols[3][i]], f))
+            };
+            'blocks: for b in b0..b1 {
+                let m = &idx.blocks[b];
+                let whole = m.first >= lo && m.last <= hi;
+                if whole {
+                    if !rows_of(memo.block(snap, idx, b)?, true, &mut f) {
+                        break;
+                    }
+                    continue;
+                }
+                match memo.rows(snap, idx, b, &lo, &hi)? {
+                    Rows::Whole(blk) => {
+                        if !rows_of(blk, false, &mut f) {
+                            break;
+                        }
+                    }
+                    Rows::Segments(s0, s1) => {
+                        for s in s0..s1 {
+                            if !rows_of(memo.segment(snap, idx, b, s)?, false, &mut f) {
+                                break 'blocks;
+                            }
+                        }
+                    }
                 }
             }
         }
         Ok(completed && last(cur, &mut f))
+    }
+
+    /// The number of blocks the scan of a pattern reads, without reading any.
+    pub fn blocks(&self, s: Option<u64>, p: Option<u64>, o: Option<u64>) -> usize {
+        let (perm, lo, hi) = self.access(s, p, o);
+        let (b0, b1) = self.snap.perm(perm).key_block_range(&lo, &hi);
+        b1 - b0
     }
 
     /// The pattern's scan cut into contiguous shares of about `rows` rows each, in the
@@ -567,7 +657,27 @@ impl Base {
             if b > b0 && m.first > lo {
                 cuts.push(triple_start(m.first));
             }
-            if within && m.rows as usize > rows {
+            if within
+                && m.rows as usize > rows
+                && let Some(n) = idx.segment_count(b)
+            {
+                // a segmented block is cut at the starts of its segments, without a read
+                let mut last = 0;
+                for sg in 1..n {
+                    let (r0, _) = idx.segment_rows(b, sg);
+                    let k = idx.segment_first(b, sg);
+                    if k > hi {
+                        break;
+                    }
+                    let k = triple_start(k);
+                    if k <= lo {
+                        last = r0;
+                    } else if r0 - last >= rows {
+                        cuts.push(k);
+                        last = r0;
+                    }
+                }
+            } else if within && m.rows as usize > rows {
                 let blk = self.snap.cache.get_cols(idx, b, ALL_COLS)?;
                 let (s0, e0) = if m.first >= lo && m.last <= hi {
                     (0, blk.len())
@@ -645,8 +755,23 @@ impl Base {
                 if b >= idx.blocks.len() || idx.blocks[b].first > key {
                     false
                 } else {
-                    let (s, e) = memo.block(snap, idx, b)?.prefix_range(&key);
-                    s < e
+                    let hit = |blk: &Block| {
+                        let (s, e) = blk.prefix_range(&key);
+                        s < e
+                    };
+                    match memo.rows(snap, idx, b, &key, &key)? {
+                        Rows::Whole(blk) => hit(blk),
+                        Rows::Segments(s0, s1) => {
+                            let mut found = false;
+                            for s in s0..s1 {
+                                if hit(memo.segment(snap, idx, b, s)?) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            found
+                        }
+                    }
                 }
             };
             if found {
@@ -656,11 +781,31 @@ impl Base {
         Ok(false)
     }
 
-    /// [`contains`](Self::contains) for triples in sorted order: one pass per input
-    /// graph over the blocks they fall in, searching forward from the previous triple's
-    /// row.
+    /// [`contains`](Self::contains) for triples in sorted order. Runs of at least
+    /// [`SORTED_RUN`] triples are searched in parallel, each with one pass per input graph
+    /// over the blocks its triples fall in, searching forward from the previous triple's
+    /// row. A block that neither the pass nor the store's cache holds is read by the
+    /// segment that can hold the triple, so a few probes in a block decode a few segments
+    /// of it instead of all of it.
     pub fn contains_sorted(&self, ts: &[Triple]) -> anyhow::Result<Vec<bool>> {
+        use rayon::prelude::*;
         let mut found = vec![false; ts.len()];
+        if ts.len() < 2 * SORTED_RUN {
+            self.contains_run(ts, &mut found)?;
+            return Ok(found);
+        }
+        let run = ts
+            .len()
+            .div_ceil(rayon::current_num_threads().max(1) * 4)
+            .max(SORTED_RUN);
+        ts.par_chunks(run)
+            .zip(found.par_chunks_mut(run))
+            .try_for_each(|(t, f)| self.contains_run(t, f))?;
+        Ok(found)
+    }
+
+    /// One run of [`contains_sorted`](Self::contains_sorted), its answers set in `found`.
+    fn contains_run(&self, ts: &[Triple], found: &mut [bool]) -> anyhow::Result<()> {
         let snap = &*self.snap;
         let single = self.single().is_some();
         let mut memo = Memo::default();
@@ -671,7 +816,7 @@ impl Base {
                 (Perm::Spo, |g, t| [t[0], t[1], t[2], g])
             };
             let idx = snap.perm(perm);
-            // the block and row the last search ended at
+            // the block and row the last search of a whole block ended at
             let mut at: Option<(usize, usize)> = None;
             for (i, t) in ts.iter().enumerate() {
                 if found[i] || t.iter().any(|&x| Id(x).tag() == Tag::Local) {
@@ -698,7 +843,20 @@ impl Base {
                     Some((ab, r)) if ab == b => r,
                     _ => 0,
                 };
-                let blk = memo.block(snap, idx, b)?;
+                let blk = match memo.rows(snap, idx, b, &k, &k)? {
+                    Rows::Whole(blk) => blk,
+                    Rows::Segments(s0, s1) => {
+                        for s in s0..s1 {
+                            let (a, z) = memo.segment(snap, idx, b, s)?.prefix_range(&k);
+                            if a < z {
+                                found[i] = true;
+                                break;
+                            }
+                        }
+                        at = Some((b, 0));
+                        continue;
+                    }
+                };
                 // gallop forward from `from` to the first row not less than `k`
                 let n = blk.len();
                 let less = |r: usize| blk.key(r) < k;
@@ -719,27 +877,30 @@ impl Base {
                 at = Some((b, a));
             }
         }
-        Ok(found)
+        Ok(())
     }
 
-    /// False when `t` is certainly not a fact of the tier: a term is not in the store,
-    /// no quad has its predicate, or, for a predicate with few distinct objects, no quad
-    /// has its predicate and object.
-    pub fn may_contain(&self, t: &Triple, f: &mut ProbeFilter) -> bool {
+    /// What a probe of `t` needs: none when `t` is certainly not a fact of the tier, since
+    /// a term is not in the store or no quad has its predicate, and a check of its
+    /// predicate and object with [`po_any`](Self::po_any) first when its predicate has few
+    /// distinct objects.
+    pub fn classify(&self, t: &Triple, f: &mut ProbeFilter) -> Probe {
         if t.iter().any(|&x| Id(x).tag() == Tag::Local) {
-            return false;
+            return Probe::No;
         }
         let (any, few_objects) =
             *f.p.entry(t[1])
                 .or_insert_with(|| (self.count_p(t[1]) > 0, self.pstats(t[1]).1 <= FEW_OBJECTS));
-        if !any || !few_objects {
-            return any;
+        match (any, few_objects) {
+            (false, _) => Probe::No,
+            (true, false) => Probe::Maybe,
+            (true, true) => Probe::Pair,
         }
-        *f.po.entry((t[1], t[2])).or_insert_with(|| {
-            self.snap
-                .count(Perm::Pos, &[t[1], t[2]])
-                .map_or(true, |n| n > 0)
-        })
+    }
+
+    /// Whether the store has quads with predicate `p` and object `o`.
+    pub fn po_any(&self, p: u64, o: u64) -> bool {
+        self.snap.count(Perm::Pos, &[p, o]).map_or(true, |n| n > 0)
     }
 
     /// Quads with predicate `p` in the store: an upper bound of the tier's facts.
@@ -747,7 +908,12 @@ impl Base {
         if let Some(n) = self.counts.read().get(&p) {
             return *n;
         }
-        let n = self.snap.count(Perm::Pso, &[p]).unwrap_or(u64::MAX / 4);
+        // the generation's statistics give the count without decoding the blocks at the
+        // ends of the predicate's range
+        let n = match self.snap.predicate_count(Perm::Pso, &[p]) {
+            Some(n) => n,
+            None => self.snap.count(Perm::Pso, &[p]).unwrap_or(u64::MAX / 4),
+        };
         self.counts.write().insert(p, n);
         n
     }
@@ -761,5 +927,124 @@ impl Base {
 
     pub fn distinct_predicates(&self) -> usize {
         self.snap.generation.stats.distinct_predicates as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::Budget;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    /// Reads of a few rows of a segmented generation decode segments, and give the facts
+    /// a scan of whole blocks gives, in the same order: every pattern of bound positions,
+    /// a probe of a fact and of a triple the tier may lack, with and without remembered
+    /// lookups.
+    #[test]
+    fn segment_reads_match_whole_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), StoreOptions::default()).unwrap();
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r % n
+        };
+        let mut nt = String::new();
+        for _ in 0..90_000 {
+            let (s, p, o) = (next(12_000), next(6), next(4_000));
+            nt.push_str(&format!("<urn:s{s}> <urn:p{p}> <urn:o{o}> .\n"));
+        }
+        store
+            .load(&[Source::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let gspo = snap.perm(Perm::Gspo);
+        assert!(gspo.segmented() && gspo.blocks.len() > 1);
+        let g = Id::DEFAULT_GRAPH;
+        let mut all: Vec<Triple> = Vec::new();
+        snap.scan(Perm::Gspo, &[g.0], |c| {
+            match c {
+                Chunk::Block(b, s, e) => {
+                    all.extend((s..e).map(|i| [b.cols[1][i], b.cols[2][i], b.cols[3][i]]))
+                }
+                Chunk::Row(k) => all.push([k[1], k[2], k[3]]),
+            }
+            Ok(true)
+        })
+        .unwrap();
+        let budget = Budget::unlimited();
+        for round in 0..2 {
+            for i in 0..100 {
+                let t = all[next(all.len() as u64) as usize];
+                // a tier of its own reads the blocks afresh, one with lookups keeps answers
+                let mut base = Base::new(snap.clone(), &[g]).unwrap();
+                if round == 1 {
+                    base = base.with_lookups(Lookups::new(&budget, lookups::DEFAULT_MAX_BYTES));
+                }
+                for mask in 1u8..8 {
+                    let at = |c: usize| (mask & (1 << c) != 0).then_some(t[c]);
+                    let k = [at(0), at(1), at(2)];
+                    let pat = [k[0].unwrap_or(0), k[1].unwrap_or(0), k[2].unwrap_or(0)];
+                    let mut want: Vec<Triple> = all
+                        .iter()
+                        .filter(|x| (0..3).all(|c| k[c].is_none_or(|v| v == x[c])))
+                        .copied()
+                        .collect();
+                    want.sort_by_key(|x| rank(&pat, x));
+                    for _ in 0..2 {
+                        let mut got = Vec::new();
+                        base.for_each(k[0], k[1], k[2], |x| {
+                            got.push(x);
+                            true
+                        })
+                        .unwrap();
+                        assert_eq!(got, want, "round {round} lookup {i} {pat:?}");
+                        assert!(base.any(&mut Memo::default(), k[0], k[1], k[2]).unwrap());
+                    }
+                    // the shares of the scan, cut at segment starts, list the same facts
+                    for rows in [1, 100, 4096] {
+                        let mut got = Vec::new();
+                        let mut memo = Memo::default();
+                        for r in base.ranges(k[0], k[1], k[2], rows).unwrap() {
+                            base.for_range(&mut memo, &r, k[0], k[1], k[2], |x| {
+                                got.push(x);
+                                true
+                            })
+                            .unwrap();
+                        }
+                        assert_eq!(got, want, "round {round} shares {i} {pat:?} {rows}");
+                    }
+                }
+                assert!(base.contains(&t).unwrap());
+                let other = [t[0], t[1], all[next(all.len() as u64) as usize][2]];
+                assert_eq!(base.contains(&other).unwrap(), all.contains(&other));
+            }
+            // sorted probes, in runs searched in parallel, half of them facts
+            let mut probes: Vec<Triple> = (0..3_000)
+                .map(|j| {
+                    let t = all[next(all.len() as u64) as usize];
+                    if j % 2 == 0 {
+                        t
+                    } else {
+                        [t[0], t[1], next(4_000)]
+                    }
+                })
+                .collect();
+            probes.sort_unstable();
+            probes.dedup();
+            let base = Base::new(snap.clone(), &[g]).unwrap();
+            let have: rustc_hash::FxHashSet<Triple> = all.iter().copied().collect();
+            let want: Vec<bool> = probes.iter().map(|t| have.contains(t)).collect();
+            for n in [1, 10, probes.len()] {
+                assert_eq!(base.contains_sorted(&probes[..n]).unwrap(), want[..n]);
+            }
+        }
     }
 }
