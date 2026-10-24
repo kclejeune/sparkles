@@ -501,7 +501,8 @@ The data is §7's dataset `q`.
 ## Outcome
 
 Phases 1 to 3 are not built, and [ROADMAP](../ROADMAP.md) item 31 covers them. Phase 4
-shipped on 2026-10-23 under item 106, and item 120 holds what it left for later.
+shipped on 2026-10-23 under item 106. Item 120 moved the overlay into U10's badge channel
+on the same day, and it still holds the read of the Phase 1 record.
 
 ### Phase 4 (2026-10-23)
 
@@ -536,10 +537,18 @@ cost does not grow with the dataset.
 
 **Decisions taken where the spec left them open.**
 
-1. **A toolbar toggle instead of the lens menu.** U10's badge channel is not built, so
-   **Validation** is a toggle beside the canvas. With no choice made, it is on when the
-   dataset has a guard the caller may use. The choice is remembered in the browser. Item
-   120 moves it into the lens menu.
+1. **The badge channel's validation lens.** Phase 4 first shipped a toolbar toggle,
+   because U10's badge channel was not built. Item 120 replaced it with **validation
+   results** in the badge channel of the lens menu, with the source picker under the
+   channels while the lens is on. With no choice made, the lens is on when the dataset has
+   a guard the caller may use. A choice the person makes is remembered in the browser, and
+   `Shift+3` turns the channel's last lens on again. For a caller whose grants cover some
+   graphs the menu does not offer the lens and says "Validation needs access to every
+   graph." The lens's result carries the overlay's counts to the legend, which groups the
+   nodes by their worst severity, to the list view's column and to the node descriptions.
+   The overlay keeps drawing the badges itself, because they show the worst severity's
+   mark and open the results, which the channel's count pills cannot. The badge channel
+   holds one lens, so the validation lens and the inferred-edge badges replace each other.
 2. **No read of the Phase 1 record.** Phase 1 is not built, so the overlay always
    validates, and `focus=` on `GET /$/validation/{ds}/results` waits for item 120.
 3. **A named source takes a form body.** §11.3 asks for an empty body with `shapes` or
@@ -592,10 +601,10 @@ cost does not grow with the dataset.
     update runs. Under an incremental guard on a dataset with other results, that is the
     usual answer, and item 121 lets the preview validate the result's focus node in full.
 13. **The list view.** When Phase 4 was built, Explore's node-link canvas had no list
-    view, so the overlay has its own **Nodes with results** table with a Validation column.
-    The **List** view that U10 added shows the same column beside the lens columns. The
-    overlay validates the nodes the canvas draws, which include the path finder's nodes
-    and leave out a comparison's ghosts.
+    view, so the overlay had its own **Nodes with results** table. Item 120 removed that
+    table, and the **List** view that U10 added shows the lens's column. The overlay
+    validates the nodes the canvas draws, which include the path finder's nodes and leave
+    out a comparison's ghosts.
 14. **Pausing.** The overlay waits while the graph's history plays, through a callback that
     TimeSlider gained, and it validates the drawn nodes 150 ms after they stop changing.
 15. **The graph a fix writes.** A result does not name its graph, so the overlay reads the

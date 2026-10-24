@@ -45,9 +45,17 @@ open('A10 and A11: badges, and a fix previewed and run', async ({ page, request 
   const b = await badgesOf(page);
   for (const p of ['p1', 'p2', 'p3']) expect(b[`<${EX}${p}>`]).toBe('✕1');
   expect(b[`<${EX}p4>`]).toBeUndefined();
-  const overlay = page.getByRole('region', { name: 'Validation overlay' });
-  await overlay.getByText(/Nodes with results \(3\)/).click();
-  await expect(overlay.getByRole('row').filter({ hasText: 'p2' })).toContainText('1 violation');
+  // the badge channel's validation lens, on by default with a guard
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await expect(menu.getByRole('combobox', { name: 'Badges' })).toHaveValue('validation');
+  await page.keyboard.press('Escape');
+  // the list view's column
+  await page.getByRole('button', { name: 'List', exact: true }).click();
+  await expect(page.getByRole('row').filter({ hasText: 'p2' }).first()).toContainText(
+    '1 violation',
+  );
+  await page.getByRole('button', { name: 'List', exact: true }).click();
 
   await page.getByRole('button', { name: /p2, 1 violation/ }).click();
   const panel = page.getByRole('dialog', { name: /Validation results of/ });
@@ -98,7 +106,11 @@ open('a ShEx guard badges the nodes that do not conform', async ({ page, request
   await expect
     .poll(async () => Object.keys(await badgesOf(page)).length, { timeout: 20_000 })
     .toBe(3);
-  await expect(page.getByRole('combobox', { name: 'Validation source' })).toContainText('ShEx');
+  // the lens menu's source picker names the guard's language
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await expect(menu.getByRole('combobox', { name: 'Validation source' })).toContainText('ShEx');
+  await page.keyboard.press('Escape');
   await page.getByRole('button', { name: /p3, 1 violation/ }).click();
   const panel = page.getByRole('dialog', { name: /Validation results of/ });
   await expect(panel).toContainText('cardinality');
@@ -129,13 +141,16 @@ anonymous('A13: a caller limited to some graphs gets no overlay', async ({ brows
   }
   await page.goto(`/ui/explore?ds=overlay-limited&iri=${encodeURIComponent(`${EX}p1`)}`);
   await expect(page.locator('.wrap[data-graph]')).toBeVisible({ timeout: 20_000 });
-  // on by default only with a guard the caller may use: nothing shows
+  // the lens menu has no validation lens, and says why
   await expect(page.getByRole('region', { name: 'Validation overlay' })).toHaveCount(0);
-  // turned on, it gives the reason
-  await page.getByRole('button', { name: 'Validation', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Validation overlay' })).toContainText(
-    'Validation needs access to every graph',
+  await page.getByRole('button', { name: /^Lenses/ }).click();
+  const menu = page.getByRole('dialog', { name: 'Lenses' });
+  await expect(menu.getByTestId('lens-validation-note')).toHaveText(
+    'Validation needs access to every graph.',
   );
+  await expect(
+    menu.getByRole('combobox', { name: 'Badges' }).locator('option[value="validation"]'),
+  ).toHaveCount(0);
   expect(await badgesOf(page)).toEqual({});
   await ctx.close();
 });

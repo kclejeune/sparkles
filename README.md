@@ -281,7 +281,7 @@ validation on the graph.
   </tr>
   <tr>
     <td><img src="docs/images/map-arcs.png" alt="The resource explorer showing a freight company's graph as a world map, with arcs from its head office in Dubai to its offices, partners and employees on six continents, coloured by predicate"></td>
-    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, a bad email address and its edge marked, and a results panel previewing an update that adds a missing name"></td>
+    <td><img src="docs/images/validation-overlay.png" alt="The resource explorer with validation badges on three people, the validation lens's legend grouping the nodes by their worst severity, and a results panel previewing an update that adds a missing name"></td>
   </tr>
   <tr>
     <td>A graph's relations drawn as arcs on a map</td>

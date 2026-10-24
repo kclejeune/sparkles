@@ -6,7 +6,7 @@
    * badge and edge lens off and on again while `keys` is set. At 390 px it is a bottom sheet.
    * A polite live region announces each lens's result.
    */
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, type Snippet } from 'svelte';
   import { CHANNEL_NAMES, CHANNELS, type Channel } from '$lib/lens';
   import { LENS_OPTIONS, type LensId, type Lenses } from '$lib/lenses.svelte';
   import Icon from './Icon.svelte';
@@ -15,12 +15,15 @@
     lenses,
     short,
     keys = true,
+    extra,
   }: {
     lenses: Lenses;
     /** A short form of an IRI, for the property picker. */
     short: (iri: string) => string;
     /** Whether the keyboard shortcuts apply, such as while the graph is on screen. */
     keys?: boolean;
+    /** More controls for the panel, such as the validation lens's source. */
+    extra?: Snippet;
   } = $props();
 
   let open = $state(false);
@@ -32,7 +35,10 @@
 
   const count = $derived(CHANNELS.filter((c) => lenses.choice[c].lens !== 'none').length);
 
-  const options = (ch: Channel) => LENS_OPTIONS[ch].filter((o) => !o.reasoning || lenses.reasoning);
+  const options = (ch: Channel) =>
+    LENS_OPTIONS[ch].filter(
+      (o) => (!o.reasoning || lenses.reasoning) && (!o.validation || lenses.validation),
+    );
 
   const selectValue = (ch: Channel) =>
     picking[ch] && lenses.choice[ch].lens !== 'property' ? 'property' : lenses.choice[ch].lens;
@@ -215,6 +221,10 @@
           The dataset has no reasoning, so there are no inferred edges to show.
         </p>
       {/if}
+      {#if lenses.validationNote}
+        <p class="note faint" data-testid="lens-validation-note">{lenses.validationNote}</p>
+      {/if}
+      {#if extra}{@render extra()}{/if}
       <p class="note faint">These views are computed for this picture and are not saved.</p>
       <p class="note faint keys">Shift+1 to Shift+4 turn a channel off and on again.</p>
     </div>

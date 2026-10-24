@@ -43,6 +43,8 @@
   } from '$lib/validation-overlay';
   import Icon from './Icon.svelte';
 
+  type SourceKind = 'guard' | 'graph' | 'editor';
+
   let {
     ds,
     items,
@@ -56,6 +58,12 @@
     onshowtriples,
     onopenquery,
     auto = false,
+    on = true,
+    sourceKind = $bindable('guard'),
+    graphIri = $bindable(''),
+    probe = $bindable(null),
+    probeFor = $bindable(''),
+    hasEditor = $bindable(false),
     live = $bindable(false),
     badges = $bindable(new Map()),
     marked = $bindable(null),
@@ -80,6 +88,18 @@
     onopenquery?: (text: string) => void;
     /** On by default: show and validate only when the dataset has a guard (§11.2). */
     auto?: boolean;
+    /** The validation lens is on (U07 §11.2): the overlay validates and draws. */
+    on?: boolean;
+    /** Where the shapes come from, which the lens menu's source picker sets. */
+    sourceKind?: SourceKind;
+    /** The shapes graph of the `graph` source. */
+    graphIri?: string;
+    /** What the overlay found out about the dataset's guard, for the lens menu. */
+    probe?: GuardProbe | null;
+    /** The dataset `probe` describes. */
+    probeFor?: string;
+    /** The Validate panel has shapes, for the source picker. */
+    hasEditor?: boolean;
     /** Whether the overlay shows and validates. */
     live?: boolean;
     badges?: Map<string, Badge>;
@@ -87,12 +107,7 @@
   } = $props();
 
   // --- the source -----------------------------------------------------------------
-  let probe = $state<GuardProbe | null>(null);
   let probeError = $state<string | null>(null);
-  type SourceKind = 'guard' | 'graph' | 'editor';
-  let sourceKind = $state<SourceKind>('guard');
-  let graphIri = $state('');
-  let graphDraft = $state('');
   const editorShapes = $derived.by(() => {
     const text = load<string | null>(`sparkles.shacl.${ds}`, null);
     return text
@@ -109,6 +124,7 @@
   $effect(() => {
     const name = ds;
     probe = null;
+    probeFor = '';
     probeError = null;
     guardGraph = 'choose';
     unionDefault = null;
@@ -117,6 +133,7 @@
       .then((p) => {
         if (ds !== name) return;
         probe = p;
+        probeFor = name;
         // without a guard the editor's shapes are the source (§11.2)
         if (p.state === 'none') sourceKind = editorShapes ? 'editor' : 'graph';
         else sourceKind = 'guard';
@@ -152,7 +169,10 @@
   const available = $derived(
     probe != null && probe.state !== 'restricted' && probe.state !== 'unavailable',
   );
-  const isLive = $derived(!auto || probe?.state === 'shacl' || probe?.state === 'shex');
+  const isLive = $derived(on && (!auto || probe?.state === 'shacl' || probe?.state === 'shex'));
+  $effect(() => {
+    hasEditor = !!editorShapes;
+  });
   $effect(() => {
     live = isLive;
   });
@@ -374,10 +394,11 @@
     `${at ? `at ${at.replace(/^commit:/, 'commit ')}` : 'at the head'}${branch ? ` on ${branch}` : ''}`,
   );
   const hasSparql = $derived(lang === 'shacl' && results.some((r) => r.kind === 'sparql'));
-  function useGraph(e: SubmitEvent) {
-    e.preventDefault();
-    graphIri = graphDraft.trim();
-  }
+  const SOURCE_NAME: Record<SourceKind, string> = {
+    guard: 'the write-time guard',
+    graph: 'a shapes graph',
+    editor: "the Validate panel's shapes",
+  };
   const OUTCOME: Record<string, string> = {
     commit: 'The update would commit.',
     'no-change': 'The update would change nothing.',
@@ -399,29 +420,11 @@
       <p class="faint small"><span class="spinner"></span> Looking for the dataset's shapes…</p>
     {:else}
       <div class="vo-head">
-        <label class="row small">
-          Shapes
-          <select bind:value={sourceKind} aria-label="Validation source">
-            {#if probe.state === 'shacl' || probe.state === 'shex'}
-              <option value="guard"
-                >Write-time guard ({probe.state === 'shex' ? 'ShEx' : 'SHACL'})</option
-              >
-            {/if}
-            <option value="graph">A shapes graph</option>
-            {#if editorShapes}<option value="editor">The Validate panel's shapes</option>{/if}
-          </select>
-        </label>
-        {#if sourceKind === 'graph'}
-          <form class="row small" onsubmit={useGraph}>
-            <input
-              class="mono"
-              placeholder="http://example.org/shapes"
-              aria-label="Shapes graph IRI"
-              bind:value={graphDraft}
-            />
-            <button class="btn sm" type="submit">Use</button>
-          </form>
-        {/if}
+        <span class="small">
+          Validation with {SOURCE_NAME[sourceKind]}{sourceKind === 'graph' && graphIri
+            ? ` ${short(graphIri)}`
+            : ''}
+        </span>
         <span class="spacer"></span>
         <span class="small faint" role="status" aria-live="polite">
           {#if paused}
@@ -432,7 +435,7 @@
             )} nodes…
           {:else if !source}
             {sourceKind === 'graph'
-              ? 'Name a shapes graph of the dataset.'
+              ? 'Name a shapes graph of the dataset in the Lenses menu.'
               : 'No shapes to validate with.'}
           {:else if validatedAt}
             {fmtInt(withResults.length)} of {fmtInt(validatedAt.nodes)} nodes have results, {stateName}.
@@ -448,27 +451,6 @@
           The overlay validates the drawn nodes as focus nodes. A SHACL-SPARQL constraint that is
           not anchored at its focus node can give other results in a full validation.
         </p>
-      {/if}
-      {#if withResults.length}
-        <details class="vo-list">
-          <summary class="small">Nodes with results ({fmtInt(withResults.length)})</summary>
-          <table class="small">
-            <thead><tr><th scope="col">Node</th><th scope="col">Validation</th></tr></thead>
-            <tbody>
-              {#each withResults as n (n.id)}
-                {@const b = badges.get(n.id)}
-                <tr class:sel={n.id === selectedId}>
-                  <td>
-                    <button class="linkish" onclick={() => (onselect?.(n.id), open(n.id))}
-                      >{n.label}</button
-                    >
-                  </td>
-                  <td class={b?.worst}>{b ? `${MARK[b.worst]} ${b.words}` : ''}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </details>
       {/if}
     {/if}
   </section>
@@ -606,31 +588,8 @@
     align-items: center;
     gap: 8px;
   }
-  .vo-head input {
-    width: 22ch;
-  }
   .spacer {
     flex: 1;
-  }
-  .vo-list table {
-    border-collapse: collapse;
-    width: 100%;
-    max-width: 520px;
-  }
-  .vo-list th,
-  .vo-list td {
-    text-align: left;
-    padding: 2px 6px;
-    border-bottom: 1px solid var(--border);
-  }
-  .vo-list tr.sel td {
-    background: var(--spark-soft);
-  }
-  .vo-list td.violation {
-    color: var(--danger);
-  }
-  .vo-list td.warning {
-    color: var(--warn);
   }
   .linkish {
     background: none;

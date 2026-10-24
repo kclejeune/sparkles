@@ -161,3 +161,115 @@ describe('resultState', () => {
     expect(resultState({ meta: {} })).toBeUndefined();
   });
 });
+
+describe('the validation lens (U07 §11.2, item 120)', () => {
+  const badge = (count: number, worst: 'violation' | 'warning' | 'info' = 'violation') => ({
+    count,
+    worst,
+    words: `${count} ${worst}${count === 1 ? '' : 's'}`,
+  });
+  it('is offered only where the overlay may validate, and says why not', () => {
+    const { l } = lenses(() => []);
+    l.setInput(input({}));
+    expect(l.validation).toBe(false);
+    l.setValidation(false, 'Validation needs access to every graph.');
+    expect(l.validationNote).toBe('Validation needs access to every graph.');
+    l.setValidation(true);
+    expect(l.validation).toBe(true);
+    expect(l.validationNote).toBeNull();
+    l.destroy();
+  });
+
+  it('is a default that leaves a chosen badge lens alone, and ends when it is not offered', async () => {
+    const { l } = lenses(() => []);
+    const chosen: string[] = [];
+    l.onchoose = (ch, c) => chosen.push(`${ch}:${c.lens}`);
+    l.setInput(input({ nodes: [node('a'), node('b')] }));
+    l.setValidation(true);
+    l.suggest('badge', { lens: 'validation' });
+    expect(l.choice.badge.lens).toBe('validation');
+    // a default is not the person's choice
+    expect(chosen).toEqual([]);
+    l.setValidationBadges(new Map([[`<${EX}a>`, badge(2)]]));
+    await settle();
+    const r = l.results.badge!;
+    expect(r.lens).toBe('validation');
+    expect(r.text.get(`<${EX}a>`)).toBe('✕ 2 violations');
+    expect(r.legend.map((e) => e.ids)).toEqual([[`<${EX}a>`]]);
+    expect(l.columns.find((c) => c.channel === 'badge')?.title).toBe('validation results');
+    // the overlay draws these badges, so the canvas encoding has none
+    expect(l.encoding.badge).toBe(false);
+    expect(l.encoding.nodes.get(`<${EX}a>`)?.badge).toBeUndefined();
+    // the person turns it off, and a default no longer applies
+    l.set('badge', { lens: 'none' });
+    expect(chosen).toEqual(['badge:none']);
+    l.suggest('badge', { lens: 'validation' });
+    expect(l.choice.badge.lens).toBe('none');
+    l.set('badge', { lens: 'validation' });
+    l.setValidation(false, 'Validation needs access to every graph.');
+    expect(l.choice.badge.lens).toBe('none');
+    l.destroy();
+  });
+
+  it('a default of one dataset is not carried to the next', () => {
+    const { l } = lenses(() => []);
+    l.setInput(input({ ds: 'one' }));
+    l.setValidation(true);
+    l.suggest('badge', { lens: 'validation' });
+    expect(l.choice.badge.lens).toBe('validation');
+    l.setInput(input({ ds: 'two' }));
+    expect(l.choice.badge.lens).toBe('none');
+    l.destroy();
+  });
+});
+
+describe('the validation lens after review (item 120)', () => {
+  it('an explicit choice comes back when validation is offered again', () => {
+    const { l } = lenses(() => []);
+    l.setInput(input({ ds: 'a' }));
+    l.setValidation(true);
+    l.set('badge', { lens: 'validation' });
+    // a restricted dataset does not offer it
+    l.setInput(input({ ds: 'b' }));
+    l.setValidation(false, 'Validation needs access to every graph.');
+    expect(l.choice.badge.lens).toBe('none');
+    // back on the first dataset, the page restores the remembered choice
+    l.setInput(input({ ds: 'a' }));
+    l.setValidation(true);
+    l.restore('badge', { lens: 'validation' });
+    expect(l.choice.badge.lens).toBe('validation');
+    l.destroy();
+  });
+
+  it('Shift+3 turns on the remembered badge lens, also with reasoning', () => {
+    const { l } = lenses(() => []);
+    l.setLast('badge', { lens: 'validation' });
+    l.setInput(input({ reasoning: true }));
+    l.setValidation(true);
+    l.toggle('badge');
+    expect(l.choice.badge.lens).toBe('validation');
+    l.destroy();
+  });
+});
+
+describe('the validation lens after the second review (item 120)', () => {
+  it('turning off a default lens names it for Shift+3 after a reload', () => {
+    const { l } = lenses(() => []);
+    const remembered: string[] = [];
+    l.onchoose = (_ch, _c, remember) => remembered.push(remember.lens);
+    l.setInput(input({ reasoning: true }));
+    l.setValidation(true);
+    l.suggest('badge', { lens: 'validation' });
+    l.set('badge', { lens: 'none' });
+    expect(remembered).toEqual(['validation']);
+    l.destroy();
+    // the page opens again with what it saved
+    const { l: again } = lenses(() => []);
+    again.setLast('badge', { lens: remembered[0] as 'validation' });
+    again.setInput(input({ reasoning: true }));
+    again.setValidation(true);
+    again.toggle('badge');
+    expect(again.choice.badge.lens).toBe('validation');
+    again.destroy();
+  });
+});
