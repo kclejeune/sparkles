@@ -1861,10 +1861,13 @@ fn memory_loc() {
     assert_eq!(j["code"], "locked", "{j:#}");
 }
 
+// used only by the shacl check in memory_import_sync_and_brief
+#[cfg(feature = "shacl")]
 trait JsonValue {
     fn json_value(self) -> Value;
 }
 
+#[cfg(feature = "shacl")]
 impl JsonValue for reqwest::blocking::Response {
     fn json_value(self) -> Value {
         serde_json::from_slice(&self.bytes().unwrap()).unwrap()
