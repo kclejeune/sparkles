@@ -2841,6 +2841,127 @@ parameter. An unknown query is `404`.
 stored queries of a database directory (see [Usage](USAGE.md#stored-queries)). The Rust
 API is `sparkles::stored`.
 
+## Incremental views
+
+The design and its rationale are in
+[F13 Incremental views, live queries and fact provenance](specs/F13-incremental-views-and-provenance.md).
+
+A view is a named SELECT or CONSTRUCT query whose result the server keeps current after
+every commit. Each commit's net changes run through a circuit compiled from the query,
+so a commit that adds one quad costs work in proportion to the rows that quad affects,
+not a new evaluation. A commit whose changes miss every pattern of the query skips the
+view after one hash probe per changed quad. The definitions are kept in the database
+directory as `views/{name}/view.json`, and the state is checkpointed beside them.
+
+```json
+{
+  "query": "PREFIX org: <http://www.w3.org/ns/org#> SELECT ?team (COUNT(?p) AS ?n) WHERE { ?p org:memberOf ?team } GROUP BY ?team",
+  "principal": "reports",
+  "memoryBytes": 268435456
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `query` | A SELECT or CONSTRUCT query. The dataset's declared prefixes apply. |
+| `storedQuery` | The name of a stored query, in place of `query`. The view follows its current version when the view is attached. |
+| `principal` | The user whose view of the dataset the query reads. The default is the definer. A definer whose grants cover every graph defines a view without a principal, which reads every quad. |
+| `memoryBytes` | The budget of the view's state, 256 MiB by default. A view over its budget is suspended. |
+| `mode`, `provenance`, `maintenance`, `branches`, `keepCommits` | Phase 1 takes only `table`, `none`, `async`, `["main"]` and `0`. Other values are refused with `400 unsupported-option`. |
+
+Unknown members are refused. A query outside the incremental fragment is refused with
+`400 not-incremental` and names the construct: `NOW`, `RAND`, `UUID`, `STRUUID`, `BNODE`,
+any `SERVICE`, full-text, vector and spatial search, `DESCRIBE`, and a `GRAPH` block in a
+CONSTRUCT template. `ORDER BY` without `LIMIT` does not change a view's rows and is
+ignored. Operators that the circuit cannot maintain run as
+`recompute` nodes, which evaluate their subtree again at each commit that touches it and
+subtract the previous output. Property paths with `*`, `+` or `?`, `LIMIT` and
+`OFFSET`, a dataset clause, and `MINUS`, aggregates, `DISTINCT`, `VALUES` and subqueries
+under `GRAPH ?g` are recompute nodes. The plan in `GET /$/views/{ds}/{name}` marks each
+operator `incremental` or `recompute`, with the reason.
+
+| Method | Path | Needs | Description |
+|---|---|---|---|
+| GET | `/$/views/{ds}` | `read` | `{dataset, views: [...]}`, each view with its definition and state but without its plan. |
+| GET | `/$/views/{ds}/{name}` | `read` | The view with its state, its columns, its rows counted with multiplicity, `stateBytes`, the passes run and skipped, `passMs`, `recomputeMs` and its plan. |
+| PUT | `/$/views/{ds}/{name}` | `admin` | Defines or replaces the view and starts its first evaluation as a `view-build` task. `201` for a new view, `200` otherwise, with the plan and `task`. |
+| DELETE | `/$/views/{ds}/{name}` | `admin` | Removes the view and its state (`204`). |
+| POST | `/$/views/{ds}/{name}/rebuild` | `admin` | Evaluates the view again from scratch as a task and lifts a suspension (`202`). |
+
+A view's `state` is `building` while it is evaluated, `current` at the head commit,
+`behind` with `commits` while its pass runs after a commit, `suspended` with a `reason`
+such as `over-budget` or `pass-timeout`, or `failed` with an `error`. A pass that runs
+longer than `--view-pass-timeout`, 30 seconds by default, suspends its view. The views of
+a dataset share `--views-memory` when it is set.
+
+**Reading a view.** A query reads a view's rows with the local service `view:read`.
+
+```sparql
+PREFIX view: <urn:x-sparkles:view#>
+SELECT ?team ?n WHERE {
+  SERVICE view:read { [] view:name "team-sizes" ; view:bind ?team, ?n ; view:commit ?c }
+  FILTER (?n > 1)
+}
+```
+
+Each variable of `view:bind` reads the view's column of the same name, and the rows come
+with their multiplicities. `view:commit` binds the commit the rows reflect. A read at a
+commit the view has not reached waits up to 2 seconds and then fails with
+`503 view-behind` and `Retry-After`. `view:allowStale true` reads the latest state
+instead. A suspended view answers `503 view-suspended`, and an unknown one
+`404 view-not-found`.
+
+A caller may read a view when its own grants cover every graph, or when its grants equal
+those of the view's principal. Otherwise the read fails with `403 view-access`. Phase 1
+does not compare grant sets for containment and has no grant that declassifies a view by
+name.
+
+**Persistence.** A view's state is checkpointed to `views/{name}/main/state-{commit}.bin`
+every 60 seconds while it changes and when the dataset closes. On open the newest
+checkpoint is loaded and the commits after it are applied from the change log or from
+history. When neither covers them, the view is evaluated again and is `building`
+meanwhile. A checkpoint in a format this release does not read is left in place and the
+view is built from the data. An in-memory dataset keeps view state in memory only.
+Backups and clones do not carry view definitions in Phase 1.
+
+`sparkles views --loc DB list|get|put|delete|rebuild|explain` manages the views of a
+database directory or, with `--server`, of a server (see
+[Usage](USAGE.md#incremental-views)). The Rust API is `Dataset::views()` and
+`sparkles::incr`.
+
+## Live queries
+
+`GET /{ds}/live?query=…` runs a SELECT, ASK or CONSTRUCT query that a view could be and
+streams its result and its changes as server-sent events. It needs `read` on the dataset,
+and the query reads the caller's view of the dataset.
+
+| Event | Data | When |
+|---|---|---|
+| `snapshot` | `{commit, vars, rows, more}` | The result at the start, in pages of at most 10,000 rows. The last page has `more: false`. |
+| `diff` | `{commit, from, removed, added}` | After each commit that changed the result. `from` is the commit of the previous event. |
+| `reset` | as `snapshot` | The server evaluated the query again, after changes it could not follow or a resume it could not bridge. The client replaces its copy. |
+| `error` | `{code, error}` | The stream ends. |
+
+A row is `{"values": [...]}` with one SPARQL JSON term or `null` per variable of `vars`,
+and `count` when the row was added or removed more than once. CONSTRUCT streams rows of
+`subject`, `predicate` and `object`. ASK streams `{commit, value}` at the start and a
+`diff` of `{commit, from, value}` only when the value changes. Each event's id is the
+commit it reflects.
+
+`Last-Event-ID: N` or `after=commit:N` resumes after commit N. The first event is then
+the change from N, taken from the diffs the query's circuit keeps or by evaluating the
+query before the changes since N, and a `reset` when the change log and history cannot
+bridge the gap. `coalesceMs` merges the diffs of commits that arrive within the interval
+into one event whose id is the last commit. Commits that do not change the result send
+nothing but a comment line every 15 seconds.
+
+Live queries and views that ask the same question with the same access share one
+circuit. A dataset runs at most `--max-live-queries` live queries, 1,000 by default, and
+`--max-live-queries-per-principal`, 20 by default, for each principal. More are refused
+with `429 too-many-live-queries`. The first evaluation counts against the rate limit as
+a query. A stream ends when the server drains, and with an `access-changed` error when
+the access policy changes, after which the client reconnects under the new grants.
+
 ## GraphQL
 
 The design and its rationale are in [C03 GraphQL read adapter](specs/C03-graphql.md).

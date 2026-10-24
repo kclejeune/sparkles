@@ -262,7 +262,8 @@ async fn metrics_count_requests_by_dataset_operation_and_outcome() {
         let (series, v) = l.rsplit_once(' ').unwrap();
         let count = series
             .replace("_bucket{", "_count{")
-            .replace(",le=\"+Inf\"", "");
+            .replace(",le=\"+Inf\"", "")
+            .replace("{le=\"+Inf\"}", "");
         assert_eq!(sample(&m, &count), Some(v.parse().unwrap()), "{l}");
     }
 }

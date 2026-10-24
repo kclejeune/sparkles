@@ -496,6 +496,25 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("listStoredQueryVersions", "queries.versions", |ds| {
             ds.queries().versions("q");
         }),
+        // ------------------------------------------------ incremental views (F13)
+        op!("listViews", "views.list", |ds| {
+            ds.views().list();
+        }),
+        op!("getView", "views.get", |ds| {
+            ds.views().get("v");
+        }),
+        op!("putView", "views.put", |ds| {
+            ds.views().put("v", any());
+        }),
+        op!("deleteView", "views.delete", |ds| {
+            ds.views().delete("v");
+        }),
+        op!("rebuildView", "views.rebuild", |ds| {
+            ds.views().rebuild("v");
+        }),
+        op!("liveQuery", "live", |ds| {
+            ds.live("q", &Default::default());
+        }),
         op_if!("graphql", "getGraphqlConfig", "graphql.config.get", |ds| {
             ds.graphql().get(None);
         }),

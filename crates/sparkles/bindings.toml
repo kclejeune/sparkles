@@ -895,3 +895,33 @@ node = "Dataset.validation.shacl"
 python = "Dataset.validation.shex"
 jvm = "DatasetGraphSparkles.validation().shex"
 node = "Dataset.validation.shex"
+
+["views.delete"]
+python = "Dataset.views.delete"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["views.get"]
+python = "Dataset.views.get"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["views.list"]
+python = "Dataset.views.list"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["views.put"]
+python = "Dataset.views.put"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["views.rebuild"]
+python = "Dataset.views.rebuild"
+jvm = "planned: F13 Phase 2 adds the JVM API"
+node = "planned: F13 Phase 2 adds the Node.js API"
+
+["live"]
+python = "Dataset.live"
+jvm = "planned: F13 Phase 2 adds a LiveQuery with a listener"
+node = "planned: F13 Phase 2 adds an async iterator with an AbortSignal"

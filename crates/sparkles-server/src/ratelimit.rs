@@ -164,6 +164,7 @@ pub fn classify(
         | "/{ds}/shex"
         | "/{ds}/diff"
         | "/{ds}/queries/{name}"
+        | "/{ds}/live"
         | "/{ds}/graphql"
         | "/{ds}/graphql/schema" => Some(Class::Query),
         "/{ds}/update" | "/{ds}/upload" | "/{ds}/facts" => Some(Class::Update),

@@ -396,6 +396,9 @@ pub struct AppState {
     /// the largest closure a dataset keeps in memory for incremental reasoning, in
     /// derived triples (`serve --reason-cache-triples`)
     pub reason_cache_triples: usize,
+    /// the settings of incremental views and live queries (`serve --max-live-queries`,
+    /// `--view-pass-timeout`, …)
+    pub views_options: sparkles::incr::RuntimeOptions,
     /// the derived triples a materialization may produce before it fails
     /// (`serve --reason-max-inferred`, 0 on the command line for no limit, which is
     /// `usize::MAX` here); a request may ask for less with `maxInferred`
@@ -679,6 +682,7 @@ impl AppState {
             http_compression: Default::default(),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
+            views_options: Default::default(),
             reason_max_inferred: DEFAULT_REASON_MAX_INFERRED,
             compaction: Default::default(),
             #[cfg(feature = "backup")]
@@ -740,6 +744,7 @@ impl AppState {
             phase: AtomicU8::new(crate::obs::Phase::Ready as u8),
             auto_reason: None,
             reason_cache_triples: DEFAULT_REASON_CACHE_TRIPLES,
+            views_options: Default::default(),
             reason_max_inferred: DEFAULT_REASON_MAX_INFERRED,
             compaction: Default::default(),
             #[cfg(feature = "backup")]
@@ -844,6 +849,7 @@ impl AppState {
         dataset
             .store()
             .set_prefix_filter(Some(self.settings.prefix_filter(name)));
+        crate::http::start_views(self, name, &dataset);
         Arc::new(Dataset {
             name: name.to_string(),
             kind,
@@ -854,6 +860,15 @@ impl AppState {
             offline: AtomicBool::new(false),
             dataset,
         })
+    }
+
+    /// The routing objects of the datasets open now, without opening any.
+    pub fn open_datasets(&self) -> Vec<(String, Arc<Dataset>)> {
+        self.routing
+            .lock()
+            .iter()
+            .map(|(n, ds)| (n.clone(), ds.clone()))
+            .collect()
     }
 
     /// A snapshot of the server's routing objects for the catalog's datasets.
